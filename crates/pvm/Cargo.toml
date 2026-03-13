@@ -1,0 +1,8 @@
+[package]
+name = "pyde-vm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ethnum = "1.5.2"
+thiserror = "2"
