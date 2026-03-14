@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 
 use ml_kem::{
-    Decapsulate, MlKem768, Seed,
     kem::{Encapsulate, Kem, KeyExport},
+    Decapsulate, MlKem768, Seed,
 };
 
 // ML-KEM-768 sizes

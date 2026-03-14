@@ -89,8 +89,7 @@ pub fn falcon_keygen() -> (FalconPublicKey, FalconSecretKey) {
 
 /// Sign a message with a FALCON-512 secret key.
 pub fn falcon_sign(sk: &FalconSecretKey, msg: &[u8]) -> FalconSignature {
-    let kp =
-        FnDsaKeyPair::from_private_key(&sk.0).expect("invalid FALCON-512 secret key");
+    let kp = FnDsaKeyPair::from_private_key(&sk.0).expect("invalid FALCON-512 secret key");
     let sig = kp
         .sign(msg, &DomainSeparation::None)
         .expect("FALCON-512 signing failed");
@@ -104,9 +103,7 @@ pub fn falcon_verify(pk: &FalconPublicKey, msg: &[u8], sig: &FalconSignature) ->
 
 /// Batch verify multiple FALCON-512 signatures.
 /// Returns true only if ALL signatures are valid.
-pub fn falcon_batch_verify(
-    items: &[(&FalconPublicKey, &[u8], &FalconSignature)],
-) -> bool {
+pub fn falcon_batch_verify(items: &[(&FalconPublicKey, &[u8], &FalconSignature)]) -> bool {
     items
         .iter()
         .all(|(pk, msg, sig)| falcon_verify(pk, msg, sig))

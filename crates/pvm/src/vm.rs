@@ -1,12 +1,68 @@
 //! PVM execution engine: ties CPU, memory, and control flow together.
 
 use crate::cpu::{Cpu, Trap};
-use crate::isa::{decode, decode_mem_offset, decode_mem_width, sign_extend_18, Instruction, MemWidth, Opcode};
-use crate::wide::U256;
+use crate::isa::{
+    decode, decode_mem_offset, decode_mem_width, sign_extend_18, Instruction, MemWidth, Opcode,
+};
 use crate::memory::Memory;
+use crate::wide::U256;
 
 /// Maximum call depth (nested function calls).
 const MAX_CALL_DEPTH: usize = 1024;
+
+/// Sub-codes for the `Caller` opcode (GP-width environment queries).
+/// The immediate field selects which value to return.
+pub mod env_gp {
+    pub const CALLER: u32 = 0;
+    pub const ADDRESS: u32 = 1;
+    pub const BLOCK_NUMBER: u32 = 2;
+    pub const TIMESTAMP: u32 = 3;
+    pub const GAS_REMAINING: u32 = 4;
+}
+
+/// Sub-codes for the `Callvalue` opcode (wide environment queries).
+pub mod env_wide {
+    pub const CALL_VALUE: u32 = 0;
+    pub const GAS_PRICE: u32 = 1;
+    pub const BALANCE: u32 = 2;
+}
+
+/// Execution context: caller info, block info, and balances.
+#[derive(Clone, Debug)]
+pub struct ExecutionContext {
+    /// Address of the caller (msg.sender).
+    pub caller: u64,
+    /// Address of the current contract.
+    pub self_address: u64,
+    /// Value sent with the call (msg.value), 256-bit.
+    pub call_value: U256,
+    /// Current block number.
+    pub block_number: u64,
+    /// Current block timestamp (Unix seconds).
+    pub timestamp: u64,
+    /// Current base fee / gas price, 256-bit.
+    pub gas_price: U256,
+    /// Recent block hashes (index 0 = most recent). Up to 256 entries.
+    pub block_hashes: Vec<U256>,
+    /// Balance lookup function: address → balance.
+    /// Stored as a simple map for now.
+    pub balances: std::collections::HashMap<u64, U256>,
+}
+
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self {
+            caller: 0,
+            self_address: 0,
+            call_value: U256::ZERO,
+            block_number: 0,
+            timestamp: 0,
+            gas_price: U256::ZERO,
+            block_hashes: Vec::new(),
+            balances: std::collections::HashMap::new(),
+        }
+    }
+}
 
 /// A saved call frame on the call stack.
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +114,8 @@ pub struct Vm {
     pub gas_limit: u64,
     /// Accumulated gas refund (e.g. from SDELETE).
     pub gas_refund: u64,
+    /// Execution context (caller, block info, etc.).
+    pub ctx: ExecutionContext,
 }
 
 impl Vm {
@@ -72,6 +130,7 @@ impl Vm {
             gas: GasUsed::default(),
             gas_limit: 0,
             gas_refund: 0,
+            ctx: ExecutionContext::default(),
         }
     }
 
@@ -83,9 +142,25 @@ impl Vm {
         }
     }
 
+    /// Create a new VM with an execution context.
+    pub fn with_context(ctx: ExecutionContext) -> Self {
+        Self { ctx, ..Self::new() }
+    }
+
+    /// Create a new VM with both a gas limit and execution context.
+    pub fn with_gas_limit_and_context(gas_limit: u64, ctx: ExecutionContext) -> Self {
+        Self {
+            gas_limit,
+            ctx,
+            ..Self::new()
+        }
+    }
+
     /// Load bytecode and prepare for execution.
     pub fn load(&mut self, bytecode: &[u8]) -> Result<(), Trap> {
-        self.memory.load_code(bytecode).map_err(|_| Trap::MemoryFault)?;
+        self.memory
+            .load_code(bytecode)
+            .map_err(|_| Trap::MemoryFault)?;
         self.pc = 0;
         Ok(())
     }
@@ -193,19 +268,43 @@ impl Vm {
             }
 
             // --- ALU ops: delegate to cpu ---
-            Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Mod
-            | Opcode::Addi | Opcode::And | Opcode::Or | Opcode::Xor | Opcode::Not
-            | Opcode::Shl | Opcode::Shr | Opcode::Sar
-            | Opcode::Lt | Opcode::Gt | Opcode::Eq | Opcode::Slt | Opcode::Sgt => {
+            Opcode::Add
+            | Opcode::Sub
+            | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Mod
+            | Opcode::Addi
+            | Opcode::And
+            | Opcode::Or
+            | Opcode::Xor
+            | Opcode::Not
+            | Opcode::Shl
+            | Opcode::Shr
+            | Opcode::Sar
+            | Opcode::Lt
+            | Opcode::Gt
+            | Opcode::Eq
+            | Opcode::Slt
+            | Opcode::Sgt => {
                 self.cpu.exec_alu(instr)?;
                 self.pc += 4;
             }
 
             // --- Wide ops: delegate to cpu ---
-            Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv | Opcode::Wmod
-            | Opcode::Wand | Opcode::Wor | Opcode::Wxor | Opcode::Wnot
-            | Opcode::Wmov | Opcode::Narrow | Opcode::Widen
-            | Opcode::Weq | Opcode::Wlt => {
+            Opcode::Wadd
+            | Opcode::Wsub
+            | Opcode::Wmul
+            | Opcode::Wdiv
+            | Opcode::Wmod
+            | Opcode::Wand
+            | Opcode::Wor
+            | Opcode::Wxor
+            | Opcode::Wnot
+            | Opcode::Wmov
+            | Opcode::Narrow
+            | Opcode::Widen
+            | Opcode::Weq
+            | Opcode::Wlt => {
                 self.cpu.exec_wide(instr)?;
                 self.pc += 4;
             }
@@ -218,8 +317,12 @@ impl Vm {
                 let addr = (base as i64 + offset) as u32;
                 let val = match width {
                     MemWidth::W8 => self.memory.load8(addr).map_err(|_| Trap::MemoryFault)? as u64,
-                    MemWidth::W16 => self.memory.load16(addr).map_err(|_| Trap::MemoryFault)? as u64,
-                    MemWidth::W32 => self.memory.load32(addr).map_err(|_| Trap::MemoryFault)? as u64,
+                    MemWidth::W16 => {
+                        self.memory.load16(addr).map_err(|_| Trap::MemoryFault)? as u64
+                    }
+                    MemWidth::W32 => {
+                        self.memory.load32(addr).map_err(|_| Trap::MemoryFault)? as u64
+                    }
                     MemWidth::W64 => self.memory.load64(addr).map_err(|_| Trap::MemoryFault)?,
                 };
                 self.cpu.write_gp(d.rd, val);
@@ -232,10 +335,22 @@ impl Vm {
                 let addr = (base as i64 + offset) as u32;
                 let val = self.cpu.read_gp(d.rd);
                 match width {
-                    MemWidth::W8 => self.memory.store8(addr, val as u8).map_err(|_| Trap::MemoryFault)?,
-                    MemWidth::W16 => self.memory.store16(addr, val as u16).map_err(|_| Trap::MemoryFault)?,
-                    MemWidth::W32 => self.memory.store32(addr, val as u32).map_err(|_| Trap::MemoryFault)?,
-                    MemWidth::W64 => self.memory.store64(addr, val).map_err(|_| Trap::MemoryFault)?,
+                    MemWidth::W8 => self
+                        .memory
+                        .store8(addr, val as u8)
+                        .map_err(|_| Trap::MemoryFault)?,
+                    MemWidth::W16 => self
+                        .memory
+                        .store16(addr, val as u16)
+                        .map_err(|_| Trap::MemoryFault)?,
+                    MemWidth::W32 => self
+                        .memory
+                        .store32(addr, val as u32)
+                        .map_err(|_| Trap::MemoryFault)?,
+                    MemWidth::W64 => self
+                        .memory
+                        .store64(addr, val)
+                        .map_err(|_| Trap::MemoryFault)?,
                 };
                 self.pc += 4;
             }
@@ -252,21 +367,72 @@ impl Vm {
                 let offset = sign_extend_18(d.rs2_or_imm) as i64;
                 let addr = (base as i64 + offset) as u32;
                 let val = self.cpu.read_wide(d.rd);
-                self.memory.store256(addr, &val.to_le_bytes()).map_err(|_| Trap::MemoryFault)?;
+                self.memory
+                    .store256(addr, &val.to_le_bytes())
+                    .map_err(|_| Trap::MemoryFault)?;
                 self.pc += 4;
             }
             Opcode::Push => {
                 let val = self.cpu.read_gp(d.rd);
                 self.memory.stack_pointer -= 8;
-                self.memory.store64(self.memory.stack_pointer, val)
+                self.memory
+                    .store64(self.memory.stack_pointer, val)
                     .map_err(|_| Trap::MemoryFault)?;
                 self.pc += 4;
             }
             Opcode::Pop => {
-                let val = self.memory.load64(self.memory.stack_pointer)
+                let val = self
+                    .memory
+                    .load64(self.memory.stack_pointer)
                     .map_err(|_| Trap::MemoryFault)?;
                 self.cpu.write_gp(d.rd, val);
                 self.memory.stack_pointer += 8;
+                self.pc += 4;
+            }
+
+            // --- System instructions (environment queries) ---
+            Opcode::Caller => {
+                let sub = d.rs2_or_imm;
+                let val = match sub {
+                    env_gp::CALLER => self.ctx.caller,
+                    env_gp::ADDRESS => self.ctx.self_address,
+                    env_gp::BLOCK_NUMBER => self.ctx.block_number,
+                    env_gp::TIMESTAMP => self.ctx.timestamp,
+                    env_gp::GAS_REMAINING => self.gas_remaining(),
+                    _ => return Err(Trap::InvalidOpcode),
+                };
+                self.cpu.write_gp(d.rd, val);
+                self.pc += 4;
+            }
+            Opcode::Callvalue => {
+                let sub = d.rs2_or_imm;
+                let val = match sub {
+                    env_wide::CALL_VALUE => self.ctx.call_value,
+                    env_wide::GAS_PRICE => self.ctx.gas_price,
+                    env_wide::BALANCE => {
+                        let addr = self.cpu.read_gp(d.rs1);
+                        *self.ctx.balances.get(&addr).unwrap_or(&U256::ZERO)
+                    }
+                    _ => return Err(Trap::InvalidOpcode),
+                };
+                self.cpu.write_wide(d.rd, val);
+                self.pc += 4;
+            }
+            Opcode::Blockhash => {
+                let height = self.cpu.read_gp(d.rs1);
+                let current = self.ctx.block_number;
+                // Only allow recent blocks (up to 256 back), and not current/future
+                let hash = if height < current && current - height <= 256 {
+                    let idx = (current - height - 1) as usize;
+                    self.ctx
+                        .block_hashes
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(U256::ZERO)
+                } else {
+                    U256::ZERO
+                };
+                self.cpu.write_wide(d.rd, hash);
                 self.pc += 4;
             }
 
@@ -330,7 +496,9 @@ mod tests {
 
     /// Helper: encode a LOAD/STORE instruction with width and offset.
     fn instr_mem(op: Opcode, rd: u8, rs1: u8, offset: i32, width: MemWidth) -> [u8; 4] {
-        encode(op, rd, rs1, encode_mem_immediate(offset, width)).0.to_le_bytes()
+        encode(op, rd, rs1, encode_mem_immediate(offset, width))
+            .0
+            .to_le_bytes()
     }
 
     /// Build bytecode from instruction byte arrays.
@@ -682,22 +850,22 @@ mod tests {
         // [64] RET
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 0),    // [0]
-            instr_ri(Opcode::Call, 0, 0, 8),     // [4]
-            instr_bytes(Opcode::Halt, 0, 0, 0),  // [8]
-            instr_ri(Opcode::Addi, 1, 1, 1),     // [12]
-            instr_ri(Opcode::Call, 0, 0, 8),     // [16]
-            instr_bytes(Opcode::Ret, 0, 0, 0),   // [20]
-            instr_ri(Opcode::Addi, 1, 1, 1),     // [24]
-            instr_ri(Opcode::Call, 0, 0, 8),     // [28]
-            instr_bytes(Opcode::Ret, 0, 0, 0),   // [32]
-            instr_ri(Opcode::Addi, 1, 1, 1),     // [36]
-            instr_ri(Opcode::Call, 0, 0, 8),     // [40]
-            instr_bytes(Opcode::Ret, 0, 0, 0),   // [44]
-            instr_ri(Opcode::Addi, 1, 1, 1),     // [48]
-            instr_ri(Opcode::Call, 0, 0, 8),     // [52]
-            instr_bytes(Opcode::Ret, 0, 0, 0),   // [56]
-            instr_ri(Opcode::Addi, 1, 1, 1),     // [60]
-            instr_bytes(Opcode::Ret, 0, 0, 0),   // [64]
+            instr_ri(Opcode::Call, 0, 0, 8),    // [4]
+            instr_bytes(Opcode::Halt, 0, 0, 0), // [8]
+            instr_ri(Opcode::Addi, 1, 1, 1),    // [12]
+            instr_ri(Opcode::Call, 0, 0, 8),    // [16]
+            instr_bytes(Opcode::Ret, 0, 0, 0),  // [20]
+            instr_ri(Opcode::Addi, 1, 1, 1),    // [24]
+            instr_ri(Opcode::Call, 0, 0, 8),    // [28]
+            instr_bytes(Opcode::Ret, 0, 0, 0),  // [32]
+            instr_ri(Opcode::Addi, 1, 1, 1),    // [36]
+            instr_ri(Opcode::Call, 0, 0, 8),    // [40]
+            instr_bytes(Opcode::Ret, 0, 0, 0),  // [44]
+            instr_ri(Opcode::Addi, 1, 1, 1),    // [48]
+            instr_ri(Opcode::Call, 0, 0, 8),    // [52]
+            instr_bytes(Opcode::Ret, 0, 0, 0),  // [56]
+            instr_ri(Opcode::Addi, 1, 1, 1),    // [60]
+            instr_bytes(Opcode::Ret, 0, 0, 0),  // [64]
         ]);
         let mut vm = Vm::new();
         vm.load(&code).unwrap();
@@ -709,9 +877,7 @@ mod tests {
 
     #[test]
     fn ret_without_call_traps() {
-        let code = bytecode(&[
-            instr_bytes(Opcode::Ret, 0, 0, 0),
-        ]);
+        let code = bytecode(&[instr_bytes(Opcode::Ret, 0, 0, 0)]);
         let mut vm = Vm::new();
         vm.load(&code).unwrap();
         assert_eq!(vm.run(), Err(Trap::StackUnderflow));
@@ -788,10 +954,10 @@ mod tests {
     fn load_store_8bit() {
         let heap = crate::memory::HEAP_START;
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, heap as i32),       // r1 = heap addr
-            instr_ri(Opcode::Addi, 2, 0, 0xAB),              // r2 = 0xAB
+            instr_ri(Opcode::Addi, 1, 0, heap as i32), // r1 = heap addr
+            instr_ri(Opcode::Addi, 2, 0, 0xAB),        // r2 = 0xAB
             instr_mem(Opcode::Store, 2, 1, 0, MemWidth::W8), // store8(r1+0, r2)
-            instr_mem(Opcode::Load, 3, 1, 0, MemWidth::W8),  // r3 = load8(r1+0)
+            instr_mem(Opcode::Load, 3, 1, 0, MemWidth::W8), // r3 = load8(r1+0)
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         let mut vm = Vm::new();
@@ -821,7 +987,7 @@ mod tests {
         let heap = crate::memory::HEAP_START;
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, heap as i32),
-            instr_ri(Opcode::Addi, 2, 0, 0x7FFF),            // small value that fits in imm
+            instr_ri(Opcode::Addi, 2, 0, 0x7FFF), // small value that fits in imm
             instr_mem(Opcode::Store, 2, 1, 0, MemWidth::W32),
             instr_mem(Opcode::Load, 3, 1, 0, MemWidth::W32),
             instr_bytes(Opcode::Halt, 0, 0, 0),
@@ -891,10 +1057,10 @@ mod tests {
         vm.memory.store256(heap, &val.to_le_bytes()).unwrap();
 
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, heap as i32),        // r1 = heap addr
+            instr_ri(Opcode::Addi, 1, 0, heap as i32), // r1 = heap addr
             instr_ri(Opcode::Addi, 2, 0, (heap + 32) as i32), // r2 = heap+32
-            instr_bytes(Opcode::Wload, 0, 1, 0),              // w0 = mem256[r1]
-            instr_bytes(Opcode::Wstore, 0, 2, 0),             // mem256[r2] = w0
+            instr_bytes(Opcode::Wload, 0, 1, 0),       // w0 = mem256[r1]
+            instr_bytes(Opcode::Wstore, 0, 2, 0),      // mem256[r2] = w0
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         vm.load(&code).unwrap();
@@ -934,7 +1100,7 @@ mod tests {
         let mut vm = Vm::new();
         vm.load(&code).unwrap();
         vm.run().unwrap();
-        assert_eq!(vm.gas.exec, 2);  // ADDI(1) + HALT(1)
+        assert_eq!(vm.gas.exec, 2); // ADDI(1) + HALT(1)
         assert_eq!(vm.gas.prove, 3); // ADDI(2) + HALT(1)
         assert_eq!(vm.gas.total(), 5);
     }
@@ -999,10 +1165,10 @@ mod tests {
         // Loop: ADDI + BNE + ADDI costs per iteration
         // Counter from 0 to 100 — should run out of gas partway
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 0),     // r1 = 0 (counter)
-            instr_ri(Opcode::Addi, 2, 0, 100),   // r2 = 100 (limit)
-            instr_ri(Opcode::Addi, 1, 1, 1),     // r1++ (3 gas)
-            instr_ri(Opcode::Bne, 1, 2, -4),     // if r1 != r2, jump back (3 gas)
+            instr_ri(Opcode::Addi, 1, 0, 0),   // r1 = 0 (counter)
+            instr_ri(Opcode::Addi, 2, 0, 100), // r2 = 100 (limit)
+            instr_ri(Opcode::Addi, 1, 1, 1),   // r1++ (3 gas)
+            instr_ri(Opcode::Bne, 1, 2, -4),   // if r1 != r2, jump back (3 gas)
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         let mut vm = Vm::with_gas_limit(30); // not enough for 100 iterations
@@ -1068,5 +1234,232 @@ mod tests {
         assert!(vm_mul.gas.total() > vm_add.gas.total());
         assert!(vm_mul.gas.exec > vm_add.gas.exec);
         assert!(vm_mul.gas.prove > vm_add.gas.prove);
+    }
+
+    // ========== System instructions (M1.8) ==========
+
+    #[test]
+    fn caller_returns_msg_sender() {
+        let ctx = ExecutionContext {
+            caller: 0xDEAD_BEEF,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, env_gp::CALLER),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(1), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn address_returns_self() {
+        let ctx = ExecutionContext {
+            self_address: 0xCAFE_BABE,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, env_gp::ADDRESS),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(1), 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn blocknumber_returns_height() {
+        let ctx = ExecutionContext {
+            block_number: 12345,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, env_gp::BLOCK_NUMBER),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(1), 12345);
+    }
+
+    #[test]
+    fn timestamp_returns_unix_time() {
+        let ctx = ExecutionContext {
+            timestamp: 1_700_000_000,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, env_gp::TIMESTAMP),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(1), 1_700_000_000);
+    }
+
+    #[test]
+    fn gasremaining_returns_remaining() {
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, env_gp::GAS_REMAINING),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(1000);
+        vm.load(&code).unwrap();
+        // After executing Caller (gas cost 3), remaining should be 1000 - 3 = 997
+        vm.step().unwrap();
+        assert_eq!(vm.cpu.read_gp(1), 997);
+    }
+
+    #[test]
+    fn callvalue_returns_msg_value() {
+        let val = U256::from(1_000_000_000u64) * U256::from(10u64).pow(9); // 1e18
+        let ctx = ExecutionContext {
+            call_value: val,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Callvalue, 0, 0, env_wide::CALL_VALUE),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), val);
+    }
+
+    #[test]
+    fn gasprice_returns_base_fee() {
+        let price = U256::from(25_000_000_000u64); // 25 gwei
+        let ctx = ExecutionContext {
+            gas_price: price,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Callvalue, 0, 0, env_wide::GAS_PRICE),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), price);
+    }
+
+    #[test]
+    fn balance_returns_account_balance() {
+        let bal = U256::from(42_000u64);
+        let mut ctx = ExecutionContext::default();
+        ctx.balances.insert(100, bal);
+
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 100), // r1 = address 100
+            instr_bytes(Opcode::Callvalue, 0, 1, env_wide::BALANCE), // w0 = balance(r1)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), bal);
+    }
+
+    #[test]
+    fn balance_unknown_address_returns_zero() {
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 999),
+            instr_bytes(Opcode::Callvalue, 0, 1, env_wide::BALANCE),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), U256::ZERO);
+    }
+
+    #[test]
+    fn blockhash_recent_block() {
+        let hash = U256::from(0xABCD_1234u64) << 128 | U256::from(0x5678u64);
+        let ctx = ExecutionContext {
+            block_number: 10,
+            block_hashes: vec![hash], // index 0 = block 9 (most recent)
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 9),         // r1 = block height 9
+            instr_bytes(Opcode::Blockhash, 0, 1, 0), // w0 = blockhash(9)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), hash);
+    }
+
+    #[test]
+    fn blockhash_too_old_returns_zero() {
+        let ctx = ExecutionContext {
+            block_number: 300,
+            block_hashes: vec![U256::from(1u64); 256], // 256 recent hashes
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 43), // block 43 (300 - 43 = 257 blocks ago)
+            instr_bytes(Opcode::Blockhash, 0, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), U256::ZERO); // too old
+    }
+
+    #[test]
+    fn blockhash_current_block_returns_zero() {
+        let ctx = ExecutionContext {
+            block_number: 10,
+            block_hashes: vec![U256::from(1u64); 10],
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 10), // current block
+            instr_bytes(Opcode::Blockhash, 0, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), U256::ZERO); // current block not available
+    }
+
+    #[test]
+    fn blockhash_future_block_returns_zero() {
+        let ctx = ExecutionContext {
+            block_number: 10,
+            block_hashes: vec![U256::from(1u64); 10],
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 15), // future block
+            instr_bytes(Opcode::Blockhash, 0, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), U256::ZERO);
+    }
+
+    #[test]
+    fn invalid_env_subcode_traps() {
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, 99), // invalid sub-code
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run(), Err(Trap::InvalidOpcode));
     }
 }

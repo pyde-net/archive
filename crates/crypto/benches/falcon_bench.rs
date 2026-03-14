@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use pyde_crypto::falcon::{falcon_keygen, falcon_sign, falcon_verify, falcon_batch_verify};
+use pyde_crypto::falcon::{falcon_batch_verify, falcon_keygen, falcon_sign, falcon_verify};
 
 fn bench_keygen() {
     println!("=== FALCON-512 keygen ===\n");

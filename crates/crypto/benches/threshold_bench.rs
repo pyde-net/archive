@@ -1,8 +1,8 @@
 use std::time::Instant;
 
 use pyde_crypto::threshold::{
-    EpochKeyMaterial, combine_shares, generate_decryption_share, pss_refresh, threshold_encrypt,
-    threshold_keygen,
+    combine_shares, generate_decryption_share, pss_refresh, threshold_encrypt, threshold_keygen,
+    EpochKeyMaterial,
 };
 
 fn bench_keygen() {

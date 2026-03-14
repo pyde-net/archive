@@ -5,8 +5,8 @@ use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
 use p3_goldilocks::Goldilocks;
 
 use crate::kyber::{
-    KyberCiphertext, KyberPublicKey, KyberSecretKey, SharedSecret, kyber_decapsulate,
-    kyber_encapsulate, kyber_keygen,
+    kyber_decapsulate, kyber_encapsulate, kyber_keygen, KyberCiphertext, KyberPublicKey,
+    KyberSecretKey, SharedSecret,
 };
 use crate::poseidon2::poseidon2_hash;
 
@@ -167,7 +167,10 @@ fn compute_mac(shared_secret: &SharedSecret, ciphertext: &[u8]) -> [u8; 32] {
 }
 
 fn xor_bytes(data: &[u8], keystream: &[u8]) -> Vec<u8> {
-    data.iter().zip(keystream.iter()).map(|(a, b)| a ^ b).collect()
+    data.iter()
+        .zip(keystream.iter())
+        .map(|(a, b)| a ^ b)
+        .collect()
 }
 
 // --- Public API ---
@@ -350,34 +353,29 @@ pub fn generate_refresh_contribution(
     let mut all_deltas: Vec<Vec<Vec<Goldilocks>>> = Vec::with_capacity(SEED_ELEMENTS);
     for elem_idx in 0..SEED_ELEMENTS {
         // shamir_split with secret=0 gives us zero-secret shares
-        let zero_shares =
-            shamir_split(Goldilocks::ZERO, n, threshold, domain_entropy.as_bytes(), elem_idx);
+        let zero_shares = shamir_split(
+            Goldilocks::ZERO,
+            n,
+            threshold,
+            domain_entropy.as_bytes(),
+            elem_idx,
+        );
         let element_deltas: Vec<Goldilocks> = zero_shares.iter().map(|s| s.y).collect();
         all_deltas.push(vec![element_deltas]);
     }
 
     // Transpose to per-validator: deltas[validator_idx][elem_idx]
     let deltas: Vec<Vec<Goldilocks>> = (0..n)
-        .map(|v| {
-            (0..SEED_ELEMENTS)
-                .map(|e| all_deltas[e][0][v])
-                .collect()
-        })
+        .map(|v| (0..SEED_ELEMENTS).map(|e| all_deltas[e][0][v]).collect())
         .collect();
 
-    RefreshContribution {
-        from_index,
-        deltas,
-    }
+    RefreshContribution { from_index, deltas }
 }
 
 /// Apply refresh contributions to a validator's key share.
 /// Each validator sums the delta values from all contributions into their share.
 /// The underlying secret remains the same, but all shares change.
-pub fn apply_refresh(
-    key_share: &KeyShare,
-    contributions: &[RefreshContribution],
-) -> KeyShare {
+pub fn apply_refresh(key_share: &KeyShare, contributions: &[RefreshContribution]) -> KeyShare {
     let validator_idx = key_share.index - 1; // 0-based index into deltas
     let mut new_shares = key_share.shares.clone();
 
@@ -395,10 +393,7 @@ pub fn apply_refresh(
 
 /// Verify a refresh contribution by checking that each zero-secret polynomial
 /// evaluates correctly (the shares from this contribution alone reconstruct to zero).
-pub fn verify_refresh_contribution(
-    contribution: &RefreshContribution,
-    threshold: usize,
-) -> bool {
+pub fn verify_refresh_contribution(contribution: &RefreshContribution, threshold: usize) -> bool {
     // For each seed element, take `threshold` shares and verify they reconstruct to zero
     for elem_idx in 0..SEED_ELEMENTS {
         let field_shares: Vec<FieldShare> = (0..threshold)
@@ -601,11 +596,21 @@ mod tests {
         let shares = shamir_split(secret, 5, 3, entropy.as_bytes(), 0);
 
         // Reconstruct from first 3
-        let reconstructed = shamir_reconstruct(&shares[..3].iter().map(|s| FieldShare { x: s.x, y: s.y }).collect::<Vec<_>>());
+        let reconstructed = shamir_reconstruct(
+            &shares[..3]
+                .iter()
+                .map(|s| FieldShare { x: s.x, y: s.y })
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(gl_to_u64(reconstructed), 12345);
 
         // Reconstruct from last 3
-        let reconstructed2 = shamir_reconstruct(&shares[2..5].iter().map(|s| FieldShare { x: s.x, y: s.y }).collect::<Vec<_>>());
+        let reconstructed2 = shamir_reconstruct(
+            &shares[2..5]
+                .iter()
+                .map(|s| FieldShare { x: s.x, y: s.y })
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(gl_to_u64(reconstructed2), 12345);
     }
 
@@ -681,12 +686,15 @@ mod tests {
         // Mix old and new shares from different validators — should fail
         // because shares from different epochs lie on different polynomials
         let mixed_shares = vec![
-            generate_decryption_share(&shares[0], &ct),      // old share, validator 1
-            generate_decryption_share(&new_shares[1], &ct),   // new share, validator 2
-            generate_decryption_share(&new_shares[2], &ct),   // new share, validator 3
+            generate_decryption_share(&shares[0], &ct), // old share, validator 1
+            generate_decryption_share(&new_shares[1], &ct), // new share, validator 2
+            generate_decryption_share(&new_shares[2], &ct), // new share, validator 3
         ];
         let result = combine_shares(&mixed_shares, 3, &ct);
-        assert!(result.is_err(), "mixing old and new epoch shares should fail");
+        assert!(
+            result.is_err(),
+            "mixing old and new epoch shares should fail"
+        );
     }
 
     #[test]
