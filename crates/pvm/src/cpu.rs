@@ -17,6 +17,8 @@ pub enum Trap {
     InvalidOpcode,
     #[error("narrow: value exceeds 64 bits")]
     NarrowOverflow,
+    #[error("memory fault")]
+    MemoryFault,
 }
 
 /// The CPU register file and minimal execution state.
