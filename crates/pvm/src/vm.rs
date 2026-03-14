@@ -6,6 +6,7 @@ use crate::isa::{
 };
 use crate::memory::Memory;
 use crate::wide::U256;
+use std::collections::HashMap;
 
 /// Maximum call depth (nested function calls).
 const MAX_CALL_DEPTH: usize = 1024;
@@ -116,6 +117,10 @@ pub struct Vm {
     pub gas_refund: u64,
     /// Execution context (caller, block info, etc.).
     pub ctx: ExecutionContext,
+    /// Key-value storage overlay (derived_key → variable-length bytes).
+    /// Pre-populated with witness data before execution.
+    /// After execution, diff against initial state for state transition.
+    pub storage: HashMap<U256, Vec<u8>>,
 }
 
 impl Vm {
@@ -131,6 +136,7 @@ impl Vm {
             gas_limit: 0,
             gas_refund: 0,
             ctx: ExecutionContext::default(),
+            storage: HashMap::new(),
         }
     }
 
@@ -452,6 +458,98 @@ impl Vm {
                 self.cpu.write_wide(d.rd, U256::from_le_bytes(hash_bytes));
                 self.pc += 4;
             }
+            // --- Storage instructions ---
+            // imm & 0x3: 0 = wide register (32 bytes), 1 = memory (variable), 2 = GP register (8 bytes)
+            Opcode::Sload => {
+                let slot = self.cpu.read_wide(d.rs1);
+                let key = self.derive_storage_key(slot);
+                let mode = d.rs2_or_imm & 0x3;
+                match mode {
+                    0 => {
+                        // Wide register mode: sload wd, ws1
+                        let mut buf = [0u8; 32];
+                        if let Some(data) = self.storage.get(&key) {
+                            let len = data.len().min(32);
+                            buf[..len].copy_from_slice(&data[..len]);
+                        }
+                        self.cpu.write_wide(d.rd, U256::from_le_bytes(buf));
+                    }
+                    1 => {
+                        // Memory mode: sloadb rd_len, ws1, rs_ptr
+                        let ptr_reg = ((d.rs2_or_imm >> 2) & 0xF) as u8;
+                        let ptr = self.cpu.read_gp(ptr_reg) as u32;
+                        if let Some(data) = self.storage.get(&key) {
+                            for (i, &b) in data.iter().enumerate() {
+                                self.memory
+                                    .store8(ptr + i as u32, b)
+                                    .map_err(|_| Trap::MemoryFault)?;
+                            }
+                            self.cpu.write_gp(d.rd, data.len() as u64);
+                        } else {
+                            self.cpu.write_gp(d.rd, 0);
+                        }
+                    }
+                    2 => {
+                        // GP register mode: sloadg rd, ws1
+                        let mut buf = [0u8; 8];
+                        if let Some(data) = self.storage.get(&key) {
+                            let len = data.len().min(8);
+                            buf[..len].copy_from_slice(&data[..len]);
+                        }
+                        self.cpu.write_gp(d.rd, u64::from_le_bytes(buf));
+                    }
+                    _ => return Err(Trap::InvalidOpcode),
+                }
+                self.pc += 4;
+            }
+            Opcode::Sstore => {
+                let slot = self.cpu.read_wide(d.rs1);
+                let key = self.derive_storage_key(slot);
+                let mode = d.rs2_or_imm & 0x3;
+                match mode {
+                    0 => {
+                        // Wide register mode: sstore ws1, wd
+                        let value = self.cpu.read_wide(d.rd);
+                        self.storage.insert(key, value.to_le_bytes().to_vec());
+                    }
+                    2 => {
+                        // GP register mode: sstoreg ws1, rd
+                        let value = self.cpu.read_gp(d.rd);
+                        self.storage.insert(key, value.to_le_bytes().to_vec());
+                    }
+                    1 => {
+                        // Memory mode: sstoreb ws1, rs_ptr, rs_len
+                        // ptr register in imm bits [5:2], len register in imm bits [9:6]
+                        let ptr_reg = ((d.rs2_or_imm >> 2) & 0xF) as u8;
+                        let len_reg = ((d.rs2_or_imm >> 6) & 0xF) as u8;
+                        let ptr = self.cpu.read_gp(ptr_reg) as u32;
+                        let len = self.cpu.read_gp(len_reg) as usize;
+                        let mut data = vec![0u8; len];
+                        for (i, byte) in data.iter_mut().enumerate() {
+                            *byte = self
+                                .memory
+                                .load8(ptr + i as u32)
+                                .map_err(|_| Trap::MemoryFault)?;
+                        }
+                        self.storage.insert(key, data);
+                    }
+                    _ => return Err(Trap::InvalidOpcode),
+                }
+                self.pc += 4;
+            }
+            Opcode::Sdelete => {
+                // sdelete ws1 — clear storage slot, grant gas refund if non-empty
+                let slot = self.cpu.read_wide(d.rs1);
+                let key = self.derive_storage_key(slot);
+                if let Some(v) = self.storage.get(&key) {
+                    if !v.is_empty() {
+                        self.gas_refund += 1500;
+                    }
+                }
+                self.storage.insert(key, Vec::new());
+                self.pc += 4;
+            }
+
             Opcode::VerifySig => {
                 // verifysig rd, rs1 — rs1 points to descriptor in memory:
                 //   [msg_ptr:8][msg_len:8][sig_ptr:8][sig_len:8][pk_ptr:8][pk_len:8]
@@ -542,6 +640,16 @@ impl Vm {
         } else {
             self.gas_limit.saturating_sub(self.gas.total())
         }
+    }
+
+    /// Derive a storage key from a slot and the contract's address.
+    /// key = poseidon2(slot_bytes ++ address_bytes)
+    fn derive_storage_key(&self, slot: U256) -> U256 {
+        let mut buf = [0u8; 40]; // 32 (slot) + 8 (address)
+        buf[..32].copy_from_slice(&slot.to_le_bytes());
+        buf[32..].copy_from_slice(&self.ctx.self_address.to_le_bytes());
+        let hash = pyde_crypto::poseidon2::poseidon2_hash(&buf);
+        U256::from_le_bytes(hash.to_bytes())
     }
 
     /// Effective gas used after applying refund (capped at 50% of total used).
@@ -1754,5 +1862,286 @@ mod tests {
         // Poseidon costs (exec=50, prove=150) = 200 total
         // Plus 2x ADDI (3 each) + HALT (2) = 208 total
         assert!(vm.gas.total() >= 200);
+    }
+
+    // --- Storage instruction tests ---
+
+    #[test]
+    fn sload_uninitialized_returns_zero() {
+        // SLOAD from a slot that was never written should return U256::ZERO
+        let mut vm = Vm::new();
+        // Set slot in w0 to some arbitrary value
+        vm.cpu.write_wide(0, U256::from(42u64));
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sload, 1, 0, 0), // w1 = storage[w0]
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(1), U256::ZERO);
+    }
+
+    #[test]
+    fn sstore_then_sload_roundtrip() {
+        let ctx = ExecutionContext {
+            self_address: 0xBEEF,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+        // w0 = slot, w1 = value to store
+        vm.cpu.write_wide(0, U256::from(1u64));
+        vm.cpu.write_wide(1, U256::from(0xDEAD_CAFEu64));
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 0), // storage[w0] = w1
+            instr_bytes(Opcode::Sload, 2, 0, 0),  // w2 = storage[w0]
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(2), U256::from(0xDEAD_CAFEu64));
+    }
+
+    #[test]
+    fn sdelete_sets_value_to_zero_and_grants_refund() {
+        let ctx = ExecutionContext {
+            self_address: 0xBEEF,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+        // Write a value first
+        vm.cpu.write_wide(0, U256::from(5u64));
+        vm.cpu.write_wide(1, U256::from(999u64));
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 0),  // storage[w0] = w1
+            instr_bytes(Opcode::Sdelete, 0, 0, 0), // delete storage[w0]
+            instr_bytes(Opcode::Sload, 2, 0, 0),   // w2 = storage[w0] (should be 0)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(2), U256::ZERO);
+        assert_eq!(vm.gas_refund, 1500);
+    }
+
+    #[test]
+    fn sdelete_nonexistent_no_refund() {
+        let mut vm = Vm::new();
+        vm.cpu.write_wide(0, U256::from(99u64));
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sdelete, 0, 0, 0), // delete nonexistent key
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.gas_refund, 0); // no refund for deleting nothing
+    }
+
+    #[test]
+    fn storage_key_derivation_uses_contract_address() {
+        // Same slot, different contract address → different derived key
+        let ctx1 = ExecutionContext {
+            self_address: 0xAAAA,
+            ..Default::default()
+        };
+        let ctx2 = ExecutionContext {
+            self_address: 0xBBBB,
+            ..Default::default()
+        };
+        let mut vm1 = Vm::with_context(ctx1);
+        let mut vm2 = Vm::with_context(ctx2);
+        let slot = U256::from(1u64);
+        let value = U256::from(42u64);
+
+        // Write same slot+value to both VMs
+        vm1.cpu.write_wide(0, slot);
+        vm1.cpu.write_wide(1, value);
+        vm2.cpu.write_wide(0, slot);
+        vm2.cpu.write_wide(1, value);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm1.load(&code).unwrap();
+        vm2.load(&code).unwrap();
+        vm1.run().unwrap();
+        vm2.run().unwrap();
+
+        // Derived keys should differ
+        let key1: Vec<_> = vm1.storage.keys().collect();
+        let key2: Vec<_> = vm2.storage.keys().collect();
+        assert_eq!(key1.len(), 1);
+        assert_eq!(key2.len(), 1);
+        assert_ne!(key1[0], key2[0]);
+    }
+
+    #[test]
+    fn storage_gas_costs() {
+        let mut vm = Vm::with_gas_limit(100_000);
+        vm.cpu.write_wide(0, U256::from(1u64));
+        vm.cpu.write_wide(1, U256::from(42u64));
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 0),  // 3000 gas
+            instr_bytes(Opcode::Sload, 2, 0, 0),   // 300 gas
+            instr_bytes(Opcode::Sdelete, 0, 0, 0), // 700 gas
+            instr_bytes(Opcode::Halt, 0, 0, 0),    // 2 gas
+        ]);
+        vm.load(&code).unwrap();
+        vm.run().unwrap();
+        // SSTORE=3000, SLOAD=300, SDELETE=700, HALT=2
+        assert_eq!(vm.gas.total(), 3000 + 300 + 700 + 2);
+    }
+
+    #[test]
+    fn sstoreb_sloadb_roundtrip() {
+        // Store a 50-byte value via memory mode, load it back
+        let heap = crate::memory::HEAP_START;
+        let ctx = ExecutionContext {
+            self_address: 0xBEEF,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+
+        // Write 50 bytes of test data to heap memory
+        let test_data: Vec<u8> = (0..50).collect();
+        for (i, &b) in test_data.iter().enumerate() {
+            vm.memory.store8(heap + i as u32, b).unwrap();
+        }
+
+        // w0 = slot key
+        vm.cpu.write_wide(0, U256::from(7u64));
+        // r1 = pointer to data, r2 = length
+        vm.cpu.write_gp(1, heap as u64);
+        vm.cpu.write_gp(2, 50);
+
+        // sstoreb w0, r1, r2 → imm = 1 | (1 << 2) | (2 << 6) = 1 + 4 + 128 = 133
+        // sloadb r3, w0, r4 where r4 = output pointer
+        // r4 = heap + 100 (read into a different spot)
+        vm.cpu.write_gp(4, (heap + 100) as u64);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 0, 0, 133),          // sstoreb w0, r1, r2
+            instr_bytes(Opcode::Sload, 3, 0, 1 | (4 << 2)),  // sloadb r3, w0, r4
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+
+        // r3 should have the length
+        assert_eq!(vm.cpu.read_gp(3), 50);
+
+        // Verify data at heap+100 matches original
+        for i in 0..50u32 {
+            let b = vm.memory.load8(heap + 100 + i).unwrap();
+            assert_eq!(b, i as u8);
+        }
+    }
+
+    #[test]
+    fn sstore_register_then_sloadb_memory() {
+        // Store via register mode (32 bytes), load back via memory mode
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+
+        vm.cpu.write_wide(0, U256::from(1u64)); // slot
+        vm.cpu.write_wide(1, U256::from(0xCAFEu64)); // value
+        vm.cpu.write_gp(3, heap as u64); // output pointer
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 0),            // sstore w0, w1 (register mode)
+            instr_bytes(Opcode::Sload, 2, 0, 1 | (3 << 2)),  // sloadb r2, w0, r3
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+
+        // Register mode stores 32 bytes
+        assert_eq!(vm.cpu.read_gp(2), 32);
+    }
+
+    #[test]
+    fn sstoreb_then_sload_register_truncates() {
+        // Store >32 bytes via memory mode, load back via register mode (truncates to 32)
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+
+        // Write 64 bytes of data
+        for i in 0..64u32 {
+            vm.memory.store8(heap + i, (i + 1) as u8).unwrap();
+        }
+
+        vm.cpu.write_wide(0, U256::from(1u64)); // slot
+        vm.cpu.write_gp(1, heap as u64); // pointer
+        vm.cpu.write_gp(2, 64); // length
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 0, 0, 1 | (1 << 2) | (2 << 6)), // sstoreb w0, r1, r2
+            instr_bytes(Opcode::Sload, 3, 0, 0),                         // sload w3, w0 (register)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+
+        // w3 should contain first 32 bytes only
+        let loaded = vm.cpu.read_wide(3);
+        let bytes = loaded.to_le_bytes();
+        for i in 0..32 {
+            assert_eq!(bytes[i], (i + 1) as u8);
+        }
+    }
+
+    #[test]
+    fn sstoreg_sloadg_roundtrip() {
+        // Store a u64 via GP mode (8 bytes), load it back
+        let mut vm = Vm::new();
+        vm.cpu.write_wide(0, U256::from(3u64)); // slot
+        vm.cpu.write_gp(1, 0xDEAD_BEEF_CAFE_BABEu64); // value
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 2), // sstoreg w0, r1
+            instr_bytes(Opcode::Sload, 2, 0, 2),  // sloadg r2, w0
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(2), 0xDEAD_BEEF_CAFE_BABEu64);
+    }
+
+    #[test]
+    fn sstoreg_stores_only_8_bytes() {
+        // Verify GP mode stores exactly 8 bytes, not 32
+        let mut vm = Vm::new();
+        vm.cpu.write_wide(0, U256::from(1u64)); // slot
+        vm.cpu.write_gp(1, 42);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 2), // sstoreg w0, r1
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        vm.run().unwrap();
+
+        let key = vm.derive_storage_key(U256::from(1u64));
+        let stored = vm.storage.get(&key).unwrap();
+        assert_eq!(stored.len(), 8); // exactly 8 bytes, not 32
+    }
+
+    #[test]
+    fn sstoreg_then_sload_wide_zero_pads() {
+        // Store 8 bytes via GP, load via wide register — should zero-pad to 32
+        let mut vm = Vm::new();
+        vm.cpu.write_wide(0, U256::from(1u64));
+        vm.cpu.write_gp(1, 0xFF);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 2), // sstoreg w0, r1 (8 bytes)
+            instr_bytes(Opcode::Sload, 2, 0, 0),  // sload w2, w0 (wide, zero-padded)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        vm.run().unwrap();
+
+        // Should get 0xFF in first byte, rest zeros
+        assert_eq!(vm.cpu.read_wide(2), U256::from(0xFFu64));
     }
 }

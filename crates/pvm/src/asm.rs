@@ -364,8 +364,8 @@ fn mnemonic_to_opcode(s: &str) -> Option<Opcode> {
         "halt" => Some(Opcode::Halt),
         "revert" => Some(Opcode::Revert),
         "assert" => Some(Opcode::Assert),
-        "sload" => Some(Opcode::Sload),
-        "sstore" => Some(Opcode::Sstore),
+        "sload" | "sloadb" | "sloadg" => Some(Opcode::Sload),
+        "sstore" | "sstoreb" | "sstoreg" => Some(Opcode::Sstore),
         "sdelete" => Some(Opcode::Sdelete),
         "caller" => Some(Opcode::Caller),
         "callvalue" => Some(Opcode::Callvalue),
@@ -474,6 +474,8 @@ struct ParsedInstr {
     mem_width: Option<MemWidth>,
     /// For pseudo env instructions, the sub-code and variant.
     env_pseudo: Option<PseudoEnv>,
+    /// Storage mode: 0=wide, 1=memory, 2=gp.
+    storage_mode: u8,
     operands: Vec<Operand>,
 }
 
@@ -632,6 +634,12 @@ fn parse(
                     })?;
                 }
 
+                let storage_mode = match mnem.as_str() {
+                    "sloadb" | "sstoreb" => 1,
+                    "sloadg" | "sstoreg" => 2,
+                    _ => 0,
+                };
+
                 i += 1;
 
                 // Collect operands until newline or end
@@ -673,6 +681,7 @@ fn parse(
                     opcode,
                     mem_width,
                     env_pseudo,
+                    storage_mode,
                     operands,
                 }));
                 offset += 4;
@@ -1138,6 +1147,108 @@ fn encode_instr(
             Ok(encode(pi.opcode, wd, rs1, 0))
         }
 
+        // --- Storage: sload/sloadb/sloadg ---
+        Opcode::Sload => {
+            match pi.storage_mode {
+                0 => {
+                    // sload wd, ws1 (wide register mode)
+                    if ops.len() != 2 {
+                        return Err(AsmError::Parse {
+                            line,
+                            msg: "sload requires 2 operands: wd, ws1".into(),
+                        });
+                    }
+                    let wd = expect_wide(&ops[0], line, "wd")?;
+                    let ws1 = expect_wide(&ops[1], line, "ws1")?;
+                    Ok(encode(pi.opcode, wd, ws1, 0))
+                }
+                1 => {
+                    // sloadb rd_len, ws1, rs_ptr (memory mode)
+                    if ops.len() != 3 {
+                        return Err(AsmError::Parse {
+                            line,
+                            msg: "sloadb requires 3 operands: rd_len, ws1, rs_ptr".into(),
+                        });
+                    }
+                    let rd = expect_gp(&ops[0], line, "rd_len")?;
+                    let ws1 = expect_wide(&ops[1], line, "ws1")?;
+                    let rs_ptr = expect_gp(&ops[2], line, "rs_ptr")?;
+                    let imm = 1u32 | ((rs_ptr as u32) << 2);
+                    Ok(encode(pi.opcode, rd, ws1, imm))
+                }
+                2 => {
+                    // sloadg rd, ws1 (GP register mode)
+                    if ops.len() != 2 {
+                        return Err(AsmError::Parse {
+                            line,
+                            msg: "sloadg requires 2 operands: rd, ws1".into(),
+                        });
+                    }
+                    let rd = expect_gp(&ops[0], line, "rd")?;
+                    let ws1 = expect_wide(&ops[1], line, "ws1")?;
+                    Ok(encode(pi.opcode, rd, ws1, 2))
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // --- Storage: sstore/sstoreb/sstoreg ---
+        Opcode::Sstore => {
+            match pi.storage_mode {
+                0 => {
+                    // sstore ws1, wd (wide register mode)
+                    if ops.len() != 2 {
+                        return Err(AsmError::Parse {
+                            line,
+                            msg: "sstore requires 2 operands: ws1, wd".into(),
+                        });
+                    }
+                    let ws1 = expect_wide(&ops[0], line, "ws1")?;
+                    let wd = expect_wide(&ops[1], line, "wd")?;
+                    Ok(encode(pi.opcode, wd, ws1, 0))
+                }
+                1 => {
+                    // sstoreb ws1, rs_ptr, rs_len (memory mode)
+                    if ops.len() != 3 {
+                        return Err(AsmError::Parse {
+                            line,
+                            msg: "sstoreb requires 3 operands: ws1, rs_ptr, rs_len".into(),
+                        });
+                    }
+                    let ws1 = expect_wide(&ops[0], line, "ws1")?;
+                    let rs_ptr = expect_gp(&ops[1], line, "rs_ptr")?;
+                    let rs_len = expect_gp(&ops[2], line, "rs_len")?;
+                    let imm = 1u32 | ((rs_ptr as u32) << 2) | ((rs_len as u32) << 6);
+                    Ok(encode(pi.opcode, 0, ws1, imm))
+                }
+                2 => {
+                    // sstoreg ws1, rd (GP register mode)
+                    if ops.len() != 2 {
+                        return Err(AsmError::Parse {
+                            line,
+                            msg: "sstoreg requires 2 operands: ws1, rd".into(),
+                        });
+                    }
+                    let ws1 = expect_wide(&ops[0], line, "ws1")?;
+                    let rd = expect_gp(&ops[1], line, "rd")?;
+                    Ok(encode(pi.opcode, rd, ws1, 2))
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // --- Storage: sdelete ws1 ---
+        Opcode::Sdelete => {
+            if ops.len() != 1 {
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "sdelete requires 1 operand: ws1".into(),
+                });
+            }
+            let ws1 = expect_wide(&ops[0], line, "ws1")?;
+            Ok(encode(pi.opcode, 0, ws1, 0))
+        }
+
         // --- Crypto: poseidon wd, rs1, rs2 ---
         Opcode::Poseidon => {
             if ops.len() != 3 {
@@ -1399,6 +1510,32 @@ fn disassemble_one(opcode: Opcode, rd: u8, rs1: u8, rs2_or_imm: u32) -> String {
         // Crypto
         Opcode::Poseidon => format!("poseidon w{}, r{}, r{}", rd, rs1, rs2_or_imm & 0xF),
         Opcode::VerifySig => format!("verifysig r{}, r{}", rd, rs1),
+
+        // Storage
+        Opcode::Sload => {
+            match rs2_or_imm & 0x3 {
+                0 => format!("sload w{}, w{}", rd, rs1),
+                1 => {
+                    let ptr_reg = (rs2_or_imm >> 2) & 0xF;
+                    format!("sloadb r{}, w{}, r{}", rd, rs1, ptr_reg)
+                }
+                2 => format!("sloadg r{}, w{}", rd, rs1),
+                _ => format!("sload? {}, {}, {}", rd, rs1, rs2_or_imm),
+            }
+        }
+        Opcode::Sstore => {
+            match rs2_or_imm & 0x3 {
+                0 => format!("sstore w{}, w{}", rs1, rd),
+                1 => {
+                    let ptr_reg = (rs2_or_imm >> 2) & 0xF;
+                    let len_reg = (rs2_or_imm >> 6) & 0xF;
+                    format!("sstoreb w{}, r{}, r{}", rs1, ptr_reg, len_reg)
+                }
+                2 => format!("sstoreg w{}, r{}", rs1, rd),
+                _ => format!("sstore? {}, {}, {}", rd, rs1, rs2_or_imm),
+            }
+        }
+        Opcode::Sdelete => format!("sdelete w{}", rs1),
 
         // Assert
         Opcode::Assert => format!("assert r{}", rs1),
