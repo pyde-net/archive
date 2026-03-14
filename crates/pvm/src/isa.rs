@@ -95,8 +95,12 @@ pub enum Opcode {
     FieldMul = 0x39, // rd = rs1 * rs2 (mod field prime)
     Commit = 0x3A,   // commit rd to public output
 
+    // --- Wide Comparisons (result → GP register) ---
+    Weq = 0x00, // rd = (ws1 == ws2) ? 1 : 0
+    Wlt = 0x3F, // rd = (ws1 < ws2) ? 1 : 0
+
     // --- Invalid ---
-    Invalid = 0x3F, // decoded from unrecognized opcode bits
+    Invalid = 0xFF, // decoded from unrecognized opcode bits (not a real 6-bit slot)
 }
 
 impl Opcode {
@@ -165,6 +169,8 @@ impl Opcode {
             0x3C => Opcode::Wmov,
             0x3D => Opcode::Narrow,
             0x3E => Opcode::Widen,
+            0x00 => Opcode::Weq,
+            0x3F => Opcode::Wlt,
             _ => Opcode::Invalid,
         }
     }
@@ -278,6 +284,8 @@ pub const ALL_OPCODES: &[Opcode] = &[
     Opcode::Wmov,
     Opcode::Narrow,
     Opcode::Widen,
+    Opcode::Weq,
+    Opcode::Wlt,
 ];
 
 // --- Instruction encoding/decoding ---
@@ -367,6 +375,54 @@ pub fn encode_immediate(val: i32) -> u32 {
         val
     );
     (val as u32) & RS2_IMM_MASK
+}
+
+// --- Width-encoded memory access ---
+// For LOAD/STORE, the 18-bit immediate is split:
+//   [offset: 16 bits (signed)][width: 2 bits]
+//   width: 00=8-bit, 01=16-bit, 10=32-bit, 11=64-bit
+
+/// Memory access width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MemWidth {
+    W8 = 0,
+    W16 = 1,
+    W32 = 2,
+    W64 = 3,
+}
+
+/// Extract the width from the lower 2 bits of the 18-bit immediate.
+pub fn decode_mem_width(raw: u32) -> MemWidth {
+    match raw & 0x03 {
+        0 => MemWidth::W8,
+        1 => MemWidth::W16,
+        2 => MemWidth::W32,
+        3 => MemWidth::W64,
+        _ => unreachable!(),
+    }
+}
+
+/// Extract the 16-bit signed offset from bits [17:2] of the 18-bit immediate.
+pub fn decode_mem_offset(raw: u32) -> i32 {
+    let bits = (raw >> 2) & 0xFFFF;
+    if bits & (1 << 15) != 0 {
+        (bits | 0xFFFF_0000) as i32
+    } else {
+        bits as i32
+    }
+}
+
+/// Encode a memory immediate: 16-bit signed offset + 2-bit width.
+/// Panics if offset is out of range [-32768, 32767].
+pub fn encode_mem_immediate(offset: i32, width: MemWidth) -> u32 {
+    assert!(
+        offset >= -32768 && offset <= 32767,
+        "memory offset {} out of 16-bit signed range",
+        offset
+    );
+    let offset_bits = (offset as u32) & 0xFFFF;
+    ((offset_bits << 2) | (width as u32)) & RS2_IMM_MASK
 }
 
 // --- Gas Table ---
@@ -470,6 +526,10 @@ pub fn gas_cost(op: Opcode) -> GasCost {
         Opcode::FieldMul => GasCost::new(2, 3),
         Opcode::Commit => GasCost::new(5, 5),
 
+        // Wide comparisons
+        Opcode::Weq => GasCost::new(2, 4),
+        Opcode::Wlt => GasCost::new(2, 4),
+
         // Invalid
         Opcode::Invalid => GasCost::new(0, 0),
     }
@@ -527,15 +587,14 @@ mod tests {
 
     #[test]
     fn invalid_opcode_bits_decode_to_invalid() {
-        // 0x00 is not assigned
+        // All 64 slots (0x00-0x3F) are now assigned.
+        // Invalid only comes from values outside 6-bit range, which can't happen in practice.
+        // Verify 0x00 = Weq, 0x3F = Wlt
         let instr = Instruction(0x00 << OPCODE_SHIFT);
-        assert_eq!(decode(instr).opcode, Opcode::Invalid);
+        assert_eq!(decode(instr).opcode, Opcode::Weq);
 
-        // 0x1F is Wnot, 0x2D-0x2F are Wand/Wor/Wxor (wide logical ops)
-
-        // 0x3F is explicitly Invalid
         let instr = Instruction(0x3F << OPCODE_SHIFT);
-        assert_eq!(decode(instr).opcode, Opcode::Invalid);
+        assert_eq!(decode(instr).opcode, Opcode::Wlt);
     }
 
     #[test]
@@ -722,8 +781,8 @@ mod tests {
     fn opcode_count() {
         // Design spec says ~45 core opcodes + extended instructions = ~58
         assert!(
-            ALL_OPCODES.len() >= 45 && ALL_OPCODES.len() <= 63,
-            "expected 45-63 opcodes (6-bit max), got {}",
+            ALL_OPCODES.len() >= 45 && ALL_OPCODES.len() <= 64,
+            "expected 45-64 opcodes (6-bit max), got {}",
             ALL_OPCODES.len()
         );
     }

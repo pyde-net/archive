@@ -19,6 +19,10 @@ pub enum Trap {
     NarrowOverflow,
     #[error("memory fault")]
     MemoryFault,
+    #[error("call stack overflow")]
+    StackOverflow,
+    #[error("call stack underflow")]
+    StackUnderflow,
 }
 
 /// The CPU register file and minimal execution state.
@@ -252,6 +256,16 @@ impl Cpu {
             Opcode::Widen => {
                 let val = self.read_gp(d.rs1);
                 self.write_wide(d.rd, U256::from(val));
+            }
+            Opcode::Weq => {
+                let ws1 = self.read_wide(d.rs1);
+                let ws2 = self.read_wide(d.rs2_or_imm as u8);
+                self.write_gp(d.rd, if ws1 == ws2 { 1 } else { 0 });
+            }
+            Opcode::Wlt => {
+                let ws1 = self.read_wide(d.rs1);
+                let ws2 = self.read_wide(d.rs2_or_imm as u8);
+                self.write_gp(d.rd, if ws1 < ws2 { 1 } else { 0 });
             }
             _ => return Err(Trap::InvalidOpcode),
         }
@@ -1280,6 +1294,71 @@ mod tests {
         // ADD r0, r1, r2 — result should be discarded
         exec_rr(&mut cpu, Opcode::Add, 0, 1, 2).unwrap();
         assert_eq!(cpu.read_gp(0), 0);
+    }
+
+    // ========== Wide comparisons (WEQ, WLT) ==========
+
+    #[test]
+    fn weq_equal() {
+        let mut cpu = fresh();
+        cpu.write_wide(1, U256::from(42u64));
+        cpu.write_wide(2, U256::from(42u64));
+        exec_wide_rr(&mut cpu, Opcode::Weq, 3, 1, 2).unwrap();
+        assert_eq!(cpu.read_gp(3), 1);
+    }
+
+    #[test]
+    fn weq_not_equal() {
+        let mut cpu = fresh();
+        cpu.write_wide(1, U256::from(42u64));
+        cpu.write_wide(2, U256::from(43u64));
+        exec_wide_rr(&mut cpu, Opcode::Weq, 3, 1, 2).unwrap();
+        assert_eq!(cpu.read_gp(3), 0);
+    }
+
+    #[test]
+    fn weq_large_values() {
+        let mut cpu = fresh();
+        cpu.write_wide(1, U256::MAX);
+        cpu.write_wide(2, U256::MAX);
+        exec_wide_rr(&mut cpu, Opcode::Weq, 3, 1, 2).unwrap();
+        assert_eq!(cpu.read_gp(3), 1);
+    }
+
+    #[test]
+    fn wlt_true() {
+        let mut cpu = fresh();
+        cpu.write_wide(1, U256::from(100u64));
+        cpu.write_wide(2, U256::from(200u64));
+        exec_wide_rr(&mut cpu, Opcode::Wlt, 3, 1, 2).unwrap();
+        assert_eq!(cpu.read_gp(3), 1);
+    }
+
+    #[test]
+    fn wlt_false() {
+        let mut cpu = fresh();
+        cpu.write_wide(1, U256::from(200u64));
+        cpu.write_wide(2, U256::from(100u64));
+        exec_wide_rr(&mut cpu, Opcode::Wlt, 3, 1, 2).unwrap();
+        assert_eq!(cpu.read_gp(3), 0);
+    }
+
+    #[test]
+    fn wlt_equal_is_false() {
+        let mut cpu = fresh();
+        cpu.write_wide(1, U256::from(42u64));
+        cpu.write_wide(2, U256::from(42u64));
+        exec_wide_rr(&mut cpu, Opcode::Wlt, 3, 1, 2).unwrap();
+        assert_eq!(cpu.read_gp(3), 0);
+    }
+
+    #[test]
+    fn wlt_large_values() {
+        let mut cpu = fresh();
+        cpu.write_wide(1, U256::MAX - U256::ONE);
+        cpu.write_wide(2, U256::MAX);
+        exec_wide_rr(&mut cpu, Opcode::Wlt, 3, 1, 2).unwrap();
+        assert_eq!(cpu.read_gp(3), 1);
     }
 
     // ========== Invalid opcode ==========
