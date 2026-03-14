@@ -296,6 +296,15 @@ impl Memory {
         buf
     }
 
+    /// Read a slice with access checking and gas metering (single check for the range).
+    pub fn checked_read_slice(&mut self, addr: u32, len: usize) -> Result<Vec<u8>, MemoryError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        self.check_access(addr, len as u32)?;
+        Ok(self.read_slice(addr, len))
+    }
+
     /// Read a 32-bit instruction word from the code section (no gas charge).
     /// Code pages are always materialized by `load_code()`.
     #[inline]
