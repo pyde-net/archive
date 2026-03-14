@@ -309,13 +309,7 @@ mod tests {
         cpu.exec_alu(encode(op, rd, rs1, encode_immediate(imm)))
     }
 
-    fn exec_wide_rr(
-        cpu: &mut Cpu,
-        op: Opcode,
-        wd: u8,
-        ws1: u8,
-        ws2: u8,
-    ) -> Result<(), Trap> {
+    fn exec_wide_rr(cpu: &mut Cpu, op: Opcode, wd: u8, ws1: u8, ws2: u8) -> Result<(), Trap> {
         use crate::isa::encode;
         cpu.exec_wide(encode(op, wd, ws1, ws2 as u32))
     }
@@ -447,10 +441,7 @@ mod tests {
         cpu.write_wide(1, u256(0xFF00, 0xFF00, 0xFF00, 0xFF00));
         cpu.write_wide(2, u256(0x0FF0, 0x0FF0, 0x0FF0, 0x0FF0));
         exec_wide_rr(&mut cpu, Opcode::Wand, 3, 1, 2).unwrap();
-        assert_eq!(
-            cpu.read_wide(3),
-            u256(0x0F00, 0x0F00, 0x0F00, 0x0F00)
-        );
+        assert_eq!(cpu.read_wide(3), u256(0x0F00, 0x0F00, 0x0F00, 0x0F00));
     }
 
     // ========== Task 0113b: WOR ==========

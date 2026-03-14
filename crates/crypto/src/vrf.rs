@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::falcon::{FalconPublicKey, FalconSecretKey, falcon_sign, falcon_verify};
+use crate::falcon::{falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey};
 use crate::hash::Hash256;
 use crate::poseidon2::poseidon2_hash;
 
@@ -46,8 +46,7 @@ fn compute_vrf_output(sk: &FalconSecretKey, input: &[u8]) -> VrfOutput {
     let sk_fingerprint = poseidon2_hash(&sk_input);
 
     // Compute output = H(domain || fingerprint || input)
-    let mut output_input =
-        Vec::with_capacity(VRF_DOMAIN_OUTPUT.len() + 32 + input.len());
+    let mut output_input = Vec::with_capacity(VRF_DOMAIN_OUTPUT.len() + 32 + input.len());
     output_input.extend_from_slice(VRF_DOMAIN_OUTPUT);
     output_input.extend_from_slice(sk_fingerprint.as_bytes());
     output_input.extend_from_slice(input);

@@ -44,7 +44,10 @@ mod tests {
 
     #[test]
     fn add_basic() {
-        assert_eq!(wide_add(U256::from(100u64), U256::from(200u64)).unwrap(), U256::from(300u64));
+        assert_eq!(
+            wide_add(U256::from(100u64), U256::from(200u64)).unwrap(),
+            U256::from(300u64)
+        );
     }
 
     #[test]
@@ -54,7 +57,10 @@ mod tests {
 
     #[test]
     fn sub_basic() {
-        assert_eq!(wide_sub(U256::from(300u64), U256::from(100u64)).unwrap(), U256::from(200u64));
+        assert_eq!(
+            wide_sub(U256::from(300u64), U256::from(100u64)).unwrap(),
+            U256::from(200u64)
+        );
     }
 
     #[test]
@@ -64,7 +70,10 @@ mod tests {
 
     #[test]
     fn mul_basic() {
-        assert_eq!(wide_mul(U256::from(7u64), U256::from(6u64)).unwrap(), U256::from(42u64));
+        assert_eq!(
+            wide_mul(U256::from(7u64), U256::from(6u64)).unwrap(),
+            U256::from(42u64)
+        );
     }
 
     #[test]
@@ -75,22 +84,34 @@ mod tests {
 
     #[test]
     fn div_basic() {
-        assert_eq!(wide_div(U256::from(42u64), U256::from(7u64)).unwrap(), U256::from(6u64));
+        assert_eq!(
+            wide_div(U256::from(42u64), U256::from(7u64)).unwrap(),
+            U256::from(6u64)
+        );
     }
 
     #[test]
     fn div_by_zero() {
-        assert_eq!(wide_div(U256::from(42u64), U256::ZERO), Err(Trap::DivisionByZero));
+        assert_eq!(
+            wide_div(U256::from(42u64), U256::ZERO),
+            Err(Trap::DivisionByZero)
+        );
     }
 
     #[test]
     fn mod_basic() {
-        assert_eq!(wide_mod(U256::from(10u64), U256::from(3u64)).unwrap(), U256::from(1u64));
+        assert_eq!(
+            wide_mod(U256::from(10u64), U256::from(3u64)).unwrap(),
+            U256::from(1u64)
+        );
     }
 
     #[test]
     fn mod_by_zero() {
-        assert_eq!(wide_mod(U256::from(10u64), U256::ZERO), Err(Trap::DivisionByZero));
+        assert_eq!(
+            wide_mod(U256::from(10u64), U256::ZERO),
+            Err(Trap::DivisionByZero)
+        );
     }
 
     #[test]
