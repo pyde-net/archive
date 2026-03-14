@@ -234,11 +234,11 @@ Everything else depends on these. Build and test in isolation first.
 - [x] 0218 — Implement gas refund tracking (gas_refund field, for future SDELETE)
 - [x] 0219 — Implement gas refund cap (50% of total gas used)
 - [x] 0220 — Implement two-dimensional gas tracking (exec_cost + prove_cost)
-- [ ] 0221 — Implement gas forwarding rules for external calls (remaining - 2300) _(blocked: needs M1.12 contract calls)_
+- [x] 0221 — Implement gas forwarding rules for external calls (remaining - 2300)
 - [x] 0222 — Test: transaction runs out of gas mid-execution → revert
 - [x] 0223 — Test: gas refund applied correctly at end of transaction
 - [x] 0224 — Test: gas refund capped at 50%
-- [ ] 0225 — Test: nested call gas forwarding _(blocked: needs M1.12 contract calls)_
+- [x] 0225 — Test: nested call gas forwarding
 - [x] 0226 — Test: two-dimensional gas both components tracked
 - [x] 1171 — Implement combined gas lookup table (precompute total_gas per opcode, charge once per step instead of two additions)
 - [x] 1172 — Test: combined gas charging matches two-dimensional tracking
@@ -310,7 +310,7 @@ Everything else depends on these. Build and test in isolation first.
 - [x] 0211 — ~~Indexed field topic encoding~~ — compiler concern; VM just stores topics as U256 values
 - [x] 0212 — Implement event log accumulation — `Vec<EventLog>` on Vm, rolled back in M1.12
 - [x] 0213 — Test: event emitted with correct topics and data
-- [ ] 0214 — Test: events rolled back on revert — deferred to M1.12 (state rollback)
+- [x] 0214 — Test: events rolled back on revert (covered by execute_revert_rolls_back_logs)
 - [x] 0215 — Test: multiple events in single transaction
 
 ### M1.12 — Interpreter (Full Execution Engine)
@@ -322,7 +322,7 @@ Everything else depends on these. Build and test in isolation first.
 - [x] 0229 — Implement execution result type (Success, Revert, OutOfGas, Trap)
 - [x] 0230 — Test: simple program (add two numbers, return result)
 - [x] 0231 — Test: fibonacci sequence computation
-- [ ] 0232 — Test: contract deployment and call _(blocked: needs M1.13 contract calls)_
+- [x] 0232 — Test: contract deployment and call
 - [x] 0233 — Test: token transfer (read balance, check, write balance)
 - [x] 0234 — Test: revert rolls back all changes
 - [x] 0235 — Test: out-of-gas rolls back all changes
@@ -341,23 +341,23 @@ Everything else depends on these. Build and test in isolation first.
 
 > Requires: M1.8, M1.10, M1.12. Most complex — needs full execution context, storage, and state rollback.
 
-- [ ] 0193 — Implement `CALL` (external contract call with gas forwarding)
-- [ ] 0194 — Implement call context creation (new msg.sender, self, gas)
-- [ ] 0195 — Implement calldata encoding/decoding
-- [ ] 0196 — Implement return data handling
-- [ ] 0197 — Implement reentrancy guard (default on, per-function flag)
-- [ ] 0198 — Implement `STATICCALL` (view call, no state modification allowed)
-- [ ] 0199 — Implement `DELEGATECALL` (call with caller's context)
-- [ ] 0200 — Implement `CREATE` (deploy new contract)
-- [ ] 0201 — Implement `CREATE2` (deterministic contract address)
-- [ ] 0202 — Test: cross-contract call with value transfer
-- [ ] 0203 — Test: reentrancy guard blocks re-entrant call
-- [ ] 0204 — Test: #[reentrant] function allows re-entry
-- [ ] 0205 — Test: STATICCALL reverts on state modification attempt
-- [ ] 0206 — Test: nested calls (A calls B calls C)
-- [ ] 0207 — Test: call with insufficient gas → revert called contract only
-- [ ] 0208 — Test: CREATE deploys and returns correct address
-- [ ] 0238 — Test: CREATE2 address is deterministic
+- [x] 0193 — Implement `CALL` (external contract call with gas forwarding)
+- [x] 0194 — Implement call context creation (new msg.sender, self, gas)
+- [x] 0195 — Implement calldata encoding/decoding
+- [x] 0196 — Implement return data handling
+- [x] 0197 — Implement reentrancy guard (default on, per-function flag)
+- [x] 0198 — Implement `STATICCALL` (view call, no state modification allowed)
+- [x] 0199 — Implement `DELEGATECALL` (call with caller's context)
+- [x] 0200 — Implement `CREATE` (deploy new contract)
+- [x] 0201 — Implement `CREATE2` (deterministic contract address)
+- [x] 0202 — Test: cross-contract call with value transfer
+- [x] 0203 — Test: reentrancy guard blocks re-entrant call
+- [ ] 0204 — Test: #[reentrant] function allows re-entry _(deferred: needs compiler annotation support)_
+- [x] 0205 — Test: STATICCALL reverts on state modification attempt
+- [x] 0206 — Test: nested calls (A calls B calls C)
+- [x] 0207 — Test: call with insufficient gas → revert called contract only
+- [x] 0208 — Test: CREATE deploys and returns correct address
+- [x] 0238 — Test: CREATE2 address is deterministic
 
 ### M1.14 — AOT Compiler
 

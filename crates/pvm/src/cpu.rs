@@ -25,6 +25,10 @@ pub enum Trap {
     StackUnderflow,
     #[error("out of gas")]
     OutOfGas,
+    #[error("state modification in static call")]
+    StaticModeViolation,
+    #[error("reentrancy detected")]
+    Reentrancy,
 }
 
 /// The CPU register file and minimal execution state.
