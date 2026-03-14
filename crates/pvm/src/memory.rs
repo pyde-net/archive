@@ -101,7 +101,9 @@ impl Memory {
         }
 
         // Bounds check
-        let end = addr.checked_add(len).ok_or(MemoryError::OutOfBounds(addr))?;
+        let end = addr
+            .checked_add(len)
+            .ok_or(MemoryError::OutOfBounds(addr))?;
         if end > MEMORY_SIZE as u32 {
             return Err(MemoryError::OutOfBounds(addr));
         }
@@ -121,7 +123,7 @@ impl Memory {
 
     /// Check that the address is not in the code section (for writes).
     fn check_writable(&self, addr: u32) -> Result<(), MemoryError> {
-        if addr >= CODE_START && addr < CODE_END {
+        if (CODE_START..CODE_END).contains(&addr) {
             return Err(MemoryError::CodeWriteProtected(addr));
         }
         Ok(())
@@ -129,7 +131,9 @@ impl Memory {
 
     /// Grow the heap by `bytes` bytes. Returns the old heap_top (start of allocation).
     pub fn heap_alloc(&mut self, bytes: u32) -> Result<u32, MemoryError> {
-        let new_top = self.heap_top.checked_add(bytes)
+        let new_top = self
+            .heap_top
+            .checked_add(bytes)
             .ok_or(MemoryError::OutOfBounds(self.heap_top))?;
         if new_top > self.stack_pointer {
             return Err(MemoryError::HeapStackCollision);
@@ -141,7 +145,9 @@ impl Memory {
 
     /// Push to stack (decrement SP). Returns new SP.
     pub fn stack_alloc(&mut self, bytes: u32) -> Result<u32, MemoryError> {
-        let new_sp = self.stack_pointer.checked_sub(bytes)
+        let new_sp = self
+            .stack_pointer
+            .checked_sub(bytes)
             .ok_or(MemoryError::HeapStackCollision)?;
         if new_sp < self.heap_top {
             return Err(MemoryError::HeapStackCollision);
@@ -188,7 +194,10 @@ impl Memory {
         self.check_access(addr, 4)?;
         let a = addr as usize;
         Ok(u32::from_le_bytes([
-            self.data[a], self.data[a + 1], self.data[a + 2], self.data[a + 3],
+            self.data[a],
+            self.data[a + 1],
+            self.data[a + 2],
+            self.data[a + 3],
         ]))
     }
 
@@ -207,8 +216,14 @@ impl Memory {
         self.check_access(addr, 8)?;
         let a = addr as usize;
         Ok(u64::from_le_bytes([
-            self.data[a], self.data[a + 1], self.data[a + 2], self.data[a + 3],
-            self.data[a + 4], self.data[a + 5], self.data[a + 6], self.data[a + 7],
+            self.data[a],
+            self.data[a + 1],
+            self.data[a + 2],
+            self.data[a + 3],
+            self.data[a + 4],
+            self.data[a + 5],
+            self.data[a + 6],
+            self.data[a + 7],
         ]))
     }
 
@@ -403,7 +418,7 @@ mod tests {
     fn load_code_too_large() {
         let mut m = mem();
         let big = vec![0u8; 65536]; // exactly 64 KB — should fail (code section is 60 KB)
-        // CODE_START=0x1000, CODE_END=0x10000, so max code = 0xF000 = 61440
+                                    // CODE_START=0x1000, CODE_END=0x10000, so max code = 0xF000 = 61440
         assert!(m.load_code(&big).is_err());
     }
 

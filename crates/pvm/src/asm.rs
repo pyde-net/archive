@@ -17,9 +17,8 @@
 //! ```
 
 use crate::isa::{
-    decode, encode, encode_immediate, encode_mem_immediate, sign_extend_18,
-    decode_mem_offset, decode_mem_width,
-    Instruction, MemWidth, Opcode,
+    decode, decode_mem_offset, decode_mem_width, encode, encode_immediate, encode_mem_immediate,
+    sign_extend_18, Instruction, MemWidth, Opcode,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -47,11 +46,11 @@ pub enum AsmError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
     Mnemonic(String),
-    Register(u8),      // r0-r15
-    WideRegister(u8),  // w0-w7
+    Register(u8),     // r0-r15
+    WideRegister(u8), // w0-w7
     Immediate(i64),
-    Label(String),     // "foo:"
-    LabelRef(String),  // "foo" used as operand
+    Label(String),    // "foo:"
+    LabelRef(String), // "foo" used as operand
     Comma,
     Newline,
 }
@@ -193,16 +192,20 @@ fn parse_int(s: &str) -> Result<i64, String> {
 }
 
 fn parse_gp_reg(s: &str) -> Option<u8> {
-    if s.starts_with('r') {
-        s[1..].parse::<u8>().ok().filter(|&n| n <= 15)
+    if let Some(rest) = s.strip_prefix('r') {
+        rest.parse::<u8>().ok().filter(|&n| n <= 15)
     } else {
         None
     }
 }
 
 fn parse_wide_reg(s: &str) -> Option<u8> {
-    if s.starts_with('w') && s.len() == 2 {
-        s[1..].parse::<u8>().ok().filter(|&n| n <= 7)
+    if let Some(rest) = s.strip_prefix('w') {
+        if rest.len() == 1 {
+            rest.parse::<u8>().ok().filter(|&n| n <= 7)
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -255,7 +258,9 @@ fn parse_pseudo_env(s: &str) -> Option<PseudoEnv> {
 }
 
 fn is_mnemonic(s: &str) -> bool {
-    parse_pseudo_mem(s).is_some() || parse_pseudo_env(s).is_some() || mnemonic_to_opcode(s).is_some()
+    parse_pseudo_mem(s).is_some()
+        || parse_pseudo_env(s).is_some()
+        || mnemonic_to_opcode(s).is_some()
 }
 
 fn mnemonic_to_opcode(s: &str) -> Option<Opcode> {
@@ -626,7 +631,10 @@ fn encode_instr(
             PseudoEnv::Gp(sub) => {
                 // e.g., "address r1" → Caller r1, r0, sub
                 if ops.len() != 1 {
-                    return Err(AsmError::Parse { line, msg: "env query requires 1 operand: rd".into() });
+                    return Err(AsmError::Parse {
+                        line,
+                        msg: "env query requires 1 operand: rd".into(),
+                    });
                 }
                 let rd = expect_gp(&ops[0], line, "rd")?;
                 return Ok(encode(Opcode::Caller, rd, 0, sub));
@@ -634,7 +642,10 @@ fn encode_instr(
             PseudoEnv::Wide(sub) => {
                 // e.g., "gasprice w0" → Callvalue w0, r0, sub
                 if ops.len() != 1 {
-                    return Err(AsmError::Parse { line, msg: "env query requires 1 operand: wd".into() });
+                    return Err(AsmError::Parse {
+                        line,
+                        msg: "env query requires 1 operand: wd".into(),
+                    });
                 }
                 let wd = expect_wide(&ops[0], line, "wd")?;
                 return Ok(encode(Opcode::Callvalue, wd, 0, sub));
@@ -642,7 +653,10 @@ fn encode_instr(
             PseudoEnv::WideWithInput(sub) => {
                 // e.g., "balance w0, r1" → Callvalue w0, r1, sub
                 if ops.len() != 2 {
-                    return Err(AsmError::Parse { line, msg: "balance requires 2 operands: wd, rs1".into() });
+                    return Err(AsmError::Parse {
+                        line,
+                        msg: "balance requires 2 operands: wd, rs1".into(),
+                    });
                 }
                 let wd = expect_wide(&ops[0], line, "wd")?;
                 let rs1 = expect_gp(&ops[1], line, "rs1")?;
@@ -657,7 +671,10 @@ fn encode_instr(
         if ops.len() != 3 {
             return Err(AsmError::Parse {
                 line,
-                msg: format!("{} requires 3 operands: rd, rs1, offset", opcode_to_mnemonic(actual_op)),
+                msg: format!(
+                    "{} requires 3 operands: rd, rs1, offset",
+                    opcode_to_mnemonic(actual_op)
+                ),
             });
         }
         let rd = expect_gp(&ops[0], line, "rd")?;
@@ -669,12 +686,27 @@ fn encode_instr(
 
     match pi.opcode {
         // --- Three-register ops: op rd, rs1, rs2 ---
-        Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Mod
-        | Opcode::And | Opcode::Or | Opcode::Xor
-        | Opcode::Shl | Opcode::Shr | Opcode::Sar
-        | Opcode::Lt | Opcode::Gt | Opcode::Eq | Opcode::Slt | Opcode::Sgt => {
+        Opcode::Add
+        | Opcode::Sub
+        | Opcode::Mul
+        | Opcode::Div
+        | Opcode::Mod
+        | Opcode::And
+        | Opcode::Or
+        | Opcode::Xor
+        | Opcode::Shl
+        | Opcode::Shr
+        | Opcode::Sar
+        | Opcode::Lt
+        | Opcode::Gt
+        | Opcode::Eq
+        | Opcode::Slt
+        | Opcode::Sgt => {
             if ops.len() != 3 {
-                return Err(AsmError::Parse { line, msg: format!("{} requires 3 operands", opcode_to_mnemonic(pi.opcode)) });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: format!("{} requires 3 operands", opcode_to_mnemonic(pi.opcode)),
+                });
             }
             let rd = expect_gp(&ops[0], line, "rd")?;
             let rs1 = expect_gp(&ops[1], line, "rs1")?;
@@ -683,10 +715,19 @@ fn encode_instr(
         }
 
         // --- Wide three-register: op wd, ws1, ws2 ---
-        Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv | Opcode::Wmod
-        | Opcode::Wand | Opcode::Wor | Opcode::Wxor => {
+        Opcode::Wadd
+        | Opcode::Wsub
+        | Opcode::Wmul
+        | Opcode::Wdiv
+        | Opcode::Wmod
+        | Opcode::Wand
+        | Opcode::Wor
+        | Opcode::Wxor => {
             if ops.len() != 3 {
-                return Err(AsmError::Parse { line, msg: format!("{} requires 3 operands", opcode_to_mnemonic(pi.opcode)) });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: format!("{} requires 3 operands", opcode_to_mnemonic(pi.opcode)),
+                });
             }
             let wd = expect_wide(&ops[0], line, "wd")?;
             let ws1 = expect_wide(&ops[1], line, "ws1")?;
@@ -697,7 +738,10 @@ fn encode_instr(
         // --- Wide compare: op rd, ws1, ws2 (result → GP register) ---
         Opcode::Weq | Opcode::Wlt => {
             if ops.len() != 3 {
-                return Err(AsmError::Parse { line, msg: format!("{} requires 3 operands", opcode_to_mnemonic(pi.opcode)) });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: format!("{} requires 3 operands", opcode_to_mnemonic(pi.opcode)),
+                });
             }
             let rd = expect_gp(&ops[0], line, "rd")?;
             let ws1 = expect_wide(&ops[1], line, "ws1")?;
@@ -708,7 +752,10 @@ fn encode_instr(
         // --- rd = rs1 op imm: addi rd, rs1, imm ---
         Opcode::Addi => {
             if ops.len() != 3 {
-                return Err(AsmError::Parse { line, msg: "addi requires 3 operands: rd, rs1, imm".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "addi requires 3 operands: rd, rs1, imm".into(),
+                });
             }
             let rd = expect_gp(&ops[0], line, "rd")?;
             let rs1 = expect_gp(&ops[1], line, "rs1")?;
@@ -719,7 +766,10 @@ fn encode_instr(
         // --- Unary: not rd, rs1 ---
         Opcode::Not => {
             if ops.len() != 2 {
-                return Err(AsmError::Parse { line, msg: "not requires 2 operands: rd, rs1".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "not requires 2 operands: rd, rs1".into(),
+                });
             }
             let rd = expect_gp(&ops[0], line, "rd")?;
             let rs1 = expect_gp(&ops[1], line, "rs1")?;
@@ -729,7 +779,10 @@ fn encode_instr(
         // --- Wide unary: wnot wd, ws1 ---
         Opcode::Wnot => {
             if ops.len() != 2 {
-                return Err(AsmError::Parse { line, msg: "wnot requires 2 operands: wd, ws1".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "wnot requires 2 operands: wd, ws1".into(),
+                });
             }
             let wd = expect_wide(&ops[0], line, "wd")?;
             let ws1 = expect_wide(&ops[1], line, "ws1")?;
@@ -739,7 +792,10 @@ fn encode_instr(
         // --- Wide move: wmov wd, ws1 ---
         Opcode::Wmov => {
             if ops.len() != 2 {
-                return Err(AsmError::Parse { line, msg: "wmov requires 2 operands: wd, ws1".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "wmov requires 2 operands: wd, ws1".into(),
+                });
             }
             let wd = expect_wide(&ops[0], line, "wd")?;
             let ws1 = expect_wide(&ops[1], line, "ws1")?;
@@ -749,7 +805,10 @@ fn encode_instr(
         // --- Narrow: narrow rd, ws1 ---
         Opcode::Narrow => {
             if ops.len() != 2 {
-                return Err(AsmError::Parse { line, msg: "narrow requires 2 operands: rd, ws1".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "narrow requires 2 operands: rd, ws1".into(),
+                });
             }
             let rd = expect_gp(&ops[0], line, "rd")?;
             let ws1 = expect_wide(&ops[1], line, "ws1")?;
@@ -759,7 +818,10 @@ fn encode_instr(
         // --- Widen: widen wd, rs1 ---
         Opcode::Widen => {
             if ops.len() != 2 {
-                return Err(AsmError::Parse { line, msg: "widen requires 2 operands: wd, rs1".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "widen requires 2 operands: wd, rs1".into(),
+                });
             }
             let wd = expect_wide(&ops[0], line, "wd")?;
             let rs1 = expect_gp(&ops[1], line, "rs1")?;
@@ -769,7 +831,10 @@ fn encode_instr(
         // --- WLOAD: wload wd, rs1, imm ---
         Opcode::Wload => {
             if ops.len() < 2 || ops.len() > 3 {
-                return Err(AsmError::Parse { line, msg: "wload requires 2-3 operands: wd, rs1[, offset]".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "wload requires 2-3 operands: wd, rs1[, offset]".into(),
+                });
             }
             let wd = expect_wide(&ops[0], line, "wd")?;
             let rs1 = expect_gp(&ops[1], line, "rs1")?;
@@ -784,7 +849,10 @@ fn encode_instr(
         // --- WSTORE: wstore ws, rs1, imm ---
         Opcode::Wstore => {
             if ops.len() < 2 || ops.len() > 3 {
-                return Err(AsmError::Parse { line, msg: "wstore requires 2-3 operands: ws, rs1[, offset]".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "wstore requires 2-3 operands: ws, rs1[, offset]".into(),
+                });
             }
             let ws = expect_wide(&ops[0], line, "ws")?;
             let rs1 = expect_gp(&ops[1], line, "rs1")?;
@@ -799,7 +867,10 @@ fn encode_instr(
         // --- Push/Pop: push rd / pop rd ---
         Opcode::Push | Opcode::Pop => {
             if ops.len() != 1 {
-                return Err(AsmError::Parse { line, msg: format!("{} requires 1 operand: rd", opcode_to_mnemonic(pi.opcode)) });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: format!("{} requires 1 operand: rd", opcode_to_mnemonic(pi.opcode)),
+                });
             }
             let rd = expect_gp(&ops[0], line, "rd")?;
             Ok(encode(pi.opcode, rd, 0, 0))
@@ -808,7 +879,10 @@ fn encode_instr(
         // --- JMP: jmp imm/label ---
         Opcode::Jmp => {
             if ops.len() != 1 {
-                return Err(AsmError::Parse { line, msg: "jmp requires 1 operand: target".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "jmp requires 1 operand: target".into(),
+                });
             }
             let imm = expect_imm_or_label(&ops[0], pc, labels, line)?;
             Ok(encode(pi.opcode, 0, 0, encode_immediate(imm)))
@@ -817,7 +891,13 @@ fn encode_instr(
         // --- Branches: beq rd, rs1, imm/label ---
         Opcode::Beq | Opcode::Bne | Opcode::Blt | Opcode::Bge => {
             if ops.len() != 3 {
-                return Err(AsmError::Parse { line, msg: format!("{} requires 3 operands: rs1, rs2, target", opcode_to_mnemonic(pi.opcode)) });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: format!(
+                        "{} requires 3 operands: rs1, rs2, target",
+                        opcode_to_mnemonic(pi.opcode)
+                    ),
+                });
             }
             let rd = expect_gp(&ops[0], line, "rs1")?;
             let rs1 = expect_gp(&ops[1], line, "rs2")?;
@@ -828,7 +908,10 @@ fn encode_instr(
         // --- CALL: call imm/label ---
         Opcode::Call => {
             if ops.len() != 1 {
-                return Err(AsmError::Parse { line, msg: "call requires 1 operand: target".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "call requires 1 operand: target".into(),
+                });
             }
             let imm = expect_imm_or_label(&ops[0], pc, labels, line)?;
             Ok(encode(pi.opcode, 0, 0, encode_immediate(imm)))
@@ -837,7 +920,10 @@ fn encode_instr(
         // --- No operand: ret, halt, revert ---
         Opcode::Ret | Opcode::Halt | Opcode::Revert => {
             if !ops.is_empty() {
-                return Err(AsmError::Parse { line, msg: format!("{} takes no operands", opcode_to_mnemonic(pi.opcode)) });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: format!("{} takes no operands", opcode_to_mnemonic(pi.opcode)),
+                });
             }
             Ok(encode(pi.opcode, 0, 0, 0))
         }
@@ -845,7 +931,10 @@ fn encode_instr(
         // --- System: caller rd (shorthand for Caller with sub=0) ---
         Opcode::Caller => {
             if ops.len() != 1 {
-                return Err(AsmError::Parse { line, msg: "caller requires 1 operand: rd".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "caller requires 1 operand: rd".into(),
+                });
             }
             let rd = expect_gp(&ops[0], line, "rd")?;
             Ok(encode(pi.opcode, rd, 0, 0)) // sub-code 0 = CALLER
@@ -854,7 +943,10 @@ fn encode_instr(
         // --- System: callvalue wd ---
         Opcode::Callvalue => {
             if ops.len() != 1 {
-                return Err(AsmError::Parse { line, msg: "callvalue requires 1 operand: wd".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "callvalue requires 1 operand: wd".into(),
+                });
             }
             let wd = expect_wide(&ops[0], line, "wd")?;
             Ok(encode(pi.opcode, wd, 0, 0)) // sub-code 0 = CALL_VALUE
@@ -863,7 +955,10 @@ fn encode_instr(
         // --- System: blockhash wd, rs1 ---
         Opcode::Blockhash => {
             if ops.len() != 2 {
-                return Err(AsmError::Parse { line, msg: "blockhash requires 2 operands: wd, rs1".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "blockhash requires 2 operands: wd, rs1".into(),
+                });
             }
             let wd = expect_wide(&ops[0], line, "wd")?;
             let rs1 = expect_gp(&ops[1], line, "rs1")?;
@@ -873,7 +968,10 @@ fn encode_instr(
         // --- Assert: assert rs1 ---
         Opcode::Assert => {
             if ops.len() != 1 {
-                return Err(AsmError::Parse { line, msg: "assert requires 1 operand: rs1".into() });
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "assert requires 1 operand: rs1".into(),
+                });
             }
             let rs1 = expect_gp(&ops[0], line, "rs1")?;
             Ok(encode(pi.opcode, 0, rs1, 0))
@@ -881,9 +979,21 @@ fn encode_instr(
 
         // --- Fallback for unimplemented syscalls: encode raw ---
         _ => {
-            let rd = if !ops.is_empty() { expect_reg_or_imm(&ops[0], line)? as u8 } else { 0 };
-            let rs1 = if ops.len() > 1 { expect_reg_or_imm(&ops[1], line)? as u8 } else { 0 };
-            let rs2 = if ops.len() > 2 { expect_reg_or_imm(&ops[2], line)? as u32 } else { 0 };
+            let rd = if !ops.is_empty() {
+                expect_reg_or_imm(&ops[0], line)? as u8
+            } else {
+                0
+            };
+            let rs1 = if ops.len() > 1 {
+                expect_reg_or_imm(&ops[1], line)? as u8
+            } else {
+                0
+            };
+            let rs2 = if ops.len() > 2 {
+                expect_reg_or_imm(&ops[2], line)? as u32
+            } else {
+                0
+            };
             Ok(encode(pi.opcode, rd, rs1, rs2))
         }
     }
@@ -919,22 +1029,58 @@ pub fn disassemble(bytecode: &[u8]) -> String {
 fn disassemble_one(opcode: Opcode, rd: u8, rs1: u8, rs2_or_imm: u32) -> String {
     match opcode {
         // Three-register GP
-        Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Mod
-        | Opcode::And | Opcode::Or | Opcode::Xor
-        | Opcode::Shl | Opcode::Shr | Opcode::Sar
-        | Opcode::Lt | Opcode::Gt | Opcode::Eq | Opcode::Slt | Opcode::Sgt => {
-            format!("{} r{}, r{}, r{}", opcode_to_mnemonic(opcode), rd, rs1, rs2_or_imm & 0xF)
+        Opcode::Add
+        | Opcode::Sub
+        | Opcode::Mul
+        | Opcode::Div
+        | Opcode::Mod
+        | Opcode::And
+        | Opcode::Or
+        | Opcode::Xor
+        | Opcode::Shl
+        | Opcode::Shr
+        | Opcode::Sar
+        | Opcode::Lt
+        | Opcode::Gt
+        | Opcode::Eq
+        | Opcode::Slt
+        | Opcode::Sgt => {
+            format!(
+                "{} r{}, r{}, r{}",
+                opcode_to_mnemonic(opcode),
+                rd,
+                rs1,
+                rs2_or_imm & 0xF
+            )
         }
 
         // Three-register wide
-        Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv | Opcode::Wmod
-        | Opcode::Wand | Opcode::Wor | Opcode::Wxor => {
-            format!("{} w{}, w{}, w{}", opcode_to_mnemonic(opcode), rd, rs1, rs2_or_imm & 0x7)
+        Opcode::Wadd
+        | Opcode::Wsub
+        | Opcode::Wmul
+        | Opcode::Wdiv
+        | Opcode::Wmod
+        | Opcode::Wand
+        | Opcode::Wor
+        | Opcode::Wxor => {
+            format!(
+                "{} w{}, w{}, w{}",
+                opcode_to_mnemonic(opcode),
+                rd,
+                rs1,
+                rs2_or_imm & 0x7
+            )
         }
 
         // Wide compare → GP
         Opcode::Weq | Opcode::Wlt => {
-            format!("{} r{}, w{}, w{}", opcode_to_mnemonic(opcode), rd, rs1, rs2_or_imm & 0x7)
+            format!(
+                "{} r{}, w{}, w{}",
+                opcode_to_mnemonic(opcode),
+                rd,
+                rs1,
+                rs2_or_imm & 0x7
+            )
         }
 
         // ADDI
@@ -1054,7 +1200,13 @@ fn disassemble_one(opcode: Opcode, rd: u8, rs1: u8, rs2_or_imm: u32) -> String {
         Opcode::Assert => format!("assert r{}", rs1),
 
         // Fallback
-        _ => format!("{} {}, {}, {}", opcode_to_mnemonic(opcode), rd, rs1, rs2_or_imm),
+        _ => format!(
+            "{} {}, {}, {}",
+            opcode_to_mnemonic(opcode),
+            rd,
+            rs1,
+            rs2_or_imm
+        ),
     }
 }
 
@@ -1088,7 +1240,9 @@ mod tests {
     #[test]
     fn assemble_add_three_reg() {
         let code = assemble("add r3, r1, r2").unwrap();
-        let d = decode(Instruction(u32::from_le_bytes(code[..4].try_into().unwrap())));
+        let d = decode(Instruction(u32::from_le_bytes(
+            code[..4].try_into().unwrap(),
+        )));
         assert_eq!(d.opcode, Opcode::Add);
         assert_eq!(d.rd, 3);
         assert_eq!(d.rs1, 1);
@@ -1098,7 +1252,9 @@ mod tests {
     #[test]
     fn assemble_wide_ops() {
         let code = assemble("wadd w0, w1, w2").unwrap();
-        let d = decode(Instruction(u32::from_le_bytes(code[..4].try_into().unwrap())));
+        let d = decode(Instruction(u32::from_le_bytes(
+            code[..4].try_into().unwrap(),
+        )));
         assert_eq!(d.opcode, Opcode::Wadd);
         assert_eq!(d.rd, 0);
         assert_eq!(d.rs1, 1);
@@ -1114,8 +1270,10 @@ mod tests {
             halt";
         let code = assemble(src).unwrap();
         assert_eq!(code.len(), 12); // 3 instructions
-        // JMP should encode offset = +8 (skip addi, land on halt)
-        let d = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+                                    // JMP should encode offset = +8 (skip addi, land on halt)
+        let d = decode(Instruction(u32::from_le_bytes(
+            code[0..4].try_into().unwrap(),
+        )));
         assert_eq!(d.opcode, Opcode::Jmp);
         assert_eq!(sign_extend_18(d.rs2_or_imm), 8);
     }
@@ -1128,7 +1286,9 @@ mod tests {
             jmp loop";
         let code = assemble(src).unwrap();
         // JMP is at offset 4, loop is at offset 0, so offset = -4
-        let d = decode(Instruction(u32::from_le_bytes(code[4..8].try_into().unwrap())));
+        let d = decode(Instruction(u32::from_le_bytes(
+            code[4..8].try_into().unwrap(),
+        )));
         assert_eq!(d.opcode, Opcode::Jmp);
         assert_eq!(sign_extend_18(d.rs2_or_imm), -4);
     }
@@ -1144,8 +1304,10 @@ mod tests {
             halt";
         let code = assemble(src).unwrap();
         assert_eq!(code.len(), 20); // 5 instructions
-        // BEQ at offset 8, done at offset 16, so offset = +8
-        let d = decode(Instruction(u32::from_le_bytes(code[8..12].try_into().unwrap())));
+                                    // BEQ at offset 8, done at offset 16, so offset = +8
+        let d = decode(Instruction(u32::from_le_bytes(
+            code[8..12].try_into().unwrap(),
+        )));
         assert_eq!(d.opcode, Opcode::Beq);
         assert_eq!(sign_extend_18(d.rs2_or_imm), 8);
     }
@@ -1171,17 +1333,23 @@ mod tests {
         let code = assemble(src).unwrap();
         assert_eq!(code.len(), 20);
 
-        let d0 = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        let d0 = decode(Instruction(u32::from_le_bytes(
+            code[0..4].try_into().unwrap(),
+        )));
         assert_eq!(d0.opcode, Opcode::Load);
         assert_eq!(decode_mem_width(d0.rs2_or_imm), MemWidth::W8);
         assert_eq!(decode_mem_offset(d0.rs2_or_imm), 0);
 
-        let d1 = decode(Instruction(u32::from_le_bytes(code[4..8].try_into().unwrap())));
+        let d1 = decode(Instruction(u32::from_le_bytes(
+            code[4..8].try_into().unwrap(),
+        )));
         assert_eq!(d1.opcode, Opcode::Load);
         assert_eq!(decode_mem_width(d1.rs2_or_imm), MemWidth::W16);
         assert_eq!(decode_mem_offset(d1.rs2_or_imm), 4);
 
-        let d2 = decode(Instruction(u32::from_le_bytes(code[8..12].try_into().unwrap())));
+        let d2 = decode(Instruction(u32::from_le_bytes(
+            code[8..12].try_into().unwrap(),
+        )));
         assert_eq!(d2.opcode, Opcode::Store);
         assert_eq!(decode_mem_width(d2.rs2_or_imm), MemWidth::W32);
         assert_eq!(decode_mem_offset(d2.rs2_or_imm), -8);
@@ -1191,10 +1359,14 @@ mod tests {
     fn assemble_push_pop() {
         let src = "push r5\npop r6\nhalt";
         let code = assemble(src).unwrap();
-        let d0 = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        let d0 = decode(Instruction(u32::from_le_bytes(
+            code[0..4].try_into().unwrap(),
+        )));
         assert_eq!(d0.opcode, Opcode::Push);
         assert_eq!(d0.rd, 5);
-        let d1 = decode(Instruction(u32::from_le_bytes(code[4..8].try_into().unwrap())));
+        let d1 = decode(Instruction(u32::from_le_bytes(
+            code[4..8].try_into().unwrap(),
+        )));
         assert_eq!(d1.opcode, Opcode::Pop);
         assert_eq!(d1.rd, 6);
     }
@@ -1208,7 +1380,9 @@ mod tests {
             addi r1, r0, 1
             ret";
         let code = assemble(src).unwrap();
-        let d = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        let d = decode(Instruction(u32::from_le_bytes(
+            code[0..4].try_into().unwrap(),
+        )));
         assert_eq!(d.opcode, Opcode::Call);
         assert_eq!(sign_extend_18(d.rs2_or_imm), 8); // func at offset 8
     }
@@ -1216,14 +1390,18 @@ mod tests {
     #[test]
     fn assemble_negative_immediate() {
         let code = assemble("addi r1, r0, -100").unwrap();
-        let d = decode(Instruction(u32::from_le_bytes(code[..4].try_into().unwrap())));
+        let d = decode(Instruction(u32::from_le_bytes(
+            code[..4].try_into().unwrap(),
+        )));
         assert_eq!(sign_extend_18(d.rs2_or_imm), -100);
     }
 
     #[test]
     fn assemble_hex_immediate() {
         let code = assemble("addi r1, r0, 0xFF").unwrap();
-        let d = decode(Instruction(u32::from_le_bytes(code[..4].try_into().unwrap())));
+        let d = decode(Instruction(u32::from_le_bytes(
+            code[..4].try_into().unwrap(),
+        )));
         assert_eq!(sign_extend_18(d.rs2_or_imm), 255);
     }
 
@@ -1362,12 +1540,16 @@ mod tests {
     #[test]
     fn weq_wlt_assembly() {
         let code = assemble("weq r1, w0, w1\nwlt r2, w3, w4\nhalt").unwrap();
-        let d0 = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        let d0 = decode(Instruction(u32::from_le_bytes(
+            code[0..4].try_into().unwrap(),
+        )));
         assert_eq!(d0.opcode, Opcode::Weq);
         assert_eq!(d0.rd, 1);
         assert_eq!(d0.rs1, 0);
         assert_eq!(d0.rs2_or_imm, 1);
-        let d1 = decode(Instruction(u32::from_le_bytes(code[4..8].try_into().unwrap())));
+        let d1 = decode(Instruction(u32::from_le_bytes(
+            code[4..8].try_into().unwrap(),
+        )));
         assert_eq!(d1.opcode, Opcode::Wlt);
         assert_eq!(d1.rd, 2);
         assert_eq!(d1.rs1, 3);
@@ -1377,11 +1559,15 @@ mod tests {
     #[test]
     fn narrow_widen_assembly() {
         let code = assemble("widen w0, r1\nnarrow r2, w3\nhalt").unwrap();
-        let d0 = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        let d0 = decode(Instruction(u32::from_le_bytes(
+            code[0..4].try_into().unwrap(),
+        )));
         assert_eq!(d0.opcode, Opcode::Widen);
         assert_eq!(d0.rd, 0); // wd
         assert_eq!(d0.rs1, 1); // rs1
-        let d1 = decode(Instruction(u32::from_le_bytes(code[4..8].try_into().unwrap())));
+        let d1 = decode(Instruction(u32::from_le_bytes(
+            code[4..8].try_into().unwrap(),
+        )));
         assert_eq!(d1.opcode, Opcode::Narrow);
         assert_eq!(d1.rd, 2); // rd
         assert_eq!(d1.rs1, 3); // ws1
@@ -1392,26 +1578,38 @@ mod tests {
         use crate::vm::env_gp;
 
         // GP env queries
-        let code = assemble("caller r1\naddress r2\nblocknumber r3\ntimestamp r4\ngasremaining r5\nhalt").unwrap();
-        let d0 = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        let code =
+            assemble("caller r1\naddress r2\nblocknumber r3\ntimestamp r4\ngasremaining r5\nhalt")
+                .unwrap();
+        let d0 = decode(Instruction(u32::from_le_bytes(
+            code[0..4].try_into().unwrap(),
+        )));
         assert_eq!(d0.opcode, Opcode::Caller);
         assert_eq!(d0.rd, 1);
         assert_eq!(d0.rs2_or_imm, env_gp::CALLER);
 
-        let d1 = decode(Instruction(u32::from_le_bytes(code[4..8].try_into().unwrap())));
+        let d1 = decode(Instruction(u32::from_le_bytes(
+            code[4..8].try_into().unwrap(),
+        )));
         assert_eq!(d1.opcode, Opcode::Caller);
         assert_eq!(d1.rd, 2);
         assert_eq!(d1.rs2_or_imm, env_gp::ADDRESS);
 
-        let d2 = decode(Instruction(u32::from_le_bytes(code[8..12].try_into().unwrap())));
+        let d2 = decode(Instruction(u32::from_le_bytes(
+            code[8..12].try_into().unwrap(),
+        )));
         assert_eq!(d2.opcode, Opcode::Caller);
         assert_eq!(d2.rs2_or_imm, env_gp::BLOCK_NUMBER);
 
-        let d3 = decode(Instruction(u32::from_le_bytes(code[12..16].try_into().unwrap())));
+        let d3 = decode(Instruction(u32::from_le_bytes(
+            code[12..16].try_into().unwrap(),
+        )));
         assert_eq!(d3.opcode, Opcode::Caller);
         assert_eq!(d3.rs2_or_imm, env_gp::TIMESTAMP);
 
-        let d4 = decode(Instruction(u32::from_le_bytes(code[16..20].try_into().unwrap())));
+        let d4 = decode(Instruction(u32::from_le_bytes(
+            code[16..20].try_into().unwrap(),
+        )));
         assert_eq!(d4.opcode, Opcode::Caller);
         assert_eq!(d4.rs2_or_imm, env_gp::GAS_REMAINING);
     }
@@ -1421,17 +1619,23 @@ mod tests {
         use crate::vm::env_wide;
 
         let code = assemble("callvalue w0\ngasprice w1\nbalance w2, r3\nhalt").unwrap();
-        let d0 = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        let d0 = decode(Instruction(u32::from_le_bytes(
+            code[0..4].try_into().unwrap(),
+        )));
         assert_eq!(d0.opcode, Opcode::Callvalue);
         assert_eq!(d0.rd, 0);
         assert_eq!(d0.rs2_or_imm, env_wide::CALL_VALUE);
 
-        let d1 = decode(Instruction(u32::from_le_bytes(code[4..8].try_into().unwrap())));
+        let d1 = decode(Instruction(u32::from_le_bytes(
+            code[4..8].try_into().unwrap(),
+        )));
         assert_eq!(d1.opcode, Opcode::Callvalue);
         assert_eq!(d1.rd, 1);
         assert_eq!(d1.rs2_or_imm, env_wide::GAS_PRICE);
 
-        let d2 = decode(Instruction(u32::from_le_bytes(code[8..12].try_into().unwrap())));
+        let d2 = decode(Instruction(u32::from_le_bytes(
+            code[8..12].try_into().unwrap(),
+        )));
         assert_eq!(d2.opcode, Opcode::Callvalue);
         assert_eq!(d2.rd, 2);
         assert_eq!(d2.rs1, 3);
@@ -1441,7 +1645,9 @@ mod tests {
     #[test]
     fn assemble_blockhash() {
         let code = assemble("blockhash w0, r1\nhalt").unwrap();
-        let d = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        let d = decode(Instruction(u32::from_le_bytes(
+            code[0..4].try_into().unwrap(),
+        )));
         assert_eq!(d.opcode, Opcode::Blockhash);
         assert_eq!(d.rd, 0);
         assert_eq!(d.rs1, 1);

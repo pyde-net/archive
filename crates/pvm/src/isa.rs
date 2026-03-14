@@ -370,7 +370,7 @@ pub fn sign_extend_18(raw: u32) -> i32 {
 /// Panics if the value is out of range [-131072, 131071].
 pub fn encode_immediate(val: i32) -> u32 {
     assert!(
-        val >= -131072 && val <= 131071,
+        (-131072..=131071).contains(&val),
         "immediate {} out of 18-bit signed range",
         val
     );
@@ -417,7 +417,7 @@ pub fn decode_mem_offset(raw: u32) -> i32 {
 /// Panics if offset is out of range [-32768, 32767].
 pub fn encode_mem_immediate(offset: i32, width: MemWidth) -> u32 {
     assert!(
-        offset >= -32768 && offset <= 32767,
+        (-32768..=32767).contains(&offset),
         "memory offset {} out of 16-bit signed range",
         offset
     );
