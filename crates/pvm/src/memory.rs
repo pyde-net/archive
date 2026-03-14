@@ -1,4 +1,4 @@
-//! PVM linear memory: 4 MB address space with page tracking and gas metering.
+//! PVM linear memory: 4 MB address space with lazy page allocation and gas metering.
 
 use crate::cpu::Trap;
 use thiserror::Error;
@@ -54,10 +54,16 @@ impl From<MemoryError> for Trap {
     }
 }
 
-/// 4 MB linear memory with page tracking.
+/// A single 4 KB page, heap-allocated on first touch.
+type Page = Box<[u8; PAGE_SIZE]>;
+
+/// 4 MB linear memory with lazy page allocation and gas metering.
+///
+/// Pages are allocated on first touch instead of eagerly allocating 4 MB.
+/// Reads from untouched pages return zero (same semantic as before).
 pub struct Memory {
-    /// Byte-addressable memory.
-    data: Vec<u8>,
+    /// Lazily-allocated pages. `None` = untouched (reads return zero).
+    pages: Vec<Option<Page>>,
     /// Which pages have been accessed (for gas metering).
     pages_touched: [bool; PAGE_COUNT],
     /// Total gas charged for page allocations.
@@ -72,13 +78,60 @@ pub struct Memory {
 
 impl Memory {
     pub fn new() -> Self {
+        let mut pages = Vec::with_capacity(PAGE_COUNT);
+        for _ in 0..PAGE_COUNT {
+            pages.push(None);
+        }
         Self {
-            data: vec![0u8; MEMORY_SIZE],
+            pages,
             pages_touched: [false; PAGE_COUNT],
             page_gas_used: 0,
             heap_top: HEAP_START,
             stack_pointer: STACK_TOP,
             code_end: CODE_START,
+        }
+    }
+
+    /// Ensure a page is physically allocated. Returns a mutable reference to the page data.
+    #[inline]
+    fn ensure_page(&mut self, page_idx: usize) -> &mut [u8; PAGE_SIZE] {
+        if self.pages[page_idx].is_none() {
+            self.pages[page_idx] = Some(Box::new([0u8; PAGE_SIZE]));
+        }
+        self.pages[page_idx].as_mut().unwrap()
+    }
+
+    /// Read a byte from a page (returns 0 if page not materialized).
+    #[inline]
+    fn read_byte(&self, addr: u32) -> u8 {
+        let page_idx = addr as usize / PAGE_SIZE;
+        let offset = addr as usize % PAGE_SIZE;
+        match &self.pages[page_idx] {
+            Some(page) => page[offset],
+            None => 0,
+        }
+    }
+
+    /// Write a byte, materializing the page if needed.
+    #[inline]
+    fn write_byte(&mut self, addr: u32, val: u8) {
+        let page_idx = addr as usize / PAGE_SIZE;
+        let offset = addr as usize % PAGE_SIZE;
+        let page = self.ensure_page(page_idx);
+        page[offset] = val;
+    }
+
+    /// Read a contiguous slice of bytes into a buffer.
+    fn read_bytes(&self, addr: u32, buf: &mut [u8]) {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = self.read_byte(addr + i as u32);
+        }
+    }
+
+    /// Write a contiguous slice of bytes, materializing pages as needed.
+    fn write_bytes(&mut self, addr: u32, data: &[u8]) {
+        for (i, &b) in data.iter().enumerate() {
+            self.write_byte(addr + i as u32, b);
         }
     }
 
@@ -88,7 +141,8 @@ impl Memory {
         if end > CODE_END as usize {
             return Err(MemoryError::OutOfBounds(end as u32));
         }
-        self.data[CODE_START as usize..end].copy_from_slice(bytecode);
+        // Materialize code pages and copy bytecode
+        self.write_bytes(CODE_START, bytecode);
         self.code_end = end as u32;
         Ok(())
     }
@@ -160,13 +214,13 @@ impl Memory {
 
     pub fn load8(&mut self, addr: u32) -> Result<u8, MemoryError> {
         self.check_access(addr, 1)?;
-        Ok(self.data[addr as usize])
+        Ok(self.read_byte(addr))
     }
 
     pub fn store8(&mut self, addr: u32, val: u8) -> Result<(), MemoryError> {
         self.check_access(addr, 1)?;
         self.check_writable(addr)?;
-        self.data[addr as usize] = val;
+        self.write_byte(addr, val);
         Ok(())
     }
 
@@ -174,17 +228,15 @@ impl Memory {
 
     pub fn load16(&mut self, addr: u32) -> Result<u16, MemoryError> {
         self.check_access(addr, 2)?;
-        let a = addr as usize;
-        Ok(u16::from_le_bytes([self.data[a], self.data[a + 1]]))
+        let mut buf = [0u8; 2];
+        self.read_bytes(addr, &mut buf);
+        Ok(u16::from_le_bytes(buf))
     }
 
     pub fn store16(&mut self, addr: u32, val: u16) -> Result<(), MemoryError> {
         self.check_access(addr, 2)?;
         self.check_writable(addr)?;
-        let bytes = val.to_le_bytes();
-        let a = addr as usize;
-        self.data[a] = bytes[0];
-        self.data[a + 1] = bytes[1];
+        self.write_bytes(addr, &val.to_le_bytes());
         Ok(())
     }
 
@@ -192,21 +244,15 @@ impl Memory {
 
     pub fn load32(&mut self, addr: u32) -> Result<u32, MemoryError> {
         self.check_access(addr, 4)?;
-        let a = addr as usize;
-        Ok(u32::from_le_bytes([
-            self.data[a],
-            self.data[a + 1],
-            self.data[a + 2],
-            self.data[a + 3],
-        ]))
+        let mut buf = [0u8; 4];
+        self.read_bytes(addr, &mut buf);
+        Ok(u32::from_le_bytes(buf))
     }
 
     pub fn store32(&mut self, addr: u32, val: u32) -> Result<(), MemoryError> {
         self.check_access(addr, 4)?;
         self.check_writable(addr)?;
-        let bytes = val.to_le_bytes();
-        let a = addr as usize;
-        self.data[a..a + 4].copy_from_slice(&bytes);
+        self.write_bytes(addr, &val.to_le_bytes());
         Ok(())
     }
 
@@ -214,25 +260,15 @@ impl Memory {
 
     pub fn load64(&mut self, addr: u32) -> Result<u64, MemoryError> {
         self.check_access(addr, 8)?;
-        let a = addr as usize;
-        Ok(u64::from_le_bytes([
-            self.data[a],
-            self.data[a + 1],
-            self.data[a + 2],
-            self.data[a + 3],
-            self.data[a + 4],
-            self.data[a + 5],
-            self.data[a + 6],
-            self.data[a + 7],
-        ]))
+        let mut buf = [0u8; 8];
+        self.read_bytes(addr, &mut buf);
+        Ok(u64::from_le_bytes(buf))
     }
 
     pub fn store64(&mut self, addr: u32, val: u64) -> Result<(), MemoryError> {
         self.check_access(addr, 8)?;
         self.check_writable(addr)?;
-        let bytes = val.to_le_bytes();
-        let a = addr as usize;
-        self.data[a..a + 8].copy_from_slice(&bytes);
+        self.write_bytes(addr, &val.to_le_bytes());
         Ok(())
     }
 
@@ -240,28 +276,46 @@ impl Memory {
 
     pub fn load256(&mut self, addr: u32) -> Result<[u8; 32], MemoryError> {
         self.check_access(addr, 32)?;
-        let a = addr as usize;
         let mut buf = [0u8; 32];
-        buf.copy_from_slice(&self.data[a..a + 32]);
+        self.read_bytes(addr, &mut buf);
         Ok(buf)
     }
 
     pub fn store256(&mut self, addr: u32, val: &[u8; 32]) -> Result<(), MemoryError> {
         self.check_access(addr, 32)?;
         self.check_writable(addr)?;
-        let a = addr as usize;
-        self.data[a..a + 32].copy_from_slice(val);
+        self.write_bytes(addr, val);
         Ok(())
     }
 
-    /// Immutable reference to the raw memory bytes.
-    pub fn data_ref(&self) -> &[u8] {
-        &self.data
+    /// Immutable reference to a contiguous slice of memory.
+    /// For ranges that span unmaterialized pages, this allocates a temporary buffer.
+    pub fn read_slice(&self, addr: u32, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        self.read_bytes(addr, &mut buf);
+        buf
+    }
+
+    /// Read a 32-bit instruction word from the code section (no gas charge).
+    /// Code pages are always materialized by `load_code()`.
+    #[inline]
+    pub fn fetch_code_u32(&self, addr: u32) -> u32 {
+        let mut buf = [0u8; 4];
+        buf[0] = self.read_byte(addr);
+        buf[1] = self.read_byte(addr + 1);
+        buf[2] = self.read_byte(addr + 2);
+        buf[3] = self.read_byte(addr + 3);
+        u32::from_le_bytes(buf)
     }
 
     /// How many pages have been touched.
     pub fn pages_allocated(&self) -> usize {
         self.pages_touched.iter().filter(|&&t| t).count()
+    }
+
+    /// How many pages are physically materialized (have backing memory).
+    pub fn pages_materialized(&self) -> usize {
+        self.pages.iter().filter(|p| p.is_some()).count()
     }
 }
 
@@ -577,5 +631,56 @@ mod tests {
         let mut m = mem();
         assert!(m.load8(MEMORY_SIZE as u32).is_err());
         assert!(m.load64(MEMORY_SIZE as u32 - 4).is_err()); // partially OOB
+    }
+
+    // ========== Task 1168: Lazy page allocation ==========
+
+    #[test]
+    fn lazy_no_pages_materialized_on_new() {
+        let m = mem();
+        assert_eq!(m.pages_materialized(), 0);
+    }
+
+    #[test]
+    fn lazy_read_untouched_returns_zero() {
+        let mut m = mem();
+        assert_eq!(m.load8(HEAP_START).unwrap(), 0);
+        assert_eq!(m.load64(HEAP_START).unwrap(), 0);
+        assert_eq!(m.load256(HEAP_START).unwrap(), [0u8; 32]);
+    }
+
+    #[test]
+    fn lazy_write_materializes_page() {
+        let mut m = mem();
+        assert_eq!(m.pages_materialized(), 0);
+        m.store8(HEAP_START, 42).unwrap();
+        assert!(m.pages_materialized() >= 1);
+        assert_eq!(m.load8(HEAP_START).unwrap(), 42);
+    }
+
+    #[test]
+    fn lazy_code_load_materializes_code_pages_only() {
+        let mut m = mem();
+        let code = vec![0xAB; 100]; // 100 bytes, fits in 1 page
+        m.load_code(&code).unwrap();
+        // Only code page(s) should be materialized
+        let materialized = m.pages_materialized();
+        assert!(materialized <= 2); // code might span 1-2 pages
+        assert!(materialized >= 1);
+    }
+
+    #[test]
+    fn lazy_typical_transfer_touches_few_pages() {
+        let mut m = mem();
+        // Simulate a token transfer: load code, write a few values to heap
+        let code = vec![0x00; 52]; // 13 instructions
+        m.load_code(&code).unwrap();
+        m.store64(HEAP_START, 1000).unwrap();        // sender balance
+        m.store64(HEAP_START + 8, 500).unwrap();     // receiver balance
+        m.store64(HEAP_START + 16, 50).unwrap();     // transfer amount
+
+        // Should only have materialized code page(s) + 1 heap page
+        let materialized = m.pages_materialized();
+        assert!(materialized <= 3);
     }
 }

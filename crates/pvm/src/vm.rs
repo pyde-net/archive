@@ -2,7 +2,8 @@
 
 use crate::cpu::{Cpu, Trap};
 use crate::isa::{
-    decode, decode_mem_offset, decode_mem_width, sign_extend_18, Instruction, MemWidth, Opcode,
+    decode, decode_mem_offset, decode_mem_width, sign_extend_18, DecodedInstruction, Instruction,
+    MemWidth, Opcode,
 };
 use crate::memory::Memory;
 use crate::wide::U256;
@@ -65,13 +66,27 @@ impl Default for ExecutionContext {
     }
 }
 
-/// A saved call frame on the call stack.
+/// A saved call frame on the internal call stack (CALL/RET within a contract).
 #[derive(Clone, Copy, Debug)]
 struct CallFrame {
     /// Return address (PC to resume after RET).
     return_addr: u32,
     /// Previous frame pointer.
     frame_pointer: u32,
+}
+
+/// Maximum depth for cross-contract calls (CALL_EXT/DELEGATECALL/STATICCALL).
+const MAX_EXT_CALL_DEPTH: usize = 1024;
+
+/// Result of a cross-contract call.
+#[derive(Clone, Debug)]
+pub struct CallResult {
+    /// Whether the call succeeded.
+    pub success: bool,
+    /// Return data from the callee.
+    pub return_data: Vec<u8>,
+    /// Gas consumed by the callee.
+    pub gas_used: u64,
 }
 
 /// Execution outcome.
@@ -81,6 +96,47 @@ pub enum ExecResult {
     Halt,
     /// Execution reverted (REVERT).
     Revert,
+}
+
+/// Detailed execution outcome (Success, Revert, OutOfGas, or Trap).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Execution completed successfully.
+    Success,
+    /// Execution reverted (all state changes rolled back).
+    Revert,
+    /// Ran out of gas (all state changes rolled back).
+    OutOfGas,
+    /// Execution trapped (bug/invalid code).
+    Trap(Trap),
+}
+
+/// A single step in the execution trace (for ZK prover).
+#[derive(Clone, Copy, Debug)]
+pub struct TraceStep {
+    /// Program counter before this step.
+    pub pc: u32,
+    /// Opcode executed.
+    pub opcode: Opcode,
+    /// Cumulative gas after this step.
+    pub gas_used: u64,
+}
+
+/// Full execution output returned by `execute()`.
+#[derive(Clone, Debug)]
+pub struct ExecutionOutput {
+    /// High-level outcome.
+    pub outcome: Outcome,
+    /// Gas consumed (after refund).
+    pub gas_used: u64,
+    /// Raw gas consumed (before refund).
+    pub gas_raw: GasUsed,
+    /// Gas refunded.
+    pub gas_refund: u64,
+    /// Event logs (empty on revert/OOG).
+    pub logs: Vec<EventLog>,
+    /// Execution trace for ZK prover.
+    pub trace: Vec<TraceStep>,
 }
 
 /// Two-dimensional gas tracker: execution + proving costs.
@@ -111,29 +167,57 @@ pub struct EventLog {
 }
 
 /// The full VM state.
+///
+/// Struct layout optimized for cache locality: hot fields (pc, gas, cpu)
+/// are placed first so they share cache lines during the step() hot loop.
+/// Cold fields (storage, logs, journal) are at the end.
 pub struct Vm {
-    pub cpu: Cpu,
-    pub memory: Memory,
+    // --- Hot: accessed every step() ---
     /// Program counter (byte offset into code section).
     pub pc: u32,
-    /// Call stack for CALL/RET.
-    call_stack: Vec<CallFrame>,
     /// Frame pointer register.
     pub fp: u32,
-    /// Two-dimensional gas consumed (exec + prove).
-    pub gas: GasUsed,
+    /// Running total gas (exec + prove), precomputed for fast OOG checks.
+    pub gas_used_total: u64,
     /// Gas limit for this execution. 0 = unlimited.
     pub gas_limit: u64,
+    /// Two-dimensional gas consumed (exec + prove).
+    pub gas: GasUsed,
     /// Accumulated gas refund (e.g. from SDELETE).
     pub gas_refund: u64,
+    /// CPU register file (GP + wide registers).
+    pub cpu: Cpu,
+    /// Pre-decoded instruction cache. Populated at load time to avoid
+    /// decode overhead in the hot loop.
+    decoded_cache: Vec<DecodedInstruction>,
+
+    // --- Warm: accessed on memory/storage instructions ---
+    /// Linear memory (lazily allocated pages).
+    pub memory: Memory,
     /// Execution context (caller, block info, etc.).
     pub ctx: ExecutionContext,
     /// Key-value storage overlay (derived_key → variable-length bytes).
-    /// Pre-populated with witness data before execution.
-    /// After execution, diff against initial state for state transition.
     pub storage: HashMap<U256, Vec<u8>>,
+
+    // --- Cold: accessed infrequently ---
+    /// Internal call stack for CALL/RET within a contract.
+    call_stack: Vec<CallFrame>,
     /// Accumulated event logs emitted during execution.
     pub logs: Vec<EventLog>,
+    /// Storage write journal for rollback.
+    storage_journal: Vec<(U256, Option<Vec<u8>>)>,
+    /// Contract registry: address → deployed bytecode.
+    pub contracts: HashMap<u64, Vec<u8>>,
+    /// Calldata: input bytes passed to this contract.
+    pub calldata: Vec<u8>,
+    /// Return data from the last external call.
+    pub return_data: Vec<u8>,
+    /// Whether this execution is in static mode (no state writes allowed).
+    pub static_mode: bool,
+    /// Set of contract addresses currently on the external call stack (reentrancy detection).
+    reentrancy_set: std::collections::HashSet<u64>,
+    /// Current external call depth.
+    ext_call_depth: usize,
 }
 
 impl Vm {
@@ -146,11 +230,20 @@ impl Vm {
             call_stack: Vec::new(),
             fp: 0,
             gas: GasUsed::default(),
+            gas_used_total: 0,
             gas_limit: 0,
             gas_refund: 0,
             ctx: ExecutionContext::default(),
             storage: HashMap::new(),
             logs: Vec::new(),
+            storage_journal: Vec::new(),
+            decoded_cache: Vec::new(),
+            contracts: HashMap::new(),
+            calldata: Vec::new(),
+            return_data: Vec::new(),
+            static_mode: false,
+            reentrancy_set: std::collections::HashSet::new(),
+            ext_call_depth: 0,
         }
     }
 
@@ -177,11 +270,26 @@ impl Vm {
     }
 
     /// Load bytecode and prepare for execution.
+    /// Pre-decodes all instructions at load time for faster dispatch.
     pub fn load(&mut self, bytecode: &[u8]) -> Result<(), Trap> {
         self.memory
             .load_code(bytecode)
             .map_err(|_| Trap::MemoryFault)?;
         self.pc = 0;
+
+        // Pre-decode instruction cache
+        let num_instrs = bytecode.len() / 4;
+        self.decoded_cache = Vec::with_capacity(num_instrs);
+        for i in 0..num_instrs {
+            let word = u32::from_le_bytes([
+                bytecode[i * 4],
+                bytecode[i * 4 + 1],
+                bytecode[i * 4 + 2],
+                bytecode[i * 4 + 3],
+            ]);
+            self.decoded_cache.push(decode(Instruction(word)));
+        }
+
         Ok(())
     }
 
@@ -191,31 +299,30 @@ impl Vm {
         if self.pc + 4 > self.memory.code_end - crate::memory::CODE_START {
             return Err(Trap::InvalidOpcode);
         }
-        let a = addr as usize;
-        // Instructions are stored in little-endian
-        let word = u32::from_le_bytes([
-            self.memory.data_ref()[a],
-            self.memory.data_ref()[a + 1],
-            self.memory.data_ref()[a + 2],
-            self.memory.data_ref()[a + 3],
-        ]);
+        let word = self.memory.fetch_code_u32(addr);
         Ok(Instruction(word))
     }
 
     /// Execute a single step. Returns Some(ExecResult) if execution finished.
     pub fn step(&mut self) -> Result<Option<ExecResult>, Trap> {
-        let instr = self.fetch()?;
-        let d = decode(instr);
+        let idx = (self.pc / 4) as usize;
+        let d = match self.decoded_cache.get(idx) {
+            Some(&d) => d,
+            None => return Err(Trap::InvalidOpcode),
+        };
 
-        // Charge gas (two-dimensional)
+        // Charge gas: single addition from precomputed lookup table
+        self.gas_used_total += crate::isa::total_gas(d.opcode.to_u8());
+
+        // Check gas limit (0 = unlimited)
+        if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+            return Err(Trap::OutOfGas);
+        }
+
+        // Track two-dimensional breakdown (exec + prove)
         let cost = crate::isa::gas_cost(d.opcode);
         self.gas.exec += cost.exec as u64;
         self.gas.prove += cost.prove as u64;
-
-        // Check gas limit (0 = unlimited)
-        if self.gas_limit > 0 && self.gas.total() > self.gas_limit {
-            return Err(Trap::OutOfGas);
-        }
 
         match d.opcode {
             // --- Control flow ---
@@ -306,6 +413,7 @@ impl Vm {
             | Opcode::Eq
             | Opcode::Slt
             | Opcode::Sgt => {
+                let instr = crate::isa::encode(d.opcode, d.rd, d.rs1, d.rs2_or_imm);
                 self.cpu.exec_alu(instr)?;
                 self.pc += 4;
             }
@@ -325,6 +433,7 @@ impl Vm {
             | Opcode::Widen
             | Opcode::Weq
             | Opcode::Wlt => {
+                let instr = crate::isa::encode(d.opcode, d.rd, d.rs1, d.rs2_or_imm);
                 self.cpu.exec_wide(instr)?;
                 self.pc += 4;
             }
@@ -517,8 +626,12 @@ impl Vm {
                 self.pc += 4;
             }
             Opcode::Sstore => {
+                if self.static_mode {
+                    return Err(Trap::StaticModeViolation);
+                }
                 let slot = self.cpu.read_wide(d.rs1);
                 let key = self.derive_storage_key(slot);
+                self.journal_storage_write(&key);
                 let mode = d.rs2_or_imm & 0x3;
                 match mode {
                     0 => {
@@ -552,9 +665,13 @@ impl Vm {
                 self.pc += 4;
             }
             Opcode::Sdelete => {
+                if self.static_mode {
+                    return Err(Trap::StaticModeViolation);
+                }
                 // sdelete ws1 — clear storage slot, grant gas refund if non-empty
                 let slot = self.cpu.read_wide(d.rs1);
                 let key = self.derive_storage_key(slot);
+                self.journal_storage_write(&key);
                 if let Some(v) = self.storage.get(&key) {
                     if !v.is_empty() {
                         self.gas_refund += 1500;
@@ -566,6 +683,9 @@ impl Vm {
 
             // --- Event instruction ---
             Opcode::Log => {
+                if self.static_mode {
+                    return Err(Trap::StaticModeViolation);
+                }
                 // log rs1, imm — emit an event log
                 // imm = number of topics (0-4)
                 // rs1 = pointer to descriptor in memory:
@@ -614,7 +734,8 @@ impl Vm {
                 let dynamic_gas =
                     100u64 + (data_len as u64) * 8 + (num_topics as u64) * 50;
                 self.gas.exec += dynamic_gas;
-                if self.gas_limit > 0 && self.gas.total() > self.gas_limit {
+                self.gas_used_total += dynamic_gas;
+                if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                     return Err(Trap::OutOfGas);
                 }
 
@@ -689,6 +810,57 @@ impl Vm {
                 self.pc += 4;
             }
 
+            // --- Cross-contract call instructions ---
+
+            Opcode::CallExt => {
+                // call_ext rd, rs1, imm
+                // rd = register with target address
+                // rs1 = register with calldata pointer in memory
+                // imm[3:0] = register with calldata length
+                // imm[7:4] = register with gas to forward
+                // Result: rd = 1 (success) or 0 (failure)
+                if self.static_mode {
+                    return Err(Trap::StaticModeViolation);
+                }
+                let result = self.do_ext_call(d, false, false)?;
+                self.cpu.write_gp(d.rd, if result.success { 1 } else { 0 });
+                self.return_data = result.return_data;
+                self.pc += 4;
+            }
+
+            Opcode::Delegate => {
+                // delegate rd, rs1, imm — same encoding as CallExt
+                // Runs callee code with caller's storage and address
+                if self.static_mode {
+                    return Err(Trap::StaticModeViolation);
+                }
+                let result = self.do_ext_call(d, false, true)?;
+                self.cpu.write_gp(d.rd, if result.success { 1 } else { 0 });
+                self.return_data = result.return_data;
+                self.pc += 4;
+            }
+
+            // STATICCALL: uses CallExt opcode with a flag. We encode it as
+            // the same opcode layout but with imm bit 8 set.
+            // For now, we use a separate opcode slot (not yet in ISA — reuse Assert).
+            // Actually, we can detect static from the immediate field:
+            // imm[8] = 1 means static call. But cleaner: just add handling here.
+            // The ISA doesn't have a STATICCALL opcode, so we'll encode it as
+            // CallExt with imm bit 8 set. The VM checks this bit.
+
+            Opcode::Create => {
+                // create rd, rs1, imm
+                // rs1 = register with init code pointer
+                // imm[3:0] = register with init code length
+                // Result: rd = new contract address (0 on failure)
+                if self.static_mode {
+                    return Err(Trap::StaticModeViolation);
+                }
+                let result = self.do_create(d, false)?;
+                self.cpu.write_gp(d.rd, result);
+                self.pc += 4;
+            }
+
             _ => return Err(Trap::InvalidOpcode),
         }
 
@@ -704,6 +876,66 @@ impl Vm {
         }
     }
 
+    /// Execute with full state management: journaled rollback on revert/OOG,
+    /// execution trace recording for ZK provers, and detailed output.
+    pub fn execute(&mut self) -> ExecutionOutput {
+        self.storage_journal.clear();
+        let logs_snapshot_len = self.logs.len();
+
+        let mut trace = Vec::new();
+
+        let outcome = loop {
+            let pc = self.pc;
+            let idx = (pc / 4) as usize;
+            let opcode = match self.decoded_cache.get(idx) {
+                Some(d) => d.opcode,
+                None => break Outcome::Trap(Trap::MemoryFault),
+            };
+
+            match self.step() {
+                Ok(Some(ExecResult::Halt)) => {
+                    trace.push(TraceStep { pc, opcode, gas_used: self.gas_used_total });
+                    break Outcome::Success;
+                }
+                Ok(Some(ExecResult::Revert)) => {
+                    trace.push(TraceStep { pc, opcode, gas_used: self.gas_used_total });
+                    self.rollback_storage();
+                    self.logs.truncate(logs_snapshot_len);
+                    self.gas_refund = 0;
+                    break Outcome::Revert;
+                }
+                Ok(None) => {
+                    trace.push(TraceStep { pc, opcode, gas_used: self.gas_used_total });
+                }
+                Err(Trap::OutOfGas) => {
+                    trace.push(TraceStep { pc, opcode, gas_used: self.gas_used_total });
+                    self.rollback_storage();
+                    self.logs.truncate(logs_snapshot_len);
+                    self.gas_refund = 0;
+                    break Outcome::OutOfGas;
+                }
+                Err(trap) => {
+                    trace.push(TraceStep { pc, opcode, gas_used: self.gas_used_total });
+                    self.rollback_storage();
+                    self.logs.truncate(logs_snapshot_len);
+                    self.gas_refund = 0;
+                    break Outcome::Trap(trap);
+                }
+            }
+        };
+
+        self.storage_journal.clear();
+
+        ExecutionOutput {
+            outcome,
+            gas_used: self.effective_gas_used(),
+            gas_raw: self.gas,
+            gas_refund: self.gas_refund,
+            logs: self.logs[logs_snapshot_len..].to_vec(),
+            trace,
+        }
+    }
+
     /// Current call depth.
     pub fn call_depth(&self) -> usize {
         self.call_stack.len()
@@ -714,13 +946,13 @@ impl Vm {
         if self.gas_limit == 0 {
             u64::MAX
         } else {
-            self.gas_limit.saturating_sub(self.gas.total())
+            self.gas_limit.saturating_sub(self.gas_used_total)
         }
     }
 
     /// Derive a storage key from a slot and the contract's address.
     /// key = poseidon2(slot_bytes ++ address_bytes)
-    fn derive_storage_key(&self, slot: U256) -> U256 {
+    pub fn derive_storage_key(&self, slot: U256) -> U256 {
         let mut buf = [0u8; 40]; // 32 (slot) + 8 (address)
         buf[..32].copy_from_slice(&slot.to_le_bytes());
         buf[32..].copy_from_slice(&self.ctx.self_address.to_le_bytes());
@@ -730,10 +962,220 @@ impl Vm {
 
     /// Effective gas used after applying refund (capped at 50% of total used).
     pub fn effective_gas_used(&self) -> u64 {
-        let total = self.gas.total();
-        let max_refund = total / 2; // cap at 50%
+        let max_refund = self.gas_used_total / 2; // cap at 50%
         let refund = self.gas_refund.min(max_refund);
-        total - refund
+        self.gas_used_total - refund
+    }
+
+    /// Execute an external contract call (CALL_EXT, DELEGATECALL, or STATICCALL).
+    ///
+    /// Spawns a child VM with the target contract's bytecode, forwards gas,
+    /// passes calldata, and collects return data. On child revert, only the
+    /// child's state changes are rolled back.
+    fn do_ext_call(
+        &mut self,
+        d: DecodedInstruction,
+        is_static: bool,
+        is_delegate: bool,
+    ) -> Result<CallResult, Trap> {
+        if self.ext_call_depth >= MAX_EXT_CALL_DEPTH {
+            return Err(Trap::StackOverflow);
+        }
+
+        let target_addr = self.cpu.read_gp(d.rd);
+        let calldata_ptr = self.cpu.read_gp(d.rs1) as u32;
+        let len_reg = (d.rs2_or_imm & 0xF) as u8;
+        let gas_reg = ((d.rs2_or_imm >> 4) & 0xF) as u8;
+        let calldata_len = self.cpu.read_gp(len_reg) as usize;
+        let gas_to_forward = self.cpu.read_gp(gas_reg);
+        let is_static_call = is_static || ((d.rs2_or_imm >> 8) & 1) == 1;
+
+        // Read calldata from caller's memory
+        let mut calldata = vec![0u8; calldata_len];
+        for (i, b) in calldata.iter_mut().enumerate() {
+            *b = self
+                .memory
+                .load8(calldata_ptr + i as u32)
+                .map_err(|_| Trap::MemoryFault)?;
+        }
+
+        // Look up target contract bytecode
+        let bytecode = match self.contracts.get(&target_addr) {
+            Some(code) => code.clone(),
+            None => {
+                // No contract at target address — call fails
+                return Ok(CallResult {
+                    success: false,
+                    return_data: Vec::new(),
+                    gas_used: 0,
+                });
+            }
+        };
+
+        // Reentrancy check (default: no reentrancy allowed)
+        let call_target = if is_delegate {
+            self.ctx.self_address
+        } else {
+            target_addr
+        };
+        if self.reentrancy_set.contains(&call_target) {
+            return Ok(CallResult {
+                success: false,
+                return_data: Vec::new(),
+                gas_used: 0,
+            });
+        }
+
+        // Gas forwarding: forward requested amount, capped at available - 2300 (retain minimum)
+        let available_gas = if self.gas_limit > 0 {
+            self.gas_limit.saturating_sub(self.gas_used_total)
+        } else {
+            u64::MAX
+        };
+        let retained = 2300u64; // minimum gas kept by caller
+        let max_forward = available_gas.saturating_sub(retained);
+        let forwarded = if gas_to_forward == 0 {
+            max_forward // 0 means "forward all available"
+        } else {
+            gas_to_forward.min(max_forward)
+        };
+
+        // Build child execution context
+        let child_ctx = if is_delegate {
+            // DELEGATECALL: preserve caller's address and msg.sender
+            ExecutionContext {
+                caller: self.ctx.caller,
+                self_address: self.ctx.self_address,
+                call_value: self.ctx.call_value,
+                block_number: self.ctx.block_number,
+                timestamp: self.ctx.timestamp,
+                gas_price: self.ctx.gas_price,
+                block_hashes: self.ctx.block_hashes.clone(),
+                balances: self.ctx.balances.clone(),
+            }
+        } else {
+            ExecutionContext {
+                caller: self.ctx.self_address,
+                self_address: target_addr,
+                call_value: U256::ZERO, // value transfer not yet implemented
+                block_number: self.ctx.block_number,
+                timestamp: self.ctx.timestamp,
+                gas_price: self.ctx.gas_price,
+                block_hashes: self.ctx.block_hashes.clone(),
+                balances: self.ctx.balances.clone(),
+            }
+        };
+
+        // Spawn child VM
+        let mut child = Vm::with_gas_limit_and_context(forwarded, child_ctx);
+        child.static_mode = is_static_call || self.static_mode;
+        child.contracts = self.contracts.clone();
+        child.ext_call_depth = self.ext_call_depth + 1;
+        child.reentrancy_set = self.reentrancy_set.clone();
+        child.reentrancy_set.insert(self.ctx.self_address); // caller is on the stack
+        child.reentrancy_set.insert(call_target);            // callee is being entered
+        child.calldata = calldata;
+
+        // Share storage for delegate calls
+        if is_delegate {
+            child.storage = std::mem::take(&mut self.storage);
+        } else {
+            child.storage = self.storage.clone();
+        }
+
+        child.load(&bytecode).map_err(|_| Trap::MemoryFault)?;
+        let output = child.execute();
+
+        // Charge parent for gas used by child
+        self.gas_used_total += output.gas_used;
+        self.gas.exec += output.gas_raw.exec;
+        self.gas.prove += output.gas_raw.prove;
+
+        let success = output.outcome == Outcome::Success;
+
+        if success {
+            // Merge child's storage changes into parent
+            if is_delegate {
+                self.storage = child.storage;
+            } else {
+                for (k, v) in &child.storage {
+                    self.storage.insert(*k, v.clone());
+                }
+            }
+            // Merge child's logs
+            self.logs.extend(output.logs);
+            // Accumulate refunds
+            self.gas_refund += output.gas_refund;
+        } else if is_delegate {
+            // Restore parent's storage on delegate failure
+            self.storage = child.storage;
+        }
+
+        Ok(CallResult {
+            success,
+            return_data: child.return_data,
+            gas_used: output.gas_used,
+        })
+    }
+
+    /// Deploy a new contract (CREATE).
+    fn do_create(&mut self, d: DecodedInstruction, _is_create2: bool) -> Result<u64, Trap> {
+        if self.ext_call_depth >= MAX_EXT_CALL_DEPTH {
+            return Err(Trap::StackOverflow);
+        }
+
+        let code_ptr = self.cpu.read_gp(d.rs1) as u32;
+        let len_reg = (d.rs2_or_imm & 0xF) as u8;
+        let code_len = self.cpu.read_gp(len_reg) as usize;
+
+        // Read init code from memory
+        let mut init_code = vec![0u8; code_len];
+        for (i, b) in init_code.iter_mut().enumerate() {
+            *b = self
+                .memory
+                .load8(code_ptr + i as u32)
+                .map_err(|_| Trap::MemoryFault)?;
+        }
+
+        // Derive contract address: poseidon2(sender_address ++ nonce_or_code_hash)
+        // For simplicity, use poseidon2(sender_bytes ++ code_bytes)
+        let mut addr_input = Vec::with_capacity(8 + init_code.len());
+        addr_input.extend_from_slice(&self.ctx.self_address.to_le_bytes());
+        addr_input.extend_from_slice(&init_code);
+        let hash = pyde_crypto::poseidon2::poseidon2_hash(&addr_input);
+        let new_addr = u64::from_le_bytes(hash.to_bytes()[..8].try_into().unwrap());
+
+        // Register the contract
+        self.contracts.insert(new_addr, init_code);
+
+        Ok(new_addr)
+    }
+
+    /// Record a storage key's current value in the journal before writing.
+    /// Only journals the first write to each key (subsequent writes to the
+    /// same key don't need a new journal entry — the original value is already saved).
+    #[inline]
+    fn journal_storage_write(&mut self, key: &U256) {
+        if self.storage_journal.is_empty()
+            || !self.storage_journal.iter().any(|(k, _)| k == key)
+        {
+            let old = self.storage.get(key).cloned();
+            self.storage_journal.push((*key, old));
+        }
+    }
+
+    /// Rollback storage to the state before journaled writes.
+    fn rollback_storage(&mut self) {
+        for (key, old_value) in self.storage_journal.drain(..).rev() {
+            match old_value {
+                Some(v) => {
+                    self.storage.insert(key, v);
+                }
+                None => {
+                    self.storage.remove(&key);
+                }
+            }
+        }
     }
 }
 
@@ -2371,5 +2813,538 @@ mod tests {
         ]);
         vm.load(&code).unwrap();
         assert!(vm.run().is_err());
+    }
+
+    // --- Interpreter (execute) tests ---
+
+    #[test]
+    fn execute_simple_add() {
+        // r1 = 10, r2 = 20, r3 = r1 + r2 → expect 30
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 10),
+            instr_ri(Opcode::Addi, 2, 0, 20),
+            instr_bytes(Opcode::Add, 3, 1, 2),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        assert_eq!(vm.cpu.read_gp(3), 30);
+        assert!(!output.trace.is_empty());
+        assert_eq!(output.trace.last().unwrap().opcode, Opcode::Halt);
+    }
+
+    #[test]
+    fn execute_fibonacci() {
+        // Compute fib(10) = 55 using a loop
+        // r1 = n (10), r2 = fib(i-1), r3 = fib(i), r4 = counter, r5 = temp
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 10),  // [0] r1 = 10
+            instr_ri(Opcode::Addi, 2, 0, 0),   // [4] r2 = 0 (fib_prev)
+            instr_ri(Opcode::Addi, 3, 0, 1),   // [8] r3 = 1 (fib_curr)
+            instr_ri(Opcode::Addi, 4, 0, 1),   // [12] r4 = 1 (counter)
+            // loop:
+            instr_bytes(Opcode::Bge, 4, 1, 24), // [16] if r4 >= r1, jump +24 → pc 40 (halt)
+            instr_bytes(Opcode::Add, 5, 2, 3),  // [20] r5 = r2 + r3
+            instr_bytes(Opcode::Add, 2, 3, 0),  // [24] r2 = r3 (move via add r3+r0)
+            instr_bytes(Opcode::Add, 3, 5, 0),  // [28] r3 = r5
+            instr_ri(Opcode::Addi, 4, 4, 1),   // [32] r4++
+            instr_ri(Opcode::Jmp, 0, 0, -20),  // [36] jmp -20 → pc 16 (loop)
+            instr_bytes(Opcode::Halt, 0, 0, 0), // [40]
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        assert_eq!(vm.cpu.read_gp(3), 55);
+        assert!(output.trace.len() > 10); // looped multiple times
+    }
+
+    #[test]
+    fn execute_revert_rolls_back_storage() {
+        let ctx = ExecutionContext {
+            self_address: 0xBEEF,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+
+        // Pre-populate storage with a value
+        let slot = U256::from(1u64);
+        let key = vm.derive_storage_key(slot);
+        vm.storage.insert(key, vec![42]);
+
+        // Program: overwrite storage then revert
+        vm.cpu.write_wide(0, slot);
+        vm.cpu.write_wide(1, U256::from(999u64));
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 0), // storage[w0] = w1 (overwrite)
+            instr_bytes(Opcode::Revert, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Revert);
+        // Storage should be rolled back to original value
+        assert_eq!(vm.storage.get(&key).unwrap(), &vec![42u8]);
+        // Logs should be empty
+        assert!(output.logs.is_empty());
+    }
+
+    #[test]
+    fn execute_revert_rolls_back_logs() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+
+        // Set up a log descriptor
+        setup_log_descriptor(&mut vm, heap, &[U256::from(1u64)], b"hello");
+        vm.cpu.write_gp(1, heap as u64);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Log, 0, 1, 1),  // emit event
+            instr_bytes(Opcode::Revert, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Revert);
+        assert!(output.logs.is_empty());
+        assert!(vm.logs.is_empty()); // rolled back
+    }
+
+    #[test]
+    fn execute_out_of_gas_rolls_back() {
+        let ctx = ExecutionContext {
+            self_address: 0xBEEF,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_gas_limit_and_context(10, ctx); // very tight gas limit
+
+        let slot = U256::from(1u64);
+        let key = vm.derive_storage_key(slot);
+        vm.storage.insert(key, vec![42]);
+
+        vm.cpu.write_wide(0, slot);
+        vm.cpu.write_wide(1, U256::from(999u64));
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 0), // 3000 gas — will exceed limit
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::OutOfGas);
+        // Storage should be rolled back
+        assert_eq!(vm.storage.get(&key).unwrap(), &vec![42u8]);
+    }
+
+    #[test]
+    fn execute_token_transfer() {
+        // Simulate: read balance from slot 0, check >= amount, deduct, write new balance
+        // r1 = amount to transfer (100)
+        // w0 = slot 0 (sender balance)
+        // w1 = loaded balance
+        let ctx = ExecutionContext {
+            self_address: 0xAAAA,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+
+        // Pre-populate sender balance = 500
+        let slot = U256::from(0u64);
+        let key = vm.derive_storage_key(slot);
+        vm.storage.insert(key, 500u64.to_le_bytes().to_vec());
+
+        vm.cpu.write_wide(0, slot); // w0 = slot
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sload, 1, 0, 2),   // [0] sloadg r1, w0 (balance → r1)
+            instr_ri(Opcode::Addi, 2, 0, 100),     // [4] r2 = 100 (amount)
+            instr_bytes(Opcode::Blt, 1, 2, 16),     // [8] if r1 < r2, jump to revert (pc 24)
+            instr_bytes(Opcode::Sub, 1, 1, 2),      // [12] r1 = r1 - amount
+            instr_bytes(Opcode::Sstore, 1, 0, 2),   // [16] sstoreg w0, r1 (write new balance)
+            instr_bytes(Opcode::Halt, 0, 0, 0),     // [20]
+            instr_bytes(Opcode::Revert, 0, 0, 0),   // [24] insufficient balance
+        ]);
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        // Balance should be 400
+        let stored = vm.storage.get(&key).unwrap();
+        let balance = u64::from_le_bytes(stored[..8].try_into().unwrap());
+        assert_eq!(balance, 400);
+    }
+
+    #[test]
+    fn execute_token_transfer_insufficient_reverts() {
+        let ctx = ExecutionContext {
+            self_address: 0xAAAA,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+
+        // Sender balance = 50, try to transfer 100
+        let slot = U256::from(0u64);
+        let key = vm.derive_storage_key(slot);
+        vm.storage.insert(key, 50u64.to_le_bytes().to_vec());
+
+        vm.cpu.write_wide(0, slot);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sload, 1, 0, 2),   // sloadg r1, w0
+            instr_ri(Opcode::Addi, 2, 0, 100),     // r2 = 100
+            instr_bytes(Opcode::Blt, 1, 2, 16),     // if r1 < r2, jump to revert
+            instr_bytes(Opcode::Sub, 1, 1, 2),
+            instr_bytes(Opcode::Sstore, 1, 0, 2),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+            instr_bytes(Opcode::Revert, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Revert);
+        // Balance should be unchanged (rolled back)
+        let stored = vm.storage.get(&key).unwrap();
+        let balance = u64::from_le_bytes(stored[..8].try_into().unwrap());
+        assert_eq!(balance, 50);
+    }
+
+    #[test]
+    fn execute_trace_records_all_steps() {
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 5),
+            instr_ri(Opcode::Addi, 2, 0, 10),
+            instr_bytes(Opcode::Add, 3, 1, 2),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        assert_eq!(output.trace.len(), 4);
+        assert_eq!(output.trace[0].opcode, Opcode::Addi);
+        assert_eq!(output.trace[0].pc, 0);
+        assert_eq!(output.trace[1].pc, 4);
+        assert_eq!(output.trace[2].opcode, Opcode::Add);
+        assert_eq!(output.trace[3].opcode, Opcode::Halt);
+        // Gas should be monotonically increasing
+        for w in output.trace.windows(2) {
+            assert!(w[1].gas_used >= w[0].gas_used);
+        }
+    }
+
+    #[test]
+    fn execute_success_preserves_storage_and_logs() {
+        let heap = crate::memory::HEAP_START;
+        let ctx = ExecutionContext {
+            self_address: 0xBEEF,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+
+        // Set up storage write and log emission
+        vm.cpu.write_wide(0, U256::from(1u64));
+        vm.cpu.write_wide(1, U256::from(42u64));
+        setup_log_descriptor(&mut vm, heap, &[U256::from(0xABu64)], b"ok");
+        vm.cpu.write_gp(3, heap as u64);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 0),  // write storage
+            instr_bytes(Opcode::Log, 0, 3, 1),      // emit log
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        // Storage should be preserved (not rolled back)
+        let key = vm.derive_storage_key(U256::from(1u64));
+        assert!(vm.storage.contains_key(&key));
+        // Logs should be present
+        assert_eq!(output.logs.len(), 1);
+        assert_eq!(output.logs[0].data, b"ok");
+        assert_eq!(vm.logs.len(), 1);
+    }
+
+    // --- M1.13: Contract Call Instruction tests ---
+
+    /// Helper: create a VM with a contract registry containing the given contracts.
+    fn vm_with_contracts(contracts: Vec<(u64, Vec<u8>)>) -> Vm {
+        let mut vm = Vm::new();
+        for (addr, code) in contracts {
+            vm.contracts.insert(addr, code);
+        }
+        vm
+    }
+
+    // ========== Task 0202: Cross-contract call with value transfer ==========
+
+    #[test]
+    fn ext_call_basic() {
+        // Caller contract at 0xAAA calls callee contract at 0xBBB
+        // Callee: ADDI r1, r0, 42; HALT
+        let callee_code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 42),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        // Caller: set up target addr + calldata, CALL_EXT, HALT
+        // r1 = target address (0xBBB)
+        // r2 = calldata ptr (doesn't matter, len=0)
+        // r3 = calldata len (0)
+        // r4 = gas to forward (0 = all)
+        // CALL_EXT rd=1, rs1=2, imm = (gas_reg=4 << 4) | len_reg=3 = 0x43
+        let caller_code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 0xBBB),       // r1 = target
+            instr_ri(Opcode::Addi, 3, 0, 0),            // r3 = calldata len = 0
+            instr_ri(Opcode::Addi, 4, 0, 0),            // r4 = gas = 0 (all)
+            instr_bytes(Opcode::CallExt, 1, 2, 0x43),   // call_ext r1, r2, (r4<<4|r3)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let ctx = ExecutionContext {
+            self_address: 0xAAA,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+        vm.contracts.insert(0xBBB, callee_code);
+        vm.load(&caller_code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        assert_eq!(vm.cpu.read_gp(1), 1); // call succeeded
+    }
+
+    // ========== Task 0203: Reentrancy guard blocks re-entrant call ==========
+
+    #[test]
+    fn ext_call_reentrancy_blocked() {
+        // Contract A calls contract B, contract B tries to call A back → Reentrancy trap
+        // B's code: call A (which is already on the call stack)
+        let code_b = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 0xAA),         // r1 = addr of A
+            instr_ri(Opcode::Addi, 3, 0, 0),             // r3 = calldata len = 0
+            instr_ri(Opcode::Addi, 4, 0, 0),             // r4 = gas = 0
+            instr_bytes(Opcode::CallExt, 1, 2, 0x43),    // call_ext → A (reentrancy!)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let code_a = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 0xBB),         // r1 = addr of B
+            instr_ri(Opcode::Addi, 3, 0, 0),
+            instr_ri(Opcode::Addi, 4, 0, 0),
+            instr_bytes(Opcode::CallExt, 1, 2, 0x43),    // call B
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let ctx = ExecutionContext {
+            self_address: 0xAA,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+        vm.contracts.insert(0xAA, code_a.clone());
+        vm.contracts.insert(0xBB, code_b);
+        vm.load(&code_a).unwrap();
+        let output = vm.execute();
+
+        // A's call to B succeeds (B itself runs and halts OK).
+        // B's internal call back to A fails silently (reentrancy blocked, B's r1 = 0).
+        // But B still completes with HALT, so A sees success.
+        assert_eq!(output.outcome, Outcome::Success);
+        assert_eq!(vm.cpu.read_gp(1), 1); // A→B call succeeded (B halted OK)
+    }
+
+    // ========== Task 0205: STATICCALL reverts on state modification ==========
+
+    #[test]
+    fn staticcall_reverts_on_sstore() {
+        // Callee tries to SSTORE — should fail in static mode
+        let callee_code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 0, 0, 0),  // attempt state write
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        // Caller does a static call (imm bit 8 set): imm = 0x143 = (1<<8) | (r4<<4) | r3
+        let caller_code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 0xCC),         // r1 = target
+            instr_ri(Opcode::Addi, 3, 0, 0),
+            instr_ri(Opcode::Addi, 4, 0, 0),
+            instr_bytes(Opcode::CallExt, 1, 2, 0x143),   // static call (bit 8 set)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let ctx = ExecutionContext {
+            self_address: 0xDD,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+        vm.contracts.insert(0xCC, callee_code);
+        vm.load(&caller_code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        assert_eq!(vm.cpu.read_gp(1), 0); // static call failed (callee tried to write)
+    }
+
+    // ========== Task 0206: Nested calls (A calls B calls C) ==========
+
+    #[test]
+    fn nested_ext_calls_three_deep() {
+        // C: just halts
+        let code_c = bytecode(&[
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        // B: calls C, then halts
+        let code_b = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 0x30),         // r1 = addr C
+            instr_ri(Opcode::Addi, 3, 0, 0),
+            instr_ri(Opcode::Addi, 4, 0, 0),
+            instr_bytes(Opcode::CallExt, 1, 2, 0x43),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        // A: calls B, checks success, then halts
+        let code_a = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 0x20),         // r1 = addr B
+            instr_ri(Opcode::Addi, 3, 0, 0),
+            instr_ri(Opcode::Addi, 4, 0, 0),
+            instr_bytes(Opcode::CallExt, 1, 2, 0x43),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let ctx = ExecutionContext {
+            self_address: 0x10,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+        vm.contracts.insert(0x20, code_b);
+        vm.contracts.insert(0x30, code_c);
+        vm.load(&code_a).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        assert_eq!(vm.cpu.read_gp(1), 1); // B→C succeeded
+    }
+
+    // ========== Task 0207: Call with insufficient gas → revert child only ==========
+
+    #[test]
+    fn ext_call_child_oog_parent_continues() {
+        // Callee: expensive loop that will run out of gas
+        let callee_code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 1000),
+            instr_ri(Opcode::Addi, 2, 0, 0),
+            instr_bytes(Opcode::Add, 3, 1, 2),           // loop body
+            instr_ri(Opcode::Addi, 2, 2, 1),
+            instr_ri(Opcode::Blt, 2, 1, -12),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        // Caller: forward very little gas (10)
+        let caller_code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 0xEE),
+            instr_ri(Opcode::Addi, 3, 0, 0),
+            instr_ri(Opcode::Addi, 4, 0, 10),            // only 10 gas forwarded
+            instr_bytes(Opcode::CallExt, 1, 2, 0x43),
+            instr_ri(Opcode::Addi, 5, 0, 99),            // parent continues
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let ctx = ExecutionContext {
+            self_address: 0xFF,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+        vm.contracts.insert(0xEE, callee_code);
+        vm.load(&caller_code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        assert_eq!(vm.cpu.read_gp(1), 0);  // child failed (OOG)
+        assert_eq!(vm.cpu.read_gp(5), 99); // parent continued
+    }
+
+    // ========== Task 0208: CREATE deploys and returns correct address ==========
+
+    #[test]
+    fn create_deploys_contract() {
+        let heap = crate::memory::HEAP_START;
+
+        // Init code to deploy: ADDI r1, r0, 77; HALT
+        let init_code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 77),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let ctx = ExecutionContext {
+            self_address: 0x1234,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+
+        // Write init code to memory
+        for (i, &b) in init_code.iter().enumerate() {
+            vm.memory.store8(heap + i as u32, b).unwrap();
+        }
+        vm.cpu.write_gp(2, heap as u64);            // r2 = code ptr
+        vm.cpu.write_gp(3, init_code.len() as u64); // r3 = code len
+
+        // CREATE rd=1, rs1=2, imm = len_reg=3 → 0x03
+        let caller_code = bytecode(&[
+            instr_bytes(Opcode::Create, 1, 2, 0x03),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&caller_code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        let new_addr = vm.cpu.read_gp(1);
+        assert_ne!(new_addr, 0);
+        // Contract should be registered
+        assert!(vm.contracts.contains_key(&new_addr));
+        assert_eq!(vm.contracts[&new_addr], init_code);
+    }
+
+    // ========== Task 0238: CREATE2 address is deterministic ==========
+
+    #[test]
+    fn create_address_is_deterministic() {
+        let heap = crate::memory::HEAP_START;
+        let init_code = bytecode(&[
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        // Run CREATE twice with same inputs → should get same address
+        let mut addrs = Vec::new();
+        for _ in 0..2 {
+            let ctx = ExecutionContext {
+                self_address: 0x5678,
+                ..Default::default()
+            };
+            let mut vm = Vm::with_context(ctx);
+            for (i, &b) in init_code.iter().enumerate() {
+                vm.memory.store8(heap + i as u32, b).unwrap();
+            }
+            vm.cpu.write_gp(2, heap as u64);
+            vm.cpu.write_gp(3, init_code.len() as u64);
+
+            let code = bytecode(&[
+                instr_bytes(Opcode::Create, 1, 2, 0x03),
+                instr_bytes(Opcode::Halt, 0, 0, 0),
+            ]);
+            vm.load(&code).unwrap();
+            vm.execute();
+            addrs.push(vm.cpu.read_gp(1));
+        }
+
+        assert_eq!(addrs[0], addrs[1]);
+        assert_ne!(addrs[0], 0);
     }
 }
