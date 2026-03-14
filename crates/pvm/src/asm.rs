@@ -1263,6 +1263,27 @@ fn encode_instr(
             Ok(encode(pi.opcode, wd, rs1, rs2 as u32))
         }
 
+        // --- Event: log rs1, imm (imm = topic count) ---
+        Opcode::Log => {
+            if ops.len() != 2 {
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "log requires 2 operands: rs1, num_topics".into(),
+                });
+            }
+            let rs1 = expect_gp(&ops[0], line, "rs1")?;
+            let num_topics = match &ops[1] {
+                Operand::Imm(v) => *v as u32,
+                _ => {
+                    return Err(AsmError::Parse {
+                        line,
+                        msg: "log: second operand must be immediate (topic count)".into(),
+                    })
+                }
+            };
+            Ok(encode(pi.opcode, 0, rs1, num_topics))
+        }
+
         // --- Crypto: verifysig rd, rs1 ---
         Opcode::VerifySig => {
             if ops.len() != 2 {
@@ -1539,6 +1560,9 @@ fn disassemble_one(opcode: Opcode, rd: u8, rs1: u8, rs2_or_imm: u32) -> String {
 
         // Assert
         Opcode::Assert => format!("assert r{}", rs1),
+
+        // Event
+        Opcode::Log => format!("log r{}, {}", rs1, rs2_or_imm),
 
         // Fallback
         _ => format!(
