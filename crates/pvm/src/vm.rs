@@ -206,6 +206,8 @@ pub struct Vm {
     pub logs: Vec<EventLog>,
     /// Storage write journal for rollback.
     storage_journal: Vec<(U256, Option<Vec<u8>>)>,
+    /// Keys already journaled (O(1) dedup instead of O(n) scan).
+    storage_journal_keys: std::collections::HashSet<U256>,
     /// Contract registry: address → deployed bytecode.
     pub contracts: HashMap<u64, Vec<u8>>,
     /// Calldata: input bytes passed to this contract.
@@ -218,6 +220,16 @@ pub struct Vm {
     reentrancy_set: std::collections::HashSet<u64>,
     /// Current external call depth.
     ext_call_depth: usize,
+}
+
+/// Safe address calculation: base (u64) + offset (i64) → u32, or MemoryFault.
+#[inline]
+fn safe_addr(base: u64, offset: i64) -> Result<u32, Trap> {
+    let result = (base as i128) + (offset as i128);
+    if result < 0 || result > u32::MAX as i128 {
+        return Err(Trap::MemoryFault);
+    }
+    Ok(result as u32)
 }
 
 impl Vm {
@@ -237,6 +249,7 @@ impl Vm {
             storage: HashMap::new(),
             logs: Vec::new(),
             storage_journal: Vec::new(),
+            storage_journal_keys: std::collections::HashSet::new(),
             decoded_cache: Vec::new(),
             contracts: HashMap::new(),
             calldata: Vec::new(),
@@ -443,7 +456,7 @@ impl Vm {
                 let base = self.cpu.read_gp(d.rs1);
                 let offset = decode_mem_offset(d.rs2_or_imm) as i64;
                 let width = decode_mem_width(d.rs2_or_imm);
-                let addr = (base as i64 + offset) as u32;
+                let addr = safe_addr(base, offset)?;
                 let val = match width {
                     MemWidth::W8 => self.memory.load8(addr).map_err(|_| Trap::MemoryFault)? as u64,
                     MemWidth::W16 => {
@@ -461,7 +474,7 @@ impl Vm {
                 let base = self.cpu.read_gp(d.rs1);
                 let offset = decode_mem_offset(d.rs2_or_imm) as i64;
                 let width = decode_mem_width(d.rs2_or_imm);
-                let addr = (base as i64 + offset) as u32;
+                let addr = safe_addr(base, offset)?;
                 let val = self.cpu.read_gp(d.rd);
                 match width {
                     MemWidth::W8 => self
@@ -486,7 +499,7 @@ impl Vm {
             Opcode::Wload => {
                 let base = self.cpu.read_gp(d.rs1);
                 let offset = sign_extend_18(d.rs2_or_imm) as i64;
-                let addr = (base as i64 + offset) as u32;
+                let addr = safe_addr(base, offset)?;
                 let bytes = self.memory.load256(addr).map_err(|_| Trap::MemoryFault)?;
                 self.cpu.write_wide(d.rd, U256::from_le_bytes(bytes));
                 self.pc += 4;
@@ -494,7 +507,7 @@ impl Vm {
             Opcode::Wstore => {
                 let base = self.cpu.read_gp(d.rs1);
                 let offset = sign_extend_18(d.rs2_or_imm) as i64;
-                let addr = (base as i64 + offset) as u32;
+                let addr = safe_addr(base, offset)?;
                 let val = self.cpu.read_wide(d.rd);
                 self.memory
                     .store256(addr, &val.to_le_bytes())
@@ -503,19 +516,26 @@ impl Vm {
             }
             Opcode::Push => {
                 let val = self.cpu.read_gp(d.rd);
-                self.memory.stack_pointer -= 8;
+                let sp = self
+                    .memory
+                    .stack_alloc(8)
+                    .map_err(|_| Trap::MemoryFault)?;
                 self.memory
-                    .store64(self.memory.stack_pointer, val)
+                    .store64(sp, val)
                     .map_err(|_| Trap::MemoryFault)?;
                 self.pc += 4;
             }
             Opcode::Pop => {
+                let sp = self.memory.stack_pointer;
+                if sp.checked_add(8).is_none() || sp + 8 > crate::memory::STACK_TOP {
+                    return Err(Trap::MemoryFault);
+                }
                 let val = self
                     .memory
-                    .load64(self.memory.stack_pointer)
+                    .load64(sp)
                     .map_err(|_| Trap::MemoryFault)?;
                 self.cpu.write_gp(d.rd, val);
-                self.memory.stack_pointer += 8;
+                self.memory.stack_pointer = sp + 8;
                 self.pc += 4;
             }
 
@@ -569,13 +589,10 @@ impl Vm {
             Opcode::Poseidon => {
                 // poseidon wd, rs1, rs2 — hash rs2 bytes from memory[rs1] → wd
                 let addr = self.cpu.read_gp(d.rs1) as u32;
-                let len = (d.rs2_or_imm & 0xF) as u8; // rs2 register index
+                let len = (d.rs2_or_imm & 0xF) as u8;
                 let byte_len = self.cpu.read_gp(len) as usize;
-                // Read bytes from memory
-                let mut data = vec![0u8; byte_len];
-                for (i, byte) in data.iter_mut().enumerate() {
-                    *byte = self.memory.load8(addr + i as u32).map_err(|_| Trap::MemoryFault)?;
-                }
+                let data = self.memory.checked_read_slice(addr, byte_len)
+                    .map_err(|_| Trap::MemoryFault)?;
                 let hash = pyde_crypto::poseidon2::poseidon2_hash(&data);
                 let hash_bytes: [u8; 32] = hash.to_bytes();
                 self.cpu.write_wide(d.rd, U256::from_le_bytes(hash_bytes));
@@ -861,6 +878,44 @@ impl Vm {
                 self.pc += 4;
             }
 
+            // --- ZK-native instructions ---
+            Opcode::Assert => {
+                // assert rs1 — if rs1 == 0, revert (provable assertion)
+                let val = self.cpu.read_gp(d.rs1);
+                if val == 0 {
+                    return Ok(Some(ExecResult::Revert));
+                }
+                self.pc += 4;
+            }
+            Opcode::FieldMul => {
+                // field_mul rd, rs1, rs2 — modular multiplication over Goldilocks field
+                // p = 2^64 - 2^32 + 1 (Goldilocks prime)
+                let a = self.cpu.read_gp(d.rs1) as u128;
+                let rs2 = (d.rs2_or_imm & 0xF) as u8;
+                let b = self.cpu.read_gp(rs2) as u128;
+                const GOLDILOCKS_P: u128 = (1u128 << 64) - (1u128 << 32) + 1;
+                let result = ((a * b) % GOLDILOCKS_P) as u64;
+                self.cpu.write_gp(d.rd, result);
+                self.pc += 4;
+            }
+            Opcode::Commit => {
+                // commit rd — write rd value to public output (ZK prover captures from trace)
+                self.pc += 4;
+            }
+            Opcode::Selfdestruct => {
+                if self.static_mode {
+                    return Err(Trap::StaticModeViolation);
+                }
+                self.storage.clear();
+                return Ok(Some(ExecResult::Halt));
+            }
+            Opcode::MerkleVerify => {
+                // merkle_verify rd, ws1, rs2 — stub: always returns 1
+                // Full impl needs witness data from full nodes
+                self.cpu.write_gp(d.rd, 1);
+                self.pc += 4;
+            }
+
             _ => return Err(Trap::InvalidOpcode),
         }
 
@@ -880,6 +935,7 @@ impl Vm {
     /// execution trace recording for ZK provers, and detailed output.
     pub fn execute(&mut self) -> ExecutionOutput {
         self.storage_journal.clear();
+        self.storage_journal_keys.clear();
         let logs_snapshot_len = self.logs.len();
 
         let mut trace = Vec::new();
@@ -925,6 +981,7 @@ impl Vm {
         };
 
         self.storage_journal.clear();
+        self.storage_journal_keys.clear();
 
         ExecutionOutput {
             outcome,
@@ -1119,7 +1176,7 @@ impl Vm {
     }
 
     /// Deploy a new contract (CREATE).
-    fn do_create(&mut self, d: DecodedInstruction, _is_create2: bool) -> Result<u64, Trap> {
+    fn do_create(&mut self, d: DecodedInstruction, is_create2: bool) -> Result<u64, Trap> {
         if self.ext_call_depth >= MAX_EXT_CALL_DEPTH {
             return Err(Trap::StackOverflow);
         }
@@ -1128,24 +1185,31 @@ impl Vm {
         let len_reg = (d.rs2_or_imm & 0xF) as u8;
         let code_len = self.cpu.read_gp(len_reg) as usize;
 
-        // Read init code from memory
-        let mut init_code = vec![0u8; code_len];
-        for (i, b) in init_code.iter_mut().enumerate() {
-            *b = self
-                .memory
-                .load8(code_ptr + i as u32)
-                .map_err(|_| Trap::MemoryFault)?;
-        }
+        let init_code = self.memory.checked_read_slice(code_ptr, code_len)
+            .map_err(|_| Trap::MemoryFault)?;
 
-        // Derive contract address: poseidon2(sender_address ++ nonce_or_code_hash)
-        // For simplicity, use poseidon2(sender_bytes ++ code_bytes)
-        let mut addr_input = Vec::with_capacity(8 + init_code.len());
-        addr_input.extend_from_slice(&self.ctx.self_address.to_le_bytes());
-        addr_input.extend_from_slice(&init_code);
-        let hash = pyde_crypto::poseidon2::poseidon2_hash(&addr_input);
-        let new_addr = u64::from_le_bytes(hash.to_bytes()[..8].try_into().unwrap());
+        // Derive contract address
+        let new_addr = if is_create2 {
+            // CREATE2: address = poseidon2(0xFF ++ sender ++ salt ++ code_hash)
+            // salt is in the wide register w0
+            let salt = self.cpu.read_wide(0);
+            let code_hash = pyde_crypto::poseidon2::poseidon2_hash(&init_code);
+            let mut addr_input = Vec::with_capacity(1 + 8 + 32 + 32);
+            addr_input.push(0xFF);
+            addr_input.extend_from_slice(&self.ctx.self_address.to_le_bytes());
+            addr_input.extend_from_slice(&salt.to_le_bytes());
+            addr_input.extend_from_slice(&code_hash.to_bytes());
+            let hash = pyde_crypto::poseidon2::poseidon2_hash(&addr_input);
+            u64::from_le_bytes(hash.to_bytes()[..8].try_into().unwrap())
+        } else {
+            // CREATE: address = poseidon2(sender ++ code)
+            let mut addr_input = Vec::with_capacity(8 + init_code.len());
+            addr_input.extend_from_slice(&self.ctx.self_address.to_le_bytes());
+            addr_input.extend_from_slice(&init_code);
+            let hash = pyde_crypto::poseidon2::poseidon2_hash(&addr_input);
+            u64::from_le_bytes(hash.to_bytes()[..8].try_into().unwrap())
+        };
 
-        // Register the contract
         self.contracts.insert(new_addr, init_code);
 
         Ok(new_addr)
@@ -1156,9 +1220,7 @@ impl Vm {
     /// same key don't need a new journal entry — the original value is already saved).
     #[inline]
     pub fn journal_storage_write(&mut self, key: &U256) {
-        if self.storage_journal.is_empty()
-            || !self.storage_journal.iter().any(|(k, _)| k == key)
-        {
+        if self.storage_journal_keys.insert(*key) {
             let old = self.storage.get(key).cloned();
             self.storage_journal.push((*key, old));
         }
@@ -1166,6 +1228,7 @@ impl Vm {
 
     /// Rollback storage to the state before journaled writes.
     fn rollback_storage(&mut self) {
+        self.storage_journal_keys.clear();
         for (key, old_value) in self.storage_journal.drain(..).rev() {
             match old_value {
                 Some(v) => {

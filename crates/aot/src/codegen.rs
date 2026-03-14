@@ -133,12 +133,16 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_sstore = module.declare_function("host_sstore", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
-    // host_sdelete(ctx, ws_slot) -> u64
+    // host_sdelete(ctx, ws_slot) -> u64 / host_sloadg(ctx, ws_slot) -> u64
     let mut sig_sdel = module.make_signature();
     sig_sdel.params.push(AbiParam::new(ptr_type));
     sig_sdel.params.push(AbiParam::new(I64));
     sig_sdel.returns.push(AbiParam::new(I64));
     let fn_sdelete = module.declare_function("host_sdelete", Linkage::Import, &sig_sdel)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+
+    // host_sloadg(ctx, ws_slot) -> u64 (same signature as sdelete)
+    let fn_sloadg = module.declare_function("host_sloadg", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_poseidon(ctx, addr, len, wd) -> u64
@@ -170,6 +174,32 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_pop = module.declare_function("host_pop", Linkage::Import, &sig_pop)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
+    // Environment host functions: (ctx) -> u64
+    let fn_caller = module.declare_function("host_caller", Linkage::Import, &sig_pop)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    let fn_address = module.declare_function("host_address", Linkage::Import, &sig_pop)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    let fn_block_number = module.declare_function("host_block_number", Linkage::Import, &sig_pop)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    let fn_timestamp = module.declare_function("host_timestamp", Linkage::Import, &sig_pop)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    let fn_gas_remaining = module.declare_function("host_gas_remaining", Linkage::Import, &sig_pop)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    // (ctx, wd) -> u64
+    let fn_callvalue = module.declare_function("host_callvalue", Linkage::Import, &sig_sdel)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    let fn_gasprice = module.declare_function("host_gasprice", Linkage::Import, &sig_sdel)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    // (ctx, addr, wd) -> u64
+    let fn_balance = module.declare_function("host_balance", Linkage::Import, &sig_sload)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    // (ctx, val) -> u64
+    let fn_assert = module.declare_function("host_assert", Linkage::Import, &sig_sdel)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    // (ctx, a, b) -> u64
+    let fn_field_mul = module.declare_function("host_field_mul", Linkage::Import, &sig_sload)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+
     // host_wload(ctx, addr, wd) -> u64
     let fn_wload = module.declare_function("host_wload", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
@@ -189,11 +219,16 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_wide_alu = module.declare_function("host_wide_alu", Linkage::Import, &sig_wide)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
-    // host_narrow(ctx, rd, ws1) -> u64
-    let fn_narrow = module.declare_function("host_narrow", Linkage::Import, &sig_sload)
+    // host_narrow(ctx, ws1, trap_out) -> u64 (returns narrowed value)
+    let mut sig_narrow = module.make_signature();
+    sig_narrow.params.push(AbiParam::new(ptr_type));
+    sig_narrow.params.push(AbiParam::new(I64));
+    sig_narrow.params.push(AbiParam::new(ptr_type)); // trap_out pointer
+    sig_narrow.returns.push(AbiParam::new(I64));
+    let fn_narrow = module.declare_function("host_narrow", Linkage::Import, &sig_narrow)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
-    // host_widen(ctx, wd, rs1) -> u64
+    // host_widen(ctx, wd, gp_value) -> u64
     let fn_widen = module.declare_function("host_widen", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
@@ -220,6 +255,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_sload_ref = module.declare_func_in_func(fn_sload, &mut ctx.func);
     let fn_sstore_ref = module.declare_func_in_func(fn_sstore, &mut ctx.func);
     let fn_sdelete_ref = module.declare_func_in_func(fn_sdelete, &mut ctx.func);
+    let fn_sloadg_ref = module.declare_func_in_func(fn_sloadg, &mut ctx.func);
     let fn_poseidon_ref = module.declare_func_in_func(fn_poseidon, &mut ctx.func);
     let fn_push_ref = module.declare_func_in_func(fn_push, &mut ctx.func);
     let fn_pop_ref = module.declare_func_in_func(fn_pop, &mut ctx.func);
@@ -233,6 +269,16 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_checked_mul_ref = module.declare_func_in_func(fn_checked_mul, &mut ctx.func);
     let fn_checked_div_ref = module.declare_func_in_func(fn_checked_div, &mut ctx.func);
     let fn_checked_mod_ref = module.declare_func_in_func(fn_checked_mod, &mut ctx.func);
+    let fn_caller_ref = module.declare_func_in_func(fn_caller, &mut ctx.func);
+    let fn_address_ref = module.declare_func_in_func(fn_address, &mut ctx.func);
+    let fn_block_number_ref = module.declare_func_in_func(fn_block_number, &mut ctx.func);
+    let fn_timestamp_ref = module.declare_func_in_func(fn_timestamp, &mut ctx.func);
+    let fn_gas_remaining_ref = module.declare_func_in_func(fn_gas_remaining, &mut ctx.func);
+    let fn_callvalue_ref = module.declare_func_in_func(fn_callvalue, &mut ctx.func);
+    let fn_gasprice_ref = module.declare_func_in_func(fn_gasprice, &mut ctx.func);
+    let fn_balance_ref = module.declare_func_in_func(fn_balance, &mut ctx.func);
+    let fn_assert_ref = module.declare_func_in_func(fn_assert, &mut ctx.func);
+    let fn_field_mul_ref = module.declare_func_in_func(fn_field_mul, &mut ctx.func);
 
     {
         let mut fn_builder_ctx = FunctionBuilderContext::new();
@@ -454,12 +500,24 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                     Opcode::Push => {
                         let val = builder.use_var(Variable::from_u32(d.rd as u32));
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        builder.ins().call(fn_push_ref, &[vm_ctx, val]);
+                        let call = builder.ins().call(fn_push_ref, &[vm_ctx, val]);
+                        let result = builder.inst_results(call)[0];
+                        let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(is_err, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
                     }
                     Opcode::Pop => {
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_pop_ref, &[vm_ctx]);
                         let result = builder.inst_results(call)[0];
+                        // Check for fault (u64::MAX)
+                        let is_err = builder.ins().icmp_imm(IntCC::Equal, result, -1i64);
+                        let cont = builder.create_block();
+                        builder.ins().brif(is_err, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
                         if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), result); }
                     }
 
@@ -484,37 +542,53 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let addr = builder.use_var(Variable::from_u32(d.rs1 as u32));
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        builder.ins().call(fn_wload_ref, &[vm_ctx, addr, wd]);
+                        let call = builder.ins().call(fn_wload_ref, &[vm_ctx, addr, wd]);
+                        let result = builder.inst_results(call)[0];
+                        let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(is_err, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
                     }
                     Opcode::Wstore => {
                         let addr = builder.use_var(Variable::from_u32(d.rs1 as u32));
                         let ws = builder.ins().iconst(I64, d.rd as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        builder.ins().call(fn_wstore_ref, &[vm_ctx, addr, ws]);
+                        let call = builder.ins().call(fn_wstore_ref, &[vm_ctx, addr, ws]);
+                        let result = builder.inst_results(call)[0];
+                        let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(is_err, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
                     }
                     Opcode::Narrow => {
+                        // host_narrow(ctx, ws1, trap_out) -> u64 (the narrowed value)
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        let rd = builder.ins().iconst(I64, d.rd as i64);
                         let ws1 = builder.ins().iconst(I64, d.rs1 as i64);
-                        let call = builder.ins().call(fn_narrow_ref, &[vm_ctx, rd, ws1]);
-                        let result = builder.inst_results(call)[0];
-                        let trapped = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        // Zero trap flag, get pointer
+                        let z = builder.ins().iconst(I64, 0);
+                        builder.ins().stack_store(z, trap_flag_ss, 0);
+                        let trap_ptr = builder.ins().stack_addr(ptr_type, trap_flag_ss, 0);
+                        let call = builder.ins().call(fn_narrow_ref, &[vm_ctx, ws1, trap_ptr]);
+                        let narrowed_val = builder.inst_results(call)[0];
+                        // Update the AOT GP variable with the result
+                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), narrowed_val); }
+                        // Check trap flag
+                        let flag = builder.ins().stack_load(I64, trap_flag_ss, 0);
+                        let trapped = builder.ins().icmp_imm(IntCC::NotEqual, flag, 0);
                         let cont = builder.create_block();
                         builder.ins().brif(trapped, trap_block, &[], cont, &[]);
                         builder.seal_block(cont);
                         builder.switch_to_block(cont);
-                        // Narrow writes to a GP reg via the CPU — sync it back
-                        // For now, the host writes to vm.cpu, but the AOT var isn't updated.
-                        // This is a limitation — narrow result must be read from vm.cpu after AOT.
                     }
                     Opcode::Widen => {
+                        // host_widen(ctx, wd, gp_value) -> 0
+                        // Pass the current AOT variable value directly
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let wd = builder.ins().iconst(I64, d.rd as i64);
-                        let rs1_val = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        // Write GP reg value to vm.cpu first so host_widen reads correct value
-                        // For now, pass register index and let host read from vm.cpu
-                        let rs1_idx = builder.ins().iconst(I64, d.rs1 as i64);
-                        builder.ins().call(fn_widen_ref, &[vm_ctx, wd, rs1_idx]);
+                        let gp_val = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        builder.ins().call(fn_widen_ref, &[vm_ctx, wd, gp_val]);
                     }
 
                     // --- Memory operations (host calls) ---
@@ -547,13 +621,23 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let mode = d.rs2_or_imm & 0x3;
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let ws_slot = builder.ins().iconst(I64, d.rs1 as i64);
-                        let wd = builder.ins().iconst(I64, d.rd as i64);
-                        if mode == 0 {
-                            // Wide register mode
-                            builder.ins().call(fn_sload_ref, &[vm_ctx, ws_slot, wd]);
-                        } else {
-                            // Other modes: use sload for now (GP mode handled via host)
-                            builder.ins().call(fn_sload_ref, &[vm_ctx, ws_slot, wd]);
+                        match mode {
+                            0 => {
+                                // Wide register mode: sload wd, ws1
+                                let wd = builder.ins().iconst(I64, d.rd as i64);
+                                builder.ins().call(fn_sload_ref, &[vm_ctx, ws_slot, wd]);
+                            }
+                            2 => {
+                                // GP register mode: sloadg rd, ws1 → returns u64
+                                let call = builder.ins().call(fn_sloadg_ref, &[vm_ctx, ws_slot]);
+                                let result = builder.inst_results(call)[0];
+                                if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), result); }
+                            }
+                            _ => {
+                                // Mode 1 (memory) and others: delegate to wide mode for now
+                                let wd = builder.ins().iconst(I64, d.rd as i64);
+                                builder.ins().call(fn_sload_ref, &[vm_ctx, ws_slot, wd]);
+                            }
                         }
                     }
                     Opcode::Sstore => {
@@ -588,7 +672,13 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let len = builder.use_var(Variable::from_u32(len_reg));
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        builder.ins().call(fn_poseidon_ref, &[vm_ctx, addr, len, wd]);
+                        let call = builder.ins().call(fn_poseidon_ref, &[vm_ctx, addr, len, wd]);
+                        let result = builder.inst_results(call)[0];
+                        let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(is_err, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
                     }
 
                     // --- Control flow ---
@@ -635,8 +725,89 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         break;
                     }
 
-                    // Unhandled: no-op
-                    _ => {}
+                    // --- Environment queries (host calls) ---
+                    Opcode::Caller => {
+                        let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                        let sub = d.rs2_or_imm;
+                        let call = match sub {
+                            0 => builder.ins().call(fn_caller_ref, &[vm_ctx]),      // CALLER
+                            1 => builder.ins().call(fn_address_ref, &[vm_ctx]),     // ADDRESS
+                            2 => builder.ins().call(fn_block_number_ref, &[vm_ctx]),// BLOCK_NUMBER
+                            3 => builder.ins().call(fn_timestamp_ref, &[vm_ctx]),   // TIMESTAMP
+                            4 => builder.ins().call(fn_gas_remaining_ref, &[vm_ctx]),// GAS_REMAINING
+                            _ => {
+                                builder.ins().jump(trap_block, &[]);
+                                terminated = true;
+                                break;
+                            }
+                        };
+                        let result = builder.inst_results(call)[0];
+                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), result); }
+                    }
+                    Opcode::Callvalue => {
+                        let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                        let sub = d.rs2_or_imm;
+                        let wd = builder.ins().iconst(I64, d.rd as i64);
+                        match sub {
+                            0 => { builder.ins().call(fn_callvalue_ref, &[vm_ctx, wd]); }
+                            1 => { builder.ins().call(fn_gasprice_ref, &[vm_ctx, wd]); }
+                            2 => {
+                                let addr = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                                builder.ins().call(fn_balance_ref, &[vm_ctx, addr, wd]);
+                            }
+                            _ => {
+                                builder.ins().jump(trap_block, &[]);
+                                terminated = true;
+                                break;
+                            }
+                        }
+                    }
+                    Opcode::Blockhash => {
+                        // Blockhash not yet fully supported in AOT — write zero
+                        let z = builder.ins().iconst(I64, 0);
+                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), z); }
+                    }
+
+                    // --- ZK-native (host calls) ---
+                    Opcode::Assert => {
+                        let val = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                        let call = builder.ins().call(fn_assert_ref, &[vm_ctx, val]);
+                        let result = builder.inst_results(call)[0];
+                        let should_revert = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(should_revert, revert_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
+                    }
+                    Opcode::FieldMul => {
+                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let rs2 = (d.rs2_or_imm & 0xF) as u32;
+                        let b = builder.use_var(Variable::from_u32(rs2));
+                        let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                        let call = builder.ins().call(fn_field_mul_ref, &[vm_ctx, a, b]);
+                        let result = builder.inst_results(call)[0];
+                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), result); }
+                    }
+                    Opcode::Commit => {
+                        // Commit is captured from trace, no runtime effect
+                    }
+                    Opcode::Selfdestruct => {
+                        // Selfdestruct halts execution after clearing storage
+                        builder.ins().jump(success_block, &[]);
+                        terminated = true;
+                        break;
+                    }
+
+                    // Remaining opcodes not yet AOT-compiled (Call, Ret, CallExt,
+                    // Delegate, Create, Log, VerifySig, MerkleVerify) trap.
+                    // These require complex VM state interaction that's better
+                    // handled by falling back to the interpreter for now.
+                    _ => {
+                        builder.ins().jump(trap_block, &[]);
+                        terminated = true;
+                        break;
+                    }
                 }
             }
 
@@ -653,7 +824,8 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
         // === Success: store registers back ===
         builder.switch_to_block(success_block);
         let regs_ptr = builder.use_var(Variable::from_u32(VAR_REGS_PTR));
-        for i in 0..16u32 {
+        // Write r1-r15 back (r0 is always zero, skip it)
+        for i in 1..16u32 {
             let val = builder.use_var(Variable::from_u32(i));
             builder.ins().store(MemFlags::trusted(), val, regs_ptr, (i as i32) * 8);
         }

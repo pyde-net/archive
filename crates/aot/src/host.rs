@@ -218,21 +218,24 @@ pub extern "C" fn host_wide_alu(ctx: *mut VmCtx, op_code: u64, wd: u64, ws1: u64
     }
 }
 
-/// Host: narrow (wide → GP). Returns 0 on success, 1 on overflow.
-pub extern "C" fn host_narrow(ctx: *mut VmCtx, rd: u64, ws1: u64) -> u64 {
+/// Host: narrow (wide → GP). Returns the narrowed u64 value.
+/// Sets *trap_out to 1 if value exceeds u64::MAX.
+pub extern "C" fn host_narrow(ctx: *mut VmCtx, ws1: u64, trap_out: *mut u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    let instr = pyde_vm::isa::encode(pyde_vm::isa::Opcode::Narrow, rd as u8, ws1 as u8, 0);
-    match vm.cpu.exec_wide(instr) {
-        Ok(()) => 0,
-        Err(_) => 1,
+    let wide_val = vm.cpu.read_wide(ws1 as u8);
+    let bytes = wide_val.to_le_bytes();
+    // Check if any bytes above the first 8 are non-zero
+    if bytes[8..].iter().any(|&b| b != 0) {
+        unsafe { *trap_out = 1; }
+        return 0;
     }
+    u64::from_le_bytes(bytes[..8].try_into().unwrap())
 }
 
-/// Host: widen (GP → wide). Always succeeds.
-pub extern "C" fn host_widen(ctx: *mut VmCtx, wd: u64, rs1: u64) -> u64 {
+/// Host: widen (GP → wide). Takes the GP value directly from AOT, writes to wide register.
+pub extern "C" fn host_widen(ctx: *mut VmCtx, wd: u64, gp_value: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    let instr = pyde_vm::isa::encode(pyde_vm::isa::Opcode::Widen, wd as u8, rs1 as u8, 0);
-    let _ = vm.cpu.exec_wide(instr);
+    vm.cpu.write_wide(wd as u8, pyde_vm::wide::U256::from(gp_value));
     0
 }
 
@@ -303,6 +306,71 @@ pub extern "C" fn host_log(ctx: *mut VmCtx, desc_ptr: u64, num_topics: u64) -> u
     0
 }
 
+// ── Environment queries ────────────────────────────────────────────────
+
+/// Host: get caller (msg.sender). Returns the caller address.
+pub extern "C" fn host_caller(ctx: *mut VmCtx) -> u64 {
+    let vm = unsafe { &mut *ctx };
+    vm.ctx.caller
+}
+
+/// Host: get self address.
+pub extern "C" fn host_address(ctx: *mut VmCtx) -> u64 {
+    let vm = unsafe { &mut *ctx };
+    vm.ctx.self_address
+}
+
+/// Host: get block number.
+pub extern "C" fn host_block_number(ctx: *mut VmCtx) -> u64 {
+    let vm = unsafe { &mut *ctx };
+    vm.ctx.block_number
+}
+
+/// Host: get timestamp.
+pub extern "C" fn host_timestamp(ctx: *mut VmCtx) -> u64 {
+    let vm = unsafe { &mut *ctx };
+    vm.ctx.timestamp
+}
+
+/// Host: get gas remaining.
+pub extern "C" fn host_gas_remaining(ctx: *mut VmCtx) -> u64 {
+    let vm = unsafe { &mut *ctx };
+    vm.gas_remaining()
+}
+
+/// Host: get call value (256-bit) into wide register.
+pub extern "C" fn host_callvalue(ctx: *mut VmCtx, wd: u64) -> u64 {
+    let vm = unsafe { &mut *ctx };
+    vm.cpu.write_wide(wd as u8, vm.ctx.call_value);
+    0
+}
+
+/// Host: get gas price into wide register.
+pub extern "C" fn host_gasprice(ctx: *mut VmCtx, wd: u64) -> u64 {
+    let vm = unsafe { &mut *ctx };
+    vm.cpu.write_wide(wd as u8, vm.ctx.gas_price);
+    0
+}
+
+/// Host: get balance of address into wide register.
+pub extern "C" fn host_balance(ctx: *mut VmCtx, addr: u64, wd: u64) -> u64 {
+    let vm = unsafe { &mut *ctx };
+    let bal = vm.ctx.balances.get(&addr).copied().unwrap_or(U256::ZERO);
+    vm.cpu.write_wide(wd as u8, bal);
+    0
+}
+
+/// Host: assert — returns 0 if val != 0, 1 (revert) if val == 0.
+pub extern "C" fn host_assert(_ctx: *mut VmCtx, val: u64) -> u64 {
+    if val == 0 { 1 } else { 0 }
+}
+
+/// Host: field_mul rd = (a * b) mod Goldilocks prime. Returns result.
+pub extern "C" fn host_field_mul(_ctx: *mut VmCtx, a: u64, b: u64) -> u64 {
+    const GOLDILOCKS_P: u128 = (1u128 << 64) - (1u128 << 32) + 1;
+    ((a as u128 * b as u128) % GOLDILOCKS_P) as u64
+}
+
 /// List of all host function names and their function pointers, for
 /// registration with the JIT module.
 pub fn host_functions() -> Vec<(&'static str, *const u8)> {
@@ -323,6 +391,16 @@ pub fn host_functions() -> Vec<(&'static str, *const u8)> {
         ("host_wide_alu", host_wide_alu as *const u8),
         ("host_narrow", host_narrow as *const u8),
         ("host_widen", host_widen as *const u8),
+        ("host_caller", host_caller as *const u8),
+        ("host_address", host_address as *const u8),
+        ("host_block_number", host_block_number as *const u8),
+        ("host_timestamp", host_timestamp as *const u8),
+        ("host_gas_remaining", host_gas_remaining as *const u8),
+        ("host_callvalue", host_callvalue as *const u8),
+        ("host_gasprice", host_gasprice as *const u8),
+        ("host_balance", host_balance as *const u8),
+        ("host_assert", host_assert as *const u8),
+        ("host_field_mul", host_field_mul as *const u8),
         ("host_checked_add", host_checked_add as *const u8),
         ("host_checked_sub", host_checked_sub as *const u8),
         ("host_checked_mul", host_checked_mul as *const u8),
