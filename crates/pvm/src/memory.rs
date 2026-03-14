@@ -239,6 +239,11 @@ impl Memory {
         Ok(())
     }
 
+    /// Immutable reference to the raw memory bytes.
+    pub fn data_ref(&self) -> &[u8] {
+        &self.data
+    }
+
     /// How many pages have been touched.
     pub fn pages_allocated(&self) -> usize {
         self.pages_touched.iter().filter(|&&t| t).count()
