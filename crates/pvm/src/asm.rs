@@ -229,8 +229,33 @@ fn parse_pseudo_mem(s: &str) -> Option<PseudoMem> {
     }
 }
 
+/// Pseudo-mnemonics for system/env instructions that map to Caller/Callvalue
+/// with a sub-code in the immediate field.
+#[derive(Clone, Copy, Debug)]
+enum PseudoEnv {
+    /// GP-width query: maps to Caller opcode with sub-code in imm
+    Gp(u32),
+    /// Wide query: maps to Callvalue opcode with sub-code in imm
+    Wide(u32),
+    /// Wide query that also takes an rs1 input (e.g., balance)
+    WideWithInput(u32),
+}
+
+fn parse_pseudo_env(s: &str) -> Option<PseudoEnv> {
+    use crate::vm::{env_gp, env_wide};
+    match s {
+        "address" => Some(PseudoEnv::Gp(env_gp::ADDRESS)),
+        "blocknumber" => Some(PseudoEnv::Gp(env_gp::BLOCK_NUMBER)),
+        "timestamp" => Some(PseudoEnv::Gp(env_gp::TIMESTAMP)),
+        "gasremaining" => Some(PseudoEnv::Gp(env_gp::GAS_REMAINING)),
+        "gasprice" => Some(PseudoEnv::Wide(env_wide::GAS_PRICE)),
+        "balance" => Some(PseudoEnv::WideWithInput(env_wide::BALANCE)),
+        _ => None,
+    }
+}
+
 fn is_mnemonic(s: &str) -> bool {
-    parse_pseudo_mem(s).is_some() || mnemonic_to_opcode(s).is_some()
+    parse_pseudo_mem(s).is_some() || parse_pseudo_env(s).is_some() || mnemonic_to_opcode(s).is_some()
 }
 
 fn mnemonic_to_opcode(s: &str) -> Option<Opcode> {
@@ -389,6 +414,8 @@ struct ParsedInstr {
     opcode: Opcode,
     /// For pseudo load/store, the width.
     mem_width: Option<MemWidth>,
+    /// For pseudo env instructions, the sub-code and variant.
+    env_pseudo: Option<PseudoEnv>,
     operands: Vec<Operand>,
 }
 
@@ -423,6 +450,8 @@ fn parse(tokens: &[(usize, Token)]) -> Result<(Vec<ParsedInstr>, HashMap<String,
                 let mut mem_width = None;
                 let opcode;
 
+                let mut env_pseudo = None;
+
                 if let Some(pseudo) = parse_pseudo_mem(mnem) {
                     match pseudo {
                         PseudoMem::Load(w) => {
@@ -434,6 +463,12 @@ fn parse(tokens: &[(usize, Token)]) -> Result<(Vec<ParsedInstr>, HashMap<String,
                             mem_width = Some(w);
                         }
                     }
+                } else if let Some(pseudo) = parse_pseudo_env(mnem) {
+                    env_pseudo = Some(pseudo);
+                    opcode = match pseudo {
+                        PseudoEnv::Gp(_) => Opcode::Caller,
+                        PseudoEnv::Wide(_) | PseudoEnv::WideWithInput(_) => Opcode::Callvalue,
+                    };
                 } else {
                     opcode = mnemonic_to_opcode(mnem).ok_or_else(|| AsmError::Parse {
                         line,
@@ -481,6 +516,7 @@ fn parse(tokens: &[(usize, Token)]) -> Result<(Vec<ParsedInstr>, HashMap<String,
                     line,
                     opcode,
                     mem_width,
+                    env_pseudo,
                     operands,
                 });
                 offset += 4;
@@ -583,6 +619,37 @@ fn encode_instr(
 ) -> Result<Instruction, AsmError> {
     let ops = &pi.operands;
     let line = pi.line;
+
+    // Env pseudo-mnemonics (address, blocknumber, timestamp, etc.)
+    if let Some(env) = pi.env_pseudo {
+        match env {
+            PseudoEnv::Gp(sub) => {
+                // e.g., "address r1" → Caller r1, r0, sub
+                if ops.len() != 1 {
+                    return Err(AsmError::Parse { line, msg: "env query requires 1 operand: rd".into() });
+                }
+                let rd = expect_gp(&ops[0], line, "rd")?;
+                return Ok(encode(Opcode::Caller, rd, 0, sub));
+            }
+            PseudoEnv::Wide(sub) => {
+                // e.g., "gasprice w0" → Callvalue w0, r0, sub
+                if ops.len() != 1 {
+                    return Err(AsmError::Parse { line, msg: "env query requires 1 operand: wd".into() });
+                }
+                let wd = expect_wide(&ops[0], line, "wd")?;
+                return Ok(encode(Opcode::Callvalue, wd, 0, sub));
+            }
+            PseudoEnv::WideWithInput(sub) => {
+                // e.g., "balance w0, r1" → Callvalue w0, r1, sub
+                if ops.len() != 2 {
+                    return Err(AsmError::Parse { line, msg: "balance requires 2 operands: wd, rs1".into() });
+                }
+                let wd = expect_wide(&ops[0], line, "wd")?;
+                let rs1 = expect_gp(&ops[1], line, "rs1")?;
+                return Ok(encode(Opcode::Callvalue, wd, rs1, sub));
+            }
+        }
+    }
 
     // Width-encoded LOAD/STORE
     if let Some(width) = pi.mem_width {
@@ -775,6 +842,34 @@ fn encode_instr(
             Ok(encode(pi.opcode, 0, 0, 0))
         }
 
+        // --- System: caller rd (shorthand for Caller with sub=0) ---
+        Opcode::Caller => {
+            if ops.len() != 1 {
+                return Err(AsmError::Parse { line, msg: "caller requires 1 operand: rd".into() });
+            }
+            let rd = expect_gp(&ops[0], line, "rd")?;
+            Ok(encode(pi.opcode, rd, 0, 0)) // sub-code 0 = CALLER
+        }
+
+        // --- System: callvalue wd ---
+        Opcode::Callvalue => {
+            if ops.len() != 1 {
+                return Err(AsmError::Parse { line, msg: "callvalue requires 1 operand: wd".into() });
+            }
+            let wd = expect_wide(&ops[0], line, "wd")?;
+            Ok(encode(pi.opcode, wd, 0, 0)) // sub-code 0 = CALL_VALUE
+        }
+
+        // --- System: blockhash wd, rs1 ---
+        Opcode::Blockhash => {
+            if ops.len() != 2 {
+                return Err(AsmError::Parse { line, msg: "blockhash requires 2 operands: wd, rs1".into() });
+            }
+            let wd = expect_wide(&ops[0], line, "wd")?;
+            let rs1 = expect_gp(&ops[1], line, "rs1")?;
+            Ok(encode(pi.opcode, wd, rs1, 0))
+        }
+
         // --- Assert: assert rs1 ---
         Opcode::Assert => {
             if ops.len() != 1 {
@@ -927,6 +1022,33 @@ fn disassemble_one(opcode: Opcode, rd: u8, rs1: u8, rs2_or_imm: u32) -> String {
         Opcode::Ret => "ret".into(),
         Opcode::Halt => "halt".into(),
         Opcode::Revert => "revert".into(),
+
+        // System: Caller (GP env query dispatched by immediate)
+        Opcode::Caller => {
+            use crate::vm::env_gp;
+            match rs2_or_imm {
+                env_gp::CALLER => format!("caller r{}", rd),
+                env_gp::ADDRESS => format!("address r{}", rd),
+                env_gp::BLOCK_NUMBER => format!("blocknumber r{}", rd),
+                env_gp::TIMESTAMP => format!("timestamp r{}", rd),
+                env_gp::GAS_REMAINING => format!("gasremaining r{}", rd),
+                _ => format!("caller r{}, r{}, {}", rd, rs1, rs2_or_imm),
+            }
+        }
+
+        // System: Callvalue (wide env query dispatched by immediate)
+        Opcode::Callvalue => {
+            use crate::vm::env_wide;
+            match rs2_or_imm {
+                env_wide::CALL_VALUE => format!("callvalue w{}", rd),
+                env_wide::GAS_PRICE => format!("gasprice w{}", rd),
+                env_wide::BALANCE => format!("balance w{}, r{}", rd, rs1),
+                _ => format!("callvalue w{}, r{}, {}", rd, rs1, rs2_or_imm),
+            }
+        }
+
+        // System: Blockhash
+        Opcode::Blockhash => format!("blockhash w{}, r{}", rd, rs1),
 
         // Assert
         Opcode::Assert => format!("assert r{}", rs1),
@@ -1263,5 +1385,87 @@ mod tests {
         assert_eq!(d1.opcode, Opcode::Narrow);
         assert_eq!(d1.rd, 2); // rd
         assert_eq!(d1.rs1, 3); // ws1
+    }
+
+    #[test]
+    fn assemble_system_pseudo_mnemonics() {
+        use crate::vm::env_gp;
+
+        // GP env queries
+        let code = assemble("caller r1\naddress r2\nblocknumber r3\ntimestamp r4\ngasremaining r5\nhalt").unwrap();
+        let d0 = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        assert_eq!(d0.opcode, Opcode::Caller);
+        assert_eq!(d0.rd, 1);
+        assert_eq!(d0.rs2_or_imm, env_gp::CALLER);
+
+        let d1 = decode(Instruction(u32::from_le_bytes(code[4..8].try_into().unwrap())));
+        assert_eq!(d1.opcode, Opcode::Caller);
+        assert_eq!(d1.rd, 2);
+        assert_eq!(d1.rs2_or_imm, env_gp::ADDRESS);
+
+        let d2 = decode(Instruction(u32::from_le_bytes(code[8..12].try_into().unwrap())));
+        assert_eq!(d2.opcode, Opcode::Caller);
+        assert_eq!(d2.rs2_or_imm, env_gp::BLOCK_NUMBER);
+
+        let d3 = decode(Instruction(u32::from_le_bytes(code[12..16].try_into().unwrap())));
+        assert_eq!(d3.opcode, Opcode::Caller);
+        assert_eq!(d3.rs2_or_imm, env_gp::TIMESTAMP);
+
+        let d4 = decode(Instruction(u32::from_le_bytes(code[16..20].try_into().unwrap())));
+        assert_eq!(d4.opcode, Opcode::Caller);
+        assert_eq!(d4.rs2_or_imm, env_gp::GAS_REMAINING);
+    }
+
+    #[test]
+    fn assemble_wide_env_pseudo_mnemonics() {
+        use crate::vm::env_wide;
+
+        let code = assemble("callvalue w0\ngasprice w1\nbalance w2, r3\nhalt").unwrap();
+        let d0 = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        assert_eq!(d0.opcode, Opcode::Callvalue);
+        assert_eq!(d0.rd, 0);
+        assert_eq!(d0.rs2_or_imm, env_wide::CALL_VALUE);
+
+        let d1 = decode(Instruction(u32::from_le_bytes(code[4..8].try_into().unwrap())));
+        assert_eq!(d1.opcode, Opcode::Callvalue);
+        assert_eq!(d1.rd, 1);
+        assert_eq!(d1.rs2_or_imm, env_wide::GAS_PRICE);
+
+        let d2 = decode(Instruction(u32::from_le_bytes(code[8..12].try_into().unwrap())));
+        assert_eq!(d2.opcode, Opcode::Callvalue);
+        assert_eq!(d2.rd, 2);
+        assert_eq!(d2.rs1, 3);
+        assert_eq!(d2.rs2_or_imm, env_wide::BALANCE);
+    }
+
+    #[test]
+    fn assemble_blockhash() {
+        let code = assemble("blockhash w0, r1\nhalt").unwrap();
+        let d = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        assert_eq!(d.opcode, Opcode::Blockhash);
+        assert_eq!(d.rd, 0);
+        assert_eq!(d.rs1, 1);
+    }
+
+    #[test]
+    fn disassemble_system_roundtrip() {
+        let src = "caller r1\naddress r2\nblocknumber r3\ntimestamp r4\ngasremaining r5\nhalt\n";
+        let code = assemble(src).unwrap();
+        let text = disassemble(&code);
+        assert!(text.contains("caller r1"));
+        assert!(text.contains("address r2"));
+        assert!(text.contains("blocknumber r3"));
+        assert!(text.contains("timestamp r4"));
+        assert!(text.contains("gasremaining r5"));
+    }
+
+    #[test]
+    fn disassemble_wide_env_roundtrip() {
+        let src = "callvalue w0\ngasprice w1\nbalance w2, r3\nhalt\n";
+        let code = assemble(src).unwrap();
+        let text = disassemble(&code);
+        assert!(text.contains("callvalue w0"));
+        assert!(text.contains("gasprice w1"));
+        assert!(text.contains("balance w2, r3"));
     }
 }

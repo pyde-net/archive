@@ -8,6 +8,60 @@ use crate::memory::Memory;
 /// Maximum call depth (nested function calls).
 const MAX_CALL_DEPTH: usize = 1024;
 
+/// Sub-codes for the `Caller` opcode (GP-width environment queries).
+/// The immediate field selects which value to return.
+pub mod env_gp {
+    pub const CALLER: u32 = 0;
+    pub const ADDRESS: u32 = 1;
+    pub const BLOCK_NUMBER: u32 = 2;
+    pub const TIMESTAMP: u32 = 3;
+    pub const GAS_REMAINING: u32 = 4;
+}
+
+/// Sub-codes for the `Callvalue` opcode (wide environment queries).
+pub mod env_wide {
+    pub const CALL_VALUE: u32 = 0;
+    pub const GAS_PRICE: u32 = 1;
+    pub const BALANCE: u32 = 2;
+}
+
+/// Execution context: caller info, block info, and balances.
+#[derive(Clone, Debug)]
+pub struct ExecutionContext {
+    /// Address of the caller (msg.sender).
+    pub caller: u64,
+    /// Address of the current contract.
+    pub self_address: u64,
+    /// Value sent with the call (msg.value), 256-bit.
+    pub call_value: U256,
+    /// Current block number.
+    pub block_number: u64,
+    /// Current block timestamp (Unix seconds).
+    pub timestamp: u64,
+    /// Current base fee / gas price, 256-bit.
+    pub gas_price: U256,
+    /// Recent block hashes (index 0 = most recent). Up to 256 entries.
+    pub block_hashes: Vec<U256>,
+    /// Balance lookup function: address → balance.
+    /// Stored as a simple map for now.
+    pub balances: std::collections::HashMap<u64, U256>,
+}
+
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self {
+            caller: 0,
+            self_address: 0,
+            call_value: U256::ZERO,
+            block_number: 0,
+            timestamp: 0,
+            gas_price: U256::ZERO,
+            block_hashes: Vec::new(),
+            balances: std::collections::HashMap::new(),
+        }
+    }
+}
+
 /// A saved call frame on the call stack.
 #[derive(Clone, Copy, Debug)]
 struct CallFrame {
@@ -58,6 +112,8 @@ pub struct Vm {
     pub gas_limit: u64,
     /// Accumulated gas refund (e.g. from SDELETE).
     pub gas_refund: u64,
+    /// Execution context (caller, block info, etc.).
+    pub ctx: ExecutionContext,
 }
 
 impl Vm {
@@ -72,6 +128,7 @@ impl Vm {
             gas: GasUsed::default(),
             gas_limit: 0,
             gas_refund: 0,
+            ctx: ExecutionContext::default(),
         }
     }
 
@@ -79,6 +136,23 @@ impl Vm {
     pub fn with_gas_limit(gas_limit: u64) -> Self {
         Self {
             gas_limit,
+            ..Self::new()
+        }
+    }
+
+    /// Create a new VM with an execution context.
+    pub fn with_context(ctx: ExecutionContext) -> Self {
+        Self {
+            ctx,
+            ..Self::new()
+        }
+    }
+
+    /// Create a new VM with both a gas limit and execution context.
+    pub fn with_gas_limit_and_context(gas_limit: u64, ctx: ExecutionContext) -> Self {
+        Self {
+            gas_limit,
+            ctx,
             ..Self::new()
         }
     }
@@ -267,6 +341,48 @@ impl Vm {
                     .map_err(|_| Trap::MemoryFault)?;
                 self.cpu.write_gp(d.rd, val);
                 self.memory.stack_pointer += 8;
+                self.pc += 4;
+            }
+
+            // --- System instructions (environment queries) ---
+            Opcode::Caller => {
+                let sub = d.rs2_or_imm;
+                let val = match sub {
+                    env_gp::CALLER => self.ctx.caller,
+                    env_gp::ADDRESS => self.ctx.self_address,
+                    env_gp::BLOCK_NUMBER => self.ctx.block_number,
+                    env_gp::TIMESTAMP => self.ctx.timestamp,
+                    env_gp::GAS_REMAINING => self.gas_remaining(),
+                    _ => return Err(Trap::InvalidOpcode),
+                };
+                self.cpu.write_gp(d.rd, val);
+                self.pc += 4;
+            }
+            Opcode::Callvalue => {
+                let sub = d.rs2_or_imm;
+                let val = match sub {
+                    env_wide::CALL_VALUE => self.ctx.call_value,
+                    env_wide::GAS_PRICE => self.ctx.gas_price,
+                    env_wide::BALANCE => {
+                        let addr = self.cpu.read_gp(d.rs1);
+                        *self.ctx.balances.get(&addr).unwrap_or(&U256::ZERO)
+                    }
+                    _ => return Err(Trap::InvalidOpcode),
+                };
+                self.cpu.write_wide(d.rd, val);
+                self.pc += 4;
+            }
+            Opcode::Blockhash => {
+                let height = self.cpu.read_gp(d.rs1);
+                let current = self.ctx.block_number;
+                // Only allow recent blocks (up to 256 back), and not current/future
+                let hash = if height < current && current - height <= 256 {
+                    let idx = (current - height - 1) as usize;
+                    self.ctx.block_hashes.get(idx).copied().unwrap_or(U256::ZERO)
+                } else {
+                    U256::ZERO
+                };
+                self.cpu.write_wide(d.rd, hash);
                 self.pc += 4;
             }
 
@@ -1068,5 +1184,232 @@ mod tests {
         assert!(vm_mul.gas.total() > vm_add.gas.total());
         assert!(vm_mul.gas.exec > vm_add.gas.exec);
         assert!(vm_mul.gas.prove > vm_add.gas.prove);
+    }
+
+    // ========== System instructions (M1.8) ==========
+
+    #[test]
+    fn caller_returns_msg_sender() {
+        let ctx = ExecutionContext {
+            caller: 0xDEAD_BEEF,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, env_gp::CALLER),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(1), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn address_returns_self() {
+        let ctx = ExecutionContext {
+            self_address: 0xCAFE_BABE,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, env_gp::ADDRESS),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(1), 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn blocknumber_returns_height() {
+        let ctx = ExecutionContext {
+            block_number: 12345,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, env_gp::BLOCK_NUMBER),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(1), 12345);
+    }
+
+    #[test]
+    fn timestamp_returns_unix_time() {
+        let ctx = ExecutionContext {
+            timestamp: 1_700_000_000,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, env_gp::TIMESTAMP),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(1), 1_700_000_000);
+    }
+
+    #[test]
+    fn gasremaining_returns_remaining() {
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, env_gp::GAS_REMAINING),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(1000);
+        vm.load(&code).unwrap();
+        // After executing Caller (gas cost 3), remaining should be 1000 - 3 = 997
+        vm.step().unwrap();
+        assert_eq!(vm.cpu.read_gp(1), 997);
+    }
+
+    #[test]
+    fn callvalue_returns_msg_value() {
+        let val = U256::from(1_000_000_000u64) * U256::from(10u64).pow(9); // 1e18
+        let ctx = ExecutionContext {
+            call_value: val,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Callvalue, 0, 0, env_wide::CALL_VALUE),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), val);
+    }
+
+    #[test]
+    fn gasprice_returns_base_fee() {
+        let price = U256::from(25_000_000_000u64); // 25 gwei
+        let ctx = ExecutionContext {
+            gas_price: price,
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_bytes(Opcode::Callvalue, 0, 0, env_wide::GAS_PRICE),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), price);
+    }
+
+    #[test]
+    fn balance_returns_account_balance() {
+        let bal = U256::from(42_000u64);
+        let mut ctx = ExecutionContext::default();
+        ctx.balances.insert(100, bal);
+
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 100),  // r1 = address 100
+            instr_bytes(Opcode::Callvalue, 0, 1, env_wide::BALANCE), // w0 = balance(r1)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), bal);
+    }
+
+    #[test]
+    fn balance_unknown_address_returns_zero() {
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 999),
+            instr_bytes(Opcode::Callvalue, 0, 1, env_wide::BALANCE),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), U256::ZERO);
+    }
+
+    #[test]
+    fn blockhash_recent_block() {
+        let hash = U256::from(0xABCD_1234u64) << 128 | U256::from(0x5678u64);
+        let ctx = ExecutionContext {
+            block_number: 10,
+            block_hashes: vec![hash], // index 0 = block 9 (most recent)
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 9),  // r1 = block height 9
+            instr_bytes(Opcode::Blockhash, 0, 1, 0), // w0 = blockhash(9)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), hash);
+    }
+
+    #[test]
+    fn blockhash_too_old_returns_zero() {
+        let ctx = ExecutionContext {
+            block_number: 300,
+            block_hashes: vec![U256::from(1u64); 256], // 256 recent hashes
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 43),  // block 43 (300 - 43 = 257 blocks ago)
+            instr_bytes(Opcode::Blockhash, 0, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), U256::ZERO); // too old
+    }
+
+    #[test]
+    fn blockhash_current_block_returns_zero() {
+        let ctx = ExecutionContext {
+            block_number: 10,
+            block_hashes: vec![U256::from(1u64); 10],
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 10),  // current block
+            instr_bytes(Opcode::Blockhash, 0, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), U256::ZERO); // current block not available
+    }
+
+    #[test]
+    fn blockhash_future_block_returns_zero() {
+        let ctx = ExecutionContext {
+            block_number: 10,
+            block_hashes: vec![U256::from(1u64); 10],
+            ..Default::default()
+        };
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 15),  // future block
+            instr_bytes(Opcode::Blockhash, 0, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_context(ctx);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), U256::ZERO);
+    }
+
+    #[test]
+    fn invalid_env_subcode_traps() {
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, 99), // invalid sub-code
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run(), Err(Trap::InvalidOpcode));
     }
 }
