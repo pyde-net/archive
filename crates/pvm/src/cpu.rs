@@ -23,6 +23,8 @@ pub enum Trap {
     StackOverflow,
     #[error("call stack underflow")]
     StackUnderflow,
+    #[error("out of gas")]
+    OutOfGas,
 }
 
 /// The CPU register file and minimal execution state.

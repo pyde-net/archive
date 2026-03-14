@@ -26,6 +26,22 @@ pub enum ExecResult {
     Revert,
 }
 
+/// Two-dimensional gas tracker: execution + proving costs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GasUsed {
+    /// Total execution gas consumed.
+    pub exec: u64,
+    /// Total proving gas consumed.
+    pub prove: u64,
+}
+
+impl GasUsed {
+    /// Total gas = exec + prove.
+    pub fn total(&self) -> u64 {
+        self.exec + self.prove
+    }
+}
+
 /// The full VM state.
 pub struct Vm {
     pub cpu: Cpu,
@@ -36,11 +52,16 @@ pub struct Vm {
     call_stack: Vec<CallFrame>,
     /// Frame pointer register.
     pub fp: u32,
-    /// Total gas consumed.
-    pub gas_used: u64,
+    /// Two-dimensional gas consumed (exec + prove).
+    pub gas: GasUsed,
+    /// Gas limit for this execution. 0 = unlimited.
+    pub gas_limit: u64,
+    /// Accumulated gas refund (e.g. from SDELETE).
+    pub gas_refund: u64,
 }
 
 impl Vm {
+    /// Create a new VM with no gas limit (unlimited).
     pub fn new() -> Self {
         Self {
             cpu: Cpu::new(),
@@ -48,7 +69,17 @@ impl Vm {
             pc: 0,
             call_stack: Vec::new(),
             fp: 0,
-            gas_used: 0,
+            gas: GasUsed::default(),
+            gas_limit: 0,
+            gas_refund: 0,
+        }
+    }
+
+    /// Create a new VM with a gas limit.
+    pub fn with_gas_limit(gas_limit: u64) -> Self {
+        Self {
+            gas_limit,
+            ..Self::new()
         }
     }
 
@@ -81,9 +112,15 @@ impl Vm {
         let instr = self.fetch()?;
         let d = decode(instr);
 
-        // Charge gas
+        // Charge gas (two-dimensional)
         let cost = crate::isa::gas_cost(d.opcode);
-        self.gas_used += cost.total() as u64;
+        self.gas.exec += cost.exec as u64;
+        self.gas.prove += cost.prove as u64;
+
+        // Check gas limit (0 = unlimited)
+        if self.gas_limit > 0 && self.gas.total() > self.gas_limit {
+            return Err(Trap::OutOfGas);
+        }
 
         match d.opcode {
             // --- Control flow ---
@@ -251,6 +288,23 @@ impl Vm {
     /// Current call depth.
     pub fn call_depth(&self) -> usize {
         self.call_stack.len()
+    }
+
+    /// Remaining gas (returns u64::MAX if unlimited).
+    pub fn gas_remaining(&self) -> u64 {
+        if self.gas_limit == 0 {
+            u64::MAX
+        } else {
+            self.gas_limit.saturating_sub(self.gas.total())
+        }
+    }
+
+    /// Effective gas used after applying refund (capped at 50% of total used).
+    pub fn effective_gas_used(&self) -> u64 {
+        let total = self.gas.total();
+        let max_refund = total / 2; // cap at 50%
+        let refund = self.gas_refund.min(max_refund);
+        total - refund
     }
 }
 
@@ -691,7 +745,7 @@ mod tests {
         let mut vm = Vm::new();
         vm.load(&code).unwrap();
         vm.run().unwrap();
-        assert!(vm.gas_used > 0);
+        assert!(vm.gas.total() > 0);
     }
 
     // ========== Push/Pop through VM ==========
@@ -866,5 +920,153 @@ mod tests {
         vm.load(&code).unwrap();
         assert_eq!(vm.run().unwrap(), ExecResult::Halt);
         assert_eq!(vm.cpu.read_wide(3), U256::from(42u64));
+    }
+
+    // ========== Gas metering ==========
+
+    #[test]
+    fn two_dimensional_gas_tracked() {
+        // ADDI costs (exec=1, prove=2), HALT costs (exec=1, prove=1)
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 42),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        vm.run().unwrap();
+        assert_eq!(vm.gas.exec, 2);  // ADDI(1) + HALT(1)
+        assert_eq!(vm.gas.prove, 3); // ADDI(2) + HALT(1)
+        assert_eq!(vm.gas.total(), 5);
+    }
+
+    #[test]
+    fn out_of_gas_traps() {
+        // ADDI costs 3 total, HALT costs 2 total = 5 total
+        // Set limit to 4 — should fail on HALT
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 42),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(4);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run(), Err(Trap::OutOfGas));
+    }
+
+    #[test]
+    fn gas_limit_exact_succeeds() {
+        // ADDI(3) + HALT(2) = 5 total
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 42),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(5);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.gas_remaining(), 0);
+    }
+
+    #[test]
+    fn gas_limit_zero_means_unlimited() {
+        // Many instructions, no limit
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 1),
+            instr_ri(Opcode::Addi, 2, 0, 2),
+            instr_ri(Opcode::Addi, 3, 0, 3),
+            instr_ri(Opcode::Addi, 4, 0, 4),
+            instr_ri(Opcode::Addi, 5, 0, 5),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new(); // gas_limit = 0
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.gas_remaining(), u64::MAX);
+    }
+
+    #[test]
+    fn gas_remaining_decreases() {
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 42),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(100);
+        vm.load(&code).unwrap();
+        vm.run().unwrap();
+        assert_eq!(vm.gas_remaining(), 95); // 100 - 5
+    }
+
+    #[test]
+    fn out_of_gas_mid_loop() {
+        // Loop: ADDI + BNE + ADDI costs per iteration
+        // Counter from 0 to 100 — should run out of gas partway
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 0),     // r1 = 0 (counter)
+            instr_ri(Opcode::Addi, 2, 0, 100),   // r2 = 100 (limit)
+            instr_ri(Opcode::Addi, 1, 1, 1),     // r1++ (3 gas)
+            instr_ri(Opcode::Bne, 1, 2, -4),     // if r1 != r2, jump back (3 gas)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(30); // not enough for 100 iterations
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run(), Err(Trap::OutOfGas));
+        // Counter should be partway through
+        assert!(vm.cpu.read_gp(1) > 0);
+        assert!(vm.cpu.read_gp(1) < 100);
+    }
+
+    #[test]
+    fn gas_refund_cap_50_percent() {
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 42),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        vm.run().unwrap();
+
+        let total = vm.gas.total(); // 5
+
+        // No refund → effective = total
+        assert_eq!(vm.effective_gas_used(), total);
+
+        // Refund less than 50% → fully applied
+        vm.gas_refund = 1;
+        assert_eq!(vm.effective_gas_used(), total - 1);
+
+        // Refund exactly 50% → fully applied
+        vm.gas_refund = total / 2; // 2
+        assert_eq!(vm.effective_gas_used(), total - total / 2);
+
+        // Refund more than 50% → capped
+        vm.gas_refund = total; // try 100% refund
+        assert_eq!(vm.effective_gas_used(), total - total / 2); // capped at 50%
+    }
+
+    #[test]
+    fn mul_costs_more_gas_than_add() {
+        let code_add = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 10),
+            instr_ri(Opcode::Addi, 2, 0, 20),
+            instr_bytes(Opcode::Add, 3, 1, 2),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let code_mul = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 10),
+            instr_ri(Opcode::Addi, 2, 0, 20),
+            instr_bytes(Opcode::Mul, 3, 1, 2),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let mut vm_add = Vm::new();
+        vm_add.load(&code_add).unwrap();
+        vm_add.run().unwrap();
+
+        let mut vm_mul = Vm::new();
+        vm_mul.load(&code_mul).unwrap();
+        vm_mul.run().unwrap();
+
+        // MUL(10) > ADD(3), so total should differ
+        assert!(vm_mul.gas.total() > vm_add.gas.total());
+        assert!(vm_mul.gas.exec > vm_add.gas.exec);
+        assert!(vm_mul.gas.prove > vm_add.gas.prove);
     }
 }
