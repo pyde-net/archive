@@ -436,6 +436,85 @@ impl Vm {
                 self.pc += 4;
             }
 
+            // --- Crypto instructions ---
+            Opcode::Poseidon => {
+                // poseidon wd, rs1, rs2 — hash rs2 bytes from memory[rs1] → wd
+                let addr = self.cpu.read_gp(d.rs1) as u32;
+                let len = (d.rs2_or_imm & 0xF) as u8; // rs2 register index
+                let byte_len = self.cpu.read_gp(len) as usize;
+                // Read bytes from memory
+                let mut data = vec![0u8; byte_len];
+                for (i, byte) in data.iter_mut().enumerate() {
+                    *byte = self.memory.load8(addr + i as u32).map_err(|_| Trap::MemoryFault)?;
+                }
+                let hash = pyde_crypto::poseidon2::poseidon2_hash(&data);
+                let hash_bytes: [u8; 32] = hash.to_bytes();
+                self.cpu.write_wide(d.rd, U256::from_le_bytes(hash_bytes));
+                self.pc += 4;
+            }
+            Opcode::VerifySig => {
+                // verifysig rd, rs1 — rs1 points to descriptor in memory:
+                //   [msg_ptr:8][msg_len:8][sig_ptr:8][sig_len:8][pk_ptr:8][pk_len:8]
+                // rd = 1 if valid, 0 if invalid
+                let desc_addr = self.cpu.read_gp(d.rs1) as u32;
+                let msg_ptr = self.memory.load64(desc_addr).map_err(|_| Trap::MemoryFault)? as u32;
+                let msg_len =
+                    self.memory.load64(desc_addr + 8).map_err(|_| Trap::MemoryFault)? as usize;
+                let sig_ptr = self
+                    .memory
+                    .load64(desc_addr + 16)
+                    .map_err(|_| Trap::MemoryFault)? as u32;
+                let sig_len = self
+                    .memory
+                    .load64(desc_addr + 24)
+                    .map_err(|_| Trap::MemoryFault)? as usize;
+                let pk_ptr = self
+                    .memory
+                    .load64(desc_addr + 32)
+                    .map_err(|_| Trap::MemoryFault)? as u32;
+                let pk_len = self
+                    .memory
+                    .load64(desc_addr + 40)
+                    .map_err(|_| Trap::MemoryFault)? as usize;
+
+                // Read msg, sig, pk from memory
+                let mut msg = vec![0u8; msg_len];
+                for (i, byte) in msg.iter_mut().enumerate() {
+                    *byte = self
+                        .memory
+                        .load8(msg_ptr + i as u32)
+                        .map_err(|_| Trap::MemoryFault)?;
+                }
+                let mut sig_bytes = vec![0u8; sig_len];
+                for (i, byte) in sig_bytes.iter_mut().enumerate() {
+                    *byte = self
+                        .memory
+                        .load8(sig_ptr + i as u32)
+                        .map_err(|_| Trap::MemoryFault)?;
+                }
+                let mut pk_bytes = vec![0u8; pk_len];
+                for (i, byte) in pk_bytes.iter_mut().enumerate() {
+                    *byte = self
+                        .memory
+                        .load8(pk_ptr + i as u32)
+                        .map_err(|_| Trap::MemoryFault)?;
+                }
+
+                let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&pk_bytes) {
+                    Some(pk) => pk,
+                    None => {
+                        // Invalid public key size → verification fails
+                        self.cpu.write_gp(d.rd, 0);
+                        self.pc += 4;
+                        return Ok(None);
+                    }
+                };
+                let sig = pyde_crypto::falcon::FalconSignature::from_bytes(&sig_bytes);
+                let valid = pyde_crypto::falcon::falcon_verify(&pk, &msg, &sig);
+                self.cpu.write_gp(d.rd, if valid { 1 } else { 0 });
+                self.pc += 4;
+            }
+
             _ => return Err(Trap::InvalidOpcode),
         }
 
@@ -1461,5 +1540,219 @@ mod tests {
         let mut vm = Vm::new();
         vm.load(&code).unwrap();
         assert_eq!(vm.run(), Err(Trap::InvalidOpcode));
+    }
+
+    // ========== Crypto instructions (M1.9) ==========
+
+    #[test]
+    fn poseidon_hashes_memory() {
+        let heap = crate::memory::HEAP_START;
+        let input = b"hello pyde";
+        let expected = pyde_crypto::poseidon2::poseidon2_hash(input);
+
+        let mut vm = Vm::new();
+        // Write input bytes to heap
+        for (i, &b) in input.iter().enumerate() {
+            vm.memory.store8(heap + i as u32, b).unwrap();
+        }
+
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap as i32),          // r1 = data ptr
+            instr_ri(Opcode::Addi, 2, 0, input.len() as i32),   // r2 = data len
+            instr_bytes(Opcode::Poseidon, 0, 1, 2),             // w0 = poseidon(mem[r1..r1+r2])
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+
+        let result = vm.cpu.read_wide(0);
+        assert_eq!(result, U256::from_le_bytes(expected.to_bytes()));
+    }
+
+    #[test]
+    fn poseidon_empty_input() {
+        let expected = pyde_crypto::poseidon2::poseidon2_hash(b"");
+        let heap = crate::memory::HEAP_START;
+
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap as i32), // r1 = ptr (doesn't matter)
+            instr_ri(Opcode::Addi, 2, 0, 0),           // r2 = 0 bytes
+            instr_bytes(Opcode::Poseidon, 0, 1, 2),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_wide(0), U256::from_le_bytes(expected.to_bytes()));
+    }
+
+    #[test]
+    fn poseidon_different_inputs_differ() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+
+        // Write "aaa" to heap
+        for i in 0..3 {
+            vm.memory.store8(heap + i, b'a').unwrap();
+        }
+        // Write "bbb" to heap+8
+        for i in 0..3 {
+            vm.memory.store8(heap + 8 + i, b'b').unwrap();
+        }
+
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap as i32),
+            instr_ri(Opcode::Addi, 2, 0, 3),
+            instr_bytes(Opcode::Poseidon, 0, 1, 2),       // w0 = hash("aaa")
+            instr_ri(Opcode::Addi, 3, 0, (heap + 8) as i32),
+            instr_bytes(Opcode::Poseidon, 1, 3, 2),       // w1 = hash("bbb")
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_ne!(vm.cpu.read_wide(0), vm.cpu.read_wide(1));
+    }
+
+    #[test]
+    fn verifysig_valid_signature() {
+        let heap = crate::memory::HEAP_START;
+        let (pk, sk) = pyde_crypto::falcon::falcon_keygen();
+        let msg = b"test message";
+        let sig = pyde_crypto::falcon::falcon_sign(&sk, msg);
+
+        let mut vm = Vm::new();
+
+        // Layout in memory:
+        // heap+0:    descriptor (48 bytes)
+        // heap+48:   msg
+        // heap+48+msg_len: sig
+        // heap+48+msg_len+sig_len: pk
+        let msg_ptr = heap + 48;
+        let sig_ptr = msg_ptr + msg.len() as u32;
+        let pk_ptr = sig_ptr + sig.len() as u32;
+
+        // Write descriptor: [msg_ptr:8][msg_len:8][sig_ptr:8][sig_len:8][pk_ptr:8][pk_len:8]
+        vm.memory.store64(heap, msg_ptr as u64).unwrap();
+        vm.memory.store64(heap + 8, msg.len() as u64).unwrap();
+        vm.memory.store64(heap + 16, sig_ptr as u64).unwrap();
+        vm.memory.store64(heap + 24, sig.len() as u64).unwrap();
+        vm.memory.store64(heap + 32, pk_ptr as u64).unwrap();
+        vm.memory
+            .store64(heap + 40, pk.as_bytes().len() as u64)
+            .unwrap();
+
+        // Write msg, sig, pk to memory
+        for (i, &b) in msg.iter().enumerate() {
+            vm.memory.store8(msg_ptr + i as u32, b).unwrap();
+        }
+        for (i, &b) in sig.as_bytes().iter().enumerate() {
+            vm.memory.store8(sig_ptr + i as u32, b).unwrap();
+        }
+        for (i, &b) in pk.as_bytes().iter().enumerate() {
+            vm.memory.store8(pk_ptr + i as u32, b).unwrap();
+        }
+
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap as i32),
+            instr_bytes(Opcode::VerifySig, 2, 1, 0), // r2 = verifysig(descriptor at r1)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(2), 1); // valid
+    }
+
+    #[test]
+    fn verifysig_invalid_signature() {
+        let heap = crate::memory::HEAP_START;
+        let (pk, sk) = pyde_crypto::falcon::falcon_keygen();
+        let msg = b"test message";
+        let sig = pyde_crypto::falcon::falcon_sign(&sk, msg);
+
+        let mut vm = Vm::new();
+
+        let msg_ptr = heap + 48;
+        let sig_ptr = msg_ptr + msg.len() as u32;
+        let pk_ptr = sig_ptr + sig.len() as u32;
+
+        // Write descriptor
+        vm.memory.store64(heap, msg_ptr as u64).unwrap();
+        vm.memory.store64(heap + 8, msg.len() as u64).unwrap();
+        vm.memory.store64(heap + 16, sig_ptr as u64).unwrap();
+        vm.memory.store64(heap + 24, sig.len() as u64).unwrap();
+        vm.memory.store64(heap + 32, pk_ptr as u64).unwrap();
+        vm.memory
+            .store64(heap + 40, pk.as_bytes().len() as u64)
+            .unwrap();
+
+        // Write WRONG msg (different from what was signed)
+        let wrong_msg = b"wrong message";
+        for (i, &b) in wrong_msg.iter().enumerate() {
+            vm.memory.store8(msg_ptr + i as u32, b).unwrap();
+        }
+        // Update msg_len in descriptor
+        vm.memory
+            .store64(heap + 8, wrong_msg.len() as u64)
+            .unwrap();
+
+        for (i, &b) in sig.as_bytes().iter().enumerate() {
+            vm.memory.store8(sig_ptr + i as u32, b).unwrap();
+        }
+        for (i, &b) in pk.as_bytes().iter().enumerate() {
+            vm.memory.store8(pk_ptr + i as u32, b).unwrap();
+        }
+
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap as i32),
+            instr_bytes(Opcode::VerifySig, 2, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(2), 0); // invalid
+    }
+
+    #[test]
+    fn verifysig_bad_pk_size_returns_zero() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+
+        let msg_ptr = heap + 48;
+        let sig_ptr = msg_ptr + 4;
+        let pk_ptr = sig_ptr + 4;
+
+        // Descriptor with wrong pk_len (should be 897)
+        vm.memory.store64(heap, msg_ptr as u64).unwrap();
+        vm.memory.store64(heap + 8, 4).unwrap();
+        vm.memory.store64(heap + 16, sig_ptr as u64).unwrap();
+        vm.memory.store64(heap + 24, 4).unwrap();
+        vm.memory.store64(heap + 32, pk_ptr as u64).unwrap();
+        vm.memory.store64(heap + 40, 10).unwrap(); // wrong size
+
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap as i32),
+            instr_bytes(Opcode::VerifySig, 2, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(2), 0); // invalid pk → 0
+    }
+
+    #[test]
+    fn poseidon_gas_cost() {
+        let heap = crate::memory::HEAP_START;
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap as i32),
+            instr_ri(Opcode::Addi, 2, 0, 0),
+            instr_bytes(Opcode::Poseidon, 0, 1, 2),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        vm.run().unwrap();
+        // Poseidon costs (exec=50, prove=150) = 200 total
+        // Plus 2x ADDI (3 each) + HALT (2) = 208 total
+        assert!(vm.gas.total() >= 200);
     }
 }
