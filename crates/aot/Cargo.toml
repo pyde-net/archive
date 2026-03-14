@@ -1,0 +1,18 @@
+[package]
+name = "pyde-aot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pyde-vm = { path = "../pvm" }
+pyde-crypto = { path = "../crypto" }
+cranelift-codegen = "0.116"
+cranelift-frontend = "0.116"
+cranelift-module = "0.116"
+cranelift-jit = "0.116"
+cranelift-native = "0.116"
+target-lexicon = "0.12"
+
+[[bench]]
+name = "aot_bench"
+harness = false

@@ -1155,7 +1155,7 @@ impl Vm {
     /// Only journals the first write to each key (subsequent writes to the
     /// same key don't need a new journal entry — the original value is already saved).
     #[inline]
-    fn journal_storage_write(&mut self, key: &U256) {
+    pub fn journal_storage_write(&mut self, key: &U256) {
         if self.storage_journal.is_empty()
             || !self.storage_journal.iter().any(|(k, _)| k == key)
         {
