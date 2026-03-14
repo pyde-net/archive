@@ -51,6 +51,8 @@ enum Token {
     Immediate(i64),
     Label(String),    // "foo:"
     LabelRef(String), // "foo" used as operand
+    Directive(String), // ".ascii", ".bytes", ".align"
+    StringLiteral(Vec<u8>), // "hello"
     Comma,
     Newline,
 }
@@ -125,6 +127,56 @@ fn lex(source: &str) -> Result<Vec<(usize, Token)>, AsmError> {
                     msg: e,
                 })?;
                 tokens.push((line_num, Token::Immediate(val)));
+                continue;
+            }
+
+            // String literal
+            if ch == '"' {
+                chars.next(); // skip opening quote
+                let mut bytes = Vec::new();
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some('n') => bytes.push(b'\n'),
+                            Some('t') => bytes.push(b'\t'),
+                            Some('\\') => bytes.push(b'\\'),
+                            Some('"') => bytes.push(b'"'),
+                            Some('0') => bytes.push(0),
+                            Some(c) => {
+                                return Err(AsmError::Parse {
+                                    line: line_num,
+                                    msg: format!("unknown escape '\\{}'", c),
+                                })
+                            }
+                            None => {
+                                return Err(AsmError::Parse {
+                                    line: line_num,
+                                    msg: "unterminated string".into(),
+                                })
+                            }
+                        },
+                        Some(c) => bytes.push(c as u8),
+                        None => {
+                            return Err(AsmError::Parse {
+                                line: line_num,
+                                msg: "unterminated string".into(),
+                            })
+                        }
+                    }
+                }
+                tokens.push((line_num, Token::StringLiteral(bytes)));
+                continue;
+            }
+
+            // Directive (.ascii, .bytes, .align)
+            if ch == '.' {
+                chars.next();
+                let name: String = chars
+                    .by_ref()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                tokens.push((line_num, Token::Directive(name.to_lowercase())));
                 continue;
             }
 
@@ -258,7 +310,8 @@ fn parse_pseudo_env(s: &str) -> Option<PseudoEnv> {
 }
 
 fn is_mnemonic(s: &str) -> bool {
-    parse_pseudo_mem(s).is_some()
+    s == "la"
+        || parse_pseudo_mem(s).is_some()
         || parse_pseudo_env(s).is_some()
         || mnemonic_to_opcode(s).is_some()
 }
@@ -424,14 +477,26 @@ struct ParsedInstr {
     operands: Vec<Operand>,
 }
 
+/// A parsed item: either an instruction or raw data.
+#[derive(Clone, Debug)]
+enum ParsedItem {
+    Instr(ParsedInstr),
+    /// Raw data bytes (from .ascii, .bytes directives).
+    Data(Vec<u8>),
+    /// Load address pseudo: `la rd, label` → addi rd, r0, CODE_START + label_offset
+    LoadAddr { line: usize, rd: u8, label: String },
+}
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
 
-fn parse(tokens: &[(usize, Token)]) -> Result<(Vec<ParsedInstr>, HashMap<String, u32>), AsmError> {
-    let mut instrs: Vec<ParsedInstr> = Vec::new();
+fn parse(
+    tokens: &[(usize, Token)],
+) -> Result<(Vec<ParsedItem>, HashMap<String, u32>), AsmError> {
+    let mut items: Vec<ParsedItem> = Vec::new();
     let mut labels: HashMap<String, u32> = HashMap::new();
-    let mut offset: u32 = 0; // byte offset (each instruction = 4 bytes)
+    let mut offset: u32 = 0;
 
     let mut i = 0;
     while i < tokens.len() {
@@ -450,7 +515,93 @@ fn parse(tokens: &[(usize, Token)]) -> Result<(Vec<ParsedInstr>, HashMap<String,
                 i += 1;
                 continue;
             }
+            Token::Directive(dir) => {
+                i += 1;
+                match dir.as_str() {
+                    "ascii" | "bytes" => {
+                        // Collect data: string literals and/or comma-separated bytes
+                        let mut data = Vec::new();
+                        while i < tokens.len() {
+                            let (_, ref t) = tokens[i];
+                            match t {
+                                Token::Newline => break,
+                                Token::Comma => {
+                                    i += 1;
+                                    continue;
+                                }
+                                Token::StringLiteral(bytes) => {
+                                    data.extend_from_slice(bytes);
+                                    i += 1;
+                                }
+                                Token::Immediate(v) => {
+                                    data.push(*v as u8);
+                                    i += 1;
+                                }
+                                _ => {
+                                    return Err(AsmError::Parse {
+                                        line,
+                                        msg: format!(
+                                            ".{} expects string literals or byte values",
+                                            dir
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        let len = data.len() as u32;
+                        items.push(ParsedItem::Data(data));
+                        offset += len;
+                    }
+                    "align" => {
+                        // Align to 4-byte boundary by padding with zeros
+                        let padding = (4 - (offset % 4)) % 4;
+                        if padding > 0 {
+                            items.push(ParsedItem::Data(vec![0u8; padding as usize]));
+                            offset += padding;
+                        }
+                        i += 1; // skip newline if present
+                    }
+                    _ => {
+                        return Err(AsmError::Parse {
+                            line,
+                            msg: format!("unknown directive '.{}'", dir),
+                        });
+                    }
+                }
+            }
             Token::Mnemonic(mnem) => {
+                // Handle `la rd, label` pseudo-instruction
+                if mnem == "la" {
+                    i += 1;
+                    let rd = match tokens.get(i) {
+                        Some((_, Token::Register(r))) => *r,
+                        _ => {
+                            return Err(AsmError::Parse {
+                                line,
+                                msg: "la requires: la rd, label".into(),
+                            })
+                        }
+                    };
+                    i += 1;
+                    // skip comma
+                    if matches!(tokens.get(i), Some((_, Token::Comma))) {
+                        i += 1;
+                    }
+                    let label = match tokens.get(i) {
+                        Some((_, Token::LabelRef(name))) => name.clone(),
+                        _ => {
+                            return Err(AsmError::Parse {
+                                line,
+                                msg: "la requires: la rd, label".into(),
+                            })
+                        }
+                    };
+                    i += 1;
+                    items.push(ParsedItem::LoadAddr { line, rd, label });
+                    offset += 4;
+                    continue;
+                }
+
                 let mut operands = Vec::new();
                 let mut mem_width = None;
                 let opcode;
@@ -517,25 +668,25 @@ fn parse(tokens: &[(usize, Token)]) -> Result<(Vec<ParsedInstr>, HashMap<String,
                     }
                 }
 
-                instrs.push(ParsedInstr {
+                items.push(ParsedItem::Instr(ParsedInstr {
                     line,
                     opcode,
                     mem_width,
                     env_pseudo,
                     operands,
-                });
+                }));
                 offset += 4;
             }
             _ => {
                 return Err(AsmError::Parse {
                     line,
-                    msg: format!("expected mnemonic or label, got {:?}", tok),
+                    msg: format!("expected mnemonic, directive, or label, got {:?}", tok),
                 });
             }
         }
     }
 
-    Ok((instrs, labels))
+    Ok((items, labels))
 }
 
 // ---------------------------------------------------------------------------
@@ -545,14 +696,36 @@ fn parse(tokens: &[(usize, Token)]) -> Result<(Vec<ParsedInstr>, HashMap<String,
 /// Assemble source text into bytecode.
 pub fn assemble(source: &str) -> Result<Vec<u8>, AsmError> {
     let tokens = lex(source)?;
-    let (instrs, labels) = parse(&tokens)?;
+    let (items, labels) = parse(&tokens)?;
 
-    let mut bytecode = Vec::with_capacity(instrs.len() * 4);
+    let mut bytecode = Vec::new();
 
-    for (idx, pi) in instrs.iter().enumerate() {
-        let pc = (idx as u32) * 4;
-        let word = encode_instr(pi, pc, &labels)?;
-        bytecode.extend_from_slice(&word.0.to_le_bytes());
+    for item in &items {
+        let pc = bytecode.len() as u32;
+        match item {
+            ParsedItem::Instr(pi) => {
+                let word = encode_instr(pi, pc, &labels)?;
+                bytecode.extend_from_slice(&word.0.to_le_bytes());
+            }
+            ParsedItem::Data(data) => {
+                bytecode.extend_from_slice(data);
+            }
+            ParsedItem::LoadAddr { line, rd, label } => {
+                let target = *labels
+                    .get(label)
+                    .ok_or_else(|| AsmError::UndefinedLabel(label.clone()))?;
+                let abs_addr = crate::memory::CODE_START + target;
+                let abs_i32 = abs_addr as i32;
+                if !(-131072..=131071).contains(&abs_i32) {
+                    return Err(AsmError::ImmediateRange(format!(
+                        "line {}: address 0x{:X} out of 18-bit range",
+                        line, abs_addr
+                    )));
+                }
+                let word = encode(Opcode::Addi, *rd, 0, encode_immediate(abs_i32));
+                bytecode.extend_from_slice(&word.0.to_le_bytes());
+            }
+        }
     }
 
     Ok(bytecode)
@@ -965,6 +1138,33 @@ fn encode_instr(
             Ok(encode(pi.opcode, wd, rs1, 0))
         }
 
+        // --- Crypto: poseidon wd, rs1, rs2 ---
+        Opcode::Poseidon => {
+            if ops.len() != 3 {
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "poseidon requires 3 operands: wd, rs1, rs2".into(),
+                });
+            }
+            let wd = expect_wide(&ops[0], line, "wd")?;
+            let rs1 = expect_gp(&ops[1], line, "rs1")?;
+            let rs2 = expect_gp(&ops[2], line, "rs2")?;
+            Ok(encode(pi.opcode, wd, rs1, rs2 as u32))
+        }
+
+        // --- Crypto: verifysig rd, rs1 ---
+        Opcode::VerifySig => {
+            if ops.len() != 2 {
+                return Err(AsmError::Parse {
+                    line,
+                    msg: "verifysig requires 2 operands: rd, rs1".into(),
+                });
+            }
+            let rd = expect_gp(&ops[0], line, "rd")?;
+            let rs1 = expect_gp(&ops[1], line, "rs1")?;
+            Ok(encode(pi.opcode, rd, rs1, 0))
+        }
+
         // --- Assert: assert rs1 ---
         Opcode::Assert => {
             if ops.len() != 1 {
@@ -1195,6 +1395,10 @@ fn disassemble_one(opcode: Opcode, rd: u8, rs1: u8, rs2_or_imm: u32) -> String {
 
         // System: Blockhash
         Opcode::Blockhash => format!("blockhash w{}, r{}", rd, rs1),
+
+        // Crypto
+        Opcode::Poseidon => format!("poseidon w{}, r{}, r{}", rd, rs1, rs2_or_imm & 0xF),
+        Opcode::VerifySig => format!("verifysig r{}, r{}", rd, rs1),
 
         // Assert
         Opcode::Assert => format!("assert r{}", rs1),
@@ -1673,5 +1877,111 @@ mod tests {
         assert!(text.contains("callvalue w0"));
         assert!(text.contains("gasprice w1"));
         assert!(text.contains("balance w2, r3"));
+    }
+
+    // ========== Data directives ==========
+
+    #[test]
+    fn ascii_directive_embeds_bytes() {
+        let src = r#"
+            halt
+        msg:
+            .ascii "hello"
+        "#;
+        let code = assemble(src).unwrap();
+        // halt = 4 bytes, then "hello" = 5 bytes
+        assert_eq!(code.len(), 9);
+        assert_eq!(&code[4..9], b"hello");
+    }
+
+    #[test]
+    fn bytes_directive_with_values() {
+        let src = "halt\ndata: .bytes 0x41, 0x42, 0x43";
+        let code = assemble(src).unwrap();
+        assert_eq!(code.len(), 7); // 4 + 3
+        assert_eq!(&code[4..7], b"ABC");
+    }
+
+    #[test]
+    fn ascii_with_escape_sequences() {
+        let src = r#"halt
+msg: .ascii "hi\n\0""#;
+        let code = assemble(src).unwrap();
+        assert_eq!(code.len(), 8); // 4 + 4 bytes ("hi" + \n + \0)
+        assert_eq!(code[4], b'h');
+        assert_eq!(code[5], b'i');
+        assert_eq!(code[6], b'\n');
+        assert_eq!(code[7], 0);
+    }
+
+    #[test]
+    fn align_directive_pads_to_4() {
+        let src = r#"
+            halt
+        data:
+            .ascii "hi"
+            .align
+        next:
+            halt
+        "#;
+        let code = assemble(src).unwrap();
+        // halt(4) + "hi"(2) + align pad(2) + halt(4) = 12
+        assert_eq!(code.len(), 12);
+    }
+
+    #[test]
+    fn la_pseudo_loads_absolute_address() {
+        let src = r#"
+            la r1, msg
+            halt
+        msg:
+            .ascii "test"
+        "#;
+        let code = assemble(src).unwrap();
+        // la is at offset 0, msg is at offset 8 (after la + halt)
+        // la should encode: addi r1, r0, CODE_START + 8
+        let d = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        assert_eq!(d.opcode, Opcode::Addi);
+        assert_eq!(d.rd, 1);
+        assert_eq!(d.rs1, 0);
+        let expected_addr = crate::memory::CODE_START + 8;
+        assert_eq!(sign_extend_18(d.rs2_or_imm), expected_addr as i32);
+    }
+
+    #[test]
+    fn la_and_data_full_program() {
+        // Load address of embedded data and use it with poseidon
+        let src = r#"
+            la r1, msg          ; r1 = address of "hello"
+            addi r2, r0, 5      ; r2 = length
+            halt
+        msg:
+            .ascii "hello"
+        "#;
+        let code = assemble(src).unwrap();
+
+        let mut vm = crate::vm::Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), crate::vm::ExecResult::Halt);
+
+        // r1 should point to the "hello" data in code section
+        let addr = vm.cpu.read_gp(1) as u32;
+        let mut loaded = Vec::new();
+        for i in 0..5 {
+            loaded.push(vm.memory.load8(addr + i).unwrap());
+        }
+        assert_eq!(&loaded, b"hello");
+    }
+
+    #[test]
+    fn mixed_bytes_and_string() {
+        let src = r#"halt
+data: .bytes 0xFF, "AB", 0x00"#;
+        let code = assemble(src).unwrap();
+        assert_eq!(code.len(), 8); // 4 + 4 bytes
+        assert_eq!(code[4], 0xFF);
+        assert_eq!(code[5], b'A');
+        assert_eq!(code[6], b'B');
+        assert_eq!(code[7], 0x00);
     }
 }
