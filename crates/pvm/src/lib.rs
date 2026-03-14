@@ -1,3 +1,4 @@
+pub mod asm;
 pub mod cpu;
 pub mod isa;
 pub mod memory;
