@@ -99,6 +99,17 @@ impl GasUsed {
     }
 }
 
+/// An emitted event log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventLog {
+    /// Contract address that emitted the event.
+    pub address: u64,
+    /// Indexed topics (up to 4: topic0 = event signature hash, topic1-3 = indexed fields).
+    pub topics: Vec<U256>,
+    /// Non-indexed data payload.
+    pub data: Vec<u8>,
+}
+
 /// The full VM state.
 pub struct Vm {
     pub cpu: Cpu,
@@ -121,6 +132,8 @@ pub struct Vm {
     /// Pre-populated with witness data before execution.
     /// After execution, diff against initial state for state transition.
     pub storage: HashMap<U256, Vec<u8>>,
+    /// Accumulated event logs emitted during execution.
+    pub logs: Vec<EventLog>,
 }
 
 impl Vm {
@@ -137,6 +150,7 @@ impl Vm {
             gas_refund: 0,
             ctx: ExecutionContext::default(),
             storage: HashMap::new(),
+            logs: Vec::new(),
         }
     }
 
@@ -547,6 +561,68 @@ impl Vm {
                     }
                 }
                 self.storage.insert(key, Vec::new());
+                self.pc += 4;
+            }
+
+            // --- Event instruction ---
+            Opcode::Log => {
+                // log rs1, imm — emit an event log
+                // imm = number of topics (0-4)
+                // rs1 = pointer to descriptor in memory:
+                //   [topic0:32][topic1:32]...[topicN:32][data_ptr:8][data_len:8]
+                let num_topics = (d.rs2_or_imm & 0x7) as usize;
+                if num_topics > 4 {
+                    return Err(Trap::InvalidOpcode);
+                }
+                let desc_ptr = self.cpu.read_gp(d.rs1) as u32;
+
+                // Read topics
+                let mut topics = Vec::with_capacity(num_topics);
+                for t in 0..num_topics {
+                    let offset = desc_ptr + (t as u32) * 32;
+                    let mut buf = [0u8; 32];
+                    for (j, byte) in buf.iter_mut().enumerate() {
+                        *byte = self
+                            .memory
+                            .load8(offset + j as u32)
+                            .map_err(|_| Trap::MemoryFault)?;
+                    }
+                    topics.push(U256::from_le_bytes(buf));
+                }
+
+                // Read data_ptr and data_len after the topics
+                let after_topics = desc_ptr + (num_topics as u32) * 32;
+                let data_ptr = self
+                    .memory
+                    .load64(after_topics)
+                    .map_err(|_| Trap::MemoryFault)? as u32;
+                let data_len = self
+                    .memory
+                    .load64(after_topics + 8)
+                    .map_err(|_| Trap::MemoryFault)? as usize;
+
+                // Read data payload
+                let mut data = vec![0u8; data_len];
+                for (i, byte) in data.iter_mut().enumerate() {
+                    *byte = self
+                        .memory
+                        .load8(data_ptr + i as u32)
+                        .map_err(|_| Trap::MemoryFault)?;
+                }
+
+                // Charge dynamic gas: 100 base + 8 per data byte + 50 per topic
+                let dynamic_gas =
+                    100u64 + (data_len as u64) * 8 + (num_topics as u64) * 50;
+                self.gas.exec += dynamic_gas;
+                if self.gas_limit > 0 && self.gas.total() > self.gas_limit {
+                    return Err(Trap::OutOfGas);
+                }
+
+                self.logs.push(EventLog {
+                    address: self.ctx.self_address,
+                    topics,
+                    data,
+                });
                 self.pc += 4;
             }
 
@@ -2143,5 +2219,157 @@ mod tests {
 
         // Should get 0xFF in first byte, rest zeros
         assert_eq!(vm.cpu.read_wide(2), U256::from(0xFFu64));
+    }
+
+    // --- Event instruction tests ---
+
+    /// Helper: build a LOG descriptor in memory.
+    /// Returns the descriptor start address.
+    fn setup_log_descriptor(
+        vm: &mut Vm,
+        base: u32,
+        topics: &[U256],
+        data: &[u8],
+    ) -> u32 {
+        let mut offset = base;
+        // Write topics (32 bytes each)
+        for topic in topics {
+            let bytes = topic.to_le_bytes();
+            for (j, &b) in bytes.iter().enumerate() {
+                vm.memory.store8(offset + j as u32, b).unwrap();
+            }
+            offset += 32;
+        }
+        // Write data to a separate region and store pointer + length
+        let data_start = offset + 16; // after ptr+len fields
+        vm.memory.store64(offset, data_start as u64).unwrap();
+        vm.memory.store64(offset + 8, data.len() as u64).unwrap();
+        for (i, &b) in data.iter().enumerate() {
+            vm.memory.store8(data_start + i as u32, b).unwrap();
+        }
+        base
+    }
+
+    #[test]
+    fn log_emits_event_with_topics_and_data() {
+        let heap = crate::memory::HEAP_START;
+        let ctx = ExecutionContext {
+            self_address: 0xCAFE,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+
+        let topic0 = U256::from(0xABCDu64);
+        let topic1 = U256::from(0x1234u64);
+        let data = b"hello";
+
+        setup_log_descriptor(&mut vm, heap, &[topic0, topic1], data);
+        vm.cpu.write_gp(1, heap as u64);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Log, 0, 1, 2), // log r1, 2 (2 topics)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+
+        assert_eq!(vm.logs.len(), 1);
+        let log = &vm.logs[0];
+        assert_eq!(log.address, 0xCAFE);
+        assert_eq!(log.topics.len(), 2);
+        assert_eq!(log.topics[0], topic0);
+        assert_eq!(log.topics[1], topic1);
+        assert_eq!(log.data, b"hello");
+    }
+
+    #[test]
+    fn log_zero_topics() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+
+        let data = b"event data";
+        setup_log_descriptor(&mut vm, heap, &[], data);
+        vm.cpu.write_gp(1, heap as u64);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Log, 0, 1, 0), // log r1, 0
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+
+        assert_eq!(vm.logs.len(), 1);
+        assert!(vm.logs[0].topics.is_empty());
+        assert_eq!(vm.logs[0].data, b"event data");
+    }
+
+    #[test]
+    fn log_multiple_events() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+
+        // First event at heap
+        let topic_a = U256::from(1u64);
+        setup_log_descriptor(&mut vm, heap, &[topic_a], b"first");
+        vm.cpu.write_gp(1, heap as u64);
+
+        // Second event at heap + 200
+        let topic_b = U256::from(2u64);
+        setup_log_descriptor(&mut vm, heap + 200, &[topic_b], b"second");
+        vm.cpu.write_gp(2, (heap + 200) as u64);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Log, 0, 1, 1), // log r1, 1
+            instr_bytes(Opcode::Log, 0, 2, 1), // log r2, 1
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+
+        assert_eq!(vm.logs.len(), 2);
+        assert_eq!(vm.logs[0].topics[0], U256::from(1u64));
+        assert_eq!(vm.logs[0].data, b"first");
+        assert_eq!(vm.logs[1].topics[0], U256::from(2u64));
+        assert_eq!(vm.logs[1].data, b"second");
+    }
+
+    #[test]
+    fn log_dynamic_gas_cost() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::with_gas_limit(100_000);
+
+        // 3 topics, 10 bytes of data
+        let topics = [U256::from(1u64), U256::from(2u64), U256::from(3u64)];
+        setup_log_descriptor(&mut vm, heap, &topics, &[0u8; 10]);
+        vm.cpu.write_gp(1, heap as u64);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Log, 0, 1, 3), // log r1, 3
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        vm.run().unwrap();
+
+        // Base ISA gas (50 exec + 25 prove = 75) + dynamic (100 + 10*8 + 3*50 = 330)
+        // + HALT (2) = 407
+        let log_gas = 75 + 100 + 80 + 150; // 405
+        let halt_gas = 2;
+        assert_eq!(vm.gas.total(), log_gas + halt_gas);
+    }
+
+    #[test]
+    fn log_too_many_topics_fails() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+
+        setup_log_descriptor(&mut vm, heap, &[], b"");
+        vm.cpu.write_gp(1, heap as u64);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Log, 0, 1, 5), // 5 topics — invalid
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert!(vm.run().is_err());
     }
 }
