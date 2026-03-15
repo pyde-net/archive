@@ -165,12 +165,47 @@ fn bench_update_all_scaling() {
 }
 
 
+fn bench_witness() {
+    println!("\n=== Witness generation & verification ===\n");
+
+    let mut smt = PydeSMT::new();
+    let keys: Vec<_> = (0..1_000).map(|i| key_from_seed(i)).collect();
+    for (i, k) in keys.iter().enumerate() {
+        smt.insert(*k, format!("v{i}").into_bytes());
+    }
+
+    // Generation
+    for count in [10u64, 100, 1_000] {
+        let access_keys: Vec<_> = keys[..count as usize].to_vec();
+        let start = Instant::now();
+        let witness = pyde_state::witness::generate_witnesses(&smt, &access_keys);
+        let elapsed = start.elapsed();
+        let us = elapsed.as_micros() as f64;
+        let size = witness.size_bytes();
+        println!(
+            "  {count:>5} keys:  generate {us:>8.0}µs  size {size:>6} bytes ({:.0} bytes/key)",
+            size as f64 / count as f64
+        );
+
+        // Verification
+        let start = Instant::now();
+        let valid = pyde_state::witness::verify_witnesses(&witness);
+        let elapsed = start.elapsed();
+        assert!(valid);
+        println!(
+            "              verify   {:>8.0}µs",
+            elapsed.as_micros() as f64
+        );
+    }
+}
+
 fn main() {
     bench_insert();
     bench_batch_insert();
     bench_update_all_scaling();
     bench_get();
     bench_proof();
+    bench_witness();
     bench_rocksdb();
     println!();
 }
