@@ -1,6 +1,10 @@
 use std::time::Instant;
 
-use pyde_state::smt::{key_from_seed, PydeSMT};
+use pyde_state::backend::RocksDBBackend;
+use pyde_state::smt::{key_from_seed, Poseidon2Hasher, SmtValue};
+use pyde_state::smt::{PydeSMT};
+use sparse_merkle_tree::SparseMerkleTree;
+use sparse_merkle_tree::H256;
 
 fn bench_insert() {
     println!("=== SMT insert throughput ===\n");
@@ -98,10 +102,51 @@ fn bench_batch_insert() {
     }
 }
 
+fn bench_rocksdb() {
+    println!("\n=== RocksDB backend ===\n");
+
+    type SMT = SparseMerkleTree<Poseidon2Hasher, SmtValue, RocksDBBackend>;
+
+    for count in [100u64, 1_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RocksDBBackend::open(dir.path().to_str().unwrap()).unwrap();
+        let mut smt = SMT::new(H256::zero(), store);
+
+        let pairs: Vec<_> = (0..count)
+            .map(|i| (key_from_seed(i), SmtValue(format!("v{i}").into_bytes())))
+            .collect();
+
+        let start = Instant::now();
+        smt.update_all(pairs).unwrap();
+        let elapsed = start.elapsed();
+
+        let ops_sec = count as f64 / elapsed.as_secs_f64();
+        println!(
+            "  {count:>6} inserts:  {ops_sec:>10.0} ops/sec ({:.1}ms)",
+            elapsed.as_secs_f64() * 1000.0
+        );
+
+        // Read benchmark
+        let keys: Vec<_> = (0..count).map(|i| key_from_seed(i)).collect();
+        let iterations = count;
+        let start = Instant::now();
+        for i in 0..iterations {
+            std::hint::black_box(smt.get(&keys[i as usize % keys.len()]).unwrap());
+        }
+        let elapsed = start.elapsed();
+        let read_ops = iterations as f64 / elapsed.as_secs_f64();
+        println!(
+            "  {iterations:>6} reads:    {read_ops:>10.0} ops/sec ({:.1}ms)",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+}
+
 fn main() {
     bench_insert();
     bench_batch_insert();
     bench_get();
     bench_proof();
+    bench_rocksdb();
     println!();
 }
