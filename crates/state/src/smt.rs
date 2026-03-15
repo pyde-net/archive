@@ -526,4 +526,5 @@ mod tests {
         assert!(compiled.verify(root, vec![(key, value.clone())]));
         assert!(!compiled.verify(root, vec![(key, b"wrong".to_vec())]));
     }
+
 }

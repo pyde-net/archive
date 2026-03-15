@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 pyde-crypto = { path = "../crypto" }
 sparse-merkle-tree = "0.6"
+rocksdb = "0.24"
+lru = "0.16"
+tempfile = "3"
 
 [[bench]]
 name = "smt_bench"
