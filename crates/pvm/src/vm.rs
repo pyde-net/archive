@@ -9,33 +9,40 @@ use crate::memory::Memory;
 use crate::wide::U256;
 use std::collections::HashMap;
 
+/// 32-byte address type (Poseidon2 hash of FALCON-512 public key).
+pub type Address = [u8; 32];
+
+/// Zero address constant.
+pub const ZERO_ADDRESS: Address = [0u8; 32];
+
 /// Maximum call depth (nested function calls).
 const MAX_CALL_DEPTH: usize = 1024;
 
 /// Sub-codes for the `Caller` opcode (GP-width environment queries).
 /// The immediate field selects which value to return.
 pub mod env_gp {
-    pub const CALLER: u32 = 0;
-    pub const ADDRESS: u32 = 1;
-    pub const BLOCK_NUMBER: u32 = 2;
-    pub const TIMESTAMP: u32 = 3;
-    pub const GAS_REMAINING: u32 = 4;
+    pub const BLOCK_NUMBER: u32 = 0;
+    pub const TIMESTAMP: u32 = 1;
+    pub const GAS_REMAINING: u32 = 2;
 }
 
 /// Sub-codes for the `Callvalue` opcode (wide environment queries).
+/// Addresses are 32 bytes, so CALLER and ADDRESS are wide.
 pub mod env_wide {
     pub const CALL_VALUE: u32 = 0;
     pub const GAS_PRICE: u32 = 1;
     pub const BALANCE: u32 = 2;
+    pub const CALLER: u32 = 3;
+    pub const ADDRESS: u32 = 4;
 }
 
 /// Execution context: caller info, block info, and balances.
 #[derive(Clone, Debug)]
 pub struct ExecutionContext {
-    /// Address of the caller (msg.sender).
-    pub caller: u64,
-    /// Address of the current contract.
-    pub self_address: u64,
+    /// Address of the caller (msg.sender), 32 bytes.
+    pub caller: Address,
+    /// Address of the current contract, 32 bytes.
+    pub self_address: Address,
     /// Value sent with the call (msg.value), 256-bit.
     pub call_value: U256,
     /// Current block number.
@@ -46,22 +53,21 @@ pub struct ExecutionContext {
     pub gas_price: U256,
     /// Recent block hashes (index 0 = most recent). Up to 256 entries.
     pub block_hashes: Vec<U256>,
-    /// Balance lookup function: address → balance.
-    /// Stored as a simple map for now.
-    pub balances: std::collections::HashMap<u64, U256>,
+    /// Balance lookup: address → balance.
+    pub balances: HashMap<Address, U256>,
 }
 
 impl Default for ExecutionContext {
     fn default() -> Self {
         Self {
-            caller: 0,
-            self_address: 0,
+            caller: ZERO_ADDRESS,
+            self_address: ZERO_ADDRESS,
             call_value: U256::ZERO,
             block_number: 0,
             timestamp: 0,
             gas_price: U256::ZERO,
             block_hashes: Vec::new(),
-            balances: std::collections::HashMap::new(),
+            balances: HashMap::new(),
         }
     }
 }
@@ -159,7 +165,7 @@ impl GasUsed {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventLog {
     /// Contract address that emitted the event.
-    pub address: u64,
+    pub address: Address,
     /// Indexed topics (up to 4: topic0 = event signature hash, topic1-3 = indexed fields).
     pub topics: Vec<U256>,
     /// Non-indexed data payload.
@@ -209,7 +215,7 @@ pub struct Vm {
     /// Keys already journaled (O(1) dedup instead of O(n) scan).
     storage_journal_keys: std::collections::HashSet<U256>,
     /// Contract registry: address → deployed bytecode.
-    pub contracts: HashMap<u64, Vec<u8>>,
+    pub contracts: HashMap<Address, Vec<u8>>,
     /// Calldata: input bytes passed to this contract.
     pub calldata: Vec<u8>,
     /// Return data from the last external call.
@@ -217,7 +223,7 @@ pub struct Vm {
     /// Whether this execution is in static mode (no state writes allowed).
     pub static_mode: bool,
     /// Set of contract addresses currently on the external call stack (reentrancy detection).
-    reentrancy_set: std::collections::HashSet<u64>,
+    reentrancy_set: std::collections::HashSet<Address>,
     /// Current external call depth.
     ext_call_depth: usize,
 }
@@ -543,8 +549,6 @@ impl Vm {
             Opcode::Caller => {
                 let sub = d.rs2_or_imm;
                 let val = match sub {
-                    env_gp::CALLER => self.ctx.caller,
-                    env_gp::ADDRESS => self.ctx.self_address,
                     env_gp::BLOCK_NUMBER => self.ctx.block_number,
                     env_gp::TIMESTAMP => self.ctx.timestamp,
                     env_gp::GAS_REMAINING => self.gas_remaining(),
@@ -559,9 +563,13 @@ impl Vm {
                     env_wide::CALL_VALUE => self.ctx.call_value,
                     env_wide::GAS_PRICE => self.ctx.gas_price,
                     env_wide::BALANCE => {
-                        let addr = self.cpu.read_gp(d.rs1);
+                        // Address in wide register ws1
+                        let addr_u256 = self.cpu.read_wide(d.rs1);
+                        let addr: Address = addr_u256.to_le_bytes();
                         *self.ctx.balances.get(&addr).unwrap_or(&U256::ZERO)
                     }
+                    env_wide::CALLER => U256::from_le_bytes(self.ctx.caller),
+                    env_wide::ADDRESS => U256::from_le_bytes(self.ctx.self_address),
                     _ => return Err(Trap::InvalidOpcode),
                 };
                 self.cpu.write_wide(d.rd, val);
@@ -830,29 +838,30 @@ impl Vm {
             // --- Cross-contract call instructions ---
 
             Opcode::CallExt => {
-                // call_ext rd, rs1, imm
-                // rd = register with target address
-                // rs1 = register with calldata pointer in memory
-                // imm[3:0] = register with calldata length
-                // imm[7:4] = register with gas to forward
-                // Result: rd = 1 (success) or 0 (failure)
+                // call_ext wd, rs1, imm
+                // wd = wide register with target address (32 bytes)
+                // rs1 = GP register with calldata pointer in memory
+                // imm[3:0] = GP register with calldata length
+                // imm[7:4] = GP register with gas to forward
+                // imm[11:8] = GP register for result (1=success, 0=failure)
                 if self.static_mode {
                     return Err(Trap::StaticModeViolation);
                 }
+                let result_reg = ((d.rs2_or_imm >> 8) & 0xF) as u8;
                 let result = self.do_ext_call(d, false, false)?;
-                self.cpu.write_gp(d.rd, if result.success { 1 } else { 0 });
+                self.cpu.write_gp(result_reg, if result.success { 1 } else { 0 });
                 self.return_data = result.return_data;
                 self.pc += 4;
             }
 
             Opcode::Delegate => {
-                // delegate rd, rs1, imm — same encoding as CallExt
-                // Runs callee code with caller's storage and address
+                // delegate wd, rs1, imm — same encoding as CallExt
                 if self.static_mode {
                     return Err(Trap::StaticModeViolation);
                 }
+                let result_reg = ((d.rs2_or_imm >> 8) & 0xF) as u8;
                 let result = self.do_ext_call(d, false, true)?;
-                self.cpu.write_gp(d.rd, if result.success { 1 } else { 0 });
+                self.cpu.write_gp(result_reg, if result.success { 1 } else { 0 });
                 self.return_data = result.return_data;
                 self.pc += 4;
             }
@@ -866,15 +875,15 @@ impl Vm {
             // CallExt with imm bit 8 set. The VM checks this bit.
 
             Opcode::Create => {
-                // create rd, rs1, imm
-                // rs1 = register with init code pointer
-                // imm[3:0] = register with init code length
-                // Result: rd = new contract address (0 on failure)
+                // create wd, rs1, imm
+                // wd = wide register for new contract address (32 bytes)
+                // rs1 = GP register with init code pointer
+                // imm[3:0] = GP register with init code length
                 if self.static_mode {
                     return Err(Trap::StaticModeViolation);
                 }
-                let result = self.do_create(d, false)?;
-                self.cpu.write_gp(d.rd, result);
+                let new_addr = self.do_create(d, false)?;
+                self.cpu.write_wide(d.rd, U256::from_le_bytes(new_addr));
                 self.pc += 4;
             }
 
@@ -1010,9 +1019,9 @@ impl Vm {
     /// Derive a storage key from a slot and the contract's address.
     /// key = poseidon2(slot_bytes ++ address_bytes)
     pub fn derive_storage_key(&self, slot: U256) -> U256 {
-        let mut buf = [0u8; 40]; // 32 (slot) + 8 (address)
+        let mut buf = [0u8; 64]; // 32 (slot) + 32 (address)
         buf[..32].copy_from_slice(&slot.to_le_bytes());
-        buf[32..].copy_from_slice(&self.ctx.self_address.to_le_bytes());
+        buf[32..64].copy_from_slice(&self.ctx.self_address);
         let hash = pyde_crypto::poseidon2::poseidon2_hash(&buf);
         U256::from_le_bytes(hash.to_bytes())
     }
@@ -1039,13 +1048,13 @@ impl Vm {
             return Err(Trap::StackOverflow);
         }
 
-        let target_addr = self.cpu.read_gp(d.rd);
+        let target_addr: Address = self.cpu.read_wide(d.rd).to_le_bytes();
         let calldata_ptr = self.cpu.read_gp(d.rs1) as u32;
         let len_reg = (d.rs2_or_imm & 0xF) as u8;
         let gas_reg = ((d.rs2_or_imm >> 4) & 0xF) as u8;
         let calldata_len = self.cpu.read_gp(len_reg) as usize;
         let gas_to_forward = self.cpu.read_gp(gas_reg);
-        let is_static_call = is_static || ((d.rs2_or_imm >> 8) & 1) == 1;
+        let is_static_call = is_static || ((d.rs2_or_imm >> 12) & 1) == 1;
 
         // Read calldata from caller's memory
         let mut calldata = vec![0u8; calldata_len];
@@ -1175,8 +1184,8 @@ impl Vm {
         })
     }
 
-    /// Deploy a new contract (CREATE).
-    fn do_create(&mut self, d: DecodedInstruction, is_create2: bool) -> Result<u64, Trap> {
+    /// Deploy a new contract (CREATE/CREATE2). Returns the 32-byte address.
+    fn do_create(&mut self, d: DecodedInstruction, is_create2: bool) -> Result<Address, Trap> {
         if self.ext_call_depth >= MAX_EXT_CALL_DEPTH {
             return Err(Trap::StackOverflow);
         }
@@ -1188,26 +1197,23 @@ impl Vm {
         let init_code = self.memory.checked_read_slice(code_ptr, code_len)
             .map_err(|_| Trap::MemoryFault)?;
 
-        // Derive contract address
-        let new_addr = if is_create2 {
+        // Derive 32-byte contract address
+        let new_addr: Address = if is_create2 {
             // CREATE2: address = poseidon2(0xFF ++ sender ++ salt ++ code_hash)
-            // salt is in the wide register w0
             let salt = self.cpu.read_wide(0);
             let code_hash = pyde_crypto::poseidon2::poseidon2_hash(&init_code);
-            let mut addr_input = Vec::with_capacity(1 + 8 + 32 + 32);
+            let mut addr_input = Vec::with_capacity(1 + 32 + 32 + 32);
             addr_input.push(0xFF);
-            addr_input.extend_from_slice(&self.ctx.self_address.to_le_bytes());
+            addr_input.extend_from_slice(&self.ctx.self_address);
             addr_input.extend_from_slice(&salt.to_le_bytes());
             addr_input.extend_from_slice(&code_hash.to_bytes());
-            let hash = pyde_crypto::poseidon2::poseidon2_hash(&addr_input);
-            u64::from_le_bytes(hash.to_bytes()[..8].try_into().unwrap())
+            pyde_crypto::poseidon2::poseidon2_hash(&addr_input).to_bytes()
         } else {
             // CREATE: address = poseidon2(sender ++ code)
-            let mut addr_input = Vec::with_capacity(8 + init_code.len());
-            addr_input.extend_from_slice(&self.ctx.self_address.to_le_bytes());
+            let mut addr_input = Vec::with_capacity(32 + init_code.len());
+            addr_input.extend_from_slice(&self.ctx.self_address);
             addr_input.extend_from_slice(&init_code);
-            let hash = pyde_crypto::poseidon2::poseidon2_hash(&addr_input);
-            u64::from_le_bytes(hash.to_bytes()[..8].try_into().unwrap())
+            pyde_crypto::poseidon2::poseidon2_hash(&addr_input).to_bytes()
         };
 
         self.contracts.insert(new_addr, init_code);
@@ -1272,6 +1278,13 @@ mod tests {
     /// Build bytecode from instruction byte arrays.
     fn bytecode(instrs: &[[u8; 4]]) -> Vec<u8> {
         instrs.iter().flat_map(|i| i.iter().copied()).collect()
+    }
+
+    /// Helper: create a 32-byte Address from a u64 seed (for test readability).
+    fn addr(seed: u64) -> Address {
+        let mut a = ZERO_ADDRESS;
+        a[..8].copy_from_slice(&seed.to_le_bytes());
+        a
     }
 
     // ========== Task 0145: JMP ==========
@@ -2008,34 +2021,37 @@ mod tests {
 
     #[test]
     fn caller_returns_msg_sender() {
+        let caller_addr = addr(0xDEAD_BEEF);
         let ctx = ExecutionContext {
-            caller: 0xDEAD_BEEF,
+            caller: caller_addr,
             ..Default::default()
         };
         let code = bytecode(&[
-            instr_bytes(Opcode::Caller, 1, 0, env_gp::CALLER),
+            // CALLER returns 32-byte address via wide register
+            instr_bytes(Opcode::Callvalue, 0, 0, env_wide::CALLER),
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         let mut vm = Vm::with_context(ctx);
         vm.load(&code).unwrap();
         assert_eq!(vm.run().unwrap(), ExecResult::Halt);
-        assert_eq!(vm.cpu.read_gp(1), 0xDEAD_BEEF);
+        assert_eq!(vm.cpu.read_wide(0).to_le_bytes(), caller_addr);
     }
 
     #[test]
     fn address_returns_self() {
+        let self_addr = addr(0xCAFE_BABE);
         let ctx = ExecutionContext {
-            self_address: 0xCAFE_BABE,
+            self_address: self_addr,
             ..Default::default()
         };
         let code = bytecode(&[
-            instr_bytes(Opcode::Caller, 1, 0, env_gp::ADDRESS),
+            instr_bytes(Opcode::Callvalue, 0, 0, env_wide::ADDRESS),
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         let mut vm = Vm::with_context(ctx);
         vm.load(&code).unwrap();
         assert_eq!(vm.run().unwrap(), ExecResult::Halt);
-        assert_eq!(vm.cpu.read_gp(1), 0xCAFE_BABE);
+        assert_eq!(vm.cpu.read_wide(0).to_le_bytes(), self_addr);
     }
 
     #[test]
@@ -2120,15 +2136,17 @@ mod tests {
     #[test]
     fn balance_returns_account_balance() {
         let bal = U256::from(42_000u64);
+        let target_addr = addr(100);
         let mut ctx = ExecutionContext::default();
-        ctx.balances.insert(100, bal);
+        ctx.balances.insert(target_addr, bal);
 
+        // Put target address into wide register w1, query balance into w0
+        let mut vm = Vm::with_context(ctx);
+        vm.cpu.write_wide(1, U256::from_le_bytes(target_addr));
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 100), // r1 = address 100
-            instr_bytes(Opcode::Callvalue, 0, 1, env_wide::BALANCE), // w0 = balance(r1)
+            instr_bytes(Opcode::Callvalue, 0, 1, env_wide::BALANCE), // w0 = balance(w1)
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
-        let mut vm = Vm::with_context(ctx);
         vm.load(&code).unwrap();
         assert_eq!(vm.run().unwrap(), ExecResult::Halt);
         assert_eq!(vm.cpu.read_wide(0), bal);
@@ -2136,12 +2154,12 @@ mod tests {
 
     #[test]
     fn balance_unknown_address_returns_zero() {
+        let mut vm = Vm::new();
+        vm.cpu.write_wide(1, U256::from(999u64));
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 999),
             instr_bytes(Opcode::Callvalue, 0, 1, env_wide::BALANCE),
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
-        let mut vm = Vm::new();
         vm.load(&code).unwrap();
         assert_eq!(vm.run().unwrap(), ExecResult::Halt);
         assert_eq!(vm.cpu.read_wide(0), U256::ZERO);
@@ -2465,7 +2483,7 @@ mod tests {
     #[test]
     fn sstore_then_sload_roundtrip() {
         let ctx = ExecutionContext {
-            self_address: 0xBEEF,
+            self_address: addr(0xBEEF),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
@@ -2485,7 +2503,7 @@ mod tests {
     #[test]
     fn sdelete_sets_value_to_zero_and_grants_refund() {
         let ctx = ExecutionContext {
-            self_address: 0xBEEF,
+            self_address: addr(0xBEEF),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
@@ -2521,11 +2539,11 @@ mod tests {
     fn storage_key_derivation_uses_contract_address() {
         // Same slot, different contract address → different derived key
         let ctx1 = ExecutionContext {
-            self_address: 0xAAAA,
+            self_address: addr(0xAAAA),
             ..Default::default()
         };
         let ctx2 = ExecutionContext {
-            self_address: 0xBBBB,
+            self_address: addr(0xBBBB),
             ..Default::default()
         };
         let mut vm1 = Vm::with_context(ctx1);
@@ -2578,7 +2596,7 @@ mod tests {
         // Store a 50-byte value via memory mode, load it back
         let heap = crate::memory::HEAP_START;
         let ctx = ExecutionContext {
-            self_address: 0xBEEF,
+            self_address: addr(0xBEEF),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
@@ -2759,7 +2777,7 @@ mod tests {
     fn log_emits_event_with_topics_and_data() {
         let heap = crate::memory::HEAP_START;
         let ctx = ExecutionContext {
-            self_address: 0xCAFE,
+            self_address: addr(0xCAFE),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
@@ -2780,7 +2798,7 @@ mod tests {
 
         assert_eq!(vm.logs.len(), 1);
         let log = &vm.logs[0];
-        assert_eq!(log.address, 0xCAFE);
+        assert_eq!(log.address, addr(0xCAFE));
         assert_eq!(log.topics.len(), 2);
         assert_eq!(log.topics[0], topic0);
         assert_eq!(log.topics[1], topic1);
@@ -2929,7 +2947,7 @@ mod tests {
     #[test]
     fn execute_revert_rolls_back_storage() {
         let ctx = ExecutionContext {
-            self_address: 0xBEEF,
+            self_address: addr(0xBEEF),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
@@ -2981,7 +2999,7 @@ mod tests {
     #[test]
     fn execute_out_of_gas_rolls_back() {
         let ctx = ExecutionContext {
-            self_address: 0xBEEF,
+            self_address: addr(0xBEEF),
             ..Default::default()
         };
         let mut vm = Vm::with_gas_limit_and_context(10, ctx); // very tight gas limit
@@ -3012,7 +3030,7 @@ mod tests {
         // w0 = slot 0 (sender balance)
         // w1 = loaded balance
         let ctx = ExecutionContext {
-            self_address: 0xAAAA,
+            self_address: addr(0xAAAA),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
@@ -3046,7 +3064,7 @@ mod tests {
     #[test]
     fn execute_token_transfer_insufficient_reverts() {
         let ctx = ExecutionContext {
-            self_address: 0xAAAA,
+            self_address: addr(0xAAAA),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
@@ -3106,7 +3124,7 @@ mod tests {
     fn execute_success_preserves_storage_and_logs() {
         let heap = crate::memory::HEAP_START;
         let ctx = ExecutionContext {
-            self_address: 0xBEEF,
+            self_address: addr(0xBEEF),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
@@ -3138,10 +3156,10 @@ mod tests {
     // --- M1.13: Contract Call Instruction tests ---
 
     /// Helper: create a VM with a contract registry containing the given contracts.
-    fn vm_with_contracts(contracts: Vec<(u64, Vec<u8>)>) -> Vm {
+    fn vm_with_contracts(contracts: Vec<(Address, Vec<u8>)>) -> Vm {
         let mut vm = Vm::new();
-        for (addr, code) in contracts {
-            vm.contracts.insert(addr, code);
+        for (a, code) in contracts {
+            vm.contracts.insert(a, code);
         }
         vm
     }
@@ -3157,26 +3175,22 @@ mod tests {
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
-        // Caller: set up target addr + calldata, CALL_EXT, HALT
-        // r1 = target address (0xBBB)
-        // r2 = calldata ptr (doesn't matter, len=0)
-        // r3 = calldata len (0)
-        // r4 = gas to forward (0 = all)
-        // CALL_EXT rd=1, rs1=2, imm = (gas_reg=4 << 4) | len_reg=3 = 0x43
+        // Caller: target address in w0, calldata in r2, len in r3, gas in r4
+        // CallExt wd=0, rs1=2, imm = (result_reg=1 << 8) | (gas_reg=4 << 4) | len_reg=3
         let caller_code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 0xBBB),       // r1 = target
             instr_ri(Opcode::Addi, 3, 0, 0),            // r3 = calldata len = 0
             instr_ri(Opcode::Addi, 4, 0, 0),            // r4 = gas = 0 (all)
-            instr_bytes(Opcode::CallExt, 1, 2, 0x43),   // call_ext r1, r2, (r4<<4|r3)
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143),  // call_ext w0, r2, (r1<<8|r4<<4|r3)
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
         let ctx = ExecutionContext {
-            self_address: 0xAAA,
+            self_address: addr(0xAAA),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
-        vm.contracts.insert(0xBBB, callee_code);
+        vm.cpu.write_wide(0, U256::from_le_bytes(addr(0xBBB)));
+        vm.contracts.insert(addr(0xBBB), callee_code);
         vm.load(&caller_code).unwrap();
         let output = vm.execute();
 
@@ -3188,71 +3202,71 @@ mod tests {
 
     #[test]
     fn ext_call_reentrancy_blocked() {
-        // Contract A calls contract B, contract B tries to call A back → Reentrancy trap
-        // B's code: call A (which is already on the call stack)
+        // B's code: load addr A into w0, call A (reentrancy!)
         let code_b = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 0xAA),         // r1 = addr of A
-            instr_ri(Opcode::Addi, 3, 0, 0),             // r3 = calldata len = 0
-            instr_ri(Opcode::Addi, 4, 0, 0),             // r4 = gas = 0
-            instr_bytes(Opcode::CallExt, 1, 2, 0x43),    // call_ext → A (reentrancy!)
+            instr_ri(Opcode::Addi, 1, 0, 0xAA),
+            instr_bytes(Opcode::Widen, 0, 1, 0),         // w0 = addr(0xAA)
+            instr_ri(Opcode::Addi, 3, 0, 0),
+            instr_ri(Opcode::Addi, 4, 0, 0),
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143),   // result→r1
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
+        // A's code: load addr B into w0, call B
         let code_a = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 0xBB),         // r1 = addr of B
+            instr_ri(Opcode::Addi, 1, 0, 0xBB),
+            instr_bytes(Opcode::Widen, 0, 1, 0),         // w0 = addr(0xBB)
             instr_ri(Opcode::Addi, 3, 0, 0),
             instr_ri(Opcode::Addi, 4, 0, 0),
-            instr_bytes(Opcode::CallExt, 1, 2, 0x43),    // call B
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143),   // result→r1
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
         let ctx = ExecutionContext {
-            self_address: 0xAA,
+            self_address: addr(0xAA),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
-        vm.contracts.insert(0xAA, code_a.clone());
-        vm.contracts.insert(0xBB, code_b);
+        vm.contracts.insert(addr(0xAA), code_a.clone());
+        vm.contracts.insert(addr(0xBB), code_b);
         vm.load(&code_a).unwrap();
         let output = vm.execute();
 
-        // A's call to B succeeds (B itself runs and halts OK).
-        // B's internal call back to A fails silently (reentrancy blocked, B's r1 = 0).
-        // But B still completes with HALT, so A sees success.
         assert_eq!(output.outcome, Outcome::Success);
-        assert_eq!(vm.cpu.read_gp(1), 1); // A→B call succeeded (B halted OK)
+        assert_eq!(vm.cpu.read_gp(1), 1);
     }
 
     // ========== Task 0205: STATICCALL reverts on state modification ==========
 
     #[test]
     fn staticcall_reverts_on_sstore() {
-        // Callee tries to SSTORE — should fail in static mode
         let callee_code = bytecode(&[
-            instr_bytes(Opcode::Sstore, 0, 0, 0),  // attempt state write
+            instr_bytes(Opcode::Sstore, 0, 0, 0),
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
-        // Caller does a static call (imm bit 8 set): imm = 0x143 = (1<<8) | (r4<<4) | r3
+        // imm = (result_reg=1 << 8) | (static=1 << 12) | (gas_reg=4 << 4) | len_reg=3
+        // But we need static bit — with new encoding, static is imm[12]
+        // For simplicity, pre-load w0 with target and set static_mode on caller
         let caller_code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 0xCC),         // r1 = target
             instr_ri(Opcode::Addi, 3, 0, 0),
             instr_ri(Opcode::Addi, 4, 0, 0),
-            instr_bytes(Opcode::CallExt, 1, 2, 0x143),   // static call (bit 8 set)
+            instr_bytes(Opcode::CallExt, 0, 2, 0x1143), // result→r1, static bit[12]=1
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
         let ctx = ExecutionContext {
-            self_address: 0xDD,
+            self_address: addr(0xDD),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
-        vm.contracts.insert(0xCC, callee_code);
+        vm.cpu.write_wide(0, U256::from_le_bytes(addr(0xCC)));
+        vm.contracts.insert(addr(0xCC), callee_code);
         vm.load(&caller_code).unwrap();
         let output = vm.execute();
 
         assert_eq!(output.outcome, Outcome::Success);
-        assert_eq!(vm.cpu.read_gp(1), 0); // static call failed (callee tried to write)
+        assert_eq!(vm.cpu.read_gp(1), 0);
     }
 
     // ========== Task 0206: Nested calls (A calls B calls C) ==========
@@ -3266,29 +3280,30 @@ mod tests {
 
         // B: calls C, then halts
         let code_b = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 0x30),         // r1 = addr C
+            instr_ri(Opcode::Addi, 1, 0, 0x30),
+            instr_bytes(Opcode::Widen, 0, 1, 0),         // w0 = addr(0x30)
             instr_ri(Opcode::Addi, 3, 0, 0),
             instr_ri(Opcode::Addi, 4, 0, 0),
-            instr_bytes(Opcode::CallExt, 1, 2, 0x43),
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143),   // result→r1
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
-        // A: calls B, checks success, then halts
         let code_a = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 0x20),         // r1 = addr B
+            instr_ri(Opcode::Addi, 1, 0, 0x20),
+            instr_bytes(Opcode::Widen, 0, 1, 0),         // w0 = addr(0x20)
             instr_ri(Opcode::Addi, 3, 0, 0),
             instr_ri(Opcode::Addi, 4, 0, 0),
-            instr_bytes(Opcode::CallExt, 1, 2, 0x43),
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143),   // result→r1
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
         let ctx = ExecutionContext {
-            self_address: 0x10,
+            self_address: addr(0x10),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
-        vm.contracts.insert(0x20, code_b);
-        vm.contracts.insert(0x30, code_c);
+        vm.contracts.insert(addr(0x20), code_b);
+        vm.contracts.insert(addr(0x30), code_c);
         vm.load(&code_a).unwrap();
         let output = vm.execute();
 
@@ -3310,22 +3325,21 @@ mod tests {
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
-        // Caller: forward very little gas (10)
         let caller_code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 0xEE),
             instr_ri(Opcode::Addi, 3, 0, 0),
             instr_ri(Opcode::Addi, 4, 0, 10),            // only 10 gas forwarded
-            instr_bytes(Opcode::CallExt, 1, 2, 0x43),
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143),   // result→r1
             instr_ri(Opcode::Addi, 5, 0, 99),            // parent continues
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
         let ctx = ExecutionContext {
-            self_address: 0xFF,
+            self_address: addr(0xFF),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
-        vm.contracts.insert(0xEE, callee_code);
+        vm.cpu.write_wide(0, U256::from_le_bytes(addr(0xEE)));
+        vm.contracts.insert(addr(0xEE), callee_code);
         vm.load(&caller_code).unwrap();
         let output = vm.execute();
 
@@ -3347,7 +3361,7 @@ mod tests {
         ]);
 
         let ctx = ExecutionContext {
-            self_address: 0x1234,
+            self_address: addr(0x1234),
             ..Default::default()
         };
         let mut vm = Vm::with_context(ctx);
@@ -3359,7 +3373,8 @@ mod tests {
         vm.cpu.write_gp(2, heap as u64);            // r2 = code ptr
         vm.cpu.write_gp(3, init_code.len() as u64); // r3 = code len
 
-        // CREATE rd=1, rs1=2, imm = len_reg=3 → 0x03
+        // CREATE wd=1, rs1=2, imm = len_reg=3 → 0x03
+        // Result address written to wide register w1
         let caller_code = bytecode(&[
             instr_bytes(Opcode::Create, 1, 2, 0x03),
             instr_bytes(Opcode::Halt, 0, 0, 0),
@@ -3368,8 +3383,8 @@ mod tests {
         let output = vm.execute();
 
         assert_eq!(output.outcome, Outcome::Success);
-        let new_addr = vm.cpu.read_gp(1);
-        assert_ne!(new_addr, 0);
+        let new_addr: Address = vm.cpu.read_wide(1).to_le_bytes();
+        assert_ne!(new_addr, ZERO_ADDRESS);
         // Contract should be registered
         assert!(vm.contracts.contains_key(&new_addr));
         assert_eq!(vm.contracts[&new_addr], init_code);
@@ -3388,7 +3403,7 @@ mod tests {
         let mut addrs = Vec::new();
         for _ in 0..2 {
             let ctx = ExecutionContext {
-                self_address: 0x5678,
+                self_address: addr(0x5678),
                 ..Default::default()
             };
             let mut vm = Vm::with_context(ctx);
@@ -3404,10 +3419,11 @@ mod tests {
             ]);
             vm.load(&code).unwrap();
             vm.execute();
-            addrs.push(vm.cpu.read_gp(1));
+            let new_addr: Address = vm.cpu.read_wide(1).to_le_bytes();
+            addrs.push(new_addr);
         }
 
         assert_eq!(addrs[0], addrs[1]);
-        assert_ne!(addrs[0], 0);
+        assert_ne!(addrs[0], ZERO_ADDRESS);
     }
 }

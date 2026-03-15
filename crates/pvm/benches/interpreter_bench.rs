@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use pyde_vm::isa::{encode, encode_immediate, Opcode};
-use pyde_vm::vm::{ExecutionContext, ExecResult, Outcome, Vm};
+use pyde_vm::vm::{ExecutionContext, ExecResult, Outcome, Vm, ZERO_ADDRESS};
 use pyde_vm::wide::U256;
 
 /// Helper: encode an instruction to little-endian bytes.
@@ -159,7 +159,11 @@ fn transfer_code() -> Vec<u8> {
 /// Set up a VM with pre-populated storage for a token transfer.
 fn setup_transfer_vm(code: &[u8], gas_limit: u64) -> Vm {
     let ctx = ExecutionContext {
-        self_address: 0xAAAA,
+        self_address: {
+            let mut a = ZERO_ADDRESS;
+            a[..8].copy_from_slice(&0xAAAAu64.to_le_bytes());
+            a
+        },
         ..Default::default()
     };
     let mut vm = if gas_limit > 0 {

@@ -126,8 +126,10 @@ fn transfer_code() -> Vec<u8> {
 }
 
 fn setup_transfer_vm(code: &[u8]) -> Vm {
+    let mut addr = [0u8; 32];
+    addr[..8].copy_from_slice(&0xAAAAu64.to_le_bytes());
     let ctx = ExecutionContext {
-        self_address: 0xAAAA,
+        self_address: addr,
         ..Default::default()
     };
     let mut vm = Vm::with_context(ctx);
