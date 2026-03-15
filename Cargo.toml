@@ -4,4 +4,5 @@ members = [
     "crates/crypto",
     "crates/pvm",
     "crates/aot",
+    "crates/state",
 ]
