@@ -174,6 +174,15 @@ pub struct MerkleProof {
 }
 
 impl MerkleProof {
+    /// Compile this proof into a more compact representation for serialization.
+    pub fn compile(self, keys: Vec<Key>) -> CompiledProof {
+        let compiled = self
+            .inner
+            .compile(keys)
+            .expect("proof compilation failed");
+        CompiledProof { inner: compiled }
+    }
+
     /// Verify this proof against a root hash and expected leaves.
     /// `leaves` is a list of (key, value) pairs. Use empty vec for non-existence.
     pub fn verify(
@@ -191,7 +200,7 @@ impl MerkleProof {
         self.inner
             .clone()
             .verify::<Poseidon2Hasher>(&root, smt_leaves)
-            .is_ok()
+            .unwrap_or(false)
     }
 
     /// Verify non-existence of keys against a root hash.
@@ -203,7 +212,41 @@ impl MerkleProof {
         self.inner
             .clone()
             .verify::<Poseidon2Hasher>(&root, smt_leaves)
-            .is_ok()
+            .unwrap_or(false)
+    }
+}
+
+/// A compiled Merkle proof — more compact, better for serialization and wire transfer.
+pub struct CompiledProof {
+    inner: sparse_merkle_tree::CompiledMerkleProof,
+}
+
+impl CompiledProof {
+    /// Verify this compiled proof against a root and leaves.
+    pub fn verify(&self, root: H256, leaves: Vec<(Key, Vec<u8>)>) -> bool {
+        let smt_leaves: Vec<(Key, H256)> = leaves
+            .iter()
+            .map(|(k, v)| {
+                let val = SmtValue(v.clone());
+                (*k, val.to_h256())
+            })
+            .collect();
+        self.inner
+            .clone()
+            .verify::<Poseidon2Hasher>(&root, smt_leaves)
+            .unwrap_or(false)
+    }
+
+    /// Serialize to bytes for wire transfer.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.inner.clone().into()
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(data: Vec<u8>) -> Self {
+        Self {
+            inner: sparse_merkle_tree::CompiledMerkleProof(data),
+        }
     }
 }
 
@@ -433,5 +476,54 @@ mod tests {
     fn empty_tree_is_empty() {
         let smt = PydeSMT::new();
         assert!(smt.is_empty());
+    }
+
+    #[test]
+    fn verify_rejects_tampered_value() {
+        let mut smt = PydeSMT::new();
+        let key = key_from_seed(1);
+        smt.insert(key, b"real".to_vec());
+
+        let root = smt.root();
+        let proof = smt.prove(vec![key]);
+
+        // Correct value passes
+        assert!(proof.verify(root, vec![(key, b"real".to_vec())]));
+        // Tampered value fails
+        assert!(!proof.verify(root, vec![(key, b"fake".to_vec())]));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_root() {
+        let mut smt = PydeSMT::new();
+        let key = key_from_seed(1);
+        let value = b"data".to_vec();
+        smt.insert(key, value.clone());
+
+        let root = smt.root();
+        let proof = smt.prove(vec![key]);
+
+        // Correct root passes
+        assert!(proof.verify(root, vec![(key, value.clone())]));
+        // Wrong root fails
+        let fake_root = H256::from(poseidon2_hash(b"wrong").to_bytes());
+        assert!(!proof.verify(fake_root, vec![(key, value)]));
+    }
+
+    // ========== Compiled proof ==========
+
+    #[test]
+    fn compiled_proof_verifies() {
+        let mut smt = PydeSMT::new();
+        let key = key_from_seed(1);
+        let value = b"value".to_vec();
+        smt.insert(key, value.clone());
+
+        let root = smt.root();
+        let proof = smt.prove(vec![key]);
+        let compiled = proof.compile(vec![key]);
+
+        assert!(compiled.verify(root, vec![(key, value.clone())]));
+        assert!(!compiled.verify(root, vec![(key, b"wrong".to_vec())]));
     }
 }

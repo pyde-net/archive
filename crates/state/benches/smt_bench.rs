@@ -77,8 +77,30 @@ fn bench_proof() {
     println!("  {iterations:>6} verifies: {us_per_verify:>8.1} µs/verify");
 }
 
+fn bench_batch_insert() {
+    println!("\n=== SMT batch insert (update_all) ===\n");
+
+    for count in [100u64, 1_000, 10_000] {
+        let pairs: Vec<_> = (0..count)
+            .map(|i| (key_from_seed(i + 100_000), format!("v{i}").into_bytes()))
+            .collect();
+
+        let mut smt = PydeSMT::new();
+        let start = Instant::now();
+        smt.update_all(pairs);
+        let elapsed = start.elapsed();
+
+        let ops_sec = count as f64 / elapsed.as_secs_f64();
+        println!(
+            "  {count:>6} batch:    {ops_sec:>10.0} ops/sec ({:.1}ms)",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+}
+
 fn main() {
     bench_insert();
+    bench_batch_insert();
     bench_get();
     bench_proof();
     println!();
