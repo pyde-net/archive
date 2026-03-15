@@ -1,0 +1,9 @@
+[package]
+name = "pyde-account"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pyde-crypto = { path = "../crypto" }
+pyde-state = { path = "../state" }
+sparse-merkle-tree = "0.6"
