@@ -8,7 +8,7 @@
 //! shared siblings. This reduces witness size from O(N * depth) to
 //! O(N * log(N) + depth) for N keys.
 
-use crate::smt::{CompiledProof, Key, PydeSMT, SmtValue};
+use crate::smt::{CompiledProof, Key, PydeSMT};
 use sparse_merkle_tree::H256;
 
 /// A leaf entry in the witness: key + current value.
@@ -36,9 +36,7 @@ pub struct BlockWitness {
 impl BlockWitness {
     /// Total serialized size of the witness (proof + entries).
     pub fn size_bytes(&self) -> usize {
-        let entries_size: usize = self.entries.iter()
-            .map(|e| 32 + e.value.len())
-            .sum();
+        let entries_size: usize = self.entries.iter().map(|e| 32 + e.value.len()).sum();
         self.proof.len() + entries_size + 64 // + 2 roots
     }
 

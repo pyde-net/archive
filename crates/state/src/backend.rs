@@ -214,7 +214,7 @@ impl RocksDBBackend {
     /// Open a temporary database (for testing).
     pub fn open_tmp() -> Result<Self, BackendError> {
         let dir = tempfile::tempdir().map_err(|e| BackendError::Io(e.to_string()))?;
-        Self::open(dir.into_path().to_str().unwrap())
+        Self::open(dir.keep().to_str().unwrap())
     }
 
     fn branch_key_bytes(bk: &BranchKey) -> Vec<u8> {
@@ -329,8 +329,12 @@ impl<S> CachedBackend<S> {
     pub fn new(inner: S, capacity: usize) -> Self {
         Self {
             inner,
-            branch_cache: RefCell::new(lru::LruCache::new(std::num::NonZeroUsize::new(capacity).unwrap())),
-            leaf_cache: RefCell::new(lru::LruCache::new(std::num::NonZeroUsize::new(capacity).unwrap())),
+            branch_cache: RefCell::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(capacity).unwrap(),
+            )),
+            leaf_cache: RefCell::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(capacity).unwrap(),
+            )),
             hits: RefCell::new(0),
             misses: RefCell::new(0),
         }
@@ -348,7 +352,11 @@ impl<S> CachedBackend<S> {
         let h = *self.hits.borrow();
         let m = *self.misses.borrow();
         let total = h + m;
-        if total == 0 { 0.0 } else { h as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            h as f64 / total as f64
+        }
     }
 }
 
@@ -363,7 +371,9 @@ impl<S: StoreReadOps<SmtValue>> StoreReadOps<SmtValue> for CachedBackend<S> {
         }
         *self.misses.borrow_mut() += 1;
         let result = self.inner.get_branch(branch_key)?;
-        self.branch_cache.borrow_mut().put(branch_key.clone(), result.clone());
+        self.branch_cache
+            .borrow_mut()
+            .put(branch_key.clone(), result.clone());
         Ok(result)
     }
 
@@ -388,7 +398,9 @@ impl<S: StoreWriteOps<SmtValue>> StoreWriteOps<SmtValue> for CachedBackend<S> {
         node_key: BranchKey,
         branch: sparse_merkle_tree::BranchNode,
     ) -> Result<(), sparse_merkle_tree::error::Error> {
-        self.branch_cache.borrow_mut().put(node_key.clone(), Some(branch.clone()));
+        self.branch_cache
+            .borrow_mut()
+            .put(node_key.clone(), Some(branch.clone()));
         self.inner.insert_branch(node_key, branch)
     }
 
@@ -397,7 +409,9 @@ impl<S: StoreWriteOps<SmtValue>> StoreWriteOps<SmtValue> for CachedBackend<S> {
         leaf_key: H256,
         leaf: SmtValue,
     ) -> Result<(), sparse_merkle_tree::error::Error> {
-        self.leaf_cache.borrow_mut().put(leaf_key, Some(leaf.clone()));
+        self.leaf_cache
+            .borrow_mut()
+            .put(leaf_key, Some(leaf.clone()));
         self.inner.insert_leaf(leaf_key, leaf)
     }
 
@@ -542,9 +556,12 @@ mod tests {
         let _val = smt.get(&key).unwrap();
 
         let store = smt.take_store();
-        assert!(store.cache_hits() > 0 || store.cache_misses() > 0,
+        assert!(
+            store.cache_hits() > 0 || store.cache_misses() > 0,
             "cache should have recorded activity: hits={} misses={}",
-            store.cache_hits(), store.cache_misses());
+            store.cache_hits(),
+            store.cache_misses()
+        );
     }
 
     // ========== Serialization roundtrip ==========

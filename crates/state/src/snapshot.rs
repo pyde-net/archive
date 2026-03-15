@@ -5,7 +5,7 @@
 //! - Chunking: split snapshot into fixed-size chunks for network transfer
 //! - Verification: reconstruct root from chunks to verify integrity
 
-use crate::smt::{Key, PydeSMT, SmtValue};
+use crate::smt::{Key, PydeSMT};
 use pyde_crypto::poseidon2::poseidon2_hash;
 use sparse_merkle_tree::H256;
 
