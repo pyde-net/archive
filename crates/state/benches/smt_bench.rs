@@ -142,9 +142,33 @@ fn bench_rocksdb() {
     }
 }
 
+fn bench_update_all_scaling() {
+    println!("\n=== update_all scaling (single call per block) ===\n");
+
+    for count in [1_000u64, 5_000, 10_000, 20_000, 50_000, 80_000] {
+        let mut smt = PydeSMT::new();
+        let entries: Vec<_> = (0..count)
+            .map(|i| (key_from_seed(i), format!("v{i}").into_bytes()))
+            .collect();
+
+        let start = Instant::now();
+        smt.update_all(entries);
+        let elapsed = start.elapsed();
+
+        let ops_sec = count as f64 / elapsed.as_secs_f64();
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        let within_budget = if ms < 400.0 { "OK" } else { "SLOW" };
+        println!(
+            "  {count:>6} updates:  {ops_sec:>10.0} ops/sec ({ms:.0}ms) [{within_budget}]"
+        );
+    }
+}
+
+
 fn main() {
     bench_insert();
     bench_batch_insert();
+    bench_update_all_scaling();
     bench_get();
     bench_proof();
     bench_rocksdb();
