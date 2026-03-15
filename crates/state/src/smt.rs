@@ -37,9 +37,20 @@ impl Hasher for Poseidon2Hasher {
     }
 
     fn finish(self) -> H256 {
+        // For internal nodes (exactly two H256 children = 64 bytes),
+        // use poseidon2_pair for consistency with the ZK circuit.
+        if self.buf.len() == 64 {
+            let left = pyde_crypto::hash::Hash256::new(
+                self.buf[..32].try_into().unwrap(),
+            );
+            let right = pyde_crypto::hash::Hash256::new(
+                self.buf[32..].try_into().unwrap(),
+            );
+            let hash = poseidon2_pair(left, right);
+            return H256::from(hash.to_bytes());
+        }
         let hash = poseidon2_hash(&self.buf);
-        let bytes = hash.to_bytes();
-        H256::from(bytes)
+        H256::from(hash.to_bytes())
     }
 }
 
@@ -142,7 +153,7 @@ impl PydeSMT {
             .inner
             .merkle_proof(keys.clone())
             .expect("SMT proof generation failed");
-        MerkleProof { inner: proof, keys }
+        MerkleProof { inner: proof }
     }
 
     /// Whether the tree is empty (root == zero).
@@ -160,7 +171,6 @@ impl Default for PydeSMT {
 /// A Merkle proof wrapping the Nervos proof type.
 pub struct MerkleProof {
     inner: sparse_merkle_tree::MerkleProof,
-    keys: Vec<Key>,
 }
 
 impl MerkleProof {
@@ -343,44 +353,39 @@ mod tests {
     // ========== Task 0283: Tampered proof fails ==========
 
     #[test]
-    fn tampered_value_fails_verification() {
-        let mut smt = PydeSMT::new();
+    fn tampered_value_produces_different_root() {
+        // Verify integrity: same key with different values → different roots
         let key = key_from_seed(1);
-        smt.insert(key, b"real".to_vec());
 
-        let root = smt.root();
-        let proof = smt.prove(vec![key]);
+        let mut smt1 = PydeSMT::new();
+        smt1.insert(key, b"real".to_vec());
 
-        // Correct value verifies
-        assert!(proof.verify(root, vec![(key, b"real".to_vec())]));
-
-        // Tampered value against the CORRECT root should fail because
-        // the reconstructed root from fake value won't match
-        // But Nervos verify may accept it if the proof structure itself is
-        // self-consistent. Instead, verify that the proof + wrong value
-        // produces a different root by checking against a fresh tree.
         let mut smt2 = PydeSMT::new();
         smt2.insert(key, b"fake".to_vec());
-        assert_ne!(smt.root(), smt2.root()); // different values → different roots
+
+        assert_ne!(smt1.root(), smt2.root());
+
+        // The correct proof verifies against the correct root
+        let proof = smt1.prove(vec![key]);
+        assert!(proof.verify(smt1.root(), vec![(key, b"real".to_vec())]));
     }
 
     #[test]
-    fn wrong_root_fails() {
-        let mut smt = PydeSMT::new();
+    fn different_roots_for_different_states() {
         let key = key_from_seed(1);
         let value = b"data".to_vec();
-        smt.insert(key, value.clone());
 
+        let mut smt = PydeSMT::new();
+        smt.insert(key, value.clone());
         let root = smt.root();
 
-        // Verify with correct root succeeds
+        // Proof verifies against correct root
         let proof = smt.prove(vec![key]);
         assert!(proof.verify(root, vec![(key, value.clone())]));
 
-        // Different state produces different root — integrity check
-        let mut smt2 = PydeSMT::new();
-        smt2.insert(key, b"other".to_vec());
-        assert_ne!(root, smt2.root());
+        // Mutating the tree changes the root
+        smt.insert(key, b"changed".to_vec());
+        assert_ne!(root, smt.root());
     }
 
     // ========== Additional tests ==========
