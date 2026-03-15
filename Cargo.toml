@@ -6,4 +6,5 @@ members = [
     "crates/aot",
     "crates/state",
     "crates/account",
+    "crates/tx",
 ]
