@@ -175,9 +175,10 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // Environment host functions: (ctx) -> u64
-    let fn_caller = module.declare_function("host_caller", Linkage::Import, &sig_pop)
+    // host_caller(ctx, wd) -> u64, host_address(ctx, wd) -> u64
+    let fn_caller = module.declare_function("host_caller", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let fn_address = module.declare_function("host_address", Linkage::Import, &sig_pop)
+    let fn_address = module.declare_function("host_address", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     let fn_block_number = module.declare_function("host_block_number", Linkage::Import, &sig_pop)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
@@ -730,11 +731,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let sub = d.rs2_or_imm;
                         let call = match sub {
-                            0 => builder.ins().call(fn_caller_ref, &[vm_ctx]),      // CALLER
-                            1 => builder.ins().call(fn_address_ref, &[vm_ctx]),     // ADDRESS
-                            2 => builder.ins().call(fn_block_number_ref, &[vm_ctx]),// BLOCK_NUMBER
-                            3 => builder.ins().call(fn_timestamp_ref, &[vm_ctx]),   // TIMESTAMP
-                            4 => builder.ins().call(fn_gas_remaining_ref, &[vm_ctx]),// GAS_REMAINING
+                            0 => builder.ins().call(fn_block_number_ref, &[vm_ctx]),
+                            1 => builder.ins().call(fn_timestamp_ref, &[vm_ctx]),
+                            2 => builder.ins().call(fn_gas_remaining_ref, &[vm_ctx]),
                             _ => {
                                 builder.ins().jump(trap_block, &[]);
                                 terminated = true;
@@ -755,6 +754,8 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                                 let addr = builder.use_var(Variable::from_u32(d.rs1 as u32));
                                 builder.ins().call(fn_balance_ref, &[vm_ctx, addr, wd]);
                             }
+                            3 => { builder.ins().call(fn_caller_ref, &[vm_ctx, wd]); }  // CALLER
+                            4 => { builder.ins().call(fn_address_ref, &[vm_ctx, wd]); } // ADDRESS
                             _ => {
                                 builder.ins().jump(trap_block, &[]);
                                 terminated = true;

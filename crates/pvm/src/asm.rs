@@ -299,10 +299,11 @@ enum PseudoEnv {
 fn parse_pseudo_env(s: &str) -> Option<PseudoEnv> {
     use crate::vm::{env_gp, env_wide};
     match s {
-        "address" => Some(PseudoEnv::Gp(env_gp::ADDRESS)),
         "blocknumber" => Some(PseudoEnv::Gp(env_gp::BLOCK_NUMBER)),
         "timestamp" => Some(PseudoEnv::Gp(env_gp::TIMESTAMP)),
         "gasremaining" => Some(PseudoEnv::Gp(env_gp::GAS_REMAINING)),
+        "caller" => Some(PseudoEnv::Wide(env_wide::CALLER)),
+        "address" => Some(PseudoEnv::Wide(env_wide::ADDRESS)),
         "gasprice" => Some(PseudoEnv::Wide(env_wide::GAS_PRICE)),
         "balance" => Some(PseudoEnv::WideWithInput(env_wide::BALANCE)),
         _ => None,
@@ -1505,8 +1506,6 @@ fn disassemble_one(opcode: Opcode, rd: u8, rs1: u8, rs2_or_imm: u32) -> String {
         Opcode::Caller => {
             use crate::vm::env_gp;
             match rs2_or_imm {
-                env_gp::CALLER => format!("caller r{}", rd),
-                env_gp::ADDRESS => format!("address r{}", rd),
                 env_gp::BLOCK_NUMBER => format!("blocknumber r{}", rd),
                 env_gp::TIMESTAMP => format!("timestamp r{}", rd),
                 env_gp::GAS_REMAINING => format!("gasremaining r{}", rd),
@@ -1521,6 +1520,8 @@ fn disassemble_one(opcode: Opcode, rd: u8, rs1: u8, rs2_or_imm: u32) -> String {
                 env_wide::CALL_VALUE => format!("callvalue w{}", rd),
                 env_wide::GAS_PRICE => format!("gasprice w{}", rd),
                 env_wide::BALANCE => format!("balance w{}, r{}", rd, rs1),
+                env_wide::CALLER => format!("caller w{}", rd),
+                env_wide::ADDRESS => format!("address w{}", rd),
                 _ => format!("callvalue w{}, r{}, {}", rd, rs1, rs2_or_imm),
             }
         }
@@ -1940,25 +1941,26 @@ mod tests {
 
     #[test]
     fn assemble_system_pseudo_mnemonics() {
-        use crate::vm::env_gp;
+        use crate::vm::{env_gp, env_wide};
 
         // GP env queries
         let code =
-            assemble("caller r1\naddress r2\nblocknumber r3\ntimestamp r4\ngasremaining r5\nhalt")
+            assemble("caller w1\naddress w2\nblocknumber r3\ntimestamp r4\ngasremaining r5\nhalt")
                 .unwrap();
         let d0 = decode(Instruction(u32::from_le_bytes(
             code[0..4].try_into().unwrap(),
         )));
-        assert_eq!(d0.opcode, Opcode::Caller);
+        // caller and address are now wide queries (Callvalue opcode)
+        assert_eq!(d0.opcode, Opcode::Callvalue);
         assert_eq!(d0.rd, 1);
-        assert_eq!(d0.rs2_or_imm, env_gp::CALLER);
+        assert_eq!(d0.rs2_or_imm, env_wide::CALLER);
 
         let d1 = decode(Instruction(u32::from_le_bytes(
             code[4..8].try_into().unwrap(),
         )));
-        assert_eq!(d1.opcode, Opcode::Caller);
+        assert_eq!(d1.opcode, Opcode::Callvalue);
         assert_eq!(d1.rd, 2);
-        assert_eq!(d1.rs2_or_imm, env_gp::ADDRESS);
+        assert_eq!(d1.rs2_or_imm, env_wide::ADDRESS);
 
         let d2 = decode(Instruction(u32::from_le_bytes(
             code[8..12].try_into().unwrap(),
@@ -2020,11 +2022,11 @@ mod tests {
 
     #[test]
     fn disassemble_system_roundtrip() {
-        let src = "caller r1\naddress r2\nblocknumber r3\ntimestamp r4\ngasremaining r5\nhalt\n";
+        let src = "caller w1\naddress w2\nblocknumber r3\ntimestamp r4\ngasremaining r5\nhalt\n";
         let code = assemble(src).unwrap();
         let text = disassemble(&code);
-        assert!(text.contains("caller r1"));
-        assert!(text.contains("address r2"));
+        assert!(text.contains("caller w1"));
+        assert!(text.contains("address w2"));
         assert!(text.contains("blocknumber r3"));
         assert!(text.contains("timestamp r4"));
         assert!(text.contains("gasremaining r5"));

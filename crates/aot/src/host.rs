@@ -308,16 +308,18 @@ pub extern "C" fn host_log(ctx: *mut VmCtx, desc_ptr: u64, num_topics: u64) -> u
 
 // ── Environment queries ────────────────────────────────────────────────
 
-/// Host: get caller (msg.sender). Returns the caller address.
-pub extern "C" fn host_caller(ctx: *mut VmCtx) -> u64 {
+/// Host: get caller (msg.sender) into wide register wd.
+pub extern "C" fn host_caller(ctx: *mut VmCtx, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    vm.ctx.caller
+    vm.cpu.write_wide(wd as u8, pyde_vm::wide::U256::from_le_bytes(vm.ctx.caller));
+    0
 }
 
-/// Host: get self address.
-pub extern "C" fn host_address(ctx: *mut VmCtx) -> u64 {
+/// Host: get self address into wide register wd.
+pub extern "C" fn host_address(ctx: *mut VmCtx, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    vm.ctx.self_address
+    vm.cpu.write_wide(wd as u8, pyde_vm::wide::U256::from_le_bytes(vm.ctx.self_address));
+    0
 }
 
 /// Host: get block number.
@@ -352,9 +354,11 @@ pub extern "C" fn host_gasprice(ctx: *mut VmCtx, wd: u64) -> u64 {
     0
 }
 
-/// Host: get balance of address into wide register.
-pub extern "C" fn host_balance(ctx: *mut VmCtx, addr: u64, wd: u64) -> u64 {
+/// Host: get balance of address (in wide register ws) into wide register wd.
+pub extern "C" fn host_balance(ctx: *mut VmCtx, ws_addr: u64, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
+    let addr_u256 = vm.cpu.read_wide(ws_addr as u8);
+    let addr: [u8; 32] = addr_u256.to_le_bytes();
     let bal = vm.ctx.balances.get(&addr).copied().unwrap_or(U256::ZERO);
     vm.cpu.write_wide(wd as u8, bal);
     0
