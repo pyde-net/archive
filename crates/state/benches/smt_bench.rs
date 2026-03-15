@@ -199,6 +199,36 @@ fn bench_witness() {
     }
 }
 
+fn bench_snapshot() {
+    println!("\n=== Snapshot create/restore ===\n");
+
+    for count in [100u64, 1_000, 10_000] {
+        let mut smt = PydeSMT::new();
+        let keys: Vec<_> = (0..count).map(|i| key_from_seed(i)).collect();
+        for (i, k) in keys.iter().enumerate() {
+            smt.insert(*k, format!("v{i}").into_bytes());
+        }
+
+        let start = Instant::now();
+        let snapshot = pyde_state::snapshot::create_snapshot(&smt, &keys);
+        let create_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let start = Instant::now();
+        let restored = pyde_state::snapshot::restore_snapshot(&snapshot);
+        let restore_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        assert_eq!(restored.root(), smt.root());
+
+        let size_kb = snapshot.entries.iter()
+            .map(|(k, v)| 32 + v.len())
+            .sum::<usize>() as f64 / 1024.0;
+
+        println!(
+            "  {count:>6} entries:  create {create_ms:>6.1}ms  restore {restore_ms:>6.1}ms  size {size_kb:.0}KB"
+        );
+    }
+}
+
 fn main() {
     bench_insert();
     bench_batch_insert();
@@ -206,6 +236,7 @@ fn main() {
     bench_get();
     bench_proof();
     bench_witness();
+    bench_snapshot();
     bench_rocksdb();
     println!();
 }
