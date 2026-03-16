@@ -85,11 +85,14 @@ impl FeePayer {
     }
 }
 
-/// An access list entry: contract address + storage keys it will touch.
+/// An access list entry: contract address + read/write storage keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessEntry {
     pub address: Address,
-    pub storage_keys: Vec<[u8; 32]>,
+    /// Storage keys that will only be read.
+    pub reads: Vec<[u8; 32]>,
+    /// Storage keys that will be written (may also be read).
+    pub writes: Vec<[u8; 32]>,
 }
 
 /// The full transaction structure.
@@ -261,8 +264,12 @@ fn hash_access_list(access_list: &[AccessEntry]) -> [u8; 32] {
     let mut buf = Vec::new();
     for entry in access_list {
         buf.extend_from_slice(&entry.address);
-        buf.extend_from_slice(&(entry.storage_keys.len() as u32).to_le_bytes());
-        for key in &entry.storage_keys {
+        buf.extend_from_slice(&(entry.reads.len() as u32).to_le_bytes());
+        for key in &entry.reads {
+            buf.extend_from_slice(key);
+        }
+        buf.extend_from_slice(&(entry.writes.len() as u32).to_le_bytes());
+        for key in &entry.writes {
             buf.extend_from_slice(key);
         }
     }
@@ -274,8 +281,12 @@ fn serialize_access_list(access_list: &[AccessEntry]) -> Vec<u8> {
     buf.extend_from_slice(&(access_list.len() as u32).to_le_bytes());
     for entry in access_list {
         buf.extend_from_slice(&entry.address);
-        buf.extend_from_slice(&(entry.storage_keys.len() as u32).to_le_bytes());
-        for key in &entry.storage_keys {
+        buf.extend_from_slice(&(entry.reads.len() as u32).to_le_bytes());
+        for key in &entry.reads {
+            buf.extend_from_slice(key);
+        }
+        buf.extend_from_slice(&(entry.writes.len() as u32).to_le_bytes());
+        for key in &entry.writes {
             buf.extend_from_slice(key);
         }
     }
@@ -295,20 +306,26 @@ fn deserialize_access_list(data: &[u8]) -> Vec<AccessEntry> {
         }
         let address: Address = data[offset..offset + 32].try_into().unwrap();
         offset += 32;
-        let num_keys = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        // Reads
+        let num_reads = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
-        let mut storage_keys = Vec::with_capacity(num_keys);
-        for _ in 0..num_keys {
-            if offset + 32 > data.len() {
-                break;
-            }
-            storage_keys.push(data[offset..offset + 32].try_into().unwrap());
+        let mut reads = Vec::with_capacity(num_reads);
+        for _ in 0..num_reads {
+            if offset + 32 > data.len() { break; }
+            reads.push(data[offset..offset + 32].try_into().unwrap());
             offset += 32;
         }
-        entries.push(AccessEntry {
-            address,
-            storage_keys,
-        });
+        // Writes
+        if offset + 4 > data.len() { break; }
+        let num_writes = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        let mut writes = Vec::with_capacity(num_writes);
+        for _ in 0..num_writes {
+            if offset + 32 > data.len() { break; }
+            writes.push(data[offset..offset + 32].try_into().unwrap());
+            offset += 32;
+        }
+        entries.push(AccessEntry { address, reads, writes });
     }
     entries
 }
@@ -352,11 +369,13 @@ mod tests {
         tx.access_list = vec![
             AccessEntry {
                 address: [0x11; 32],
-                storage_keys: vec![[0x22; 32], [0x33; 32]],
+                reads: vec![[0x22; 32]],
+                writes: vec![[0x33; 32]],
             },
             AccessEntry {
                 address: [0x44; 32],
-                storage_keys: vec![],
+                reads: vec![],
+                writes: vec![],
             },
         ];
         let bytes = tx.to_bytes();

@@ -459,8 +459,8 @@ mod tests {
     fn duplicate_access_list_address_rejected() {
         let (mut tx, _, _) = make_valid_tx_and_account();
         tx.access_list = vec![
-            AccessEntry { address: [0xAA; 32], storage_keys: vec![] },
-            AccessEntry { address: [0xAA; 32], storage_keys: vec![] }, // duplicate
+            AccessEntry { address: [0xAA; 32], reads: vec![], writes: vec![] },
+            AccessEntry { address: [0xAA; 32], reads: vec![], writes: vec![] }, // duplicate
         ];
         let err = validate_access_list(&tx).unwrap_err();
         assert!(matches!(err, ValidationError::InvalidAccessList(_)));
@@ -470,8 +470,8 @@ mod tests {
     fn valid_access_list_passes() {
         let (mut tx, _, _) = make_valid_tx_and_account();
         tx.access_list = vec![
-            AccessEntry { address: [0xAA; 32], storage_keys: vec![[0x11; 32]] },
-            AccessEntry { address: [0xBB; 32], storage_keys: vec![] },
+            AccessEntry { address: [0xAA; 32], reads: vec![[0x11; 32]], writes: vec![] },
+            AccessEntry { address: [0xBB; 32], reads: vec![], writes: vec![] },
         ];
         assert!(validate_access_list(&tx).is_ok());
     }
