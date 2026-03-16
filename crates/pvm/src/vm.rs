@@ -309,6 +309,40 @@ impl Vm {
             self.decoded_cache.push(decode(Instruction(word)));
         }
 
+        // Map calldata into memory if present
+        if !self.calldata.is_empty() {
+            self.map_calldata()?;
+        }
+
+        Ok(())
+    }
+
+    /// Copy calldata into memory at HEAP_START and set r4 = calldata length.
+    /// Advances heap_top past the calldata so allocations don't overwrite it.
+    /// Aligns heap_top to 8 bytes after calldata for clean memory access.
+    fn map_calldata(&mut self) -> Result<(), Trap> {
+        let heap_start = crate::memory::HEAP_START;
+        let len = self.calldata.len();
+
+        if len == 0 {
+            return Ok(());
+        }
+
+        // Bulk write calldata into memory at HEAP_START (single bounds check)
+        self.memory
+            .checked_write_slice(heap_start, &self.calldata)
+            .map_err(|_| Trap::MemoryFault)?;
+
+        // Advance heap_top past calldata (aligned to 8 bytes)
+        let aligned_len = (len + 7) & !7; // round up to 8-byte boundary
+        self.memory.heap_top = heap_start + aligned_len as u32;
+
+        // r4 = calldata length (function argument register convention)
+        self.cpu.write_gp(4, len as u64);
+
+        // r5 = calldata pointer (HEAP_START) for convenience
+        self.cpu.write_gp(5, heap_start as u64);
+
         Ok(())
     }
 
@@ -627,11 +661,9 @@ impl Vm {
                         let ptr_reg = ((d.rs2_or_imm >> 2) & 0xF) as u8;
                         let ptr = self.cpu.read_gp(ptr_reg) as u32;
                         if let Some(data) = self.storage.get(&key) {
-                            for (i, &b) in data.iter().enumerate() {
-                                self.memory
-                                    .store8(ptr + i as u32, b)
-                                    .map_err(|_| Trap::MemoryFault)?;
-                            }
+                            self.memory
+                                .checked_write_slice(ptr, data)
+                                .map_err(|_| Trap::MemoryFault)?;
                             self.cpu.write_gp(d.rd, data.len() as u64);
                         } else {
                             self.cpu.write_gp(d.rd, 0);
@@ -676,13 +708,9 @@ impl Vm {
                         let len_reg = ((d.rs2_or_imm >> 6) & 0xF) as u8;
                         let ptr = self.cpu.read_gp(ptr_reg) as u32;
                         let len = self.cpu.read_gp(len_reg) as usize;
-                        let mut data = vec![0u8; len];
-                        for (i, byte) in data.iter_mut().enumerate() {
-                            *byte = self
-                                .memory
-                                .load8(ptr + i as u32)
-                                .map_err(|_| Trap::MemoryFault)?;
-                        }
+                        let data = self.memory
+                            .checked_read_slice(ptr, len)
+                            .map_err(|_| Trap::MemoryFault)?;
                         self.storage.insert(key, data);
                     }
                     _ => return Err(Trap::InvalidOpcode),
@@ -746,14 +774,10 @@ impl Vm {
                     .load64(after_topics + 8)
                     .map_err(|_| Trap::MemoryFault)? as usize;
 
-                // Read data payload
-                let mut data = vec![0u8; data_len];
-                for (i, byte) in data.iter_mut().enumerate() {
-                    *byte = self
-                        .memory
-                        .load8(data_ptr + i as u32)
-                        .map_err(|_| Trap::MemoryFault)?;
-                }
+                // Read data payload (bulk)
+                let data = self.memory
+                    .checked_read_slice(data_ptr, data_len)
+                    .map_err(|_| Trap::MemoryFault)?;
 
                 // Charge dynamic gas: 100 base + 8 per data byte + 50 per topic
                 let dynamic_gas =
@@ -798,27 +822,12 @@ impl Vm {
                     .map_err(|_| Trap::MemoryFault)? as usize;
 
                 // Read msg, sig, pk from memory
-                let mut msg = vec![0u8; msg_len];
-                for (i, byte) in msg.iter_mut().enumerate() {
-                    *byte = self
-                        .memory
-                        .load8(msg_ptr + i as u32)
-                        .map_err(|_| Trap::MemoryFault)?;
-                }
-                let mut sig_bytes = vec![0u8; sig_len];
-                for (i, byte) in sig_bytes.iter_mut().enumerate() {
-                    *byte = self
-                        .memory
-                        .load8(sig_ptr + i as u32)
-                        .map_err(|_| Trap::MemoryFault)?;
-                }
-                let mut pk_bytes = vec![0u8; pk_len];
-                for (i, byte) in pk_bytes.iter_mut().enumerate() {
-                    *byte = self
-                        .memory
-                        .load8(pk_ptr + i as u32)
-                        .map_err(|_| Trap::MemoryFault)?;
-                }
+                let msg = self.memory.checked_read_slice(msg_ptr, msg_len)
+                    .map_err(|_| Trap::MemoryFault)?;
+                let sig_bytes = self.memory.checked_read_slice(sig_ptr, sig_len)
+                    .map_err(|_| Trap::MemoryFault)?;
+                let pk_bytes = self.memory.checked_read_slice(pk_ptr, pk_len)
+                    .map_err(|_| Trap::MemoryFault)?;
 
                 let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&pk_bytes) {
                     Some(pk) => pk,
@@ -1056,14 +1065,10 @@ impl Vm {
         let gas_to_forward = self.cpu.read_gp(gas_reg);
         let is_static_call = is_static || ((d.rs2_or_imm >> 12) & 1) == 1;
 
-        // Read calldata from caller's memory
-        let mut calldata = vec![0u8; calldata_len];
-        for (i, b) in calldata.iter_mut().enumerate() {
-            *b = self
-                .memory
-                .load8(calldata_ptr + i as u32)
-                .map_err(|_| Trap::MemoryFault)?;
-        }
+        // Read calldata from caller's memory (bulk)
+        let calldata = self.memory
+            .checked_read_slice(calldata_ptr, calldata_len)
+            .map_err(|_| Trap::MemoryFault)?;
 
         // Look up target contract bytecode
         let bytecode = match self.contracts.get(&target_addr) {
@@ -3425,5 +3430,131 @@ mod tests {
 
         assert_eq!(addrs[0], addrs[1]);
         assert_ne!(addrs[0], ZERO_ADDRESS);
+    }
+
+    // --- Memory-mapped calldata tests ---
+
+    #[test]
+    fn calldata_mapped_to_heap_start() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+        vm.calldata = b"hello world".to_vec();
+
+        let code = bytecode(&[instr_bytes(Opcode::Halt, 0, 0, 0)]);
+        vm.load(&code).unwrap();
+
+        // r4 = calldata length
+        assert_eq!(vm.cpu.read_gp(4), 11);
+        // r5 = calldata pointer (HEAP_START)
+        assert_eq!(vm.cpu.read_gp(5), heap as u64);
+
+        // Read calldata from memory
+        assert_eq!(vm.memory.load8(heap).unwrap(), b'h');
+        assert_eq!(vm.memory.load8(heap + 1).unwrap(), b'e');
+        assert_eq!(vm.memory.load8(heap + 10).unwrap(), b'd');
+    }
+
+    #[test]
+    fn calldata_heap_advanced_past_data() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+        vm.calldata = vec![0xAB; 13]; // 13 bytes, aligned to 16
+
+        let code = bytecode(&[instr_bytes(Opcode::Halt, 0, 0, 0)]);
+        vm.load(&code).unwrap();
+
+        // heap_top should be past calldata, aligned to 8
+        assert_eq!(vm.memory.heap_top, heap + 16); // 13 → aligned to 16
+    }
+
+    #[test]
+    fn calldata_readable_via_load_instruction() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+        // Calldata: 8 bytes representing u64 value 42
+        vm.calldata = 42u64.to_le_bytes().to_vec();
+
+        // Load calldata[0..8] into r1 via LOAD64
+        // r5 already points to HEAP_START after map_calldata
+        let code = bytecode(&[
+            instr_mem(Opcode::Load, 1, 5, 0, MemWidth::W64), // r1 = mem[r5 + 0]
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        vm.run().unwrap();
+
+        assert_eq!(vm.cpu.read_gp(1), 42);
+    }
+
+    #[test]
+    fn calldata_multiple_args() {
+        let mut vm = Vm::new();
+        // Calldata: two u64 values: 100 and 200
+        let mut cd = Vec::new();
+        cd.extend_from_slice(&100u64.to_le_bytes());
+        cd.extend_from_slice(&200u64.to_le_bytes());
+        vm.calldata = cd;
+
+        let code = bytecode(&[
+            instr_mem(Opcode::Load, 1, 5, 0, MemWidth::W64),  // r1 = arg0 = 100
+            instr_mem(Opcode::Load, 2, 5, 8, MemWidth::W64),  // r2 = arg1 = 200
+            instr_bytes(Opcode::Add, 3, 1, 2),                 // r3 = 100 + 200
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        vm.run().unwrap();
+
+        assert_eq!(vm.cpu.read_gp(1), 100);
+        assert_eq!(vm.cpu.read_gp(2), 200);
+        assert_eq!(vm.cpu.read_gp(3), 300);
+    }
+
+    #[test]
+    fn empty_calldata_no_effect() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::new();
+        // No calldata
+
+        let code = bytecode(&[instr_bytes(Opcode::Halt, 0, 0, 0)]);
+        vm.load(&code).unwrap();
+
+        assert_eq!(vm.cpu.read_gp(4), 0); // no calldata length
+        assert_eq!(vm.memory.heap_top, heap); // heap not advanced
+    }
+
+    #[test]
+    fn calldata_in_cross_contract_call() {
+        let heap = crate::memory::HEAP_START;
+
+        // Callee reads first arg from calldata (r5 = calldata ptr set by map_calldata)
+        let callee_code = bytecode(&[
+            instr_mem(Opcode::Load, 1, 5, 0, MemWidth::W64), // r1 = calldata[0]
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        // Caller: write arg (99) to its own heap, then call with it as calldata
+        // Caller has no calldata, so r5 is 0. Use r8 = HEAP_START instead.
+        let caller_code = bytecode(&[
+            instr_ri(Opcode::Addi, 8, 0, heap as i32),         // r8 = HEAP_START
+            instr_ri(Opcode::Addi, 6, 0, 99),                  // r6 = 99
+            instr_mem(Opcode::Store, 6, 8, 0, MemWidth::W64),  // mem[HEAP_START] = 99
+            instr_ri(Opcode::Addi, 3, 0, 8),                   // r3 = calldata len = 8
+            instr_ri(Opcode::Addi, 7, 0, 0),                   // r7 = gas = 0 (all)
+            instr_bytes(Opcode::CallExt, 0, 8, 0x173),         // call w0, r8, (result=1,gas=7,len=3)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let ctx = ExecutionContext {
+            self_address: addr(0xAA),
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+        vm.cpu.write_wide(0, U256::from_le_bytes(addr(0xBB)));
+        vm.contracts.insert(addr(0xBB), callee_code);
+        vm.load(&caller_code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        assert_eq!(vm.cpu.read_gp(1), 1); // call succeeded
     }
 }
