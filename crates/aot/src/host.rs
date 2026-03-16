@@ -185,13 +185,10 @@ pub extern "C" fn host_poseidon(ctx: *mut VmCtx, addr: u64, len: u64, wd: u64) -
     let vm = unsafe { &mut *ctx };
     let addr = addr as u32;
     let len = len as usize;
-    let mut data = vec![0u8; len];
-    for (i, b) in data.iter_mut().enumerate() {
-        match vm.memory.load8(addr + i as u32) {
-            Ok(v) => *b = v,
-            Err(_) => return 1,
-        }
-    }
+    let data = match vm.memory.checked_read_slice(addr, len) {
+        Ok(d) => d,
+        Err(_) => return 1,
+    };
     let hash = pyde_crypto::poseidon2::poseidon2_hash(&data);
     let hash_bytes: [u8; 32] = hash.to_bytes();
     vm.cpu.write_wide(wd as u8, U256::from_le_bytes(hash_bytes));
@@ -226,7 +223,9 @@ pub extern "C" fn host_narrow(ctx: *mut VmCtx, ws1: u64, trap_out: *mut u64) -> 
     let bytes = wide_val.to_le_bytes();
     // Check if any bytes above the first 8 are non-zero
     if bytes[8..].iter().any(|&b| b != 0) {
-        unsafe { *trap_out = 1; }
+        unsafe {
+            *trap_out = 1;
+        }
         return 0;
     }
     u64::from_le_bytes(bytes[..8].try_into().unwrap())
@@ -235,7 +234,8 @@ pub extern "C" fn host_narrow(ctx: *mut VmCtx, ws1: u64, trap_out: *mut u64) -> 
 /// Host: widen (GP → wide). Takes the GP value directly from AOT, writes to wide register.
 pub extern "C" fn host_widen(ctx: *mut VmCtx, wd: u64, gp_value: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    vm.cpu.write_wide(wd as u8, pyde_vm::wide::U256::from(gp_value));
+    vm.cpu
+        .write_wide(wd as u8, pyde_vm::wide::U256::from(gp_value));
     0
 }
 
@@ -246,7 +246,9 @@ pub extern "C" fn host_checked_add(a: u64, b: u64, trap_out: *mut u64) -> u64 {
     match a.checked_add(b) {
         Some(r) => r,
         None => {
-            unsafe { *trap_out = 1; }
+            unsafe {
+                *trap_out = 1;
+            }
             0
         }
     }
@@ -257,7 +259,9 @@ pub extern "C" fn host_checked_sub(a: u64, b: u64, trap_out: *mut u64) -> u64 {
     match a.checked_sub(b) {
         Some(r) => r,
         None => {
-            unsafe { *trap_out = 1; }
+            unsafe {
+                *trap_out = 1;
+            }
             0
         }
     }
@@ -268,7 +272,9 @@ pub extern "C" fn host_checked_mul(a: u64, b: u64, trap_out: *mut u64) -> u64 {
     match a.checked_mul(b) {
         Some(r) => r,
         None => {
-            unsafe { *trap_out = 1; }
+            unsafe {
+                *trap_out = 1;
+            }
             0
         }
     }
@@ -277,7 +283,9 @@ pub extern "C" fn host_checked_mul(a: u64, b: u64, trap_out: *mut u64) -> u64 {
 /// Host: checked div. Returns result, sets *trap_out to 1 on div-by-zero.
 pub extern "C" fn host_checked_div(a: u64, b: u64, trap_out: *mut u64) -> u64 {
     if b == 0 {
-        unsafe { *trap_out = 1; }
+        unsafe {
+            *trap_out = 1;
+        }
         return 0;
     }
     a / b
@@ -286,7 +294,9 @@ pub extern "C" fn host_checked_div(a: u64, b: u64, trap_out: *mut u64) -> u64 {
 /// Host: checked mod. Returns result, sets *trap_out to 1 on div-by-zero.
 pub extern "C" fn host_checked_mod(a: u64, b: u64, trap_out: *mut u64) -> u64 {
     if b == 0 {
-        unsafe { *trap_out = 1; }
+        unsafe {
+            *trap_out = 1;
+        }
         return 0;
     }
     a % b
@@ -311,14 +321,18 @@ pub extern "C" fn host_log(ctx: *mut VmCtx, desc_ptr: u64, num_topics: u64) -> u
 /// Host: get caller (msg.sender) into wide register wd.
 pub extern "C" fn host_caller(ctx: *mut VmCtx, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    vm.cpu.write_wide(wd as u8, pyde_vm::wide::U256::from_le_bytes(vm.ctx.caller));
+    vm.cpu
+        .write_wide(wd as u8, pyde_vm::wide::U256::from_le_bytes(vm.ctx.caller));
     0
 }
 
 /// Host: get self address into wide register wd.
 pub extern "C" fn host_address(ctx: *mut VmCtx, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    vm.cpu.write_wide(wd as u8, pyde_vm::wide::U256::from_le_bytes(vm.ctx.self_address));
+    vm.cpu.write_wide(
+        wd as u8,
+        pyde_vm::wide::U256::from_le_bytes(vm.ctx.self_address),
+    );
     0
 }
 
@@ -366,7 +380,11 @@ pub extern "C" fn host_balance(ctx: *mut VmCtx, ws_addr: u64, wd: u64) -> u64 {
 
 /// Host: assert — returns 0 if val != 0, 1 (revert) if val == 0.
 pub extern "C" fn host_assert(_ctx: *mut VmCtx, val: u64) -> u64 {
-    if val == 0 { 1 } else { 0 }
+    if val == 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Host: field_mul rd = (a * b) mod Goldilocks prime. Returns result.

@@ -305,6 +305,17 @@ impl Memory {
         Ok(self.read_slice(addr, len))
     }
 
+    /// Write a slice with access checking, writable check, and gas metering (single check).
+    pub fn checked_write_slice(&mut self, addr: u32, data: &[u8]) -> Result<(), MemoryError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.check_access(addr, data.len() as u32)?;
+        self.check_writable(addr)?;
+        self.write_bytes(addr, data);
+        Ok(())
+    }
+
     /// Read a 32-bit instruction word from the code section (no gas charge).
     /// Code pages are always materialized by `load_code()`.
     #[inline]
