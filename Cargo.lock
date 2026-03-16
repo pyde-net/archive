@@ -929,6 +929,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyde-account"
+version = "0.1.0"
+dependencies = [
+ "pyde-crypto",
+ "pyde-state",
+ "sparse-merkle-tree",
+]
+
+[[package]]
 name = "pyde-aot"
 version = "0.1.0"
 dependencies = [
@@ -963,6 +972,15 @@ dependencies = [
  "rocksdb",
  "sparse-merkle-tree",
  "tempfile",
+]
+
+[[package]]
+name = "pyde-tx"
+version = "0.1.0"
+dependencies = [
+ "pyde-account",
+ "pyde-crypto",
+ "sparse-merkle-tree",
 ]
 
 [[package]]
