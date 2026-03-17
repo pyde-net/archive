@@ -952,6 +952,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyde-consensus"
+version = "0.1.0"
+dependencies = [
+ "pyde-account",
+ "pyde-crypto",
+ "pyde-tx",
+ "sparse-merkle-tree",
+]
+
+[[package]]
 name = "pyde-crypto"
 version = "0.1.0"
 dependencies = [
