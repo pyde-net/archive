@@ -556,10 +556,7 @@ impl Vm {
             }
             Opcode::Push => {
                 let val = self.cpu.read_gp(d.rd);
-                let sp = self
-                    .memory
-                    .stack_alloc(8)
-                    .map_err(|_| Trap::MemoryFault)?;
+                let sp = self.memory.stack_alloc(8).map_err(|_| Trap::MemoryFault)?;
                 self.memory
                     .store64(sp, val)
                     .map_err(|_| Trap::MemoryFault)?;
@@ -570,10 +567,7 @@ impl Vm {
                 if sp.checked_add(8).is_none() || sp + 8 > crate::memory::STACK_TOP {
                     return Err(Trap::MemoryFault);
                 }
-                let val = self
-                    .memory
-                    .load64(sp)
-                    .map_err(|_| Trap::MemoryFault)?;
+                let val = self.memory.load64(sp).map_err(|_| Trap::MemoryFault)?;
                 self.cpu.write_gp(d.rd, val);
                 self.memory.stack_pointer = sp + 8;
                 self.pc += 4;
@@ -633,7 +627,9 @@ impl Vm {
                 let addr = self.cpu.read_gp(d.rs1) as u32;
                 let len = (d.rs2_or_imm & 0xF) as u8;
                 let byte_len = self.cpu.read_gp(len) as usize;
-                let data = self.memory.checked_read_slice(addr, byte_len)
+                let data = self
+                    .memory
+                    .checked_read_slice(addr, byte_len)
                     .map_err(|_| Trap::MemoryFault)?;
                 let hash = pyde_crypto::poseidon2::poseidon2_hash(&data);
                 let hash_bytes: [u8; 32] = hash.to_bytes();
@@ -708,7 +704,8 @@ impl Vm {
                         let len_reg = ((d.rs2_or_imm >> 6) & 0xF) as u8;
                         let ptr = self.cpu.read_gp(ptr_reg) as u32;
                         let len = self.cpu.read_gp(len_reg) as usize;
-                        let data = self.memory
+                        let data = self
+                            .memory
                             .checked_read_slice(ptr, len)
                             .map_err(|_| Trap::MemoryFault)?;
                         self.storage.insert(key, data);
@@ -775,13 +772,13 @@ impl Vm {
                     .map_err(|_| Trap::MemoryFault)? as usize;
 
                 // Read data payload (bulk)
-                let data = self.memory
+                let data = self
+                    .memory
                     .checked_read_slice(data_ptr, data_len)
                     .map_err(|_| Trap::MemoryFault)?;
 
                 // Charge dynamic gas: 100 base + 8 per data byte + 50 per topic
-                let dynamic_gas =
-                    100u64 + (data_len as u64) * 8 + (num_topics as u64) * 50;
+                let dynamic_gas = 100u64 + (data_len as u64) * 8 + (num_topics as u64) * 50;
                 self.gas.exec += dynamic_gas;
                 self.gas_used_total += dynamic_gas;
                 if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
@@ -801,9 +798,14 @@ impl Vm {
                 //   [msg_ptr:8][msg_len:8][sig_ptr:8][sig_len:8][pk_ptr:8][pk_len:8]
                 // rd = 1 if valid, 0 if invalid
                 let desc_addr = self.cpu.read_gp(d.rs1) as u32;
-                let msg_ptr = self.memory.load64(desc_addr).map_err(|_| Trap::MemoryFault)? as u32;
-                let msg_len =
-                    self.memory.load64(desc_addr + 8).map_err(|_| Trap::MemoryFault)? as usize;
+                let msg_ptr = self
+                    .memory
+                    .load64(desc_addr)
+                    .map_err(|_| Trap::MemoryFault)? as u32;
+                let msg_len = self
+                    .memory
+                    .load64(desc_addr + 8)
+                    .map_err(|_| Trap::MemoryFault)? as usize;
                 let sig_ptr = self
                     .memory
                     .load64(desc_addr + 16)
@@ -822,11 +824,17 @@ impl Vm {
                     .map_err(|_| Trap::MemoryFault)? as usize;
 
                 // Read msg, sig, pk from memory
-                let msg = self.memory.checked_read_slice(msg_ptr, msg_len)
+                let msg = self
+                    .memory
+                    .checked_read_slice(msg_ptr, msg_len)
                     .map_err(|_| Trap::MemoryFault)?;
-                let sig_bytes = self.memory.checked_read_slice(sig_ptr, sig_len)
+                let sig_bytes = self
+                    .memory
+                    .checked_read_slice(sig_ptr, sig_len)
                     .map_err(|_| Trap::MemoryFault)?;
-                let pk_bytes = self.memory.checked_read_slice(pk_ptr, pk_len)
+                let pk_bytes = self
+                    .memory
+                    .checked_read_slice(pk_ptr, pk_len)
                     .map_err(|_| Trap::MemoryFault)?;
 
                 let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&pk_bytes) {
@@ -845,7 +853,6 @@ impl Vm {
             }
 
             // --- Cross-contract call instructions ---
-
             Opcode::CallExt => {
                 // call_ext wd, rs1, imm
                 // wd = wide register with target address (32 bytes)
@@ -858,7 +865,8 @@ impl Vm {
                 }
                 let result_reg = ((d.rs2_or_imm >> 8) & 0xF) as u8;
                 let result = self.do_ext_call(d, false, false)?;
-                self.cpu.write_gp(result_reg, if result.success { 1 } else { 0 });
+                self.cpu
+                    .write_gp(result_reg, if result.success { 1 } else { 0 });
                 self.return_data = result.return_data;
                 self.pc += 4;
             }
@@ -870,7 +878,8 @@ impl Vm {
                 }
                 let result_reg = ((d.rs2_or_imm >> 8) & 0xF) as u8;
                 let result = self.do_ext_call(d, false, true)?;
-                self.cpu.write_gp(result_reg, if result.success { 1 } else { 0 });
+                self.cpu
+                    .write_gp(result_reg, if result.success { 1 } else { 0 });
                 self.return_data = result.return_data;
                 self.pc += 4;
             }
@@ -882,7 +891,6 @@ impl Vm {
             // imm[8] = 1 means static call. But cleaner: just add handling here.
             // The ISA doesn't have a STATICCALL opcode, so we'll encode it as
             // CallExt with imm bit 8 set. The VM checks this bit.
-
             Opcode::Create => {
                 // create wd, rs1, imm
                 // wd = wide register for new contract address (32 bytes)
@@ -957,7 +965,6 @@ impl Vm {
         let logs_snapshot_len = self.logs.len();
 
         let mut trace = Vec::new();
-
         let outcome = loop {
             let pc = self.pc;
             let idx = (pc / 4) as usize;
@@ -968,28 +975,48 @@ impl Vm {
 
             match self.step() {
                 Ok(Some(ExecResult::Halt)) => {
-                    trace.push(TraceStep { pc, opcode, gas_used: self.gas_used_total });
+                    trace.push(TraceStep {
+                        pc,
+                        opcode,
+                        gas_used: self.gas_used_total,
+                    });
                     break Outcome::Success;
                 }
                 Ok(Some(ExecResult::Revert)) => {
-                    trace.push(TraceStep { pc, opcode, gas_used: self.gas_used_total });
+                    trace.push(TraceStep {
+                        pc,
+                        opcode,
+                        gas_used: self.gas_used_total,
+                    });
                     self.rollback_storage();
                     self.logs.truncate(logs_snapshot_len);
                     self.gas_refund = 0;
                     break Outcome::Revert;
                 }
                 Ok(None) => {
-                    trace.push(TraceStep { pc, opcode, gas_used: self.gas_used_total });
+                    trace.push(TraceStep {
+                        pc,
+                        opcode,
+                        gas_used: self.gas_used_total,
+                    });
                 }
                 Err(Trap::OutOfGas) => {
-                    trace.push(TraceStep { pc, opcode, gas_used: self.gas_used_total });
+                    trace.push(TraceStep {
+                        pc,
+                        opcode,
+                        gas_used: self.gas_used_total,
+                    });
                     self.rollback_storage();
                     self.logs.truncate(logs_snapshot_len);
                     self.gas_refund = 0;
                     break Outcome::OutOfGas;
                 }
                 Err(trap) => {
-                    trace.push(TraceStep { pc, opcode, gas_used: self.gas_used_total });
+                    trace.push(TraceStep {
+                        pc,
+                        opcode,
+                        gas_used: self.gas_used_total,
+                    });
                     self.rollback_storage();
                     self.logs.truncate(logs_snapshot_len);
                     self.gas_refund = 0;
@@ -1066,7 +1093,8 @@ impl Vm {
         let is_static_call = is_static || ((d.rs2_or_imm >> 12) & 1) == 1;
 
         // Read calldata from caller's memory (bulk)
-        let calldata = self.memory
+        let calldata = self
+            .memory
             .checked_read_slice(calldata_ptr, calldata_len)
             .map_err(|_| Trap::MemoryFault)?;
 
@@ -1144,7 +1172,7 @@ impl Vm {
         child.ext_call_depth = self.ext_call_depth + 1;
         child.reentrancy_set = self.reentrancy_set.clone();
         child.reentrancy_set.insert(self.ctx.self_address); // caller is on the stack
-        child.reentrancy_set.insert(call_target);            // callee is being entered
+        child.reentrancy_set.insert(call_target); // callee is being entered
         child.calldata = calldata;
 
         // Share storage for delegate calls
@@ -1199,7 +1227,9 @@ impl Vm {
         let len_reg = (d.rs2_or_imm & 0xF) as u8;
         let code_len = self.cpu.read_gp(len_reg) as usize;
 
-        let init_code = self.memory.checked_read_slice(code_ptr, code_len)
+        let init_code = self
+            .memory
+            .checked_read_slice(code_ptr, code_len)
             .map_err(|_| Trap::MemoryFault)?;
 
         // Derive 32-byte contract address
@@ -2269,9 +2299,9 @@ mod tests {
         }
 
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, heap as i32),          // r1 = data ptr
-            instr_ri(Opcode::Addi, 2, 0, input.len() as i32),   // r2 = data len
-            instr_bytes(Opcode::Poseidon, 0, 1, 2),             // w0 = poseidon(mem[r1..r1+r2])
+            instr_ri(Opcode::Addi, 1, 0, heap as i32), // r1 = data ptr
+            instr_ri(Opcode::Addi, 2, 0, input.len() as i32), // r2 = data len
+            instr_bytes(Opcode::Poseidon, 0, 1, 2),    // w0 = poseidon(mem[r1..r1+r2])
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         vm.load(&code).unwrap();
@@ -2295,7 +2325,10 @@ mod tests {
         let mut vm = Vm::new();
         vm.load(&code).unwrap();
         assert_eq!(vm.run().unwrap(), ExecResult::Halt);
-        assert_eq!(vm.cpu.read_wide(0), U256::from_le_bytes(expected.to_bytes()));
+        assert_eq!(
+            vm.cpu.read_wide(0),
+            U256::from_le_bytes(expected.to_bytes())
+        );
     }
 
     #[test]
@@ -2315,9 +2348,9 @@ mod tests {
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, heap as i32),
             instr_ri(Opcode::Addi, 2, 0, 3),
-            instr_bytes(Opcode::Poseidon, 0, 1, 2),       // w0 = hash("aaa")
+            instr_bytes(Opcode::Poseidon, 0, 1, 2), // w0 = hash("aaa")
             instr_ri(Opcode::Addi, 3, 0, (heap + 8) as i32),
-            instr_bytes(Opcode::Poseidon, 1, 3, 2),       // w1 = hash("bbb")
+            instr_bytes(Opcode::Poseidon, 1, 3, 2), // w1 = hash("bbb")
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         vm.load(&code).unwrap();
@@ -2403,9 +2436,7 @@ mod tests {
             vm.memory.store8(msg_ptr + i as u32, b).unwrap();
         }
         // Update msg_len in descriptor
-        vm.memory
-            .store64(heap + 8, wrong_msg.len() as u64)
-            .unwrap();
+        vm.memory.store64(heap + 8, wrong_msg.len() as u64).unwrap();
 
         for (i, &b) in sig.as_bytes().iter().enumerate() {
             vm.memory.store8(sig_ptr + i as u32, b).unwrap();
@@ -2624,8 +2655,8 @@ mod tests {
         vm.cpu.write_gp(4, (heap + 100) as u64);
 
         let code = bytecode(&[
-            instr_bytes(Opcode::Sstore, 0, 0, 133),          // sstoreb w0, r1, r2
-            instr_bytes(Opcode::Sload, 3, 0, 1 | (4 << 2)),  // sloadb r3, w0, r4
+            instr_bytes(Opcode::Sstore, 0, 0, 133), // sstoreb w0, r1, r2
+            instr_bytes(Opcode::Sload, 3, 0, 1 | (4 << 2)), // sloadb r3, w0, r4
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         vm.load(&code).unwrap();
@@ -2652,8 +2683,8 @@ mod tests {
         vm.cpu.write_gp(3, heap as u64); // output pointer
 
         let code = bytecode(&[
-            instr_bytes(Opcode::Sstore, 1, 0, 0),            // sstore w0, w1 (register mode)
-            instr_bytes(Opcode::Sload, 2, 0, 1 | (3 << 2)),  // sloadb r2, w0, r3
+            instr_bytes(Opcode::Sstore, 1, 0, 0), // sstore w0, w1 (register mode)
+            instr_bytes(Opcode::Sload, 2, 0, 1 | (3 << 2)), // sloadb r2, w0, r3
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         vm.load(&code).unwrap();
@@ -2680,7 +2711,7 @@ mod tests {
 
         let code = bytecode(&[
             instr_bytes(Opcode::Sstore, 0, 0, 1 | (1 << 2) | (2 << 6)), // sstoreb w0, r1, r2
-            instr_bytes(Opcode::Sload, 3, 0, 0),                         // sload w3, w0 (register)
+            instr_bytes(Opcode::Sload, 3, 0, 0),                        // sload w3, w0 (register)
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         vm.load(&code).unwrap();
@@ -2753,12 +2784,7 @@ mod tests {
 
     /// Helper: build a LOG descriptor in memory.
     /// Returns the descriptor start address.
-    fn setup_log_descriptor(
-        vm: &mut Vm,
-        base: u32,
-        topics: &[U256],
-        data: &[u8],
-    ) -> u32 {
+    fn setup_log_descriptor(vm: &mut Vm, base: u32, topics: &[U256], data: &[u8]) -> u32 {
         let mut offset = base;
         // Write topics (32 bytes each)
         for topic in topics {
@@ -2927,17 +2953,17 @@ mod tests {
         // Compute fib(10) = 55 using a loop
         // r1 = n (10), r2 = fib(i-1), r3 = fib(i), r4 = counter, r5 = temp
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 10),  // [0] r1 = 10
-            instr_ri(Opcode::Addi, 2, 0, 0),   // [4] r2 = 0 (fib_prev)
-            instr_ri(Opcode::Addi, 3, 0, 1),   // [8] r3 = 1 (fib_curr)
-            instr_ri(Opcode::Addi, 4, 0, 1),   // [12] r4 = 1 (counter)
+            instr_ri(Opcode::Addi, 1, 0, 10), // [0] r1 = 10
+            instr_ri(Opcode::Addi, 2, 0, 0),  // [4] r2 = 0 (fib_prev)
+            instr_ri(Opcode::Addi, 3, 0, 1),  // [8] r3 = 1 (fib_curr)
+            instr_ri(Opcode::Addi, 4, 0, 1),  // [12] r4 = 1 (counter)
             // loop:
             instr_bytes(Opcode::Bge, 4, 1, 24), // [16] if r4 >= r1, jump +24 → pc 40 (halt)
             instr_bytes(Opcode::Add, 5, 2, 3),  // [20] r5 = r2 + r3
             instr_bytes(Opcode::Add, 2, 3, 0),  // [24] r2 = r3 (move via add r3+r0)
             instr_bytes(Opcode::Add, 3, 5, 0),  // [28] r3 = r5
-            instr_ri(Opcode::Addi, 4, 4, 1),   // [32] r4++
-            instr_ri(Opcode::Jmp, 0, 0, -20),  // [36] jmp -20 → pc 16 (loop)
+            instr_ri(Opcode::Addi, 4, 4, 1),    // [32] r4++
+            instr_ri(Opcode::Jmp, 0, 0, -20),   // [36] jmp -20 → pc 16 (loop)
             instr_bytes(Opcode::Halt, 0, 0, 0), // [40]
         ]);
         let mut vm = Vm::new();
@@ -2990,7 +3016,7 @@ mod tests {
         vm.cpu.write_gp(1, heap as u64);
 
         let code = bytecode(&[
-            instr_bytes(Opcode::Log, 0, 1, 1),  // emit event
+            instr_bytes(Opcode::Log, 0, 1, 1), // emit event
             instr_bytes(Opcode::Revert, 0, 0, 0),
         ]);
         vm.load(&code).unwrap();
@@ -3048,13 +3074,13 @@ mod tests {
         vm.cpu.write_wide(0, slot); // w0 = slot
 
         let code = bytecode(&[
-            instr_bytes(Opcode::Sload, 1, 0, 2),   // [0] sloadg r1, w0 (balance → r1)
-            instr_ri(Opcode::Addi, 2, 0, 100),     // [4] r2 = 100 (amount)
-            instr_bytes(Opcode::Blt, 1, 2, 16),     // [8] if r1 < r2, jump to revert (pc 24)
-            instr_bytes(Opcode::Sub, 1, 1, 2),      // [12] r1 = r1 - amount
-            instr_bytes(Opcode::Sstore, 1, 0, 2),   // [16] sstoreg w0, r1 (write new balance)
-            instr_bytes(Opcode::Halt, 0, 0, 0),     // [20]
-            instr_bytes(Opcode::Revert, 0, 0, 0),   // [24] insufficient balance
+            instr_bytes(Opcode::Sload, 1, 0, 2), // [0] sloadg r1, w0 (balance → r1)
+            instr_ri(Opcode::Addi, 2, 0, 100),   // [4] r2 = 100 (amount)
+            instr_bytes(Opcode::Blt, 1, 2, 16),  // [8] if r1 < r2, jump to revert (pc 24)
+            instr_bytes(Opcode::Sub, 1, 1, 2),   // [12] r1 = r1 - amount
+            instr_bytes(Opcode::Sstore, 1, 0, 2), // [16] sstoreg w0, r1 (write new balance)
+            instr_bytes(Opcode::Halt, 0, 0, 0),  // [20]
+            instr_bytes(Opcode::Revert, 0, 0, 0), // [24] insufficient balance
         ]);
         vm.load(&code).unwrap();
         let output = vm.execute();
@@ -3082,9 +3108,9 @@ mod tests {
         vm.cpu.write_wide(0, slot);
 
         let code = bytecode(&[
-            instr_bytes(Opcode::Sload, 1, 0, 2),   // sloadg r1, w0
-            instr_ri(Opcode::Addi, 2, 0, 100),     // r2 = 100
-            instr_bytes(Opcode::Blt, 1, 2, 16),     // if r1 < r2, jump to revert
+            instr_bytes(Opcode::Sload, 1, 0, 2), // sloadg r1, w0
+            instr_ri(Opcode::Addi, 2, 0, 100),   // r2 = 100
+            instr_bytes(Opcode::Blt, 1, 2, 16),  // if r1 < r2, jump to revert
             instr_bytes(Opcode::Sub, 1, 1, 2),
             instr_bytes(Opcode::Sstore, 1, 0, 2),
             instr_bytes(Opcode::Halt, 0, 0, 0),
@@ -3141,8 +3167,8 @@ mod tests {
         vm.cpu.write_gp(3, heap as u64);
 
         let code = bytecode(&[
-            instr_bytes(Opcode::Sstore, 1, 0, 0),  // write storage
-            instr_bytes(Opcode::Log, 0, 3, 1),      // emit log
+            instr_bytes(Opcode::Sstore, 1, 0, 0), // write storage
+            instr_bytes(Opcode::Log, 0, 3, 1),    // emit log
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         vm.load(&code).unwrap();
@@ -3183,9 +3209,9 @@ mod tests {
         // Caller: target address in w0, calldata in r2, len in r3, gas in r4
         // CallExt wd=0, rs1=2, imm = (result_reg=1 << 8) | (gas_reg=4 << 4) | len_reg=3
         let caller_code = bytecode(&[
-            instr_ri(Opcode::Addi, 3, 0, 0),            // r3 = calldata len = 0
-            instr_ri(Opcode::Addi, 4, 0, 0),            // r4 = gas = 0 (all)
-            instr_bytes(Opcode::CallExt, 0, 2, 0x143),  // call_ext w0, r2, (r1<<8|r4<<4|r3)
+            instr_ri(Opcode::Addi, 3, 0, 0),           // r3 = calldata len = 0
+            instr_ri(Opcode::Addi, 4, 0, 0),           // r4 = gas = 0 (all)
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143), // call_ext w0, r2, (r1<<8|r4<<4|r3)
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
@@ -3210,20 +3236,20 @@ mod tests {
         // B's code: load addr A into w0, call A (reentrancy!)
         let code_b = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 0xAA),
-            instr_bytes(Opcode::Widen, 0, 1, 0),         // w0 = addr(0xAA)
+            instr_bytes(Opcode::Widen, 0, 1, 0), // w0 = addr(0xAA)
             instr_ri(Opcode::Addi, 3, 0, 0),
             instr_ri(Opcode::Addi, 4, 0, 0),
-            instr_bytes(Opcode::CallExt, 0, 2, 0x143),   // result→r1
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143), // result→r1
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
         // A's code: load addr B into w0, call B
         let code_a = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 0xBB),
-            instr_bytes(Opcode::Widen, 0, 1, 0),         // w0 = addr(0xBB)
+            instr_bytes(Opcode::Widen, 0, 1, 0), // w0 = addr(0xBB)
             instr_ri(Opcode::Addi, 3, 0, 0),
             instr_ri(Opcode::Addi, 4, 0, 0),
-            instr_bytes(Opcode::CallExt, 0, 2, 0x143),   // result→r1
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143), // result→r1
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
@@ -3279,26 +3305,24 @@ mod tests {
     #[test]
     fn nested_ext_calls_three_deep() {
         // C: just halts
-        let code_c = bytecode(&[
-            instr_bytes(Opcode::Halt, 0, 0, 0),
-        ]);
+        let code_c = bytecode(&[instr_bytes(Opcode::Halt, 0, 0, 0)]);
 
         // B: calls C, then halts
         let code_b = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 0x30),
-            instr_bytes(Opcode::Widen, 0, 1, 0),         // w0 = addr(0x30)
+            instr_bytes(Opcode::Widen, 0, 1, 0), // w0 = addr(0x30)
             instr_ri(Opcode::Addi, 3, 0, 0),
             instr_ri(Opcode::Addi, 4, 0, 0),
-            instr_bytes(Opcode::CallExt, 0, 2, 0x143),   // result→r1
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143), // result→r1
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
         let code_a = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 0x20),
-            instr_bytes(Opcode::Widen, 0, 1, 0),         // w0 = addr(0x20)
+            instr_bytes(Opcode::Widen, 0, 1, 0), // w0 = addr(0x20)
             instr_ri(Opcode::Addi, 3, 0, 0),
             instr_ri(Opcode::Addi, 4, 0, 0),
-            instr_bytes(Opcode::CallExt, 0, 2, 0x143),   // result→r1
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143), // result→r1
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
@@ -3324,7 +3348,7 @@ mod tests {
         let callee_code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 1000),
             instr_ri(Opcode::Addi, 2, 0, 0),
-            instr_bytes(Opcode::Add, 3, 1, 2),           // loop body
+            instr_bytes(Opcode::Add, 3, 1, 2), // loop body
             instr_ri(Opcode::Addi, 2, 2, 1),
             instr_ri(Opcode::Blt, 2, 1, -12),
             instr_bytes(Opcode::Halt, 0, 0, 0),
@@ -3332,9 +3356,9 @@ mod tests {
 
         let caller_code = bytecode(&[
             instr_ri(Opcode::Addi, 3, 0, 0),
-            instr_ri(Opcode::Addi, 4, 0, 10),            // only 10 gas forwarded
-            instr_bytes(Opcode::CallExt, 0, 2, 0x143),   // result→r1
-            instr_ri(Opcode::Addi, 5, 0, 99),            // parent continues
+            instr_ri(Opcode::Addi, 4, 0, 10), // only 10 gas forwarded
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143), // result→r1
+            instr_ri(Opcode::Addi, 5, 0, 99), // parent continues
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
@@ -3349,7 +3373,7 @@ mod tests {
         let output = vm.execute();
 
         assert_eq!(output.outcome, Outcome::Success);
-        assert_eq!(vm.cpu.read_gp(1), 0);  // child failed (OOG)
+        assert_eq!(vm.cpu.read_gp(1), 0); // child failed (OOG)
         assert_eq!(vm.cpu.read_gp(5), 99); // parent continued
     }
 
@@ -3375,7 +3399,7 @@ mod tests {
         for (i, &b) in init_code.iter().enumerate() {
             vm.memory.store8(heap + i as u32, b).unwrap();
         }
-        vm.cpu.write_gp(2, heap as u64);            // r2 = code ptr
+        vm.cpu.write_gp(2, heap as u64); // r2 = code ptr
         vm.cpu.write_gp(3, init_code.len() as u64); // r3 = code len
 
         // CREATE wd=1, rs1=2, imm = len_reg=3 → 0x03
@@ -3400,9 +3424,7 @@ mod tests {
     #[test]
     fn create_address_is_deterministic() {
         let heap = crate::memory::HEAP_START;
-        let init_code = bytecode(&[
-            instr_bytes(Opcode::Halt, 0, 0, 0),
-        ]);
+        let init_code = bytecode(&[instr_bytes(Opcode::Halt, 0, 0, 0)]);
 
         // Run CREATE twice with same inputs → should get same address
         let mut addrs = Vec::new();
@@ -3496,9 +3518,9 @@ mod tests {
         vm.calldata = cd;
 
         let code = bytecode(&[
-            instr_mem(Opcode::Load, 1, 5, 0, MemWidth::W64),  // r1 = arg0 = 100
-            instr_mem(Opcode::Load, 2, 5, 8, MemWidth::W64),  // r2 = arg1 = 200
-            instr_bytes(Opcode::Add, 3, 1, 2),                 // r3 = 100 + 200
+            instr_mem(Opcode::Load, 1, 5, 0, MemWidth::W64), // r1 = arg0 = 100
+            instr_mem(Opcode::Load, 2, 5, 8, MemWidth::W64), // r2 = arg1 = 200
+            instr_bytes(Opcode::Add, 3, 1, 2),               // r3 = 100 + 200
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
         vm.load(&code).unwrap();
@@ -3535,12 +3557,12 @@ mod tests {
         // Caller: write arg (99) to its own heap, then call with it as calldata
         // Caller has no calldata, so r5 is 0. Use r8 = HEAP_START instead.
         let caller_code = bytecode(&[
-            instr_ri(Opcode::Addi, 8, 0, heap as i32),         // r8 = HEAP_START
-            instr_ri(Opcode::Addi, 6, 0, 99),                  // r6 = 99
-            instr_mem(Opcode::Store, 6, 8, 0, MemWidth::W64),  // mem[HEAP_START] = 99
-            instr_ri(Opcode::Addi, 3, 0, 8),                   // r3 = calldata len = 8
-            instr_ri(Opcode::Addi, 7, 0, 0),                   // r7 = gas = 0 (all)
-            instr_bytes(Opcode::CallExt, 0, 8, 0x173),         // call w0, r8, (result=1,gas=7,len=3)
+            instr_ri(Opcode::Addi, 8, 0, heap as i32), // r8 = HEAP_START
+            instr_ri(Opcode::Addi, 6, 0, 99),          // r6 = 99
+            instr_mem(Opcode::Store, 6, 8, 0, MemWidth::W64), // mem[HEAP_START] = 99
+            instr_ri(Opcode::Addi, 3, 0, 8),           // r3 = calldata len = 8
+            instr_ri(Opcode::Addi, 7, 0, 0),           // r7 = gas = 0 (all)
+            instr_bytes(Opcode::CallExt, 0, 8, 0x173), // call w0, r8, (result=1,gas=7,len=3)
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
