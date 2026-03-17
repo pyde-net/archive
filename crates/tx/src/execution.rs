@@ -6,7 +6,7 @@
 //! 2. Value transfer: sender → recipient
 //! 3. PVM execution (contract call or deployment)
 //! 4. Post-execution: refund unused gas, apply SDELETE refunds
-//! 5. Fee distribution: 70% burn, 20% validator, 10% prover
+//! 5. Fee distribution: 70% burn, 15% validator, 15% prover
 //! 6. Generate receipt
 
 use crate::types::{FeePayer, Transaction, TransactionType};
@@ -165,7 +165,7 @@ pub fn post_execution_refund(
     (effective_gas, actual_refund)
 }
 
-/// Distribute the fee: 70% burn, 20% validator, 10% prover.
+/// Distribute the fee: 70% burn, 15% validator, 15% prover.
 pub fn distribute_fee(effective_gas: u64, base_fee: u128) -> FeeDistribution {
     let total_fee = effective_gas as u128 * base_fee;
     let burned = total_fee * FEE_BURN_PCT as u128 / 100;
