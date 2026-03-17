@@ -980,6 +980,8 @@ version = "0.1.0"
 dependencies = [
  "pyde-account",
  "pyde-crypto",
+ "pyde-state",
+ "pyde-vm",
  "sparse-merkle-tree",
 ]
 
