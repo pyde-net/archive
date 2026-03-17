@@ -6,4 +6,6 @@ edition = "2021"
 [dependencies]
 pyde-crypto = { path = "../crypto" }
 pyde-account = { path = "../account" }
+pyde-vm = { path = "../pvm" }
+pyde-state = { path = "../state" }
 sparse-merkle-tree = "0.6"

@@ -4,5 +4,6 @@ pub mod execution;
 pub mod fee;
 pub mod gas_tank;
 pub mod parallel;
+pub mod pipeline;
 pub mod types;
 pub mod validation;
