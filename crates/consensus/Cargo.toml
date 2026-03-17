@@ -1,0 +1,10 @@
+[package]
+name = "pyde-consensus"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pyde-crypto = { path = "../crypto" }
+pyde-account = { path = "../account" }
+pyde-tx = { path = "../tx" }
+sparse-merkle-tree = "0.6"
