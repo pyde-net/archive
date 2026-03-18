@@ -54,10 +54,15 @@ impl ViewChangeQC {
 }
 
 /// Timeout state tracker for a single slot.
+///
+/// The runtime (Phase 7) provides timestamps via `is_expired(now_ms)`.
+/// This crate never reads the system clock directly.
 #[derive(Clone, Debug)]
 pub struct TimeoutTracker {
     /// Slot being tracked.
     pub slot: u64,
+    /// Timestamp when this slot started (Unix ms, set by runtime).
+    pub slot_start_ms: u64,
     /// Collected view change messages.
     pub messages: Vec<ViewChangeMessage>,
     /// Whether a valid proposal was received (cancels timeout).
@@ -67,9 +72,10 @@ pub struct TimeoutTracker {
 }
 
 impl TimeoutTracker {
-    pub fn new(slot: u64) -> Self {
+    pub fn new(slot: u64, slot_start_ms: u64) -> Self {
         Self {
             slot,
+            slot_start_ms,
             messages: Vec::new(),
             proposal_received: false,
             view_change_qc: None,
@@ -81,15 +87,29 @@ impl TimeoutTracker {
         self.proposal_received = true;
     }
 
-    /// Whether this slot has timed out (no proposal and no QC yet).
-    pub fn is_timed_out(&self) -> bool {
-        !self.proposal_received && self.view_change_qc.is_none()
+    /// Check if the proposal timeout has expired.
+    /// `now_ms` is provided by the runtime (system clock).
+    pub fn is_expired(&self, now_ms: u64) -> bool {
+        !self.proposal_received
+            && self.view_change_qc.is_none()
+            && now_ms.saturating_sub(self.slot_start_ms) >= PROPOSAL_TIMEOUT_MS
+    }
+
+    /// Check if the entire slot duration has elapsed.
+    pub fn slot_elapsed(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.slot_start_ms) >= SLOT_DURATION_MS
+    }
+
+    /// Milliseconds remaining until proposal timeout.
+    pub fn ms_until_timeout(&self, now_ms: u64) -> u64 {
+        let elapsed = now_ms.saturating_sub(self.slot_start_ms);
+        PROPOSAL_TIMEOUT_MS.saturating_sub(elapsed)
     }
 }
 
 /// Build the message that validators sign for view change.
 fn view_change_sign_message(slot: u64) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(16);
+    let mut msg = Vec::with_capacity(19); // "view_change"(11) + slot(8)
     msg.extend_from_slice(b"view_change");
     msg.extend_from_slice(&slot.to_le_bytes());
     msg
@@ -348,19 +368,46 @@ mod tests {
     // ========== Timeout tracker ==========
 
     #[test]
-    fn timeout_tracker_basic() {
-        let mut tracker = TimeoutTracker::new(5);
-        assert!(tracker.is_timed_out());
+    fn not_expired_before_200ms() {
+        let tracker = TimeoutTracker::new(5, 1000);
+        // At 1199ms (199ms elapsed) → not expired
+        assert!(!tracker.is_expired(1199));
+    }
 
-        tracker.receive_proposal();
-        assert!(!tracker.is_timed_out());
+    #[test]
+    fn expired_at_200ms() {
+        let tracker = TimeoutTracker::new(5, 1000);
+        // At 1200ms (200ms elapsed) → expired
+        assert!(tracker.is_expired(1200));
+    }
+
+    #[test]
+    fn expired_well_past_200ms() {
+        let tracker = TimeoutTracker::new(5, 1000);
+        assert!(tracker.is_expired(5000));
     }
 
     #[test]
     fn timeout_cancelled_by_proposal() {
-        let mut tracker = TimeoutTracker::new(5);
-        assert!(tracker.is_timed_out());
+        let mut tracker = TimeoutTracker::new(5, 1000);
         tracker.receive_proposal();
-        assert!(!tracker.is_timed_out());
+        // Even past 200ms, not expired because proposal received
+        assert!(!tracker.is_expired(2000));
+    }
+
+    #[test]
+    fn slot_elapsed_at_400ms() {
+        let tracker = TimeoutTracker::new(5, 1000);
+        assert!(!tracker.slot_elapsed(1399)); // 399ms
+        assert!(tracker.slot_elapsed(1400));  // 400ms
+    }
+
+    #[test]
+    fn ms_until_timeout() {
+        let tracker = TimeoutTracker::new(5, 1000);
+        assert_eq!(tracker.ms_until_timeout(1000), 200); // just started
+        assert_eq!(tracker.ms_until_timeout(1100), 100); // 100ms in
+        assert_eq!(tracker.ms_until_timeout(1200), 0);   // at timeout
+        assert_eq!(tracker.ms_until_timeout(1500), 0);   // past timeout
     }
 }

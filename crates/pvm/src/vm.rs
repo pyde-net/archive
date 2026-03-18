@@ -1,4 +1,24 @@
 //! PVM execution engine: ties CPU, memory, and control flow together.
+//!
+//! ## Storage Layout (TODO: Phase 9 Otigen Compiler)
+//!
+//! The PVM's SSTORE/SLOAD work with arbitrary-length byte values in the SMT.
+//! The Otigen compiler will decide storage strategy per type:
+//!
+//! - **Small values** (u64, u128, address, bool): packed into one slot.
+//! - **Arrays/maps**: slot-per-element for O(1) random access and minimal
+//!   witness size (critical for stateless provers).
+//! - **Small structs** (< 256 bytes): packed into one slot.
+//! - **Strings**: variable-length, stored via memory-mode SSTORE (mode 1).
+//!
+//! ## Heap Memory Layout (TODO: Phase 9 Otigen Compiler)
+//!
+//! Dynamic arrays in execution memory use a bump allocator:
+//! - Array header: (data_ptr, len, capacity) on heap
+//! - Push with space: O(1) write to next slot
+//! - Push at capacity: realloc 2x, copy headers, leak old block
+//! - Gas cost prevents unbounded growth; memory freed after tx
+//! - MEMCPY instruction needed for efficient reallocation (TODO: add to ISA).
 
 use crate::cpu::{Cpu, Trap};
 use crate::isa::{
