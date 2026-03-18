@@ -158,7 +158,7 @@ fn derive_keystream(shared_secret: &SharedSecret, len: usize) -> Vec<u8> {
 }
 
 fn compute_mac(shared_secret: &SharedSecret, ciphertext: &[u8]) -> [u8; 32] {
-    let mut input = Vec::with_capacity(32 + ciphertext.len());
+    let mut input = Vec::with_capacity(8 + 32 + ciphertext.len()); // prefix(8) + secret(32) + ciphertext
     // Domain-separate MAC from keystream by using a different prefix
     input.extend_from_slice(&[0xFF; 8]);
     input.extend_from_slice(shared_secret.as_bytes());
