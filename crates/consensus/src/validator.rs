@@ -157,15 +157,36 @@ impl ValidatorSet {
         }
     }
 
-    /// Get all active (eligible) validators.
+    /// Get all active (eligible) validators with sufficient stake.
     pub fn active_validators(&self) -> Vec<&Validator> {
         self.validators
             .iter()
-            .filter(|v| v.status == ValidatorStatus::Active)
+            .filter(|v| v.status == ValidatorStatus::Active && v.stake >= VALIDATOR_STAKE)
             .collect()
     }
 
+    /// Get active validators with stake below the required minimum.
+    /// These validators should top up before the next epoch or be excluded.
+    pub fn underfunded_validators(&self) -> Vec<&Validator> {
+        self.validators
+            .iter()
+            .filter(|v| v.status == ValidatorStatus::Active && v.stake < VALIDATOR_STAKE)
+            .collect()
+    }
+
+    /// Top up a validator's stake (e.g., after partial slash).
+    pub fn top_up_stake(&mut self, address: &Address, amount: u128) -> Result<(), ValidatorError> {
+        let validator = self
+            .validators
+            .iter_mut()
+            .find(|v| v.address == *address)
+            .ok_or(ValidatorError::NotFound(*address))?;
+        validator.stake += amount;
+        Ok(())
+    }
+
     /// Select a committee of 128 validators for the given epoch.
+    /// Only validators with Active status AND sufficient stake are eligible.
     /// Uses VRF-seeded randomness for deterministic, unpredictable selection.
     pub fn select_committee(
         &self,
@@ -176,7 +197,7 @@ impl ValidatorSet {
         let eligible: Vec<Validator> = self
             .validators
             .iter()
-            .filter(|v| v.status == ValidatorStatus::Active)
+            .filter(|v| v.status == ValidatorStatus::Active && v.stake >= VALIDATOR_STAKE)
             .cloned()
             .collect();
 
@@ -427,5 +448,38 @@ mod tests {
         for m in &committee.members {
             assert!(committee.contains(&m.address));
         }
+    }
+
+    // ========== Underfunded after slash ==========
+
+    #[test]
+    fn underfunded_validator_excluded_from_committee() {
+        let mut set = ValidatorSet::new();
+        register_n(&mut set, 130);
+
+        // Slash one validator's stake below minimum
+        set.validators[0].stake = VALIDATOR_STAKE - 1;
+
+        // Underfunded detected
+        assert_eq!(set.underfunded_validators().len(), 1);
+
+        // Excluded from committee selection
+        let committee = set.select_committee(0, &[0xAA; 32], vec![]).unwrap();
+        assert!(!committee.contains(&set.validators[0].address));
+    }
+
+    #[test]
+    fn top_up_restores_eligibility() {
+        let mut set = ValidatorSet::new();
+        register_n(&mut set, 130);
+
+        // Slash below minimum
+        set.validators[0].stake = VALIDATOR_STAKE - 100;
+        assert_eq!(set.underfunded_validators().len(), 1);
+
+        // Top up
+        set.top_up_stake(&set.validators[0].address.clone(), 100).unwrap();
+        assert_eq!(set.underfunded_validators().len(), 0);
+        assert_eq!(set.validators[0].stake, VALIDATOR_STAKE);
     }
 }
