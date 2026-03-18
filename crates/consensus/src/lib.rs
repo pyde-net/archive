@@ -4,5 +4,6 @@ pub mod block;
 pub mod finality;
 pub mod hotstuff;
 pub mod proposer;
+pub mod slashing;
 pub mod validator;
 pub mod view_change;
