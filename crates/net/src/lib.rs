@@ -11,6 +11,8 @@
 //! messages are already signed with FALCON-512 and encrypted with
 //! threshold Kyber. See ROADMAP tasks for upgrade path.
 
+pub mod channels;
 pub mod config;
+pub mod discovery;
 pub mod node;
 pub mod peer;
