@@ -1,0 +1,252 @@
+//! Pyde P2P node: libp2p swarm with QUIC transport.
+//!
+//! ## Transport Crypto Upgrade Path (Pre-Mainnet)
+//!
+//! Current: Ed25519 identity + Noise/X25519 encryption (libp2p default)
+//! Target:  FALCON-512 identity + Kyber-768 key exchange
+//!
+//! The upgrade requires implementing:
+//! 1. Custom `libp2p::identity::Keypair` backed by FALCON-512
+//! 2. Custom Noise handshake pattern using Kyber-768 KEM
+//! Both are isolated to this module — no changes needed above transport layer.
+
+use crate::config::NetworkConfig;
+use libp2p::{
+    gossipsub, identify, identity,
+    kad::{self, store::MemoryStore},
+    noise,
+    swarm::NetworkBehaviour,
+    Multiaddr, PeerId, Swarm, SwarmBuilder,
+};
+use std::time::Duration;
+
+/// The combined network behaviour for Pyde nodes.
+#[derive(NetworkBehaviour)]
+pub struct PydeBehaviour {
+    /// Gossipsub for message propagation (5 channels).
+    pub gossipsub: gossipsub::Behaviour,
+    /// Kademlia DHT for peer discovery.
+    pub kademlia: kad::Behaviour<MemoryStore>,
+    /// Identify protocol (exchange peer info on connect).
+    pub identify: identify::Behaviour,
+}
+
+/// Generate a new node keypair. Call once on first run, then persist.
+pub fn generate_keypair() -> identity::Keypair {
+    identity::Keypair::generate_ed25519()
+}
+
+/// Serialize a keypair to bytes for disk persistence.
+pub fn keypair_to_bytes(keypair: &identity::Keypair) -> Result<Vec<u8>, String> {
+    keypair.to_protobuf_encoding().map_err(|e| format!("keypair serialize error: {e}"))
+}
+
+/// Deserialize a keypair from bytes (loaded from disk).
+pub fn keypair_from_bytes(bytes: &[u8]) -> Result<identity::Keypair, String> {
+    identity::Keypair::from_protobuf_encoding(bytes)
+        .map_err(|e| format!("keypair deserialize error: {e}"))
+}
+
+/// Create a new Pyde P2P node with an existing keypair.
+///
+/// The keypair should be loaded from disk for identity persistence.
+/// Use `generate_keypair()` on first run, persist with `keypair_to_bytes()`,
+/// and reload with `keypair_from_bytes()` on subsequent runs.
+///
+/// Returns the Swarm and the local PeerId.
+pub fn create_node(config: &NetworkConfig, local_key: identity::Keypair) -> Result<(Swarm<PydeBehaviour>, PeerId), String> {
+    let local_peer_id = PeerId::from(local_key.public());
+
+    // Build swarm
+    let swarm = SwarmBuilder::with_existing_identity(local_key)
+        .with_tokio()
+        .with_quic()
+        .with_behaviour(|key| {
+            // Gossipsub
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(Duration::from_millis(400)) // match block time
+                .validation_mode(gossipsub::ValidationMode::Strict)
+                .max_transmit_size(256 * 1024) // 256KB max message
+                .build()
+                .map_err(|e| format!("gossipsub config error: {e}"))
+                .expect("valid gossipsub config");
+
+            let gossipsub = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )
+            .map_err(|e| format!("gossipsub error: {e}"))
+            .expect("valid gossipsub");
+
+            // Kademlia
+            let kademlia = kad::Behaviour::new(
+                PeerId::from(key.public()),
+                MemoryStore::new(PeerId::from(key.public())),
+            );
+
+            // Identify
+            let identify = identify::Behaviour::new(identify::Config::new(
+                "/pyde/1.0.0".to_string(),
+                key.public(),
+            ));
+
+            PydeBehaviour {
+                gossipsub,
+                kademlia,
+                identify,
+            }
+        })
+        .map_err(|e| format!("behaviour error: {e}"))?
+        .with_swarm_config(|cfg| {
+            cfg.with_idle_connection_timeout(config.idle_timeout)
+        })
+        .build();
+
+    Ok((swarm, local_peer_id))
+}
+
+/// The 5 gossipsub topic names for Pyde's message channels.
+pub mod topics {
+    use libp2p::gossipsub::IdentTopic;
+
+    /// Consensus messages (votes, view changes) — validators only.
+    pub fn consensus() -> IdentTopic {
+        IdentTopic::new("pyde/consensus/1")
+    }
+
+    /// Encrypted transactions from users.
+    pub fn transactions() -> IdentTopic {
+        IdentTopic::new("pyde/transactions/1")
+    }
+
+    /// Proposed blocks and scheduled blocks.
+    pub fn blocks() -> IdentTopic {
+        IdentTopic::new("pyde/blocks/1")
+    }
+
+    /// ZK proofs from provers.
+    pub fn proofs() -> IdentTopic {
+        IdentTopic::new("pyde/proofs/1")
+    }
+
+    /// State sync and witness delivery.
+    pub fn sync() -> IdentTopic {
+        IdentTopic::new("pyde/sync/1")
+    }
+
+    /// All topic names.
+    pub fn all() -> Vec<IdentTopic> {
+        vec![consensus(), transactions(), blocks(), proofs(), sync()]
+    }
+}
+
+/// Subscribe a swarm to the appropriate topics based on node role.
+pub fn subscribe_topics(
+    swarm: &mut Swarm<PydeBehaviour>,
+    is_validator: bool,
+) -> Result<(), String> {
+    // All nodes subscribe to transactions, blocks, sync
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&topics::transactions())
+        .map_err(|e| format!("subscribe error: {e}"))?;
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&topics::blocks())
+        .map_err(|e| format!("subscribe error: {e}"))?;
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&topics::sync())
+        .map_err(|e| format!("subscribe error: {e}"))?;
+
+    // Validators also subscribe to consensus and proofs
+    if is_validator {
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&topics::consensus())
+            .map_err(|e| format!("subscribe error: {e}"))?;
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&topics::proofs())
+            .map_err(|e| format!("subscribe error: {e}"))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topic_names_unique() {
+        let topics = topics::all();
+        let mut names: Vec<String> = topics.iter().map(|t| t.hash().to_string()).collect();
+        let len = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), len); // all unique
+    }
+
+    #[test]
+    fn topic_count() {
+        assert_eq!(topics::all().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn create_node_succeeds() {
+        let config = NetworkConfig::default();
+        let key = generate_keypair();
+        let (swarm, peer_id) = create_node(&config, key).unwrap();
+        assert!(!peer_id.to_string().is_empty());
+        drop(swarm);
+    }
+
+    #[tokio::test]
+    async fn create_validator_node() {
+        let config = NetworkConfig::validator(30303);
+        let (mut swarm, _) = create_node(&config, generate_keypair()).unwrap();
+        subscribe_topics(&mut swarm, true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_full_node() {
+        let config = NetworkConfig::full_node(30304);
+        let (mut swarm, _) = create_node(&config, generate_keypair()).unwrap();
+        subscribe_topics(&mut swarm, false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn keypair_persistence_roundtrip() {
+        let key = generate_keypair();
+        let peer_id = PeerId::from(key.public());
+
+        // Serialize → deserialize
+        let bytes = keypair_to_bytes(&key).unwrap();
+        let restored = keypair_from_bytes(&bytes).unwrap();
+        let restored_id = PeerId::from(restored.public());
+
+        // Same PeerId after restore
+        assert_eq!(peer_id, restored_id);
+    }
+
+    #[tokio::test]
+    async fn persistent_identity_across_restarts() {
+        let key = generate_keypair();
+        let bytes = keypair_to_bytes(&key).unwrap();
+
+        // "First run"
+        let config = NetworkConfig::default();
+        let (_, id1) = create_node(&config, keypair_from_bytes(&bytes).unwrap()).unwrap();
+
+        // "Second run" (same keypair bytes)
+        let (_, id2) = create_node(&config, keypair_from_bytes(&bytes).unwrap()).unwrap();
+
+        assert_eq!(id1, id2); // same identity
+    }
+}
