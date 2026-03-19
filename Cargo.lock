@@ -974,6 +974,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyde-mempool"
+version = "0.1.0"
+dependencies = [
+ "pyde-account",
+ "pyde-crypto",
+ "pyde-tx",
+]
+
+[[package]]
 name = "pyde-state"
 version = "0.1.0"
 dependencies = [

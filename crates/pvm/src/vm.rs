@@ -246,6 +246,10 @@ pub struct Vm {
     reentrancy_set: std::collections::HashSet<Address>,
     /// Current external call depth.
     ext_call_depth: usize,
+    /// Allowed storage keys from the access list. If Some, SLOAD/SSTORE
+    /// on unlisted keys will trap (strict access list enforcement).
+    /// If None, all keys are allowed (no enforcement).
+    pub allowed_storage_keys: Option<std::collections::HashSet<U256>>,
 }
 
 /// Safe address calculation: base (u64) + offset (i64) → u32, or MemoryFault.
@@ -283,6 +287,7 @@ impl Vm {
             static_mode: false,
             reentrancy_set: std::collections::HashSet::new(),
             ext_call_depth: 0,
+            allowed_storage_keys: None,
         }
     }
 
@@ -661,6 +666,12 @@ impl Vm {
             Opcode::Sload => {
                 let slot = self.cpu.read_wide(d.rs1);
                 let key = self.derive_storage_key(slot);
+                // Strict access list enforcement: revert if key not in allowed set
+                if let Some(ref allowed) = self.allowed_storage_keys {
+                    if !allowed.contains(&key) {
+                        return Err(Trap::AccessListViolation);
+                    }
+                }
                 let mode = d.rs2_or_imm & 0x3;
                 match mode {
                     0 => {
@@ -704,6 +715,12 @@ impl Vm {
                 }
                 let slot = self.cpu.read_wide(d.rs1);
                 let key = self.derive_storage_key(slot);
+                // Strict access list enforcement: revert if key not in allowed set
+                if let Some(ref allowed) = self.allowed_storage_keys {
+                    if !allowed.contains(&key) {
+                        return Err(Trap::AccessListViolation);
+                    }
+                }
                 self.journal_storage_write(&key);
                 let mode = d.rs2_or_imm & 0x3;
                 match mode {
