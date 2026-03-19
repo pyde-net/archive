@@ -154,6 +154,89 @@ pub fn schedule(txs: &[Transaction]) -> ExecutionSchedule {
     }
 }
 
+/// Check if two access lists conflict (shared key with at least one write).
+pub fn access_lists_conflict(a: &[AccessEntry], b: &[AccessEntry]) -> bool {
+    let writes_a: HashSet<(Address, [u8; 32])> = a
+        .iter()
+        .flat_map(|entry| entry.writes.iter().map(move |k| (entry.address, *k)))
+        .collect();
+
+    let writes_b: HashSet<(Address, [u8; 32])> = b
+        .iter()
+        .flat_map(|entry| entry.writes.iter().map(move |k| (entry.address, *k)))
+        .collect();
+
+    let all_a: HashSet<(Address, [u8; 32])> = a
+        .iter()
+        .flat_map(|entry| {
+            entry.reads.iter().chain(entry.writes.iter())
+                .map(move |k| (entry.address, *k))
+        })
+        .collect();
+
+    let all_b: HashSet<(Address, [u8; 32])> = b
+        .iter()
+        .flat_map(|entry| {
+            entry.reads.iter().chain(entry.writes.iter())
+                .map(move |k| (entry.address, *k))
+        })
+        .collect();
+
+    for wk in &writes_a {
+        if all_b.contains(wk) {
+            return true;
+        }
+    }
+    for wk in &writes_b {
+        if all_a.contains(wk) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Schedule from raw access lists (works for both Transaction and EncryptedTx).
+/// Each element in `access_lists` is the access list for one transaction.
+pub fn schedule_from_access_lists(access_lists: &[Vec<AccessEntry>]) -> ExecutionSchedule {
+    let n = access_lists.len();
+    if n == 0 {
+        return ExecutionSchedule {
+            groups: vec![],
+            total_txs: 0,
+        };
+    }
+
+    let mut groups: Vec<ExecutionGroup> = Vec::new();
+
+    for i in 0..n {
+        let mut assigned = false;
+
+        for group in groups.iter_mut() {
+            let has_conflict = group
+                .tx_indices
+                .iter()
+                .any(|&j| access_lists_conflict(&access_lists[i], &access_lists[j]));
+
+            if !has_conflict {
+                group.tx_indices.push(i);
+                assigned = true;
+                break;
+            }
+        }
+
+        if !assigned {
+            groups.push(ExecutionGroup {
+                tx_indices: vec![i],
+            });
+        }
+    }
+
+    ExecutionSchedule {
+        groups,
+        total_txs: n,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

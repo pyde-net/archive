@@ -138,6 +138,23 @@ pub struct ThresholdCiphertext {
     mac: [u8; 32],
 }
 
+impl ThresholdCiphertext {
+    /// Length of the encrypted message.
+    pub fn encrypted_len(&self) -> usize {
+        self.encrypted_msg.len()
+    }
+
+    /// Serialize to bytes for hashing/transmission.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let ct_bytes = self.kyber_ct.as_bytes();
+        let mut buf = Vec::with_capacity(ct_bytes.len() + self.encrypted_msg.len() + 32);
+        buf.extend_from_slice(ct_bytes);
+        buf.extend_from_slice(&self.encrypted_msg);
+        buf.extend_from_slice(&self.mac);
+        buf
+    }
+}
+
 // --- Symmetric encryption using Poseidon2-derived keystream ---
 
 const SEED_ELEMENTS: usize = 8; // 64-byte seed = 8 × 8-byte elements
@@ -240,7 +257,23 @@ pub fn threshold_encrypt(tpk: &ThresholdPublicKey, msg: &[u8]) -> ThresholdCiphe
 }
 
 /// Generate a decryption share from a validator's key share.
-/// (In the reconstruct-then-decrypt model, the share is just passed through.)
+///
+/// ## SECURITY TODO (Production)
+///
+/// Current implementation uses reconstruct-then-decrypt: the share is the
+/// raw KeyShare, independent of the ciphertext. This means 85+ shares
+/// collected from ANY decryption round can reconstruct the full secret key
+/// and decrypt ALL transactions for the current epoch.
+///
+/// Production must upgrade to **per-ciphertext shares**:
+///   share_i = f(key_share_i, ciphertext)
+/// This binds each share to a specific ciphertext, preventing reuse across
+/// different transactions. Collecting shares from Block N would be useless
+/// for decrypting Block N+1's transactions.
+///
+/// Risk is bounded by BFT assumption: 85/128 colluding validators already
+/// exceeds the 43/128 Byzantine threshold. PSS epoch refresh limits exposure
+/// to a single epoch.
 pub fn generate_decryption_share(
     key_share: &KeyShare,
     _ct: &ThresholdCiphertext,

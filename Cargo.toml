@@ -8,4 +8,5 @@ members = [
     "crates/account",
     "crates/tx",
     "crates/consensus",
+    "crates/mempool",
 ]

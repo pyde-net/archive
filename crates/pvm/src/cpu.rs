@@ -29,6 +29,8 @@ pub enum Trap {
     StaticModeViolation,
     #[error("reentrancy detected")]
     Reentrancy,
+    #[error("storage access not in access list")]
+    AccessListViolation,
 }
 
 /// The CPU register file and minimal execution state.

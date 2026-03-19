@@ -1,0 +1,9 @@
+[package]
+name = "pyde-mempool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pyde-crypto = { path = "../crypto" }
+pyde-account = { path = "../account" }
+pyde-tx = { path = "../tx" }
