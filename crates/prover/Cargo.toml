@@ -1,0 +1,20 @@
+[package]
+name = "pyde-prover"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pyde-crypto = { path = "../crypto" }
+pyde-account = { path = "../account" }
+pyde-vm = { path = "../pvm" }
+p3-field = "0.2"
+p3-air = "0.2"
+p3-matrix = "0.2"
+p3-uni-stark = "0.2"
+p3-goldilocks = "0.2"
+p3-challenger = "0.2"
+p3-commit = "0.2"
+p3-fri = "0.2"
+p3-merkle-tree = "0.2"
+p3-poseidon2 = "0.2"
+p3-symmetric = "0.2"

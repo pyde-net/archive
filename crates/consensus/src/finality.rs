@@ -3,16 +3,62 @@
 //! **Soft finality (~400ms)**: block has a valid QC (86+ votes).
 //! - Content finality: transactions and ordering locked.
 //! - No rollback under honest majority (<1/3 malicious).
+//! - Full nodes execute optimistically → state changes applied here.
 //! - Use cases: payments, DEX orders, game state, social.
 //!
 //! **Hard finality (~2.5s)**: soft finality + STARK proof + 86+ finality signatures.
 //! - Execution correctness: mathematically proven state transition.
 //! - Irreversibility: cannot revert without breaking STARK assumptions.
+//! - State_root committed by the STARK proof, not the block proposer
+//!   (proposer can't compute state_root because txs are encrypted at proposal time).
 //! - Use cases: bridge transfers, large settlements, governance.
+//!
+//! **Proof failure does NOT mean state is wrong:**
+//! - Execution is deterministic — same inputs always produce same result.
+//! - A failed proof means the PROVER failed, not the state.
+//! - Full nodes computed state correctly at soft finality regardless.
+//! - The proof is for light clients, bridges, and hard finality anchor.
+//!
+//! **Unproven window:** if provers fall behind, block production adapts:
+//! - 0-100 unproven blocks: normal operation (400ms block time)
+//! - 100-500 unproven blocks: slowed production (800ms block time)
+//! - 500+ unproven blocks: empty blocks only (no new txs, chain liveness preserved)
+//! - Provers can catch up retroactively by proving backlog blocks.
 
 use crate::block::{QuorumCert, QUORUM_THRESHOLD};
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature};
+
+/// Max unproven blocks before production slows (doubled block time).
+pub const MAX_UNPROVEN_WINDOW: u64 = 100;
+
+/// Max unproven blocks before production pauses (empty blocks only).
+pub const MAX_UNPROVEN_CRITICAL: u64 = 500;
+
+/// Block time when in slowed mode (ms).
+pub const SLOWED_BLOCK_TIME_MS: u64 = 800;
+
+/// Production mode based on unproven backlog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProductionMode {
+    /// Normal: 400ms block time, full transactions.
+    Normal,
+    /// Slowed: 800ms block time, full transactions. Provers catching up.
+    Slowed,
+    /// Paused: empty blocks only. Provers critically behind.
+    Paused,
+}
+
+/// Determine production mode from unproven block count.
+pub fn production_mode(unproven_count: u64) -> ProductionMode {
+    if unproven_count >= MAX_UNPROVEN_CRITICAL {
+        ProductionMode::Paused
+    } else if unproven_count >= MAX_UNPROVEN_WINDOW {
+        ProductionMode::Slowed
+    } else {
+        ProductionMode::Normal
+    }
+}
 
 /// Finality level for a block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -222,6 +268,10 @@ pub struct FinalityTracker {
     pub latest_checkpoint: Option<FinalityCheckpoint>,
     /// Pending finality statuses for recent blocks.
     pub pending: Vec<FinalityStatus>,
+    /// Highest soft-finalized slot.
+    pub highest_soft_slot: u64,
+    /// Highest hard-finalized slot.
+    pub highest_hard_slot: u64,
 }
 
 impl FinalityTracker {
@@ -229,19 +279,38 @@ impl FinalityTracker {
         Self {
             latest_checkpoint: None,
             pending: Vec::new(),
+            highest_soft_slot: 0,
+            highest_hard_slot: 0,
         }
+    }
+
+    /// Number of blocks with soft finality but no hard finality.
+    pub fn unproven_count(&self) -> u64 {
+        self.highest_soft_slot.saturating_sub(self.highest_hard_slot)
+    }
+
+    /// Current production mode based on unproven backlog.
+    pub fn production_mode(&self) -> ProductionMode {
+        production_mode(self.unproven_count())
     }
 
     /// Record soft finality for a block.
     pub fn record_soft_finality(&mut self, slot: u64, block_hash: [u8; 32], qc: QuorumCert) {
         let status = soft_finality_status(slot, block_hash, &qc);
         if status.level == FinalityLevel::Soft {
+            if slot > self.highest_soft_slot {
+                self.highest_soft_slot = slot;
+            }
             self.pending.push(status);
         }
     }
 
     /// Record hard finality and create a checkpoint.
+    /// The state_root is committed by the STARK proof, not the block proposer.
     pub fn record_hard_finality(&mut self, cert: HardFinalityCert) {
+        if cert.slot > self.highest_hard_slot {
+            self.highest_hard_slot = cert.slot;
+        }
         let checkpoint = FinalityCheckpoint {
             slot: cert.slot,
             block_hash: cert.block_hash,
@@ -523,5 +592,73 @@ mod tests {
         // Only slot 15 remains pending
         assert_eq!(tracker.pending.len(), 1);
         assert_eq!(tracker.pending[0].slot, 15);
+    }
+
+    // ========== Unproven window ==========
+
+    #[test]
+    fn unproven_count_tracks_gap() {
+        let mut tracker = FinalityTracker::new();
+
+        // Soft finality for slots 1-50
+        for slot in 1..=50 {
+            tracker.record_soft_finality(slot, [slot as u8; 32], make_qc(slot, 90));
+        }
+        assert_eq!(tracker.unproven_count(), 50);
+
+        // Hard finality for slot 20
+        let cert = HardFinalityCert {
+            slot: 20,
+            block_hash: [20; 32],
+            proof_hash: [0xBB; 32],
+            state_root: [0xCC; 32],
+            voter_bitmap: (1u128 << 86) - 1,
+            signatures: vec![],
+        };
+        tracker.record_hard_finality(cert);
+        assert_eq!(tracker.unproven_count(), 30); // 50 - 20
+    }
+
+    #[test]
+    fn production_mode_normal() {
+        assert_eq!(production_mode(0), ProductionMode::Normal);
+        assert_eq!(production_mode(99), ProductionMode::Normal);
+    }
+
+    #[test]
+    fn production_mode_slowed() {
+        assert_eq!(production_mode(100), ProductionMode::Slowed);
+        assert_eq!(production_mode(499), ProductionMode::Slowed);
+    }
+
+    #[test]
+    fn production_mode_paused() {
+        assert_eq!(production_mode(500), ProductionMode::Paused);
+        assert_eq!(production_mode(1000), ProductionMode::Paused);
+    }
+
+    #[test]
+    fn tracker_production_mode() {
+        let mut tracker = FinalityTracker::new();
+        assert_eq!(tracker.production_mode(), ProductionMode::Normal);
+
+        // Soft finality races ahead
+        for slot in 1..=150 {
+            tracker.record_soft_finality(slot, [slot as u8; 32], make_qc(slot, 90));
+        }
+        assert_eq!(tracker.production_mode(), ProductionMode::Slowed);
+
+        // Hard finality catches up
+        let cert = HardFinalityCert {
+            slot: 100,
+            block_hash: [100; 32],
+            proof_hash: [0xBB; 32],
+            state_root: [0xCC; 32],
+            voter_bitmap: (1u128 << 86) - 1,
+            signatures: vec![],
+        };
+        tracker.record_hard_finality(cert);
+        assert_eq!(tracker.unproven_count(), 50); // 150 - 100
+        assert_eq!(tracker.production_mode(), ProductionMode::Normal);
     }
 }

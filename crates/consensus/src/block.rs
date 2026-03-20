@@ -77,6 +77,9 @@ pub struct BlockHeader {
     /// Merkle root of the transactions in this block.
     pub tx_root: [u8; 32],
     /// State root after executing all transactions.
+    /// NOTE: Empty at proposal time (txs encrypted, can't compute).
+    /// Set by full nodes after optimistic execution at soft finality.
+    /// Proven correct by the STARK proof and committed in HardFinalityCert.
     pub state_root: [u8; 32],
     /// Block timestamp (Unix milliseconds).
     pub timestamp: u64,
