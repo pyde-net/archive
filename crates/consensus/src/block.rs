@@ -48,6 +48,15 @@ impl QuorumCert {
         self.vote_count() >= QUORUM_THRESHOLD as u32
     }
 
+    /// Hash this QC: Poseidon2(slot + block_hash + voter_bitmap).
+    pub fn hash(&self) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(56); // 8 + 32 + 16 = 56
+        buf.extend_from_slice(&self.slot.to_le_bytes());
+        buf.extend_from_slice(&self.block_hash);
+        buf.extend_from_slice(&self.voter_bitmap.to_le_bytes());
+        poseidon2_hash(&buf).to_bytes()
+    }
+
     /// Empty QC (for genesis block).
     pub fn empty() -> Self {
         Self {
@@ -86,18 +95,22 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
-    /// Compute the block hash: Poseidon2 of all header fields.
+    /// Compute the block hash: Poseidon2 of header fields.
+    ///
+    /// Includes all fields that uniquely identify this block's CONTENT.
+    /// Does NOT include state_root — it's unknown at proposal time (txs encrypted)
+    /// and committed separately via HardFinalityCert after STARK proof.
+    /// Excludes QC signatures/bitmap (large, and QC slot+hash suffice).
     pub fn hash(&self) -> [u8; 32] {
-        let mut buf = Vec::with_capacity(256);
-        buf.extend_from_slice(&self.slot.to_le_bytes());
-        buf.extend_from_slice(&self.epoch.to_le_bytes());
-        buf.extend_from_slice(&self.parent_hash);
-        buf.extend_from_slice(&self.proposer);
-        buf.extend_from_slice(&self.tx_root);
-        buf.extend_from_slice(&self.state_root);
-        buf.extend_from_slice(&self.timestamp.to_le_bytes());
-        buf.extend_from_slice(&self.qc_previous.slot.to_le_bytes());
-        buf.extend_from_slice(&self.qc_previous.block_hash);
+        let mut buf = Vec::with_capacity(192); // 8+8+32+32+32+32+8+32 = 184
+        buf.extend_from_slice(&self.slot.to_le_bytes());       // 8
+        buf.extend_from_slice(&self.epoch.to_le_bytes());      // 8
+        buf.extend_from_slice(&self.parent_hash);              // 32
+        buf.extend_from_slice(&self.proposer);                 // 32
+        buf.extend_from_slice(&poseidon2_hash(&self.vrf_proof).to_bytes()); // 32
+        buf.extend_from_slice(&self.tx_root);                  // 32
+        buf.extend_from_slice(&self.timestamp.to_le_bytes());  // 8
+        buf.extend_from_slice(&self.qc_previous.hash());       // 32 (hashed QC)
         poseidon2_hash(&buf).to_bytes()
     }
 }
@@ -204,8 +217,9 @@ mod tests {
 
     #[test]
     fn different_blocks_different_hash() {
+        // state_root not in hash (unknown at proposal), so differ by timestamp
         let b1 = genesis_block([0xAA; 32], 1_000_000);
-        let b2 = genesis_block([0xBB; 32], 1_000_000);
+        let b2 = genesis_block([0xAA; 32], 2_000_000);
         assert_ne!(b1.hash(), b2.hash());
     }
 
