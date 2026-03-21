@@ -73,6 +73,7 @@
 //! provers each epoch.
 
 pub mod air;
+pub mod poseidon2_air;
 pub mod prove;
 pub mod recorder;
 pub mod registry;
