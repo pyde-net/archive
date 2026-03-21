@@ -95,6 +95,26 @@ pub enum Opcode {
     FieldMul = 0x39, // rd = rs1 * rs2 (mod field prime)
     Commit = 0x3A,   // commit rd to public output
 
+    // --- Bulk Memory Copy (Phase 9) ---
+    //
+    // Problem: no Mcopy instruction, and all 64 opcode slots are used.
+    //
+    // Solution: turn opcode 0x00 (currently Weq) into a gateway for new
+    // instructions. When the VM sees opcode 0x00, it looks at the imm field
+    // to decide what to actually do:
+    //
+    //   0x00 + imm says "NOP"   → do nothing (all-zero instruction is safe)
+    //   0x00 + imm says "Weq"   → wide equal (same as current Weq)
+    //   0x00 + imm says "Mcopy" → bulk memory copy (new!)
+    //   0x00 + imm says "Mset"  → bulk memory set (new!)
+    //   ... room for 60 more future instructions
+    //
+    // This gives us 64 new instructions without changing the 32-bit encoding.
+    //
+    // Until Phase 9, bulk writes use a WSTORE loop:
+    //   for each 32-byte chunk: WSTORE to heap, advance pointer
+    //   ~N/32 instructions for N bytes (not N instructions)
+
     // --- Wide Comparisons (result → GP register) ---
     Weq = 0x00, // rd = (ws1 == ws2) ? 1 : 0
     Wlt = 0x3F, // rd = (ws1 < ws2) ? 1 : 0

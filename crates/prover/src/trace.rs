@@ -15,7 +15,7 @@
 //! constraints that each row must satisfy. The prover generates a
 //! STARK proof that the trace is valid.
 
-use p3_field::{AbstractField, PrimeField64};
+use p3_field::AbstractField;
 use p3_goldilocks::Goldilocks;
 
 /// Number of GP register columns (r0-r15).
@@ -48,25 +48,32 @@ pub struct TraceRow {
     /// w0-w7, each split into 4 × u64 limbs for field compatibility.
     pub wide_limbs: [Goldilocks; NUM_WIDE_LIMBS],
 
-    // === Memory (4 columns) ===
-    /// Memory read address (0 if no read).
-    pub mem_read_addr: Goldilocks,
-    /// Memory read value.
-    pub mem_read_val: Goldilocks,
-    /// Memory write address (0 if no write).
-    pub mem_write_addr: Goldilocks,
-    /// Memory write value.
-    pub mem_write_val: Goldilocks,
+    // === Memory (7 columns) ===
+    /// Memory address (read or write).
+    pub mem_addr: Goldilocks,
+    /// Memory value: 4 × u64 limbs.
+    /// - GP mode (width ≤ 8): val[0] = raw u64, val[1..3] = 0
+    /// - Bulk mode (width > 8): val[0..3] = Poseidon2(raw_bytes) hash limbs
+    ///   (actual bytes in auxiliary witness, AIR verifies hash)
+    pub mem_val: [Goldilocks; 4],
+    /// Memory access width in bytes (1, 2, 4, 8 for GP; or N for bulk writes).
+    pub mem_width: Goldilocks,
+    /// Memory is write (1) or read (0).
+    pub mem_is_write: Goldilocks,
 
-    // === Storage (4 columns) ===
-    /// Storage key (hash, lower 64 bits).
-    pub storage_key_lo: Goldilocks,
-    /// Storage key (hash, upper 64 bits).
-    pub storage_key_hi: Goldilocks,
-    /// Storage value (lower 64 bits).
-    pub storage_val_lo: Goldilocks,
-    /// Storage value (upper 64 bits).
-    pub storage_val_hi: Goldilocks,
+    // === Storage (10 columns) ===
+    /// Storage key: 4 × u64 limbs (U256, always fixed size).
+    pub storage_key: [Goldilocks; 4],
+    /// Storage value: 4 × u64 limbs. Interpretation derived from storage_val_len:
+    /// - len ≤ 8:  val[0] = raw u64, val[1..3] = 0
+    /// - len ≤ 32: val[0..3] = raw U256 limbs
+    /// - len > 32: val[0..3] = Poseidon2(raw_bytes) hash limbs
+    ///   (actual bytes in auxiliary witness, AIR verifies hash)
+    pub storage_val: [Goldilocks; 4],
+    /// Length of the raw storage value in bytes (same role as mem_width).
+    pub storage_val_len: Goldilocks,
+    /// Storage is write (1) or read (0).
+    pub storage_is_write: Goldilocks,
 
     // === Gas (2 columns) ===
     /// Gas used this step.
@@ -85,8 +92,8 @@ pub struct TraceRow {
 
 impl TraceRow {
     /// Total number of columns in the trace.
-    pub const NUM_COLUMNS: usize = 5 + NUM_GP_REGS + NUM_WIDE_LIMBS + 4 + 4 + 2 + 3;
-    // 5 + 16 + 32 + 4 + 4 + 2 + 3 = 66 columns
+    /// 5 control + 16 GP + 32 wide + 7 memory + 10 storage + 2 gas + 3 flags = 75
+    pub const NUM_COLUMNS: usize = 5 + NUM_GP_REGS + NUM_WIDE_LIMBS + 7 + 10 + 2 + 3;
 
     /// Create an empty trace row (all zeros).
     pub fn zero() -> Self {
@@ -98,14 +105,14 @@ impl TraceRow {
             rs2_imm: Goldilocks::zero(),
             gp_regs: [Goldilocks::zero(); NUM_GP_REGS],
             wide_limbs: [Goldilocks::zero(); NUM_WIDE_LIMBS],
-            mem_read_addr: Goldilocks::zero(),
-            mem_read_val: Goldilocks::zero(),
-            mem_write_addr: Goldilocks::zero(),
-            mem_write_val: Goldilocks::zero(),
-            storage_key_lo: Goldilocks::zero(),
-            storage_key_hi: Goldilocks::zero(),
-            storage_val_lo: Goldilocks::zero(),
-            storage_val_hi: Goldilocks::zero(),
+            mem_addr: Goldilocks::zero(),
+            mem_val: [Goldilocks::zero(); 4],
+            mem_width: Goldilocks::zero(),
+            mem_is_write: Goldilocks::zero(),
+            storage_key: [Goldilocks::zero(); 4],
+            storage_val: [Goldilocks::zero(); 4],
+            storage_val_len: Goldilocks::zero(),
+            storage_is_write: Goldilocks::zero(),
             gas_step: Goldilocks::zero(),
             gas_cumulative: Goldilocks::zero(),
             is_memory_op: Goldilocks::zero(),
@@ -124,14 +131,14 @@ impl TraceRow {
         fields.push(self.rs2_imm);
         fields.extend_from_slice(&self.gp_regs);
         fields.extend_from_slice(&self.wide_limbs);
-        fields.push(self.mem_read_addr);
-        fields.push(self.mem_read_val);
-        fields.push(self.mem_write_addr);
-        fields.push(self.mem_write_val);
-        fields.push(self.storage_key_lo);
-        fields.push(self.storage_key_hi);
-        fields.push(self.storage_val_lo);
-        fields.push(self.storage_val_hi);
+        fields.push(self.mem_addr);
+        fields.extend_from_slice(&self.mem_val);
+        fields.push(self.mem_width);
+        fields.push(self.mem_is_write);
+        fields.extend_from_slice(&self.storage_key);
+        fields.extend_from_slice(&self.storage_val);
+        fields.push(self.storage_val_len);
+        fields.push(self.storage_is_write);
         fields.push(self.gas_step);
         fields.push(self.gas_cumulative);
         fields.push(self.is_memory_op);
@@ -222,14 +229,14 @@ mod tests {
 
     #[test]
     fn trace_row_column_count() {
-        assert_eq!(TraceRow::NUM_COLUMNS, 66);
+        assert_eq!(TraceRow::NUM_COLUMNS, 75);
     }
 
     #[test]
     fn zero_row_all_zeros() {
         let row = TraceRow::zero();
         let fields = row.to_fields();
-        assert_eq!(fields.len(), 66);
+        assert_eq!(fields.len(), 75);
         for f in &fields {
             assert_eq!(*f, Goldilocks::zero());
         }
@@ -247,8 +254,8 @@ mod tests {
         assert_eq!(fields[0], to_field(42)); // pc
         assert_eq!(fields[1], to_field(7)); // opcode
         assert_eq!(fields[5], to_field(100)); // gp_regs[0]
-                                              // gas_cumulative: 5 control + 16 gp + 32 wide + 4 mem + 4 storage + 1 gas_step = index 62
-        assert_eq!(fields[62], to_field(21000)); // gas_cumulative
+                                              // gas_cumulative: 5 control + 16 gp + 32 wide + 7 mem + 10 storage + 1 gas_step = index 71
+        assert_eq!(fields[71], to_field(21000)); // gas_cumulative
     }
 
     #[test]
@@ -299,7 +306,7 @@ mod tests {
         trace.push(row2);
 
         let cols = trace.to_column_major();
-        assert_eq!(cols.len(), 66);
+        assert_eq!(cols.len(), 75);
         assert_eq!(cols[0].len(), 2); // 2 rows
 
         // Column 0 = pc: [0, 4]
@@ -315,7 +322,7 @@ mod tests {
     fn empty_trace_column_major() {
         let trace = ExecutionTrace::new();
         let cols = trace.to_column_major();
-        assert_eq!(cols.len(), 66);
+        assert_eq!(cols.len(), 75);
         for col in &cols {
             assert!(col.is_empty());
         }

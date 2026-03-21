@@ -72,6 +72,7 @@
 //! incentivize fast hardware, and the committee is selected from registered
 //! provers each epoch.
 
+pub mod recorder;
 pub mod registry;
 pub mod trace;
 
