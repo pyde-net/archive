@@ -73,6 +73,7 @@
 //! provers each epoch.
 
 pub mod air;
+pub mod prove;
 pub mod recorder;
 pub mod registry;
 pub mod trace;

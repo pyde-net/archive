@@ -3033,10 +3033,12 @@ dependencies = [
  "p3-air",
  "p3-challenger 0.2.0",
  "p3-commit",
+ "p3-dft 0.2.0",
  "p3-field 0.2.0",
  "p3-fri",
  "p3-goldilocks 0.2.0",
  "p3-matrix 0.2.0",
+ "p3-maybe-rayon 0.2.0",
  "p3-merkle-tree",
  "p3-poseidon2 0.2.0",
  "p3-symmetric 0.2.0",
@@ -3044,6 +3046,8 @@ dependencies = [
  "pyde-account",
  "pyde-crypto",
  "pyde-vm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
