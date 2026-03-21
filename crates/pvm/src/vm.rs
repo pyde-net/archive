@@ -137,18 +137,11 @@ pub enum Outcome {
     Trap(Trap),
 }
 
-/// A single step in the execution trace (for ZK prover).
-#[derive(Clone, Copy, Debug)]
-pub struct TraceStep {
-    /// Program counter before this step.
-    pub pc: u32,
-    /// Opcode executed.
-    pub opcode: Opcode,
-    /// Cumulative gas after this step.
-    pub gas_used: u64,
-}
-
 /// Full execution output returned by `execute()`.
+///
+/// No trace is captured here — full nodes don't need it.
+/// Provers use `pyde_prover::recorder::record_execution()` for full
+/// 66-column STARK trace capture.
 #[derive(Clone, Debug)]
 pub struct ExecutionOutput {
     /// High-level outcome.
@@ -161,8 +154,6 @@ pub struct ExecutionOutput {
     pub gas_refund: u64,
     /// Event logs (empty on revert/OOG).
     pub logs: Vec<EventLog>,
-    /// Execution trace for ZK prover.
-    pub trace: Vec<TraceStep>,
 }
 
 /// Two-dimensional gas tracker: execution + proving costs.
@@ -1001,59 +992,23 @@ impl Vm {
         self.storage_journal_keys.clear();
         let logs_snapshot_len = self.logs.len();
 
-        let mut trace = Vec::new();
         let outcome = loop {
-            let pc = self.pc;
-            let idx = (pc / 4) as usize;
-            let opcode = match self.decoded_cache.get(idx) {
-                Some(d) => d.opcode,
-                None => break Outcome::Trap(Trap::MemoryFault),
-            };
-
             match self.step() {
-                Ok(Some(ExecResult::Halt)) => {
-                    trace.push(TraceStep {
-                        pc,
-                        opcode,
-                        gas_used: self.gas_used_total,
-                    });
-                    break Outcome::Success;
-                }
+                Ok(Some(ExecResult::Halt)) => break Outcome::Success,
                 Ok(Some(ExecResult::Revert)) => {
-                    trace.push(TraceStep {
-                        pc,
-                        opcode,
-                        gas_used: self.gas_used_total,
-                    });
                     self.rollback_storage();
                     self.logs.truncate(logs_snapshot_len);
                     self.gas_refund = 0;
                     break Outcome::Revert;
                 }
-                Ok(None) => {
-                    trace.push(TraceStep {
-                        pc,
-                        opcode,
-                        gas_used: self.gas_used_total,
-                    });
-                }
+                Ok(None) => {}
                 Err(Trap::OutOfGas) => {
-                    trace.push(TraceStep {
-                        pc,
-                        opcode,
-                        gas_used: self.gas_used_total,
-                    });
                     self.rollback_storage();
                     self.logs.truncate(logs_snapshot_len);
                     self.gas_refund = 0;
                     break Outcome::OutOfGas;
                 }
                 Err(trap) => {
-                    trace.push(TraceStep {
-                        pc,
-                        opcode,
-                        gas_used: self.gas_used_total,
-                    });
                     self.rollback_storage();
                     self.logs.truncate(logs_snapshot_len);
                     self.gas_refund = 0;
@@ -1071,7 +1026,6 @@ impl Vm {
             gas_raw: self.gas,
             gas_refund: self.gas_refund,
             logs: self.logs[logs_snapshot_len..].to_vec(),
-            trace,
         }
     }
 
@@ -1097,6 +1051,16 @@ impl Vm {
         buf[32..64].copy_from_slice(&self.ctx.self_address);
         let hash = pyde_crypto::poseidon2::poseidon2_hash(&buf);
         U256::from_le_bytes(hash.to_bytes())
+    }
+
+    /// Access the decoded instruction cache (for trace recording).
+    pub fn decoded_cache(&self) -> &[crate::isa::DecodedInstruction] {
+        &self.decoded_cache
+    }
+
+    /// Rollback storage to pre-execution state (public for trace recorder).
+    pub fn rollback_storage_pub(&mut self) {
+        self.rollback_storage();
     }
 
     /// Effective gas used after applying refund (capped at 50% of total used).
@@ -2981,8 +2945,6 @@ mod tests {
 
         assert_eq!(output.outcome, Outcome::Success);
         assert_eq!(vm.cpu.read_gp(3), 30);
-        assert!(!output.trace.is_empty());
-        assert_eq!(output.trace.last().unwrap().opcode, Opcode::Halt);
     }
 
     #[test]
@@ -3009,7 +2971,6 @@ mod tests {
 
         assert_eq!(output.outcome, Outcome::Success);
         assert_eq!(vm.cpu.read_gp(3), 55);
-        assert!(output.trace.len() > 10); // looped multiple times
     }
 
     #[test]
@@ -3163,30 +3124,8 @@ mod tests {
         assert_eq!(balance, 50);
     }
 
-    #[test]
-    fn execute_trace_records_all_steps() {
-        let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 5),
-            instr_ri(Opcode::Addi, 2, 0, 10),
-            instr_bytes(Opcode::Add, 3, 1, 2),
-            instr_bytes(Opcode::Halt, 0, 0, 0),
-        ]);
-        let mut vm = Vm::new();
-        vm.load(&code).unwrap();
-        let output = vm.execute();
-
-        assert_eq!(output.outcome, Outcome::Success);
-        assert_eq!(output.trace.len(), 4);
-        assert_eq!(output.trace[0].opcode, Opcode::Addi);
-        assert_eq!(output.trace[0].pc, 0);
-        assert_eq!(output.trace[1].pc, 4);
-        assert_eq!(output.trace[2].opcode, Opcode::Add);
-        assert_eq!(output.trace[3].opcode, Opcode::Halt);
-        // Gas should be monotonically increasing
-        for w in output.trace.windows(2) {
-            assert!(w[1].gas_used >= w[0].gas_used);
-        }
-    }
+    // Trace recording moved to pyde-prover::recorder (record_execution).
+    // Full nodes use lean execute() with no trace overhead.
 
     #[test]
     fn execute_success_preserves_storage_and_logs() {
