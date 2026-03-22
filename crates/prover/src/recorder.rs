@@ -13,7 +13,7 @@
 //! use the standard `vm.execute()` without overhead.
 
 use crate::trace::{to_field, ExecutionTrace, TraceRow, NUM_GP_REGS};
-use p3_field::AbstractField;
+use p3_field::{AbstractField, Field};
 use p3_goldilocks::Goldilocks;
 use pyde_vm::isa::Opcode;
 use pyde_vm::vm::{ExecResult, Outcome, Vm};
@@ -26,6 +26,7 @@ use pyde_vm::cpu::Trap;
 pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
     let mut trace = ExecutionTrace::new();
     let logs_snapshot_len = vm.logs.len();
+    let mut call_depth: u64 = 0;
 
     let outcome = loop {
         let pc = vm.pc;
@@ -69,9 +70,18 @@ pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
             Ok(Some(ExecResult::Halt)) | Ok(Some(ExecResult::Revert)) | Err(_)
         );
 
-        let row = build_trace_row(vm, pc, decoded.opcode, decoded.rd, decoded.rs1,
+        let mut row = build_trace_row(vm, pc, decoded.opcode, decoded.rd, decoded.rs1,
             decoded.rs2_or_imm, gas_step, gas_after, is_mem, is_storage, is_final,
             &mem_access, &storage_access);
+        // Set call depth and update for next iteration
+        row.call_depth = to_field(call_depth);
+        if decoded.opcode == Opcode::Call || decoded.opcode == Opcode::CallExt
+            || decoded.opcode == Opcode::Delegate {
+            call_depth += 1;
+        } else if decoded.opcode == Opcode::Ret && call_depth > 0 {
+            call_depth -= 1;
+        }
+
         trace.push(row);
 
         match step_result {
@@ -382,6 +392,237 @@ fn build_trace_row(
     row.is_memory_op = if is_mem { Goldilocks::one() } else { Goldilocks::zero() };
     row.is_storage_op = if is_storage { Goldilocks::one() } else { Goldilocks::zero() };
     row.is_final = if is_final { Goldilocks::one() } else { Goldilocks::zero() };
+
+    // Opcode bits: binary decomposition of 6-bit opcode
+    let op_val = opcode.to_u8() as u64;
+    for bit in 0..6 {
+        row.opcode_bits[bit] = if (op_val >> bit) & 1 == 1 {
+            Goldilocks::one()
+        } else {
+            Goldilocks::zero()
+        };
+    }
+
+    // Operand columns: resolved from registers post-step
+    // op_a = gp[rs1] (first source operand)
+    // op_b = gp[rs2] or immediate (second operand)
+    // op_result = gp[rd] post-step (result written)
+    row.op_a = to_field(vm.cpu.read_gp(rs1));
+    // For register-register ops, rs2 is in rs2_imm lower 4 bits.
+    // For immediate ops (ADDI), rs2_imm is the immediate value.
+    let is_immediate = matches!(opcode,
+        Opcode::Addi | Opcode::Jmp | Opcode::Beq | Opcode::Bne
+        | Opcode::Blt | Opcode::Bge | Opcode::Call
+    );
+    if is_immediate {
+        row.op_b = to_field(pyde_vm::isa::sign_extend_18(rs2_imm) as u64);
+    } else {
+        let rs2_reg = (rs2_imm & 0xF) as u8;
+        row.op_b = to_field(vm.cpu.read_gp(rs2_reg));
+    }
+    row.op_result = to_field(vm.cpu.read_gp(rd));
+
+    // SHR remainder: op_a = result * 2^shift + remainder
+    if opcode == Opcode::Shr || opcode == Opcode::Sar {
+        let a = vm.cpu.read_gp(rs1);
+        let b_reg = (rs2_imm & 0xF) as u8;
+        let shift = vm.cpu.read_gp(b_reg) & 63; // shift amount mod 64
+        if shift > 0 {
+            let mask = (1u64 << shift) - 1;
+            row.shift_remainder = to_field(a & mask);
+        }
+    }
+
+    // Wide operands (for WADD, WSUB, WMUL, etc.)
+    // rs1 field selects the wide source register for wide ops
+    let is_wide_op = matches!(opcode,
+        Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv | Opcode::Wmod
+        | Opcode::Wand | Opcode::Wor | Opcode::Wxor | Opcode::Wnot
+    );
+    if is_wide_op {
+        // wide_op_a from ws1 (rs1 field), wide_op_b from ws2 (rs2 field)
+        let wa = vm.cpu.read_wide(rs1);
+        let wa_bytes = wa.to_le_bytes();
+        for i in 0..4 {
+            row.wide_op_a[i] = to_field(u64::from_le_bytes(
+                wa_bytes[i * 8..(i + 1) * 8].try_into().unwrap(),
+            ));
+        }
+
+        if opcode != Opcode::Wnot {
+            let ws2 = (rs2_imm & 0xF) as u8;
+            let wb = vm.cpu.read_wide(ws2);
+            let wb_bytes = wb.to_le_bytes();
+            for i in 0..4 {
+                row.wide_op_b[i] = to_field(u64::from_le_bytes(
+                    wb_bytes[i * 8..(i + 1) * 8].try_into().unwrap(),
+                ));
+            }
+        }
+
+        // Result from destination wide register (post-step)
+        let wr = vm.cpu.read_wide(rd);
+        let wr_bytes = wr.to_le_bytes();
+        for i in 0..4 {
+            row.wide_result[i] = to_field(u64::from_le_bytes(
+                wr_bytes[i * 8..(i + 1) * 8].try_into().unwrap(),
+            ));
+        }
+
+        // Carry computation for WADD/WSUB
+        if opcode == Opcode::Wadd {
+            let mut carry = 0u128;
+            for i in 0..4 {
+                let a_limb = u64::from_le_bytes(wa_bytes[i * 8..(i + 1) * 8].try_into().unwrap()) as u128;
+                let wb = vm.cpu.read_wide((rs2_imm & 0xF) as u8);
+                let wb_bytes = wb.to_le_bytes();
+                let b_limb = u64::from_le_bytes(wb_bytes[i * 8..(i + 1) * 8].try_into().unwrap()) as u128;
+                let sum = a_limb + b_limb + carry;
+                carry = sum >> 64;
+                row.wide_carry[i] = to_field(carry as u64);
+            }
+        }
+
+        // Wide quotient for WMOD: a = quotient * b + result
+        // After step, wide_result = remainder. Quotient = a / b (integer).
+        // We compute quotient per-limb from the pre-step operands.
+        if opcode == Opcode::Wmod || opcode == Opcode::Wdiv {
+            // For simple cases where b fits in limb 0 and higher limbs are 0,
+            // quotient[0] = a[0] / b[0]. For full U256 division, the VM
+            // already computed the result. We store the quotient from the
+            // relationship: quotient = (a - result) / b, using limb 0.
+            let ws2 = (rs2_imm & 0xF) as u8;
+            let b0 = {
+                let wb = vm.cpu.read_wide(ws2);
+                let wb_bytes = wb.to_le_bytes();
+                u64::from_le_bytes(wb_bytes[0..8].try_into().unwrap())
+            };
+            if b0 != 0 {
+                let a0 = {
+                    let bytes = wa_bytes;
+                    u64::from_le_bytes(bytes[0..8].try_into().unwrap())
+                };
+                row.wide_quotient[0] = to_field(a0 / b0);
+            }
+        }
+    }
+
+    // Quotient for MOD: op_a = quotient * op_b + result
+    if opcode == Opcode::Mod {
+        let a = vm.cpu.read_gp(rs1);
+        let b_reg = (rs2_imm & 0xF) as u8;
+        let b = vm.cpu.read_gp(b_reg);
+        if b != 0 {
+            row.op_quotient = to_field(a / b);
+        }
+    }
+    // Quotient also useful for DIV verification
+    if opcode == Opcode::Div {
+        let a = vm.cpu.read_gp(rs1);
+        let b_reg = (rs2_imm & 0xF) as u8;
+        let b = vm.cpu.read_gp(b_reg);
+        if b != 0 {
+            row.op_quotient = to_field(a % b); // remainder for DIV cross-check
+        }
+    }
+
+    // Branch taken + diff_inv for BEQ/BNE constraints
+    let is_branch_op = matches!(opcode,
+        Opcode::Beq | Opcode::Bne | Opcode::Blt | Opcode::Bge
+    );
+    if is_branch_op {
+        let a_val = vm.cpu.read_gp(rd); // BEQ uses rd and rs1 for comparison
+        let b_val = vm.cpu.read_gp(rs1);
+        let taken = match opcode {
+            Opcode::Beq => a_val == b_val,
+            Opcode::Bne => a_val != b_val,
+            Opcode::Blt => (a_val as i64) < (b_val as i64),
+            Opcode::Bge => (a_val as i64) >= (b_val as i64),
+            _ => false,
+        };
+        row.branch_taken = if taken { Goldilocks::one() } else { Goldilocks::zero() };
+
+        // diff_inv = 1/(a - b) when a != b, 0 when equal
+        // Goldilocks field: p = 2^64 - 2^32 + 1
+        // Inverse via Fermat: inv = diff^(p-2) mod p
+        if a_val != b_val {
+            let diff = Goldilocks::from_canonical_u64(a_val.wrapping_sub(b_val));
+            // Use p3_field's inverse
+            let inv = diff.try_inverse();
+            if let Some(inv_val) = inv {
+                row.diff_inv = inv_val;
+            }
+        }
+    }
+
+    // Call depth tracking: we maintain a static counter in the trace.
+    // The AIR constrains: CALL → depth+1, RET → depth-1, else stable.
+    // The recorder reads from the previous row's value + opcode delta.
+    // Since we're building rows sequentially, we compute it here.
+    // Note: the actual call_depth is set AFTER the step, so we read
+    // the VM's state. The ext_call_depth field tracks this.
+    // For external calls, the VM increments ext_call_depth internally.
+
+    // Wide bit decomposition for WAND/WOR/WXOR
+    let is_wide_bitwise = matches!(opcode, Opcode::Wand | Opcode::Wor | Opcode::Wxor);
+    if is_wide_bitwise {
+        let wa = vm.cpu.read_wide(rs1);
+        let wa_bytes = wa.to_le_bytes();
+        let ws2 = (rs2_imm & 0xF) as u8;
+        let wb = vm.cpu.read_wide(ws2);
+        let wb_bytes = wb.to_le_bytes();
+
+        // Decompose all 256 bits of each operand
+        for byte_idx in 0..32 {
+            for bit in 0..8 {
+                let bit_idx = byte_idx * 8 + bit;
+                row.wide_a_bits[bit_idx] = if (wa_bytes[byte_idx] >> bit) & 1 == 1 {
+                    Goldilocks::one()
+                } else {
+                    Goldilocks::zero()
+                };
+                row.wide_b_bits[bit_idx] = if (wb_bytes[byte_idx] >> bit) & 1 == 1 {
+                    Goldilocks::one()
+                } else {
+                    Goldilocks::zero()
+                };
+            }
+        }
+    }
+
+    // Bit decomposition of operands (for bitwise/shift constraints)
+    let a_raw = vm.cpu.read_gp(rs1);
+    let b_raw = if is_immediate {
+        pyde_vm::isa::sign_extend_18(rs2_imm) as u64
+    } else {
+        vm.cpu.read_gp((rs2_imm & 0xF) as u8)
+    };
+    for bit in 0..64 {
+        row.op_a_bits[bit] = if (a_raw >> bit) & 1 == 1 {
+            Goldilocks::one()
+        } else {
+            Goldilocks::zero()
+        };
+        row.op_b_bits[bit] = if (b_raw >> bit) & 1 == 1 {
+            Goldilocks::one()
+        } else {
+            Goldilocks::zero()
+        };
+    }
+
+    // Register selectors: one-hot encoding of rd, rs1, rs2
+    if (rd as usize) < 16 {
+        row.rd_sel[rd as usize] = Goldilocks::one();
+    }
+    if (rs1 as usize) < 16 {
+        row.rs1_sel[rs1 as usize] = Goldilocks::one();
+    }
+    if !is_immediate {
+        let rs2_reg = (rs2_imm & 0xF) as usize;
+        if rs2_reg < 16 {
+            row.rs2_sel[rs2_reg] = Goldilocks::one();
+        }
+    }
 
     row
 }

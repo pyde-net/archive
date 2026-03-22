@@ -105,8 +105,8 @@ pub fn build_config() -> PydeStarkConfig {
     let dft = Dft {};
 
     let fri_config = FriConfig {
-        log_blowup: 1,
-        num_queries: 100,
+        log_blowup: 4, // Supports high-degree constraints (bitwise: opcode selector * 64 bit sums)
+        num_queries: 30,
         proof_of_work_bits: 16,
         mmcs: challenge_mmcs,
     };
@@ -217,20 +217,54 @@ mod tests {
     use super::*;
     use crate::trace::{to_field, TraceRow};
 
+    /// Set opcode_bits and register selectors for a trace row.
+    fn setup_row(row: &mut TraceRow, opcode: u64, rd: u8, rs1: u8, rs2: u8) {
+        row.opcode = to_field(opcode);
+        row.rd = to_field(rd as u64);
+        row.rs1 = to_field(rs1 as u64);
+        for i in 0..6 {
+            row.opcode_bits[i] = if (opcode >> i) & 1 == 1 {
+                Goldilocks::one()
+            } else {
+                Goldilocks::zero()
+            };
+        }
+        // Register selectors (one-hot)
+        if (rd as usize) < 16 {
+            row.rd_sel[rd as usize] = Goldilocks::one();
+        }
+        if (rs1 as usize) < 16 {
+            row.rs1_sel[rs1 as usize] = Goldilocks::one();
+        }
+        if (rs2 as usize) < 16 {
+            row.rs2_sel[rs2 as usize] = Goldilocks::one();
+        }
+    }
+
     fn minimal_trace() -> ExecutionTrace {
         let mut trace = ExecutionTrace::new();
 
-        let mut row1 = TraceRow::zero();
-        row1.gas_step = to_field(10);
-        row1.gas_cumulative = to_field(10);
+        let mut cumulative = 0u64;
+        for i in 0..15u64 {
+            let step_gas = 3;
+            cumulative += step_gas;
+            let mut row = TraceRow::zero();
+            row.pc = to_field(i * 4);
+            setup_row(&mut row, 0x0E, 1, 0, 0); // ADDI r1, r0, imm
+            row.op_a = to_field(0); // gp[r0] = 0
+            row.gas_step = to_field(step_gas);
+            row.gas_cumulative = to_field(cumulative);
+            trace.push(row);
+        }
+        let mut last = TraceRow::zero();
+        last.pc = to_field(15 * 4);
+        setup_row(&mut last, 0x2C, 0, 0, 0); // HALT
+        last.gas_step = to_field(3);
+        cumulative += 3;
+        last.gas_cumulative = to_field(cumulative);
+        last.is_final = Goldilocks::one();
+        trace.push(last);
 
-        let mut row2 = TraceRow::zero();
-        row2.gas_step = to_field(5);
-        row2.gas_cumulative = to_field(15);
-        row2.is_final = Goldilocks::one();
-
-        trace.push(row1);
-        trace.push(row2);
         trace
     }
 
@@ -243,18 +277,21 @@ mod tests {
     fn trace_to_matrix_correct_dimensions() {
         let trace = minimal_trace();
         let matrix = trace_to_matrix(&trace);
-        assert_eq!(matrix.height(), 2);
-        assert_eq!(matrix.width, TraceRow::NUM_COLUMNS);
+        assert_eq!(matrix.height(), 16);
+        assert_eq!(matrix.width, 861);
     }
 
     #[test]
     fn trace_to_matrix_values_preserved() {
         let trace = minimal_trace();
         let matrix = trace_to_matrix(&trace);
-        assert_eq!(matrix.get(0, 70), to_field(10));  // gas_step
-        assert_eq!(matrix.get(0, 71), to_field(10));  // gas_cumulative
-        assert_eq!(matrix.get(1, 71), to_field(15));  // next gas_cumulative
-        assert_eq!(matrix.get(1, 74), Goldilocks::one()); // is_final
+        // Row 0: gas_step=3, gas_cumulative=3
+        assert_eq!(matrix.get(0, 70), to_field(3));   // gas_step
+        assert_eq!(matrix.get(0, 71), to_field(3));   // gas_cumulative
+        // Row 1: gas_cumulative=6
+        assert_eq!(matrix.get(1, 71), to_field(6));
+        // Last row (15): is_final=1
+        assert_eq!(matrix.get(15, 74), Goldilocks::one());
     }
 
     #[test]
@@ -268,7 +305,7 @@ mod tests {
         }
         let matrix = prepare_trace(&mut trace);
         assert_eq!(matrix.height(), 8);
-        assert_eq!(matrix.width, TraceRow::NUM_COLUMNS);
+        assert_eq!(matrix.width, 861);
     }
 
     #[test]
@@ -296,19 +333,26 @@ mod tests {
     fn prove_and_verify_longer_trace() {
         let mut trace = ExecutionTrace::new();
         let mut cumulative = 0u64;
-        for i in 0..7u64 {
-            let step_gas = 3 + i;
+        for i in 0..31u64 {
+            let step_gas = 3 + (i % 5);
             cumulative += step_gas;
             let mut row = TraceRow::zero();
             row.pc = to_field(i * 4);
-            row.opcode = to_field(0x01);
+            setup_row(&mut row, 0x0E, 1, 0, 0); // ADDI r1, r0, imm
+            row.op_a = to_field(0);
             row.gas_step = to_field(step_gas);
             row.gas_cumulative = to_field(cumulative);
-            if i == 6 {
-                row.is_final = Goldilocks::one();
-            }
             trace.push(row);
         }
+        let mut last = TraceRow::zero();
+        last.pc = to_field(31 * 4);
+        setup_row(&mut last, 0x2C, 0, 0, 0);
+        last.gas_step = to_field(3);
+        cumulative += 3;
+        last.gas_cumulative = to_field(cumulative);
+        last.is_final = Goldilocks::one();
+        trace.push(last);
+
         let proof = generate_proof(&mut trace, &[]);
         assert!(verify_proof(&proof, &[]).is_ok());
     }
@@ -317,17 +361,24 @@ mod tests {
     fn tampered_trace_fails() {
         let mut trace = ExecutionTrace::new();
 
-        let mut row1 = TraceRow::zero();
-        row1.gas_step = to_field(10);
-        row1.gas_cumulative = to_field(10);
-
-        let mut row2 = TraceRow::zero();
-        row2.gas_step = to_field(5);
-        row2.gas_cumulative = to_field(999); // WRONG: should be 15
-        row2.is_final = Goldilocks::one();
-
-        trace.push(row1);
-        trace.push(row2);
+        let mut cumulative = 0u64;
+        for i in 0..15u64 {
+            cumulative += 3;
+            let mut row = TraceRow::zero();
+            row.pc = to_field(i * 4);
+            setup_row(&mut row, 0x0E, 1, 0, 0);
+            row.op_a = to_field(0);
+            row.gas_step = to_field(3);
+            row.gas_cumulative = to_field(cumulative);
+            trace.push(row);
+        }
+        let mut last = TraceRow::zero();
+        last.pc = to_field(15 * 4);
+        setup_row(&mut last, 0x2C, 0, 0, 0);
+        last.gas_step = to_field(3);
+        last.gas_cumulative = to_field(99999); // WRONG
+        last.is_final = Goldilocks::one();
+        trace.push(last);
 
         // This should either panic during proving (debug) or produce
         // a proof that fails verification
@@ -450,5 +501,92 @@ mod tests {
         println!("Verify time:     {:.2?}", verify_time);
         println!("Proof size:      {:.1} KB ({} bytes)", proof_size_kb, proof_bytes.len());
         println!();
+    }
+
+    // ========== M8.9: Proof Verification tests ==========
+
+    #[test]
+    fn wrong_public_inputs_fails() {
+        // Generate proof with no public inputs
+        let mut trace = minimal_trace();
+        let proof = generate_proof(&mut trace, &[]);
+
+        // Verify with WRONG public inputs — should fail (panic or Err)
+        let wrong_pi = vec![Goldilocks::from_canonical_u64(999)];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            verify_proof(&proof, &wrong_pi)
+        }));
+
+        // Either panicked (dimension mismatch) or returned Err
+        match result {
+            Err(_) => {} // panicked — expected
+            Ok(Err(_)) => {} // returned error — expected
+            Ok(Ok(_)) => panic!("should fail with wrong public inputs"),
+        }
+    }
+
+    #[test]
+    fn batch_verify_multiple_proofs() {
+        // Generate multiple proofs and verify all
+        let mut results = Vec::new();
+
+        for gas_base in [3u64, 5, 7] {
+            let mut trace = ExecutionTrace::new();
+            let mut cumulative = 0u64;
+            for i in 0..15u64 {
+                cumulative += gas_base;
+                let mut row = TraceRow::zero();
+                row.pc = to_field(i * 4);
+                setup_row(&mut row, 0x0E, 1, 0, 0);
+                row.op_a = to_field(0);
+                row.gas_step = to_field(gas_base);
+                row.gas_cumulative = to_field(cumulative);
+                trace.push(row);
+            }
+            let mut last = TraceRow::zero();
+            last.pc = to_field(15 * 4);
+            setup_row(&mut last, 0x2C, 0, 0, 0);
+            last.gas_step = to_field(gas_base);
+            cumulative += gas_base;
+            last.gas_cumulative = to_field(cumulative);
+            last.is_final = Goldilocks::one();
+            trace.push(last);
+
+            let proof = generate_proof(&mut trace, &[]);
+            results.push(verify_proof(&proof, &[]));
+        }
+
+        // All 3 proofs should verify
+        for (i, r) in results.iter().enumerate() {
+            assert!(r.is_ok(), "proof {} failed", i);
+        }
+    }
+
+    #[test]
+    fn public_inputs_extraction() {
+        let pi = PublicInputs {
+            pre_state_root: [0x11; 32],
+            post_state_root: [0x22; 32],
+            tx_hash: [0x33; 32],
+            gas_used: 42000,
+        };
+
+        let fields = pi.to_fields();
+        assert_eq!(fields.len(), 13);
+
+        // Pre-state root limbs
+        for i in 0..4 {
+            assert_eq!(fields[i], Goldilocks::from_canonical_u64(
+                u64::from_le_bytes([0x11; 8])
+            ));
+        }
+        // Post-state root limbs
+        for i in 4..8 {
+            assert_eq!(fields[i], Goldilocks::from_canonical_u64(
+                u64::from_le_bytes([0x22; 8])
+            ));
+        }
+        // Gas
+        assert_eq!(fields[12], Goldilocks::from_canonical_u64(42000));
     }
 }

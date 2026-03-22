@@ -73,6 +73,9 @@
 //! provers each epoch.
 
 pub mod air;
+pub mod cross_table;
+pub mod memory_air;
+pub mod poseidon2_air;
 pub mod prove;
 pub mod recorder;
 pub mod registry;
