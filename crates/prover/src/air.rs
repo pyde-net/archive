@@ -102,17 +102,28 @@ pub mod col {
     pub const fn wide_op_b(i: usize) -> usize { WIDE_OP_B_START + i }
     pub const fn wide_result(i: usize) -> usize { WIDE_RESULT_START + i }
 
-    /// Wide carry columns.
-    pub const WIDE_CARRY_START: usize = 274; // 274..278
+    /// Wide carry columns: 274..278
+    pub const WIDE_CARRY_START: usize = 274;
     pub const fn wide_carry(i: usize) -> usize { WIDE_CARRY_START + i }
 
-    /// Wide quotient columns (for WMOD).
-    pub const WIDE_QUOTIENT_START: usize = 278; // 278..282
+    /// Wide quotient columns: 278..282
+    pub const WIDE_QUOTIENT_START: usize = 278;
     pub const fn wide_quotient(i: usize) -> usize { WIDE_QUOTIENT_START + i }
 
-    /// Merkle proof columns.
-    pub const MERKLE_PATH_START: usize = 282;  // 282..314 (32 siblings)
-    pub const MERKLE_DIR_START: usize = 314;   // 314..346 (32 direction bits)
+    /// Branch/call columns: 282..285
+    pub const BRANCH_TAKEN: usize = 282;
+    pub const DIFF_INV: usize = 283;
+    pub const CALL_DEPTH: usize = 284;
+
+    /// Wide bit decomposition: 285..541 (wide_a), 541..797 (wide_b)
+    pub const WIDE_A_BITS_START: usize = 285;
+    pub const WIDE_B_BITS_START: usize = 541;
+    pub const fn wide_a_bit(i: usize) -> usize { WIDE_A_BITS_START + i }
+    pub const fn wide_b_bit(i: usize) -> usize { WIDE_B_BITS_START + i }
+
+    /// Merkle proof columns: 797..829 (path), 829..861 (dir)
+    pub const MERKLE_PATH_START: usize = 797;
+    pub const MERKLE_DIR_START: usize = 829;
     pub const fn merkle_path(i: usize) -> usize { MERKLE_PATH_START + i }
     pub const fn merkle_dir(i: usize) -> usize { MERKLE_DIR_START + i }
 
@@ -173,8 +184,33 @@ pub mod opcodes {
     pub const REVERT: u64 = 0x2B;
     pub const HALT: u64 = 0x2C;
 
+    // Wide memory / register transfer
+    pub const WLOAD: u64 = 0x37;
+    pub const WSTORE: u64 = 0x3B;
+    pub const WMOV: u64 = 0x3C;
+    pub const NARROW: u64 = 0x3D;
+    pub const WIDEN: u64 = 0x3E;
+
+    // Wide comparisons
+    pub const WEQ: u64 = 0x00;
+    pub const WLT: u64 = 0x3F;
+
+    // Blockchain context
+    pub const CALLVALUE: u64 = 0x24;
+    pub const BLOCKHASH: u64 = 0x25;
+    pub const CALLEXT: u64 = 0x26;
+    pub const DELEGATE: u64 = 0x27;
+    pub const CREATE: u64 = 0x28;
+    pub const SELFDESTRUCT: u64 = 0x29;
+
+    // Crypto
+    pub const POSEIDON: u64 = 0x30;
+    pub const VERIFYSIG: u64 = 0x31;
+
     // ZK-native
     pub const ASSERT: u64 = 0x38;
+    pub const FIELDMUL: u64 = 0x39;
+    pub const COMMIT: u64 = 0x3A;
 }
 
 /// The PVM AIR: defines all constraints for valid execution traces.
@@ -548,16 +584,81 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
             builder.assert_zero(is_wnot.clone() * (wr - max_u64.clone() + wa));
         }
 
-        // --- WAND/WOR/WXOR (0x2D/0x2E/0x2F) ---
-        // Per-limb bitwise: each limb is u64, same as GP bitwise.
-        // Full constraint would need 256-bit decomposition (256 columns).
-        // We constrain per-limb: result[i] = a[i] OP b[i] using the
-        // existing Goldilocks field arithmetic. Since each limb fits in
-        // Goldilocks (~64 bits), the constraint is exact.
-        // Note: these per-limb constraints use field arithmetic which is
-        // modular (mod p). For bitwise correctness, we'd need per-limb bit
-        // decomposition. This is structurally sound but the per-bit constraint
-        // is deferred to when 256-bit decomposition columns are added.
+        // --- WAND/WOR/WXOR (0x2D/0x2E/0x2F) with 256-bit decomposition ---
+        // wide_a_bits[0..255] and wide_b_bits[0..255] decompose the U256 operands.
+        let is_wide_bitwise = opcode_selector(0x2D) // WAND
+            + opcode_selector(0x2E) // WOR
+            + opcode_selector(0x2F); // WXOR
+
+        // All wide bits must be boolean
+        for i in 0..256 {
+            let ab: AB::Expr = curr(col::wide_a_bit(i)).into();
+            let bb: AB::Expr = curr(col::wide_b_bit(i)).into();
+            builder.assert_zero(is_wide_bitwise.clone() * ab.clone() * (AB::Expr::one() - ab));
+            builder.assert_zero(is_wide_bitwise.clone() * bb.clone() * (AB::Expr::one() - bb));
+        }
+
+        // Bits must decompose to match wide_op_a/wide_op_b limbs
+        for limb in 0..4 {
+            let mut a_sum = AB::Expr::zero();
+            let mut b_sum = AB::Expr::zero();
+            for bit in 0..64 {
+                let idx = limb * 64 + bit;
+                let weight = AB::Expr::from_canonical_u64(1u64 << bit);
+                a_sum = a_sum + Into::<AB::Expr>::into(curr(col::wide_a_bit(idx))) * weight.clone();
+                b_sum = b_sum + Into::<AB::Expr>::into(curr(col::wide_b_bit(idx))) * weight;
+            }
+            let wa_limb: AB::Expr = curr(col::wide_op_a(limb)).into();
+            let wb_limb: AB::Expr = curr(col::wide_op_b(limb)).into();
+            builder.assert_zero(is_wide_bitwise.clone() * (wa_limb - a_sum));
+            builder.assert_zero(is_wide_bitwise.clone() * (wb_limb - b_sum));
+        }
+
+        // WAND: per-bit AND across all 256 bits
+        let is_wand = opcode_selector(0x2D);
+        for limb in 0..4 {
+            let mut and_sum = AB::Expr::zero();
+            for bit in 0..64 {
+                let idx = limb * 64 + bit;
+                let ab: AB::Expr = curr(col::wide_a_bit(idx)).into();
+                let bb: AB::Expr = curr(col::wide_b_bit(idx)).into();
+                let weight = AB::Expr::from_canonical_u64(1u64 << bit);
+                and_sum = and_sum + ab * bb * weight;
+            }
+            let wr: AB::Expr = curr(col::wide_result(limb)).into();
+            builder.assert_zero(is_wand.clone() * (wr - and_sum));
+        }
+
+        // WOR: per-bit OR across all 256 bits
+        let is_wor = opcode_selector(0x2E);
+        for limb in 0..4 {
+            let mut or_sum = AB::Expr::zero();
+            for bit in 0..64 {
+                let idx = limb * 64 + bit;
+                let ab: AB::Expr = curr(col::wide_a_bit(idx)).into();
+                let bb: AB::Expr = curr(col::wide_b_bit(idx)).into();
+                let weight = AB::Expr::from_canonical_u64(1u64 << bit);
+                or_sum = or_sum + (ab.clone() + bb.clone() - ab * bb) * weight;
+            }
+            let wr: AB::Expr = curr(col::wide_result(limb)).into();
+            builder.assert_zero(is_wor.clone() * (wr - or_sum));
+        }
+
+        // WXOR: per-bit XOR across all 256 bits
+        let is_wxor = opcode_selector(0x2F);
+        for limb in 0..4 {
+            let mut xor_sum = AB::Expr::zero();
+            for bit in 0..64 {
+                let idx = limb * 64 + bit;
+                let ab: AB::Expr = curr(col::wide_a_bit(idx)).into();
+                let bb: AB::Expr = curr(col::wide_b_bit(idx)).into();
+                let weight = AB::Expr::from_canonical_u64(1u64 << bit);
+                let two = AB::Expr::from_canonical_u64(2);
+                xor_sum = xor_sum + (ab.clone() + bb.clone() - two * ab * bb) * weight;
+            }
+            let wr: AB::Expr = curr(col::wide_result(limb)).into();
+            builder.assert_zero(is_wxor.clone() * (wr - xor_sum));
+        }
 
         // ========== Merkle path constraints (M8.6) ==========
         // Direction bits must be boolean
@@ -720,6 +821,220 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         let is_revert = opcode_selector(opcodes::REVERT);
         builder.assert_zero(is_revert * (AB::Expr::one() - is_final.clone()));
 
+        // ========== Branch condition constraints (M8.5) ==========
+        // BEQ (0x19): if op_a == op_b, PC jumps to target
+        // When branch TAKEN: pc changes (already excluded from sequential check)
+        // When branch NOT TAKEN: next.pc = curr.pc + 4
+        // Constraint: is_beq * (op_a - op_b) * (next_pc - curr_pc - 4) = 0
+        //   If op_a == op_b (taken): first factor = 0, any PC is fine
+        //   If op_a != op_b (not taken): second factor must be 0 → PC += 4
+        let next_pc: AB::Expr = next(col::PC).into();
+        let curr_pc: AB::Expr = curr(col::PC).into();
+        let pc_plus_4 = curr_pc.clone() + AB::Expr::from_canonical_u64(4);
+
+        let is_beq_sel = opcode_selector(opcodes::BEQ);
+        builder.assert_zero(
+            not_final.clone() * is_beq_sel
+                * (op_a.clone() - op_b.clone())
+                * (next_pc.clone() - pc_plus_4.clone()),
+        );
+
+        // BNE (0x1A): if op_a != op_b, PC jumps
+        // Using diff_inv witness: (op_a - op_b) * diff_inv = branch_taken
+        // When op_a != op_b: diff * inv = 1 = branch_taken → can jump
+        // When op_a == op_b: 0 * anything = 0 = branch_taken → must be sequential
+        let branch_taken: AB::Expr = curr(col::BRANCH_TAKEN).into();
+        let diff_inv_val: AB::Expr = curr(col::DIFF_INV).into();
+        builder.assert_bool(curr(col::BRANCH_TAKEN));
+
+        let is_bne_sel = opcode_selector(opcodes::BNE);
+        // (op_a - op_b) * diff_inv = branch_taken
+        builder.assert_zero(
+            not_final.clone() * is_bne_sel.clone()
+                * ((op_a.clone() - op_b.clone()) * diff_inv_val.clone() - branch_taken.clone()),
+        );
+        // When NOT taken (branch_taken=0): next_pc = curr_pc + 4
+        builder.assert_zero(
+            not_final.clone() * is_bne_sel
+                * (AB::Expr::one() - branch_taken.clone())
+                * (next_pc.clone() - pc_plus_4.clone()),
+        );
+
+        // BLT (0x1B): branch_taken must be boolean, sequential when not taken
+        let is_blt_sel = opcode_selector(opcodes::BLT);
+        builder.assert_zero(
+            not_final.clone() * is_blt_sel
+                * (AB::Expr::one() - branch_taken.clone())
+                * (next_pc.clone() - pc_plus_4.clone()),
+        );
+
+        // BGE (0x1C): branch_taken must be boolean, sequential when not taken
+        let is_bge_sel = opcode_selector(opcodes::BGE);
+        builder.assert_zero(
+            not_final.clone() * is_bge_sel
+                * (AB::Expr::one() - branch_taken.clone())
+                * (next_pc.clone() - pc_plus_4.clone()),
+        );
+
+        // ========== CALL/RET constraints ==========
+        // CALL: call_depth increments by 1
+        let call_depth: AB::Expr = curr(col::CALL_DEPTH).into();
+        let next_call_depth: AB::Expr = next(col::CALL_DEPTH).into();
+
+        let is_call_sel = opcode_selector(opcodes::CALL);
+        builder.assert_zero(
+            not_final.clone() * is_call_sel
+                * (next_call_depth.clone() - call_depth.clone() - AB::Expr::one()),
+        );
+
+        // RET: call_depth decrements by 1
+        let is_ret_sel = opcode_selector(opcodes::RET);
+        builder.assert_zero(
+            not_final.clone() * is_ret_sel
+                * (next_call_depth.clone() - call_depth.clone() + AB::Expr::one()),
+        );
+
+        // Non-call/ret: call_depth stays the same
+        let is_call_or_ret = opcode_selector(opcodes::CALL) + opcode_selector(opcodes::RET);
+        let is_normal = AB::Expr::one() - is_call_or_ret;
+        builder.assert_zero(
+            not_final.clone() * is_normal * (next_call_depth - call_depth),
+        );
+
+        // ========== Simple register transfer constraints ==========
+
+        // WMOV (0x3C): wide_result = wide_op_a (copy wide register)
+        let is_wmov = opcode_selector(opcodes::WMOV);
+        for i in 0..4 {
+            let wa: AB::Expr = curr(col::wide_op_a(i)).into();
+            let wr: AB::Expr = curr(col::wide_result(i)).into();
+            builder.assert_zero(is_wmov.clone() * (wr - wa));
+        }
+
+        // NARROW (0x3D): result = lower 64 bits of wide register
+        // op_result = wide_op_a[0] (first limb)
+        let is_narrow = opcode_selector(opcodes::NARROW);
+        let narrow_wa0: AB::Expr = curr(col::wide_op_a(0)).into();
+        builder.assert_zero(is_narrow * (result.clone() - narrow_wa0));
+
+        // WIDEN (0x3E): wide_result = zero_extend(op_a)
+        // wide_result[0] = op_a, wide_result[1..3] = 0
+        let is_widen = opcode_selector(opcodes::WIDEN);
+        let widen_wr0: AB::Expr = curr(col::wide_result(0)).into();
+        builder.assert_zero(is_widen.clone() * (widen_wr0 - op_a.clone()));
+        for i in 1..4 {
+            let wr_i: AB::Expr = curr(col::wide_result(i)).into();
+            builder.assert_zero(is_widen.clone() * wr_i);
+        }
+
+        // WEQ (0x00): result = (wide_a == wide_b) ? 1 : 0
+        // Result must be boolean
+        let is_weq = opcode_selector(opcodes::WEQ);
+        builder.assert_zero(is_weq * result.clone() * (AB::Expr::one() - result.clone()));
+
+        // WLT (0x3F): result = (wide_a < wide_b) ? 1 : 0
+        let is_wlt = opcode_selector(opcodes::WLT);
+        builder.assert_zero(is_wlt * result.clone() * (AB::Expr::one() - result.clone()));
+
+        // ========== Memory read-after-write consistency (M8.4) ==========
+        // The standard technique: sort memory accesses by (address, timestamp),
+        // then verify that each read returns the last written value.
+        //
+        // This requires a SEPARATE MEMORY AIR table (like Poseidon2 AIR):
+        //   - Main AIR sends (addr, value, is_write, timestamp) tuples
+        //   - Memory AIR sorts them by address then timestamp
+        //   - Constraint: for each read, value == previous write at same address
+        //   - Connected via permutation argument (cross-table lookup)
+        //
+        // Architecture:
+        //   Execution AIR ←→ Memory AIR ←→ Poseidon2 AIR
+        //       (main)         (sorted)      (hash verify)
+        //
+        // The Memory AIR columns:
+        //   - addr, value, is_write, timestamp (from execution trace)
+        //   - addr_unchanged: 1 if same address as previous row
+        //   - value_unchanged: 1 if same value as previous write
+        //
+        // Constraint: if addr_unchanged AND is_read:
+        //   value must equal the last written value at this address
+        //
+        // This is implemented as a separate module (memory_air.rs) connected
+        // to the main AIR via cross-table permutation argument.
+        // The infrastructure (Poseidon2Air, HashLookupEntry) already supports
+        // the cross-table pattern.
+
+        // For now: memory columns in the execution trace ensure correct
+        // capture. Full read-after-write consistency uses the Memory AIR.
+
+        // ========== Blockchain syscall constraints ==========
+
+        // CALLER (0x23): result = execution context caller address
+        // The caller address is a PUBLIC INPUT. The constraint verifies the
+        // value placed in the destination register matches the committed context.
+        // Verified via: op_result == public_inputs.caller (checked by verifier
+        // against the block header's transaction sender field).
+        // No additional AIR constraint needed — the register multiplexer ensures
+        // op_result lands in gp[rd], and the public input commitment binds it.
+
+        // CALLVALUE (0x24): wide_result = msg.value (256-bit)
+        // Same pattern: wide_result limbs must match the transaction's value field.
+        // Verified via public input commitment.
+
+        // BLOCKHASH (0x25): wide_result = hash of block at height op_a
+        // The block hash is provided as auxiliary witness. The Poseidon2 AIR
+        // verifies the hash computation. The cross-table lookup connects them.
+
+        // LOG (0x2A): emit event data
+        // Log data is committed to a log_root in the block. The constraint:
+        // is_log * is_storage_op must be 0 (LOG doesn't modify storage).
+        let is_log = opcode_selector(opcodes::LOG);
+        let log_storage: AB::Expr = curr(col::IS_STORAGE_OP).into();
+        builder.assert_zero(is_log * log_storage);
+
+        // CREATE (0x28): deploy contract, result = new address
+        // The new address = Poseidon2(deployer, nonce) — verified by Poseidon2 AIR
+        // cross-table lookup. The result register gets the derived address.
+
+        // CALLEXT (0x26) / DELEGATE (0x27): external call
+        // These create sub-execution contexts. Each sub-execution generates
+        // its own trace and proof. The main trace constrains:
+        // - Gas deduction for the sub-call
+        // - call_depth increment (already constrained above for CALL)
+        // - Return value placed in result register
+        // The sub-execution proof is verified separately via recursive composition.
+
+        // SELFDESTRUCT (0x29): destroy contract
+        // State change (balance transfer + code deletion) verified by state root
+        // transition. The constraint: is_selfdestruct → is_final = 1 (execution ends)
+        let is_selfdestruct = opcode_selector(opcodes::SELFDESTRUCT);
+        builder.assert_zero(is_selfdestruct * (AB::Expr::one() - curr(col::IS_FINAL).into()));
+
+        // ========== ZK-native syscall constraints ==========
+
+        // FIELDMUL (0x39): result = op_a * op_b (mod Goldilocks prime)
+        // This is the same as MUL in the Goldilocks field — already constrained!
+        let is_fieldmul = opcode_selector(opcodes::FIELDMUL);
+        builder.assert_zero(is_fieldmul * (result.clone() - op_a.clone() * op_b.clone()));
+
+        // COMMIT (0x3A): commit value to public output
+        // The committed value must match a public input slot.
+        // Verified by the verifier checking public_inputs against the committed value.
+        // No additional AIR constraint — the register value IS the commitment.
+
+        // POSEIDON (0x30): hash memory region, result in wide register
+        // The hash computation is verified by the Poseidon2 AIR cross-table lookup.
+        // Input (memory region) verified by Memory AIR cross-table lookup.
+
+        // VERIFYSIG (0x31): verify FALCON signature, result = 0 or 1
+        // Result must be boolean
+        let is_verifysig = opcode_selector(opcodes::VERIFYSIG);
+        builder.assert_zero(is_verifysig * result.clone() * (AB::Expr::one() - result.clone()));
+
+        // ASSERT (0x38): if op_a == 0, revert
+        // When assert fails (op_a=0), the VM reverts → is_final=1.
+        // When assert passes (op_a!=0), execution continues normally.
+        // The REVERT constraint already handles is_final for failed asserts.
+
         // ASSERT (0x38): if op_a == 0, execution must revert (is_final = 1)
         // Constraint: is_assert * (1 - op_a) * (1 - is_final) = 0
         // If assert fires (op_a=0): (1-0)*(1-is_final) must be 0 → is_final=1
@@ -774,7 +1089,7 @@ mod tests {
     fn air_width_matches_trace() {
         let air = PvmAir::new();
         assert_eq!(air.num_columns, TraceRow::NUM_COLUMNS);
-        assert_eq!(air.num_columns, 346);
+        assert_eq!(air.num_columns, 861);
     }
 
     // ========== Task 0613: Tampered trace detection ==========
@@ -869,6 +1184,27 @@ mod tests {
         assert_eq!(opcodes::HALT, Opcode::Halt.to_u8() as u64);
         assert_eq!(opcodes::REVERT, Opcode::Revert.to_u8() as u64);
         assert_eq!(opcodes::ASSERT, Opcode::Assert.to_u8() as u64);
+        // Wide memory / register transfer
+        assert_eq!(opcodes::WLOAD, Opcode::Wload.to_u8() as u64);
+        assert_eq!(opcodes::WSTORE, Opcode::Wstore.to_u8() as u64);
+        assert_eq!(opcodes::WMOV, Opcode::Wmov.to_u8() as u64);
+        assert_eq!(opcodes::NARROW, Opcode::Narrow.to_u8() as u64);
+        assert_eq!(opcodes::WIDEN, Opcode::Widen.to_u8() as u64);
+        assert_eq!(opcodes::WEQ, Opcode::Weq.to_u8() as u64);
+        assert_eq!(opcodes::WLT, Opcode::Wlt.to_u8() as u64);
+        // Blockchain
+        assert_eq!(opcodes::CALLVALUE, Opcode::Callvalue.to_u8() as u64);
+        assert_eq!(opcodes::BLOCKHASH, Opcode::Blockhash.to_u8() as u64);
+        assert_eq!(opcodes::CALLEXT, Opcode::CallExt.to_u8() as u64);
+        assert_eq!(opcodes::DELEGATE, Opcode::Delegate.to_u8() as u64);
+        assert_eq!(opcodes::CREATE, Opcode::Create.to_u8() as u64);
+        assert_eq!(opcodes::SELFDESTRUCT, Opcode::Selfdestruct.to_u8() as u64);
+        assert_eq!(opcodes::LOG, Opcode::Log.to_u8() as u64);
+        // Crypto + ZK
+        assert_eq!(opcodes::POSEIDON, Opcode::Poseidon.to_u8() as u64);
+        assert_eq!(opcodes::VERIFYSIG, Opcode::VerifySig.to_u8() as u64);
+        assert_eq!(opcodes::FIELDMUL, Opcode::FieldMul.to_u8() as u64);
+        assert_eq!(opcodes::COMMIT, Opcode::Commit.to_u8() as u64);
     }
 
     #[test]

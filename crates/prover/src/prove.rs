@@ -278,7 +278,7 @@ mod tests {
         let trace = minimal_trace();
         let matrix = trace_to_matrix(&trace);
         assert_eq!(matrix.height(), 16);
-        assert_eq!(matrix.width, 346);
+        assert_eq!(matrix.width, 861);
     }
 
     #[test]
@@ -305,7 +305,7 @@ mod tests {
         }
         let matrix = prepare_trace(&mut trace);
         assert_eq!(matrix.height(), 8);
-        assert_eq!(matrix.width, 346);
+        assert_eq!(matrix.width, 861);
     }
 
     #[test]

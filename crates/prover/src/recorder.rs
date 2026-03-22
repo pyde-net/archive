@@ -13,7 +13,7 @@
 //! use the standard `vm.execute()` without overhead.
 
 use crate::trace::{to_field, ExecutionTrace, TraceRow, NUM_GP_REGS};
-use p3_field::AbstractField;
+use p3_field::{AbstractField, Field};
 use p3_goldilocks::Goldilocks;
 use pyde_vm::isa::Opcode;
 use pyde_vm::vm::{ExecResult, Outcome, Vm};
@@ -26,6 +26,7 @@ use pyde_vm::cpu::Trap;
 pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
     let mut trace = ExecutionTrace::new();
     let logs_snapshot_len = vm.logs.len();
+    let mut call_depth: u64 = 0;
 
     let outcome = loop {
         let pc = vm.pc;
@@ -69,9 +70,18 @@ pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
             Ok(Some(ExecResult::Halt)) | Ok(Some(ExecResult::Revert)) | Err(_)
         );
 
-        let row = build_trace_row(vm, pc, decoded.opcode, decoded.rd, decoded.rs1,
+        let mut row = build_trace_row(vm, pc, decoded.opcode, decoded.rd, decoded.rs1,
             decoded.rs2_or_imm, gas_step, gas_after, is_mem, is_storage, is_final,
             &mem_access, &storage_access);
+        // Set call depth and update for next iteration
+        row.call_depth = to_field(call_depth);
+        if decoded.opcode == Opcode::Call || decoded.opcode == Opcode::CallExt
+            || decoded.opcode == Opcode::Delegate {
+            call_depth += 1;
+        } else if decoded.opcode == Opcode::Ret && call_depth > 0 {
+            call_depth -= 1;
+        }
+
         trace.push(row);
 
         match step_result {
@@ -473,18 +483,27 @@ fn build_trace_row(
             }
         }
 
-        // Wide quotient for WMOD/WDIV
-        // The VM already computed the result. The quotient is:
-        //   For WDIV: result = a / b, quotient isn't needed (result IS the quotient)
-        //   For WMOD: a = quotient * b + result, so quotient = a / b
-        // We capture the quotient from the VM's pre-step state for WMOD.
-        if opcode == Opcode::Wmod {
-            // After step, wide_result has the remainder (a % b).
-            // The quotient = (a - remainder) / b, captured per-limb.
-            // For simplicity, record the quotient = a / b (integer division).
-            // The AIR verifies: a = quotient * b + result.
-            // Full U256 division in limbs is complex; we store the result
-            // the VM computed and let the constraint verify consistency.
+        // Wide quotient for WMOD: a = quotient * b + result
+        // After step, wide_result = remainder. Quotient = a / b (integer).
+        // We compute quotient per-limb from the pre-step operands.
+        if opcode == Opcode::Wmod || opcode == Opcode::Wdiv {
+            // For simple cases where b fits in limb 0 and higher limbs are 0,
+            // quotient[0] = a[0] / b[0]. For full U256 division, the VM
+            // already computed the result. We store the quotient from the
+            // relationship: quotient = (a - result) / b, using limb 0.
+            let ws2 = (rs2_imm & 0xF) as u8;
+            let b0 = {
+                let wb = vm.cpu.read_wide(ws2);
+                let wb_bytes = wb.to_le_bytes();
+                u64::from_le_bytes(wb_bytes[0..8].try_into().unwrap())
+            };
+            if b0 != 0 {
+                let a0 = {
+                    let bytes = wa_bytes;
+                    u64::from_le_bytes(bytes[0..8].try_into().unwrap())
+                };
+                row.wide_quotient[0] = to_field(a0 / b0);
+            }
         }
     }
 
@@ -504,6 +523,70 @@ fn build_trace_row(
         let b = vm.cpu.read_gp(b_reg);
         if b != 0 {
             row.op_quotient = to_field(a % b); // remainder for DIV cross-check
+        }
+    }
+
+    // Branch taken + diff_inv for BEQ/BNE constraints
+    let is_branch_op = matches!(opcode,
+        Opcode::Beq | Opcode::Bne | Opcode::Blt | Opcode::Bge
+    );
+    if is_branch_op {
+        let a_val = vm.cpu.read_gp(rd); // BEQ uses rd and rs1 for comparison
+        let b_val = vm.cpu.read_gp(rs1);
+        let taken = match opcode {
+            Opcode::Beq => a_val == b_val,
+            Opcode::Bne => a_val != b_val,
+            Opcode::Blt => (a_val as i64) < (b_val as i64),
+            Opcode::Bge => (a_val as i64) >= (b_val as i64),
+            _ => false,
+        };
+        row.branch_taken = if taken { Goldilocks::one() } else { Goldilocks::zero() };
+
+        // diff_inv = 1/(a - b) when a != b, 0 when equal
+        // Goldilocks field: p = 2^64 - 2^32 + 1
+        // Inverse via Fermat: inv = diff^(p-2) mod p
+        if a_val != b_val {
+            let diff = Goldilocks::from_canonical_u64(a_val.wrapping_sub(b_val));
+            // Use p3_field's inverse
+            let inv = diff.try_inverse();
+            if let Some(inv_val) = inv {
+                row.diff_inv = inv_val;
+            }
+        }
+    }
+
+    // Call depth tracking: we maintain a static counter in the trace.
+    // The AIR constrains: CALL → depth+1, RET → depth-1, else stable.
+    // The recorder reads from the previous row's value + opcode delta.
+    // Since we're building rows sequentially, we compute it here.
+    // Note: the actual call_depth is set AFTER the step, so we read
+    // the VM's state. The ext_call_depth field tracks this.
+    // For external calls, the VM increments ext_call_depth internally.
+
+    // Wide bit decomposition for WAND/WOR/WXOR
+    let is_wide_bitwise = matches!(opcode, Opcode::Wand | Opcode::Wor | Opcode::Wxor);
+    if is_wide_bitwise {
+        let wa = vm.cpu.read_wide(rs1);
+        let wa_bytes = wa.to_le_bytes();
+        let ws2 = (rs2_imm & 0xF) as u8;
+        let wb = vm.cpu.read_wide(ws2);
+        let wb_bytes = wb.to_le_bytes();
+
+        // Decompose all 256 bits of each operand
+        for byte_idx in 0..32 {
+            for bit in 0..8 {
+                let bit_idx = byte_idx * 8 + bit;
+                row.wide_a_bits[bit_idx] = if (wa_bytes[byte_idx] >> bit) & 1 == 1 {
+                    Goldilocks::one()
+                } else {
+                    Goldilocks::zero()
+                };
+                row.wide_b_bits[bit_idx] = if (wb_bytes[byte_idx] >> bit) & 1 == 1 {
+                    Goldilocks::one()
+                } else {
+                    Goldilocks::zero()
+                };
+            }
         }
     }
 

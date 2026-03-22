@@ -141,6 +141,22 @@ pub struct TraceRow {
     /// Wide quotient: wide_op_a = wide_quotient * wide_op_b + wide_result.
     pub wide_quotient: [Goldilocks; 4],
 
+    // === Branch/Call (3 columns) ===
+    /// 1 if branch was taken, 0 if not taken.
+    pub branch_taken: Goldilocks,
+    /// Inverse of (op_a - op_b) for equality/inequality proofs.
+    /// When op_a != op_b: diff_inv = 1/(op_a - op_b).
+    /// When op_a == op_b: diff_inv = 0.
+    pub diff_inv: Goldilocks,
+    /// Current call stack depth (0 at top level).
+    pub call_depth: Goldilocks,
+
+    // === Wide bit decomposition (512 columns) ===
+    /// Binary decomposition of wide_op_a (256 bits = 4 limbs × 64 bits).
+    pub wide_a_bits: [Goldilocks; 256],
+    /// Binary decomposition of wide_op_b (256 bits).
+    pub wide_b_bits: [Goldilocks; 256],
+
     // === Merkle proof (34 columns) ===
     /// Merkle path: 32 sibling hashes (each as single Goldilocks element,
     /// which is the Poseidon2 hash of the full 32-byte sibling compressed
@@ -156,9 +172,9 @@ impl TraceRow {
     /// 5 control + 16 GP + 32 wide regs + 7 memory + 10 storage + 2 gas + 3 flags
     /// + 6 opcode_bits + 4 operands + 48 reg selectors + 128 bit decomp
     /// + 1 shift remainder + 12 wide operands + 4 wide carry + 4 wide quotient
-    /// + 32 merkle path + 32 merkle dir = 346
+    /// + 3 branch/call + 512 wide bit decomp + 32 merkle path + 32 merkle dir = 861
     pub const NUM_COLUMNS: usize = 5 + NUM_GP_REGS + NUM_WIDE_LIMBS + 7 + 10 + 2 + 3
-        + 6 + 4 + 48 + 128 + 1 + 12 + 4 + 4 + 32 + 32;
+        + 6 + 4 + 48 + 128 + 1 + 12 + 4 + 4 + 3 + 512 + 32 + 32;
 
     /// Create an empty trace row (all zeros).
     pub fn zero() -> Self {
@@ -199,6 +215,11 @@ impl TraceRow {
             wide_result: [Goldilocks::zero(); 4],
             wide_carry: [Goldilocks::zero(); 4],
             wide_quotient: [Goldilocks::zero(); 4],
+            branch_taken: Goldilocks::zero(),
+            diff_inv: Goldilocks::zero(),
+            call_depth: Goldilocks::zero(),
+            wide_a_bits: [Goldilocks::zero(); 256],
+            wide_b_bits: [Goldilocks::zero(); 256],
             merkle_path: [Goldilocks::zero(); 32],
             merkle_dir: [Goldilocks::zero(); 32],
         }
@@ -243,6 +264,11 @@ impl TraceRow {
         fields.extend_from_slice(&self.wide_result);
         fields.extend_from_slice(&self.wide_carry);
         fields.extend_from_slice(&self.wide_quotient);
+        fields.push(self.branch_taken);
+        fields.push(self.diff_inv);
+        fields.push(self.call_depth);
+        fields.extend_from_slice(&self.wide_a_bits);
+        fields.extend_from_slice(&self.wide_b_bits);
         fields.extend_from_slice(&self.merkle_path);
         fields.extend_from_slice(&self.merkle_dir);
         fields
@@ -338,14 +364,14 @@ mod tests {
 
     #[test]
     fn trace_row_column_count() {
-        assert_eq!(TraceRow::NUM_COLUMNS, 346);
+        assert_eq!(TraceRow::NUM_COLUMNS, 861);
     }
 
     #[test]
     fn zero_row_all_zeros() {
         let row = TraceRow::zero();
         let fields = row.to_fields();
-        assert_eq!(fields.len(), 346);
+        assert_eq!(fields.len(), 861);
         for f in &fields {
             assert_eq!(*f, Goldilocks::zero());
         }
@@ -415,7 +441,7 @@ mod tests {
         trace.push(row2);
 
         let cols = trace.to_column_major();
-        assert_eq!(cols.len(), 346);
+        assert_eq!(cols.len(), 861);
         assert_eq!(cols[0].len(), 2); // 2 rows
 
         // Column 0 = pc: [0, 4]
@@ -431,7 +457,7 @@ mod tests {
     fn empty_trace_column_major() {
         let trace = ExecutionTrace::new();
         let cols = trace.to_column_major();
-        assert_eq!(cols.len(), 346);
+        assert_eq!(cols.len(), 861);
         for col in &cols {
             assert!(col.is_empty());
         }
