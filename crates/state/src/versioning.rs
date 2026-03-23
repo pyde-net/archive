@@ -139,13 +139,18 @@ impl VersionedState {
 
     /// Query the state value at a specific historical height.
     /// Walks backward through undo logs from current state.
-    /// Returns None if the height is beyond undo history.
+    /// Returns None if the height is beyond undo history or has been pruned.
     pub fn get_at_height(&self, key: &Key, target_height: u64) -> Option<Vec<u8>> {
         if target_height > self.height {
             return None;
         }
         if target_height == self.height {
             return self.get(key);
+        }
+
+        // Reject queries for heights that have been pruned away
+        if target_height < self.oldest_available_height() {
+            return None;
         }
 
         // Walk undo logs backward

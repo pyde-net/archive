@@ -58,6 +58,9 @@ pub fn adjust_base_fee(
         let fee_delta = parent_base_fee * gas_delta as u128
             / parent_gas_target as u128
             / ADJUSTMENT_DIVISOR;
+        // Ensure minimum decrease of 1 when there IS a delta, so small fees
+        // don't get stuck due to integer division rounding to zero.
+        let fee_delta = if gas_delta > 0 { fee_delta.max(1) } else { fee_delta };
         parent_base_fee.saturating_sub(fee_delta)
     };
 

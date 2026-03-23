@@ -176,8 +176,11 @@ pub fn try_form_view_change_qc(
             voter_bitmap |= 1u128 << idx;
             valid_count += 1;
 
-            // Track highest QC across all messages
-            if msg.highest_qc.slot > highest_qc.slot {
+            // Track highest QC across all messages.
+            // Only accept a reported highest_qc if it actually has quorum —
+            // otherwise a malicious validator could claim an arbitrarily high
+            // slot with a fake (zero-vote) QC to manipulate the view change.
+            if msg.highest_qc.slot > highest_qc.slot && msg.highest_qc.has_quorum() {
                 highest_qc = msg.highest_qc.clone();
             }
         }

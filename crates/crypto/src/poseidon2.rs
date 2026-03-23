@@ -1,7 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use p3_field::PrimeCharacteristicRing;
+use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_goldilocks::{
     Goldilocks, Poseidon2GoldilocksHL, HL_GOLDILOCKS_8_EXTERNAL_ROUND_CONSTANTS,
     HL_GOLDILOCKS_8_INTERNAL_ROUND_CONSTANTS,
@@ -50,9 +50,7 @@ fn elements_to_hash(elements: [Goldilocks; OUT]) -> Hash256 {
 }
 
 fn goldilocks_to_u64(el: Goldilocks) -> u64 {
-    // Goldilocks stores canonical value in LE u64
-    let bytes: [u8; 8] = unsafe { core::mem::transmute(el) };
-    u64::from_le_bytes(bytes)
+    el.as_canonical_u64()
 }
 
 fn u64_to_goldilocks(val: u64) -> Goldilocks {

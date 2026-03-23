@@ -50,6 +50,8 @@ pub enum ValidationError {
     InvalidAccessList(String),
     /// Wrong chain ID.
     WrongChainId { expected: u64, got: u64 },
+    /// Paymaster address is invalid (zero address).
+    InvalidPaymaster,
 }
 
 /// Validate a transaction against the sender's account and block context.
@@ -144,8 +146,13 @@ fn validate_balance(
             }
             return Ok(());
         }
-        crate::types::FeePayer::Paymaster(_) => {
-            // Paymaster pays everything — sender needs no balance
+        crate::types::FeePayer::Paymaster(paymaster_addr) => {
+            // Paymaster pays everything — but verify the paymaster address is non-zero.
+            // Full paymaster balance/existence check happens at execution time when
+            // state is available. This structural check catches obvious misconfiguration.
+            if *paymaster_addr == [0u8; 32] {
+                return Err(ValidationError::InvalidPaymaster);
+            }
             return Ok(());
         }
     };

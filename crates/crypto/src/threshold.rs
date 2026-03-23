@@ -427,6 +427,10 @@ pub fn apply_refresh(key_share: &KeyShare, contributions: &[RefreshContribution]
 /// Verify a refresh contribution by checking that each zero-secret polynomial
 /// evaluates correctly (the shares from this contribution alone reconstruct to zero).
 pub fn verify_refresh_contribution(contribution: &RefreshContribution, threshold: usize) -> bool {
+    // Guard: threshold must not exceed the number of deltas provided
+    if threshold > contribution.deltas.len() {
+        return false;
+    }
     // For each seed element, take `threshold` shares and verify they reconstruct to zero
     for elem_idx in 0..SEED_ELEMENTS {
         let field_shares: Vec<FieldShare> = (0..threshold)
