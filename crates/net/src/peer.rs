@@ -158,6 +158,12 @@ impl PeerManager {
         }
     }
 
+    /// Prune expired rate limit entries to prevent unbounded HashMap growth.
+    /// Call this periodically (e.g., once per block or every few seconds).
+    pub fn prune_rate_limits(&mut self) {
+        self.rate_limits.retain(|_, (_, window_start)| window_start.elapsed().as_secs() < 60);
+    }
+
     /// Add a connected peer. Returns false if limits exceeded.
     pub fn add_peer(&mut self, info: PeerInfo) -> bool {
         if !self.can_accept(info.direction, info.ip) {

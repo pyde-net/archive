@@ -30,7 +30,15 @@ pub struct BlockDecryptor {
 
 impl BlockDecryptor {
     /// Create a new decryptor for a set of encrypted transactions.
+    ///
+    /// # Panics
+    /// Panics if `threshold` is 0 or greater than 128 (committee size).
     pub fn new(encrypted_txs: Vec<EncryptedTx>, threshold: usize) -> Self {
+        assert!(
+            threshold >= 1 && threshold <= 128,
+            "decryption threshold must be in [1, 128], got {}",
+            threshold
+        );
         let n = encrypted_txs.len();
         Self {
             encrypted_txs,
@@ -66,7 +74,8 @@ impl BlockDecryptor {
 
     /// Add decryption shares for ALL transactions from a single committee member.
     /// This is the common case: one member generates one share per tx.
-    pub fn add_member_shares(&mut self, key_share: &KeyShare) {
+    /// Returns the number of shares successfully added (excludes duplicates).
+    pub fn add_member_shares(&mut self, key_share: &KeyShare) -> usize {
         // Generate all shares first to avoid borrow conflict
         let shares: Vec<DecryptionShare> = self
             .encrypted_txs
@@ -74,9 +83,13 @@ impl BlockDecryptor {
             .map(|tx| generate_decryption_share(key_share, &tx.ciphertext))
             .collect();
 
+        let mut accepted = 0;
         for (i, share) in shares.into_iter().enumerate() {
-            self.add_share(i, share);
+            if self.add_share(i, share) {
+                accepted += 1;
+            }
         }
+        accepted
     }
 
     /// Number of shares collected for a specific transaction.
