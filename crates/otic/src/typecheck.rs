@@ -740,16 +740,16 @@ impl TypeChecker {
                         }
                         // Common method return types
                         match method.name.as_str() {
+                            // Collections
                             "len" => Ty::U64,
                             "push" | "pop" => Ty::Unit,
-                            "as_bytes" | "to_bytes" => Ty::Bytes,
                             "is_empty" => Ty::Bool,
-                            "concat" => obj_ty, // String.concat() → String, bytes.concat() → bytes
-                            "contains" | "starts_with" | "ends_with" | "equals" => Ty::Bool,
-                            "char_at" | "index_of" => Ty::U64,
-                            "substring" | "trim" | "to_lower" | "to_upper" => Ty::StringTy,
+                            // String (minimal — only essentials for contracts)
+                            "concat" => obj_ty,  // String.concat() → String
+                            // Bytes
+                            "as_bytes" | "to_bytes" => Ty::Bytes,
                             "append" => Ty::Unit, // bytes.append()
-                            // Math extension methods return same type
+                            // Math extension methods (use std::math)
                             "sqrt" | "pow" | "min" | "max" | "clamp"
                             | "mul_div" | "checked_add" | "checked_sub"
                             | "saturating_add" | "saturating_sub"
