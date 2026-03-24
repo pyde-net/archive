@@ -1,0 +1,272 @@
+// English auction contract for NFTs.
+// Supports timed auctions with minimum bid increments, reserve prices,
+// automatic extensions on late bids, and settlement.
+
+use std::token::INFT;
+
+contract NFTAuction {
+    const DEFAULT_MIN_BID_INCREMENT_BPS: u256 = 500;  // 5% minimum increment
+    const DEFAULT_EXTENSION_WINDOW: u64 = 300;         // 5 minutes
+    const DEFAULT_EXTENSION_DURATION: u64 = 300;       // 5 minutes
+    const MIN_AUCTION_DURATION: u64 = 3600;            // 1 hour
+
+    storage {
+        owner: Address,
+        auction_count: u256,
+        auctions: Map<u256, Auction>,
+        // auction_id -> bidder -> refundable amount
+        pending_returns: Map<u256, Map<Address, u256>>,
+        fee_percent: u256,
+        fee_recipient: Address,
+        min_bid_increment_bps: u256,   // basis points (e.g. 500 = 5%)
+        extension_window: u64,         // seconds before end that trigger extension
+        extension_duration: u64,       // seconds to extend by
+    }
+
+    struct Auction {
+        auction_id: u256,
+        seller: Address,
+        nft_contract: Address,
+        token_id: u256,
+        reserve_price: u256,
+        start_time: u64,
+        end_time: u64,
+        highest_bidder: Address,
+        highest_bid: u256,
+        settled: bool,
+        cancelled: bool,
+    }
+
+    event AuctionCreated {
+        #[indexed]
+        auction_id: u256,
+        #[indexed]
+        seller: Address,
+        nft_contract: Address,
+        token_id: u256,
+        reserve_price: u256,
+        start_time: u64,
+        end_time: u64,
+    }
+
+    event BidPlaced {
+        #[indexed]
+        auction_id: u256,
+        #[indexed]
+        bidder: Address,
+        amount: u256,
+        extended: bool,
+    }
+
+    event AuctionSettled {
+        #[indexed]
+        auction_id: u256,
+        winner: Address,
+        amount: u256,
+    }
+
+    event AuctionCancelled {
+        #[indexed]
+        auction_id: u256,
+    }
+
+    event BidRefunded {
+        #[indexed]
+        auction_id: u256,
+        #[indexed]
+        bidder: Address,
+        amount: u256,
+    }
+
+    error AuctionNotActive {}
+    error AuctionNotEnded {}
+    error AuctionAlreadyStarted {}
+    error BidBelowReserve { reserve: u256, bid: u256 }
+    error BidTooLow { minimum: u256, bid: u256 }
+    error NotAuctionSeller {}
+    error AuctionAlreadySettled {}
+    error NoPendingReturn {}
+    error SellerCannotBid {}
+    error InvalidDuration {}
+
+    #[constructor]
+    pub fn init(fee_percent: u256, fee_recipient: Address) {
+        self.owner = msg.sender;
+        self.fee_percent = fee_percent;
+        self.fee_recipient = fee_recipient;
+        self.auction_count = 0;
+        self.min_bid_increment_bps = DEFAULT_MIN_BID_INCREMENT_BPS;
+        self.extension_window = DEFAULT_EXTENSION_WINDOW;
+        self.extension_duration = DEFAULT_EXTENSION_DURATION;
+    }
+
+    pub fn create_auction(
+        nft_contract: Address,
+        token_id: u256,
+        reserve_price: u256,
+        duration: u64,
+    ) {
+        require!(duration >= MIN_AUCTION_DURATION, InvalidDuration {});
+
+        // Transfer NFT to this contract for escrow
+        let nft = INFT::at(nft_contract);
+        nft.transfer_from(msg.sender, address(self), token_id);
+
+        self.auction_count = self.auction_count + 1;
+        let auction_id = self.auction_count;
+        let start = block.timestamp;
+        let end = start + duration;
+
+        self.auctions[auction_id] = Auction {
+            auction_id: auction_id,
+            seller: msg.sender,
+            nft_contract: nft_contract,
+            token_id: token_id,
+            reserve_price: reserve_price,
+            start_time: start,
+            end_time: end,
+            highest_bidder: Address::ZERO,
+            highest_bid: 0,
+            settled: false,
+            cancelled: false,
+        };
+
+        emit AuctionCreated {
+            auction_id: auction_id,
+            seller: msg.sender,
+            nft_contract: nft_contract,
+            token_id: token_id,
+            reserve_price: reserve_price,
+            start_time: start,
+            end_time: end,
+        };
+    }
+
+    pub fn bid(auction_id: u256) {
+        let auction = self.auctions[auction_id];
+        require!(!auction.settled && !auction.cancelled, AuctionNotActive {});
+        require!(block.timestamp >= auction.start_time, AuctionNotActive {});
+        require!(block.timestamp < auction.end_time, AuctionNotActive {});
+        require!(msg.sender != auction.seller, SellerCannotBid {});
+
+        // First bid must meet reserve
+        if auction.highest_bid == 0 {
+            require!(msg.value >= auction.reserve_price, BidBelowReserve {
+                reserve: auction.reserve_price,
+                bid: msg.value,
+            });
+        } else {
+            // Subsequent bids must exceed by minimum increment
+            let min_bid = auction.highest_bid
+                + (auction.highest_bid * self.min_bid_increment_bps) / 10000;
+            require!(msg.value >= min_bid, BidTooLow {
+                minimum: min_bid,
+                bid: msg.value,
+            });
+
+            // Queue refund for previous highest bidder
+            self.pending_returns[auction_id][auction.highest_bidder] =
+                self.pending_returns[auction_id][auction.highest_bidder] + auction.highest_bid;
+        }
+
+        self.auctions[auction_id].highest_bidder = msg.sender;
+        self.auctions[auction_id].highest_bid = msg.value;
+
+        // Extend auction if bid placed within extension window
+        let mut extended = false;
+        let time_remaining = auction.end_time - block.timestamp;
+        if time_remaining < self.extension_window {
+            self.auctions[auction_id].end_time = block.timestamp + self.extension_duration;
+            extended = true;
+        }
+
+        emit BidPlaced {
+            auction_id: auction_id,
+            bidder: msg.sender,
+            amount: msg.value,
+            extended: extended,
+        };
+    }
+
+    pub fn settle(auction_id: u256) {
+        let auction = self.auctions[auction_id];
+        require!(!auction.settled && !auction.cancelled, AuctionAlreadySettled {});
+        require!(block.timestamp >= auction.end_time, AuctionNotEnded {});
+
+        self.auctions[auction_id].settled = true;
+
+        let nft = INFT::at(auction.nft_contract);
+
+        if auction.highest_bidder == Address::ZERO {
+            // No bids: return NFT to seller
+            nft.transfer_from(address(self), auction.seller, auction.token_id);
+            emit AuctionSettled { auction_id: auction_id, winner: Address::ZERO, amount: 0 };
+        } else {
+            // Distribute funds
+            let fee = (auction.highest_bid * self.fee_percent) / 10000;
+            let seller_amount = auction.highest_bid - fee;
+
+            raw_call!(auction.seller, seller_amount, bytes(""));
+            if fee > 0 {
+                raw_call!(self.fee_recipient, fee, bytes(""));
+            }
+
+            // Transfer NFT to winner
+            nft.transfer_from(address(self), auction.highest_bidder, auction.token_id);
+
+            emit AuctionSettled {
+                auction_id: auction_id,
+                winner: auction.highest_bidder,
+                amount: auction.highest_bid,
+            };
+        }
+    }
+
+    pub fn cancel_auction(auction_id: u256) {
+        let auction = self.auctions[auction_id];
+        require!(auction.seller == msg.sender, NotAuctionSeller {});
+        require!(!auction.settled && !auction.cancelled, AuctionAlreadySettled {});
+        require!(auction.highest_bidder == Address::ZERO, AuctionAlreadyStarted {});
+
+        self.auctions[auction_id].cancelled = true;
+
+        // Return NFT to seller
+        let nft = INFT::at(auction.nft_contract);
+        nft.transfer_from(address(self), auction.seller, auction.token_id);
+
+        emit AuctionCancelled { auction_id: auction_id };
+    }
+
+    pub fn withdraw_bid(auction_id: u256) {
+        let amount = self.pending_returns[auction_id][msg.sender];
+        require!(amount > 0, NoPendingReturn {});
+
+        self.pending_returns[auction_id][msg.sender] = 0;
+        raw_call!(msg.sender, amount, bytes(""));
+
+        emit BidRefunded { auction_id: auction_id, bidder: msg.sender, amount: amount };
+    }
+
+    #[view]
+    pub fn get_auction(auction_id: u256) -> Auction {
+        return self.auctions[auction_id];
+    }
+
+    #[view]
+    pub fn time_remaining(auction_id: u256) -> u64 {
+        let auction = self.auctions[auction_id];
+        if block.timestamp >= auction.end_time {
+            return 0;
+        }
+        return auction.end_time - block.timestamp;
+    }
+
+    #[view]
+    pub fn minimum_bid(auction_id: u256) -> u256 {
+        let auction = self.auctions[auction_id];
+        if auction.highest_bid == 0 {
+            return auction.reserve_price;
+        }
+        return auction.highest_bid + (auction.highest_bid * self.min_bid_increment_bps) / 10000;
+    }
+}

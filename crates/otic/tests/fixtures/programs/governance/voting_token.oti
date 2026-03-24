@@ -1,0 +1,296 @@
+// Governance token with vote delegation and checkpoint snapshots.
+// Supports ERC20 functionality plus delegation, vote checkpointing
+// at each block, and historical vote queries.
+
+contract VotingToken {
+    storage {
+        name: String,
+        symbol: String,
+        decimals: u8,
+        total_supply: u256,
+        balances: Map<Address, u256>,
+        allowances: Map<Address, Map<Address, u256>>,
+
+        // Delegation
+        delegates: Map<Address, Address>,
+
+        // Vote checkpoints: address -> checkpoint index -> checkpoint
+        num_checkpoints: Map<Address, u256>,
+        checkpoints: Map<Address, Map<u256, Checkpoint>>,
+
+        // Permit nonces for gasless approvals
+        nonces: Map<Address, u256>,
+
+        owner: Address,
+        minter: Address,
+        max_supply: u256,
+    }
+
+    struct Checkpoint {
+        from_block: u64,
+        votes: u256,
+    }
+
+    event Transfer {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    event Approval {
+        #[indexed]
+        owner: Address,
+        #[indexed]
+        spender: Address,
+        amount: u256,
+    }
+
+    event DelegateChanged {
+        #[indexed]
+        delegator: Address,
+        #[indexed]
+        from_delegate: Address,
+        #[indexed]
+        to_delegate: Address,
+    }
+
+    event DelegateVotesChanged {
+        #[indexed]
+        delegate: Address,
+        previous_votes: u256,
+        new_votes: u256,
+    }
+
+    error InsufficientBalance { available: u256, required: u256 }
+    error InsufficientAllowance { available: u256, required: u256 }
+    error TransferToZeroAddress {}
+    error ExceedsMaxSupply { max: u256, attempted: u256 }
+    error NotMinter {}
+    error BlockNotYetMined { queried: u64, current: u64 }
+    error SelfDelegation {}
+    error NotContractOwner {}
+
+    #[constructor]
+    pub fn init(
+        name: String,
+        symbol: String,
+        max_supply: u256,
+        initial_supply: u256,
+    ) {
+        self.name = name;
+        self.symbol = symbol;
+        self.decimals = 18;
+        self.max_supply = max_supply;
+        self.owner = msg.sender;
+        self.minter = msg.sender;
+
+        if initial_supply > 0 {
+            self.mint_internal(msg.sender, initial_supply);
+        }
+    }
+
+    pub fn transfer(to: Address, amount: u256) {
+        self.transfer_internal(msg.sender, to, amount);
+    }
+
+    pub fn approve(spender: Address, amount: u256) {
+        self.allowances[msg.sender][spender] = amount;
+        emit Approval { owner: msg.sender, spender: spender, amount: amount };
+    }
+
+    pub fn transfer_from(from: Address, to: Address, amount: u256) {
+        let current_allowance = self.allowances[from][msg.sender];
+        require!(current_allowance >= amount, InsufficientAllowance {
+            available: current_allowance,
+            required: amount,
+        });
+        self.allowances[from][msg.sender] = current_allowance - amount;
+        self.transfer_internal(from, to, amount);
+    }
+
+    // Delegate votes to another address. The delegatee receives
+    // all of the delegator's voting power.
+    pub fn delegate(delegatee: Address) {
+        let current_delegate = self.delegates[msg.sender];
+        let delegator_balance = self.balances[msg.sender];
+
+        self.delegates[msg.sender] = delegatee;
+
+        emit DelegateChanged {
+            delegator: msg.sender,
+            from_delegate: current_delegate,
+            to_delegate: delegatee,
+        };
+
+        // Move votes from old delegate to new delegate
+        if current_delegate != Address::ZERO {
+            self.move_voting_power(current_delegate, Address::ZERO, delegator_balance);
+        }
+        if delegatee != Address::ZERO {
+            self.move_voting_power(Address::ZERO, delegatee, delegator_balance);
+        }
+    }
+
+    pub fn mint(to: Address, amount: u256) {
+        require!(msg.sender == self.minter, NotMinter {});
+        self.mint_internal(to, amount);
+    }
+
+    pub fn set_minter(new_minter: Address) {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        self.minter = new_minter;
+    }
+
+    #[view]
+    pub fn balance_of(account: Address) -> u256 {
+        return self.balances[account];
+    }
+
+    #[view]
+    pub fn allowance(owner: Address, spender: Address) -> u256 {
+        return self.allowances[owner][spender];
+    }
+
+    #[view]
+    pub fn get_votes(account: Address) -> u256 {
+        let num = self.num_checkpoints[account];
+        if num == 0 {
+            return 0;
+        }
+        return self.checkpoints[account][num - 1].votes;
+    }
+
+    #[view]
+    pub fn get_past_votes(account: Address, block_number: u64) -> u256 {
+        require!(block_number < block.height, BlockNotYetMined {
+            queried: block_number,
+            current: block.height,
+        });
+
+        let num = self.num_checkpoints[account];
+        if num == 0 {
+            return 0;
+        }
+
+        // Most recent checkpoint is before the queried block
+        if self.checkpoints[account][num - 1].from_block <= block_number {
+            return self.checkpoints[account][num - 1].votes;
+        }
+
+        // First checkpoint is after the queried block
+        if self.checkpoints[account][0].from_block > block_number {
+            return 0;
+        }
+
+        // Binary search for the checkpoint at block_number
+        let mut low: u256 = 0;
+        let mut high: u256 = num - 1;
+        while low < high {
+            let mid = (low + high + 1) / 2;
+            if self.checkpoints[account][mid].from_block <= block_number {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        return self.checkpoints[account][low].votes;
+    }
+
+    #[view]
+    pub fn delegates_of(account: Address) -> Address {
+        return self.delegates[account];
+    }
+
+    #[view]
+    pub fn get_total_supply() -> u256 {
+        return self.total_supply;
+    }
+
+    fn transfer_internal(from: Address, to: Address, amount: u256) {
+        require!(to != Address::ZERO, TransferToZeroAddress {});
+        let from_bal = self.balances[from];
+        require!(from_bal >= amount, InsufficientBalance {
+            available: from_bal,
+            required: amount,
+        });
+
+        self.balances[from] = from_bal - amount;
+        self.balances[to] = self.balances[to] + amount;
+
+        emit Transfer { from: from, to: to, amount: amount };
+
+        // Move voting power between delegates
+        let from_delegate = self.delegates[from];
+        let to_delegate = self.delegates[to];
+        self.move_voting_power(from_delegate, to_delegate, amount);
+    }
+
+    fn mint_internal(to: Address, amount: u256) {
+        require!(
+            self.total_supply + amount <= self.max_supply,
+            ExceedsMaxSupply { max: self.max_supply, attempted: self.total_supply + amount }
+        );
+
+        self.total_supply = self.total_supply + amount;
+        self.balances[to] = self.balances[to] + amount;
+
+        emit Transfer { from: Address::ZERO, to: to, amount: amount };
+
+        // If the recipient has a delegate, add voting power
+        let delegate = self.delegates[to];
+        if delegate != Address::ZERO {
+            self.move_voting_power(Address::ZERO, delegate, amount);
+        }
+    }
+
+    fn move_voting_power(from: Address, to: Address, amount: u256) {
+        if amount == 0 {
+            return;
+        }
+
+        if from != Address::ZERO {
+            let num = self.num_checkpoints[from];
+            let old_votes = if num > 0 {
+                self.checkpoints[from][num - 1].votes
+            } else {
+                0
+            };
+            let new_votes = old_votes - amount;
+            self.write_checkpoint(from, num, old_votes, new_votes);
+        }
+
+        if to != Address::ZERO {
+            let num = self.num_checkpoints[to];
+            let old_votes = if num > 0 {
+                self.checkpoints[to][num - 1].votes
+            } else {
+                0
+            };
+            let new_votes = old_votes + amount;
+            self.write_checkpoint(to, num, old_votes, new_votes);
+        }
+    }
+
+    fn write_checkpoint(account: Address, num: u256, old_votes: u256, new_votes: u256) {
+        if num > 0 && self.checkpoints[account][num - 1].from_block == block.height {
+            // Overwrite checkpoint at same block
+            self.checkpoints[account][num - 1].votes = new_votes;
+        } else {
+            // Write new checkpoint
+            self.checkpoints[account][num] = Checkpoint {
+                from_block: block.height,
+                votes: new_votes,
+            };
+            self.num_checkpoints[account] = num + 1;
+        }
+
+        emit DelegateVotesChanged {
+            delegate: account,
+            previous_votes: old_votes,
+            new_votes: new_votes,
+        };
+    }
+}

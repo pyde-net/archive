@@ -1,0 +1,362 @@
+// Timelock controller contract for delayed execution of governance actions.
+// Supports scheduling, cancellation, batched operations, and role-based access
+// with proposer/executor/admin separation.
+
+contract TimelockController {
+    storage {
+        admin: Address,
+        min_delay: u64,
+        operation_count: u256,
+        operations: Map<u256, Operation>,
+        // op_hash -> operation id
+        hash_to_id: Map<u256, u256>,
+        // Role management
+        proposers: Map<Address, bool>,
+        executors: Map<Address, bool>,
+        cancellers: Map<Address, bool>,
+        proposer_count: u256,
+        executor_count: u256,
+        // Batch tracking
+        batch_count: u256,
+        batches: Map<u256, Batch>,
+        batch_operations: Map<u256, Map<u256, u256>>, // batch_id -> index -> op_id
+    }
+
+    struct Operation {
+        id: u256,
+        target: Address,
+        value: u256,
+        calldata: bytes,
+        predecessor: u256,       // id of operation that must execute first (0 = none)
+        salt: u256,
+        scheduled_at: u64,
+        ready_at: u64,
+        executed: bool,
+        cancelled: bool,
+    }
+
+    struct Batch {
+        batch_id: u256,
+        operation_count: u256,
+        scheduled_at: u64,
+        ready_at: u64,
+        executed: bool,
+        cancelled: bool,
+    }
+
+    event OperationScheduled {
+        #[indexed]
+        id: u256,
+        target: Address,
+        value: u256,
+        ready_at: u64,
+    }
+
+    event OperationExecuted {
+        #[indexed]
+        id: u256,
+    }
+
+    event OperationCancelled {
+        #[indexed]
+        id: u256,
+    }
+
+    event BatchScheduled {
+        #[indexed]
+        batch_id: u256,
+        operation_count: u256,
+        ready_at: u64,
+    }
+
+    event BatchExecuted {
+        #[indexed]
+        batch_id: u256,
+    }
+
+    event MinDelayChanged {
+        old_delay: u64,
+        new_delay: u64,
+    }
+
+    event RoleGranted {
+        #[indexed]
+        account: Address,
+        role: String,
+    }
+
+    event RoleRevoked {
+        #[indexed]
+        account: Address,
+        role: String,
+    }
+
+    error NotProposer {}
+    error NotExecutor {}
+    error NotCanceller {}
+    error NotAdmin {}
+    error OperationNotFound {}
+    error OperationAlreadyScheduled {}
+    error OperationNotReady {}
+    error OperationAlreadyExecuted {}
+    error OperationCancelledErr {}
+    error PredecessorNotExecuted { predecessor_id: u256 }
+    error DelayTooShort { min: u64, requested: u64 }
+    error BatchNotReady {}
+    error InvalidBatch {}
+    error TimelockSelfOnly {}
+
+    #[constructor]
+    pub fn init(min_delay: u64, proposers: Vec<Address>, executors: Vec<Address>) {
+        self.admin = msg.sender;
+        self.min_delay = min_delay;
+        self.operation_count = 0;
+        self.batch_count = 0;
+        self.proposer_count = 0;
+        self.executor_count = 0;
+
+        for i in 0..proposers.len() {
+            self.proposers[proposers[i]] = true;
+            self.cancellers[proposers[i]] = true;
+            self.proposer_count = self.proposer_count + 1;
+            emit RoleGranted { account: proposers[i], role: "proposer" };
+        }
+
+        for i in 0..executors.len() {
+            self.executors[executors[i]] = true;
+            self.executor_count = self.executor_count + 1;
+            emit RoleGranted { account: executors[i], role: "executor" };
+        }
+    }
+
+    pub fn schedule(
+        target: Address,
+        value: u256,
+        calldata: bytes,
+        predecessor: u256,
+        salt: u256,
+        delay: u64,
+    ) -> u256 {
+        require!(self.proposers[msg.sender], NotProposer {});
+        require!(delay >= self.min_delay, DelayTooShort {
+            min: self.min_delay,
+            requested: delay,
+        });
+
+        // Verify predecessor exists if specified
+        if predecessor > 0 {
+            require!(
+                self.operations[predecessor].id == predecessor,
+                PredecessorNotExecuted { predecessor_id: predecessor }
+            );
+        }
+
+        self.operation_count = self.operation_count + 1;
+        let id = self.operation_count;
+        let ready_at = block.timestamp + delay;
+
+        self.operations[id] = Operation {
+            id: id,
+            target: target,
+            value: value,
+            calldata: calldata,
+            predecessor: predecessor,
+            salt: salt,
+            scheduled_at: block.timestamp,
+            ready_at: ready_at,
+            executed: false,
+            cancelled: false,
+        };
+
+        emit OperationScheduled {
+            id: id,
+            target: target,
+            value: value,
+            ready_at: ready_at,
+        };
+
+        return id;
+    }
+
+    pub fn schedule_batch(
+        targets: Vec<Address>,
+        values: Vec<u256>,
+        calldatas: Vec<bytes>,
+        predecessor: u256,
+        salt: u256,
+        delay: u64,
+    ) -> u256 {
+        require!(self.proposers[msg.sender], NotProposer {});
+        require!(delay >= self.min_delay, DelayTooShort {
+            min: self.min_delay,
+            requested: delay,
+        });
+        require!(targets.len() > 0, InvalidBatch {});
+
+        let ready_at = block.timestamp + delay;
+        self.batch_count = self.batch_count + 1;
+        let batch_id = self.batch_count;
+
+        self.batches[batch_id] = Batch {
+            batch_id: batch_id,
+            operation_count: targets.len(),
+            scheduled_at: block.timestamp,
+            ready_at: ready_at,
+            executed: false,
+            cancelled: false,
+        };
+
+        for i in 0..targets.len() {
+            self.operation_count = self.operation_count + 1;
+            let op_id = self.operation_count;
+
+            self.operations[op_id] = Operation {
+                id: op_id,
+                target: targets[i],
+                value: values[i],
+                calldata: calldatas[i],
+                predecessor: predecessor,
+                salt: salt,
+                scheduled_at: block.timestamp,
+                ready_at: ready_at,
+                executed: false,
+                cancelled: false,
+            };
+
+            self.batch_operations[batch_id][i] = op_id;
+        }
+
+        emit BatchScheduled {
+            batch_id: batch_id,
+            operation_count: targets.len(),
+            ready_at: ready_at,
+        };
+
+        return batch_id;
+    }
+
+    pub fn execute(id: u256) {
+        require!(self.executors[msg.sender], NotExecutor {});
+
+        let op = self.operations[id];
+        require!(op.id == id, OperationNotFound {});
+        require!(!op.executed, OperationAlreadyExecuted {});
+        require!(!op.cancelled, OperationCancelledErr {});
+        require!(block.timestamp >= op.ready_at, OperationNotReady {});
+
+        // Check predecessor
+        if op.predecessor > 0 {
+            require!(
+                self.operations[op.predecessor].executed,
+                PredecessorNotExecuted { predecessor_id: op.predecessor }
+            );
+        }
+
+        self.operations[id].executed = true;
+        raw_call!(op.target, op.value, op.calldata);
+
+        emit OperationExecuted { id: id };
+    }
+
+    pub fn execute_batch(batch_id: u256) {
+        require!(self.executors[msg.sender], NotExecutor {});
+
+        let batch = self.batches[batch_id];
+        require!(batch.batch_id == batch_id, InvalidBatch {});
+        require!(!batch.executed, OperationAlreadyExecuted {});
+        require!(!batch.cancelled, OperationCancelledErr {});
+        require!(block.timestamp >= batch.ready_at, BatchNotReady {});
+
+        self.batches[batch_id].executed = true;
+
+        for i in 0..batch.operation_count {
+            let op_id = self.batch_operations[batch_id][i];
+            let op = self.operations[op_id];
+
+            if op.predecessor > 0 {
+                require!(
+                    self.operations[op.predecessor].executed,
+                    PredecessorNotExecuted { predecessor_id: op.predecessor }
+                );
+            }
+
+            self.operations[op_id].executed = true;
+            raw_call!(op.target, op.value, op.calldata);
+            emit OperationExecuted { id: op_id };
+        }
+
+        emit BatchExecuted { batch_id: batch_id };
+    }
+
+    pub fn cancel(id: u256) {
+        require!(self.cancellers[msg.sender], NotCanceller {});
+
+        let op = self.operations[id];
+        require!(op.id == id, OperationNotFound {});
+        require!(!op.executed, OperationAlreadyExecuted {});
+
+        self.operations[id].cancelled = true;
+
+        emit OperationCancelled { id: id };
+    }
+
+    // Only callable by the timelock itself (through a scheduled operation)
+    pub fn update_delay(new_delay: u64) {
+        require!(msg.sender == address(self), TimelockSelfOnly {});
+        let old = self.min_delay;
+        self.min_delay = new_delay;
+        emit MinDelayChanged { old_delay: old, new_delay: new_delay };
+    }
+
+    pub fn grant_proposer(account: Address) {
+        require!(msg.sender == self.admin || msg.sender == address(self), NotAdmin {});
+        self.proposers[account] = true;
+        self.cancellers[account] = true;
+        self.proposer_count = self.proposer_count + 1;
+        emit RoleGranted { account: account, role: "proposer" };
+    }
+
+    pub fn grant_executor(account: Address) {
+        require!(msg.sender == self.admin || msg.sender == address(self), NotAdmin {});
+        self.executors[account] = true;
+        self.executor_count = self.executor_count + 1;
+        emit RoleGranted { account: account, role: "executor" };
+    }
+
+    pub fn revoke_proposer(account: Address) {
+        require!(msg.sender == self.admin || msg.sender == address(self), NotAdmin {});
+        self.proposers[account] = false;
+        self.cancellers[account] = false;
+        self.proposer_count = self.proposer_count - 1;
+        emit RoleRevoked { account: account, role: "proposer" };
+    }
+
+    pub fn revoke_executor(account: Address) {
+        require!(msg.sender == self.admin || msg.sender == address(self), NotAdmin {});
+        self.executors[account] = false;
+        self.executor_count = self.executor_count - 1;
+        emit RoleRevoked { account: account, role: "executor" };
+    }
+
+    #[view]
+    pub fn get_operation(id: u256) -> Operation {
+        return self.operations[id];
+    }
+
+    #[view]
+    pub fn is_ready(id: u256) -> bool {
+        let op = self.operations[id];
+        return !op.executed && !op.cancelled && block.timestamp >= op.ready_at;
+    }
+
+    #[view]
+    pub fn is_pending(id: u256) -> bool {
+        let op = self.operations[id];
+        return !op.executed && !op.cancelled && block.timestamp < op.ready_at;
+    }
+
+    #[view]
+    pub fn get_min_delay() -> u64 {
+        return self.min_delay;
+    }
+}

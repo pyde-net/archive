@@ -1,0 +1,308 @@
+// Escrow contract with arbiter-mediated dispute resolution.
+// Supports deposit, release, refund, and dispute workflows.
+
+contract Escrow {
+    storage {
+        next_escrow_id: u64,
+        escrows: Map<u64, EscrowEntry>,
+        user_escrows: Map<Address, Vec<u64>>,
+        platform_fee_bps: u64,
+        platform_treasury: Address,
+        owner: Address,
+    }
+
+    enum EscrowStatus {
+        Pending = 0,
+        Funded = 1,
+        Released = 2,
+        Refunded = 3,
+        Disputed = 4,
+        Resolved = 5,
+    }
+
+    struct EscrowEntry {
+        buyer: Address,
+        seller: Address,
+        arbiter: Address,
+        amount: u256,
+        deposited_at: u64,
+        deadline: u64,
+        status: EscrowStatus,
+        dispute_reason: String,
+        arbiter_fee_bps: u64,
+    }
+
+    const MAX_PLATFORM_FEE_BPS: u64 = 500; // 5%
+    const MAX_ARBITER_FEE_BPS: u64 = 1000; // 10%
+    const BPS_DENOMINATOR: u256 = 10000;
+
+    event EscrowCreated {
+        #[indexed]
+        escrow_id: u64,
+        #[indexed]
+        buyer: Address,
+        seller: Address,
+        arbiter: Address,
+        amount: u256,
+        deadline: u64,
+    }
+
+    event EscrowFunded {
+        #[indexed]
+        escrow_id: u64,
+        amount: u256,
+    }
+
+    event EscrowReleased {
+        #[indexed]
+        escrow_id: u64,
+        seller: Address,
+        amount: u256,
+        fee: u256,
+    }
+
+    event EscrowRefunded {
+        #[indexed]
+        escrow_id: u64,
+        buyer: Address,
+        amount: u256,
+    }
+
+    event DisputeOpened {
+        #[indexed]
+        escrow_id: u64,
+        opened_by: Address,
+        reason: String,
+    }
+
+    event DisputeResolved {
+        #[indexed]
+        escrow_id: u64,
+        winner: Address,
+        amount: u256,
+        arbiter_fee: u256,
+    }
+
+    error Unauthorized {}
+    error EscrowNotFound {}
+    error NotBuyer {}
+    error NotSeller {}
+    error NotArbiter {}
+    error NotParty {}
+    error InvalidStatus { expected: EscrowStatus, actual: EscrowStatus }
+    error DeadlineExpired {}
+    error DeadlineNotExpired {}
+    error IncorrectDepositAmount { expected: u256, sent: u256 }
+    error InvalidFeeBps {}
+    error ZeroAddress {}
+    error ZeroAmount {}
+
+    #[constructor]
+    pub fn init(treasury: Address, fee_bps: u64) {
+        require!(treasury != Address::ZERO, ZeroAddress {});
+        require!(fee_bps <= MAX_PLATFORM_FEE_BPS, InvalidFeeBps {});
+        self.owner = msg.sender;
+        self.platform_treasury = treasury;
+        self.platform_fee_bps = fee_bps;
+        self.next_escrow_id = 1;
+    }
+
+    pub fn create_escrow(
+        seller: Address,
+        arbiter: Address,
+        amount: u256,
+        deadline: u64,
+        arbiter_fee_bps: u64,
+    ) -> u64 {
+        require!(seller != Address::ZERO, ZeroAddress {});
+        require!(arbiter != Address::ZERO, ZeroAddress {});
+        require!(amount > 0, ZeroAmount {});
+        require!(deadline > block.timestamp, DeadlineExpired {});
+        require!(arbiter_fee_bps <= MAX_ARBITER_FEE_BPS, InvalidFeeBps {});
+
+        let id = self.next_escrow_id;
+        self.next_escrow_id = id + 1;
+
+        let entry = EscrowEntry {
+            buyer: msg.sender,
+            seller: seller,
+            arbiter: arbiter,
+            amount: amount,
+            deposited_at: 0,
+            deadline: deadline,
+            status: EscrowStatus::Pending,
+            dispute_reason: "",
+            arbiter_fee_bps: arbiter_fee_bps,
+        };
+
+        self.escrows[id] = entry;
+        self.user_escrows[msg.sender].push(id);
+        self.user_escrows[seller].push(id);
+
+        emit EscrowCreated {
+            escrow_id: id,
+            buyer: msg.sender,
+            seller: seller,
+            arbiter: arbiter,
+            amount: amount,
+            deadline: deadline,
+        };
+
+        return id;
+    }
+
+    pub fn fund_escrow(escrow_id: u64) {
+        let mut entry = self.escrows[escrow_id];
+        require!(entry.buyer != Address::ZERO, EscrowNotFound {});
+        require!(msg.sender == entry.buyer, NotBuyer {});
+        require!(entry.status == EscrowStatus::Pending, InvalidStatus { expected: EscrowStatus::Pending, actual: entry.status });
+        require!(msg.value == entry.amount, IncorrectDepositAmount {
+            expected: entry.amount,
+            sent: msg.value,
+        });
+
+        entry.status = EscrowStatus::Funded;
+        entry.deposited_at = block.timestamp;
+        self.escrows[escrow_id] = entry;
+
+        emit EscrowFunded { escrow_id: escrow_id, amount: msg.value };
+    }
+
+    // Buyer confirms delivery and releases funds to seller
+    pub fn release(escrow_id: u64) {
+        let mut entry = self.escrows[escrow_id];
+        require!(entry.buyer != Address::ZERO, EscrowNotFound {});
+        require!(msg.sender == entry.buyer, NotBuyer {});
+        require!(entry.status == EscrowStatus::Funded, InvalidStatus { expected: EscrowStatus::Funded, actual: entry.status });
+
+        let platform_fee = (entry.amount * self.platform_fee_bps) / BPS_DENOMINATOR;
+        let seller_amount = entry.amount - platform_fee;
+
+        entry.status = EscrowStatus::Released;
+        self.escrows[escrow_id] = entry;
+
+        raw_call!(entry.seller, seller_amount, bytes::empty());
+        if platform_fee > 0 {
+            raw_call!(self.platform_treasury, platform_fee, bytes::empty());
+        }
+
+        emit EscrowReleased {
+            escrow_id: escrow_id,
+            seller: entry.seller,
+            amount: seller_amount,
+            fee: platform_fee,
+        };
+    }
+
+    // Seller can refund voluntarily
+    pub fn refund(escrow_id: u64) {
+        let mut entry = self.escrows[escrow_id];
+        require!(entry.buyer != Address::ZERO, EscrowNotFound {});
+        require!(msg.sender == entry.seller, NotSeller {});
+        require!(entry.status == EscrowStatus::Funded, InvalidStatus { expected: EscrowStatus::Funded, actual: entry.status });
+
+        entry.status = EscrowStatus::Refunded;
+        self.escrows[escrow_id] = entry;
+
+        raw_call!(entry.buyer, entry.amount, bytes::empty());
+
+        emit EscrowRefunded {
+            escrow_id: escrow_id,
+            buyer: entry.buyer,
+            amount: entry.amount,
+        };
+    }
+
+    // Buyer can claim refund after deadline if still funded
+    pub fn claim_expired(escrow_id: u64) {
+        let mut entry = self.escrows[escrow_id];
+        require!(entry.buyer != Address::ZERO, EscrowNotFound {});
+        require!(msg.sender == entry.buyer, NotBuyer {});
+        require!(entry.status == EscrowStatus::Funded, InvalidStatus { expected: EscrowStatus::Funded, actual: entry.status });
+        require!(block.timestamp > entry.deadline, DeadlineNotExpired {});
+
+        entry.status = EscrowStatus::Refunded;
+        self.escrows[escrow_id] = entry;
+
+        raw_call!(entry.buyer, entry.amount, bytes::empty());
+
+        emit EscrowRefunded {
+            escrow_id: escrow_id,
+            buyer: entry.buyer,
+            amount: entry.amount,
+        };
+    }
+
+    // Either buyer or seller can open a dispute
+    pub fn open_dispute(escrow_id: u64, reason: String) {
+        let mut entry = self.escrows[escrow_id];
+        require!(entry.buyer != Address::ZERO, EscrowNotFound {});
+        require!(
+            msg.sender == entry.buyer || msg.sender == entry.seller,
+            NotParty {},
+        );
+        require!(entry.status == EscrowStatus::Funded, InvalidStatus { expected: EscrowStatus::Funded, actual: entry.status });
+
+        entry.status = EscrowStatus::Disputed;
+        entry.dispute_reason = reason;
+        self.escrows[escrow_id] = entry;
+
+        emit DisputeOpened {
+            escrow_id: escrow_id,
+            opened_by: msg.sender,
+            reason: reason,
+        };
+    }
+
+    // Arbiter resolves a dispute, awarding funds to winner
+    pub fn resolve_dispute(escrow_id: u64, award_to_buyer: bool) {
+        let mut entry = self.escrows[escrow_id];
+        require!(entry.buyer != Address::ZERO, EscrowNotFound {});
+        require!(msg.sender == entry.arbiter, NotArbiter {});
+        require!(entry.status == EscrowStatus::Disputed, InvalidStatus { expected: EscrowStatus::Disputed, actual: entry.status });
+
+        let arbiter_fee = (entry.amount * entry.arbiter_fee_bps) / BPS_DENOMINATOR;
+        let platform_fee = (entry.amount * self.platform_fee_bps) / BPS_DENOMINATOR;
+        let remaining = entry.amount - arbiter_fee - platform_fee;
+
+        entry.status = EscrowStatus::Resolved;
+        self.escrows[escrow_id] = entry;
+
+        let winner = if award_to_buyer { entry.buyer } else { entry.seller };
+
+        raw_call!(winner, remaining, bytes::empty());
+        raw_call!(entry.arbiter, arbiter_fee, bytes::empty());
+        if platform_fee > 0 {
+            raw_call!(self.platform_treasury, platform_fee, bytes::empty());
+        }
+
+        emit DisputeResolved {
+            escrow_id: escrow_id,
+            winner: winner,
+            amount: remaining,
+            arbiter_fee: arbiter_fee,
+        };
+    }
+
+    #[view]
+    pub fn get_escrow(escrow_id: u64) -> EscrowEntry {
+        return self.escrows[escrow_id];
+    }
+
+    #[view]
+    pub fn get_user_escrows(user: Address) -> Vec<u64> {
+        return self.user_escrows[user];
+    }
+
+    pub fn update_platform_fee(new_fee_bps: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(new_fee_bps <= MAX_PLATFORM_FEE_BPS, InvalidFeeBps {});
+        self.platform_fee_bps = new_fee_bps;
+    }
+
+    pub fn update_treasury(new_treasury: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(new_treasury != Address::ZERO, ZeroAddress {});
+        self.platform_treasury = new_treasury;
+    }
+}

@@ -1,0 +1,285 @@
+// Array and vector helper functions for Otigen smart contracts.
+// Provides sorting, searching, filtering, and common collection operations.
+
+module array_utils;
+
+error EmptyArray {}
+error IndexOutOfRange { index: u64, length: u64 }
+error ElementNotFound {}
+
+/// Returns the length of a vector.
+pub fn length(arr: Vec<u256>) -> u64 {
+    return arr.len();
+}
+
+/// Returns true if the vector is empty.
+pub fn is_empty(arr: Vec<u256>) -> bool {
+    return arr.len() == 0u64;
+}
+
+/// Returns the element at the given index, reverting if out of bounds.
+pub fn get(arr: Vec<u256>, index: u64) -> u256 {
+    require!(index < arr.len(), IndexOutOfRange { index: index, length: arr.len() });
+    return arr[index];
+}
+
+/// Returns the first element, reverting if empty.
+pub fn first(arr: Vec<u256>) -> u256 {
+    require!(arr.len() > 0u64, EmptyArray {});
+    return arr[0u64];
+}
+
+/// Returns the last element, reverting if empty.
+pub fn last(arr: Vec<u256>) -> u256 {
+    let len = arr.len();
+    require!(len > 0u64, EmptyArray {});
+    return arr[len - 1u64];
+}
+
+/// Returns the sum of all elements.
+pub fn sum(arr: Vec<u256>) -> u256 {
+    let mut total = 0u256;
+    for i in 0u64..arr.len() {
+        total = total + arr[i];
+    }
+    return total;
+}
+
+/// Returns the minimum element, reverting if empty.
+pub fn min(arr: Vec<u256>) -> u256 {
+    let len = arr.len();
+    require!(len > 0u64, EmptyArray {});
+    let mut result = arr[0u64];
+    for i in 1u64..len {
+        if arr[i] < result {
+            result = arr[i];
+        }
+    }
+    return result;
+}
+
+/// Returns the maximum element, reverting if empty.
+pub fn max(arr: Vec<u256>) -> u256 {
+    let len = arr.len();
+    require!(len > 0u64, EmptyArray {});
+    let mut result = arr[0u64];
+    for i in 1u64..len {
+        if arr[i] > result {
+            result = arr[i];
+        }
+    }
+    return result;
+}
+
+/// Returns the average of all elements (integer division), reverting if empty.
+pub fn average(arr: Vec<u256>) -> u256 {
+    let len = arr.len();
+    require!(len > 0u64, EmptyArray {});
+    let total = sum(arr);
+    return total / (len as u256);
+}
+
+/// Returns the index of the first occurrence of the value, or reverts if not found.
+pub fn find(arr: Vec<u256>, value: u256) -> u64 {
+    for i in 0u64..arr.len() {
+        if arr[i] == value {
+            return i;
+        }
+    }
+    revert!(ElementNotFound {});
+}
+
+/// Returns true if the vector contains the given value.
+pub fn contains(arr: Vec<u256>, value: u256) -> bool {
+    for i in 0u64..arr.len() {
+        if arr[i] == value {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Returns a new vector with duplicate values removed.
+/// Preserves the order of first occurrence.
+pub fn deduplicate(arr: Vec<u256>) -> Vec<u256> {
+    let mut result: Vec<u256> = Vec::new();
+    for i in 0u64..arr.len() {
+        let mut found = false;
+        for j in 0u64..result.len() {
+            if result[j] == arr[i] {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            result.push(arr[i]);
+        }
+    }
+    return result;
+}
+
+/// Returns a new vector containing only elements greater than threshold.
+pub fn filter_above(arr: Vec<u256>, threshold: u256) -> Vec<u256> {
+    let mut result: Vec<u256> = Vec::new();
+    for i in 0u64..arr.len() {
+        if arr[i] > threshold {
+            result.push(arr[i]);
+        }
+    }
+    return result;
+}
+
+/// Returns a new vector containing only elements less than threshold.
+pub fn filter_below(arr: Vec<u256>, threshold: u256) -> Vec<u256> {
+    let mut result: Vec<u256> = Vec::new();
+    for i in 0u64..arr.len() {
+        if arr[i] < threshold {
+            result.push(arr[i]);
+        }
+    }
+    return result;
+}
+
+/// Returns a new vector containing elements within [low, high] inclusive.
+pub fn filter_range(arr: Vec<u256>, low: u256, high: u256) -> Vec<u256> {
+    let mut result: Vec<u256> = Vec::new();
+    for i in 0u64..arr.len() {
+        if arr[i] >= low && arr[i] <= high {
+            result.push(arr[i]);
+        }
+    }
+    return result;
+}
+
+/// Sorts a vector in ascending order using insertion sort.
+/// Suitable for small on-chain arrays where gas is a concern.
+pub fn sort_ascending(arr: Vec<u256>) -> Vec<u256> {
+    let mut sorted = arr;
+    let len = sorted.len();
+
+    for i in 1u64..len {
+        let key = sorted[i];
+        let mut j = i;
+        while j > 0u64 && sorted[j - 1u64] > key {
+            sorted[j] = sorted[j - 1u64];
+            j = j - 1u64;
+        }
+        sorted[j] = key;
+    }
+
+    return sorted;
+}
+
+/// Sorts a vector in descending order.
+pub fn sort_descending(arr: Vec<u256>) -> Vec<u256> {
+    let mut sorted = arr;
+    let len = sorted.len();
+
+    for i in 1u64..len {
+        let key = sorted[i];
+        let mut j = i;
+        while j > 0u64 && sorted[j - 1u64] < key {
+            sorted[j] = sorted[j - 1u64];
+            j = j - 1u64;
+        }
+        sorted[j] = key;
+    }
+
+    return sorted;
+}
+
+/// Returns a reversed copy of the vector.
+pub fn reverse(arr: Vec<u256>) -> Vec<u256> {
+    let len = arr.len();
+    let mut result: Vec<u256> = Vec::new();
+    if len == 0u64 {
+        return result;
+    }
+    let mut i = len;
+    while i > 0u64 {
+        i = i - 1u64;
+        result.push(arr[i]);
+    }
+    return result;
+}
+
+/// Returns a slice of the vector from start (inclusive) to end (exclusive).
+pub fn slice(arr: Vec<u256>, start: u64, end: u64) -> Vec<u256> {
+    let len = arr.len();
+    require!(start <= len, IndexOutOfRange { index: start, length: len });
+    require!(end <= len, IndexOutOfRange { index: end, length: len });
+
+    let mut result: Vec<u256> = Vec::new();
+    for i in start..end {
+        result.push(arr[i]);
+    }
+    return result;
+}
+
+/// Concatenates two vectors into a new vector.
+pub fn concat(a: Vec<u256>, b: Vec<u256>) -> Vec<u256> {
+    let mut result: Vec<u256> = Vec::new();
+    for i in 0u64..a.len() {
+        result.push(a[i]);
+    }
+    for i in 0u64..b.len() {
+        result.push(b[i]);
+    }
+    return result;
+}
+
+/// Performs a binary search on a sorted (ascending) vector.
+/// Returns the index if found, or u64::MAX if not found.
+pub fn binary_search(sorted_arr: Vec<u256>, target: u256) -> u64 {
+    let len = sorted_arr.len();
+    if len == 0u64 {
+        return 18446744073709551615u64;
+    }
+
+    let mut low = 0u64;
+    let mut high = len - 1u64;
+
+    while low <= high {
+        let mid = low + (high - low) / 2u64;
+        if sorted_arr[mid] == target {
+            return mid;
+        } else if sorted_arr[mid] < target {
+            low = mid + 1u64;
+        } else {
+            if mid == 0u64 {
+                break;
+            }
+            high = mid - 1u64;
+        }
+    }
+
+    return 18446744073709551615u64;
+}
+
+// --- Tests ---
+
+#[test]
+fn test_sort_ascending() {
+    let mut arr: Vec<u256> = Vec::new();
+    arr.push(5u256);
+    arr.push(2u256);
+    arr.push(8u256);
+    arr.push(1u256);
+
+    let sorted = sort_ascending(arr);
+    require!(sorted[0u64] == 1u256, EmptyArray {});
+    require!(sorted[1u64] == 2u256, EmptyArray {});
+    require!(sorted[2u64] == 5u256, EmptyArray {});
+    require!(sorted[3u64] == 8u256, EmptyArray {});
+}
+
+#[test]
+fn test_contains() {
+    let mut arr: Vec<u256> = Vec::new();
+    arr.push(10u256);
+    arr.push(20u256);
+    arr.push(30u256);
+
+    require!(contains(arr, 20u256), EmptyArray {});
+    require!(!contains(arr, 99u256), EmptyArray {});
+}

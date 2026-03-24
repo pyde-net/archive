@@ -1,0 +1,398 @@
+// Reputation system with time-based decay, categories, and endorsements.
+// Reputation scores decrease over time unless refreshed by positive actions.
+// Supports multiple reputation categories, peer endorsements, and slashing.
+
+contract ReputationSystem {
+    const DEFAULT_MIN_ENDORSEMENT_SCORE: u256 = 100;
+
+    storage {
+        admin: Address,
+        // Per-user per-category reputation
+        reputation: Map<Address, Map<String, ReputationData>>,
+        // Global reputation (aggregated across categories)
+        global_score: Map<Address, u256>,
+        // Category registry
+        categories: Vec<String>,
+        category_exists: Map<String, bool>,
+        category_weight: Map<String, u256>,    // weight in basis points
+        // Authorized reporters
+        reporters: Map<Address, bool>,
+        reporter_count: u256,
+        // Endorsement tracking
+        endorsements_given: Map<Address, Map<Address, Map<String, bool>>>,
+        endorsement_count: Map<Address, Map<String, u256>>,
+        // Decay configuration
+        decay_rate_bps: u256,       // per-period decay in basis points
+        decay_period: u64,          // seconds per decay period
+        // Slashing
+        slash_proposals: Map<u256, SlashProposal>,
+        slash_count: u256,
+        // Thresholds
+        min_endorsement_score: u256,   // minimum score to endorse others
+    }
+
+    struct ReputationData {
+        score: u256,
+        last_updated: u64,
+        total_earned: u256,
+        total_slashed: u256,
+        endorsement_bonus: u256,
+        action_count: u256,
+    }
+
+    struct SlashProposal {
+        id: u256,
+        target: Address,
+        category: String,
+        amount: u256,
+        reason: String,
+        proposer: Address,
+        approvals: u256,
+        executed: bool,
+        created_at: u64,
+    }
+
+    event ReputationEarned {
+        #[indexed]
+        account: Address,
+        #[indexed]
+        category: String,
+        amount: u256,
+        reason: String,
+    }
+
+    event ReputationDecayed {
+        #[indexed]
+        account: Address,
+        #[indexed]
+        category: String,
+        old_score: u256,
+        new_score: u256,
+    }
+
+    event Endorsed {
+        #[indexed]
+        endorser: Address,
+        #[indexed]
+        endorsee: Address,
+        category: String,
+    }
+
+    event Slashed {
+        #[indexed]
+        account: Address,
+        #[indexed]
+        category: String,
+        amount: u256,
+        reason: String,
+    }
+
+    event CategoryAdded {
+        name: String,
+        weight: u256,
+    }
+
+    event ReporterAdded {
+        #[indexed]
+        reporter: Address,
+    }
+
+    event ReporterRemoved {
+        #[indexed]
+        reporter: Address,
+    }
+
+    error NotAdmin {}
+    error NotReporter {}
+    error CategoryNotFound { category: String }
+    error CategoryAlreadyExists { category: String }
+    error AlreadyEndorsed {}
+    error InsufficientReputation { required: u256, available: u256 }
+    error CannotEndorseSelf {}
+    error SlashProposalNotFound {}
+    error SlashAlreadyExecuted {}
+    error InvalidAmount {}
+    error AlreadyReporter {}
+    error NotAReporter {}
+
+    #[constructor]
+    pub fn init(decay_rate_bps: u256, decay_period: u64) {
+        self.admin = msg.sender;
+        self.decay_rate_bps = decay_rate_bps;
+        self.decay_period = decay_period;
+        self.reporter_count = 0;
+        self.slash_count = 0;
+        self.min_endorsement_score = DEFAULT_MIN_ENDORSEMENT_SCORE;
+
+        // Add the admin as a reporter
+        self.reporters[msg.sender] = true;
+        self.reporter_count = 1;
+    }
+
+    pub fn add_category(name: String, weight: u256) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        require!(!self.category_exists[name], CategoryAlreadyExists { category: name });
+
+        self.categories.push(name);
+        self.category_exists[name] = true;
+        self.category_weight[name] = weight;
+
+        emit CategoryAdded { name: name, weight: weight };
+    }
+
+    pub fn add_reporter(reporter: Address) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        require!(!self.reporters[reporter], AlreadyReporter {});
+        self.reporters[reporter] = true;
+        self.reporter_count = self.reporter_count + 1;
+        emit ReporterAdded { reporter: reporter };
+    }
+
+    pub fn remove_reporter(reporter: Address) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        require!(self.reporters[reporter], NotAReporter {});
+        self.reporters[reporter] = false;
+        self.reporter_count = self.reporter_count - 1;
+        emit ReporterRemoved { reporter: reporter };
+    }
+
+    // Award reputation to an account in a specific category
+    pub fn award(account: Address, category: String, amount: u256, reason: String) {
+        require!(self.reporters[msg.sender], NotReporter {});
+        require!(self.category_exists[category], CategoryNotFound { category: category });
+        require!(amount > 0, InvalidAmount {});
+
+        // Apply decay before awarding
+        self.apply_decay(account, category);
+
+        let rep = self.reputation[account][category];
+        self.reputation[account][category].score = rep.score + amount;
+        self.reputation[account][category].total_earned = rep.total_earned + amount;
+        self.reputation[account][category].action_count = rep.action_count + 1;
+        self.reputation[account][category].last_updated = block.timestamp;
+
+        self.recalculate_global(account);
+
+        emit ReputationEarned {
+            account: account,
+            category: category,
+            amount: amount,
+            reason: reason,
+        };
+    }
+
+    // Peer endorsement: costs no tokens but requires minimum reputation
+    pub fn endorse(endorsee: Address, category: String) {
+        require!(msg.sender != endorsee, CannotEndorseSelf {});
+        require!(self.category_exists[category], CategoryNotFound { category: category });
+        require!(
+            !self.endorsements_given[msg.sender][endorsee][category],
+            AlreadyEndorsed {}
+        );
+
+        // Endorser must have minimum reputation
+        self.apply_decay(msg.sender, category);
+        let endorser_score = self.reputation[msg.sender][category].score;
+        require!(endorser_score >= self.min_endorsement_score, InsufficientReputation {
+            required: self.min_endorsement_score,
+            available: endorser_score,
+        });
+
+        self.endorsements_given[msg.sender][endorsee][category] = true;
+        self.endorsement_count[endorsee][category] =
+            self.endorsement_count[endorsee][category] + 1;
+
+        // Award endorsement bonus (scaled by endorser's reputation)
+        let bonus = endorser_score / 10; // 10% of endorser's score
+        self.apply_decay(endorsee, category);
+        self.reputation[endorsee][category].score =
+            self.reputation[endorsee][category].score + bonus;
+        self.reputation[endorsee][category].endorsement_bonus =
+            self.reputation[endorsee][category].endorsement_bonus + bonus;
+        self.reputation[endorsee][category].last_updated = block.timestamp;
+
+        self.recalculate_global(endorsee);
+
+        emit Endorsed { endorser: msg.sender, endorsee: endorsee, category: category };
+    }
+
+    // Propose slashing someone's reputation
+    pub fn propose_slash(
+        target: Address,
+        category: String,
+        amount: u256,
+        reason: String,
+    ) -> u256 {
+        require!(self.reporters[msg.sender], NotReporter {});
+        require!(self.category_exists[category], CategoryNotFound { category: category });
+
+        self.slash_count = self.slash_count + 1;
+        let id = self.slash_count;
+
+        self.slash_proposals[id] = SlashProposal {
+            id: id,
+            target: target,
+            category: category,
+            amount: amount,
+            reason: reason,
+            proposer: msg.sender,
+            approvals: 1,
+            executed: false,
+            created_at: block.timestamp,
+        };
+
+        return id;
+    }
+
+    pub fn approve_slash(slash_id: u256) {
+        require!(self.reporters[msg.sender], NotReporter {});
+        let proposal = self.slash_proposals[slash_id];
+        require!(proposal.id == slash_id, SlashProposalNotFound {});
+        require!(!proposal.executed, SlashAlreadyExecuted {});
+
+        self.slash_proposals[slash_id].approvals = proposal.approvals + 1;
+
+        // Execute if majority of reporters approve
+        let required = (self.reporter_count / 2) + 1;
+        if self.slash_proposals[slash_id].approvals >= required {
+            self.execute_slash(slash_id);
+        }
+    }
+
+    // Trigger decay manually (anyone can call this)
+    pub fn trigger_decay(account: Address, category: String) {
+        require!(self.category_exists[category], CategoryNotFound { category: category });
+        self.apply_decay(account, category);
+        self.recalculate_global(account);
+    }
+
+    #[view]
+    pub fn get_score(account: Address, category: String) -> u256 {
+        let rep = self.reputation[account][category];
+        if rep.last_updated == 0 {
+            return 0;
+        }
+
+        // Calculate decayed score without writing
+        let elapsed = block.timestamp - rep.last_updated;
+        let periods = elapsed / self.decay_period;
+        if periods == 0 {
+            return rep.score;
+        }
+
+        let mut score = rep.score;
+        for i in 0..periods {
+            let decay = (score * self.decay_rate_bps) / 10000;
+            if decay >= score {
+                return 0;
+            }
+            score = score - decay;
+        }
+        return score;
+    }
+
+    #[view]
+    pub fn get_global_score(account: Address) -> u256 {
+        return self.global_score[account];
+    }
+
+    #[view]
+    pub fn get_reputation_data(account: Address, category: String) -> ReputationData {
+        return self.reputation[account][category];
+    }
+
+    #[view]
+    pub fn get_endorsement_count(account: Address, category: String) -> u256 {
+        return self.endorsement_count[account][category];
+    }
+
+    #[view]
+    pub fn has_endorsed(endorser: Address, endorsee: Address, category: String) -> bool {
+        return self.endorsements_given[endorser][endorsee][category];
+    }
+
+    #[view]
+    pub fn get_slash_proposal(slash_id: u256) -> SlashProposal {
+        return self.slash_proposals[slash_id];
+    }
+
+    fn apply_decay(account: Address, category: String) {
+        let rep = self.reputation[account][category];
+        if rep.last_updated == 0 || rep.score == 0 {
+            return;
+        }
+
+        let elapsed = block.timestamp - rep.last_updated;
+        let periods = elapsed / self.decay_period;
+        if periods == 0 {
+            return;
+        }
+
+        let old_score = rep.score;
+        let mut new_score = rep.score;
+
+        for i in 0..periods {
+            let decay = (new_score * self.decay_rate_bps) / 10000;
+            if decay >= new_score {
+                new_score = 0;
+                break;
+            }
+            new_score = new_score - decay;
+        }
+
+        self.reputation[account][category].score = new_score;
+        self.reputation[account][category].last_updated = block.timestamp;
+
+        if old_score != new_score {
+            emit ReputationDecayed {
+                account: account,
+                category: category,
+                old_score: old_score,
+                new_score: new_score,
+            };
+        }
+    }
+
+    fn recalculate_global(account: Address) {
+        let mut weighted_sum: u256 = 0;
+        let mut total_weight: u256 = 0;
+
+        for i in 0..self.categories.len() {
+            let cat = self.categories[i];
+            let weight = self.category_weight[cat];
+            let score = self.reputation[account][cat].score;
+            weighted_sum = weighted_sum + (score * weight);
+            total_weight = total_weight + weight;
+        }
+
+        if total_weight > 0 {
+            self.global_score[account] = weighted_sum / total_weight;
+        } else {
+            self.global_score[account] = 0;
+        }
+    }
+
+    fn execute_slash(slash_id: u256) {
+        let proposal = self.slash_proposals[slash_id];
+        self.slash_proposals[slash_id].executed = true;
+
+        self.apply_decay(proposal.target, proposal.category);
+
+        let current = self.reputation[proposal.target][proposal.category].score;
+        let slash_amount = if proposal.amount > current { current } else { proposal.amount };
+
+        self.reputation[proposal.target][proposal.category].score = current - slash_amount;
+        self.reputation[proposal.target][proposal.category].total_slashed =
+            self.reputation[proposal.target][proposal.category].total_slashed + slash_amount;
+        self.reputation[proposal.target][proposal.category].last_updated = block.timestamp;
+
+        self.recalculate_global(proposal.target);
+
+        emit Slashed {
+            account: proposal.target,
+            category: proposal.category,
+            amount: slash_amount,
+            reason: proposal.reason,
+        };
+    }
+}

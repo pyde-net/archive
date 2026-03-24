@@ -1,0 +1,356 @@
+// Protocol fee distributor with epoch-based distribution and multiple reward tokens
+use std::math;
+use std::token::IERC20;
+
+contract FeeDistributor {
+    storage {
+        owner: Address,
+
+        // Voting escrow token for weight
+        ve_token: Address,
+
+        // Reward tokens
+        reward_tokens: Vec<Address>,
+        reward_count: u256,
+        is_reward_token: Map<Address, bool>,
+
+        // Epoch tracking
+        current_epoch: u256,
+        epoch_start_time: Map<u256, u64>,
+        epoch_duration: u64,
+        start_time: u64,
+
+        // Per-epoch, per-token fee totals
+        epoch_fees: Map<u256, Map<Address, u256>>,
+
+        // Per-epoch total voting power snapshot
+        epoch_total_supply: Map<u256, u256>,
+
+        // User claims
+        user_last_claimed_epoch: Map<Address, u256>,
+        user_epoch_balance: Map<u256, Map<Address, u256>>, // snapshot of user veToken at epoch
+
+        // Token accumulations before checkpoint
+        token_buffer: Map<Address, u256>,
+
+        // Emergency
+        paused: bool,
+        can_checkpoint_token: Map<Address, bool>,
+
+        // Accumulated per-user claimable (for gas efficiency)
+        claimable: Map<Address, Map<Address, u256>>, // user -> token -> amount
+
+        // Stats
+        total_distributed: Map<Address, u256>,
+        total_claimed: Map<Address, u256>,
+
+        scale: u256,
+    }
+
+    event EpochCheckpoint {
+        #[indexed]
+        epoch: u256,
+        timestamp: u64,
+    }
+
+    event FeesDeposited {
+        #[indexed]
+        token: Address,
+        #[indexed]
+        epoch: u256,
+        amount: u256,
+    }
+
+    event FeesClaimed {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        token: Address,
+        amount: u256,
+    }
+
+    event RewardTokenAdded {
+        #[indexed]
+        token: Address,
+    }
+
+    event UserCheckpointed {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        epoch: u256,
+        balance: u256,
+    }
+
+    error NotOwner {}
+    error Paused {}
+    error TokenAlreadyAdded { token: Address }
+    error TokenNotSupported { token: Address }
+    error NothingToClaim {}
+    error EpochNotFinalized { epoch: u256 }
+    error ZeroAmount {}
+    error EpochInFuture { epoch: u256, current: u256 }
+
+    #[constructor]
+    pub fn init(ve_token: Address, epoch_duration: u64) {
+        self.owner = msg.sender;
+        self.ve_token = ve_token;
+        self.epoch_duration = epoch_duration;
+        self.start_time = block.timestamp;
+        self.current_epoch = 0u256;
+        self.epoch_start_time[0] = block.timestamp;
+        self.paused = false;
+        self.scale = 1000000000000000000u256;
+    }
+
+    // --- Internal ---
+
+    fn get_epoch_at_timestamp(timestamp: u64) -> u256 {
+        if timestamp < self.start_time {
+            return 0u256;
+        }
+        let elapsed = timestamp - self.start_time;
+        return (elapsed / self.epoch_duration) as u256;
+    }
+
+    fn advance_epoch() {
+        let expected_epoch = self.get_epoch_at_timestamp(block.timestamp);
+        while self.current_epoch < expected_epoch {
+            let next = self.current_epoch + 1u256;
+            self.epoch_start_time[next] = self.start_time + ((next as u64) * self.epoch_duration);
+            self.current_epoch = next;
+
+            emit EpochCheckpoint { epoch: next, timestamp: self.epoch_start_time[next] };
+        }
+    }
+
+    fn checkpoint_user(user: Address) {
+        self.advance_epoch();
+
+        // Snapshot user's veToken balance for current epoch
+        let balance = IERC20::at(self.ve_token).balance_of(user);
+        self.user_epoch_balance[self.current_epoch][user] = balance;
+
+        emit UserCheckpointed {
+            user: user,
+            epoch: self.current_epoch,
+            balance: balance,
+        };
+    }
+
+    fn compute_user_share(user: Address, epoch: u256, token: Address) -> u256 {
+        let total = self.epoch_total_supply[epoch];
+        if total == 0u256 {
+            return 0u256;
+        }
+
+        let user_balance = self.user_epoch_balance[epoch][user];
+        if user_balance == 0u256 {
+            return 0u256;
+        }
+
+        let epoch_fee = self.epoch_fees[epoch][token];
+        return (epoch_fee * user_balance) / total;
+    }
+
+    // --- Admin ---
+
+    pub fn add_reward_token(token: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(!self.is_reward_token[token], TokenAlreadyAdded { token: token });
+
+        self.reward_tokens.push(token);
+        self.is_reward_token[token] = true;
+        self.reward_count = self.reward_count + 1u256;
+
+        emit RewardTokenAdded { token: token };
+    }
+
+    pub fn pause() {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.paused = true;
+    }
+
+    pub fn unpause() {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.paused = false;
+    }
+
+    // --- Fee deposit ---
+
+    pub fn deposit_fee(token: Address, amount: u256) {
+        require!(!self.paused, Paused {});
+        require!(self.is_reward_token[token], TokenNotSupported { token: token });
+        require!(amount > 0u256, ZeroAmount {});
+
+        self.advance_epoch();
+
+        IERC20::at(token).transfer_from(msg.sender, address(self), amount);
+
+        self.epoch_fees[self.current_epoch][token] = self.epoch_fees[self.current_epoch][token] + amount;
+        self.total_distributed[token] = self.total_distributed[token] + amount;
+
+        emit FeesDeposited { token: token, epoch: self.current_epoch, amount: amount };
+    }
+
+    // Deposit multiple tokens in one transaction
+    pub fn deposit_fees_batch(tokens: Vec<Address>, amounts: Vec<u256>) {
+        require!(!self.paused, Paused {});
+        self.advance_epoch();
+
+        let count = tokens.len();
+        for i in 0..count {
+            let token = tokens[i];
+            let amount = amounts[i];
+            require!(self.is_reward_token[token], TokenNotSupported { token: token });
+            require!(amount > 0u256, ZeroAmount {});
+
+            IERC20::at(token).transfer_from(msg.sender, address(self), amount);
+            self.epoch_fees[self.current_epoch][token] = self.epoch_fees[self.current_epoch][token] + amount;
+            self.total_distributed[token] = self.total_distributed[token] + amount;
+
+            emit FeesDeposited { token: token, epoch: self.current_epoch, amount: amount };
+        }
+    }
+
+    // --- Checkpoint ---
+
+    pub fn checkpoint() {
+        self.advance_epoch();
+
+        // Snapshot total supply
+        let total = IERC20::at(self.ve_token).get_total_supply();
+        self.epoch_total_supply[self.current_epoch] = total;
+    }
+
+    pub fn checkpoint_user_balance() {
+        self.checkpoint_user(msg.sender);
+    }
+
+    pub fn checkpoint_user_balance_for(user: Address) {
+        self.checkpoint_user(user);
+    }
+
+    // --- Claiming ---
+
+    pub fn claim(token: Address) {
+        require!(!self.paused, Paused {});
+        require!(self.is_reward_token[token], TokenNotSupported { token: token });
+
+        self.advance_epoch();
+
+        let last_claimed = self.user_last_claimed_epoch[msg.sender];
+        let claimable_until = if self.current_epoch > 0u256 {
+            self.current_epoch - 1u256  // Can only claim completed epochs
+        } else {
+            0u256
+        };
+
+        let mut total_claimable: u256 = 0u256;
+
+        let mut epoch = last_claimed;
+        while epoch <= claimable_until {
+            let share = self.compute_user_share(msg.sender, epoch, token);
+            total_claimable = total_claimable + share;
+            epoch = epoch + 1u256;
+        }
+
+        require!(total_claimable > 0u256, NothingToClaim {});
+
+        self.user_last_claimed_epoch[msg.sender] = claimable_until + 1u256;
+        self.total_claimed[token] = self.total_claimed[token] + total_claimable;
+
+        IERC20::at(token).transfer(msg.sender, total_claimable);
+
+        emit FeesClaimed { user: msg.sender, token: token, amount: total_claimable };
+    }
+
+    // Claim all supported reward tokens at once
+    pub fn claim_all() {
+        require!(!self.paused, Paused {});
+        self.advance_epoch();
+
+        for i in 0..self.reward_count {
+            let token = self.reward_tokens[i];
+            let last_claimed = self.user_last_claimed_epoch[msg.sender];
+            let claimable_until = if self.current_epoch > 0u256 {
+                self.current_epoch - 1u256
+            } else {
+                0u256
+            };
+
+            let mut total_claimable: u256 = 0u256;
+            let mut epoch = last_claimed;
+            while epoch <= claimable_until {
+                let share = self.compute_user_share(msg.sender, epoch, token);
+                total_claimable = total_claimable + share;
+                epoch = epoch + 1u256;
+            }
+
+            if total_claimable > 0u256 {
+                self.total_claimed[token] = self.total_claimed[token] + total_claimable;
+                IERC20::at(token).transfer(msg.sender, total_claimable);
+                emit FeesClaimed { user: msg.sender, token: token, amount: total_claimable };
+            }
+        }
+
+        let claimable_until = if self.current_epoch > 0u256 {
+            self.current_epoch - 1u256
+        } else {
+            0u256
+        };
+        self.user_last_claimed_epoch[msg.sender] = claimable_until + 1u256;
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn get_claimable(user: Address, token: Address) -> u256 {
+        let last_claimed = self.user_last_claimed_epoch[user];
+        let current = self.get_epoch_at_timestamp(block.timestamp);
+        let claimable_until = if current > 0u256 { current - 1u256 } else { 0u256 };
+
+        let mut total: u256 = 0u256;
+        let mut epoch = last_claimed;
+        while epoch <= claimable_until {
+            total = total + self.compute_user_share(user, epoch, token);
+            epoch = epoch + 1u256;
+        }
+        return total;
+    }
+
+    #[view]
+    pub fn get_current_epoch() -> u256 {
+        return self.get_epoch_at_timestamp(block.timestamp);
+    }
+
+    #[view]
+    pub fn get_epoch_fees(epoch: u256, token: Address) -> u256 {
+        return self.epoch_fees[epoch][token];
+    }
+
+    #[view]
+    pub fn get_epoch_total_supply(epoch: u256) -> u256 {
+        return self.epoch_total_supply[epoch];
+    }
+
+    #[view]
+    pub fn get_total_distributed(token: Address) -> u256 {
+        return self.total_distributed[token];
+    }
+
+    #[view]
+    pub fn get_total_claimed(token: Address) -> u256 {
+        return self.total_claimed[token];
+    }
+
+    #[view]
+    pub fn get_reward_token_count() -> u256 {
+        return self.reward_count;
+    }
+
+    #[view]
+    pub fn get_user_epoch_balance(epoch: u256, user: Address) -> u256 {
+        return self.user_epoch_balance[epoch][user];
+    }
+}

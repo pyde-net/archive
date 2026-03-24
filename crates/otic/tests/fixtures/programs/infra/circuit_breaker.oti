@@ -1,0 +1,537 @@
+// Emergency circuit breaker contract.
+// Monitors on-chain metrics and can automatically or manually halt
+// protected contracts when thresholds are breached. Supports cooldowns,
+// graduated responses, and multi-guardian consensus for recovery.
+
+use std::math;
+
+enum CircuitState {
+    Closed,      // 0 - normal operation
+    Open,        // 1 - halted
+    HalfOpen,    // 2 - testing
+}
+
+enum Severity {
+    Info,        // 0
+    Warning,     // 1
+    Critical,    // 2
+}
+
+enum ThresholdType {
+    Max,         // 0 - trip if above
+    Min,         // 1 - trip if below
+}
+
+contract CircuitBreaker {
+    storage {
+        owner: Address,
+        guardians: Map<Address, bool>,
+        guardian_list: Vec<Address>,
+        guardian_count: u32,
+        recovery_threshold: u32,          // guardians needed to recover
+
+        next_circuit_id: u64,
+        circuits: Map<u64, Circuit>,
+        circuit_by_contract: Map<Address, u64>,
+
+        metrics: Map<u64, Map<u8, MetricState>>,  // circuit_id -> metric_id -> state
+        metric_configs: Map<u64, Vec<MetricConfig>>,
+
+        trip_history: Map<u64, Vec<TripRecord>>,
+        recovery_votes: Map<u64, Map<Address, bool>>,
+        recovery_vote_count: Map<u64, u32>,
+
+        global_halt: bool,
+        global_halt_at: u64,
+    }
+
+    const MANUAL_TRIP_METRIC_ID: u8 = 255;
+
+    struct Circuit {
+        id: u64,
+        protected_contract: Address,
+        name: String,
+        state: CircuitState,
+        severity: Severity,
+        tripped_at: u64,
+        cooldown_blocks: u64,    // minimum blocks before recovery attempt
+        auto_recover_blocks: u64, // 0 = no auto recovery
+        trip_count: u64,
+        last_recovery: u64,
+        created_at: u64,
+    }
+
+    struct MetricConfig {
+        metric_id: u8,
+        name: String,
+        threshold_value: u256,
+        threshold_type: ThresholdType,
+        window_blocks: u64,
+        enabled: bool,
+    }
+
+    struct MetricState {
+        current_value: u256,
+        peak_value: u256,
+        trough_value: u256,
+        sample_count: u64,
+        last_updated: u64,
+        window_start: u64,
+        cumulative: u256,
+    }
+
+    struct TripRecord {
+        tripped_at: u64,
+        metric_id: u8,
+        metric_value: u256,
+        threshold: u256,
+        severity: Severity,
+        recovered_at: u64,
+        trip_reason: String,
+    }
+
+    event CircuitCreated {
+        #[indexed]
+        circuit_id: u64,
+        #[indexed]
+        protected_contract: Address,
+        name: String,
+    }
+
+    event CircuitTripped {
+        #[indexed]
+        circuit_id: u64,
+        #[indexed]
+        metric_id: u8,
+        severity: Severity,
+        value: u256,
+        threshold: u256,
+    }
+
+    event CircuitRecovered {
+        #[indexed]
+        circuit_id: u64,
+        recovered_by: Address,
+    }
+
+    event CircuitHalfOpen {
+        #[indexed]
+        circuit_id: u64,
+    }
+
+    event MetricUpdated {
+        #[indexed]
+        circuit_id: u64,
+        metric_id: u8,
+        value: u256,
+    }
+
+    event GlobalHalt {
+        activated_by: Address,
+    }
+
+    event GlobalResume {
+        activated_by: Address,
+    }
+
+    event GuardianAdded {
+        #[indexed]
+        guardian: Address,
+    }
+
+    event GuardianRemoved {
+        #[indexed]
+        guardian: Address,
+    }
+
+    event RecoveryVoteCast {
+        #[indexed]
+        circuit_id: u64,
+        #[indexed]
+        guardian: Address,
+        votes: u32,
+        threshold: u32,
+    }
+
+    error Unauthorized {}
+    error NotGuardian {}
+    error CircuitNotFound {}
+    error CircuitAlreadyOpen {}
+    error CircuitNotOpen {}
+    error CooldownNotElapsed { ready_at: u64 }
+    error InsufficientVotes { required: u32, current: u32 }
+    error AlreadyVoted {}
+    error GloballyHalted {}
+    error ContractAlreadyProtected {}
+    error InvalidMetricId {}
+    error InvalidThreshold {}
+    error AlreadyGuardian {}
+    error NotAGuardian {}
+
+    #[constructor]
+    pub fn init(recovery_threshold: u32) {
+        self.owner = msg.sender;
+        self.recovery_threshold = recovery_threshold;
+        self.next_circuit_id = 1;
+        self.global_halt = false;
+        self.global_halt_at = 0;
+        self.guardian_count = 0;
+
+        // Owner is always a guardian
+        self.guardians[msg.sender] = true;
+        self.guardian_list.push(msg.sender);
+        self.guardian_count = 1;
+    }
+
+    pub fn add_guardian(guardian: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(!self.guardians[guardian], AlreadyGuardian {});
+        self.guardians[guardian] = true;
+        self.guardian_list.push(guardian);
+        self.guardian_count = self.guardian_count + 1;
+        emit GuardianAdded { guardian: guardian };
+    }
+
+    pub fn remove_guardian(guardian: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(self.guardians[guardian], NotAGuardian {});
+        self.guardians[guardian] = false;
+        self.guardian_count = self.guardian_count - 1;
+
+        let mut new_list: Vec<Address> = Vec::new();
+        for i in 0..self.guardian_list.len() {
+            if self.guardian_list[i] != guardian {
+                new_list.push(self.guardian_list[i]);
+            }
+        }
+        self.guardian_list = new_list;
+
+        emit GuardianRemoved { guardian: guardian };
+    }
+
+    pub fn create_circuit(
+        protected_contract: Address,
+        name: String,
+        cooldown_blocks: u64,
+        auto_recover_blocks: u64,
+    ) -> u64 {
+        require!(
+            msg.sender == self.owner || self.guardians[msg.sender],
+            NotGuardian {}
+        );
+        require!(self.circuit_by_contract[protected_contract] == 0, ContractAlreadyProtected {});
+
+        let circuit_id = self.next_circuit_id;
+        self.next_circuit_id = circuit_id + 1;
+
+        self.circuits[circuit_id] = Circuit {
+            id: circuit_id,
+            protected_contract: protected_contract,
+            name: name,
+            state: CircuitState::Closed,
+            severity: Severity::Info,
+            tripped_at: 0,
+            cooldown_blocks: cooldown_blocks,
+            auto_recover_blocks: auto_recover_blocks,
+            trip_count: 0,
+            last_recovery: 0,
+            created_at: block.height,
+        };
+
+        self.circuit_by_contract[protected_contract] = circuit_id;
+
+        emit CircuitCreated {
+            circuit_id: circuit_id,
+            protected_contract: protected_contract,
+            name: name,
+        };
+
+        return circuit_id;
+    }
+
+    pub fn add_metric(
+        circuit_id: u64,
+        name: String,
+        threshold_value: u256,
+        threshold_type: ThresholdType,
+        window_blocks: u64,
+    ) -> u8 {
+        require!(
+            msg.sender == self.owner || self.guardians[msg.sender],
+            NotGuardian {}
+        );
+        let circuit = self.circuits[circuit_id];
+        require!(circuit.id != 0, CircuitNotFound {});
+
+        let mut configs = self.metric_configs[circuit_id];
+        let metric_id = configs.len() as u8;
+
+        configs.push(MetricConfig {
+            metric_id: metric_id,
+            name: name,
+            threshold_value: threshold_value,
+            threshold_type: threshold_type,
+            window_blocks: window_blocks,
+            enabled: true,
+        });
+
+        self.metric_configs[circuit_id] = configs;
+
+        self.metrics[circuit_id][metric_id] = MetricState {
+            current_value: 0,
+            peak_value: 0,
+            trough_value: u256::MAX,
+            sample_count: 0,
+            last_updated: 0,
+            window_start: block.height,
+            cumulative: 0,
+        };
+
+        return metric_id;
+    }
+
+    // Report a metric value; may auto-trip the circuit
+    pub fn report_metric(circuit_id: u64, metric_id: u8, value: u256) {
+        require!(!self.global_halt, GloballyHalted {});
+        let circuit = self.circuits[circuit_id];
+        require!(circuit.id != 0, CircuitNotFound {});
+
+        let configs = self.metric_configs[circuit_id];
+        require!((metric_id as u64) < configs.len() as u64, InvalidMetricId {});
+        let config = configs[metric_id as u64];
+
+        let mut state = self.metrics[circuit_id][metric_id];
+
+        // Reset window if expired
+        if block.height >= state.window_start + config.window_blocks {
+            state.window_start = block.height;
+            state.cumulative = 0;
+            state.sample_count = 0;
+            state.peak_value = 0;
+            state.trough_value = u256::MAX;
+        }
+
+        state.current_value = value;
+        state.sample_count = state.sample_count + 1;
+        state.cumulative = state.cumulative + value;
+        state.last_updated = block.height;
+
+        if value > state.peak_value {
+            state.peak_value = value;
+        }
+        if value < state.trough_value {
+            state.trough_value = value;
+        }
+
+        self.metrics[circuit_id][metric_id] = state;
+
+        emit MetricUpdated {
+            circuit_id: circuit_id,
+            metric_id: metric_id,
+            value: value,
+        };
+
+        // Check threshold breach
+        if config.enabled && circuit.state == CircuitState::Closed {
+            let breached = if config.threshold_type == ThresholdType::Max {
+                value > config.threshold_value
+            } else {
+                value < config.threshold_value
+            };
+
+            if breached {
+                self.trip_circuit(circuit_id, metric_id, value, config.threshold_value);
+            }
+        }
+    }
+
+    fn trip_circuit(circuit_id: u64, metric_id: u8, value: u256, threshold: u256) {
+        let mut circuit = self.circuits[circuit_id];
+
+        // Escalate severity based on trip count
+        let severity: Severity = if circuit.trip_count == 0 {
+            Severity::Warning
+        } else {
+            Severity::Critical
+        };
+
+        circuit.state = CircuitState::Open; // halted
+        circuit.severity = severity;
+        circuit.tripped_at = block.height;
+        circuit.trip_count = circuit.trip_count + 1;
+        self.circuits[circuit_id] = circuit;
+
+        // Clear any existing recovery votes
+        self.recovery_vote_count[circuit_id] = 0;
+        for i in 0..self.guardian_list.len() {
+            self.recovery_votes[circuit_id][self.guardian_list[i]] = false;
+        }
+
+        // Record trip
+        let mut history = self.trip_history[circuit_id];
+        history.push(TripRecord {
+            tripped_at: block.height,
+            metric_id: metric_id,
+            metric_value: value,
+            threshold: threshold,
+            severity: severity,
+            recovered_at: 0,
+            trip_reason: "Threshold breached",
+        });
+        self.trip_history[circuit_id] = history;
+
+        emit CircuitTripped {
+            circuit_id: circuit_id,
+            metric_id: metric_id,
+            severity: severity,
+            value: value,
+            threshold: threshold,
+        };
+    }
+
+    // Manual trip by guardian
+    pub fn manual_trip(circuit_id: u64, reason: String) {
+        require!(self.guardians[msg.sender], NotGuardian {});
+        let mut circuit = self.circuits[circuit_id];
+        require!(circuit.id != 0, CircuitNotFound {});
+        require!(circuit.state == CircuitState::Closed, CircuitAlreadyOpen {});
+
+        circuit.state = CircuitState::Open;
+        circuit.severity = Severity::Critical;
+        circuit.tripped_at = block.height;
+        circuit.trip_count = circuit.trip_count + 1;
+        self.circuits[circuit_id] = circuit;
+
+        let mut history = self.trip_history[circuit_id];
+        history.push(TripRecord {
+            tripped_at: block.height,
+            metric_id: MANUAL_TRIP_METRIC_ID,
+            metric_value: 0,
+            threshold: 0,
+            severity: Severity::Critical,
+            recovered_at: 0,
+            trip_reason: reason,
+        });
+        self.trip_history[circuit_id] = history;
+
+        emit CircuitTripped {
+            circuit_id: circuit_id,
+            metric_id: MANUAL_TRIP_METRIC_ID,
+            severity: Severity::Critical,
+            value: 0,
+            threshold: 0,
+        };
+    }
+
+    // Vote to recover a tripped circuit
+    pub fn vote_recover(circuit_id: u64) {
+        require!(self.guardians[msg.sender], NotGuardian {});
+        let circuit = self.circuits[circuit_id];
+        require!(circuit.state == CircuitState::Open, CircuitNotOpen {});
+        require!(
+            block.height >= circuit.tripped_at + circuit.cooldown_blocks,
+            CooldownNotElapsed { ready_at: circuit.tripped_at + circuit.cooldown_blocks }
+        );
+        require!(!self.recovery_votes[circuit_id][msg.sender], AlreadyVoted {});
+
+        self.recovery_votes[circuit_id][msg.sender] = true;
+        let new_count = self.recovery_vote_count[circuit_id] + 1;
+        self.recovery_vote_count[circuit_id] = new_count;
+
+        emit RecoveryVoteCast {
+            circuit_id: circuit_id,
+            guardian: msg.sender,
+            votes: new_count,
+            threshold: self.recovery_threshold,
+        };
+
+        // Execute recovery if threshold met
+        if new_count >= self.recovery_threshold {
+            self.recover_circuit(circuit_id);
+        }
+    }
+
+    fn recover_circuit(circuit_id: u64) {
+        let mut circuit = self.circuits[circuit_id];
+        circuit.state = CircuitState::Closed;
+        circuit.severity = Severity::Info;
+        circuit.last_recovery = block.height;
+        self.circuits[circuit_id] = circuit;
+
+        // Update trip history with recovery time
+        let mut history = self.trip_history[circuit_id];
+        if history.len() > 0 {
+            let last_idx = history.len() - 1;
+            let mut last_record = history[last_idx as u64];
+            last_record.recovered_at = block.height;
+            history[last_idx as u64] = last_record;
+            self.trip_history[circuit_id] = history;
+        }
+
+        emit CircuitRecovered { circuit_id: circuit_id, recovered_by: msg.sender };
+    }
+
+    // Check if auto-recovery should trigger
+    pub fn check_auto_recover(circuit_id: u64) {
+        let circuit = self.circuits[circuit_id];
+        require!(circuit.state == CircuitState::Open, CircuitNotOpen {});
+        require!(circuit.auto_recover_blocks > 0, CircuitNotOpen {});
+
+        if block.height >= circuit.tripped_at + circuit.auto_recover_blocks {
+            self.recover_circuit(circuit_id);
+        }
+    }
+
+    // Global emergency halt
+    pub fn activate_global_halt() {
+        require!(self.guardians[msg.sender], NotGuardian {});
+        self.global_halt = true;
+        self.global_halt_at = block.height;
+        emit GlobalHalt { activated_by: msg.sender };
+    }
+
+    pub fn deactivate_global_halt() {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.global_halt = false;
+        emit GlobalResume { activated_by: msg.sender };
+    }
+
+    // Check function: other contracts call this to see if they should proceed
+    #[view]
+    pub fn is_operational(protected_contract: Address) -> bool {
+        if self.global_halt {
+            return false;
+        }
+        let circuit_id = self.circuit_by_contract[protected_contract];
+        if circuit_id == 0 {
+            return true; // Not protected, assume operational
+        }
+        let circuit = self.circuits[circuit_id];
+        return circuit.state == CircuitState::Closed;
+    }
+
+    #[view]
+    pub fn get_circuit(circuit_id: u64) -> Circuit {
+        return self.circuits[circuit_id];
+    }
+
+    #[view]
+    pub fn get_metric_state(circuit_id: u64, metric_id: u8) -> MetricState {
+        return self.metrics[circuit_id][metric_id];
+    }
+
+    #[view]
+    pub fn get_trip_history(circuit_id: u64) -> Vec<TripRecord> {
+        return self.trip_history[circuit_id];
+    }
+
+    #[view]
+    pub fn get_recovery_status(circuit_id: u64) -> (u32, u32) {
+        return (self.recovery_vote_count[circuit_id], self.recovery_threshold);
+    }
+
+    #[view]
+    pub fn is_globally_halted() -> bool {
+        return self.global_halt;
+    }
+}

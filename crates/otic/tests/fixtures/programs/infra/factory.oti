@@ -1,0 +1,354 @@
+// Contract factory pattern.
+// Deploys and manages child contract instances from templates.
+// Tracks all deployments, supports versioned templates, and
+// provides a registry of deployed contracts.
+
+use std::math;
+
+contract ContractFactory {
+    storage {
+        owner: Address,
+        next_template_id: u64,
+        next_deploy_id: u64,
+        templates: Map<u64, Template>,
+        template_versions: Map<u64, Vec<TemplateVersion>>,
+        deployments: Map<u64, Deployment>,
+        deployer_contracts: Map<Address, Vec<u64>>,   // deployer -> list of deploy_ids
+        template_deployments: Map<u64, Vec<u64>>,     // template_id -> list of deploy_ids
+        deployed_address_map: Map<Address, u64>,       // contract address -> deploy_id
+        deploy_fee: u256,
+        revenue: u256,
+        whitelisted_deployers: Map<Address, bool>,
+        require_whitelist: bool,
+        paused: bool,
+    }
+
+    const INITIAL_VERSION: u32 = 1;
+
+    struct Template {
+        id: u64,
+        name: String,
+        creator: Address,
+        bytecode_hash: u256,
+        current_version: u32,
+        deploy_count: u64,
+        active: bool,
+        created_at: u64,
+    }
+
+    struct TemplateVersion {
+        version: u32,
+        bytecode_hash: u256,
+        changelog: String,
+        published_at: u64,
+        published_by: Address,
+    }
+
+    struct Deployment {
+        id: u64,
+        template_id: u64,
+        template_version: u32,
+        deployed_address: Address,
+        deployer: Address,
+        constructor_args_hash: u256,
+        deployed_at: u64,
+        active: bool,
+        label: String,
+    }
+
+    event TemplateRegistered {
+        #[indexed]
+        template_id: u64,
+        #[indexed]
+        creator: Address,
+        name: String,
+        bytecode_hash: u256,
+    }
+
+    event TemplateUpdated {
+        #[indexed]
+        template_id: u64,
+        version: u32,
+        bytecode_hash: u256,
+    }
+
+    event TemplateDeactivated {
+        #[indexed]
+        template_id: u64,
+    }
+
+    event ContractDeployed {
+        #[indexed]
+        deploy_id: u64,
+        #[indexed]
+        template_id: u64,
+        #[indexed]
+        deployed_address: Address,
+        deployer: Address,
+    }
+
+    event DeploymentDeactivated {
+        #[indexed]
+        deploy_id: u64,
+    }
+
+    event WhitelistUpdated {
+        #[indexed]
+        account: Address,
+        whitelisted: bool,
+    }
+
+    error Unauthorized {}
+    error NotTemplateCreator {}
+    error Paused {}
+    error TemplateNotFound {}
+    error TemplateInactive {}
+    error DeploymentNotFound {}
+    error NotWhitelisted {}
+    error InsufficientFee { required: u256, sent: u256 }
+    error TemplateNameTaken {}
+    error InvalidBytecode {}
+    error DeployFailed {}
+    error AddressAlreadyTracked {}
+
+    #[constructor]
+    pub fn init(deploy_fee: u256, require_whitelist: bool) {
+        self.owner = msg.sender;
+        self.deploy_fee = deploy_fee;
+        self.require_whitelist = require_whitelist;
+        self.next_template_id = 1;
+        self.next_deploy_id = 1;
+        self.revenue = 0;
+        self.paused = false;
+    }
+
+    pub fn register_template(name: String, bytecode_hash: u256, changelog: String) -> u64 {
+        require!(!self.paused, Paused {});
+        require!(bytecode_hash != 0, InvalidBytecode {});
+
+        let template_id = self.next_template_id;
+        self.next_template_id = template_id + 1;
+
+        self.templates[template_id] = Template {
+            id: template_id,
+            name: name,
+            creator: msg.sender,
+            bytecode_hash: bytecode_hash,
+            current_version: INITIAL_VERSION,
+            deploy_count: 0,
+            active: true,
+            created_at: block.height,
+        };
+
+        let initial_version = TemplateVersion {
+            version: INITIAL_VERSION,
+            bytecode_hash: bytecode_hash,
+            changelog: changelog,
+            published_at: block.height,
+            published_by: msg.sender,
+        };
+
+        let mut versions: Vec<TemplateVersion> = Vec::new();
+        versions.push(initial_version);
+        self.template_versions[template_id] = versions;
+
+        emit TemplateRegistered {
+            template_id: template_id,
+            creator: msg.sender,
+            name: name,
+            bytecode_hash: bytecode_hash,
+        };
+
+        return template_id;
+    }
+
+    pub fn update_template(template_id: u64, new_bytecode_hash: u256, changelog: String) {
+        let mut template = self.templates[template_id];
+        require!(template.active, TemplateNotFound {});
+        require!(
+            msg.sender == template.creator || msg.sender == self.owner,
+            NotTemplateCreator {}
+        );
+        require!(new_bytecode_hash != 0, InvalidBytecode {});
+
+        template.current_version = template.current_version + 1;
+        template.bytecode_hash = new_bytecode_hash;
+        self.templates[template_id] = template;
+
+        let mut versions = self.template_versions[template_id];
+        versions.push(TemplateVersion {
+            version: template.current_version,
+            bytecode_hash: new_bytecode_hash,
+            changelog: changelog,
+            published_at: block.height,
+            published_by: msg.sender,
+        });
+        self.template_versions[template_id] = versions;
+
+        emit TemplateUpdated {
+            template_id: template_id,
+            version: template.current_version,
+            bytecode_hash: new_bytecode_hash,
+        };
+    }
+
+    pub fn deploy(
+        template_id: u64,
+        constructor_args: bytes,
+        label: String,
+        salt: u256,
+    ) -> Address {
+        require!(!self.paused, Paused {});
+        if self.require_whitelist {
+            require!(self.whitelisted_deployers[msg.sender], NotWhitelisted {});
+        }
+        require!(msg.value >= self.deploy_fee, InsufficientFee { required: self.deploy_fee, sent: msg.value });
+
+        let template = self.templates[template_id];
+        require!(template.active, TemplateNotFound {});
+
+        // Deploy using CREATE2 with salt for deterministic addresses
+        let deploy_salt = math::keccak256(
+            salt ^ (msg.sender as u256) ^ (template_id as u256)
+        );
+        let deployed_address = raw_call!(
+            Address::ZERO,
+            msg.value - self.deploy_fee,
+            constructor_args
+        );
+
+        // In practice the VM would return the new contract's address.
+        // We model this as deriving it from the salt.
+        let derived_address = Address::from_u256(
+            math::keccak256(deploy_salt ^ template.bytecode_hash)
+        );
+
+        let deploy_id = self.next_deploy_id;
+        self.next_deploy_id = deploy_id + 1;
+
+        let args_hash = math::keccak256_bytes(constructor_args);
+
+        self.deployments[deploy_id] = Deployment {
+            id: deploy_id,
+            template_id: template_id,
+            template_version: template.current_version,
+            deployed_address: derived_address,
+            deployer: msg.sender,
+            constructor_args_hash: args_hash,
+            deployed_at: block.height,
+            active: true,
+            label: label,
+        };
+
+        // Update indexes
+        let mut deployer_list = self.deployer_contracts[msg.sender];
+        deployer_list.push(deploy_id);
+        self.deployer_contracts[msg.sender] = deployer_list;
+
+        let mut template_list = self.template_deployments[template_id];
+        template_list.push(deploy_id);
+        self.template_deployments[template_id] = template_list;
+
+        self.deployed_address_map[derived_address] = deploy_id;
+
+        // Update template deploy count
+        let mut updated_template = self.templates[template_id];
+        updated_template.deploy_count = updated_template.deploy_count + 1;
+        self.templates[template_id] = updated_template;
+
+        self.revenue = self.revenue + self.deploy_fee;
+
+        emit ContractDeployed {
+            deploy_id: deploy_id,
+            template_id: template_id,
+            deployed_address: derived_address,
+            deployer: msg.sender,
+        };
+
+        return derived_address;
+    }
+
+    pub fn deactivate_template(template_id: u64) {
+        let mut template = self.templates[template_id];
+        require!(
+            msg.sender == template.creator || msg.sender == self.owner,
+            NotTemplateCreator {}
+        );
+        template.active = false;
+        self.templates[template_id] = template;
+        emit TemplateDeactivated { template_id: template_id };
+    }
+
+    pub fn deactivate_deployment(deploy_id: u64) {
+        let mut deployment = self.deployments[deploy_id];
+        require!(
+            msg.sender == deployment.deployer || msg.sender == self.owner,
+            Unauthorized {}
+        );
+        deployment.active = false;
+        self.deployments[deploy_id] = deployment;
+        emit DeploymentDeactivated { deploy_id: deploy_id };
+    }
+
+    pub fn set_whitelist(account: Address, whitelisted: bool) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.whitelisted_deployers[account] = whitelisted;
+        emit WhitelistUpdated { account: account, whitelisted: whitelisted };
+    }
+
+    pub fn batch_whitelist(accounts: Vec<Address>, whitelisted: bool) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        for i in 0..accounts.len() {
+            self.whitelisted_deployers[accounts[i]] = whitelisted;
+            emit WhitelistUpdated { account: accounts[i], whitelisted: whitelisted };
+        }
+    }
+
+    pub fn set_deploy_fee(new_fee: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.deploy_fee = new_fee;
+    }
+
+    pub fn set_paused(paused: bool) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.paused = paused;
+    }
+
+    pub fn withdraw_revenue(to: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        let amount = self.revenue;
+        self.revenue = 0;
+        raw_call!(to, amount, bytes::empty());
+    }
+
+    #[view]
+    pub fn get_template(template_id: u64) -> Template {
+        return self.templates[template_id];
+    }
+
+    #[view]
+    pub fn get_template_versions(template_id: u64) -> Vec<TemplateVersion> {
+        return self.template_versions[template_id];
+    }
+
+    #[view]
+    pub fn get_deployment(deploy_id: u64) -> Deployment {
+        return self.deployments[deploy_id];
+    }
+
+    #[view]
+    pub fn get_deployer_contracts(deployer: Address) -> Vec<u64> {
+        return self.deployer_contracts[deployer];
+    }
+
+    #[view]
+    pub fn get_template_deploy_count(template_id: u64) -> u64 {
+        return self.templates[template_id].deploy_count;
+    }
+
+    #[view]
+    pub fn lookup_by_address(addr: Address) -> Deployment {
+        let deploy_id = self.deployed_address_map[addr];
+        return self.deployments[deploy_id];
+    }
+}

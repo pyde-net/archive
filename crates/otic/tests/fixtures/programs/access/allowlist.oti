@@ -1,0 +1,356 @@
+// Dynamic allowlist with add/remove, batch operations, expiration,
+// capacity limits, and operator delegation.
+
+contract Allowlist {
+    storage {
+        owner: Address,
+        operators: Map<Address, bool>,
+        allowed: Map<Address, AllowEntry>,
+        allowed_list: Vec<Address>,
+        total_allowed: u64,
+        max_capacity: u64, // 0 = unlimited
+        default_expiry: u64, // default TTL in seconds, 0 = no expiry
+        paused: bool,
+        allow_count_history: Vec<u64>,
+        list_name: String,
+        list_description: String,
+    }
+
+    struct AllowEntry {
+        is_allowed: bool,
+        added_at: u64,
+        added_by: Address,
+        expires_at: u64, // 0 = never
+        metadata: String,
+    }
+
+    const MAX_BATCH_SIZE: u64 = 100;
+
+    event AddressAdded {
+        #[indexed]
+        account: Address,
+        added_by: Address,
+        expires_at: u64,
+    }
+
+    event AddressRemoved {
+        #[indexed]
+        account: Address,
+        removed_by: Address,
+    }
+
+    event AddressExpired {
+        #[indexed]
+        account: Address,
+    }
+
+    event OperatorAdded {
+        #[indexed]
+        operator: Address,
+    }
+
+    event OperatorRemoved {
+        #[indexed]
+        operator: Address,
+    }
+
+    event ListPaused {}
+    event ListUnpaused {}
+
+    event CapacityUpdated {
+        old_capacity: u64,
+        new_capacity: u64,
+    }
+
+    error Unauthorized {}
+    error NotOwner {}
+    error NotOperator {}
+    error AlreadyAllowed { account: Address }
+    error NotAllowed { account: Address }
+    error ListFull { capacity: u64 }
+    error ListPausedError {}
+    error ZeroAddress {}
+    error BatchTooLarge { max: u64 }
+    error CapacityBelowCurrent { current: u64, requested: u64 }
+    error AlreadyOperator {}
+    error NotAnOperator {}
+
+    #[constructor]
+    pub fn init(name: String, description: String, max_capacity: u64, default_expiry: u64) {
+        self.owner = msg.sender;
+        self.list_name = name;
+        self.list_description = description;
+        self.max_capacity = max_capacity;
+        self.default_expiry = default_expiry;
+        self.total_allowed = 0;
+        self.paused = false;
+    }
+
+    fn ensure_authorized() {
+        require!(
+            msg.sender == self.owner || self.operators[msg.sender],
+            NotOperator {},
+        );
+    }
+
+    pub fn add(account: Address, metadata: String) {
+        self.ensure_authorized();
+        require!(!self.paused, ListPausedError {});
+        require!(account != Address::ZERO, ZeroAddress {});
+        require!(!self.allowed[account].is_allowed, AlreadyAllowed { account: account });
+
+        if self.max_capacity > 0 {
+            require!(self.total_allowed < self.max_capacity, ListFull {
+                capacity: self.max_capacity,
+            });
+        }
+
+        let expires = if self.default_expiry > 0 {
+            block.timestamp + self.default_expiry
+        } else {
+            0
+        };
+
+        self.allowed[account] = AllowEntry {
+            is_allowed: true,
+            added_at: block.timestamp,
+            added_by: msg.sender,
+            expires_at: expires,
+            metadata: metadata,
+        };
+
+        self.allowed_list.push(account);
+        self.total_allowed = self.total_allowed + 1;
+
+        emit AddressAdded {
+            account: account,
+            added_by: msg.sender,
+            expires_at: expires,
+        };
+    }
+
+    pub fn add_with_expiry(account: Address, expiry_seconds: u64, metadata: String) {
+        self.ensure_authorized();
+        require!(!self.paused, ListPausedError {});
+        require!(account != Address::ZERO, ZeroAddress {});
+        require!(!self.allowed[account].is_allowed, AlreadyAllowed { account: account });
+
+        if self.max_capacity > 0 {
+            require!(self.total_allowed < self.max_capacity, ListFull {
+                capacity: self.max_capacity,
+            });
+        }
+
+        let expires = if expiry_seconds > 0 {
+            block.timestamp + expiry_seconds
+        } else {
+            0
+        };
+
+        self.allowed[account] = AllowEntry {
+            is_allowed: true,
+            added_at: block.timestamp,
+            added_by: msg.sender,
+            expires_at: expires,
+            metadata: metadata,
+        };
+
+        self.allowed_list.push(account);
+        self.total_allowed = self.total_allowed + 1;
+
+        emit AddressAdded {
+            account: account,
+            added_by: msg.sender,
+            expires_at: expires,
+        };
+    }
+
+    pub fn remove(account: Address) {
+        self.ensure_authorized();
+        require!(self.allowed[account].is_allowed, NotAllowed { account: account });
+
+        self.allowed[account].is_allowed = false;
+        self.total_allowed = self.total_allowed - 1;
+
+        // Remove from list
+        let mut new_list: Vec<Address> = Vec::new();
+        for i in 0..self.allowed_list.len() {
+            if self.allowed_list[i] != account {
+                new_list.push(self.allowed_list[i]);
+            }
+        }
+        self.allowed_list = new_list;
+
+        emit AddressRemoved { account: account, removed_by: msg.sender };
+    }
+
+    pub fn batch_add(accounts: Vec<Address>) {
+        self.ensure_authorized();
+        require!(!self.paused, ListPausedError {});
+        require!(accounts.len() <= MAX_BATCH_SIZE, BatchTooLarge { max: MAX_BATCH_SIZE });
+
+        for i in 0..accounts.len() {
+            let account = accounts[i];
+            if account == Address::ZERO || self.allowed[account].is_allowed {
+                continue;
+            }
+
+            if self.max_capacity > 0 && self.total_allowed >= self.max_capacity {
+                break;
+            }
+
+            let expires = if self.default_expiry > 0 {
+                block.timestamp + self.default_expiry
+            } else {
+                0
+            };
+
+            self.allowed[account] = AllowEntry {
+                is_allowed: true,
+                added_at: block.timestamp,
+                added_by: msg.sender,
+                expires_at: expires,
+                metadata: "",
+            };
+
+            self.allowed_list.push(account);
+            self.total_allowed = self.total_allowed + 1;
+
+            emit AddressAdded {
+                account: account,
+                added_by: msg.sender,
+                expires_at: expires,
+            };
+        }
+    }
+
+    pub fn batch_remove(accounts: Vec<Address>) {
+        self.ensure_authorized();
+        require!(accounts.len() <= MAX_BATCH_SIZE, BatchTooLarge { max: MAX_BATCH_SIZE });
+
+        for i in 0..accounts.len() {
+            let account = accounts[i];
+            if !self.allowed[account].is_allowed {
+                continue;
+            }
+
+            self.allowed[account].is_allowed = false;
+            self.total_allowed = self.total_allowed - 1;
+
+            emit AddressRemoved { account: account, removed_by: msg.sender };
+        }
+
+        // Rebuild list (more efficient than per-item removal)
+        let mut new_list: Vec<Address> = Vec::new();
+        for i in 0..self.allowed_list.len() {
+            if self.allowed[self.allowed_list[i]].is_allowed {
+                new_list.push(self.allowed_list[i]);
+            }
+        }
+        self.allowed_list = new_list;
+    }
+
+    // Clean up expired entries
+    pub fn prune_expired() {
+        let mut pruned: Vec<Address> = Vec::new();
+        let mut new_list: Vec<Address> = Vec::new();
+
+        for i in 0..self.allowed_list.len() {
+            let account = self.allowed_list[i];
+            let entry = self.allowed[account];
+
+            if entry.is_allowed && entry.expires_at > 0 && block.timestamp > entry.expires_at {
+                self.allowed[account].is_allowed = false;
+                self.total_allowed = self.total_allowed - 1;
+                pruned.push(account);
+                emit AddressExpired { account: account };
+            } else if entry.is_allowed {
+                new_list.push(account);
+            }
+        }
+
+        self.allowed_list = new_list;
+    }
+
+    pub fn add_operator(operator: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(operator != Address::ZERO, ZeroAddress {});
+        require!(!self.operators[operator], AlreadyOperator {});
+        self.operators[operator] = true;
+        emit OperatorAdded { operator: operator };
+    }
+
+    pub fn remove_operator(operator: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(self.operators[operator], NotAnOperator {});
+        self.operators[operator] = false;
+        emit OperatorRemoved { operator: operator };
+    }
+
+    pub fn pause() {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.paused = true;
+        emit ListPaused {};
+    }
+
+    pub fn unpause() {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.paused = false;
+        emit ListUnpaused {};
+    }
+
+    pub fn set_capacity(new_capacity: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        if new_capacity > 0 {
+            require!(new_capacity >= self.total_allowed, CapacityBelowCurrent {
+                current: self.total_allowed,
+                requested: new_capacity,
+            });
+        }
+        let old = self.max_capacity;
+        self.max_capacity = new_capacity;
+        emit CapacityUpdated { old_capacity: old, new_capacity: new_capacity };
+    }
+
+    pub fn set_default_expiry(expiry_seconds: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.default_expiry = expiry_seconds;
+    }
+
+    #[view]
+    pub fn is_allowed(account: Address) -> bool {
+        let entry = self.allowed[account];
+        if !entry.is_allowed {
+            return false;
+        }
+        if entry.expires_at > 0 && block.timestamp > entry.expires_at {
+            return false;
+        }
+        return true;
+    }
+
+    #[view]
+    pub fn get_entry(account: Address) -> AllowEntry {
+        return self.allowed[account];
+    }
+
+    #[view]
+    pub fn get_all_allowed() -> Vec<Address> {
+        return self.allowed_list;
+    }
+
+    #[view]
+    pub fn get_count() -> u64 {
+        return self.total_allowed;
+    }
+
+    #[view]
+    pub fn get_capacity() -> u64 {
+        return self.max_capacity;
+    }
+
+    #[view]
+    pub fn is_operator(account: Address) -> bool {
+        return self.operators[account];
+    }
+}

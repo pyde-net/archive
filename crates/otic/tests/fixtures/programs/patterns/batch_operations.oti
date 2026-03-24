@@ -1,0 +1,364 @@
+// Batch processing contract for efficient multi-operation transactions.
+// Supports batch transfers, batch approvals, batch minting, and
+// aggregate queries over arrays of accounts.
+
+use std::math;
+use std::token::IERC20;
+
+contract BatchProcessor {
+    storage {
+        owner: Address,
+        paused: bool,
+        max_batch_size: u64,
+
+        // Internal token ledger for gas-efficient batch ops
+        balances: Map<Address, u256>,
+        total_supply: u256,
+
+        // Whitelist for batch recipients
+        whitelisted: Map<Address, bool>,
+        whitelist_enabled: bool,
+
+        // Batch operation nonces for replay protection
+        batch_nonce: Map<Address, u256>,
+
+        // Statistics
+        total_batches_processed: u256,
+        total_operations: u256,
+    }
+
+    event BatchTransfer {
+        #[indexed]
+        sender: Address,
+        recipient_count: u64,
+        total_amount: u256,
+    }
+
+    event BatchMint {
+        #[indexed]
+        minter: Address,
+        recipient_count: u64,
+        total_minted: u256,
+    }
+
+    event SingleTransfer {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    event BatchCompleted {
+        #[indexed]
+        operator: Address,
+        batch_id: u256,
+        operation_count: u64,
+    }
+
+    error NotOwner {}
+    error Paused {}
+    error BatchTooLarge { size: u64, max: u64 }
+    error ArrayLengthMismatch { recipients: u64, amounts: u64 }
+    error InsufficientBalance { available: u256, required: u256 }
+    error ZeroAddress {}
+    error NotWhitelisted { account: Address }
+    error ZeroAmount {}
+    error EmptyBatch {}
+
+    #[constructor]
+    pub fn init(max_batch_size: u64) {
+        self.owner = msg.sender;
+        self.paused = false;
+        self.max_batch_size = max_batch_size;
+        self.total_supply = 0u256;
+        self.whitelist_enabled = false;
+        self.total_batches_processed = 0u256;
+        self.total_operations = 0u256;
+    }
+
+    fn require_owner() {
+        require!(msg.sender == self.owner, NotOwner {});
+    }
+
+    fn require_not_paused() {
+        require!(!self.paused, Paused {});
+    }
+
+    fn validate_batch_size(size: u64) {
+        require!(size > 0u64, EmptyBatch {});
+        require!(size <= self.max_batch_size, BatchTooLarge {
+            size: size,
+            max: self.max_batch_size,
+        });
+    }
+
+    fn check_whitelist(account: Address) {
+        if self.whitelist_enabled {
+            require!(self.whitelisted[account], NotWhitelisted { account: account });
+        }
+    }
+
+    // --- Admin ---
+
+    pub fn set_max_batch_size(new_max: u64) {
+        self.require_owner();
+        self.max_batch_size = new_max;
+    }
+
+    pub fn toggle_whitelist(enabled: bool) {
+        self.require_owner();
+        self.whitelist_enabled = enabled;
+    }
+
+    pub fn set_whitelist(accounts: Vec<Address>, status: bool) {
+        self.require_owner();
+        for i in 0u64..accounts.len() {
+            self.whitelisted[accounts[i]] = status;
+        }
+    }
+
+    pub fn pause() {
+        self.require_owner();
+        self.paused = true;
+    }
+
+    pub fn unpause() {
+        self.require_owner();
+        self.paused = false;
+    }
+
+    // --- Batch transfers ---
+
+    /// Sends different amounts to multiple recipients in one transaction.
+    pub fn batch_transfer(recipients: Vec<Address>, amounts: Vec<u256>) {
+        self.require_not_paused();
+        let count = recipients.len();
+        require!(count == amounts.len(), ArrayLengthMismatch {
+            recipients: count,
+            amounts: amounts.len(),
+        });
+        self.validate_batch_size(count);
+
+        // Pre-calculate total to check balance once
+        let mut total = 0u256;
+        for i in 0u64..count {
+            require!(amounts[i] > 0u256, ZeroAmount {});
+            require!(recipients[i] != Address::ZERO, ZeroAddress {});
+            self.check_whitelist(recipients[i]);
+            total = total + amounts[i];
+        }
+
+        let sender_balance = self.balances[msg.sender];
+        require!(sender_balance >= total, InsufficientBalance {
+            available: sender_balance,
+            required: total,
+        });
+
+        // Debit sender once
+        self.balances[msg.sender] = sender_balance - total;
+
+        // Credit each recipient
+        for i in 0u64..count {
+            self.balances[recipients[i]] = self.balances[recipients[i]] + amounts[i];
+            emit SingleTransfer {
+                from: msg.sender,
+                to: recipients[i],
+                amount: amounts[i],
+            };
+        }
+
+        self.total_batches_processed = self.total_batches_processed + 1u256;
+        self.total_operations = self.total_operations + (count as u256);
+
+        emit BatchTransfer {
+            sender: msg.sender,
+            recipient_count: count,
+            total_amount: total,
+        };
+    }
+
+    /// Sends the same amount to multiple recipients.
+    pub fn batch_transfer_uniform(recipients: Vec<Address>, amount: u256) {
+        self.require_not_paused();
+        let count = recipients.len();
+        self.validate_batch_size(count);
+        require!(amount > 0u256, ZeroAmount {});
+
+        let total = amount * (count as u256);
+        let sender_balance = self.balances[msg.sender];
+        require!(sender_balance >= total, InsufficientBalance {
+            available: sender_balance,
+            required: total,
+        });
+
+        self.balances[msg.sender] = sender_balance - total;
+
+        for i in 0u64..count {
+            require!(recipients[i] != Address::ZERO, ZeroAddress {});
+            self.check_whitelist(recipients[i]);
+            self.balances[recipients[i]] = self.balances[recipients[i]] + amount;
+            emit SingleTransfer {
+                from: msg.sender,
+                to: recipients[i],
+                amount: amount,
+            };
+        }
+
+        self.total_batches_processed = self.total_batches_processed + 1u256;
+        self.total_operations = self.total_operations + (count as u256);
+
+        emit BatchTransfer {
+            sender: msg.sender,
+            recipient_count: count,
+            total_amount: total,
+        };
+    }
+
+    // --- Batch minting ---
+
+    /// Mints tokens to multiple recipients with different amounts.
+    pub fn batch_mint(recipients: Vec<Address>, amounts: Vec<u256>) {
+        self.require_owner();
+        let count = recipients.len();
+        require!(count == amounts.len(), ArrayLengthMismatch {
+            recipients: count,
+            amounts: amounts.len(),
+        });
+        self.validate_batch_size(count);
+
+        let mut total_minted = 0u256;
+
+        for i in 0u64..count {
+            require!(recipients[i] != Address::ZERO, ZeroAddress {});
+            require!(amounts[i] > 0u256, ZeroAmount {});
+            self.balances[recipients[i]] = self.balances[recipients[i]] + amounts[i];
+            total_minted = total_minted + amounts[i];
+
+            emit SingleTransfer {
+                from: Address::ZERO,
+                to: recipients[i],
+                amount: amounts[i],
+            };
+        }
+
+        self.total_supply = self.total_supply + total_minted;
+        self.total_batches_processed = self.total_batches_processed + 1u256;
+        self.total_operations = self.total_operations + (count as u256);
+
+        emit BatchMint {
+            minter: msg.sender,
+            recipient_count: count,
+            total_minted: total_minted,
+        };
+    }
+
+    // --- Batch ERC20 operations (external tokens) ---
+
+    /// Collects tokens from multiple senders (requires pre-approval).
+    pub fn batch_collect(
+        token: Address,
+        senders: Vec<Address>,
+        amounts: Vec<u256>,
+    ) {
+        self.require_not_paused();
+        let count = senders.len();
+        require!(count == amounts.len(), ArrayLengthMismatch {
+            recipients: count,
+            amounts: amounts.len(),
+        });
+        self.validate_batch_size(count);
+
+        for i in 0u64..count {
+            IERC20::at(token).transfer_from(senders[i], address(self), amounts[i]);
+        }
+
+        self.total_batches_processed = self.total_batches_processed + 1u256;
+        self.total_operations = self.total_operations + (count as u256);
+    }
+
+    /// Distributes an external token to multiple recipients.
+    pub fn batch_distribute(
+        token: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<u256>,
+    ) {
+        self.require_not_paused();
+        let count = recipients.len();
+        require!(count == amounts.len(), ArrayLengthMismatch {
+            recipients: count,
+            amounts: amounts.len(),
+        });
+        self.validate_batch_size(count);
+
+        for i in 0u64..count {
+            require!(recipients[i] != Address::ZERO, ZeroAddress {});
+            IERC20::at(token).transfer(recipients[i], amounts[i]);
+        }
+
+        self.total_batches_processed = self.total_batches_processed + 1u256;
+        self.total_operations = self.total_operations + (count as u256);
+    }
+
+    // --- Aggregate queries ---
+
+    /// Returns the sum of balances for the given accounts.
+    #[view]
+    pub fn aggregate_balances(accounts: Vec<Address>) -> u256 {
+        let mut total = 0u256;
+        for i in 0u64..accounts.len() {
+            total = total + self.balances[accounts[i]];
+        }
+        return total;
+    }
+
+    /// Returns the minimum balance among the given accounts.
+    #[view]
+    pub fn min_balance(accounts: Vec<Address>) -> u256 {
+        require!(accounts.len() > 0u64, EmptyBatch {});
+        let mut result = self.balances[accounts[0u64]];
+        for i in 1u64..accounts.len() {
+            let bal = self.balances[accounts[i]];
+            if bal < result {
+                result = bal;
+            }
+        }
+        return result;
+    }
+
+    /// Returns the maximum balance among the given accounts.
+    #[view]
+    pub fn max_balance(accounts: Vec<Address>) -> u256 {
+        require!(accounts.len() > 0u64, EmptyBatch {});
+        let mut result = self.balances[accounts[0u64]];
+        for i in 1u64..accounts.len() {
+            let bal = self.balances[accounts[i]];
+            if bal > result {
+                result = bal;
+            }
+        }
+        return result;
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn balance_of(account: Address) -> u256 {
+        return self.balances[account];
+    }
+
+    #[view]
+    pub fn get_total_supply() -> u256 {
+        return self.total_supply;
+    }
+
+    #[view]
+    pub fn get_total_batches() -> u256 {
+        return self.total_batches_processed;
+    }
+
+    #[view]
+    pub fn get_total_operations() -> u256 {
+        return self.total_operations;
+    }
+}

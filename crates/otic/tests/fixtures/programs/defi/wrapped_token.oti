@@ -1,0 +1,265 @@
+// Wrapped native token (WPYDE - like WETH)
+// Allows native tokens to be used as ERC20-compatible tokens
+
+contract WrappedToken {
+    storage {
+        name: String,
+        symbol: String,
+        decimals: u8,
+        total_supply: u256,
+        balances: Map<Address, u256>,
+        allowances: Map<Address, Map<Address, u256>>,
+
+        // Deposit/withdrawal tracking
+        total_deposits: u256,
+        total_withdrawals: u256,
+        deposit_count: Map<Address, u256>,
+
+        // Emergency controls
+        owner: Address,
+        paused: bool,
+        max_single_deposit: u256,
+        max_single_withdrawal: u256,
+    }
+
+    event Transfer {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    event Approval {
+        #[indexed]
+        owner: Address,
+        #[indexed]
+        spender: Address,
+        amount: u256,
+    }
+
+    event Deposit {
+        #[indexed]
+        account: Address,
+        amount: u256,
+    }
+
+    event Withdrawal {
+        #[indexed]
+        account: Address,
+        amount: u256,
+    }
+
+    event Paused {
+        #[indexed]
+        by: Address,
+    }
+
+    event Unpaused {
+        #[indexed]
+        by: Address,
+    }
+
+    error InsufficientBalance { available: u256, required: u256 }
+    error InsufficientAllowance { available: u256, required: u256 }
+    error TransferToZeroAddress {}
+    error ZeroDeposit {}
+    error ContractPaused {}
+    error NotOwner {}
+    error ExceedsMaxDeposit { max: u256, attempted: u256 }
+    error ExceedsMaxWithdrawal { max: u256, attempted: u256 }
+
+    #[constructor]
+    pub fn init(name: String, symbol: String) {
+        self.name = name;
+        self.symbol = symbol;
+        self.decimals = 18u8;
+        self.owner = msg.sender;
+        self.paused = false;
+        self.max_single_deposit = 1000000000000000000000000u256;   // 1M tokens
+        self.max_single_withdrawal = 1000000000000000000000000u256;
+    }
+
+    fn require_not_paused() {
+        require!(!self.paused, ContractPaused {});
+    }
+
+    // --- Wrap / Unwrap ---
+
+    #[sponsored]
+    pub fn deposit() {
+        self.require_not_paused();
+        let amount = msg.value;
+        require!(amount > 0u256, ZeroDeposit {});
+        require!(amount <= self.max_single_deposit, ExceedsMaxDeposit {
+            max: self.max_single_deposit,
+            attempted: amount,
+        });
+
+        self.balances[msg.sender] = self.balances[msg.sender] + amount;
+        self.total_supply = self.total_supply + amount;
+        self.total_deposits = self.total_deposits + amount;
+        self.deposit_count[msg.sender] = self.deposit_count[msg.sender] + 1u256;
+
+        emit Deposit { account: msg.sender, amount: amount };
+        emit Transfer { from: Address::ZERO, to: msg.sender, amount: amount };
+    }
+
+    pub fn withdraw(amount: u256) {
+        self.require_not_paused();
+        require!(amount <= self.max_single_withdrawal, ExceedsMaxWithdrawal {
+            max: self.max_single_withdrawal,
+            attempted: amount,
+        });
+
+        let bal = self.balances[msg.sender];
+        require!(bal >= amount, InsufficientBalance { available: bal, required: amount });
+
+        self.balances[msg.sender] = bal - amount;
+        self.total_supply = self.total_supply - amount;
+        self.total_withdrawals = self.total_withdrawals + amount;
+
+        // Transfer native token back to sender
+        raw_call!(msg.sender, amount);
+
+        emit Withdrawal { account: msg.sender, amount: amount };
+        emit Transfer { from: msg.sender, to: Address::ZERO, amount: amount };
+    }
+
+    // Deposit and transfer in one step
+    pub fn deposit_to(to: Address) {
+        self.require_not_paused();
+        require!(to != Address::ZERO, TransferToZeroAddress {});
+        let amount = msg.value;
+        require!(amount > 0u256, ZeroDeposit {});
+
+        self.balances[to] = self.balances[to] + amount;
+        self.total_supply = self.total_supply + amount;
+        self.total_deposits = self.total_deposits + amount;
+
+        emit Deposit { account: to, amount: amount };
+        emit Transfer { from: Address::ZERO, to: to, amount: amount };
+    }
+
+    // Withdraw and send to a different address
+    pub fn withdraw_to(to: Address, amount: u256) {
+        self.require_not_paused();
+        require!(to != Address::ZERO, TransferToZeroAddress {});
+
+        let bal = self.balances[msg.sender];
+        require!(bal >= amount, InsufficientBalance { available: bal, required: amount });
+
+        self.balances[msg.sender] = bal - amount;
+        self.total_supply = self.total_supply - amount;
+        self.total_withdrawals = self.total_withdrawals + amount;
+
+        raw_call!(to, amount);
+
+        emit Withdrawal { account: msg.sender, amount: amount };
+        emit Transfer { from: msg.sender, to: Address::ZERO, amount: amount };
+    }
+
+    // --- ERC20 ---
+
+    pub fn transfer(to: Address, amount: u256) {
+        self.require_not_paused();
+        require!(to != Address::ZERO, TransferToZeroAddress {});
+        let from_bal = self.balances[msg.sender];
+        require!(from_bal >= amount, InsufficientBalance {
+            available: from_bal,
+            required: amount,
+        });
+
+        self.balances[msg.sender] = from_bal - amount;
+        self.balances[to] = self.balances[to] + amount;
+        emit Transfer { from: msg.sender, to: to, amount: amount };
+    }
+
+    pub fn approve(spender: Address, amount: u256) {
+        self.allowances[msg.sender][spender] = amount;
+        emit Approval { owner: msg.sender, spender: spender, amount: amount };
+    }
+
+    pub fn transfer_from(from: Address, to: Address, amount: u256) {
+        self.require_not_paused();
+        require!(to != Address::ZERO, TransferToZeroAddress {});
+
+        let allowed = self.allowances[from][msg.sender];
+        require!(allowed >= amount, InsufficientAllowance {
+            available: allowed,
+            required: amount,
+        });
+        self.allowances[from][msg.sender] = allowed - amount;
+
+        let from_bal = self.balances[from];
+        require!(from_bal >= amount, InsufficientBalance {
+            available: from_bal,
+            required: amount,
+        });
+
+        self.balances[from] = from_bal - amount;
+        self.balances[to] = self.balances[to] + amount;
+        emit Transfer { from: from, to: to, amount: amount };
+    }
+
+    // --- Admin ---
+
+    pub fn pause() {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.paused = true;
+        emit Paused { by: msg.sender };
+    }
+
+    pub fn unpause() {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.paused = false;
+        emit Unpaused { by: msg.sender };
+    }
+
+    pub fn set_max_deposit(max: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.max_single_deposit = max;
+    }
+
+    pub fn set_max_withdrawal(max: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.max_single_withdrawal = max;
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn balance_of(account: Address) -> u256 {
+        return self.balances[account];
+    }
+
+    #[view]
+    pub fn allowance(owner: Address, spender: Address) -> u256 {
+        return self.allowances[owner][spender];
+    }
+
+    #[view]
+    pub fn get_total_supply() -> u256 {
+        return self.total_supply;
+    }
+
+    #[view]
+    pub fn get_total_deposits() -> u256 {
+        return self.total_deposits;
+    }
+
+    #[view]
+    pub fn get_total_withdrawals() -> u256 {
+        return self.total_withdrawals;
+    }
+
+    #[view]
+    pub fn get_deposit_count(account: Address) -> u256 {
+        return self.deposit_count[account];
+    }
+
+    #[view]
+    pub fn is_paused() -> bool {
+        return self.paused;
+    }
+}

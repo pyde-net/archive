@@ -1,0 +1,405 @@
+// Role-based access control registry.
+// A universal permission system that other contracts can integrate with.
+// Supports hierarchical roles, time-bound grants, multi-sig role admin,
+// and role enumeration.
+
+use std::math;
+
+contract AccessControl {
+    storage {
+        super_admin: Address,
+        roles: Map<u256, Role>,                        // role_hash -> Role definition
+        role_members: Map<u256, Map<Address, Grant>>,  // role_hash -> member -> grant
+        role_member_list: Map<u256, Vec<Address>>,     // role_hash -> list of members (for enum)
+        member_roles: Map<Address, Vec<u256>>,          // member -> list of role hashes
+        role_admin: Map<u256, u256>,                    // role -> admin role (who can grant/revoke)
+        role_count: u64,
+        pending_grants: Map<u256, PendingGrant>,        // request_hash -> pending
+        pending_grant_count: u64,
+        multi_sig_threshold: Map<u256, u32>,            // role_hash -> signatures required
+        grant_approvals: Map<u256, Map<Address, bool>>, // request_hash -> approver -> approved
+        grant_approval_count: Map<u256, u32>,           // request_hash -> count
+    }
+
+    const DEFAULT_ADMIN_NAME: String = "DEFAULT_ADMIN";
+    const DEFAULT_ADMIN_DESCRIPTION: String = "Super administrator role";
+
+    struct Role {
+        name: String,
+        description: String,
+        exists: bool,
+        max_members: u32,        // 0 = unlimited
+        current_members: u32,
+        created_at: u64,
+    }
+
+    struct Grant {
+        granted: bool,
+        granted_at: u64,
+        expires_at: u64,         // 0 = never expires
+        granted_by: Address,
+    }
+
+    struct PendingGrant {
+        role_hash: u256,
+        grantee: Address,
+        expires_at: u64,
+        proposer: Address,
+        proposed_at: u64,
+        executed: bool,
+    }
+
+    event RoleCreated {
+        #[indexed]
+        role_hash: u256,
+        name: String,
+        admin_role: u256,
+    }
+
+    event RoleGranted {
+        #[indexed]
+        role_hash: u256,
+        #[indexed]
+        account: Address,
+        #[indexed]
+        granted_by: Address,
+        expires_at: u64,
+    }
+
+    event RoleRevoked {
+        #[indexed]
+        role_hash: u256,
+        #[indexed]
+        account: Address,
+        #[indexed]
+        revoked_by: Address,
+    }
+
+    event RoleRenounced {
+        #[indexed]
+        role_hash: u256,
+        #[indexed]
+        account: Address,
+    }
+
+    event GrantProposed {
+        #[indexed]
+        request_hash: u256,
+        #[indexed]
+        role_hash: u256,
+        grantee: Address,
+    }
+
+    event GrantApproved {
+        #[indexed]
+        request_hash: u256,
+        #[indexed]
+        approver: Address,
+    }
+
+    event GrantExecuted {
+        #[indexed]
+        request_hash: u256,
+    }
+
+    error NotSuperAdmin {}
+    error NotRoleAdmin {}
+    error RoleAlreadyExists {}
+    error RoleNotFound {}
+    error AlreadyGranted {}
+    error NotGranted {}
+    error GrantExpired {}
+    error MaxMembersReached { max: u32 }
+    error CannotRevokeYourself {}
+    error GrantNotFound {}
+    error GrantAlreadyExecuted {}
+    error InsufficientApprovals { required: u32, current: u32 }
+    error AlreadyApproved {}
+    error ZeroAddress {}
+
+    #[constructor]
+    pub fn init() {
+        self.super_admin = msg.sender;
+        self.role_count = 0;
+        self.pending_grant_count = 0;
+
+        // Create the DEFAULT_ADMIN_ROLE
+        let admin_hash = math::keccak256_str(DEFAULT_ADMIN_NAME);
+        self.roles[admin_hash] = Role {
+            name: DEFAULT_ADMIN_NAME,
+            description: DEFAULT_ADMIN_DESCRIPTION,
+            exists: true,
+            max_members: 0,
+            current_members: 1,
+            created_at: block.height,
+        };
+        self.role_admin[admin_hash] = admin_hash; // admin of itself
+
+        // Grant admin role to deployer
+        self.role_members[admin_hash][msg.sender] = Grant {
+            granted: true,
+            granted_at: block.height,
+            expires_at: 0,
+            granted_by: msg.sender,
+        };
+
+        let mut admin_members: Vec<Address> = Vec::new();
+        admin_members.push(msg.sender);
+        self.role_member_list[admin_hash] = admin_members;
+
+        let mut sender_roles: Vec<u256> = Vec::new();
+        sender_roles.push(admin_hash);
+        self.member_roles[msg.sender] = sender_roles;
+
+        self.role_count = 1;
+    }
+
+    pub fn create_role(
+        name: String,
+        description: String,
+        admin_role: u256,
+        max_members: u32,
+        multi_sig_threshold: u32,
+    ) -> u256 {
+        let role_hash = math::keccak256_str(name);
+        require!(!self.roles[role_hash].exists, RoleAlreadyExists {});
+
+        // Only someone with the admin_role can create roles under it
+        require!(self.has_active_role(admin_role, msg.sender), NotRoleAdmin {});
+
+        self.roles[role_hash] = Role {
+            name: name,
+            description: description,
+            exists: true,
+            max_members: max_members,
+            current_members: 0,
+            created_at: block.height,
+        };
+
+        self.role_admin[role_hash] = admin_role;
+        self.multi_sig_threshold[role_hash] = multi_sig_threshold;
+        self.role_count = self.role_count + 1;
+
+        emit RoleCreated { role_hash: role_hash, name: name, admin_role: admin_role };
+        return role_hash;
+    }
+
+    pub fn grant_role(role_hash: u256, account: Address, expires_at: u64) {
+        require!(account != Address::ZERO, ZeroAddress {});
+        let admin_role = self.role_admin[role_hash];
+        require!(self.has_active_role(admin_role, msg.sender), NotRoleAdmin {});
+        require!(self.roles[role_hash].exists, RoleNotFound {});
+
+        let threshold = self.multi_sig_threshold[role_hash];
+        if threshold > 1 {
+            // Multi-sig: create a pending grant proposal
+            self.propose_grant(role_hash, account, expires_at);
+            return;
+        }
+
+        self.execute_grant(role_hash, account, expires_at, msg.sender);
+    }
+
+    fn propose_grant(role_hash: u256, grantee: Address, expires_at: u64) {
+        let request_hash = math::keccak256(
+            role_hash ^ (grantee as u256) ^ (block.height as u256)
+        );
+
+        self.pending_grants[request_hash] = PendingGrant {
+            role_hash: role_hash,
+            grantee: grantee,
+            expires_at: expires_at,
+            proposer: msg.sender,
+            proposed_at: block.height,
+            executed: false,
+        };
+
+        self.grant_approvals[request_hash][msg.sender] = true;
+        self.grant_approval_count[request_hash] = 1;
+        self.pending_grant_count = self.pending_grant_count + 1;
+
+        emit GrantProposed {
+            request_hash: request_hash,
+            role_hash: role_hash,
+            grantee: grantee,
+        };
+    }
+
+    pub fn approve_grant(request_hash: u256) {
+        let pending = self.pending_grants[request_hash];
+        require!(pending.proposer != Address::ZERO, GrantNotFound {});
+        require!(!pending.executed, GrantAlreadyExecuted {});
+
+        let admin_role = self.role_admin[pending.role_hash];
+        require!(self.has_active_role(admin_role, msg.sender), NotRoleAdmin {});
+        require!(!self.grant_approvals[request_hash][msg.sender], AlreadyApproved {});
+
+        self.grant_approvals[request_hash][msg.sender] = true;
+        let new_count = self.grant_approval_count[request_hash] + 1;
+        self.grant_approval_count[request_hash] = new_count;
+
+        emit GrantApproved { request_hash: request_hash, approver: msg.sender };
+
+        // Check if threshold met
+        let threshold = self.multi_sig_threshold[pending.role_hash];
+        if new_count >= threshold {
+            let mut executed = pending;
+            executed.executed = true;
+            self.pending_grants[request_hash] = executed;
+
+            self.execute_grant(
+                pending.role_hash,
+                pending.grantee,
+                pending.expires_at,
+                pending.proposer,
+            );
+
+            emit GrantExecuted { request_hash: request_hash };
+        }
+    }
+
+    fn execute_grant(role_hash: u256, account: Address, expires_at: u64, grantor: Address) {
+        let existing = self.role_members[role_hash][account];
+        require!(!existing.granted || self.is_expired(existing), AlreadyGranted {});
+
+        let mut role = self.roles[role_hash];
+        if role.max_members > 0 {
+            require!(role.current_members < role.max_members, MaxMembersReached { max: role.max_members });
+        }
+
+        self.role_members[role_hash][account] = Grant {
+            granted: true,
+            granted_at: block.height,
+            expires_at: expires_at,
+            granted_by: grantor,
+        };
+
+        // Update member lists if new member
+        if !existing.granted {
+            role.current_members = role.current_members + 1;
+            self.roles[role_hash] = role;
+
+            let mut members = self.role_member_list[role_hash];
+            members.push(account);
+            self.role_member_list[role_hash] = members;
+
+            let mut roles = self.member_roles[account];
+            roles.push(role_hash);
+            self.member_roles[account] = roles;
+        }
+
+        emit RoleGranted {
+            role_hash: role_hash,
+            account: account,
+            granted_by: grantor,
+            expires_at: expires_at,
+        };
+    }
+
+    pub fn revoke_role(role_hash: u256, account: Address) {
+        let admin_role = self.role_admin[role_hash];
+        require!(self.has_active_role(admin_role, msg.sender), NotRoleAdmin {});
+
+        let grant = self.role_members[role_hash][account];
+        require!(grant.granted, NotGranted {});
+
+        self.remove_grant(role_hash, account);
+
+        emit RoleRevoked {
+            role_hash: role_hash,
+            account: account,
+            revoked_by: msg.sender,
+        };
+    }
+
+    pub fn renounce_role(role_hash: u256) {
+        let grant = self.role_members[role_hash][msg.sender];
+        require!(grant.granted, NotGranted {});
+
+        self.remove_grant(role_hash, msg.sender);
+
+        emit RoleRenounced { role_hash: role_hash, account: msg.sender };
+    }
+
+    fn remove_grant(role_hash: u256, account: Address) {
+        self.role_members[role_hash][account] = Grant {
+            granted: false,
+            granted_at: 0,
+            expires_at: 0,
+            granted_by: Address::ZERO,
+        };
+
+        let mut role = self.roles[role_hash];
+        if role.current_members > 0 {
+            role.current_members = role.current_members - 1;
+        }
+        self.roles[role_hash] = role;
+
+        // Remove from member list
+        let mut new_members: Vec<Address> = Vec::new();
+        let members = self.role_member_list[role_hash];
+        for i in 0..members.len() {
+            if members[i] != account {
+                new_members.push(members[i]);
+            }
+        }
+        self.role_member_list[role_hash] = new_members;
+    }
+
+    fn has_active_role(role_hash: u256, account: Address) -> bool {
+        // Super admin always has access
+        if account == self.super_admin {
+            return true;
+        }
+        let grant = self.role_members[role_hash][account];
+        if !grant.granted {
+            return false;
+        }
+        if grant.expires_at != 0 && block.height > grant.expires_at {
+            return false;
+        }
+        return true;
+    }
+
+    fn is_expired(grant: Grant) -> bool {
+        if grant.expires_at == 0 {
+            return false;
+        }
+        return block.height > grant.expires_at;
+    }
+
+    #[view]
+    pub fn has_role(role_hash: u256, account: Address) -> bool {
+        return self.has_active_role(role_hash, account);
+    }
+
+    #[view]
+    pub fn get_role(role_hash: u256) -> Role {
+        return self.roles[role_hash];
+    }
+
+    #[view]
+    pub fn get_role_members(role_hash: u256) -> Vec<Address> {
+        return self.role_member_list[role_hash];
+    }
+
+    #[view]
+    pub fn get_member_roles(account: Address) -> Vec<u256> {
+        return self.member_roles[account];
+    }
+
+    #[view]
+    pub fn get_grant(role_hash: u256, account: Address) -> Grant {
+        return self.role_members[role_hash][account];
+    }
+
+    #[view]
+    pub fn get_role_admin(role_hash: u256) -> u256 {
+        return self.role_admin[role_hash];
+    }
+
+    #[view]
+    pub fn compute_role_hash(name: String) -> u256 {
+        return math::keccak256_str(name);
+    }
+}

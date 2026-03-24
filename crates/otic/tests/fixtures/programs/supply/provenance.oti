@@ -1,0 +1,281 @@
+// Product provenance and authenticity verification with ownership chain
+
+enum ItemStatus {
+    Active,    // 0
+    Flagged,   // 1
+    Retired,   // 2
+}
+
+contract ProvenanceRegistry {
+    storage {
+        admin: Address,
+        next_item_id: u64,
+        items: Map<u64, Item>,
+        ownership_history: Map<u64, Map<u32, OwnershipRecord>>,
+        history_lengths: Map<u64, u32>,
+        transformations: Map<u64, Map<u32, Transformation>>,
+        transform_counts: Map<u64, u32>,
+        authenticity_verifiers: Map<Address, bool>,
+        verifications: Map<u64, Map<u32, Verification>>,
+        verification_counts: Map<u64, u32>,
+        material_sources: Map<u64, Vec<u64>>,
+        item_by_serial: Map<u256, u64>,
+        brand_registry: Map<Address, Brand>,
+    }
+
+    struct Item {
+        brand: Address,
+        serial_hash: u256,
+        product_type: u16,
+        manufactured_at: u64,
+        current_owner: Address,
+        metadata_uri_hash: u256,
+        is_composite: bool,
+        status: u8,
+    }
+
+    struct OwnershipRecord {
+        from: Address,
+        to: Address,
+        timestamp: u64,
+        transfer_type: u8,
+        price: u256,
+        location_hash: u256,
+    }
+
+    struct Transformation {
+        input_items: Vec<u64>,
+        description_hash: u256,
+        timestamp: u64,
+        facility_hash: u256,
+        operator: Address,
+    }
+
+    struct Verification {
+        verifier: Address,
+        timestamp: u64,
+        result: bool,
+        evidence_hash: u256,
+        method: u8,
+    }
+
+    struct Brand {
+        name_hash: u256,
+        registered: bool,
+        item_count: u64,
+    }
+
+    event ItemRegistered {
+        #[indexed]
+        item_id: u64,
+        #[indexed]
+        brand: Address,
+        serial_hash: u256,
+    }
+
+    event OwnershipTransferred {
+        #[indexed]
+        item_id: u64,
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+    }
+
+    event ItemVerified {
+        #[indexed]
+        item_id: u64,
+        #[indexed]
+        verifier: Address,
+        result: bool,
+    }
+
+    event ItemTransformed {
+        #[indexed]
+        item_id: u64,
+        input_count: u32,
+    }
+
+    event BrandRegistered {
+        #[indexed]
+        brand: Address,
+        name_hash: u256,
+    }
+
+    error NotAdmin {}
+    error NotBrand {}
+    error BrandNotRegistered {}
+    error ItemNotFound { id: u64 }
+    error NotItemOwner {}
+    error SerialAlreadyRegistered {}
+    error NotVerifier {}
+    error ItemRetired {}
+
+    #[constructor]
+    pub fn init() {
+        self.admin = msg.sender;
+        self.next_item_id = 1;
+    }
+
+    pub fn register_brand(name_hash: u256) {
+        self.brand_registry[msg.sender] = Brand {
+            name_hash: name_hash,
+            registered: true,
+            item_count: 0,
+        };
+        emit BrandRegistered { brand: msg.sender, name_hash: name_hash };
+    }
+
+    pub fn add_verifier(verifier: Address) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        self.authenticity_verifiers[verifier] = true;
+    }
+
+    pub fn register_item(
+        serial_hash: u256,
+        product_type: u16,
+        metadata_uri_hash: u256,
+        source_material_ids: Vec<u64>,
+    ) -> u64 {
+        require!(self.brand_registry[msg.sender].registered, BrandNotRegistered {});
+        require!(self.item_by_serial[serial_hash] == 0, SerialAlreadyRegistered {});
+
+        let item_id = self.next_item_id;
+        self.next_item_id += 1;
+
+        let is_composite = source_material_ids.len() > 0;
+
+        self.items[item_id] = Item {
+            brand: msg.sender,
+            serial_hash: serial_hash,
+            product_type: product_type,
+            manufactured_at: block.timestamp,
+            current_owner: msg.sender,
+            metadata_uri_hash: metadata_uri_hash,
+            is_composite: is_composite,
+            status: 0,
+        };
+
+        // Record source materials
+        if is_composite {
+            for i in 0..source_material_ids.len() {
+                let source_id = source_material_ids[i];
+                require!(source_id < self.next_item_id, ItemNotFound { id: source_id });
+                self.material_sources[item_id].push(source_id);
+            }
+        }
+
+        self.item_by_serial[serial_hash] = item_id;
+        self.history_lengths[item_id] = 0;
+        self.brand_registry[msg.sender].item_count += 1;
+
+        emit ItemRegistered { item_id: item_id, brand: msg.sender, serial_hash: serial_hash };
+        return item_id;
+    }
+
+    pub fn transfer_ownership(
+        item_id: u64,
+        to: Address,
+        transfer_type: u8,
+        price: u256,
+        location_hash: u256,
+    ) {
+        let item = self.items[item_id];
+        require!(item.status != 2, ItemRetired {});
+        require!(item.current_owner == msg.sender, NotItemOwner {});
+
+        let idx = self.history_lengths[item_id];
+        self.ownership_history[item_id][idx] = OwnershipRecord {
+            from: msg.sender,
+            to: to,
+            timestamp: block.timestamp,
+            transfer_type: transfer_type,
+            price: price,
+            location_hash: location_hash,
+        };
+        self.history_lengths[item_id] = idx + 1;
+        self.items[item_id].current_owner = to;
+
+        emit OwnershipTransferred { item_id: item_id, from: msg.sender, to: to };
+    }
+
+    pub fn verify_item(item_id: u64, result: bool, evidence_hash: u256, method: u8) {
+        require!(self.authenticity_verifiers[msg.sender], NotVerifier {});
+        require!(item_id < self.next_item_id, ItemNotFound { id: item_id });
+
+        let idx = self.verification_counts[item_id];
+        self.verifications[item_id][idx] = Verification {
+            verifier: msg.sender,
+            timestamp: block.timestamp,
+            result: result,
+            evidence_hash: evidence_hash,
+            method: method,
+        };
+        self.verification_counts[item_id] = idx + 1;
+
+        if !result {
+            self.items[item_id].status = 1; // flagged
+        }
+
+        emit ItemVerified { item_id: item_id, verifier: msg.sender, result: result };
+    }
+
+    pub fn record_transformation(
+        output_item_id: u64,
+        input_items: Vec<u64>,
+        description_hash: u256,
+        facility_hash: u256,
+    ) {
+        require!(self.items[output_item_id].brand == msg.sender, NotBrand {});
+
+        let idx = self.transform_counts[output_item_id];
+        self.transformations[output_item_id][idx] = Transformation {
+            input_items: input_items,
+            description_hash: description_hash,
+            timestamp: block.timestamp,
+            facility_hash: facility_hash,
+            operator: msg.sender,
+        };
+        self.transform_counts[output_item_id] = idx + 1;
+
+        emit ItemTransformed {
+            item_id: output_item_id,
+            input_count: input_items.len() as u32,
+        };
+    }
+
+    pub fn retire_item(item_id: u64) {
+        require!(self.items[item_id].current_owner == msg.sender, NotItemOwner {});
+        self.items[item_id].status = 2;
+    }
+
+    #[view]
+    pub fn get_item(item_id: u64) -> Item {
+        return self.items[item_id];
+    }
+
+    #[view]
+    pub fn get_ownership_record(item_id: u64, index: u32) -> OwnershipRecord {
+        return self.ownership_history[item_id][index];
+    }
+
+    #[view]
+    pub fn get_ownership_chain_length(item_id: u64) -> u32 {
+        return self.history_lengths[item_id];
+    }
+
+    #[view]
+    pub fn lookup_by_serial(serial_hash: u256) -> u64 {
+        return self.item_by_serial[serial_hash];
+    }
+
+    #[view]
+    pub fn get_verification(item_id: u64, index: u32) -> Verification {
+        return self.verifications[item_id][index];
+    }
+
+    #[view]
+    pub fn get_brand(addr: Address) -> Brand {
+        return self.brand_registry[addr];
+    }
+}

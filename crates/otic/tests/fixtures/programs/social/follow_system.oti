@@ -1,0 +1,232 @@
+// On-chain follow/unfollow system with mutual follow detection and weighted social graph
+use std::math;
+
+contract FollowSystem {
+    storage {
+        following: Map<Address, Map<Address, bool>>,
+        follower_count: Map<Address, u64>,
+        following_count: Map<Address, u64>,
+        follow_timestamps: Map<Address, Map<Address, u64>>,
+        mutual_follows: Map<Address, Map<Address, bool>>,
+        trust_scores: Map<Address, Map<Address, u8>>,
+        lists: Map<Address, Map<u32, FollowList>>,
+        list_members: Map<Address, Map<u32, Map<Address, bool>>>,
+        list_count: Map<Address, u32>,
+        verified: Map<Address, bool>,
+        admin: Address,
+        max_following: u64,
+    }
+
+    struct FollowList {
+        name_hash: u256,
+        member_count: u32,
+        is_private: bool,
+        created_at: u64,
+    }
+
+    event Followed {
+        #[indexed]
+        follower: Address,
+        #[indexed]
+        followed: Address,
+        timestamp: u64,
+    }
+
+    event Unfollowed {
+        #[indexed]
+        follower: Address,
+        #[indexed]
+        unfollowed: Address,
+    }
+
+    event MutualFollowDetected {
+        #[indexed]
+        user_a: Address,
+        #[indexed]
+        user_b: Address,
+    }
+
+    event TrustScoreSet {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        score: u8,
+    }
+
+    event ListCreated {
+        #[indexed]
+        owner: Address,
+        list_id: u32,
+    }
+
+    event Verified {
+        #[indexed]
+        user: Address,
+    }
+
+    error AlreadyFollowing {}
+    error NotFollowing {}
+    error CannotFollowSelf {}
+    error MaxFollowingReached { max: u64 }
+    error InvalidTrustScore { min: u8, max: u8, given: u8 }
+    error ListNotFound { list_id: u32 }
+    error NotAdmin {}
+    error AlreadyVerified {}
+
+    const MAX_TRUST_SCORE: u8 = 100;
+
+    #[constructor]
+    pub fn init(max_following: u64) {
+        self.admin = msg.sender;
+        self.max_following = max_following;
+    }
+
+    pub fn follow(target: Address) {
+        require!(target != msg.sender, CannotFollowSelf {});
+        require!(!self.following[msg.sender][target], AlreadyFollowing {});
+        require!(self.following_count[msg.sender] < self.max_following, MaxFollowingReached {
+            max: self.max_following,
+        });
+
+        self.following[msg.sender][target] = true;
+        self.follower_count[target] += 1;
+        self.following_count[msg.sender] += 1;
+        self.follow_timestamps[msg.sender][target] = block.timestamp;
+
+        emit Followed { follower: msg.sender, followed: target, timestamp: block.timestamp };
+
+        // Check for mutual follow
+        if self.following[target][msg.sender] {
+            self.mutual_follows[msg.sender][target] = true;
+            self.mutual_follows[target][msg.sender] = true;
+            emit MutualFollowDetected { user_a: msg.sender, user_b: target };
+        }
+    }
+
+    pub fn unfollow(target: Address) {
+        require!(self.following[msg.sender][target], NotFollowing {});
+
+        self.following[msg.sender][target] = false;
+        self.follower_count[target] -= 1;
+        self.following_count[msg.sender] -= 1;
+        self.follow_timestamps[msg.sender][target] = 0;
+
+        // Remove mutual follow status
+        if self.mutual_follows[msg.sender][target] {
+            self.mutual_follows[msg.sender][target] = false;
+            self.mutual_follows[target][msg.sender] = false;
+        }
+
+        emit Unfollowed { follower: msg.sender, unfollowed: target };
+    }
+
+    pub fn batch_follow(targets: Vec<Address>) {
+        let remaining_capacity = self.max_following - self.following_count[msg.sender];
+        let count = targets.len();
+        let mut followed: u64 = 0;
+
+        for i in 0..count {
+            if followed >= remaining_capacity {
+                break;
+            }
+            let target = targets[i];
+            if target != msg.sender && !self.following[msg.sender][target] {
+                self.following[msg.sender][target] = true;
+                self.follower_count[target] += 1;
+                self.following_count[msg.sender] += 1;
+                self.follow_timestamps[msg.sender][target] = block.timestamp;
+                followed += 1;
+
+                emit Followed { follower: msg.sender, followed: target, timestamp: block.timestamp };
+
+                if self.following[target][msg.sender] {
+                    self.mutual_follows[msg.sender][target] = true;
+                    self.mutual_follows[target][msg.sender] = true;
+                    emit MutualFollowDetected { user_a: msg.sender, user_b: target };
+                }
+            }
+        }
+    }
+
+    pub fn set_trust_score(target: Address, score: u8) {
+        require!(score <= MAX_TRUST_SCORE, InvalidTrustScore { min: 0, max: MAX_TRUST_SCORE, given: score });
+        require!(self.following[msg.sender][target], NotFollowing {});
+
+        self.trust_scores[msg.sender][target] = score;
+        emit TrustScoreSet { from: msg.sender, to: target, score: score };
+    }
+
+    pub fn create_list(name_hash: u256, is_private: bool) -> u32 {
+        let list_id = self.list_count[msg.sender];
+        self.list_count[msg.sender] = list_id + 1;
+
+        self.lists[msg.sender][list_id] = FollowList {
+            name_hash: name_hash,
+            member_count: 0,
+            is_private: is_private,
+            created_at: block.timestamp,
+        };
+
+        emit ListCreated { owner: msg.sender, list_id: list_id };
+        return list_id;
+    }
+
+    pub fn add_to_list(list_id: u32, member: Address) {
+        require!(list_id < self.list_count[msg.sender], ListNotFound { list_id: list_id });
+        if !self.list_members[msg.sender][list_id][member] {
+            self.list_members[msg.sender][list_id][member] = true;
+            self.lists[msg.sender][list_id].member_count += 1;
+        }
+    }
+
+    pub fn remove_from_list(list_id: u32, member: Address) {
+        require!(list_id < self.list_count[msg.sender], ListNotFound { list_id: list_id });
+        if self.list_members[msg.sender][list_id][member] {
+            self.list_members[msg.sender][list_id][member] = false;
+            self.lists[msg.sender][list_id].member_count -= 1;
+        }
+    }
+
+    pub fn verify_account(user: Address) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        require!(!self.verified[user], AlreadyVerified {});
+        self.verified[user] = true;
+        emit Verified { user: user };
+    }
+
+    #[view]
+    pub fn is_following(follower: Address, target: Address) -> bool {
+        return self.following[follower][target];
+    }
+
+    #[view]
+    pub fn is_mutual(user_a: Address, user_b: Address) -> bool {
+        return self.mutual_follows[user_a][user_b];
+    }
+
+    #[view]
+    pub fn get_follower_count(user: Address) -> u64 {
+        return self.follower_count[user];
+    }
+
+    #[view]
+    pub fn get_following_count(user: Address) -> u64 {
+        return self.following_count[user];
+    }
+
+    #[view]
+    pub fn get_trust_score(from: Address, to: Address) -> u8 {
+        return self.trust_scores[from][to];
+    }
+
+    #[view]
+    pub fn is_verified(user: Address) -> bool {
+        return self.verified[user];
+    }
+
+    #[view]
+    pub fn get_list(owner: Address, list_id: u32) -> FollowList {
+        return self.lists[owner][list_id];
+    }
+}

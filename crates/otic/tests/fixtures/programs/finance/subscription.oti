@@ -1,0 +1,311 @@
+// Recurring subscription payment system with plan management,
+// grace periods, and automatic renewal tracking.
+
+use std::token::IERC20;
+
+contract Subscription {
+    storage {
+        owner: Address,
+        payment_token: Address,
+        treasury: Address,
+        next_plan_id: u64,
+        next_sub_id: u64,
+        plans: Map<u64, Plan>,
+        subscriptions: Map<u64, Sub>,
+        user_sub: Map<Address, Map<u64, u64>>, // user -> plan_id -> sub_id
+        active_plan_ids: Vec<u64>,
+        total_collected: u256,
+        grace_period: u64,
+    }
+
+    struct Plan {
+        name: String,
+        price: u256,
+        interval: u64, // seconds between payments
+        active: bool,
+        subscriber_count: u64,
+        max_subscribers: u64, // 0 = unlimited
+        metadata_uri: String,
+    }
+
+    struct Sub {
+        subscriber: Address,
+        plan_id: u64,
+        started_at: u64,
+        last_paid_at: u64,
+        next_due_at: u64,
+        payments_made: u64,
+        total_paid: u256,
+        active: bool,
+    }
+
+    event PlanCreated {
+        #[indexed]
+        plan_id: u64,
+        name: String,
+        price: u256,
+        interval: u64,
+    }
+
+    event PlanDeactivated {
+        #[indexed]
+        plan_id: u64,
+    }
+
+    event Subscribed {
+        #[indexed]
+        sub_id: u64,
+        #[indexed]
+        subscriber: Address,
+        plan_id: u64,
+    }
+
+    event PaymentMade {
+        #[indexed]
+        sub_id: u64,
+        #[indexed]
+        subscriber: Address,
+        amount: u256,
+        period_number: u64,
+    }
+
+    event SubscriptionCancelled {
+        #[indexed]
+        sub_id: u64,
+        #[indexed]
+        subscriber: Address,
+    }
+
+    event SubscriptionExpired {
+        #[indexed]
+        sub_id: u64,
+        subscriber: Address,
+    }
+
+    error Unauthorized {}
+    error PlanNotFound {}
+    error PlanNotActive {}
+    error PlanFull {}
+    error AlreadySubscribed {}
+    error NotSubscribed {}
+    error PaymentNotDue {}
+    error PaymentFailed {}
+    error SubscriptionInactive {}
+    error NotOwner {}
+    error ZeroAddress {}
+    error ZeroPrice {}
+    error ZeroInterval {}
+    error InGracePeriod {}
+
+    #[constructor]
+    pub fn init(payment_token: Address, treasury: Address, grace_period_seconds: u64) {
+        require!(payment_token != Address::ZERO, ZeroAddress {});
+        require!(treasury != Address::ZERO, ZeroAddress {});
+        self.owner = msg.sender;
+        self.payment_token = payment_token;
+        self.treasury = treasury;
+        self.grace_period = grace_period_seconds;
+        self.next_plan_id = 1;
+        self.next_sub_id = 1;
+    }
+
+    pub fn create_plan(
+        name: String,
+        price: u256,
+        interval: u64,
+        max_subscribers: u64,
+        metadata_uri: String,
+    ) -> u64 {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(price > 0, ZeroPrice {});
+        require!(interval > 0, ZeroInterval {});
+
+        let plan_id = self.next_plan_id;
+        self.next_plan_id = plan_id + 1;
+
+        self.plans[plan_id] = Plan {
+            name: name,
+            price: price,
+            interval: interval,
+            active: true,
+            subscriber_count: 0,
+            max_subscribers: max_subscribers,
+            metadata_uri: metadata_uri,
+        };
+
+        self.active_plan_ids.push(plan_id);
+
+        emit PlanCreated {
+            plan_id: plan_id,
+            name: name,
+            price: price,
+            interval: interval,
+        };
+
+        return plan_id;
+    }
+
+    pub fn deactivate_plan(plan_id: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        let mut plan = self.plans[plan_id];
+        require!(plan.active, PlanNotFound {});
+        plan.active = false;
+        self.plans[plan_id] = plan;
+        emit PlanDeactivated { plan_id: plan_id };
+    }
+
+    pub fn subscribe(plan_id: u64) -> u64 {
+        let plan = self.plans[plan_id];
+        require!(plan.active, PlanNotActive {});
+        require!(
+            plan.max_subscribers == 0 || plan.subscriber_count < plan.max_subscribers,
+            PlanFull {},
+        );
+        require!(self.user_sub[msg.sender][plan_id] == 0, AlreadySubscribed {});
+
+        // Charge first payment
+        let token = IERC20::at(self.payment_token);
+        let success = token.transfer_from(msg.sender, self.treasury, plan.price);
+        require!(success, PaymentFailed {});
+
+        let sub_id = self.next_sub_id;
+        self.next_sub_id = sub_id + 1;
+
+        self.subscriptions[sub_id] = Sub {
+            subscriber: msg.sender,
+            plan_id: plan_id,
+            started_at: block.timestamp,
+            last_paid_at: block.timestamp,
+            next_due_at: block.timestamp + plan.interval,
+            payments_made: 1,
+            total_paid: plan.price,
+            active: true,
+        };
+
+        self.user_sub[msg.sender][plan_id] = sub_id;
+        self.total_collected = self.total_collected + plan.price;
+
+        // Update plan subscriber count
+        let mut updated_plan = self.plans[plan_id];
+        updated_plan.subscriber_count = updated_plan.subscriber_count + 1;
+        self.plans[plan_id] = updated_plan;
+
+        emit Subscribed {
+            sub_id: sub_id,
+            subscriber: msg.sender,
+            plan_id: plan_id,
+        };
+
+        emit PaymentMade {
+            sub_id: sub_id,
+            subscriber: msg.sender,
+            amount: plan.price,
+            period_number: 1,
+        };
+
+        return sub_id;
+    }
+
+    // Renew: anyone can call to charge a subscription that is due
+    pub fn renew(sub_id: u64) {
+        let mut sub = self.subscriptions[sub_id];
+        require!(sub.active, SubscriptionInactive {});
+        require!(block.timestamp >= sub.next_due_at, PaymentNotDue {});
+
+        let plan = self.plans[sub.plan_id];
+
+        // Check if past grace period
+        if block.timestamp > sub.next_due_at + self.grace_period {
+            sub.active = false;
+            self.subscriptions[sub_id] = sub;
+
+            let mut p = self.plans[sub.plan_id];
+            p.subscriber_count = p.subscriber_count - 1;
+            self.plans[sub.plan_id] = p;
+
+            emit SubscriptionExpired { sub_id: sub_id, subscriber: sub.subscriber };
+            return;
+        }
+
+        let token = IERC20::at(self.payment_token);
+        let success = token.transfer_from(sub.subscriber, self.treasury, plan.price);
+
+        if !success {
+            // Payment failed, still within grace period
+            return;
+        }
+
+        sub.last_paid_at = block.timestamp;
+        sub.next_due_at = sub.next_due_at + plan.interval;
+        sub.payments_made = sub.payments_made + 1;
+        sub.total_paid = sub.total_paid + plan.price;
+        self.subscriptions[sub_id] = sub;
+        self.total_collected = self.total_collected + plan.price;
+
+        emit PaymentMade {
+            sub_id: sub_id,
+            subscriber: sub.subscriber,
+            amount: plan.price,
+            period_number: sub.payments_made,
+        };
+    }
+
+    pub fn cancel(plan_id: u64) {
+        let sub_id = self.user_sub[msg.sender][plan_id];
+        require!(sub_id != 0, NotSubscribed {});
+
+        let mut sub = self.subscriptions[sub_id];
+        require!(sub.active, SubscriptionInactive {});
+
+        sub.active = false;
+        self.subscriptions[sub_id] = sub;
+        self.user_sub[msg.sender][plan_id] = 0;
+
+        let mut plan = self.plans[plan_id];
+        plan.subscriber_count = plan.subscriber_count - 1;
+        self.plans[plan_id] = plan;
+
+        emit SubscriptionCancelled { sub_id: sub_id, subscriber: msg.sender };
+    }
+
+    #[view]
+    pub fn is_active(subscriber: Address, plan_id: u64) -> bool {
+        let sub_id = self.user_sub[subscriber][plan_id];
+        if sub_id == 0 {
+            return false;
+        }
+        let sub = self.subscriptions[sub_id];
+        if !sub.active {
+            return false;
+        }
+        // Active if within current period + grace
+        return block.timestamp <= sub.next_due_at + self.grace_period;
+    }
+
+    #[view]
+    pub fn get_plan(plan_id: u64) -> Plan {
+        return self.plans[plan_id];
+    }
+
+    #[view]
+    pub fn get_subscription(sub_id: u64) -> Sub {
+        return self.subscriptions[sub_id];
+    }
+
+    #[view]
+    pub fn get_user_subscription(user: Address, plan_id: u64) -> Sub {
+        let sub_id = self.user_sub[user][plan_id];
+        return self.subscriptions[sub_id];
+    }
+
+    pub fn update_grace_period(new_period: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.grace_period = new_period;
+    }
+
+    pub fn update_treasury(new_treasury: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(new_treasury != Address::ZERO, ZeroAddress {});
+        self.treasury = new_treasury;
+    }
+}

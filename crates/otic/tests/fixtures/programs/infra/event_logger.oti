@@ -1,0 +1,400 @@
+// Universal event logging contract.
+// Any contract or EOA can log structured events through this registry.
+// Supports namespaces, schemas, retention policies, and search indexes.
+
+use std::math;
+
+contract EventLogger {
+    storage {
+        owner: Address,
+        next_log_id: u64,
+        next_namespace_id: u64,
+        next_schema_id: u64,
+        namespaces: Map<u64, Namespace>,
+        namespace_by_name: Map<u256, u64>,        // hash(name) -> namespace_id
+        schemas: Map<u64, Schema>,
+        logs: Map<u64, LogEntry>,
+        namespace_logs: Map<u64, Vec<u64>>,       // namespace_id -> log_ids
+        emitter_logs: Map<Address, Vec<u64>>,     // emitter -> log_ids
+        topic_index: Map<u256, Vec<u64>>,         // topic_hash -> log_ids
+        namespace_admins: Map<u64, Map<Address, bool>>,
+        log_fee: u256,
+        revenue: u256,
+        total_logs: u64,
+        max_data_size: u64,
+        retention_blocks: Map<u64, u64>,          // namespace_id -> blocks to retain
+    }
+
+    struct Namespace {
+        id: u64,
+        name: String,
+        owner: Address,
+        schema_id: u64,          // 0 = no schema enforcement
+        created_at: u64,
+        log_count: u64,
+        active: bool,
+        public_write: bool,      // anyone can log to this namespace
+    }
+
+    struct Schema {
+        id: u64,
+        name: String,
+        fields: Vec<SchemaField>,
+        created_by: Address,
+        created_at: u64,
+    }
+
+    struct SchemaField {
+        name: String,
+        field_type: String,     // "u256", "Address", "String", "bool", "bytes"
+        required: bool,
+        indexed: bool,
+    }
+
+    struct LogEntry {
+        id: u64,
+        namespace_id: u64,
+        emitter: Address,
+        topic: u256,
+        data: bytes,
+        data_hash: u256,
+        block_number: u64,
+        timestamp: u64,
+    }
+
+    event NamespaceCreated {
+        #[indexed]
+        namespace_id: u64,
+        #[indexed]
+        owner: Address,
+        name: String,
+    }
+
+    event SchemaCreated {
+        #[indexed]
+        schema_id: u64,
+        name: String,
+    }
+
+    event LogEmitted {
+        #[indexed]
+        log_id: u64,
+        #[indexed]
+        namespace_id: u64,
+        #[indexed]
+        topic: u256,
+        emitter: Address,
+    }
+
+    event NamespaceUpdated {
+        #[indexed]
+        namespace_id: u64,
+    }
+
+    error Unauthorized {}
+    error NotNamespaceAdmin {}
+    error NamespaceNotFound {}
+    error NamespaceInactive {}
+    error NamespaceTaken {}
+    error SchemaNotFound {}
+    error NotAuthorizedToLog {}
+    error DataTooLarge { max: u64, actual: u64 }
+    error InsufficientFee { required: u256, sent: u256 }
+    error LogNotFound {}
+    error InvalidSchemaField {}
+
+    #[constructor]
+    pub fn init(log_fee: u256, max_data_size: u64) {
+        self.owner = msg.sender;
+        self.log_fee = log_fee;
+        self.max_data_size = max_data_size;
+        self.next_log_id = 1;
+        self.next_namespace_id = 1;
+        self.next_schema_id = 1;
+        self.revenue = 0;
+        self.total_logs = 0;
+    }
+
+    pub fn create_namespace(
+        name: String,
+        public_write: bool,
+        schema_id: u64,
+        retention_blocks: u64,
+    ) -> u64 {
+        let name_hash = math::keccak256_str(name);
+        require!(self.namespace_by_name[name_hash] == 0, NamespaceTaken {});
+
+        if schema_id > 0 {
+            require!(self.schemas[schema_id].id != 0, SchemaNotFound {});
+        }
+
+        let ns_id = self.next_namespace_id;
+        self.next_namespace_id = ns_id + 1;
+
+        self.namespaces[ns_id] = Namespace {
+            id: ns_id,
+            name: name,
+            owner: msg.sender,
+            schema_id: schema_id,
+            created_at: block.height,
+            log_count: 0,
+            active: true,
+            public_write: public_write,
+        };
+
+        self.namespace_by_name[name_hash] = ns_id;
+        self.namespace_admins[ns_id][msg.sender] = true;
+
+        if retention_blocks > 0 {
+            self.retention_blocks[ns_id] = retention_blocks;
+        }
+
+        emit NamespaceCreated {
+            namespace_id: ns_id,
+            owner: msg.sender,
+            name: name,
+        };
+
+        return ns_id;
+    }
+
+    pub fn create_schema(
+        name: String,
+        field_names: Vec<String>,
+        field_types: Vec<String>,
+        field_required: Vec<bool>,
+        field_indexed: Vec<bool>,
+    ) -> u64 {
+        require!(field_names.len() == field_types.len(), InvalidSchemaField {});
+        require!(field_names.len() == field_required.len(), InvalidSchemaField {});
+        require!(field_names.len() == field_indexed.len(), InvalidSchemaField {});
+
+        let schema_id = self.next_schema_id;
+        self.next_schema_id = schema_id + 1;
+
+        let mut fields: Vec<SchemaField> = Vec::new();
+        for i in 0..field_names.len() {
+            fields.push(SchemaField {
+                name: field_names[i],
+                field_type: field_types[i],
+                required: field_required[i],
+                indexed: field_indexed[i],
+            });
+        }
+
+        self.schemas[schema_id] = Schema {
+            id: schema_id,
+            name: name,
+            fields: fields,
+            created_by: msg.sender,
+            created_at: block.height,
+        };
+
+        emit SchemaCreated { schema_id: schema_id, name: name };
+        return schema_id;
+    }
+
+    pub fn log(namespace_id: u64, topic: u256, data: bytes) -> u64 {
+        let ns = self.namespaces[namespace_id];
+        require!(ns.active, NamespaceNotFound {});
+        require!(
+            ns.public_write || self.namespace_admins[namespace_id][msg.sender],
+            NotAuthorizedToLog {}
+        );
+
+        let data_len = data.len() as u64;
+        require!(
+            data_len <= self.max_data_size,
+            DataTooLarge { max: self.max_data_size, actual: data_len }
+        );
+
+        require!(msg.value >= self.log_fee, InsufficientFee { required: self.log_fee, sent: msg.value });
+
+        let log_id = self.next_log_id;
+        self.next_log_id = log_id + 1;
+
+        let data_hash = math::keccak256_bytes(data);
+
+        self.logs[log_id] = LogEntry {
+            id: log_id,
+            namespace_id: namespace_id,
+            emitter: msg.sender,
+            topic: topic,
+            data: data,
+            data_hash: data_hash,
+            block_number: block.height,
+            timestamp: block.timestamp,
+        };
+
+        // Update indexes
+        let mut ns_logs = self.namespace_logs[namespace_id];
+        ns_logs.push(log_id);
+        self.namespace_logs[namespace_id] = ns_logs;
+
+        let mut emitter_log_list = self.emitter_logs[msg.sender];
+        emitter_log_list.push(log_id);
+        self.emitter_logs[msg.sender] = emitter_log_list;
+
+        let mut topic_logs = self.topic_index[topic];
+        topic_logs.push(log_id);
+        self.topic_index[topic] = topic_logs;
+
+        // Update namespace stats
+        let mut updated_ns = self.namespaces[namespace_id];
+        updated_ns.log_count = updated_ns.log_count + 1;
+        self.namespaces[namespace_id] = updated_ns;
+
+        self.revenue = self.revenue + self.log_fee;
+        self.total_logs = self.total_logs + 1;
+
+        emit LogEmitted {
+            log_id: log_id,
+            namespace_id: namespace_id,
+            topic: topic,
+            emitter: msg.sender,
+        };
+
+        return log_id;
+    }
+
+    // Batch log: emit multiple logs in one transaction
+    pub fn batch_log(
+        namespace_id: u64,
+        topics: Vec<u256>,
+        data_items: Vec<bytes>,
+    ) -> Vec<u64> {
+        require!(topics.len() == data_items.len(), InvalidSchemaField {});
+
+        let total_fee = self.log_fee * (topics.len() as u256);
+        require!(msg.value >= total_fee, InsufficientFee { required: total_fee, sent: msg.value });
+
+        let mut log_ids: Vec<u64> = Vec::new();
+        for i in 0..topics.len() {
+            let log_id = self.log_single(namespace_id, topics[i], data_items[i]);
+            log_ids.push(log_id);
+        }
+
+        return log_ids;
+    }
+
+    fn log_single(namespace_id: u64, topic: u256, data: bytes) -> u64 {
+        let ns = self.namespaces[namespace_id];
+        require!(ns.active, NamespaceNotFound {});
+        require!(
+            ns.public_write || self.namespace_admins[namespace_id][msg.sender],
+            NotAuthorizedToLog {}
+        );
+
+        let log_id = self.next_log_id;
+        self.next_log_id = log_id + 1;
+
+        let data_hash = math::keccak256_bytes(data);
+
+        self.logs[log_id] = LogEntry {
+            id: log_id,
+            namespace_id: namespace_id,
+            emitter: msg.sender,
+            topic: topic,
+            data: data,
+            data_hash: data_hash,
+            block_number: block.height,
+            timestamp: block.timestamp,
+        };
+
+        let mut ns_logs = self.namespace_logs[namespace_id];
+        ns_logs.push(log_id);
+        self.namespace_logs[namespace_id] = ns_logs;
+
+        let mut topic_logs = self.topic_index[topic];
+        topic_logs.push(log_id);
+        self.topic_index[topic] = topic_logs;
+
+        let mut updated_ns = self.namespaces[namespace_id];
+        updated_ns.log_count = updated_ns.log_count + 1;
+        self.namespaces[namespace_id] = updated_ns;
+
+        self.total_logs = self.total_logs + 1;
+
+        emit LogEmitted {
+            log_id: log_id,
+            namespace_id: namespace_id,
+            topic: topic,
+            emitter: msg.sender,
+        };
+
+        return log_id;
+    }
+
+    pub fn add_namespace_admin(namespace_id: u64, admin: Address) {
+        let ns = self.namespaces[namespace_id];
+        require!(ns.owner == msg.sender, NotNamespaceAdmin {});
+        self.namespace_admins[namespace_id][admin] = true;
+    }
+
+    pub fn remove_namespace_admin(namespace_id: u64, admin: Address) {
+        let ns = self.namespaces[namespace_id];
+        require!(ns.owner == msg.sender, NotNamespaceAdmin {});
+        self.namespace_admins[namespace_id][admin] = false;
+    }
+
+    pub fn deactivate_namespace(namespace_id: u64) {
+        let mut ns = self.namespaces[namespace_id];
+        require!(ns.owner == msg.sender || msg.sender == self.owner, NotNamespaceAdmin {});
+        ns.active = false;
+        self.namespaces[namespace_id] = ns;
+        emit NamespaceUpdated { namespace_id: namespace_id };
+    }
+
+    pub fn set_log_fee(new_fee: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.log_fee = new_fee;
+    }
+
+    pub fn withdraw_revenue(to: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        let amount = self.revenue;
+        self.revenue = 0;
+        raw_call!(to, amount, bytes::empty());
+    }
+
+    #[view]
+    pub fn get_log(log_id: u64) -> LogEntry {
+        return self.logs[log_id];
+    }
+
+    #[view]
+    pub fn get_namespace(namespace_id: u64) -> Namespace {
+        return self.namespaces[namespace_id];
+    }
+
+    #[view]
+    pub fn get_schema(schema_id: u64) -> Schema {
+        return self.schemas[schema_id];
+    }
+
+    #[view]
+    pub fn get_namespace_logs(namespace_id: u64) -> Vec<u64> {
+        return self.namespace_logs[namespace_id];
+    }
+
+    #[view]
+    pub fn get_emitter_logs(emitter: Address) -> Vec<u64> {
+        return self.emitter_logs[emitter];
+    }
+
+    #[view]
+    pub fn get_logs_by_topic(topic: u256) -> Vec<u64> {
+        return self.topic_index[topic];
+    }
+
+    #[view]
+    pub fn lookup_namespace(name: String) -> u64 {
+        let name_hash = math::keccak256_str(name);
+        return self.namespace_by_name[name_hash];
+    }
+
+    #[view]
+    pub fn get_total_logs() -> u64 {
+        return self.total_logs;
+    }
+}

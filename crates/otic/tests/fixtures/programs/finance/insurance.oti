@@ -1,0 +1,443 @@
+// Decentralized insurance pool with policy issuance, premium collection,
+// claim submission, voting-based claim approval, and payout distribution.
+
+contract Insurance {
+    storage {
+        owner: Address,
+        pool_balance: u256,
+        next_policy_id: u64,
+        next_claim_id: u64,
+        policies: Map<u64, Policy>,
+        claims: Map<u64, Claim>,
+        claim_votes: Map<u64, Map<Address, bool>>,
+        user_policies: Map<Address, Vec<u64>>,
+        assessors: Map<Address, bool>,
+        assessor_list: Vec<Address>,
+        min_assessors_for_quorum: u64,
+        premium_rate_bps: u64, // annual premium as bps of coverage
+        max_coverage: u256,
+        total_coverage_outstanding: u256,
+        treasury_reserve_bps: u64, // % kept in reserve
+        paused: bool,
+    }
+
+    enum PolicyType {
+        Basic = 0,
+        Standard = 1,
+        Premium = 2,
+    }
+
+    enum ClaimStatus {
+        Pending = 0,
+        Approved = 1,
+        Denied = 2,
+        Paid = 3,
+        Expired = 4,
+    }
+
+    struct Policy {
+        holder: Address,
+        coverage_amount: u256,
+        premium_per_period: u256,
+        period_seconds: u64,
+        start_date: u64,
+        expiry_date: u64,
+        last_premium_paid: u64,
+        premiums_paid_count: u64,
+        active: bool,
+        policy_type: PolicyType,
+        metadata: String,
+    }
+
+    struct Claim {
+        policy_id: u64,
+        claimant: Address,
+        amount: u256,
+        description: String,
+        evidence_hash: [u8; 32],
+        filed_at: u64,
+        status: ClaimStatus,
+        votes_for: u64,
+        votes_against: u64,
+        voting_deadline: u64,
+    }
+
+    const BPS_DENOMINATOR: u256 = 10000;
+    const MONTHLY_SECONDS: u64 = 2592000; // 30 * 86400
+    const MONTHS_PER_YEAR: u64 = 12;
+    const VOTING_PERIOD_SECONDS: u64 = 604800; // 7 * 86400
+
+    event PolicyCreated {
+        #[indexed]
+        policy_id: u64,
+        #[indexed]
+        holder: Address,
+        coverage: u256,
+        premium: u256,
+        expiry: u64,
+    }
+
+    event PremiumPaid {
+        #[indexed]
+        policy_id: u64,
+        amount: u256,
+        period: u64,
+    }
+
+    event PolicyExpired {
+        #[indexed]
+        policy_id: u64,
+    }
+
+    event ClaimFiled {
+        #[indexed]
+        claim_id: u64,
+        #[indexed]
+        policy_id: u64,
+        amount: u256,
+    }
+
+    event ClaimVoted {
+        #[indexed]
+        claim_id: u64,
+        assessor: Address,
+        approved: bool,
+    }
+
+    event ClaimApproved {
+        #[indexed]
+        claim_id: u64,
+        amount: u256,
+    }
+
+    event ClaimDenied {
+        #[indexed]
+        claim_id: u64,
+    }
+
+    event ClaimPaid {
+        #[indexed]
+        claim_id: u64,
+        #[indexed]
+        claimant: Address,
+        amount: u256,
+    }
+
+    event AssessorAdded {
+        #[indexed]
+        assessor: Address,
+    }
+
+    event AssessorRemoved {
+        #[indexed]
+        assessor: Address,
+    }
+
+    event PoolFunded {
+        funder: Address,
+        amount: u256,
+    }
+
+    error Unauthorized {}
+    error NotOwner {}
+    error NotPolicyHolder {}
+    error NotAssessor {}
+    error PolicyNotFound {}
+    error PolicyNotActive {}
+    error PolicyExpiredError {}
+    error ClaimNotFound {}
+    error ClaimNotPending {}
+    error AlreadyVoted {}
+    error VotingDeadlinePassed {}
+    error VotingNotComplete {}
+    error CoverageExceedsMax { requested: u256, available: u256 }
+    error PremiumNotDue {}
+    error InsufficientPoolFunds { needed: u256, available: u256 }
+    error InsufficientPremium { required: u256, sent: u256 }
+    error ClaimExceedsCoverage { coverage: u256, claimed: u256 }
+    error ContractPaused {}
+    error ZeroAmount {}
+
+    #[constructor]
+    pub fn init(
+        premium_rate_bps: u64,
+        max_coverage: u256,
+        min_assessors: u64,
+        treasury_reserve_bps: u64,
+    ) {
+        self.owner = msg.sender;
+        self.premium_rate_bps = premium_rate_bps;
+        self.max_coverage = max_coverage;
+        self.min_assessors_for_quorum = min_assessors;
+        self.treasury_reserve_bps = treasury_reserve_bps;
+        self.next_policy_id = 1;
+        self.next_claim_id = 1;
+        self.paused = false;
+    }
+
+    // Fund the insurance pool
+    pub fn fund_pool() {
+        require!(msg.value > 0, ZeroAmount {});
+        self.pool_balance = self.pool_balance + msg.value;
+        emit PoolFunded { funder: msg.sender, amount: msg.value };
+    }
+
+    pub fn purchase_policy(
+        coverage_amount: u256,
+        duration_seconds: u64,
+        policy_type: PolicyType,
+        metadata: String,
+    ) -> u64 {
+        require!(!self.paused, ContractPaused {});
+        require!(coverage_amount > 0, ZeroAmount {});
+
+        let available = self.max_coverage - self.total_coverage_outstanding;
+        require!(coverage_amount <= available, CoverageExceedsMax {
+            requested: coverage_amount,
+            available: available,
+        });
+
+        // Calculate premium: coverage * rate / 10000, scaled by duration
+        let annual_premium = (coverage_amount * self.premium_rate_bps) / BPS_DENOMINATOR;
+        let period_seconds: u64 = MONTHLY_SECONDS;
+        let periods = duration_seconds / period_seconds;
+        let premium_per_period = annual_premium / MONTHS_PER_YEAR;
+
+        // Collect first premium
+        require!(msg.value >= premium_per_period, InsufficientPremium {
+            required: premium_per_period,
+            sent: msg.value,
+        });
+
+        let policy_id = self.next_policy_id;
+        self.next_policy_id = policy_id + 1;
+
+        self.policies[policy_id] = Policy {
+            holder: msg.sender,
+            coverage_amount: coverage_amount,
+            premium_per_period: premium_per_period,
+            period_seconds: period_seconds,
+            start_date: block.timestamp,
+            expiry_date: block.timestamp + duration_seconds,
+            last_premium_paid: block.timestamp,
+            premiums_paid_count: 1,
+            active: true,
+            policy_type: policy_type,
+            metadata: metadata,
+        };
+
+        self.user_policies[msg.sender].push(policy_id);
+        self.total_coverage_outstanding = self.total_coverage_outstanding + coverage_amount;
+        self.pool_balance = self.pool_balance + msg.value;
+
+        emit PolicyCreated {
+            policy_id: policy_id,
+            holder: msg.sender,
+            coverage: coverage_amount,
+            premium: premium_per_period,
+            expiry: block.timestamp + duration_seconds,
+        };
+
+        return policy_id;
+    }
+
+    pub fn pay_premium(policy_id: u64) {
+        let mut policy = self.policies[policy_id];
+        require!(policy.holder != Address::ZERO, PolicyNotFound {});
+        require!(policy.active, PolicyNotActive {});
+        require!(msg.sender == policy.holder, NotPolicyHolder {});
+
+        // Check if premium is due
+        let next_due = policy.last_premium_paid + policy.period_seconds;
+        require!(block.timestamp >= next_due, PremiumNotDue {});
+
+        require!(msg.value >= policy.premium_per_period, InsufficientPremium {
+            required: policy.premium_per_period,
+            sent: msg.value,
+        });
+
+        policy.last_premium_paid = block.timestamp;
+        policy.premiums_paid_count = policy.premiums_paid_count + 1;
+        self.policies[policy_id] = policy;
+        self.pool_balance = self.pool_balance + msg.value;
+
+        emit PremiumPaid {
+            policy_id: policy_id,
+            amount: msg.value,
+            period: policy.premiums_paid_count,
+        };
+
+        // Check expiry
+        if block.timestamp >= policy.expiry_date {
+            let mut p = self.policies[policy_id];
+            p.active = false;
+            self.policies[policy_id] = p;
+            self.total_coverage_outstanding = self.total_coverage_outstanding - p.coverage_amount;
+            emit PolicyExpired { policy_id: policy_id };
+        }
+    }
+
+    pub fn file_claim(
+        policy_id: u64,
+        amount: u256,
+        description: String,
+        evidence_hash: [u8; 32],
+    ) -> u64 {
+        let policy = self.policies[policy_id];
+        require!(policy.holder != Address::ZERO, PolicyNotFound {});
+        require!(policy.active, PolicyNotActive {});
+        require!(msg.sender == policy.holder, NotPolicyHolder {});
+        require!(block.timestamp < policy.expiry_date, PolicyExpiredError {});
+        require!(amount <= policy.coverage_amount, ClaimExceedsCoverage {
+            coverage: policy.coverage_amount,
+            claimed: amount,
+        });
+
+        let claim_id = self.next_claim_id;
+        self.next_claim_id = claim_id + 1;
+
+        let voting_deadline = block.timestamp + VOTING_PERIOD_SECONDS;
+
+        self.claims[claim_id] = Claim {
+            policy_id: policy_id,
+            claimant: msg.sender,
+            amount: amount,
+            description: description,
+            evidence_hash: evidence_hash,
+            filed_at: block.timestamp,
+            status: ClaimStatus::Pending,
+            votes_for: 0,
+            votes_against: 0,
+            voting_deadline: voting_deadline,
+        };
+
+        emit ClaimFiled {
+            claim_id: claim_id,
+            policy_id: policy_id,
+            amount: amount,
+        };
+
+        return claim_id;
+    }
+
+    pub fn vote_on_claim(claim_id: u64, approve: bool) {
+        require!(self.assessors[msg.sender], NotAssessor {});
+
+        let mut claim = self.claims[claim_id];
+        require!(claim.claimant != Address::ZERO, ClaimNotFound {});
+        require!(claim.status == ClaimStatus::Pending, ClaimNotPending {});
+        require!(block.timestamp <= claim.voting_deadline, VotingDeadlinePassed {});
+        require!(!self.claim_votes[claim_id][msg.sender], AlreadyVoted {});
+
+        self.claim_votes[claim_id][msg.sender] = true;
+
+        if approve {
+            claim.votes_for = claim.votes_for + 1;
+        } else {
+            claim.votes_against = claim.votes_against + 1;
+        }
+
+        self.claims[claim_id] = claim;
+
+        emit ClaimVoted {
+            claim_id: claim_id,
+            assessor: msg.sender,
+            approved: approve,
+        };
+    }
+
+    // Finalize a claim after voting period
+    pub fn finalize_claim(claim_id: u64) {
+        let mut claim = self.claims[claim_id];
+        require!(claim.claimant != Address::ZERO, ClaimNotFound {});
+        require!(claim.status == ClaimStatus::Pending, ClaimNotPending {});
+        require!(block.timestamp > claim.voting_deadline, VotingNotComplete {});
+
+        let total_votes = claim.votes_for + claim.votes_against;
+
+        if total_votes >= self.min_assessors_for_quorum && claim.votes_for > claim.votes_against {
+            claim.status = ClaimStatus::Approved;
+            self.claims[claim_id] = claim;
+            emit ClaimApproved { claim_id: claim_id, amount: claim.amount };
+        } else {
+            claim.status = ClaimStatus::Denied;
+            self.claims[claim_id] = claim;
+            emit ClaimDenied { claim_id: claim_id };
+        }
+    }
+
+    // Pay out an approved claim
+    pub fn payout_claim(claim_id: u64) {
+        let mut claim = self.claims[claim_id];
+        require!(claim.status == ClaimStatus::Approved, ClaimNotPending {}); // must be approved
+
+        let reserve = (self.pool_balance * self.treasury_reserve_bps) / BPS_DENOMINATOR;
+        let available = self.pool_balance - reserve;
+        require!(claim.amount <= available, InsufficientPoolFunds {
+            needed: claim.amount,
+            available: available,
+        });
+
+        claim.status = ClaimStatus::Paid;
+        self.claims[claim_id] = claim;
+        self.pool_balance = self.pool_balance - claim.amount;
+
+        raw_call!(claim.claimant, claim.amount, bytes::empty());
+
+        emit ClaimPaid {
+            claim_id: claim_id,
+            claimant: claim.claimant,
+            amount: claim.amount,
+        };
+    }
+
+    pub fn add_assessor(assessor: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.assessors[assessor] = true;
+        self.assessor_list.push(assessor);
+        emit AssessorAdded { assessor: assessor };
+    }
+
+    pub fn remove_assessor(assessor: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.assessors[assessor] = false;
+        let mut new_list: Vec<Address> = Vec::new();
+        for i in 0..self.assessor_list.len() {
+            if self.assessor_list[i] != assessor {
+                new_list.push(self.assessor_list[i]);
+            }
+        }
+        self.assessor_list = new_list;
+        emit AssessorRemoved { assessor: assessor };
+    }
+
+    pub fn set_paused(is_paused: bool) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.paused = is_paused;
+    }
+
+    #[view]
+    pub fn get_policy(policy_id: u64) -> Policy {
+        return self.policies[policy_id];
+    }
+
+    #[view]
+    pub fn get_claim(claim_id: u64) -> Claim {
+        return self.claims[claim_id];
+    }
+
+    #[view]
+    pub fn get_pool_balance() -> u256 {
+        return self.pool_balance;
+    }
+
+    #[view]
+    pub fn get_user_policies(user: Address) -> Vec<u64> {
+        return self.user_policies[user];
+    }
+
+    #[view]
+    pub fn get_assessor_count() -> u64 {
+        return self.assessor_list.len() as u64;
+    }
+}

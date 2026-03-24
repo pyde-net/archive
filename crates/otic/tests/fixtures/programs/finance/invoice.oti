@@ -1,0 +1,318 @@
+// Invoice management system with creation, partial payments,
+// late fee calculation, and payment history tracking.
+
+use std::token::IERC20;
+
+contract Invoice {
+    storage {
+        owner: Address,
+        next_invoice_id: u64,
+        invoices: Map<u64, InvoiceData>,
+        vendor_invoices: Map<Address, Vec<u64>>,
+        client_invoices: Map<Address, Vec<u64>>,
+        payments: Map<u64, Vec<PaymentRecord>>,
+        accepted_tokens: Map<Address, bool>,
+        late_fee_bps_per_day: u64,
+        max_late_fee_bps: u64,
+    }
+
+    enum InvoiceStatus {
+        Draft = 0,
+        Sent = 1,
+        Partial = 2,
+        Paid = 3,
+        Cancelled = 4,
+        Overdue = 5,
+    }
+
+    struct InvoiceData {
+        vendor: Address,
+        client: Address,
+        amount: u256,
+        amount_paid: u256,
+        token: Address, // Address::ZERO for native
+        issued_at: u64,
+        due_at: u64,
+        status: InvoiceStatus,
+        description: String,
+        reference: String,
+        line_items_count: u64,
+    }
+
+    struct PaymentRecord {
+        payer: Address,
+        amount: u256,
+        paid_at: u64,
+        tx_reference: String,
+    }
+
+    struct LineItem {
+        description: String,
+        quantity: u64,
+        unit_price: u256,
+        total: u256,
+    }
+
+    const BPS_DENOMINATOR: u256 = 10000;
+    const SECONDS_PER_DAY: u64 = 86400;
+
+    event InvoiceCreated {
+        #[indexed]
+        invoice_id: u64,
+        #[indexed]
+        vendor: Address,
+        #[indexed]
+        client: Address,
+        amount: u256,
+        due_at: u64,
+    }
+
+    event InvoiceSent {
+        #[indexed]
+        invoice_id: u64,
+    }
+
+    event InvoicePaid {
+        #[indexed]
+        invoice_id: u64,
+        payer: Address,
+        amount: u256,
+        remaining: u256,
+    }
+
+    event InvoiceFullyPaid {
+        #[indexed]
+        invoice_id: u64,
+    }
+
+    event InvoiceCancelled {
+        #[indexed]
+        invoice_id: u64,
+    }
+
+    error Unauthorized {}
+    error InvoiceNotFound {}
+    error NotVendor {}
+    error NotClientOrVendor {}
+    error InvalidStatus { status: InvoiceStatus }
+    error ZeroAmount {}
+    error PastDueDate {}
+    error OverpaymentNotAllowed { remaining: u256, sent: u256 }
+    error TokenNotAccepted { token: Address }
+    error PaymentFailed {}
+    error ZeroAddress {}
+    error NotOwner {}
+
+    #[constructor]
+    pub fn init(late_fee_bps_per_day: u64, max_late_fee_bps: u64) {
+        self.owner = msg.sender;
+        self.next_invoice_id = 1;
+        self.late_fee_bps_per_day = late_fee_bps_per_day;
+        self.max_late_fee_bps = max_late_fee_bps;
+    }
+
+    pub fn create_invoice(
+        client: Address,
+        amount: u256,
+        token: Address,
+        due_at: u64,
+        description: String,
+        reference: String,
+    ) -> u64 {
+        require!(client != Address::ZERO, ZeroAddress {});
+        require!(amount > 0, ZeroAmount {});
+        require!(due_at > block.timestamp, PastDueDate {});
+
+        if token != Address::ZERO {
+            require!(self.accepted_tokens[token], TokenNotAccepted { token: token });
+        }
+
+        let invoice_id = self.next_invoice_id;
+        self.next_invoice_id = invoice_id + 1;
+
+        self.invoices[invoice_id] = InvoiceData {
+            vendor: msg.sender,
+            client: client,
+            amount: amount,
+            amount_paid: 0,
+            token: token,
+            issued_at: block.timestamp,
+            due_at: due_at,
+            status: InvoiceStatus::Draft,
+            description: description,
+            reference: reference,
+            line_items_count: 0,
+        };
+
+        self.vendor_invoices[msg.sender].push(invoice_id);
+        self.client_invoices[client].push(invoice_id);
+
+        emit InvoiceCreated {
+            invoice_id: invoice_id,
+            vendor: msg.sender,
+            client: client,
+            amount: amount,
+            due_at: due_at,
+        };
+
+        return invoice_id;
+    }
+
+    // Vendor marks an invoice as sent to client
+    pub fn send_invoice(invoice_id: u64) {
+        let mut inv = self.invoices[invoice_id];
+        require!(inv.vendor != Address::ZERO, InvoiceNotFound {});
+        require!(msg.sender == inv.vendor, NotVendor {});
+        require!(inv.status == InvoiceStatus::Draft, InvalidStatus { status: inv.status });
+
+        inv.status = InvoiceStatus::Sent;
+        self.invoices[invoice_id] = inv;
+
+        emit InvoiceSent { invoice_id: invoice_id };
+    }
+
+    // Pay an invoice (full or partial)
+    pub fn pay_invoice(invoice_id: u64, amount: u256, tx_reference: String) {
+        let mut inv = self.invoices[invoice_id];
+        require!(inv.vendor != Address::ZERO, InvoiceNotFound {});
+        require!(
+            inv.status == InvoiceStatus::Sent || inv.status == InvoiceStatus::Partial || inv.status == InvoiceStatus::Overdue,
+            InvalidStatus { status: inv.status },
+        );
+
+        let total_with_late_fee = self.calculate_total_due(invoice_id);
+        let remaining = total_with_late_fee - inv.amount_paid;
+        require!(amount > 0, ZeroAmount {});
+        require!(amount <= remaining, OverpaymentNotAllowed {
+            remaining: remaining,
+            sent: amount,
+        });
+
+        // Transfer payment
+        if inv.token == Address::ZERO {
+            require!(msg.value >= amount, PaymentFailed {});
+            raw_call!(inv.vendor, amount, bytes::empty());
+        } else {
+            let token = IERC20::at(inv.token);
+            let success = token.transfer_from(msg.sender, inv.vendor, amount);
+            require!(success, PaymentFailed {});
+        }
+
+        inv.amount_paid = inv.amount_paid + amount;
+
+        // Record payment
+        self.payments[invoice_id].push(PaymentRecord {
+            payer: msg.sender,
+            amount: amount,
+            paid_at: block.timestamp,
+            tx_reference: tx_reference,
+        });
+
+        // Update status
+        if inv.amount_paid >= total_with_late_fee {
+            inv.status = InvoiceStatus::Paid;
+            emit InvoiceFullyPaid { invoice_id: invoice_id };
+        } else {
+            inv.status = InvoiceStatus::Partial;
+        }
+
+        self.invoices[invoice_id] = inv;
+
+        emit InvoicePaid {
+            invoice_id: invoice_id,
+            payer: msg.sender,
+            amount: amount,
+            remaining: total_with_late_fee - inv.amount_paid,
+        };
+    }
+
+    pub fn cancel_invoice(invoice_id: u64) {
+        let mut inv = self.invoices[invoice_id];
+        require!(inv.vendor != Address::ZERO, InvoiceNotFound {});
+        require!(msg.sender == inv.vendor, NotVendor {});
+        require!(
+            inv.status == InvoiceStatus::Draft || inv.status == InvoiceStatus::Sent,
+            InvalidStatus { status: inv.status },
+        );
+
+        inv.status = InvoiceStatus::Cancelled;
+        self.invoices[invoice_id] = inv;
+
+        emit InvoiceCancelled { invoice_id: invoice_id };
+    }
+
+    // Mark overdue invoices - anyone can call this
+    pub fn mark_overdue(invoice_id: u64) {
+        let mut inv = self.invoices[invoice_id];
+        require!(inv.vendor != Address::ZERO, InvoiceNotFound {});
+        require!(
+            inv.status == InvoiceStatus::Sent || inv.status == InvoiceStatus::Partial,
+            InvalidStatus { status: inv.status },
+        );
+        require!(block.timestamp > inv.due_at, PastDueDate {});
+
+        inv.status = InvoiceStatus::Overdue;
+        self.invoices[invoice_id] = inv;
+    }
+
+    #[view]
+    pub fn calculate_total_due(invoice_id: u64) -> u256 {
+        let inv = self.invoices[invoice_id];
+        if block.timestamp <= inv.due_at {
+            return inv.amount;
+        }
+
+        let seconds_late = block.timestamp - inv.due_at;
+        let days_late = seconds_late / SECONDS_PER_DAY;
+        if days_late == 0 {
+            return inv.amount;
+        }
+
+        let late_fee_bps = days_late * self.late_fee_bps_per_day;
+        let capped_fee_bps = if late_fee_bps > self.max_late_fee_bps {
+            self.max_late_fee_bps
+        } else {
+            late_fee_bps
+        };
+
+        let late_fee = (inv.amount * capped_fee_bps) / BPS_DENOMINATOR;
+        return inv.amount + late_fee;
+    }
+
+    #[view]
+    pub fn get_invoice(invoice_id: u64) -> InvoiceData {
+        return self.invoices[invoice_id];
+    }
+
+    #[view]
+    pub fn get_payment_history(invoice_id: u64) -> Vec<PaymentRecord> {
+        return self.payments[invoice_id];
+    }
+
+    #[view]
+    pub fn get_vendor_invoices(vendor: Address) -> Vec<u64> {
+        return self.vendor_invoices[vendor];
+    }
+
+    #[view]
+    pub fn get_client_invoices(client: Address) -> Vec<u64> {
+        return self.client_invoices[client];
+    }
+
+    pub fn add_accepted_token(token: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(token != Address::ZERO, ZeroAddress {});
+        self.accepted_tokens[token] = true;
+    }
+
+    pub fn remove_accepted_token(token: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.accepted_tokens[token] = false;
+    }
+
+    pub fn update_late_fees(new_daily_bps: u64, new_max_bps: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.late_fee_bps_per_day = new_daily_bps;
+        self.max_late_fee_bps = new_max_bps;
+    }
+}

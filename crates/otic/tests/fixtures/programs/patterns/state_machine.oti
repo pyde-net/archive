@@ -1,0 +1,375 @@
+// State machine pattern for a decentralized escrow service.
+// Orders progress through well-defined states using match expressions.
+// Invalid transitions are rejected at the contract level.
+
+use std::math;
+use std::token::IERC20;
+
+enum OrderState {
+    Created,       // 0: buyer deposited, awaiting seller acceptance
+    Accepted,      // 1: seller accepted, preparing shipment
+    Shipped,       // 2: seller shipped, awaiting buyer confirmation
+    Delivered,     // 3: buyer confirmed delivery
+    Completed,     // 4: funds released to seller
+    Disputed,      // 5: either party raised a dispute
+    Resolved,      // 6: arbiter resolved the dispute
+    Cancelled,     // 7: order cancelled before acceptance
+    Refunded,      // 8: full refund issued
+}
+
+contract EscrowStateMachine {
+    storage {
+        owner: Address,
+        next_order_id: u256,
+
+        // Order data
+        order_state: Map<u256, u8>,
+        order_buyer: Map<u256, Address>,
+        order_seller: Map<u256, Address>,
+        order_arbiter: Map<u256, Address>,
+        order_token: Map<u256, Address>,
+        order_amount: Map<u256, u256>,
+        order_created_at: Map<u256, u64>,
+        order_shipped_at: Map<u256, u64>,
+        order_completed_at: Map<u256, u64>,
+        order_description: Map<u256, String>,
+        order_tracking: Map<u256, String>,
+        order_dispute_reason: Map<u256, String>,
+
+        // Arbiter registry
+        registered_arbiters: Map<Address, bool>,
+        arbiter_fee_bps: u256,
+        platform_fee_bps: u256,
+        fee_recipient: Address,
+
+        // Stats
+        total_volume: u256,
+        completed_orders: u256,
+        disputed_orders: u256,
+    }
+
+    const BPS_DENOMINATOR: u256 = 10000;
+    const DEFAULT_ARBITER_FEE_BPS: u256 = 100;
+    const DEFAULT_PLATFORM_FEE_BPS: u256 = 50;
+
+    event OrderCreated {
+        #[indexed]
+        order_id: u256,
+        #[indexed]
+        buyer: Address,
+        #[indexed]
+        seller: Address,
+        amount: u256,
+    }
+
+    event OrderAccepted {
+        #[indexed]
+        order_id: u256,
+    }
+
+    event OrderShipped {
+        #[indexed]
+        order_id: u256,
+        tracking: String,
+    }
+
+    event OrderDelivered {
+        #[indexed]
+        order_id: u256,
+    }
+
+    event OrderCompleted {
+        #[indexed]
+        order_id: u256,
+        seller_payout: u256,
+    }
+
+    event OrderDisputed {
+        #[indexed]
+        order_id: u256,
+        #[indexed]
+        raised_by: Address,
+        reason: String,
+    }
+
+    event DisputeResolved {
+        #[indexed]
+        order_id: u256,
+        buyer_refund: u256,
+        seller_payout: u256,
+    }
+
+    event OrderCancelled {
+        #[indexed]
+        order_id: u256,
+    }
+
+    error InvalidStateTransition { current: u8, attempted: u8 }
+    error NotBuyer { order_id: u256 }
+    error NotSeller { order_id: u256 }
+    error NotArbiter { order_id: u256 }
+    error NotRegisteredArbiter {}
+    error OrderNotFound { order_id: u256 }
+    error ZeroAmount {}
+    error InvalidSplit { buyer_share: u256, seller_share: u256, total: u256 }
+    error NotOwner {}
+    error Unauthorized {}
+
+    #[constructor]
+    pub fn init(fee_recipient: Address) {
+        self.owner = msg.sender;
+        self.next_order_id = 1u256;
+        self.arbiter_fee_bps = DEFAULT_ARBITER_FEE_BPS;
+        self.platform_fee_bps = DEFAULT_PLATFORM_FEE_BPS;
+        self.fee_recipient = fee_recipient;
+        self.total_volume = 0u256;
+        self.completed_orders = 0u256;
+        self.disputed_orders = 0u256;
+    }
+
+    // --- State transition validation ---
+
+    fn validate_transition(order_id: u256, new_state: u8) {
+        let current = self.order_state[order_id];
+        let valid = match current {
+            0u8 => new_state == 1u8 || new_state == 7u8,    // Created -> Accepted or Cancelled
+            1u8 => new_state == 2u8 || new_state == 5u8,    // Accepted -> Shipped or Disputed
+            2u8 => new_state == 3u8 || new_state == 5u8,    // Shipped -> Delivered or Disputed
+            3u8 => new_state == 4u8,                         // Delivered -> Completed
+            5u8 => new_state == 6u8,                         // Disputed -> Resolved
+        };
+        require!(valid, InvalidStateTransition { current: current, attempted: new_state });
+    }
+
+    fn get_state_name(state: u8) -> String {
+        match state {
+            0u8 => return "Created",
+            1u8 => return "Accepted",
+            2u8 => return "Shipped",
+            3u8 => return "Delivered",
+            4u8 => return "Completed",
+            5u8 => return "Disputed",
+            6u8 => return "Resolved",
+            7u8 => return "Cancelled",
+            8u8 => return "Refunded",
+        }
+        return "Unknown";
+    }
+
+    // --- Admin ---
+
+    pub fn register_arbiter(arbiter: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.registered_arbiters[arbiter] = true;
+    }
+
+    pub fn update_fees(platform_bps: u256, arbiter_bps: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.platform_fee_bps = platform_bps;
+        self.arbiter_fee_bps = arbiter_bps;
+    }
+
+    // --- Order lifecycle ---
+
+    /// Buyer creates a new escrow order and deposits tokens.
+    pub fn create_order(
+        seller: Address,
+        arbiter: Address,
+        token: Address,
+        amount: u256,
+        description: String,
+    ) -> u256 {
+        require!(amount > 0u256, ZeroAmount {});
+        require!(self.registered_arbiters[arbiter], NotRegisteredArbiter {});
+
+        let order_id = self.next_order_id;
+        self.next_order_id = order_id + 1u256;
+
+        // Transfer tokens from buyer to escrow
+        IERC20::at(token).transfer_from(msg.sender, address(self), amount);
+
+        // Initialize order
+        self.order_state[order_id] = 0u8; // Created
+        self.order_buyer[order_id] = msg.sender;
+        self.order_seller[order_id] = seller;
+        self.order_arbiter[order_id] = arbiter;
+        self.order_token[order_id] = token;
+        self.order_amount[order_id] = amount;
+        self.order_created_at[order_id] = block.timestamp;
+        self.order_description[order_id] = description;
+
+        self.total_volume = self.total_volume + amount;
+
+        emit OrderCreated {
+            order_id: order_id,
+            buyer: msg.sender,
+            seller: seller,
+            amount: amount,
+        };
+
+        return order_id;
+    }
+
+    /// Seller accepts the order.
+    pub fn accept_order(order_id: u256) {
+        require!(msg.sender == self.order_seller[order_id], NotSeller { order_id: order_id });
+        self.validate_transition(order_id, 1u8);
+        self.order_state[order_id] = 1u8;
+
+        emit OrderAccepted { order_id: order_id };
+    }
+
+    /// Seller marks order as shipped with tracking info.
+    pub fn ship_order(order_id: u256, tracking: String) {
+        require!(msg.sender == self.order_seller[order_id], NotSeller { order_id: order_id });
+        self.validate_transition(order_id, 2u8);
+
+        self.order_state[order_id] = 2u8;
+        self.order_shipped_at[order_id] = block.timestamp;
+        self.order_tracking[order_id] = tracking;
+
+        emit OrderShipped { order_id: order_id, tracking: tracking };
+    }
+
+    /// Buyer confirms delivery.
+    pub fn confirm_delivery(order_id: u256) {
+        require!(msg.sender == self.order_buyer[order_id], NotBuyer { order_id: order_id });
+        self.validate_transition(order_id, 3u8);
+
+        self.order_state[order_id] = 3u8;
+
+        emit OrderDelivered { order_id: order_id };
+
+        // Auto-complete: release funds to seller
+        self.complete_order(order_id);
+    }
+
+    /// Internal: releases funds to seller with fee deductions.
+    fn complete_order(order_id: u256) {
+        self.validate_transition(order_id, 4u8);
+        self.order_state[order_id] = 4u8;
+        self.order_completed_at[order_id] = block.timestamp;
+
+        let token = self.order_token[order_id];
+        let amount = self.order_amount[order_id];
+        let seller = self.order_seller[order_id];
+
+        // Calculate fees
+        let platform_fee = (amount * self.platform_fee_bps) / BPS_DENOMINATOR;
+        let seller_payout = amount - platform_fee;
+
+        // Transfer
+        IERC20::at(token).transfer(seller, seller_payout);
+        if platform_fee > 0u256 {
+            IERC20::at(token).transfer(self.fee_recipient, platform_fee);
+        }
+
+        self.completed_orders = self.completed_orders + 1u256;
+
+        emit OrderCompleted { order_id: order_id, seller_payout: seller_payout };
+    }
+
+    /// Either buyer or seller can raise a dispute.
+    pub fn raise_dispute(order_id: u256, reason: String) {
+        let is_buyer = msg.sender == self.order_buyer[order_id];
+        let is_seller = msg.sender == self.order_seller[order_id];
+        require!(is_buyer || is_seller, NotBuyer { order_id: order_id });
+
+        self.validate_transition(order_id, 5u8);
+        self.order_state[order_id] = 5u8;
+        self.order_dispute_reason[order_id] = reason;
+        self.disputed_orders = self.disputed_orders + 1u256;
+
+        emit OrderDisputed {
+            order_id: order_id,
+            raised_by: msg.sender,
+            reason: reason,
+        };
+    }
+
+    /// Arbiter resolves the dispute by splitting funds.
+    pub fn resolve_dispute(
+        order_id: u256,
+        buyer_refund_bps: u256,
+    ) {
+        require!(msg.sender == self.order_arbiter[order_id], NotArbiter { order_id: order_id });
+        self.validate_transition(order_id, 6u8);
+
+        let amount = self.order_amount[order_id];
+        let token = self.order_token[order_id];
+
+        // Arbiter fee
+        let arbiter_fee = (amount * self.arbiter_fee_bps) / BPS_DENOMINATOR;
+        let distributable = amount - arbiter_fee;
+
+        // Split between buyer and seller
+        let buyer_refund = (distributable * buyer_refund_bps) / BPS_DENOMINATOR;
+        let seller_payout = distributable - buyer_refund;
+
+        self.order_state[order_id] = 6u8;
+
+        // Transfer payouts
+        if buyer_refund > 0u256 {
+            IERC20::at(token).transfer(self.order_buyer[order_id], buyer_refund);
+        }
+        if seller_payout > 0u256 {
+            IERC20::at(token).transfer(self.order_seller[order_id], seller_payout);
+        }
+        if arbiter_fee > 0u256 {
+            IERC20::at(token).transfer(self.order_arbiter[order_id], arbiter_fee);
+        }
+
+        emit DisputeResolved {
+            order_id: order_id,
+            buyer_refund: buyer_refund,
+            seller_payout: seller_payout,
+        };
+    }
+
+    /// Buyer cancels an order that hasn't been accepted yet.
+    pub fn cancel_order(order_id: u256) {
+        require!(msg.sender == self.order_buyer[order_id], NotBuyer { order_id: order_id });
+        self.validate_transition(order_id, 7u8);
+
+        self.order_state[order_id] = 7u8;
+
+        // Refund full amount to buyer
+        let token = self.order_token[order_id];
+        let amount = self.order_amount[order_id];
+        IERC20::at(token).transfer(msg.sender, amount);
+
+        emit OrderCancelled { order_id: order_id };
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn get_order_state(order_id: u256) -> u8 {
+        return self.order_state[order_id];
+    }
+
+    #[view]
+    pub fn get_order_state_name(order_id: u256) -> String {
+        return get_state_name(self.order_state[order_id]);
+    }
+
+    #[view]
+    pub fn get_order_amount(order_id: u256) -> u256 {
+        return self.order_amount[order_id];
+    }
+
+    #[view]
+    pub fn get_total_volume() -> u256 {
+        return self.total_volume;
+    }
+
+    #[view]
+    pub fn get_completed_count() -> u256 {
+        return self.completed_orders;
+    }
+
+    #[view]
+    pub fn get_disputed_count() -> u256 {
+        return self.disputed_orders;
+    }
+}

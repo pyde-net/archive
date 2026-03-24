@@ -1,0 +1,357 @@
+// Scholarship fund management with application, review, and disbursement using resource types
+use std::math;
+
+struct ScholarshipGrant {
+    scholarship_id: u32,
+    recipient: Address,
+    amount: u256,
+    disbursed: u256,
+    created_at: u64,
+}
+
+contract ScholarshipFund {
+    storage {
+        admin: Address,
+        next_scholarship_id: u32,
+        scholarships: Map<u32, Scholarship>,
+        applications: Map<u32, Map<u64, Application>>,
+        application_counts: Map<u32, u64>,
+        applicant_index: Map<u32, Map<Address, u64>>,
+        reviewers: Map<Address, bool>,
+        review_scores: Map<u32, Map<u64, Map<Address, ReviewScore>>>,
+        grants: Map<u32, Map<Address, GrantInfo>>,
+        disbursement_schedule: Map<u32, Map<Address, Map<u8, Disbursement>>>,
+        total_funds: u256,
+        total_granted: u256,
+        total_disbursed: u256,
+    }
+
+    struct Scholarship {
+        name_hash: u256,
+        criteria_hash: u256,
+        total_fund: u256,
+        remaining_fund: u256,
+        max_award: u256,
+        min_gpa_x100: u16,
+        application_deadline: u64,
+        num_awards: u32,
+        awarded: u32,
+        status: u8,
+        created_at: u64,
+    }
+
+    struct Application {
+        applicant: Address,
+        essay_hash: u256,
+        gpa_x100: u16,
+        transcript_hash: u256,
+        submitted_at: u64,
+        status: u8,
+        total_score: u32,
+        review_count: u8,
+    }
+
+    struct ReviewScore {
+        academic: u8,
+        leadership: u8,
+        community: u8,
+        essay_quality: u8,
+        overall: u8,
+        comments_hash: u256,
+        timestamp: u64,
+    }
+
+    struct GrantInfo {
+        amount: u256,
+        approved: bool,
+        approved_at: u64,
+        total_disbursed: u256,
+        installments_paid: u8,
+        total_installments: u8,
+    }
+
+    struct Disbursement {
+        amount: u256,
+        scheduled_at: u64,
+        paid_at: u64,
+        paid: bool,
+    }
+
+    event ScholarshipCreated {
+        #[indexed]
+        scholarship_id: u32,
+        total_fund: u256,
+    }
+
+    event ApplicationSubmitted {
+        #[indexed]
+        scholarship_id: u32,
+        #[indexed]
+        applicant: Address,
+        app_index: u64,
+    }
+
+    event ApplicationReviewed {
+        #[indexed]
+        scholarship_id: u32,
+        app_index: u64,
+        reviewer: Address,
+    }
+
+    event GrantAwarded {
+        #[indexed]
+        scholarship_id: u32,
+        #[indexed]
+        recipient: Address,
+        amount: u256,
+    }
+
+    event DisbursementPaid {
+        #[indexed]
+        scholarship_id: u32,
+        #[indexed]
+        recipient: Address,
+        installment: u8,
+        amount: u256,
+    }
+
+    error NotAdmin {}
+    error NotReviewer {}
+    error ScholarshipNotFound { id: u32 }
+    error ApplicationDeadlinePassed {}
+    error AlreadyApplied {}
+    error GpaBelowMinimum { required: u16, actual: u16 }
+    error NoAwardsRemaining {}
+    error InsufficientFunds { available: u256, required: u256 }
+    error ApplicationNotFound { index: u64 }
+    error AlreadyReviewed {}
+    error NotEnoughReviews { required: u8, actual: u8 }
+    error AlreadyAwarded {}
+    error DisbursementNotDue {}
+    error AlreadyDisbursed {}
+    error GrantNotFound {}
+
+    const SECONDS_PER_DAY: u64 = 86400;
+    const DISBURSEMENT_INTERVAL_DAYS: u64 = 90;
+    const MIN_REVIEWS_REQUIRED: u8 = 2;
+
+    #[constructor]
+    pub fn init() {
+        self.admin = msg.sender;
+        self.next_scholarship_id = 1;
+        self.total_funds = 0;
+        self.total_granted = 0;
+        self.total_disbursed = 0;
+    }
+
+    pub fn add_reviewer(reviewer: Address) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        self.reviewers[reviewer] = true;
+    }
+
+    pub fn create_scholarship(
+        name_hash: u256,
+        criteria_hash: u256,
+        max_award: u256,
+        min_gpa_x100: u16,
+        deadline_days: u64,
+        num_awards: u32,
+    ) -> u32 {
+        require!(msg.sender == self.admin, NotAdmin {});
+
+        let id = self.next_scholarship_id;
+        self.next_scholarship_id += 1;
+
+        self.scholarships[id] = Scholarship {
+            name_hash: name_hash,
+            criteria_hash: criteria_hash,
+            total_fund: msg.value,
+            remaining_fund: msg.value,
+            max_award: max_award,
+            min_gpa_x100: min_gpa_x100,
+            application_deadline: block.timestamp + (deadline_days * 86400),
+            num_awards: num_awards,
+            awarded: 0,
+            status: 0,
+            created_at: block.timestamp,
+        };
+
+        self.application_counts[id] = 0;
+        self.total_funds += msg.value;
+
+        emit ScholarshipCreated { scholarship_id: id, total_fund: msg.value };
+        return id;
+    }
+
+    pub fn apply(
+        scholarship_id: u32,
+        essay_hash: u256,
+        gpa_x100: u16,
+        transcript_hash: u256,
+    ) {
+        let s = self.scholarships[scholarship_id];
+        require!(s.status == 0 || s.status == 1, ScholarshipNotFound { id: scholarship_id });
+        require!(block.timestamp <= s.application_deadline, ApplicationDeadlinePassed {});
+        require!(gpa_x100 >= s.min_gpa_x100, GpaBelowMinimum {
+            required: s.min_gpa_x100,
+            actual: gpa_x100,
+        });
+
+        let existing = self.applicant_index[scholarship_id][msg.sender];
+        require!(existing == 0, AlreadyApplied {});
+
+        let idx = self.application_counts[scholarship_id] + 1;
+        self.application_counts[scholarship_id] = idx;
+
+        self.applications[scholarship_id][idx] = Application {
+            applicant: msg.sender,
+            essay_hash: essay_hash,
+            gpa_x100: gpa_x100,
+            transcript_hash: transcript_hash,
+            submitted_at: block.timestamp,
+            status: 0,
+            total_score: 0,
+            review_count: 0,
+        };
+
+        self.applicant_index[scholarship_id][msg.sender] = idx;
+        emit ApplicationSubmitted { scholarship_id: scholarship_id, applicant: msg.sender, app_index: idx };
+    }
+
+    pub fn review_application(
+        scholarship_id: u32,
+        app_index: u64,
+        academic: u8,
+        leadership: u8,
+        community: u8,
+        essay_quality: u8,
+        comments_hash: u256,
+    ) {
+        require!(self.reviewers[msg.sender], NotReviewer {});
+        require!(app_index <= self.application_counts[scholarship_id], ApplicationNotFound { index: app_index });
+
+        let existing = self.review_scores[scholarship_id][app_index][msg.sender];
+        require!(existing.timestamp == 0, AlreadyReviewed {});
+
+        let overall = (academic as u32 + leadership as u32 + community as u32 + essay_quality as u32) / 4;
+
+        self.review_scores[scholarship_id][app_index][msg.sender] = ReviewScore {
+            academic: academic,
+            leadership: leadership,
+            community: community,
+            essay_quality: essay_quality,
+            overall: overall as u8,
+            comments_hash: comments_hash,
+            timestamp: block.timestamp,
+        };
+
+        self.applications[scholarship_id][app_index].total_score += overall;
+        self.applications[scholarship_id][app_index].review_count += 1;
+
+        emit ApplicationReviewed {
+            scholarship_id: scholarship_id,
+            app_index: app_index,
+            reviewer: msg.sender,
+        };
+    }
+
+    #[reentrant]
+    pub fn award_grant(
+        scholarship_id: u32,
+        recipient: Address,
+        amount: u256,
+        installments: u8,
+    ) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        let s = self.scholarships[scholarship_id];
+        require!(s.awarded < s.num_awards, NoAwardsRemaining {});
+        require!(amount <= s.max_award, InsufficientFunds { available: s.max_award, required: amount });
+        require!(amount <= s.remaining_fund, InsufficientFunds {
+            available: s.remaining_fund,
+            required: amount,
+        });
+
+        let app_idx = self.applicant_index[scholarship_id][recipient];
+        require!(app_idx > 0, ApplicationNotFound { index: 0 });
+        require!(
+            self.applications[scholarship_id][app_idx].review_count >= 2,
+            NotEnoughReviews { required: 2, actual: self.applications[scholarship_id][app_idx].review_count }
+        );
+
+        self.grants[scholarship_id][recipient] = GrantInfo {
+            amount: amount,
+            approved: true,
+            approved_at: block.timestamp,
+            total_disbursed: 0,
+            installments_paid: 0,
+            total_installments: installments,
+        };
+
+        // Set up disbursement schedule
+        let per_installment = amount / installments as u256;
+        let mut i: u8 = 0;
+        while i < installments {
+            let scheduled = block.timestamp + (i as u64 * 90 * 86400);
+            self.disbursement_schedule[scholarship_id][recipient][i] = Disbursement {
+                amount: per_installment,
+                scheduled_at: scheduled,
+                paid_at: 0,
+                paid: false,
+            };
+            i += 1;
+        }
+
+        self.scholarships[scholarship_id].awarded += 1;
+        self.scholarships[scholarship_id].remaining_fund -= amount;
+        self.applications[scholarship_id][app_idx].status = 1;
+        self.total_granted += amount;
+
+        emit GrantAwarded { scholarship_id: scholarship_id, recipient: recipient, amount: amount };
+    }
+
+    #[reentrant]
+    pub fn disburse(scholarship_id: u32, recipient: Address, installment: u8) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        let grant = self.grants[scholarship_id][recipient];
+        require!(grant.approved, GrantNotFound {});
+
+        let d = self.disbursement_schedule[scholarship_id][recipient][installment];
+        require!(!d.paid, AlreadyDisbursed {});
+        require!(block.timestamp >= d.scheduled_at, DisbursementNotDue {});
+
+        self.disbursement_schedule[scholarship_id][recipient][installment].paid = true;
+        self.disbursement_schedule[scholarship_id][recipient][installment].paid_at = block.timestamp;
+        self.grants[scholarship_id][recipient].installments_paid += 1;
+        self.grants[scholarship_id][recipient].total_disbursed += d.amount;
+        self.total_disbursed += d.amount;
+
+        raw_call!(recipient, d.amount, bytes(""));
+
+        emit DisbursementPaid {
+            scholarship_id: scholarship_id,
+            recipient: recipient,
+            installment: installment,
+            amount: d.amount,
+        };
+    }
+
+    #[view]
+    pub fn get_scholarship(id: u32) -> Scholarship {
+        return self.scholarships[id];
+    }
+
+    #[view]
+    pub fn get_application(scholarship_id: u32, index: u64) -> Application {
+        return self.applications[scholarship_id][index];
+    }
+
+    #[view]
+    pub fn get_grant(scholarship_id: u32, recipient: Address) -> GrantInfo {
+        return self.grants[scholarship_id][recipient];
+    }
+
+    #[view]
+    pub fn get_total_stats() -> (u256, u256, u256) {
+        return (self.total_funds, self.total_granted, self.total_disbursed);
+    }
+}

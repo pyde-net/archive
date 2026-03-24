@@ -1,0 +1,233 @@
+// String manipulation utilities for Otigen smart contracts.
+// Provides common string operations: length, concatenation, slicing,
+// comparison, hashing, and conversion helpers.
+
+module string_utils;
+
+error IndexOutOfBounds { index: u64, length: u64 }
+error EmptyString {}
+error InvalidHexCharacter { char_code: u8 }
+
+/// Returns the length of a string in bytes.
+pub fn length(s: String) -> u64 {
+    return s.len();
+}
+
+/// Returns true if the string is empty.
+pub fn is_empty(s: String) -> bool {
+    return s.len() == 0u64;
+}
+
+/// Returns true if two strings are equal.
+pub fn equals(a: String, b: String) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    return a == b;
+}
+
+/// Concatenates two strings.
+pub fn concat(a: String, b: String) -> String {
+    return a + b;
+}
+
+/// Concatenates three strings.
+pub fn concat3(a: String, b: String, c: String) -> String {
+    return a + b + c;
+}
+
+/// Returns a substring from start index (inclusive) to end index (exclusive).
+pub fn substring(s: String, start: u64, end: u64) -> String {
+    let len = s.len();
+    require!(start <= len, IndexOutOfBounds { index: start, length: len });
+    require!(end <= len, IndexOutOfBounds { index: end, length: len });
+    require!(start <= end, IndexOutOfBounds { index: start, length: end });
+    return s.slice(start, end);
+}
+
+/// Returns the character (as a single-byte string) at the given index.
+pub fn char_at(s: String, index: u64) -> String {
+    let len = s.len();
+    require!(index < len, IndexOutOfBounds { index: index, length: len });
+    return s.slice(index, index + 1u64);
+}
+
+/// Returns true if the string starts with the given prefix.
+pub fn starts_with(s: String, prefix: String) -> bool {
+    let s_len = s.len();
+    let p_len = prefix.len();
+    if p_len > s_len {
+        return false;
+    }
+    return s.slice(0u64, p_len) == prefix;
+}
+
+/// Returns true if the string ends with the given suffix.
+pub fn ends_with(s: String, suffix: String) -> bool {
+    let s_len = s.len();
+    let sf_len = suffix.len();
+    if sf_len > s_len {
+        return false;
+    }
+    return s.slice(s_len - sf_len, s_len) == suffix;
+}
+
+/// Returns true if the string contains the given substring.
+pub fn contains(haystack: String, needle: String) -> bool {
+    let h_len = haystack.len();
+    let n_len = needle.len();
+    if n_len > h_len {
+        return false;
+    }
+    if n_len == 0u64 {
+        return true;
+    }
+
+    let end = h_len - n_len + 1u64;
+    for i in 0u64..end {
+        if haystack.slice(i, i + n_len) == needle {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Returns the first index of needle in haystack, or max u64 if not found.
+pub fn index_of(haystack: String, needle: String) -> u64 {
+    let h_len = haystack.len();
+    let n_len = needle.len();
+    if n_len > h_len {
+        return 18446744073709551615u64; // u64::MAX as "not found"
+    }
+
+    let end = h_len - n_len + 1u64;
+    for i in 0u64..end {
+        if haystack.slice(i, i + n_len) == needle {
+            return i;
+        }
+    }
+    return 18446744073709551615u64;
+}
+
+/// Pads a string on the left with the given pad character to reach target length.
+pub fn pad_left(s: String, target_len: u64, pad: String) -> String {
+    let mut result = s;
+    while result.len() < target_len {
+        result = pad + result;
+    }
+    return result;
+}
+
+/// Pads a string on the right with the given pad character to reach target length.
+pub fn pad_right(s: String, target_len: u64, pad: String) -> String {
+    let mut result = s;
+    while result.len() < target_len {
+        result = result + pad;
+    }
+    return result;
+}
+
+/// Repeats a string n times.
+pub fn repeat(s: String, n: u64) -> String {
+    let mut result = "";
+    for i in 0u64..n {
+        result = result + s;
+    }
+    return result;
+}
+
+/// Converts a u256 value to its decimal string representation.
+pub fn u256_to_string(value: u256) -> String {
+    if value == 0u256 {
+        return "0";
+    }
+
+    let mut result = "";
+    let mut remaining = value;
+
+    while remaining > 0u256 {
+        let digit = remaining % 10u256;
+        let digit_char = match digit {
+            0u256 => "0",
+            1u256 => "1",
+            2u256 => "2",
+            3u256 => "3",
+            4u256 => "4",
+            5u256 => "5",
+            6u256 => "6",
+            7u256 => "7",
+            8u256 => "8",
+            9u256 => "9",
+        };
+        result = digit_char + result;
+        remaining = remaining / 10u256;
+    }
+
+    return result;
+}
+
+/// Converts a hex nibble (0-15) to its character.
+fn nibble_to_hex(n: u8) -> String {
+    match n {
+        0u8 => return "0",
+        1u8 => return "1",
+        2u8 => return "2",
+        3u8 => return "3",
+        4u8 => return "4",
+        5u8 => return "5",
+        6u8 => return "6",
+        7u8 => return "7",
+        8u8 => return "8",
+        9u8 => return "9",
+        10u8 => return "a",
+        11u8 => return "b",
+        12u8 => return "c",
+        13u8 => return "d",
+        14u8 => return "e",
+        15u8 => return "f",
+    }
+    return "0";
+}
+
+/// Converts a single byte to a two-character hex string.
+pub fn byte_to_hex(b: u8) -> String {
+    let high = nibble_to_hex(b / 16u8);
+    let low = nibble_to_hex(b % 16u8);
+    return high + low;
+}
+
+/// Converts an Address to its lowercase hex string with "0x" prefix.
+pub fn address_to_hex_string(addr: Address) -> String {
+    let raw: bytes = addr.to_bytes();
+    let mut result = "0x";
+    for i in 0u64..20u64 {
+        result = result + byte_to_hex(raw[i]);
+    }
+    return result;
+}
+
+// --- Tests ---
+
+#[test]
+fn test_concat() {
+    let result = concat("hello", " world");
+    require!(result == "hello world", EmptyString {});
+}
+
+#[test]
+fn test_starts_with() {
+    require!(starts_with("hello world", "hello"), EmptyString {});
+    require!(!starts_with("hello", "world"), EmptyString {});
+}
+
+#[test]
+fn test_contains() {
+    require!(contains("foobar", "oba"), EmptyString {});
+    require!(!contains("foobar", "xyz"), EmptyString {});
+}
+
+#[test]
+fn test_u256_to_string() {
+    let s = u256_to_string(12345u256);
+    require!(s == "12345", EmptyString {});
+}

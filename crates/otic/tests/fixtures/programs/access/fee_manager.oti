@@ -1,0 +1,505 @@
+// Fee configuration manager with tiered fee structures, volume discounts,
+// fee collection, distribution, and admin controls.
+
+use std::token::IERC20;
+
+contract FeeManager {
+    storage {
+        owner: Address,
+        fee_collector: Address,
+        treasury: Address,
+        next_tier_id: u64,
+        tiers: Map<u64, FeeTier>,
+        tier_ids: Vec<u64>,
+        user_tier_override: Map<Address, u64>,
+        fee_exemptions: Map<Address, bool>,
+        collected_fees: Map<Address, u256>, // token -> total collected
+        unclaimed_fees: Map<Address, u256>,
+        fee_recipients: Vec<FeeRecipient>,
+        total_distribution_bps: u64,
+        volume_tracker: Map<Address, VolumeInfo>,
+        volume_discount_tiers: Vec<VolumeDiscount>,
+        protocol_fee_bps: u64,
+        max_fee_bps: u64,
+        min_fee_bps: u64,
+        fee_update_cooldown: u64,
+        last_fee_update: u64,
+        paused: bool,
+    }
+
+    struct FeeTier {
+        id: u64,
+        name: String,
+        fee_bps: u64,
+        min_amount: u256,
+        max_amount: u256, // 0 = unlimited
+        active: bool,
+    }
+
+    struct FeeRecipient {
+        recipient: Address,
+        share_bps: u64,
+        name: String,
+        total_received: u256,
+    }
+
+    struct VolumeInfo {
+        total_volume: u256,
+        volume_this_period: u256,
+        period_start: u64,
+        discount_bps: u64,
+    }
+
+    struct VolumeDiscount {
+        min_volume: u256,
+        discount_bps: u64,
+    }
+
+    struct FeeCalculation {
+        base_fee: u256,
+        discount: u256,
+        net_fee: u256,
+        tier_used: u64,
+    }
+
+    const BPS_DENOMINATOR: u256 = 10000;
+    const MAX_DISTRIBUTION_BPS: u64 = 10000;
+    const MAX_PROTOCOL_FEE_BPS: u64 = 5000; // 50%
+    const MIN_FEE_BPS: u64 = 1; // 0.01%
+    const VOLUME_PERIOD_SECONDS: u64 = 2592000; // 30 days
+
+    event FeeCollected {
+        #[indexed]
+        payer: Address,
+        #[indexed]
+        token: Address,
+        amount: u256,
+        fee: u256,
+        tier: u64,
+    }
+
+    event FeeDistributed {
+        #[indexed]
+        recipient: Address,
+        #[indexed]
+        token: Address,
+        amount: u256,
+    }
+
+    event TierCreated {
+        #[indexed]
+        tier_id: u64,
+        name: String,
+        fee_bps: u64,
+    }
+
+    event TierUpdated {
+        #[indexed]
+        tier_id: u64,
+        old_fee_bps: u64,
+        new_fee_bps: u64,
+    }
+
+    event ExemptionGranted {
+        #[indexed]
+        account: Address,
+    }
+
+    event ExemptionRevoked {
+        #[indexed]
+        account: Address,
+    }
+
+    event FeeRecipientAdded {
+        recipient: Address,
+        share_bps: u64,
+    }
+
+    event ProtocolFeeUpdated {
+        old_bps: u64,
+        new_bps: u64,
+    }
+
+    error Unauthorized {}
+    error NotOwner {}
+    error NotCollector {}
+    error TierNotFound {}
+    error TierNotActive {}
+    error ExemptUser {}
+    error InvalidFeeBps { fee: u64, max: u64 }
+    error CooldownNotElapsed { next_update_at: u64 }
+    error DistributionExceeds10000 { total: u64 }
+    error NoFeesToDistribute {}
+    error ZeroAddress {}
+    error ZeroAmount {}
+    error ContractPaused {}
+    error AmountOutOfTierRange { amount: u256, min: u256, max: u256 }
+    error TransferFailed {}
+
+    #[constructor]
+    pub fn init(
+        fee_collector: Address,
+        treasury: Address,
+        protocol_fee_bps: u64,
+        max_fee_bps: u64,
+        fee_update_cooldown: u64,
+    ) {
+        require!(fee_collector != Address::ZERO, ZeroAddress {});
+        require!(treasury != Address::ZERO, ZeroAddress {});
+
+        self.owner = msg.sender;
+        self.fee_collector = fee_collector;
+        self.treasury = treasury;
+        self.protocol_fee_bps = protocol_fee_bps;
+        self.max_fee_bps = max_fee_bps;
+        self.min_fee_bps = MIN_FEE_BPS;
+        self.fee_update_cooldown = fee_update_cooldown;
+        self.next_tier_id = 1;
+        self.paused = false;
+    }
+
+    pub fn create_tier(
+        name: String,
+        fee_bps: u64,
+        min_amount: u256,
+        max_amount: u256,
+    ) -> u64 {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(fee_bps <= self.max_fee_bps, InvalidFeeBps {
+            fee: fee_bps,
+            max: self.max_fee_bps,
+        });
+
+        let id = self.next_tier_id;
+        self.next_tier_id = id + 1;
+
+        self.tiers[id] = FeeTier {
+            id: id,
+            name: name,
+            fee_bps: fee_bps,
+            min_amount: min_amount,
+            max_amount: max_amount,
+            active: true,
+        };
+
+        self.tier_ids.push(id);
+
+        emit TierCreated { tier_id: id, name: name, fee_bps: fee_bps };
+
+        return id;
+    }
+
+    pub fn update_tier_fee(tier_id: u64, new_fee_bps: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(new_fee_bps <= self.max_fee_bps, InvalidFeeBps {
+            fee: new_fee_bps,
+            max: self.max_fee_bps,
+        });
+        require!(
+            block.timestamp >= self.last_fee_update + self.fee_update_cooldown,
+            CooldownNotElapsed {
+                next_update_at: self.last_fee_update + self.fee_update_cooldown,
+            },
+        );
+
+        let mut tier = self.tiers[tier_id];
+        require!(tier.active, TierNotFound {});
+
+        let old_bps = tier.fee_bps;
+        tier.fee_bps = new_fee_bps;
+        self.tiers[tier_id] = tier;
+        self.last_fee_update = block.timestamp;
+
+        emit TierUpdated {
+            tier_id: tier_id,
+            old_fee_bps: old_bps,
+            new_fee_bps: new_fee_bps,
+        };
+    }
+
+    pub fn deactivate_tier(tier_id: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        let mut tier = self.tiers[tier_id];
+        require!(tier.active, TierNotFound {});
+        tier.active = false;
+        self.tiers[tier_id] = tier;
+    }
+
+    // Calculate fee for a given amount and user
+    #[view]
+    pub fn calculate_fee(user: Address, amount: u256) -> FeeCalculation {
+        if self.fee_exemptions[user] {
+            return FeeCalculation {
+                base_fee: 0,
+                discount: 0,
+                net_fee: 0,
+                tier_used: 0,
+            };
+        }
+
+        // Find applicable tier
+        let tier_id = self.find_tier(user, amount);
+        let tier = self.tiers[tier_id];
+        let base_fee = (amount * tier.fee_bps) / BPS_DENOMINATOR;
+
+        // Apply volume discount
+        let vol = self.volume_tracker[user];
+        let discount_bps = self.get_volume_discount(vol.total_volume);
+        let discount = (base_fee * discount_bps) / BPS_DENOMINATOR;
+        let net_fee = base_fee - discount;
+
+        return FeeCalculation {
+            base_fee: base_fee,
+            discount: discount,
+            net_fee: net_fee,
+            tier_used: tier_id,
+        };
+    }
+
+    fn find_tier(user: Address, amount: u256) -> u64 {
+        // Check for user-specific tier override
+        let override_tier = self.user_tier_override[user];
+        if override_tier != 0 && self.tiers[override_tier].active {
+            return override_tier;
+        }
+
+        // Find best matching tier based on amount
+        let mut best_tier: u64 = 0;
+        for i in 0..self.tier_ids.len() {
+            let tid = self.tier_ids[i];
+            let tier = self.tiers[tid];
+            if !tier.active {
+                continue;
+            }
+            if amount >= tier.min_amount {
+                if tier.max_amount == 0 || amount <= tier.max_amount {
+                    best_tier = tid;
+                }
+            }
+        }
+
+        return best_tier;
+    }
+
+    fn get_volume_discount(total_volume: u256) -> u64 {
+        let mut best_discount: u64 = 0;
+        for i in 0..self.volume_discount_tiers.len() {
+            let vd = self.volume_discount_tiers[i];
+            if total_volume >= vd.min_volume && vd.discount_bps > best_discount {
+                best_discount = vd.discount_bps;
+            }
+        }
+        return best_discount;
+    }
+
+    // Collect fee on a transaction (called by integrated contracts)
+    pub fn collect_fee(payer: Address, token: Address, amount: u256) -> u256 {
+        require!(!self.paused, ContractPaused {});
+        require!(amount > 0, ZeroAmount {});
+
+        if self.fee_exemptions[payer] {
+            return 0;
+        }
+
+        let calc = self.calculate_fee(payer, amount);
+        if calc.net_fee == 0 {
+            return 0;
+        }
+
+        // Transfer fee from payer
+        if token == Address::ZERO {
+            // Native token - fee must be included in msg.value
+            self.collected_fees[Address::ZERO] = self.collected_fees[Address::ZERO] + calc.net_fee;
+            self.unclaimed_fees[Address::ZERO] = self.unclaimed_fees[Address::ZERO] + calc.net_fee;
+        } else {
+            let erc20 = IERC20::at(token);
+            let success = erc20.transfer_from(payer, address(self), calc.net_fee);
+            require!(success, TransferFailed {});
+            self.collected_fees[token] = self.collected_fees[token] + calc.net_fee;
+            self.unclaimed_fees[token] = self.unclaimed_fees[token] + calc.net_fee;
+        }
+
+        // Update volume tracking
+        let mut vol = self.volume_tracker[payer];
+        if block.timestamp > vol.period_start + VOLUME_PERIOD_SECONDS {
+            vol.volume_this_period = amount;
+            vol.period_start = block.timestamp;
+        } else {
+            vol.volume_this_period = vol.volume_this_period + amount;
+        }
+        vol.total_volume = vol.total_volume + amount;
+        vol.discount_bps = self.get_volume_discount(vol.total_volume);
+        self.volume_tracker[payer] = vol;
+
+        emit FeeCollected {
+            payer: payer,
+            token: token,
+            amount: amount,
+            fee: calc.net_fee,
+            tier: calc.tier_used,
+        };
+
+        return calc.net_fee;
+    }
+
+    // Distribute collected fees to recipients
+    pub fn distribute_fees(token: Address) {
+        require!(
+            msg.sender == self.owner || msg.sender == self.fee_collector,
+            NotCollector {},
+        );
+
+        let available = self.unclaimed_fees[token];
+        require!(available > 0, NoFeesToDistribute {});
+
+        // Protocol fee goes to treasury
+        let protocol_amount = (available * self.protocol_fee_bps) / BPS_DENOMINATOR;
+        let distributable = available - protocol_amount;
+
+        if protocol_amount > 0 {
+            if token == Address::ZERO {
+                raw_call!(self.treasury, protocol_amount, bytes::empty());
+            } else {
+                let erc20 = IERC20::at(token);
+                let success = erc20.transfer(self.treasury, protocol_amount);
+                require!(success, TransferFailed {});
+            }
+        }
+
+        // Distribute to recipients by share
+        for i in 0..self.fee_recipients.len() {
+            let mut recipient = self.fee_recipients[i];
+            let share = (distributable * recipient.share_bps) / BPS_DENOMINATOR;
+            if share > 0 {
+                if token == Address::ZERO {
+                    raw_call!(recipient.recipient, share, bytes::empty());
+                } else {
+                    let erc20 = IERC20::at(token);
+                    let success = erc20.transfer(recipient.recipient, share);
+                    require!(success, TransferFailed {});
+                }
+                recipient.total_received = recipient.total_received + share;
+                self.fee_recipients[i] = recipient;
+
+                emit FeeDistributed {
+                    recipient: recipient.recipient,
+                    token: token,
+                    amount: share,
+                };
+            }
+        }
+
+        self.unclaimed_fees[token] = 0;
+    }
+
+    pub fn add_fee_recipient(recipient: Address, share_bps: u64, name: String) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(recipient != Address::ZERO, ZeroAddress {});
+        let new_total = self.total_distribution_bps + share_bps;
+        require!(new_total <= MAX_DISTRIBUTION_BPS, DistributionExceeds10000 { total: new_total });
+
+        self.fee_recipients.push(FeeRecipient {
+            recipient: recipient,
+            share_bps: share_bps,
+            name: name,
+            total_received: 0,
+        });
+
+        self.total_distribution_bps = new_total;
+
+        emit FeeRecipientAdded { recipient: recipient, share_bps: share_bps };
+    }
+
+    pub fn add_volume_discount(min_volume: u256, discount_bps: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.volume_discount_tiers.push(VolumeDiscount {
+            min_volume: min_volume,
+            discount_bps: discount_bps,
+        });
+    }
+
+    pub fn grant_exemption(account: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.fee_exemptions[account] = true;
+        emit ExemptionGranted { account: account };
+    }
+
+    pub fn revoke_exemption(account: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.fee_exemptions[account] = false;
+        emit ExemptionRevoked { account: account };
+    }
+
+    pub fn set_user_tier(user: Address, tier_id: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.user_tier_override[user] = tier_id;
+    }
+
+    pub fn update_protocol_fee(new_bps: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(new_bps <= MAX_PROTOCOL_FEE_BPS, InvalidFeeBps { fee: new_bps, max: MAX_PROTOCOL_FEE_BPS });
+        let old = self.protocol_fee_bps;
+        self.protocol_fee_bps = new_bps;
+        emit ProtocolFeeUpdated { old_bps: old, new_bps: new_bps };
+    }
+
+    pub fn set_fee_collector(new_collector: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(new_collector != Address::ZERO, ZeroAddress {});
+        self.fee_collector = new_collector;
+    }
+
+    pub fn pause() {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.paused = true;
+    }
+
+    pub fn unpause() {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.paused = false;
+    }
+
+    #[view]
+    pub fn get_tier(tier_id: u64) -> FeeTier {
+        return self.tiers[tier_id];
+    }
+
+    #[view]
+    pub fn get_all_tier_ids() -> Vec<u64> {
+        return self.tier_ids;
+    }
+
+    #[view]
+    pub fn get_collected_fees(token: Address) -> u256 {
+        return self.collected_fees[token];
+    }
+
+    #[view]
+    pub fn get_unclaimed_fees(token: Address) -> u256 {
+        return self.unclaimed_fees[token];
+    }
+
+    #[view]
+    pub fn get_user_volume(user: Address) -> VolumeInfo {
+        return self.volume_tracker[user];
+    }
+
+    #[view]
+    pub fn is_exempt(user: Address) -> bool {
+        return self.fee_exemptions[user];
+    }
+
+    #[view]
+    pub fn get_fee_recipients() -> Vec<FeeRecipient> {
+        return self.fee_recipients;
+    }
+
+    #[view]
+    pub fn get_effective_fee_bps(user: Address, amount: u256) -> u64 {
+        let calc = self.calculate_fee(user, amount);
+        if amount == 0 {
+            return 0;
+        }
+        return ((calc.net_fee * BPS_DENOMINATOR) / amount) as u64;
+    }
+}

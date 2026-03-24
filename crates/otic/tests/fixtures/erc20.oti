@@ -1,0 +1,94 @@
+contract PydeToken {
+    storage {
+        name: String,
+        symbol: String,
+        decimals: u8,
+        total_supply: u256,
+        balances: Map<Address, u256>,
+        allowances: Map<Address, Map<Address, u256>>,
+    }
+
+    event Transfer {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    event Approval {
+        #[indexed]
+        owner: Address,
+        #[indexed]
+        spender: Address,
+        amount: u256,
+    }
+
+    error InsufficientBalance { available: u256, required: u256 }
+    error InsufficientAllowance { available: u256, required: u256 }
+    error TransferToZeroAddress {}
+
+    #[constructor]
+    pub fn init(name: String, symbol: String, decimals: u8, initial_supply: u256) {
+        self.name = name;
+        self.symbol = symbol;
+        self.decimals = decimals;
+        self.total_supply = initial_supply;
+        self.balances[msg.sender] = initial_supply;
+        emit Transfer { from: Address::ZERO, to: msg.sender, amount: initial_supply };
+    }
+
+    pub fn transfer(to: Address, amount: u256) {
+        require!(to != Address::ZERO, TransferToZeroAddress {});
+        let from_bal = self.balances[msg.sender];
+        require!(from_bal >= amount, InsufficientBalance {
+            available: from_bal,
+            required: amount,
+        });
+
+        self.balances[msg.sender] = from_bal - amount;
+        self.balances[to] = self.balances[to] + amount;
+        emit Transfer { from: msg.sender, to: to, amount: amount };
+    }
+
+    pub fn approve(spender: Address, amount: u256) {
+        self.allowances[msg.sender][spender] = amount;
+        emit Approval { owner: msg.sender, spender: spender, amount: amount };
+    }
+
+    pub fn transfer_from(from: Address, to: Address, amount: u256) {
+        require!(to != Address::ZERO, TransferToZeroAddress {});
+        let allowance = self.allowances[from][msg.sender];
+        require!(allowance >= amount, InsufficientAllowance {
+            available: allowance,
+            required: amount,
+        });
+
+        self.allowances[from][msg.sender] = allowance - amount;
+
+        let from_bal = self.balances[from];
+        require!(from_bal >= amount, InsufficientBalance {
+            available: from_bal,
+            required: amount,
+        });
+
+        self.balances[from] = from_bal - amount;
+        self.balances[to] = self.balances[to] + amount;
+        emit Transfer { from: from, to: to, amount: amount };
+    }
+
+    #[view]
+    pub fn balance_of(owner: Address) -> u256 {
+        return self.balances[owner];
+    }
+
+    #[view]
+    pub fn allowance(owner: Address, spender: Address) -> u256 {
+        return self.allowances[owner][spender];
+    }
+
+    #[view]
+    pub fn get_total_supply() -> u256 {
+        return self.total_supply;
+    }
+}

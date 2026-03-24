@@ -1,0 +1,308 @@
+// Complex struct patterns: nested structs, arrays, bytes, strings
+
+use std::signature;
+
+contract DocumentVault {
+    struct Document {
+        id: u256,
+        title: String,
+        content_hash: [u8; 32],
+        metadata: DocumentMetadata,
+        signatures: Vec<SignatureRecord>,
+        tags: Vec<String>,
+        raw_data: bytes,
+        version: u32,
+    }
+
+    struct DocumentMetadata {
+        author: Address,
+        created_at: u64,
+        updated_at: u64,
+        mime_type: String,
+        size_bytes: u64,
+        checksum: [u8; 32],
+        permissions: AccessPermissions,
+    }
+
+    struct AccessPermissions {
+        owner: Address,
+        readers: Vec<Address>,
+        writers: Vec<Address>,
+        is_public: bool,
+        expiry: u64,
+    }
+
+    struct SignatureRecord {
+        signer: Address,
+        signature: bytes,
+        public_key: bytes,
+        signed_at: u64,
+        purpose: String,
+    }
+
+    struct SearchResult {
+        doc_id: u256,
+        title: String,
+        author: Address,
+        relevance_score: u64,
+    }
+
+    storage {
+        owner: Address,
+        next_id: u256,
+        documents: Map<u256, Document>,
+        author_docs: Map<Address, Vec<u256>>,
+        tag_index: Map<String, Vec<u256>>,
+        nonces: Map<Address, u256>,
+    }
+
+    event DocumentCreated {
+        #[indexed]
+        id: u256,
+        #[indexed]
+        author: Address,
+        title: String,
+        content_hash: [u8; 32],
+    }
+
+    event DocumentSigned {
+        #[indexed]
+        doc_id: u256,
+        #[indexed]
+        signer: Address,
+        purpose: String,
+    }
+
+    event PermissionsUpdated {
+        #[indexed]
+        doc_id: u256,
+        is_public: bool,
+        reader_count: u64,
+    }
+
+    error DocumentNotFound { id: u256 }
+    error Unauthorized { caller: Address, doc_id: u256 }
+    error InvalidSignature { signer: Address }
+    error DuplicateSignature { signer: Address, doc_id: u256 }
+    error ExpiredPermission { doc_id: u256, expiry: u64 }
+    error InvalidContentHash {}
+
+    #[constructor]
+    pub fn init() {
+        self.owner = msg.sender;
+        self.next_id = 1;
+    }
+
+    pub fn create_document(
+        title: String,
+        content_hash: [u8; 32],
+        mime_type: String,
+        size_bytes: u64,
+        raw_data: bytes,
+        tags: Vec<String>,
+        is_public: bool,
+    ) -> u256 {
+        require!(content_hash != [0u8; 32], InvalidContentHash {});
+
+        let checksum = hash(raw_data.as_bytes());
+        let id = self.next_id;
+
+        let permissions = AccessPermissions {
+            owner: msg.sender,
+            readers: Vec::new(),
+            writers: Vec::new(),
+            is_public: is_public,
+            expiry: 0,
+        };
+
+        let metadata = DocumentMetadata {
+            author: msg.sender,
+            created_at: block.timestamp,
+            updated_at: block.timestamp,
+            mime_type: mime_type,
+            size_bytes: size_bytes,
+            checksum: checksum,
+            permissions: permissions,
+        };
+
+        let doc = Document {
+            id: id,
+            title: title,
+            content_hash: content_hash,
+            metadata: metadata,
+            signatures: Vec::new(),
+            tags: tags,
+            raw_data: raw_data,
+            version: 1,
+        };
+
+        // Index by tag
+        for i in 0..doc.tags.len() {
+            let tag = doc.tags[i];
+            self.tag_index[tag].push(id);
+        }
+
+        self.documents[id] = doc;
+        self.author_docs[msg.sender].push(id);
+        self.next_id = id + 1;
+
+        emit DocumentCreated {
+            id: id,
+            author: msg.sender,
+            title: title,
+            content_hash: content_hash,
+        };
+
+        return id;
+    }
+
+    pub fn sign_document(
+        doc_id: u256,
+        sig: bytes,
+        public_key: bytes,
+        purpose: String,
+    ) {
+        require!(self.documents[doc_id].id != 0, DocumentNotFound { id: doc_id });
+        let doc = self.documents[doc_id];
+
+        // Verify the signature over the content hash
+        let message = doc.content_hash;
+        let valid = signature::verify(message, sig, public_key);
+        let signer = signature::recover(message, sig);
+        require!(valid, InvalidSignature { signer: msg.sender });
+
+        // Check no duplicate signature from same signer
+        for i in 0..doc.signatures.len() {
+            require!(
+                doc.signatures[i].signer != msg.sender,
+                DuplicateSignature { signer: msg.sender, doc_id: doc_id }
+            );
+        }
+
+        let record = SignatureRecord {
+            signer: msg.sender,
+            signature: sig,
+            public_key: public_key,
+            signed_at: block.timestamp,
+            purpose: purpose,
+        };
+
+        self.documents[doc_id].signatures.push(record);
+
+        emit DocumentSigned {
+            doc_id: doc_id,
+            signer: msg.sender,
+            purpose: purpose,
+        };
+    }
+
+    pub fn update_permissions(
+        doc_id: u256,
+        readers: Vec<Address>,
+        writers: Vec<Address>,
+        is_public: bool,
+        expiry: u64,
+    ) {
+        let doc = self.documents[doc_id];
+        require!(doc.id != 0, DocumentNotFound { id: doc_id });
+        require!(
+            doc.metadata.permissions.owner == msg.sender,
+            Unauthorized { caller: msg.sender, doc_id: doc_id }
+        );
+
+        self.documents[doc_id].metadata.permissions = AccessPermissions {
+            owner: msg.sender,
+            readers: readers,
+            writers: writers,
+            is_public: is_public,
+            expiry: expiry,
+        };
+
+        self.documents[doc_id].metadata.updated_at = block.timestamp;
+
+        emit PermissionsUpdated {
+            doc_id: doc_id,
+            is_public: is_public,
+            reader_count: readers.len() as u64,
+        };
+    }
+
+    #[view]
+    pub fn get_document(doc_id: u256) -> Document {
+        let doc = self.documents[doc_id];
+        require!(doc.id != 0, DocumentNotFound { id: doc_id });
+
+        // Check access
+        if !doc.metadata.permissions.is_public {
+            let perms = doc.metadata.permissions;
+            let mut has_access = msg.sender == perms.owner;
+
+            if !has_access {
+                for i in 0..perms.readers.len() {
+                    if perms.readers[i] == msg.sender {
+                        has_access = true;
+                        break;
+                    }
+                }
+            }
+
+            require!(has_access, Unauthorized { caller: msg.sender, doc_id: doc_id });
+
+            if perms.expiry > 0 {
+                require!(
+                    block.timestamp <= perms.expiry,
+                    ExpiredPermission { doc_id: doc_id, expiry: perms.expiry }
+                );
+            }
+        }
+
+        return doc;
+    }
+
+    #[view]
+    pub fn get_signatures(doc_id: u256) -> Vec<SignatureRecord> {
+        let doc = self.documents[doc_id];
+        require!(doc.id != 0, DocumentNotFound { id: doc_id });
+        return doc.signatures;
+    }
+
+    #[view]
+    pub fn verify_document_signature(doc_id: u256, signer: Address) -> bool {
+        let doc = self.documents[doc_id];
+        for i in 0..doc.signatures.len() {
+            if doc.signatures[i].signer == signer {
+                let record = doc.signatures[i];
+                let valid = signature::verify(
+                    doc.content_hash,
+                    record.signature,
+                    record.public_key,
+                );
+                return valid;
+            }
+        }
+        return false;
+    }
+
+    #[view]
+    pub fn search_by_tag(tag: String) -> Vec<SearchResult> {
+        let doc_ids = self.tag_index[tag];
+        let mut results: Vec<SearchResult> = Vec::new();
+
+        for i in 0..doc_ids.len() {
+            let doc = self.documents[doc_ids[i]];
+            results.push(SearchResult {
+                doc_id: doc.id,
+                title: doc.title,
+                author: doc.metadata.author,
+                relevance_score: 100,
+            });
+        }
+
+        return results;
+    }
+
+    #[view]
+    pub fn get_document_count_by_author(author: Address) -> u64 {
+        return self.author_docs[author].len() as u64;
+    }
+}

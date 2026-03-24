@@ -1,0 +1,513 @@
+// StableSwap AMM using the Curve invariant for stablecoin pairs
+// Uses the StableSwap invariant: A*n^n * sum(x_i) + D = A*D*n^n + D^(n+1) / (n^n * prod(x_i))
+use std::math;
+use std::token::IERC20;
+
+contract StableSwap {
+    storage {
+        owner: Address,
+
+        // Pool tokens (up to 4 assets)
+        tokens: Vec<Address>,
+        token_count: u256,
+        token_index: Map<Address, u256>,       // token -> index in pool
+        token_precision: Map<u256, u256>,       // index -> 10^(18-decimals) precision multiplier
+        balances: Vec<u256>,                    // normalized balances (all in 18 decimals)
+
+        // LP token
+        lp_total_supply: u256,
+        lp_balances: Map<Address, u256>,
+
+        // Curve parameters
+        amplification: u256,        // A parameter (higher = more stable, lower = more like constant product)
+        future_amplification: u256,
+        amplification_ramp_end: u64,
+        amplification_ramp_start: u64,
+        initial_amplification: u256,
+
+        // Fees (scaled 1e10)
+        swap_fee: u256,             // e.g. 4000000 = 0.04%
+        admin_fee: u256,            // percentage of swap_fee that goes to admin
+        admin_balances: Vec<u256>,
+
+        fee_recipient: Address,
+        locked: bool,
+
+        // Stats
+        total_trades: u256,
+        total_volume: u256,
+
+        scale: u256,
+        fee_scale: u256,
+    }
+
+    event TokenSwap {
+        #[indexed]
+        buyer: Address,
+        token_sold: u256,
+        token_bought: u256,
+        sold_amount: u256,
+        bought_amount: u256,
+    }
+
+    event AddLiquidity {
+        #[indexed]
+        provider: Address,
+        token_amounts: Vec<u256>,
+        lp_minted: u256,
+    }
+
+    event RemoveLiquidity {
+        #[indexed]
+        provider: Address,
+        token_amounts: Vec<u256>,
+        lp_burned: u256,
+    }
+
+    event RemoveLiquidityOne {
+        #[indexed]
+        provider: Address,
+        token_index: u256,
+        amount: u256,
+        lp_burned: u256,
+    }
+
+    event RampA {
+        old_a: u256,
+        new_a: u256,
+        ramp_end: u64,
+    }
+
+    error InvalidTokenIndex { index: u256, max: u256 }
+    error InsufficientOutput { expected: u256, actual: u256 }
+    error SlippageExceeded { min_amount: u256, actual: u256 }
+    error InsufficientLpBalance { available: u256, required: u256 }
+    error PoolImbalanced {}
+    error Locked {}
+    error NotOwner {}
+    error ZeroAmount {}
+    error InvariantBroken {}
+    error IdenticalTokens {}
+    error RampInProgress {}
+
+    #[constructor]
+    pub fn init(
+        tokens: Vec<Address>,
+        precisions: Vec<u256>,
+        amplification: u256,
+        swap_fee: u256,
+        admin_fee: u256,
+    ) {
+        self.owner = msg.sender;
+        self.fee_recipient = msg.sender;
+        self.token_count = tokens.len();
+        self.amplification = amplification;
+        self.swap_fee = swap_fee;
+        self.admin_fee = admin_fee;
+        self.locked = false;
+        self.scale = 1000000000000000000u256;
+        self.fee_scale = 10000000000u256;
+
+        for i in 0..tokens.len() {
+            self.tokens.push(tokens[i]);
+            self.token_index[tokens[i]] = i;
+            self.token_precision[i] = precisions[i];
+            self.balances.push(0u256);
+            self.admin_balances.push(0u256);
+        }
+    }
+
+    fn lock() {
+        require!(!self.locked, Locked {});
+        self.locked = true;
+    }
+
+    fn unlock() {
+        self.locked = false;
+    }
+
+    // Get the current amplification coefficient (may be ramping)
+    fn get_a() -> u256 {
+        if block.timestamp >= self.amplification_ramp_end {
+            return self.future_amplification;
+        }
+
+        let elapsed = block.timestamp - self.amplification_ramp_start;
+        let total_duration = self.amplification_ramp_end - self.amplification_ramp_start;
+        let diff = if self.future_amplification > self.initial_amplification {
+            self.future_amplification - self.initial_amplification
+        } else {
+            self.initial_amplification - self.future_amplification
+        };
+
+        let change = (diff * (elapsed as u256)) / (total_duration as u256);
+
+        if self.future_amplification > self.initial_amplification {
+            return self.initial_amplification + change;
+        }
+        return self.initial_amplification - change;
+    }
+
+    // Compute the StableSwap invariant D
+    // Newton's method: D_new = (A*n*S + n*D_P*D) / ((A*n - 1)*D + (n+1)*D_P)
+    fn get_d(xp: Vec<u256>, amp: u256) -> u256 {
+        let n = self.token_count;
+        let mut s: u256 = 0u256;
+        for i in 0..n {
+            s = s + xp[i];
+        }
+        if s == 0u256 {
+            return 0u256;
+        }
+
+        let ann = amp * n;
+        let mut d = s;
+
+        // Newton iterations
+        for _iter in 0..256u256 {
+            let mut d_p = d;
+            for i in 0..n {
+                d_p = (d_p * d) / (xp[i] * n);
+            }
+
+            let d_prev = d;
+            let numerator = (ann * s + d_p * n) * d;
+            let denominator = (ann - 1u256) * d + (n + 1u256) * d_p;
+            d = numerator / denominator;
+
+            // Check convergence
+            let diff = if d > d_prev { d - d_prev } else { d_prev - d };
+            if diff <= 1u256 {
+                return d;
+            }
+        }
+
+        return d;
+    }
+
+    // Get y (balance of token j) given x (new balance of token i) and D
+    fn get_y(i: u256, j: u256, x: u256, xp: Vec<u256>) -> u256 {
+        let n = self.token_count;
+        let amp = self.get_a();
+        let d = self.get_d(xp, amp);
+        let ann = amp * n;
+
+        let mut s: u256 = 0u256;
+        let mut c = d;
+
+        for k in 0..n {
+            let x_k = if k == i { x } else { xp[k] };
+            if k != j {
+                s = s + x_k;
+                c = (c * d) / (x_k * n);
+            }
+        }
+
+        c = (c * d) / (ann * n);
+        let b = s + d / ann;
+
+        let mut y = d;
+        for _iter in 0..256u256 {
+            let y_prev = y;
+            y = (y * y + c) / (2u256 * y + b - d);
+
+            let diff = if y > y_prev { y - y_prev } else { y_prev - y };
+            if diff <= 1u256 {
+                return y;
+            }
+        }
+
+        return y;
+    }
+
+    // --- Core operations ---
+
+    #[reentrant]
+    pub fn swap(
+        token_in: Address,
+        token_out: Address,
+        amount_in: u256,
+        min_amount_out: u256,
+    ) -> u256 {
+        self.lock();
+        require!(token_in != token_out, IdenticalTokens {});
+        require!(amount_in > 0u256, ZeroAmount {});
+
+        let i = self.token_index[token_in];
+        let j = self.token_index[token_out];
+        require!(i < self.token_count, InvalidTokenIndex { index: i, max: self.token_count });
+        require!(j < self.token_count, InvalidTokenIndex { index: j, max: self.token_count });
+
+        // Normalize to 18 decimals
+        let dx = amount_in * self.token_precision[i];
+
+        // Build xp (current balances)
+        let mut xp: Vec<u256> = Vec::new();
+        for k in 0..self.token_count {
+            xp.push(self.balances[k]);
+        }
+
+        let x_new = xp[i] + dx;
+        let y_new = self.get_y(i, j, x_new, xp);
+        let dy = xp[j] - y_new - 1u256; // -1 for rounding
+
+        // Apply swap fee
+        let fee = (dy * self.swap_fee) / self.fee_scale;
+        let admin_fee_amount = (fee * self.admin_fee) / self.fee_scale;
+        let dy_after_fee = dy - fee;
+
+        // Convert back from normalized
+        let amount_out = dy_after_fee / self.token_precision[j];
+
+        require!(amount_out >= min_amount_out, SlippageExceeded {
+            min_amount: min_amount_out,
+            actual: amount_out,
+        });
+
+        // Update balances
+        self.balances[i] = x_new;
+        self.balances[j] = y_new + admin_fee_amount;
+        self.admin_balances[j] = self.admin_balances[j] + admin_fee_amount;
+
+        // Transfer tokens
+        IERC20::at(token_in).transfer_from(msg.sender, address(self), amount_in);
+        IERC20::at(token_out).transfer(msg.sender, amount_out);
+
+        self.total_trades = self.total_trades + 1u256;
+        self.total_volume = self.total_volume + amount_in;
+
+        emit TokenSwap {
+            buyer: msg.sender,
+            token_sold: i,
+            token_bought: j,
+            sold_amount: amount_in,
+            bought_amount: amount_out,
+        };
+
+        self.unlock();
+        return amount_out;
+    }
+
+    #[reentrant]
+    pub fn add_liquidity(amounts: Vec<u256>, min_lp: u256) -> u256 {
+        self.lock();
+        let n = self.token_count;
+        let amp = self.get_a();
+
+        // Get D before
+        let mut old_xp: Vec<u256> = Vec::new();
+        for i in 0..n {
+            old_xp.push(self.balances[i]);
+        }
+        let d0 = self.get_d(old_xp, amp);
+
+        // Deposit tokens and compute new balances
+        let mut new_xp: Vec<u256> = Vec::new();
+        for i in 0..n {
+            let amount = amounts[i];
+            if amount > 0u256 {
+                IERC20::at(self.tokens[i]).transfer_from(msg.sender, address(self), amount);
+            }
+            let normalized = amount * self.token_precision[i];
+            new_xp.push(self.balances[i] + normalized);
+            self.balances[i] = self.balances[i] + normalized;
+        }
+
+        // Get D after
+        let d1 = self.get_d(new_xp, amp);
+        require!(d1 > d0, PoolImbalanced {});
+
+        // Calculate LP tokens to mint
+        let mut lp_minted: u256 = 0u256;
+        if self.lp_total_supply == 0u256 {
+            lp_minted = d1;
+        } else {
+            lp_minted = (self.lp_total_supply * (d1 - d0)) / d0;
+        }
+
+        require!(lp_minted >= min_lp, SlippageExceeded { min_amount: min_lp, actual: lp_minted });
+
+        self.lp_balances[msg.sender] = self.lp_balances[msg.sender] + lp_minted;
+        self.lp_total_supply = self.lp_total_supply + lp_minted;
+
+        emit AddLiquidity { provider: msg.sender, token_amounts: amounts, lp_minted: lp_minted };
+
+        self.unlock();
+        return lp_minted;
+    }
+
+    #[reentrant]
+    pub fn remove_liquidity(lp_amount: u256, min_amounts: Vec<u256>) {
+        self.lock();
+        let lp_bal = self.lp_balances[msg.sender];
+        require!(lp_bal >= lp_amount, InsufficientLpBalance {
+            available: lp_bal,
+            required: lp_amount,
+        });
+
+        let n = self.token_count;
+        let mut amounts: Vec<u256> = Vec::new();
+
+        for i in 0..n {
+            let amount_normalized = (self.balances[i] * lp_amount) / self.lp_total_supply;
+            let amount = amount_normalized / self.token_precision[i];
+            require!(amount >= min_amounts[i], SlippageExceeded {
+                min_amount: min_amounts[i],
+                actual: amount,
+            });
+            amounts.push(amount);
+            self.balances[i] = self.balances[i] - amount_normalized;
+            IERC20::at(self.tokens[i]).transfer(msg.sender, amount);
+        }
+
+        self.lp_balances[msg.sender] = lp_bal - lp_amount;
+        self.lp_total_supply = self.lp_total_supply - lp_amount;
+
+        emit RemoveLiquidity { provider: msg.sender, token_amounts: amounts, lp_burned: lp_amount };
+        self.unlock();
+    }
+
+    #[reentrant]
+    pub fn remove_liquidity_one_token(lp_amount: u256, token_index: u256, min_amount: u256) -> u256 {
+        self.lock();
+        require!(token_index < self.token_count, InvalidTokenIndex {
+            index: token_index,
+            max: self.token_count,
+        });
+
+        let lp_bal = self.lp_balances[msg.sender];
+        require!(lp_bal >= lp_amount, InsufficientLpBalance {
+            available: lp_bal,
+            required: lp_amount,
+        });
+
+        let amp = self.get_a();
+        let n = self.token_count;
+
+        // Calculate amount to withdraw
+        let mut xp: Vec<u256> = Vec::new();
+        for i in 0..n {
+            xp.push(self.balances[i]);
+        }
+
+        let d0 = self.get_d(xp, amp);
+        let d1 = d0 - (lp_amount * d0) / self.lp_total_supply;
+
+        // Calculate new balance for target token
+        let mut new_xp: Vec<u256> = Vec::new();
+        for i in 0..n {
+            if i == token_index {
+                new_xp.push(0u256); // placeholder
+            } else {
+                new_xp.push(xp[i]);
+            }
+        }
+
+        let y = self.get_y(token_index, token_index, d1, xp);
+        let dy = xp[token_index] - y;
+
+        // Apply fee
+        let fee = (dy * self.swap_fee) / self.fee_scale;
+        let amount_out = (dy - fee) / self.token_precision[token_index];
+
+        require!(amount_out >= min_amount, SlippageExceeded {
+            min_amount: min_amount,
+            actual: amount_out,
+        });
+
+        self.balances[token_index] = self.balances[token_index] - dy + fee;
+        self.lp_balances[msg.sender] = lp_bal - lp_amount;
+        self.lp_total_supply = self.lp_total_supply - lp_amount;
+
+        IERC20::at(self.tokens[token_index]).transfer(msg.sender, amount_out);
+
+        emit RemoveLiquidityOne {
+            provider: msg.sender,
+            token_index: token_index,
+            amount: amount_out,
+            lp_burned: lp_amount,
+        };
+
+        self.unlock();
+        return amount_out;
+    }
+
+    // --- Admin ---
+
+    pub fn ramp_a(new_a: u256, ramp_duration: u64) {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(block.timestamp >= self.amplification_ramp_end, RampInProgress {});
+
+        self.initial_amplification = self.get_a();
+        self.future_amplification = new_a;
+        self.amplification_ramp_start = block.timestamp;
+        self.amplification_ramp_end = block.timestamp + ramp_duration;
+
+        emit RampA {
+            old_a: self.initial_amplification,
+            new_a: new_a,
+            ramp_end: self.amplification_ramp_end,
+        };
+    }
+
+    pub fn withdraw_admin_fees() {
+        require!(msg.sender == self.owner, NotOwner {});
+        for i in 0..self.token_count {
+            let amount = self.admin_balances[i] / self.token_precision[i];
+            if amount > 0u256 {
+                self.admin_balances[i] = 0u256;
+                IERC20::at(self.tokens[i]).transfer(self.fee_recipient, amount);
+            }
+        }
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn get_dy(i: u256, j: u256, dx: u256) -> u256 {
+        let dx_normalized = dx * self.token_precision[i];
+        let mut xp: Vec<u256> = Vec::new();
+        for k in 0..self.token_count {
+            xp.push(self.balances[k]);
+        }
+        let x_new = xp[i] + dx_normalized;
+        let y_new = self.get_y(i, j, x_new, xp);
+        let dy = xp[j] - y_new - 1u256;
+        let fee = (dy * self.swap_fee) / self.fee_scale;
+        return (dy - fee) / self.token_precision[j];
+    }
+
+    #[view]
+    pub fn get_virtual_price() -> u256 {
+        let amp = self.get_a();
+        let mut xp: Vec<u256> = Vec::new();
+        for i in 0..self.token_count {
+            xp.push(self.balances[i]);
+        }
+        let d = self.get_d(xp, amp);
+        if self.lp_total_supply == 0u256 {
+            return 0u256;
+        }
+        return (d * self.scale) / self.lp_total_supply;
+    }
+
+    #[view]
+    pub fn get_amplification() -> u256 {
+        return self.get_a();
+    }
+
+    #[view]
+    pub fn get_balances() -> Vec<u256> {
+        return self.balances;
+    }
+
+    #[view]
+    pub fn get_lp_balance(user: Address) -> u256 {
+        return self.lp_balances[user];
+    }
+
+    #[view]
+    pub fn get_total_trades() -> u256 {
+        return self.total_trades;
+    }
+}

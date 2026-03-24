@@ -1,0 +1,312 @@
+// Renewable Energy Certificate (REC) issuance, trading, and retirement
+use std::math;
+
+struct RenewableCertificate {
+    certificate_id: u64,
+    source: u8,
+    mwh_generated: u256,
+    vintage_month: u8,
+    vintage_year: u16,
+    facility_id: u32,
+}
+
+enum RECSourceType {
+    Solar,         // 0
+    OnshoreWind,   // 1
+    OffshoreWind,  // 2
+    Hydro,         // 3
+    Geothermal,    // 4
+    Biomass,       // 5
+}
+
+contract RECRegistry {
+    storage {
+        authority: Address,
+        next_cert_id: u64,
+        next_facility_id: u32,
+        facilities: Map<u32, Facility>,
+        certificates: Map<u64, CertificateInfo>,
+        cert_owners: Map<u64, Address>,
+        owner_certs: Map<Address, Vec<u64>>,
+        retired_certs: Map<u64, RetirementInfo>,
+        facility_operators: Map<Address, Vec<u32>>,
+        monthly_generation: Map<u32, Map<u16, Map<u8, u256>>>,
+        total_mwh_certified: u256,
+        total_mwh_retired: u256,
+        bundled_sales: Map<u64, BundledSale>,
+        next_sale_id: u64,
+    }
+
+    struct Facility {
+        operator: Address,
+        name_hash: u256,
+        location_hash: u256,
+        source_type: u8,
+        capacity_mw: u32,
+        commissioned_at: u64,
+        active: bool,
+        total_generation_mwh: u256,
+    }
+
+    struct CertificateInfo {
+        facility_id: u32,
+        source_type: u8,
+        mwh: u256,
+        vintage_month: u8,
+        vintage_year: u16,
+        issued_at: u64,
+        active: bool,
+        tracking_id_hash: u256,
+    }
+
+    struct RetirementInfo {
+        retired: bool,
+        retired_by: Address,
+        retired_at: u64,
+        beneficiary_hash: u256,
+        purpose: u8,
+        compliance_year: u16,
+    }
+
+    struct BundledSale {
+        seller: Address,
+        cert_ids: Vec<u64>,
+        total_mwh: u256,
+        price: u256,
+        buyer: Address,
+        completed: bool,
+    }
+
+    event FacilityRegistered {
+        #[indexed]
+        facility_id: u32,
+        source_type: u8,
+        capacity_mw: u32,
+    }
+
+    event CertificateIssued {
+        #[indexed]
+        cert_id: u64,
+        #[indexed]
+        facility_id: u32,
+        mwh: u256,
+    }
+
+    event CertificateTransferred {
+        #[indexed]
+        cert_id: u64,
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+    }
+
+    event CertificateRetired {
+        #[indexed]
+        cert_id: u64,
+        #[indexed]
+        retired_by: Address,
+        mwh: u256,
+    }
+
+    event BundledSaleCreated {
+        #[indexed]
+        sale_id: u64,
+        total_mwh: u256,
+        price: u256,
+    }
+
+    error NotAuthority {}
+    error FacilityNotFound { id: u32 }
+    error NotOperator {}
+    error CertNotFound { id: u64 }
+    error NotCertOwner {}
+    error CertAlreadyRetired {}
+    error CertNotActive {}
+    error InvalidMonth { month: u8 }
+    error SaleNotFound { id: u64 }
+    error SaleAlreadyCompleted {}
+    error InsufficientPayment { required: u256, sent: u256 }
+    error FacilityInactive {}
+
+    #[constructor]
+    pub fn init() {
+        self.authority = msg.sender;
+        self.next_cert_id = 1;
+        self.next_facility_id = 1;
+        self.next_sale_id = 1;
+        self.total_mwh_certified = 0;
+        self.total_mwh_retired = 0;
+    }
+
+    pub fn register_facility(
+        name_hash: u256,
+        location_hash: u256,
+        source_type: u8,
+        capacity_mw: u32,
+    ) -> u32 {
+        require!(msg.sender == self.authority, NotAuthority {});
+        let id = self.next_facility_id;
+        self.next_facility_id += 1;
+
+        // source_type: 0=solar, 1=onshore_wind, 2=offshore_wind, 3=hydro, 4=geothermal, 5=biomass
+        self.facilities[id] = Facility {
+            operator: msg.sender,
+            name_hash: name_hash,
+            location_hash: location_hash,
+            source_type: source_type,
+            capacity_mw: capacity_mw,
+            commissioned_at: block.timestamp,
+            active: true,
+            total_generation_mwh: 0,
+        };
+
+        self.facility_operators[msg.sender].push(id);
+        emit FacilityRegistered { facility_id: id, source_type: source_type, capacity_mw: capacity_mw };
+        return id;
+    }
+
+    pub fn issue_certificate(
+        facility_id: u32,
+        mwh: u256,
+        vintage_month: u8,
+        vintage_year: u16,
+        tracking_id_hash: u256,
+    ) -> u64 {
+        let facility = self.facilities[facility_id];
+        require!(facility.active, FacilityInactive {});
+        require!(facility.operator == msg.sender || msg.sender == self.authority, NotOperator {});
+        require!(vintage_month >= 1 && vintage_month <= 12, InvalidMonth { month: vintage_month });
+
+        let cert_id = self.next_cert_id;
+        self.next_cert_id += 1;
+
+        self.certificates[cert_id] = CertificateInfo {
+            facility_id: facility_id,
+            source_type: facility.source_type,
+            mwh: mwh,
+            vintage_month: vintage_month,
+            vintage_year: vintage_year,
+            issued_at: block.timestamp,
+            active: true,
+            tracking_id_hash: tracking_id_hash,
+        };
+
+        self.cert_owners[cert_id] = msg.sender;
+        self.owner_certs[msg.sender].push(cert_id);
+        self.facilities[facility_id].total_generation_mwh += mwh;
+        self.monthly_generation[facility_id][vintage_year][vintage_month] += mwh;
+        self.total_mwh_certified += mwh;
+
+        emit CertificateIssued { cert_id: cert_id, facility_id: facility_id, mwh: mwh };
+        return cert_id;
+    }
+
+    pub fn transfer_certificate(cert_id: u64, to: Address) {
+        require!(self.cert_owners[cert_id] == msg.sender, NotCertOwner {});
+        require!(self.certificates[cert_id].active, CertNotActive {});
+        require!(!self.retired_certs[cert_id].retired, CertAlreadyRetired {});
+
+        self.cert_owners[cert_id] = to;
+        self.owner_certs[to].push(cert_id);
+
+        emit CertificateTransferred { cert_id: cert_id, from: msg.sender, to: to };
+    }
+
+    pub fn retire_certificate(
+        cert_id: u64,
+        beneficiary_hash: u256,
+        purpose: u8,
+        compliance_year: u16,
+    ) {
+        require!(self.cert_owners[cert_id] == msg.sender, NotCertOwner {});
+        require!(self.certificates[cert_id].active, CertNotActive {});
+        require!(!self.retired_certs[cert_id].retired, CertAlreadyRetired {});
+
+        let mwh = self.certificates[cert_id].mwh;
+
+        self.retired_certs[cert_id] = RetirementInfo {
+            retired: true,
+            retired_by: msg.sender,
+            retired_at: block.timestamp,
+            beneficiary_hash: beneficiary_hash,
+            purpose: purpose,
+            compliance_year: compliance_year,
+        };
+
+        self.certificates[cert_id].active = false;
+        self.total_mwh_retired += mwh;
+
+        emit CertificateRetired { cert_id: cert_id, retired_by: msg.sender, mwh: mwh };
+    }
+
+    pub fn create_bundled_sale(cert_ids: Vec<u64>, price: u256) -> u64 {
+        let mut total_mwh: u256 = 0;
+
+        for i in 0..cert_ids.len() {
+            let cid = cert_ids[i];
+            require!(self.cert_owners[cid] == msg.sender, NotCertOwner {});
+            require!(self.certificates[cid].active, CertNotActive {});
+            total_mwh += self.certificates[cid].mwh;
+        }
+
+        let sale_id = self.next_sale_id;
+        self.next_sale_id += 1;
+
+        self.bundled_sales[sale_id] = BundledSale {
+            seller: msg.sender,
+            cert_ids: cert_ids,
+            total_mwh: total_mwh,
+            price: price,
+            buyer: Address::ZERO,
+            completed: false,
+        };
+
+        emit BundledSaleCreated { sale_id: sale_id, total_mwh: total_mwh, price: price };
+        return sale_id;
+    }
+
+    #[reentrant]
+    pub fn buy_bundle(sale_id: u64) {
+        let sale = self.bundled_sales[sale_id];
+        require!(!sale.completed, SaleAlreadyCompleted {});
+        require!(msg.value >= sale.price, InsufficientPayment { required: sale.price, sent: msg.value });
+
+        let ids = sale.cert_ids;
+        for i in 0..ids.len() {
+            self.cert_owners[ids[i]] = msg.sender;
+            self.owner_certs[msg.sender].push(ids[i]);
+            emit CertificateTransferred { cert_id: ids[i], from: sale.seller, to: msg.sender };
+        }
+
+        self.bundled_sales[sale_id].buyer = msg.sender;
+        self.bundled_sales[sale_id].completed = true;
+
+        raw_call!(sale.seller, msg.value, bytes(""));
+    }
+
+    #[view]
+    pub fn get_certificate(cert_id: u64) -> CertificateInfo {
+        return self.certificates[cert_id];
+    }
+
+    #[view]
+    pub fn get_facility(id: u32) -> Facility {
+        return self.facilities[id];
+    }
+
+    #[view]
+    pub fn get_cert_owner(cert_id: u64) -> Address {
+        return self.cert_owners[cert_id];
+    }
+
+    #[view]
+    pub fn is_retired(cert_id: u64) -> bool {
+        return self.retired_certs[cert_id].retired;
+    }
+
+    #[view]
+    pub fn get_monthly_generation(facility_id: u32, year: u16, month: u8) -> u256 {
+        return self.monthly_generation[facility_id][year][month];
+    }
+}

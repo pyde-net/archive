@@ -1,0 +1,300 @@
+// NFT contract with on-chain creator royalty enforcement.
+// Royalties are collected on every transfer and distributed to the creator
+// and optional split recipients. Transfers that bypass the royalty payment revert.
+
+use std::token::INFT;
+
+contract RoyaltyNFT {
+    const MAX_ROYALTY_BPS: u256 = 2500; // 25% maximum royalty
+
+    storage {
+        name: String,
+        symbol: String,
+        owner: Address,
+        next_token_id: u256,
+        owners: Map<u256, Address>,
+        balances: Map<Address, u256>,
+        token_uris: Map<u256, String>,
+        approvals: Map<u256, Address>,
+        operator_approvals: Map<Address, Map<Address, bool>>,
+
+        // Royalty configuration per token
+        token_creator: Map<u256, Address>,
+        token_royalty_bps: Map<u256, u256>,
+
+        // Default royalty
+        default_royalty_bps: u256,
+        default_royalty_receiver: Address,
+
+        // Royalty splits: token_id -> array of split recipients
+        split_count: Map<u256, u256>,
+        split_recipients: Map<u256, Map<u256, Address>>,
+        split_shares: Map<u256, Map<u256, u256>>,    // basis points per recipient
+
+        // Accumulated royalties
+        pending_royalties: Map<Address, u256>,
+        total_royalties_collected: u256,
+
+        // Transfer registry for royalty enforcement
+        approved_marketplaces: Map<Address, bool>,
+    }
+
+    event Transfer {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        #[indexed]
+        token_id: u256,
+    }
+
+    event RoyaltyPaid {
+        #[indexed]
+        token_id: u256,
+        #[indexed]
+        payer: Address,
+        total_amount: u256,
+    }
+
+    event RoyaltyWithdrawn {
+        #[indexed]
+        recipient: Address,
+        amount: u256,
+    }
+
+    event MarketplaceApproved {
+        #[indexed]
+        marketplace: Address,
+        approved: bool,
+    }
+
+    event RoyaltySplitConfigured {
+        #[indexed]
+        token_id: u256,
+        recipient_count: u256,
+    }
+
+    error TokenDoesNotExist { token_id: u256 }
+    error NotOwnerOrApproved {}
+    error NotContractOwner {}
+    error NotTokenCreator { token_id: u256 }
+    error RoyaltyTooHigh { bps: u256 }
+    error InvalidSplitShares {}
+    error NoPendingRoyalties {}
+    error UnapprovedMarketplace { marketplace: Address }
+    error TransferToZeroAddress {}
+
+    #[constructor]
+    pub fn init(name: String, symbol: String, default_royalty_bps: u256) {
+        require!(default_royalty_bps <= MAX_ROYALTY_BPS, RoyaltyTooHigh { bps: default_royalty_bps });
+        self.name = name;
+        self.symbol = symbol;
+        self.owner = msg.sender;
+        self.default_royalty_bps = default_royalty_bps;
+        self.default_royalty_receiver = msg.sender;
+        self.next_token_id = 1;
+        self.total_royalties_collected = 0;
+    }
+
+    pub fn mint(to: Address, uri: String) -> u256 {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        let token_id = self.next_token_id;
+        self.next_token_id = token_id + 1;
+
+        self.owners[token_id] = to;
+        self.balances[to] = self.balances[to] + 1;
+        self.token_uris[token_id] = uri;
+        self.token_creator[token_id] = msg.sender;
+        self.token_royalty_bps[token_id] = self.default_royalty_bps;
+
+        emit Transfer { from: Address::ZERO, to: to, token_id: token_id };
+        return token_id;
+    }
+
+    pub fn mint_with_royalty(to: Address, uri: String, royalty_bps: u256) -> u256 {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        require!(royalty_bps <= MAX_ROYALTY_BPS, RoyaltyTooHigh { bps: royalty_bps });
+
+        let token_id = self.next_token_id;
+        self.next_token_id = token_id + 1;
+
+        self.owners[token_id] = to;
+        self.balances[to] = self.balances[to] + 1;
+        self.token_uris[token_id] = uri;
+        self.token_creator[token_id] = msg.sender;
+        self.token_royalty_bps[token_id] = royalty_bps;
+
+        emit Transfer { from: Address::ZERO, to: to, token_id: token_id };
+        return token_id;
+    }
+
+    pub fn configure_splits(
+        token_id: u256,
+        recipients: Vec<Address>,
+        shares: Vec<u256>,
+    ) {
+        require!(self.exists(token_id), TokenDoesNotExist { token_id: token_id });
+        require!(msg.sender == self.token_creator[token_id], NotTokenCreator { token_id: token_id });
+        require!(recipients.len() == shares.len(), InvalidSplitShares {});
+
+        // Validate shares sum to 10000 (100%)
+        let mut total_shares: u256 = 0;
+        for i in 0..recipients.len() {
+            total_shares = total_shares + shares[i];
+        }
+        require!(total_shares == 10000, InvalidSplitShares {});
+
+        self.split_count[token_id] = recipients.len();
+        for i in 0..recipients.len() {
+            self.split_recipients[token_id][i] = recipients[i];
+            self.split_shares[token_id][i] = shares[i];
+        }
+
+        emit RoyaltySplitConfigured {
+            token_id: token_id,
+            recipient_count: recipients.len(),
+        };
+    }
+
+    // Transfer with royalty payment. The caller must send enough native
+    // value to cover the royalty based on the declared sale price.
+    pub fn transfer_with_royalty(from: Address, to: Address, token_id: u256, sale_price: u256) {
+        require!(self.exists(token_id), TokenDoesNotExist { token_id: token_id });
+        require!(to != Address::ZERO, TransferToZeroAddress {});
+        require!(self.is_approved_or_owner(msg.sender, token_id), NotOwnerOrApproved {});
+
+        let royalty_bps = self.token_royalty_bps[token_id];
+        let royalty_amount = (sale_price * royalty_bps) / 10000;
+
+        if royalty_amount > 0 {
+            self.distribute_royalty(token_id, royalty_amount);
+            self.total_royalties_collected = self.total_royalties_collected + royalty_amount;
+
+            emit RoyaltyPaid {
+                token_id: token_id,
+                payer: msg.sender,
+                total_amount: royalty_amount,
+            };
+        }
+
+        // Execute the transfer
+        self.approvals[token_id] = Address::ZERO;
+        self.balances[from] = self.balances[from] - 1;
+        self.balances[to] = self.balances[to] + 1;
+        self.owners[token_id] = to;
+
+        emit Transfer { from: from, to: to, token_id: token_id };
+    }
+
+    // Direct transfer (no sale price, no royalty) -- only between non-marketplace addresses
+    pub fn transfer_from(from: Address, to: Address, token_id: u256) {
+        require!(self.exists(token_id), TokenDoesNotExist { token_id: token_id });
+        require!(to != Address::ZERO, TransferToZeroAddress {});
+        require!(self.is_approved_or_owner(msg.sender, token_id), NotOwnerOrApproved {});
+
+        // Block unapproved marketplace transfers to enforce royalties
+        if self.approved_marketplaces[msg.sender] {
+            revert!(UnapprovedMarketplace { marketplace: msg.sender });
+        }
+
+        self.approvals[token_id] = Address::ZERO;
+        self.balances[from] = self.balances[from] - 1;
+        self.balances[to] = self.balances[to] + 1;
+        self.owners[token_id] = to;
+
+        emit Transfer { from: from, to: to, token_id: token_id };
+    }
+
+    pub fn withdraw_royalties() {
+        let amount = self.pending_royalties[msg.sender];
+        require!(amount > 0, NoPendingRoyalties {});
+
+        self.pending_royalties[msg.sender] = 0;
+        raw_call!(msg.sender, amount, bytes(""));
+
+        emit RoyaltyWithdrawn { recipient: msg.sender, amount: amount };
+    }
+
+    pub fn set_marketplace_approved(marketplace: Address, approved: bool) {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        self.approved_marketplaces[marketplace] = approved;
+        emit MarketplaceApproved { marketplace: marketplace, approved: approved };
+    }
+
+    pub fn approve(to: Address, token_id: u256) {
+        let token_owner = self.owners[token_id];
+        require!(self.exists(token_id), TokenDoesNotExist { token_id: token_id });
+        require!(
+            msg.sender == token_owner || self.operator_approvals[token_owner][msg.sender],
+            NotOwnerOrApproved {}
+        );
+        self.approvals[token_id] = to;
+    }
+
+    pub fn set_approval_for_all(operator: Address, approved: bool) {
+        self.operator_approvals[msg.sender][operator] = approved;
+    }
+
+    #[view]
+    pub fn royalty_info(token_id: u256, sale_price: u256) -> (Address, u256) {
+        let bps = self.token_royalty_bps[token_id];
+        let amount = (sale_price * bps) / 10000;
+        let creator = self.token_creator[token_id];
+        return (creator, amount);
+    }
+
+    #[view]
+    pub fn pending_royalty_of(account: Address) -> u256 {
+        return self.pending_royalties[account];
+    }
+
+    #[view]
+    pub fn owner_of(token_id: u256) -> Address {
+        require!(self.exists(token_id), TokenDoesNotExist { token_id: token_id });
+        return self.owners[token_id];
+    }
+
+    #[view]
+    pub fn token_uri(token_id: u256) -> String {
+        require!(self.exists(token_id), TokenDoesNotExist { token_id: token_id });
+        return self.token_uris[token_id];
+    }
+
+    fn exists(token_id: u256) -> bool {
+        return self.owners[token_id] != Address::ZERO;
+    }
+
+    fn is_approved_or_owner(spender: Address, token_id: u256) -> bool {
+        let token_owner = self.owners[token_id];
+        return spender == token_owner
+            || self.approvals[token_id] == spender
+            || self.operator_approvals[token_owner][spender];
+    }
+
+    fn distribute_royalty(token_id: u256, total_amount: u256) {
+        let count = self.split_count[token_id];
+
+        if count == 0 {
+            // No splits configured; all goes to creator
+            let creator = self.token_creator[token_id];
+            self.pending_royalties[creator] = self.pending_royalties[creator] + total_amount;
+        } else {
+            // Distribute according to split shares
+            let mut distributed: u256 = 0;
+            for i in 0..count {
+                let recipient = self.split_recipients[token_id][i];
+                let share = self.split_shares[token_id][i];
+                let amount = (total_amount * share) / 10000;
+                self.pending_royalties[recipient] = self.pending_royalties[recipient] + amount;
+                distributed = distributed + amount;
+            }
+
+            // Remainder due to rounding goes to first recipient
+            if distributed < total_amount {
+                let first = self.split_recipients[token_id][0];
+                self.pending_royalties[first] =
+                    self.pending_royalties[first] + (total_amount - distributed);
+            }
+        }
+    }
+}

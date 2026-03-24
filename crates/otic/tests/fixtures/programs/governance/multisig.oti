@@ -1,0 +1,320 @@
+// Multi-signature wallet requiring n-of-m owner confirmations to execute transactions.
+// Supports adding/removing owners, changing threshold, batched transactions,
+// and transaction expiration.
+
+contract Multisig {
+    const DEFAULT_EXPIRY_DURATION: u64 = 604800; // 7 days in seconds
+
+    storage {
+        owners: Map<Address, bool>,
+        owner_list: Vec<Address>,
+        owner_count: u256,
+        threshold: u256,
+        tx_count: u256,
+        transactions: Map<u256, Transaction>,
+        // tx_id -> owner -> confirmed
+        confirmations: Map<u256, Map<Address, bool>>,
+        confirmation_count: Map<u256, u256>,
+        // Nonce for replay protection
+        nonce: u256,
+    }
+
+    struct Transaction {
+        id: u256,
+        to: Address,
+        value: u256,
+        data: bytes,
+        description: String,
+        submitted_by: Address,
+        submitted_at: u64,
+        expires_at: u64,
+        executed: bool,
+        revoked: bool,
+    }
+
+    event TransactionSubmitted {
+        #[indexed]
+        tx_id: u256,
+        #[indexed]
+        submitter: Address,
+        to: Address,
+        value: u256,
+    }
+
+    event TransactionConfirmed {
+        #[indexed]
+        tx_id: u256,
+        #[indexed]
+        owner: Address,
+    }
+
+    event ConfirmationRevoked {
+        #[indexed]
+        tx_id: u256,
+        #[indexed]
+        owner: Address,
+    }
+
+    event TransactionExecuted {
+        #[indexed]
+        tx_id: u256,
+    }
+
+    event TransactionRevoked {
+        #[indexed]
+        tx_id: u256,
+    }
+
+    event OwnerAdded {
+        #[indexed]
+        owner: Address,
+    }
+
+    event OwnerRemoved {
+        #[indexed]
+        owner: Address,
+    }
+
+    event ThresholdChanged {
+        old_threshold: u256,
+        new_threshold: u256,
+    }
+
+    event Deposited {
+        #[indexed]
+        sender: Address,
+        amount: u256,
+    }
+
+    error NotOwner {}
+    error AlreadyOwner { owner: Address }
+    error NotAnOwner { account: Address }
+    error InvalidThreshold { threshold: u256, owner_count: u256 }
+    error TransactionNotFound {}
+    error TransactionAlreadyExecuted {}
+    error TransactionRevokedErr {}
+    error TransactionExpired {}
+    error AlreadyConfirmed {}
+    error NotConfirmed {}
+    error InsufficientConfirmations { required: u256, current: u256 }
+    error CannotRemoveLastOwner {}
+    error MultisigOnly {}
+    error ZeroAddress {}
+
+    #[constructor]
+    pub fn init(initial_owners: Vec<Address>, threshold: u256) {
+        require!(initial_owners.len() > 0, InvalidThreshold {
+            threshold: threshold,
+            owner_count: 0,
+        });
+        require!(
+            threshold > 0 && threshold <= initial_owners.len(),
+            InvalidThreshold { threshold: threshold, owner_count: initial_owners.len() }
+        );
+
+        for i in 0..initial_owners.len() {
+            let owner = initial_owners[i];
+            require!(owner != Address::ZERO, ZeroAddress {});
+            require!(!self.owners[owner], AlreadyOwner { owner: owner });
+            self.owners[owner] = true;
+            self.owner_list.push(owner);
+        }
+
+        self.owner_count = initial_owners.len();
+        self.threshold = threshold;
+        self.tx_count = 0;
+        self.nonce = 0;
+    }
+
+    // Accept native currency deposits
+    #[sponsored]
+    pub fn deposit() {
+        emit Deposited { sender: msg.sender, amount: msg.value };
+    }
+
+    pub fn submit(
+        to: Address,
+        value: u256,
+        data: bytes,
+        description: String,
+        expiry_duration: u64,
+    ) -> u256 {
+        require!(self.owners[msg.sender], NotOwner {});
+
+        self.tx_count = self.tx_count + 1;
+        let tx_id = self.tx_count;
+        let expires = if expiry_duration > 0 {
+            block.timestamp + expiry_duration
+        } else {
+            block.timestamp + DEFAULT_EXPIRY_DURATION
+        };
+
+        self.transactions[tx_id] = Transaction {
+            id: tx_id,
+            to: to,
+            value: value,
+            data: data,
+            description: description,
+            submitted_by: msg.sender,
+            submitted_at: block.timestamp,
+            expires_at: expires,
+            executed: false,
+            revoked: false,
+        };
+
+        // Auto-confirm by submitter
+        self.confirmations[tx_id][msg.sender] = true;
+        self.confirmation_count[tx_id] = 1;
+
+        emit TransactionSubmitted {
+            tx_id: tx_id,
+            submitter: msg.sender,
+            to: to,
+            value: value,
+        };
+        emit TransactionConfirmed { tx_id: tx_id, owner: msg.sender };
+
+        return tx_id;
+    }
+
+    pub fn confirm(tx_id: u256) {
+        require!(self.owners[msg.sender], NotOwner {});
+        let tx = self.transactions[tx_id];
+        require!(tx.id == tx_id, TransactionNotFound {});
+        require!(!tx.executed, TransactionAlreadyExecuted {});
+        require!(!tx.revoked, TransactionRevokedErr {});
+        require!(block.timestamp <= tx.expires_at, TransactionExpired {});
+        require!(!self.confirmations[tx_id][msg.sender], AlreadyConfirmed {});
+
+        self.confirmations[tx_id][msg.sender] = true;
+        self.confirmation_count[tx_id] = self.confirmation_count[tx_id] + 1;
+
+        emit TransactionConfirmed { tx_id: tx_id, owner: msg.sender };
+    }
+
+    pub fn revoke_confirmation(tx_id: u256) {
+        require!(self.owners[msg.sender], NotOwner {});
+        let tx = self.transactions[tx_id];
+        require!(tx.id == tx_id, TransactionNotFound {});
+        require!(!tx.executed, TransactionAlreadyExecuted {});
+        require!(self.confirmations[tx_id][msg.sender], NotConfirmed {});
+
+        self.confirmations[tx_id][msg.sender] = false;
+        self.confirmation_count[tx_id] = self.confirmation_count[tx_id] - 1;
+
+        emit ConfirmationRevoked { tx_id: tx_id, owner: msg.sender };
+    }
+
+    pub fn execute(tx_id: u256) {
+        require!(self.owners[msg.sender], NotOwner {});
+        let tx = self.transactions[tx_id];
+        require!(tx.id == tx_id, TransactionNotFound {});
+        require!(!tx.executed, TransactionAlreadyExecuted {});
+        require!(!tx.revoked, TransactionRevokedErr {});
+        require!(block.timestamp <= tx.expires_at, TransactionExpired {});
+
+        let confirms = self.confirmation_count[tx_id];
+        require!(confirms >= self.threshold, InsufficientConfirmations {
+            required: self.threshold,
+            current: confirms,
+        });
+
+        self.transactions[tx_id].executed = true;
+        self.nonce = self.nonce + 1;
+
+        raw_call!(tx.to, tx.value, tx.data);
+
+        emit TransactionExecuted { tx_id: tx_id };
+    }
+
+    pub fn revoke_transaction(tx_id: u256) {
+        require!(self.owners[msg.sender], NotOwner {});
+        let tx = self.transactions[tx_id];
+        require!(tx.id == tx_id, TransactionNotFound {});
+        require!(!tx.executed, TransactionAlreadyExecuted {});
+        require!(tx.submitted_by == msg.sender, NotOwner {});
+
+        self.transactions[tx_id].revoked = true;
+
+        emit TransactionRevoked { tx_id: tx_id };
+    }
+
+    // Only callable via confirmed multisig transaction to self
+    pub fn add_owner(new_owner: Address) {
+        require!(msg.sender == address(self), MultisigOnly {});
+        require!(new_owner != Address::ZERO, ZeroAddress {});
+        require!(!self.owners[new_owner], AlreadyOwner { owner: new_owner });
+
+        self.owners[new_owner] = true;
+        self.owner_list.push(new_owner);
+        self.owner_count = self.owner_count + 1;
+
+        emit OwnerAdded { owner: new_owner };
+    }
+
+    pub fn remove_owner(owner_to_remove: Address) {
+        require!(msg.sender == address(self), MultisigOnly {});
+        require!(self.owners[owner_to_remove], NotAnOwner { account: owner_to_remove });
+        require!(self.owner_count > 1, CannotRemoveLastOwner {});
+
+        self.owners[owner_to_remove] = false;
+        self.owner_count = self.owner_count - 1;
+
+        // Adjust threshold if needed
+        if self.threshold > self.owner_count {
+            let old = self.threshold;
+            self.threshold = self.owner_count;
+            emit ThresholdChanged { old_threshold: old, new_threshold: self.owner_count };
+        }
+
+        emit OwnerRemoved { owner: owner_to_remove };
+    }
+
+    pub fn change_threshold(new_threshold: u256) {
+        require!(msg.sender == address(self), MultisigOnly {});
+        require!(
+            new_threshold > 0 && new_threshold <= self.owner_count,
+            InvalidThreshold { threshold: new_threshold, owner_count: self.owner_count }
+        );
+
+        let old = self.threshold;
+        self.threshold = new_threshold;
+
+        emit ThresholdChanged { old_threshold: old, new_threshold: new_threshold };
+    }
+
+    #[view]
+    pub fn get_transaction(tx_id: u256) -> Transaction {
+        return self.transactions[tx_id];
+    }
+
+    #[view]
+    pub fn is_confirmed(tx_id: u256) -> bool {
+        return self.confirmation_count[tx_id] >= self.threshold;
+    }
+
+    #[view]
+    pub fn get_confirmation_count(tx_id: u256) -> u256 {
+        return self.confirmation_count[tx_id];
+    }
+
+    #[view]
+    pub fn is_owner(account: Address) -> bool {
+        return self.owners[account];
+    }
+
+    #[view]
+    pub fn get_threshold() -> u256 {
+        return self.threshold;
+    }
+
+    #[view]
+    pub fn get_owner_count() -> u256 {
+        return self.owner_count;
+    }
+
+    #[view]
+    pub fn get_nonce() -> u256 {
+        return self.nonce;
+    }
+}

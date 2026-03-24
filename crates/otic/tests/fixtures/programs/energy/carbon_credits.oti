@@ -1,0 +1,310 @@
+// Carbon credit registry with minting, retirement, and offset verification
+use std::math;
+use std::token::IERC20;
+
+enum CarbonProjectType {
+    Reforestation,      // 0
+    RenewableEnergy,    // 1
+    MethaneCapture,     // 2
+    DirectAirCapture,   // 3
+}
+
+contract CarbonCreditRegistry {
+    storage {
+        authority: Address,
+        next_project_id: u32,
+        next_credit_batch: u64,
+        projects: Map<u32, CarbonProject>,
+        credit_batches: Map<u64, CreditBatch>,
+        balances: Map<Address, Map<u64, u256>>,
+        retired_credits: Map<Address, u256>,
+        total_issued: u256,
+        total_retired: u256,
+        verifiers: Map<Address, Verifier>,
+        offset_claims: Map<u64, OffsetClaim>,
+        next_claim_id: u64,
+        vintage_year_supply: Map<u16, u256>,
+        project_credit_batches: Map<u32, Vec<u64>>,
+        market_price: Map<u8, u256>,
+    }
+
+    struct CarbonProject {
+        developer: Address,
+        name_hash: u256,
+        methodology_hash: u256,
+        location_hash: u256,
+        project_type: u8,
+        start_date: u64,
+        crediting_period_years: u8,
+        estimated_annual_reduction_tons: u64,
+        verified: bool,
+        verifier: Address,
+        status: u8,
+    }
+
+    struct CreditBatch {
+        project_id: u32,
+        vintage_year: u16,
+        quantity_tons: u256,
+        remaining: u256,
+        verification_hash: u256,
+        issued_at: u64,
+        credit_type: u8,
+        serial_start: u64,
+        serial_end: u64,
+    }
+
+    struct Verifier {
+        accredited: bool,
+        name_hash: u256,
+        projects_verified: u32,
+        methodology_expertise: u8,
+    }
+
+    struct OffsetClaim {
+        claimer: Address,
+        batch_id: u64,
+        amount_tons: u256,
+        purpose_hash: u256,
+        timestamp: u64,
+        verified: bool,
+    }
+
+    event ProjectRegistered {
+        #[indexed]
+        project_id: u32,
+        #[indexed]
+        developer: Address,
+        project_type: u8,
+    }
+
+    event CreditsIssued {
+        #[indexed]
+        batch_id: u64,
+        #[indexed]
+        project_id: u32,
+        quantity_tons: u256,
+        vintage_year: u16,
+    }
+
+    event CreditsTransferred {
+        #[indexed]
+        batch_id: u64,
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    event CreditsRetired {
+        #[indexed]
+        batch_id: u64,
+        #[indexed]
+        retiree: Address,
+        amount: u256,
+    }
+
+    event OffsetClaimCreated {
+        #[indexed]
+        claim_id: u64,
+        claimer: Address,
+        amount_tons: u256,
+    }
+
+    event ProjectVerified {
+        #[indexed]
+        project_id: u32,
+        #[indexed]
+        verifier: Address,
+    }
+
+    error NotAuthority {}
+    error ProjectNotFound { id: u32 }
+    error NotVerifier {}
+    error ProjectNotVerified {}
+    error InsufficientCredits { available: u256, requested: u256 }
+    error BatchNotFound { id: u64 }
+    error NotProjectDeveloper {}
+    error ProjectAlreadyVerified {}
+    error InvalidVintageYear { year: u16 }
+
+    const MIN_VINTAGE_YEAR: u16 = 2020;
+    const MAX_VINTAGE_YEAR: u16 = 2100;
+
+    #[constructor]
+    pub fn init() {
+        self.authority = msg.sender;
+        self.next_project_id = 1;
+        self.next_credit_batch = 1;
+        self.next_claim_id = 1;
+        self.total_issued = 0;
+        self.total_retired = 0;
+    }
+
+    pub fn accredit_verifier(verifier: Address, name_hash: u256, expertise: u8) {
+        require!(msg.sender == self.authority, NotAuthority {});
+        self.verifiers[verifier] = Verifier {
+            accredited: true,
+            name_hash: name_hash,
+            projects_verified: 0,
+            methodology_expertise: expertise,
+        };
+    }
+
+    pub fn register_project(
+        name_hash: u256,
+        methodology_hash: u256,
+        location_hash: u256,
+        project_type: u8,
+        crediting_years: u8,
+        estimated_annual_tons: u64,
+    ) -> u32 {
+        let id = self.next_project_id;
+        self.next_project_id += 1;
+
+        // project_type: 0=reforestation, 1=renewable_energy, 2=methane_capture, 3=direct_air_capture
+        self.projects[id] = CarbonProject {
+            developer: msg.sender,
+            name_hash: name_hash,
+            methodology_hash: methodology_hash,
+            location_hash: location_hash,
+            project_type: project_type,
+            start_date: block.timestamp,
+            crediting_period_years: crediting_years,
+            estimated_annual_reduction_tons: estimated_annual_tons,
+            verified: false,
+            verifier: Address::ZERO,
+            status: 0,
+        };
+
+        emit ProjectRegistered { project_id: id, developer: msg.sender, project_type: project_type };
+        return id;
+    }
+
+    pub fn verify_project(project_id: u32, verification_notes_hash: u256) {
+        require!(self.verifiers[msg.sender].accredited, NotVerifier {});
+        require!(!self.projects[project_id].verified, ProjectAlreadyVerified {});
+
+        self.projects[project_id].verified = true;
+        self.projects[project_id].verifier = msg.sender;
+        self.projects[project_id].status = 1;
+        self.verifiers[msg.sender].projects_verified += 1;
+
+        emit ProjectVerified { project_id: project_id, verifier: msg.sender };
+    }
+
+    pub fn issue_credits(
+        project_id: u32,
+        vintage_year: u16,
+        quantity_tons: u256,
+        verification_hash: u256,
+        credit_type: u8,
+    ) -> u64 {
+        let project = self.projects[project_id];
+        require!(project.developer == msg.sender, NotProjectDeveloper {});
+        require!(project.verified, ProjectNotVerified {});
+        require!(vintage_year >= MIN_VINTAGE_YEAR && vintage_year <= MAX_VINTAGE_YEAR, InvalidVintageYear { year: vintage_year });
+
+        let batch_id = self.next_credit_batch;
+        self.next_credit_batch += 1;
+
+        let serial_start = self.total_issued as u64;
+
+        self.credit_batches[batch_id] = CreditBatch {
+            project_id: project_id,
+            vintage_year: vintage_year,
+            quantity_tons: quantity_tons,
+            remaining: quantity_tons,
+            verification_hash: verification_hash,
+            issued_at: block.timestamp,
+            credit_type: credit_type,
+            serial_start: serial_start,
+            serial_end: serial_start + quantity_tons as u64,
+        };
+
+        self.balances[msg.sender][batch_id] = quantity_tons;
+        self.total_issued += quantity_tons;
+        self.vintage_year_supply[vintage_year] += quantity_tons;
+        self.project_credit_batches[project_id].push(batch_id);
+
+        emit CreditsIssued {
+            batch_id: batch_id,
+            project_id: project_id,
+            quantity_tons: quantity_tons,
+            vintage_year: vintage_year,
+        };
+        return batch_id;
+    }
+
+    pub fn transfer_credits(batch_id: u64, to: Address, amount: u256) {
+        let balance = self.balances[msg.sender][batch_id];
+        require!(balance >= amount, InsufficientCredits { available: balance, requested: amount });
+
+        self.balances[msg.sender][batch_id] -= amount;
+        self.balances[to][batch_id] += amount;
+
+        emit CreditsTransferred { batch_id: batch_id, from: msg.sender, to: to, amount: amount };
+    }
+
+    pub fn retire_credits(batch_id: u64, amount: u256, purpose_hash: u256) {
+        let balance = self.balances[msg.sender][batch_id];
+        require!(balance >= amount, InsufficientCredits { available: balance, requested: amount });
+
+        self.balances[msg.sender][batch_id] -= amount;
+        self.credit_batches[batch_id].remaining -= amount;
+        self.retired_credits[msg.sender] += amount;
+        self.total_retired += amount;
+
+        // Create offset claim
+        let claim_id = self.next_claim_id;
+        self.next_claim_id += 1;
+
+        self.offset_claims[claim_id] = OffsetClaim {
+            claimer: msg.sender,
+            batch_id: batch_id,
+            amount_tons: amount,
+            purpose_hash: purpose_hash,
+            timestamp: block.timestamp,
+            verified: true,
+        };
+
+        emit CreditsRetired { batch_id: batch_id, retiree: msg.sender, amount: amount };
+        emit OffsetClaimCreated { claim_id: claim_id, claimer: msg.sender, amount_tons: amount };
+    }
+
+    pub fn set_market_price(credit_type: u8, price: u256) {
+        require!(msg.sender == self.authority, NotAuthority {});
+        self.market_price[credit_type] = price;
+    }
+
+    #[view]
+    pub fn get_balance(owner: Address, batch_id: u64) -> u256 {
+        return self.balances[owner][batch_id];
+    }
+
+    #[view]
+    pub fn get_project(project_id: u32) -> CarbonProject {
+        return self.projects[project_id];
+    }
+
+    #[view]
+    pub fn get_batch(batch_id: u64) -> CreditBatch {
+        return self.credit_batches[batch_id];
+    }
+
+    #[view]
+    pub fn get_total_retired(account: Address) -> u256 {
+        return self.retired_credits[account];
+    }
+
+    #[view]
+    pub fn get_vintage_supply(year: u16) -> u256 {
+        return self.vintage_year_supply[year];
+    }
+
+    #[view]
+    pub fn get_global_stats() -> (u256, u256) {
+        return (self.total_issued, self.total_retired);
+    }
+}

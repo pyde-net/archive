@@ -1,0 +1,293 @@
+// On-chain coin flip game.
+// House-banked: the contract holds a bankroll and pays winners 1.95x.
+// Uses commit-reveal for provably fair randomness.
+
+use std::math;
+
+contract CoinFlip {
+    storage {
+        owner: Address,
+        operator: Address,
+        bankroll: u256,
+        min_bet: u256,
+        max_bet_ratio: u256,    // max bet as fraction of bankroll (bps)
+        house_edge_bps: u256,
+        next_flip_id: u64,
+        flips: Map<u64, Flip>,
+        pending_flips: Vec<u64>,
+        player_total_wagered: Map<Address, u256>,
+        player_total_won: Map<Address, u256>,
+        player_flip_count: Map<Address, u64>,
+        total_flips: u64,
+        total_wagered: u256,
+        total_paid_out: u256,
+        paused: bool,
+    }
+
+    const BPS_DENOMINATOR: u256 = 10000;
+    const PAYOUT_MULTIPLIER: u256 = 2;
+
+    struct Flip {
+        player: Address,
+        wager: u256,
+        choice: bool,         // true = heads, false = tails
+        commit_hash: u256,
+        resolved: bool,
+        won: bool,
+        payout: u256,
+        created_at: u64,
+    }
+
+    event FlipRequested {
+        #[indexed]
+        flip_id: u64,
+        #[indexed]
+        player: Address,
+        wager: u256,
+        choice: bool,
+    }
+
+    event FlipResolved {
+        #[indexed]
+        flip_id: u64,
+        #[indexed]
+        player: Address,
+        won: bool,
+        payout: u256,
+        result: bool,
+    }
+
+    event BankrollAdded {
+        #[indexed]
+        depositor: Address,
+        amount: u256,
+    }
+
+    event BankrollWithdrawn {
+        amount: u256,
+    }
+
+    error Unauthorized {}
+    error NotOperator {}
+    error Paused {}
+    error BetTooSmall { min: u256 }
+    error BetTooLarge { max: u256 }
+    error FlipNotFound {}
+    error FlipAlreadyResolved {}
+    error InvalidReveal {}
+    error InsufficientBankroll { available: u256, needed: u256 }
+    error NoPendingFlips {}
+    error WithdrawalExceedsSafety {}
+
+    #[constructor]
+    pub fn init(operator: Address, min_bet: u256, max_bet_ratio: u256, house_edge_bps: u256) {
+        self.owner = msg.sender;
+        self.operator = operator;
+        self.min_bet = min_bet;
+        self.max_bet_ratio = max_bet_ratio;
+        self.house_edge_bps = house_edge_bps;
+        self.next_flip_id = 1;
+        self.total_flips = 0;
+        self.total_wagered = 0;
+        self.total_paid_out = 0;
+        self.bankroll = 0;
+        self.paused = false;
+    }
+
+    pub fn deposit_bankroll() {
+        require!(!self.paused, Paused {});
+        self.bankroll = self.bankroll + msg.value;
+        emit BankrollAdded { depositor: msg.sender, amount: msg.value };
+    }
+
+    pub fn place_flip(choice: bool, server_commit: u256) {
+        require!(!self.paused, Paused {});
+        require!(msg.value >= self.min_bet, BetTooSmall { min: self.min_bet });
+
+        let max_bet = (self.bankroll * self.max_bet_ratio) / BPS_DENOMINATOR;
+        require!(msg.value <= max_bet, BetTooLarge { max: max_bet });
+
+        // Ensure bankroll can cover potential payout
+        let potential_payout = self.calculate_payout(msg.value);
+        require!(
+            self.bankroll >= potential_payout,
+            InsufficientBankroll { available: self.bankroll, needed: potential_payout }
+        );
+
+        let flip_id = self.next_flip_id;
+        self.next_flip_id = flip_id + 1;
+
+        self.flips[flip_id] = Flip {
+            player: msg.sender,
+            wager: msg.value,
+            choice: choice,
+            commit_hash: server_commit,
+            resolved: false,
+            won: false,
+            payout: 0,
+            created_at: block.height,
+        };
+
+        // Add wager to bankroll (it stays in contract)
+        self.bankroll = self.bankroll + msg.value;
+        self.pending_flips.push(flip_id);
+
+        self.player_total_wagered[msg.sender] = self.player_total_wagered[msg.sender] + msg.value;
+        self.player_flip_count[msg.sender] = self.player_flip_count[msg.sender] + 1;
+        self.total_flips = self.total_flips + 1;
+        self.total_wagered = self.total_wagered + msg.value;
+
+        emit FlipRequested {
+            flip_id: flip_id,
+            player: msg.sender,
+            wager: msg.value,
+            choice: choice,
+        };
+    }
+
+    // Operator reveals the server seed to resolve a flip
+    pub fn resolve_flip(flip_id: u64, server_seed: u256) {
+        require!(msg.sender == self.operator, NotOperator {});
+
+        let mut flip = self.flips[flip_id];
+        require!(flip.player != Address::ZERO, FlipNotFound {});
+        require!(!flip.resolved, FlipAlreadyResolved {});
+
+        // Verify server seed against commit
+        let computed_hash = math::keccak256(server_seed);
+        require!(computed_hash == flip.commit_hash, InvalidReveal {});
+
+        // Determine result: combine server seed with block data for final randomness
+        let combined = server_seed ^ (block.timestamp as u256) ^ (flip_id as u256);
+        let result_hash = math::keccak256(combined);
+        let coin_result = (result_hash % 2) == 0; // true = heads, false = tails
+
+        flip.resolved = true;
+        if coin_result == flip.choice {
+            // Player wins
+            let payout = self.calculate_payout(flip.wager);
+            flip.won = true;
+            flip.payout = payout;
+            self.bankroll = self.bankroll - payout;
+            self.total_paid_out = self.total_paid_out + payout;
+            self.player_total_won[flip.player] = self.player_total_won[flip.player] + payout;
+            raw_call!(flip.player, payout, bytes::empty());
+        }
+
+        self.flips[flip_id] = flip;
+        self.remove_pending(flip_id);
+
+        emit FlipResolved {
+            flip_id: flip_id,
+            player: flip.player,
+            won: flip.won,
+            payout: flip.payout,
+            result: coin_result,
+        };
+    }
+
+    // Batch resolve multiple flips in one transaction
+    pub fn batch_resolve(flip_ids: Vec<u64>, server_seeds: Vec<u256>) {
+        require!(msg.sender == self.operator, NotOperator {});
+        require!(flip_ids.len() == server_seeds.len(), FlipNotFound {});
+
+        for i in 0..flip_ids.len() {
+            self.resolve_single(flip_ids[i], server_seeds[i]);
+        }
+    }
+
+    fn resolve_single(flip_id: u64, server_seed: u256) {
+        let mut flip = self.flips[flip_id];
+        if flip.player == Address::ZERO || flip.resolved {
+            return;
+        }
+        let computed_hash = math::keccak256(server_seed);
+        if computed_hash != flip.commit_hash {
+            return;
+        }
+
+        let combined = server_seed ^ (block.timestamp as u256) ^ (flip_id as u256);
+        let result_hash = math::keccak256(combined);
+        let coin_result = (result_hash % 2) == 0;
+
+        flip.resolved = true;
+        if coin_result == flip.choice {
+            let payout = self.calculate_payout(flip.wager);
+            flip.won = true;
+            flip.payout = payout;
+            self.bankroll = self.bankroll - payout;
+            self.total_paid_out = self.total_paid_out + payout;
+            self.player_total_won[flip.player] = self.player_total_won[flip.player] + payout;
+            raw_call!(flip.player, payout, bytes::empty());
+        }
+
+        self.flips[flip_id] = flip;
+        self.remove_pending(flip_id);
+    }
+
+    fn calculate_payout(wager: u256) -> u256 {
+        // Payout = 2x minus house edge
+        let gross = wager * PAYOUT_MULTIPLIER;
+        let edge = (gross * self.house_edge_bps) / BPS_DENOMINATOR;
+        return gross - edge;
+    }
+
+    fn remove_pending(flip_id: u64) {
+        let mut new_pending: Vec<u64> = Vec::new();
+        for i in 0..self.pending_flips.len() {
+            if self.pending_flips[i] != flip_id {
+                new_pending.push(self.pending_flips[i]);
+            }
+        }
+        self.pending_flips = new_pending;
+    }
+
+    pub fn withdraw_bankroll(amount: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        // Cannot withdraw if it would leave insufficient funds for pending bets
+        let mut max_liability: u256 = 0;
+        for i in 0..self.pending_flips.len() {
+            let flip = self.flips[self.pending_flips[i]];
+            max_liability = max_liability + self.calculate_payout(flip.wager);
+        }
+        require!(self.bankroll - amount >= max_liability, WithdrawalExceedsSafety {});
+
+        self.bankroll = self.bankroll - amount;
+        raw_call!(msg.sender, amount, bytes::empty());
+        emit BankrollWithdrawn { amount: amount };
+    }
+
+    pub fn set_paused(paused: bool) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.paused = paused;
+    }
+
+    pub fn set_operator(new_operator: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.operator = new_operator;
+    }
+
+    #[view]
+    pub fn get_flip(flip_id: u64) -> Flip {
+        return self.flips[flip_id];
+    }
+
+    #[view]
+    pub fn get_max_bet() -> u256 {
+        return (self.bankroll * self.max_bet_ratio) / BPS_DENOMINATOR;
+    }
+
+    #[view]
+    pub fn get_stats() -> (u64, u256, u256, u256) {
+        return (self.total_flips, self.total_wagered, self.total_paid_out, self.bankroll);
+    }
+
+    #[view]
+    pub fn get_player_stats(player: Address) -> (u64, u256, u256) {
+        return (
+            self.player_flip_count[player],
+            self.player_total_wagered[player],
+            self.player_total_won[player],
+        );
+    }
+}

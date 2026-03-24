@@ -1,0 +1,315 @@
+// Exercises bytes manipulation, hash operations, signature verification,
+// fixed arrays, and complex type compositions
+
+use std::signature;
+
+contract VerifiedMessaging {
+    struct Message {
+        id: u256,
+        sender: Address,
+        recipient: Address,
+        content: bytes,
+        content_hash: [u8; 32],
+        nonce: u256,
+        timestamp: u64,
+        attachments: Vec<Attachment>,
+        encryption_key: [u8; 32],
+        read: bool,
+    }
+
+    struct Attachment {
+        name: String,
+        mime_type: String,
+        data_hash: [u8; 32],
+        size: u64,
+        data: bytes,
+    }
+
+    struct VerifiedIdentity {
+        address: Address,
+        public_key: bytes,
+        display_name: String,
+        avatar_hash: [u8; 32],
+        registered_at: u64,
+        key_rotation_nonce: u64,
+    }
+
+    struct MessageProof {
+        message_hash: [u8; 32],
+        sender_sig: bytes,
+        merkle_path: Vec<[u8; 32]>,
+        merkle_directions: Vec<bool>,
+        root: [u8; 32],
+    }
+
+    storage {
+        owner: Address,
+        next_message_id: u256,
+        messages: Map<u256, Message>,
+        inbox: Map<Address, Vec<u256>>,
+        outbox: Map<Address, Vec<u256>>,
+        identities: Map<Address, VerifiedIdentity>,
+        message_tree_root: [u8; 32],
+        message_count: u256,
+        blocked: Map<Address, Map<Address, bool>>,
+        nonces: Map<Address, u256>,
+    }
+
+    event MessageSent {
+        #[indexed]
+        id: u256,
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        content_hash: [u8; 32],
+    }
+
+    event IdentityRegistered {
+        #[indexed]
+        user: Address,
+        display_name: String,
+    }
+
+    event KeyRotated {
+        #[indexed]
+        user: Address,
+        new_key_hash: [u8; 32],
+        rotation_nonce: u64,
+    }
+
+    event MessageVerified {
+        #[indexed]
+        message_id: u256,
+        verified: bool,
+    }
+
+    error NotRegistered { user: Address }
+    error AlreadyRegistered { user: Address }
+    error InvalidSignature { signer: Address }
+    error UserBlocked { blocker: Address, blocked: Address }
+    error MessageNotFound { id: u256 }
+    error InvalidMerkleProof {}
+    error InvalidNonce { expected: u256, got: u256 }
+    error EmptyContent {}
+    error AttachmentTooLarge { size: u64, max: u64 }
+
+    const MAX_ATTACHMENT_SIZE: u64 = 1_000_000;
+
+    #[constructor]
+    pub fn init() {
+        self.owner = msg.sender;
+        self.next_message_id = 1;
+        self.message_tree_root = [0u8; 32];
+    }
+
+    pub fn register(
+        public_key: bytes,
+        display_name: String,
+        avatar_data: bytes,
+    ) {
+        require!(
+            self.identities[msg.sender].address == Address::ZERO,
+            AlreadyRegistered { user: msg.sender }
+        );
+
+        let avatar_hash = hash(avatar_data);
+
+        self.identities[msg.sender] = VerifiedIdentity {
+            address: msg.sender,
+            public_key: public_key,
+            display_name: display_name,
+            avatar_hash: avatar_hash,
+            registered_at: block.timestamp,
+            key_rotation_nonce: 0,
+        };
+
+        emit IdentityRegistered { user: msg.sender, display_name: display_name };
+    }
+
+    pub fn rotate_key(new_public_key: bytes, rotation_sig: bytes) {
+        let identity = self.identities[msg.sender];
+        require!(identity.address != Address::ZERO, NotRegistered { user: msg.sender });
+
+        // Verify signature with OLD key over the new key hash
+        let new_key_hash = hash(new_public_key);
+        let mut rotation_message: bytes = bytes::new();
+        rotation_message.append(msg.sender.as_bytes());
+        rotation_message.append(new_public_key);
+        rotation_message.append(identity.key_rotation_nonce.to_bytes());
+
+        let message_hash = hash(rotation_message);
+        let valid = signature::verify(message_hash, rotation_sig, identity.public_key);
+        require!(valid, InvalidSignature { signer: msg.sender });
+
+        self.identities[msg.sender].public_key = new_public_key;
+        self.identities[msg.sender].key_rotation_nonce += 1;
+
+        emit KeyRotated {
+            user: msg.sender,
+            new_key_hash: new_key_hash,
+            rotation_nonce: identity.key_rotation_nonce + 1,
+        };
+    }
+
+    pub fn send_message(
+        recipient: Address,
+        content: bytes,
+        attachments: Vec<Attachment>,
+        encryption_key: [u8; 32],
+        sig: bytes,
+    ) -> u256 {
+        require!(content.len() > 0, EmptyContent {});
+        require!(
+            self.identities[msg.sender].address != Address::ZERO,
+            NotRegistered { user: msg.sender }
+        );
+        require!(
+            !self.blocked[recipient][msg.sender],
+            UserBlocked { blocker: recipient, blocked: msg.sender }
+        );
+
+        // Validate attachments
+        for i in 0..attachments.len() {
+            require!(
+                attachments[i].size <= MAX_ATTACHMENT_SIZE,
+                AttachmentTooLarge { size: attachments[i].size, max: MAX_ATTACHMENT_SIZE }
+            );
+        }
+
+        // Hash the content
+        let content_hash = hash(content);
+
+        // Verify sender's signature over content hash
+        let identity = self.identities[msg.sender];
+        let mut sig_message: bytes = bytes::new();
+        sig_message.append(content_hash);
+        sig_message.append(recipient.as_bytes());
+        sig_message.append(self.nonces[msg.sender].to_bytes());
+
+        let sig_hash = hash(sig_message);
+        let valid = signature::verify(sig_hash, sig, identity.public_key);
+        require!(valid, InvalidSignature { signer: msg.sender });
+
+        let id = self.next_message_id;
+        let msg_obj = Message {
+            id: id,
+            sender: msg.sender,
+            recipient: recipient,
+            content: content,
+            content_hash: content_hash,
+            nonce: self.nonces[msg.sender],
+            timestamp: block.timestamp,
+            attachments: attachments,
+            encryption_key: encryption_key,
+            read: false,
+        };
+
+        self.messages[id] = msg_obj;
+        self.inbox[recipient].push(id);
+        self.outbox[msg.sender].push(id);
+        self.nonces[msg.sender] += 1;
+        self.next_message_id = id + 1;
+
+        // Update message merkle tree
+        let leaf = hash(content_hash, id.to_bytes());
+        self.message_tree_root = hash(self.message_tree_root, leaf);
+        self.message_count += 1;
+
+        emit MessageSent {
+            id: id,
+            from: msg.sender,
+            to: recipient,
+            content_hash: content_hash,
+        };
+
+        return id;
+    }
+
+    pub fn verify_message_inclusion(proof: MessageProof) -> bool {
+        // Walk the Merkle path to reconstruct the root
+        let mut current_hash = proof.message_hash;
+
+        for i in 0..proof.merkle_path.len() {
+            let sibling = proof.merkle_path[i];
+            if proof.merkle_directions[i] {
+                // current is left child
+                current_hash = hash(current_hash, sibling);
+            } else {
+                // current is right child
+                current_hash = hash(sibling, current_hash);
+            }
+        }
+
+        let valid = current_hash == proof.root && proof.root == self.message_tree_root;
+
+        emit MessageVerified {
+            message_id: 0,
+            verified: valid,
+        };
+
+        return valid;
+    }
+
+    pub fn block_user(user: Address) {
+        self.blocked[msg.sender][user] = true;
+    }
+
+    pub fn unblock_user(user: Address) {
+        self.blocked[msg.sender][user] = false;
+    }
+
+    pub fn mark_read(message_id: u256) {
+        let msg_obj = self.messages[message_id];
+        require!(msg_obj.id != 0, MessageNotFound { id: message_id });
+        require!(msg_obj.recipient == msg.sender, InvalidSignature { signer: msg.sender });
+        self.messages[message_id].read = true;
+    }
+
+    #[view]
+    pub fn get_inbox(user: Address) -> Vec<u256> {
+        return self.inbox[user];
+    }
+
+    #[view]
+    pub fn get_message(id: u256) -> Message {
+        require!(self.messages[id].id != 0, MessageNotFound { id: id });
+        return self.messages[id];
+    }
+
+    #[view]
+    pub fn get_identity(user: Address) -> VerifiedIdentity {
+        require!(
+            self.identities[user].address != Address::ZERO,
+            NotRegistered { user: user }
+        );
+        return self.identities[user];
+    }
+
+    #[view]
+    pub fn compute_content_hash(content: bytes) -> [u8; 32] {
+        return hash(content);
+    }
+
+    #[view]
+    pub fn get_message_root() -> [u8; 32] {
+        return self.message_tree_root;
+    }
+
+    #[view]
+    pub fn get_nonce(user: Address) -> u256 {
+        return self.nonces[user];
+    }
+
+    #[view]
+    pub fn unread_count(user: Address) -> u64 {
+        let inbox = self.inbox[user];
+        let mut count: u64 = 0;
+        for i in 0..inbox.len() {
+            if !self.messages[inbox[i]].read {
+                count += 1;
+            }
+        }
+        return count;
+    }
+}

@@ -1,0 +1,313 @@
+// Digital prescription management with controlled substance tracking and pharmacy verification
+
+contract PrescriptionSystem {
+    storage {
+        health_authority: Address,
+        next_rx_id: u64,
+        prescriptions: Map<u64, Prescription>,
+        patient_prescriptions: Map<Address, Vec<u64>>,
+        licensed_doctors: Map<Address, DoctorLicense>,
+        licensed_pharmacies: Map<Address, PharmacyLicense>,
+        dispensing_log: Map<u64, Map<u32, DispensingRecord>>,
+        dispense_counts: Map<u64, u32>,
+        controlled_substance_limits: Map<u16, ControlledLimit>,
+        patient_substance_history: Map<Address, Map<u16, u64>>,
+        interaction_warnings: Map<u16, Map<u16, u8>>,
+    }
+
+    struct Prescription {
+        doctor: Address,
+        patient: Address,
+        drug_code: u16,
+        dosage_mg: u32,
+        frequency_hours: u8,
+        duration_days: u16,
+        refills_allowed: u8,
+        refills_used: u8,
+        issued_at: u64,
+        expires_at: u64,
+        is_controlled: bool,
+        schedule: u8,
+        status: u8,
+        notes_hash: u256,
+    }
+
+    struct DoctorLicense {
+        license_hash: u256,
+        specialty: u16,
+        dea_number_hash: u256,
+        can_prescribe_controlled: bool,
+        active: bool,
+        issued_at: u64,
+        expires_at: u64,
+    }
+
+    struct PharmacyLicense {
+        license_hash: u256,
+        name_hash: u256,
+        active: bool,
+        dispensed_count: u64,
+    }
+
+    struct DispensingRecord {
+        pharmacy: Address,
+        quantity: u32,
+        dispensed_at: u64,
+        refill_number: u8,
+        pharmacist_hash: u256,
+    }
+
+    struct ControlledLimit {
+        max_daily_mg: u32,
+        max_duration_days: u16,
+        require_id_verification: bool,
+        cooling_period_hours: u32,
+    }
+
+    event PrescriptionIssued {
+        #[indexed]
+        rx_id: u64,
+        #[indexed]
+        doctor: Address,
+        #[indexed]
+        patient: Address,
+        drug_code: u16,
+    }
+
+    event PrescriptionDispensed {
+        #[indexed]
+        rx_id: u64,
+        #[indexed]
+        pharmacy: Address,
+        refill_number: u8,
+    }
+
+    event PrescriptionCancelled {
+        #[indexed]
+        rx_id: u64,
+    }
+
+    event InteractionWarning {
+        #[indexed]
+        patient: Address,
+        drug_a: u16,
+        drug_b: u16,
+        severity: u8,
+    }
+
+    event DoctorLicensed {
+        #[indexed]
+        doctor: Address,
+    }
+
+    error NotHealthAuthority {}
+    error DoctorNotLicensed {}
+    error PharmacyNotLicensed {}
+    error PrescriptionNotFound { rx_id: u64 }
+    error PrescriptionExpired {}
+    error NoRefillsRemaining {}
+    error NotAuthorized {}
+    error ControlledSubstanceLimitExceeded { max_mg: u32, requested_mg: u32 }
+    error CoolingPeriodNotElapsed { remaining_hours: u32 }
+    error CannotPrescribeControlled {}
+    error PrescriptionCancelled {}
+
+    const SECONDS_PER_DAY: u64 = 86400;
+    const SECONDS_PER_HOUR: u64 = 3600;
+
+    #[constructor]
+    pub fn init() {
+        self.health_authority = msg.sender;
+        self.next_rx_id = 1;
+    }
+
+    pub fn license_doctor(
+        doctor: Address,
+        license_hash: u256,
+        specialty: u16,
+        dea_hash: u256,
+        can_prescribe_controlled: bool,
+        validity_days: u64,
+    ) {
+        require!(msg.sender == self.health_authority, NotHealthAuthority {});
+        self.licensed_doctors[doctor] = DoctorLicense {
+            license_hash: license_hash,
+            specialty: specialty,
+            dea_number_hash: dea_hash,
+            can_prescribe_controlled: can_prescribe_controlled,
+            active: true,
+            issued_at: block.timestamp,
+            expires_at: block.timestamp + (validity_days * 86400),
+        };
+        emit DoctorLicensed { doctor: doctor };
+    }
+
+    pub fn license_pharmacy(pharmacy: Address, license_hash: u256, name_hash: u256) {
+        require!(msg.sender == self.health_authority, NotHealthAuthority {});
+        self.licensed_pharmacies[pharmacy] = PharmacyLicense {
+            license_hash: license_hash,
+            name_hash: name_hash,
+            active: true,
+            dispensed_count: 0,
+        };
+    }
+
+    pub fn set_controlled_limit(
+        drug_code: u16,
+        max_daily_mg: u32,
+        max_duration_days: u16,
+        require_id: bool,
+        cooling_hours: u32,
+    ) {
+        require!(msg.sender == self.health_authority, NotHealthAuthority {});
+        self.controlled_substance_limits[drug_code] = ControlledLimit {
+            max_daily_mg: max_daily_mg,
+            max_duration_days: max_duration_days,
+            require_id_verification: require_id,
+            cooling_period_hours: cooling_hours,
+        };
+    }
+
+    pub fn set_interaction_warning(drug_a: u16, drug_b: u16, severity: u8) {
+        require!(msg.sender == self.health_authority, NotHealthAuthority {});
+        self.interaction_warnings[drug_a][drug_b] = severity;
+        self.interaction_warnings[drug_b][drug_a] = severity;
+    }
+
+    pub fn prescribe(
+        patient: Address,
+        drug_code: u16,
+        dosage_mg: u32,
+        frequency_hours: u8,
+        duration_days: u16,
+        refills: u8,
+        notes_hash: u256,
+    ) -> u64 {
+        let doc = self.licensed_doctors[msg.sender];
+        require!(doc.active && doc.expires_at > block.timestamp, DoctorNotLicensed {});
+
+        let is_controlled = self.controlled_substance_limits[drug_code].max_daily_mg > 0;
+
+        if is_controlled {
+            require!(doc.can_prescribe_controlled, CannotPrescribeControlled {});
+
+            let limits = self.controlled_substance_limits[drug_code];
+            let daily_total = (dosage_mg * (24 / frequency_hours as u32));
+            require!(daily_total <= limits.max_daily_mg, ControlledSubstanceLimitExceeded {
+                max_mg: limits.max_daily_mg,
+                requested_mg: daily_total,
+            });
+
+            // Check cooling period
+            let last_dispensed = self.patient_substance_history[patient][drug_code];
+            if last_dispensed > 0 {
+                let hours_since = (block.timestamp - last_dispensed) / 3600;
+                if hours_since < limits.cooling_period_hours as u64 {
+                    let remaining = limits.cooling_period_hours - hours_since as u32;
+                    revert!(CoolingPeriodNotElapsed { remaining_hours: remaining });
+                }
+            }
+        }
+
+        let rx_id = self.next_rx_id;
+        self.next_rx_id += 1;
+
+        let schedule = if is_controlled {
+            match drug_code {
+                100..200 => 2u8,
+                200..300 => 3u8,
+                300..400 => 4u8,
+                _ => 5u8,
+            }
+        } else {
+            0u8
+        };
+
+        self.prescriptions[rx_id] = Prescription {
+            doctor: msg.sender,
+            patient: patient,
+            drug_code: drug_code,
+            dosage_mg: dosage_mg,
+            frequency_hours: frequency_hours,
+            duration_days: duration_days,
+            refills_allowed: refills,
+            refills_used: 0,
+            issued_at: block.timestamp,
+            expires_at: block.timestamp + (duration_days as u64 * 86400),
+            is_controlled: is_controlled,
+            schedule: schedule,
+            status: 0,
+            notes_hash: notes_hash,
+        };
+
+        self.patient_prescriptions[patient].push(rx_id);
+        self.dispense_counts[rx_id] = 0;
+
+        emit PrescriptionIssued {
+            rx_id: rx_id,
+            doctor: msg.sender,
+            patient: patient,
+            drug_code: drug_code,
+        };
+        return rx_id;
+    }
+
+    pub fn dispense(rx_id: u64, quantity: u32, pharmacist_hash: u256) {
+        require!(self.licensed_pharmacies[msg.sender].active, PharmacyNotLicensed {});
+
+        let rx = self.prescriptions[rx_id];
+        require!(rx.status != 2, PrescriptionCancelled {});
+        require!(rx.expires_at >= block.timestamp, PrescriptionExpired {});
+        require!(rx.refills_used <= rx.refills_allowed, NoRefillsRemaining {});
+
+        let refill_num = rx.refills_used;
+        let idx = self.dispense_counts[rx_id];
+
+        self.dispensing_log[rx_id][idx] = DispensingRecord {
+            pharmacy: msg.sender,
+            quantity: quantity,
+            dispensed_at: block.timestamp,
+            refill_number: refill_num,
+            pharmacist_hash: pharmacist_hash,
+        };
+        self.dispense_counts[rx_id] = idx + 1;
+        self.prescriptions[rx_id].refills_used += 1;
+        self.prescriptions[rx_id].status = 1;
+
+        self.licensed_pharmacies[msg.sender].dispensed_count += 1;
+
+        if rx.is_controlled {
+            self.patient_substance_history[rx.patient][rx.drug_code] = block.timestamp;
+        }
+
+        emit PrescriptionDispensed { rx_id: rx_id, pharmacy: msg.sender, refill_number: refill_num };
+    }
+
+    pub fn cancel_prescription(rx_id: u64) {
+        let rx = self.prescriptions[rx_id];
+        require!(msg.sender == rx.doctor || msg.sender == self.health_authority, NotAuthorized {});
+        self.prescriptions[rx_id].status = 2;
+        emit PrescriptionCancelled { rx_id: rx_id };
+    }
+
+    #[view]
+    pub fn get_prescription(rx_id: u64) -> Prescription {
+        return self.prescriptions[rx_id];
+    }
+
+    #[view]
+    pub fn get_dispensing_record(rx_id: u64, index: u32) -> DispensingRecord {
+        return self.dispensing_log[rx_id][index];
+    }
+
+    #[view]
+    pub fn check_interaction(drug_a: u16, drug_b: u16) -> u8 {
+        return self.interaction_warnings[drug_a][drug_b];
+    }
+
+    #[view]
+    pub fn is_doctor_licensed(doctor: Address) -> bool {
+        let doc = self.licensed_doctors[doctor];
+        return doc.active && doc.expires_at > block.timestamp;
+    }
+}

@@ -1,0 +1,261 @@
+// Decentralized content publishing with paywall, subscriptions, and royalties
+use std::math;
+use std::token::IERC20;
+
+contract ContentPlatform {
+    storage {
+        owner: Address,
+        next_content_id: u64,
+        content_registry: Map<u64, Content>,
+        subscriptions: Map<Address, Map<Address, Subscription>>,
+        creator_earnings: Map<Address, u256>,
+        platform_fee_bps: u16,
+        royalty_bps: Map<u64, u16>,
+        access_grants: Map<u64, Map<Address, bool>>,
+        categories: Map<u64, u8>,
+        content_ratings: Map<u64, Map<Address, u8>>,
+        rating_sums: Map<u64, u64>,
+        rating_counts: Map<u64, u32>,
+        total_platform_fees: u256,
+    }
+
+    struct Content {
+        creator: Address,
+        content_hash: u256,
+        metadata_hash: u256,
+        price: u256,
+        is_free: bool,
+        created_at: u64,
+        updated_at: u64,
+        purchase_count: u64,
+        active: bool,
+    }
+
+    struct Subscription {
+        tier: u8,
+        price_per_month: u256,
+        started_at: u64,
+        expires_at: u64,
+        auto_renew: bool,
+    }
+
+    event ContentPublished {
+        #[indexed]
+        content_id: u64,
+        #[indexed]
+        creator: Address,
+        price: u256,
+    }
+
+    event ContentPurchased {
+        #[indexed]
+        content_id: u64,
+        #[indexed]
+        buyer: Address,
+        price: u256,
+    }
+
+    event SubscriptionStarted {
+        #[indexed]
+        subscriber: Address,
+        #[indexed]
+        creator: Address,
+        tier: u8,
+        expires_at: u64,
+    }
+
+    event ContentRated {
+        #[indexed]
+        content_id: u64,
+        #[indexed]
+        rater: Address,
+        rating: u8,
+    }
+
+    event EarningsWithdrawn {
+        #[indexed]
+        creator: Address,
+        amount: u256,
+    }
+
+    error ContentNotFound { content_id: u64 }
+    error ContentInactive {}
+    error InsufficientPayment { required: u256, sent: u256 }
+    error AlreadyPurchased {}
+    error NotCreator {}
+    error InvalidRating { min: u8, max: u8, given: u8 }
+    error SubscriptionActive {}
+    error NoEarnings {}
+    error InvalidTier { tier: u8 }
+    error NotOwner {}
+
+    const BPS_DENOMINATOR: u256 = 10000;
+    const SECONDS_PER_DAY: u64 = 86400;
+    const DAYS_PER_MONTH: u64 = 30;
+    const MIN_RATING: u8 = 1;
+    const MAX_RATING: u8 = 5;
+
+    #[constructor]
+    pub fn init(platform_fee_bps: u16) {
+        self.owner = msg.sender;
+        self.next_content_id = 1;
+        self.platform_fee_bps = platform_fee_bps;
+        self.total_platform_fees = 0;
+    }
+
+    pub fn publish(content_hash: u256, metadata_hash: u256, price: u256, category: u8, royalty_bps: u16) -> u64 {
+        let content_id = self.next_content_id;
+        self.next_content_id += 1;
+
+        let is_free = price == 0;
+        let content = Content {
+            creator: msg.sender,
+            content_hash: content_hash,
+            metadata_hash: metadata_hash,
+            price: price,
+            is_free: is_free,
+            created_at: block.timestamp,
+            updated_at: block.timestamp,
+            purchase_count: 0,
+            active: true,
+        };
+
+        self.content_registry[content_id] = content;
+        self.categories[content_id] = category;
+        self.royalty_bps[content_id] = royalty_bps;
+
+        emit ContentPublished { content_id: content_id, creator: msg.sender, price: price };
+        return content_id;
+    }
+
+    pub fn purchase_content(content_id: u64) {
+        let content = self.content_registry[content_id];
+        require!(content.active, ContentInactive {});
+        require!(!self.access_grants[content_id][msg.sender], AlreadyPurchased {});
+
+        if !content.is_free {
+            require!(msg.value >= content.price, InsufficientPayment {
+                required: content.price,
+                sent: msg.value,
+            });
+
+            let platform_cut = (content.price * self.platform_fee_bps as u256) / BPS_DENOMINATOR;
+            let creator_cut = content.price - platform_cut;
+
+            self.creator_earnings[content.creator] += creator_cut;
+            self.total_platform_fees += platform_cut;
+        }
+
+        self.access_grants[content_id][msg.sender] = true;
+        self.content_registry[content_id].purchase_count += 1;
+
+        emit ContentPurchased { content_id: content_id, buyer: msg.sender, price: content.price };
+    }
+
+    pub fn subscribe(creator: Address, tier: u8, months: u8) {
+        require!(tier >= 1 && tier <= 3, InvalidTier { tier: tier });
+
+        let existing = self.subscriptions[msg.sender][creator];
+        require!(existing.expires_at < block.timestamp, SubscriptionActive {});
+
+        let price_per_month = match tier {
+            1 => 1000u256,
+            2 => 5000u256,
+            3 => 15000u256,
+            _ => 0u256,
+        };
+
+        let total_price = price_per_month * months as u256;
+        require!(msg.value >= total_price, InsufficientPayment {
+            required: total_price,
+            sent: msg.value,
+        });
+
+        let duration = months as u64 * 30 * 86400;
+        let expires_at = block.timestamp + duration;
+
+        self.subscriptions[msg.sender][creator] = Subscription {
+            tier: tier,
+            price_per_month: price_per_month,
+            started_at: block.timestamp,
+            expires_at: expires_at,
+            auto_renew: false,
+        };
+
+        let platform_cut = (total_price * self.platform_fee_bps as u256) / BPS_DENOMINATOR;
+        self.creator_earnings[creator] += total_price - platform_cut;
+        self.total_platform_fees += platform_cut;
+
+        emit SubscriptionStarted {
+            subscriber: msg.sender,
+            creator: creator,
+            tier: tier,
+            expires_at: expires_at,
+        };
+    }
+
+    pub fn rate_content(content_id: u64, rating: u8) {
+        require!(rating >= 1 && rating <= 5, InvalidRating { min: 1, max: 5, given: rating });
+        require!(self.access_grants[content_id][msg.sender], ContentNotFound { content_id: content_id });
+
+        let prev_rating = self.content_ratings[content_id][msg.sender];
+        if prev_rating > 0 {
+            self.rating_sums[content_id] = self.rating_sums[content_id] - prev_rating as u64 + rating as u64;
+        } else {
+            self.rating_sums[content_id] += rating as u64;
+            self.rating_counts[content_id] += 1;
+        }
+
+        self.content_ratings[content_id][msg.sender] = rating;
+        emit ContentRated { content_id: content_id, rater: msg.sender, rating: rating };
+    }
+
+    pub fn update_content(content_id: u64, new_hash: u256, new_metadata: u256) {
+        require!(self.content_registry[content_id].creator == msg.sender, NotCreator {});
+        self.content_registry[content_id].content_hash = new_hash;
+        self.content_registry[content_id].metadata_hash = new_metadata;
+        self.content_registry[content_id].updated_at = block.timestamp;
+    }
+
+    pub fn deactivate_content(content_id: u64) {
+        require!(self.content_registry[content_id].creator == msg.sender, NotCreator {});
+        self.content_registry[content_id].active = false;
+    }
+
+    pub fn withdraw_earnings() {
+        let earnings = self.creator_earnings[msg.sender];
+        require!(earnings > 0, NoEarnings {});
+        self.creator_earnings[msg.sender] = 0;
+        raw_call!(msg.sender, earnings, bytes(""));
+        emit EarningsWithdrawn { creator: msg.sender, amount: earnings };
+    }
+
+    #[view]
+    pub fn has_access(content_id: u64, user: Address) -> bool {
+        if self.access_grants[content_id][user] {
+            return true;
+        }
+        let creator = self.content_registry[content_id].creator;
+        let sub = self.subscriptions[user][creator];
+        return sub.expires_at >= block.timestamp;
+    }
+
+    #[view]
+    pub fn get_average_rating(content_id: u64) -> u64 {
+        let count = self.rating_counts[content_id];
+        if count == 0 {
+            return 0;
+        }
+        return self.rating_sums[content_id] / count as u64;
+    }
+
+    #[view]
+    pub fn get_content(content_id: u64) -> Content {
+        return self.content_registry[content_id];
+    }
+
+    #[view]
+    pub fn get_subscription(subscriber: Address, creator: Address) -> Subscription {
+        return self.subscriptions[subscriber][creator];
+    }
+}

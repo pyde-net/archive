@@ -1,0 +1,297 @@
+// Warehouse inventory management with batch operations and low-stock alerts
+use std::math;
+
+contract InventoryManager {
+    storage {
+        owner: Address,
+        warehouse_count: u32,
+        warehouses: Map<u32, Warehouse>,
+        warehouse_managers: Map<u32, Map<Address, bool>>,
+        next_sku_id: u64,
+        skus: Map<u64, SKU>,
+        stock_levels: Map<u32, Map<u64, u64>>,
+        reorder_points: Map<u64, u64>,
+        pending_orders: Map<u64, Map<u32, PurchaseOrder>>,
+        order_counts: Map<u64, u32>,
+        transfer_log: Map<u64, StockTransfer>,
+        next_transfer_id: u64,
+        sku_by_barcode: Map<u256, u64>,
+    }
+
+    struct Warehouse {
+        name_hash: u256,
+        location_hash: u256,
+        capacity: u64,
+        used_capacity: u64,
+        active: bool,
+    }
+
+    struct SKU {
+        name_hash: u256,
+        category: u16,
+        unit_weight_grams: u32,
+        unit_cost: u256,
+        barcode_hash: u256,
+        active: bool,
+        total_quantity: u64,
+    }
+
+    struct PurchaseOrder {
+        supplier_hash: u256,
+        quantity: u64,
+        unit_price: u256,
+        ordered_at: u64,
+        fulfilled: bool,
+    }
+
+    struct StockTransfer {
+        sku_id: u64,
+        from_warehouse: u32,
+        to_warehouse: u32,
+        quantity: u64,
+        initiated_by: Address,
+        timestamp: u64,
+    }
+
+    event SKUCreated {
+        #[indexed]
+        sku_id: u64,
+        barcode_hash: u256,
+    }
+
+    event StockUpdated {
+        #[indexed]
+        warehouse_id: u32,
+        #[indexed]
+        sku_id: u64,
+        new_quantity: u64,
+    }
+
+    event LowStockAlert {
+        #[indexed]
+        sku_id: u64,
+        #[indexed]
+        warehouse_id: u32,
+        current: u64,
+        reorder_point: u64,
+    }
+
+    event StockTransferred {
+        #[indexed]
+        transfer_id: u64,
+        sku_id: u64,
+        quantity: u64,
+    }
+
+    event WarehouseCreated {
+        #[indexed]
+        warehouse_id: u32,
+    }
+
+    error NotOwner {}
+    error NotManager { warehouse_id: u32 }
+    error SKUNotFound { sku_id: u64 }
+    error WarehouseNotFound { id: u32 }
+    error InsufficientStock { available: u64, requested: u64 }
+    error WarehouseCapacityExceeded { capacity: u64, used: u64, adding: u64 }
+    error DuplicateBarcode {}
+    error SKUInactive {}
+
+    #[constructor]
+    pub fn init() {
+        self.owner = msg.sender;
+        self.warehouse_count = 0;
+        self.next_sku_id = 1;
+        self.next_transfer_id = 1;
+    }
+
+    fn require_manager(warehouse_id: u32) {
+        require!(
+            msg.sender == self.owner || self.warehouse_managers[warehouse_id][msg.sender],
+            NotManager { warehouse_id: warehouse_id }
+        );
+    }
+
+    pub fn create_warehouse(name_hash: u256, location_hash: u256, capacity: u64) -> u32 {
+        require!(msg.sender == self.owner, NotOwner {});
+        let id = self.warehouse_count;
+        self.warehouse_count = id + 1;
+
+        self.warehouses[id] = Warehouse {
+            name_hash: name_hash,
+            location_hash: location_hash,
+            capacity: capacity,
+            used_capacity: 0,
+            active: true,
+        };
+
+        emit WarehouseCreated { warehouse_id: id };
+        return id;
+    }
+
+    pub fn add_manager(warehouse_id: u32, manager: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(warehouse_id < self.warehouse_count, WarehouseNotFound { id: warehouse_id });
+        self.warehouse_managers[warehouse_id][manager] = true;
+    }
+
+    pub fn create_sku(
+        name_hash: u256,
+        category: u16,
+        unit_weight_grams: u32,
+        unit_cost: u256,
+        barcode_hash: u256,
+        reorder_point: u64,
+    ) -> u64 {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(self.sku_by_barcode[barcode_hash] == 0, DuplicateBarcode {});
+
+        let sku_id = self.next_sku_id;
+        self.next_sku_id += 1;
+
+        self.skus[sku_id] = SKU {
+            name_hash: name_hash,
+            category: category,
+            unit_weight_grams: unit_weight_grams,
+            unit_cost: unit_cost,
+            barcode_hash: barcode_hash,
+            active: true,
+            total_quantity: 0,
+        };
+
+        self.sku_by_barcode[barcode_hash] = sku_id;
+        self.reorder_points[sku_id] = reorder_point;
+
+        emit SKUCreated { sku_id: sku_id, barcode_hash: barcode_hash };
+        return sku_id;
+    }
+
+    pub fn receive_stock(warehouse_id: u32, sku_id: u64, quantity: u64) {
+        self.require_manager(warehouse_id);
+        require!(self.skus[sku_id].active, SKUInactive {});
+
+        let warehouse = self.warehouses[warehouse_id];
+        let weight_per_unit = self.skus[sku_id].unit_weight_grams as u64;
+        let added_capacity = quantity * weight_per_unit;
+
+        require!(
+            warehouse.used_capacity + added_capacity <= warehouse.capacity,
+            WarehouseCapacityExceeded {
+                capacity: warehouse.capacity,
+                used: warehouse.used_capacity,
+                adding: added_capacity,
+            }
+        );
+
+        self.stock_levels[warehouse_id][sku_id] += quantity;
+        self.warehouses[warehouse_id].used_capacity += added_capacity;
+        self.skus[sku_id].total_quantity += quantity;
+
+        emit StockUpdated {
+            warehouse_id: warehouse_id,
+            sku_id: sku_id,
+            new_quantity: self.stock_levels[warehouse_id][sku_id],
+        };
+    }
+
+    pub fn dispatch_stock(warehouse_id: u32, sku_id: u64, quantity: u64) {
+        self.require_manager(warehouse_id);
+        let current = self.stock_levels[warehouse_id][sku_id];
+        require!(current >= quantity, InsufficientStock {
+            available: current,
+            requested: quantity,
+        });
+
+        self.stock_levels[warehouse_id][sku_id] = current - quantity;
+        let weight_per_unit = self.skus[sku_id].unit_weight_grams as u64;
+        self.warehouses[warehouse_id].used_capacity -= quantity * weight_per_unit;
+        self.skus[sku_id].total_quantity -= quantity;
+
+        let new_level = self.stock_levels[warehouse_id][sku_id];
+        emit StockUpdated { warehouse_id: warehouse_id, sku_id: sku_id, new_quantity: new_level };
+
+        if new_level < self.reorder_points[sku_id] {
+            emit LowStockAlert {
+                sku_id: sku_id,
+                warehouse_id: warehouse_id,
+                current: new_level,
+                reorder_point: self.reorder_points[sku_id],
+            };
+        }
+    }
+
+    pub fn transfer_stock(from_warehouse: u32, to_warehouse: u32, sku_id: u64, quantity: u64) {
+        self.require_manager(from_warehouse);
+        let from_stock = self.stock_levels[from_warehouse][sku_id];
+        require!(from_stock >= quantity, InsufficientStock {
+            available: from_stock,
+            requested: quantity,
+        });
+
+        let weight = quantity * self.skus[sku_id].unit_weight_grams as u64;
+        let to_wh = self.warehouses[to_warehouse];
+        require!(
+            to_wh.used_capacity + weight <= to_wh.capacity,
+            WarehouseCapacityExceeded {
+                capacity: to_wh.capacity,
+                used: to_wh.used_capacity,
+                adding: weight,
+            }
+        );
+
+        self.stock_levels[from_warehouse][sku_id] -= quantity;
+        self.stock_levels[to_warehouse][sku_id] += quantity;
+        self.warehouses[from_warehouse].used_capacity -= weight;
+        self.warehouses[to_warehouse].used_capacity += weight;
+
+        let transfer_id = self.next_transfer_id;
+        self.next_transfer_id += 1;
+        self.transfer_log[transfer_id] = StockTransfer {
+            sku_id: sku_id,
+            from_warehouse: from_warehouse,
+            to_warehouse: to_warehouse,
+            quantity: quantity,
+            initiated_by: msg.sender,
+            timestamp: block.timestamp,
+        };
+
+        emit StockTransferred { transfer_id: transfer_id, sku_id: sku_id, quantity: quantity };
+    }
+
+    pub fn batch_receive(warehouse_id: u32, sku_ids: Vec<u64>, quantities: Vec<u64>) {
+        self.require_manager(warehouse_id);
+        for i in 0..sku_ids.len() {
+            let sku_id = sku_ids[i];
+            let qty = quantities[i];
+            if self.skus[sku_id].active {
+                self.stock_levels[warehouse_id][sku_id] += qty;
+                self.skus[sku_id].total_quantity += qty;
+                emit StockUpdated {
+                    warehouse_id: warehouse_id,
+                    sku_id: sku_id,
+                    new_quantity: self.stock_levels[warehouse_id][sku_id],
+                };
+            }
+        }
+    }
+
+    #[view]
+    pub fn get_stock(warehouse_id: u32, sku_id: u64) -> u64 {
+        return self.stock_levels[warehouse_id][sku_id];
+    }
+
+    #[view]
+    pub fn get_sku(sku_id: u64) -> SKU {
+        return self.skus[sku_id];
+    }
+
+    #[view]
+    pub fn get_warehouse(id: u32) -> Warehouse {
+        return self.warehouses[id];
+    }
+
+    #[view]
+    pub fn lookup_by_barcode(barcode_hash: u256) -> u64 {
+        return self.sku_by_barcode[barcode_hash];
+    }
+}

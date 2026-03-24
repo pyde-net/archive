@@ -1,0 +1,448 @@
+// NFT-based battle game.
+// Players register NFTs as fighters with stats derived from token metadata.
+// Battles are resolved using on-chain pseudo-randomness weighted by stats.
+// Winners earn experience points and can level up their fighters.
+
+use std::math;
+use std::token::IERC721;
+
+contract NftBattle {
+    storage {
+        owner: Address,
+        nft_contract: Address,
+        next_battle_id: u64,
+        fighters: Map<u256, Fighter>,         // token_id -> Fighter
+        battles: Map<u64, Battle>,
+        battle_queue: Vec<u64>,               // token_ids waiting for match
+        leaderboard: Map<Address, PlayerStats>,
+        level_xp_table: Map<u8, u64>,         // level -> xp required
+        max_level: u8,
+        base_hp: u32,
+        base_attack: u32,
+        base_defense: u32,
+        xp_per_win: u64,
+        xp_per_loss: u64,
+        entry_fee: u256,
+        prize_pool: u256,
+        season: u32,
+        season_wins: Map<u32, Map<u256, u32>>,  // season -> token_id -> wins
+        paused: bool,
+    }
+
+    const MAX_LEVEL: u8 = 50;
+    const BASE_HP: u32 = 100;
+    const BASE_ATTACK: u32 = 10;
+    const BASE_DEFENSE: u32 = 5;
+    const XP_PER_WIN: u64 = 100;
+    const XP_PER_LOSS: u64 = 25;
+    const XP_MULTIPLIER: u64 = 150;
+    const MAX_COMBAT_ROUNDS: u8 = 10;
+    const INITIAL_COOLDOWN: u64 = 10;
+    const HP_PER_LEVEL: u32 = 5;
+    const ATTACK_PER_LEVEL: u32 = 2;
+    const DEFENSE_PER_LEVEL: u32 = 1;
+    const HP_LEVEL_BONUS: u32 = 10;
+    const DAMAGE_VARIANCE_RANGE: u256 = 30;
+    const DAMAGE_VARIANCE_BASE: u32 = 85;
+    const DAMAGE_SCALE: u32 = 100;
+    const PRIZE_FEE_DIVISOR: u256 = 10;
+
+    struct Fighter {
+        token_id: u256,
+        owner: Address,
+        level: u8,
+        xp: u64,
+        total_hp: u32,
+        attack: u32,
+        defense: u32,
+        speed: u32,
+        wins: u32,
+        losses: u32,
+        registered: bool,
+        last_battle_block: u64,
+        cooldown_blocks: u64,
+    }
+
+    struct Battle {
+        fighter_a: u256,
+        fighter_b: u256,
+        owner_a: Address,
+        owner_b: Address,
+        winner_token: u256,
+        damage_dealt_a: u32,
+        damage_dealt_b: u32,
+        rounds: u8,
+        timestamp: u64,
+        resolved: bool,
+    }
+
+    struct PlayerStats {
+        total_battles: u64,
+        total_wins: u64,
+        total_losses: u64,
+        fighters_registered: u32,
+        total_xp_earned: u64,
+    }
+
+    event FighterRegistered {
+        #[indexed]
+        token_id: u256,
+        #[indexed]
+        owner: Address,
+        attack: u32,
+        defense: u32,
+        speed: u32,
+    }
+
+    event BattleStarted {
+        #[indexed]
+        battle_id: u64,
+        fighter_a: u256,
+        fighter_b: u256,
+    }
+
+    event BattleResolved {
+        #[indexed]
+        battle_id: u64,
+        #[indexed]
+        winner_token: u256,
+        #[indexed]
+        winner_owner: Address,
+        rounds: u8,
+    }
+
+    event LevelUp {
+        #[indexed]
+        token_id: u256,
+        new_level: u8,
+    }
+
+    event SeasonStarted {
+        #[indexed]
+        season: u32,
+    }
+
+    error Unauthorized {}
+    error Paused {}
+    error NotTokenOwner {}
+    error FighterAlreadyRegistered {}
+    error FighterNotRegistered {}
+    error FighterOnCooldown { ready_at: u64 }
+    error InsufficientFee { required: u256, sent: u256 }
+    error CannotFightSelf {}
+    error BattleNotFound {}
+    error AlreadyInQueue {}
+    error MaxLevelReached {}
+
+    #[constructor]
+    pub fn init(nft_contract: Address, entry_fee: u256) {
+        self.owner = msg.sender;
+        self.nft_contract = nft_contract;
+        self.entry_fee = entry_fee;
+        self.next_battle_id = 1;
+        self.base_hp = BASE_HP;
+        self.base_attack = BASE_ATTACK;
+        self.base_defense = BASE_DEFENSE;
+        self.max_level = MAX_LEVEL;
+        self.xp_per_win = XP_PER_WIN;
+        self.xp_per_loss = XP_PER_LOSS;
+        self.prize_pool = 0;
+        self.season = 1;
+        self.paused = false;
+
+        // Initialize XP table: level N requires N * 150 XP
+        for lvl in 1..51 {
+            self.level_xp_table[lvl as u8] = (lvl as u64) * XP_MULTIPLIER;
+        }
+    }
+
+    pub fn register_fighter(token_id: u256) {
+        require!(!self.paused, Paused {});
+
+        // Verify ownership via NFT contract
+        let nft = IERC721::at(self.nft_contract);
+        let token_owner = nft.owner_of(token_id);
+        require!(token_owner == msg.sender, NotTokenOwner {});
+        require!(!self.fighters[token_id].registered, FighterAlreadyRegistered {});
+
+        // Derive stats from token_id hash (deterministic pseudo-random stats)
+        let stat_seed = math::keccak256(token_id);
+        let attack_bonus = ((stat_seed % 20) + 1) as u32;
+        let defense_bonus = (((stat_seed >> 8) % 15) + 1) as u32;
+        let speed = (((stat_seed >> 16) % 20) + 5) as u32;
+
+        self.fighters[token_id] = Fighter {
+            token_id: token_id,
+            owner: msg.sender,
+            level: 1,
+            xp: 0,
+            total_hp: self.base_hp,
+            attack: self.base_attack + attack_bonus,
+            defense: self.base_defense + defense_bonus,
+            speed: speed,
+            wins: 0,
+            losses: 0,
+            registered: true,
+            last_battle_block: 0,
+            cooldown_blocks: INITIAL_COOLDOWN,
+        };
+
+        let mut stats = self.leaderboard[msg.sender];
+        stats.fighters_registered = stats.fighters_registered + 1;
+        self.leaderboard[msg.sender] = stats;
+
+        emit FighterRegistered {
+            token_id: token_id,
+            owner: msg.sender,
+            attack: self.base_attack + attack_bonus,
+            defense: self.base_defense + defense_bonus,
+            speed: speed,
+        };
+    }
+
+    pub fn enter_battle(token_id: u256) {
+        require!(!self.paused, Paused {});
+        let fighter = self.fighters[token_id];
+        require!(fighter.registered, FighterNotRegistered {});
+        require!(fighter.owner == msg.sender, NotTokenOwner {});
+        require!(
+            block.height >= fighter.last_battle_block + fighter.cooldown_blocks,
+            FighterOnCooldown { ready_at: fighter.last_battle_block + fighter.cooldown_blocks }
+        );
+        require!(
+            msg.value >= self.entry_fee,
+            InsufficientFee { required: self.entry_fee, sent: msg.value }
+        );
+
+        // Check not already in queue
+        for i in 0..self.battle_queue.len() {
+            require!(self.battle_queue[i] != token_id, AlreadyInQueue {});
+        }
+
+        self.prize_pool = self.prize_pool + msg.value;
+
+        // If there's someone waiting, start a battle
+        if self.battle_queue.len() > 0 {
+            let opponent_id = self.battle_queue[self.battle_queue.len() - 1];
+            let opponent = self.fighters[opponent_id];
+
+            // Cannot fight yourself
+            if opponent.owner == msg.sender {
+                self.battle_queue.push(token_id);
+                return;
+            }
+
+            // Remove opponent from queue
+            self.battle_queue.pop();
+
+            // Create and resolve battle
+            let battle_id = self.next_battle_id;
+            self.next_battle_id = battle_id + 1;
+
+            self.battles[battle_id] = Battle {
+                fighter_a: token_id,
+                fighter_b: opponent_id,
+                owner_a: msg.sender,
+                owner_b: opponent.owner,
+                winner_token: 0,
+                damage_dealt_a: 0,
+                damage_dealt_b: 0,
+                rounds: 0,
+                timestamp: block.height,
+                resolved: false,
+            };
+
+            emit BattleStarted {
+                battle_id: battle_id,
+                fighter_a: token_id,
+                fighter_b: opponent_id,
+            };
+
+            self.resolve_battle(battle_id);
+        } else {
+            self.battle_queue.push(token_id);
+        }
+    }
+
+    fn resolve_battle(battle_id: u64) {
+        let mut battle = self.battles[battle_id];
+        let mut a = self.fighters[battle.fighter_a];
+        let mut b = self.fighters[battle.fighter_b];
+
+        // Combat simulation: up to MAX_COMBAT_ROUNDS rounds
+        let mut hp_a: i32 = (a.total_hp + (a.level as u32) * HP_LEVEL_BONUS) as i32;
+        let mut hp_b: i32 = (b.total_hp + (b.level as u32) * HP_LEVEL_BONUS) as i32;
+        let mut total_dmg_a: u32 = 0;
+        let mut total_dmg_b: u32 = 0;
+        let mut rounds: u8 = 0;
+
+        let mut seed = math::keccak256(
+            (battle_id as u256) ^ (block.timestamp as u256) ^ battle.fighter_a ^ battle.fighter_b
+        );
+
+        while hp_a > 0 && hp_b > 0 && rounds < MAX_COMBAT_ROUNDS {
+            rounds = rounds + 1;
+            seed = math::keccak256(seed);
+
+            // Determine who attacks first based on speed
+            let speed_roll = (seed % 100) as u32;
+            let a_goes_first = speed_roll < ((a.speed * DAMAGE_SCALE) / (a.speed + b.speed));
+
+            if a_goes_first {
+                let dmg_a = self.calculate_damage(a.attack, b.defense, seed);
+                hp_b = hp_b - (dmg_a as i32);
+                total_dmg_a = total_dmg_a + dmg_a;
+                seed = math::keccak256(seed);
+
+                if hp_b > 0 {
+                    let dmg_b = self.calculate_damage(b.attack, a.defense, seed);
+                    hp_a = hp_a - (dmg_b as i32);
+                    total_dmg_b = total_dmg_b + dmg_b;
+                }
+            } else {
+                let dmg_b = self.calculate_damage(b.attack, a.defense, seed);
+                hp_a = hp_a - (dmg_b as i32);
+                total_dmg_b = total_dmg_b + dmg_b;
+                seed = math::keccak256(seed);
+
+                if hp_a > 0 {
+                    let dmg_a = self.calculate_damage(a.attack, b.defense, seed);
+                    hp_b = hp_b - (dmg_a as i32);
+                    total_dmg_a = total_dmg_a + dmg_a;
+                }
+            }
+
+            seed = math::keccak256(seed);
+        }
+
+        // Determine winner
+        let winner_is_a = if hp_a > hp_b { true } else { false };
+        let winner_token = if winner_is_a { battle.fighter_a } else { battle.fighter_b };
+        let winner_owner = if winner_is_a { battle.owner_a } else { battle.owner_b };
+
+        // Update battle record
+        battle.winner_token = winner_token;
+        battle.damage_dealt_a = total_dmg_a;
+        battle.damage_dealt_b = total_dmg_b;
+        battle.rounds = rounds;
+        battle.resolved = true;
+        self.battles[battle_id] = battle;
+
+        // Update fighter stats
+        if winner_is_a {
+            a.wins = a.wins + 1;
+            a.xp = a.xp + self.xp_per_win;
+            b.losses = b.losses + 1;
+            b.xp = b.xp + self.xp_per_loss;
+        } else {
+            b.wins = b.wins + 1;
+            b.xp = b.xp + self.xp_per_win;
+            a.losses = a.losses + 1;
+            a.xp = a.xp + self.xp_per_loss;
+        }
+
+        a.last_battle_block = block.height;
+        b.last_battle_block = block.height;
+
+        // Check level ups
+        self.try_level_up(battle.fighter_a, a);
+        self.try_level_up(battle.fighter_b, b);
+
+        // Update season wins
+        self.season_wins[self.season][winner_token] = self.season_wins[self.season][winner_token] + 1;
+
+        // Update player stats
+        let mut stats_a = self.leaderboard[battle.owner_a];
+        let mut stats_b = self.leaderboard[battle.owner_b];
+        stats_a.total_battles = stats_a.total_battles + 1;
+        stats_b.total_battles = stats_b.total_battles + 1;
+
+        if winner_is_a {
+            stats_a.total_wins = stats_a.total_wins + 1;
+            stats_a.total_xp_earned = stats_a.total_xp_earned + self.xp_per_win;
+            stats_b.total_losses = stats_b.total_losses + 1;
+            stats_b.total_xp_earned = stats_b.total_xp_earned + self.xp_per_loss;
+        } else {
+            stats_b.total_wins = stats_b.total_wins + 1;
+            stats_b.total_xp_earned = stats_b.total_xp_earned + self.xp_per_win;
+            stats_a.total_losses = stats_a.total_losses + 1;
+            stats_a.total_xp_earned = stats_a.total_xp_earned + self.xp_per_loss;
+        }
+
+        self.leaderboard[battle.owner_a] = stats_a;
+        self.leaderboard[battle.owner_b] = stats_b;
+
+        // Pay winner from prize pool (2x entry fee minus small cut)
+        let payout = self.entry_fee * 2 - (self.entry_fee / PRIZE_FEE_DIVISOR);
+        if self.prize_pool >= payout {
+            self.prize_pool = self.prize_pool - payout;
+            raw_call!(winner_owner, payout, bytes::empty());
+        }
+
+        emit BattleResolved {
+            battle_id: battle_id,
+            winner_token: winner_token,
+            winner_owner: winner_owner,
+            rounds: rounds,
+        };
+    }
+
+    fn calculate_damage(attack: u32, defense: u32, seed: u256) -> u32 {
+        let variance = ((seed % DAMAGE_VARIANCE_RANGE) + (DAMAGE_VARIANCE_BASE as u256)) as u32; // 85-114% damage roll
+        let raw_damage = (attack * variance) / DAMAGE_SCALE;
+        let reduction = defense / 2;
+        if raw_damage > reduction {
+            return raw_damage - reduction;
+        }
+        return 1; // Minimum 1 damage
+    }
+
+    fn try_level_up(token_id: u256, mut fighter: Fighter) {
+        while fighter.level < self.max_level {
+            let required = self.level_xp_table[fighter.level + 1];
+            if fighter.xp >= required {
+                fighter.xp = fighter.xp - required;
+                fighter.level = fighter.level + 1;
+                fighter.total_hp = fighter.total_hp + HP_PER_LEVEL;
+                fighter.attack = fighter.attack + ATTACK_PER_LEVEL;
+                fighter.defense = fighter.defense + DEFENSE_PER_LEVEL;
+
+                emit LevelUp { token_id: token_id, new_level: fighter.level };
+            } else {
+                break;
+            }
+        }
+        self.fighters[token_id] = fighter;
+    }
+
+    pub fn start_new_season() {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.season = self.season + 1;
+        emit SeasonStarted { season: self.season };
+    }
+
+    pub fn set_paused(paused: bool) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.paused = paused;
+    }
+
+    #[view]
+    pub fn get_fighter(token_id: u256) -> Fighter {
+        return self.fighters[token_id];
+    }
+
+    #[view]
+    pub fn get_battle(battle_id: u64) -> Battle {
+        return self.battles[battle_id];
+    }
+
+    #[view]
+    pub fn get_player_stats(player: Address) -> PlayerStats {
+        return self.leaderboard[player];
+    }
+
+    #[view]
+    pub fn get_queue_length() -> u64 {
+        return self.battle_queue.len() as u64;
+    }
+}

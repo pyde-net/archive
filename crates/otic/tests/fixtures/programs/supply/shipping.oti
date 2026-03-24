@@ -1,0 +1,326 @@
+// International shipping and customs clearance with escrow and insurance
+use std::math;
+use std::token::IERC20;
+
+enum ShipOrderStatus {
+    Created,         // 0
+    PickedUp,        // 1
+    InTransit,       // 2
+    Customs,         // 3
+    OutForDelivery,  // 4
+    Delivered,       // 5
+    Returned,        // 6
+}
+
+contract ShippingContract {
+    storage {
+        owner: Address,
+        next_order_id: u64,
+        orders: Map<u64, ShipOrder>,
+        customs_declarations: Map<u64, CustomsDeclaration>,
+        insurance_policies: Map<u64, InsurancePolicy>,
+        carrier_registry: Map<Address, Carrier>,
+        escrow_balances: Map<u64, u256>,
+        route_prices: Map<u256, u256>,
+        tariff_rates: Map<u16, u16>,
+        total_orders: u64,
+        insurance_pool: u256,
+    }
+
+    struct ShipOrder {
+        shipper: Address,
+        recipient: Address,
+        carrier: Address,
+        origin_country: u16,
+        dest_country: u16,
+        weight_kg_x100: u32,
+        dimensions_cm: [u16; 3],
+        declared_value: u256,
+        shipping_cost: u256,
+        status: u8,
+        created_at: u64,
+        estimated_delivery: u64,
+        tracking_hash: u256,
+    }
+
+    struct CustomsDeclaration {
+        hs_code: u32,
+        description_hash: u256,
+        declared_value: u256,
+        tariff_paid: u256,
+        cleared: bool,
+        cleared_at: u64,
+        inspector: Address,
+    }
+
+    struct InsurancePolicy {
+        coverage_amount: u256,
+        premium_paid: u256,
+        deductible: u256,
+        active: bool,
+        claimed: bool,
+        claim_amount: u256,
+    }
+
+    struct Carrier {
+        name_hash: u256,
+        license_hash: u256,
+        registered: bool,
+        completed_shipments: u64,
+        rating_sum: u64,
+        rating_count: u32,
+    }
+
+    event OrderCreated {
+        #[indexed]
+        order_id: u64,
+        #[indexed]
+        shipper: Address,
+        carrier: Address,
+    }
+
+    event OrderStatusChanged {
+        #[indexed]
+        order_id: u64,
+        old_status: u8,
+        new_status: u8,
+    }
+
+    event CustomsCleared {
+        #[indexed]
+        order_id: u64,
+        tariff_paid: u256,
+    }
+
+    event InsuranceClaimed {
+        #[indexed]
+        order_id: u64,
+        claim_amount: u256,
+    }
+
+    event EscrowReleased {
+        #[indexed]
+        order_id: u64,
+        amount: u256,
+    }
+
+    error NotOwner {}
+    error OrderNotFound { id: u64 }
+    error CarrierNotRegistered {}
+    error InvalidStatusTransition { from: u8, to: u8 }
+    error NotCarrier {}
+    error NotShipper {}
+    error EscrowInsufficient {}
+    error AlreadyCleared {}
+    error InsuranceNotActive {}
+    error AlreadyClaimed {}
+    error InsufficientPayment { required: u256, sent: u256 }
+    error OrderNotDelivered {}
+
+    const SECONDS_PER_DAY: u64 = 86400;
+    const BPS_DENOMINATOR: u256 = 10000;
+    const INSURANCE_PREMIUM_DIVISOR: u256 = 50;
+    const INSURANCE_DEDUCTIBLE_DIVISOR: u256 = 10;
+    const VOLUMETRIC_DIVISOR: u32 = 5000;
+
+    #[constructor]
+    pub fn init() {
+        self.owner = msg.sender;
+        self.next_order_id = 1;
+        self.total_orders = 0;
+        self.insurance_pool = 0;
+    }
+
+    pub fn register_carrier(name_hash: u256, license_hash: u256) {
+        self.carrier_registry[msg.sender] = Carrier {
+            name_hash: name_hash,
+            license_hash: license_hash,
+            registered: true,
+            completed_shipments: 0,
+            rating_sum: 0,
+            rating_count: 0,
+        };
+    }
+
+    pub fn set_route_price(route_hash: u256, price: u256) {
+        require!(self.carrier_registry[msg.sender].registered, CarrierNotRegistered {});
+        self.route_prices[route_hash] = price;
+    }
+
+    pub fn set_tariff_rate(country_code: u16, rate_bps: u16) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.tariff_rates[country_code] = rate_bps;
+    }
+
+    #[reentrant]
+    pub fn create_order(
+        recipient: Address,
+        carrier: Address,
+        origin_country: u16,
+        dest_country: u16,
+        weight_kg_x100: u32,
+        length_cm: u16,
+        width_cm: u16,
+        height_cm: u16,
+        declared_value: u256,
+        estimated_days: u64,
+    ) -> u64 {
+        require!(self.carrier_registry[carrier].registered, CarrierNotRegistered {});
+
+        let order_id = self.next_order_id;
+        self.next_order_id += 1;
+
+        // Calculate volumetric weight
+        let vol_weight = (length_cm as u32 * width_cm as u32 * height_cm as u32) / 5000;
+        let chargeable_weight = if weight_kg_x100 > vol_weight * 100 {
+            weight_kg_x100
+        } else {
+            vol_weight * 100
+        };
+
+        let base_cost = chargeable_weight as u256 * 10;
+        require!(msg.value >= base_cost, InsufficientPayment { required: base_cost, sent: msg.value });
+
+        self.orders[order_id] = ShipOrder {
+            shipper: msg.sender,
+            recipient: recipient,
+            carrier: carrier,
+            origin_country: origin_country,
+            dest_country: dest_country,
+            weight_kg_x100: weight_kg_x100,
+            dimensions_cm: [length_cm, width_cm, height_cm],
+            declared_value: declared_value,
+            shipping_cost: msg.value,
+            status: 0,
+            created_at: block.timestamp,
+            estimated_delivery: block.timestamp + (estimated_days * 86400),
+            tracking_hash: 0,
+        };
+
+        self.escrow_balances[order_id] = msg.value;
+        self.total_orders += 1;
+
+        emit OrderCreated { order_id: order_id, shipper: msg.sender, carrier: carrier };
+        return order_id;
+    }
+
+    pub fn purchase_insurance(order_id: u64, coverage_amount: u256) {
+        let order = self.orders[order_id];
+        require!(order.shipper == msg.sender, NotShipper {});
+
+        // Premium is 2% of coverage
+        let premium = coverage_amount / 50;
+        require!(msg.value >= premium, InsufficientPayment { required: premium, sent: msg.value });
+
+        self.insurance_policies[order_id] = InsurancePolicy {
+            coverage_amount: coverage_amount,
+            premium_paid: msg.value,
+            deductible: coverage_amount / 10,
+            active: true,
+            claimed: false,
+            claim_amount: 0,
+        };
+
+        self.insurance_pool += msg.value;
+    }
+
+    pub fn update_status(order_id: u64, new_status: u8, tracking_hash: u256) {
+        let order = self.orders[order_id];
+        require!(msg.sender == order.carrier, NotCarrier {});
+
+        let current = order.status;
+        // 0=created, 1=picked_up, 2=in_transit, 3=customs, 4=out_for_delivery, 5=delivered, 6=returned
+        let valid = match current {
+            0 => new_status == 1,
+            1 => new_status == 2,
+            2 => new_status == 3 || new_status == 4,
+            3 => new_status == 2 || new_status == 4,
+            4 => new_status == 5 || new_status == 6,
+            _ => false,
+        };
+        require!(valid, InvalidStatusTransition { from: current, to: new_status });
+
+        self.orders[order_id].status = new_status;
+        self.orders[order_id].tracking_hash = tracking_hash;
+
+        emit OrderStatusChanged { order_id: order_id, old_status: current, new_status: new_status };
+    }
+
+    pub fn clear_customs(order_id: u64, hs_code: u32, description_hash: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(!self.customs_declarations[order_id].cleared, AlreadyCleared {});
+
+        let order = self.orders[order_id];
+        let tariff_rate = self.tariff_rates[order.dest_country];
+        let tariff = (order.declared_value * tariff_rate as u256) / 10000;
+
+        self.customs_declarations[order_id] = CustomsDeclaration {
+            hs_code: hs_code,
+            description_hash: description_hash,
+            declared_value: order.declared_value,
+            tariff_paid: tariff,
+            cleared: true,
+            cleared_at: block.timestamp,
+            inspector: msg.sender,
+        };
+
+        emit CustomsCleared { order_id: order_id, tariff_paid: tariff };
+    }
+
+    pub fn confirm_delivery(order_id: u64) {
+        let order = self.orders[order_id];
+        require!(msg.sender == order.recipient || msg.sender == order.shipper, NotShipper {});
+        require!(order.status == 5, OrderNotDelivered {});
+
+        let amount = self.escrow_balances[order_id];
+        self.escrow_balances[order_id] = 0;
+        raw_call!(order.carrier, amount, bytes(""));
+
+        self.carrier_registry[order.carrier].completed_shipments += 1;
+        emit EscrowReleased { order_id: order_id, amount: amount };
+    }
+
+    pub fn rate_carrier(order_id: u64, rating: u8) {
+        let order = self.orders[order_id];
+        require!(msg.sender == order.shipper, NotShipper {});
+        require!(order.status == 5, OrderNotDelivered {});
+
+        let clamped = if rating > 5 { 5 } else { rating };
+        self.carrier_registry[order.carrier].rating_sum += clamped as u64;
+        self.carrier_registry[order.carrier].rating_count += 1;
+    }
+
+    pub fn file_insurance_claim(order_id: u64, claim_amount: u256) {
+        let policy = self.insurance_policies[order_id];
+        require!(policy.active, InsuranceNotActive {});
+        require!(!policy.claimed, AlreadyClaimed {});
+
+        let payout = if claim_amount > policy.coverage_amount {
+            policy.coverage_amount - policy.deductible
+        } else {
+            claim_amount - policy.deductible
+        };
+
+        self.insurance_policies[order_id].claimed = true;
+        self.insurance_policies[order_id].claim_amount = payout;
+        self.insurance_pool -= payout;
+
+        raw_call!(self.orders[order_id].shipper, payout, bytes(""));
+        emit InsuranceClaimed { order_id: order_id, claim_amount: payout };
+    }
+
+    #[view]
+    pub fn get_order(order_id: u64) -> ShipOrder {
+        return self.orders[order_id];
+    }
+
+    #[view]
+    pub fn get_carrier(addr: Address) -> Carrier {
+        return self.carrier_registry[addr];
+    }
+
+    #[view]
+    pub fn get_escrow(order_id: u64) -> u256 {
+        return self.escrow_balances[order_id];
+    }
+}

@@ -1,0 +1,377 @@
+// Governor contract (Compound-style) supporting multiple actions per proposal,
+// vote delegation snapshots, proposal thresholds, and grace periods.
+
+use std::token::IERC20;
+
+contract Governor {
+    const MAX_ACTIONS: u256 = 10;
+    const TIMELOCK_DELAY: u64 = 172800;   // 2 days in seconds
+    const GRACE_PERIOD: u64 = 1209600;    // 14 days in seconds
+
+    enum VoteType {
+        Against,
+        For,
+        Abstain,
+    }
+
+    enum ProposalState {
+        Pending,
+        Active,
+        Cancelled,
+        Defeated,
+        Succeeded,
+        Queued,
+        Expired,
+        Executed,
+    }
+
+    storage {
+        name: String,
+        governance_token: Address,
+        timelock: Address,
+        guardian: Address,
+        proposal_count: u256,
+        proposals: Map<u256, Proposal>,
+        // proposal_id -> action index -> action
+        proposal_actions: Map<u256, Map<u256, Action>>,
+        proposal_action_count: Map<u256, u256>,
+        // proposal_id -> voter -> receipt
+        receipts: Map<u256, Map<Address, VoteReceipt>>,
+        // Track latest proposal per proposer to prevent spam
+        latest_proposal: Map<Address, u256>,
+
+        // Config
+        voting_delay: u64,
+        voting_period: u64,
+        proposal_threshold: u256,
+        quorum_votes: u256,
+        grace_period: u64,
+    }
+
+    struct Proposal {
+        id: u256,
+        proposer: Address,
+        eta: u64,
+        start_block: u64,
+        end_block: u64,
+        for_votes: u256,
+        against_votes: u256,
+        abstain_votes: u256,
+        cancelled: bool,
+        executed: bool,
+        description_hash: u256,
+    }
+
+    struct Action {
+        target: Address,
+        value: u256,
+        calldata: bytes,
+        signature: String,
+    }
+
+    struct VoteReceipt {
+        has_voted: bool,
+        support: VoteType,
+        votes: u256,
+    }
+
+    event ProposalCreated {
+        #[indexed]
+        id: u256,
+        #[indexed]
+        proposer: Address,
+        start_block: u64,
+        end_block: u64,
+        description: String,
+    }
+
+    event VoteCast {
+        #[indexed]
+        voter: Address,
+        #[indexed]
+        proposal_id: u256,
+        support: VoteType,
+        votes: u256,
+    }
+
+    event ProposalQueued {
+        #[indexed]
+        id: u256,
+        eta: u64,
+    }
+
+    event ProposalExecuted {
+        #[indexed]
+        id: u256,
+    }
+
+    event ProposalCancelled {
+        #[indexed]
+        id: u256,
+    }
+
+    event GuardianChanged {
+        #[indexed]
+        old_guardian: Address,
+        #[indexed]
+        new_guardian: Address,
+    }
+
+    error ProposalNotFound {}
+    error ProposalAlreadyPending {}
+    error InsufficientVotingPower { required: u256, available: u256 }
+    error AlreadyVoted {}
+    error VotingNotStarted {}
+    error VotingEnded {}
+    error InvalidSupport {}
+    error ProposalNotSucceeded {}
+    error ProposalNotQueued {}
+    error TimelockNotReached {}
+    error ProposalExpired {}
+    error NotGuardian {}
+    error EmptyActions {}
+    error TooManyActions { max: u256 }
+    error ActionCountMismatch {}
+    error ProposalAlreadyExecutedOrCancelled {}
+    error NotContractOwner {}
+
+    #[constructor]
+    pub fn init(
+        name: String,
+        governance_token: Address,
+        timelock: Address,
+        voting_delay: u64,
+        voting_period: u64,
+        proposal_threshold: u256,
+        quorum_votes: u256,
+    ) {
+        self.name = name;
+        self.governance_token = governance_token;
+        self.timelock = timelock;
+        self.guardian = msg.sender;
+        self.voting_delay = voting_delay;
+        self.voting_period = voting_period;
+        self.proposal_threshold = proposal_threshold;
+        self.quorum_votes = quorum_votes;
+        self.proposal_count = 0;
+        self.grace_period = GRACE_PERIOD;
+    }
+
+    pub fn propose(
+        targets: Vec<Address>,
+        values: Vec<u256>,
+        calldatas: Vec<bytes>,
+        signatures: Vec<String>,
+        description: String,
+    ) -> u256 {
+        let action_count = targets.len();
+        require!(action_count > 0, EmptyActions {});
+        require!(action_count <= MAX_ACTIONS, TooManyActions { max: MAX_ACTIONS });
+        require!(
+            values.len() == action_count
+            && calldatas.len() == action_count
+            && signatures.len() == action_count,
+            ActionCountMismatch {}
+        );
+
+        let token = IERC20::at(self.governance_token);
+        let proposer_votes = token.balance_of(msg.sender);
+        require!(proposer_votes >= self.proposal_threshold, InsufficientVotingPower {
+            required: self.proposal_threshold,
+            available: proposer_votes,
+        });
+
+        // Check that proposer's latest proposal is not still pending
+        let latest = self.latest_proposal[msg.sender];
+        if latest > 0 {
+            let latest_proposal = self.proposals[latest];
+            let latest_state = self.compute_state(latest_proposal);
+            require!(
+                latest_state != ProposalState::Pending && latest_state != ProposalState::Active,
+                ProposalAlreadyPending {}
+            );
+        }
+
+        self.proposal_count = self.proposal_count + 1;
+        let id = self.proposal_count;
+        let start = block.height + self.voting_delay;
+        let end = start + self.voting_period;
+
+        self.proposals[id] = Proposal {
+            id: id,
+            proposer: msg.sender,
+            eta: 0,
+            start_block: start,
+            end_block: end,
+            for_votes: 0,
+            against_votes: 0,
+            abstain_votes: 0,
+            cancelled: false,
+            executed: false,
+            description_hash: 0,
+        };
+
+        // Store actions
+        self.proposal_action_count[id] = action_count;
+        for i in 0..action_count {
+            self.proposal_actions[id][i] = Action {
+                target: targets[i],
+                value: values[i],
+                calldata: calldatas[i],
+                signature: signatures[i],
+            };
+        }
+
+        self.latest_proposal[msg.sender] = id;
+
+        emit ProposalCreated {
+            id: id,
+            proposer: msg.sender,
+            start_block: start,
+            end_block: end,
+            description: description,
+        };
+
+        return id;
+    }
+
+    pub fn cast_vote(proposal_id: u256, support: VoteType) {
+        let proposal = self.proposals[proposal_id];
+        require!(!proposal.cancelled && !proposal.executed, ProposalAlreadyExecutedOrCancelled {});
+        require!(block.height >= proposal.start_block, VotingNotStarted {});
+        require!(block.height <= proposal.end_block, VotingEnded {});
+
+        let receipt = self.receipts[proposal_id][msg.sender];
+        require!(!receipt.has_voted, AlreadyVoted {});
+
+        let token = IERC20::at(self.governance_token);
+        let votes = token.balance_of(msg.sender);
+
+        self.receipts[proposal_id][msg.sender] = VoteReceipt {
+            has_voted: true,
+            support: support,
+            votes: votes,
+        };
+
+        match support {
+            VoteType::Against => {
+                self.proposals[proposal_id].against_votes = proposal.against_votes + votes;
+            },
+            VoteType::For => {
+                self.proposals[proposal_id].for_votes = proposal.for_votes + votes;
+            },
+            VoteType::Abstain => {
+                self.proposals[proposal_id].abstain_votes = proposal.abstain_votes + votes;
+            },
+        }
+
+        emit VoteCast {
+            voter: msg.sender,
+            proposal_id: proposal_id,
+            support: support,
+            votes: votes,
+        };
+    }
+
+    pub fn queue(proposal_id: u256) {
+        let proposal = self.proposals[proposal_id];
+        let state = self.compute_state(proposal);
+        require!(state == ProposalState::Succeeded, ProposalNotSucceeded {});
+
+        let eta = block.timestamp + TIMELOCK_DELAY;
+        self.proposals[proposal_id].eta = eta;
+
+        emit ProposalQueued { id: proposal_id, eta: eta };
+    }
+
+    pub fn execute(proposal_id: u256) {
+        let proposal = self.proposals[proposal_id];
+        require!(!proposal.executed && !proposal.cancelled, ProposalAlreadyExecutedOrCancelled {});
+        require!(proposal.eta > 0, ProposalNotQueued {});
+        require!(block.timestamp >= proposal.eta, TimelockNotReached {});
+        require!(block.timestamp <= proposal.eta + self.grace_period, ProposalExpired {});
+
+        self.proposals[proposal_id].executed = true;
+
+        let count = self.proposal_action_count[proposal_id];
+        for i in 0..count {
+            let action = self.proposal_actions[proposal_id][i];
+            raw_call!(action.target, action.value, action.calldata);
+        }
+
+        emit ProposalExecuted { id: proposal_id };
+    }
+
+    pub fn cancel(proposal_id: u256) {
+        let proposal = self.proposals[proposal_id];
+        require!(!proposal.executed && !proposal.cancelled, ProposalAlreadyExecutedOrCancelled {});
+
+        // Guardian can cancel any proposal; proposer can cancel their own
+        require!(
+            msg.sender == self.guardian || msg.sender == proposal.proposer,
+            NotGuardian {}
+        );
+
+        self.proposals[proposal_id].cancelled = true;
+
+        emit ProposalCancelled { id: proposal_id };
+    }
+
+    pub fn set_guardian(new_guardian: Address) {
+        require!(msg.sender == self.guardian, NotContractOwner {});
+        let old = self.guardian;
+        self.guardian = new_guardian;
+        emit GuardianChanged { old_guardian: old, new_guardian: new_guardian };
+    }
+
+    #[view]
+    pub fn get_proposal(proposal_id: u256) -> Proposal {
+        return self.proposals[proposal_id];
+    }
+
+    #[view]
+    pub fn get_actions(proposal_id: u256, index: u256) -> Action {
+        return self.proposal_actions[proposal_id][index];
+    }
+
+    #[view]
+    pub fn get_receipt(proposal_id: u256, voter: Address) -> VoteReceipt {
+        return self.receipts[proposal_id][voter];
+    }
+
+    #[view]
+    pub fn state(proposal_id: u256) -> ProposalState {
+        let proposal = self.proposals[proposal_id];
+        return self.compute_state(proposal);
+    }
+
+    fn compute_state(proposal: Proposal) -> ProposalState {
+        if proposal.cancelled {
+            return ProposalState::Cancelled;
+        }
+        if proposal.executed {
+            return ProposalState::Executed;
+        }
+        if block.height < proposal.start_block {
+            return ProposalState::Pending;
+        }
+        if block.height <= proposal.end_block {
+            return ProposalState::Active;
+        }
+        // Voting ended
+        let total_for_against = proposal.for_votes + proposal.against_votes + proposal.abstain_votes;
+        if total_for_against < self.quorum_votes || proposal.for_votes <= proposal.against_votes {
+            return ProposalState::Defeated;
+        }
+        if proposal.eta == 0 {
+            return ProposalState::Succeeded;
+        }
+        if block.timestamp < proposal.eta {
+            return ProposalState::Queued;
+        }
+        if block.timestamp > proposal.eta + self.grace_period {
+            return ProposalState::Expired;
+        }
+        return ProposalState::Succeeded;
+    }
+}

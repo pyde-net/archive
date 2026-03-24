@@ -1,0 +1,254 @@
+// Two-step ownership transfer requiring the new owner to explicitly
+// accept ownership. Prevents accidental transfers to wrong addresses.
+
+contract TwoStepOwnership {
+    storage {
+        owner: Address,
+        pending_owner: Address,
+        proposed_at: u64,
+        proposal_expiry: u64, // seconds until a proposal expires
+        transfer_count: u64,
+        history: Vec<TransferRecord>,
+        authorized_proposers: Map<Address, bool>,
+        require_proposer: bool,
+    }
+
+    struct TransferRecord {
+        from: Address,
+        to: Address,
+        proposed_at: u64,
+        accepted_at: u64,
+    }
+
+    const MIN_EXPIRY_SECONDS: u64 = 3600;       // 1 hour
+    const MAX_EXPIRY_SECONDS: u64 = 2592000;     // 30 * 86400
+
+    event OwnershipProposed {
+        #[indexed]
+        current_owner: Address,
+        #[indexed]
+        proposed_owner: Address,
+        expires_at: u64,
+    }
+
+    event OwnershipAccepted {
+        #[indexed]
+        previous_owner: Address,
+        #[indexed]
+        new_owner: Address,
+    }
+
+    event ProposalCancelled {
+        #[indexed]
+        cancelled_by: Address,
+        proposed_owner: Address,
+    }
+
+    event ProposalExpired {
+        proposed_owner: Address,
+    }
+
+    event ProposerAuthorized {
+        #[indexed]
+        proposer: Address,
+    }
+
+    event ProposerRevoked {
+        #[indexed]
+        proposer: Address,
+    }
+
+    event ExpiryUpdated {
+        old_expiry: u64,
+        new_expiry: u64,
+    }
+
+    error NotOwner {}
+    error NotPendingOwner { expected: Address, actual: Address }
+    error NoPendingTransfer {}
+    error ProposalExpiredError {}
+    error ProposalStillActive {}
+    error ZeroAddress {}
+    error SameOwner {}
+    error NotAuthorizedProposer {}
+    error ExpiryTooShort { min: u64 }
+    error ExpiryTooLong { max: u64 }
+
+    #[constructor]
+    pub fn init(proposal_expiry_seconds: u64) {
+        self.owner = msg.sender;
+        self.pending_owner = Address::ZERO;
+        self.proposal_expiry = proposal_expiry_seconds;
+        self.transfer_count = 0;
+        self.require_proposer = false;
+
+        // Min 1 hour, max 30 days
+        if proposal_expiry_seconds < MIN_EXPIRY_SECONDS {
+            self.proposal_expiry = MIN_EXPIRY_SECONDS;
+        }
+        if proposal_expiry_seconds > MAX_EXPIRY_SECONDS {
+            self.proposal_expiry = MAX_EXPIRY_SECONDS;
+        }
+    }
+
+    fn ensure_owner() {
+        require!(msg.sender == self.owner, NotOwner {});
+    }
+
+    // Step 1: Current owner proposes a new owner
+    pub fn propose_transfer(new_owner: Address) {
+        self.ensure_owner();
+        require!(new_owner != Address::ZERO, ZeroAddress {});
+        require!(new_owner != self.owner, SameOwner {});
+
+        if self.require_proposer {
+            require!(
+                self.authorized_proposers[msg.sender] || msg.sender == self.owner,
+                NotAuthorizedProposer {},
+            );
+        }
+
+        self.pending_owner = new_owner;
+        self.proposed_at = block.timestamp;
+
+        let expires = block.timestamp + self.proposal_expiry;
+
+        emit OwnershipProposed {
+            current_owner: self.owner,
+            proposed_owner: new_owner,
+            expires_at: expires,
+        };
+    }
+
+    // Step 2: Proposed owner accepts ownership
+    pub fn accept_ownership() {
+        require!(self.pending_owner != Address::ZERO, NoPendingTransfer {});
+        require!(msg.sender == self.pending_owner, NotPendingOwner {
+            expected: self.pending_owner,
+            actual: msg.sender,
+        });
+
+        let deadline = self.proposed_at + self.proposal_expiry;
+        require!(block.timestamp <= deadline, ProposalExpiredError {});
+
+        let previous = self.owner;
+        self.owner = self.pending_owner;
+        self.pending_owner = Address::ZERO;
+        self.transfer_count = self.transfer_count + 1;
+
+        self.history.push(TransferRecord {
+            from: previous,
+            to: self.owner,
+            proposed_at: self.proposed_at,
+            accepted_at: block.timestamp,
+        });
+
+        emit OwnershipAccepted {
+            previous_owner: previous,
+            new_owner: self.owner,
+        };
+    }
+
+    // Cancel a pending proposal
+    pub fn cancel_proposal() {
+        self.ensure_owner();
+        require!(self.pending_owner != Address::ZERO, NoPendingTransfer {});
+
+        let proposed = self.pending_owner;
+        self.pending_owner = Address::ZERO;
+        self.proposed_at = 0;
+
+        emit ProposalCancelled {
+            cancelled_by: msg.sender,
+            proposed_owner: proposed,
+        };
+    }
+
+    // Anyone can clean up an expired proposal
+    pub fn clear_expired_proposal() {
+        require!(self.pending_owner != Address::ZERO, NoPendingTransfer {});
+        let deadline = self.proposed_at + self.proposal_expiry;
+        require!(block.timestamp > deadline, ProposalStillActive {});
+
+        let proposed = self.pending_owner;
+        self.pending_owner = Address::ZERO;
+        self.proposed_at = 0;
+
+        emit ProposalExpired { proposed_owner: proposed };
+    }
+
+    pub fn set_proposal_expiry(new_expiry: u64) {
+        self.ensure_owner();
+        require!(new_expiry >= MIN_EXPIRY_SECONDS, ExpiryTooShort { min: MIN_EXPIRY_SECONDS });
+        require!(new_expiry <= MAX_EXPIRY_SECONDS, ExpiryTooLong { max: MAX_EXPIRY_SECONDS });
+
+        let old = self.proposal_expiry;
+        self.proposal_expiry = new_expiry;
+
+        emit ExpiryUpdated { old_expiry: old, new_expiry: new_expiry };
+    }
+
+    pub fn authorize_proposer(proposer: Address) {
+        self.ensure_owner();
+        require!(proposer != Address::ZERO, ZeroAddress {});
+        self.authorized_proposers[proposer] = true;
+        emit ProposerAuthorized { proposer: proposer };
+    }
+
+    pub fn revoke_proposer(proposer: Address) {
+        self.ensure_owner();
+        self.authorized_proposers[proposer] = false;
+        emit ProposerRevoked { proposer: proposer };
+    }
+
+    pub fn set_require_proposer(required: bool) {
+        self.ensure_owner();
+        self.require_proposer = required;
+    }
+
+    #[view]
+    pub fn get_owner() -> Address {
+        return self.owner;
+    }
+
+    #[view]
+    pub fn get_pending_owner() -> Address {
+        return self.pending_owner;
+    }
+
+    #[view]
+    pub fn is_proposal_active() -> bool {
+        if self.pending_owner == Address::ZERO {
+            return false;
+        }
+        let deadline = self.proposed_at + self.proposal_expiry;
+        return block.timestamp <= deadline;
+    }
+
+    #[view]
+    pub fn proposal_time_remaining() -> u64 {
+        if self.pending_owner == Address::ZERO {
+            return 0;
+        }
+        let deadline = self.proposed_at + self.proposal_expiry;
+        if block.timestamp >= deadline {
+            return 0;
+        }
+        return deadline - block.timestamp;
+    }
+
+    #[view]
+    pub fn get_transfer_history() -> Vec<TransferRecord> {
+        return self.history;
+    }
+
+    #[view]
+    pub fn get_transfer_count() -> u64 {
+        return self.transfer_count;
+    }
+
+    #[view]
+    pub fn is_authorized_proposer(account: Address) -> bool {
+        return self.authorized_proposers[account];
+    }
+}

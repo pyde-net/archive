@@ -1,0 +1,339 @@
+// Liquidity mining gauge with boost mechanics and weighted voting
+use std::math;
+use std::token::IERC20;
+
+interface IGaugeController {
+    fn get_gauge_weight(gauge: Address) -> u256;
+    fn get_total_weight() -> u256;
+    fn checkpoint_gauge(gauge: Address);
+}
+
+interface IVotingEscrow {
+    fn balance_of(user: Address) -> u256;
+    fn total_supply() -> u256;
+}
+
+contract LiquidityGauge {
+    storage {
+        // Core references
+        lp_token: Address,
+        reward_token: Address,
+        gauge_controller: Address,
+        voting_escrow: Address,
+        minter: Address,
+
+        // Global state
+        total_staked: u256,
+        reward_rate: u256,               // tokens per second
+        period_timestamp: Vec<u64>,
+        period_rewards: Vec<u256>,
+        current_period: u256,
+
+        // Integral tracking for reward distribution
+        reward_integral: u256,           // integral of reward rate / total_staked dt
+        reward_integral_for: Map<Address, u256>,
+
+        // Boost tracking
+        working_supply: u256,            // sum of working balances
+        working_balances: Map<Address, u256>,
+
+        // User state
+        staked_balances: Map<Address, u256>,
+        claimable_reward: Map<Address, u256>,
+        claimed_reward: Map<Address, u256>,
+
+        // Kick mechanics (force re-checkpoint of stale boosts)
+        last_user_checkpoint: Map<Address, u64>,
+        kick_threshold: u64,             // seconds before a user can be kicked
+
+        // Admin
+        owner: Address,
+        is_killed: bool,                 // emergency kill switch
+        inflation_rate: u256,
+
+        scale: u256,
+        boost_scale: u256,              // 1e18
+        max_boost: u256,                // 2.5x = 2500 (scaled 1e3)
+    }
+
+    event Deposit {
+        #[indexed]
+        user: Address,
+        amount: u256,
+    }
+
+    event Withdraw {
+        #[indexed]
+        user: Address,
+        amount: u256,
+    }
+
+    event UpdateLiquidityLimit {
+        #[indexed]
+        user: Address,
+        original_balance: u256,
+        working_balance: u256,
+        original_supply: u256,
+        working_supply: u256,
+    }
+
+    event RewardClaimed {
+        #[indexed]
+        user: Address,
+        amount: u256,
+    }
+
+    event Kicked {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        kicker: Address,
+    }
+
+    event Killed {}
+
+    error InsufficientBalance { available: u256, requested: u256 }
+    error ZeroAmount {}
+    error NotOwner {}
+    error GaugeKilled {}
+    error KickNotAllowed { last_checkpoint: u64, threshold: u64 }
+    error NothingToClaim {}
+
+    #[constructor]
+    pub fn init(
+        lp_token: Address,
+        reward_token: Address,
+        gauge_controller: Address,
+        voting_escrow: Address,
+        minter: Address,
+    ) {
+        self.lp_token = lp_token;
+        self.reward_token = reward_token;
+        self.gauge_controller = gauge_controller;
+        self.voting_escrow = voting_escrow;
+        self.minter = minter;
+        self.owner = msg.sender;
+        self.is_killed = false;
+        self.scale = 1000000000000000000u256;
+        self.boost_scale = 1000000000000000000u256;
+        self.max_boost = 2500u256; // 2.5x
+        self.kick_threshold = 604800u64; // 7 days
+        self.current_period = 0u256;
+        self.period_timestamp.push(block.timestamp);
+    }
+
+    // --- Internal ---
+
+    fn checkpoint_reward() {
+        if self.working_supply > 0u256 {
+            let last_time = self.period_timestamp[self.current_period];
+            let dt = (block.timestamp - last_time) as u256;
+            let reward = dt * self.reward_rate;
+            self.reward_integral = self.reward_integral + (reward * self.scale) / self.working_supply;
+        }
+
+        self.current_period = self.current_period + 1u256;
+        self.period_timestamp.push(block.timestamp);
+    }
+
+    fn checkpoint_user_reward(user: Address) {
+        let integral = self.reward_integral;
+        let integral_for = self.reward_integral_for[user];
+
+        if integral > integral_for {
+            let working_bal = self.working_balances[user];
+            let delta = (working_bal * (integral - integral_for)) / self.scale;
+            self.claimable_reward[user] = self.claimable_reward[user] + delta;
+        }
+
+        self.reward_integral_for[user] = integral;
+    }
+
+    // Calculate the working (boosted) balance for a user
+    // working_balance = min(0.4 * balance + 0.6 * balance * (veBalance / veTotal), balance)
+    fn update_liquidity_limit(user: Address) {
+        let balance = self.staked_balances[user];
+        let total = self.total_staked;
+
+        let ve_balance = IVotingEscrow::at(self.voting_escrow).balance_of(user);
+        let ve_total = IVotingEscrow::at(self.voting_escrow).total_supply();
+
+        // Base: 40% of balance (no boost needed)
+        let base = (balance * 40u256) / 100u256;
+
+        // Boost component: 60% of balance * (user_ve / total_ve)
+        let mut boost_component: u256 = 0u256;
+        if ve_total > 0u256 {
+            boost_component = (balance * 60u256 * ve_balance) / (100u256 * ve_total);
+        }
+
+        let mut working = base + boost_component;
+        if working > balance {
+            working = balance; // Cap at 100% (2.5x boost is the max)
+        }
+
+        let old_working = self.working_balances[user];
+        self.working_balances[user] = working;
+        self.working_supply = self.working_supply - old_working + working;
+
+        emit UpdateLiquidityLimit {
+            user: user,
+            original_balance: balance,
+            working_balance: working,
+            original_supply: total,
+            working_supply: self.working_supply,
+        };
+
+        self.last_user_checkpoint[user] = block.timestamp;
+    }
+
+    // --- Core ---
+
+    pub fn deposit(amount: u256) {
+        require!(!self.is_killed, GaugeKilled {});
+        require!(amount > 0u256, ZeroAmount {});
+
+        self.checkpoint_reward();
+        self.checkpoint_user_reward(msg.sender);
+
+        IERC20::at(self.lp_token).transfer_from(msg.sender, address(self), amount);
+
+        self.staked_balances[msg.sender] = self.staked_balances[msg.sender] + amount;
+        self.total_staked = self.total_staked + amount;
+
+        self.update_liquidity_limit(msg.sender);
+
+        emit Deposit { user: msg.sender, amount: amount };
+    }
+
+    pub fn withdraw(amount: u256) {
+        require!(amount > 0u256, ZeroAmount {});
+        let bal = self.staked_balances[msg.sender];
+        require!(bal >= amount, InsufficientBalance { available: bal, requested: amount });
+
+        self.checkpoint_reward();
+        self.checkpoint_user_reward(msg.sender);
+
+        self.staked_balances[msg.sender] = bal - amount;
+        self.total_staked = self.total_staked - amount;
+
+        self.update_liquidity_limit(msg.sender);
+
+        IERC20::at(self.lp_token).transfer(msg.sender, amount);
+
+        emit Withdraw { user: msg.sender, amount: amount };
+    }
+
+    pub fn claim_rewards() {
+        self.checkpoint_reward();
+        self.checkpoint_user_reward(msg.sender);
+
+        let claimable = self.claimable_reward[msg.sender];
+        require!(claimable > 0u256, NothingToClaim {});
+
+        self.claimable_reward[msg.sender] = 0u256;
+        self.claimed_reward[msg.sender] = self.claimed_reward[msg.sender] + claimable;
+
+        IERC20::at(self.reward_token).transfer(msg.sender, claimable);
+
+        emit RewardClaimed { user: msg.sender, amount: claimable };
+    }
+
+    // Force-update a user's boost if their veToken balance has changed significantly
+    pub fn kick(user: Address) {
+        let last_ckpt = self.last_user_checkpoint[user];
+        require!(
+            block.timestamp >= last_ckpt + self.kick_threshold,
+            KickNotAllowed { last_checkpoint: last_ckpt, threshold: self.kick_threshold },
+        );
+
+        self.checkpoint_reward();
+        self.checkpoint_user_reward(user);
+        self.update_liquidity_limit(user);
+
+        emit Kicked { user: user, kicker: msg.sender };
+    }
+
+    // Refresh own boost
+    pub fn user_checkpoint() {
+        self.checkpoint_reward();
+        self.checkpoint_user_reward(msg.sender);
+        self.update_liquidity_limit(msg.sender);
+    }
+
+    // --- Admin ---
+
+    pub fn set_reward_rate(rate: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.checkpoint_reward();
+        self.reward_rate = rate;
+    }
+
+    pub fn kill_gauge() {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.is_killed = true;
+        self.checkpoint_reward();
+        self.reward_rate = 0u256;
+        emit Killed {};
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn get_staked(user: Address) -> u256 {
+        return self.staked_balances[user];
+    }
+
+    #[view]
+    pub fn get_working_balance(user: Address) -> u256 {
+        return self.working_balances[user];
+    }
+
+    #[view]
+    pub fn get_boost(user: Address) -> u256 {
+        let balance = self.staked_balances[user];
+        let working = self.working_balances[user];
+        if balance == 0u256 {
+            return self.scale;
+        }
+        // Boost = working_balance / (0.4 * balance) in 1e18
+        let base = (balance * 40u256) / 100u256;
+        if base == 0u256 {
+            return self.scale;
+        }
+        return (working * self.scale) / base;
+    }
+
+    #[view]
+    pub fn get_claimable(user: Address) -> u256 {
+        let integral = self.reward_integral;
+        let integral_for = self.reward_integral_for[user];
+        let working_bal = self.working_balances[user];
+        let pending = if integral > integral_for {
+            (working_bal * (integral - integral_for)) / self.scale
+        } else {
+            0u256
+        };
+        return self.claimable_reward[user] + pending;
+    }
+
+    #[view]
+    pub fn get_total_staked() -> u256 {
+        return self.total_staked;
+    }
+
+    #[view]
+    pub fn get_working_supply() -> u256 {
+        return self.working_supply;
+    }
+
+    #[view]
+    pub fn get_claimed(user: Address) -> u256 {
+        return self.claimed_reward[user];
+    }
+
+    #[view]
+    pub fn is_killed() -> bool {
+        return self.is_killed;
+    }
+}

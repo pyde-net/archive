@@ -1,0 +1,368 @@
+// On-chain dispute resolution with arbitrator selection, evidence submission, and appeal process
+use std::math;
+
+enum DisputeStatus {
+    Filed,            // 0
+    EvidencePhase,    // 1
+    Deliberation,     // 2
+    Resolved,         // 3
+    Appealed,         // 4
+    AppealResolved,   // 5
+}
+
+contract DisputeResolution {
+    storage {
+        governance: Address,
+        next_dispute_id: u64,
+        disputes: Map<u64, Dispute>,
+        evidence: Map<u64, Map<u32, Evidence>>,
+        evidence_counts: Map<u64, u32>,
+        arbitrators: Map<Address, Arbitrator>,
+        arbitrator_list: Vec<Address>,
+        dispute_arbitrators: Map<u64, Vec<Address>>,
+        arbitrator_votes: Map<u64, Map<Address, Vote>>,
+        appeals: Map<u64, Appeal>,
+        stake_amount: u256,
+        filing_fee: u256,
+        dispute_stakes: Map<u64, Map<Address, u256>>,
+        resolution_deadline_days: u64,
+    }
+
+    struct Dispute {
+        claimant: Address,
+        respondent: Address,
+        category: u8,
+        description_hash: u256,
+        amount_in_dispute: u256,
+        status: u8,
+        filed_at: u64,
+        resolved_at: u64,
+        deadline: u64,
+        outcome: u8,
+        panel_size: u8,
+    }
+
+    struct Evidence {
+        submitter: Address,
+        evidence_hash: u256,
+        evidence_type: u8,
+        timestamp: u64,
+        description_hash: u256,
+        challenged: bool,
+    }
+
+    struct Arbitrator {
+        registered: bool,
+        specialty: u8,
+        cases_handled: u64,
+        reputation: u256,
+        staked: u256,
+        active: bool,
+        correct_rulings: u64,
+    }
+
+    struct Vote {
+        voted: bool,
+        in_favor_of_claimant: bool,
+        reasoning_hash: u256,
+        timestamp: u64,
+        damages_awarded: u256,
+    }
+
+    struct Appeal {
+        filed: bool,
+        filed_by: Address,
+        filed_at: u64,
+        grounds_hash: u256,
+        appeal_fee: u256,
+        resolved: bool,
+        upheld: bool,
+    }
+
+    event DisputeFiled {
+        #[indexed]
+        dispute_id: u64,
+        #[indexed]
+        claimant: Address,
+        #[indexed]
+        respondent: Address,
+    }
+
+    event EvidenceSubmitted {
+        #[indexed]
+        dispute_id: u64,
+        evidence_index: u32,
+        submitter: Address,
+    }
+
+    event ArbitratorAssigned {
+        #[indexed]
+        dispute_id: u64,
+        arbitrator: Address,
+    }
+
+    event VoteCast {
+        #[indexed]
+        dispute_id: u64,
+        #[indexed]
+        arbitrator: Address,
+    }
+
+    event DisputeResolved {
+        #[indexed]
+        dispute_id: u64,
+        outcome: u8,
+    }
+
+    event AppealFiled {
+        #[indexed]
+        dispute_id: u64,
+        filed_by: Address,
+    }
+
+    error NotGovernance {}
+    error DisputeNotFound { id: u64 }
+    error NotParty {}
+    error DisputeNotActive {}
+    error NotArbitrator {}
+    error AlreadyVoted {}
+    error DeadlinePassed {}
+    error InsufficientFee { required: u256, sent: u256 }
+    error InsufficientStake {}
+    error ArbitratorNotActive {}
+    error AppealAlreadyFiled {}
+    error CannotAppeal {}
+    error PanelNotComplete {}
+
+    const SECONDS_PER_DAY: u64 = 86400;
+    const INITIAL_REPUTATION: u256 = 100;
+    const APPEAL_FEE_MULTIPLIER: u256 = 2;
+
+    #[constructor]
+    pub fn init(stake_amount: u256, filing_fee: u256, deadline_days: u64) {
+        self.governance = msg.sender;
+        self.next_dispute_id = 1;
+        self.stake_amount = stake_amount;
+        self.filing_fee = filing_fee;
+        self.resolution_deadline_days = deadline_days;
+    }
+
+    pub fn register_arbitrator(specialty: u8) {
+        require!(msg.value >= self.stake_amount, InsufficientStake {});
+
+        self.arbitrators[msg.sender] = Arbitrator {
+            registered: true,
+            specialty: specialty,
+            cases_handled: 0,
+            reputation: 100,
+            staked: msg.value,
+            active: true,
+            correct_rulings: 0,
+        };
+        self.arbitrator_list.push(msg.sender);
+    }
+
+    pub fn file_dispute(
+        respondent: Address,
+        category: u8,
+        description_hash: u256,
+        amount_in_dispute: u256,
+        panel_size: u8,
+    ) -> u64 {
+        require!(msg.value >= self.filing_fee, InsufficientFee {
+            required: self.filing_fee,
+            sent: msg.value,
+        });
+
+        let dispute_id = self.next_dispute_id;
+        self.next_dispute_id += 1;
+
+        let effective_panel = if panel_size % 2 == 0 { panel_size + 1 } else { panel_size };
+        let deadline = block.timestamp + (self.resolution_deadline_days * 86400);
+
+        // Status: 0=filed, 1=evidence_phase, 2=deliberation, 3=resolved, 4=appealed, 5=appeal_resolved
+        self.disputes[dispute_id] = Dispute {
+            claimant: msg.sender,
+            respondent: respondent,
+            category: category,
+            description_hash: description_hash,
+            amount_in_dispute: amount_in_dispute,
+            status: 0,
+            filed_at: block.timestamp,
+            resolved_at: 0,
+            deadline: deadline,
+            outcome: 0,
+            panel_size: effective_panel,
+        };
+
+        self.evidence_counts[dispute_id] = 0;
+        self.dispute_stakes[dispute_id][msg.sender] = msg.value;
+
+        emit DisputeFiled { dispute_id: dispute_id, claimant: msg.sender, respondent: respondent };
+        return dispute_id;
+    }
+
+    pub fn respond_to_dispute(dispute_id: u64) {
+        let dispute = self.disputes[dispute_id];
+        require!(msg.sender == dispute.respondent, NotParty {});
+        require!(msg.value >= self.filing_fee, InsufficientFee {
+            required: self.filing_fee,
+            sent: msg.value,
+        });
+
+        self.dispute_stakes[dispute_id][msg.sender] = msg.value;
+        self.disputes[dispute_id].status = 1; // Move to evidence phase
+    }
+
+    pub fn submit_evidence(
+        dispute_id: u64,
+        evidence_hash: u256,
+        evidence_type: u8,
+        description_hash: u256,
+    ) {
+        let dispute = self.disputes[dispute_id];
+        require!(dispute.status == 1, DisputeNotActive {});
+        require!(block.timestamp < dispute.deadline, DeadlinePassed {});
+        require!(
+            msg.sender == dispute.claimant || msg.sender == dispute.respondent,
+            NotParty {}
+        );
+
+        let idx = self.evidence_counts[dispute_id];
+        self.evidence[dispute_id][idx] = Evidence {
+            submitter: msg.sender,
+            evidence_hash: evidence_hash,
+            evidence_type: evidence_type,
+            timestamp: block.timestamp,
+            description_hash: description_hash,
+            challenged: false,
+        };
+        self.evidence_counts[dispute_id] = idx + 1;
+
+        emit EvidenceSubmitted { dispute_id: dispute_id, evidence_index: idx, submitter: msg.sender };
+    }
+
+    pub fn challenge_evidence(dispute_id: u64, evidence_index: u32) {
+        let dispute = self.disputes[dispute_id];
+        require!(
+            msg.sender == dispute.claimant || msg.sender == dispute.respondent,
+            NotParty {}
+        );
+        require!(self.evidence[dispute_id][evidence_index].submitter != msg.sender, NotParty {});
+        self.evidence[dispute_id][evidence_index].challenged = true;
+    }
+
+    pub fn assign_arbitrator(dispute_id: u64, arbitrator: Address) {
+        require!(msg.sender == self.governance, NotGovernance {});
+        require!(self.arbitrators[arbitrator].active, ArbitratorNotActive {});
+
+        self.dispute_arbitrators[dispute_id].push(arbitrator);
+        self.arbitrators[arbitrator].cases_handled += 1;
+
+        let assigned = self.dispute_arbitrators[dispute_id].len() as u8;
+        if assigned >= self.disputes[dispute_id].panel_size {
+            self.disputes[dispute_id].status = 2;
+        }
+
+        emit ArbitratorAssigned { dispute_id: dispute_id, arbitrator: arbitrator };
+    }
+
+    pub fn cast_vote(
+        dispute_id: u64,
+        in_favor_of_claimant: bool,
+        reasoning_hash: u256,
+        damages_awarded: u256,
+    ) {
+        let dispute = self.disputes[dispute_id];
+        require!(dispute.status == 2, DisputeNotActive {});
+        require!(self.arbitrators[msg.sender].active, NotArbitrator {});
+        require!(!self.arbitrator_votes[dispute_id][msg.sender].voted, AlreadyVoted {});
+
+        self.arbitrator_votes[dispute_id][msg.sender] = Vote {
+            voted: true,
+            in_favor_of_claimant: in_favor_of_claimant,
+            reasoning_hash: reasoning_hash,
+            timestamp: block.timestamp,
+            damages_awarded: damages_awarded,
+        };
+
+        emit VoteCast { dispute_id: dispute_id, arbitrator: msg.sender };
+
+        // Check if all votes are in
+        let panel = self.dispute_arbitrators[dispute_id];
+        let mut votes_in: u8 = 0;
+        let mut claimant_votes: u8 = 0;
+
+        for i in 0..panel.len() {
+            let arb = panel[i];
+            if self.arbitrator_votes[dispute_id][arb].voted {
+                votes_in += 1;
+                if self.arbitrator_votes[dispute_id][arb].in_favor_of_claimant {
+                    claimant_votes += 1;
+                }
+            }
+        }
+
+        if votes_in >= dispute.panel_size {
+            let majority = (dispute.panel_size / 2) + 1;
+            let outcome = if claimant_votes >= majority { 1u8 } else { 2u8 };
+
+            self.disputes[dispute_id].outcome = outcome;
+            self.disputes[dispute_id].status = 3;
+            self.disputes[dispute_id].resolved_at = block.timestamp;
+
+            emit DisputeResolved { dispute_id: dispute_id, outcome: outcome };
+        }
+    }
+
+    pub fn file_appeal(dispute_id: u64, grounds_hash: u256) {
+        let dispute = self.disputes[dispute_id];
+        require!(dispute.status == 3, CannotAppeal {});
+        require!(!self.appeals[dispute_id].filed, AppealAlreadyFiled {});
+        require!(
+            msg.sender == dispute.claimant || msg.sender == dispute.respondent,
+            NotParty {}
+        );
+
+        let appeal_fee = self.filing_fee * 2;
+        require!(msg.value >= appeal_fee, InsufficientFee { required: appeal_fee, sent: msg.value });
+
+        self.appeals[dispute_id] = Appeal {
+            filed: true,
+            filed_by: msg.sender,
+            filed_at: block.timestamp,
+            grounds_hash: grounds_hash,
+            appeal_fee: msg.value,
+            resolved: false,
+            upheld: false,
+        };
+
+        self.disputes[dispute_id].status = 4;
+        emit AppealFiled { dispute_id: dispute_id, filed_by: msg.sender };
+    }
+
+    #[view]
+    pub fn get_dispute(dispute_id: u64) -> Dispute {
+        return self.disputes[dispute_id];
+    }
+
+    #[view]
+    pub fn get_evidence(dispute_id: u64, index: u32) -> Evidence {
+        return self.evidence[dispute_id][index];
+    }
+
+    #[view]
+    pub fn get_arbitrator(addr: Address) -> Arbitrator {
+        return self.arbitrators[addr];
+    }
+
+    #[view]
+    pub fn get_appeal(dispute_id: u64) -> Appeal {
+        return self.appeals[dispute_id];
+    }
+
+    #[view]
+    pub fn get_vote(dispute_id: u64, arbitrator: Address) -> Vote {
+        return self.arbitrator_votes[dispute_id][arbitrator];
+    }
+}

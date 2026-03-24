@@ -1,0 +1,311 @@
+// Demonstrates #[sponsored] and #[sponsored(Paymaster)] patterns
+// Gas sponsorship for gasless UX
+
+use std::token::IERC20;
+use std::signature;
+
+interface IPaymaster {
+    fn validate_and_pay(user: Address, function_sig: bytes, gas_cost: u256) -> bool;
+    fn balance_of(user: Address) -> u256;
+}
+
+contract GaslessToken {
+    storage {
+        name: String,
+        symbol: String,
+        total_supply: u256,
+        balances: Map<Address, u256>,
+        allowances: Map<Address, Map<Address, u256>>,
+        nonces: Map<Address, u256>,
+        paymaster: Address,
+        gas_tank_deposits: Map<Address, u256>,
+        sponsored_ops_count: Map<Address, u64>,
+        max_sponsored_per_day: u64,
+        daily_reset_timestamp: Map<Address, u64>,
+    }
+
+    struct PermitData {
+        owner: Address,
+        spender: Address,
+        value: u256,
+        nonce: u256,
+        deadline: u64,
+        signature: bytes,
+    }
+
+    struct MetaTxData {
+        from: Address,
+        to: Address,
+        amount: u256,
+        nonce: u256,
+        deadline: u64,
+        signature: bytes,
+        public_key: bytes,
+    }
+
+    struct BatchTransfer {
+        recipient: Address,
+        amount: u256,
+    }
+
+    event Transfer {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    event Approval {
+        #[indexed]
+        owner: Address,
+        #[indexed]
+        spender: Address,
+        amount: u256,
+    }
+
+    event GasTankDeposit {
+        #[indexed]
+        depositor: Address,
+        amount: u256,
+    }
+
+    event SponsoredTransfer {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        amount: u256,
+        gas_sponsor: String,
+    }
+
+    error InsufficientBalance { available: u256, required: u256 }
+    error InvalidSignature {}
+    error ExpiredDeadline { deadline: u64, current: u64 }
+    error InvalidNonce { expected: u256, got: u256 }
+    error SponsorshipLimitReached { address: Address, limit: u64 }
+    error InsufficientGasTank { available: u256 }
+
+    const SECONDS_PER_DAY: u64 = 86400;
+    const DEFAULT_MAX_SPONSORED_PER_DAY: u64 = 50;
+
+    #[constructor]
+    pub fn init(
+        name: String,
+        symbol: String,
+        initial_supply: u256,
+        paymaster_addr: Address,
+    ) {
+        self.name = name;
+        self.symbol = symbol;
+        self.total_supply = initial_supply;
+        self.balances[msg.sender] = initial_supply;
+        self.paymaster = paymaster_addr;
+        self.max_sponsored_per_day = DEFAULT_MAX_SPONSORED_PER_DAY;
+
+        emit Transfer { from: Address::ZERO, to: msg.sender, amount: initial_supply };
+    }
+
+    // Standard transfer — caller pays gas
+    pub fn transfer(to: Address, amount: u256) {
+        let from_bal = self.balances[msg.sender];
+        require!(from_bal >= amount, InsufficientBalance {
+            available: from_bal,
+            required: amount,
+        });
+
+        self.balances[msg.sender] = from_bal - amount;
+        self.balances[to] = self.balances[to] + amount;
+
+        emit Transfer { from: msg.sender, to: to, amount: amount };
+    }
+
+    // Gas from caller's gas tank deposit
+    #[sponsored]
+    pub fn transfer_sponsored(to: Address, amount: u256) {
+        // Check daily limit
+        check_daily_limit(msg.sender);
+
+        let from_bal = self.balances[msg.sender];
+        require!(from_bal >= amount, InsufficientBalance {
+            available: from_bal,
+            required: amount,
+        });
+
+        self.balances[msg.sender] = from_bal - amount;
+        self.balances[to] = self.balances[to] + amount;
+        self.sponsored_ops_count[msg.sender] += 1;
+
+        emit SponsoredTransfer {
+            from: msg.sender,
+            to: to,
+            amount: amount,
+            gas_sponsor: "gas_tank",
+        };
+    }
+
+    // Gas paid by external paymaster contract
+    #[sponsored(IPaymaster)]
+    pub fn transfer_paymaster(to: Address, amount: u256) {
+        let from_bal = self.balances[msg.sender];
+        require!(from_bal >= amount, InsufficientBalance {
+            available: from_bal,
+            required: amount,
+        });
+
+        self.balances[msg.sender] = from_bal - amount;
+        self.balances[to] = self.balances[to] + amount;
+
+        emit SponsoredTransfer {
+            from: msg.sender,
+            to: to,
+            amount: amount,
+            gas_sponsor: "paymaster",
+        };
+    }
+
+    // Batch sponsored transfers — one gas payment for many transfers
+    #[sponsored]
+    pub fn batch_transfer_sponsored(transfers: Vec<BatchTransfer>) {
+        check_daily_limit(msg.sender);
+
+        let mut total: u256 = 0;
+        for i in 0..transfers.len() {
+            total += transfers[i].amount;
+        }
+
+        let from_bal = self.balances[msg.sender];
+        require!(from_bal >= total, InsufficientBalance {
+            available: from_bal,
+            required: total,
+        });
+
+        self.balances[msg.sender] = from_bal - total;
+
+        for i in 0..transfers.len() {
+            let t = transfers[i];
+            self.balances[t.recipient] = self.balances[t.recipient] + t.amount;
+            emit Transfer { from: msg.sender, to: t.recipient, amount: t.amount };
+        }
+
+        self.sponsored_ops_count[msg.sender] += 1;
+    }
+
+    // Meta-transaction: user signs off-chain, relayer submits
+    pub fn execute_meta_transfer(meta: MetaTxData) {
+        // Verify deadline
+        require!(
+            block.timestamp <= meta.deadline,
+            ExpiredDeadline { deadline: meta.deadline, current: block.timestamp }
+        );
+
+        // Verify nonce
+        let expected_nonce = self.nonces[meta.from];
+        require!(
+            meta.nonce == expected_nonce,
+            InvalidNonce { expected: expected_nonce, got: meta.nonce }
+        );
+
+        // Build message hash: hash(from, to, amount, nonce, deadline)
+        let mut message_bytes: bytes = bytes::new();
+        message_bytes.append(meta.from.as_bytes());
+        message_bytes.append(meta.to.as_bytes());
+        message_bytes.append(meta.amount.to_bytes());
+        message_bytes.append(meta.nonce.to_bytes());
+        message_bytes.append(meta.deadline.to_bytes());
+
+        let message_hash = hash(message_bytes);
+
+        // Verify signature
+        let valid = signature::verify(message_hash, meta.signature, meta.public_key);
+        let recovered = signature::recover(message_hash, meta.signature);
+        require!(valid && recovered == meta.from, InvalidSignature {});
+
+        // Execute transfer
+        let from_bal = self.balances[meta.from];
+        require!(from_bal >= meta.amount, InsufficientBalance {
+            available: from_bal,
+            required: meta.amount,
+        });
+
+        self.balances[meta.from] = from_bal - meta.amount;
+        self.balances[meta.to] = self.balances[meta.to] + meta.amount;
+        self.nonces[meta.from] = expected_nonce + 1;
+
+        emit Transfer { from: meta.from, to: meta.to, amount: meta.amount };
+    }
+
+    // EIP-2612 style permit
+    pub fn permit(data: PermitData) {
+        require!(
+            block.timestamp <= data.deadline,
+            ExpiredDeadline { deadline: data.deadline, current: block.timestamp }
+        );
+
+        let expected_nonce = self.nonces[data.owner];
+        require!(
+            data.nonce == expected_nonce,
+            InvalidNonce { expected: expected_nonce, got: data.nonce }
+        );
+
+        let mut message_bytes: bytes = bytes::new();
+        message_bytes.append(data.owner.as_bytes());
+        message_bytes.append(data.spender.as_bytes());
+        message_bytes.append(data.value.to_bytes());
+        message_bytes.append(data.nonce.to_bytes());
+        message_bytes.append(data.deadline.to_bytes());
+
+        let message_hash = hash(message_bytes);
+        let valid = signature::verify(message_hash, data.signature, bytes::new());
+        require!(valid, InvalidSignature {});
+
+        self.allowances[data.owner][data.spender] = data.value;
+        self.nonces[data.owner] = expected_nonce + 1;
+
+        emit Approval { owner: data.owner, spender: data.spender, amount: data.value };
+    }
+
+    // Deposit to gas tank for sponsored transactions
+    pub fn deposit_gas_tank() {
+        require!(msg.value > 0, InsufficientGasTank { available: 0 });
+        self.gas_tank_deposits[msg.sender] += msg.value;
+
+        emit GasTankDeposit { depositor: msg.sender, amount: msg.value };
+    }
+
+    fn check_daily_limit(user: Address) {
+        let last_reset = self.daily_reset_timestamp[user];
+        if block.timestamp - last_reset >= SECONDS_PER_DAY {
+            self.sponsored_ops_count[user] = 0;
+            self.daily_reset_timestamp[user] = block.timestamp;
+        }
+
+        require!(
+            self.sponsored_ops_count[user] < self.max_sponsored_per_day,
+            SponsorshipLimitReached {
+                address: user,
+                limit: self.max_sponsored_per_day,
+            }
+        );
+    }
+
+    #[view]
+    pub fn get_nonce(owner: Address) -> u256 {
+        return self.nonces[owner];
+    }
+
+    #[view]
+    pub fn gas_tank_balance(user: Address) -> u256 {
+        return self.gas_tank_deposits[user];
+    }
+
+    #[view]
+    pub fn sponsored_ops_today(user: Address) -> u64 {
+        return self.sponsored_ops_count[user];
+    }
+
+    #[view]
+    pub fn balance_of(owner: Address) -> u256 {
+        return self.balances[owner];
+    }
+}

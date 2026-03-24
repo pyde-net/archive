@@ -1,0 +1,393 @@
+// ERC4626-style tokenized yield vault
+use std::math;
+use std::token::IERC20;
+
+contract YieldVault {
+    storage {
+        // Vault metadata
+        name: String,
+        symbol: String,
+        decimals: u8,
+
+        // Underlying asset
+        asset: Address,
+
+        // Share tracking (vault token is the share)
+        total_shares: u256,
+        share_balances: Map<Address, u256>,
+        share_allowances: Map<Address, Map<Address, u256>>,
+
+        // Vault state
+        total_assets_managed: u256,
+        last_harvest_time: u64,
+        performance_fee: u256,      // scaled 1e6 (e.g. 200000 = 20%)
+        management_fee: u256,       // annual fee scaled 1e6
+        fee_recipient: Address,
+        accrued_fees: u256,
+
+        // Strategy
+        strategy: Address,
+        pending_strategy: Address,
+        strategy_change_time: u64,
+        strategy_timelock: u64,
+
+        // Deposit limits
+        deposit_limit: u256,
+        per_user_limit: u256,
+        user_deposits: Map<Address, u256>,
+        whitelisted: Map<Address, bool>,
+        whitelist_enabled: bool,
+
+        // Emergency
+        owner: Address,
+        emergency_shutdown: bool,
+
+        scale: u256,
+        percent_scale: u256,
+        seconds_per_year: u256,
+    }
+
+    event Deposited {
+        #[indexed]
+        user: Address,
+        assets: u256,
+        shares: u256,
+    }
+
+    event Withdrawn {
+        #[indexed]
+        user: Address,
+        assets: u256,
+        shares: u256,
+    }
+
+    event Harvested {
+        profit: u256,
+        loss: u256,
+        fees: u256,
+    }
+
+    event StrategyProposed {
+        #[indexed]
+        new_strategy: Address,
+        effective_time: u64,
+    }
+
+    event StrategyChanged {
+        #[indexed]
+        old_strategy: Address,
+        #[indexed]
+        new_strategy: Address,
+    }
+
+    event EmergencyShutdown {
+        #[indexed]
+        by: Address,
+    }
+
+    event ShareTransfer {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    event FeesCollected {
+        #[indexed]
+        recipient: Address,
+        amount: u256,
+    }
+
+    error DepositLimitExceeded { limit: u256, attempted: u256 }
+    error PerUserLimitExceeded { limit: u256, current: u256, attempted: u256 }
+    error InsufficientShares { available: u256, required: u256 }
+    error ZeroAssets {}
+    error ZeroShares {}
+    error VaultShutdown {}
+    error NotOwner {}
+    error NotWhitelisted { account: Address }
+    error StrategyTimelockNotExpired { ready_at: u64 }
+    error NoStrategyPending {}
+    error InsufficientAllowance { available: u256, required: u256 }
+
+    #[constructor]
+    pub fn init(
+        name: String,
+        symbol: String,
+        asset: Address,
+        performance_fee: u256,
+        management_fee: u256,
+        deposit_limit: u256,
+    ) {
+        self.name = name;
+        self.symbol = symbol;
+        self.decimals = 18u8;
+        self.asset = asset;
+        self.performance_fee = performance_fee;
+        self.management_fee = management_fee;
+        self.deposit_limit = deposit_limit;
+        self.per_user_limit = deposit_limit;
+        self.owner = msg.sender;
+        self.fee_recipient = msg.sender;
+        self.emergency_shutdown = false;
+        self.whitelist_enabled = false;
+        self.strategy_timelock = 172800u64; // 48 hours
+        self.last_harvest_time = block.timestamp;
+        self.scale = 1000000000000000000u256;
+        self.percent_scale = 1000000u256;
+        self.seconds_per_year = 31536000u256;
+    }
+
+    // --- Internal helpers ---
+
+    fn convert_to_shares(assets: u256) -> u256 {
+        if self.total_shares == 0u256 || self.total_assets_managed == 0u256 {
+            return assets; // 1:1 on first deposit
+        }
+        return (assets * self.total_shares) / self.total_assets_managed;
+    }
+
+    fn convert_to_assets(shares: u256) -> u256 {
+        if self.total_shares == 0u256 {
+            return shares;
+        }
+        return (shares * self.total_assets_managed) / self.total_shares;
+    }
+
+    fn accrue_management_fee() {
+        let time_delta = block.timestamp - self.last_harvest_time;
+        if time_delta == 0u64 {
+            return;
+        }
+        let fee = (self.total_assets_managed * self.management_fee * (time_delta as u256))
+            / (self.percent_scale * self.seconds_per_year);
+        self.accrued_fees = self.accrued_fees + fee;
+    }
+
+    // --- ERC4626 Core ---
+
+    pub fn deposit(assets: u256) -> u256 {
+        require!(!self.emergency_shutdown, VaultShutdown {});
+        require!(assets > 0u256, ZeroAssets {});
+
+        if self.whitelist_enabled {
+            require!(self.whitelisted[msg.sender], NotWhitelisted { account: msg.sender });
+        }
+
+        require!(self.total_assets_managed + assets <= self.deposit_limit, DepositLimitExceeded {
+            limit: self.deposit_limit,
+            attempted: self.total_assets_managed + assets,
+        });
+
+        let user_total = self.user_deposits[msg.sender] + assets;
+        require!(user_total <= self.per_user_limit, PerUserLimitExceeded {
+            limit: self.per_user_limit,
+            current: self.user_deposits[msg.sender],
+            attempted: assets,
+        });
+
+        self.accrue_management_fee();
+
+        let shares = self.convert_to_shares(assets);
+        require!(shares > 0u256, ZeroShares {});
+
+        IERC20::at(self.asset).transfer_from(msg.sender, address(self), assets);
+
+        self.share_balances[msg.sender] = self.share_balances[msg.sender] + shares;
+        self.total_shares = self.total_shares + shares;
+        self.total_assets_managed = self.total_assets_managed + assets;
+        self.user_deposits[msg.sender] = user_total;
+
+        emit Deposited { user: msg.sender, assets: assets, shares: shares };
+        emit ShareTransfer { from: Address::ZERO, to: msg.sender, amount: shares };
+
+        return shares;
+    }
+
+    pub fn withdraw(assets: u256) -> u256 {
+        require!(assets > 0u256, ZeroAssets {});
+        self.accrue_management_fee();
+
+        let shares = self.convert_to_shares(assets);
+        let user_shares = self.share_balances[msg.sender];
+        require!(user_shares >= shares, InsufficientShares {
+            available: user_shares,
+            required: shares,
+        });
+
+        self.share_balances[msg.sender] = user_shares - shares;
+        self.total_shares = self.total_shares - shares;
+        self.total_assets_managed = self.total_assets_managed - assets;
+
+        if self.user_deposits[msg.sender] > assets {
+            self.user_deposits[msg.sender] = self.user_deposits[msg.sender] - assets;
+        } else {
+            self.user_deposits[msg.sender] = 0u256;
+        }
+
+        IERC20::at(self.asset).transfer(msg.sender, assets);
+
+        emit Withdrawn { user: msg.sender, assets: assets, shares: shares };
+        emit ShareTransfer { from: msg.sender, to: Address::ZERO, amount: shares };
+
+        return shares;
+    }
+
+    pub fn redeem(shares: u256) -> u256 {
+        require!(shares > 0u256, ZeroShares {});
+        self.accrue_management_fee();
+
+        let user_shares = self.share_balances[msg.sender];
+        require!(user_shares >= shares, InsufficientShares {
+            available: user_shares,
+            required: shares,
+        });
+
+        let assets = self.convert_to_assets(shares);
+        require!(assets > 0u256, ZeroAssets {});
+
+        self.share_balances[msg.sender] = user_shares - shares;
+        self.total_shares = self.total_shares - shares;
+        self.total_assets_managed = self.total_assets_managed - assets;
+
+        IERC20::at(self.asset).transfer(msg.sender, assets);
+
+        emit Withdrawn { user: msg.sender, assets: assets, shares: shares };
+        emit ShareTransfer { from: msg.sender, to: Address::ZERO, amount: shares };
+
+        return assets;
+    }
+
+    // --- Share transfers ---
+
+    pub fn transfer_shares(to: Address, amount: u256) {
+        let from_bal = self.share_balances[msg.sender];
+        require!(from_bal >= amount, InsufficientShares { available: from_bal, required: amount });
+        self.share_balances[msg.sender] = from_bal - amount;
+        self.share_balances[to] = self.share_balances[to] + amount;
+        emit ShareTransfer { from: msg.sender, to: to, amount: amount };
+    }
+
+    pub fn approve_shares(spender: Address, amount: u256) {
+        self.share_allowances[msg.sender][spender] = amount;
+    }
+
+    pub fn transfer_shares_from(from: Address, to: Address, amount: u256) {
+        let allowed = self.share_allowances[from][msg.sender];
+        require!(allowed >= amount, InsufficientAllowance { available: allowed, required: amount });
+        self.share_allowances[from][msg.sender] = allowed - amount;
+
+        let from_bal = self.share_balances[from];
+        require!(from_bal >= amount, InsufficientShares { available: from_bal, required: amount });
+        self.share_balances[from] = from_bal - amount;
+        self.share_balances[to] = self.share_balances[to] + amount;
+        emit ShareTransfer { from: from, to: to, amount: amount };
+    }
+
+    // --- Strategy & Harvest ---
+
+    pub fn harvest(profit: u256, loss: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.accrue_management_fee();
+
+        let mut fee: u256 = 0u256;
+        if profit > 0u256 {
+            fee = (profit * self.performance_fee) / self.percent_scale;
+            self.accrued_fees = self.accrued_fees + fee;
+            self.total_assets_managed = self.total_assets_managed + profit - fee;
+        }
+
+        if loss > 0u256 {
+            self.total_assets_managed = self.total_assets_managed - loss;
+        }
+
+        self.last_harvest_time = block.timestamp;
+        emit Harvested { profit: profit, loss: loss, fees: fee };
+    }
+
+    pub fn collect_fees() {
+        require!(msg.sender == self.owner, NotOwner {});
+        let fees = self.accrued_fees;
+        self.accrued_fees = 0u256;
+        IERC20::at(self.asset).transfer(self.fee_recipient, fees);
+        emit FeesCollected { recipient: self.fee_recipient, amount: fees };
+    }
+
+    pub fn propose_strategy(new_strategy: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.pending_strategy = new_strategy;
+        self.strategy_change_time = block.timestamp + self.strategy_timelock;
+        emit StrategyProposed {
+            new_strategy: new_strategy,
+            effective_time: self.strategy_change_time,
+        };
+    }
+
+    pub fn accept_strategy() {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(self.pending_strategy != Address::ZERO, NoStrategyPending {});
+        require!(block.timestamp >= self.strategy_change_time, StrategyTimelockNotExpired {
+            ready_at: self.strategy_change_time,
+        });
+
+        let old = self.strategy;
+        self.strategy = self.pending_strategy;
+        self.pending_strategy = Address::ZERO;
+        emit StrategyChanged { old_strategy: old, new_strategy: self.strategy };
+    }
+
+    pub fn emergency_withdraw_all() {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.emergency_shutdown = true;
+        emit EmergencyShutdown { by: msg.sender };
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn preview_deposit(assets: u256) -> u256 {
+        return self.convert_to_shares(assets);
+    }
+
+    #[view]
+    pub fn preview_redeem(shares: u256) -> u256 {
+        return self.convert_to_assets(shares);
+    }
+
+    #[view]
+    pub fn price_per_share() -> u256 {
+        if self.total_shares == 0u256 {
+            return self.scale;
+        }
+        return (self.total_assets_managed * self.scale) / self.total_shares;
+    }
+
+    #[view]
+    pub fn max_deposit(user: Address) -> u256 {
+        if self.emergency_shutdown {
+            return 0u256;
+        }
+        let global_remaining = self.deposit_limit - self.total_assets_managed;
+        let user_remaining = self.per_user_limit - self.user_deposits[user];
+        if global_remaining < user_remaining {
+            return global_remaining;
+        }
+        return user_remaining;
+    }
+
+    #[view]
+    pub fn get_share_balance(user: Address) -> u256 {
+        return self.share_balances[user];
+    }
+
+    #[view]
+    pub fn get_total_assets() -> u256 {
+        return self.total_assets_managed;
+    }
+
+    #[view]
+    pub fn get_total_shares() -> u256 {
+        return self.total_shares;
+    }
+}

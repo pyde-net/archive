@@ -1,0 +1,374 @@
+// Diamond storage pattern for modular, upgradeable contracts.
+// Each "facet" manages its own storage namespace, and a central router
+// delegates calls to the appropriate facet based on function selectors.
+// This avoids storage collisions and allows adding/removing modules.
+
+use std::math;
+
+// Interface for facets that the diamond can delegate to
+interface IFacet {
+    fn execute(selector: u32, data: bytes) -> bytes;
+    fn get_selectors() -> Vec<u32>;
+}
+
+contract Diamond {
+    storage {
+        owner: Address,
+
+        // Facet routing: function selector -> facet address
+        selector_to_facet: Map<u32, Address>,
+        // All known selectors for enumeration
+        selectors: Vec<u32>,
+        selector_exists: Map<u32, bool>,
+
+        // Facet registry
+        facets: Vec<Address>,
+        facet_registered: Map<Address, bool>,
+        facet_selector_count: Map<Address, u64>,
+
+        // Access control per facet
+        facet_roles: Map<Address, Map<Address, bool>>,  // facet -> user -> has_role
+        facet_paused: Map<Address, bool>,
+
+        // Diamond-level storage namespaces for built-in facets
+        // --- Ownership facet ---
+        pending_owner: Address,
+
+        // --- Pause facet ---
+        global_paused: bool,
+
+        // --- ACL facet ---
+        roles: Map<u256, Map<Address, bool>>,       // role_id -> user -> has_role
+        role_admin: Map<u256, u256>,                 // role_id -> admin_role_id
+        role_member_count: Map<u256, u256>,
+
+        // --- ERC20 facet storage namespace ---
+        erc20_name: String,
+        erc20_symbol: String,
+        erc20_decimals: u8,
+        erc20_total_supply: u256,
+        erc20_balances: Map<Address, u256>,
+        erc20_allowances: Map<Address, Map<Address, u256>>,
+    }
+
+    event FacetAdded {
+        #[indexed]
+        facet: Address,
+        selector_count: u64,
+    }
+
+    event FacetRemoved {
+        #[indexed]
+        facet: Address,
+    }
+
+    event SelectorUpdated {
+        #[indexed]
+        selector: u32,
+        #[indexed]
+        old_facet: Address,
+        #[indexed]
+        new_facet: Address,
+    }
+
+    event OwnershipTransferStarted {
+        #[indexed]
+        current: Address,
+        #[indexed]
+        pending: Address,
+    }
+
+    event OwnershipTransferred {
+        #[indexed]
+        previous: Address,
+        #[indexed]
+        new_owner: Address,
+    }
+
+    event RoleGranted {
+        #[indexed]
+        role_id: u256,
+        #[indexed]
+        account: Address,
+        #[indexed]
+        sender: Address,
+    }
+
+    event RoleRevoked {
+        #[indexed]
+        role_id: u256,
+        #[indexed]
+        account: Address,
+        #[indexed]
+        sender: Address,
+    }
+
+    event DiamondPaused {
+        #[indexed]
+        by: Address,
+    }
+
+    event DiamondUnpaused {
+        #[indexed]
+        by: Address,
+    }
+
+    error NotOwner {}
+    error NotPendingOwner {}
+    error GlobalPaused {}
+    error FacetPaused { facet: Address }
+    error SelectorNotFound { selector: u32 }
+    error SelectorAlreadyExists { selector: u32 }
+    error FacetAlreadyRegistered { facet: Address }
+    error FacetNotRegistered { facet: Address }
+    error ZeroAddress {}
+    error RoleNotGranted { role_id: u256, account: Address }
+    error NotRoleAdmin { role_id: u256 }
+    error SelectorCollision { selector: u32, existing_facet: Address }
+
+    #[constructor]
+    pub fn init(erc20_name: String, erc20_symbol: String, erc20_decimals: u8) {
+        self.owner = msg.sender;
+        self.global_paused = false;
+        self.erc20_name = erc20_name;
+        self.erc20_symbol = erc20_symbol;
+        self.erc20_decimals = erc20_decimals;
+        self.erc20_total_supply = 0u256;
+    }
+
+    fn require_owner() {
+        require!(msg.sender == self.owner, NotOwner {});
+    }
+
+    fn require_not_paused() {
+        require!(!self.global_paused, GlobalPaused {});
+    }
+
+    // --- Diamond Cut (facet management) ---
+
+    /// Adds a new facet and registers all its selectors.
+    pub fn add_facet(facet: Address, function_selectors: Vec<u32>) {
+        self.require_owner();
+        require!(facet != Address::ZERO, ZeroAddress {});
+        require!(!self.facet_registered[facet], FacetAlreadyRegistered { facet: facet });
+
+        let count = function_selectors.len();
+
+        // Register each selector
+        for i in 0u64..count {
+            let sel = function_selectors[i];
+            require!(!self.selector_exists[sel], SelectorCollision {
+                selector: sel,
+                existing_facet: self.selector_to_facet[sel],
+            });
+
+            self.selector_to_facet[sel] = facet;
+            self.selector_exists[sel] = true;
+            self.selectors.push(sel);
+        }
+
+        self.facets.push(facet);
+        self.facet_registered[facet] = true;
+        self.facet_selector_count[facet] = count;
+
+        emit FacetAdded { facet: facet, selector_count: count };
+    }
+
+    /// Replaces selectors to point to a different facet (upgrade).
+    pub fn replace_facet_selectors(
+        old_facet: Address,
+        new_facet: Address,
+        function_selectors: Vec<u32>,
+    ) {
+        self.require_owner();
+        require!(new_facet != Address::ZERO, ZeroAddress {});
+
+        for i in 0u64..function_selectors.len() {
+            let sel = function_selectors[i];
+            require!(self.selector_exists[sel], SelectorNotFound { selector: sel });
+
+            let current_facet = self.selector_to_facet[sel];
+            self.selector_to_facet[sel] = new_facet;
+
+            emit SelectorUpdated {
+                selector: sel,
+                old_facet: current_facet,
+                new_facet: new_facet,
+            };
+        }
+
+        // Register new facet if not already registered
+        if !self.facet_registered[new_facet] {
+            self.facets.push(new_facet);
+            self.facet_registered[new_facet] = true;
+            self.facet_selector_count[new_facet] = function_selectors.len();
+        }
+    }
+
+    /// Removes selectors (disabling functionality).
+    pub fn remove_selectors(function_selectors: Vec<u32>) {
+        self.require_owner();
+        for i in 0u64..function_selectors.len() {
+            let sel = function_selectors[i];
+            require!(self.selector_exists[sel], SelectorNotFound { selector: sel });
+
+            let facet = self.selector_to_facet[sel];
+            self.selector_to_facet[sel] = Address::ZERO;
+            self.selector_exists[sel] = false;
+
+            if self.facet_selector_count[facet] > 0u64 {
+                self.facet_selector_count[facet] = self.facet_selector_count[facet] - 1u64;
+            }
+        }
+    }
+
+    /// Delegates a call to the correct facet based on the selector.
+    pub fn delegate(selector: u32, data: bytes) -> bytes {
+        self.require_not_paused();
+        require!(self.selector_exists[selector], SelectorNotFound { selector: selector });
+
+        let facet = self.selector_to_facet[selector];
+        require!(!self.facet_paused[facet], FacetPaused { facet: facet });
+
+        return IFacet::at(facet).execute(selector, data);
+    }
+
+    // --- Ownership facet (two-step) ---
+
+    pub fn transfer_ownership(new_owner: Address) {
+        self.require_owner();
+        require!(new_owner != Address::ZERO, ZeroAddress {});
+        self.pending_owner = new_owner;
+
+        emit OwnershipTransferStarted { current: self.owner, pending: new_owner };
+    }
+
+    pub fn accept_ownership() {
+        require!(msg.sender == self.pending_owner, NotPendingOwner {});
+        let previous = self.owner;
+        self.owner = msg.sender;
+        self.pending_owner = Address::ZERO;
+
+        emit OwnershipTransferred { previous: previous, new_owner: msg.sender };
+    }
+
+    // --- Pause facet ---
+
+    pub fn pause_diamond() {
+        self.require_owner();
+        self.global_paused = true;
+        emit DiamondPaused { by: msg.sender };
+    }
+
+    pub fn unpause_diamond() {
+        self.require_owner();
+        self.global_paused = false;
+        emit DiamondUnpaused { by: msg.sender };
+    }
+
+    pub fn pause_facet(facet: Address) {
+        self.require_owner();
+        self.facet_paused[facet] = true;
+    }
+
+    pub fn unpause_facet(facet: Address) {
+        self.require_owner();
+        self.facet_paused[facet] = false;
+    }
+
+    // --- ACL facet ---
+
+    pub fn grant_role(role_id: u256, account: Address) {
+        // Only role admin or contract owner can grant
+        let admin_role = self.role_admin[role_id];
+        require!(
+            self.roles[admin_role][msg.sender] || msg.sender == self.owner,
+            NotRoleAdmin { role_id: role_id }
+        );
+
+        if !self.roles[role_id][account] {
+            self.roles[role_id][account] = true;
+            self.role_member_count[role_id] = self.role_member_count[role_id] + 1u256;
+
+            emit RoleGranted { role_id: role_id, account: account, sender: msg.sender };
+        }
+    }
+
+    pub fn revoke_role(role_id: u256, account: Address) {
+        let admin_role = self.role_admin[role_id];
+        require!(
+            self.roles[admin_role][msg.sender] || msg.sender == self.owner,
+            NotRoleAdmin { role_id: role_id }
+        );
+
+        if self.roles[role_id][account] {
+            self.roles[role_id][account] = false;
+            self.role_member_count[role_id] = self.role_member_count[role_id] - 1u256;
+
+            emit RoleRevoked { role_id: role_id, account: account, sender: msg.sender };
+        }
+    }
+
+    /// Users can renounce their own role.
+    pub fn renounce_role(role_id: u256) {
+        if self.roles[role_id][msg.sender] {
+            self.roles[role_id][msg.sender] = false;
+            self.role_member_count[role_id] = self.role_member_count[role_id] - 1u256;
+
+            emit RoleRevoked { role_id: role_id, account: msg.sender, sender: msg.sender };
+        }
+    }
+
+    // --- ERC20 facet (built-in, diamond-namespaced) ---
+
+    pub fn erc20_mint(to: Address, amount: u256) {
+        self.require_owner();
+        self.erc20_total_supply = self.erc20_total_supply + amount;
+        self.erc20_balances[to] = self.erc20_balances[to] + amount;
+    }
+
+    pub fn erc20_transfer(to: Address, amount: u256) {
+        self.require_not_paused();
+        let bal = self.erc20_balances[msg.sender];
+        require!(bal >= amount, RoleNotGranted { role_id: 0u256, account: msg.sender });
+        self.erc20_balances[msg.sender] = bal - amount;
+        self.erc20_balances[to] = self.erc20_balances[to] + amount;
+    }
+
+    // --- View functions ---
+
+    #[view]
+    pub fn get_facet_address(selector: u32) -> Address {
+        return self.selector_to_facet[selector];
+    }
+
+    #[view]
+    pub fn get_facet_count() -> u64 {
+        return self.facets.len();
+    }
+
+    #[view]
+    pub fn get_selector_count() -> u64 {
+        return self.selectors.len();
+    }
+
+    #[view]
+    pub fn has_role(role_id: u256, account: Address) -> bool {
+        return self.roles[role_id][account];
+    }
+
+    #[view]
+    pub fn is_global_paused() -> bool {
+        return self.global_paused;
+    }
+
+    #[view]
+    pub fn get_owner() -> Address {
+        return self.owner;
+    }
+
+    #[view]
+    pub fn erc20_balance_of(account: Address) -> u256 {
+        return self.erc20_balances[account];
+    }
+}

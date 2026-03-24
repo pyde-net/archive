@@ -1,0 +1,295 @@
+// Fractional real estate ownership with dividend distribution and share trading
+use std::math;
+use std::token::IERC20;
+
+contract FractionalOwnership {
+    storage {
+        manager: Address,
+        next_property_id: u32,
+        properties: Map<u32, Property>,
+        shares: Map<u32, Map<Address, u256>>,
+        total_shares: Map<u32, u256>,
+        dividend_pool: Map<u32, u256>,
+        claimed_dividends: Map<u32, Map<Address, u256>>,
+        dividend_per_share: Map<u32, u256>,
+        sell_orders: Map<u32, Map<u64, SellOrder>>,
+        next_order_id: Map<u32, u64>,
+        shareholder_count: Map<u32, u32>,
+        votes: Map<u32, Map<u256, ProposalVote>>,
+        vote_tallies: Map<u32, Map<u256, u256>>,
+        min_investment: u256,
+    }
+
+    struct Property {
+        name_hash: u256,
+        location_hash: u256,
+        total_value: u256,
+        share_price: u256,
+        rental_yield_bps: u16,
+        property_type: u8,
+        active: bool,
+        created_at: u64,
+    }
+
+    struct SellOrder {
+        seller: Address,
+        amount: u256,
+        price_per_share: u256,
+        created_at: u64,
+        filled: bool,
+    }
+
+    struct ProposalVote {
+        voter: Address,
+        weight: u256,
+        in_favor: bool,
+        timestamp: u64,
+    }
+
+    event PropertyListed {
+        #[indexed]
+        property_id: u32,
+        total_value: u256,
+        share_price: u256,
+    }
+
+    event SharesPurchased {
+        #[indexed]
+        property_id: u32,
+        #[indexed]
+        buyer: Address,
+        amount: u256,
+    }
+
+    event DividendDistributed {
+        #[indexed]
+        property_id: u32,
+        total_amount: u256,
+    }
+
+    event DividendClaimed {
+        #[indexed]
+        property_id: u32,
+        #[indexed]
+        shareholder: Address,
+        amount: u256,
+    }
+
+    event SellOrderCreated {
+        #[indexed]
+        property_id: u32,
+        order_id: u64,
+        amount: u256,
+        price: u256,
+    }
+
+    event SellOrderFilled {
+        #[indexed]
+        property_id: u32,
+        order_id: u64,
+        #[indexed]
+        buyer: Address,
+    }
+
+    error NotManager {}
+    error PropertyNotFound { id: u32 }
+    error InsufficientShares { available: u256, requested: u256 }
+    error InsufficientPayment { required: u256, sent: u256 }
+    error OrderNotFound { id: u64 }
+    error OrderAlreadyFilled {}
+    error NoDividendsToClaim {}
+    error BelowMinInvestment {}
+    error PropertyInactive {}
+
+    #[constructor]
+    pub fn init(min_investment: u256) {
+        self.manager = msg.sender;
+        self.next_property_id = 1;
+        self.min_investment = min_investment;
+    }
+
+    pub fn list_property(
+        name_hash: u256,
+        location_hash: u256,
+        total_value: u256,
+        share_price: u256,
+        rental_yield_bps: u16,
+        property_type: u8,
+    ) -> u32 {
+        require!(msg.sender == self.manager, NotManager {});
+
+        let property_id = self.next_property_id;
+        self.next_property_id += 1;
+
+        self.properties[property_id] = Property {
+            name_hash: name_hash,
+            location_hash: location_hash,
+            total_value: total_value,
+            share_price: share_price,
+            rental_yield_bps: rental_yield_bps,
+            property_type: property_type,
+            active: true,
+            created_at: block.timestamp,
+        };
+
+        let total = total_value / share_price;
+        self.total_shares[property_id] = total;
+        self.shares[property_id][self.manager] = total;
+        self.shareholder_count[property_id] = 1;
+        self.next_order_id[property_id] = 1;
+
+        emit PropertyListed { property_id: property_id, total_value: total_value, share_price: share_price };
+        return property_id;
+    }
+
+    pub fn buy_shares(property_id: u32, amount: u256) {
+        let prop = self.properties[property_id];
+        require!(prop.active, PropertyInactive {});
+        let cost = amount * prop.share_price;
+        require!(cost >= self.min_investment, BelowMinInvestment {});
+        require!(msg.value >= cost, InsufficientPayment { required: cost, sent: msg.value });
+
+        let manager_shares = self.shares[property_id][self.manager];
+        require!(manager_shares >= amount, InsufficientShares {
+            available: manager_shares,
+            requested: amount,
+        });
+
+        // Settle any outstanding dividends before transfer
+        self.settle_dividend(property_id, msg.sender);
+        self.settle_dividend(property_id, self.manager);
+
+        if self.shares[property_id][msg.sender] == 0 {
+            self.shareholder_count[property_id] += 1;
+        }
+
+        self.shares[property_id][self.manager] -= amount;
+        self.shares[property_id][msg.sender] += amount;
+
+        if self.shares[property_id][self.manager] == 0 {
+            self.shareholder_count[property_id] -= 1;
+        }
+
+        emit SharesPurchased { property_id: property_id, buyer: msg.sender, amount: amount };
+    }
+
+    pub fn distribute_dividend(property_id: u32) {
+        require!(msg.sender == self.manager, NotManager {});
+        require!(msg.value > 0, InsufficientPayment { required: 1, sent: 0 });
+
+        let total = self.total_shares[property_id];
+        let per_share = msg.value / total;
+        self.dividend_per_share[property_id] += per_share;
+        self.dividend_pool[property_id] += msg.value;
+
+        emit DividendDistributed { property_id: property_id, total_amount: msg.value };
+    }
+
+    fn settle_dividend(property_id: u32, account: Address) {
+        let user_shares = self.shares[property_id][account];
+        if user_shares == 0 {
+            return;
+        }
+        let total_per_share = self.dividend_per_share[property_id];
+        let claimed = self.claimed_dividends[property_id][account];
+        let owed = user_shares * total_per_share - claimed;
+
+        if owed > 0 {
+            self.claimed_dividends[property_id][account] += owed;
+        }
+    }
+
+    #[reentrant]
+    pub fn claim_dividends(property_id: u32) {
+        let user_shares = self.shares[property_id][msg.sender];
+        let total_per_share = self.dividend_per_share[property_id];
+        let total_owed = user_shares * total_per_share;
+        let already_claimed = self.claimed_dividends[property_id][msg.sender];
+
+        let claimable = total_owed - already_claimed;
+        require!(claimable > 0, NoDividendsToClaim {});
+
+        self.claimed_dividends[property_id][msg.sender] = total_owed;
+        self.dividend_pool[property_id] -= claimable;
+
+        raw_call!(msg.sender, claimable, bytes(""));
+        emit DividendClaimed { property_id: property_id, shareholder: msg.sender, amount: claimable };
+    }
+
+    pub fn create_sell_order(property_id: u32, amount: u256, price_per_share: u256) -> u64 {
+        require!(self.shares[property_id][msg.sender] >= amount, InsufficientShares {
+            available: self.shares[property_id][msg.sender],
+            requested: amount,
+        });
+
+        let order_id = self.next_order_id[property_id];
+        self.next_order_id[property_id] = order_id + 1;
+
+        self.sell_orders[property_id][order_id] = SellOrder {
+            seller: msg.sender,
+            amount: amount,
+            price_per_share: price_per_share,
+            created_at: block.timestamp,
+            filled: false,
+        };
+
+        emit SellOrderCreated {
+            property_id: property_id,
+            order_id: order_id,
+            amount: amount,
+            price: price_per_share,
+        };
+        return order_id;
+    }
+
+    #[reentrant]
+    pub fn fill_sell_order(property_id: u32, order_id: u64) {
+        let order = self.sell_orders[property_id][order_id];
+        require!(!order.filled, OrderAlreadyFilled {});
+
+        let total_cost = order.amount * order.price_per_share;
+        require!(msg.value >= total_cost, InsufficientPayment { required: total_cost, sent: msg.value });
+
+        self.settle_dividend(property_id, msg.sender);
+        self.settle_dividend(property_id, order.seller);
+
+        if self.shares[property_id][msg.sender] == 0 {
+            self.shareholder_count[property_id] += 1;
+        }
+
+        self.shares[property_id][order.seller] -= order.amount;
+        self.shares[property_id][msg.sender] += order.amount;
+        self.sell_orders[property_id][order_id].filled = true;
+
+        if self.shares[property_id][order.seller] == 0 {
+            self.shareholder_count[property_id] -= 1;
+        }
+
+        raw_call!(order.seller, total_cost, bytes(""));
+
+        emit SellOrderFilled { property_id: property_id, order_id: order_id, buyer: msg.sender };
+    }
+
+    #[view]
+    pub fn get_shares(property_id: u32, account: Address) -> u256 {
+        return self.shares[property_id][account];
+    }
+
+    #[view]
+    pub fn get_property(property_id: u32) -> Property {
+        return self.properties[property_id];
+    }
+
+    #[view]
+    pub fn get_claimable_dividends(property_id: u32, account: Address) -> u256 {
+        let user_shares = self.shares[property_id][account];
+        let total_per_share = self.dividend_per_share[property_id];
+        let claimed = self.claimed_dividends[property_id][account];
+        return user_shares * total_per_share - claimed;
+    }
+
+    #[view]
+    pub fn get_sell_order(property_id: u32, order_id: u64) -> SellOrder {
+        return self.sell_orders[property_id][order_id];
+    }
+}

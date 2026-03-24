@@ -1,0 +1,320 @@
+// Token contract demonstrating vault-based fungible token management.
+// Vaults encapsulate token balances and are tracked via a registry,
+// preventing accidental loss of value.
+
+use std::math;
+
+// A struct representing a fungible token balance.
+struct TokenVault {
+    owner: Address,
+    amount: u256,
+    token_id: u256,
+}
+
+// A struct representing a locked position (e.g., staking, vesting).
+struct LockedPosition {
+    vault: TokenVault,
+    unlock_time: u64,
+    beneficiary: Address,
+}
+
+contract ResourceToken {
+    storage {
+        name: String,
+        symbol: String,
+        decimals: u8,
+        total_supply: u256,
+        next_token_id: u256,
+        owner: Address,
+        vault_registry: Map<u256, bool>,
+        vault_data: Map<u256, TokenVault>,
+        balances: Map<Address, u256>,
+        lock_count: u256,
+        locked_positions: Map<u256, LockedPosition>,
+        next_lock_id: u256,
+    }
+
+    const BPS_DENOMINATOR: u256 = 10000;
+
+    event VaultCreated {
+        #[indexed]
+        vault_id: u256,
+        #[indexed]
+        owner: Address,
+        amount: u256,
+    }
+
+    event VaultTransferred {
+        #[indexed]
+        vault_id: u256,
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+    }
+
+    event VaultDestroyed {
+        #[indexed]
+        vault_id: u256,
+        amount: u256,
+    }
+
+    event VaultMerged {
+        #[indexed]
+        source_id: u256,
+        #[indexed]
+        target_id: u256,
+        merged_amount: u256,
+    }
+
+    event PositionLocked {
+        #[indexed]
+        beneficiary: Address,
+        amount: u256,
+        unlock_time: u64,
+    }
+
+    event PositionUnlocked {
+        #[indexed]
+        beneficiary: Address,
+        amount: u256,
+    }
+
+    error InsufficientBalance { available: u256, requested: u256 }
+    error VaultNotFound { vault_id: u256 }
+    error NotVaultOwner {}
+    error ZeroAmount {}
+    error LockNotExpired { current_time: u64, unlock_time: u64 }
+    error NotBeneficiary {}
+    error NotContractOwner {}
+    error SplitExceedsBalance { vault_amount: u256, split_amount: u256 }
+    error Unauthorized {}
+
+    #[constructor]
+    pub fn init(name: String, symbol: String, decimals: u8) {
+        self.name = name;
+        self.symbol = symbol;
+        self.decimals = decimals;
+        self.total_supply = 0u256;
+        self.next_token_id = 1u256;
+        self.owner = msg.sender;
+        self.lock_count = 0u256;
+        self.next_lock_id = 1u256;
+    }
+
+    /// Mints new tokens into a vault owned by the recipient.
+    pub fn mint(to: Address, amount: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(amount > 0u256, ZeroAmount {});
+
+        let vault_id = self.next_token_id;
+        self.next_token_id = vault_id + 1u256;
+
+        self.total_supply = self.total_supply + amount;
+        self.balances[to] = self.balances[to] + amount;
+        self.vault_registry[vault_id] = true;
+
+        self.vault_data[vault_id] = TokenVault {
+            owner: to,
+            amount: amount,
+            token_id: vault_id,
+        };
+
+        emit VaultCreated { vault_id: vault_id, owner: to, amount: amount };
+    }
+
+    /// Transfers ownership of a vault to a new address.
+    pub fn transfer_vault(vault_id: u256, to: Address) {
+        let vault = self.vault_data[vault_id];
+        require!(vault.owner == msg.sender, NotVaultOwner {});
+
+        let from = vault.owner;
+
+        // Update balance tracking
+        self.balances[from] = self.balances[from] - vault.amount;
+        self.balances[to] = self.balances[to] + vault.amount;
+
+        self.vault_data[vault_id] = TokenVault {
+            owner: to,
+            amount: vault.amount,
+            token_id: vault.token_id,
+        };
+
+        emit VaultTransferred {
+            vault_id: vault_id,
+            from: from,
+            to: to,
+        };
+    }
+
+    /// Splits a vault into two: one with `split_amount` and one with the remainder.
+    pub fn split_vault(vault_id: u256, split_amount: u256) -> (u256, u256) {
+        let vault = self.vault_data[vault_id];
+        require!(vault.owner == msg.sender, NotVaultOwner {});
+        require!(split_amount > 0u256, ZeroAmount {});
+        require!(split_amount < vault.amount, SplitExceedsBalance {
+            vault_amount: vault.amount,
+            split_amount: split_amount,
+        });
+
+        let remainder = vault.amount - split_amount;
+        let new_id = self.next_token_id;
+        self.next_token_id = new_id + 1u256;
+        self.vault_registry[new_id] = true;
+
+        // Create new vault with split amount
+        self.vault_data[new_id] = TokenVault {
+            owner: vault.owner,
+            amount: split_amount,
+            token_id: new_id,
+        };
+
+        // Update original vault with remainder
+        self.vault_data[vault_id] = TokenVault {
+            owner: vault.owner,
+            amount: remainder,
+            token_id: vault_id,
+        };
+
+        return (new_id, vault_id);
+    }
+
+    /// Merges two vaults belonging to the same owner into one.
+    pub fn merge_vaults(vault_a_id: u256, vault_b_id: u256) -> u256 {
+        let a = self.vault_data[vault_a_id];
+        let b = self.vault_data[vault_b_id];
+        require!(a.owner == msg.sender, NotVaultOwner {});
+        require!(b.owner == msg.sender, NotVaultOwner {});
+        require!(a.owner == b.owner, NotVaultOwner {});
+
+        let merged_amount = a.amount + b.amount;
+
+        // Update vault a with merged amount
+        self.vault_data[vault_a_id] = TokenVault {
+            owner: a.owner,
+            amount: merged_amount,
+            token_id: vault_a_id,
+        };
+
+        // Deregister vault b
+        self.vault_registry[vault_b_id] = false;
+        self.vault_data[vault_b_id] = TokenVault {
+            owner: Address::ZERO,
+            amount: 0u256,
+            token_id: vault_b_id,
+        };
+
+        emit VaultMerged {
+            source_id: vault_b_id,
+            target_id: vault_a_id,
+            merged_amount: merged_amount,
+        };
+
+        return vault_a_id;
+    }
+
+    /// Burns tokens by destroying a vault. The supply is reduced.
+    pub fn burn(vault_id: u256) {
+        let vault = self.vault_data[vault_id];
+        require!(vault.owner == msg.sender, NotVaultOwner {});
+
+        let amount = vault.amount;
+        let owner = vault.owner;
+
+        self.total_supply = self.total_supply - amount;
+        self.balances[owner] = self.balances[owner] - amount;
+        self.vault_registry[vault_id] = false;
+
+        self.vault_data[vault_id] = TokenVault {
+            owner: Address::ZERO,
+            amount: 0u256,
+            token_id: vault_id,
+        };
+
+        emit VaultDestroyed { vault_id: vault_id, amount: amount };
+    }
+
+    /// Locks a vault until a future timestamp. Returns a lock ID.
+    pub fn lock(vault_id: u256, unlock_time: u64, beneficiary: Address) -> u256 {
+        let vault = self.vault_data[vault_id];
+        require!(vault.owner == msg.sender, NotVaultOwner {});
+        require!(unlock_time > block.timestamp, LockNotExpired {
+            current_time: block.timestamp,
+            unlock_time: unlock_time,
+        });
+
+        let lock_id = self.next_lock_id;
+        self.next_lock_id = lock_id + 1u256;
+        self.lock_count = self.lock_count + 1u256;
+
+        emit PositionLocked {
+            beneficiary: beneficiary,
+            amount: vault.amount,
+            unlock_time: unlock_time,
+        };
+
+        self.locked_positions[lock_id] = LockedPosition {
+            vault: vault,
+            unlock_time: unlock_time,
+            beneficiary: beneficiary,
+        };
+
+        // Mark vault as locked by transferring ownership to the contract
+        self.vault_registry[vault_id] = false;
+
+        return lock_id;
+    }
+
+    /// Unlocks a position after the lock period expires.
+    /// Returns the vault to the beneficiary.
+    pub fn unlock(lock_id: u256) -> u256 {
+        let position = self.locked_positions[lock_id];
+        require!(msg.sender == position.beneficiary, NotBeneficiary {});
+        require!(block.timestamp >= position.unlock_time, LockNotExpired {
+            current_time: block.timestamp,
+            unlock_time: position.unlock_time,
+        });
+
+        let vault = position.vault;
+        let amount = vault.amount;
+
+        // Restore vault to registry
+        self.vault_registry[vault.token_id] = true;
+        self.vault_data[vault.token_id] = TokenVault {
+            owner: position.beneficiary,
+            amount: amount,
+            token_id: vault.token_id,
+        };
+
+        self.lock_count = self.lock_count - 1u256;
+
+        emit PositionUnlocked {
+            beneficiary: position.beneficiary,
+            amount: amount,
+        };
+
+        return vault.token_id;
+    }
+
+    // --- View functions ---
+
+    #[view]
+    pub fn get_total_supply() -> u256 {
+        return self.total_supply;
+    }
+
+    #[view]
+    pub fn balance_of(account: Address) -> u256 {
+        return self.balances[account];
+    }
+
+    #[view]
+    pub fn is_vault_active(vault_id: u256) -> bool {
+        return self.vault_registry[vault_id];
+    }
+
+    #[view]
+    pub fn get_lock_count() -> u256 {
+        return self.lock_count;
+    }
+}

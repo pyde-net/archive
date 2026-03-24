@@ -1,0 +1,310 @@
+// Upgradeable proxy pattern.
+// Delegates all calls to an implementation contract. The admin can
+// upgrade the implementation. Supports a two-step upgrade with a
+// timelock for safety.
+
+use std::math;
+
+contract UpgradeableProxy {
+    storage {
+        admin: Address,
+        pending_admin: Address,
+        implementation: Address,
+        pending_implementation: Address,
+        upgrade_timelock: u64,           // blocks to wait before upgrade applies
+        upgrade_ready_at: u64,
+        initialized: bool,
+        paused: bool,
+        version: u32,
+        upgrade_history: Vec<UpgradeRecord>,
+        guardian: Address,               // can pause but not upgrade
+        nonce: u64,                      // for replay protection
+    }
+
+    const MIN_TIMELOCK: u64 = 10;
+    const INITIAL_VERSION: u32 = 1;
+
+    struct UpgradeRecord {
+        version: u32,
+        implementation: Address,
+        upgraded_at: u64,
+        upgraded_by: Address,
+    }
+
+    event Upgraded {
+        #[indexed]
+        version: u32,
+        #[indexed]
+        new_implementation: Address,
+        old_implementation: Address,
+    }
+
+    event UpgradeScheduled {
+        #[indexed]
+        new_implementation: Address,
+        ready_at: u64,
+    }
+
+    event UpgradeCancelled {
+        #[indexed]
+        cancelled_implementation: Address,
+    }
+
+    event AdminTransferStarted {
+        #[indexed]
+        current_admin: Address,
+        #[indexed]
+        pending_admin: Address,
+    }
+
+    event AdminTransferCompleted {
+        #[indexed]
+        new_admin: Address,
+    }
+
+    event Paused {
+        #[indexed]
+        by: Address,
+    }
+
+    event Unpaused {
+        #[indexed]
+        by: Address,
+    }
+
+    event GuardianUpdated {
+        #[indexed]
+        new_guardian: Address,
+    }
+
+    event Delegated {
+        #[indexed]
+        caller: Address,
+        #[indexed]
+        implementation: Address,
+        call_data_hash: u256,
+    }
+
+    error NotAdmin {}
+    error NotGuardian {}
+    error NotPendingAdmin {}
+    error AlreadyInitialized {}
+    error NotInitialized {}
+    error IsPaused {}
+    error NotPaused {}
+    error UpgradeNotScheduled {}
+    error UpgradeNotReady { ready_at: u64, current: u64 }
+    error InvalidImplementation {}
+    error SameImplementation {}
+    error TimelockTooShort { min: u64 }
+    error NoUpgradePending {}
+    error ZeroAddress {}
+
+    #[constructor]
+    pub fn init(
+        implementation: Address,
+        timelock_blocks: u64,
+        guardian: Address,
+    ) {
+        require!(implementation != Address::ZERO, ZeroAddress {});
+        require!(timelock_blocks >= MIN_TIMELOCK, TimelockTooShort { min: MIN_TIMELOCK });
+
+        self.admin = msg.sender;
+        self.pending_admin = Address::ZERO;
+        self.implementation = implementation;
+        self.pending_implementation = Address::ZERO;
+        self.upgrade_timelock = timelock_blocks;
+        self.upgrade_ready_at = 0;
+        self.initialized = true;
+        self.paused = false;
+        self.version = INITIAL_VERSION;
+        self.guardian = guardian;
+        self.nonce = 0;
+
+        self.upgrade_history.push(UpgradeRecord {
+            version: INITIAL_VERSION,
+            implementation: implementation,
+            upgraded_at: block.height,
+            upgraded_by: msg.sender,
+        });
+
+        emit Upgraded {
+            version: INITIAL_VERSION,
+            new_implementation: implementation,
+            old_implementation: Address::ZERO,
+        };
+    }
+
+    // Schedule an upgrade (starts the timelock)
+    pub fn schedule_upgrade(new_implementation: Address) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        require!(new_implementation != Address::ZERO, ZeroAddress {});
+        require!(new_implementation != self.implementation, SameImplementation {});
+
+        // Basic code-existence check: implementation must have code
+        // (In a real VM this would be a code_size check)
+        self.pending_implementation = new_implementation;
+        self.upgrade_ready_at = block.height + self.upgrade_timelock;
+
+        emit UpgradeScheduled {
+            new_implementation: new_implementation,
+            ready_at: self.upgrade_ready_at,
+        };
+    }
+
+    // Execute a scheduled upgrade after timelock passes
+    pub fn execute_upgrade() {
+        require!(msg.sender == self.admin, NotAdmin {});
+        require!(self.pending_implementation != Address::ZERO, NoUpgradePending {});
+        require!(
+            block.height >= self.upgrade_ready_at,
+            UpgradeNotReady { ready_at: self.upgrade_ready_at, current: block.height }
+        );
+
+        let old_impl = self.implementation;
+        let new_impl = self.pending_implementation;
+
+        self.implementation = new_impl;
+        self.pending_implementation = Address::ZERO;
+        self.upgrade_ready_at = 0;
+        self.version = self.version + 1;
+
+        self.upgrade_history.push(UpgradeRecord {
+            version: self.version,
+            implementation: new_impl,
+            upgraded_at: block.height,
+            upgraded_by: msg.sender,
+        });
+
+        emit Upgraded {
+            version: self.version,
+            new_implementation: new_impl,
+            old_implementation: old_impl,
+        };
+    }
+
+    // Cancel a pending upgrade
+    pub fn cancel_upgrade() {
+        require!(msg.sender == self.admin || msg.sender == self.guardian, NotAdmin {});
+        require!(self.pending_implementation != Address::ZERO, NoUpgradePending {});
+
+        let cancelled = self.pending_implementation;
+        self.pending_implementation = Address::ZERO;
+        self.upgrade_ready_at = 0;
+
+        emit UpgradeCancelled { cancelled_implementation: cancelled };
+    }
+
+    // Delegate a call to the implementation
+    #[reentrant]
+    pub fn delegate(call_data: bytes) -> bytes {
+        require!(self.initialized, NotInitialized {});
+        require!(!self.paused, IsPaused {});
+
+        self.nonce = self.nonce + 1;
+        let data_hash = math::keccak256_bytes(call_data);
+
+        emit Delegated {
+            caller: msg.sender,
+            implementation: self.implementation,
+            call_data_hash: data_hash,
+        };
+
+        let result = raw_call!(self.implementation, 0, call_data);
+        return result;
+    }
+
+    // Delegate with value forwarding
+    pub fn delegate_with_value(call_data: bytes) -> bytes {
+        require!(self.initialized, NotInitialized {});
+        require!(!self.paused, IsPaused {});
+
+        let result = raw_call!(self.implementation, msg.value, call_data);
+        return result;
+    }
+
+    // Two-step admin transfer
+    pub fn transfer_admin(new_admin: Address) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        require!(new_admin != Address::ZERO, ZeroAddress {});
+        self.pending_admin = new_admin;
+
+        emit AdminTransferStarted {
+            current_admin: self.admin,
+            pending_admin: new_admin,
+        };
+    }
+
+    pub fn accept_admin() {
+        require!(msg.sender == self.pending_admin, NotPendingAdmin {});
+        self.admin = msg.sender;
+        self.pending_admin = Address::ZERO;
+        emit AdminTransferCompleted { new_admin: msg.sender };
+    }
+
+    // Guardian or admin can pause
+    pub fn pause() {
+        require!(
+            msg.sender == self.admin || msg.sender == self.guardian,
+            NotGuardian {}
+        );
+        require!(!self.paused, IsPaused {});
+        self.paused = true;
+        emit Paused { by: msg.sender };
+    }
+
+    // Only admin can unpause
+    pub fn unpause() {
+        require!(msg.sender == self.admin, NotAdmin {});
+        require!(self.paused, NotPaused {});
+        self.paused = false;
+        emit Unpaused { by: msg.sender };
+    }
+
+    pub fn set_guardian(new_guardian: Address) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        self.guardian = new_guardian;
+        emit GuardianUpdated { new_guardian: new_guardian };
+    }
+
+    pub fn set_timelock(new_timelock: u64) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        require!(new_timelock >= MIN_TIMELOCK, TimelockTooShort { min: MIN_TIMELOCK });
+        self.upgrade_timelock = new_timelock;
+    }
+
+    #[view]
+    pub fn get_implementation() -> Address {
+        return self.implementation;
+    }
+
+    #[view]
+    pub fn get_pending_upgrade() -> (Address, u64) {
+        return (self.pending_implementation, self.upgrade_ready_at);
+    }
+
+    #[view]
+    pub fn get_admin() -> Address {
+        return self.admin;
+    }
+
+    #[view]
+    pub fn get_version() -> u32 {
+        return self.version;
+    }
+
+    #[view]
+    pub fn is_paused() -> bool {
+        return self.paused;
+    }
+
+    #[view]
+    pub fn get_upgrade_history() -> Vec<UpgradeRecord> {
+        return self.upgrade_history;
+    }
+
+    #[view]
+    pub fn get_nonce() -> u64 {
+        return self.nonce;
+    }
+}

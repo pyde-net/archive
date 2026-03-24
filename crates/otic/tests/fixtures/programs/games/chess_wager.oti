@@ -1,0 +1,371 @@
+// Chess wager escrow contract.
+// Two players deposit a wager; an arbiter (chess engine oracle) reports
+// the result; the winner receives the combined pot minus a small fee.
+
+use std::math;
+
+enum MatchState {
+    Open,        // 0
+    Active,      // 1
+    WhiteWon,    // 2
+    BlackWon,    // 3
+    Draw,        // 4
+    Cancelled,   // 5
+}
+
+contract ChessWager {
+    storage {
+        owner: Address,
+        arbiter: Address,
+        fee_bps: u256,
+        accumulated_fees: u256,
+        next_match_id: u64,
+        matches: Map<u64, ChessMatch>,
+        player_elo: Map<Address, u32>,
+        player_match_count: Map<Address, u64>,
+        player_win_count: Map<Address, u64>,
+        default_elo: u32,
+        elo_k_factor: u32,
+        min_wager: u256,
+        max_wager: u256,
+        open_challenges: Vec<u64>,
+    }
+
+    const DEFAULT_ELO: u32 = 1200;
+    const DEFAULT_K_FACTOR: u32 = 32;
+    const FEE_DENOMINATOR: u256 = 10000;
+    const ELO_SCALE: i32 = 400;
+    const ELO_MIN: u32 = 100;
+
+    struct ChessMatch {
+        white: Address,
+        black: Address,
+        wager: u256,
+        state: MatchState,
+        time_control: u32,   // seconds per player
+        created_at: u64,
+        started_at: u64,
+        finished_at: u64,
+        game_hash: u256,     // hash of PGN or move list for verification
+        white_claimed: bool,
+        black_claimed: bool,
+    }
+
+    event ChallengeCreated {
+        #[indexed]
+        match_id: u64,
+        #[indexed]
+        white: Address,
+        wager: u256,
+        time_control: u32,
+    }
+
+    event ChallengeAccepted {
+        #[indexed]
+        match_id: u64,
+        #[indexed]
+        black: Address,
+    }
+
+    event MatchResult {
+        #[indexed]
+        match_id: u64,
+        state: MatchState,
+        game_hash: u256,
+    }
+
+    event WinningsClaimed {
+        #[indexed]
+        match_id: u64,
+        #[indexed]
+        player: Address,
+        amount: u256,
+    }
+
+    event EloUpdated {
+        #[indexed]
+        player: Address,
+        old_elo: u32,
+        new_elo: u32,
+    }
+
+    error Unauthorized {}
+    error NotArbiter {}
+    error MatchNotFound {}
+    error InvalidState { expected: MatchState, actual: MatchState }
+    error CannotPlaySelf {}
+    error WagerMismatch { required: u256, sent: u256 }
+    error WagerOutOfRange { min: u256, max: u256 }
+    error AlreadyClaimed {}
+    error NothingToClaim {}
+    error InvalidResult {}
+    error NotAPlayer {}
+    error NoFeesToWithdraw {}
+
+    #[constructor]
+    pub fn init(arbiter: Address, fee_bps: u256, min_wager: u256, max_wager: u256) {
+        self.owner = msg.sender;
+        self.arbiter = arbiter;
+        self.fee_bps = fee_bps;
+        self.min_wager = min_wager;
+        self.max_wager = max_wager;
+        self.next_match_id = 1;
+        self.default_elo = DEFAULT_ELO;
+        self.elo_k_factor = DEFAULT_K_FACTOR;
+        self.accumulated_fees = 0;
+    }
+
+    pub fn create_challenge(time_control: u32) -> u64 {
+        require!(
+            msg.value >= self.min_wager && msg.value <= self.max_wager,
+            WagerOutOfRange { min: self.min_wager, max: self.max_wager }
+        );
+
+        let match_id = self.next_match_id;
+        self.next_match_id = match_id + 1;
+
+        // Initialize player elo if first game
+        if self.player_match_count[msg.sender] == 0 {
+            self.player_elo[msg.sender] = self.default_elo;
+        }
+
+        self.matches[match_id] = ChessMatch {
+            white: msg.sender,
+            black: Address::ZERO,
+            wager: msg.value,
+            state: MatchState::Open,
+            time_control: time_control,
+            created_at: block.height,
+            started_at: 0,
+            finished_at: 0,
+            game_hash: 0,
+            white_claimed: false,
+            black_claimed: false,
+        };
+
+        self.open_challenges.push(match_id);
+
+        emit ChallengeCreated {
+            match_id: match_id,
+            white: msg.sender,
+            wager: msg.value,
+            time_control: time_control,
+        };
+
+        return match_id;
+    }
+
+    pub fn accept_challenge(match_id: u64) {
+        let mut m = self.matches[match_id];
+        require!(m.white != Address::ZERO, MatchNotFound {});
+        require!(m.state == MatchState::Open, InvalidState { expected: MatchState::Open, actual: m.state });
+        require!(msg.sender != m.white, CannotPlaySelf {});
+        require!(msg.value == m.wager, WagerMismatch { required: m.wager, sent: msg.value });
+
+        if self.player_match_count[msg.sender] == 0 {
+            self.player_elo[msg.sender] = self.default_elo;
+        }
+
+        m.black = msg.sender;
+        m.state = MatchState::Active;
+        m.started_at = block.height;
+        self.matches[match_id] = m;
+
+        self.remove_open_challenge(match_id);
+
+        emit ChallengeAccepted { match_id: match_id, black: msg.sender };
+    }
+
+    // Arbiter reports the match result
+    pub fn report_result(match_id: u64, result: MatchState, game_hash: u256) {
+        require!(msg.sender == self.arbiter, NotArbiter {});
+        let mut m = self.matches[match_id];
+        require!(m.state == MatchState::Active, InvalidState { expected: MatchState::Active, actual: m.state });
+        require!(
+            result == MatchState::WhiteWon || result == MatchState::BlackWon || result == MatchState::Draw,
+            InvalidResult {}
+        );
+
+        m.state = result;
+        m.finished_at = block.height;
+        m.game_hash = game_hash;
+        self.matches[match_id] = m;
+
+        // Update elo ratings
+        self.update_elo(m.white, m.black, result);
+
+        // Increment match counts
+        self.player_match_count[m.white] = self.player_match_count[m.white] + 1;
+        self.player_match_count[m.black] = self.player_match_count[m.black] + 1;
+
+        if result == MatchState::WhiteWon {
+            self.player_win_count[m.white] = self.player_win_count[m.white] + 1;
+        } else if result == MatchState::BlackWon {
+            self.player_win_count[m.black] = self.player_win_count[m.black] + 1;
+        }
+
+        emit MatchResult { match_id: match_id, state: result, game_hash: game_hash };
+    }
+
+    pub fn claim(match_id: u64) {
+        let mut m = self.matches[match_id];
+        let is_white = msg.sender == m.white;
+        let is_black = msg.sender == m.black;
+        require!(is_white || is_black, NotAPlayer {});
+
+        let total_pot = m.wager * 2;
+        let fee = (total_pot * self.fee_bps) / FEE_DENOMINATOR;
+        let mut payout: u256 = 0;
+
+        match m.state {
+            MatchState::WhiteWon => {
+                if is_white {
+                    require!(!m.white_claimed, AlreadyClaimed {});
+                    m.white_claimed = true;
+                    payout = total_pot - fee;
+                }
+            },
+            MatchState::BlackWon => {
+                if is_black {
+                    require!(!m.black_claimed, AlreadyClaimed {});
+                    m.black_claimed = true;
+                    payout = total_pot - fee;
+                }
+            },
+            MatchState::Draw => {
+                // Draw - split evenly
+                if is_white {
+                    require!(!m.white_claimed, AlreadyClaimed {});
+                    m.white_claimed = true;
+                    payout = m.wager; // return original wager (no fee on draws)
+                } else {
+                    require!(!m.black_claimed, AlreadyClaimed {});
+                    m.black_claimed = true;
+                    payout = m.wager;
+                }
+            },
+            MatchState::Cancelled => {
+                // Cancelled - refund
+                if is_white && !m.white_claimed {
+                    m.white_claimed = true;
+                    payout = m.wager;
+                } else if is_black && !m.black_claimed {
+                    m.black_claimed = true;
+                    payout = m.wager;
+                }
+            },
+            _ => {
+                revert!(NothingToClaim {});
+            },
+        }
+
+        require!(payout > 0, NothingToClaim {});
+        if m.state == MatchState::WhiteWon || m.state == MatchState::BlackWon {
+            self.accumulated_fees = self.accumulated_fees + fee;
+        }
+
+        self.matches[match_id] = m;
+        raw_call!(msg.sender, payout, bytes::empty());
+
+        emit WinningsClaimed { match_id: match_id, player: msg.sender, amount: payout };
+    }
+
+    pub fn cancel_challenge(match_id: u64) {
+        let mut m = self.matches[match_id];
+        require!(msg.sender == m.white, NotAPlayer {});
+        require!(m.state == MatchState::Open, InvalidState { expected: MatchState::Open, actual: m.state });
+
+        m.state = MatchState::Cancelled;
+        m.white_claimed = false;
+        self.matches[match_id] = m;
+        self.remove_open_challenge(match_id);
+
+        // Refund wager directly
+        raw_call!(m.white, m.wager, bytes::empty());
+    }
+
+    fn update_elo(white: Address, black: Address, result: MatchState) {
+        let white_elo = self.player_elo[white];
+        let black_elo = self.player_elo[black];
+
+        // Simplified Elo: expected score approximation using integer math
+        // E_a = 1 / (1 + 10^((Rb - Ra)/400))
+        // We approximate with linear interpolation for on-chain efficiency
+        let diff: i32 = (white_elo as i32) - (black_elo as i32);
+        let clamped = math::clamp(diff, -ELO_SCALE, ELO_SCALE);
+
+        // Expected score * 100 for white (range: 0-100)
+        let white_expected: u32 = (50 + ((clamped * 50) / ELO_SCALE)) as u32;
+        let black_expected: u32 = 100 - white_expected;
+
+        let mut white_score: u32 = 0;
+        let mut black_score: u32 = 0;
+
+        if result == MatchState::WhiteWon {
+            white_score = 100;
+            black_score = 0;
+        } else if result == MatchState::BlackWon {
+            white_score = 0;
+            black_score = 100;
+        } else {
+            white_score = 50;
+            black_score = 50;
+        }
+
+        // New Elo = Old + K * (S - E) / 100
+        let k = self.elo_k_factor;
+        let white_delta: i32 = ((k as i32) * ((white_score as i32) - (white_expected as i32))) / 100;
+        let black_delta: i32 = ((k as i32) * ((black_score as i32) - (black_expected as i32))) / 100;
+
+        let new_white_elo = math::max(ELO_MIN, ((white_elo as i32) + white_delta) as u32);
+        let new_black_elo = math::max(ELO_MIN, ((black_elo as i32) + black_delta) as u32);
+
+        self.player_elo[white] = new_white_elo;
+        self.player_elo[black] = new_black_elo;
+
+        emit EloUpdated { player: white, old_elo: white_elo, new_elo: new_white_elo };
+        emit EloUpdated { player: black, old_elo: black_elo, new_elo: new_black_elo };
+    }
+
+    fn remove_open_challenge(match_id: u64) {
+        let mut new_list: Vec<u64> = Vec::new();
+        for i in 0..self.open_challenges.len() {
+            if self.open_challenges[i] != match_id {
+                new_list.push(self.open_challenges[i]);
+            }
+        }
+        self.open_challenges = new_list;
+    }
+
+    pub fn withdraw_fees(to: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        let amount = self.accumulated_fees;
+        require!(amount > 0, NoFeesToWithdraw {});
+        self.accumulated_fees = 0;
+        raw_call!(to, amount, bytes::empty());
+    }
+
+    pub fn set_arbiter(new_arbiter: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.arbiter = new_arbiter;
+    }
+
+    #[view]
+    pub fn get_match(match_id: u64) -> ChessMatch {
+        return self.matches[match_id];
+    }
+
+    #[view]
+    pub fn get_player_profile(player: Address) -> (u32, u64, u64) {
+        return (
+            self.player_elo[player],
+            self.player_match_count[player],
+            self.player_win_count[player],
+        );
+    }
+
+    #[view]
+    pub fn get_open_challenges() -> Vec<u64> {
+        return self.open_challenges;
+    }
+}

@@ -1,0 +1,275 @@
+// Binary outcome prediction market.
+// Users bet on YES or NO for a question. An oracle resolves the outcome.
+// Payouts are proportional to the losing pool distributed to winners.
+
+use std::math;
+
+contract PredictionMarket {
+    storage {
+        owner: Address,
+        oracle: Address,
+        next_market_id: u64,
+        markets: Map<u64, Market>,
+        positions: Map<u64, Map<Address, Position>>,
+        market_yes_total: Map<u64, u256>,
+        market_no_total: Map<u64, u256>,
+        protocol_fee_bps: u256,
+        protocol_balance: u256,
+    }
+
+    const FEE_DENOMINATOR: u256 = 10000;
+
+    struct Market {
+        creator: Address,
+        question: String,
+        resolution_deadline: u64,
+        betting_deadline: u64,
+        resolved: bool,
+        outcome: bool,       // true = YES won
+        cancelled: bool,
+        min_bet: u256,
+        max_bet: u256,
+    }
+
+    struct Position {
+        yes_amount: u256,
+        no_amount: u256,
+        claimed: bool,
+    }
+
+    event MarketCreated {
+        #[indexed]
+        market_id: u64,
+        #[indexed]
+        creator: Address,
+        question: String,
+        betting_deadline: u64,
+        resolution_deadline: u64,
+    }
+
+    event BetPlaced {
+        #[indexed]
+        market_id: u64,
+        #[indexed]
+        bettor: Address,
+        is_yes: bool,
+        amount: u256,
+    }
+
+    event MarketResolved {
+        #[indexed]
+        market_id: u64,
+        outcome: bool,
+    }
+
+    event MarketCancelled {
+        #[indexed]
+        market_id: u64,
+    }
+
+    event WinningsClaimed {
+        #[indexed]
+        market_id: u64,
+        #[indexed]
+        claimant: Address,
+        payout: u256,
+    }
+
+    error Unauthorized {}
+    error NotOracle {}
+    error MarketNotFound {}
+    error BettingClosed {}
+    error BettingStillOpen {}
+    error MarketAlreadyResolved {}
+    error MarketCancelledErr {}
+    error MarketNotResolved {}
+    error AlreadyClaimed {}
+    error NothingToClaim {}
+    error BetTooSmall { min: u256 }
+    error BetTooLarge { max: u256 }
+    error InvalidDeadlines {}
+    error InsufficientPayment {}
+
+    #[constructor]
+    pub fn init(oracle: Address, fee_bps: u256) {
+        self.owner = msg.sender;
+        self.oracle = oracle;
+        self.protocol_fee_bps = fee_bps;
+        self.next_market_id = 1;
+        self.protocol_balance = 0;
+    }
+
+    pub fn create_market(
+        question: String,
+        betting_duration: u64,
+        resolution_duration: u64,
+        min_bet: u256,
+        max_bet: u256,
+    ) -> u64 {
+        let betting_deadline = block.height + betting_duration;
+        let resolution_deadline = betting_deadline + resolution_duration;
+        require!(resolution_duration > 0, InvalidDeadlines {});
+        require!(betting_duration > 0, InvalidDeadlines {});
+
+        let market_id = self.next_market_id;
+        self.next_market_id = market_id + 1;
+
+        self.markets[market_id] = Market {
+            creator: msg.sender,
+            question: question,
+            resolution_deadline: resolution_deadline,
+            betting_deadline: betting_deadline,
+            resolved: false,
+            outcome: false,
+            cancelled: false,
+            min_bet: min_bet,
+            max_bet: max_bet,
+        };
+
+        self.market_yes_total[market_id] = 0;
+        self.market_no_total[market_id] = 0;
+
+        emit MarketCreated {
+            market_id: market_id,
+            creator: msg.sender,
+            question: self.markets[market_id].question,
+            betting_deadline: betting_deadline,
+            resolution_deadline: resolution_deadline,
+        };
+
+        return market_id;
+    }
+
+    pub fn place_bet(market_id: u64, is_yes: bool) {
+        let market = self.markets[market_id];
+        require!(market.creator != Address::ZERO, MarketNotFound {});
+        require!(!market.cancelled, MarketCancelledErr {});
+        require!(!market.resolved, MarketAlreadyResolved {});
+        require!(block.height <= market.betting_deadline, BettingClosed {});
+        require!(msg.value >= market.min_bet, BetTooSmall { min: market.min_bet });
+        require!(msg.value <= market.max_bet, BetTooLarge { max: market.max_bet });
+
+        let mut pos = self.positions[market_id][msg.sender];
+        if is_yes {
+            pos.yes_amount = pos.yes_amount + msg.value;
+            self.market_yes_total[market_id] = self.market_yes_total[market_id] + msg.value;
+        } else {
+            pos.no_amount = pos.no_amount + msg.value;
+            self.market_no_total[market_id] = self.market_no_total[market_id] + msg.value;
+        }
+        self.positions[market_id][msg.sender] = pos;
+
+        emit BetPlaced {
+            market_id: market_id,
+            bettor: msg.sender,
+            is_yes: is_yes,
+            amount: msg.value,
+        };
+    }
+
+    pub fn resolve(market_id: u64, outcome: bool) {
+        require!(msg.sender == self.oracle, NotOracle {});
+        let mut market = self.markets[market_id];
+        require!(market.creator != Address::ZERO, MarketNotFound {});
+        require!(!market.resolved, MarketAlreadyResolved {});
+        require!(!market.cancelled, MarketCancelledErr {});
+        require!(block.height > market.betting_deadline, BettingStillOpen {});
+
+        market.resolved = true;
+        market.outcome = outcome;
+        self.markets[market_id] = market;
+
+        emit MarketResolved { market_id: market_id, outcome: outcome };
+    }
+
+    pub fn cancel_market(market_id: u64) {
+        let mut market = self.markets[market_id];
+        require!(
+            msg.sender == self.owner || msg.sender == market.creator,
+            Unauthorized {}
+        );
+        require!(!market.resolved, MarketAlreadyResolved {});
+        require!(!market.cancelled, MarketCancelledErr {});
+
+        market.cancelled = true;
+        self.markets[market_id] = market;
+
+        emit MarketCancelled { market_id: market_id };
+    }
+
+    pub fn claim_winnings(market_id: u64) {
+        let market = self.markets[market_id];
+        let mut pos = self.positions[market_id][msg.sender];
+        require!(!pos.claimed, AlreadyClaimed {});
+
+        let mut payout: u256 = 0;
+
+        if market.cancelled {
+            // Refund both sides on cancellation
+            payout = pos.yes_amount + pos.no_amount;
+        } else {
+            require!(market.resolved, MarketNotResolved {});
+            let yes_pool = self.market_yes_total[market_id];
+            let no_pool = self.market_no_total[market_id];
+            let total_pool = yes_pool + no_pool;
+
+            if market.outcome {
+                // YES won - winners get proportional share of total pool
+                if pos.yes_amount > 0 && yes_pool > 0 {
+                    payout = (pos.yes_amount * total_pool) / yes_pool;
+                }
+            } else {
+                // NO won
+                if pos.no_amount > 0 && no_pool > 0 {
+                    payout = (pos.no_amount * total_pool) / no_pool;
+                }
+            }
+
+            // Deduct protocol fee from winnings
+            if payout > 0 {
+                let fee = (payout * self.protocol_fee_bps) / FEE_DENOMINATOR;
+                self.protocol_balance = self.protocol_balance + fee;
+                payout = payout - fee;
+            }
+        }
+
+        require!(payout > 0, NothingToClaim {});
+        pos.claimed = true;
+        self.positions[market_id][msg.sender] = pos;
+        raw_call!(msg.sender, payout, bytes::empty());
+
+        emit WinningsClaimed {
+            market_id: market_id,
+            claimant: msg.sender,
+            payout: payout,
+        };
+    }
+
+    pub fn withdraw_protocol_fees(to: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        let amount = self.protocol_balance;
+        require!(amount > 0, NothingToClaim {});
+        self.protocol_balance = 0;
+        raw_call!(to, amount, bytes::empty());
+    }
+
+    pub fn set_oracle(new_oracle: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.oracle = new_oracle;
+    }
+
+    #[view]
+    pub fn get_market(market_id: u64) -> Market {
+        return self.markets[market_id];
+    }
+
+    #[view]
+    pub fn get_odds(market_id: u64) -> (u256, u256) {
+        return (self.market_yes_total[market_id], self.market_no_total[market_id]);
+    }
+
+    #[view]
+    pub fn get_position(market_id: u64, user: Address) -> Position {
+        return self.positions[market_id][user];
+    }
+}

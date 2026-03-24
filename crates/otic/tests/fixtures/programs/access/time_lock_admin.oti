@@ -1,0 +1,355 @@
+// Time-locked admin contract that enforces a mandatory delay on
+// sensitive operations. Actions must be queued, waited on, then executed.
+
+contract TimeLockAdmin {
+    storage {
+        admin: Address,
+        guardian: Address,
+        min_delay: u64,
+        max_delay: u64,
+        next_action_id: u64,
+        actions: Map<u64, TimeLockAction>,
+        pending_action_ids: Vec<u64>,
+        executed_action_ids: Vec<u64>,
+        action_hash_used: Map<[u8; 32], bool>,
+        grace_period: u64, // time after delay before action expires
+    }
+
+    enum ActionStatus {
+        Queued = 0,
+        Executed = 1,
+        Cancelled = 2,
+        Expired = 3,
+    }
+
+    struct TimeLockAction {
+        id: u64,
+        target: Address,
+        value: u256,
+        calldata: bytes,
+        description: String,
+        queued_at: u64,
+        executable_at: u64,
+        expires_at: u64,
+        status: ActionStatus,
+        proposer: Address,
+        action_hash: [u8; 32],
+    }
+
+    const MIN_GRACE_PERIOD: u64 = 3600; // 1 hour
+
+    event ActionQueued {
+        #[indexed]
+        action_id: u64,
+        target: Address,
+        value: u256,
+        description: String,
+        executable_at: u64,
+        expires_at: u64,
+    }
+
+    event ActionExecuted {
+        #[indexed]
+        action_id: u64,
+        target: Address,
+        executor: Address,
+    }
+
+    event ActionCancelled {
+        #[indexed]
+        action_id: u64,
+        cancelled_by: Address,
+    }
+
+    event ActionExpired {
+        #[indexed]
+        action_id: u64,
+    }
+
+    event DelayUpdated {
+        old_min: u64,
+        new_min: u64,
+        old_max: u64,
+        new_max: u64,
+    }
+
+    event GuardianUpdated {
+        old_guardian: Address,
+        new_guardian: Address,
+    }
+
+    event AdminTransferred {
+        old_admin: Address,
+        new_admin: Address,
+    }
+
+    error NotAdmin {}
+    error NotGuardian {}
+    error NotAdminOrGuardian {}
+    error ActionNotFound {}
+    error ActionNotReady { current: u64, executable_at: u64 }
+    error ActionExpiredError { expired_at: u64 }
+    error ActionNotQueued { status: ActionStatus }
+    error DuplicateAction { hash: [u8; 32] }
+    error DelayTooShort { min: u64, requested: u64 }
+    error DelayTooLong { max: u64, requested: u64 }
+    error InvalidDelayRange {}
+    error ZeroAddress {}
+    error ExecutionFailed {}
+    error GracePeriodTooShort {}
+
+    #[constructor]
+    pub fn init(min_delay: u64, max_delay: u64, guardian: Address, grace_period: u64) {
+        require!(min_delay <= max_delay, InvalidDelayRange {});
+        require!(grace_period >= MIN_GRACE_PERIOD, GracePeriodTooShort {});
+
+        self.admin = msg.sender;
+        self.guardian = guardian;
+        self.min_delay = min_delay;
+        self.max_delay = max_delay;
+        self.grace_period = grace_period;
+        self.next_action_id = 1;
+    }
+
+    fn ensure_admin() {
+        require!(msg.sender == self.admin, NotAdmin {});
+    }
+
+    // Queue a new time-locked action
+    pub fn queue_action(
+        target: Address,
+        value: u256,
+        calldata: bytes,
+        delay: u64,
+        description: String,
+    ) -> u64 {
+        self.ensure_admin();
+        require!(target != Address::ZERO, ZeroAddress {});
+        require!(delay >= self.min_delay, DelayTooShort {
+            min: self.min_delay,
+            requested: delay,
+        });
+        require!(delay <= self.max_delay, DelayTooLong {
+            max: self.max_delay,
+            requested: delay,
+        });
+
+        // Compute action hash for dedup
+        let action_hash = self.compute_hash(target, value, calldata, block.timestamp);
+        require!(!self.action_hash_used[action_hash], DuplicateAction {
+            hash: action_hash,
+        });
+
+        let id = self.next_action_id;
+        self.next_action_id = id + 1;
+
+        let executable_at = block.timestamp + delay;
+        let expires_at = executable_at + self.grace_period;
+
+        self.actions[id] = TimeLockAction {
+            id: id,
+            target: target,
+            value: value,
+            calldata: calldata,
+            description: description,
+            queued_at: block.timestamp,
+            executable_at: executable_at,
+            expires_at: expires_at,
+            status: ActionStatus::Queued,
+            proposer: msg.sender,
+            action_hash: action_hash,
+        };
+
+        self.pending_action_ids.push(id);
+        self.action_hash_used[action_hash] = true;
+
+        emit ActionQueued {
+            action_id: id,
+            target: target,
+            value: value,
+            description: description,
+            executable_at: executable_at,
+            expires_at: expires_at,
+        };
+
+        return id;
+    }
+
+    // Execute a queued action after the delay has passed
+    pub fn execute_action(action_id: u64) {
+        self.ensure_admin();
+
+        let mut action = self.actions[action_id];
+        require!(action.target != Address::ZERO, ActionNotFound {});
+        require!(action.status == ActionStatus::Queued, ActionNotQueued { status: action.status });
+        require!(block.timestamp >= action.executable_at, ActionNotReady {
+            current: block.timestamp,
+            executable_at: action.executable_at,
+        });
+        require!(block.timestamp <= action.expires_at, ActionExpiredError {
+            expired_at: action.expires_at,
+        });
+
+        action.status = ActionStatus::Executed;
+        self.actions[action_id] = action;
+
+        // Remove from pending
+        let mut new_pending: Vec<u64> = Vec::new();
+        for i in 0..self.pending_action_ids.len() {
+            if self.pending_action_ids[i] != action_id {
+                new_pending.push(self.pending_action_ids[i]);
+            }
+        }
+        self.pending_action_ids = new_pending;
+        self.executed_action_ids.push(action_id);
+
+        // Execute the action
+        raw_call!(action.target, action.value, action.calldata);
+
+        emit ActionExecuted {
+            action_id: action_id,
+            target: action.target,
+            executor: msg.sender,
+        };
+    }
+
+    // Cancel a queued action (admin or guardian)
+    pub fn cancel_action(action_id: u64) {
+        require!(
+            msg.sender == self.admin || msg.sender == self.guardian,
+            NotAdminOrGuardian {},
+        );
+
+        let mut action = self.actions[action_id];
+        require!(action.target != Address::ZERO, ActionNotFound {});
+        require!(action.status == ActionStatus::Queued, ActionNotQueued { status: action.status });
+
+        action.status = ActionStatus::Cancelled;
+        self.actions[action_id] = action;
+
+        let mut new_pending: Vec<u64> = Vec::new();
+        for i in 0..self.pending_action_ids.len() {
+            if self.pending_action_ids[i] != action_id {
+                new_pending.push(self.pending_action_ids[i]);
+            }
+        }
+        self.pending_action_ids = new_pending;
+
+        emit ActionCancelled { action_id: action_id, cancelled_by: msg.sender };
+    }
+
+    // Mark expired actions - anyone can call to clean up
+    pub fn prune_expired() {
+        let mut new_pending: Vec<u64> = Vec::new();
+
+        for i in 0..self.pending_action_ids.len() {
+            let id = self.pending_action_ids[i];
+            let mut action = self.actions[id];
+
+            if action.status == ActionStatus::Queued && block.timestamp > action.expires_at {
+                action.status = ActionStatus::Expired;
+                self.actions[id] = action;
+                emit ActionExpired { action_id: id };
+            } else if action.status == ActionStatus::Queued {
+                new_pending.push(id);
+            }
+        }
+
+        self.pending_action_ids = new_pending;
+    }
+
+    // Queue a delay change (must itself go through the timelock)
+    pub fn update_delays(new_min: u64, new_max: u64) {
+        // This should only be callable via the timelock itself
+        require!(msg.sender == address(self), NotAdmin {});
+        require!(new_min <= new_max, InvalidDelayRange {});
+
+        let old_min = self.min_delay;
+        let old_max = self.max_delay;
+        self.min_delay = new_min;
+        self.max_delay = new_max;
+
+        emit DelayUpdated {
+            old_min: old_min,
+            new_min: new_min,
+            old_max: old_max,
+            new_max: new_max,
+        };
+    }
+
+    pub fn update_guardian(new_guardian: Address) {
+        self.ensure_admin();
+        let old = self.guardian;
+        self.guardian = new_guardian;
+        emit GuardianUpdated { old_guardian: old, new_guardian: new_guardian };
+    }
+
+    pub fn transfer_admin(new_admin: Address) {
+        // Only via timelock execution
+        require!(msg.sender == address(self), NotAdmin {});
+        require!(new_admin != Address::ZERO, ZeroAddress {});
+        let old = self.admin;
+        self.admin = new_admin;
+        emit AdminTransferred { old_admin: old, new_admin: new_admin };
+    }
+
+    fn compute_hash(target: Address, value: u256, data: bytes, salt: u64) -> [u8; 32] {
+        // Simplified hash computation placeholder
+        // In real implementation this would use keccak256 or poseidon
+        let mut hash: [u8; 32] = [0; 32];
+        return hash;
+    }
+
+    #[view]
+    pub fn get_action(action_id: u64) -> TimeLockAction {
+        return self.actions[action_id];
+    }
+
+    #[view]
+    pub fn get_pending_actions() -> Vec<u64> {
+        return self.pending_action_ids;
+    }
+
+    #[view]
+    pub fn get_pending_count() -> u64 {
+        return self.pending_action_ids.len() as u64;
+    }
+
+    #[view]
+    pub fn get_executed_actions() -> Vec<u64> {
+        return self.executed_action_ids;
+    }
+
+    #[view]
+    pub fn is_action_ready(action_id: u64) -> bool {
+        let action = self.actions[action_id];
+        if action.status != ActionStatus::Queued {
+            return false;
+        }
+        return block.timestamp >= action.executable_at && block.timestamp <= action.expires_at;
+    }
+
+    #[view]
+    pub fn time_until_executable(action_id: u64) -> u64 {
+        let action = self.actions[action_id];
+        if block.timestamp >= action.executable_at {
+            return 0;
+        }
+        return action.executable_at - block.timestamp;
+    }
+
+    #[view]
+    pub fn get_delays() -> (u64, u64) {
+        return (self.min_delay, self.max_delay);
+    }
+
+    #[view]
+    pub fn get_admin() -> Address {
+        return self.admin;
+    }
+
+    #[view]
+    pub fn get_guardian() -> Address {
+        return self.guardian;
+    }
+}

@@ -1,0 +1,336 @@
+// Advanced ERC20 token with mint, burn, pause, and blacklist functionality
+use std::math;
+use std::token::IERC20;
+
+contract AdvancedToken {
+    storage {
+        name: String,
+        symbol: String,
+        decimals: u8,
+        total_supply: u256,
+        max_supply: u256,
+        balances: Map<Address, u256>,
+        allowances: Map<Address, Map<Address, u256>>,
+        owner: Address,
+        paused: bool,
+        blacklisted: Map<Address, bool>,
+        minters: Map<Address, bool>,
+        nonces: Map<Address, u256>,
+    }
+
+    event Transfer {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    event Approval {
+        #[indexed]
+        owner: Address,
+        #[indexed]
+        spender: Address,
+        amount: u256,
+    }
+
+    event Mint {
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    event Burn {
+        #[indexed]
+        from: Address,
+        amount: u256,
+    }
+
+    event Paused {
+        #[indexed]
+        by: Address,
+    }
+
+    event Unpaused {
+        #[indexed]
+        by: Address,
+    }
+
+    event Blacklisted {
+        #[indexed]
+        account: Address,
+    }
+
+    event Unblacklisted {
+        #[indexed]
+        account: Address,
+    }
+
+    event MinterAdded {
+        #[indexed]
+        account: Address,
+    }
+
+    event MinterRemoved {
+        #[indexed]
+        account: Address,
+    }
+
+    event OwnershipTransferred {
+        #[indexed]
+        previous: Address,
+        #[indexed]
+        new_owner: Address,
+    }
+
+    error InsufficientBalance { available: u256, required: u256 }
+    error InsufficientAllowance { available: u256, required: u256 }
+    error TransferToZeroAddress {}
+    error ContractPaused {}
+    error AccountBlacklisted { account: Address }
+    error NotOwner {}
+    error NotMinter {}
+    error MaxSupplyExceeded { current: u256, attempted: u256, max: u256 }
+    error BurnExceedsBalance { balance: u256, amount: u256 }
+    error InvalidPermitSignature {}
+    error PermitExpired {}
+
+    #[constructor]
+    pub fn init(
+        name: String,
+        symbol: String,
+        decimals: u8,
+        initial_supply: u256,
+        max_supply: u256,
+    ) {
+        self.name = name;
+        self.symbol = symbol;
+        self.decimals = decimals;
+        self.max_supply = max_supply;
+        self.owner = msg.sender;
+        self.paused = false;
+        self.minters[msg.sender] = true;
+
+        require!(initial_supply <= max_supply, MaxSupplyExceeded {
+            current: 0u256,
+            attempted: initial_supply,
+            max: max_supply,
+        });
+
+        self.total_supply = initial_supply;
+        self.balances[msg.sender] = initial_supply;
+        emit Transfer { from: Address::ZERO, to: msg.sender, amount: initial_supply };
+    }
+
+    // --- Internal helpers ---
+
+    fn require_not_paused() {
+        require!(!self.paused, ContractPaused {});
+    }
+
+    fn require_not_blacklisted(account: Address) {
+        require!(!self.blacklisted[account], AccountBlacklisted { account: account });
+    }
+
+    fn require_owner() {
+        require!(msg.sender == self.owner, NotOwner {});
+    }
+
+    fn transfer_internal(from: Address, to: Address, amount: u256) {
+        require!(to != Address::ZERO, TransferToZeroAddress {});
+        self.require_not_paused();
+        self.require_not_blacklisted(from);
+        self.require_not_blacklisted(to);
+
+        let from_bal = self.balances[from];
+        require!(from_bal >= amount, InsufficientBalance {
+            available: from_bal,
+            required: amount,
+        });
+
+        self.balances[from] = from_bal - amount;
+        self.balances[to] = self.balances[to] + amount;
+        emit Transfer { from: from, to: to, amount: amount };
+    }
+
+    // --- ERC20 core ---
+
+    pub fn transfer(to: Address, amount: u256) {
+        self.transfer_internal(msg.sender, to, amount);
+    }
+
+    pub fn approve(spender: Address, amount: u256) {
+        self.require_not_paused();
+        self.allowances[msg.sender][spender] = amount;
+        emit Approval { owner: msg.sender, spender: spender, amount: amount };
+    }
+
+    pub fn transfer_from(from: Address, to: Address, amount: u256) {
+        let allowed = self.allowances[from][msg.sender];
+        require!(allowed >= amount, InsufficientAllowance {
+            available: allowed,
+            required: amount,
+        });
+        self.allowances[from][msg.sender] = allowed - amount;
+        self.transfer_internal(from, to, amount);
+    }
+
+    pub fn increase_allowance(spender: Address, added_value: u256) {
+        self.require_not_paused();
+        let current = self.allowances[msg.sender][spender];
+        let new_allowance = current + added_value;
+        self.allowances[msg.sender][spender] = new_allowance;
+        emit Approval { owner: msg.sender, spender: spender, amount: new_allowance };
+    }
+
+    pub fn decrease_allowance(spender: Address, subtracted_value: u256) {
+        self.require_not_paused();
+        let current = self.allowances[msg.sender][spender];
+        require!(current >= subtracted_value, InsufficientAllowance {
+            available: current,
+            required: subtracted_value,
+        });
+        let new_allowance = current - subtracted_value;
+        self.allowances[msg.sender][spender] = new_allowance;
+        emit Approval { owner: msg.sender, spender: spender, amount: new_allowance };
+    }
+
+    // --- Mint / Burn ---
+
+    pub fn mint(to: Address, amount: u256) {
+        require!(self.minters[msg.sender], NotMinter {});
+        self.require_not_paused();
+        self.require_not_blacklisted(to);
+
+        let new_supply = self.total_supply + amount;
+        require!(new_supply <= self.max_supply, MaxSupplyExceeded {
+            current: self.total_supply,
+            attempted: new_supply,
+            max: self.max_supply,
+        });
+
+        self.total_supply = new_supply;
+        self.balances[to] = self.balances[to] + amount;
+
+        emit Mint { to: to, amount: amount };
+        emit Transfer { from: Address::ZERO, to: to, amount: amount };
+    }
+
+    pub fn burn(amount: u256) {
+        self.require_not_paused();
+        let bal = self.balances[msg.sender];
+        require!(bal >= amount, BurnExceedsBalance { balance: bal, amount: amount });
+
+        self.balances[msg.sender] = bal - amount;
+        self.total_supply = self.total_supply - amount;
+
+        emit Burn { from: msg.sender, amount: amount };
+        emit Transfer { from: msg.sender, to: Address::ZERO, amount: amount };
+    }
+
+    pub fn burn_from(account: Address, amount: u256) {
+        let allowed = self.allowances[account][msg.sender];
+        require!(allowed >= amount, InsufficientAllowance {
+            available: allowed,
+            required: amount,
+        });
+        self.allowances[account][msg.sender] = allowed - amount;
+
+        let bal = self.balances[account];
+        require!(bal >= amount, BurnExceedsBalance { balance: bal, amount: amount });
+
+        self.balances[account] = bal - amount;
+        self.total_supply = self.total_supply - amount;
+
+        emit Burn { from: account, amount: amount };
+        emit Transfer { from: account, to: Address::ZERO, amount: amount };
+    }
+
+    // --- Admin functions ---
+
+    pub fn pause() {
+        self.require_owner();
+        self.paused = true;
+        emit Paused { by: msg.sender };
+    }
+
+    pub fn unpause() {
+        self.require_owner();
+        self.paused = false;
+        emit Unpaused { by: msg.sender };
+    }
+
+    pub fn blacklist(account: Address) {
+        self.require_owner();
+        self.blacklisted[account] = true;
+        emit Blacklisted { account: account };
+    }
+
+    pub fn unblacklist(account: Address) {
+        self.require_owner();
+        self.blacklisted[account] = false;
+        emit Unblacklisted { account: account };
+    }
+
+    pub fn add_minter(account: Address) {
+        self.require_owner();
+        self.minters[account] = true;
+        emit MinterAdded { account: account };
+    }
+
+    pub fn remove_minter(account: Address) {
+        self.require_owner();
+        self.minters[account] = false;
+        emit MinterRemoved { account: account };
+    }
+
+    pub fn transfer_ownership(new_owner: Address) {
+        self.require_owner();
+        require!(new_owner != Address::ZERO, TransferToZeroAddress {});
+        let previous = self.owner;
+        self.owner = new_owner;
+        emit OwnershipTransferred { previous: previous, new_owner: new_owner };
+    }
+
+    // --- View functions ---
+
+    #[view]
+    pub fn balance_of(account: Address) -> u256 {
+        return self.balances[account];
+    }
+
+    #[view]
+    pub fn allowance(owner: Address, spender: Address) -> u256 {
+        return self.allowances[owner][spender];
+    }
+
+    #[view]
+    pub fn get_total_supply() -> u256 {
+        return self.total_supply;
+    }
+
+    #[view]
+    pub fn get_max_supply() -> u256 {
+        return self.max_supply;
+    }
+
+    #[view]
+    pub fn is_paused() -> bool {
+        return self.paused;
+    }
+
+    #[view]
+    pub fn is_blacklisted(account: Address) -> bool {
+        return self.blacklisted[account];
+    }
+
+    #[view]
+    pub fn is_minter(account: Address) -> bool {
+        return self.minters[account];
+    }
+
+    #[view]
+    pub fn get_owner() -> Address {
+        return self.owner;
+    }
+}

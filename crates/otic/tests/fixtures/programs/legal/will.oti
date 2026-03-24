@@ -1,0 +1,346 @@
+// Digital will and testament with beneficiary management, asset distribution, and executor control
+use std::math;
+use std::token::IERC20;
+
+enum WillStatus {
+    Draft,      // 0
+    Witnessed,  // 1
+    Active,     // 2
+    Triggered,  // 3
+    Executed,   // 4
+}
+
+contract DigitalWill {
+    storage {
+        next_will_id: u64,
+        wills: Map<u64, Will>,
+        beneficiaries: Map<u64, Map<u32, Beneficiary>>,
+        beneficiary_counts: Map<u64, u32>,
+        asset_allocations: Map<u64, Map<u32, AssetAllocation>>,
+        allocation_counts: Map<u64, u32>,
+        witnesses: Map<u64, Map<Address, bool>>,
+        witness_counts: Map<u64, u8>,
+        will_by_testator: Map<Address, u64>,
+        heartbeat_timestamps: Map<u64, u64>,
+        conditions: Map<u64, Map<u32, Condition>>,
+        condition_counts: Map<u64, u32>,
+        distributed: Map<u64, bool>,
+    }
+
+    struct Will {
+        testator: Address,
+        executor: Address,
+        created_at: u64,
+        last_updated: u64,
+        status: u8,
+        inactivity_threshold_days: u64,
+        min_witnesses: u8,
+        document_hash: u256,
+        codicil_hash: u256,
+        version: u16,
+    }
+
+    struct Beneficiary {
+        addr: Address,
+        name_hash: u256,
+        share_bps: u16,
+        is_contingent: bool,
+        primary_index: u32,
+    }
+
+    struct AssetAllocation {
+        token: Address,
+        amount: u256,
+        beneficiary_index: u32,
+        asset_type: u8,
+        description_hash: u256,
+    }
+
+    struct Condition {
+        condition_type: u8,
+        parameter: u256,
+        met: bool,
+        verified_by: Address,
+        verified_at: u64,
+    }
+
+    event WillCreated {
+        #[indexed]
+        will_id: u64,
+        #[indexed]
+        testator: Address,
+        executor: Address,
+    }
+
+    event WillUpdated {
+        #[indexed]
+        will_id: u64,
+        version: u16,
+    }
+
+    event BeneficiaryAdded {
+        #[indexed]
+        will_id: u64,
+        beneficiary: Address,
+        share_bps: u16,
+    }
+
+    event HeartbeatRecorded {
+        #[indexed]
+        will_id: u64,
+        timestamp: u64,
+    }
+
+    event WillExecuted {
+        #[indexed]
+        will_id: u64,
+        #[indexed]
+        executor: Address,
+    }
+
+    event AssetDistributed {
+        #[indexed]
+        will_id: u64,
+        beneficiary: Address,
+        token: Address,
+        amount: u256,
+    }
+
+    event WillWitnessed {
+        #[indexed]
+        will_id: u64,
+        witness: Address,
+    }
+
+    error WillNotFound { id: u64 }
+    error NotTestator {}
+    error NotExecutor {}
+    error WillAlreadyExists {}
+    error WillNotActive {}
+    error TestatorStillAlive {}
+    error InsufficientWitnesses { required: u8, actual: u8 }
+    error SharesExceed100Percent {}
+    error AlreadyDistributed {}
+    error AlreadyWitnessed {}
+    error ConditionNotMet { index: u32 }
+    error NotWitness {}
+
+    const SECONDS_PER_DAY: u64 = 86400;
+    const BPS_DENOMINATOR: u16 = 10000;
+
+    #[constructor]
+    pub fn init() {
+        self.next_will_id = 1;
+    }
+
+    pub fn create_will(
+        executor: Address,
+        inactivity_days: u64,
+        min_witnesses: u8,
+        document_hash: u256,
+    ) -> u64 {
+        require!(self.will_by_testator[msg.sender] == 0, WillAlreadyExists {});
+
+        let will_id = self.next_will_id;
+        self.next_will_id += 1;
+
+        // Status: 0=draft, 1=witnessed, 2=active, 3=triggered, 4=executed
+        self.wills[will_id] = Will {
+            testator: msg.sender,
+            executor: executor,
+            created_at: block.timestamp,
+            last_updated: block.timestamp,
+            status: 0,
+            inactivity_threshold_days: inactivity_days,
+            min_witnesses: min_witnesses,
+            document_hash: document_hash,
+            codicil_hash: 0,
+            version: 1,
+        };
+
+        self.will_by_testator[msg.sender] = will_id;
+        self.heartbeat_timestamps[will_id] = block.timestamp;
+        self.beneficiary_counts[will_id] = 0;
+        self.allocation_counts[will_id] = 0;
+        self.condition_counts[will_id] = 0;
+        self.witness_counts[will_id] = 0;
+
+        emit WillCreated { will_id: will_id, testator: msg.sender, executor: executor };
+        return will_id;
+    }
+
+    pub fn add_beneficiary(
+        will_id: u64,
+        addr: Address,
+        name_hash: u256,
+        share_bps: u16,
+        is_contingent: bool,
+        primary_index: u32,
+    ) {
+        let will = self.wills[will_id];
+        require!(will.testator == msg.sender, NotTestator {});
+        require!(will.status < 3, WillNotActive {});
+
+        // Validate total shares
+        let count = self.beneficiary_counts[will_id];
+        let mut total_bps: u16 = share_bps;
+        let mut i: u32 = 0;
+        while i < count {
+            let b = self.beneficiaries[will_id][i];
+            if !b.is_contingent {
+                total_bps += b.share_bps;
+            }
+            i += 1;
+        }
+        if !is_contingent {
+            require!(total_bps <= 10000, SharesExceed100Percent {});
+        }
+
+        self.beneficiaries[will_id][count] = Beneficiary {
+            addr: addr,
+            name_hash: name_hash,
+            share_bps: share_bps,
+            is_contingent: is_contingent,
+            primary_index: primary_index,
+        };
+        self.beneficiary_counts[will_id] = count + 1;
+
+        self.wills[will_id].last_updated = block.timestamp;
+        self.wills[will_id].version += 1;
+
+        emit BeneficiaryAdded { will_id: will_id, beneficiary: addr, share_bps: share_bps };
+    }
+
+    pub fn add_asset_allocation(
+        will_id: u64,
+        token: Address,
+        amount: u256,
+        beneficiary_index: u32,
+        asset_type: u8,
+        description_hash: u256,
+    ) {
+        require!(self.wills[will_id].testator == msg.sender, NotTestator {});
+
+        let idx = self.allocation_counts[will_id];
+        self.asset_allocations[will_id][idx] = AssetAllocation {
+            token: token,
+            amount: amount,
+            beneficiary_index: beneficiary_index,
+            asset_type: asset_type,
+            description_hash: description_hash,
+        };
+        self.allocation_counts[will_id] = idx + 1;
+    }
+
+    pub fn witness_will(will_id: u64) {
+        let will = self.wills[will_id];
+        require!(will.status == 0 || will.status == 1, WillNotActive {});
+        require!(!self.witnesses[will_id][msg.sender], AlreadyWitnessed {});
+        require!(msg.sender != will.testator && msg.sender != will.executor, NotWitness {});
+
+        self.witnesses[will_id][msg.sender] = true;
+        self.witness_counts[will_id] += 1;
+
+        emit WillWitnessed { will_id: will_id, witness: msg.sender };
+
+        if self.witness_counts[will_id] >= will.min_witnesses {
+            self.wills[will_id].status = 2;
+        }
+    }
+
+    pub fn heartbeat(will_id: u64) {
+        require!(self.wills[will_id].testator == msg.sender, NotTestator {});
+        self.heartbeat_timestamps[will_id] = block.timestamp;
+        emit HeartbeatRecorded { will_id: will_id, timestamp: block.timestamp };
+    }
+
+    pub fn trigger_will(will_id: u64) {
+        let will = self.wills[will_id];
+        require!(will.status == 2, WillNotActive {});
+        require!(msg.sender == will.executor, NotExecutor {});
+
+        let last_heartbeat = self.heartbeat_timestamps[will_id];
+        let threshold = will.inactivity_threshold_days * 86400;
+        require!(block.timestamp > last_heartbeat + threshold, TestatorStillAlive {});
+
+        require!(
+            self.witness_counts[will_id] >= will.min_witnesses,
+            InsufficientWitnesses {
+                required: will.min_witnesses,
+                actual: self.witness_counts[will_id],
+            }
+        );
+
+        self.wills[will_id].status = 3;
+    }
+
+    #[reentrant]
+    pub fn execute_will(will_id: u64) {
+        let will = self.wills[will_id];
+        require!(will.status == 3, WillNotActive {});
+        require!(msg.sender == will.executor, NotExecutor {});
+        require!(!self.distributed[will_id], AlreadyDistributed {});
+
+        // Check all conditions are met
+        let cond_count = self.condition_counts[will_id];
+        let mut c: u32 = 0;
+        while c < cond_count {
+            require!(self.conditions[will_id][c].met, ConditionNotMet { index: c });
+            c += 1;
+        }
+
+        // Distribute specific asset allocations
+        let alloc_count = self.allocation_counts[will_id];
+        let mut a: u32 = 0;
+        while a < alloc_count {
+            let alloc = self.asset_allocations[will_id][a];
+            let beneficiary = self.beneficiaries[will_id][alloc.beneficiary_index];
+
+            if alloc.token == Address::ZERO {
+                raw_call!(beneficiary.addr, alloc.amount, bytes(""));
+            } else {
+                IERC20::at(alloc.token).transfer(beneficiary.addr, alloc.amount);
+            }
+
+            emit AssetDistributed {
+                will_id: will_id,
+                beneficiary: beneficiary.addr,
+                token: alloc.token,
+                amount: alloc.amount,
+            };
+            a += 1;
+        }
+
+        self.distributed[will_id] = true;
+        self.wills[will_id].status = 4;
+        emit WillExecuted { will_id: will_id, executor: msg.sender };
+    }
+
+    pub fn add_codicil(will_id: u64, codicil_hash: u256) {
+        require!(self.wills[will_id].testator == msg.sender, NotTestator {});
+        self.wills[will_id].codicil_hash = codicil_hash;
+        self.wills[will_id].version += 1;
+        self.wills[will_id].last_updated = block.timestamp;
+        emit WillUpdated { will_id: will_id, version: self.wills[will_id].version };
+    }
+
+    #[view]
+    pub fn get_will(will_id: u64) -> Will {
+        return self.wills[will_id];
+    }
+
+    #[view]
+    pub fn get_beneficiary(will_id: u64, index: u32) -> Beneficiary {
+        return self.beneficiaries[will_id][index];
+    }
+
+    #[view]
+    pub fn is_triggered(will_id: u64) -> bool {
+        return self.wills[will_id].status >= 3;
+    }
+
+    #[view]
+    pub fn get_will_by_testator(testator: Address) -> u64 {
+        return self.will_by_testator[testator];
+    }
+}

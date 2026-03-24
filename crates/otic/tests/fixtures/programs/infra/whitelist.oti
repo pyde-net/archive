@@ -1,0 +1,449 @@
+// Merkle tree whitelist verification contract.
+// Manages multiple whitelists using Merkle roots. Contracts can
+// verify membership by providing a proof. Supports multiple rounds,
+// claim tracking, and on-chain leaf registration for smaller lists.
+
+use std::math;
+
+enum WhitelistMode {
+    Merkle,      // 0
+    OnChain,     // 1
+    Both,        // 2
+}
+
+contract MerkleWhitelist {
+    storage {
+        owner: Address,
+        next_list_id: u64,
+        lists: Map<u64, WhitelistConfig>,
+        merkle_roots: Map<u64, u256>,
+        claimed: Map<u64, Map<Address, bool>>,
+        claim_counts: Map<u64, u64>,
+        // For small lists: store leaves directly on-chain
+        on_chain_leaves: Map<u64, Map<u256, bool>>,
+        on_chain_leaf_list: Map<u64, Vec<u256>>,
+        // Authorization: which contracts can query this whitelist
+        authorized_consumers: Map<u64, Map<Address, bool>>,
+        // Multi-root support: lists can have multiple valid roots (for updates)
+        historical_roots: Map<u64, Vec<RootRecord>>,
+        admin_roles: Map<Address, bool>,
+    }
+
+    struct WhitelistConfig {
+        id: u64,
+        name: String,
+        creator: Address,
+        mode: WhitelistMode,
+        max_claims: u64,         // 0 = unlimited
+        claim_deadline: u64,     // 0 = no deadline
+        active: bool,
+        total_leaves: u64,
+        created_at: u64,
+        allow_public_verify: bool,
+    }
+
+    struct RootRecord {
+        root: u256,
+        set_at: u64,
+        set_by: Address,
+        leaf_count: u64,
+        active: bool,
+    }
+
+    event WhitelistCreated {
+        #[indexed]
+        list_id: u64,
+        #[indexed]
+        creator: Address,
+        name: String,
+        mode: WhitelistMode,
+    }
+
+    event MerkleRootSet {
+        #[indexed]
+        list_id: u64,
+        root: u256,
+        leaf_count: u64,
+    }
+
+    event LeafAdded {
+        #[indexed]
+        list_id: u64,
+        leaf: u256,
+    }
+
+    event Claimed {
+        #[indexed]
+        list_id: u64,
+        #[indexed]
+        account: Address,
+    }
+
+    event WhitelistDeactivated {
+        #[indexed]
+        list_id: u64,
+    }
+
+    event ConsumerAuthorized {
+        #[indexed]
+        list_id: u64,
+        #[indexed]
+        consumer: Address,
+    }
+
+    event ConsumerRevoked {
+        #[indexed]
+        list_id: u64,
+        #[indexed]
+        consumer: Address,
+    }
+
+    error Unauthorized {}
+    error NotAdmin {}
+    error NotListCreator {}
+    error ListNotFound {}
+    error ListInactive {}
+    error AlreadyClaimed {}
+    error InvalidProof {}
+    error ClaimDeadlinePassed {}
+    error MaxClaimsReached { max: u64 }
+    error NotAuthorizedConsumer {}
+    error InvalidMode {}
+    error LeafAlreadyExists {}
+    error EmptyProof {}
+    error RootNotSet {}
+    error LeafNotFound {}
+
+    #[constructor]
+    pub fn init() {
+        self.owner = msg.sender;
+        self.next_list_id = 1;
+        self.admin_roles[msg.sender] = true;
+    }
+
+    pub fn create_whitelist(
+        name: String,
+        mode: WhitelistMode,
+        max_claims: u64,
+        deadline_blocks: u64,
+        allow_public: bool,
+    ) -> u64 {
+        let list_id = self.next_list_id;
+        self.next_list_id = list_id + 1;
+
+        let claim_deadline = if deadline_blocks > 0 {
+            block.height + deadline_blocks
+        } else {
+            0
+        };
+
+        self.lists[list_id] = WhitelistConfig {
+            id: list_id,
+            name: name,
+            creator: msg.sender,
+            mode: mode,
+            max_claims: max_claims,
+            claim_deadline: claim_deadline,
+            active: true,
+            total_leaves: 0,
+            created_at: block.height,
+            allow_public_verify: allow_public,
+        };
+
+        emit WhitelistCreated {
+            list_id: list_id,
+            creator: msg.sender,
+            name: name,
+            mode: mode,
+        };
+
+        return list_id;
+    }
+
+    pub fn set_merkle_root(list_id: u64, root: u256, leaf_count: u64) {
+        let list = self.lists[list_id];
+        require!(list.active, ListNotFound {});
+        require!(
+            msg.sender == list.creator || self.admin_roles[msg.sender],
+            NotListCreator {}
+        );
+        require!(
+            list.mode == WhitelistMode::Merkle || list.mode == WhitelistMode::Both,
+            InvalidMode {}
+        );
+
+        self.merkle_roots[list_id] = root;
+
+        let mut roots = self.historical_roots[list_id];
+        // Deactivate previous root
+        if roots.len() > 0 {
+            let last_idx = roots.len() - 1;
+            let mut prev = roots[last_idx as u64];
+            prev.active = false;
+            roots[last_idx as u64] = prev;
+        }
+
+        roots.push(RootRecord {
+            root: root,
+            set_at: block.height,
+            set_by: msg.sender,
+            leaf_count: leaf_count,
+            active: true,
+        });
+        self.historical_roots[list_id] = roots;
+
+        let mut updated_list = self.lists[list_id];
+        updated_list.total_leaves = leaf_count;
+        self.lists[list_id] = updated_list;
+
+        emit MerkleRootSet { list_id: list_id, root: root, leaf_count: leaf_count };
+    }
+
+    // Add individual leaves for on-chain mode
+    pub fn add_leaf(list_id: u64, leaf: u256) {
+        let list = self.lists[list_id];
+        require!(list.active, ListNotFound {});
+        require!(
+            msg.sender == list.creator || self.admin_roles[msg.sender],
+            NotListCreator {}
+        );
+        require!(
+            list.mode == WhitelistMode::OnChain || list.mode == WhitelistMode::Both,
+            InvalidMode {}
+        );
+        require!(!self.on_chain_leaves[list_id][leaf], LeafAlreadyExists {});
+
+        self.on_chain_leaves[list_id][leaf] = true;
+
+        let mut leaves = self.on_chain_leaf_list[list_id];
+        leaves.push(leaf);
+        self.on_chain_leaf_list[list_id] = leaves;
+
+        let mut updated_list = self.lists[list_id];
+        updated_list.total_leaves = updated_list.total_leaves + 1;
+        self.lists[list_id] = updated_list;
+
+        emit LeafAdded { list_id: list_id, leaf: leaf };
+    }
+
+    // Batch add leaves
+    pub fn batch_add_leaves(list_id: u64, leaves: Vec<u256>) {
+        let list = self.lists[list_id];
+        require!(list.active, ListNotFound {});
+        require!(
+            msg.sender == list.creator || self.admin_roles[msg.sender],
+            NotListCreator {}
+        );
+        require!(
+            list.mode == WhitelistMode::OnChain || list.mode == WhitelistMode::Both,
+            InvalidMode {}
+        );
+
+        for i in 0..leaves.len() {
+            let leaf = leaves[i];
+            if !self.on_chain_leaves[list_id][leaf] {
+                self.on_chain_leaves[list_id][leaf] = true;
+
+                let mut stored_leaves = self.on_chain_leaf_list[list_id];
+                stored_leaves.push(leaf);
+                self.on_chain_leaf_list[list_id] = stored_leaves;
+            }
+        }
+
+        let mut updated_list = self.lists[list_id];
+        updated_list.total_leaves = self.on_chain_leaf_list[list_id].len() as u64;
+        self.lists[list_id] = updated_list;
+    }
+
+    // Remove a leaf from on-chain storage
+    pub fn remove_leaf(list_id: u64, leaf: u256) {
+        let list = self.lists[list_id];
+        require!(
+            msg.sender == list.creator || self.admin_roles[msg.sender],
+            NotListCreator {}
+        );
+        require!(self.on_chain_leaves[list_id][leaf], LeafNotFound {});
+
+        self.on_chain_leaves[list_id][leaf] = false;
+
+        let mut new_list: Vec<u256> = Vec::new();
+        let old_list = self.on_chain_leaf_list[list_id];
+        for i in 0..old_list.len() {
+            if old_list[i] != leaf {
+                new_list.push(old_list[i]);
+            }
+        }
+        self.on_chain_leaf_list[list_id] = new_list;
+
+        let mut updated = self.lists[list_id];
+        updated.total_leaves = new_list.len() as u64;
+        self.lists[list_id] = updated;
+    }
+
+    // Verify membership and mark as claimed
+    pub fn verify_and_claim(list_id: u64, proof: Vec<u256>) {
+        let list = self.lists[list_id];
+        require!(list.active, ListInactive {});
+        require!(!self.claimed[list_id][msg.sender], AlreadyClaimed {});
+
+        if list.claim_deadline > 0 {
+            require!(block.height <= list.claim_deadline, ClaimDeadlinePassed {});
+        }
+
+        if list.max_claims > 0 {
+            require!(
+                self.claim_counts[list_id] < list.max_claims,
+                MaxClaimsReached { max: list.max_claims }
+            );
+        }
+
+        let leaf = self.compute_leaf(msg.sender);
+        let verified = self.verify_membership(list_id, leaf, proof);
+        require!(verified, InvalidProof {});
+
+        self.claimed[list_id][msg.sender] = true;
+        self.claim_counts[list_id] = self.claim_counts[list_id] + 1;
+
+        emit Claimed { list_id: list_id, account: msg.sender };
+    }
+
+    // External verify: other contracts call this to check membership
+    pub fn verify_for(list_id: u64, account: Address, proof: Vec<u256>) -> bool {
+        let list = self.lists[list_id];
+        require!(list.active, ListInactive {});
+        require!(
+            list.allow_public_verify || self.authorized_consumers[list_id][msg.sender],
+            NotAuthorizedConsumer {}
+        );
+
+        let leaf = self.compute_leaf(account);
+        return self.verify_membership(list_id, leaf, proof);
+    }
+
+    fn verify_membership(list_id: u64, leaf: u256, proof: Vec<u256>) -> bool {
+        let list = self.lists[list_id];
+
+        // Check on-chain leaves first (OnChain or Both mode)
+        if list.mode == WhitelistMode::OnChain || list.mode == WhitelistMode::Both {
+            if self.on_chain_leaves[list_id][leaf] {
+                return true;
+            }
+            if list.mode == WhitelistMode::OnChain {
+                return false; // On-chain only mode, leaf not found
+            }
+        }
+
+        // Merkle proof verification (Merkle or Both mode)
+        let root = self.merkle_roots[list_id];
+        if root == 0 {
+            return false;
+        }
+
+        let computed_root = self.compute_root(leaf, proof);
+        return computed_root == root;
+    }
+
+    fn compute_root(leaf: u256, proof: Vec<u256>) -> u256 {
+        let mut current = leaf;
+        for i in 0..proof.len() {
+            let sibling = proof[i];
+            // Sort pair to ensure consistent hashing
+            if current <= sibling {
+                current = math::keccak256(current ^ (sibling << 128));
+            } else {
+                current = math::keccak256(sibling ^ (current << 128));
+            }
+        }
+        return current;
+    }
+
+    fn compute_leaf(account: Address) -> u256 {
+        return math::keccak256(account as u256);
+    }
+
+    pub fn authorize_consumer(list_id: u64, consumer: Address) {
+        let list = self.lists[list_id];
+        require!(
+            msg.sender == list.creator || self.admin_roles[msg.sender],
+            NotListCreator {}
+        );
+        self.authorized_consumers[list_id][consumer] = true;
+        emit ConsumerAuthorized { list_id: list_id, consumer: consumer };
+    }
+
+    pub fn revoke_consumer(list_id: u64, consumer: Address) {
+        let list = self.lists[list_id];
+        require!(
+            msg.sender == list.creator || self.admin_roles[msg.sender],
+            NotListCreator {}
+        );
+        self.authorized_consumers[list_id][consumer] = false;
+        emit ConsumerRevoked { list_id: list_id, consumer: consumer };
+    }
+
+    pub fn deactivate_whitelist(list_id: u64) {
+        let mut list = self.lists[list_id];
+        require!(
+            msg.sender == list.creator || self.admin_roles[msg.sender],
+            NotListCreator {}
+        );
+        list.active = false;
+        self.lists[list_id] = list;
+        emit WhitelistDeactivated { list_id: list_id };
+    }
+
+    pub fn add_admin(admin: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.admin_roles[admin] = true;
+    }
+
+    pub fn remove_admin(admin: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.admin_roles[admin] = false;
+    }
+
+    #[view]
+    pub fn get_whitelist(list_id: u64) -> WhitelistConfig {
+        return self.lists[list_id];
+    }
+
+    #[view]
+    pub fn has_claimed(list_id: u64, account: Address) -> bool {
+        return self.claimed[list_id][account];
+    }
+
+    #[view]
+    pub fn get_claim_count(list_id: u64) -> u64 {
+        return self.claim_counts[list_id];
+    }
+
+    #[view]
+    pub fn get_merkle_root(list_id: u64) -> u256 {
+        return self.merkle_roots[list_id];
+    }
+
+    #[view]
+    pub fn get_root_history(list_id: u64) -> Vec<RootRecord> {
+        return self.historical_roots[list_id];
+    }
+
+    #[view]
+    pub fn is_on_chain_member(list_id: u64, leaf: u256) -> bool {
+        return self.on_chain_leaves[list_id][leaf];
+    }
+
+    #[view]
+    pub fn verify_proof(list_id: u64, account: Address, proof: Vec<u256>) -> bool {
+        let leaf = self.compute_leaf(account);
+        let root = self.merkle_roots[list_id];
+        if root == 0 {
+            return false;
+        }
+        return self.compute_root(leaf, proof) == root;
+    }
+
+    #[view]
+    pub fn get_on_chain_leaves(list_id: u64) -> Vec<u256> {
+        return self.on_chain_leaf_list[list_id];
+    }
+}
