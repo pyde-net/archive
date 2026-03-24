@@ -1,0 +1,365 @@
+// Clinical trial management with participant enrollment, data submission, and milestone tracking
+use std::math;
+
+enum TrialStatus {
+    Planned,     // 0
+    Recruiting,  // 1
+    Active,      // 2
+    Completed,   // 3
+    Suspended,   // 4
+    Terminated,  // 5
+}
+
+contract ClinicalTrial {
+    storage {
+        sponsor: Address,
+        next_trial_id: u32,
+        trials: Map<u32, Trial>,
+        participants: Map<u32, Map<Address, Participant>>,
+        participant_lists: Map<u32, Vec<Address>>,
+        data_submissions: Map<u32, Map<Address, Map<u32, DataPoint>>>,
+        submission_counts: Map<u32, Map<Address, u32>>,
+        milestones: Map<u32, Map<u8, Milestone>>,
+        milestone_counts: Map<u32, u8>,
+        adverse_events: Map<u32, Map<u32, AdverseEvent>>,
+        adverse_event_counts: Map<u32, u32>,
+        site_investigators: Map<u32, Map<Address, bool>>,
+        irb_approvals: Map<u32, IRBApproval>,
+        compensation_paid: Map<u32, Map<Address, u256>>,
+    }
+
+    struct Trial {
+        protocol_hash: u256,
+        title_hash: u256,
+        phase: u8,
+        target_enrollment: u32,
+        current_enrollment: u32,
+        status: u8,
+        start_date: u64,
+        estimated_end: u64,
+        min_age: u8,
+        max_age: u8,
+        compensation_per_visit: u256,
+        total_budget: u256,
+        spent: u256,
+    }
+
+    struct Participant {
+        enrolled: bool,
+        enrolled_at: u64,
+        arm: u8,
+        consent_hash: u256,
+        visits_completed: u32,
+        withdrawn: bool,
+        withdrawal_reason_hash: u256,
+    }
+
+    struct DataPoint {
+        investigator: Address,
+        data_hash: u256,
+        timestamp: u64,
+        visit_number: u32,
+        category: u8,
+        verified: bool,
+    }
+
+    struct Milestone {
+        description_hash: u256,
+        target_date: u64,
+        completed: bool,
+        completed_at: u64,
+        evidence_hash: u256,
+    }
+
+    struct AdverseEvent {
+        participant: Address,
+        severity: u8,
+        description_hash: u256,
+        reported_at: u64,
+        reported_by: Address,
+        resolved: bool,
+        causality: u8,
+    }
+
+    struct IRBApproval {
+        approved: bool,
+        irb_hash: u256,
+        approval_date: u64,
+        expiry_date: u64,
+        conditions_hash: u256,
+    }
+
+    event TrialCreated {
+        #[indexed]
+        trial_id: u32,
+        phase: u8,
+        target_enrollment: u32,
+    }
+
+    event ParticipantEnrolled {
+        #[indexed]
+        trial_id: u32,
+        #[indexed]
+        participant: Address,
+        arm: u8,
+    }
+
+    event DataSubmitted {
+        #[indexed]
+        trial_id: u32,
+        #[indexed]
+        participant: Address,
+        visit_number: u32,
+    }
+
+    event AdverseEventReported {
+        #[indexed]
+        trial_id: u32,
+        severity: u8,
+        event_index: u32,
+    }
+
+    event MilestoneCompleted {
+        #[indexed]
+        trial_id: u32,
+        milestone_index: u8,
+    }
+
+    event TrialStatusChanged {
+        #[indexed]
+        trial_id: u32,
+        new_status: u8,
+    }
+
+    event CompensationPaid {
+        #[indexed]
+        trial_id: u32,
+        #[indexed]
+        participant: Address,
+        amount: u256,
+    }
+
+    error NotSponsor {}
+    error NotInvestigator {}
+    error TrialNotFound { id: u32 }
+    error TrialNotActive {}
+    error AlreadyEnrolled {}
+    error NotEnrolled {}
+    error EnrollmentFull {}
+    error IRBNotApproved {}
+    error ParticipantWithdrawn {}
+    error InsufficientBudget { remaining: u256, required: u256 }
+    error InvalidPhase { phase: u8 }
+
+    const SECONDS_PER_DAY: u64 = 86400;
+    const CRITICAL_SEVERITY_THRESHOLD: u8 = 4;
+
+    #[constructor]
+    pub fn init() {
+        self.sponsor = msg.sender;
+        self.next_trial_id = 1;
+    }
+
+    pub fn create_trial(
+        protocol_hash: u256,
+        title_hash: u256,
+        phase: u8,
+        target_enrollment: u32,
+        duration_days: u64,
+        min_age: u8,
+        max_age: u8,
+        compensation_per_visit: u256,
+    ) -> u32 {
+        require!(msg.sender == self.sponsor, NotSponsor {});
+        require!(phase >= 1 && phase <= 4, InvalidPhase { phase: phase });
+
+        let trial_id = self.next_trial_id;
+        self.next_trial_id += 1;
+
+        // Status: 0=planned, 1=recruiting, 2=active, 3=completed, 4=suspended, 5=terminated
+        self.trials[trial_id] = Trial {
+            protocol_hash: protocol_hash,
+            title_hash: title_hash,
+            phase: phase,
+            target_enrollment: target_enrollment,
+            current_enrollment: 0,
+            status: 0,
+            start_date: block.timestamp,
+            estimated_end: block.timestamp + (duration_days * 86400),
+            min_age: min_age,
+            max_age: max_age,
+            compensation_per_visit: compensation_per_visit,
+            total_budget: msg.value,
+            spent: 0,
+        };
+
+        self.milestone_counts[trial_id] = 0;
+        self.adverse_event_counts[trial_id] = 0;
+
+        emit TrialCreated { trial_id: trial_id, phase: phase, target_enrollment: target_enrollment };
+        return trial_id;
+    }
+
+    pub fn submit_irb_approval(
+        trial_id: u32,
+        irb_hash: u256,
+        validity_days: u64,
+        conditions_hash: u256,
+    ) {
+        require!(msg.sender == self.sponsor, NotSponsor {});
+        self.irb_approvals[trial_id] = IRBApproval {
+            approved: true,
+            irb_hash: irb_hash,
+            approval_date: block.timestamp,
+            expiry_date: block.timestamp + (validity_days * 86400),
+            conditions_hash: conditions_hash,
+        };
+
+        // Move to recruiting status
+        self.trials[trial_id].status = 1;
+        emit TrialStatusChanged { trial_id: trial_id, new_status: 1 };
+    }
+
+    pub fn add_investigator(trial_id: u32, investigator: Address) {
+        require!(msg.sender == self.sponsor, NotSponsor {});
+        self.site_investigators[trial_id][investigator] = true;
+    }
+
+    pub fn enroll_participant(
+        trial_id: u32,
+        participant: Address,
+        arm: u8,
+        consent_hash: u256,
+    ) {
+        require!(self.site_investigators[trial_id][msg.sender], NotInvestigator {});
+        let trial = self.trials[trial_id];
+        require!(trial.status == 1 || trial.status == 2, TrialNotActive {});
+        require!(trial.current_enrollment < trial.target_enrollment, EnrollmentFull {});
+        require!(!self.participants[trial_id][participant].enrolled, AlreadyEnrolled {});
+
+        let irb = self.irb_approvals[trial_id];
+        require!(irb.approved && irb.expiry_date > block.timestamp, IRBNotApproved {});
+
+        self.participants[trial_id][participant] = Participant {
+            enrolled: true,
+            enrolled_at: block.timestamp,
+            arm: arm,
+            consent_hash: consent_hash,
+            visits_completed: 0,
+            withdrawn: false,
+            withdrawal_reason_hash: 0,
+        };
+
+        self.participant_lists[trial_id].push(participant);
+        self.trials[trial_id].current_enrollment += 1;
+        self.submission_counts[trial_id][participant] = 0;
+
+        if self.trials[trial_id].current_enrollment >= trial.target_enrollment {
+            self.trials[trial_id].status = 2;
+            emit TrialStatusChanged { trial_id: trial_id, new_status: 2 };
+        }
+
+        emit ParticipantEnrolled { trial_id: trial_id, participant: participant, arm: arm };
+    }
+
+    pub fn submit_data(
+        trial_id: u32,
+        participant: Address,
+        data_hash: u256,
+        visit_number: u32,
+        category: u8,
+    ) {
+        require!(self.site_investigators[trial_id][msg.sender], NotInvestigator {});
+        let p = self.participants[trial_id][participant];
+        require!(p.enrolled, NotEnrolled {});
+        require!(!p.withdrawn, ParticipantWithdrawn {});
+
+        let idx = self.submission_counts[trial_id][participant];
+        self.data_submissions[trial_id][participant][idx] = DataPoint {
+            investigator: msg.sender,
+            data_hash: data_hash,
+            timestamp: block.timestamp,
+            visit_number: visit_number,
+            category: category,
+            verified: false,
+        };
+        self.submission_counts[trial_id][participant] = idx + 1;
+        self.participants[trial_id][participant].visits_completed += 1;
+
+        emit DataSubmitted { trial_id: trial_id, participant: participant, visit_number: visit_number };
+    }
+
+    #[reentrant]
+    pub fn compensate_participant(trial_id: u32, participant: Address, visits: u32) {
+        require!(msg.sender == self.sponsor, NotSponsor {});
+        let trial = self.trials[trial_id];
+        let amount = trial.compensation_per_visit * visits as u256;
+        let remaining = trial.total_budget - trial.spent;
+        require!(remaining >= amount, InsufficientBudget { remaining: remaining, required: amount });
+
+        self.trials[trial_id].spent += amount;
+        self.compensation_paid[trial_id][participant] += amount;
+
+        raw_call!(participant, amount, bytes(""));
+        emit CompensationPaid { trial_id: trial_id, participant: participant, amount: amount };
+    }
+
+    pub fn report_adverse_event(
+        trial_id: u32,
+        participant: Address,
+        severity: u8,
+        description_hash: u256,
+        causality: u8,
+    ) {
+        require!(self.site_investigators[trial_id][msg.sender], NotInvestigator {});
+
+        let idx = self.adverse_event_counts[trial_id];
+        self.adverse_events[trial_id][idx] = AdverseEvent {
+            participant: participant,
+            severity: severity,
+            description_hash: description_hash,
+            reported_at: block.timestamp,
+            reported_by: msg.sender,
+            resolved: false,
+            causality: causality,
+        };
+        self.adverse_event_counts[trial_id] = idx + 1;
+
+        emit AdverseEventReported { trial_id: trial_id, severity: severity, event_index: idx };
+
+        // Auto-suspend on critical severity
+        if severity >= 4 {
+            self.trials[trial_id].status = 4;
+            emit TrialStatusChanged { trial_id: trial_id, new_status: 4 };
+        }
+    }
+
+    pub fn withdraw_participant(trial_id: u32, reason_hash: u256) {
+        require!(self.participants[trial_id][msg.sender].enrolled, NotEnrolled {});
+        self.participants[trial_id][msg.sender].withdrawn = true;
+        self.participants[trial_id][msg.sender].withdrawal_reason_hash = reason_hash;
+    }
+
+    pub fn complete_milestone(trial_id: u32, index: u8, evidence_hash: u256) {
+        require!(msg.sender == self.sponsor, NotSponsor {});
+        self.milestones[trial_id][index].completed = true;
+        self.milestones[trial_id][index].completed_at = block.timestamp;
+        self.milestones[trial_id][index].evidence_hash = evidence_hash;
+        emit MilestoneCompleted { trial_id: trial_id, milestone_index: index };
+    }
+
+    #[view]
+    pub fn get_trial(trial_id: u32) -> Trial {
+        return self.trials[trial_id];
+    }
+
+    #[view]
+    pub fn get_participant(trial_id: u32, addr: Address) -> Participant {
+        return self.participants[trial_id][addr];
+    }
+
+    #[view]
+    pub fn get_adverse_event(trial_id: u32, index: u32) -> AdverseEvent {
+        return self.adverse_events[trial_id][index];
+    }
+}

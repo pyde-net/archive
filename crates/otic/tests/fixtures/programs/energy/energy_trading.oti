@@ -1,0 +1,346 @@
+// Peer-to-peer energy trading with order book matching and settlement
+use std::math;
+
+enum EnergySource {
+    Solar,       // 0
+    Wind,        // 1
+    Hydro,       // 2
+    Biomass,     // 3
+    Geothermal,  // 4
+}
+
+enum OrderStatus {
+    Open,     // 0
+    Filled,   // 1
+    Cancelled, // 2
+}
+
+contract EnergyTrading {
+    storage {
+        operator: Address,
+        next_order_id: u64,
+        orders: Map<u64, Order>,
+        buy_orders: Vec<u64>,
+        sell_orders: Vec<u64>,
+        trades: Map<u64, Trade>,
+        next_trade_id: u64,
+        producer_profiles: Map<Address, Producer>,
+        consumer_profiles: Map<Address, Consumer>,
+        meter_readings: Map<Address, Map<u64, MeterReading>>,
+        reading_counts: Map<Address, u64>,
+        settlement_period: u64,
+        grid_fee_bps: u16,
+        energy_token: Address,
+        total_energy_traded_kwh: u256,
+        peak_price_per_kwh: u256,
+        min_price_per_kwh: u256,
+    }
+
+    struct Order {
+        maker: Address,
+        is_buy: bool,
+        quantity_kwh: u256,
+        price_per_kwh: u256,
+        filled_kwh: u256,
+        created_at: u64,
+        expires_at: u64,
+        status: u8,
+        energy_source: u8,
+    }
+
+    struct Trade {
+        buyer: Address,
+        seller: Address,
+        buy_order_id: u64,
+        sell_order_id: u64,
+        quantity_kwh: u256,
+        price_per_kwh: u256,
+        total_cost: u256,
+        grid_fee: u256,
+        settled_at: u64,
+    }
+
+    struct Producer {
+        registered: bool,
+        capacity_kw: u32,
+        energy_source: u8,
+        location_hash: u256,
+        total_produced_kwh: u256,
+        total_earned: u256,
+        meter_id: u256,
+    }
+
+    struct Consumer {
+        registered: bool,
+        max_demand_kw: u32,
+        location_hash: u256,
+        total_consumed_kwh: u256,
+        total_spent: u256,
+        meter_id: u256,
+    }
+
+    struct MeterReading {
+        kwh_x100: u64,
+        timestamp: u64,
+        verified: bool,
+        reading_type: u8,
+    }
+
+    event OrderPlaced {
+        #[indexed]
+        order_id: u64,
+        #[indexed]
+        maker: Address,
+        is_buy: bool,
+        quantity_kwh: u256,
+        price_per_kwh: u256,
+    }
+
+    event TradeExecuted {
+        #[indexed]
+        trade_id: u64,
+        #[indexed]
+        buyer: Address,
+        #[indexed]
+        seller: Address,
+        quantity_kwh: u256,
+    }
+
+    event OrderCancelled {
+        #[indexed]
+        order_id: u64,
+    }
+
+    event MeterReadingSubmitted {
+        #[indexed]
+        user: Address,
+        kwh_x100: u64,
+    }
+
+    error NotOperator {}
+    error ProducerNotRegistered {}
+    error ConsumerNotRegistered {}
+    error OrderNotFound { id: u64 }
+    error InsufficientPayment { required: u256, sent: u256 }
+    error OrderExpired {}
+    error OrderNotActive {}
+    error NotOrderMaker {}
+    error AlreadyRegistered {}
+    error InvalidPrice {}
+
+    const BPS_DENOMINATOR: u256 = 10000;
+    const SECONDS_PER_HOUR: u64 = 3600;
+
+    #[constructor]
+    pub fn init(grid_fee_bps: u16, settlement_period: u64, min_price: u256, max_price: u256) {
+        self.operator = msg.sender;
+        self.next_order_id = 1;
+        self.next_trade_id = 1;
+        self.grid_fee_bps = grid_fee_bps;
+        self.settlement_period = settlement_period;
+        self.min_price_per_kwh = min_price;
+        self.peak_price_per_kwh = max_price;
+        self.total_energy_traded_kwh = 0;
+    }
+
+    pub fn register_producer(capacity_kw: u32, energy_source: u8, location_hash: u256, meter_id: u256) {
+        require!(!self.producer_profiles[msg.sender].registered, AlreadyRegistered {});
+        // energy_source: 0=solar, 1=wind, 2=hydro, 3=biomass, 4=geothermal
+        self.producer_profiles[msg.sender] = Producer {
+            registered: true,
+            capacity_kw: capacity_kw,
+            energy_source: energy_source,
+            location_hash: location_hash,
+            total_produced_kwh: 0,
+            total_earned: 0,
+            meter_id: meter_id,
+        };
+    }
+
+    pub fn register_consumer(max_demand_kw: u32, location_hash: u256, meter_id: u256) {
+        require!(!self.consumer_profiles[msg.sender].registered, AlreadyRegistered {});
+        self.consumer_profiles[msg.sender] = Consumer {
+            registered: true,
+            max_demand_kw: max_demand_kw,
+            location_hash: location_hash,
+            total_consumed_kwh: 0,
+            total_spent: 0,
+            meter_id: meter_id,
+        };
+    }
+
+    pub fn place_sell_order(quantity_kwh: u256, price_per_kwh: u256, duration_hours: u64) -> u64 {
+        require!(self.producer_profiles[msg.sender].registered, ProducerNotRegistered {});
+        require!(
+            price_per_kwh >= self.min_price_per_kwh && price_per_kwh <= self.peak_price_per_kwh,
+            InvalidPrice {}
+        );
+
+        let order_id = self.next_order_id;
+        self.next_order_id += 1;
+
+        self.orders[order_id] = Order {
+            maker: msg.sender,
+            is_buy: false,
+            quantity_kwh: quantity_kwh,
+            price_per_kwh: price_per_kwh,
+            filled_kwh: 0,
+            created_at: block.timestamp,
+            expires_at: block.timestamp + (duration_hours * 3600),
+            status: 0,
+            energy_source: self.producer_profiles[msg.sender].energy_source,
+        };
+
+        self.sell_orders.push(order_id);
+        emit OrderPlaced {
+            order_id: order_id,
+            maker: msg.sender,
+            is_buy: false,
+            quantity_kwh: quantity_kwh,
+            price_per_kwh: price_per_kwh,
+        };
+        return order_id;
+    }
+
+    pub fn place_buy_order(quantity_kwh: u256, max_price_per_kwh: u256, duration_hours: u64) -> u64 {
+        require!(self.consumer_profiles[msg.sender].registered, ConsumerNotRegistered {});
+
+        let total_cost = quantity_kwh * max_price_per_kwh;
+        require!(msg.value >= total_cost, InsufficientPayment { required: total_cost, sent: msg.value });
+
+        let order_id = self.next_order_id;
+        self.next_order_id += 1;
+
+        self.orders[order_id] = Order {
+            maker: msg.sender,
+            is_buy: true,
+            quantity_kwh: quantity_kwh,
+            price_per_kwh: max_price_per_kwh,
+            filled_kwh: 0,
+            created_at: block.timestamp,
+            expires_at: block.timestamp + (duration_hours * 3600),
+            status: 0,
+            energy_source: 255,
+        };
+
+        self.buy_orders.push(order_id);
+        emit OrderPlaced {
+            order_id: order_id,
+            maker: msg.sender,
+            is_buy: true,
+            quantity_kwh: quantity_kwh,
+            price_per_kwh: max_price_per_kwh,
+        };
+        return order_id;
+    }
+
+    #[reentrant]
+    pub fn match_orders(buy_order_id: u64, sell_order_id: u64, quantity_kwh: u256) {
+        require!(msg.sender == self.operator, NotOperator {});
+
+        let buy = self.orders[buy_order_id];
+        let sell = self.orders[sell_order_id];
+
+        require!(buy.status == 0 && sell.status == 0, OrderNotActive {});
+        require!(buy.expires_at > block.timestamp, OrderExpired {});
+        require!(sell.expires_at > block.timestamp, OrderExpired {});
+        require!(buy.price_per_kwh >= sell.price_per_kwh, InvalidPrice {});
+
+        let available_buy = buy.quantity_kwh - buy.filled_kwh;
+        let available_sell = sell.quantity_kwh - sell.filled_kwh;
+        let fill_amount = if quantity_kwh < available_buy {
+            if quantity_kwh < available_sell { quantity_kwh } else { available_sell }
+        } else {
+            if available_buy < available_sell { available_buy } else { available_sell }
+        };
+
+        let exec_price = (buy.price_per_kwh + sell.price_per_kwh) / 2;
+        let total_cost = fill_amount * exec_price;
+        let grid_fee = (total_cost * self.grid_fee_bps as u256) / 10000;
+        let seller_payment = total_cost - grid_fee;
+
+        let trade_id = self.next_trade_id;
+        self.next_trade_id += 1;
+
+        self.trades[trade_id] = Trade {
+            buyer: buy.maker,
+            seller: sell.maker,
+            buy_order_id: buy_order_id,
+            sell_order_id: sell_order_id,
+            quantity_kwh: fill_amount,
+            price_per_kwh: exec_price,
+            total_cost: total_cost,
+            grid_fee: grid_fee,
+            settled_at: block.timestamp,
+        };
+
+        self.orders[buy_order_id].filled_kwh += fill_amount;
+        self.orders[sell_order_id].filled_kwh += fill_amount;
+
+        if self.orders[buy_order_id].filled_kwh >= buy.quantity_kwh {
+            self.orders[buy_order_id].status = 1;
+        }
+        if self.orders[sell_order_id].filled_kwh >= sell.quantity_kwh {
+            self.orders[sell_order_id].status = 1;
+        }
+
+        self.producer_profiles[sell.maker].total_produced_kwh += fill_amount;
+        self.producer_profiles[sell.maker].total_earned += seller_payment;
+        self.consumer_profiles[buy.maker].total_consumed_kwh += fill_amount;
+        self.consumer_profiles[buy.maker].total_spent += total_cost;
+        self.total_energy_traded_kwh += fill_amount;
+
+        raw_call!(sell.maker, seller_payment, bytes(""));
+
+        emit TradeExecuted {
+            trade_id: trade_id,
+            buyer: buy.maker,
+            seller: sell.maker,
+            quantity_kwh: fill_amount,
+        };
+    }
+
+    pub fn cancel_order(order_id: u64) {
+        require!(self.orders[order_id].maker == msg.sender, NotOrderMaker {});
+        require!(self.orders[order_id].status == 0, OrderNotActive {});
+        self.orders[order_id].status = 2;
+        emit OrderCancelled { order_id: order_id };
+    }
+
+    pub fn submit_meter_reading(kwh_x100: u64, reading_type: u8) {
+        let idx = self.reading_counts[msg.sender];
+        self.meter_readings[msg.sender][idx] = MeterReading {
+            kwh_x100: kwh_x100,
+            timestamp: block.timestamp,
+            verified: false,
+            reading_type: reading_type,
+        };
+        self.reading_counts[msg.sender] = idx + 1;
+        emit MeterReadingSubmitted { user: msg.sender, kwh_x100: kwh_x100 };
+    }
+
+    #[view]
+    pub fn get_order(order_id: u64) -> Order {
+        return self.orders[order_id];
+    }
+
+    #[view]
+    pub fn get_trade(trade_id: u64) -> Trade {
+        return self.trades[trade_id];
+    }
+
+    #[view]
+    pub fn get_producer(addr: Address) -> Producer {
+        return self.producer_profiles[addr];
+    }
+
+    #[view]
+    pub fn get_consumer(addr: Address) -> Consumer {
+        return self.consumer_profiles[addr];
+    }
+
+    #[view]
+    pub fn get_total_traded() -> u256 {
+        return self.total_energy_traded_kwh;
+    }
+}

@@ -1,0 +1,443 @@
+// Raffle contract with ticket purchasing.
+// Supports multiple prize tiers, configurable ticket supply,
+// and a verifiable random draw using commit-reveal.
+
+use std::math;
+
+enum RaffleState {
+    Pending,     // 0
+    Selling,     // 1
+    SoldOut,     // 2
+    Drawing,     // 3
+    Completed,   // 4
+    Cancelled,   // 5
+}
+
+contract Raffle {
+    storage {
+        owner: Address,
+        next_raffle_id: u64,
+        raffles: Map<u64, RaffleInfo>,
+        tickets: Map<u64, Map<u64, Address>>,       // raffle_id -> ticket_number -> buyer
+        buyer_tickets: Map<u64, Map<Address, Vec<u64>>>,  // raffle_id -> buyer -> ticket numbers
+        prize_tiers: Map<u64, Vec<PrizeTier>>,
+        winners: Map<u64, Vec<WinnerEntry>>,
+        protocol_fee_bps: u256,
+        protocol_balance: u256,
+    }
+
+    const FEE_DENOMINATOR: u256 = 10000;
+    const MAX_DRAW_ATTEMPTS: u32 = 1000;
+
+    struct RaffleInfo {
+        creator: Address,
+        title: String,
+        ticket_price: u256,
+        max_tickets: u64,
+        tickets_sold: u64,
+        sale_start: u64,
+        sale_end: u64,
+        draw_block: u64,
+        commit_hash: u256,
+        state: RaffleState,
+        total_revenue: u256,
+        num_prize_tiers: u8,
+        refundable: bool,
+    }
+
+    struct PrizeTier {
+        name: String,
+        count: u32,          // number of winners in this tier
+        amount: u256,        // prize per winner
+    }
+
+    struct WinnerEntry {
+        ticket_number: u64,
+        winner: Address,
+        tier: u8,
+        amount: u256,
+        claimed: bool,
+    }
+
+    event RaffleCreated {
+        #[indexed]
+        raffle_id: u64,
+        #[indexed]
+        creator: Address,
+        ticket_price: u256,
+        max_tickets: u64,
+    }
+
+    event TicketsPurchased {
+        #[indexed]
+        raffle_id: u64,
+        #[indexed]
+        buyer: Address,
+        start_ticket: u64,
+        count: u64,
+    }
+
+    event RaffleDrawn {
+        #[indexed]
+        raffle_id: u64,
+        total_winners: u32,
+    }
+
+    event PrizeClaimed {
+        #[indexed]
+        raffle_id: u64,
+        #[indexed]
+        winner: Address,
+        tier: u8,
+        amount: u256,
+    }
+
+    event RaffleCancelled {
+        #[indexed]
+        raffle_id: u64,
+    }
+
+    event RefundClaimed {
+        #[indexed]
+        raffle_id: u64,
+        #[indexed]
+        buyer: Address,
+        amount: u256,
+    }
+
+    error Unauthorized {}
+    error RaffleNotFound {}
+    error InvalidState { expected: RaffleState, actual: RaffleState }
+    error SaleNotStarted {}
+    error SaleEnded {}
+    error SoldOut {}
+    error InsufficientPayment { required: u256, sent: u256 }
+    error TooManyTickets { available: u64, requested: u64 }
+    error InvalidReveal {}
+    error NoTicketsOwned {}
+    error AlreadyClaimed {}
+    error NoPrizeTiers {}
+    error InvalidPrizeConfig {}
+    error DrawNotReady {}
+    error NotCancelled {}
+    error ZeroQuantity {}
+
+    #[constructor]
+    pub fn init(fee_bps: u256) {
+        self.owner = msg.sender;
+        self.next_raffle_id = 1;
+        self.protocol_fee_bps = fee_bps;
+        self.protocol_balance = 0;
+    }
+
+    pub fn create_raffle(
+        title: String,
+        ticket_price: u256,
+        max_tickets: u64,
+        sale_duration: u64,
+        draw_delay: u64,
+        commit_hash: u256,
+        refundable: bool,
+        tier_names: Vec<String>,
+        tier_counts: Vec<u32>,
+        tier_amounts: Vec<u256>,
+    ) -> u64 {
+        require!(tier_names.len() > 0, NoPrizeTiers {});
+        require!(
+            tier_names.len() == tier_counts.len() && tier_counts.len() == tier_amounts.len(),
+            InvalidPrizeConfig {}
+        );
+
+        // Validate total prize doesn't exceed max revenue
+        let max_revenue = ticket_price * (max_tickets as u256);
+        let mut total_prize: u256 = 0;
+        for i in 0..tier_names.len() {
+            total_prize = total_prize + (tier_amounts[i] * (tier_counts[i] as u256));
+        }
+        let fee = (max_revenue * self.protocol_fee_bps) / FEE_DENOMINATOR;
+        require!(total_prize + fee <= max_revenue, InvalidPrizeConfig {});
+
+        let raffle_id = self.next_raffle_id;
+        self.next_raffle_id = raffle_id + 1;
+
+        let sale_start = block.height;
+        let sale_end = sale_start + sale_duration;
+
+        self.raffles[raffle_id] = RaffleInfo {
+            creator: msg.sender,
+            title: title,
+            ticket_price: ticket_price,
+            max_tickets: max_tickets,
+            tickets_sold: 0,
+            sale_start: sale_start,
+            sale_end: sale_end,
+            draw_block: sale_end + draw_delay,
+            commit_hash: commit_hash,
+            state: RaffleState::Selling,
+            total_revenue: 0,
+            num_prize_tiers: tier_names.len() as u8,
+            refundable: refundable,
+        };
+
+        // Store prize tiers
+        let mut tiers: Vec<PrizeTier> = Vec::new();
+        for i in 0..tier_names.len() {
+            tiers.push(PrizeTier {
+                name: tier_names[i],
+                count: tier_counts[i],
+                amount: tier_amounts[i],
+            });
+        }
+        self.prize_tiers[raffle_id] = tiers;
+
+        emit RaffleCreated {
+            raffle_id: raffle_id,
+            creator: msg.sender,
+            ticket_price: ticket_price,
+            max_tickets: max_tickets,
+        };
+
+        return raffle_id;
+    }
+
+    pub fn buy_tickets(raffle_id: u64, quantity: u64) {
+        require!(quantity > 0, ZeroQuantity {});
+        let mut raffle = self.raffles[raffle_id];
+        require!(raffle.creator != Address::ZERO, RaffleNotFound {});
+        require!(raffle.state == RaffleState::Selling, InvalidState { expected: RaffleState::Selling, actual: raffle.state });
+        require!(block.height >= raffle.sale_start, SaleNotStarted {});
+        require!(block.height <= raffle.sale_end, SaleEnded {});
+
+        let remaining = raffle.max_tickets - raffle.tickets_sold;
+        require!(quantity <= remaining, TooManyTickets { available: remaining, requested: quantity });
+
+        let cost = raffle.ticket_price * (quantity as u256);
+        require!(msg.value >= cost, InsufficientPayment { required: cost, sent: msg.value });
+
+        let start_ticket = raffle.tickets_sold;
+
+        // Assign tickets
+        for j in 0..quantity {
+            let ticket_num = start_ticket + j;
+            self.tickets[raffle_id][ticket_num] = msg.sender;
+
+            let mut buyer_list = self.buyer_tickets[raffle_id][msg.sender];
+            buyer_list.push(ticket_num);
+            self.buyer_tickets[raffle_id][msg.sender] = buyer_list;
+        }
+
+        raffle.tickets_sold = raffle.tickets_sold + quantity;
+        raffle.total_revenue = raffle.total_revenue + cost;
+
+        // Check if sold out
+        if raffle.tickets_sold == raffle.max_tickets {
+            raffle.state = RaffleState::SoldOut;
+        }
+
+        self.raffles[raffle_id] = raffle;
+
+        // Refund excess
+        let excess = msg.value - cost;
+        if excess > 0 {
+            raw_call!(msg.sender, excess, bytes::empty());
+        }
+
+        emit TicketsPurchased {
+            raffle_id: raffle_id,
+            buyer: msg.sender,
+            start_ticket: start_ticket,
+            count: quantity,
+        };
+    }
+
+    pub fn draw(raffle_id: u64, reveal: u256) {
+        let mut raffle = self.raffles[raffle_id];
+        require!(
+            msg.sender == raffle.creator || msg.sender == self.owner,
+            Unauthorized {}
+        );
+        require!(
+            raffle.state == RaffleState::Selling || raffle.state == RaffleState::SoldOut,
+            InvalidState { expected: RaffleState::SoldOut, actual: raffle.state }
+        );
+        require!(block.height >= raffle.draw_block, DrawNotReady {});
+
+        // Verify commit
+        let computed = math::keccak256(reveal);
+        require!(computed == raffle.commit_hash, InvalidReveal {});
+
+        raffle.state = RaffleState::Drawing;
+        let total_sold = raffle.tickets_sold;
+
+        if total_sold == 0 {
+            raffle.state = RaffleState::Cancelled;
+            self.raffles[raffle_id] = raffle;
+            emit RaffleCancelled { raffle_id: raffle_id };
+            return;
+        }
+
+        // Draw winners for each tier
+        let mut seed = reveal;
+        let mut all_winners: Vec<WinnerEntry> = Vec::new();
+        let mut used_tickets: Map<u64, bool> = Map::new();
+        let tiers = self.prize_tiers[raffle_id];
+        let mut total_winner_count: u32 = 0;
+
+        for tier_idx in 0..(tiers.len() as u8) {
+            let tier = tiers[tier_idx as u64];
+
+            for w in 0..tier.count {
+                // Keep rolling until we find an unused ticket
+                let mut attempts: u32 = 0;
+                let mut winning_ticket: u64 = 0;
+                let mut found = false;
+
+                while !found && attempts < MAX_DRAW_ATTEMPTS {
+                    seed = math::keccak256(seed ^ (attempts as u256));
+                    winning_ticket = (seed % (total_sold as u256)) as u64;
+
+                    if !used_tickets[winning_ticket] {
+                        found = true;
+                        used_tickets[winning_ticket] = true;
+                    }
+                    attempts = attempts + 1;
+                }
+
+                if found {
+                    let winner_addr = self.tickets[raffle_id][winning_ticket];
+                    all_winners.push(WinnerEntry {
+                        ticket_number: winning_ticket,
+                        winner: winner_addr,
+                        tier: tier_idx,
+                        amount: tier.amount,
+                        claimed: false,
+                    });
+                    total_winner_count = total_winner_count + 1;
+                }
+            }
+        }
+
+        self.winners[raffle_id] = all_winners;
+        raffle.state = RaffleState::Completed;
+
+        // Take protocol fee
+        let fee = (raffle.total_revenue * self.protocol_fee_bps) / FEE_DENOMINATOR;
+        self.protocol_balance = self.protocol_balance + fee;
+
+        // Send remaining to creator
+        let total_prizes = self.sum_prizes(raffle_id);
+        let creator_share = raffle.total_revenue - fee - total_prizes;
+        if creator_share > 0 {
+            raw_call!(raffle.creator, creator_share, bytes::empty());
+        }
+
+        self.raffles[raffle_id] = raffle;
+
+        emit RaffleDrawn { raffle_id: raffle_id, total_winners: total_winner_count };
+    }
+
+    pub fn claim_prize(raffle_id: u64) {
+        let raffle = self.raffles[raffle_id];
+        require!(raffle.state == RaffleState::Completed, InvalidState { expected: RaffleState::Completed, actual: raffle.state });
+
+        let mut winner_list = self.winners[raffle_id];
+        let mut total_claimed: u256 = 0;
+        let mut found = false;
+
+        for i in 0..winner_list.len() {
+            let mut entry = winner_list[i as u64];
+            if entry.winner == msg.sender && !entry.claimed {
+                entry.claimed = true;
+                total_claimed = total_claimed + entry.amount;
+                winner_list[i as u64] = entry;
+                found = true;
+
+                emit PrizeClaimed {
+                    raffle_id: raffle_id,
+                    winner: msg.sender,
+                    tier: entry.tier,
+                    amount: entry.amount,
+                };
+            }
+        }
+
+        require!(found, NoTicketsOwned {});
+        self.winners[raffle_id] = winner_list;
+
+        if total_claimed > 0 {
+            raw_call!(msg.sender, total_claimed, bytes::empty());
+        }
+    }
+
+    // Refund tickets if raffle is cancelled
+    pub fn claim_refund(raffle_id: u64) {
+        let raffle = self.raffles[raffle_id];
+        require!(raffle.state == RaffleState::Cancelled, NotCancelled {});
+
+        let ticket_list = self.buyer_tickets[raffle_id][msg.sender];
+        require!(ticket_list.len() > 0, NoTicketsOwned {});
+
+        let refund = raffle.ticket_price * (ticket_list.len() as u256);
+
+        // Clear buyer's tickets to prevent double claim
+        self.buyer_tickets[raffle_id][msg.sender] = Vec::new();
+
+        raw_call!(msg.sender, refund, bytes::empty());
+
+        emit RefundClaimed {
+            raffle_id: raffle_id,
+            buyer: msg.sender,
+            amount: refund,
+        };
+    }
+
+    pub fn cancel_raffle(raffle_id: u64) {
+        let mut raffle = self.raffles[raffle_id];
+        require!(
+            msg.sender == raffle.creator || msg.sender == self.owner,
+            Unauthorized {}
+        );
+        require!(raffle.state == RaffleState::Selling, InvalidState { expected: RaffleState::Selling, actual: raffle.state });
+        require!(raffle.refundable, NotCancelled {});
+
+        raffle.state = RaffleState::Cancelled;
+        self.raffles[raffle_id] = raffle;
+        emit RaffleCancelled { raffle_id: raffle_id };
+    }
+
+    fn sum_prizes(raffle_id: u64) -> u256 {
+        let winner_list = self.winners[raffle_id];
+        let mut total: u256 = 0;
+        for i in 0..winner_list.len() {
+            total = total + winner_list[i as u64].amount;
+        }
+        return total;
+    }
+
+    pub fn withdraw_protocol_fees(to: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        let amount = self.protocol_balance;
+        self.protocol_balance = 0;
+        raw_call!(to, amount, bytes::empty());
+    }
+
+    #[view]
+    pub fn get_raffle(raffle_id: u64) -> RaffleInfo {
+        return self.raffles[raffle_id];
+    }
+
+    #[view]
+    pub fn get_my_tickets(raffle_id: u64, buyer: Address) -> Vec<u64> {
+        return self.buyer_tickets[raffle_id][buyer];
+    }
+
+    #[view]
+    pub fn get_winners(raffle_id: u64) -> Vec<WinnerEntry> {
+        return self.winners[raffle_id];
+    }
+
+    #[view]
+    pub fn get_prize_tiers(raffle_id: u64) -> Vec<PrizeTier> {
+        return self.prize_tiers[raffle_id];
+    }
+}

@@ -1,0 +1,397 @@
+// DAO Treasury contract managing native currency and token assets.
+// Supports spending proposals with budget caps, recurring allowances,
+// multi-asset tracking, and emergency withdrawal by guardian.
+
+use std::token::IERC20;
+
+contract Treasury {
+    const BUDGET_PERIOD: u64 = 2592000; // 30 days in seconds
+
+    storage {
+        dao: Address,
+        guardian: Address,
+        proposal_count: u256,
+        proposals: Map<u256, SpendingProposal>,
+        // Budget tracking
+        total_spent: u256,
+        monthly_budget: u256,
+        budget_period_start: u64,
+        period_spent: u256,
+        // Recurring allowances: recipient -> token -> allowance info
+        allowances: Map<Address, Map<Address, Allowance>>,
+        // Tracked tokens
+        tracked_tokens: Vec<Address>,
+        is_tracked: Map<Address, bool>,
+        // Emergency
+        emergency_mode: bool,
+        paused: bool,
+    }
+
+    struct SpendingProposal {
+        id: u256,
+        proposer: Address,
+        recipient: Address,
+        token: Address,             // Address::ZERO for native currency
+        amount: u256,
+        description: String,
+        category: String,
+        approved: bool,
+        executed: bool,
+        cancelled: bool,
+        created_at: u64,
+        executed_at: u64,
+    }
+
+    struct Allowance {
+        amount_per_period: u256,
+        period_duration: u64,
+        last_claim: u64,
+        total_claimed: u256,
+        active: bool,
+    }
+
+    event ProposalCreated {
+        #[indexed]
+        id: u256,
+        #[indexed]
+        recipient: Address,
+        token: Address,
+        amount: u256,
+        category: String,
+    }
+
+    event ProposalApproved {
+        #[indexed]
+        id: u256,
+    }
+
+    event ProposalExecuted {
+        #[indexed]
+        id: u256,
+        #[indexed]
+        recipient: Address,
+        amount: u256,
+    }
+
+    event ProposalCancelled {
+        #[indexed]
+        id: u256,
+    }
+
+    event AllowanceSet {
+        #[indexed]
+        recipient: Address,
+        #[indexed]
+        token: Address,
+        amount_per_period: u256,
+        period_duration: u64,
+    }
+
+    event AllowanceClaimed {
+        #[indexed]
+        recipient: Address,
+        #[indexed]
+        token: Address,
+        amount: u256,
+    }
+
+    event Deposited {
+        #[indexed]
+        sender: Address,
+        token: Address,
+        amount: u256,
+    }
+
+    event EmergencyWithdrawal {
+        #[indexed]
+        token: Address,
+        #[indexed]
+        recipient: Address,
+        amount: u256,
+    }
+
+    event BudgetUpdated {
+        new_budget: u256,
+    }
+
+    error NotDAO {}
+    error NotGuardian {}
+    error Paused {}
+    error ProposalNotFound {}
+    error ProposalNotApproved {}
+    error ProposalAlreadyExecuted {}
+    error ProposalAlreadyCancelled {}
+    error ExceedsBudget { budget_remaining: u256, requested: u256 }
+    error InsufficientTreasuryBalance { available: u256, requested: u256 }
+    error AllowanceNotActive {}
+    error AllowancePeriodNotElapsed { next_claim: u64 }
+    error NotEmergencyMode {}
+    error AlreadyPaused {}
+
+    #[constructor]
+    pub fn init(dao: Address, guardian: Address, monthly_budget: u256) {
+        self.dao = dao;
+        self.guardian = guardian;
+        self.monthly_budget = monthly_budget;
+        self.budget_period_start = block.timestamp;
+        self.period_spent = 0;
+        self.proposal_count = 0;
+        self.total_spent = 0;
+        self.emergency_mode = false;
+        self.paused = false;
+    }
+
+    // Accept native currency
+    pub fn deposit() {
+        require!(!self.paused, Paused {});
+        emit Deposited { sender: msg.sender, token: Address::ZERO, amount: msg.value };
+    }
+
+    pub fn deposit_token(token: Address, amount: u256) {
+        require!(!self.paused, Paused {});
+
+        let erc20 = IERC20::at(token);
+        erc20.transfer_from(msg.sender, address(self), amount);
+
+        if !self.is_tracked[token] {
+            self.tracked_tokens.push(token);
+            self.is_tracked[token] = true;
+        }
+
+        emit Deposited { sender: msg.sender, token: token, amount: amount };
+    }
+
+    pub fn create_proposal(
+        recipient: Address,
+        token: Address,
+        amount: u256,
+        description: String,
+        category: String,
+    ) -> u256 {
+        require!(msg.sender == self.dao, NotDAO {});
+        require!(!self.paused, Paused {});
+
+        self.proposal_count = self.proposal_count + 1;
+        let id = self.proposal_count;
+
+        self.proposals[id] = SpendingProposal {
+            id: id,
+            proposer: msg.sender,
+            recipient: recipient,
+            token: token,
+            amount: amount,
+            description: description,
+            category: category,
+            approved: false,
+            executed: false,
+            cancelled: false,
+            created_at: block.timestamp,
+            executed_at: 0,
+        };
+
+        emit ProposalCreated {
+            id: id,
+            recipient: recipient,
+            token: token,
+            amount: amount,
+            category: category,
+        };
+
+        return id;
+    }
+
+    pub fn approve_proposal(proposal_id: u256) {
+        require!(msg.sender == self.dao, NotDAO {});
+        let proposal = self.proposals[proposal_id];
+        require!(proposal.id == proposal_id, ProposalNotFound {});
+        require!(!proposal.executed, ProposalAlreadyExecuted {});
+        require!(!proposal.cancelled, ProposalAlreadyCancelled {});
+
+        self.proposals[proposal_id].approved = true;
+
+        emit ProposalApproved { id: proposal_id };
+    }
+
+    pub fn execute_proposal(proposal_id: u256) {
+        require!(!self.paused, Paused {});
+
+        let proposal = self.proposals[proposal_id];
+        require!(proposal.id == proposal_id, ProposalNotFound {});
+        require!(proposal.approved, ProposalNotApproved {});
+        require!(!proposal.executed, ProposalAlreadyExecuted {});
+        require!(!proposal.cancelled, ProposalAlreadyCancelled {});
+
+        // Check budget
+        self.refresh_budget_period();
+        let budget_remaining = self.monthly_budget - self.period_spent;
+        require!(proposal.amount <= budget_remaining, ExceedsBudget {
+            budget_remaining: budget_remaining,
+            requested: proposal.amount,
+        });
+
+        self.proposals[proposal_id].executed = true;
+        self.proposals[proposal_id].executed_at = block.timestamp;
+        self.period_spent = self.period_spent + proposal.amount;
+        self.total_spent = self.total_spent + proposal.amount;
+
+        // Execute transfer
+        if proposal.token == Address::ZERO {
+            raw_call!(proposal.recipient, proposal.amount, bytes(""));
+        } else {
+            let erc20 = IERC20::at(proposal.token);
+            erc20.transfer(proposal.recipient, proposal.amount);
+        }
+
+        emit ProposalExecuted {
+            id: proposal_id,
+            recipient: proposal.recipient,
+            amount: proposal.amount,
+        };
+    }
+
+    pub fn cancel_proposal(proposal_id: u256) {
+        require!(msg.sender == self.dao || msg.sender == self.guardian, NotDAO {});
+        let proposal = self.proposals[proposal_id];
+        require!(proposal.id == proposal_id, ProposalNotFound {});
+        require!(!proposal.executed, ProposalAlreadyExecuted {});
+
+        self.proposals[proposal_id].cancelled = true;
+
+        emit ProposalCancelled { id: proposal_id };
+    }
+
+    // Recurring allowance management (only DAO)
+    pub fn set_allowance(
+        recipient: Address,
+        token: Address,
+        amount_per_period: u256,
+        period_duration: u64,
+    ) {
+        require!(msg.sender == self.dao, NotDAO {});
+
+        self.allowances[recipient][token] = Allowance {
+            amount_per_period: amount_per_period,
+            period_duration: period_duration,
+            last_claim: block.timestamp,
+            total_claimed: 0,
+            active: true,
+        };
+
+        emit AllowanceSet {
+            recipient: recipient,
+            token: token,
+            amount_per_period: amount_per_period,
+            period_duration: period_duration,
+        };
+    }
+
+    pub fn revoke_allowance(recipient: Address, token: Address) {
+        require!(msg.sender == self.dao || msg.sender == self.guardian, NotDAO {});
+        self.allowances[recipient][token].active = false;
+    }
+
+    pub fn claim_allowance(token: Address) {
+        require!(!self.paused, Paused {});
+
+        let allowance = self.allowances[msg.sender][token];
+        require!(allowance.active, AllowanceNotActive {});
+
+        let next_claim = allowance.last_claim + allowance.period_duration;
+        require!(block.timestamp >= next_claim, AllowancePeriodNotElapsed {
+            next_claim: next_claim,
+        });
+
+        // Calculate how many periods have elapsed (allows catching up)
+        let elapsed = block.timestamp - allowance.last_claim;
+        let periods = elapsed / allowance.period_duration;
+        let claim_amount = allowance.amount_per_period * periods;
+
+        self.allowances[msg.sender][token].last_claim =
+            allowance.last_claim + (periods * allowance.period_duration);
+        self.allowances[msg.sender][token].total_claimed =
+            allowance.total_claimed + claim_amount;
+
+        if token == Address::ZERO {
+            raw_call!(msg.sender, claim_amount, bytes(""));
+        } else {
+            let erc20 = IERC20::at(token);
+            erc20.transfer(msg.sender, claim_amount);
+        }
+
+        emit AllowanceClaimed { recipient: msg.sender, token: token, amount: claim_amount };
+    }
+
+    pub fn set_budget(new_budget: u256) {
+        require!(msg.sender == self.dao, NotDAO {});
+        self.monthly_budget = new_budget;
+        emit BudgetUpdated { new_budget: new_budget };
+    }
+
+    // Emergency functions
+    pub fn enable_emergency() {
+        require!(msg.sender == self.guardian, NotGuardian {});
+        self.emergency_mode = true;
+        self.paused = true;
+    }
+
+    pub fn emergency_withdraw(token: Address, recipient: Address, amount: u256) {
+        require!(msg.sender == self.guardian, NotGuardian {});
+        require!(self.emergency_mode, NotEmergencyMode {});
+
+        if token == Address::ZERO {
+            raw_call!(recipient, amount, bytes(""));
+        } else {
+            let erc20 = IERC20::at(token);
+            erc20.transfer(recipient, amount);
+        }
+
+        emit EmergencyWithdrawal { token: token, recipient: recipient, amount: amount };
+    }
+
+    pub fn disable_emergency() {
+        require!(msg.sender == self.dao, NotDAO {});
+        self.emergency_mode = false;
+        self.paused = false;
+    }
+
+    #[view]
+    pub fn get_proposal(proposal_id: u256) -> SpendingProposal {
+        return self.proposals[proposal_id];
+    }
+
+    #[view]
+    pub fn budget_remaining() -> u256 {
+        let period_length: u64 = BUDGET_PERIOD;
+        if block.timestamp >= self.budget_period_start + period_length {
+            return self.monthly_budget;
+        }
+        if self.period_spent >= self.monthly_budget {
+            return 0;
+        }
+        return self.monthly_budget - self.period_spent;
+    }
+
+    #[view]
+    pub fn get_allowance(recipient: Address, token: Address) -> Allowance {
+        return self.allowances[recipient][token];
+    }
+
+    #[view]
+    pub fn native_balance() -> u256 {
+        return address(self).balance;
+    }
+
+    #[view]
+    pub fn token_balance(token: Address) -> u256 {
+        let erc20 = IERC20::at(token);
+        return erc20.balance_of(address(self));
+    }
+
+    fn refresh_budget_period() {
+        let period_length: u64 = BUDGET_PERIOD;
+        if block.timestamp >= self.budget_period_start + period_length {
+            self.budget_period_start = block.timestamp;
+            self.period_spent = 0;
+        }
+    }
+}

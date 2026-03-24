@@ -1,0 +1,312 @@
+// Privacy-preserving medical records with role-based access and consent management
+
+contract MedicalRecords {
+    storage {
+        admin: Address,
+        patients: Map<Address, PatientInfo>,
+        records: Map<Address, Map<u64, MedicalRecord>>,
+        record_counts: Map<Address, u64>,
+        access_grants: Map<Address, Map<Address, AccessPermission>>,
+        provider_registry: Map<Address, HealthcareProvider>,
+        consent_log: Map<Address, Map<u64, ConsentEntry>>,
+        consent_counts: Map<Address, u64>,
+        emergency_contacts: Map<Address, Vec<Address>>,
+        data_retention_days: u64,
+        total_patients: u64,
+        total_providers: u64,
+    }
+
+    struct PatientInfo {
+        registered: bool,
+        data_hash: u256,
+        registered_at: u64,
+        last_updated: u64,
+        record_count: u64,
+        emergency_override: bool,
+    }
+
+    struct MedicalRecord {
+        provider: Address,
+        record_type: u8,
+        data_hash: u256,
+        encryption_key_hash: u256,
+        created_at: u64,
+        expires_at: u64,
+        sensitive: bool,
+        icd_code: u32,
+    }
+
+    struct AccessPermission {
+        granted: bool,
+        level: u8,
+        granted_at: u64,
+        expires_at: u64,
+        can_write: bool,
+        can_share: bool,
+    }
+
+    struct HealthcareProvider {
+        license_hash: u256,
+        specialty: u16,
+        registered: bool,
+        facility_hash: u256,
+        active: bool,
+    }
+
+    struct ConsentEntry {
+        grantee: Address,
+        action: u8,
+        timestamp: u64,
+        granted: bool,
+        purpose_hash: u256,
+    }
+
+    event PatientRegistered {
+        #[indexed]
+        patient: Address,
+    }
+
+    event RecordAdded {
+        #[indexed]
+        patient: Address,
+        record_index: u64,
+        #[indexed]
+        provider: Address,
+    }
+
+    event AccessGranted {
+        #[indexed]
+        patient: Address,
+        #[indexed]
+        grantee: Address,
+        level: u8,
+    }
+
+    event AccessRevoked {
+        #[indexed]
+        patient: Address,
+        #[indexed]
+        revokee: Address,
+    }
+
+    event ConsentRecorded {
+        #[indexed]
+        patient: Address,
+        grantee: Address,
+        granted: bool,
+    }
+
+    event EmergencyAccess {
+        #[indexed]
+        patient: Address,
+        #[indexed]
+        accessor: Address,
+    }
+
+    error NotAdmin {}
+    error NotRegistered {}
+    error AlreadyRegistered {}
+    error ProviderNotRegistered {}
+    error AccessDenied {}
+    error InvalidAccessLevel { max: u8, given: u8 }
+    error RecordNotFound { index: u64 }
+    error ConsentRequired {}
+    error EmergencyOverrideDisabled {}
+
+    const SECONDS_PER_DAY: u64 = 86400;
+    const EMERGENCY_ACCESS_DURATION: u64 = 86400;
+    const MAX_ACCESS_LEVEL: u8 = 3;
+
+    #[constructor]
+    pub fn init(data_retention_days: u64) {
+        self.admin = msg.sender;
+        self.data_retention_days = data_retention_days;
+        self.total_patients = 0;
+        self.total_providers = 0;
+    }
+
+    pub fn register_patient(data_hash: u256) {
+        require!(!self.patients[msg.sender].registered, AlreadyRegistered {});
+
+        self.patients[msg.sender] = PatientInfo {
+            registered: true,
+            data_hash: data_hash,
+            registered_at: block.timestamp,
+            last_updated: block.timestamp,
+            record_count: 0,
+            emergency_override: true,
+        };
+        self.record_counts[msg.sender] = 0;
+        self.consent_counts[msg.sender] = 0;
+        self.total_patients += 1;
+
+        emit PatientRegistered { patient: msg.sender };
+    }
+
+    pub fn register_provider(license_hash: u256, specialty: u16, facility_hash: u256) {
+        require!(msg.sender == self.admin || self.provider_registry[msg.sender].registered, NotAdmin {});
+
+        self.provider_registry[msg.sender] = HealthcareProvider {
+            license_hash: license_hash,
+            specialty: specialty,
+            registered: true,
+            facility_hash: facility_hash,
+            active: true,
+        };
+        self.total_providers += 1;
+    }
+
+    fn has_access(patient: Address, accessor: Address, required_level: u8) -> bool {
+        if accessor == patient {
+            return true;
+        }
+        let perm = self.access_grants[patient][accessor];
+        if !perm.granted {
+            return false;
+        }
+        if perm.expires_at < block.timestamp {
+            return false;
+        }
+        return perm.level >= required_level;
+    }
+
+    pub fn grant_access(
+        grantee: Address,
+        level: u8,
+        duration_days: u64,
+        can_write: bool,
+        can_share: bool,
+        purpose_hash: u256,
+    ) {
+        require!(self.patients[msg.sender].registered, NotRegistered {});
+        require!(level <= 3, InvalidAccessLevel { max: 3, given: level });
+
+        let expires = block.timestamp + (duration_days * 86400);
+        self.access_grants[msg.sender][grantee] = AccessPermission {
+            granted: true,
+            level: level,
+            granted_at: block.timestamp,
+            expires_at: expires,
+            can_write: can_write,
+            can_share: can_share,
+        };
+
+        // Log consent
+        let idx = self.consent_counts[msg.sender];
+        self.consent_log[msg.sender][idx] = ConsentEntry {
+            grantee: grantee,
+            action: 1,
+            timestamp: block.timestamp,
+            granted: true,
+            purpose_hash: purpose_hash,
+        };
+        self.consent_counts[msg.sender] = idx + 1;
+
+        emit AccessGranted { patient: msg.sender, grantee: grantee, level: level };
+        emit ConsentRecorded { patient: msg.sender, grantee: grantee, granted: true };
+    }
+
+    pub fn revoke_access(grantee: Address) {
+        require!(self.patients[msg.sender].registered, NotRegistered {});
+        self.access_grants[msg.sender][grantee].granted = false;
+
+        let idx = self.consent_counts[msg.sender];
+        self.consent_log[msg.sender][idx] = ConsentEntry {
+            grantee: grantee,
+            action: 2,
+            timestamp: block.timestamp,
+            granted: false,
+            purpose_hash: 0,
+        };
+        self.consent_counts[msg.sender] = idx + 1;
+
+        emit AccessRevoked { patient: msg.sender, revokee: grantee };
+        emit ConsentRecorded { patient: msg.sender, grantee: grantee, granted: false };
+    }
+
+    pub fn add_record(
+        patient: Address,
+        record_type: u8,
+        data_hash: u256,
+        encryption_key_hash: u256,
+        sensitive: bool,
+        icd_code: u32,
+    ) {
+        require!(self.provider_registry[msg.sender].active, ProviderNotRegistered {});
+        let perm = self.access_grants[patient][msg.sender];
+        require!(perm.granted && perm.can_write, AccessDenied {});
+        require!(perm.expires_at >= block.timestamp, AccessDenied {});
+
+        let idx = self.record_counts[patient];
+        let expires = block.timestamp + (self.data_retention_days * 86400);
+
+        self.records[patient][idx] = MedicalRecord {
+            provider: msg.sender,
+            record_type: record_type,
+            data_hash: data_hash,
+            encryption_key_hash: encryption_key_hash,
+            created_at: block.timestamp,
+            expires_at: expires,
+            sensitive: sensitive,
+            icd_code: icd_code,
+        };
+        self.record_counts[patient] = idx + 1;
+        self.patients[patient].record_count = idx + 1;
+        self.patients[patient].last_updated = block.timestamp;
+
+        emit RecordAdded { patient: patient, record_index: idx, provider: msg.sender };
+    }
+
+    pub fn emergency_access(patient: Address) {
+        require!(self.provider_registry[msg.sender].active, ProviderNotRegistered {});
+        require!(self.patients[patient].emergency_override, EmergencyOverrideDisabled {});
+
+        // Grant temporary 24-hour access
+        self.access_grants[patient][msg.sender] = AccessPermission {
+            granted: true,
+            level: 2,
+            granted_at: block.timestamp,
+            expires_at: block.timestamp + 86400,
+            can_write: true,
+            can_share: false,
+        };
+
+        emit EmergencyAccess { patient: patient, accessor: msg.sender };
+    }
+
+    pub fn set_emergency_contacts(contacts: Vec<Address>) {
+        require!(self.patients[msg.sender].registered, NotRegistered {});
+        self.emergency_contacts[msg.sender] = contacts;
+    }
+
+    pub fn toggle_emergency_override(enabled: bool) {
+        require!(self.patients[msg.sender].registered, NotRegistered {});
+        self.patients[msg.sender].emergency_override = enabled;
+    }
+
+    #[view]
+    pub fn get_record(patient: Address, index: u64) -> MedicalRecord {
+        require!(self.has_access(patient, msg.sender, 1), AccessDenied {});
+        return self.records[patient][index];
+    }
+
+    #[view]
+    pub fn get_record_count(patient: Address) -> u64 {
+        return self.record_counts[patient];
+    }
+
+    #[view]
+    pub fn check_access(patient: Address, accessor: Address) -> AccessPermission {
+        return self.access_grants[patient][accessor];
+    }
+
+    #[view]
+    pub fn get_patient(patient: Address) -> PatientInfo {
+        return self.patients[patient];
+    }
+
+    #[view]
+    pub fn get_provider(addr: Address) -> HealthcareProvider {
+        return self.provider_registry[addr];
+    }
+}

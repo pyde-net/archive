@@ -1,0 +1,317 @@
+// Time-Weighted Average Price (TWAP) oracle with multiple price feeds
+use std::math;
+
+contract PriceOracle {
+    storage {
+        owner: Address,
+
+        // Price feeds: pair_id -> observations
+        num_pairs: u256,
+        pair_base: Map<u256, Address>,
+        pair_quote: Map<u256, Address>,
+        pair_label: Map<u256, String>,
+        pair_id_by_tokens: Map<Address, Map<Address, u256>>,
+
+        // Observation ring buffer per pair
+        observations: Map<u256, Map<u256, Observation>>,
+        observation_count: Map<u256, u256>,
+        observation_index: Map<u256, u256>,    // current write index
+        max_observations: u256,
+
+        // Latest spot prices
+        latest_price: Map<u256, u256>,
+        latest_timestamp: Map<u256, u64>,
+
+        // Cumulative prices for TWAP
+        cumulative_price: Map<u256, u256>,
+
+        // Authorized reporters
+        reporters: Map<Address, bool>,
+        reporter_count: u256,
+
+        // Staleness config
+        heartbeat: Map<u256, u64>,  // max age of price before considered stale
+        default_heartbeat: u64,
+
+        // Deviation threshold (scaled 1e6, e.g. 50000 = 5%)
+        deviation_threshold: Map<u256, u256>,
+        default_deviation: u256,
+
+        scale: u256,
+        percent_scale: u256,
+    }
+
+    struct Observation {
+        timestamp: u64,
+        price: u256,
+        cumulative_price: u256,
+    }
+
+    event PriceUpdated {
+        #[indexed]
+        pair_id: u256,
+        price: u256,
+        timestamp: u64,
+        #[indexed]
+        reporter: Address,
+    }
+
+    event PairAdded {
+        #[indexed]
+        pair_id: u256,
+        base: Address,
+        quote: Address,
+        label: String,
+    }
+
+    event ReporterAdded {
+        #[indexed]
+        reporter: Address,
+    }
+
+    event ReporterRemoved {
+        #[indexed]
+        reporter: Address,
+    }
+
+    event PriceDeviationAlert {
+        #[indexed]
+        pair_id: u256,
+        old_price: u256,
+        new_price: u256,
+        deviation: u256,
+    }
+
+    error NotOwner {}
+    error NotReporter {}
+    error PairNotFound { pair_id: u256 }
+    error PriceStale { pair_id: u256, last_update: u64, current_time: u64 }
+    error InvalidPrice {}
+    error InsufficientObservations { required: u256, available: u256 }
+    error PairAlreadyExists { base: Address, quote: Address }
+    error InvalidTwapPeriod { period: u64 }
+    error ZeroPeriod {}
+
+    #[constructor]
+    pub fn init(max_observations: u256, default_heartbeat: u64, default_deviation: u256) {
+        self.owner = msg.sender;
+        self.reporters[msg.sender] = true;
+        self.reporter_count = 1u256;
+        self.max_observations = max_observations;
+        self.default_heartbeat = default_heartbeat;
+        self.default_deviation = default_deviation;
+        self.scale = 1000000000000000000u256;
+        self.percent_scale = 1000000u256;
+    }
+
+    fn require_reporter() {
+        require!(self.reporters[msg.sender], NotReporter {});
+    }
+
+    fn abs_diff(a: u256, b: u256) -> u256 {
+        if a > b {
+            return a - b;
+        }
+        return b - a;
+    }
+
+    // --- Admin ---
+
+    pub fn add_pair(base: Address, quote: Address, label: String, heartbeat: u64) {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(
+            self.pair_id_by_tokens[base][quote] == 0u256
+                && (self.num_pairs == 0u256 || self.pair_base[0] != base || self.pair_quote[0] != quote),
+            PairAlreadyExists { base: base, quote: quote },
+        );
+
+        let pair_id = self.num_pairs;
+        self.num_pairs = pair_id + 1u256;
+
+        self.pair_base[pair_id] = base;
+        self.pair_quote[pair_id] = quote;
+        self.pair_label[pair_id] = label;
+        self.pair_id_by_tokens[base][quote] = pair_id;
+        self.heartbeat[pair_id] = heartbeat;
+        self.deviation_threshold[pair_id] = self.default_deviation;
+
+        emit PairAdded { pair_id: pair_id, base: base, quote: quote, label: label };
+    }
+
+    pub fn add_reporter(reporter: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.reporters[reporter] = true;
+        self.reporter_count = self.reporter_count + 1u256;
+        emit ReporterAdded { reporter: reporter };
+    }
+
+    pub fn remove_reporter(reporter: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.reporters[reporter] = false;
+        self.reporter_count = self.reporter_count - 1u256;
+        emit ReporterRemoved { reporter: reporter };
+    }
+
+    pub fn set_heartbeat(pair_id: u256, heartbeat: u64) {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(pair_id < self.num_pairs, PairNotFound { pair_id: pair_id });
+        self.heartbeat[pair_id] = heartbeat;
+    }
+
+    pub fn set_deviation_threshold(pair_id: u256, threshold: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(pair_id < self.num_pairs, PairNotFound { pair_id: pair_id });
+        self.deviation_threshold[pair_id] = threshold;
+    }
+
+    // --- Price reporting ---
+
+    pub fn report_price(pair_id: u256, price: u256) {
+        self.require_reporter();
+        require!(pair_id < self.num_pairs, PairNotFound { pair_id: pair_id });
+        require!(price > 0u256, InvalidPrice {});
+
+        // Check deviation from last price
+        let old_price = self.latest_price[pair_id];
+        if old_price > 0u256 {
+            let diff = self.abs_diff(price, old_price);
+            let deviation = (diff * self.percent_scale) / old_price;
+            let threshold = self.deviation_threshold[pair_id];
+
+            if deviation > threshold {
+                emit PriceDeviationAlert {
+                    pair_id: pair_id,
+                    old_price: old_price,
+                    new_price: price,
+                    deviation: deviation,
+                };
+            }
+        }
+
+        // Update cumulative price
+        let time_delta = block.timestamp - self.latest_timestamp[pair_id];
+        if time_delta > 0u64 && old_price > 0u256 {
+            self.cumulative_price[pair_id] = self.cumulative_price[pair_id]
+                + (old_price * (time_delta as u256));
+        }
+
+        // Store observation in ring buffer
+        let idx = self.observation_index[pair_id] % self.max_observations;
+        self.observations[pair_id][idx] = Observation {
+            timestamp: block.timestamp,
+            price: price,
+            cumulative_price: self.cumulative_price[pair_id],
+        };
+        self.observation_index[pair_id] = self.observation_index[pair_id] + 1u256;
+        if self.observation_count[pair_id] < self.max_observations {
+            self.observation_count[pair_id] = self.observation_count[pair_id] + 1u256;
+        }
+
+        // Update latest
+        self.latest_price[pair_id] = price;
+        self.latest_timestamp[pair_id] = block.timestamp;
+
+        emit PriceUpdated {
+            pair_id: pair_id,
+            price: price,
+            timestamp: block.timestamp,
+            reporter: msg.sender,
+        };
+    }
+
+    // Batch update multiple prices in a single transaction
+    pub fn report_prices_batch(pair_ids: Vec<u256>, prices: Vec<u256>) {
+        self.require_reporter();
+        let count = pair_ids.len();
+        for i in 0..count {
+            self.report_price(pair_ids[i], prices[i]);
+        }
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn get_price(pair_id: u256) -> u256 {
+        require!(pair_id < self.num_pairs, PairNotFound { pair_id: pair_id });
+
+        let hb = self.heartbeat[pair_id];
+        let last_update = self.latest_timestamp[pair_id];
+        require!(block.timestamp - last_update <= hb, PriceStale {
+            pair_id: pair_id,
+            last_update: last_update,
+            current_time: block.timestamp,
+        });
+
+        return self.latest_price[pair_id];
+    }
+
+    #[view]
+    pub fn get_price_unsafe(pair_id: u256) -> u256 {
+        return self.latest_price[pair_id];
+    }
+
+    #[view]
+    pub fn get_twap(pair_id: u256, period: u64) -> u256 {
+        require!(pair_id < self.num_pairs, PairNotFound { pair_id: pair_id });
+        require!(period > 0u64, ZeroPeriod {});
+        require!(self.observation_count[pair_id] >= 2u256, InsufficientObservations {
+            required: 2u256,
+            available: self.observation_count[pair_id],
+        });
+
+        // Find the observation closest to (now - period)
+        let target_time = block.timestamp - period;
+        let count = self.observation_count[pair_id];
+        let current_idx = self.observation_index[pair_id];
+
+        // Latest observation
+        let latest_obs = self.observations[pair_id][(current_idx - 1u256) % self.max_observations];
+
+        // Search for the observation closest to target_time
+        let mut oldest_idx = if current_idx >= count { current_idx - count } else { 0u256 };
+        let target_obs = self.observations[pair_id][oldest_idx % self.max_observations];
+
+        // TWAP = (cumulative_latest - cumulative_target) / (time_latest - time_target)
+        let cumulative_diff = latest_obs.cumulative_price - target_obs.cumulative_price;
+        let time_diff = latest_obs.timestamp - target_obs.timestamp;
+
+        if time_diff == 0u64 {
+            return latest_obs.price;
+        }
+
+        return cumulative_diff / (time_diff as u256);
+    }
+
+    #[view]
+    pub fn get_price_by_tokens(base: Address, quote: Address) -> u256 {
+        let pair_id = self.pair_id_by_tokens[base][quote];
+        return self.get_price(pair_id);
+    }
+
+    #[view]
+    pub fn is_price_stale(pair_id: u256) -> bool {
+        let hb = self.heartbeat[pair_id];
+        let last_update = self.latest_timestamp[pair_id];
+        return (block.timestamp - last_update) > hb;
+    }
+
+    #[view]
+    pub fn get_observation(pair_id: u256, index: u256) -> Observation {
+        return self.observations[pair_id][index % self.max_observations];
+    }
+
+    #[view]
+    pub fn get_num_pairs() -> u256 {
+        return self.num_pairs;
+    }
+
+    #[view]
+    pub fn get_observation_count(pair_id: u256) -> u256 {
+        return self.observation_count[pair_id];
+    }
+
+    #[view]
+    pub fn get_latest_timestamp(pair_id: u256) -> u64 {
+        return self.latest_timestamp[pair_id];
+    }
+}

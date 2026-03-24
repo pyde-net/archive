@@ -1,0 +1,354 @@
+// Crowdfunding contract with goal-based funding, tiered rewards,
+// deadline enforcement, and automatic refunds.
+
+contract Crowdfund {
+    storage {
+        creator: Address,
+        title: String,
+        description: String,
+        goal: u256,
+        deadline: u64,
+        total_raised: u256,
+        status: CampaignStatus,
+        contributions: Map<Address, u256>,
+        contributors: Vec<Address>,
+        contributor_count: u64,
+        tiers: Vec<RewardTier>,
+        contributor_tier: Map<Address, u64>,
+        claimed_refunds: Map<Address, bool>,
+        stretch_goals: Vec<StretchGoal>,
+        min_contribution: u256,
+        max_contribution: u256,
+        withdrawn: bool,
+    }
+
+    enum CampaignStatus {
+        Active = 0,
+        Successful = 1,
+        Failed = 2,
+        Cancelled = 3,
+    }
+
+    const BPS_DENOMINATOR: u256 = 10000;
+
+    struct RewardTier {
+        name: String,
+        min_amount: u256,
+        description: String,
+        max_claimants: u64,
+        current_claimants: u64,
+    }
+
+    struct StretchGoal {
+        target: u256,
+        description: String,
+        reached: bool,
+    }
+
+    event CampaignCreated {
+        #[indexed]
+        creator: Address,
+        goal: u256,
+        deadline: u64,
+    }
+
+    event ContributionMade {
+        #[indexed]
+        contributor: Address,
+        amount: u256,
+        total: u256,
+        tier: u64,
+    }
+
+    event ContributionIncreased {
+        #[indexed]
+        contributor: Address,
+        additional: u256,
+        new_total: u256,
+    }
+
+    event GoalReached {
+        total_raised: u256,
+        contributor_count: u64,
+    }
+
+    event StretchGoalReached {
+        index: u64,
+        target: u256,
+        description: String,
+    }
+
+    event FundsWithdrawn {
+        #[indexed]
+        creator: Address,
+        amount: u256,
+    }
+
+    event RefundClaimed {
+        #[indexed]
+        contributor: Address,
+        amount: u256,
+    }
+
+    event CampaignCancelled {}
+
+    error CampaignNotActive {}
+    error CampaignStillActive {}
+    error DeadlinePassed {}
+    error DeadlineNotPassed {}
+    error GoalNotReached {}
+    error GoalAlreadyReached {}
+    error BelowMinContribution { min: u256 }
+    error AboveMaxContribution { max: u256 }
+    error AlreadyClaimed {}
+    error NothingToRefund {}
+    error AlreadyWithdrawn {}
+    error NotCreator {}
+    error TierFull { tier: u64 }
+    error ZeroGoal {}
+
+    #[constructor]
+    pub fn init(
+        title: String,
+        description: String,
+        goal: u256,
+        deadline: u64,
+        min_contribution: u256,
+        max_contribution: u256,
+    ) {
+        require!(goal > 0, ZeroGoal {});
+        self.creator = msg.sender;
+        self.title = title;
+        self.description = description;
+        self.goal = goal;
+        self.deadline = deadline;
+        self.min_contribution = min_contribution;
+        self.max_contribution = max_contribution;
+        self.status = CampaignStatus::Active;
+        self.withdrawn = false;
+
+        emit CampaignCreated {
+            creator: msg.sender,
+            goal: goal,
+            deadline: deadline,
+        };
+    }
+
+    pub fn add_reward_tier(
+        name: String,
+        min_amount: u256,
+        description: String,
+        max_claimants: u64,
+    ) {
+        require!(msg.sender == self.creator, NotCreator {});
+        require!(self.status == CampaignStatus::Active, CampaignNotActive {});
+
+        self.tiers.push(RewardTier {
+            name: name,
+            min_amount: min_amount,
+            description: description,
+            max_claimants: max_claimants,
+            current_claimants: 0,
+        });
+    }
+
+    pub fn add_stretch_goal(target: u256, description: String) {
+        require!(msg.sender == self.creator, NotCreator {});
+        require!(self.status == CampaignStatus::Active, CampaignNotActive {});
+
+        self.stretch_goals.push(StretchGoal {
+            target: target,
+            description: description,
+            reached: false,
+        });
+    }
+
+    pub fn contribute() {
+        require!(self.status == CampaignStatus::Active, CampaignNotActive {});
+        require!(block.timestamp <= self.deadline, DeadlinePassed {});
+        require!(msg.value >= self.min_contribution, BelowMinContribution {
+            min: self.min_contribution,
+        });
+
+        let existing = self.contributions[msg.sender];
+        let new_total = existing + msg.value;
+
+        if self.max_contribution > 0 {
+            require!(new_total <= self.max_contribution, AboveMaxContribution {
+                max: self.max_contribution,
+            });
+        }
+
+        if existing == 0 {
+            self.contributors.push(msg.sender);
+            self.contributor_count = self.contributor_count + 1;
+        }
+
+        self.contributions[msg.sender] = new_total;
+        self.total_raised = self.total_raised + msg.value;
+
+        // Determine best tier
+        let mut best_tier: u64 = 0;
+        for i in 0..self.tiers.len() {
+            let tier = self.tiers[i];
+            if new_total >= tier.min_amount {
+                if tier.max_claimants == 0 || tier.current_claimants < tier.max_claimants {
+                    best_tier = (i as u64) + 1;
+                }
+            }
+        }
+
+        // Update tier assignment
+        let old_tier = self.contributor_tier[msg.sender];
+        if best_tier != old_tier {
+            if old_tier > 0 {
+                let mut old = self.tiers[old_tier - 1];
+                old.current_claimants = old.current_claimants - 1;
+                self.tiers[old_tier - 1] = old;
+            }
+            if best_tier > 0 {
+                let mut new_t = self.tiers[best_tier - 1];
+                new_t.current_claimants = new_t.current_claimants + 1;
+                self.tiers[best_tier - 1] = new_t;
+            }
+            self.contributor_tier[msg.sender] = best_tier;
+        }
+
+        if existing == 0 {
+            emit ContributionMade {
+                contributor: msg.sender,
+                amount: msg.value,
+                total: self.total_raised,
+                tier: best_tier,
+            };
+        } else {
+            emit ContributionIncreased {
+                contributor: msg.sender,
+                additional: msg.value,
+                new_total: new_total,
+            };
+        }
+
+        // Check goal reached
+        if self.total_raised >= self.goal && self.total_raised - msg.value < self.goal {
+            emit GoalReached {
+                total_raised: self.total_raised,
+                contributor_count: self.contributor_count,
+            };
+        }
+
+        // Check stretch goals
+        for i in 0..self.stretch_goals.len() {
+            let mut sg = self.stretch_goals[i];
+            if !sg.reached && self.total_raised >= sg.target {
+                sg.reached = true;
+                self.stretch_goals[i] = sg;
+                emit StretchGoalReached {
+                    index: i as u64,
+                    target: sg.target,
+                    description: sg.description,
+                };
+            }
+        }
+    }
+
+    // Creator withdraws funds after successful campaign
+    pub fn withdraw() {
+        require!(msg.sender == self.creator, NotCreator {});
+        require!(!self.withdrawn, AlreadyWithdrawn {});
+
+        // Can withdraw after deadline if goal met, or if goal met and deadline passed
+        let goal_met = self.total_raised >= self.goal;
+        require!(goal_met, GoalNotReached {});
+        require!(block.timestamp > self.deadline, DeadlineNotPassed {});
+
+        self.status = CampaignStatus::Successful;
+        self.withdrawn = true;
+
+        raw_call!(self.creator, self.total_raised, bytes::empty());
+
+        emit FundsWithdrawn {
+            creator: self.creator,
+            amount: self.total_raised,
+        };
+    }
+
+    // Finalize a failed campaign (goal not reached after deadline)
+    pub fn finalize_failed() {
+        require!(self.status == CampaignStatus::Active, CampaignNotActive {});
+        require!(block.timestamp > self.deadline, DeadlineNotPassed {});
+        require!(self.total_raised < self.goal, GoalAlreadyReached {});
+
+        self.status = CampaignStatus::Failed;
+    }
+
+    // Contributors claim refund if campaign failed or cancelled
+    pub fn claim_refund() {
+        require!(
+            self.status == CampaignStatus::Failed || self.status == CampaignStatus::Cancelled,
+            CampaignStillActive {},
+        );
+        require!(!self.claimed_refunds[msg.sender], AlreadyClaimed {});
+
+        let amount = self.contributions[msg.sender];
+        require!(amount > 0, NothingToRefund {});
+
+        self.claimed_refunds[msg.sender] = true;
+
+        raw_call!(msg.sender, amount, bytes::empty());
+
+        emit RefundClaimed { contributor: msg.sender, amount: amount };
+    }
+
+    // Creator can cancel before deadline
+    pub fn cancel() {
+        require!(msg.sender == self.creator, NotCreator {});
+        require!(self.status == CampaignStatus::Active, CampaignNotActive {});
+        require!(!self.withdrawn, AlreadyWithdrawn {});
+
+        self.status = CampaignStatus::Cancelled;
+
+        emit CampaignCancelled {};
+    }
+
+    #[view]
+    pub fn get_contribution(contributor: Address) -> u256 {
+        return self.contributions[contributor];
+    }
+
+    #[view]
+    pub fn get_contributor_tier(contributor: Address) -> u64 {
+        return self.contributor_tier[contributor];
+    }
+
+    #[view]
+    pub fn get_progress_bps() -> u256 {
+        if self.goal == 0 {
+            return BPS_DENOMINATOR;
+        }
+        return (self.total_raised * BPS_DENOMINATOR) / self.goal;
+    }
+
+    #[view]
+    pub fn get_time_remaining() -> u64 {
+        if block.timestamp >= self.deadline {
+            return 0;
+        }
+        return self.deadline - block.timestamp;
+    }
+
+    #[view]
+    pub fn get_tier(index: u64) -> RewardTier {
+        return self.tiers[index];
+    }
+
+    #[view]
+    pub fn get_tier_count() -> u64 {
+        return self.tiers.len() as u64;
+    }
+
+    #[view]
+    pub fn is_goal_reached() -> bool {
+        return self.total_raised >= self.goal;
+    }
+}

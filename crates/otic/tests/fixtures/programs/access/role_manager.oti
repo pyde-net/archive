@@ -1,0 +1,299 @@
+// Hierarchical role-based access control with admin, minter, pauser,
+// and custom roles. Supports role granting, revoking, and enumeration.
+
+contract RoleManager {
+    storage {
+        super_admin: Address,
+        role_members: Map<u8, Vec<Address>>,
+        has_role: Map<Address, Map<u8, bool>>,
+        role_admin: Map<u8, u8>, // which role can admin each role
+        role_names: Map<u8, String>,
+        next_custom_role: u8,
+        role_granted_at: Map<Address, Map<u8, u64>>,
+        role_count: Map<u8, u64>,
+        max_members_per_role: Map<u8, u64>, // 0 = unlimited
+    }
+
+    enum Role {
+        None = 0,
+        Admin = 1,
+        Minter = 2,
+        Pauser = 3,
+        Operator = 4,
+    }
+
+    const FIRST_CUSTOM_ROLE: u8 = 5;
+    const MAX_CUSTOM_ROLE_ID: u8 = 255;
+
+    event RoleGranted {
+        #[indexed]
+        role: u8,
+        #[indexed]
+        account: Address,
+        sender: Address,
+    }
+
+    event RoleRevoked {
+        #[indexed]
+        role: u8,
+        #[indexed]
+        account: Address,
+        sender: Address,
+    }
+
+    event RoleAdminChanged {
+        #[indexed]
+        role: u8,
+        previous_admin_role: u8,
+        new_admin_role: u8,
+    }
+
+    event RoleCreated {
+        role_id: u8,
+        name: String,
+        admin_role: u8,
+    }
+
+    event SuperAdminTransferred {
+        #[indexed]
+        previous: Address,
+        #[indexed]
+        new_admin: Address,
+    }
+
+    error NotSuperAdmin {}
+    error NotRoleAdmin { required_role: u8 }
+    error RoleAlreadyGranted { account: Address, role: u8 }
+    error RoleNotGranted { account: Address, role: u8 }
+    error CannotRevokeSelf {}
+    error ZeroAddress {}
+    error RoleFull { role: u8, max: u64 }
+    error InvalidRole { role: u8 }
+    error MaxCustomRolesReached {}
+    error RoleNameEmpty {}
+
+    #[constructor]
+    pub fn init() {
+        self.super_admin = msg.sender;
+        self.next_custom_role = FIRST_CUSTOM_ROLE;
+
+        // Set up default role names
+        self.role_names[1] = "ADMIN";
+        self.role_names[2] = "MINTER";
+        self.role_names[3] = "PAUSER";
+        self.role_names[4] = "OPERATOR";
+
+        // ADMIN role admins all other default roles
+        self.role_admin[1] = 1; // ADMIN is self-administered (by super_admin)
+        self.role_admin[2] = 1; // ADMIN admins MINTER
+        self.role_admin[3] = 1; // ADMIN admins PAUSER
+        self.role_admin[4] = 1; // ADMIN admins OPERATOR
+
+        // Grant ADMIN to deployer
+        self.has_role[msg.sender][1] = true;
+        self.role_members[1].push(msg.sender);
+        self.role_count[1] = 1;
+        self.role_granted_at[msg.sender][1] = block.timestamp;
+
+        emit RoleGranted { role: 1, account: msg.sender, sender: msg.sender };
+    }
+
+    fn check_role(account: Address, role: u8) -> bool {
+        return self.has_role[account][role];
+    }
+
+    fn require_role_admin(role: u8) {
+        let admin_role = self.role_admin[role];
+        if msg.sender == self.super_admin {
+            return;
+        }
+        require!(self.has_role[msg.sender][admin_role], NotRoleAdmin {
+            required_role: admin_role,
+        });
+    }
+
+    pub fn grant_role(role: u8, account: Address) {
+        require!(role > 0 && role < self.next_custom_role, InvalidRole { role: role });
+        require!(account != Address::ZERO, ZeroAddress {});
+        self.require_role_admin(role);
+
+        require!(!self.has_role[account][role], RoleAlreadyGranted {
+            account: account,
+            role: role,
+        });
+
+        // Check capacity
+        let max = self.max_members_per_role[role];
+        if max > 0 {
+            require!(self.role_count[role] < max, RoleFull { role: role, max: max });
+        }
+
+        self.has_role[account][role] = true;
+        self.role_members[role].push(account);
+        self.role_count[role] = self.role_count[role] + 1;
+        self.role_granted_at[account][role] = block.timestamp;
+
+        emit RoleGranted { role: role, account: account, sender: msg.sender };
+    }
+
+    pub fn revoke_role(role: u8, account: Address) {
+        require!(role > 0 && role < self.next_custom_role, InvalidRole { role: role });
+        self.require_role_admin(role);
+
+        require!(self.has_role[account][role], RoleNotGranted {
+            account: account,
+            role: role,
+        });
+
+        self.has_role[account][role] = false;
+        self.role_count[role] = self.role_count[role] - 1;
+
+        // Remove from members list
+        let mut new_members: Vec<Address> = Vec::new();
+        for i in 0..self.role_members[role].len() {
+            if self.role_members[role][i] != account {
+                new_members.push(self.role_members[role][i]);
+            }
+        }
+        self.role_members[role] = new_members;
+
+        emit RoleRevoked { role: role, account: account, sender: msg.sender };
+    }
+
+    // Voluntarily renounce own role
+    pub fn renounce_role(role: u8) {
+        require!(self.has_role[msg.sender][role], RoleNotGranted {
+            account: msg.sender,
+            role: role,
+        });
+
+        self.has_role[msg.sender][role] = false;
+        self.role_count[role] = self.role_count[role] - 1;
+
+        let mut new_members: Vec<Address> = Vec::new();
+        for i in 0..self.role_members[role].len() {
+            if self.role_members[role][i] != msg.sender {
+                new_members.push(self.role_members[role][i]);
+            }
+        }
+        self.role_members[role] = new_members;
+
+        emit RoleRevoked { role: role, account: msg.sender, sender: msg.sender };
+    }
+
+    // Batch grant a role to multiple accounts
+    pub fn batch_grant(role: u8, accounts: Vec<Address>) {
+        self.require_role_admin(role);
+
+        for i in 0..accounts.len() {
+            let account = accounts[i];
+            if account == Address::ZERO || self.has_role[account][role] {
+                continue;
+            }
+
+            let max = self.max_members_per_role[role];
+            if max > 0 && self.role_count[role] >= max {
+                break;
+            }
+
+            self.has_role[account][role] = true;
+            self.role_members[role].push(account);
+            self.role_count[role] = self.role_count[role] + 1;
+            self.role_granted_at[account][role] = block.timestamp;
+
+            emit RoleGranted { role: role, account: account, sender: msg.sender };
+        }
+    }
+
+    // Create a new custom role
+    pub fn create_role(name: String, admin_role: u8, max_members: u64) -> u8 {
+        require!(msg.sender == self.super_admin, NotSuperAdmin {});
+        require!(name != "", RoleNameEmpty {});
+        require!(self.next_custom_role < MAX_CUSTOM_ROLE_ID, MaxCustomRolesReached {});
+
+        let role_id = self.next_custom_role;
+        self.next_custom_role = role_id + 1;
+
+        self.role_names[role_id] = name;
+        self.role_admin[role_id] = admin_role;
+        self.max_members_per_role[role_id] = max_members;
+
+        emit RoleCreated {
+            role_id: role_id,
+            name: name,
+            admin_role: admin_role,
+        };
+
+        return role_id;
+    }
+
+    // Change which role administers another role
+    pub fn set_role_admin(role: u8, new_admin_role: u8) {
+        require!(msg.sender == self.super_admin, NotSuperAdmin {});
+        require!(role > 0 && role < self.next_custom_role, InvalidRole { role: role });
+
+        let previous = self.role_admin[role];
+        self.role_admin[role] = new_admin_role;
+
+        emit RoleAdminChanged {
+            role: role,
+            previous_admin_role: previous,
+            new_admin_role: new_admin_role,
+        };
+    }
+
+    pub fn set_max_members(role: u8, max: u64) {
+        require!(msg.sender == self.super_admin, NotSuperAdmin {});
+        self.max_members_per_role[role] = max;
+    }
+
+    pub fn transfer_super_admin(new_admin: Address) {
+        require!(msg.sender == self.super_admin, NotSuperAdmin {});
+        require!(new_admin != Address::ZERO, ZeroAddress {});
+
+        let previous = self.super_admin;
+        self.super_admin = new_admin;
+
+        emit SuperAdminTransferred { previous: previous, new_admin: new_admin };
+    }
+
+    #[view]
+    pub fn has_role_check(account: Address, role: u8) -> bool {
+        return self.has_role[account][role];
+    }
+
+    #[view]
+    pub fn get_role_members(role: u8) -> Vec<Address> {
+        return self.role_members[role];
+    }
+
+    #[view]
+    pub fn get_role_member_count(role: u8) -> u64 {
+        return self.role_count[role];
+    }
+
+    #[view]
+    pub fn get_role_admin(role: u8) -> u8 {
+        return self.role_admin[role];
+    }
+
+    #[view]
+    pub fn get_role_name(role: u8) -> String {
+        return self.role_names[role];
+    }
+
+    #[view]
+    pub fn get_super_admin() -> Address {
+        return self.super_admin;
+    }
+
+    #[view]
+    pub fn get_role_granted_at(account: Address, role: u8) -> u64 {
+        return self.role_granted_at[account][role];
+    }
+
+    #[view]
+    pub fn get_total_roles() -> u8 {
+        return self.next_custom_role - 1;
+    }
+}

@@ -1,0 +1,383 @@
+// Payroll contract with employee registry, salary configuration,
+// batch payments, and bonus distribution.
+
+use std::token::IERC20;
+
+contract Payroll {
+    storage {
+        owner: Address,
+        hr_manager: Address,
+        payment_token: Address,
+        next_employee_id: u64,
+        employees: Map<u64, Employee>,
+        employee_by_address: Map<Address, u64>,
+        active_employee_ids: Vec<u64>,
+        pay_period_seconds: u64,
+        last_payroll_run: u64,
+        total_paid_all_time: u256,
+        paused: bool,
+    }
+
+    struct Employee {
+        wallet: Address,
+        name: String,
+        department: String,
+        salary_per_period: u256,
+        bonus_pending: u256,
+        start_date: u64,
+        last_paid_at: u64,
+        periods_paid: u64,
+        total_earned: u256,
+        active: bool,
+    }
+
+    event EmployeeAdded {
+        #[indexed]
+        employee_id: u64,
+        wallet: Address,
+        name: String,
+        salary: u256,
+    }
+
+    event EmployeeDeactivated {
+        #[indexed]
+        employee_id: u64,
+    }
+
+    event EmployeeReactivated {
+        #[indexed]
+        employee_id: u64,
+    }
+
+    event SalaryUpdated {
+        #[indexed]
+        employee_id: u64,
+        old_salary: u256,
+        new_salary: u256,
+    }
+
+    event PayrollExecuted {
+        timestamp: u64,
+        employees_paid: u64,
+        total_amount: u256,
+    }
+
+    event EmployeePaid {
+        #[indexed]
+        employee_id: u64,
+        wallet: Address,
+        salary: u256,
+        bonus: u256,
+    }
+
+    event BonusAssigned {
+        #[indexed]
+        employee_id: u64,
+        amount: u256,
+        reason: String,
+    }
+
+    event EmergencyWithdraw {
+        token: Address,
+        amount: u256,
+        to: Address,
+    }
+
+    error Unauthorized {}
+    error NotOwner {}
+    error NotHRManager {}
+    error NotAuthorized {}
+    error EmployeeNotFound {}
+    error EmployeeAlreadyExists { wallet: Address }
+    error EmployeeInactive {}
+    error PayPeriodNotElapsed { next_at: u64 }
+    error InsufficientFunds { required: u256, available: u256 }
+    error ZeroAddress {}
+    error ZeroSalary {}
+    error ContractPaused {}
+    error NotPaused {}
+    error TransferFailed {}
+
+    #[constructor]
+    pub fn init(payment_token: Address, hr_manager: Address, pay_period_seconds: u64) {
+        require!(payment_token != Address::ZERO, ZeroAddress {});
+        self.owner = msg.sender;
+        self.hr_manager = hr_manager;
+        self.payment_token = payment_token;
+        self.pay_period_seconds = pay_period_seconds;
+        self.next_employee_id = 1;
+        self.paused = false;
+    }
+
+    fn only_hr_or_owner() {
+        require!(
+            msg.sender == self.owner || msg.sender == self.hr_manager,
+            NotAuthorized {},
+        );
+    }
+
+    pub fn add_employee(
+        wallet: Address,
+        name: String,
+        department: String,
+        salary_per_period: u256,
+    ) -> u64 {
+        self.only_hr_or_owner();
+        require!(!self.paused, ContractPaused {});
+        require!(wallet != Address::ZERO, ZeroAddress {});
+        require!(salary_per_period > 0, ZeroSalary {});
+        require!(
+            self.employee_by_address[wallet] == 0,
+            EmployeeAlreadyExists { wallet: wallet },
+        );
+
+        let id = self.next_employee_id;
+        self.next_employee_id = id + 1;
+
+        self.employees[id] = Employee {
+            wallet: wallet,
+            name: name,
+            department: department,
+            salary_per_period: salary_per_period,
+            bonus_pending: 0,
+            start_date: block.timestamp,
+            last_paid_at: block.timestamp,
+            periods_paid: 0,
+            total_earned: 0,
+            active: true,
+        };
+
+        self.employee_by_address[wallet] = id;
+        self.active_employee_ids.push(id);
+
+        emit EmployeeAdded {
+            employee_id: id,
+            wallet: wallet,
+            name: name,
+            salary: salary_per_period,
+        };
+
+        return id;
+    }
+
+    pub fn deactivate_employee(employee_id: u64) {
+        self.only_hr_or_owner();
+        let mut emp = self.employees[employee_id];
+        require!(emp.wallet != Address::ZERO, EmployeeNotFound {});
+        require!(emp.active, EmployeeInactive {});
+
+        emp.active = false;
+        self.employees[employee_id] = emp;
+
+        // Remove from active list
+        let mut new_active: Vec<u64> = Vec::new();
+        for i in 0..self.active_employee_ids.len() {
+            if self.active_employee_ids[i] != employee_id {
+                new_active.push(self.active_employee_ids[i]);
+            }
+        }
+        self.active_employee_ids = new_active;
+
+        emit EmployeeDeactivated { employee_id: employee_id };
+    }
+
+    pub fn reactivate_employee(employee_id: u64) {
+        self.only_hr_or_owner();
+        let mut emp = self.employees[employee_id];
+        require!(emp.wallet != Address::ZERO, EmployeeNotFound {});
+        require!(!emp.active, EmployeeInactive {});
+
+        emp.active = true;
+        emp.last_paid_at = block.timestamp;
+        self.employees[employee_id] = emp;
+        self.active_employee_ids.push(employee_id);
+
+        emit EmployeeReactivated { employee_id: employee_id };
+    }
+
+    pub fn update_salary(employee_id: u64, new_salary: u256) {
+        self.only_hr_or_owner();
+        require!(new_salary > 0, ZeroSalary {});
+        let mut emp = self.employees[employee_id];
+        require!(emp.wallet != Address::ZERO, EmployeeNotFound {});
+
+        let old_salary = emp.salary_per_period;
+        emp.salary_per_period = new_salary;
+        self.employees[employee_id] = emp;
+
+        emit SalaryUpdated {
+            employee_id: employee_id,
+            old_salary: old_salary,
+            new_salary: new_salary,
+        };
+    }
+
+    pub fn assign_bonus(employee_id: u64, amount: u256, reason: String) {
+        self.only_hr_or_owner();
+        let mut emp = self.employees[employee_id];
+        require!(emp.wallet != Address::ZERO, EmployeeNotFound {});
+        require!(emp.active, EmployeeInactive {});
+
+        emp.bonus_pending = emp.bonus_pending + amount;
+        self.employees[employee_id] = emp;
+
+        emit BonusAssigned {
+            employee_id: employee_id,
+            amount: amount,
+            reason: reason,
+        };
+    }
+
+    // Run payroll for all active employees
+    pub fn run_payroll() {
+        self.only_hr_or_owner();
+        require!(!self.paused, ContractPaused {});
+        require!(
+            block.timestamp >= self.last_payroll_run + self.pay_period_seconds,
+            PayPeriodNotElapsed {
+                next_at: self.last_payroll_run + self.pay_period_seconds,
+            },
+        );
+
+        let token = IERC20::at(self.payment_token);
+        let contract_balance = token.balance_of(address(self));
+
+        // First pass: calculate total needed
+        let mut total_needed: u256 = 0;
+        for i in 0..self.active_employee_ids.len() {
+            let eid = self.active_employee_ids[i];
+            let emp = self.employees[eid];
+            if emp.active {
+                total_needed = total_needed + emp.salary_per_period + emp.bonus_pending;
+            }
+        }
+
+        require!(contract_balance >= total_needed, InsufficientFunds {
+            required: total_needed,
+            available: contract_balance,
+        });
+
+        // Second pass: pay everyone
+        let mut paid_count: u64 = 0;
+        let mut total_amount: u256 = 0;
+
+        for i in 0..self.active_employee_ids.len() {
+            let eid = self.active_employee_ids[i];
+            let mut emp = self.employees[eid];
+            if !emp.active {
+                continue;
+            }
+
+            let payment = emp.salary_per_period + emp.bonus_pending;
+            let bonus_paid = emp.bonus_pending;
+
+            let success = token.transfer(emp.wallet, payment);
+            require!(success, TransferFailed {});
+
+            emp.last_paid_at = block.timestamp;
+            emp.periods_paid = emp.periods_paid + 1;
+            emp.total_earned = emp.total_earned + payment;
+            emp.bonus_pending = 0;
+            self.employees[eid] = emp;
+
+            paid_count = paid_count + 1;
+            total_amount = total_amount + payment;
+
+            emit EmployeePaid {
+                employee_id: eid,
+                wallet: emp.wallet,
+                salary: emp.salary_per_period,
+                bonus: bonus_paid,
+            };
+        }
+
+        self.last_payroll_run = block.timestamp;
+        self.total_paid_all_time = self.total_paid_all_time + total_amount;
+
+        emit PayrollExecuted {
+            timestamp: block.timestamp,
+            employees_paid: paid_count,
+            total_amount: total_amount,
+        };
+    }
+
+    // Pay a single employee outside the regular cycle
+    pub fn pay_individual(employee_id: u64, extra_amount: u256) {
+        self.only_hr_or_owner();
+        require!(!self.paused, ContractPaused {});
+
+        let mut emp = self.employees[employee_id];
+        require!(emp.wallet != Address::ZERO, EmployeeNotFound {});
+        require!(emp.active, EmployeeInactive {});
+
+        let token = IERC20::at(self.payment_token);
+        let success = token.transfer(emp.wallet, extra_amount);
+        require!(success, TransferFailed {});
+
+        emp.total_earned = emp.total_earned + extra_amount;
+        self.employees[employee_id] = emp;
+        self.total_paid_all_time = self.total_paid_all_time + extra_amount;
+
+        emit EmployeePaid {
+            employee_id: employee_id,
+            wallet: emp.wallet,
+            salary: extra_amount,
+            bonus: 0,
+        };
+    }
+
+    pub fn pause() {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(!self.paused, ContractPaused {});
+        self.paused = true;
+    }
+
+    pub fn unpause() {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(self.paused, NotPaused {});
+        self.paused = false;
+    }
+
+    pub fn set_hr_manager(new_hr: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(new_hr != Address::ZERO, ZeroAddress {});
+        self.hr_manager = new_hr;
+    }
+
+    pub fn emergency_withdraw(token_addr: Address, amount: u256, to: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(to != Address::ZERO, ZeroAddress {});
+        let token = IERC20::at(token_addr);
+        let success = token.transfer(to, amount);
+        require!(success, TransferFailed {});
+        emit EmergencyWithdraw { token: token_addr, amount: amount, to: to };
+    }
+
+    #[view]
+    pub fn get_employee(employee_id: u64) -> Employee {
+        return self.employees[employee_id];
+    }
+
+    #[view]
+    pub fn get_employee_by_wallet(wallet: Address) -> Employee {
+        let id = self.employee_by_address[wallet];
+        return self.employees[id];
+    }
+
+    #[view]
+    pub fn get_active_count() -> u64 {
+        return self.active_employee_ids.len() as u64;
+    }
+
+    #[view]
+    pub fn get_total_monthly_obligation() -> u256 {
+        let mut total: u256 = 0;
+        for i in 0..self.active_employee_ids.len() {
+            let emp = self.employees[self.active_employee_ids[i]];
+            if emp.active {
+                total = total + emp.salary_per_period;
+            }
+        }
+        return total;
+    }
+}

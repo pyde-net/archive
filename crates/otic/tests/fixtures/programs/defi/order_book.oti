@@ -1,0 +1,416 @@
+// On-chain limit order book DEX
+use std::math;
+use std::token::IERC20;
+
+contract OrderBook {
+    storage {
+        owner: Address,
+        base_token: Address,   // e.g. ETH
+        quote_token: Address,  // e.g. USDC
+
+        // Order storage
+        next_order_id: u256,
+        orders: Map<u256, Order>,
+        order_active: Map<u256, bool>,
+
+        // User order tracking
+        user_orders: Map<Address, Vec<u256>>,
+        user_order_count: Map<Address, u256>,
+
+        // Order book structure (price -> list of order IDs)
+        buy_orders_at_price: Map<u256, Vec<u256>>,
+        sell_orders_at_price: Map<u256, Vec<u256>>,
+        buy_price_levels: Vec<u256>,
+        sell_price_levels: Vec<u256>,
+
+        // Best prices
+        best_bid: u256,
+        best_ask: u256,
+
+        // Fee config (scaled 1e6)
+        maker_fee: u256,
+        taker_fee: u256,
+        accrued_base_fees: u256,
+        accrued_quote_fees: u256,
+        fee_recipient: Address,
+
+        // Stats
+        total_trades: u256,
+        total_base_volume: u256,
+        total_quote_volume: u256,
+
+        // Precision
+        price_precision: u256,  // min price increment
+        size_precision: u256,   // min order size
+        percent_scale: u256,
+    }
+
+    struct Order {
+        id: u256,
+        owner: Address,
+        is_buy: bool,
+        price: u256,        // quote per base (scaled 1e18)
+        size: u256,         // base token amount
+        filled: u256,       // base token amount filled
+        timestamp: u64,
+    }
+
+    event OrderPlaced {
+        #[indexed]
+        order_id: u256,
+        #[indexed]
+        owner: Address,
+        is_buy: bool,
+        price: u256,
+        size: u256,
+    }
+
+    event OrderFilled {
+        #[indexed]
+        order_id: u256,
+        #[indexed]
+        taker: Address,
+        fill_amount: u256,
+        fill_price: u256,
+    }
+
+    event OrderCancelled {
+        #[indexed]
+        order_id: u256,
+        #[indexed]
+        owner: Address,
+        remaining: u256,
+    }
+
+    event Trade {
+        #[indexed]
+        maker: Address,
+        #[indexed]
+        taker: Address,
+        price: u256,
+        base_amount: u256,
+        quote_amount: u256,
+        is_buy: bool,
+    }
+
+    error OrderNotFound { order_id: u256 }
+    error NotOrderOwner { order_id: u256 }
+    error OrderAlreadyFilled { order_id: u256 }
+    error InvalidPrice {}
+    error InvalidSize {}
+    error ZeroAmount {}
+    error InsufficientFillAmount {}
+    error NotOwner {}
+
+    #[constructor]
+    pub fn init(
+        base_token: Address,
+        quote_token: Address,
+        maker_fee: u256,
+        taker_fee: u256,
+        price_precision: u256,
+        size_precision: u256,
+    ) {
+        self.owner = msg.sender;
+        self.base_token = base_token;
+        self.quote_token = quote_token;
+        self.maker_fee = maker_fee;
+        self.taker_fee = taker_fee;
+        self.fee_recipient = msg.sender;
+        self.next_order_id = 1u256;
+        self.price_precision = price_precision;
+        self.size_precision = size_precision;
+        self.percent_scale = 1000000u256;
+        self.best_bid = 0u256;
+        self.best_ask = 0u256; // 0 means no asks
+    }
+
+    // --- Internal ---
+
+    fn calculate_quote_amount(base_amount: u256, price: u256) -> u256 {
+        return (base_amount * price) / 1000000000000000000u256;
+    }
+
+    fn try_match_buy_order(order_id: u256) {
+        let order = self.orders[order_id];
+        let mut remaining = order.size - order.filled;
+
+        // Try to match against sell orders at or below the buy price
+        let num_sell_levels = self.sell_price_levels.len();
+        for i in 0..num_sell_levels {
+            if remaining == 0u256 {
+                break;
+            }
+            let sell_price = self.sell_price_levels[i];
+            if sell_price > order.price {
+                break; // No more matching prices
+            }
+
+            let sell_orders = self.sell_orders_at_price[sell_price];
+            let num_sells = sell_orders.len();
+            for j in 0..num_sells {
+                if remaining == 0u256 {
+                    break;
+                }
+                let sell_order_id = sell_orders[j];
+                if !self.order_active[sell_order_id] {
+                    continue;
+                }
+
+                let sell_order = self.orders[sell_order_id];
+                let sell_remaining = sell_order.size - sell_order.filled;
+                let fill = if remaining < sell_remaining { remaining } else { sell_remaining };
+
+                self.execute_trade(order_id, sell_order_id, fill, sell_price);
+                remaining = remaining - fill;
+            }
+        }
+    }
+
+    fn try_match_sell_order(order_id: u256) {
+        let order = self.orders[order_id];
+        let mut remaining = order.size - order.filled;
+
+        // Try to match against buy orders at or above the sell price
+        let num_buy_levels = self.buy_price_levels.len();
+        let mut i = num_buy_levels;
+        while i > 0u256 {
+            i = i - 1u256;
+            if remaining == 0u256 {
+                break;
+            }
+            let buy_price = self.buy_price_levels[i];
+            if buy_price < order.price {
+                break;
+            }
+
+            let buy_orders = self.buy_orders_at_price[buy_price];
+            let num_buys = buy_orders.len();
+            for j in 0..num_buys {
+                if remaining == 0u256 {
+                    break;
+                }
+                let buy_order_id = buy_orders[j];
+                if !self.order_active[buy_order_id] {
+                    continue;
+                }
+
+                let buy_order = self.orders[buy_order_id];
+                let buy_remaining = buy_order.size - buy_order.filled;
+                let fill = if remaining < buy_remaining { remaining } else { buy_remaining };
+
+                self.execute_trade(buy_order_id, order_id, fill, buy_price);
+                remaining = remaining - fill;
+            }
+        }
+    }
+
+    fn execute_trade(buy_order_id: u256, sell_order_id: u256, base_amount: u256, price: u256) {
+        let buy_order = self.orders[buy_order_id];
+        let sell_order = self.orders[sell_order_id];
+        let quote_amount = self.calculate_quote_amount(base_amount, price);
+
+        // Apply fees
+        let taker_base_fee = (base_amount * self.taker_fee) / self.percent_scale;
+        let maker_quote_fee = (quote_amount * self.maker_fee) / self.percent_scale;
+
+        // Update fills
+        self.orders[buy_order_id].filled = buy_order.filled + base_amount;
+        self.orders[sell_order_id].filled = sell_order.filled + base_amount;
+
+        // Deactivate fully filled orders
+        if self.orders[buy_order_id].filled >= buy_order.size {
+            self.order_active[buy_order_id] = false;
+        }
+        if self.orders[sell_order_id].filled >= sell_order.size {
+            self.order_active[sell_order_id] = false;
+        }
+
+        // Transfer base tokens: seller -> buyer (minus taker fee)
+        IERC20::at(self.base_token).transfer(buy_order.owner, base_amount - taker_base_fee);
+        self.accrued_base_fees = self.accrued_base_fees + taker_base_fee;
+
+        // Transfer quote tokens: buyer -> seller (minus maker fee)
+        IERC20::at(self.quote_token).transfer(sell_order.owner, quote_amount - maker_quote_fee);
+        self.accrued_quote_fees = self.accrued_quote_fees + maker_quote_fee;
+
+        // Update statistics
+        self.total_trades = self.total_trades + 1u256;
+        self.total_base_volume = self.total_base_volume + base_amount;
+        self.total_quote_volume = self.total_quote_volume + quote_amount;
+
+        emit Trade {
+            maker: sell_order.owner,
+            taker: buy_order.owner,
+            price: price,
+            base_amount: base_amount,
+            quote_amount: quote_amount,
+            is_buy: true,
+        };
+
+        emit OrderFilled { order_id: buy_order_id, taker: sell_order.owner, fill_amount: base_amount, fill_price: price };
+        emit OrderFilled { order_id: sell_order_id, taker: buy_order.owner, fill_amount: base_amount, fill_price: price };
+    }
+
+    // --- Public operations ---
+
+    pub fn place_buy_order(price: u256, size: u256) -> u256 {
+        require!(price > 0u256, InvalidPrice {});
+        require!(size >= self.size_precision, InvalidSize {});
+        require!(price % self.price_precision == 0u256, InvalidPrice {});
+
+        // Lock quote tokens for the order
+        let quote_required = self.calculate_quote_amount(size, price);
+        IERC20::at(self.quote_token).transfer_from(msg.sender, address(self), quote_required);
+
+        let order_id = self.next_order_id;
+        self.next_order_id = order_id + 1u256;
+
+        self.orders[order_id] = Order {
+            id: order_id,
+            owner: msg.sender,
+            is_buy: true,
+            price: price,
+            size: size,
+            filled: 0u256,
+            timestamp: block.timestamp,
+        };
+        self.order_active[order_id] = true;
+
+        self.buy_orders_at_price[price].push(order_id);
+        self.user_orders[msg.sender].push(order_id);
+        self.user_order_count[msg.sender] = self.user_order_count[msg.sender] + 1u256;
+
+        // Update best bid
+        if price > self.best_bid {
+            self.best_bid = price;
+        }
+
+        emit OrderPlaced { order_id: order_id, owner: msg.sender, is_buy: true, price: price, size: size };
+
+        // Try to match immediately
+        self.try_match_buy_order(order_id);
+
+        return order_id;
+    }
+
+    pub fn place_sell_order(price: u256, size: u256) -> u256 {
+        require!(price > 0u256, InvalidPrice {});
+        require!(size >= self.size_precision, InvalidSize {});
+        require!(price % self.price_precision == 0u256, InvalidPrice {});
+
+        // Lock base tokens for the order
+        IERC20::at(self.base_token).transfer_from(msg.sender, address(self), size);
+
+        let order_id = self.next_order_id;
+        self.next_order_id = order_id + 1u256;
+
+        self.orders[order_id] = Order {
+            id: order_id,
+            owner: msg.sender,
+            is_buy: false,
+            price: price,
+            size: size,
+            filled: 0u256,
+            timestamp: block.timestamp,
+        };
+        self.order_active[order_id] = true;
+
+        self.sell_orders_at_price[price].push(order_id);
+        self.user_orders[msg.sender].push(order_id);
+        self.user_order_count[msg.sender] = self.user_order_count[msg.sender] + 1u256;
+
+        // Update best ask
+        if self.best_ask == 0u256 || price < self.best_ask {
+            self.best_ask = price;
+        }
+
+        emit OrderPlaced { order_id: order_id, owner: msg.sender, is_buy: false, price: price, size: size };
+
+        // Try to match immediately
+        self.try_match_sell_order(order_id);
+
+        return order_id;
+    }
+
+    pub fn cancel_order(order_id: u256) {
+        require!(self.order_active[order_id], OrderNotFound { order_id: order_id });
+        let order = self.orders[order_id];
+        require!(order.owner == msg.sender, NotOrderOwner { order_id: order_id });
+
+        let remaining = order.size - order.filled;
+        self.order_active[order_id] = false;
+
+        // Refund locked tokens
+        if order.is_buy {
+            let quote_refund = self.calculate_quote_amount(remaining, order.price);
+            IERC20::at(self.quote_token).transfer(msg.sender, quote_refund);
+        } else {
+            IERC20::at(self.base_token).transfer(msg.sender, remaining);
+        }
+
+        emit OrderCancelled { order_id: order_id, owner: msg.sender, remaining: remaining };
+    }
+
+    // --- Admin ---
+
+    pub fn collect_fees() {
+        require!(msg.sender == self.owner, NotOwner {});
+        let base_fees = self.accrued_base_fees;
+        let quote_fees = self.accrued_quote_fees;
+        self.accrued_base_fees = 0u256;
+        self.accrued_quote_fees = 0u256;
+
+        if base_fees > 0u256 {
+            IERC20::at(self.base_token).transfer(self.fee_recipient, base_fees);
+        }
+        if quote_fees > 0u256 {
+            IERC20::at(self.quote_token).transfer(self.fee_recipient, quote_fees);
+        }
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn get_order(order_id: u256) -> Order {
+        return self.orders[order_id];
+    }
+
+    #[view]
+    pub fn is_order_active(order_id: u256) -> bool {
+        return self.order_active[order_id];
+    }
+
+    #[view]
+    pub fn get_best_bid() -> u256 {
+        return self.best_bid;
+    }
+
+    #[view]
+    pub fn get_best_ask() -> u256 {
+        return self.best_ask;
+    }
+
+    #[view]
+    pub fn get_spread() -> u256 {
+        if self.best_ask == 0u256 || self.best_bid == 0u256 {
+            return 0u256;
+        }
+        return self.best_ask - self.best_bid;
+    }
+
+    #[view]
+    pub fn get_user_order_count(user: Address) -> u256 {
+        return self.user_order_count[user];
+    }
+
+    #[view]
+    pub fn get_total_trades() -> u256 {
+        return self.total_trades;
+    }
+
+    #[view]
+    pub fn get_volume() -> (u256, u256) {
+        return (self.total_base_volume, self.total_quote_volume);
+    }
+}

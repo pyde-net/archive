@@ -1,0 +1,215 @@
+// Address validation and formatting utilities for Otigen smart contracts.
+// Provides zero-address checks, comparison, set operations, and
+// address list management helpers.
+
+module address_utils;
+
+error ZeroAddress {}
+error AddressAlreadyExists { addr: Address }
+error AddressNotFound { addr: Address }
+error ListFull { max_size: u64 }
+error InvalidChecksum {}
+
+/// Returns true if the address is the zero address.
+pub fn is_zero(addr: Address) -> bool {
+    return addr == Address::ZERO;
+}
+
+/// Requires the address is not the zero address.
+pub fn require_non_zero(addr: Address) {
+    require!(addr != Address::ZERO, ZeroAddress {});
+}
+
+/// Returns true if two addresses are equal.
+pub fn equals(a: Address, b: Address) -> bool {
+    return a == b;
+}
+
+/// Returns true if the address is in the given list.
+pub fn is_in_list(addr: Address, list: Vec<Address>) -> bool {
+    for i in 0u64..list.len() {
+        if list[i] == addr {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Returns the index of the address in the list, or u64::MAX if not found.
+pub fn index_in_list(addr: Address, list: Vec<Address>) -> u64 {
+    for i in 0u64..list.len() {
+        if list[i] == addr {
+            return i;
+        }
+    }
+    return 18446744073709551615u64;
+}
+
+/// Adds an address to a list if not already present. Reverts if already exists.
+pub fn add_unique(addr: Address, list: Vec<Address>, max_size: u64) -> Vec<Address> {
+    require!(!is_in_list(addr, list), AddressAlreadyExists { addr: addr });
+    require!(list.len() < max_size, ListFull { max_size: max_size });
+    let mut new_list = list;
+    new_list.push(addr);
+    return new_list;
+}
+
+/// Removes an address from a list by swapping with the last element.
+/// Order is not preserved (swap-remove). Reverts if not found.
+pub fn remove_swap(addr: Address, list: Vec<Address>) -> Vec<Address> {
+    let len = list.len();
+    let mut new_list = list;
+
+    for i in 0u64..len {
+        if new_list[i] == addr {
+            // Swap with last element and pop
+            if i != len - 1u64 {
+                new_list[i] = new_list[len - 1u64];
+            }
+            new_list.pop();
+            return new_list;
+        }
+    }
+
+    revert!(AddressNotFound { addr: addr });
+}
+
+/// Returns the count of non-zero addresses in a list.
+pub fn count_non_zero(list: Vec<Address>) -> u64 {
+    let mut count = 0u64;
+    for i in 0u64..list.len() {
+        if list[i] != Address::ZERO {
+            count = count + 1u64;
+        }
+    }
+    return count;
+}
+
+/// Returns a new list with all zero addresses removed.
+pub fn compact(list: Vec<Address>) -> Vec<Address> {
+    let mut result: Vec<Address> = Vec::new();
+    for i in 0u64..list.len() {
+        if list[i] != Address::ZERO {
+            result.push(list[i]);
+        }
+    }
+    return result;
+}
+
+/// Returns a deduplicated copy of the address list.
+pub fn deduplicate(list: Vec<Address>) -> Vec<Address> {
+    let mut result: Vec<Address> = Vec::new();
+    for i in 0u64..list.len() {
+        let mut found = false;
+        for j in 0u64..result.len() {
+            if result[j] == list[i] {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            result.push(list[i]);
+        }
+    }
+    return result;
+}
+
+/// Returns the intersection of two address lists.
+pub fn intersection(a: Vec<Address>, b: Vec<Address>) -> Vec<Address> {
+    let mut result: Vec<Address> = Vec::new();
+    for i in 0u64..a.len() {
+        if is_in_list(a[i], b) {
+            // Only add once
+            if !is_in_list(a[i], result) {
+                result.push(a[i]);
+            }
+        }
+    }
+    return result;
+}
+
+/// Returns the union of two address lists (deduplicated).
+pub fn union(a: Vec<Address>, b: Vec<Address>) -> Vec<Address> {
+    let mut result: Vec<Address> = Vec::new();
+    for i in 0u64..a.len() {
+        if !is_in_list(a[i], result) {
+            result.push(a[i]);
+        }
+    }
+    for i in 0u64..b.len() {
+        if !is_in_list(b[i], result) {
+            result.push(b[i]);
+        }
+    }
+    return result;
+}
+
+/// Returns addresses in `a` that are not in `b`.
+pub fn difference(a: Vec<Address>, b: Vec<Address>) -> Vec<Address> {
+    let mut result: Vec<Address> = Vec::new();
+    for i in 0u64..a.len() {
+        if !is_in_list(a[i], b) {
+            result.push(a[i]);
+        }
+    }
+    return result;
+}
+
+/// Converts an address to its raw 20-byte representation.
+pub fn to_bytes(addr: Address) -> bytes {
+    return addr.to_bytes();
+}
+
+/// Compares two addresses for ordering. Returns -1, 0, or 1.
+pub fn compare(a: Address, b: Address) -> i8 {
+    let a_bytes: bytes = a.to_bytes();
+    let b_bytes: bytes = b.to_bytes();
+
+    for i in 0u64..20u64 {
+        if a_bytes[i] < b_bytes[i] {
+            return -1i8;
+        }
+        if a_bytes[i] > b_bytes[i] {
+            return 1i8;
+        }
+    }
+    return 0i8;
+}
+
+/// Sorts an address list in ascending byte-order using insertion sort.
+pub fn sort_ascending(list: Vec<Address>) -> Vec<Address> {
+    let mut sorted = list;
+    let len = sorted.len();
+
+    for i in 1u64..len {
+        let key = sorted[i];
+        let mut j = i;
+        while j > 0u64 && compare(sorted[j - 1u64], key) > 0i8 {
+            sorted[j] = sorted[j - 1u64];
+            j = j - 1u64;
+        }
+        sorted[j] = key;
+    }
+
+    return sorted;
+}
+
+// --- Tests ---
+
+#[test]
+fn test_is_zero() {
+    require!(is_zero(Address::ZERO), ZeroAddress {});
+}
+
+#[test]
+fn test_add_and_remove() {
+    let mut list: Vec<Address> = Vec::new();
+    let addr = Address::from(0x1234u256);
+
+    list = add_unique(addr, list, 10u64);
+    require!(list.len() == 1u64, ZeroAddress {});
+    require!(is_in_list(addr, list), ZeroAddress {});
+
+    list = remove_swap(addr, list);
+    require!(list.len() == 0u64, ZeroAddress {});
+}

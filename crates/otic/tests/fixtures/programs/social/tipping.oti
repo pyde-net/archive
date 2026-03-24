@@ -1,0 +1,253 @@
+// Content creator tipping platform with streaks, milestones, and leaderboard
+use std::math;
+use std::token::IERC20;
+
+contract TippingPlatform {
+    storage {
+        owner: Address,
+        platform_fee_bps: u16,
+        accumulated_fees: u256,
+        creators: Map<Address, CreatorProfile>,
+        tip_history: Map<Address, Map<u64, Tip>>,
+        tip_counts: Map<Address, u64>,
+        streak_data: Map<Address, Map<Address, StreakInfo>>,
+        milestones: [u256; 5],
+        total_tipped: u256,
+        min_tip: u256,
+        paused: bool,
+    }
+
+    struct CreatorProfile {
+        registered: bool,
+        display_name: String,
+        total_received: u256,
+        unique_tippers: u32,
+        highest_single_tip: u256,
+    }
+
+    struct Tip {
+        from: Address,
+        amount: u256,
+        message_hash: u256,
+        timestamp: u64,
+        token: Address,
+    }
+
+    struct StreakInfo {
+        current_streak: u32,
+        longest_streak: u32,
+        last_tip_day: u64,
+        total_tips: u256,
+    }
+
+    event TipSent {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        amount: u256,
+        token: Address,
+    }
+
+    event CreatorRegistered {
+        #[indexed]
+        creator: Address,
+        display_name: String,
+    }
+
+    event MilestoneReached {
+        #[indexed]
+        creator: Address,
+        milestone_index: u8,
+        total_received: u256,
+    }
+
+    event StreakUpdated {
+        #[indexed]
+        tipper: Address,
+        #[indexed]
+        creator: Address,
+        streak: u32,
+    }
+
+    event FeesWithdrawn {
+        amount: u256,
+    }
+
+    error NotRegistered {}
+    error AlreadyRegistered {}
+    error TipTooSmall { min: u256, sent: u256 }
+    error ContractPaused {}
+    error NotOwner {}
+    error ZeroAddress {}
+    error InsufficientTokenBalance {}
+
+    const BPS_DENOMINATOR: u256 = 10000;
+    const SECONDS_PER_DAY: u64 = 86400;
+
+    #[constructor]
+    pub fn init(platform_fee_bps: u16, min_tip: u256) {
+        self.owner = msg.sender;
+        self.platform_fee_bps = platform_fee_bps;
+        self.min_tip = min_tip;
+        self.paused = false;
+        self.total_tipped = 0;
+
+        // Set milestone thresholds
+        self.milestones[0] = 1000;
+        self.milestones[1] = 10000;
+        self.milestones[2] = 100000;
+        self.milestones[3] = 1000000;
+        self.milestones[4] = 10000000;
+    }
+
+    pub fn register_creator(display_name: String) {
+        require!(!self.creators[msg.sender].registered, AlreadyRegistered {});
+
+        self.creators[msg.sender] = CreatorProfile {
+            registered: true,
+            display_name: display_name,
+            total_received: 0,
+            unique_tippers: 0,
+            highest_single_tip: 0,
+        };
+
+        emit CreatorRegistered { creator: msg.sender, display_name: display_name };
+    }
+
+    fn calculate_fee(amount: u256) -> u256 {
+        return (amount * self.platform_fee_bps as u256) / BPS_DENOMINATOR;
+    }
+
+    fn update_streak(tipper: Address, creator: Address) {
+        let current_day = block.timestamp / SECONDS_PER_DAY;
+        let mut streak = self.streak_data[tipper][creator];
+        let last_day = streak.last_tip_day;
+
+        if current_day == last_day + 1 {
+            streak.current_streak += 1;
+        } else if current_day > last_day + 1 {
+            streak.current_streak = 1;
+        }
+        // Same day: streak stays the same
+
+        if streak.current_streak > streak.longest_streak {
+            streak.longest_streak = streak.current_streak;
+        }
+        streak.last_tip_day = current_day;
+
+        self.streak_data[tipper][creator] = streak;
+        emit StreakUpdated { tipper: tipper, creator: creator, streak: streak.current_streak };
+    }
+
+    fn check_milestones(creator: Address) {
+        let total = self.creators[creator].total_received;
+        let mut i: u8 = 0;
+        while i < 5 {
+            let threshold = self.milestones[i as u32];
+            if total >= threshold && (total - self.creators[creator].highest_single_tip) < threshold {
+                emit MilestoneReached {
+                    creator: creator,
+                    milestone_index: i,
+                    total_received: total,
+                };
+            }
+            i += 1;
+        }
+    }
+
+    #[reentrant]
+    pub fn tip_native(creator: Address, message_hash: u256) {
+        require!(!self.paused, ContractPaused {});
+        require!(self.creators[creator].registered, NotRegistered {});
+        require!(msg.value >= self.min_tip, TipTooSmall { min: self.min_tip, sent: msg.value });
+
+        let fee = self.calculate_fee(msg.value);
+        let net_amount = msg.value - fee;
+        self.accumulated_fees += fee;
+
+        // Record tip
+        let count = self.tip_counts[creator];
+        self.tip_history[creator][count] = Tip {
+            from: msg.sender,
+            amount: net_amount,
+            message_hash: message_hash,
+            timestamp: block.timestamp,
+            token: Address::ZERO,
+        };
+        self.tip_counts[creator] = count + 1;
+
+        // Update creator stats
+        self.creators[creator].total_received += net_amount;
+        if net_amount > self.creators[creator].highest_single_tip {
+            self.creators[creator].highest_single_tip = net_amount;
+        }
+
+        // Update streak
+        self.streak_data[msg.sender][creator].total_tips += net_amount;
+        self.update_streak(msg.sender, creator);
+
+        self.total_tipped += net_amount;
+        self.check_milestones(creator);
+
+        // Transfer to creator
+        raw_call!(creator, net_amount, bytes(""));
+
+        emit TipSent { from: msg.sender, to: creator, amount: net_amount, token: Address::ZERO };
+    }
+
+    pub fn tip_token(creator: Address, token: Address, amount: u256, message_hash: u256) {
+        require!(!self.paused, ContractPaused {});
+        require!(self.creators[creator].registered, NotRegistered {});
+        require!(amount >= self.min_tip, TipTooSmall { min: self.min_tip, sent: amount });
+
+        let fee = self.calculate_fee(amount);
+        let net_amount = amount - fee;
+
+        // Pull tokens from sender
+        IERC20::at(token).transfer_from(msg.sender, address(self), amount);
+        // Send net to creator
+        IERC20::at(token).transfer(creator, net_amount);
+
+        let count = self.tip_counts[creator];
+        self.tip_history[creator][count] = Tip {
+            from: msg.sender,
+            amount: net_amount,
+            message_hash: message_hash,
+            timestamp: block.timestamp,
+            token: token,
+        };
+        self.tip_counts[creator] = count + 1;
+        self.creators[creator].total_received += net_amount;
+
+        emit TipSent { from: msg.sender, to: creator, amount: net_amount, token: token };
+    }
+
+    pub fn withdraw_fees() {
+        require!(msg.sender == self.owner, NotOwner {});
+        let amount = self.accumulated_fees;
+        self.accumulated_fees = 0;
+        raw_call!(self.owner, amount, bytes(""));
+        emit FeesWithdrawn { amount: amount };
+    }
+
+    pub fn set_paused(state: bool) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.paused = state;
+    }
+
+    #[view]
+    pub fn get_creator(creator: Address) -> CreatorProfile {
+        return self.creators[creator];
+    }
+
+    #[view]
+    pub fn get_streak(tipper: Address, creator: Address) -> StreakInfo {
+        return self.streak_data[tipper][creator];
+    }
+
+    #[view]
+    pub fn get_total_tipped() -> u256 {
+        return self.total_tipped;
+    }
+}

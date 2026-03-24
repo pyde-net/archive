@@ -1,0 +1,283 @@
+// Product certification and standards compliance registry
+
+contract CertificationRegistry {
+    storage {
+        admin: Address,
+        next_cert_id: u64,
+        certifiers: Map<Address, Certifier>,
+        certificates: Map<u64, Certificate>,
+        product_certs: Map<u256, Vec<u64>>,
+        cert_revocations: Map<u64, Revocation>,
+        standards: Map<u32, Standard>,
+        standard_count: u32,
+        audit_logs: Map<u64, Map<u32, AuditEntry>>,
+        audit_counts: Map<u64, u32>,
+        certifier_count: u32,
+    }
+
+    struct Certifier {
+        name_hash: u256,
+        accredited: bool,
+        accredited_at: u64,
+        accreditation_expires: u64,
+        certs_issued: u64,
+        jurisdiction: u32,
+    }
+
+    struct Certificate {
+        certifier: Address,
+        product_hash: u256,
+        standard_id: u32,
+        issued_at: u64,
+        expires_at: u64,
+        evidence_hash: u256,
+        grade: u8,
+        active: bool,
+    }
+
+    struct Revocation {
+        revoked: bool,
+        revoked_at: u64,
+        reason_hash: u256,
+        revoked_by: Address,
+    }
+
+    struct Standard {
+        name_hash: u256,
+        version: u16,
+        category: u8,
+        min_grade: u8,
+        active: bool,
+    }
+
+    struct AuditEntry {
+        auditor: Address,
+        timestamp: u64,
+        result_hash: u256,
+        passed: bool,
+    }
+
+    event CertificateIssued {
+        #[indexed]
+        cert_id: u64,
+        #[indexed]
+        certifier: Address,
+        product_hash: u256,
+        standard_id: u32,
+    }
+
+    event CertificateRevoked {
+        #[indexed]
+        cert_id: u64,
+        reason_hash: u256,
+    }
+
+    event CertifierAccredited {
+        #[indexed]
+        certifier: Address,
+        expires_at: u64,
+    }
+
+    event StandardCreated {
+        standard_id: u32,
+        name_hash: u256,
+    }
+
+    event AuditCompleted {
+        #[indexed]
+        cert_id: u64,
+        passed: bool,
+    }
+
+    error NotAdmin {}
+    error NotAccredited {}
+    error AccreditationExpired {}
+    error CertNotFound { cert_id: u64 }
+    error CertAlreadyRevoked {}
+    error StandardNotFound { id: u32 }
+    error GradeBelowMinimum { grade: u8, min: u8 }
+    error CertExpired {}
+
+    const SECONDS_PER_DAY: u64 = 86400;
+
+    #[constructor]
+    pub fn init() {
+        self.admin = msg.sender;
+        self.next_cert_id = 1;
+        self.standard_count = 0;
+        self.certifier_count = 0;
+    }
+
+    fn require_admin() {
+        require!(msg.sender == self.admin, NotAdmin {});
+    }
+
+    fn require_accredited(addr: Address) {
+        require!(self.certifiers[addr].accredited, NotAccredited {});
+        require!(
+            self.certifiers[addr].accreditation_expires > block.timestamp,
+            AccreditationExpired {}
+        );
+    }
+
+    pub fn accredit_certifier(
+        certifier: Address,
+        name_hash: u256,
+        jurisdiction: u32,
+        validity_days: u64,
+    ) {
+        self.require_admin();
+        let expires = block.timestamp + (validity_days * 86400);
+
+        self.certifiers[certifier] = Certifier {
+            name_hash: name_hash,
+            accredited: true,
+            accredited_at: block.timestamp,
+            accreditation_expires: expires,
+            certs_issued: 0,
+            jurisdiction: jurisdiction,
+        };
+        self.certifier_count += 1;
+
+        emit CertifierAccredited { certifier: certifier, expires_at: expires };
+    }
+
+    pub fn create_standard(name_hash: u256, version: u16, category: u8, min_grade: u8) -> u32 {
+        self.require_admin();
+        let id = self.standard_count;
+        self.standard_count = id + 1;
+
+        self.standards[id] = Standard {
+            name_hash: name_hash,
+            version: version,
+            category: category,
+            min_grade: min_grade,
+            active: true,
+        };
+
+        emit StandardCreated { standard_id: id, name_hash: name_hash };
+        return id;
+    }
+
+    pub fn issue_certificate(
+        product_hash: u256,
+        standard_id: u32,
+        evidence_hash: u256,
+        grade: u8,
+        validity_days: u64,
+    ) -> u64 {
+        self.require_accredited(msg.sender);
+        require!(standard_id < self.standard_count, StandardNotFound { id: standard_id });
+
+        let standard = self.standards[standard_id];
+        require!(standard.active, StandardNotFound { id: standard_id });
+        require!(grade >= standard.min_grade, GradeBelowMinimum {
+            grade: grade,
+            min: standard.min_grade,
+        });
+
+        let cert_id = self.next_cert_id;
+        self.next_cert_id += 1;
+        let expires_at = block.timestamp + (validity_days * 86400);
+
+        self.certificates[cert_id] = Certificate {
+            certifier: msg.sender,
+            product_hash: product_hash,
+            standard_id: standard_id,
+            issued_at: block.timestamp,
+            expires_at: expires_at,
+            evidence_hash: evidence_hash,
+            grade: grade,
+            active: true,
+        };
+
+        self.product_certs[product_hash].push(cert_id);
+        self.certifiers[msg.sender].certs_issued += 1;
+
+        emit CertificateIssued {
+            cert_id: cert_id,
+            certifier: msg.sender,
+            product_hash: product_hash,
+            standard_id: standard_id,
+        };
+        return cert_id;
+    }
+
+    pub fn revoke_certificate(cert_id: u64, reason_hash: u256) {
+        require!(cert_id < self.next_cert_id, CertNotFound { cert_id: cert_id });
+        let cert = self.certificates[cert_id];
+        require!(
+            msg.sender == cert.certifier || msg.sender == self.admin,
+            NotAdmin {}
+        );
+        require!(!self.cert_revocations[cert_id].revoked, CertAlreadyRevoked {});
+
+        self.cert_revocations[cert_id] = Revocation {
+            revoked: true,
+            revoked_at: block.timestamp,
+            reason_hash: reason_hash,
+            revoked_by: msg.sender,
+        };
+        self.certificates[cert_id].active = false;
+
+        emit CertificateRevoked { cert_id: cert_id, reason_hash: reason_hash };
+    }
+
+    pub fn record_audit(cert_id: u64, result_hash: u256, passed: bool) {
+        self.require_accredited(msg.sender);
+        require!(cert_id < self.next_cert_id, CertNotFound { cert_id: cert_id });
+
+        let idx = self.audit_counts[cert_id];
+        self.audit_logs[cert_id][idx] = AuditEntry {
+            auditor: msg.sender,
+            timestamp: block.timestamp,
+            result_hash: result_hash,
+            passed: passed,
+        };
+        self.audit_counts[cert_id] = idx + 1;
+
+        if !passed {
+            self.certificates[cert_id].active = false;
+        }
+
+        emit AuditCompleted { cert_id: cert_id, passed: passed };
+    }
+
+    #[view]
+    pub fn verify_certificate(cert_id: u64) -> bool {
+        if cert_id >= self.next_cert_id {
+            return false;
+        }
+        let cert = self.certificates[cert_id];
+        if !cert.active {
+            return false;
+        }
+        if cert.expires_at < block.timestamp {
+            return false;
+        }
+        if self.cert_revocations[cert_id].revoked {
+            return false;
+        }
+        return true;
+    }
+
+    #[view]
+    pub fn get_certificate(cert_id: u64) -> Certificate {
+        return self.certificates[cert_id];
+    }
+
+    #[view]
+    pub fn get_certifier(addr: Address) -> Certifier {
+        return self.certifiers[addr];
+    }
+
+    #[view]
+    pub fn get_standard(id: u32) -> Standard {
+        return self.standards[id];
+    }
+
+    #[view]
+    pub fn get_audit_count(cert_id: u64) -> u32 {
+        return self.audit_counts[cert_id];
+    }
+}

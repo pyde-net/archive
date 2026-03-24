@@ -1,0 +1,402 @@
+// Lending pool with variable interest rates and liquidation
+use std::math;
+use std::token::IERC20;
+
+contract LendingPool {
+    storage {
+        owner: Address,
+        // Supported assets
+        supported_assets: Map<Address, bool>,
+        asset_list: Vec<Address>,
+
+        // Per-asset configuration
+        collateral_factor: Map<Address, u256>,  // e.g. 750000 = 75% (scaled by 1e6)
+        liquidation_bonus: Map<Address, u256>,   // e.g. 50000 = 5%
+        borrow_rate_base: Map<Address, u256>,    // base rate per second (scaled 1e18)
+        borrow_rate_slope: Map<Address, u256>,   // slope for utilization curve
+        reserve_factor: Map<Address, u256>,      // protocol take on interest (scaled 1e6)
+
+        // Pool state per asset
+        total_deposits: Map<Address, u256>,
+        total_borrows: Map<Address, u256>,
+        total_reserves: Map<Address, u256>,
+        borrow_index: Map<Address, u256>,
+        last_update_timestamp: Map<Address, u64>,
+
+        // User positions
+        deposits: Map<Address, Map<Address, u256>>,      // user -> asset -> amount
+        borrow_balance: Map<Address, Map<Address, u256>>, // user -> asset -> principal
+        borrow_index_at: Map<Address, Map<Address, u256>>, // user -> asset -> index at borrow time
+
+        // Oracle
+        price_oracle: Address,
+
+        // Constants
+        scale: u256,
+        percent_scale: u256,
+    }
+
+    struct AccountHealth {
+        total_collateral_value: u256,
+        total_borrow_value: u256,
+        health_factor: u256,
+    }
+
+    event Deposit {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        asset: Address,
+        amount: u256,
+    }
+
+    event Withdraw {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        asset: Address,
+        amount: u256,
+    }
+
+    event Borrow {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        asset: Address,
+        amount: u256,
+    }
+
+    event Repay {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        asset: Address,
+        amount: u256,
+    }
+
+    event Liquidation {
+        #[indexed]
+        liquidator: Address,
+        #[indexed]
+        borrower: Address,
+        #[indexed]
+        collateral_asset: Address,
+        debt_asset: Address,
+        debt_repaid: u256,
+        collateral_seized: u256,
+    }
+
+    event AssetAdded {
+        #[indexed]
+        asset: Address,
+        collateral_factor: u256,
+    }
+
+    event InterestAccrued {
+        #[indexed]
+        asset: Address,
+        interest: u256,
+        new_index: u256,
+    }
+
+    error AssetNotSupported { asset: Address }
+    error InsufficientDeposit { available: u256, requested: u256 }
+    error InsufficientCollateral { health_factor: u256 }
+    error PositionHealthy { health_factor: u256 }
+    error InsufficientPoolLiquidity { available: u256, requested: u256 }
+    error NotOwner {}
+    error ZeroAmount {}
+    error RepayExceedsDebt { debt: u256, repay: u256 }
+
+    #[constructor]
+    pub fn init(price_oracle: Address) {
+        self.owner = msg.sender;
+        self.price_oracle = price_oracle;
+        self.scale = 1000000000000000000u256; // 1e18
+        self.percent_scale = 1000000u256;     // 1e6
+    }
+
+    // --- Admin ---
+
+    pub fn add_asset(
+        asset: Address,
+        collateral_factor: u256,
+        liquidation_bonus: u256,
+        base_rate: u256,
+        slope: u256,
+        reserve_factor: u256,
+    ) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.supported_assets[asset] = true;
+        self.asset_list.push(asset);
+        self.collateral_factor[asset] = collateral_factor;
+        self.liquidation_bonus[asset] = liquidation_bonus;
+        self.borrow_rate_base[asset] = base_rate;
+        self.borrow_rate_slope[asset] = slope;
+        self.reserve_factor[asset] = reserve_factor;
+        self.borrow_index[asset] = self.scale;
+        self.last_update_timestamp[asset] = block.timestamp;
+
+        emit AssetAdded { asset: asset, collateral_factor: collateral_factor };
+    }
+
+    // --- Interest accrual ---
+
+    fn accrue_interest(asset: Address) {
+        let time_delta = block.timestamp - self.last_update_timestamp[asset];
+        if time_delta == 0u64 {
+            return;
+        }
+
+        let total_borrows = self.total_borrows[asset];
+        if total_borrows == 0u256 {
+            self.last_update_timestamp[asset] = block.timestamp;
+            return;
+        }
+
+        // Calculate utilization rate
+        let total_deposits = self.total_deposits[asset];
+        let utilization = (total_borrows * self.scale) / total_deposits;
+
+        // Variable rate = base + slope * utilization
+        let borrow_rate = self.borrow_rate_base[asset]
+            + (self.borrow_rate_slope[asset] * utilization) / self.scale;
+
+        // Interest = borrows * rate * time
+        let interest = (total_borrows * borrow_rate * (time_delta as u256)) / self.scale;
+
+        // Update protocol reserves
+        let reserve_share = (interest * self.reserve_factor[asset]) / self.percent_scale;
+        self.total_reserves[asset] = self.total_reserves[asset] + reserve_share;
+
+        // Update borrow index
+        let index_delta = (interest * self.scale) / total_borrows;
+        self.borrow_index[asset] = self.borrow_index[asset] + index_delta;
+        self.total_borrows[asset] = total_borrows + interest;
+        self.total_deposits[asset] = total_deposits + interest - reserve_share;
+        self.last_update_timestamp[asset] = block.timestamp;
+
+        emit InterestAccrued {
+            asset: asset,
+            interest: interest,
+            new_index: self.borrow_index[asset],
+        };
+    }
+
+    fn get_current_borrow(user: Address, asset: Address) -> u256 {
+        let principal = self.borrow_balance[user][asset];
+        if principal == 0u256 {
+            return 0u256;
+        }
+        let index_at_borrow = self.borrow_index_at[user][asset];
+        let current_index = self.borrow_index[asset];
+        return (principal * current_index) / index_at_borrow;
+    }
+
+    fn get_asset_price(asset: Address) -> u256 {
+        // Call oracle for price (scaled to 1e18)
+        return raw_call!(self.price_oracle, "getPrice(address)", asset);
+    }
+
+    fn compute_account_health(user: Address) -> AccountHealth {
+        let mut total_collateral: u256 = 0u256;
+        let mut total_borrow: u256 = 0u256;
+
+        let num_assets = self.asset_list.len();
+        for i in 0..num_assets {
+            let asset = self.asset_list[i];
+            let price = self.get_asset_price(asset);
+
+            // Collateral value (weighted by factor)
+            let deposit = self.deposits[user][asset];
+            if deposit > 0u256 {
+                let value = (deposit * price) / self.scale;
+                let weighted = (value * self.collateral_factor[asset]) / self.percent_scale;
+                total_collateral = total_collateral + weighted;
+            }
+
+            // Borrow value
+            let borrow = self.get_current_borrow(user, asset);
+            if borrow > 0u256 {
+                let value = (borrow * price) / self.scale;
+                total_borrow = total_borrow + value;
+            }
+        }
+
+        let health = if total_borrow == 0u256 {
+            self.scale * 1000u256 // effectively infinite
+        } else {
+            (total_collateral * self.scale) / total_borrow
+        };
+
+        return AccountHealth {
+            total_collateral_value: total_collateral,
+            total_borrow_value: total_borrow,
+            health_factor: health,
+        };
+    }
+
+    // --- Core operations ---
+
+    pub fn deposit(asset: Address, amount: u256) {
+        require!(amount > 0u256, ZeroAmount {});
+        require!(self.supported_assets[asset], AssetNotSupported { asset: asset });
+        self.accrue_interest(asset);
+
+        IERC20::at(asset).transfer_from(msg.sender, address(self), amount);
+
+        self.deposits[msg.sender][asset] = self.deposits[msg.sender][asset] + amount;
+        self.total_deposits[asset] = self.total_deposits[asset] + amount;
+
+        emit Deposit { user: msg.sender, asset: asset, amount: amount };
+    }
+
+    pub fn withdraw(asset: Address, amount: u256) {
+        require!(amount > 0u256, ZeroAmount {});
+        self.accrue_interest(asset);
+
+        let deposited = self.deposits[msg.sender][asset];
+        require!(deposited >= amount, InsufficientDeposit {
+            available: deposited,
+            requested: amount,
+        });
+
+        // Tentatively reduce
+        self.deposits[msg.sender][asset] = deposited - amount;
+        self.total_deposits[asset] = self.total_deposits[asset] - amount;
+
+        // Check health after withdrawal
+        let health = self.compute_account_health(msg.sender);
+        require!(health.health_factor >= self.scale, InsufficientCollateral {
+            health_factor: health.health_factor,
+        });
+
+        IERC20::at(asset).transfer(msg.sender, amount);
+        emit Withdraw { user: msg.sender, asset: asset, amount: amount };
+    }
+
+    pub fn borrow(asset: Address, amount: u256) {
+        require!(amount > 0u256, ZeroAmount {});
+        require!(self.supported_assets[asset], AssetNotSupported { asset: asset });
+        self.accrue_interest(asset);
+
+        let available = self.total_deposits[asset] - self.total_borrows[asset];
+        require!(available >= amount, InsufficientPoolLiquidity {
+            available: available,
+            requested: amount,
+        });
+
+        // Update user borrow position
+        let existing_borrow = self.get_current_borrow(msg.sender, asset);
+        self.borrow_balance[msg.sender][asset] = existing_borrow + amount;
+        self.borrow_index_at[msg.sender][asset] = self.borrow_index[asset];
+        self.total_borrows[asset] = self.total_borrows[asset] + amount;
+
+        // Check health
+        let health = self.compute_account_health(msg.sender);
+        require!(health.health_factor >= self.scale, InsufficientCollateral {
+            health_factor: health.health_factor,
+        });
+
+        IERC20::at(asset).transfer(msg.sender, amount);
+        emit Borrow { user: msg.sender, asset: asset, amount: amount };
+    }
+
+    pub fn repay(asset: Address, amount: u256) {
+        require!(amount > 0u256, ZeroAmount {});
+        self.accrue_interest(asset);
+
+        let current_debt = self.get_current_borrow(msg.sender, asset);
+        let repay_amount = if amount > current_debt { current_debt } else { amount };
+
+        IERC20::at(asset).transfer_from(msg.sender, address(self), repay_amount);
+
+        self.borrow_balance[msg.sender][asset] = current_debt - repay_amount;
+        self.borrow_index_at[msg.sender][asset] = self.borrow_index[asset];
+        self.total_borrows[asset] = self.total_borrows[asset] - repay_amount;
+
+        emit Repay { user: msg.sender, asset: asset, amount: repay_amount };
+    }
+
+    pub fn liquidate(borrower: Address, debt_asset: Address, collateral_asset: Address, repay_amount: u256) {
+        require!(repay_amount > 0u256, ZeroAmount {});
+        self.accrue_interest(debt_asset);
+        self.accrue_interest(collateral_asset);
+
+        // Verify borrower is underwater
+        let health = self.compute_account_health(borrower);
+        require!(health.health_factor < self.scale, PositionHealthy {
+            health_factor: health.health_factor,
+        });
+
+        // Repay debt
+        let current_debt = self.get_current_borrow(borrower, debt_asset);
+        let actual_repay = if repay_amount > current_debt { current_debt } else { repay_amount };
+
+        IERC20::at(debt_asset).transfer_from(msg.sender, address(self), actual_repay);
+
+        self.borrow_balance[borrower][debt_asset] = current_debt - actual_repay;
+        self.borrow_index_at[borrower][debt_asset] = self.borrow_index[debt_asset];
+        self.total_borrows[debt_asset] = self.total_borrows[debt_asset] - actual_repay;
+
+        // Seize collateral with bonus
+        let debt_price = self.get_asset_price(debt_asset);
+        let collateral_price = self.get_asset_price(collateral_asset);
+        let debt_value = (actual_repay * debt_price) / self.scale;
+        let bonus = self.liquidation_bonus[collateral_asset];
+        let seize_value = (debt_value * (self.percent_scale + bonus)) / self.percent_scale;
+        let seize_amount = (seize_value * self.scale) / collateral_price;
+
+        self.deposits[borrower][collateral_asset] = self.deposits[borrower][collateral_asset] - seize_amount;
+        self.total_deposits[collateral_asset] = self.total_deposits[collateral_asset] - seize_amount;
+
+        IERC20::at(collateral_asset).transfer(msg.sender, seize_amount);
+
+        emit Liquidation {
+            liquidator: msg.sender,
+            borrower: borrower,
+            collateral_asset: collateral_asset,
+            debt_asset: debt_asset,
+            debt_repaid: actual_repay,
+            collateral_seized: seize_amount,
+        };
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn get_user_deposit(user: Address, asset: Address) -> u256 {
+        return self.deposits[user][asset];
+    }
+
+    #[view]
+    pub fn get_user_borrow(user: Address, asset: Address) -> u256 {
+        return self.get_current_borrow(user, asset);
+    }
+
+    #[view]
+    pub fn get_health_factor(user: Address) -> u256 {
+        let health = self.compute_account_health(user);
+        return health.health_factor;
+    }
+
+    #[view]
+    pub fn get_utilization_rate(asset: Address) -> u256 {
+        let borrows = self.total_borrows[asset];
+        let deposits = self.total_deposits[asset];
+        if deposits == 0u256 {
+            return 0u256;
+        }
+        return (borrows * self.scale) / deposits;
+    }
+
+    #[view]
+    pub fn get_total_deposits(asset: Address) -> u256 {
+        return self.total_deposits[asset];
+    }
+
+    #[view]
+    pub fn get_total_borrows(asset: Address) -> u256 {
+        return self.total_borrows[asset];
+    }
+}

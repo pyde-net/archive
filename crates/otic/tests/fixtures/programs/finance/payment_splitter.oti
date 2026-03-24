@@ -1,0 +1,238 @@
+// Payment splitter that distributes incoming funds among N payees
+// proportional to their assigned shares.
+
+contract PaymentSplitter {
+    storage {
+        owner: Address,
+        payees: Vec<Address>,
+        shares: Map<Address, u256>,
+        total_shares: u256,
+        total_released: u256,
+        released: Map<Address, u256>,
+        pending_additions: Map<u64, PayeeProposal>,
+        next_proposal_id: u64,
+        locked: bool,
+    }
+
+    struct PayeeProposal {
+        payee: Address,
+        share_amount: u256,
+        proposed_at: u64,
+        approved: bool,
+    }
+
+    event PayeeAdded {
+        #[indexed]
+        payee: Address,
+        shares: u256,
+    }
+
+    event PayeeRemoved {
+        #[indexed]
+        payee: Address,
+    }
+
+    event PaymentReceived {
+        #[indexed]
+        from: Address,
+        amount: u256,
+    }
+
+    event PaymentReleased {
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    event SharesUpdated {
+        #[indexed]
+        payee: Address,
+        old_shares: u256,
+        new_shares: u256,
+    }
+
+    error Unauthorized {}
+    error NoPayees {}
+    error PayeeAlreadyExists { payee: Address }
+    error PayeeNotFound { payee: Address }
+    error ZeroShares {}
+    error ZeroAddress {}
+    error NothingToPay {}
+    error TransferFailed {}
+    error NotOwner {}
+    error Reentrancy {}
+    error SharesMismatch { payees_count: u64, shares_count: u64 }
+
+    #[constructor]
+    pub fn init(initial_payees: Vec<Address>, initial_shares: Vec<u256>) {
+        require!(initial_payees.len() > 0, NoPayees {});
+        require!(
+            initial_payees.len() == initial_shares.len(),
+            SharesMismatch {
+                payees_count: initial_payees.len() as u64,
+                shares_count: initial_shares.len() as u64,
+            },
+        );
+
+        self.owner = msg.sender;
+        self.locked = false;
+        self.next_proposal_id = 1;
+
+        let mut total: u256 = 0;
+        for i in 0..initial_payees.len() {
+            let payee = initial_payees[i];
+            let share = initial_shares[i];
+
+            require!(payee != Address::ZERO, ZeroAddress {});
+            require!(share > 0, ZeroShares {});
+            require!(self.shares[payee] == 0, PayeeAlreadyExists { payee: payee });
+
+            self.payees.push(payee);
+            self.shares[payee] = share;
+            total = total + share;
+
+            emit PayeeAdded { payee: payee, shares: share };
+        }
+
+        self.total_shares = total;
+    }
+
+    // Accept payments
+    #[reentrant]
+    pub fn deposit() {
+        require!(msg.value > 0, NothingToPay {});
+        emit PaymentReceived { from: msg.sender, amount: msg.value };
+    }
+
+    // Release owed payment to a specific payee
+    pub fn release(payee: Address) {
+        require!(!self.locked, Reentrancy {});
+        self.locked = true;
+
+        require!(self.shares[payee] > 0, PayeeNotFound { payee: payee });
+
+        let total_received = address(self).balance + self.total_released;
+        let payment = (total_received * self.shares[payee]) / self.total_shares - self.released[payee];
+
+        require!(payment > 0, NothingToPay {});
+
+        self.released[payee] = self.released[payee] + payment;
+        self.total_released = self.total_released + payment;
+
+        raw_call!(payee, payment, bytes::empty());
+
+        emit PaymentReleased { to: payee, amount: payment };
+
+        self.locked = false;
+    }
+
+    // Release to all payees in one transaction
+    pub fn release_all() {
+        require!(!self.locked, Reentrancy {});
+        self.locked = true;
+
+        let total_received = address(self).balance + self.total_released;
+
+        for i in 0..self.payees.len() {
+            let payee = self.payees[i];
+            let payment = (total_received * self.shares[payee]) / self.total_shares - self.released[payee];
+
+            if payment > 0 {
+                self.released[payee] = self.released[payee] + payment;
+                self.total_released = self.total_released + payment;
+                raw_call!(payee, payment, bytes::empty());
+                emit PaymentReleased { to: payee, amount: payment };
+            }
+        }
+
+        self.locked = false;
+    }
+
+    pub fn add_payee(payee: Address, share_amount: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(payee != Address::ZERO, ZeroAddress {});
+        require!(share_amount > 0, ZeroShares {});
+        require!(self.shares[payee] == 0, PayeeAlreadyExists { payee: payee });
+
+        self.payees.push(payee);
+        self.shares[payee] = share_amount;
+        self.total_shares = self.total_shares + share_amount;
+
+        emit PayeeAdded { payee: payee, shares: share_amount };
+    }
+
+    pub fn update_shares(payee: Address, new_shares: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(new_shares > 0, ZeroShares {});
+        let old_shares = self.shares[payee];
+        require!(old_shares > 0, PayeeNotFound { payee: payee });
+
+        self.shares[payee] = new_shares;
+        self.total_shares = self.total_shares - old_shares + new_shares;
+
+        emit SharesUpdated {
+            payee: payee,
+            old_shares: old_shares,
+            new_shares: new_shares,
+        };
+    }
+
+    pub fn remove_payee(payee: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(self.shares[payee] > 0, PayeeNotFound { payee: payee });
+
+        // Release any pending payments first
+        let total_received = address(self).balance + self.total_released;
+        let final_payment = (total_received * self.shares[payee]) / self.total_shares - self.released[payee];
+        if final_payment > 0 {
+            self.released[payee] = self.released[payee] + final_payment;
+            self.total_released = self.total_released + final_payment;
+            raw_call!(payee, final_payment, bytes::empty());
+            emit PaymentReleased { to: payee, amount: final_payment };
+        }
+
+        self.total_shares = self.total_shares - self.shares[payee];
+        self.shares[payee] = 0;
+
+        // Remove from payees array
+        let mut new_payees: Vec<Address> = Vec::new();
+        for i in 0..self.payees.len() {
+            if self.payees[i] != payee {
+                new_payees.push(self.payees[i]);
+            }
+        }
+        self.payees = new_payees;
+
+        emit PayeeRemoved { payee: payee };
+    }
+
+    #[view]
+    pub fn pending_payment(payee: Address) -> u256 {
+        if self.shares[payee] == 0 {
+            return 0;
+        }
+        let total_received = address(self).balance + self.total_released;
+        let owed = (total_received * self.shares[payee]) / self.total_shares - self.released[payee];
+        return owed;
+    }
+
+    #[view]
+    pub fn get_payees() -> Vec<Address> {
+        return self.payees;
+    }
+
+    #[view]
+    pub fn get_shares(payee: Address) -> u256 {
+        return self.shares[payee];
+    }
+
+    #[view]
+    pub fn get_total_shares() -> u256 {
+        return self.total_shares;
+    }
+
+    #[view]
+    pub fn get_released(payee: Address) -> u256 {
+        return self.released[payee];
+    }
+}

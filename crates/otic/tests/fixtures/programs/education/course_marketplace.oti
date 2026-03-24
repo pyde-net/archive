@@ -1,0 +1,324 @@
+// Decentralized course marketplace with instructor ratings, enrollment, and completion NFTs
+use std::math;
+use std::token::IERC20;
+
+contract CourseMarketplace {
+    storage {
+        owner: Address,
+        next_course_id: u32,
+        courses: Map<u32, Course>,
+        enrollments: Map<u32, Map<Address, Enrollment>>,
+        enrolled_students: Map<u32, Vec<Address>>,
+        instructor_profiles: Map<Address, InstructorProfile>,
+        course_reviews: Map<u32, Map<Address, Review>>,
+        review_counts: Map<u32, u32>,
+        rating_sums: Map<u32, u64>,
+        completion_nonce: u64,
+        platform_fee_bps: u16,
+        platform_earnings: u256,
+        categories: Map<u8, u32>,
+        refund_window_days: u64,
+    }
+
+    struct Course {
+        instructor: Address,
+        title_hash: u256,
+        description_hash: u256,
+        content_hash: u256,
+        price: u256,
+        category: u8,
+        difficulty: u8,
+        duration_hours: u16,
+        max_students: u32,
+        enrolled_count: u32,
+        completed_count: u32,
+        active: bool,
+        created_at: u64,
+        updated_at: u64,
+    }
+
+    struct Enrollment {
+        enrolled: bool,
+        enrolled_at: u64,
+        completed: bool,
+        completed_at: u64,
+        progress_pct: u8,
+        paid: u256,
+        refunded: bool,
+    }
+
+    struct InstructorProfile {
+        registered: bool,
+        bio_hash: u256,
+        course_count: u32,
+        total_students: u64,
+        total_earnings: u256,
+        avg_rating_x10: u16,
+    }
+
+    struct Review {
+        rating: u8,
+        comment_hash: u256,
+        timestamp: u64,
+        helpful_votes: u32,
+    }
+
+    event CourseCreated {
+        #[indexed]
+        course_id: u32,
+        #[indexed]
+        instructor: Address,
+        price: u256,
+    }
+
+    event StudentEnrolled {
+        #[indexed]
+        course_id: u32,
+        #[indexed]
+        student: Address,
+    }
+
+    event CourseCompleted {
+        #[indexed]
+        course_id: u32,
+        #[indexed]
+        student: Address,
+        completion_nonce: u64,
+    }
+
+    event ReviewSubmitted {
+        #[indexed]
+        course_id: u32,
+        #[indexed]
+        student: Address,
+        rating: u8,
+    }
+
+    event RefundIssued {
+        #[indexed]
+        course_id: u32,
+        #[indexed]
+        student: Address,
+        amount: u256,
+    }
+
+    error NotOwner {}
+    error NotInstructor {}
+    error CourseNotFound { id: u32 }
+    error CourseNotActive {}
+    error AlreadyEnrolled {}
+    error NotEnrolled {}
+    error CourseFull {}
+    error InsufficientPayment { required: u256, sent: u256 }
+    error AlreadyCompleted {}
+    error RefundWindowExpired {}
+    error AlreadyRefunded {}
+    error InvalidRating { min: u8, max: u8, given: u8 }
+    error NotCompleted {}
+    error InstructorNotRegistered {}
+
+    const BPS_DENOMINATOR: u256 = 10000;
+    const SECONDS_PER_DAY: u64 = 86400;
+    const MAX_RATING: u8 = 5;
+    const MIN_RATING: u8 = 1;
+    const MAX_PROGRESS: u8 = 100;
+
+    #[constructor]
+    pub fn init(platform_fee_bps: u16, refund_window_days: u64) {
+        self.owner = msg.sender;
+        self.next_course_id = 1;
+        self.platform_fee_bps = platform_fee_bps;
+        self.refund_window_days = refund_window_days;
+        self.completion_nonce = 1;
+        self.platform_earnings = 0;
+    }
+
+    pub fn register_instructor(bio_hash: u256) {
+        self.instructor_profiles[msg.sender] = InstructorProfile {
+            registered: true,
+            bio_hash: bio_hash,
+            course_count: 0,
+            total_students: 0,
+            total_earnings: 0,
+            avg_rating_x10: 0,
+        };
+    }
+
+    pub fn create_course(
+        title_hash: u256,
+        description_hash: u256,
+        content_hash: u256,
+        price: u256,
+        category: u8,
+        difficulty: u8,
+        duration_hours: u16,
+        max_students: u32,
+    ) -> u32 {
+        require!(self.instructor_profiles[msg.sender].registered, InstructorNotRegistered {});
+
+        let course_id = self.next_course_id;
+        self.next_course_id += 1;
+
+        self.courses[course_id] = Course {
+            instructor: msg.sender,
+            title_hash: title_hash,
+            description_hash: description_hash,
+            content_hash: content_hash,
+            price: price,
+            category: category,
+            difficulty: difficulty,
+            duration_hours: duration_hours,
+            max_students: max_students,
+            enrolled_count: 0,
+            completed_count: 0,
+            active: true,
+            created_at: block.timestamp,
+            updated_at: block.timestamp,
+        };
+
+        self.categories[category] += 1;
+        self.instructor_profiles[msg.sender].course_count += 1;
+
+        emit CourseCreated { course_id: course_id, instructor: msg.sender, price: price };
+        return course_id;
+    }
+
+    #[reentrant]
+    pub fn enroll(course_id: u32) {
+        let course = self.courses[course_id];
+        require!(course.active, CourseNotActive {});
+        require!(!self.enrollments[course_id][msg.sender].enrolled, AlreadyEnrolled {});
+        require!(course.enrolled_count < course.max_students, CourseFull {});
+        require!(msg.value >= course.price, InsufficientPayment {
+            required: course.price,
+            sent: msg.value,
+        });
+
+        self.enrollments[course_id][msg.sender] = Enrollment {
+            enrolled: true,
+            enrolled_at: block.timestamp,
+            completed: false,
+            completed_at: 0,
+            progress_pct: 0,
+            paid: msg.value,
+            refunded: false,
+        };
+
+        self.enrolled_students[course_id].push(msg.sender);
+        self.courses[course_id].enrolled_count += 1;
+        self.instructor_profiles[course.instructor].total_students += 1;
+
+        // Distribute payment
+        let platform_cut = (msg.value * self.platform_fee_bps as u256) / 10000;
+        let instructor_cut = msg.value - platform_cut;
+        self.platform_earnings += platform_cut;
+        self.instructor_profiles[course.instructor].total_earnings += instructor_cut;
+
+        raw_call!(course.instructor, instructor_cut, bytes(""));
+
+        emit StudentEnrolled { course_id: course_id, student: msg.sender };
+    }
+
+    pub fn update_progress(course_id: u32, student: Address, progress_pct: u8) {
+        let course = self.courses[course_id];
+        require!(course.instructor == msg.sender, NotInstructor {});
+        require!(self.enrollments[course_id][student].enrolled, NotEnrolled {});
+
+        let clamped = if progress_pct > 100 { 100u8 } else { progress_pct };
+        self.enrollments[course_id][student].progress_pct = clamped;
+    }
+
+    pub fn complete_course(course_id: u32, student: Address) {
+        let course = self.courses[course_id];
+        require!(course.instructor == msg.sender, NotInstructor {});
+        require!(self.enrollments[course_id][student].enrolled, NotEnrolled {});
+        require!(!self.enrollments[course_id][student].completed, AlreadyCompleted {});
+
+        self.enrollments[course_id][student].completed = true;
+        self.enrollments[course_id][student].completed_at = block.timestamp;
+        self.enrollments[course_id][student].progress_pct = 100;
+        self.courses[course_id].completed_count += 1;
+
+        let nonce = self.completion_nonce;
+        self.completion_nonce += 1;
+
+        emit CourseCompleted { course_id: course_id, student: student, completion_nonce: nonce };
+    }
+
+    pub fn submit_review(course_id: u32, rating: u8, comment_hash: u256) {
+        require!(rating >= 1 && rating <= 5, InvalidRating { min: 1, max: 5, given: rating });
+        require!(self.enrollments[course_id][msg.sender].completed, NotCompleted {});
+
+        let existing = self.course_reviews[course_id][msg.sender];
+        if existing.timestamp > 0 {
+            // Update existing review: adjust rating sum
+            self.rating_sums[course_id] = self.rating_sums[course_id] - existing.rating as u64 + rating as u64;
+        } else {
+            self.rating_sums[course_id] += rating as u64;
+            self.review_counts[course_id] += 1;
+        }
+
+        self.course_reviews[course_id][msg.sender] = Review {
+            rating: rating,
+            comment_hash: comment_hash,
+            timestamp: block.timestamp,
+            helpful_votes: 0,
+        };
+
+        // Update instructor average
+        let instructor = self.courses[course_id].instructor;
+        let count = self.review_counts[course_id];
+        if count > 0 {
+            let avg_x10 = (self.rating_sums[course_id] * 10) / count as u64;
+            self.instructor_profiles[instructor].avg_rating_x10 = avg_x10 as u16;
+        }
+
+        emit ReviewSubmitted { course_id: course_id, student: msg.sender, rating: rating };
+    }
+
+    #[reentrant]
+    pub fn request_refund(course_id: u32) {
+        let enrollment = self.enrollments[course_id][msg.sender];
+        require!(enrollment.enrolled, NotEnrolled {});
+        require!(!enrollment.refunded, AlreadyRefunded {});
+        require!(!enrollment.completed, AlreadyCompleted {});
+
+        let deadline = enrollment.enrolled_at + (self.refund_window_days * 86400);
+        require!(block.timestamp <= deadline, RefundWindowExpired {});
+
+        let refund_amount = enrollment.paid;
+        self.enrollments[course_id][msg.sender].refunded = true;
+        self.enrollments[course_id][msg.sender].enrolled = false;
+        self.courses[course_id].enrolled_count -= 1;
+
+        raw_call!(msg.sender, refund_amount, bytes(""));
+        emit RefundIssued { course_id: course_id, student: msg.sender, amount: refund_amount };
+    }
+
+    pub fn deactivate_course(course_id: u32) {
+        require!(self.courses[course_id].instructor == msg.sender, NotInstructor {});
+        self.courses[course_id].active = false;
+    }
+
+    #[view]
+    pub fn get_course(course_id: u32) -> Course {
+        return self.courses[course_id];
+    }
+
+    #[view]
+    pub fn get_enrollment(course_id: u32, student: Address) -> Enrollment {
+        return self.enrollments[course_id][student];
+    }
+
+    #[view]
+    pub fn get_average_rating(course_id: u32) -> u64 {
+        let count = self.review_counts[course_id];
+        if count == 0 { return 0; }
+        return self.rating_sums[course_id] / count as u64;
+    }
+
+    #[view]
+    pub fn get_instructor(addr: Address) -> InstructorProfile {
+        return self.instructor_profiles[addr];
+    }
+}

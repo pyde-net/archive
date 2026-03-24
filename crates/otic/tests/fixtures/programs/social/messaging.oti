@@ -1,0 +1,253 @@
+// End-to-end encrypted messaging with message threads and read receipts
+
+contract Messaging {
+    storage {
+        owner: Address,
+        next_thread_id: u64,
+        threads: Map<u64, Thread>,
+        thread_participants: Map<u64, Map<Address, bool>>,
+        thread_message_count: Map<u64, u64>,
+        messages: Map<u64, Map<u64, EncryptedMessage>>,
+        user_public_keys: Map<Address, u256>,
+        user_thread_ids: Map<Address, Vec<u64>>,
+        read_receipts: Map<u64, Map<Address, u64>>,
+        blocked: Map<Address, Map<Address, bool>>,
+        fee_per_message: u256,
+        treasury: u256,
+    }
+
+    struct Thread {
+        creator: Address,
+        created_at: u64,
+        participant_count: u32,
+        is_group: bool,
+        encrypted_name: u256,
+    }
+
+    struct EncryptedMessage {
+        sender: Address,
+        ciphertext_hash: u256,
+        nonce: u256,
+        timestamp: u64,
+        reply_to: u64,
+    }
+
+    event ThreadCreated {
+        #[indexed]
+        thread_id: u64,
+        #[indexed]
+        creator: Address,
+        is_group: bool,
+    }
+
+    event MessageSent {
+        #[indexed]
+        thread_id: u64,
+        #[indexed]
+        sender: Address,
+        message_index: u64,
+    }
+
+    event ParticipantAdded {
+        #[indexed]
+        thread_id: u64,
+        #[indexed]
+        participant: Address,
+    }
+
+    event ParticipantRemoved {
+        #[indexed]
+        thread_id: u64,
+        #[indexed]
+        participant: Address,
+    }
+
+    event ReadReceipt {
+        #[indexed]
+        thread_id: u64,
+        #[indexed]
+        reader: Address,
+        up_to_index: u64,
+    }
+
+    event KeyRegistered {
+        #[indexed]
+        user: Address,
+    }
+
+    error NotParticipant {}
+    error ThreadNotFound { thread_id: u64 }
+    error KeyNotRegistered { user: Address }
+    error UserBlocked {}
+    error AlreadyParticipant {}
+    error NotThreadCreator {}
+    error InsufficientFee { required: u256, sent: u256 }
+    error InvalidReplyIndex { max: u64, given: u64 }
+    error CannotBlockSelf {}
+
+    #[constructor]
+    pub fn init(fee_per_message: u256) {
+        self.owner = msg.sender;
+        self.next_thread_id = 1;
+        self.fee_per_message = fee_per_message;
+        self.treasury = 0;
+    }
+
+    pub fn register_public_key(public_key: u256) {
+        self.user_public_keys[msg.sender] = public_key;
+        emit KeyRegistered { user: msg.sender };
+    }
+
+    fn require_key_registered(user: Address) {
+        require!(self.user_public_keys[user] != 0, KeyNotRegistered { user: user });
+    }
+
+    fn require_participant(thread_id: u64) {
+        require!(self.thread_participants[thread_id][msg.sender], NotParticipant {});
+    }
+
+    pub fn create_direct_thread(other: Address) -> u64 {
+        self.require_key_registered(msg.sender);
+        self.require_key_registered(other);
+        require!(!self.blocked[other][msg.sender], UserBlocked {});
+
+        let thread_id = self.next_thread_id;
+        self.next_thread_id += 1;
+
+        let thread = Thread {
+            creator: msg.sender,
+            created_at: block.timestamp,
+            participant_count: 2,
+            is_group: false,
+            encrypted_name: 0,
+        };
+        self.threads[thread_id] = thread;
+        self.thread_participants[thread_id][msg.sender] = true;
+        self.thread_participants[thread_id][other] = true;
+        self.thread_message_count[thread_id] = 0;
+
+        self.user_thread_ids[msg.sender].push(thread_id);
+        self.user_thread_ids[other].push(thread_id);
+
+        emit ThreadCreated { thread_id: thread_id, creator: msg.sender, is_group: false };
+        return thread_id;
+    }
+
+    pub fn create_group_thread(encrypted_name: u256, initial_members: Vec<Address>) -> u64 {
+        self.require_key_registered(msg.sender);
+
+        let thread_id = self.next_thread_id;
+        self.next_thread_id += 1;
+
+        let mut member_count: u32 = 1;
+        self.thread_participants[thread_id][msg.sender] = true;
+        self.user_thread_ids[msg.sender].push(thread_id);
+
+        for i in 0..initial_members.len() {
+            let member = initial_members[i];
+            self.require_key_registered(member);
+            require!(!self.blocked[member][msg.sender], UserBlocked {});
+
+            if !self.thread_participants[thread_id][member] {
+                self.thread_participants[thread_id][member] = true;
+                self.user_thread_ids[member].push(thread_id);
+                member_count += 1;
+                emit ParticipantAdded { thread_id: thread_id, participant: member };
+            }
+        }
+
+        let thread = Thread {
+            creator: msg.sender,
+            created_at: block.timestamp,
+            participant_count: member_count,
+            is_group: true,
+            encrypted_name: encrypted_name,
+        };
+        self.threads[thread_id] = thread;
+        self.thread_message_count[thread_id] = 0;
+
+        emit ThreadCreated { thread_id: thread_id, creator: msg.sender, is_group: true };
+        return thread_id;
+    }
+
+    #[reentrant]
+    pub fn send_message(thread_id: u64, ciphertext_hash: u256, nonce: u256, reply_to: u64) {
+        require!(thread_id > 0 && thread_id < self.next_thread_id, ThreadNotFound { thread_id: thread_id });
+        self.require_participant(thread_id);
+        require!(msg.value >= self.fee_per_message, InsufficientFee {
+            required: self.fee_per_message,
+            sent: msg.value,
+        });
+
+        let msg_count = self.thread_message_count[thread_id];
+        if reply_to > 0 {
+            require!(reply_to <= msg_count, InvalidReplyIndex { max: msg_count, given: reply_to });
+        }
+
+        let new_index = msg_count + 1;
+        self.thread_message_count[thread_id] = new_index;
+
+        let encrypted_msg = EncryptedMessage {
+            sender: msg.sender,
+            ciphertext_hash: ciphertext_hash,
+            nonce: nonce,
+            timestamp: block.timestamp,
+            reply_to: reply_to,
+        };
+        self.messages[thread_id][new_index] = encrypted_msg;
+        self.treasury += msg.value;
+
+        emit MessageSent { thread_id: thread_id, sender: msg.sender, message_index: new_index };
+    }
+
+    pub fn mark_read(thread_id: u64, up_to_index: u64) {
+        self.require_participant(thread_id);
+        let current = self.read_receipts[thread_id][msg.sender];
+        if up_to_index > current {
+            self.read_receipts[thread_id][msg.sender] = up_to_index;
+            emit ReadReceipt { thread_id: thread_id, reader: msg.sender, up_to_index: up_to_index };
+        }
+    }
+
+    pub fn block_user(user: Address) {
+        require!(user != msg.sender, CannotBlockSelf {});
+        self.blocked[msg.sender][user] = true;
+    }
+
+    pub fn unblock_user(user: Address) {
+        self.blocked[msg.sender][user] = false;
+    }
+
+    pub fn add_group_member(thread_id: u64, member: Address) {
+        require!(self.threads[thread_id].is_group, ThreadNotFound { thread_id: thread_id });
+        require!(self.threads[thread_id].creator == msg.sender, NotThreadCreator {});
+        self.require_key_registered(member);
+        require!(!self.thread_participants[thread_id][member], AlreadyParticipant {});
+
+        self.thread_participants[thread_id][member] = true;
+        self.threads[thread_id].participant_count += 1;
+        self.user_thread_ids[member].push(thread_id);
+
+        emit ParticipantAdded { thread_id: thread_id, participant: member };
+    }
+
+    #[view]
+    pub fn get_message(thread_id: u64, index: u64) -> EncryptedMessage {
+        return self.messages[thread_id][index];
+    }
+
+    #[view]
+    pub fn get_thread(thread_id: u64) -> Thread {
+        return self.threads[thread_id];
+    }
+
+    #[view]
+    pub fn get_public_key(user: Address) -> u256 {
+        return self.user_public_keys[user];
+    }
+
+    #[view]
+    pub fn get_read_receipt(thread_id: u64, user: Address) -> u64 {
+        return self.read_receipts[thread_id][user];
+    }
+}

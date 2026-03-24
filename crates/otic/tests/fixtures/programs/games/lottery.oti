@@ -1,0 +1,233 @@
+// Lottery contract with ticket purchasing and random winner selection.
+// Players buy tickets during an open round; the owner draws a winner
+// after the round closes, using a commit-reveal randomness scheme.
+
+use std::math;
+use std::token::IERC20;
+
+contract Lottery {
+    storage {
+        owner: Address,
+        ticket_price: u256,
+        round_id: u64,
+        round_open: bool,
+        round_deadline: u64,
+        players: Vec<Address>,
+        ticket_counts: Map<Address, u64>,
+        total_pot: u256,
+        commit_hash: u256,
+        winner_drawn: bool,
+        fee_bps: u256,           // basis points taken as protocol fee
+        accumulated_fees: u256,
+        past_winners: Map<u64, Address>,
+        past_payouts: Map<u64, u256>,
+        max_tickets_per_player: u64,
+    }
+
+    const FEE_DENOMINATOR: u256 = 10000;
+
+    event RoundOpened {
+        #[indexed]
+        round_id: u64,
+        ticket_price: u256,
+        deadline: u64,
+    }
+
+    event TicketPurchased {
+        #[indexed]
+        buyer: Address,
+        #[indexed]
+        round_id: u64,
+        quantity: u64,
+    }
+
+    event WinnerDrawn {
+        #[indexed]
+        round_id: u64,
+        #[indexed]
+        winner: Address,
+        payout: u256,
+    }
+
+    event FeesWithdrawn {
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    error Unauthorized {}
+    error RoundNotOpen {}
+    error RoundStillOpen {}
+    error RoundAlreadyOpen {}
+    error DeadlinePassed {}
+    error InsufficientPayment { required: u256, sent: u256 }
+    error NoPlayers {}
+    error WinnerAlreadyDrawn {}
+    error InvalidTicketCount {}
+    error MaxTicketsExceeded { max: u64, requested: u64 }
+    error InvalidReveal {}
+    error NoFeesToWithdraw {}
+
+    #[constructor]
+    pub fn init(ticket_price: u256, fee_bps: u256, max_tickets: u64) {
+        self.owner = msg.sender;
+        self.ticket_price = ticket_price;
+        self.fee_bps = fee_bps;
+        self.max_tickets_per_player = max_tickets;
+        self.round_id = 0;
+        self.round_open = false;
+        self.winner_drawn = false;
+        self.total_pot = 0;
+        self.accumulated_fees = 0;
+    }
+
+    pub fn open_round(duration_blocks: u64, commit: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(!self.round_open, RoundAlreadyOpen {});
+        self.round_id = self.round_id + 1;
+        self.round_open = true;
+        self.round_deadline = block.height + duration_blocks;
+        self.commit_hash = commit;
+        self.winner_drawn = false;
+        self.total_pot = 0;
+        self.players = Vec::new();
+
+        emit RoundOpened {
+            round_id: self.round_id,
+            ticket_price: self.ticket_price,
+            deadline: self.round_deadline,
+        };
+    }
+
+    pub fn buy_tickets(quantity: u64) {
+        require!(self.round_open, RoundNotOpen {});
+        require!(block.height <= self.round_deadline, DeadlinePassed {});
+        require!(quantity > 0, InvalidTicketCount {});
+
+        let existing = self.ticket_counts[msg.sender];
+        let new_total = existing + quantity;
+        require!(
+            new_total <= self.max_tickets_per_player,
+            MaxTicketsExceeded { max: self.max_tickets_per_player, requested: new_total }
+        );
+
+        let cost = self.ticket_price * (quantity as u256);
+        require!(msg.value >= cost, InsufficientPayment { required: cost, sent: msg.value });
+
+        // Register player if first purchase this round
+        if existing == 0 {
+            self.players.push(msg.sender);
+        }
+
+        self.ticket_counts[msg.sender] = new_total;
+        self.total_pot = self.total_pot + cost;
+
+        // Refund overpayment
+        let excess = msg.value - cost;
+        if excess > 0 {
+            raw_call!(msg.sender, excess, bytes::empty());
+        }
+
+        emit TicketPurchased {
+            buyer: msg.sender,
+            round_id: self.round_id,
+            quantity: quantity,
+        };
+    }
+
+    pub fn draw_winner(reveal: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(self.round_open, RoundNotOpen {});
+        require!(block.height > self.round_deadline, RoundStillOpen {});
+        require!(!self.winner_drawn, WinnerAlreadyDrawn {});
+        require!(self.players.len() > 0, NoPlayers {});
+
+        // Verify commit-reveal
+        let computed_hash = math::keccak256(reveal);
+        require!(computed_hash == self.commit_hash, InvalidReveal {});
+
+        // Build weighted ticket array and pick winner
+        let seed = math::keccak256(reveal ^ (block.timestamp as u256));
+        let total_tickets = self.count_total_tickets();
+        let winning_ticket = (seed % (total_tickets as u256)) as u64;
+
+        let winner = self.find_ticket_owner(winning_ticket);
+
+        // Calculate fee and payout
+        let fee = (self.total_pot * self.fee_bps) / FEE_DENOMINATOR;
+        let payout = self.total_pot - fee;
+        self.accumulated_fees = self.accumulated_fees + fee;
+
+        // Transfer winnings
+        raw_call!(winner, payout, bytes::empty());
+
+        // Record results
+        self.past_winners[self.round_id] = winner;
+        self.past_payouts[self.round_id] = payout;
+        self.winner_drawn = true;
+        self.round_open = false;
+
+        emit WinnerDrawn {
+            round_id: self.round_id,
+            winner: winner,
+            payout: payout,
+        };
+    }
+
+    pub fn withdraw_fees(to: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        let amount = self.accumulated_fees;
+        require!(amount > 0, NoFeesToWithdraw {});
+        self.accumulated_fees = 0;
+        raw_call!(to, amount, bytes::empty());
+        emit FeesWithdrawn { to: to, amount: amount };
+    }
+
+    pub fn set_ticket_price(new_price: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(!self.round_open, RoundStillOpen {});
+        self.ticket_price = new_price;
+    }
+
+    fn count_total_tickets() -> u64 {
+        let mut total: u64 = 0;
+        for i in 0..self.players.len() {
+            total = total + self.ticket_counts[self.players[i]];
+        }
+        return total;
+    }
+
+    fn find_ticket_owner(ticket_index: u64) -> Address {
+        let mut cumulative: u64 = 0;
+        for i in 0..self.players.len() {
+            let player = self.players[i];
+            cumulative = cumulative + self.ticket_counts[player];
+            if ticket_index < cumulative {
+                return player;
+            }
+        }
+        // Fallback (should never reach)
+        return self.players[0];
+    }
+
+    #[view]
+    pub fn get_round_info() -> (u64, bool, u64, u256, u64) {
+        return (
+            self.round_id,
+            self.round_open,
+            self.round_deadline,
+            self.total_pot,
+            self.players.len() as u64,
+        );
+    }
+
+    #[view]
+    pub fn get_player_tickets(player: Address) -> u64 {
+        return self.ticket_counts[player];
+    }
+
+    #[view]
+    pub fn get_past_winner(round: u64) -> (Address, u256) {
+        return (self.past_winners[round], self.past_payouts[round]);
+    }
+}

@@ -1,0 +1,338 @@
+// Rental agreement management with deposits, payments, and maintenance requests
+use std::math;
+
+enum LeaseStatus {
+    Pending,     // 0
+    Active,      // 1
+    Expired,     // 2
+    Terminated,  // 3
+}
+
+contract RentalAgreement {
+    storage {
+        landlord: Address,
+        next_lease_id: u64,
+        leases: Map<u64, Lease>,
+        payments: Map<u64, Map<u32, RentPayment>>,
+        payment_counts: Map<u64, u32>,
+        deposits: Map<u64, DepositInfo>,
+        maintenance_requests: Map<u64, Map<u32, MaintenanceRequest>>,
+        maintenance_counts: Map<u64, u32>,
+        next_maintenance_id: u32,
+        tenant_leases: Map<Address, Vec<u64>>,
+        late_fee_bps: u16,
+        grace_period_days: u64,
+    }
+
+    struct Lease {
+        tenant: Address,
+        property_hash: u256,
+        monthly_rent: u256,
+        start_date: u64,
+        end_date: u64,
+        status: u8,
+        last_payment_date: u64,
+        months_paid: u32,
+        months_late: u32,
+    }
+
+    struct RentPayment {
+        amount: u256,
+        paid_at: u64,
+        for_month: u32,
+        late: bool,
+        late_fee: u256,
+    }
+
+    struct DepositInfo {
+        amount: u256,
+        paid: bool,
+        returned: bool,
+        deductions: u256,
+        deduction_reason_hash: u256,
+    }
+
+    struct MaintenanceRequest {
+        tenant: Address,
+        description_hash: u256,
+        priority: u8,
+        submitted_at: u64,
+        resolved_at: u64,
+        status: u8,
+        cost: u256,
+    }
+
+    event LeaseCreated {
+        #[indexed]
+        lease_id: u64,
+        #[indexed]
+        tenant: Address,
+        monthly_rent: u256,
+    }
+
+    event RentPaid {
+        #[indexed]
+        lease_id: u64,
+        amount: u256,
+        for_month: u32,
+        late: bool,
+    }
+
+    event DepositPaid {
+        #[indexed]
+        lease_id: u64,
+        amount: u256,
+    }
+
+    event DepositReturned {
+        #[indexed]
+        lease_id: u64,
+        returned_amount: u256,
+        deductions: u256,
+    }
+
+    event MaintenanceSubmitted {
+        #[indexed]
+        lease_id: u64,
+        request_id: u32,
+        priority: u8,
+    }
+
+    event MaintenanceResolved {
+        #[indexed]
+        lease_id: u64,
+        request_id: u32,
+    }
+
+    event LeaseTerminated {
+        #[indexed]
+        lease_id: u64,
+    }
+
+    error NotLandlord {}
+    error NotTenant {}
+    error LeaseNotFound { id: u64 }
+    error LeaseNotActive {}
+    error InsufficientPayment { required: u256, sent: u256 }
+    error DepositAlreadyPaid {}
+    error DepositNotPaid {}
+    error LeaseNotExpired {}
+    error DepositAlreadyReturned {}
+    error InvalidPriority { given: u8 }
+    error MaintenanceNotFound { id: u32 }
+
+    const SECONDS_PER_DAY: u64 = 86400;
+    const DAYS_PER_MONTH: u64 = 30;
+    const BPS_DENOMINATOR: u256 = 10000;
+
+    #[constructor]
+    pub fn init(late_fee_bps: u16, grace_period_days: u64) {
+        self.landlord = msg.sender;
+        self.next_lease_id = 1;
+        self.late_fee_bps = late_fee_bps;
+        self.grace_period_days = grace_period_days;
+        self.next_maintenance_id = 1;
+    }
+
+    fn require_landlord() {
+        require!(msg.sender == self.landlord, NotLandlord {});
+    }
+
+    pub fn create_lease(
+        tenant: Address,
+        property_hash: u256,
+        monthly_rent: u256,
+        duration_months: u32,
+        deposit_amount: u256,
+    ) -> u64 {
+        self.require_landlord();
+
+        let lease_id = self.next_lease_id;
+        self.next_lease_id += 1;
+
+        let end_date = block.timestamp + (duration_months as u64 * 30 * 86400);
+
+        // Status: 0=pending, 1=active, 2=expired, 3=terminated
+        self.leases[lease_id] = Lease {
+            tenant: tenant,
+            property_hash: property_hash,
+            monthly_rent: monthly_rent,
+            start_date: block.timestamp,
+            end_date: end_date,
+            status: 0,
+            last_payment_date: 0,
+            months_paid: 0,
+            months_late: 0,
+        };
+
+        self.deposits[lease_id] = DepositInfo {
+            amount: deposit_amount,
+            paid: false,
+            returned: false,
+            deductions: 0,
+            deduction_reason_hash: 0,
+        };
+
+        self.payment_counts[lease_id] = 0;
+        self.maintenance_counts[lease_id] = 0;
+        self.tenant_leases[tenant].push(lease_id);
+
+        emit LeaseCreated { lease_id: lease_id, tenant: tenant, monthly_rent: monthly_rent };
+        return lease_id;
+    }
+
+    pub fn pay_deposit(lease_id: u64) {
+        let lease = self.leases[lease_id];
+        require!(lease.tenant == msg.sender, NotTenant {});
+        let deposit = self.deposits[lease_id];
+        require!(!deposit.paid, DepositAlreadyPaid {});
+        require!(msg.value >= deposit.amount, InsufficientPayment {
+            required: deposit.amount,
+            sent: msg.value,
+        });
+
+        self.deposits[lease_id].paid = true;
+        self.leases[lease_id].status = 1; // activate lease
+
+        emit DepositPaid { lease_id: lease_id, amount: msg.value };
+    }
+
+    #[reentrant]
+    pub fn pay_rent(lease_id: u64) {
+        let lease = self.leases[lease_id];
+        require!(lease.tenant == msg.sender, NotTenant {});
+        require!(lease.status == 1, LeaseNotActive {});
+
+        let next_month = lease.months_paid + 1;
+        let due_date = lease.start_date + (next_month as u64 * 30 * 86400);
+        let grace_deadline = due_date + (self.grace_period_days * 86400);
+
+        let is_late = block.timestamp > grace_deadline;
+        let mut late_fee: u256 = 0;
+        let mut required = lease.monthly_rent;
+
+        if is_late {
+            late_fee = (lease.monthly_rent * self.late_fee_bps as u256) / 10000;
+            required = lease.monthly_rent + late_fee;
+        }
+
+        require!(msg.value >= required, InsufficientPayment { required: required, sent: msg.value });
+
+        let idx = self.payment_counts[lease_id];
+        self.payments[lease_id][idx] = RentPayment {
+            amount: msg.value,
+            paid_at: block.timestamp,
+            for_month: next_month,
+            late: is_late,
+            late_fee: late_fee,
+        };
+        self.payment_counts[lease_id] = idx + 1;
+
+        self.leases[lease_id].months_paid = next_month;
+        self.leases[lease_id].last_payment_date = block.timestamp;
+        if is_late {
+            self.leases[lease_id].months_late += 1;
+        }
+
+        // Forward rent to landlord
+        raw_call!(self.landlord, msg.value, bytes(""));
+
+        emit RentPaid { lease_id: lease_id, amount: msg.value, for_month: next_month, late: is_late };
+    }
+
+    pub fn submit_maintenance(lease_id: u64, description_hash: u256, priority: u8) {
+        let lease = self.leases[lease_id];
+        require!(lease.tenant == msg.sender, NotTenant {});
+        require!(lease.status == 1, LeaseNotActive {});
+        require!(priority >= 1 && priority <= 5, InvalidPriority { given: priority });
+
+        let req_id = self.maintenance_counts[lease_id];
+        self.maintenance_requests[lease_id][req_id] = MaintenanceRequest {
+            tenant: msg.sender,
+            description_hash: description_hash,
+            priority: priority,
+            submitted_at: block.timestamp,
+            resolved_at: 0,
+            status: 0,
+            cost: 0,
+        };
+        self.maintenance_counts[lease_id] = req_id + 1;
+
+        emit MaintenanceSubmitted { lease_id: lease_id, request_id: req_id, priority: priority };
+    }
+
+    pub fn resolve_maintenance(lease_id: u64, request_id: u32, cost: u256) {
+        self.require_landlord();
+        require!(request_id < self.maintenance_counts[lease_id], MaintenanceNotFound { id: request_id });
+
+        self.maintenance_requests[lease_id][request_id].resolved_at = block.timestamp;
+        self.maintenance_requests[lease_id][request_id].status = 1;
+        self.maintenance_requests[lease_id][request_id].cost = cost;
+
+        emit MaintenanceResolved { lease_id: lease_id, request_id: request_id };
+    }
+
+    pub fn terminate_lease(lease_id: u64) {
+        self.require_landlord();
+        require!(self.leases[lease_id].status == 1, LeaseNotActive {});
+        self.leases[lease_id].status = 3;
+        emit LeaseTerminated { lease_id: lease_id };
+    }
+
+    #[reentrant]
+    pub fn return_deposit(lease_id: u64, deductions: u256, reason_hash: u256) {
+        self.require_landlord();
+        let lease = self.leases[lease_id];
+        require!(lease.status == 2 || lease.status == 3, LeaseNotExpired {});
+        let deposit = self.deposits[lease_id];
+        require!(deposit.paid, DepositNotPaid {});
+        require!(!deposit.returned, DepositAlreadyReturned {});
+
+        let return_amount = if deductions >= deposit.amount {
+            0u256
+        } else {
+            deposit.amount - deductions
+        };
+
+        self.deposits[lease_id].returned = true;
+        self.deposits[lease_id].deductions = deductions;
+        self.deposits[lease_id].deduction_reason_hash = reason_hash;
+
+        if return_amount > 0 {
+            raw_call!(lease.tenant, return_amount, bytes(""));
+        }
+
+        emit DepositReturned {
+            lease_id: lease_id,
+            returned_amount: return_amount,
+            deductions: deductions,
+        };
+    }
+
+    #[view]
+    pub fn get_lease(lease_id: u64) -> Lease {
+        return self.leases[lease_id];
+    }
+
+    #[view]
+    pub fn get_deposit(lease_id: u64) -> DepositInfo {
+        return self.deposits[lease_id];
+    }
+
+    #[view]
+    pub fn get_payment(lease_id: u64, index: u32) -> RentPayment {
+        return self.payments[lease_id][index];
+    }
+
+    #[view]
+    pub fn get_maintenance(lease_id: u64, req_id: u32) -> MaintenanceRequest {
+        return self.maintenance_requests[lease_id][req_id];
+    }
+
+    #[view]
+    pub fn is_rent_current(lease_id: u64) -> bool {
+        let lease = self.leases[lease_id];
+        let months_elapsed = (block.timestamp - lease.start_date) / (30 * 86400);
+        return lease.months_paid as u64 >= months_elapsed;
+    }
+}

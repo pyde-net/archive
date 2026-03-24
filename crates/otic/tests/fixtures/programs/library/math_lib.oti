@@ -1,0 +1,209 @@
+// Math utility library for safe arithmetic, square root, exponentiation,
+// percentage calculations, and mul_div operations.
+
+module math_lib;
+
+// --- Error types ---
+
+error Overflow {}
+error DivisionByZero {}
+error SqrtNegative {}
+
+// --- Safe arithmetic ---
+
+/// Safely adds two u256 values, reverting on overflow.
+pub fn safe_add(a: u256, b: u256) -> u256 {
+    let result = a + b;
+    require!(result >= a, Overflow {});
+    return result;
+}
+
+/// Safely subtracts b from a, reverting on underflow.
+pub fn safe_sub(a: u256, b: u256) -> u256 {
+    require!(b <= a, Overflow {});
+    return a - b;
+}
+
+/// Safely multiplies two u256 values, reverting on overflow.
+pub fn safe_mul(a: u256, b: u256) -> u256 {
+    if a == 0u256 {
+        return 0u256;
+    }
+    let result = a * b;
+    require!(result / a == b, Overflow {});
+    return result;
+}
+
+/// Safely divides a by b, reverting on division by zero.
+pub fn safe_div(a: u256, b: u256) -> u256 {
+    require!(b > 0u256, DivisionByZero {});
+    return a / b;
+}
+
+/// Safely computes a modulo b, reverting on division by zero.
+pub fn safe_mod(a: u256, b: u256) -> u256 {
+    require!(b > 0u256, DivisionByZero {});
+    return a % b;
+}
+
+// --- Advanced math ---
+
+/// Integer square root using the Babylonian/Newton method.
+/// Returns floor(sqrt(x)).
+pub fn sqrt(x: u256) -> u256 {
+    if x == 0u256 {
+        return 0u256;
+    }
+    if x <= 3u256 {
+        return 1u256;
+    }
+
+    let mut z = x;
+    let mut y = (x + 1u256) / 2u256;
+
+    while y < z {
+        z = y;
+        y = (x / y + y) / 2u256;
+    }
+
+    return z;
+}
+
+/// Computes base^exp using binary exponentiation (squaring method).
+/// Reverts on overflow.
+pub fn pow(base: u256, exp: u256) -> u256 {
+    if exp == 0u256 {
+        return 1u256;
+    }
+
+    let mut result = 1u256;
+    let mut b = base;
+    let mut e = exp;
+
+    while e > 0u256 {
+        if e % 2u256 == 1u256 {
+            result = safe_mul(result, b);
+        }
+        b = safe_mul(b, b);
+        e = e / 2u256;
+    }
+
+    return result;
+}
+
+/// Computes (a * b) / denominator with full precision.
+/// Uses a two-step approach to avoid intermediate overflow where possible.
+pub fn mul_div(a: u256, b: u256, denominator: u256) -> u256 {
+    require!(denominator > 0u256, DivisionByZero {});
+
+    // If a or b is zero, result is zero
+    if a == 0u256 || b == 0u256 {
+        return 0u256;
+    }
+
+    // Check if we can safely multiply
+    let product = a * b;
+    // Verify no overflow occurred
+    require!(product / a == b, Overflow {});
+
+    return product / denominator;
+}
+
+/// Computes (a * b) / denominator, rounding up.
+pub fn mul_div_round_up(a: u256, b: u256, denominator: u256) -> u256 {
+    let result = mul_div(a, b, denominator);
+    // If there was a remainder, round up
+    if safe_mod(safe_mul(a, b), denominator) > 0u256 {
+        return safe_add(result, 1u256);
+    }
+    return result;
+}
+
+// --- Percentage calculations (basis points: 10000 = 100%) ---
+
+/// Computes the given percentage of a value using basis points.
+/// 10000 basis points = 100%.
+pub fn percentage(value: u256, bps: u256) -> u256 {
+    return mul_div(value, bps, 10000u256);
+}
+
+/// Computes the given percentage of a value, rounding up.
+pub fn percentage_round_up(value: u256, bps: u256) -> u256 {
+    return mul_div_round_up(value, bps, 10000u256);
+}
+
+/// Returns the minimum of two u256 values.
+pub fn min(a: u256, b: u256) -> u256 {
+    if a <= b {
+        return a;
+    }
+    return b;
+}
+
+/// Returns the maximum of two u256 values.
+pub fn max(a: u256, b: u256) -> u256 {
+    if a >= b {
+        return a;
+    }
+    return b;
+}
+
+/// Clamps a value between a minimum and a maximum.
+pub fn clamp(value: u256, min_val: u256, max_val: u256) -> u256 {
+    if value < min_val {
+        return min_val;
+    }
+    if value > max_val {
+        return max_val;
+    }
+    return value;
+}
+
+/// Returns the absolute difference between two u256 values.
+pub fn abs_diff(a: u256, b: u256) -> u256 {
+    if a >= b {
+        return a - b;
+    }
+    return b - a;
+}
+
+/// Computes the average of two values without overflow.
+pub fn average(a: u256, b: u256) -> u256 {
+    // (a & b) + (a ^ b) / 2
+    return (a & b) + (a ^ b) / 2u256;
+}
+
+/// Returns the number of digits in a base-10 representation.
+pub fn log10(x: u256) -> u256 {
+    if x == 0u256 {
+        return 0u256;
+    }
+    let mut count = 0u256;
+    let mut val = x;
+    while val > 0u256 {
+        val = val / 10u256;
+        count = count + 1u256;
+    }
+    return count;
+}
+
+// --- Test helpers ---
+
+#[test]
+fn test_sqrt_perfect_square() {
+    let result = sqrt(25u256);
+    require!(result == 5u256, Overflow {});
+}
+
+#[test]
+fn test_pow_basic() {
+    let result = pow(2u256, 10u256);
+    require!(result == 1024u256, Overflow {});
+}
+
+#[test]
+fn test_percentage() {
+    // 50% of 200 = 100
+    let result = percentage(200u256, 5000u256);
+    require!(result == 100u256, Overflow {});
+}

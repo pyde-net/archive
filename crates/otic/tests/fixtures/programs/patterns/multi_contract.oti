@@ -1,0 +1,352 @@
+// Multi-contract pattern demonstrating library imports, interface calls,
+// and cross-contract interactions. A treasury contract that manages
+// funds across multiple token types using external interfaces.
+
+use std::math;
+use std::token::IERC20;
+use math_lib;
+use address_utils;
+
+// Interface for an external price oracle
+interface IPriceOracle {
+    fn get_price(token: Address) -> u256;
+    fn get_price_with_decimals(token: Address) -> (u256, u8);
+    fn is_supported(token: Address) -> bool;
+}
+
+// Interface for a staking contract
+interface IStaking {
+    fn stake(amount: u256) -> u256;
+    fn unstake(stake_id: u256) -> u256;
+    fn get_rewards(staker: Address) -> u256;
+    fn claim_rewards() -> u256;
+}
+
+contract Treasury {
+    storage {
+        owner: Address,
+        guardian: Address,
+        paused: bool,
+
+        // Supported tokens and their allocations
+        supported_tokens: Vec<Address>,
+        token_enabled: Map<Address, bool>,
+        token_allocations: Map<Address, u256>,  // basis points per token
+        total_allocation_bps: u256,
+
+        // External contract references
+        oracle: Address,
+        staking_contract: Address,
+
+        // Accounting
+        deposits: Map<Address, Map<Address, u256>>,  // user => token => amount
+        total_deposits: Map<Address, u256>,           // token => total
+        user_list: Vec<Address>,
+        user_registered: Map<Address, bool>,
+
+        // Limits
+        deposit_cap: Map<Address, u256>,
+        min_deposit: u256,
+        withdrawal_cooldown: u64,
+        last_withdrawal: Map<Address, u64>,
+
+        // Fees (basis points)
+        deposit_fee_bps: u256,
+        withdrawal_fee_bps: u256,
+        fee_recipient: Address,
+        collected_fees: Map<Address, u256>,
+    }
+
+    const BPS_DENOMINATOR: u256 = 10000;
+    const DEFAULT_COOLDOWN: u64 = 3600;
+    const DEFAULT_FEE_BPS: u256 = 30;
+
+    event Deposit {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        token: Address,
+        amount: u256,
+        fee: u256,
+    }
+
+    event Withdrawal {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        token: Address,
+        amount: u256,
+        fee: u256,
+    }
+
+    event TokenAdded {
+        #[indexed]
+        token: Address,
+        allocation_bps: u256,
+    }
+
+    event TokenRemoved {
+        #[indexed]
+        token: Address,
+    }
+
+    event AllocationUpdated {
+        #[indexed]
+        token: Address,
+        old_bps: u256,
+        new_bps: u256,
+    }
+
+    event RewardsHarvested {
+        #[indexed]
+        token: Address,
+        amount: u256,
+    }
+
+    event EmergencyWithdrawal {
+        #[indexed]
+        token: Address,
+        amount: u256,
+        #[indexed]
+        recipient: Address,
+    }
+
+    error NotOwner {}
+    error NotGuardian {}
+    error Paused {}
+    error TokenNotSupported { token: Address }
+    error TokenAlreadySupported { token: Address }
+    error DepositBelowMinimum { amount: u256, minimum: u256 }
+    error DepositExceedsCap { total: u256, cap: u256 }
+    error InsufficientDeposit { available: u256, requested: u256 }
+    error CooldownNotExpired { remaining: u64 }
+    error AllocationOverflow { total_bps: u256 }
+    error ZeroAddress {}
+    error ZeroAmount {}
+    error OracleStale {}
+    error Unauthorized {}
+
+    #[constructor]
+    pub fn init(
+        oracle_addr: Address,
+        staking_addr: Address,
+        fee_recipient: Address,
+    ) {
+        self.owner = msg.sender;
+        self.guardian = msg.sender;
+        self.paused = false;
+        self.oracle = oracle_addr;
+        self.staking_contract = staking_addr;
+        self.fee_recipient = fee_recipient;
+        self.min_deposit = 1000u256;
+        self.withdrawal_cooldown = DEFAULT_COOLDOWN;
+        self.deposit_fee_bps = DEFAULT_FEE_BPS;
+        self.withdrawal_fee_bps = DEFAULT_FEE_BPS;
+        self.total_allocation_bps = 0u256;
+    }
+
+    fn require_owner() {
+        require!(msg.sender == self.owner, NotOwner {});
+    }
+
+    fn require_not_paused() {
+        require!(!self.paused, Paused {});
+    }
+
+    fn require_supported(token: Address) {
+        require!(self.token_enabled[token], TokenNotSupported { token: token });
+    }
+
+    // --- Admin ---
+
+    pub fn add_token(token: Address, allocation_bps: u256, cap: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(token != Address::ZERO, ZeroAddress {});
+        require!(!self.token_enabled[token], TokenAlreadySupported { token: token });
+
+        let new_total = self.total_allocation_bps + allocation_bps;
+        require!(new_total <= BPS_DENOMINATOR, AllocationOverflow { total_bps: new_total });
+
+        self.supported_tokens.push(token);
+        self.token_enabled[token] = true;
+        self.token_allocations[token] = allocation_bps;
+        self.total_allocation_bps = new_total;
+        self.deposit_cap[token] = cap;
+
+        emit TokenAdded { token: token, allocation_bps: allocation_bps };
+    }
+
+    pub fn update_allocation(token: Address, new_bps: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.require_supported(token);
+
+        let old_bps = self.token_allocations[token];
+        let adjusted_total = self.total_allocation_bps - old_bps + new_bps;
+        require!(adjusted_total <= BPS_DENOMINATOR, AllocationOverflow { total_bps: adjusted_total });
+
+        self.token_allocations[token] = new_bps;
+        self.total_allocation_bps = adjusted_total;
+
+        emit AllocationUpdated { token: token, old_bps: old_bps, new_bps: new_bps };
+    }
+
+    pub fn set_guardian(new_guardian: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(new_guardian != Address::ZERO, ZeroAddress {});
+        self.guardian = new_guardian;
+    }
+
+    pub fn pause() {
+        require!(msg.sender == self.owner || msg.sender == self.guardian, NotGuardian {});
+        self.paused = true;
+    }
+
+    pub fn unpause() {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.paused = false;
+    }
+
+    // --- Core operations ---
+
+    pub fn deposit(token: Address, amount: u256) {
+        self.require_not_paused();
+        self.require_supported(token);
+        require!(amount > 0u256, ZeroAmount {});
+        require!(amount >= self.min_deposit, DepositBelowMinimum {
+            amount: amount,
+            minimum: self.min_deposit,
+        });
+
+        // Calculate and deduct fee
+        let fee = math_lib::percentage(amount, self.deposit_fee_bps);
+        let net_amount = amount - fee;
+
+        // Check cap
+        let new_total = self.total_deposits[token] + net_amount;
+        require!(new_total <= self.deposit_cap[token], DepositExceedsCap {
+            total: new_total,
+            cap: self.deposit_cap[token],
+        });
+
+        // Transfer tokens from user via ERC20 interface
+        IERC20::at(token).transfer_from(msg.sender, address(self), amount);
+
+        // Transfer fee to recipient
+        if fee > 0u256 {
+            IERC20::at(token).transfer(self.fee_recipient, fee);
+            self.collected_fees[token] = self.collected_fees[token] + fee;
+        }
+
+        // Register user if new
+        if !self.user_registered[msg.sender] {
+            self.user_list.push(msg.sender);
+            self.user_registered[msg.sender] = true;
+        }
+
+        // Update accounting
+        self.deposits[msg.sender][token] = self.deposits[msg.sender][token] + net_amount;
+        self.total_deposits[token] = new_total;
+
+        emit Deposit { user: msg.sender, token: token, amount: net_amount, fee: fee };
+    }
+
+    pub fn withdraw(token: Address, amount: u256) {
+        self.require_not_paused();
+        self.require_supported(token);
+        require!(amount > 0u256, ZeroAmount {});
+
+        // Check cooldown
+        let last = self.last_withdrawal[msg.sender];
+        let elapsed = block.timestamp - last;
+        if last > 0u64 {
+            require!(elapsed >= self.withdrawal_cooldown, CooldownNotExpired {
+                remaining: self.withdrawal_cooldown - elapsed,
+            });
+        }
+
+        let user_balance = self.deposits[msg.sender][token];
+        require!(user_balance >= amount, InsufficientDeposit {
+            available: user_balance,
+            requested: amount,
+        });
+
+        // Calculate fee
+        let fee = math_lib::percentage(amount, self.withdrawal_fee_bps);
+        let net_amount = amount - fee;
+
+        // Update state before external call
+        self.deposits[msg.sender][token] = user_balance - amount;
+        self.total_deposits[token] = self.total_deposits[token] - amount;
+        self.last_withdrawal[msg.sender] = block.timestamp;
+
+        // Transfer tokens
+        IERC20::at(token).transfer(msg.sender, net_amount);
+        if fee > 0u256 {
+            IERC20::at(token).transfer(self.fee_recipient, fee);
+            self.collected_fees[token] = self.collected_fees[token] + fee;
+        }
+
+        emit Withdrawal { user: msg.sender, token: token, amount: net_amount, fee: fee };
+    }
+
+    // --- Oracle integration ---
+
+    #[view]
+    pub fn get_portfolio_value(user: Address) -> u256 {
+        let mut total_value = 0u256;
+        for i in 0u64..self.supported_tokens.len() {
+            let token = self.supported_tokens[i];
+            let balance = self.deposits[user][token];
+            if balance > 0u256 {
+                let price = IPriceOracle::at(self.oracle).get_price(token);
+                total_value = total_value + math_lib::mul_div(balance, price, 1000000000000000000u256);
+            }
+        }
+        return total_value;
+    }
+
+    // --- Staking integration ---
+
+    pub fn stake_idle_funds(token: Address, amount: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.require_supported(token);
+        IERC20::at(token).approve(self.staking_contract, amount);
+        IStaking::at(self.staking_contract).stake(amount);
+    }
+
+    pub fn harvest_rewards() {
+        require!(msg.sender == self.owner, Unauthorized {});
+        let rewards = IStaking::at(self.staking_contract).claim_rewards();
+        emit RewardsHarvested { token: self.staking_contract, amount: rewards };
+    }
+
+    // --- Emergency ---
+
+    pub fn emergency_withdraw(token: Address, amount: u256, recipient: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        IERC20::at(token).transfer(recipient, amount);
+        emit EmergencyWithdrawal { token: token, amount: amount, recipient: recipient };
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn get_user_deposit(user: Address, token: Address) -> u256 {
+        return self.deposits[user][token];
+    }
+
+    #[view]
+    pub fn get_total_deposits(token: Address) -> u256 {
+        return self.total_deposits[token];
+    }
+
+    #[view]
+    pub fn get_supported_token_count() -> u64 {
+        return self.supported_tokens.len();
+    }
+
+    #[view]
+    pub fn get_collected_fees(token: Address) -> u256 {
+        return self.collected_fees[token];
+    }
+}

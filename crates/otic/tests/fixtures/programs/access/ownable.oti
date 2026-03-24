@@ -1,0 +1,162 @@
+// Ownable contract providing basic single-owner access control
+// with ownership transfer, renouncement, and ownership history.
+
+contract Ownable {
+    storage {
+        owner: Address,
+        ownership_history: Vec<OwnershipChange>,
+        renounced: bool,
+        transfer_lock_until: u64,
+    }
+
+    struct OwnershipChange {
+        from: Address,
+        to: Address,
+        changed_at: u64,
+        block_height: u64,
+    }
+
+    const MAX_LOCK_SECONDS: u64 = 31536000; // 365 * 86400
+
+    event OwnershipTransferred {
+        #[indexed]
+        previous_owner: Address,
+        #[indexed]
+        new_owner: Address,
+    }
+
+    event OwnershipRenounced {
+        #[indexed]
+        previous_owner: Address,
+    }
+
+    event TransferLocked {
+        locked_until: u64,
+    }
+
+    error NotOwner { caller: Address, owner: Address }
+    error ZeroAddress {}
+    error OwnershipAlreadyRenounced {}
+    error TransferLocked { until: u64 }
+    error CannotTransferToSelf {}
+    error LockPeriodTooLong { max_seconds: u64 }
+
+    #[constructor]
+    pub fn init() {
+        self.owner = msg.sender;
+        self.renounced = false;
+        self.transfer_lock_until = 0;
+
+        self.ownership_history.push(OwnershipChange {
+            from: Address::ZERO,
+            to: msg.sender,
+            changed_at: block.timestamp,
+            block_height: block.height,
+        });
+
+        emit OwnershipTransferred {
+            previous_owner: Address::ZERO,
+            new_owner: msg.sender,
+        };
+    }
+
+    fn ensure_owner() {
+        require!(msg.sender == self.owner, NotOwner {
+            caller: msg.sender,
+            owner: self.owner,
+        });
+    }
+
+    pub fn transfer_ownership(new_owner: Address) {
+        self.ensure_owner();
+        require!(!self.renounced, OwnershipAlreadyRenounced {});
+        require!(new_owner != Address::ZERO, ZeroAddress {});
+        require!(new_owner != msg.sender, CannotTransferToSelf {});
+        require!(
+            block.timestamp >= self.transfer_lock_until,
+            TransferLocked { until: self.transfer_lock_until },
+        );
+
+        let previous = self.owner;
+        self.owner = new_owner;
+
+        self.ownership_history.push(OwnershipChange {
+            from: previous,
+            to: new_owner,
+            changed_at: block.timestamp,
+            block_height: block.height,
+        });
+
+        emit OwnershipTransferred {
+            previous_owner: previous,
+            new_owner: new_owner,
+        };
+    }
+
+    pub fn renounce_ownership() {
+        self.ensure_owner();
+        require!(!self.renounced, OwnershipAlreadyRenounced {});
+        require!(
+            block.timestamp >= self.transfer_lock_until,
+            TransferLocked { until: self.transfer_lock_until },
+        );
+
+        let previous = self.owner;
+        self.owner = Address::ZERO;
+        self.renounced = true;
+
+        self.ownership_history.push(OwnershipChange {
+            from: previous,
+            to: Address::ZERO,
+            changed_at: block.timestamp,
+            block_height: block.height,
+        });
+
+        emit OwnershipRenounced { previous_owner: previous };
+    }
+
+    // Lock ownership transfers for a period (up to 365 days)
+    pub fn lock_transfer(duration_seconds: u64) {
+        self.ensure_owner();
+        require!(duration_seconds <= MAX_LOCK_SECONDS, LockPeriodTooLong {
+            max_seconds: MAX_LOCK_SECONDS,
+        });
+
+        self.transfer_lock_until = block.timestamp + duration_seconds;
+
+        emit TransferLocked { locked_until: self.transfer_lock_until };
+    }
+
+    #[view]
+    pub fn get_owner() -> Address {
+        return self.owner;
+    }
+
+    #[view]
+    pub fn is_owner(account: Address) -> bool {
+        return account == self.owner;
+    }
+
+    #[view]
+    pub fn is_renounced() -> bool {
+        return self.renounced;
+    }
+
+    #[view]
+    pub fn get_transfer_lock() -> u64 {
+        if block.timestamp >= self.transfer_lock_until {
+            return 0;
+        }
+        return self.transfer_lock_until - block.timestamp;
+    }
+
+    #[view]
+    pub fn get_ownership_history() -> Vec<OwnershipChange> {
+        return self.ownership_history;
+    }
+
+    #[view]
+    pub fn get_ownership_count() -> u64 {
+        return self.ownership_history.len() as u64;
+    }
+}

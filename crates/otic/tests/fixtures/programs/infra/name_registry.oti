@@ -1,0 +1,339 @@
+// Name service registry (ENS-like).
+// Register human-readable names that resolve to addresses and records.
+// Supports subdomains, expiration, transfer, and text records.
+
+use std::math;
+
+contract NameRegistry {
+    storage {
+        owner: Address,
+        names: Map<u256, NameEntry>,             // name_hash -> entry
+        address_to_primary: Map<Address, u256>,  // reverse lookup: address -> primary name hash
+        records: Map<u256, Map<String, String>>,  // name_hash -> key -> value
+        subdomains: Map<u256, Map<String, u256>>, // parent_hash -> label -> child_hash
+        registration_fee: u256,
+        renewal_fee_per_block: u256,
+        min_registration_blocks: u64,
+        grace_period: u64,                       // blocks after expiry before anyone can claim
+        revenue: u256,
+        name_count: u64,
+    }
+
+    const MIN_NAME_LENGTH: u64 = 3;
+    const MAX_NAME_LENGTH: u64 = 64;
+
+    struct NameEntry {
+        name: String,
+        owner: Address,
+        resolver: Address,
+        registered_at: u64,
+        expires_at: u64,
+        is_subdomain: bool,
+        parent_hash: u256,
+    }
+
+    event NameRegistered {
+        #[indexed]
+        name_hash: u256,
+        #[indexed]
+        owner: Address,
+        name: String,
+        expires_at: u64,
+    }
+
+    event NameRenewed {
+        #[indexed]
+        name_hash: u256,
+        new_expiry: u64,
+    }
+
+    event NameTransferred {
+        #[indexed]
+        name_hash: u256,
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+    }
+
+    event ResolverUpdated {
+        #[indexed]
+        name_hash: u256,
+        resolver: Address,
+    }
+
+    event RecordSet {
+        #[indexed]
+        name_hash: u256,
+        key: String,
+        value: String,
+    }
+
+    event SubdomainCreated {
+        #[indexed]
+        parent_hash: u256,
+        #[indexed]
+        child_hash: u256,
+        label: String,
+    }
+
+    event PrimaryNameSet {
+        #[indexed]
+        owner: Address,
+        name_hash: u256,
+    }
+
+    error Unauthorized {}
+    error NotNameOwner {}
+    error NameTaken {}
+    error NameExpired {}
+    error NameNotExpired {}
+    error NameNotFound {}
+    error InsufficientPayment { required: u256, sent: u256 }
+    error NameTooShort { min_length: u64 }
+    error NameTooLong { max_length: u64 }
+    error InvalidName {}
+    error GracePeriodActive {}
+    error SubdomainExists {}
+    error CannotTransferSubdomain {}
+    error DurationTooShort { min: u64 }
+
+    #[constructor]
+    pub fn init(
+        registration_fee: u256,
+        renewal_fee_per_block: u256,
+        min_blocks: u64,
+        grace_period: u64,
+    ) {
+        self.owner = msg.sender;
+        self.registration_fee = registration_fee;
+        self.renewal_fee_per_block = renewal_fee_per_block;
+        self.min_registration_blocks = min_blocks;
+        self.grace_period = grace_period;
+        self.revenue = 0;
+        self.name_count = 0;
+    }
+
+    pub fn register(name: String, duration_blocks: u64) {
+        require!(duration_blocks >= self.min_registration_blocks, DurationTooShort { min: self.min_registration_blocks });
+        self.validate_name(name);
+
+        let name_hash = math::keccak256_str(name);
+        let existing = self.names[name_hash];
+
+        // If name exists, it must be expired + grace period over
+        if existing.owner != Address::ZERO {
+            require!(
+                block.height > existing.expires_at + self.grace_period,
+                NameTaken {}
+            );
+        }
+
+        let total_cost = self.registration_fee + (self.renewal_fee_per_block * (duration_blocks as u256));
+        require!(msg.value >= total_cost, InsufficientPayment { required: total_cost, sent: msg.value });
+
+        let expires_at = block.height + duration_blocks;
+
+        self.names[name_hash] = NameEntry {
+            name: name,
+            owner: msg.sender,
+            resolver: msg.sender,
+            registered_at: block.height,
+            expires_at: expires_at,
+            is_subdomain: false,
+            parent_hash: 0,
+        };
+
+        self.revenue = self.revenue + total_cost;
+        self.name_count = self.name_count + 1;
+
+        // Refund excess
+        let excess = msg.value - total_cost;
+        if excess > 0 {
+            raw_call!(msg.sender, excess, bytes::empty());
+        }
+
+        emit NameRegistered {
+            name_hash: name_hash,
+            owner: msg.sender,
+            name: name,
+            expires_at: expires_at,
+        };
+    }
+
+    pub fn renew(name_hash: u256, additional_blocks: u64) {
+        let mut entry = self.names[name_hash];
+        require!(entry.owner != Address::ZERO, NameNotFound {});
+        require!(!entry.is_subdomain, CannotTransferSubdomain {});
+
+        // Allow renewal during grace period too
+        require!(
+            block.height <= entry.expires_at + self.grace_period,
+            NameExpired {}
+        );
+
+        let cost = self.renewal_fee_per_block * (additional_blocks as u256);
+        require!(msg.value >= cost, InsufficientPayment { required: cost, sent: msg.value });
+
+        // Extend from current expiry or from now if expired
+        let base = if block.height > entry.expires_at {
+            block.height
+        } else {
+            entry.expires_at
+        };
+        entry.expires_at = base + additional_blocks;
+        self.names[name_hash] = entry;
+        self.revenue = self.revenue + cost;
+
+        let excess = msg.value - cost;
+        if excess > 0 {
+            raw_call!(msg.sender, excess, bytes::empty());
+        }
+
+        emit NameRenewed { name_hash: name_hash, new_expiry: entry.expires_at };
+    }
+
+    pub fn transfer(name_hash: u256, new_owner: Address) {
+        let mut entry = self.names[name_hash];
+        require!(entry.owner == msg.sender, NotNameOwner {});
+        require!(block.height <= entry.expires_at, NameExpired {});
+        require!(!entry.is_subdomain, CannotTransferSubdomain {});
+
+        let old_owner = entry.owner;
+        entry.owner = new_owner;
+        entry.resolver = new_owner;
+        self.names[name_hash] = entry;
+
+        // Clear primary name if it was the transferred name
+        if self.address_to_primary[old_owner] == name_hash {
+            self.address_to_primary[old_owner] = 0;
+        }
+
+        emit NameTransferred { name_hash: name_hash, from: old_owner, to: new_owner };
+    }
+
+    pub fn set_resolver(name_hash: u256, resolver: Address) {
+        let entry = self.names[name_hash];
+        require!(entry.owner == msg.sender, NotNameOwner {});
+        require!(block.height <= entry.expires_at, NameExpired {});
+
+        let mut updated = entry;
+        updated.resolver = resolver;
+        self.names[name_hash] = updated;
+
+        emit ResolverUpdated { name_hash: name_hash, resolver: resolver };
+    }
+
+    pub fn set_record(name_hash: u256, key: String, value: String) {
+        let entry = self.names[name_hash];
+        require!(entry.owner == msg.sender, NotNameOwner {});
+        require!(block.height <= entry.expires_at, NameExpired {});
+
+        self.records[name_hash][key] = value;
+
+        emit RecordSet { name_hash: name_hash, key: key, value: value };
+    }
+
+    pub fn set_primary_name(name_hash: u256) {
+        let entry = self.names[name_hash];
+        require!(entry.owner == msg.sender, NotNameOwner {});
+        require!(block.height <= entry.expires_at, NameExpired {});
+
+        self.address_to_primary[msg.sender] = name_hash;
+
+        emit PrimaryNameSet { owner: msg.sender, name_hash: name_hash };
+    }
+
+    pub fn create_subdomain(parent_hash: u256, label: String) {
+        let parent = self.names[parent_hash];
+        require!(parent.owner == msg.sender, NotNameOwner {});
+        require!(block.height <= parent.expires_at, NameExpired {});
+
+        let child_hash = math::keccak256(parent_hash ^ math::keccak256_str(label));
+        require!(self.names[child_hash].owner == Address::ZERO, SubdomainExists {});
+
+        let full_name = label + "." + parent.name;
+
+        self.names[child_hash] = NameEntry {
+            name: full_name,
+            owner: msg.sender,
+            resolver: msg.sender,
+            registered_at: block.height,
+            expires_at: parent.expires_at,   // inherits parent expiry
+            is_subdomain: true,
+            parent_hash: parent_hash,
+        };
+
+        self.subdomains[parent_hash][label] = child_hash;
+
+        emit SubdomainCreated {
+            parent_hash: parent_hash,
+            child_hash: child_hash,
+            label: label,
+        };
+    }
+
+    fn validate_name(name: String) {
+        let len = name.len();
+        require!(len >= MIN_NAME_LENGTH, NameTooShort { min_length: MIN_NAME_LENGTH });
+        require!(len <= MAX_NAME_LENGTH, NameTooLong { max_length: MAX_NAME_LENGTH });
+
+        // Check for valid characters (simplified on-chain check)
+        for i in 0..len {
+            let c = name.char_at(i);
+            let valid = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+            require!(valid, InvalidName {});
+        }
+    }
+
+    pub fn withdraw_revenue(to: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        let amount = self.revenue;
+        self.revenue = 0;
+        raw_call!(to, amount, bytes::empty());
+    }
+
+    pub fn set_fees(registration_fee: u256, renewal_fee: u256) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.registration_fee = registration_fee;
+        self.renewal_fee_per_block = renewal_fee;
+    }
+
+    #[view]
+    pub fn resolve(name_hash: u256) -> Address {
+        let entry = self.names[name_hash];
+        if block.height > entry.expires_at {
+            return Address::ZERO;
+        }
+        return entry.resolver;
+    }
+
+    #[view]
+    pub fn get_name(name_hash: u256) -> NameEntry {
+        return self.names[name_hash];
+    }
+
+    #[view]
+    pub fn get_record(name_hash: u256, key: String) -> String {
+        return self.records[name_hash][key];
+    }
+
+    #[view]
+    pub fn get_primary_name(addr: Address) -> u256 {
+        return self.address_to_primary[addr];
+    }
+
+    #[view]
+    pub fn lookup_subdomain(parent_hash: u256, label: String) -> u256 {
+        return self.subdomains[parent_hash][label];
+    }
+
+    #[view]
+    pub fn is_available(name_hash: u256) -> bool {
+        let entry = self.names[name_hash];
+        if entry.owner == Address::ZERO {
+            return true;
+        }
+        return block.height > entry.expires_at + self.grace_period;
+    }
+}

@@ -1,0 +1,500 @@
+// Token vesting contract with cliff, linear release, and revocation
+use std::math;
+use std::token::IERC20;
+
+contract TokenVesting {
+    storage {
+        owner: Address,
+        token: Address,
+
+        // Vesting schedule storage
+        next_schedule_id: u256,
+        schedules: Map<u256, VestingSchedule>,
+        schedule_active: Map<u256, bool>,
+
+        // User -> their schedule IDs
+        user_schedules: Map<Address, Vec<u256>>,
+        user_schedule_count: Map<Address, u256>,
+
+        // Global tracking
+        total_vesting_amount: u256,
+        total_released: u256,
+        total_revoked: u256,
+        total_schedules: u256,
+        active_schedules: u256,
+
+        // Revocation config
+        revocable_by_default: bool,
+
+        // Template schedules for batch creation
+        template_count: u256,
+        templates: Map<u256, VestingTemplate>,
+    }
+
+    struct VestingSchedule {
+        id: u256,
+        beneficiary: Address,
+        total_amount: u256,
+        released_amount: u256,
+        start_time: u64,
+        cliff_duration: u64,     // seconds until cliff ends
+        vesting_duration: u64,   // total vesting period (including cliff)
+        revocable: bool,
+        revoked: bool,
+        revoked_at: u64,
+        created_at: u64,
+    }
+
+    struct VestingTemplate {
+        cliff_duration: u64,
+        vesting_duration: u64,
+        revocable: bool,
+        label: String,
+    }
+
+    event ScheduleCreated {
+        #[indexed]
+        schedule_id: u256,
+        #[indexed]
+        beneficiary: Address,
+        total_amount: u256,
+        start_time: u64,
+        cliff_duration: u64,
+        vesting_duration: u64,
+    }
+
+    event TokensReleased {
+        #[indexed]
+        schedule_id: u256,
+        #[indexed]
+        beneficiary: Address,
+        amount: u256,
+    }
+
+    event ScheduleRevoked {
+        #[indexed]
+        schedule_id: u256,
+        #[indexed]
+        beneficiary: Address,
+        unvested_returned: u256,
+    }
+
+    event TemplateCreated {
+        template_id: u256,
+        label: String,
+    }
+
+    event BatchScheduleCreated {
+        count: u256,
+        total_amount: u256,
+    }
+
+    event OwnershipTransferred {
+        #[indexed]
+        previous: Address,
+        #[indexed]
+        new_owner: Address,
+    }
+
+    error NotOwner {}
+    error ScheduleNotFound { schedule_id: u256 }
+    error ScheduleRevoked { schedule_id: u256 }
+    error ScheduleNotRevocable { schedule_id: u256 }
+    error NothingToRelease {}
+    error ZeroAmount {}
+    error InvalidDuration { cliff: u64, vesting: u64 }
+    error ZeroAddress {}
+    error TemplateNotFound { template_id: u256 }
+    error NotBeneficiary { schedule_id: u256, caller: Address }
+    error CliffNotReached { cliff_end: u64, current: u64 }
+    error ArrayLengthMismatch {}
+
+    #[constructor]
+    pub fn init(token: Address, revocable_by_default: bool) {
+        self.owner = msg.sender;
+        self.token = token;
+        self.revocable_by_default = revocable_by_default;
+        self.next_schedule_id = 1u256;
+    }
+
+    // --- Internal ---
+
+    fn compute_vested_amount(schedule: VestingSchedule) -> u256 {
+        if schedule.revoked {
+            // If revoked, vested amount is frozen at revocation time
+            let cliff_end = schedule.start_time + schedule.cliff_duration;
+            if schedule.revoked_at < cliff_end {
+                return 0u256;
+            }
+
+            let elapsed = schedule.revoked_at - schedule.start_time;
+            if elapsed as u256 >= schedule.vesting_duration as u256 {
+                return schedule.total_amount;
+            }
+            return (schedule.total_amount * (elapsed as u256)) / (schedule.vesting_duration as u256);
+        }
+
+        let cliff_end = schedule.start_time + schedule.cliff_duration;
+        if block.timestamp < cliff_end {
+            return 0u256;
+        }
+
+        let vesting_end = schedule.start_time + schedule.vesting_duration;
+        if block.timestamp >= vesting_end {
+            return schedule.total_amount;
+        }
+
+        // Linear vesting
+        let elapsed = block.timestamp - schedule.start_time;
+        return (schedule.total_amount * (elapsed as u256)) / (schedule.vesting_duration as u256);
+    }
+
+    fn compute_releasable(schedule: VestingSchedule) -> u256 {
+        let vested = self.compute_vested_amount(schedule);
+        if vested <= schedule.released_amount {
+            return 0u256;
+        }
+        return vested - schedule.released_amount;
+    }
+
+    fn create_schedule_internal(
+        beneficiary: Address,
+        amount: u256,
+        start_time: u64,
+        cliff_duration: u64,
+        vesting_duration: u64,
+        revocable: bool,
+    ) -> u256 {
+        require!(beneficiary != Address::ZERO, ZeroAddress {});
+        require!(amount > 0u256, ZeroAmount {});
+        require!(vesting_duration > 0u64, InvalidDuration {
+            cliff: cliff_duration,
+            vesting: vesting_duration,
+        });
+        require!(cliff_duration <= vesting_duration, InvalidDuration {
+            cliff: cliff_duration,
+            vesting: vesting_duration,
+        });
+
+        let schedule_id = self.next_schedule_id;
+        self.next_schedule_id = schedule_id + 1u256;
+
+        self.schedules[schedule_id] = VestingSchedule {
+            id: schedule_id,
+            beneficiary: beneficiary,
+            total_amount: amount,
+            released_amount: 0u256,
+            start_time: start_time,
+            cliff_duration: cliff_duration,
+            vesting_duration: vesting_duration,
+            revocable: revocable,
+            revoked: false,
+            revoked_at: 0u64,
+            created_at: block.timestamp,
+        };
+        self.schedule_active[schedule_id] = true;
+
+        self.user_schedules[beneficiary].push(schedule_id);
+        self.user_schedule_count[beneficiary] = self.user_schedule_count[beneficiary] + 1u256;
+        self.total_vesting_amount = self.total_vesting_amount + amount;
+        self.total_schedules = self.total_schedules + 1u256;
+        self.active_schedules = self.active_schedules + 1u256;
+
+        // Transfer tokens to this contract
+        IERC20::at(self.token).transfer_from(msg.sender, address(self), amount);
+
+        emit ScheduleCreated {
+            schedule_id: schedule_id,
+            beneficiary: beneficiary,
+            total_amount: amount,
+            start_time: start_time,
+            cliff_duration: cliff_duration,
+            vesting_duration: vesting_duration,
+        };
+
+        return schedule_id;
+    }
+
+    // --- Schedule creation ---
+
+    pub fn create_schedule(
+        beneficiary: Address,
+        amount: u256,
+        start_time: u64,
+        cliff_duration: u64,
+        vesting_duration: u64,
+        revocable: bool,
+    ) -> u256 {
+        require!(msg.sender == self.owner, NotOwner {});
+        return self.create_schedule_internal(
+            beneficiary, amount, start_time, cliff_duration, vesting_duration, revocable,
+        );
+    }
+
+    pub fn create_schedule_now(
+        beneficiary: Address,
+        amount: u256,
+        cliff_duration: u64,
+        vesting_duration: u64,
+    ) -> u256 {
+        require!(msg.sender == self.owner, NotOwner {});
+        return self.create_schedule_internal(
+            beneficiary, amount, block.timestamp, cliff_duration, vesting_duration,
+            self.revocable_by_default,
+        );
+    }
+
+    // --- Template-based creation ---
+
+    pub fn create_template(cliff_duration: u64, vesting_duration: u64, revocable: bool, label: String) -> u256 {
+        require!(msg.sender == self.owner, NotOwner {});
+        let tid = self.template_count;
+        self.template_count = tid + 1u256;
+        self.templates[tid] = VestingTemplate {
+            cliff_duration: cliff_duration,
+            vesting_duration: vesting_duration,
+            revocable: revocable,
+            label: label,
+        };
+        emit TemplateCreated { template_id: tid, label: label };
+        return tid;
+    }
+
+    pub fn create_from_template(template_id: u256, beneficiary: Address, amount: u256) -> u256 {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(template_id < self.template_count, TemplateNotFound { template_id: template_id });
+        let tmpl = self.templates[template_id];
+        return self.create_schedule_internal(
+            beneficiary, amount, block.timestamp,
+            tmpl.cliff_duration, tmpl.vesting_duration, tmpl.revocable,
+        );
+    }
+
+    // Batch creation for team allocations
+    pub fn create_batch(
+        beneficiaries: Vec<Address>,
+        amounts: Vec<u256>,
+        cliff_duration: u64,
+        vesting_duration: u64,
+    ) {
+        require!(msg.sender == self.owner, NotOwner {});
+        let count = beneficiaries.len();
+        require!(count == amounts.len(), ArrayLengthMismatch {});
+
+        let mut total: u256 = 0u256;
+        for i in 0..count {
+            self.create_schedule_internal(
+                beneficiaries[i],
+                amounts[i],
+                block.timestamp,
+                cliff_duration,
+                vesting_duration,
+                self.revocable_by_default,
+            );
+            total = total + amounts[i];
+        }
+
+        emit BatchScheduleCreated { count: count, total_amount: total };
+    }
+
+    // --- Release ---
+
+    pub fn release(schedule_id: u256) {
+        require!(self.schedule_active[schedule_id], ScheduleNotFound { schedule_id: schedule_id });
+        let schedule = self.schedules[schedule_id];
+        require!(!schedule.revoked || schedule.released_amount < self.compute_vested_amount(schedule),
+            ScheduleRevoked { schedule_id: schedule_id });
+
+        // Anyone can trigger release, but tokens go to beneficiary
+        let releasable = self.compute_releasable(schedule);
+        require!(releasable > 0u256, NothingToRelease {});
+
+        self.schedules[schedule_id].released_amount = schedule.released_amount + releasable;
+        self.total_released = self.total_released + releasable;
+
+        IERC20::at(self.token).transfer(schedule.beneficiary, releasable);
+
+        emit TokensReleased {
+            schedule_id: schedule_id,
+            beneficiary: schedule.beneficiary,
+            amount: releasable,
+        };
+
+        // Deactivate if fully released
+        if self.schedules[schedule_id].released_amount >= schedule.total_amount {
+            self.schedule_active[schedule_id] = false;
+            self.active_schedules = self.active_schedules - 1u256;
+        }
+    }
+
+    // Release all schedules for the caller
+    pub fn release_all() {
+        let count = self.user_schedule_count[msg.sender];
+        let schedules = self.user_schedules[msg.sender];
+
+        let mut total_released_now: u256 = 0u256;
+
+        for i in 0..count {
+            let sid = schedules[i];
+            if !self.schedule_active[sid] {
+                continue;
+            }
+            let schedule = self.schedules[sid];
+            let releasable = self.compute_releasable(schedule);
+            if releasable > 0u256 {
+                self.schedules[sid].released_amount = schedule.released_amount + releasable;
+                total_released_now = total_released_now + releasable;
+
+                emit TokensReleased {
+                    schedule_id: sid,
+                    beneficiary: msg.sender,
+                    amount: releasable,
+                };
+
+                if self.schedules[sid].released_amount >= schedule.total_amount {
+                    self.schedule_active[sid] = false;
+                    self.active_schedules = self.active_schedules - 1u256;
+                }
+            }
+        }
+
+        require!(total_released_now > 0u256, NothingToRelease {});
+        self.total_released = self.total_released + total_released_now;
+        IERC20::at(self.token).transfer(msg.sender, total_released_now);
+    }
+
+    // --- Revocation ---
+
+    pub fn revoke(schedule_id: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(self.schedule_active[schedule_id], ScheduleNotFound { schedule_id: schedule_id });
+        let schedule = self.schedules[schedule_id];
+        require!(schedule.revocable, ScheduleNotRevocable { schedule_id: schedule_id });
+        require!(!schedule.revoked, ScheduleRevoked { schedule_id: schedule_id });
+
+        // Release any vested-but-unclaimed tokens first
+        let vested = self.compute_vested_amount(schedule);
+        let releasable = vested - schedule.released_amount;
+
+        if releasable > 0u256 {
+            self.schedules[schedule_id].released_amount = schedule.released_amount + releasable;
+            self.total_released = self.total_released + releasable;
+            IERC20::at(self.token).transfer(schedule.beneficiary, releasable);
+        }
+
+        // Return unvested tokens to owner
+        let unvested = schedule.total_amount - vested;
+        self.schedules[schedule_id].revoked = true;
+        self.schedules[schedule_id].revoked_at = block.timestamp;
+        self.total_revoked = self.total_revoked + unvested;
+
+        if unvested > 0u256 {
+            IERC20::at(self.token).transfer(self.owner, unvested);
+        }
+
+        self.schedule_active[schedule_id] = false;
+        self.active_schedules = self.active_schedules - 1u256;
+
+        emit ScheduleRevoked {
+            schedule_id: schedule_id,
+            beneficiary: schedule.beneficiary,
+            unvested_returned: unvested,
+        };
+    }
+
+    // --- Admin ---
+
+    pub fn transfer_ownership(new_owner: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(new_owner != Address::ZERO, ZeroAddress {});
+        let previous = self.owner;
+        self.owner = new_owner;
+        emit OwnershipTransferred { previous: previous, new_owner: new_owner };
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn get_schedule(schedule_id: u256) -> VestingSchedule {
+        return self.schedules[schedule_id];
+    }
+
+    #[view]
+    pub fn get_vested_amount(schedule_id: u256) -> u256 {
+        let schedule = self.schedules[schedule_id];
+        return self.compute_vested_amount(schedule);
+    }
+
+    #[view]
+    pub fn get_releasable(schedule_id: u256) -> u256 {
+        let schedule = self.schedules[schedule_id];
+        return self.compute_releasable(schedule);
+    }
+
+    #[view]
+    pub fn get_user_total_vesting(user: Address) -> u256 {
+        let count = self.user_schedule_count[user];
+        let schedules = self.user_schedules[user];
+        let mut total: u256 = 0u256;
+        for i in 0..count {
+            let sid = schedules[i];
+            if self.schedule_active[sid] {
+                total = total + self.schedules[sid].total_amount;
+            }
+        }
+        return total;
+    }
+
+    #[view]
+    pub fn get_user_total_releasable(user: Address) -> u256 {
+        let count = self.user_schedule_count[user];
+        let schedules = self.user_schedules[user];
+        let mut total: u256 = 0u256;
+        for i in 0..count {
+            let sid = schedules[i];
+            if self.schedule_active[sid] {
+                let schedule = self.schedules[sid];
+                total = total + self.compute_releasable(schedule);
+            }
+        }
+        return total;
+    }
+
+    #[view]
+    pub fn get_user_schedule_count(user: Address) -> u256 {
+        return self.user_schedule_count[user];
+    }
+
+    #[view]
+    pub fn get_total_vesting_amount() -> u256 {
+        return self.total_vesting_amount;
+    }
+
+    #[view]
+    pub fn get_total_released() -> u256 {
+        return self.total_released;
+    }
+
+    #[view]
+    pub fn get_active_schedules() -> u256 {
+        return self.active_schedules;
+    }
+
+    #[view]
+    pub fn get_template(template_id: u256) -> VestingTemplate {
+        return self.templates[template_id];
+    }
+
+    #[view]
+    pub fn get_vesting_progress(schedule_id: u256) -> u256 {
+        let schedule = self.schedules[schedule_id];
+        if schedule.vesting_duration == 0u64 {
+            return 1000000000000000000u256; // 100% in 1e18
+        }
+        let elapsed = block.timestamp - schedule.start_time;
+        if elapsed as u256 >= schedule.vesting_duration as u256 {
+            return 1000000000000000000u256;
+        }
+        return (elapsed as u256 * 1000000000000000000u256) / (schedule.vesting_duration as u256);
+    }
+}

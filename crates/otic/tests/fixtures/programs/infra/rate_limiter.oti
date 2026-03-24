@@ -1,0 +1,381 @@
+// Rate limiting contract per address.
+// Tracks call frequency for registered endpoints. Other contracts
+// call into this to enforce rate limits before executing logic.
+// Supports sliding window and fixed window strategies.
+
+use std::math;
+
+enum RateStrategy {
+    FixedWindow,    // 0
+    SlidingWindow,  // 1
+}
+
+contract RateLimiter {
+    storage {
+        owner: Address,
+        next_policy_id: u64,
+        policies: Map<u64, RatePolicy>,
+        policy_by_key: Map<u256, u64>,                 // keccak256(contract, fn_name) -> policy_id
+        fixed_window: Map<u64, Map<Address, WindowState>>,   // policy -> user -> state
+        sliding_calls: Map<u64, Map<Address, Vec<u64>>>,     // policy -> user -> call timestamps
+        global_counters: Map<u64, GlobalCounter>,
+        exemptions: Map<u64, Map<Address, bool>>,       // policy -> address -> exempt
+        authorized_callers: Map<Address, bool>,          // contracts that can call check/record
+        penalty_scores: Map<Address, u64>,               // accumulated violation score
+        banned: Map<Address, bool>,
+        ban_threshold: u64,
+        paused: bool,
+    }
+
+    struct RatePolicy {
+        id: u64,
+        target_contract: Address,
+        fn_name: String,
+        strategy: RateStrategy,
+        max_calls: u64,
+        window_blocks: u64,
+        cooldown_blocks: u64,    // minimum blocks between calls
+        global_max_per_window: u64,  // 0 = no global limit
+        penalty_on_exceed: u64,  // penalty points added on violation
+        active: bool,
+        created_at: u64,
+    }
+
+    struct WindowState {
+        call_count: u64,
+        window_start: u64,
+        last_call_block: u64,
+    }
+
+    struct GlobalCounter {
+        call_count: u64,
+        window_start: u64,
+    }
+
+    event PolicyCreated {
+        #[indexed]
+        policy_id: u64,
+        #[indexed]
+        target_contract: Address,
+        fn_name: String,
+        max_calls: u64,
+        window_blocks: u64,
+    }
+
+    event PolicyUpdated {
+        #[indexed]
+        policy_id: u64,
+    }
+
+    event RateLimitExceeded {
+        #[indexed]
+        policy_id: u64,
+        #[indexed]
+        caller: Address,
+        call_count: u64,
+        max_calls: u64,
+    }
+
+    event CallRecorded {
+        #[indexed]
+        policy_id: u64,
+        #[indexed]
+        caller: Address,
+    }
+
+    event AddressBanned {
+        #[indexed]
+        account: Address,
+        penalty_score: u64,
+    }
+
+    event AddressUnbanned {
+        #[indexed]
+        account: Address,
+    }
+
+    error Unauthorized {}
+    error NotAuthorized {}
+    error PolicyNotFound {}
+    error PolicyInactive {}
+    error RateExceeded { policy_id: u64, retry_after: u64 }
+    error CooldownActive { ready_at: u64 }
+    error GlobalLimitReached {}
+    error AddressIsBanned {}
+    error Paused {}
+    error PolicyKeyTaken {}
+    error InvalidConfig {}
+
+    #[constructor]
+    pub fn init(ban_threshold: u64) {
+        self.owner = msg.sender;
+        self.next_policy_id = 1;
+        self.ban_threshold = ban_threshold;
+        self.paused = false;
+    }
+
+    pub fn create_policy(
+        target_contract: Address,
+        fn_name: String,
+        strategy: RateStrategy,
+        max_calls: u64,
+        window_blocks: u64,
+        cooldown_blocks: u64,
+        global_max: u64,
+        penalty: u64,
+    ) -> u64 {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(max_calls > 0 && window_blocks > 0, InvalidConfig {});
+
+        let policy_key = math::keccak256((target_contract as u256) ^ math::keccak256_str(fn_name));
+        require!(self.policy_by_key[policy_key] == 0, PolicyKeyTaken {});
+
+        let policy_id = self.next_policy_id;
+        self.next_policy_id = policy_id + 1;
+
+        self.policies[policy_id] = RatePolicy {
+            id: policy_id,
+            target_contract: target_contract,
+            fn_name: fn_name,
+            strategy: strategy,
+            max_calls: max_calls,
+            window_blocks: window_blocks,
+            cooldown_blocks: cooldown_blocks,
+            global_max_per_window: global_max,
+            penalty_on_exceed: penalty,
+            active: true,
+            created_at: block.height,
+        };
+
+        self.policy_by_key[policy_key] = policy_id;
+
+        emit PolicyCreated {
+            policy_id: policy_id,
+            target_contract: target_contract,
+            fn_name: fn_name,
+            max_calls: max_calls,
+            window_blocks: window_blocks,
+        };
+
+        return policy_id;
+    }
+
+    // Called by authorized contracts to check + record a call
+    pub fn check_and_record(policy_id: u64, caller: Address) -> bool {
+        require!(!self.paused, Paused {});
+        require!(self.authorized_callers[msg.sender] || msg.sender == self.owner, NotAuthorized {});
+        require!(!self.banned[caller], AddressIsBanned {});
+
+        let policy = self.policies[policy_id];
+        require!(policy.active, PolicyInactive {});
+
+        // Check exemption
+        if self.exemptions[policy_id][caller] {
+            return true;
+        }
+
+        // Check cooldown
+        if policy.cooldown_blocks > 0 {
+            let state = self.fixed_window[policy_id][caller];
+            if state.last_call_block > 0 {
+                let ready_at = state.last_call_block + policy.cooldown_blocks;
+                if block.height < ready_at {
+                    self.apply_penalty(policy_id, caller);
+                    revert!(CooldownActive { ready_at: ready_at });
+                }
+            }
+        }
+
+        // Check global limit
+        if policy.global_max_per_window > 0 {
+            let mut gc = self.global_counters[policy_id];
+            if block.height >= gc.window_start + policy.window_blocks {
+                gc.window_start = block.height;
+                gc.call_count = 0;
+            }
+            if gc.call_count >= policy.global_max_per_window {
+                self.apply_penalty(policy_id, caller);
+                revert!(GlobalLimitReached {});
+            }
+            gc.call_count = gc.call_count + 1;
+            self.global_counters[policy_id] = gc;
+        }
+
+        // Check per-address limit
+        if policy.strategy == RateStrategy::FixedWindow {
+            return self.check_fixed_window(policy_id, caller, policy);
+        } else {
+            return self.check_sliding_window(policy_id, caller, policy);
+        }
+    }
+
+    fn check_fixed_window(policy_id: u64, caller: Address, policy: RatePolicy) -> bool {
+        let mut state = self.fixed_window[policy_id][caller];
+
+        // Reset window if expired
+        if block.height >= state.window_start + policy.window_blocks {
+            state.window_start = block.height;
+            state.call_count = 0;
+        }
+
+        if state.call_count >= policy.max_calls {
+            self.apply_penalty(policy_id, caller);
+            let retry_after = state.window_start + policy.window_blocks;
+            emit RateLimitExceeded {
+                policy_id: policy_id,
+                caller: caller,
+                call_count: state.call_count,
+                max_calls: policy.max_calls,
+            };
+            revert!(RateExceeded { policy_id: policy_id, retry_after: retry_after });
+        }
+
+        state.call_count = state.call_count + 1;
+        state.last_call_block = block.height;
+        self.fixed_window[policy_id][caller] = state;
+
+        emit CallRecorded { policy_id: policy_id, caller: caller };
+        return true;
+    }
+
+    fn check_sliding_window(policy_id: u64, caller: Address, policy: RatePolicy) -> bool {
+        let mut calls = self.sliding_calls[policy_id][caller];
+        let window_start = block.height - policy.window_blocks;
+
+        // Prune old calls outside the window
+        let mut pruned: Vec<u64> = Vec::new();
+        for i in 0..calls.len() {
+            if calls[i] > window_start {
+                pruned.push(calls[i]);
+            }
+        }
+
+        if (pruned.len() as u64) >= policy.max_calls {
+            self.apply_penalty(policy_id, caller);
+            let oldest_in_window = pruned[0];
+            let retry_after = oldest_in_window + policy.window_blocks;
+            emit RateLimitExceeded {
+                policy_id: policy_id,
+                caller: caller,
+                call_count: pruned.len() as u64,
+                max_calls: policy.max_calls,
+            };
+            revert!(RateExceeded { policy_id: policy_id, retry_after: retry_after });
+        }
+
+        pruned.push(block.height);
+        self.sliding_calls[policy_id][caller] = pruned;
+
+        // Update last call tracking
+        let mut state = self.fixed_window[policy_id][caller];
+        state.last_call_block = block.height;
+        self.fixed_window[policy_id][caller] = state;
+
+        emit CallRecorded { policy_id: policy_id, caller: caller };
+        return true;
+    }
+
+    fn apply_penalty(policy_id: u64, caller: Address) {
+        let policy = self.policies[policy_id];
+        if policy.penalty_on_exceed > 0 {
+            self.penalty_scores[caller] = self.penalty_scores[caller] + policy.penalty_on_exceed;
+
+            if self.penalty_scores[caller] >= self.ban_threshold {
+                self.banned[caller] = true;
+                emit AddressBanned {
+                    account: caller,
+                    penalty_score: self.penalty_scores[caller],
+                };
+            }
+        }
+    }
+
+    // View: check without recording (dry run)
+    #[view]
+    pub fn would_be_allowed(policy_id: u64, caller: Address) -> bool {
+        if self.banned[caller] {
+            return false;
+        }
+        if self.exemptions[policy_id][caller] {
+            return true;
+        }
+
+        let policy = self.policies[policy_id];
+        if !policy.active {
+            return false;
+        }
+
+        if policy.strategy == RateStrategy::FixedWindow {
+            let state = self.fixed_window[policy_id][caller];
+            if block.height >= state.window_start + policy.window_blocks {
+                return true;
+            }
+            return state.call_count < policy.max_calls;
+        } else {
+            let calls = self.sliding_calls[policy_id][caller];
+            let window_start = block.height - policy.window_blocks;
+            let mut count: u64 = 0;
+            for i in 0..calls.len() {
+                if calls[i] > window_start {
+                    count = count + 1;
+                }
+            }
+            return count < policy.max_calls;
+        }
+    }
+
+    pub fn authorize_caller(caller: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.authorized_callers[caller] = true;
+    }
+
+    pub fn revoke_caller(caller: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.authorized_callers[caller] = false;
+    }
+
+    pub fn set_exemption(policy_id: u64, account: Address, exempt: bool) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.exemptions[policy_id][account] = exempt;
+    }
+
+    pub fn unban(account: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.banned[account] = false;
+        self.penalty_scores[account] = 0;
+        emit AddressUnbanned { account: account };
+    }
+
+    pub fn deactivate_policy(policy_id: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        let mut policy = self.policies[policy_id];
+        policy.active = false;
+        self.policies[policy_id] = policy;
+        emit PolicyUpdated { policy_id: policy_id };
+    }
+
+    pub fn set_paused(paused: bool) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.paused = paused;
+    }
+
+    #[view]
+    pub fn get_policy(policy_id: u64) -> RatePolicy {
+        return self.policies[policy_id];
+    }
+
+    #[view]
+    pub fn get_caller_state(policy_id: u64, caller: Address) -> WindowState {
+        return self.fixed_window[policy_id][caller];
+    }
+
+    #[view]
+    pub fn get_penalty_score(account: Address) -> u64 {
+        return self.penalty_scores[account];
+    }
+
+    #[view]
+    pub fn is_banned(account: Address) -> bool {
+        return self.banned[account];
+    }
+}

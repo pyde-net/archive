@@ -1,0 +1,313 @@
+// On-chain property deed registry with lien tracking and transfer history
+
+contract PropertyDeedRegistry {
+    storage {
+        registrar: Address,
+        next_deed_id: u64,
+        deeds: Map<u64, Deed>,
+        deed_by_parcel: Map<u256, u64>,
+        liens: Map<u64, Map<u32, Lien>>,
+        lien_counts: Map<u64, u32>,
+        transfer_history: Map<u64, Map<u32, DeedTransfer>>,
+        transfer_counts: Map<u64, u32>,
+        authorized_notaries: Map<Address, bool>,
+        property_taxes: Map<u64, TaxRecord>,
+        encumbrances: Map<u64, u256>,
+        total_registered: u64,
+    }
+
+    struct Deed {
+        parcel_hash: u256,
+        owner: Address,
+        co_owners: Vec<Address>,
+        property_type: u8,
+        area_sqm: u64,
+        zoning_code: u16,
+        assessed_value: u256,
+        registered_at: u64,
+        last_transfer: u64,
+        active: bool,
+    }
+
+    struct Lien {
+        holder: Address,
+        amount: u256,
+        filed_at: u64,
+        expires_at: u64,
+        lien_type: u8,
+        released: bool,
+    }
+
+    struct DeedTransfer {
+        from: Address,
+        to: Address,
+        sale_price: u256,
+        notary: Address,
+        timestamp: u64,
+        document_hash: u256,
+    }
+
+    struct TaxRecord {
+        annual_amount: u256,
+        last_paid: u64,
+        paid_through: u64,
+        arrears: u256,
+    }
+
+    event DeedRegistered {
+        #[indexed]
+        deed_id: u64,
+        #[indexed]
+        owner: Address,
+        parcel_hash: u256,
+    }
+
+    event DeedTransferred {
+        #[indexed]
+        deed_id: u64,
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        sale_price: u256,
+    }
+
+    event LienFiled {
+        #[indexed]
+        deed_id: u64,
+        #[indexed]
+        holder: Address,
+        amount: u256,
+    }
+
+    event LienReleased {
+        #[indexed]
+        deed_id: u64,
+        lien_index: u32,
+    }
+
+    event TaxPaid {
+        #[indexed]
+        deed_id: u64,
+        amount: u256,
+        paid_through: u64,
+    }
+
+    error NotRegistrar {}
+    error NotNotary {}
+    error DeedNotFound { id: u64 }
+    error NotOwner {}
+    error ParcelAlreadyRegistered {}
+    error ActiveLiensExist { count: u32 }
+    error LienNotFound { index: u32 }
+    error NotLienHolder {}
+    error DeedInactive {}
+    error InsufficientPayment { required: u256, sent: u256 }
+
+    const SECONDS_PER_DAY: u64 = 86400;
+    const DAYS_PER_YEAR: u64 = 365;
+    const PROPERTY_TAX_DIVISOR: u256 = 100;
+
+    #[constructor]
+    pub fn init() {
+        self.registrar = msg.sender;
+        self.next_deed_id = 1;
+        self.total_registered = 0;
+    }
+
+    fn require_registrar() {
+        require!(msg.sender == self.registrar, NotRegistrar {});
+    }
+
+    pub fn authorize_notary(notary: Address) {
+        self.require_registrar();
+        self.authorized_notaries[notary] = true;
+    }
+
+    pub fn register_deed(
+        parcel_hash: u256,
+        owner: Address,
+        co_owners: Vec<Address>,
+        property_type: u8,
+        area_sqm: u64,
+        zoning_code: u16,
+        assessed_value: u256,
+    ) -> u64 {
+        self.require_registrar();
+        require!(self.deed_by_parcel[parcel_hash] == 0, ParcelAlreadyRegistered {});
+
+        let deed_id = self.next_deed_id;
+        self.next_deed_id += 1;
+
+        self.deeds[deed_id] = Deed {
+            parcel_hash: parcel_hash,
+            owner: owner,
+            co_owners: co_owners,
+            property_type: property_type,
+            area_sqm: area_sqm,
+            zoning_code: zoning_code,
+            assessed_value: assessed_value,
+            registered_at: block.timestamp,
+            last_transfer: block.timestamp,
+            active: true,
+        };
+
+        self.deed_by_parcel[parcel_hash] = deed_id;
+        self.lien_counts[deed_id] = 0;
+        self.transfer_counts[deed_id] = 0;
+
+        // Initialize tax record
+        let annual_tax = assessed_value / 100; // 1% property tax
+        self.property_taxes[deed_id] = TaxRecord {
+            annual_amount: annual_tax,
+            last_paid: 0,
+            paid_through: block.timestamp,
+            arrears: 0,
+        };
+
+        self.total_registered += 1;
+        emit DeedRegistered { deed_id: deed_id, owner: owner, parcel_hash: parcel_hash };
+        return deed_id;
+    }
+
+    pub fn transfer_deed(
+        deed_id: u64,
+        to: Address,
+        sale_price: u256,
+        document_hash: u256,
+    ) {
+        require!(self.authorized_notaries[msg.sender], NotNotary {});
+        let deed = self.deeds[deed_id];
+        require!(deed.active, DeedInactive {});
+
+        // Check no active liens
+        let mut active_liens: u32 = 0;
+        let lien_count = self.lien_counts[deed_id];
+        let mut i: u32 = 0;
+        while i < lien_count {
+            let lien = self.liens[deed_id][i];
+            if !lien.released && lien.expires_at > block.timestamp {
+                active_liens += 1;
+            }
+            i += 1;
+        }
+        require!(active_liens == 0, ActiveLiensExist { count: active_liens });
+
+        let from = deed.owner;
+        let idx = self.transfer_counts[deed_id];
+        self.transfer_history[deed_id][idx] = DeedTransfer {
+            from: from,
+            to: to,
+            sale_price: sale_price,
+            notary: msg.sender,
+            timestamp: block.timestamp,
+            document_hash: document_hash,
+        };
+        self.transfer_counts[deed_id] = idx + 1;
+
+        self.deeds[deed_id].owner = to;
+        self.deeds[deed_id].last_transfer = block.timestamp;
+        self.deeds[deed_id].co_owners = Vec::new();
+
+        // Reassess value based on sale price
+        if sale_price > 0 {
+            self.deeds[deed_id].assessed_value = sale_price;
+            self.property_taxes[deed_id].annual_amount = sale_price / 100;
+        }
+
+        emit DeedTransferred { deed_id: deed_id, from: from, to: to, sale_price: sale_price };
+    }
+
+    pub fn file_lien(
+        deed_id: u64,
+        amount: u256,
+        lien_type: u8,
+        duration_days: u64,
+    ) {
+        self.require_registrar();
+        require!(self.deeds[deed_id].active, DeedInactive {});
+
+        let idx = self.lien_counts[deed_id];
+        let expires = block.timestamp + (duration_days * 86400);
+
+        self.liens[deed_id][idx] = Lien {
+            holder: msg.sender,
+            amount: amount,
+            filed_at: block.timestamp,
+            expires_at: expires,
+            lien_type: lien_type,
+            released: false,
+        };
+        self.lien_counts[deed_id] = idx + 1;
+        self.encumbrances[deed_id] += amount;
+
+        emit LienFiled { deed_id: deed_id, holder: msg.sender, amount: amount };
+    }
+
+    pub fn release_lien(deed_id: u64, lien_index: u32) {
+        require!(lien_index < self.lien_counts[deed_id], LienNotFound { index: lien_index });
+        let lien = self.liens[deed_id][lien_index];
+        require!(
+            lien.holder == msg.sender || msg.sender == self.registrar,
+            NotLienHolder {}
+        );
+
+        self.liens[deed_id][lien_index].released = true;
+        if self.encumbrances[deed_id] >= lien.amount {
+            self.encumbrances[deed_id] -= lien.amount;
+        }
+
+        emit LienReleased { deed_id: deed_id, lien_index: lien_index };
+    }
+
+    pub fn pay_property_tax(deed_id: u64) {
+        require!(self.deeds[deed_id].active, DeedInactive {});
+        let tax = self.property_taxes[deed_id];
+        let annual = tax.annual_amount;
+        require!(msg.value >= annual, InsufficientPayment { required: annual, sent: msg.value });
+
+        let new_paid_through = tax.paid_through + 365 * 86400;
+        self.property_taxes[deed_id].last_paid = block.timestamp;
+        self.property_taxes[deed_id].paid_through = new_paid_through;
+        if tax.arrears > 0 && msg.value > annual {
+            let extra = msg.value - annual;
+            if extra >= tax.arrears {
+                self.property_taxes[deed_id].arrears = 0;
+            } else {
+                self.property_taxes[deed_id].arrears -= extra;
+            }
+        }
+
+        emit TaxPaid { deed_id: deed_id, amount: msg.value, paid_through: new_paid_through };
+    }
+
+    #[view]
+    pub fn get_deed(deed_id: u64) -> Deed {
+        return self.deeds[deed_id];
+    }
+
+    #[view]
+    pub fn lookup_by_parcel(parcel_hash: u256) -> u64 {
+        return self.deed_by_parcel[parcel_hash];
+    }
+
+    #[view]
+    pub fn get_lien(deed_id: u64, index: u32) -> Lien {
+        return self.liens[deed_id][index];
+    }
+
+    #[view]
+    pub fn get_transfer(deed_id: u64, index: u32) -> DeedTransfer {
+        return self.transfer_history[deed_id][index];
+    }
+
+    #[view]
+    pub fn get_tax_record(deed_id: u64) -> TaxRecord {
+        return self.property_taxes[deed_id];
+    }
+
+    #[view]
+    pub fn get_total_encumbrances(deed_id: u64) -> u256 {
+        return self.encumbrances[deed_id];
+    }
+}

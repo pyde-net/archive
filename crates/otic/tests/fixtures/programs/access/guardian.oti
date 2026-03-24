@@ -1,0 +1,529 @@
+// Emergency guardian contract with freeze/unfreeze capabilities,
+// circuit breaker patterns, and multi-guardian consensus.
+
+contract Guardian {
+    storage {
+        owner: Address,
+        guardians: Map<Address, GuardianInfo>,
+        guardian_list: Vec<Address>,
+        guardian_count: u64,
+        threshold: u64, // guardians needed for emergency action
+        frozen: bool,
+        frozen_at: u64,
+        frozen_by: Address,
+        freeze_reason: String,
+        max_freeze_duration: u64,
+        auto_unfreeze_at: u64,
+        freeze_history: Vec<FreezeEvent>,
+        emergency_proposals: Map<u64, EmergencyProposal>,
+        next_proposal_id: u64,
+        circuit_breakers: Map<String, CircuitBreaker>,
+        breaker_names: Vec<String>,
+        protected_contracts: Vec<Address>,
+    }
+
+    enum EmergencyActionType {
+        Freeze = 0,
+        Unfreeze = 1,
+        EmergencyWithdraw = 2,
+        PauseContract = 3,
+    }
+
+    struct GuardianInfo {
+        is_active: bool,
+        added_at: u64,
+        freeze_count: u64,
+        last_action_at: u64,
+        weight: u64,
+    }
+
+    struct FreezeEvent {
+        frozen_by: Address,
+        reason: String,
+        frozen_at: u64,
+        unfrozen_at: u64,
+        duration: u64,
+    }
+
+    struct EmergencyProposal {
+        proposer: Address,
+        action_type: EmergencyActionType,
+        target: Address,
+        description: String,
+        created_at: u64,
+        expires_at: u64,
+        approvals: u64,
+        executed: bool,
+        approved_by: Vec<Address>,
+    }
+
+    struct CircuitBreaker {
+        name: String,
+        active: bool,
+        threshold_value: u256,
+        current_value: u256,
+        window_seconds: u64,
+        window_start: u64,
+        tripped: bool,
+        tripped_at: u64,
+        auto_reset: bool,
+    }
+
+    const MAX_GUARDIANS: u64 = 20;
+    const PROPOSAL_EXPIRY_SECONDS: u64 = 86400; // 24 hours
+
+    event Frozen {
+        #[indexed]
+        frozen_by: Address,
+        reason: String,
+        auto_unfreeze_at: u64,
+    }
+
+    event Unfrozen {
+        #[indexed]
+        unfrozen_by: Address,
+        duration: u64,
+    }
+
+    event GuardianAdded {
+        #[indexed]
+        guardian: Address,
+        weight: u64,
+    }
+
+    event GuardianRemoved {
+        #[indexed]
+        guardian: Address,
+    }
+
+    event EmergencyProposalCreated {
+        #[indexed]
+        proposal_id: u64,
+        proposer: Address,
+        action_type: EmergencyActionType,
+    }
+
+    event EmergencyProposalApproved {
+        #[indexed]
+        proposal_id: u64,
+        approver: Address,
+        current_approvals: u64,
+    }
+
+    event EmergencyProposalExecuted {
+        #[indexed]
+        proposal_id: u64,
+    }
+
+    event CircuitBreakerTripped {
+        #[indexed]
+        name: String,
+        current_value: u256,
+        threshold: u256,
+    }
+
+    event CircuitBreakerReset {
+        #[indexed]
+        name: String,
+    }
+
+    error Unauthorized {}
+    error NotOwner {}
+    error NotGuardian {}
+    error AlreadyFrozen {}
+    error NotFrozen {}
+    error AlreadyGuardian {}
+    error NotAGuardian {}
+    error ThresholdTooHigh { threshold: u64, guardians: u64 }
+    error ProposalNotFound {}
+    error ProposalExpired {}
+    error ProposalAlreadyExecuted {}
+    error AlreadyApproved {}
+    error InsufficientApprovals { needed: u64, have: u64 }
+    error ZeroAddress {}
+    error InvalidThreshold {}
+    error BreakerNotFound {}
+    error BreakerAlreadyTripped {}
+    error FreezeDurationExceeded {}
+    error MaxGuardiansReached { max: u64 }
+
+    #[constructor]
+    pub fn init(threshold: u64, max_freeze_duration: u64) {
+        require!(threshold > 0, InvalidThreshold {});
+        self.owner = msg.sender;
+        self.threshold = threshold;
+        self.max_freeze_duration = max_freeze_duration;
+        self.frozen = false;
+        self.next_proposal_id = 1;
+
+        // Owner is first guardian
+        self.guardians[msg.sender] = GuardianInfo {
+            is_active: true,
+            added_at: block.timestamp,
+            freeze_count: 0,
+            last_action_at: 0,
+            weight: 1,
+        };
+        self.guardian_list.push(msg.sender);
+        self.guardian_count = 1;
+
+        emit GuardianAdded { guardian: msg.sender, weight: 1 };
+    }
+
+    fn ensure_guardian() {
+        require!(self.guardians[msg.sender].is_active, NotGuardian {});
+    }
+
+    // Single guardian emergency freeze (if threshold is 1)
+    pub fn freeze(reason: String) {
+        self.ensure_guardian();
+        require!(!self.frozen, AlreadyFrozen {});
+
+        if self.threshold == 1 {
+            self.execute_freeze(reason);
+        } else {
+            // Create a proposal for multi-guardian
+            self.create_emergency_proposal(EmergencyActionType::Freeze, Address::ZERO, reason);
+        }
+    }
+
+    fn execute_freeze(reason: String) {
+        self.frozen = true;
+        self.frozen_at = block.timestamp;
+        self.frozen_by = msg.sender;
+        self.freeze_reason = reason;
+        self.auto_unfreeze_at = block.timestamp + self.max_freeze_duration;
+
+        let mut info = self.guardians[msg.sender];
+        info.freeze_count = info.freeze_count + 1;
+        info.last_action_at = block.timestamp;
+        self.guardians[msg.sender] = info;
+
+        emit Frozen {
+            frozen_by: msg.sender,
+            reason: reason,
+            auto_unfreeze_at: self.auto_unfreeze_at,
+        };
+    }
+
+    // Unfreeze the system
+    pub fn unfreeze() {
+        self.ensure_guardian();
+        require!(self.frozen, NotFrozen {});
+
+        if self.threshold == 1 {
+            self.execute_unfreeze();
+        } else {
+            self.create_emergency_proposal(EmergencyActionType::Unfreeze, Address::ZERO, "Unfreeze system");
+        }
+    }
+
+    fn execute_unfreeze() {
+        let duration = block.timestamp - self.frozen_at;
+
+        self.freeze_history.push(FreezeEvent {
+            frozen_by: self.frozen_by,
+            reason: self.freeze_reason,
+            frozen_at: self.frozen_at,
+            unfrozen_at: block.timestamp,
+            duration: duration,
+        });
+
+        self.frozen = false;
+        self.frozen_at = 0;
+        self.frozen_by = Address::ZERO;
+        self.freeze_reason = "";
+        self.auto_unfreeze_at = 0;
+
+        emit Unfrozen { unfrozen_by: msg.sender, duration: duration };
+    }
+
+    // Auto-unfreeze after max duration (anyone can call)
+    pub fn auto_unfreeze() {
+        require!(self.frozen, NotFrozen {});
+        require!(block.timestamp >= self.auto_unfreeze_at, FreezeDurationExceeded {});
+
+        let duration = block.timestamp - self.frozen_at;
+
+        self.freeze_history.push(FreezeEvent {
+            frozen_by: self.frozen_by,
+            reason: self.freeze_reason,
+            frozen_at: self.frozen_at,
+            unfrozen_at: block.timestamp,
+            duration: duration,
+        });
+
+        self.frozen = false;
+        self.frozen_at = 0;
+        self.auto_unfreeze_at = 0;
+
+        emit Unfrozen { unfrozen_by: msg.sender, duration: duration };
+    }
+
+    fn create_emergency_proposal(action_type: EmergencyActionType, target: Address, description: String) -> u64 {
+        let id = self.next_proposal_id;
+        self.next_proposal_id = id + 1;
+
+        let mut approved_by: Vec<Address> = Vec::new();
+        approved_by.push(msg.sender);
+
+        self.emergency_proposals[id] = EmergencyProposal {
+            proposer: msg.sender,
+            action_type: action_type,
+            target: target,
+            description: description,
+            created_at: block.timestamp,
+            expires_at: block.timestamp + PROPOSAL_EXPIRY_SECONDS,
+            approvals: 1,
+            executed: false,
+            approved_by: approved_by,
+        };
+
+        emit EmergencyProposalCreated {
+            proposal_id: id,
+            proposer: msg.sender,
+            action_type: action_type,
+        };
+
+        // Check if already meets threshold
+        if 1 >= self.threshold {
+            self.execute_proposal(id);
+        }
+
+        return id;
+    }
+
+    pub fn approve_proposal(proposal_id: u64) {
+        self.ensure_guardian();
+
+        let mut proposal = self.emergency_proposals[proposal_id];
+        require!(proposal.proposer != Address::ZERO, ProposalNotFound {});
+        require!(!proposal.executed, ProposalAlreadyExecuted {});
+        require!(block.timestamp <= proposal.expires_at, ProposalExpired {});
+
+        // Check not already approved by this guardian
+        for i in 0..proposal.approved_by.len() {
+            require!(proposal.approved_by[i] != msg.sender, AlreadyApproved {});
+        }
+
+        proposal.approved_by.push(msg.sender);
+        proposal.approvals = proposal.approvals + 1;
+        self.emergency_proposals[proposal_id] = proposal;
+
+        emit EmergencyProposalApproved {
+            proposal_id: proposal_id,
+            approver: msg.sender,
+            current_approvals: proposal.approvals,
+        };
+
+        // Check threshold
+        if proposal.approvals >= self.threshold {
+            self.execute_proposal(proposal_id);
+        }
+    }
+
+    fn execute_proposal(proposal_id: u64) {
+        let mut proposal = self.emergency_proposals[proposal_id];
+
+        match proposal.action_type {
+            EmergencyActionType::Freeze => { self.execute_freeze(proposal.description); }
+            EmergencyActionType::Unfreeze => { self.execute_unfreeze(); }
+            EmergencyActionType::EmergencyWithdraw => {
+                // Emergency withdraw - send all balance to owner
+                if address(self).balance > 0 {
+                    raw_call!(self.owner, address(self).balance, bytes::empty());
+                }
+            }
+            EmergencyActionType::PauseContract => {
+                // Pause a protected contract via raw_call
+                if proposal.target != Address::ZERO {
+                    raw_call!(proposal.target, 0, bytes::empty());
+                }
+            }
+        }
+
+        proposal.executed = true;
+        self.emergency_proposals[proposal_id] = proposal;
+
+        emit EmergencyProposalExecuted { proposal_id: proposal_id };
+    }
+
+    // Circuit breaker management
+    pub fn add_circuit_breaker(
+        name: String,
+        threshold_value: u256,
+        window_seconds: u64,
+        auto_reset: bool,
+    ) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.circuit_breakers[name] = CircuitBreaker {
+            name: name,
+            active: true,
+            threshold_value: threshold_value,
+            current_value: 0,
+            window_seconds: window_seconds,
+            window_start: block.timestamp,
+            tripped: false,
+            tripped_at: 0,
+            auto_reset: auto_reset,
+        };
+        self.breaker_names.push(name);
+    }
+
+    // Report a value to a circuit breaker (called by monitored contracts)
+    pub fn report_value(breaker_name: String, value: u256) {
+        let mut breaker = self.circuit_breakers[breaker_name];
+        require!(breaker.active, BreakerNotFound {});
+
+        // Reset window if expired
+        if block.timestamp > breaker.window_start + breaker.window_seconds {
+            breaker.current_value = 0;
+            breaker.window_start = block.timestamp;
+            if breaker.tripped && breaker.auto_reset {
+                breaker.tripped = false;
+                emit CircuitBreakerReset { name: breaker_name };
+            }
+        }
+
+        breaker.current_value = breaker.current_value + value;
+
+        // Check if threshold exceeded
+        if breaker.current_value >= breaker.threshold_value && !breaker.tripped {
+            breaker.tripped = true;
+            breaker.tripped_at = block.timestamp;
+
+            emit CircuitBreakerTripped {
+                name: breaker_name,
+                current_value: breaker.current_value,
+                threshold: breaker.threshold_value,
+            };
+
+            // Auto-freeze if any breaker trips
+            if !self.frozen {
+                self.frozen = true;
+                self.frozen_at = block.timestamp;
+                self.frozen_by = Address::ZERO; // system triggered
+                self.freeze_reason = "Circuit breaker tripped";
+                self.auto_unfreeze_at = block.timestamp + self.max_freeze_duration;
+
+                emit Frozen {
+                    frozen_by: Address::ZERO,
+                    reason: "Circuit breaker tripped",
+                    auto_unfreeze_at: self.auto_unfreeze_at,
+                };
+            }
+        }
+
+        self.circuit_breakers[breaker_name] = breaker;
+    }
+
+    pub fn reset_circuit_breaker(breaker_name: String) {
+        self.ensure_guardian();
+        let mut breaker = self.circuit_breakers[breaker_name];
+        require!(breaker.active, BreakerNotFound {});
+        breaker.tripped = false;
+        breaker.current_value = 0;
+        breaker.window_start = block.timestamp;
+        self.circuit_breakers[breaker_name] = breaker;
+        emit CircuitBreakerReset { name: breaker_name };
+    }
+
+    pub fn add_guardian(guardian: Address, weight: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(guardian != Address::ZERO, ZeroAddress {});
+        require!(!self.guardians[guardian].is_active, AlreadyGuardian {});
+        require!(self.guardian_count < MAX_GUARDIANS, MaxGuardiansReached { max: MAX_GUARDIANS });
+
+        self.guardians[guardian] = GuardianInfo {
+            is_active: true,
+            added_at: block.timestamp,
+            freeze_count: 0,
+            last_action_at: 0,
+            weight: weight,
+        };
+        self.guardian_list.push(guardian);
+        self.guardian_count = self.guardian_count + 1;
+
+        emit GuardianAdded { guardian: guardian, weight: weight };
+    }
+
+    pub fn remove_guardian(guardian: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(self.guardians[guardian].is_active, NotAGuardian {});
+        require!(
+            self.guardian_count - 1 >= self.threshold,
+            ThresholdTooHigh {
+                threshold: self.threshold,
+                guardians: self.guardian_count - 1,
+            },
+        );
+
+        self.guardians[guardian].is_active = false;
+        self.guardian_count = self.guardian_count - 1;
+
+        let mut new_list: Vec<Address> = Vec::new();
+        for i in 0..self.guardian_list.len() {
+            if self.guardian_list[i] != guardian {
+                new_list.push(self.guardian_list[i]);
+            }
+        }
+        self.guardian_list = new_list;
+
+        emit GuardianRemoved { guardian: guardian };
+    }
+
+    pub fn set_threshold(new_threshold: u64) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(new_threshold > 0, InvalidThreshold {});
+        require!(new_threshold <= self.guardian_count, ThresholdTooHigh {
+            threshold: new_threshold,
+            guardians: self.guardian_count,
+        });
+        self.threshold = new_threshold;
+    }
+
+    #[view]
+    pub fn is_frozen() -> bool {
+        return self.frozen;
+    }
+
+    #[view]
+    pub fn get_freeze_info() -> (bool, u64, Address, String) {
+        return (self.frozen, self.frozen_at, self.frozen_by, self.freeze_reason);
+    }
+
+    #[view]
+    pub fn get_guardian_info(guardian: Address) -> GuardianInfo {
+        return self.guardians[guardian];
+    }
+
+    #[view]
+    pub fn get_guardian_list() -> Vec<Address> {
+        return self.guardian_list;
+    }
+
+    #[view]
+    pub fn get_threshold() -> u64 {
+        return self.threshold;
+    }
+
+    #[view]
+    pub fn get_freeze_history() -> Vec<FreezeEvent> {
+        return self.freeze_history;
+    }
+
+    #[view]
+    pub fn get_proposal(proposal_id: u64) -> EmergencyProposal {
+        return self.emergency_proposals[proposal_id];
+    }
+
+    #[view]
+    pub fn get_circuit_breaker(name: String) -> CircuitBreaker {
+        return self.circuit_breakers[name];
+    }
+
+    #[view]
+    pub fn is_breaker_tripped(name: String) -> bool {
+        return self.circuit_breakers[name].tripped;
+    }
+}

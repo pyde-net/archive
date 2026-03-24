@@ -1,0 +1,242 @@
+// Bitmap operations for efficient boolean arrays stored as u256 words.
+// Each u256 word stores 256 boolean flags. Useful for tracking large sets
+// of binary states (e.g., claimed airdrops, used nonces, voted proposals).
+
+module bitmap;
+
+error BitIndexOutOfRange { index: u64, max: u64 }
+error BitmapOverflow {}
+
+/// A bitmap bucket holds 256 bits per u256 word.
+/// To store bit N: word_index = N / 256, bit_position = N % 256.
+
+/// Returns the word index for a given bit index.
+pub fn word_index(bit_index: u64) -> u64 {
+    return bit_index / 256u64;
+}
+
+/// Returns the bit position within a word for a given bit index.
+pub fn bit_position(bit_index: u64) -> u8 {
+    return (bit_index % 256u64) as u8;
+}
+
+/// Returns a u256 mask with only the given bit position set.
+pub fn mask(position: u8) -> u256 {
+    return 1u256 << (position as u256);
+}
+
+/// Returns true if the bit at the given position is set in the word.
+pub fn is_set(word: u256, position: u8) -> bool {
+    return (word & mask(position)) != 0u256;
+}
+
+/// Sets the bit at the given position in the word. Returns the updated word.
+pub fn set_bit(word: u256, position: u8) -> u256 {
+    return word | mask(position);
+}
+
+/// Clears the bit at the given position in the word. Returns the updated word.
+pub fn clear_bit(word: u256, position: u8) -> u256 {
+    return word & (!mask(position));
+}
+
+/// Toggles the bit at the given position in the word. Returns the updated word.
+pub fn toggle_bit(word: u256, position: u8) -> u256 {
+    return word ^ mask(position);
+}
+
+/// Counts the number of set bits in a u256 word (population count).
+/// Uses the parallel bit-counting technique.
+pub fn popcount(word: u256) -> u64 {
+    let mut count = 0u64;
+    let mut w = word;
+    while w != 0u256 {
+        w = w & (w - 1u256); // Clear lowest set bit
+        count = count + 1u64;
+    }
+    return count;
+}
+
+/// Returns true if the word has no bits set.
+pub fn is_empty(word: u256) -> bool {
+    return word == 0u256;
+}
+
+/// Returns true if all 256 bits are set.
+pub fn is_full(word: u256) -> bool {
+    // All bits set in u256 means the max value
+    let all_ones = !0u256;
+    return word == all_ones;
+}
+
+/// Returns the bitwise AND of two words.
+pub fn and(a: u256, b: u256) -> u256 {
+    return a & b;
+}
+
+/// Returns the bitwise OR of two words.
+pub fn or(a: u256, b: u256) -> u256 {
+    return a | b;
+}
+
+/// Returns the bitwise XOR of two words.
+pub fn xor(a: u256, b: u256) -> u256 {
+    return a ^ b;
+}
+
+/// Returns the bitwise NOT of a word.
+pub fn not(a: u256) -> u256 {
+    return !a;
+}
+
+/// Returns the index of the lowest set bit (0-255), or 256 if no bits are set.
+pub fn lowest_set_bit(word: u256) -> u64 {
+    if word == 0u256 {
+        return 256u64;
+    }
+    let mut pos = 0u64;
+    let mut w = word;
+    // Check 128-bit halves, then 64, 32, 16, 8, 4, 2, 1
+    if (w & ((1u256 << 128u256) - 1u256)) == 0u256 {
+        w = w >> 128u256;
+        pos = pos + 128u64;
+    }
+    if (w & ((1u256 << 64u256) - 1u256)) == 0u256 {
+        w = w >> 64u256;
+        pos = pos + 64u64;
+    }
+    if (w & ((1u256 << 32u256) - 1u256)) == 0u256 {
+        w = w >> 32u256;
+        pos = pos + 32u64;
+    }
+    if (w & ((1u256 << 16u256) - 1u256)) == 0u256 {
+        w = w >> 16u256;
+        pos = pos + 16u64;
+    }
+    if (w & ((1u256 << 8u256) - 1u256)) == 0u256 {
+        w = w >> 8u256;
+        pos = pos + 8u64;
+    }
+    if (w & ((1u256 << 4u256) - 1u256)) == 0u256 {
+        w = w >> 4u256;
+        pos = pos + 4u64;
+    }
+    if (w & ((1u256 << 2u256) - 1u256)) == 0u256 {
+        w = w >> 2u256;
+        pos = pos + 2u64;
+    }
+    if (w & 1u256) == 0u256 {
+        pos = pos + 1u64;
+    }
+    return pos;
+}
+
+/// Returns the index of the highest set bit (0-255), or 256 if no bits are set.
+pub fn highest_set_bit(word: u256) -> u64 {
+    if word == 0u256 {
+        return 256u64;
+    }
+    let mut pos = 0u64;
+    let mut w = word;
+
+    if w >= (1u256 << 128u256) {
+        w = w >> 128u256;
+        pos = pos + 128u64;
+    }
+    if w >= (1u256 << 64u256) {
+        w = w >> 64u256;
+        pos = pos + 64u64;
+    }
+    if w >= (1u256 << 32u256) {
+        w = w >> 32u256;
+        pos = pos + 32u64;
+    }
+    if w >= (1u256 << 16u256) {
+        w = w >> 16u256;
+        pos = pos + 16u64;
+    }
+    if w >= (1u256 << 8u256) {
+        w = w >> 8u256;
+        pos = pos + 8u64;
+    }
+    if w >= (1u256 << 4u256) {
+        w = w >> 4u256;
+        pos = pos + 4u64;
+    }
+    if w >= (1u256 << 2u256) {
+        w = w >> 2u256;
+        pos = pos + 2u64;
+    }
+    if w >= 2u256 {
+        pos = pos + 1u64;
+    }
+    return pos;
+}
+
+/// Sets a range of bits [start, end) within a single word.
+/// Both start and end are bit positions (0-255).
+pub fn set_range(word: u256, start: u8, end: u8) -> u256 {
+    let mut result = word;
+    let mut i = start;
+    while i < end {
+        result = set_bit(result, i);
+        i = i + 1u8;
+    }
+    return result;
+}
+
+/// Clears a range of bits [start, end) within a single word.
+pub fn clear_range(word: u256, start: u8, end: u8) -> u256 {
+    let mut result = word;
+    let mut i = start;
+    while i < end {
+        result = clear_bit(result, i);
+        i = i + 1u8;
+    }
+    return result;
+}
+
+/// Counts set bits in a range [start, end) within a word.
+pub fn count_range(word: u256, start: u8, end: u8) -> u64 {
+    let mut count = 0u64;
+    let mut i = start;
+    while i < end {
+        if is_set(word, i) {
+            count = count + 1u64;
+        }
+        i = i + 1u8;
+    }
+    return count;
+}
+
+// --- Tests ---
+
+#[test]
+fn test_set_and_check() {
+    let word = 0u256;
+    let updated = set_bit(word, 42u8);
+    require!(is_set(updated, 42u8), BitmapOverflow {});
+    require!(!is_set(updated, 41u8), BitmapOverflow {});
+}
+
+#[test]
+fn test_toggle() {
+    let word = set_bit(0u256, 10u8);
+    let toggled = toggle_bit(word, 10u8);
+    require!(!is_set(toggled, 10u8), BitmapOverflow {});
+    let toggled_back = toggle_bit(toggled, 10u8);
+    require!(is_set(toggled_back, 10u8), BitmapOverflow {});
+}
+
+#[test]
+fn test_popcount() {
+    let word = set_bit(set_bit(set_bit(0u256, 0u8), 100u8), 255u8);
+    let count = popcount(word);
+    require!(count == 3u64, BitmapOverflow {});
+}
+
+#[test]
+fn test_lowest_set_bit() {
+    let word = set_bit(set_bit(0u256, 50u8), 100u8);
+    require!(lowest_set_bit(word) == 50u64, BitmapOverflow {});
+}

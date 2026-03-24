@@ -1,0 +1,303 @@
+// NFT Marketplace contract supporting listings, purchases, cancellations, and offers.
+// Collects a platform fee on every sale.
+
+use std::token::INFT;
+
+contract NFTMarketplace {
+    const MAX_FEE_BPS: u256 = 1000; // 10% maximum fee
+
+    storage {
+        owner: Address,
+        fee_percent: u256,            // basis points (e.g. 250 = 2.5%)
+        fee_recipient: Address,
+        listing_count: u256,
+        listings: Map<u256, Listing>,
+        offer_count: u256,
+        offers: Map<u256, Offer>,
+        // nft_contract -> token_id -> listing_id
+        active_listing: Map<Address, Map<u256, u256>>,
+        proceeds: Map<Address, u256>,
+    }
+
+    struct Listing {
+        listing_id: u256,
+        seller: Address,
+        nft_contract: Address,
+        token_id: u256,
+        price: u256,
+        active: bool,
+        created_at: u64,
+    }
+
+    struct Offer {
+        offer_id: u256,
+        buyer: Address,
+        nft_contract: Address,
+        token_id: u256,
+        amount: u256,
+        expiry: u64,
+        accepted: bool,
+        cancelled: bool,
+    }
+
+    event Listed {
+        #[indexed]
+        listing_id: u256,
+        #[indexed]
+        seller: Address,
+        nft_contract: Address,
+        token_id: u256,
+        price: u256,
+    }
+
+    event Sale {
+        #[indexed]
+        listing_id: u256,
+        #[indexed]
+        buyer: Address,
+        #[indexed]
+        seller: Address,
+        nft_contract: Address,
+        token_id: u256,
+        price: u256,
+    }
+
+    event ListingCancelled {
+        #[indexed]
+        listing_id: u256,
+    }
+
+    event OfferCreated {
+        #[indexed]
+        offer_id: u256,
+        #[indexed]
+        buyer: Address,
+        nft_contract: Address,
+        token_id: u256,
+        amount: u256,
+        expiry: u64,
+    }
+
+    event OfferAccepted {
+        #[indexed]
+        offer_id: u256,
+        #[indexed]
+        seller: Address,
+        amount: u256,
+    }
+
+    event OfferCancelled {
+        #[indexed]
+        offer_id: u256,
+    }
+
+    event ProceedsWithdrawn {
+        #[indexed]
+        user: Address,
+        amount: u256,
+    }
+
+    error NotListingSeller {}
+    error ListingNotActive {}
+    error InsufficientPayment { required: u256, provided: u256 }
+    error AlreadyListed { nft_contract: Address, token_id: u256 }
+    error OfferExpired {}
+    error OfferNotActive {}
+    error NotOfferBuyer {}
+    error NotTokenOwner {}
+    error ZeroPrice {}
+    error NothingToWithdraw {}
+    error FeeTooHigh {}
+
+    #[constructor]
+    pub fn init(fee_percent: u256, fee_recipient: Address) {
+        require!(fee_percent <= MAX_FEE_BPS, FeeTooHigh {});
+        self.owner = msg.sender;
+        self.fee_percent = fee_percent;
+        self.fee_recipient = fee_recipient;
+        self.listing_count = 0;
+        self.offer_count = 0;
+    }
+
+    pub fn list(nft_contract: Address, token_id: u256, price: u256) {
+        require!(price > 0, ZeroPrice {});
+        require!(
+            self.active_listing[nft_contract][token_id] == 0,
+            AlreadyListed { nft_contract: nft_contract, token_id: token_id }
+        );
+
+        // Verify caller owns the token
+        let nft = INFT::at(nft_contract);
+        let token_owner = nft.owner_of(token_id);
+        require!(token_owner == msg.sender, NotTokenOwner {});
+
+        self.listing_count = self.listing_count + 1;
+        let listing_id = self.listing_count;
+
+        self.listings[listing_id] = Listing {
+            listing_id: listing_id,
+            seller: msg.sender,
+            nft_contract: nft_contract,
+            token_id: token_id,
+            price: price,
+            active: true,
+            created_at: block.timestamp,
+        };
+
+        self.active_listing[nft_contract][token_id] = listing_id;
+
+        emit Listed {
+            listing_id: listing_id,
+            seller: msg.sender,
+            nft_contract: nft_contract,
+            token_id: token_id,
+            price: price,
+        };
+    }
+
+    pub fn buy(listing_id: u256) {
+        let listing = self.listings[listing_id];
+        require!(listing.active, ListingNotActive {});
+        require!(msg.value >= listing.price, InsufficientPayment {
+            required: listing.price,
+            provided: msg.value,
+        });
+
+        // Mark listing inactive
+        self.listings[listing_id].active = false;
+        self.active_listing[listing.nft_contract][listing.token_id] = 0;
+
+        // Calculate and distribute fees
+        let fee = (listing.price * self.fee_percent) / 10000;
+        let seller_amount = listing.price - fee;
+
+        self.proceeds[listing.seller] = self.proceeds[listing.seller] + seller_amount;
+        self.proceeds[self.fee_recipient] = self.proceeds[self.fee_recipient] + fee;
+
+        // Transfer NFT to buyer
+        let nft = INFT::at(listing.nft_contract);
+        nft.transfer_from(listing.seller, msg.sender, listing.token_id);
+
+        emit Sale {
+            listing_id: listing_id,
+            buyer: msg.sender,
+            seller: listing.seller,
+            nft_contract: listing.nft_contract,
+            token_id: listing.token_id,
+            price: listing.price,
+        };
+    }
+
+    pub fn cancel_listing(listing_id: u256) {
+        let listing = self.listings[listing_id];
+        require!(listing.active, ListingNotActive {});
+        require!(listing.seller == msg.sender, NotListingSeller {});
+
+        self.listings[listing_id].active = false;
+        self.active_listing[listing.nft_contract][listing.token_id] = 0;
+
+        emit ListingCancelled { listing_id: listing_id };
+    }
+
+    pub fn make_offer(nft_contract: Address, token_id: u256, expiry: u64) {
+        require!(msg.value > 0, ZeroPrice {});
+        require!(expiry > block.timestamp, OfferExpired {});
+
+        self.offer_count = self.offer_count + 1;
+        let offer_id = self.offer_count;
+
+        self.offers[offer_id] = Offer {
+            offer_id: offer_id,
+            buyer: msg.sender,
+            nft_contract: nft_contract,
+            token_id: token_id,
+            amount: msg.value,
+            expiry: expiry,
+            accepted: false,
+            cancelled: false,
+        };
+
+        emit OfferCreated {
+            offer_id: offer_id,
+            buyer: msg.sender,
+            nft_contract: nft_contract,
+            token_id: token_id,
+            amount: msg.value,
+            expiry: expiry,
+        };
+    }
+
+    pub fn accept_offer(offer_id: u256) {
+        let offer = self.offers[offer_id];
+        require!(!offer.accepted && !offer.cancelled, OfferNotActive {});
+        require!(offer.expiry >= block.timestamp, OfferExpired {});
+
+        // Verify caller owns the token
+        let nft = INFT::at(offer.nft_contract);
+        let token_owner = nft.owner_of(offer.token_id);
+        require!(token_owner == msg.sender, NotTokenOwner {});
+
+        self.offers[offer_id].accepted = true;
+
+        // Calculate fees
+        let fee = (offer.amount * self.fee_percent) / 10000;
+        let seller_amount = offer.amount - fee;
+
+        self.proceeds[msg.sender] = self.proceeds[msg.sender] + seller_amount;
+        self.proceeds[self.fee_recipient] = self.proceeds[self.fee_recipient] + fee;
+
+        // Transfer NFT
+        nft.transfer_from(msg.sender, offer.buyer, offer.token_id);
+
+        // Cancel any active listing
+        let listing_id = self.active_listing[offer.nft_contract][offer.token_id];
+        if listing_id > 0 {
+            self.listings[listing_id].active = false;
+            self.active_listing[offer.nft_contract][offer.token_id] = 0;
+        }
+
+        emit OfferAccepted {
+            offer_id: offer_id,
+            seller: msg.sender,
+            amount: offer.amount,
+        };
+    }
+
+    pub fn cancel_offer(offer_id: u256) {
+        let offer = self.offers[offer_id];
+        require!(offer.buyer == msg.sender, NotOfferBuyer {});
+        require!(!offer.accepted && !offer.cancelled, OfferNotActive {});
+
+        self.offers[offer_id].cancelled = true;
+
+        // Refund the buyer
+        self.proceeds[msg.sender] = self.proceeds[msg.sender] + offer.amount;
+
+        emit OfferCancelled { offer_id: offer_id };
+    }
+
+    pub fn withdraw_proceeds() {
+        let amount = self.proceeds[msg.sender];
+        require!(amount > 0, NothingToWithdraw {});
+
+        self.proceeds[msg.sender] = 0;
+        raw_call!(msg.sender, amount, bytes(""));
+
+        emit ProceedsWithdrawn { user: msg.sender, amount: amount };
+    }
+
+    #[view]
+    pub fn get_listing(listing_id: u256) -> Listing {
+        return self.listings[listing_id];
+    }
+
+    #[view]
+    pub fn get_offer(offer_id: u256) -> Offer {
+        return self.offers[offer_id];
+    }
+
+    #[view]
+    pub fn get_proceeds(user: Address) -> u256 {
+        return self.proceeds[user];
+    }
+}

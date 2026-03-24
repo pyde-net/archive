@@ -1,0 +1,335 @@
+// Commit-reveal rock paper scissors.
+// Players commit a hashed move, then reveal. Winner takes the pot.
+// Uses a two-phase approach to prevent front-running.
+
+use std::math;
+
+enum Move {
+    Rock,        // 1
+    Paper,       // 2
+    Scissors,    // 3
+}
+
+enum GameState {
+    Waiting,     // 0
+    Committed,   // 1
+    Revealed,    // 2
+    Finished,    // 3
+    Cancelled,   // 4
+}
+
+contract RockPaperScissors {
+    storage {
+        next_game_id: u64,
+        games: Map<u64, Game>,
+        commits: Map<u64, Map<Address, u256>>,  // game_id -> player -> commit hash
+        reveals: Map<u64, Map<Address, u8>>,     // game_id -> player -> move (1=rock,2=paper,3=scissors)
+        player_wins: Map<Address, u64>,
+        player_losses: Map<Address, u64>,
+        player_draws: Map<Address, u64>,
+        min_wager: u256,
+    }
+
+    const MOVE_ROCK: u8 = 1;
+    const MOVE_PAPER: u8 = 2;
+    const MOVE_SCISSORS: u8 = 3;
+    const POT_MULTIPLIER: u256 = 2;
+
+    struct Game {
+        player1: Address,
+        player2: Address,
+        wager: u256,
+        state: GameState,
+        commit_deadline: u64,
+        reveal_deadline: u64,
+        player1_committed: bool,
+        player2_committed: bool,
+        player1_revealed: bool,
+        player2_revealed: bool,
+        winner: Address,
+    }
+
+    event GameCreated {
+        #[indexed]
+        game_id: u64,
+        #[indexed]
+        player1: Address,
+        wager: u256,
+    }
+
+    event PlayerJoined {
+        #[indexed]
+        game_id: u64,
+        #[indexed]
+        player2: Address,
+    }
+
+    event MoveCommitted {
+        #[indexed]
+        game_id: u64,
+        #[indexed]
+        player: Address,
+    }
+
+    event MoveRevealed {
+        #[indexed]
+        game_id: u64,
+        #[indexed]
+        player: Address,
+        choice: u8,
+    }
+
+    event GameFinished {
+        #[indexed]
+        game_id: u64,
+        #[indexed]
+        winner: Address,
+        payout: u256,
+        is_draw: bool,
+    }
+
+    event GameCancelled {
+        #[indexed]
+        game_id: u64,
+    }
+
+    error GameNotFound {}
+    error InvalidState { expected: GameState, actual: GameState }
+    error NotAPlayer {}
+    error AlreadyCommitted {}
+    error AlreadyRevealed {}
+    error WagerMismatch { required: u256, sent: u256 }
+    error BelowMinWager { min: u256 }
+    error InvalidMove {}
+    error InvalidReveal {}
+    error DeadlineNotPassed {}
+    error DeadlinePassed {}
+    error CannotJoinOwnGame {}
+
+    #[constructor]
+    pub fn init(min_wager: u256) {
+        self.next_game_id = 1;
+        self.min_wager = min_wager;
+    }
+
+    pub fn create_game(commit_blocks: u64, reveal_blocks: u64) -> u64 {
+        require!(msg.value >= self.min_wager, BelowMinWager { min: self.min_wager });
+
+        let game_id = self.next_game_id;
+        self.next_game_id = game_id + 1;
+
+        self.games[game_id] = Game {
+            player1: msg.sender,
+            player2: Address::ZERO,
+            wager: msg.value,
+            state: GameState::Waiting,
+            commit_deadline: 0,
+            reveal_deadline: 0,
+            player1_committed: false,
+            player2_committed: false,
+            player1_revealed: false,
+            player2_revealed: false,
+            winner: Address::ZERO,
+        };
+
+        // Store deadlines separately since they start after player2 joins
+        self.games[game_id].commit_deadline = commit_blocks;
+        self.games[game_id].reveal_deadline = reveal_blocks;
+
+        emit GameCreated {
+            game_id: game_id,
+            player1: msg.sender,
+            wager: msg.value,
+        };
+        return game_id;
+    }
+
+    pub fn join_game(game_id: u64) {
+        let mut game = self.games[game_id];
+        require!(game.player1 != Address::ZERO, GameNotFound {});
+        require!(game.state == GameState::Waiting, InvalidState { expected: GameState::Waiting, actual: game.state });
+        require!(msg.sender != game.player1, CannotJoinOwnGame {});
+        require!(msg.value == game.wager, WagerMismatch { required: game.wager, sent: msg.value });
+
+        game.player2 = msg.sender;
+        game.state = GameState::Committed;  // Move to commit phase
+        // Now set real deadlines from current block
+        let commit_blocks = game.commit_deadline;
+        let reveal_blocks = game.reveal_deadline;
+        game.commit_deadline = block.height + commit_blocks;
+        game.reveal_deadline = block.height + commit_blocks + reveal_blocks;
+        self.games[game_id] = game;
+
+        emit PlayerJoined { game_id: game_id, player2: msg.sender };
+    }
+
+    // commit = keccak256(move || salt) where move in {1,2,3}
+    pub fn commit_move(game_id: u64, commit_hash: u256) {
+        let mut game = self.games[game_id];
+        require!(game.state == GameState::Committed, InvalidState { expected: GameState::Committed, actual: game.state });
+        require!(block.height <= game.commit_deadline, DeadlinePassed {});
+
+        let is_p1 = msg.sender == game.player1;
+        let is_p2 = msg.sender == game.player2;
+        require!(is_p1 || is_p2, NotAPlayer {});
+
+        if is_p1 {
+            require!(!game.player1_committed, AlreadyCommitted {});
+            game.player1_committed = true;
+        } else {
+            require!(!game.player2_committed, AlreadyCommitted {});
+            game.player2_committed = true;
+        }
+
+        self.commits[game_id][msg.sender] = commit_hash;
+
+        // If both committed, advance to reveal phase
+        if game.player1_committed && game.player2_committed {
+            game.state = GameState::Revealed;
+        }
+        self.games[game_id] = game;
+
+        emit MoveCommitted { game_id: game_id, player: msg.sender };
+    }
+
+    pub fn reveal_move(game_id: u64, choice: u8, salt: u256) {
+        let mut game = self.games[game_id];
+        require!(game.state == GameState::Revealed, InvalidState { expected: GameState::Revealed, actual: game.state });
+        require!(block.height <= game.reveal_deadline, DeadlinePassed {});
+        require!(choice >= MOVE_ROCK && choice <= MOVE_SCISSORS, InvalidMove {});
+
+        let is_p1 = msg.sender == game.player1;
+        let is_p2 = msg.sender == game.player2;
+        require!(is_p1 || is_p2, NotAPlayer {});
+
+        // Verify commit
+        let computed = math::keccak256((choice as u256) ^ salt);
+        require!(computed == self.commits[game_id][msg.sender], InvalidReveal {});
+
+        if is_p1 {
+            require!(!game.player1_revealed, AlreadyRevealed {});
+            game.player1_revealed = true;
+        } else {
+            require!(!game.player2_revealed, AlreadyRevealed {});
+            game.player2_revealed = true;
+        }
+
+        self.reveals[game_id][msg.sender] = choice;
+        self.games[game_id] = game;
+
+        emit MoveRevealed { game_id: game_id, player: msg.sender, choice: choice };
+
+        // If both revealed, resolve
+        if game.player1_revealed && game.player2_revealed {
+            self.resolve_game(game_id);
+        }
+    }
+
+    fn resolve_game(game_id: u64) {
+        let mut game = self.games[game_id];
+        let m1 = self.reveals[game_id][game.player1];
+        let m2 = self.reveals[game_id][game.player2];
+        let total_pot = game.wager * POT_MULTIPLIER;
+
+        let is_draw = m1 == m2;
+        let p1_wins = (m1 == MOVE_ROCK && m2 == MOVE_SCISSORS)
+            || (m1 == MOVE_PAPER && m2 == MOVE_ROCK)
+            || (m1 == MOVE_SCISSORS && m2 == MOVE_PAPER);
+
+        if is_draw {
+            // Return wagers
+            raw_call!(game.player1, game.wager, bytes::empty());
+            raw_call!(game.player2, game.wager, bytes::empty());
+            self.player_draws[game.player1] = self.player_draws[game.player1] + 1;
+            self.player_draws[game.player2] = self.player_draws[game.player2] + 1;
+            game.winner = Address::ZERO;
+        } else if p1_wins {
+            raw_call!(game.player1, total_pot, bytes::empty());
+            game.winner = game.player1;
+            self.player_wins[game.player1] = self.player_wins[game.player1] + 1;
+            self.player_losses[game.player2] = self.player_losses[game.player2] + 1;
+        } else {
+            raw_call!(game.player2, total_pot, bytes::empty());
+            game.winner = game.player2;
+            self.player_wins[game.player2] = self.player_wins[game.player2] + 1;
+            self.player_losses[game.player1] = self.player_losses[game.player1] + 1;
+        }
+
+        game.state = GameState::Finished;
+        self.games[game_id] = game;
+
+        emit GameFinished {
+            game_id: game_id,
+            winner: game.winner,
+            payout: total_pot,
+            is_draw: is_draw,
+        };
+    }
+
+    // If opponent doesn't commit or reveal, the other player can claim
+    pub fn claim_timeout(game_id: u64) {
+        let mut game = self.games[game_id];
+        let is_p1 = msg.sender == game.player1;
+        let is_p2 = msg.sender == game.player2;
+        require!(is_p1 || is_p2, NotAPlayer {});
+
+        let total_pot = game.wager * POT_MULTIPLIER;
+
+        if game.state == GameState::Committed && block.height > game.commit_deadline {
+            // Commit phase expired
+            if game.player1_committed && !game.player2_committed {
+                raw_call!(game.player1, total_pot, bytes::empty());
+                game.winner = game.player1;
+            } else if !game.player1_committed && game.player2_committed {
+                raw_call!(game.player2, total_pot, bytes::empty());
+                game.winner = game.player2;
+            } else {
+                // Neither committed, refund both
+                raw_call!(game.player1, game.wager, bytes::empty());
+                raw_call!(game.player2, game.wager, bytes::empty());
+            }
+        } else if game.state == GameState::Revealed && block.height > game.reveal_deadline {
+            // Reveal phase expired
+            if game.player1_revealed && !game.player2_revealed {
+                raw_call!(game.player1, total_pot, bytes::empty());
+                game.winner = game.player1;
+            } else if !game.player1_revealed && game.player2_revealed {
+                raw_call!(game.player2, total_pot, bytes::empty());
+                game.winner = game.player2;
+            } else {
+                raw_call!(game.player1, game.wager, bytes::empty());
+                raw_call!(game.player2, game.wager, bytes::empty());
+            }
+        } else {
+            revert!(DeadlineNotPassed {});
+        }
+
+        game.state = GameState::Finished;
+        self.games[game_id] = game;
+    }
+
+    // Cancel a game that no one joined yet
+    pub fn cancel_game(game_id: u64) {
+        let mut game = self.games[game_id];
+        require!(msg.sender == game.player1, NotAPlayer {});
+        require!(game.state == GameState::Waiting, InvalidState { expected: GameState::Waiting, actual: game.state });
+        game.state = GameState::Cancelled;
+        self.games[game_id] = game;
+        raw_call!(game.player1, game.wager, bytes::empty());
+        emit GameCancelled { game_id: game_id };
+    }
+
+    #[view]
+    pub fn get_game(game_id: u64) -> Game {
+        return self.games[game_id];
+    }
+
+    #[view]
+    pub fn get_stats(player: Address) -> (u64, u64, u64) {
+        return (
+            self.player_wins[player],
+            self.player_losses[player],
+            self.player_draws[player],
+        );
+    }
+}

@@ -1,0 +1,329 @@
+// Full DAO contract with proposal creation, voting, and execution.
+// Supports configurable quorum, voting delay, voting period, and
+// both for/against/abstain voting with reason strings.
+
+use std::token::IERC20;
+
+contract DAO {
+    enum VoteType {
+        Against,
+        For,
+        Abstain,
+    }
+
+    storage {
+        name: String,
+        governance_token: Address,
+        owner: Address,
+        proposal_count: u256,
+        proposals: Map<u256, Proposal>,
+        // proposal_id -> voter -> receipt
+        receipts: Map<u256, Map<Address, VoteReceipt>>,
+        has_voted: Map<u256, Map<Address, bool>>,
+
+        // Configuration
+        voting_delay: u64,          // blocks after proposal before voting starts
+        voting_period: u64,         // blocks that voting lasts
+        proposal_threshold: u256,   // min tokens to create proposal
+        quorum_bps: u256,           // quorum as basis points of total supply
+
+        // Execution
+        execution_delay: u64,       // seconds after voting ends before execution
+    }
+
+    struct Proposal {
+        id: u256,
+        proposer: Address,
+        description: String,
+        target: Address,
+        calldata: bytes,
+        value: u256,
+        start_block: u64,
+        end_block: u64,
+        for_votes: u256,
+        against_votes: u256,
+        abstain_votes: u256,
+        executed: bool,
+        cancelled: bool,
+        created_at: u64,
+        eta: u64,                   // earliest execution time
+    }
+
+    struct VoteReceipt {
+        has_voted: bool,
+        support: VoteType,
+        votes: u256,
+        reason: String,
+    }
+
+    event ProposalCreated {
+        #[indexed]
+        id: u256,
+        #[indexed]
+        proposer: Address,
+        description: String,
+        start_block: u64,
+        end_block: u64,
+    }
+
+    event VoteCast {
+        #[indexed]
+        voter: Address,
+        #[indexed]
+        proposal_id: u256,
+        support: VoteType,
+        votes: u256,
+        reason: String,
+    }
+
+    event ProposalExecuted {
+        #[indexed]
+        id: u256,
+    }
+
+    event ProposalCancelled {
+        #[indexed]
+        id: u256,
+    }
+
+    event ConfigUpdated {
+        voting_delay: u64,
+        voting_period: u64,
+        proposal_threshold: u256,
+        quorum_bps: u256,
+    }
+
+    error ProposalNotActive {}
+    error ProposalNotSucceeded {}
+    error ProposalNotReady {}
+    error AlreadyVoted { voter: Address, proposal_id: u256 }
+    error InsufficientVotingPower { required: u256, available: u256 }
+    error InvalidSupport {}
+    error ProposalAlreadyExecuted {}
+    error ProposalAlreadyCancelled {}
+    error NotProposer {}
+    error VotingNotStarted {}
+    error VotingEnded {}
+    error QuorumNotReached { required: u256, total: u256 }
+    error ExecutionFailed {}
+    error NotContractOwner {}
+
+    #[constructor]
+    pub fn init(
+        name: String,
+        governance_token: Address,
+        voting_delay: u64,
+        voting_period: u64,
+        proposal_threshold: u256,
+        quorum_bps: u256,
+        execution_delay: u64,
+    ) {
+        self.name = name;
+        self.governance_token = governance_token;
+        self.owner = msg.sender;
+        self.voting_delay = voting_delay;
+        self.voting_period = voting_period;
+        self.proposal_threshold = proposal_threshold;
+        self.quorum_bps = quorum_bps;
+        self.execution_delay = execution_delay;
+        self.proposal_count = 0;
+    }
+
+    pub fn propose(
+        target: Address,
+        calldata: bytes,
+        value: u256,
+        description: String,
+    ) -> u256 {
+        let token = IERC20::at(self.governance_token);
+        let proposer_votes = token.balance_of(msg.sender);
+        require!(proposer_votes >= self.proposal_threshold, InsufficientVotingPower {
+            required: self.proposal_threshold,
+            available: proposer_votes,
+        });
+
+        self.proposal_count = self.proposal_count + 1;
+        let id = self.proposal_count;
+        let start = block.height + self.voting_delay;
+        let end = start + self.voting_period;
+
+        self.proposals[id] = Proposal {
+            id: id,
+            proposer: msg.sender,
+            description: description,
+            target: target,
+            calldata: calldata,
+            value: value,
+            start_block: start,
+            end_block: end,
+            for_votes: 0,
+            against_votes: 0,
+            abstain_votes: 0,
+            executed: false,
+            cancelled: false,
+            created_at: block.timestamp,
+            eta: 0,
+        };
+
+        emit ProposalCreated {
+            id: id,
+            proposer: msg.sender,
+            description: description,
+            start_block: start,
+            end_block: end,
+        };
+
+        return id;
+    }
+
+    pub fn cast_vote(proposal_id: u256, support: VoteType, reason: String) {
+        let proposal = self.proposals[proposal_id];
+        require!(!proposal.executed && !proposal.cancelled, ProposalNotActive {});
+        require!(block.height >= proposal.start_block, VotingNotStarted {});
+        require!(block.height <= proposal.end_block, VotingEnded {});
+        require!(!self.has_voted[proposal_id][msg.sender], AlreadyVoted {
+            voter: msg.sender,
+            proposal_id: proposal_id,
+        });
+
+        let token = IERC20::at(self.governance_token);
+        let votes = token.balance_of(msg.sender);
+
+        self.has_voted[proposal_id][msg.sender] = true;
+        self.receipts[proposal_id][msg.sender] = VoteReceipt {
+            has_voted: true,
+            support: support,
+            votes: votes,
+            reason: reason,
+        };
+
+        match support {
+            VoteType::Against => {
+                self.proposals[proposal_id].against_votes =
+                    proposal.against_votes + votes;
+            },
+            VoteType::For => {
+                self.proposals[proposal_id].for_votes =
+                    proposal.for_votes + votes;
+            },
+            VoteType::Abstain => {
+                self.proposals[proposal_id].abstain_votes =
+                    proposal.abstain_votes + votes;
+            },
+        }
+
+        emit VoteCast {
+            voter: msg.sender,
+            proposal_id: proposal_id,
+            support: support,
+            votes: votes,
+            reason: reason,
+        };
+    }
+
+    pub fn queue(proposal_id: u256) {
+        let proposal = self.proposals[proposal_id];
+        require!(!proposal.executed, ProposalAlreadyExecuted {});
+        require!(!proposal.cancelled, ProposalAlreadyCancelled {});
+        require!(block.height > proposal.end_block, ProposalNotActive {});
+
+        // Check quorum
+        let token = IERC20::at(self.governance_token);
+        let total_supply = token.get_total_supply();
+        let quorum = (total_supply * self.quorum_bps) / 10000;
+        let total_votes = proposal.for_votes + proposal.against_votes + proposal.abstain_votes;
+        require!(total_votes >= quorum, QuorumNotReached {
+            required: quorum,
+            total: total_votes,
+        });
+
+        // Check vote passed
+        require!(proposal.for_votes > proposal.against_votes, ProposalNotSucceeded {});
+
+        // Set execution time
+        self.proposals[proposal_id].eta = block.timestamp + self.execution_delay;
+    }
+
+    pub fn execute(proposal_id: u256) {
+        let proposal = self.proposals[proposal_id];
+        require!(!proposal.executed, ProposalAlreadyExecuted {});
+        require!(!proposal.cancelled, ProposalAlreadyCancelled {});
+        require!(proposal.eta > 0, ProposalNotSucceeded {});
+        require!(block.timestamp >= proposal.eta, ProposalNotReady {});
+
+        self.proposals[proposal_id].executed = true;
+
+        // Execute the proposal action
+        raw_call!(proposal.target, proposal.value, proposal.calldata);
+
+        emit ProposalExecuted { id: proposal_id };
+    }
+
+    pub fn cancel(proposal_id: u256) {
+        let proposal = self.proposals[proposal_id];
+        require!(!proposal.executed, ProposalAlreadyExecuted {});
+        require!(!proposal.cancelled, ProposalAlreadyCancelled {});
+        require!(msg.sender == proposal.proposer || msg.sender == self.owner, NotProposer {});
+
+        self.proposals[proposal_id].cancelled = true;
+
+        emit ProposalCancelled { id: proposal_id };
+    }
+
+    pub fn update_config(
+        voting_delay: u64,
+        voting_period: u64,
+        proposal_threshold: u256,
+        quorum_bps: u256,
+    ) {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        self.voting_delay = voting_delay;
+        self.voting_period = voting_period;
+        self.proposal_threshold = proposal_threshold;
+        self.quorum_bps = quorum_bps;
+
+        emit ConfigUpdated {
+            voting_delay: voting_delay,
+            voting_period: voting_period,
+            proposal_threshold: proposal_threshold,
+            quorum_bps: quorum_bps,
+        };
+    }
+
+    #[view]
+    pub fn get_proposal(proposal_id: u256) -> Proposal {
+        return self.proposals[proposal_id];
+    }
+
+    #[view]
+    pub fn get_receipt(proposal_id: u256, voter: Address) -> VoteReceipt {
+        return self.receipts[proposal_id][voter];
+    }
+
+    #[view]
+    pub fn state(proposal_id: u256) -> String {
+        let p = self.proposals[proposal_id];
+        if p.cancelled {
+            return "Cancelled";
+        }
+        if p.executed {
+            return "Executed";
+        }
+        if block.height < p.start_block {
+            return "Pending";
+        }
+        if block.height <= p.end_block {
+            return "Active";
+        }
+        if p.for_votes <= p.against_votes {
+            return "Defeated";
+        }
+        if p.eta == 0 {
+            return "Succeeded";
+        }
+        if block.timestamp < p.eta {
+            return "Queued";
+        }
+        return "Ready";
+    }
+}

@@ -1,0 +1,399 @@
+// Bond issuance contract with fixed maturity, periodic coupon payments,
+// secondary market transfers, and early redemption.
+
+use std::token::IERC20;
+
+contract Bond {
+    storage {
+        issuer: Address,
+        payment_token: Address,
+        bond_name: String,
+        bond_symbol: String,
+        face_value: u256,          // par value per bond
+        coupon_rate_bps: u64,      // annual coupon in basis points
+        coupon_interval: u64,      // seconds between coupon payments
+        issue_date: u64,
+        maturity_date: u64,
+        total_issued: u64,
+        max_supply: u64,
+        next_bond_id: u64,
+        bonds: Map<u64, BondToken>,
+        holder_bonds: Map<Address, Vec<u64>>,
+        coupon_payments: Map<u64, u64>, // bond_id -> coupons paid count
+        total_coupons_due: u64,         // total coupon periods
+        early_redemption_penalty_bps: u64,
+        paused: bool,
+        total_face_value_outstanding: u256,
+        issuer_deposited: u256,
+    }
+
+    struct BondToken {
+        id: u64,
+        holder: Address,
+        face_value: u256,
+        purchase_price: u256,
+        purchased_at: u64,
+        matured: bool,
+        redeemed: bool,
+        coupons_claimed: u64,
+    }
+
+    struct BondInfo {
+        name: String,
+        symbol: String,
+        face_value: u256,
+        coupon_rate_bps: u64,
+        maturity_date: u64,
+        total_issued: u64,
+        max_supply: u64,
+    }
+
+    const BPS_DENOMINATOR: u256 = 10000;
+    const SECONDS_PER_YEAR: u64 = 31536000; // 365 * 86400
+
+    event BondIssued {
+        #[indexed]
+        bond_id: u64,
+        #[indexed]
+        buyer: Address,
+        face_value: u256,
+        price_paid: u256,
+    }
+
+    event CouponPaid {
+        #[indexed]
+        bond_id: u64,
+        #[indexed]
+        holder: Address,
+        amount: u256,
+        period: u64,
+    }
+
+    event BondRedeemed {
+        #[indexed]
+        bond_id: u64,
+        #[indexed]
+        holder: Address,
+        amount: u256,
+    }
+
+    event BondTransferred {
+        #[indexed]
+        bond_id: u64,
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+    }
+
+    event EarlyRedemption {
+        #[indexed]
+        bond_id: u64,
+        holder: Address,
+        payout: u256,
+        penalty: u256,
+    }
+
+    event IssuerDeposit {
+        amount: u256,
+    }
+
+    error Unauthorized {}
+    error NotIssuer {}
+    error NotBondHolder { bond_id: u64 }
+    error BondNotFound {}
+    error BondAlreadyRedeemed {}
+    error BondNotMatured {}
+    error MaxSupplyReached {}
+    error NoCouponsDue {}
+    error InsufficientPayment { required: u256, sent: u256 }
+    error InsufficientIssuerFunds { needed: u256, available: u256 }
+    error ContractPaused {}
+    error ZeroAddress {}
+    error TransferToSelf {}
+    error MaturityInPast {}
+    error EarlyRedemptionDisabled {}
+
+    #[constructor]
+    pub fn init(
+        payment_token: Address,
+        name: String,
+        symbol: String,
+        face_value: u256,
+        coupon_rate_bps: u64,
+        coupon_interval: u64,
+        maturity_seconds: u64,
+        max_supply: u64,
+        early_redemption_penalty_bps: u64,
+    ) {
+        require!(payment_token != Address::ZERO, ZeroAddress {});
+        require!(maturity_seconds > 0, MaturityInPast {});
+
+        self.issuer = msg.sender;
+        self.payment_token = payment_token;
+        self.bond_name = name;
+        self.bond_symbol = symbol;
+        self.face_value = face_value;
+        self.coupon_rate_bps = coupon_rate_bps;
+        self.coupon_interval = coupon_interval;
+        self.issue_date = block.timestamp;
+        self.maturity_date = block.timestamp + maturity_seconds;
+        self.max_supply = max_supply;
+        self.next_bond_id = 1;
+        self.early_redemption_penalty_bps = early_redemption_penalty_bps;
+        self.paused = false;
+
+        // Calculate total coupon periods
+        self.total_coupons_due = maturity_seconds / coupon_interval;
+    }
+
+    // Issuer deposits funds to cover coupons and redemptions
+    pub fn deposit_funds(amount: u256) {
+        require!(msg.sender == self.issuer, NotIssuer {});
+        let token = IERC20::at(self.payment_token);
+        let success = token.transfer_from(msg.sender, address(self), amount);
+        require!(success, InsufficientPayment { required: amount, sent: 0 });
+
+        self.issuer_deposited = self.issuer_deposited + amount;
+
+        emit IssuerDeposit { amount: amount };
+    }
+
+    // Purchase a bond at face value (or market price set by issuer)
+    pub fn purchase(price: u256) -> u64 {
+        require!(!self.paused, ContractPaused {});
+        require!(self.total_issued < self.max_supply, MaxSupplyReached {});
+        require!(block.timestamp < self.maturity_date, MaturityInPast {});
+
+        let token = IERC20::at(self.payment_token);
+        let success = token.transfer_from(msg.sender, self.issuer, price);
+        require!(success, InsufficientPayment { required: price, sent: 0 });
+
+        let bond_id = self.next_bond_id;
+        self.next_bond_id = bond_id + 1;
+        self.total_issued = self.total_issued + 1;
+
+        self.bonds[bond_id] = BondToken {
+            id: bond_id,
+            holder: msg.sender,
+            face_value: self.face_value,
+            purchase_price: price,
+            purchased_at: block.timestamp,
+            matured: false,
+            redeemed: false,
+            coupons_claimed: 0,
+        };
+
+        self.holder_bonds[msg.sender].push(bond_id);
+        self.total_face_value_outstanding = self.total_face_value_outstanding + self.face_value;
+
+        emit BondIssued {
+            bond_id: bond_id,
+            buyer: msg.sender,
+            face_value: self.face_value,
+            price_paid: price,
+        };
+
+        return bond_id;
+    }
+
+    // Claim accrued coupon payments
+    pub fn claim_coupons(bond_id: u64) {
+        let mut bond = self.bonds[bond_id];
+        require!(bond.holder != Address::ZERO, BondNotFound {});
+        require!(msg.sender == bond.holder, NotBondHolder { bond_id: bond_id });
+        require!(!bond.redeemed, BondAlreadyRedeemed {});
+
+        let elapsed = block.timestamp - self.issue_date;
+        let periods_elapsed = elapsed / self.coupon_interval;
+        let claimable = periods_elapsed - bond.coupons_claimed;
+        require!(claimable > 0, NoCouponsDue {});
+
+        // Coupon per period = face_value * rate / 10000 / (periods per year)
+        let periods_per_year = SECONDS_PER_YEAR / self.coupon_interval;
+        let coupon_per_period = (bond.face_value * self.coupon_rate_bps) / (BPS_DENOMINATOR * periods_per_year);
+        let total_payout = coupon_per_period * claimable;
+
+        // Verify issuer has deposited enough
+        require!(self.issuer_deposited >= total_payout, InsufficientIssuerFunds {
+            needed: total_payout,
+            available: self.issuer_deposited,
+        });
+
+        bond.coupons_claimed = bond.coupons_claimed + claimable;
+        self.bonds[bond_id] = bond;
+        self.issuer_deposited = self.issuer_deposited - total_payout;
+
+        let token = IERC20::at(self.payment_token);
+        let success = token.transfer(bond.holder, total_payout);
+        require!(success, InsufficientPayment { required: total_payout, sent: 0 });
+
+        emit CouponPaid {
+            bond_id: bond_id,
+            holder: bond.holder,
+            amount: total_payout,
+            period: bond.coupons_claimed,
+        };
+    }
+
+    // Redeem bond at maturity for face value
+    pub fn redeem(bond_id: u64) {
+        let mut bond = self.bonds[bond_id];
+        require!(bond.holder != Address::ZERO, BondNotFound {});
+        require!(msg.sender == bond.holder, NotBondHolder { bond_id: bond_id });
+        require!(!bond.redeemed, BondAlreadyRedeemed {});
+        require!(block.timestamp >= self.maturity_date, BondNotMatured {});
+
+        // Claim any remaining coupons first
+        let remaining_coupons = self.total_coupons_due - bond.coupons_claimed;
+        let periods_per_year = SECONDS_PER_YEAR / self.coupon_interval;
+        let coupon_per_period = (bond.face_value * self.coupon_rate_bps) / (BPS_DENOMINATOR * periods_per_year);
+        let coupon_payout = coupon_per_period * remaining_coupons;
+
+        let total_payout = bond.face_value + coupon_payout;
+
+        require!(self.issuer_deposited >= total_payout, InsufficientIssuerFunds {
+            needed: total_payout,
+            available: self.issuer_deposited,
+        });
+
+        bond.redeemed = true;
+        bond.matured = true;
+        bond.coupons_claimed = self.total_coupons_due;
+        self.bonds[bond_id] = bond;
+
+        self.issuer_deposited = self.issuer_deposited - total_payout;
+        self.total_face_value_outstanding = self.total_face_value_outstanding - bond.face_value;
+
+        let token = IERC20::at(self.payment_token);
+        let success = token.transfer(bond.holder, total_payout);
+        require!(success, InsufficientPayment { required: total_payout, sent: 0 });
+
+        emit BondRedeemed {
+            bond_id: bond_id,
+            holder: bond.holder,
+            amount: total_payout,
+        };
+    }
+
+    // Early redemption with penalty
+    pub fn redeem_early(bond_id: u64) {
+        require!(self.early_redemption_penalty_bps > 0, EarlyRedemptionDisabled {});
+
+        let mut bond = self.bonds[bond_id];
+        require!(bond.holder != Address::ZERO, BondNotFound {});
+        require!(msg.sender == bond.holder, NotBondHolder { bond_id: bond_id });
+        require!(!bond.redeemed, BondAlreadyRedeemed {});
+        require!(block.timestamp < self.maturity_date, BondNotMatured {});
+
+        let penalty = (bond.face_value * self.early_redemption_penalty_bps) / BPS_DENOMINATOR;
+        let payout = bond.face_value - penalty;
+
+        require!(self.issuer_deposited >= payout, InsufficientIssuerFunds {
+            needed: payout,
+            available: self.issuer_deposited,
+        });
+
+        bond.redeemed = true;
+        self.bonds[bond_id] = bond;
+        self.issuer_deposited = self.issuer_deposited - payout;
+        self.total_face_value_outstanding = self.total_face_value_outstanding - bond.face_value;
+
+        let token = IERC20::at(self.payment_token);
+        let success = token.transfer(bond.holder, payout);
+        require!(success, InsufficientPayment { required: payout, sent: 0 });
+
+        emit EarlyRedemption {
+            bond_id: bond_id,
+            holder: bond.holder,
+            payout: payout,
+            penalty: penalty,
+        };
+    }
+
+    // Transfer bond to another holder (secondary market)
+    pub fn transfer(bond_id: u64, to: Address) {
+        require!(to != Address::ZERO, ZeroAddress {});
+        let mut bond = self.bonds[bond_id];
+        require!(bond.holder != Address::ZERO, BondNotFound {});
+        require!(msg.sender == bond.holder, NotBondHolder { bond_id: bond_id });
+        require!(!bond.redeemed, BondAlreadyRedeemed {});
+        require!(to != msg.sender, TransferToSelf {});
+
+        let from = bond.holder;
+        bond.holder = to;
+        self.bonds[bond_id] = bond;
+
+        // Update holder tracking
+        let mut from_bonds: Vec<u64> = Vec::new();
+        for i in 0..self.holder_bonds[from].len() {
+            if self.holder_bonds[from][i] != bond_id {
+                from_bonds.push(self.holder_bonds[from][i]);
+            }
+        }
+        self.holder_bonds[from] = from_bonds;
+        self.holder_bonds[to].push(bond_id);
+
+        emit BondTransferred { bond_id: bond_id, from: from, to: to };
+    }
+
+    pub fn pause() {
+        require!(msg.sender == self.issuer, Unauthorized {});
+        self.paused = true;
+    }
+
+    pub fn unpause() {
+        require!(msg.sender == self.issuer, Unauthorized {});
+        self.paused = false;
+    }
+
+    #[view]
+    pub fn get_bond(bond_id: u64) -> BondToken {
+        return self.bonds[bond_id];
+    }
+
+    #[view]
+    pub fn get_holder_bonds(holder: Address) -> Vec<u64> {
+        return self.holder_bonds[holder];
+    }
+
+    #[view]
+    pub fn get_bond_info() -> BondInfo {
+        return BondInfo {
+            name: self.bond_name,
+            symbol: self.bond_symbol,
+            face_value: self.face_value,
+            coupon_rate_bps: self.coupon_rate_bps,
+            maturity_date: self.maturity_date,
+            total_issued: self.total_issued,
+            max_supply: self.max_supply,
+        };
+    }
+
+    #[view]
+    pub fn get_accrued_coupons(bond_id: u64) -> u256 {
+        let bond = self.bonds[bond_id];
+        if bond.redeemed {
+            return 0;
+        }
+        let elapsed = block.timestamp - self.issue_date;
+        let periods_elapsed = elapsed / self.coupon_interval;
+        let claimable = periods_elapsed - bond.coupons_claimed;
+        let periods_per_year = SECONDS_PER_YEAR / self.coupon_interval;
+        let coupon_per_period = (bond.face_value * self.coupon_rate_bps) / (BPS_DENOMINATOR * periods_per_year);
+        return coupon_per_period * claimable;
+    }
+
+    #[view]
+    pub fn get_yield_to_maturity(bond_id: u64) -> u256 {
+        let bond = self.bonds[bond_id];
+        if bond.redeemed || block.timestamp >= self.maturity_date {
+            return 0;
+        }
+        let remaining_periods = self.total_coupons_due - bond.coupons_claimed;
+        let periods_per_year = SECONDS_PER_YEAR / self.coupon_interval;
+        let coupon_per_period = (bond.face_value * self.coupon_rate_bps) / (BPS_DENOMINATOR * periods_per_year);
+        let total_future_coupons = coupon_per_period * remaining_periods;
+        return total_future_coupons + bond.face_value;
+    }
+}

@@ -1,0 +1,277 @@
+// Generative NFT collection with phased minting, provenance hash,
+// delayed reveal, and per-wallet mint limits.
+
+contract NFTCollection {
+    const DEFAULT_ROYALTY_BPS: u256 = 500; // 5%
+
+    enum MintPhase {
+        Paused,
+        Allowlist,
+        Public,
+    }
+
+    storage {
+        name: String,
+        symbol: String,
+        owner: Address,
+        max_supply: u256,
+        total_minted: u256,
+        mint_price: u256,
+        max_per_wallet: u256,
+        minted_per_wallet: Map<Address, u256>,
+
+        // Token data
+        owners: Map<u256, Address>,
+        balances: Map<Address, u256>,
+        approvals: Map<u256, Address>,
+
+        // Reveal mechanism
+        base_uri: String,
+        unrevealed_uri: String,
+        revealed: bool,
+        provenance_hash: u256,
+
+        // Mint phases
+        phase: MintPhase,
+        allowlist: Map<Address, bool>,
+
+        // Royalty
+        royalty_recipient: Address,
+        royalty_bps: u256,
+
+        // Withdraw
+        withdrawn: bool,
+    }
+
+    event Minted {
+        #[indexed]
+        to: Address,
+        start_token_id: u256,
+        quantity: u256,
+    }
+
+    event Transfer {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        #[indexed]
+        token_id: u256,
+    }
+
+    event Revealed {
+        base_uri: String,
+    }
+
+    event PhaseChanged {
+        new_phase: MintPhase,
+    }
+
+    event ProvenanceSet {
+        hash: u256,
+    }
+
+    error MintPaused {}
+    error NotAllowlisted {}
+    error ExceedsMaxSupply { requested: u256, remaining: u256 }
+    error ExceedsWalletLimit { allowed: u256, already_minted: u256 }
+    error InsufficientPayment { required: u256, sent: u256 }
+    error AlreadyRevealed {}
+    error TokenDoesNotExist { token_id: u256 }
+    error NotOwnerOrApproved {}
+    error NotContractOwner {}
+    error AlreadyWithdrawn {}
+    error InvalidPhase {}
+    error ZeroQuantity {}
+
+    #[constructor]
+    pub fn init(
+        name: String,
+        symbol: String,
+        max_supply: u256,
+        mint_price: u256,
+        max_per_wallet: u256,
+        unrevealed_uri: String,
+    ) {
+        self.name = name;
+        self.symbol = symbol;
+        self.owner = msg.sender;
+        self.max_supply = max_supply;
+        self.mint_price = mint_price;
+        self.max_per_wallet = max_per_wallet;
+        self.unrevealed_uri = unrevealed_uri;
+        self.total_minted = 0;
+        self.phase = MintPhase::Paused;
+        self.revealed = false;
+        self.royalty_recipient = msg.sender;
+        self.royalty_bps = DEFAULT_ROYALTY_BPS;
+    }
+
+    pub fn mint(quantity: u256) {
+        require!(quantity > 0, ZeroQuantity {});
+        require!(self.phase != MintPhase::Paused, MintPaused {});
+
+        if self.phase == MintPhase::Allowlist {
+            require!(self.allowlist[msg.sender], NotAllowlisted {});
+        }
+
+        let already = self.minted_per_wallet[msg.sender];
+        require!(already + quantity <= self.max_per_wallet, ExceedsWalletLimit {
+            allowed: self.max_per_wallet,
+            already_minted: already,
+        });
+
+        let remaining = self.max_supply - self.total_minted;
+        require!(quantity <= remaining, ExceedsMaxSupply {
+            requested: quantity,
+            remaining: remaining,
+        });
+
+        let total_cost = self.mint_price * quantity;
+        require!(msg.value >= total_cost, InsufficientPayment {
+            required: total_cost,
+            sent: msg.value,
+        });
+
+        let start_id = self.total_minted + 1;
+
+        for i in 0..quantity {
+            let token_id = start_id + i;
+            self.owners[token_id] = msg.sender;
+
+            emit Transfer { from: Address::ZERO, to: msg.sender, token_id: token_id };
+        }
+
+        self.total_minted = self.total_minted + quantity;
+        self.balances[msg.sender] = self.balances[msg.sender] + quantity;
+        self.minted_per_wallet[msg.sender] = already + quantity;
+
+        emit Minted { to: msg.sender, start_token_id: start_id, quantity: quantity };
+    }
+
+    pub fn set_phase(phase: MintPhase) {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        self.phase = phase;
+        emit PhaseChanged { new_phase: phase };
+    }
+
+    pub fn add_to_allowlist(addresses: Vec<Address>) {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        for i in 0..addresses.len() {
+            self.allowlist[addresses[i]] = true;
+        }
+    }
+
+    pub fn remove_from_allowlist(addresses: Vec<Address>) {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        for i in 0..addresses.len() {
+            self.allowlist[addresses[i]] = false;
+        }
+    }
+
+    pub fn set_provenance_hash(hash: u256) {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        self.provenance_hash = hash;
+        emit ProvenanceSet { hash: hash };
+    }
+
+    pub fn reveal(base_uri: String) {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        require!(!self.revealed, AlreadyRevealed {});
+        self.revealed = true;
+        self.base_uri = base_uri;
+        emit Revealed { base_uri: base_uri };
+    }
+
+    pub fn set_royalty(recipient: Address, bps: u256) {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        self.royalty_recipient = recipient;
+        self.royalty_bps = bps;
+    }
+
+    pub fn withdraw() {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        require!(!self.withdrawn, AlreadyWithdrawn {});
+        self.withdrawn = true;
+
+        let balance = address(self).balance;
+        raw_call!(self.owner, balance, bytes(""));
+    }
+
+    pub fn owner_mint(to: Address, quantity: u256) {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        require!(quantity > 0, ZeroQuantity {});
+        let remaining = self.max_supply - self.total_minted;
+        require!(quantity <= remaining, ExceedsMaxSupply {
+            requested: quantity,
+            remaining: remaining,
+        });
+
+        let start_id = self.total_minted + 1;
+
+        for i in 0..quantity {
+            let token_id = start_id + i;
+            self.owners[token_id] = to;
+            emit Transfer { from: Address::ZERO, to: to, token_id: token_id };
+        }
+
+        self.total_minted = self.total_minted + quantity;
+        self.balances[to] = self.balances[to] + quantity;
+
+        emit Minted { to: to, start_token_id: start_id, quantity: quantity };
+    }
+
+    pub fn transfer_from(from: Address, to: Address, token_id: u256) {
+        require!(self.owners[token_id] != Address::ZERO, TokenDoesNotExist { token_id: token_id });
+        let token_owner = self.owners[token_id];
+        require!(
+            msg.sender == token_owner || self.approvals[token_id] == msg.sender,
+            NotOwnerOrApproved {}
+        );
+
+        self.approvals[token_id] = Address::ZERO;
+        self.balances[from] = self.balances[from] - 1;
+        self.balances[to] = self.balances[to] + 1;
+        self.owners[token_id] = to;
+
+        emit Transfer { from: from, to: to, token_id: token_id };
+    }
+
+    #[view]
+    pub fn token_uri(token_id: u256) -> String {
+        require!(
+            token_id >= 1 && token_id <= self.total_minted,
+            TokenDoesNotExist { token_id: token_id }
+        );
+
+        if !self.revealed {
+            return self.unrevealed_uri;
+        }
+        return self.base_uri;
+    }
+
+    #[view]
+    pub fn royalty_info(sale_price: u256) -> (Address, u256) {
+        let royalty_amount = (sale_price * self.royalty_bps) / 10000;
+        return (self.royalty_recipient, royalty_amount);
+    }
+
+    #[view]
+    pub fn owner_of(token_id: u256) -> Address {
+        require!(
+            self.owners[token_id] != Address::ZERO,
+            TokenDoesNotExist { token_id: token_id }
+        );
+        return self.owners[token_id];
+    }
+
+    #[view]
+    pub fn total_supply() -> u256 {
+        return self.total_minted;
+    }
+
+    #[view]
+    pub fn is_allowlisted(account: Address) -> bool {
+        return self.allowlist[account];
+    }
+}

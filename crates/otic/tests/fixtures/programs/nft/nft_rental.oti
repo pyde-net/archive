@@ -1,0 +1,363 @@
+// NFT Rental contract allowing owners to rent out their NFTs for
+// time-limited access. Supports fixed-duration and open-ended rentals,
+// early termination with pro-rata refunds, and collateral.
+
+use std::token::INFT;
+
+contract NFTRental {
+    storage {
+        owner: Address,
+        rental_count: u256,
+        rentals: Map<u256, Rental>,
+        // nft_contract -> token_id -> active rental id (0 if none)
+        active_rental: Map<Address, Map<u256, u256>>,
+        listing_count: u256,
+        rental_listings: Map<u256, RentalListing>,
+        // nft_contract -> token_id -> listing id
+        active_listing: Map<Address, Map<u256, u256>>,
+        platform_fee_bps: u256,
+        fee_recipient: Address,
+        accumulated_fees: u256,
+        earnings: Map<Address, u256>,
+    }
+
+    struct RentalListing {
+        listing_id: u256,
+        lender: Address,
+        nft_contract: Address,
+        token_id: u256,
+        price_per_day: u256,
+        min_duration: u64,         // seconds
+        max_duration: u64,         // seconds
+        collateral_required: u256,
+        active: bool,
+    }
+
+    struct Rental {
+        rental_id: u256,
+        lender: Address,
+        renter: Address,
+        nft_contract: Address,
+        token_id: u256,
+        start_time: u64,
+        end_time: u64,
+        price_per_day: u256,
+        total_paid: u256,
+        collateral: u256,
+        active: bool,
+        terminated_early: bool,
+    }
+
+    event RentalListingCreated {
+        #[indexed]
+        listing_id: u256,
+        #[indexed]
+        lender: Address,
+        nft_contract: Address,
+        token_id: u256,
+        price_per_day: u256,
+    }
+
+    event RentalListingCancelled {
+        #[indexed]
+        listing_id: u256,
+    }
+
+    event RentalStarted {
+        #[indexed]
+        rental_id: u256,
+        #[indexed]
+        lender: Address,
+        #[indexed]
+        renter: Address,
+        nft_contract: Address,
+        token_id: u256,
+        duration: u64,
+    }
+
+    event RentalEnded {
+        #[indexed]
+        rental_id: u256,
+        returned_collateral: u256,
+    }
+
+    event RentalTerminatedEarly {
+        #[indexed]
+        rental_id: u256,
+        refund: u256,
+    }
+
+    event EarningsWithdrawn {
+        #[indexed]
+        user: Address,
+        amount: u256,
+    }
+
+    error ListingNotActive {}
+    error RentalNotActive {}
+    error NotLender {}
+    error NotRenter {}
+    error DurationTooShort { min: u64, requested: u64 }
+    error DurationTooLong { max: u64, requested: u64 }
+    error InsufficientPayment { required: u256, sent: u256 }
+    error RentalNotExpired {}
+    error AlreadyRented { nft_contract: Address, token_id: u256 }
+    error AlreadyListed {}
+    error NotTokenOwner {}
+    error NothingToWithdraw {}
+    error RentalStillActive {}
+    error NotContractOwner {}
+
+    #[constructor]
+    pub fn init(platform_fee_bps: u256, fee_recipient: Address) {
+        self.owner = msg.sender;
+        self.platform_fee_bps = platform_fee_bps;
+        self.fee_recipient = fee_recipient;
+        self.rental_count = 0;
+        self.listing_count = 0;
+        self.accumulated_fees = 0;
+    }
+
+    pub fn create_listing(
+        nft_contract: Address,
+        token_id: u256,
+        price_per_day: u256,
+        min_duration: u64,
+        max_duration: u64,
+        collateral_required: u256,
+    ) {
+        // Verify ownership
+        let nft = INFT::at(nft_contract);
+        require!(nft.owner_of(token_id) == msg.sender, NotTokenOwner {});
+        require!(
+            self.active_listing[nft_contract][token_id] == 0,
+            AlreadyListed {}
+        );
+
+        self.listing_count = self.listing_count + 1;
+        let listing_id = self.listing_count;
+
+        self.rental_listings[listing_id] = RentalListing {
+            listing_id: listing_id,
+            lender: msg.sender,
+            nft_contract: nft_contract,
+            token_id: token_id,
+            price_per_day: price_per_day,
+            min_duration: min_duration,
+            max_duration: max_duration,
+            collateral_required: collateral_required,
+            active: true,
+        };
+
+        self.active_listing[nft_contract][token_id] = listing_id;
+
+        emit RentalListingCreated {
+            listing_id: listing_id,
+            lender: msg.sender,
+            nft_contract: nft_contract,
+            token_id: token_id,
+            price_per_day: price_per_day,
+        };
+    }
+
+    pub fn cancel_listing(listing_id: u256) {
+        let listing = self.rental_listings[listing_id];
+        require!(listing.active, ListingNotActive {});
+        require!(listing.lender == msg.sender, NotLender {});
+
+        // Ensure no active rental
+        let rental_id = self.active_rental[listing.nft_contract][listing.token_id];
+        if rental_id > 0 {
+            require!(!self.rentals[rental_id].active, RentalStillActive {});
+        }
+
+        self.rental_listings[listing_id].active = false;
+        self.active_listing[listing.nft_contract][listing.token_id] = 0;
+
+        emit RentalListingCancelled { listing_id: listing_id };
+    }
+
+    pub fn rent(listing_id: u256, duration: u64) {
+        let listing = self.rental_listings[listing_id];
+        require!(listing.active, ListingNotActive {});
+        require!(duration >= listing.min_duration, DurationTooShort {
+            min: listing.min_duration,
+            requested: duration,
+        });
+        require!(duration <= listing.max_duration, DurationTooLong {
+            max: listing.max_duration,
+            requested: duration,
+        });
+
+        require!(
+            self.active_rental[listing.nft_contract][listing.token_id] == 0,
+            AlreadyRented {
+                nft_contract: listing.nft_contract,
+                token_id: listing.token_id,
+            }
+        );
+
+        // Calculate cost: price_per_day * duration_in_days (rounded up)
+        let seconds_per_day: u64 = 86400;
+        let days = (duration + seconds_per_day - 1) / seconds_per_day;
+        let rental_cost = listing.price_per_day * days;
+        let total_required = rental_cost + listing.collateral_required;
+
+        require!(msg.value >= total_required, InsufficientPayment {
+            required: total_required,
+            sent: msg.value,
+        });
+
+        self.rental_count = self.rental_count + 1;
+        let rental_id = self.rental_count;
+
+        self.rentals[rental_id] = Rental {
+            rental_id: rental_id,
+            lender: listing.lender,
+            renter: msg.sender,
+            nft_contract: listing.nft_contract,
+            token_id: listing.token_id,
+            start_time: block.timestamp,
+            end_time: block.timestamp + duration,
+            price_per_day: listing.price_per_day,
+            total_paid: rental_cost,
+            collateral: listing.collateral_required,
+            active: true,
+            terminated_early: false,
+        };
+
+        self.active_rental[listing.nft_contract][listing.token_id] = rental_id;
+
+        // Transfer NFT to renter for usage period
+        let nft = INFT::at(listing.nft_contract);
+        nft.transfer_from(listing.lender, msg.sender, listing.token_id);
+
+        // Credit lender earnings (minus platform fee)
+        let fee = (rental_cost * self.platform_fee_bps) / 10000;
+        let lender_amount = rental_cost - fee;
+        self.earnings[listing.lender] = self.earnings[listing.lender] + lender_amount;
+        self.accumulated_fees = self.accumulated_fees + fee;
+
+        emit RentalStarted {
+            rental_id: rental_id,
+            lender: listing.lender,
+            renter: msg.sender,
+            nft_contract: listing.nft_contract,
+            token_id: listing.token_id,
+            duration: duration,
+        };
+    }
+
+    pub fn return_nft(rental_id: u256) {
+        let rental = self.rentals[rental_id];
+        require!(rental.active, RentalNotActive {});
+        require!(
+            msg.sender == rental.renter || msg.sender == rental.lender,
+            NotRenter {}
+        );
+
+        self.rentals[rental_id].active = false;
+        self.active_rental[rental.nft_contract][rental.token_id] = 0;
+
+        // Transfer NFT back to lender
+        let nft = INFT::at(rental.nft_contract);
+        nft.transfer_from(rental.renter, rental.lender, rental.token_id);
+
+        // Check for early termination refund
+        let mut refund: u256 = 0;
+        if block.timestamp < rental.end_time {
+            self.rentals[rental_id].terminated_early = true;
+            let total_duration = rental.end_time - rental.start_time;
+            let elapsed = block.timestamp - rental.start_time;
+            let unused_fraction_num = total_duration - elapsed;
+            refund = (rental.total_paid * unused_fraction_num) / total_duration;
+
+            // Deduct refund from lender earnings
+            self.earnings[rental.lender] = self.earnings[rental.lender] - refund;
+        }
+
+        // Return collateral + any refund to renter
+        let renter_return = rental.collateral + refund;
+        if renter_return > 0 {
+            raw_call!(rental.renter, renter_return, bytes(""));
+        }
+
+        if refund > 0 {
+            emit RentalTerminatedEarly { rental_id: rental_id, refund: refund };
+        }
+
+        emit RentalEnded { rental_id: rental_id, returned_collateral: rental.collateral };
+    }
+
+    // Lender can claim NFT + collateral if renter doesn't return after expiry
+    pub fn claim_expired(rental_id: u256) {
+        let rental = self.rentals[rental_id];
+        require!(rental.active, RentalNotActive {});
+        require!(rental.lender == msg.sender, NotLender {});
+        require!(block.timestamp > rental.end_time, RentalNotExpired {});
+
+        self.rentals[rental_id].active = false;
+        self.active_rental[rental.nft_contract][rental.token_id] = 0;
+
+        // Collateral goes to lender as penalty
+        self.earnings[rental.lender] = self.earnings[rental.lender] + rental.collateral;
+
+        // Attempt to recover NFT if possible
+        let nft = INFT::at(rental.nft_contract);
+        nft.transfer_from(rental.renter, rental.lender, rental.token_id);
+
+        emit RentalEnded { rental_id: rental_id, returned_collateral: 0 };
+    }
+
+    pub fn withdraw_earnings() {
+        let amount = self.earnings[msg.sender];
+        require!(amount > 0, NothingToWithdraw {});
+
+        self.earnings[msg.sender] = 0;
+        raw_call!(msg.sender, amount, bytes(""));
+
+        emit EarningsWithdrawn { user: msg.sender, amount: amount };
+    }
+
+    pub fn withdraw_fees() {
+        require!(msg.sender == self.owner, NotContractOwner {});
+        let amount = self.accumulated_fees;
+        require!(amount > 0, NothingToWithdraw {});
+
+        self.accumulated_fees = 0;
+        raw_call!(self.fee_recipient, amount, bytes(""));
+    }
+
+    #[view]
+    pub fn get_rental(rental_id: u256) -> Rental {
+        return self.rentals[rental_id];
+    }
+
+    #[view]
+    pub fn get_listing(listing_id: u256) -> RentalListing {
+        return self.rental_listings[listing_id];
+    }
+
+    #[view]
+    pub fn is_rented(nft_contract: Address, token_id: u256) -> bool {
+        let rental_id = self.active_rental[nft_contract][token_id];
+        if rental_id == 0 {
+            return false;
+        }
+        return self.rentals[rental_id].active;
+    }
+
+    #[view]
+    pub fn rental_time_remaining(rental_id: u256) -> u64 {
+        let rental = self.rentals[rental_id];
+        if !rental.active || block.timestamp >= rental.end_time {
+            return 0;
+        }
+        return rental.end_time - block.timestamp;
+    }
+
+    #[view]
+    pub fn get_earnings(user: Address) -> u256 {
+        return self.earnings[user];
+    }
+}

@@ -1,0 +1,270 @@
+// Supply chain tracking with multi-checkpoint verification and temperature monitoring
+use std::math;
+
+enum ShipmentStatus {
+    Created,         // 0
+    InTransit,       // 1
+    AtCheckpoint,    // 2
+    OutForDelivery,  // 3
+    Delivered,       // 4
+    Returned,        // 5
+}
+
+contract SupplyChainTracker {
+    storage {
+        owner: Address,
+        next_shipment_id: u64,
+        shipments: Map<u64, Shipment>,
+        checkpoints: Map<u64, Map<u32, Checkpoint>>,
+        checkpoint_counts: Map<u64, u32>,
+        authorized_handlers: Map<Address, bool>,
+        handler_roles: Map<Address, u8>,
+        temperature_logs: Map<u64, Map<u32, TemperatureReading>>,
+        temp_log_counts: Map<u64, u32>,
+        dispute_flags: Map<u64, bool>,
+        shipment_batch: Map<u256, Vec<u64>>,
+    }
+
+    struct Shipment {
+        sender: Address,
+        receiver: Address,
+        origin_hash: u256,
+        destination_hash: u256,
+        status: u8,
+        created_at: u64,
+        delivered_at: u64,
+        item_count: u32,
+        weight_grams: u64,
+        requires_cold_chain: bool,
+        min_temp_celsius: i16,
+        max_temp_celsius: i16,
+    }
+
+    struct Checkpoint {
+        handler: Address,
+        location_hash: u256,
+        timestamp: u64,
+        status: u8,
+        notes_hash: u256,
+        signature: u256,
+    }
+
+    struct TemperatureReading {
+        sensor_id: u32,
+        temp_celsius_x100: i32,
+        humidity_pct: u8,
+        timestamp: u64,
+        within_range: bool,
+    }
+
+    event ShipmentCreated {
+        #[indexed]
+        shipment_id: u64,
+        #[indexed]
+        sender: Address,
+        #[indexed]
+        receiver: Address,
+    }
+
+    event CheckpointAdded {
+        #[indexed]
+        shipment_id: u64,
+        checkpoint_index: u32,
+        handler: Address,
+        status: u8,
+    }
+
+    event ShipmentDelivered {
+        #[indexed]
+        shipment_id: u64,
+        timestamp: u64,
+    }
+
+    event TemperatureAlert {
+        #[indexed]
+        shipment_id: u64,
+        reading_index: u32,
+        temp_celsius_x100: i32,
+    }
+
+    event DisputeRaised {
+        #[indexed]
+        shipment_id: u64,
+        #[indexed]
+        raised_by: Address,
+    }
+
+    error ShipmentNotFound { id: u64 }
+    error NotAuthorized {}
+    error ShipmentAlreadyDelivered {}
+    error InvalidStatus { current: u8, attempted: u8 }
+    error TemperatureOutOfRange { min: i16, max: i16, actual_x100: i32 }
+    error NotSenderOrReceiver {}
+    error ShipmentInDispute {}
+
+    const DELIVERED_STATUS: u8 = 4;
+    const RETURNED_STATUS: u8 = 5;
+
+    #[constructor]
+    pub fn init() {
+        self.owner = msg.sender;
+        self.next_shipment_id = 1;
+        self.authorized_handlers[msg.sender] = true;
+    }
+
+    pub fn authorize_handler(handler: Address, role: u8) {
+        require!(msg.sender == self.owner, NotAuthorized {});
+        self.authorized_handlers[handler] = true;
+        self.handler_roles[handler] = role;
+    }
+
+    pub fn create_shipment(
+        receiver: Address,
+        origin_hash: u256,
+        destination_hash: u256,
+        item_count: u32,
+        weight_grams: u64,
+        requires_cold_chain: bool,
+        min_temp: i16,
+        max_temp: i16,
+        batch_id: u256,
+    ) -> u64 {
+        let shipment_id = self.next_shipment_id;
+        self.next_shipment_id += 1;
+
+        // Status: 0=created, 1=in_transit, 2=at_checkpoint, 3=out_for_delivery, 4=delivered, 5=returned
+        self.shipments[shipment_id] = Shipment {
+            sender: msg.sender,
+            receiver: receiver,
+            origin_hash: origin_hash,
+            destination_hash: destination_hash,
+            status: 0,
+            created_at: block.timestamp,
+            delivered_at: 0,
+            item_count: item_count,
+            weight_grams: weight_grams,
+            requires_cold_chain: requires_cold_chain,
+            min_temp_celsius: min_temp,
+            max_temp_celsius: max_temp,
+        };
+
+        if batch_id != 0 {
+            self.shipment_batch[batch_id].push(shipment_id);
+        }
+        self.checkpoint_counts[shipment_id] = 0;
+        self.temp_log_counts[shipment_id] = 0;
+
+        emit ShipmentCreated { shipment_id: shipment_id, sender: msg.sender, receiver: receiver };
+        return shipment_id;
+    }
+
+    pub fn add_checkpoint(
+        shipment_id: u64,
+        location_hash: u256,
+        new_status: u8,
+        notes_hash: u256,
+        signature: u256,
+    ) {
+        require!(self.authorized_handlers[msg.sender], NotAuthorized {});
+        let shipment = self.shipments[shipment_id];
+        require!(shipment.status != 4 && shipment.status != 5, ShipmentAlreadyDelivered {});
+        require!(!self.dispute_flags[shipment_id], ShipmentInDispute {});
+
+        // Validate status transitions
+        let valid_transition = match shipment.status {
+            0 => new_status == 1 || new_status == 5,
+            1 => new_status == 2 || new_status == 3 || new_status == 5,
+            2 => new_status == 1 || new_status == 3 || new_status == 5,
+            3 => new_status == 4 || new_status == 5,
+            _ => false,
+        };
+        require!(valid_transition, InvalidStatus { current: shipment.status, attempted: new_status });
+
+        let idx = self.checkpoint_counts[shipment_id];
+        self.checkpoints[shipment_id][idx] = Checkpoint {
+            handler: msg.sender,
+            location_hash: location_hash,
+            timestamp: block.timestamp,
+            status: new_status,
+            notes_hash: notes_hash,
+            signature: signature,
+        };
+        self.checkpoint_counts[shipment_id] = idx + 1;
+        self.shipments[shipment_id].status = new_status;
+
+        if new_status == 4 {
+            self.shipments[shipment_id].delivered_at = block.timestamp;
+            emit ShipmentDelivered { shipment_id: shipment_id, timestamp: block.timestamp };
+        }
+
+        emit CheckpointAdded {
+            shipment_id: shipment_id,
+            checkpoint_index: idx,
+            handler: msg.sender,
+            status: new_status,
+        };
+    }
+
+    pub fn log_temperature(
+        shipment_id: u64,
+        sensor_id: u32,
+        temp_celsius_x100: i32,
+        humidity_pct: u8,
+    ) {
+        require!(self.authorized_handlers[msg.sender], NotAuthorized {});
+        let shipment = self.shipments[shipment_id];
+        require!(shipment.requires_cold_chain, NotAuthorized {});
+
+        let min_x100 = shipment.min_temp_celsius as i32 * 100;
+        let max_x100 = shipment.max_temp_celsius as i32 * 100;
+        let within_range = temp_celsius_x100 >= min_x100 && temp_celsius_x100 <= max_x100;
+
+        let idx = self.temp_log_counts[shipment_id];
+        self.temperature_logs[shipment_id][idx] = TemperatureReading {
+            sensor_id: sensor_id,
+            temp_celsius_x100: temp_celsius_x100,
+            humidity_pct: humidity_pct,
+            timestamp: block.timestamp,
+            within_range: within_range,
+        };
+        self.temp_log_counts[shipment_id] = idx + 1;
+
+        if !within_range {
+            emit TemperatureAlert {
+                shipment_id: shipment_id,
+                reading_index: idx,
+                temp_celsius_x100: temp_celsius_x100,
+            };
+        }
+    }
+
+    pub fn raise_dispute(shipment_id: u64) {
+        let shipment = self.shipments[shipment_id];
+        require!(
+            msg.sender == shipment.sender || msg.sender == shipment.receiver,
+            NotSenderOrReceiver {}
+        );
+        self.dispute_flags[shipment_id] = true;
+        emit DisputeRaised { shipment_id: shipment_id, raised_by: msg.sender };
+    }
+
+    #[view]
+    pub fn get_shipment(shipment_id: u64) -> Shipment {
+        return self.shipments[shipment_id];
+    }
+
+    #[view]
+    pub fn get_checkpoint(shipment_id: u64, index: u32) -> Checkpoint {
+        return self.checkpoints[shipment_id][index];
+    }
+
+    #[view]
+    pub fn get_checkpoint_count(shipment_id: u64) -> u32 {
+        return self.checkpoint_counts[shipment_id];
+    }
+
+    #[view]
+    pub fn get_temperature(shipment_id: u64, index: u32) -> TemperatureReading {
+        return self.temperature_logs[shipment_id][index];
+    }
+}

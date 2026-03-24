@@ -1,0 +1,375 @@
+// Legally binding smart agreement with clause management, signatures, and escrow
+use std::math;
+
+enum AgreementStatus {
+    Draft,               // 0
+    PendingSignatures,   // 1
+    Active,              // 2
+    Completed,           // 3
+    Terminated,          // 4
+    Disputed,            // 5
+}
+
+contract SmartAgreement {
+    storage {
+        next_agreement_id: u64,
+        agreements: Map<u64, Agreement>,
+        clauses: Map<u64, Map<u32, Clause>>,
+        clause_counts: Map<u64, u32>,
+        signatures: Map<u64, Map<Address, Signature>>,
+        signature_counts: Map<u64, u8>,
+        escrow_balances: Map<u64, u256>,
+        amendments: Map<u64, Map<u32, Amendment>>,
+        amendment_counts: Map<u64, u32>,
+        amendment_approvals: Map<u64, Map<u32, Map<Address, bool>>>,
+        party_obligations: Map<u64, Map<Address, Map<u32, Obligation>>>,
+        obligation_counts: Map<u64, Map<Address, u32>>,
+        templates: Map<u256, u64>,
+    }
+
+    struct Agreement {
+        creator: Address,
+        parties: Vec<Address>,
+        title_hash: u256,
+        terms_hash: u256,
+        governing_law_hash: u256,
+        created_at: u64,
+        effective_date: u64,
+        expiry_date: u64,
+        status: u8,
+        requires_escrow: bool,
+        escrow_amount: u256,
+        fully_signed: bool,
+    }
+
+    struct Clause {
+        clause_hash: u256,
+        clause_type: u8,
+        penalty_amount: u256,
+        enforceable: bool,
+        conditions_hash: u256,
+    }
+
+    struct Signature {
+        signed: bool,
+        signed_at: u64,
+        signature_hash: u256,
+        ip_hash: u256,
+    }
+
+    struct Amendment {
+        proposer: Address,
+        description_hash: u256,
+        old_clause_index: u32,
+        new_clause_hash: u256,
+        proposed_at: u64,
+        approval_count: u8,
+        required_approvals: u8,
+        applied: bool,
+    }
+
+    struct Obligation {
+        description_hash: u256,
+        deadline: u64,
+        fulfilled: bool,
+        fulfilled_at: u64,
+        evidence_hash: u256,
+        penalty: u256,
+    }
+
+    event AgreementCreated {
+        #[indexed]
+        agreement_id: u64,
+        #[indexed]
+        creator: Address,
+        party_count: u8,
+    }
+
+    event AgreementSigned {
+        #[indexed]
+        agreement_id: u64,
+        #[indexed]
+        signer: Address,
+    }
+
+    event AgreementActivated {
+        #[indexed]
+        agreement_id: u64,
+    }
+
+    event AmendmentProposed {
+        #[indexed]
+        agreement_id: u64,
+        amendment_index: u32,
+    }
+
+    event AmendmentApplied {
+        #[indexed]
+        agreement_id: u64,
+        amendment_index: u32,
+    }
+
+    event ObligationFulfilled {
+        #[indexed]
+        agreement_id: u64,
+        #[indexed]
+        party: Address,
+        obligation_index: u32,
+    }
+
+    event EscrowDeposited {
+        #[indexed]
+        agreement_id: u64,
+        amount: u256,
+    }
+
+    event AgreementTerminated {
+        #[indexed]
+        agreement_id: u64,
+    }
+
+    error AgreementNotFound { id: u64 }
+    error NotParty {}
+    error AlreadySigned {}
+    error AgreementNotActive {}
+    error InsufficientEscrow { required: u256, sent: u256 }
+    error AmendmentNotFound { index: u32 }
+    error AlreadyApprovedAmendment {}
+    error ObligationNotFound { index: u32 }
+    error ObligationDeadlinePassed {}
+    error AlreadyFulfilled {}
+    error AgreementExpired {}
+    error NotFullySigned {}
+
+    const SECONDS_PER_DAY: u64 = 86400;
+
+    #[constructor]
+    pub fn init() {
+        self.next_agreement_id = 1;
+    }
+
+    fn is_party(agreement_id: u64, addr: Address) -> bool {
+        let parties = self.agreements[agreement_id].parties;
+        for i in 0..parties.len() {
+            if parties[i] == addr {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn create_agreement(
+        parties: Vec<Address>,
+        title_hash: u256,
+        terms_hash: u256,
+        governing_law_hash: u256,
+        duration_days: u64,
+        requires_escrow: bool,
+        escrow_amount: u256,
+    ) -> u64 {
+        let agreement_id = self.next_agreement_id;
+        self.next_agreement_id += 1;
+
+        let expiry = block.timestamp + (duration_days * 86400);
+
+        // Status: 0=draft, 1=pending_signatures, 2=active, 3=completed, 4=terminated, 5=disputed
+        self.agreements[agreement_id] = Agreement {
+            creator: msg.sender,
+            parties: parties,
+            title_hash: title_hash,
+            terms_hash: terms_hash,
+            governing_law_hash: governing_law_hash,
+            created_at: block.timestamp,
+            effective_date: 0,
+            expiry_date: expiry,
+            status: 1,
+            requires_escrow: requires_escrow,
+            escrow_amount: escrow_amount,
+            fully_signed: false,
+        };
+
+        self.clause_counts[agreement_id] = 0;
+        self.amendment_counts[agreement_id] = 0;
+        self.signature_counts[agreement_id] = 0;
+
+        let party_count = parties.len() as u8;
+        emit AgreementCreated { agreement_id: agreement_id, creator: msg.sender, party_count: party_count };
+        return agreement_id;
+    }
+
+    pub fn add_clause(
+        agreement_id: u64,
+        clause_hash: u256,
+        clause_type: u8,
+        penalty_amount: u256,
+        conditions_hash: u256,
+    ) {
+        require!(self.agreements[agreement_id].creator == msg.sender, NotParty {});
+        require!(self.agreements[agreement_id].status <= 1, AgreementNotActive {});
+
+        let idx = self.clause_counts[agreement_id];
+        self.clauses[agreement_id][idx] = Clause {
+            clause_hash: clause_hash,
+            clause_type: clause_type,
+            penalty_amount: penalty_amount,
+            enforceable: true,
+            conditions_hash: conditions_hash,
+        };
+        self.clause_counts[agreement_id] = idx + 1;
+    }
+
+    pub fn add_obligation(
+        agreement_id: u64,
+        party: Address,
+        description_hash: u256,
+        deadline_days: u64,
+        penalty: u256,
+    ) {
+        require!(self.agreements[agreement_id].creator == msg.sender, NotParty {});
+        require!(self.is_party(agreement_id, party), NotParty {});
+
+        let deadline = block.timestamp + (deadline_days * 86400);
+        let idx = self.obligation_counts[agreement_id][party];
+
+        self.party_obligations[agreement_id][party][idx] = Obligation {
+            description_hash: description_hash,
+            deadline: deadline,
+            fulfilled: false,
+            fulfilled_at: 0,
+            evidence_hash: 0,
+            penalty: penalty,
+        };
+        self.obligation_counts[agreement_id][party] = idx + 1;
+    }
+
+    pub fn sign_agreement(agreement_id: u64, signature_hash: u256, ip_hash: u256) {
+        require!(self.is_party(agreement_id, msg.sender), NotParty {});
+        require!(self.agreements[agreement_id].status == 1, AgreementNotActive {});
+        require!(!self.signatures[agreement_id][msg.sender].signed, AlreadySigned {});
+
+        if self.agreements[agreement_id].requires_escrow {
+            require!(msg.value >= self.agreements[agreement_id].escrow_amount, InsufficientEscrow {
+                required: self.agreements[agreement_id].escrow_amount,
+                sent: msg.value,
+            });
+            self.escrow_balances[agreement_id] += msg.value;
+            emit EscrowDeposited { agreement_id: agreement_id, amount: msg.value };
+        }
+
+        self.signatures[agreement_id][msg.sender] = Signature {
+            signed: true,
+            signed_at: block.timestamp,
+            signature_hash: signature_hash,
+            ip_hash: ip_hash,
+        };
+        self.signature_counts[agreement_id] += 1;
+
+        emit AgreementSigned { agreement_id: agreement_id, signer: msg.sender };
+
+        // Check if all parties have signed
+        let parties = self.agreements[agreement_id].parties;
+        let mut all_signed = true;
+        for i in 0..parties.len() {
+            if !self.signatures[agreement_id][parties[i]].signed {
+                all_signed = false;
+                break;
+            }
+        }
+
+        if all_signed {
+            self.agreements[agreement_id].fully_signed = true;
+            self.agreements[agreement_id].status = 2;
+            self.agreements[agreement_id].effective_date = block.timestamp;
+            emit AgreementActivated { agreement_id: agreement_id };
+        }
+    }
+
+    pub fn fulfill_obligation(agreement_id: u64, obligation_index: u32, evidence_hash: u256) {
+        require!(self.is_party(agreement_id, msg.sender), NotParty {});
+        require!(self.agreements[agreement_id].status == 2, AgreementNotActive {});
+
+        let obl = self.party_obligations[agreement_id][msg.sender][obligation_index];
+        require!(!obl.fulfilled, AlreadyFulfilled {});
+
+        self.party_obligations[agreement_id][msg.sender][obligation_index].fulfilled = true;
+        self.party_obligations[agreement_id][msg.sender][obligation_index].fulfilled_at = block.timestamp;
+        self.party_obligations[agreement_id][msg.sender][obligation_index].evidence_hash = evidence_hash;
+
+        emit ObligationFulfilled {
+            agreement_id: agreement_id,
+            party: msg.sender,
+            obligation_index: obligation_index,
+        };
+    }
+
+    pub fn propose_amendment(
+        agreement_id: u64,
+        description_hash: u256,
+        old_clause_index: u32,
+        new_clause_hash: u256,
+    ) {
+        require!(self.is_party(agreement_id, msg.sender), NotParty {});
+        require!(self.agreements[agreement_id].status == 2, AgreementNotActive {});
+
+        let idx = self.amendment_counts[agreement_id];
+        let parties = self.agreements[agreement_id].parties;
+
+        self.amendments[agreement_id][idx] = Amendment {
+            proposer: msg.sender,
+            description_hash: description_hash,
+            old_clause_index: old_clause_index,
+            new_clause_hash: new_clause_hash,
+            proposed_at: block.timestamp,
+            approval_count: 1,
+            required_approvals: parties.len() as u8,
+            applied: false,
+        };
+        self.amendment_approvals[agreement_id][idx][msg.sender] = true;
+        self.amendment_counts[agreement_id] = idx + 1;
+
+        emit AmendmentProposed { agreement_id: agreement_id, amendment_index: idx };
+    }
+
+    pub fn approve_amendment(agreement_id: u64, amendment_index: u32) {
+        require!(self.is_party(agreement_id, msg.sender), NotParty {});
+        require!(!self.amendment_approvals[agreement_id][amendment_index][msg.sender], AlreadyApprovedAmendment {});
+
+        self.amendment_approvals[agreement_id][amendment_index][msg.sender] = true;
+        self.amendments[agreement_id][amendment_index].approval_count += 1;
+
+        let amendment = self.amendments[agreement_id][amendment_index];
+        if amendment.approval_count >= amendment.required_approvals && !amendment.applied {
+            let clause_idx = amendment.old_clause_index;
+            self.clauses[agreement_id][clause_idx].clause_hash = amendment.new_clause_hash;
+            self.amendments[agreement_id][amendment_index].applied = true;
+            emit AmendmentApplied { agreement_id: agreement_id, amendment_index: amendment_index };
+        }
+    }
+
+    pub fn terminate_agreement(agreement_id: u64) {
+        require!(self.is_party(agreement_id, msg.sender), NotParty {});
+        require!(self.agreements[agreement_id].status == 2, AgreementNotActive {});
+        self.agreements[agreement_id].status = 4;
+        emit AgreementTerminated { agreement_id: agreement_id };
+    }
+
+    #[view]
+    pub fn get_agreement(agreement_id: u64) -> Agreement {
+        return self.agreements[agreement_id];
+    }
+
+    #[view]
+    pub fn get_clause(agreement_id: u64, index: u32) -> Clause {
+        return self.clauses[agreement_id][index];
+    }
+
+    #[view]
+    pub fn has_signed(agreement_id: u64, party: Address) -> bool {
+        return self.signatures[agreement_id][party].signed;
+    }
+
+    #[view]
+    pub fn get_obligation(agreement_id: u64, party: Address, index: u32) -> Obligation {
+        return self.party_obligations[agreement_id][party][index];
+    }
+}

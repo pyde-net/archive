@@ -1,0 +1,444 @@
+// Exercises deeply nested types, tuples, complex return types,
+// fixed arrays as params, and type casting
+
+use std::math;
+
+enum ProductStatus {
+    Created,     // 0
+    InTransit,   // 1
+    Delivered,   // 2
+    Recalled,    // 3
+}
+
+enum FacilityType {
+    Warehouse,   // 0
+    Factory,     // 1
+    Port,        // 2
+    Retail,      // 3
+}
+
+enum TransportMode {
+    Truck,       // 0
+    Rail,        // 1
+    Sea,         // 2
+    Air,         // 3
+}
+
+contract SupplyChainTracker {
+    struct Product {
+        id: u256,
+        name: String,
+        sku: String,
+        batch_code: [u8; 16],
+        dimensions: Dimensions,
+        certifications: Vec<Certification>,
+        composition: Vec<Component>,
+        current_location: Location,
+        history: Vec<TransitRecord>,
+        status: u8,  // 0=created, 1=in_transit, 2=delivered, 3=recalled
+    }
+
+    struct Dimensions {
+        length_mm: u32,
+        width_mm: u32,
+        height_mm: u32,
+        weight_grams: u64,
+        volume_cm3: u64,
+    }
+
+    struct Certification {
+        cert_type: String,
+        issuer: Address,
+        issued_at: u64,
+        expires_at: u64,
+        document_hash: [u8; 32],
+        signature: bytes,
+        metadata: CertMetadata,
+    }
+
+    struct CertMetadata {
+        standard: String,
+        version: String,
+        scope: String,
+        audit_date: u64,
+        auditor_name: String,
+    }
+
+    struct Component {
+        name: String,
+        percentage: u16,  // basis points (0-10000)
+        origin_country: String,
+        supplier: Address,
+        is_organic: bool,
+        allergens: Vec<String>,
+    }
+
+    struct Location {
+        latitude: i64,   // microdegrees
+        longitude: i64,
+        facility_name: String,
+        facility_type: u8,  // 0=warehouse, 1=factory, 2=port, 3=retail
+        country_code: String,
+        timestamp: u64,
+    }
+
+    struct TransitRecord {
+        from: Location,
+        to: Location,
+        carrier: Address,
+        departed_at: u64,
+        arrived_at: u64,
+        transport_mode: u8,  // 0=truck, 1=rail, 2=sea, 3=air
+        temperature_log: Vec<TemperatureReading>,
+        customs_docs: Vec<[u8; 32]>,
+        seal_number: String,
+    }
+
+    struct TemperatureReading {
+        celsius_x100: i32,  // temperature * 100 for precision
+        humidity_pct: u8,
+        timestamp: u64,
+        sensor_id: [u8; 8],
+    }
+
+    struct ProductSummary {
+        id: u256,
+        name: String,
+        status: u8,
+        total_distance_km: u64,
+        transit_count: u64,
+        cert_count: u64,
+        current_country: String,
+    }
+
+    struct QualityReport {
+        product_id: u256,
+        avg_temp_x100: i32,
+        max_temp_x100: i32,
+        min_temp_x100: i32,
+        temp_violations: u64,
+        cert_valid: bool,
+        all_components_verified: bool,
+    }
+
+    storage {
+        owner: Address,
+        next_product_id: u256,
+        products: Map<u256, Product>,
+        sku_to_id: Map<String, u256>,
+        supplier_products: Map<Address, Vec<u256>>,
+        carrier_registry: Map<Address, bool>,
+        temp_threshold_min: i32,
+        temp_threshold_max: i32,
+    }
+
+    event ProductCreated {
+        #[indexed]
+        id: u256,
+        name: String,
+        sku: String,
+    }
+
+    event TransitStarted {
+        #[indexed]
+        product_id: u256,
+        #[indexed]
+        carrier: Address,
+        from_facility: String,
+        to_facility: String,
+    }
+
+    event TransitCompleted {
+        #[indexed]
+        product_id: u256,
+        arrived_at: u64,
+    }
+
+    event TemperatureViolation {
+        #[indexed]
+        product_id: u256,
+        reading: i32,
+        threshold_min: i32,
+        threshold_max: i32,
+    }
+
+    event ProductRecalled {
+        #[indexed]
+        product_id: u256,
+        reason: String,
+    }
+
+    error ProductNotFound { id: u256 }
+    error SKUExists { sku: String }
+    error UnauthorizedCarrier { carrier: Address }
+    error InvalidStatus { current: u8, expected: u8 }
+    error ComponentPercentageInvalid { total: u16 }
+    error CertificationExpired { cert_type: String }
+    error Unauthorized {}
+
+    #[constructor]
+    pub fn init(temp_min: i32, temp_max: i32) {
+        self.owner = msg.sender;
+        self.next_product_id = 1;
+        self.temp_threshold_min = temp_min;
+        self.temp_threshold_max = temp_max;
+    }
+
+    pub fn create_product(
+        name: String,
+        sku: String,
+        batch_code: [u8; 16],
+        dimensions: Dimensions,
+        components: Vec<Component>,
+        initial_location: Location,
+    ) -> u256 {
+        require!(self.sku_to_id[sku] == 0, SKUExists { sku: sku });
+
+        // Validate component percentages sum to 10000
+        let mut total_pct: u16 = 0;
+        for i in 0..components.len() {
+            total_pct += components[i].percentage;
+        }
+        require!(
+            total_pct == 10000,
+            ComponentPercentageInvalid { total: total_pct }
+        );
+
+        // Calculate volume from dimensions
+        let volume = (dimensions.length_mm as u64 * dimensions.width_mm as u64
+            * dimensions.height_mm as u64) / 1000;  // mm^3 to cm^3
+
+        let dims = Dimensions {
+            length_mm: dimensions.length_mm,
+            width_mm: dimensions.width_mm,
+            height_mm: dimensions.height_mm,
+            weight_grams: dimensions.weight_grams,
+            volume_cm3: volume,
+        };
+
+        let id = self.next_product_id;
+        let product = Product {
+            id: id,
+            name: name,
+            sku: sku,
+            batch_code: batch_code,
+            dimensions: dims,
+            certifications: Vec::new(),
+            composition: components,
+            current_location: initial_location,
+            history: Vec::new(),
+            status: 0,
+        };
+
+        self.products[id] = product;
+        self.sku_to_id[sku] = id;
+        self.supplier_products[msg.sender].push(id);
+        self.next_product_id = id + 1;
+
+        emit ProductCreated { id: id, name: name, sku: sku };
+        return id;
+    }
+
+    pub fn add_certification(
+        product_id: u256,
+        cert_type: String,
+        expires_at: u64,
+        document_hash: [u8; 32],
+        sig: bytes,
+        metadata: CertMetadata,
+    ) {
+        require!(
+            self.products[product_id].id != 0,
+            ProductNotFound { id: product_id }
+        );
+
+        let cert = Certification {
+            cert_type: cert_type,
+            issuer: msg.sender,
+            issued_at: block.timestamp,
+            expires_at: expires_at,
+            document_hash: document_hash,
+            signature: sig,
+            metadata: metadata,
+        };
+
+        self.products[product_id].certifications.push(cert);
+    }
+
+    pub fn start_transit(
+        product_id: u256,
+        destination: Location,
+        transport_mode: u8,
+        seal_number: String,
+    ) {
+        let product = self.products[product_id];
+        require!(product.id != 0, ProductNotFound { id: product_id });
+        require!(
+            self.carrier_registry[msg.sender],
+            UnauthorizedCarrier { carrier: msg.sender }
+        );
+
+        let record = TransitRecord {
+            from: product.current_location,
+            to: destination,
+            carrier: msg.sender,
+            departed_at: block.timestamp,
+            arrived_at: 0,
+            transport_mode: transport_mode,
+            temperature_log: Vec::new(),
+            customs_docs: Vec::new(),
+            seal_number: seal_number,
+        };
+
+        self.products[product_id].history.push(record);
+        self.products[product_id].status = 1;
+
+        emit TransitStarted {
+            product_id: product_id,
+            carrier: msg.sender,
+            from_facility: product.current_location.facility_name,
+            to_facility: destination.facility_name,
+        };
+    }
+
+    pub fn record_temperature(
+        product_id: u256,
+        celsius_x100: i32,
+        humidity_pct: u8,
+        sensor_id: [u8; 8],
+    ) {
+        let product = self.products[product_id];
+        require!(product.id != 0, ProductNotFound { id: product_id });
+        require!(product.status == 1, InvalidStatus { current: product.status, expected: 1 });
+
+        let reading = TemperatureReading {
+            celsius_x100: celsius_x100,
+            humidity_pct: humidity_pct,
+            timestamp: block.timestamp,
+            sensor_id: sensor_id,
+        };
+
+        let history_len = product.history.len();
+        self.products[product_id].history[history_len - 1].temperature_log.push(reading);
+
+        // Check for violations
+        if celsius_x100 < self.temp_threshold_min || celsius_x100 > self.temp_threshold_max {
+            emit TemperatureViolation {
+                product_id: product_id,
+                reading: celsius_x100,
+                threshold_min: self.temp_threshold_min,
+                threshold_max: self.temp_threshold_max,
+            };
+        }
+    }
+
+    pub fn complete_transit(product_id: u256, final_location: Location) {
+        let product = self.products[product_id];
+        require!(product.id != 0, ProductNotFound { id: product_id });
+        require!(product.status == 1, InvalidStatus { current: product.status, expected: 1 });
+
+        let history_len = product.history.len();
+        self.products[product_id].history[history_len - 1].arrived_at = block.timestamp;
+        self.products[product_id].current_location = final_location;
+        self.products[product_id].status = 2;
+
+        emit TransitCompleted { product_id: product_id, arrived_at: block.timestamp };
+    }
+
+    pub fn register_carrier(carrier: Address) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        self.carrier_registry[carrier] = true;
+    }
+
+    pub fn recall_product(product_id: u256, reason: String) {
+        require!(msg.sender == self.owner, Unauthorized {});
+        require!(
+            self.products[product_id].id != 0,
+            ProductNotFound { id: product_id }
+        );
+        self.products[product_id].status = 3;
+        emit ProductRecalled { product_id: product_id, reason: reason };
+    }
+
+    #[view]
+    pub fn get_quality_report(product_id: u256) -> QualityReport {
+        let product = self.products[product_id];
+        require!(product.id != 0, ProductNotFound { id: product_id });
+
+        let mut total_temp: i64 = 0;
+        let mut max_temp: i32 = -100_00; // -100.00 C
+        let mut min_temp: i32 = 100_00;  // 100.00 C
+        let mut reading_count: u64 = 0;
+        let mut violations: u64 = 0;
+
+        for i in 0..product.history.len() {
+            let transit = product.history[i];
+            for j in 0..transit.temperature_log.len() {
+                let temp = transit.temperature_log[j].celsius_x100;
+                total_temp += temp as i64;
+                reading_count += 1;
+
+                if temp > max_temp { max_temp = temp; }
+                if temp < min_temp { min_temp = temp; }
+                if temp < self.temp_threshold_min || temp > self.temp_threshold_max {
+                    violations += 1;
+                }
+            }
+        }
+
+        let avg_temp = if reading_count > 0 {
+            (total_temp / reading_count as i64) as i32
+        } else {
+            0
+        };
+
+        // Check certifications are all valid
+        let mut cert_valid = true;
+        for i in 0..product.certifications.len() {
+            if product.certifications[i].expires_at < block.timestamp {
+                cert_valid = false;
+                break;
+            }
+        }
+
+        return QualityReport {
+            product_id: product_id,
+            avg_temp_x100: avg_temp,
+            max_temp_x100: max_temp,
+            min_temp_x100: min_temp,
+            temp_violations: violations,
+            cert_valid: cert_valid,
+            all_components_verified: product.composition.len() > 0,
+        };
+    }
+
+    #[view]
+    pub fn get_product_summary(product_id: u256) -> ProductSummary {
+        let product = self.products[product_id];
+        require!(product.id != 0, ProductNotFound { id: product_id });
+
+        return ProductSummary {
+            id: product.id,
+            name: product.name,
+            status: product.status,
+            total_distance_km: 0, // would need geo calculation
+            transit_count: product.history.len() as u64,
+            cert_count: product.certifications.len() as u64,
+            current_country: product.current_location.country_code,
+        };
+    }
+
+    #[view]
+    pub fn get_product(product_id: u256) -> Product {
+        require!(
+            self.products[product_id].id != 0,
+            ProductNotFound { id: product_id }
+        );
+        return self.products[product_id];
+    }
+
+    #[view]
+    pub fn lookup_by_sku(sku: String) -> u256 {
+        return self.sku_to_id[sku];
+    }
+}

@@ -1,0 +1,323 @@
+// Constant-product AMM pool (Uniswap V2-style)
+use std::math;
+use std::token::IERC20;
+
+contract AmmPool {
+    storage {
+        token0: Address,
+        token1: Address,
+        reserve0: u256,
+        reserve1: u256,
+        total_lp_supply: u256,
+        lp_balances: Map<Address, u256>,
+        fee_numerator: u256,
+        fee_denominator: u256,
+        k_last: u256,
+        factory: Address,
+        locked: bool,
+        cumulative_price0: u256,
+        cumulative_price1: u256,
+        last_block_timestamp: u64,
+        protocol_fee_recipient: Address,
+        min_liquidity: u256,
+    }
+
+    event Mint {
+        #[indexed]
+        provider: Address,
+        amount0: u256,
+        amount1: u256,
+        lp_minted: u256,
+    }
+
+    event Burn {
+        #[indexed]
+        provider: Address,
+        amount0: u256,
+        amount1: u256,
+        lp_burned: u256,
+    }
+
+    event Swap {
+        #[indexed]
+        sender: Address,
+        amount_in: u256,
+        amount_out: u256,
+        #[indexed]
+        token_in: Address,
+        #[indexed]
+        token_out: Address,
+    }
+
+    event Sync {
+        reserve0: u256,
+        reserve1: u256,
+    }
+
+    error InsufficientLiquidity {}
+    error InsufficientInputAmount {}
+    error InsufficientOutputAmount {}
+    error InvalidToken {}
+    error InvariantViolation { k_before: u256, k_after: u256 }
+    error SlippageExceeded { expected: u256, actual: u256 }
+    error ReentrantCall {}
+    error InsufficientLpBalance { available: u256, required: u256 }
+    error ZeroAmount {}
+    error IdenticalTokens {}
+    error Locked {}
+
+    #[constructor]
+    pub fn init(token0: Address, token1: Address, fee_numerator: u256, fee_denominator: u256) {
+        require!(token0 != token1, IdenticalTokens {});
+        self.token0 = token0;
+        self.token1 = token1;
+        self.fee_numerator = fee_numerator;
+        self.fee_denominator = fee_denominator;
+        self.factory = msg.sender;
+        self.locked = false;
+        self.min_liquidity = 1000u256;
+        self.protocol_fee_recipient = msg.sender;
+        self.last_block_timestamp = block.timestamp;
+    }
+
+    fn lock() {
+        require!(!self.locked, Locked {});
+        self.locked = true;
+    }
+
+    fn unlock() {
+        self.locked = false;
+    }
+
+    fn update_cumulative_prices() {
+        let time_elapsed = block.timestamp - self.last_block_timestamp;
+        if time_elapsed > 0u64 && self.reserve0 > 0u256 && self.reserve1 > 0u256 {
+            // Price accumulators for TWAP oracle
+            let price0 = (self.reserve1 * 1000000000000000000u256) / self.reserve0;
+            let price1 = (self.reserve0 * 1000000000000000000u256) / self.reserve1;
+            self.cumulative_price0 = self.cumulative_price0 + (price0 * time_elapsed as u256);
+            self.cumulative_price1 = self.cumulative_price1 + (price1 * time_elapsed as u256);
+        }
+        self.last_block_timestamp = block.timestamp;
+    }
+
+    fn sync_reserves() {
+        self.update_cumulative_prices();
+        emit Sync { reserve0: self.reserve0, reserve1: self.reserve1 };
+    }
+
+    fn sqrt(x: u256) -> u256 {
+        if x == 0u256 {
+            return 0u256;
+        }
+        let mut z = (x + 1u256) / 2u256;
+        let mut y = x;
+        while z < y {
+            y = z;
+            z = (x / z + z) / 2u256;
+        }
+        return y;
+    }
+
+    fn min(a: u256, b: u256) -> u256 {
+        if a < b {
+            return a;
+        }
+        return b;
+    }
+
+    // --- Core functions ---
+
+    #[reentrant]
+    pub fn add_liquidity(
+        amount0_desired: u256,
+        amount1_desired: u256,
+        amount0_min: u256,
+        amount1_min: u256,
+    ) -> u256 {
+        self.lock();
+        require!(amount0_desired > 0u256, ZeroAmount {});
+        require!(amount1_desired > 0u256, ZeroAmount {});
+
+        let mut amount0 = amount0_desired;
+        let mut amount1 = amount1_desired;
+
+        // Calculate optimal amounts if pool already has liquidity
+        if self.reserve0 > 0u256 && self.reserve1 > 0u256 {
+            let optimal1 = (amount0_desired * self.reserve1) / self.reserve0;
+            if optimal1 <= amount1_desired {
+                amount0 = amount0_desired;
+                amount1 = optimal1;
+            } else {
+                let optimal0 = (amount1_desired * self.reserve0) / self.reserve1;
+                amount0 = optimal0;
+                amount1 = amount1_desired;
+            }
+        }
+
+        require!(amount0 >= amount0_min, SlippageExceeded { expected: amount0_min, actual: amount0 });
+        require!(amount1 >= amount1_min, SlippageExceeded { expected: amount1_min, actual: amount1 });
+
+        // Transfer tokens in
+        IERC20::at(self.token0).transfer_from(msg.sender, address(self), amount0);
+        IERC20::at(self.token1).transfer_from(msg.sender, address(self), amount1);
+
+        // Mint LP tokens
+        let mut lp_minted: u256 = 0u256;
+        if self.total_lp_supply == 0u256 {
+            lp_minted = self.sqrt(amount0 * amount1) - self.min_liquidity;
+            // Lock minimum liquidity forever
+            self.lp_balances[Address::ZERO] = self.min_liquidity;
+            self.total_lp_supply = self.min_liquidity;
+        } else {
+            let lp_from_0 = (amount0 * self.total_lp_supply) / self.reserve0;
+            let lp_from_1 = (amount1 * self.total_lp_supply) / self.reserve1;
+            lp_minted = self.min(lp_from_0, lp_from_1);
+        }
+
+        require!(lp_minted > 0u256, InsufficientLiquidity {});
+
+        self.lp_balances[msg.sender] = self.lp_balances[msg.sender] + lp_minted;
+        self.total_lp_supply = self.total_lp_supply + lp_minted;
+
+        self.reserve0 = self.reserve0 + amount0;
+        self.reserve1 = self.reserve1 + amount1;
+        self.k_last = self.reserve0 * self.reserve1;
+
+        self.sync_reserves();
+        emit Mint { provider: msg.sender, amount0: amount0, amount1: amount1, lp_minted: lp_minted };
+
+        self.unlock();
+        return lp_minted;
+    }
+
+    #[reentrant]
+    pub fn remove_liquidity(
+        lp_amount: u256,
+        amount0_min: u256,
+        amount1_min: u256,
+    ) -> (u256, u256) {
+        self.lock();
+        let lp_bal = self.lp_balances[msg.sender];
+        require!(lp_bal >= lp_amount, InsufficientLpBalance {
+            available: lp_bal,
+            required: lp_amount,
+        });
+
+        let amount0 = (lp_amount * self.reserve0) / self.total_lp_supply;
+        let amount1 = (lp_amount * self.reserve1) / self.total_lp_supply;
+
+        require!(amount0 >= amount0_min, SlippageExceeded { expected: amount0_min, actual: amount0 });
+        require!(amount1 >= amount1_min, SlippageExceeded { expected: amount1_min, actual: amount1 });
+
+        self.lp_balances[msg.sender] = lp_bal - lp_amount;
+        self.total_lp_supply = self.total_lp_supply - lp_amount;
+
+        self.reserve0 = self.reserve0 - amount0;
+        self.reserve1 = self.reserve1 - amount1;
+        self.k_last = self.reserve0 * self.reserve1;
+
+        IERC20::at(self.token0).transfer(msg.sender, amount0);
+        IERC20::at(self.token1).transfer(msg.sender, amount1);
+
+        self.sync_reserves();
+        emit Burn { provider: msg.sender, amount0: amount0, amount1: amount1, lp_burned: lp_amount };
+
+        self.unlock();
+        return (amount0, amount1);
+    }
+
+    #[reentrant]
+    pub fn swap(token_in: Address, amount_in: u256, min_amount_out: u256) -> u256 {
+        self.lock();
+        require!(amount_in > 0u256, InsufficientInputAmount {});
+        require!(
+            token_in == self.token0 || token_in == self.token1,
+            InvalidToken {},
+        );
+
+        let is_token0 = token_in == self.token0;
+        let reserve_in = if is_token0 { self.reserve0 } else { self.reserve1 };
+        let reserve_out = if is_token0 { self.reserve1 } else { self.reserve0 };
+        let token_out = if is_token0 { self.token1 } else { self.token0 };
+
+        // Apply fee: amount_in_with_fee = amount_in * (fee_denominator - fee_numerator) / fee_denominator
+        let amount_in_with_fee = (amount_in * (self.fee_denominator - self.fee_numerator)) / self.fee_denominator;
+        let amount_out = (amount_in_with_fee * reserve_out) / (reserve_in + amount_in_with_fee);
+
+        require!(amount_out >= min_amount_out, SlippageExceeded {
+            expected: min_amount_out,
+            actual: amount_out,
+        });
+        require!(amount_out > 0u256, InsufficientOutputAmount {});
+
+        // Transfer tokens
+        IERC20::at(token_in).transfer_from(msg.sender, address(self), amount_in);
+        IERC20::at(token_out).transfer(msg.sender, amount_out);
+
+        // Update reserves
+        if is_token0 {
+            self.reserve0 = self.reserve0 + amount_in;
+            self.reserve1 = self.reserve1 - amount_out;
+        } else {
+            self.reserve1 = self.reserve1 + amount_in;
+            self.reserve0 = self.reserve0 - amount_out;
+        }
+
+        // Verify invariant (k should not decrease)
+        let k_new = self.reserve0 * self.reserve1;
+        require!(k_new >= self.k_last, InvariantViolation {
+            k_before: self.k_last,
+            k_after: k_new,
+        });
+        self.k_last = k_new;
+
+        self.sync_reserves();
+        emit Swap {
+            sender: msg.sender,
+            amount_in: amount_in,
+            amount_out: amount_out,
+            token_in: token_in,
+            token_out: token_out,
+        };
+
+        self.unlock();
+        return amount_out;
+    }
+
+    // --- View functions ---
+
+    #[view]
+    pub fn get_amount_out(token_in: Address, amount_in: u256) -> u256 {
+        let is_token0 = token_in == self.token0;
+        let reserve_in = if is_token0 { self.reserve0 } else { self.reserve1 };
+        let reserve_out = if is_token0 { self.reserve1 } else { self.reserve0 };
+        let amount_in_with_fee = (amount_in * (self.fee_denominator - self.fee_numerator)) / self.fee_denominator;
+        return (amount_in_with_fee * reserve_out) / (reserve_in + amount_in_with_fee);
+    }
+
+    #[view]
+    pub fn get_reserves() -> (u256, u256) {
+        return (self.reserve0, self.reserve1);
+    }
+
+    #[view]
+    pub fn get_lp_balance(account: Address) -> u256 {
+        return self.lp_balances[account];
+    }
+
+    #[view]
+    pub fn get_total_lp_supply() -> u256 {
+        return self.total_lp_supply;
+    }
+
+    #[view]
+    pub fn get_price0_cumulative() -> u256 {
+        return self.cumulative_price0;
+    }
+
+    #[view]
+    pub fn get_price1_cumulative() -> u256 {
+        return self.cumulative_price1;
+    }
+}

@@ -1,0 +1,322 @@
+// Token staking contract with time-weighted reward distribution
+use std::math;
+use std::token::IERC20;
+
+contract StakingPool {
+    storage {
+        owner: Address,
+        staking_token: Address,
+        reward_token: Address,
+
+        // Global state
+        total_staked: u256,
+        reward_rate: u256,           // rewards per second (scaled 1e18)
+        reward_per_token_stored: u256,
+        last_update_time: u64,
+        reward_end_time: u64,
+
+        // User state
+        staked_balances: Map<Address, u256>,
+        user_reward_per_token_paid: Map<Address, u256>,
+        rewards_earned: Map<Address, u256>,
+        stake_timestamp: Map<Address, u64>,
+
+        // Lock configuration
+        min_stake_duration: u64,
+        early_withdrawal_penalty: u256, // scaled 1e6 (e.g. 100000 = 10%)
+
+        // Boost tiers
+        tier_thresholds: Vec<u256>,
+        tier_multipliers: Vec<u256>,   // scaled 1e6 (e.g. 1500000 = 1.5x)
+
+        // Totals tracking
+        total_rewards_distributed: u256,
+        total_penalties_collected: u256,
+        penalty_recipient: Address,
+
+        paused: bool,
+        scale: u256,
+        percent_scale: u256,
+    }
+
+    event Staked {
+        #[indexed]
+        user: Address,
+        amount: u256,
+        total_staked: u256,
+    }
+
+    event Unstaked {
+        #[indexed]
+        user: Address,
+        amount: u256,
+        penalty: u256,
+    }
+
+    event RewardClaimed {
+        #[indexed]
+        user: Address,
+        amount: u256,
+    }
+
+    event RewardRateUpdated {
+        new_rate: u256,
+        duration: u64,
+    }
+
+    event TierAdded {
+        threshold: u256,
+        multiplier: u256,
+    }
+
+    error InsufficientStake { available: u256, requested: u256 }
+    error ZeroAmount {}
+    error NoRewards {}
+    error PoolPaused {}
+    error NotOwner {}
+    error StakingPeriodEnded {}
+    error MinStakeNotMet { minimum: u256, actual: u256 }
+
+    #[constructor]
+    pub fn init(
+        staking_token: Address,
+        reward_token: Address,
+        min_stake_duration: u64,
+        early_withdrawal_penalty: u256,
+    ) {
+        self.owner = msg.sender;
+        self.staking_token = staking_token;
+        self.reward_token = reward_token;
+        self.min_stake_duration = min_stake_duration;
+        self.early_withdrawal_penalty = early_withdrawal_penalty;
+        self.penalty_recipient = msg.sender;
+        self.paused = false;
+        self.scale = 1000000000000000000u256;
+        self.percent_scale = 1000000u256;
+        self.last_update_time = block.timestamp;
+    }
+
+    // --- Internal ---
+
+    fn update_reward(user: Address) {
+        self.reward_per_token_stored = self.reward_per_token();
+
+        let applicable_time = if block.timestamp < self.reward_end_time {
+            block.timestamp
+        } else {
+            self.reward_end_time
+        };
+        self.last_update_time = applicable_time;
+
+        if user != Address::ZERO {
+            self.rewards_earned[user] = self.earned(user);
+            self.user_reward_per_token_paid[user] = self.reward_per_token_stored;
+        }
+    }
+
+    fn reward_per_token() -> u256 {
+        if self.total_staked == 0u256 {
+            return self.reward_per_token_stored;
+        }
+
+        let applicable_time = if block.timestamp < self.reward_end_time {
+            block.timestamp
+        } else {
+            self.reward_end_time
+        };
+
+        let time_delta = applicable_time - self.last_update_time;
+        let additional = (time_delta as u256 * self.reward_rate * self.scale) / self.total_staked;
+        return self.reward_per_token_stored + additional;
+    }
+
+    fn get_user_multiplier(user: Address) -> u256 {
+        let staked = self.staked_balances[user];
+        let mut multiplier = self.percent_scale; // 1x base
+
+        let num_tiers = self.tier_thresholds.len();
+        for i in 0..num_tiers {
+            if staked >= self.tier_thresholds[i] {
+                multiplier = self.tier_multipliers[i];
+            }
+        }
+
+        return multiplier;
+    }
+
+    fn earned(user: Address) -> u256 {
+        let staked = self.staked_balances[user];
+        let rpt = self.reward_per_token();
+        let paid = self.user_reward_per_token_paid[user];
+        let multiplier = self.get_user_multiplier(user);
+
+        let base_earned = (staked * (rpt - paid)) / self.scale;
+        let boosted = (base_earned * multiplier) / self.percent_scale;
+        return self.rewards_earned[user] + boosted;
+    }
+
+    // --- Core ---
+
+    pub fn stake(amount: u256) {
+        require!(!self.paused, PoolPaused {});
+        require!(amount > 0u256, ZeroAmount {});
+
+        self.update_reward(msg.sender);
+
+        IERC20::at(self.staking_token).transfer_from(msg.sender, address(self), amount);
+
+        self.staked_balances[msg.sender] = self.staked_balances[msg.sender] + amount;
+        self.total_staked = self.total_staked + amount;
+        self.stake_timestamp[msg.sender] = block.timestamp;
+
+        emit Staked {
+            user: msg.sender,
+            amount: amount,
+            total_staked: self.total_staked,
+        };
+    }
+
+    pub fn unstake(amount: u256) {
+        require!(amount > 0u256, ZeroAmount {});
+        let staked = self.staked_balances[msg.sender];
+        require!(staked >= amount, InsufficientStake {
+            available: staked,
+            requested: amount,
+        });
+
+        self.update_reward(msg.sender);
+
+        self.staked_balances[msg.sender] = staked - amount;
+        self.total_staked = self.total_staked - amount;
+
+        // Apply early withdrawal penalty if applicable
+        let time_staked = block.timestamp - self.stake_timestamp[msg.sender];
+        let mut penalty: u256 = 0u256;
+        let mut transfer_amount = amount;
+
+        if time_staked < self.min_stake_duration {
+            penalty = (amount * self.early_withdrawal_penalty) / self.percent_scale;
+            transfer_amount = amount - penalty;
+            self.total_penalties_collected = self.total_penalties_collected + penalty;
+
+            // Send penalty to recipient
+            IERC20::at(self.staking_token).transfer(self.penalty_recipient, penalty);
+        }
+
+        IERC20::at(self.staking_token).transfer(msg.sender, transfer_amount);
+
+        emit Unstaked { user: msg.sender, amount: amount, penalty: penalty };
+    }
+
+    pub fn claim_rewards() {
+        self.update_reward(msg.sender);
+
+        let reward = self.rewards_earned[msg.sender];
+        require!(reward > 0u256, NoRewards {});
+
+        self.rewards_earned[msg.sender] = 0u256;
+        self.total_rewards_distributed = self.total_rewards_distributed + reward;
+
+        IERC20::at(self.reward_token).transfer(msg.sender, reward);
+
+        emit RewardClaimed { user: msg.sender, amount: reward };
+    }
+
+    pub fn compound() {
+        // Claim rewards and restake (only works if staking_token == reward_token)
+        self.update_reward(msg.sender);
+
+        let reward = self.rewards_earned[msg.sender];
+        require!(reward > 0u256, NoRewards {});
+
+        self.rewards_earned[msg.sender] = 0u256;
+        self.total_rewards_distributed = self.total_rewards_distributed + reward;
+
+        // Restake the reward
+        self.staked_balances[msg.sender] = self.staked_balances[msg.sender] + reward;
+        self.total_staked = self.total_staked + reward;
+
+        emit RewardClaimed { user: msg.sender, amount: reward };
+        emit Staked {
+            user: msg.sender,
+            amount: reward,
+            total_staked: self.total_staked,
+        };
+    }
+
+    // --- Admin ---
+
+    pub fn set_reward_rate(reward_rate: u256, duration: u64) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.update_reward(Address::ZERO);
+
+        self.reward_rate = reward_rate;
+        self.reward_end_time = block.timestamp + duration;
+
+        emit RewardRateUpdated { new_rate: reward_rate, duration: duration };
+    }
+
+    pub fn add_tier(threshold: u256, multiplier: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.tier_thresholds.push(threshold);
+        self.tier_multipliers.push(multiplier);
+        emit TierAdded { threshold: threshold, multiplier: multiplier };
+    }
+
+    pub fn pause() {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.paused = true;
+    }
+
+    pub fn unpause() {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.paused = false;
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn get_staked(user: Address) -> u256 {
+        return self.staked_balances[user];
+    }
+
+    #[view]
+    pub fn get_earned(user: Address) -> u256 {
+        return self.earned(user);
+    }
+
+    #[view]
+    pub fn get_total_staked() -> u256 {
+        return self.total_staked;
+    }
+
+    #[view]
+    pub fn get_reward_rate() -> u256 {
+        return self.reward_rate;
+    }
+
+    #[view]
+    pub fn get_apr() -> u256 {
+        if self.total_staked == 0u256 {
+            return 0u256;
+        }
+        // APR = (reward_rate * seconds_per_year * 100) / total_staked
+        let seconds_per_year: u256 = 31536000u256;
+        return (self.reward_rate * seconds_per_year * 100u256 * self.scale) / self.total_staked;
+    }
+
+    #[view]
+    pub fn get_user_tier(user: Address) -> u256 {
+        return self.get_user_multiplier(user);
+    }
+
+    #[view]
+    pub fn time_until_penalty_free(user: Address) -> u64 {
+        let staked_at = self.stake_timestamp[user];
+        let penalty_free_time = staked_at + self.min_stake_duration;
+        if block.timestamp >= penalty_free_time {
+            return 0u64;
+        }
+        return penalty_free_time - block.timestamp;
+    }
+}

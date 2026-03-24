@@ -1,0 +1,400 @@
+// Yield farming with LP token staking and multiple reward tokens
+use std::math;
+use std::token::IERC20;
+
+contract YieldFarm {
+    storage {
+        owner: Address,
+
+        // Pool configuration
+        num_pools: u256,
+        pool_lp_token: Map<u256, Address>,
+        pool_alloc_points: Map<u256, u256>,
+        pool_last_reward_time: Map<u256, u64>,
+        pool_acc_reward_per_share: Map<u256, u256>,
+        pool_total_staked: Map<u256, u256>,
+        pool_deposit_fee: Map<u256, u256>,    // scaled 1e6
+        pool_enabled: Map<u256, bool>,
+        total_alloc_points: u256,
+
+        // Reward tokens (up to 3)
+        reward_tokens: Vec<Address>,
+        reward_per_second: Map<Address, u256>,
+        reward_end_time: Map<Address, u64>,
+
+        // User positions
+        user_amount: Map<u256, Map<Address, u256>>,        // pool_id -> user -> staked
+        user_reward_debt: Map<u256, Map<Address, u256>>,   // pool_id -> user -> reward debt
+        user_pending_rewards: Map<u256, Map<Address, u256>>,
+
+        // Referral system
+        referrals: Map<Address, Address>,       // user -> referrer
+        referral_rate: u256,                    // scaled 1e6 (e.g. 10000 = 1%)
+        referral_earnings: Map<Address, u256>,
+
+        // Harvest lockup (anti-bot)
+        harvest_lockup: Map<u256, u64>,         // pool_id -> lockup duration
+        user_last_harvest: Map<u256, Map<Address, u64>>,
+
+        // Emergency
+        emergency_withdraw_enabled: bool,
+
+        // Protocol
+        fee_recipient: Address,
+        total_fees_collected: u256,
+
+        scale: u256,
+        percent_scale: u256,
+    }
+
+    event PoolAdded {
+        #[indexed]
+        pool_id: u256,
+        #[indexed]
+        lp_token: Address,
+        alloc_points: u256,
+    }
+
+    event Deposited {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        pool_id: u256,
+        amount: u256,
+    }
+
+    event Withdrawn {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        pool_id: u256,
+        amount: u256,
+    }
+
+    event Harvested {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        pool_id: u256,
+        amount: u256,
+    }
+
+    event EmergencyWithdraw {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        pool_id: u256,
+        amount: u256,
+    }
+
+    event ReferralRecorded {
+        #[indexed]
+        user: Address,
+        #[indexed]
+        referrer: Address,
+    }
+
+    event ReferralPaid {
+        #[indexed]
+        referrer: Address,
+        #[indexed]
+        user: Address,
+        amount: u256,
+    }
+
+    error PoolNotFound { pool_id: u256 }
+    error PoolDisabled { pool_id: u256 }
+    error InsufficientStake { available: u256, requested: u256 }
+    error HarvestLocked { unlock_time: u64, current_time: u64 }
+    error ZeroAmount {}
+    error NotOwner {}
+    error DuplicatePool { lp_token: Address }
+    error SelfReferral {}
+    error ReferrerAlreadySet {}
+
+    #[constructor]
+    pub fn init(fee_recipient: Address, referral_rate: u256) {
+        self.owner = msg.sender;
+        self.fee_recipient = fee_recipient;
+        self.referral_rate = referral_rate;
+        self.emergency_withdraw_enabled = false;
+        self.scale = 1000000000000000000u256;
+        self.percent_scale = 1000000u256;
+    }
+
+    // --- Internal ---
+
+    fn get_reward_multiplier(from: u64, to: u64, reward_token: Address) -> u256 {
+        let end = self.reward_end_time[reward_token];
+        let effective_to = if to > end { end } else { to };
+        if effective_to <= from {
+            return 0u256;
+        }
+        return (effective_to - from) as u256;
+    }
+
+    fn update_pool(pool_id: u256) {
+        let total = self.pool_total_staked[pool_id];
+        if total == 0u256 {
+            self.pool_last_reward_time[pool_id] = block.timestamp;
+            return;
+        }
+
+        let last_time = self.pool_last_reward_time[pool_id];
+        let alloc = self.pool_alloc_points[pool_id];
+        let total_alloc = self.total_alloc_points;
+
+        // Accumulate rewards from primary reward token
+        if self.reward_tokens.len() > 0u256 {
+            let reward_token = self.reward_tokens[0];
+            let multiplier = self.get_reward_multiplier(last_time, block.timestamp, reward_token);
+            let reward = (multiplier * self.reward_per_second[reward_token] * alloc) / total_alloc;
+            let acc_per_share = self.pool_acc_reward_per_share[pool_id];
+            self.pool_acc_reward_per_share[pool_id] = acc_per_share + (reward * self.scale) / total;
+        }
+
+        self.pool_last_reward_time[pool_id] = block.timestamp;
+    }
+
+    fn calculate_pending(pool_id: u256, user: Address) -> u256 {
+        let amount = self.user_amount[pool_id][user];
+        if amount == 0u256 {
+            return 0u256;
+        }
+
+        let acc = self.pool_acc_reward_per_share[pool_id];
+        let debt = self.user_reward_debt[pool_id][user];
+        let pending = (amount * acc) / self.scale - debt;
+        return pending + self.user_pending_rewards[pool_id][user];
+    }
+
+    fn pay_referral(user: Address, reward_amount: u256) {
+        let referrer = self.referrals[user];
+        if referrer == Address::ZERO {
+            return;
+        }
+
+        let commission = (reward_amount * self.referral_rate) / self.percent_scale;
+        if commission > 0u256 {
+            self.referral_earnings[referrer] = self.referral_earnings[referrer] + commission;
+
+            if self.reward_tokens.len() > 0u256 {
+                IERC20::at(self.reward_tokens[0]).transfer(referrer, commission);
+            }
+
+            emit ReferralPaid { referrer: referrer, user: user, amount: commission };
+        }
+    }
+
+    // --- Admin ---
+
+    pub fn add_pool(
+        lp_token: Address,
+        alloc_points: u256,
+        deposit_fee: u256,
+        harvest_lockup: u64,
+    ) {
+        require!(msg.sender == self.owner, NotOwner {});
+
+        let pool_id = self.num_pools;
+        self.num_pools = pool_id + 1u256;
+
+        self.pool_lp_token[pool_id] = lp_token;
+        self.pool_alloc_points[pool_id] = alloc_points;
+        self.pool_last_reward_time[pool_id] = block.timestamp;
+        self.pool_deposit_fee[pool_id] = deposit_fee;
+        self.pool_enabled[pool_id] = true;
+        self.harvest_lockup[pool_id] = harvest_lockup;
+        self.total_alloc_points = self.total_alloc_points + alloc_points;
+
+        emit PoolAdded { pool_id: pool_id, lp_token: lp_token, alloc_points: alloc_points };
+    }
+
+    pub fn set_pool_alloc(pool_id: u256, alloc_points: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        require!(pool_id < self.num_pools, PoolNotFound { pool_id: pool_id });
+
+        self.update_pool(pool_id);
+
+        let old_alloc = self.pool_alloc_points[pool_id];
+        self.total_alloc_points = self.total_alloc_points - old_alloc + alloc_points;
+        self.pool_alloc_points[pool_id] = alloc_points;
+    }
+
+    pub fn add_reward_token(token: Address, per_second: u256, duration: u64) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.reward_tokens.push(token);
+        self.reward_per_second[token] = per_second;
+        self.reward_end_time[token] = block.timestamp + duration;
+    }
+
+    pub fn set_emergency_withdraw(enabled: bool) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.emergency_withdraw_enabled = enabled;
+    }
+
+    // --- User operations ---
+
+    pub fn set_referrer(referrer: Address) {
+        require!(referrer != msg.sender, SelfReferral {});
+        require!(self.referrals[msg.sender] == Address::ZERO, ReferrerAlreadySet {});
+        self.referrals[msg.sender] = referrer;
+        emit ReferralRecorded { user: msg.sender, referrer: referrer };
+    }
+
+    pub fn deposit(pool_id: u256, amount: u256) {
+        require!(pool_id < self.num_pools, PoolNotFound { pool_id: pool_id });
+        require!(self.pool_enabled[pool_id], PoolDisabled { pool_id: pool_id });
+        require!(amount > 0u256, ZeroAmount {});
+
+        self.update_pool(pool_id);
+
+        // Harvest existing rewards
+        let existing = self.user_amount[pool_id][msg.sender];
+        if existing > 0u256 {
+            let pending = self.calculate_pending(pool_id, msg.sender);
+            if pending > 0u256 {
+                self.user_pending_rewards[pool_id][msg.sender] = pending;
+            }
+        }
+
+        // Apply deposit fee
+        let fee = (amount * self.pool_deposit_fee[pool_id]) / self.percent_scale;
+        let deposit_amount = amount - fee;
+
+        IERC20::at(self.pool_lp_token[pool_id]).transfer_from(msg.sender, address(self), amount);
+
+        if fee > 0u256 {
+            IERC20::at(self.pool_lp_token[pool_id]).transfer(self.fee_recipient, fee);
+            self.total_fees_collected = self.total_fees_collected + fee;
+        }
+
+        self.user_amount[pool_id][msg.sender] = existing + deposit_amount;
+        self.pool_total_staked[pool_id] = self.pool_total_staked[pool_id] + deposit_amount;
+
+        let acc = self.pool_acc_reward_per_share[pool_id];
+        self.user_reward_debt[pool_id][msg.sender] = (self.user_amount[pool_id][msg.sender] * acc) / self.scale;
+
+        emit Deposited { user: msg.sender, pool_id: pool_id, amount: deposit_amount };
+    }
+
+    pub fn withdraw(pool_id: u256, amount: u256) {
+        require!(pool_id < self.num_pools, PoolNotFound { pool_id: pool_id });
+        require!(amount > 0u256, ZeroAmount {});
+
+        let staked = self.user_amount[pool_id][msg.sender];
+        require!(staked >= amount, InsufficientStake {
+            available: staked,
+            requested: amount,
+        });
+
+        self.update_pool(pool_id);
+
+        // Auto-harvest on withdraw
+        let pending = self.calculate_pending(pool_id, msg.sender);
+        if pending > 0u256 {
+            self.user_pending_rewards[pool_id][msg.sender] = 0u256;
+            if self.reward_tokens.len() > 0u256 {
+                IERC20::at(self.reward_tokens[0]).transfer(msg.sender, pending);
+            }
+            self.pay_referral(msg.sender, pending);
+            emit Harvested { user: msg.sender, pool_id: pool_id, amount: pending };
+        }
+
+        self.user_amount[pool_id][msg.sender] = staked - amount;
+        self.pool_total_staked[pool_id] = self.pool_total_staked[pool_id] - amount;
+
+        let acc = self.pool_acc_reward_per_share[pool_id];
+        self.user_reward_debt[pool_id][msg.sender] = (self.user_amount[pool_id][msg.sender] * acc) / self.scale;
+
+        IERC20::at(self.pool_lp_token[pool_id]).transfer(msg.sender, amount);
+
+        emit Withdrawn { user: msg.sender, pool_id: pool_id, amount: amount };
+    }
+
+    pub fn harvest(pool_id: u256) {
+        require!(pool_id < self.num_pools, PoolNotFound { pool_id: pool_id });
+
+        // Check harvest lockup
+        let lockup = self.harvest_lockup[pool_id];
+        let last_harvest = self.user_last_harvest[pool_id][msg.sender];
+        require!(block.timestamp >= last_harvest + lockup, HarvestLocked {
+            unlock_time: last_harvest + lockup,
+            current_time: block.timestamp,
+        });
+
+        self.update_pool(pool_id);
+
+        let pending = self.calculate_pending(pool_id, msg.sender);
+        require!(pending > 0u256, ZeroAmount {});
+
+        self.user_pending_rewards[pool_id][msg.sender] = 0u256;
+        let acc = self.pool_acc_reward_per_share[pool_id];
+        self.user_reward_debt[pool_id][msg.sender] = (self.user_amount[pool_id][msg.sender] * acc) / self.scale;
+        self.user_last_harvest[pool_id][msg.sender] = block.timestamp;
+
+        if self.reward_tokens.len() > 0u256 {
+            IERC20::at(self.reward_tokens[0]).transfer(msg.sender, pending);
+        }
+        self.pay_referral(msg.sender, pending);
+
+        emit Harvested { user: msg.sender, pool_id: pool_id, amount: pending };
+    }
+
+    pub fn emergency_withdraw(pool_id: u256) {
+        require!(self.emergency_withdraw_enabled, PoolDisabled { pool_id: pool_id });
+        let amount = self.user_amount[pool_id][msg.sender];
+        require!(amount > 0u256, ZeroAmount {});
+
+        self.user_amount[pool_id][msg.sender] = 0u256;
+        self.user_reward_debt[pool_id][msg.sender] = 0u256;
+        self.user_pending_rewards[pool_id][msg.sender] = 0u256;
+        self.pool_total_staked[pool_id] = self.pool_total_staked[pool_id] - amount;
+
+        IERC20::at(self.pool_lp_token[pool_id]).transfer(msg.sender, amount);
+
+        emit EmergencyWithdraw { user: msg.sender, pool_id: pool_id, amount: amount };
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn pending_reward(pool_id: u256, user: Address) -> u256 {
+        return self.calculate_pending(pool_id, user);
+    }
+
+    #[view]
+    pub fn get_user_stake(pool_id: u256, user: Address) -> u256 {
+        return self.user_amount[pool_id][user];
+    }
+
+    #[view]
+    pub fn get_pool_total_staked(pool_id: u256) -> u256 {
+        return self.pool_total_staked[pool_id];
+    }
+
+    #[view]
+    pub fn get_num_pools() -> u256 {
+        return self.num_pools;
+    }
+
+    #[view]
+    pub fn get_referral_earnings(user: Address) -> u256 {
+        return self.referral_earnings[user];
+    }
+
+    #[view]
+    pub fn get_pool_apr(pool_id: u256) -> u256 {
+        let total = self.pool_total_staked[pool_id];
+        if total == 0u256 || self.total_alloc_points == 0u256 {
+            return 0u256;
+        }
+        let alloc = self.pool_alloc_points[pool_id];
+        if self.reward_tokens.len() == 0u256 {
+            return 0u256;
+        }
+        let rps = self.reward_per_second[self.reward_tokens[0]];
+        let annual_reward = rps * 31536000u256 * alloc / self.total_alloc_points;
+        return (annual_reward * self.scale * 100u256) / total;
+    }
+}

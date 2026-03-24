@@ -1,0 +1,422 @@
+// Multi-hop swap router supporting multiple DEX pool types
+use std::math;
+use std::token::IERC20;
+
+interface IAmmPool {
+    fn swap(token_in: Address, amount_in: u256, min_amount_out: u256) -> u256;
+    fn get_amount_out(token_in: Address, amount_in: u256) -> u256;
+    fn get_reserves() -> (u256, u256);
+}
+
+interface IStablePool {
+    fn swap(token_in: Address, token_out: Address, amount_in: u256, min_amount_out: u256) -> u256;
+    fn get_dy(i: u256, j: u256, dx: u256) -> u256;
+}
+
+contract SwapRouter {
+    storage {
+        owner: Address,
+        factory: Address,
+
+        // Registered pool registry
+        pool_count: u256,
+        pool_addresses: Map<u256, Address>,
+        pool_type: Map<Address, u256>,         // 0 = AMM, 1 = Stable, 2 = Concentrated
+        pool_enabled: Map<Address, bool>,
+
+        // Token -> Token -> Best pool mapping for quick lookups
+        best_pool: Map<Address, Map<Address, Address>>,
+
+        // WPYDE for native token wrapping
+        wpyde: Address,
+
+        // Fee on top of pool fees (router fee)
+        router_fee: u256,     // scaled 1e6 (e.g. 1000 = 0.1%)
+        fee_recipient: Address,
+        accrued_fees: Map<Address, u256>,
+
+        // Deadline protection
+        max_deadline: u64,
+
+        // Stats
+        total_swaps: u256,
+        total_volume: Map<Address, u256>,
+
+        percent_scale: u256,
+    }
+
+    struct SwapStep {
+        pool: Address,
+        token_in: Address,
+        token_out: Address,
+    }
+
+    event SwapExecuted {
+        #[indexed]
+        user: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: u256,
+        amount_out: u256,
+        hops: u256,
+    }
+
+    event MultiHopSwap {
+        #[indexed]
+        user: Address,
+        path_length: u256,
+        initial_amount: u256,
+        final_amount: u256,
+    }
+
+    event PoolRegistered {
+        #[indexed]
+        pool: Address,
+        pool_type: u256,
+    }
+
+    event PoolDisabled {
+        #[indexed]
+        pool: Address,
+    }
+
+    error DeadlineExpired { deadline: u64, current: u64 }
+    error InsufficientOutput { minimum: u256, actual: u256 }
+    error PoolNotRegistered { pool: Address }
+    error PoolDisabledError { pool: Address }
+    error InvalidPath {}
+    error EmptyPath {}
+    error ZeroAmount {}
+    error NotOwner {}
+    error ExcessiveHops { max: u256, actual: u256 }
+    error IdenticalTokens {}
+
+    #[constructor]
+    pub fn init(factory: Address, wpyde: Address, router_fee: u256) {
+        self.owner = msg.sender;
+        self.factory = factory;
+        self.wpyde = wpyde;
+        self.router_fee = router_fee;
+        self.fee_recipient = msg.sender;
+        self.max_deadline = 1800u64; // 30 minutes
+        self.percent_scale = 1000000u256;
+    }
+
+    // --- Internal ---
+
+    fn require_deadline(deadline: u64) {
+        require!(block.timestamp <= deadline, DeadlineExpired {
+            deadline: deadline,
+            current: block.timestamp,
+        });
+    }
+
+    fn deduct_router_fee(token: Address, amount: u256) -> u256 {
+        if self.router_fee == 0u256 {
+            return amount;
+        }
+        let fee = (amount * self.router_fee) / self.percent_scale;
+        self.accrued_fees[token] = self.accrued_fees[token] + fee;
+        return amount - fee;
+    }
+
+    fn execute_pool_swap(pool: Address, token_in: Address, token_out: Address, amount_in: u256) -> u256 {
+        require!(self.pool_enabled[pool], PoolDisabledError { pool: pool });
+
+        let ptype = self.pool_type[pool];
+
+        // Approve pool to spend tokens
+        IERC20::at(token_in).approve(pool, amount_in);
+
+        let amount_out = if ptype == 0u256 {
+            // AMM pool
+            IAmmPool::at(pool).swap(token_in, amount_in, 0u256)
+        } else if ptype == 1u256 {
+            // Stable pool
+            IStablePool::at(pool).swap(token_in, token_out, amount_in, 0u256)
+        } else {
+            // Default to AMM interface
+            IAmmPool::at(pool).swap(token_in, amount_in, 0u256)
+        };
+
+        return amount_out;
+    }
+
+    // --- Admin ---
+
+    pub fn register_pool(pool: Address, ptype: u256, token_a: Address, token_b: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+
+        self.pool_addresses[self.pool_count] = pool;
+        self.pool_count = self.pool_count + 1u256;
+        self.pool_type[pool] = ptype;
+        self.pool_enabled[pool] = true;
+
+        // Register as best pool if no other exists
+        if self.best_pool[token_a][token_b] == Address::ZERO {
+            self.best_pool[token_a][token_b] = pool;
+            self.best_pool[token_b][token_a] = pool;
+        }
+
+        emit PoolRegistered { pool: pool, pool_type: ptype };
+    }
+
+    pub fn set_best_pool(token_a: Address, token_b: Address, pool: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.best_pool[token_a][token_b] = pool;
+        self.best_pool[token_b][token_a] = pool;
+    }
+
+    pub fn disable_pool(pool: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.pool_enabled[pool] = false;
+        emit PoolDisabled { pool: pool };
+    }
+
+    pub fn enable_pool(pool: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.pool_enabled[pool] = true;
+    }
+
+    pub fn set_router_fee(fee: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.router_fee = fee;
+    }
+
+    pub fn collect_fees(token: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+        let fees = self.accrued_fees[token];
+        self.accrued_fees[token] = 0u256;
+        IERC20::at(token).transfer(self.fee_recipient, fees);
+    }
+
+    // --- Single swap ---
+
+    pub fn swap_exact_input(
+        token_in: Address,
+        token_out: Address,
+        amount_in: u256,
+        min_amount_out: u256,
+        deadline: u64,
+    ) -> u256 {
+        self.require_deadline(deadline);
+        require!(amount_in > 0u256, ZeroAmount {});
+        require!(token_in != token_out, IdenticalTokens {});
+
+        // Transfer tokens from user
+        IERC20::at(token_in).transfer_from(msg.sender, address(self), amount_in);
+
+        // Deduct router fee
+        let net_amount = self.deduct_router_fee(token_in, amount_in);
+
+        // Find and execute swap
+        let pool = self.best_pool[token_in][token_out];
+        require!(pool != Address::ZERO, PoolNotRegistered { pool: pool });
+
+        let amount_out = self.execute_pool_swap(pool, token_in, token_out, net_amount);
+
+        require!(amount_out >= min_amount_out, InsufficientOutput {
+            minimum: min_amount_out,
+            actual: amount_out,
+        });
+
+        // Transfer output to user
+        IERC20::at(token_out).transfer(msg.sender, amount_out);
+
+        self.total_swaps = self.total_swaps + 1u256;
+        self.total_volume[token_in] = self.total_volume[token_in] + amount_in;
+
+        emit SwapExecuted {
+            user: msg.sender,
+            token_in: token_in,
+            token_out: token_out,
+            amount_in: amount_in,
+            amount_out: amount_out,
+            hops: 1u256,
+        };
+
+        return amount_out;
+    }
+
+    // --- Multi-hop swap ---
+
+    pub fn swap_exact_input_multi(
+        path: Vec<SwapStep>,
+        amount_in: u256,
+        min_amount_out: u256,
+        deadline: u64,
+    ) -> u256 {
+        self.require_deadline(deadline);
+        require!(amount_in > 0u256, ZeroAmount {});
+
+        let hop_count = path.len();
+        require!(hop_count > 0u256, EmptyPath {});
+        require!(hop_count <= 4u256, ExcessiveHops { max: 4u256, actual: hop_count });
+
+        let first_step = path[0];
+
+        // Transfer initial tokens from user
+        IERC20::at(first_step.token_in).transfer_from(msg.sender, address(self), amount_in);
+
+        // Deduct router fee on input
+        let mut current_amount = self.deduct_router_fee(first_step.token_in, amount_in);
+
+        // Execute each hop
+        for i in 0..hop_count {
+            let step = path[i];
+            current_amount = self.execute_pool_swap(
+                step.pool,
+                step.token_in,
+                step.token_out,
+                current_amount,
+            );
+        }
+
+        require!(current_amount >= min_amount_out, InsufficientOutput {
+            minimum: min_amount_out,
+            actual: current_amount,
+        });
+
+        // Transfer final output to user
+        let last_step = path[hop_count - 1u256];
+        IERC20::at(last_step.token_out).transfer(msg.sender, current_amount);
+
+        self.total_swaps = self.total_swaps + 1u256;
+        self.total_volume[first_step.token_in] = self.total_volume[first_step.token_in] + amount_in;
+
+        emit MultiHopSwap {
+            user: msg.sender,
+            path_length: hop_count,
+            initial_amount: amount_in,
+            final_amount: current_amount,
+        };
+
+        return current_amount;
+    }
+
+    // --- Native token swaps ---
+
+    pub fn swap_native_for_token(
+        token_out: Address,
+        min_amount_out: u256,
+        deadline: u64,
+    ) -> u256 {
+        self.require_deadline(deadline);
+        let amount_in = msg.value;
+        require!(amount_in > 0u256, ZeroAmount {});
+
+        // Wrap native token
+        raw_call!(self.wpyde, amount_in, "deposit()");
+
+        let net_amount = self.deduct_router_fee(self.wpyde, amount_in);
+
+        let pool = self.best_pool[self.wpyde][token_out];
+        require!(pool != Address::ZERO, PoolNotRegistered { pool: pool });
+
+        let amount_out = self.execute_pool_swap(pool, self.wpyde, token_out, net_amount);
+
+        require!(amount_out >= min_amount_out, InsufficientOutput {
+            minimum: min_amount_out,
+            actual: amount_out,
+        });
+
+        IERC20::at(token_out).transfer(msg.sender, amount_out);
+
+        self.total_swaps = self.total_swaps + 1u256;
+
+        emit SwapExecuted {
+            user: msg.sender,
+            token_in: self.wpyde,
+            token_out: token_out,
+            amount_in: amount_in,
+            amount_out: amount_out,
+            hops: 1u256,
+        };
+
+        return amount_out;
+    }
+
+    pub fn swap_token_for_native(
+        token_in: Address,
+        amount_in: u256,
+        min_amount_out: u256,
+        deadline: u64,
+    ) -> u256 {
+        self.require_deadline(deadline);
+        require!(amount_in > 0u256, ZeroAmount {});
+
+        IERC20::at(token_in).transfer_from(msg.sender, address(self), amount_in);
+
+        let net_amount = self.deduct_router_fee(token_in, amount_in);
+
+        let pool = self.best_pool[token_in][self.wpyde];
+        require!(pool != Address::ZERO, PoolNotRegistered { pool: pool });
+
+        let wpyde_out = self.execute_pool_swap(pool, token_in, self.wpyde, net_amount);
+
+        require!(wpyde_out >= min_amount_out, InsufficientOutput {
+            minimum: min_amount_out,
+            actual: wpyde_out,
+        });
+
+        // Unwrap and send native
+        raw_call!(self.wpyde, "withdraw(uint256)", wpyde_out);
+        raw_call!(msg.sender, wpyde_out);
+
+        self.total_swaps = self.total_swaps + 1u256;
+
+        emit SwapExecuted {
+            user: msg.sender,
+            token_in: token_in,
+            token_out: self.wpyde,
+            amount_in: amount_in,
+            amount_out: wpyde_out,
+            hops: 1u256,
+        };
+
+        return wpyde_out;
+    }
+
+    // --- Quote functions ---
+
+    #[view]
+    pub fn get_amount_out(token_in: Address, token_out: Address, amount_in: u256) -> u256 {
+        let pool = self.best_pool[token_in][token_out];
+        if pool == Address::ZERO {
+            return 0u256;
+        }
+        let net = amount_in - (amount_in * self.router_fee) / self.percent_scale;
+        return IAmmPool::at(pool).get_amount_out(token_in, net);
+    }
+
+    #[view]
+    pub fn get_amount_out_multi(path: Vec<SwapStep>, amount_in: u256) -> u256 {
+        let mut current = amount_in - (amount_in * self.router_fee) / self.percent_scale;
+        let hops = path.len();
+        for i in 0..hops {
+            let step = path[i];
+            current = IAmmPool::at(step.pool).get_amount_out(step.token_in, current);
+        }
+        return current;
+    }
+
+    #[view]
+    pub fn get_best_pool_for(token_a: Address, token_b: Address) -> Address {
+        return self.best_pool[token_a][token_b];
+    }
+
+    #[view]
+    pub fn get_total_swaps() -> u256 {
+        return self.total_swaps;
+    }
+
+    #[view]
+    pub fn get_volume(token: Address) -> u256 {
+        return self.total_volume[token];
+    }
+
+    #[view]
+    pub fn get_pool_count() -> u256 {
+        return self.pool_count;
+    }
+}

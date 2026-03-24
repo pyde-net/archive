@@ -1,0 +1,344 @@
+// Quadratic voting mechanism where voting cost scales quadratically.
+// Each additional vote on the same option costs progressively more credits.
+// Supports multiple polls, credit allocation, and result tallying.
+
+use std::token::IERC20;
+
+contract QuadraticVoting {
+    const MAX_OPTIONS: u256 = 20;
+
+    storage {
+        admin: Address,
+        credit_token: Address,           // token used to purchase voting credits
+        credit_price: u256,              // price per credit in tokens
+        poll_count: u256,
+        polls: Map<u256, Poll>,
+        // poll_id -> option_index -> vote tally (in raw votes, not credits)
+        option_votes: Map<u256, Map<u256, u256>>,
+        // poll_id -> voter -> credits remaining for this poll
+        voter_credits: Map<u256, Map<Address, u256>>,
+        // poll_id -> voter -> option -> votes cast
+        votes_cast: Map<u256, Map<Address, Map<u256, u256>>>,
+        // poll_id -> voter -> has participated
+        has_participated: Map<u256, Map<Address, bool>>,
+        // Credit balances (pre-purchased)
+        credit_balances: Map<Address, u256>,
+        // Global stats
+        total_polls_created: u256,
+        total_votes_cast: u256,
+    }
+
+    struct Poll {
+        id: u256,
+        creator: Address,
+        title: String,
+        description: String,
+        option_count: u256,
+        option_labels: Vec<String>,
+        credits_per_voter: u256,
+        start_time: u64,
+        end_time: u64,
+        voter_count: u256,
+        total_credits_spent: u256,
+        finalized: bool,
+        winning_option: u256,
+    }
+
+    event PollCreated {
+        #[indexed]
+        poll_id: u256,
+        #[indexed]
+        creator: Address,
+        title: String,
+        option_count: u256,
+        credits_per_voter: u256,
+    }
+
+    event VoteCast {
+        #[indexed]
+        poll_id: u256,
+        #[indexed]
+        voter: Address,
+        option: u256,
+        votes: u256,
+        credits_spent: u256,
+    }
+
+    event CreditsPurchased {
+        #[indexed]
+        buyer: Address,
+        amount: u256,
+        cost: u256,
+    }
+
+    event PollFinalized {
+        #[indexed]
+        poll_id: u256,
+        winning_option: u256,
+        winning_votes: u256,
+    }
+
+    event CreditsRefunded {
+        #[indexed]
+        poll_id: u256,
+        #[indexed]
+        voter: Address,
+        credits: u256,
+    }
+
+    error PollNotFound {}
+    error PollNotActive {}
+    error PollNotEnded {}
+    error PollAlreadyFinalized {}
+    error InvalidOption { option: u256, max: u256 }
+    error InsufficientCredits { available: u256, required: u256 }
+    error ZeroVotes {}
+    error NotAdmin {}
+    error InvalidPollConfig {}
+    error PollAlreadyStarted {}
+    error InsufficientTokenBalance { required: u256 }
+    error NoCreditsToRefund {}
+    error TooManyOptions {}
+
+    #[constructor]
+    pub fn init(credit_token: Address, credit_price: u256) {
+        self.admin = msg.sender;
+        self.credit_token = credit_token;
+        self.credit_price = credit_price;
+        self.poll_count = 0;
+        self.total_polls_created = 0;
+        self.total_votes_cast = 0;
+    }
+
+    // Purchase voting credits with tokens
+    pub fn purchase_credits(amount: u256) {
+        let cost = amount * self.credit_price;
+        let token = IERC20::at(self.credit_token);
+
+        let balance = token.balance_of(msg.sender);
+        require!(balance >= cost, InsufficientTokenBalance { required: cost });
+
+        token.transfer_from(msg.sender, address(self), cost);
+        self.credit_balances[msg.sender] = self.credit_balances[msg.sender] + amount;
+
+        emit CreditsPurchased { buyer: msg.sender, amount: amount, cost: cost };
+    }
+
+    pub fn create_poll(
+        title: String,
+        description: String,
+        option_labels: Vec<String>,
+        credits_per_voter: u256,
+        start_time: u64,
+        end_time: u64,
+    ) -> u256 {
+        let option_count = option_labels.len();
+        require!(option_count >= 2, InvalidPollConfig {});
+        require!(option_count <= MAX_OPTIONS, TooManyOptions {});
+        require!(credits_per_voter > 0, InvalidPollConfig {});
+        require!(start_time >= block.timestamp, InvalidPollConfig {});
+        require!(end_time > start_time, InvalidPollConfig {});
+
+        self.poll_count = self.poll_count + 1;
+        let poll_id = self.poll_count;
+
+        self.polls[poll_id] = Poll {
+            id: poll_id,
+            creator: msg.sender,
+            title: title,
+            description: description,
+            option_count: option_count,
+            option_labels: option_labels,
+            credits_per_voter: credits_per_voter,
+            start_time: start_time,
+            end_time: end_time,
+            voter_count: 0,
+            total_credits_spent: 0,
+            finalized: false,
+            winning_option: 0,
+        };
+
+        self.total_polls_created = self.total_polls_created + 1;
+
+        emit PollCreated {
+            poll_id: poll_id,
+            creator: msg.sender,
+            title: title,
+            option_count: option_count,
+            credits_per_voter: credits_per_voter,
+        };
+
+        return poll_id;
+    }
+
+    // Cast votes on an option. The cost in credits is votes^2.
+    // This is incremental: if you already cast 2 votes and want 3 total,
+    // you pay 3^2 - 2^2 = 5 additional credits.
+    pub fn vote(poll_id: u256, option: u256, additional_votes: u256) {
+        require!(additional_votes > 0, ZeroVotes {});
+
+        let poll = self.polls[poll_id];
+        require!(poll.id == poll_id, PollNotFound {});
+        require!(block.timestamp >= poll.start_time, PollNotActive {});
+        require!(block.timestamp <= poll.end_time, PollNotActive {});
+        require!(!poll.finalized, PollAlreadyFinalized {});
+        require!(option < poll.option_count, InvalidOption {
+            option: option,
+            max: poll.option_count - 1,
+        });
+
+        // Initialize voter credits on first participation
+        if !self.has_participated[poll_id][msg.sender] {
+            // Deduct credits from user's global balance
+            require!(
+                self.credit_balances[msg.sender] >= poll.credits_per_voter,
+                InsufficientCredits {
+                    available: self.credit_balances[msg.sender],
+                    required: poll.credits_per_voter,
+                }
+            );
+            self.credit_balances[msg.sender] =
+                self.credit_balances[msg.sender] - poll.credits_per_voter;
+            self.voter_credits[poll_id][msg.sender] = poll.credits_per_voter;
+            self.has_participated[poll_id][msg.sender] = true;
+            self.polls[poll_id].voter_count = poll.voter_count + 1;
+        }
+
+        let current_votes = self.votes_cast[poll_id][msg.sender][option];
+        let new_total_votes = current_votes + additional_votes;
+
+        // Quadratic cost: new_total^2 - current^2
+        let new_cost = new_total_votes * new_total_votes;
+        let old_cost = current_votes * current_votes;
+        let credits_needed = new_cost - old_cost;
+
+        let available = self.voter_credits[poll_id][msg.sender];
+        require!(available >= credits_needed, InsufficientCredits {
+            available: available,
+            required: credits_needed,
+        });
+
+        // Apply the vote
+        self.voter_credits[poll_id][msg.sender] = available - credits_needed;
+        self.votes_cast[poll_id][msg.sender][option] = new_total_votes;
+        self.option_votes[poll_id][option] =
+            self.option_votes[poll_id][option] + additional_votes;
+        self.polls[poll_id].total_credits_spent =
+            self.polls[poll_id].total_credits_spent + credits_needed;
+        self.total_votes_cast = self.total_votes_cast + additional_votes;
+
+        emit VoteCast {
+            poll_id: poll_id,
+            voter: msg.sender,
+            option: option,
+            votes: additional_votes,
+            credits_spent: credits_needed,
+        };
+    }
+
+    // Reclaim unused credits after poll ends
+    pub fn refund_credits(poll_id: u256) {
+        let poll = self.polls[poll_id];
+        require!(poll.id == poll_id, PollNotFound {});
+        require!(block.timestamp > poll.end_time, PollNotEnded {});
+
+        let remaining = self.voter_credits[poll_id][msg.sender];
+        require!(remaining > 0, NoCreditsToRefund {});
+
+        self.voter_credits[poll_id][msg.sender] = 0;
+        self.credit_balances[msg.sender] = self.credit_balances[msg.sender] + remaining;
+
+        emit CreditsRefunded { poll_id: poll_id, voter: msg.sender, credits: remaining };
+    }
+
+    // Finalize poll and determine winner
+    pub fn finalize(poll_id: u256) {
+        let poll = self.polls[poll_id];
+        require!(poll.id == poll_id, PollNotFound {});
+        require!(block.timestamp > poll.end_time, PollNotEnded {});
+        require!(!poll.finalized, PollAlreadyFinalized {});
+
+        let mut max_votes: u256 = 0;
+        let mut winner: u256 = 0;
+
+        for i in 0..poll.option_count {
+            let votes = self.option_votes[poll_id][i];
+            if votes > max_votes {
+                max_votes = votes;
+                winner = i;
+            }
+        }
+
+        self.polls[poll_id].finalized = true;
+        self.polls[poll_id].winning_option = winner;
+
+        emit PollFinalized {
+            poll_id: poll_id,
+            winning_option: winner,
+            winning_votes: max_votes,
+        };
+    }
+
+    pub fn set_credit_price(new_price: u256) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        self.credit_price = new_price;
+    }
+
+    #[view]
+    pub fn get_poll(poll_id: u256) -> Poll {
+        return self.polls[poll_id];
+    }
+
+    #[view]
+    pub fn get_option_votes(poll_id: u256, option: u256) -> u256 {
+        return self.option_votes[poll_id][option];
+    }
+
+    #[view]
+    pub fn get_voter_info(poll_id: u256, voter: Address) -> (u256, bool) {
+        let credits = self.voter_credits[poll_id][voter];
+        let participated = self.has_participated[poll_id][voter];
+        return (credits, participated);
+    }
+
+    #[view]
+    pub fn get_votes_on_option(poll_id: u256, voter: Address, option: u256) -> u256 {
+        return self.votes_cast[poll_id][voter][option];
+    }
+
+    #[view]
+    pub fn credit_balance(account: Address) -> u256 {
+        return self.credit_balances[account];
+    }
+
+    // Calculate how many votes you can cast with given credits
+    #[view]
+    pub fn votes_for_credits(credits: u256) -> u256 {
+        // votes = floor(sqrt(credits))
+        return sqrt(credits);
+    }
+
+    // Calculate credits needed for a given number of votes
+    #[view]
+    pub fn credits_for_votes(votes: u256) -> u256 {
+        return votes * votes;
+    }
+
+    // Get all results for a poll
+    #[view]
+    pub fn get_results(poll_id: u256) -> Vec<u256> {
+        let poll = self.polls[poll_id];
+        let mut results: Vec<u256> = Vec::new();
+
+        for i in 0..poll.option_count {
+            results.push(self.option_votes[poll_id][i]);
+        }
+
+        return results;
+    }
+
+    #[view]
+    pub fn get_stats() -> (u256, u256) {
+        return (self.total_polls_created, self.total_votes_cast);
+    }
+}

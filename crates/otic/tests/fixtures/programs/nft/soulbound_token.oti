@@ -1,0 +1,254 @@
+// Soulbound Token (SBT) contract.
+// Non-transferable tokens bound permanently to an address.
+// Supports issuance by authorized issuers, revocation, and expiry.
+
+contract SoulboundToken {
+    storage {
+        name: String,
+        symbol: String,
+        admin: Address,
+        next_token_id: u256,
+        tokens: Map<u256, SBTData>,
+        // address -> category -> token_id (one SBT per category per address)
+        holder_tokens: Map<Address, Map<String, u256>>,
+        authorized_issuers: Map<Address, bool>,
+        issuer_count: u256,
+        total_issued: u256,
+        total_revoked: u256,
+    }
+
+    struct SBTData {
+        token_id: u256,
+        holder: Address,
+        issuer: Address,
+        category: String,
+        metadata_uri: String,
+        issued_at: u64,
+        expires_at: u64,         // 0 = no expiry
+        revoked: bool,
+        revoked_at: u64,
+        revocation_reason: String,
+    }
+
+    event Issued {
+        #[indexed]
+        token_id: u256,
+        #[indexed]
+        holder: Address,
+        #[indexed]
+        issuer: Address,
+        category: String,
+    }
+
+    event Revoked {
+        #[indexed]
+        token_id: u256,
+        #[indexed]
+        holder: Address,
+        reason: String,
+    }
+
+    event IssuerAdded {
+        #[indexed]
+        issuer: Address,
+    }
+
+    event IssuerRemoved {
+        #[indexed]
+        issuer: Address,
+    }
+
+    error NotAdmin {}
+    error NotAuthorizedIssuer {}
+    error TokenDoesNotExist { token_id: u256 }
+    error TokenAlreadyRevoked { token_id: u256 }
+    error TransferNotAllowed {}
+    error AlreadyHoldsCategory { holder: Address, category: String }
+    error NotIssuerOfToken {}
+    error AlreadyIssuer { issuer: Address }
+    error NotIssuer { issuer: Address }
+    error TokenExpired { token_id: u256 }
+    error InvalidExpiry {}
+
+    #[constructor]
+    pub fn init(name: String, symbol: String) {
+        self.name = name;
+        self.symbol = symbol;
+        self.admin = msg.sender;
+        self.next_token_id = 1;
+        self.authorized_issuers[msg.sender] = true;
+        self.issuer_count = 1;
+        self.total_issued = 0;
+        self.total_revoked = 0;
+    }
+
+    pub fn issue(
+        holder: Address,
+        category: String,
+        metadata_uri: String,
+        expires_at: u64,
+    ) {
+        require!(self.authorized_issuers[msg.sender], NotAuthorizedIssuer {});
+        require!(
+            self.holder_tokens[holder][category] == 0,
+            AlreadyHoldsCategory { holder: holder, category: category }
+        );
+        if expires_at > 0 {
+            require!(expires_at > block.timestamp, InvalidExpiry {});
+        }
+
+        let token_id = self.next_token_id;
+        self.next_token_id = token_id + 1;
+
+        self.tokens[token_id] = SBTData {
+            token_id: token_id,
+            holder: holder,
+            issuer: msg.sender,
+            category: category,
+            metadata_uri: metadata_uri,
+            issued_at: block.timestamp,
+            expires_at: expires_at,
+            revoked: false,
+            revoked_at: 0,
+            revocation_reason: "",
+        };
+
+        self.holder_tokens[holder][category] = token_id;
+        self.total_issued = self.total_issued + 1;
+
+        emit Issued {
+            token_id: token_id,
+            holder: holder,
+            issuer: msg.sender,
+            category: category,
+        };
+    }
+
+    pub fn revoke(token_id: u256, reason: String) {
+        let token = self.tokens[token_id];
+        require!(token.holder != Address::ZERO, TokenDoesNotExist { token_id: token_id });
+        require!(!token.revoked, TokenAlreadyRevoked { token_id: token_id });
+
+        // Only the issuer or admin can revoke
+        require!(
+            msg.sender == token.issuer || msg.sender == self.admin,
+            NotIssuerOfToken {}
+        );
+
+        self.tokens[token_id].revoked = true;
+        self.tokens[token_id].revoked_at = block.timestamp;
+        self.tokens[token_id].revocation_reason = reason;
+        self.holder_tokens[token.holder][token.category] = 0;
+        self.total_revoked = self.total_revoked + 1;
+
+        emit Revoked { token_id: token_id, holder: token.holder, reason: reason };
+    }
+
+    pub fn batch_issue(
+        holders: Vec<Address>,
+        category: String,
+        metadata_uri: String,
+        expires_at: u64,
+    ) {
+        require!(self.authorized_issuers[msg.sender], NotAuthorizedIssuer {});
+
+        for i in 0..holders.len() {
+            let holder = holders[i];
+
+            // Skip if holder already has this category
+            if self.holder_tokens[holder][category] != 0 {
+                continue;
+            }
+
+            let token_id = self.next_token_id;
+            self.next_token_id = token_id + 1;
+
+            self.tokens[token_id] = SBTData {
+                token_id: token_id,
+                holder: holder,
+                issuer: msg.sender,
+                category: category,
+                metadata_uri: metadata_uri,
+                issued_at: block.timestamp,
+                expires_at: expires_at,
+                revoked: false,
+                revoked_at: 0,
+                revocation_reason: "",
+            };
+
+            self.holder_tokens[holder][category] = token_id;
+            self.total_issued = self.total_issued + 1;
+
+            emit Issued {
+                token_id: token_id,
+                holder: holder,
+                issuer: msg.sender,
+                category: category,
+            };
+        }
+    }
+
+    pub fn add_issuer(issuer: Address) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        require!(!self.authorized_issuers[issuer], AlreadyIssuer { issuer: issuer });
+        self.authorized_issuers[issuer] = true;
+        self.issuer_count = self.issuer_count + 1;
+        emit IssuerAdded { issuer: issuer };
+    }
+
+    pub fn remove_issuer(issuer: Address) {
+        require!(msg.sender == self.admin, NotAdmin {});
+        require!(self.authorized_issuers[issuer], NotIssuer { issuer: issuer });
+        self.authorized_issuers[issuer] = false;
+        self.issuer_count = self.issuer_count - 1;
+        emit IssuerRemoved { issuer: issuer };
+    }
+
+    #[view]
+    pub fn is_valid(token_id: u256) -> bool {
+        let token = self.tokens[token_id];
+        if token.holder == Address::ZERO {
+            return false;
+        }
+        if token.revoked {
+            return false;
+        }
+        if token.expires_at > 0 && block.timestamp > token.expires_at {
+            return false;
+        }
+        return true;
+    }
+
+    #[view]
+    pub fn get_token(token_id: u256) -> SBTData {
+        require!(
+            self.tokens[token_id].holder != Address::ZERO,
+            TokenDoesNotExist { token_id: token_id }
+        );
+        return self.tokens[token_id];
+    }
+
+    #[view]
+    pub fn has_valid_token(holder: Address, category: String) -> bool {
+        let token_id = self.holder_tokens[holder][category];
+        if token_id == 0 {
+            return false;
+        }
+        return self.is_valid(token_id);
+    }
+
+    #[view]
+    pub fn token_of(holder: Address, category: String) -> u256 {
+        return self.holder_tokens[holder][category];
+    }
+
+    #[view]
+    pub fn is_issuer(account: Address) -> bool {
+        return self.authorized_issuers[account];
+    }
+
+    #[view]
+    pub fn stats() -> (u256, u256, u256) {
+        return (self.total_issued, self.total_revoked, self.total_issued - self.total_revoked);
+    }
+}

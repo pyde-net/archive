@@ -1,0 +1,302 @@
+// Flash loan provider with multi-asset support and fee collection
+use std::math;
+use std::token::IERC20;
+
+interface IFlashBorrower {
+    fn on_flash_loan(
+        initiator: Address,
+        token: Address,
+        amount: u256,
+        fee: u256,
+        data: bytes,
+    ) -> bool;
+}
+
+contract FlashLoanProvider {
+    storage {
+        owner: Address,
+
+        // Supported tokens and their pool balances
+        supported_tokens: Map<Address, bool>,
+        token_list: Vec<Address>,
+        pool_balances: Map<Address, u256>,
+
+        // Fee configuration per token (scaled 1e6, e.g. 500 = 0.05%)
+        flash_fee_rate: Map<Address, u256>,
+        default_fee_rate: u256,
+
+        // Protocol revenue
+        accrued_fees: Map<Address, u256>,
+        fee_recipient: Address,
+
+        // Flash loan state (reentrancy guard)
+        active_loan: bool,
+        active_borrower: Address,
+        active_token: Address,
+        active_amount: u256,
+        active_fee: u256,
+
+        // Statistics
+        total_flash_loans: u256,
+        total_volume: Map<Address, u256>,
+        total_fees_earned: Map<Address, u256>,
+
+        // Liquidity providers
+        lp_deposits: Map<Address, Map<Address, u256>>, // user -> token -> amount
+        total_lp_deposits: Map<Address, u256>,
+
+        // Governance
+        max_flash_amount: Map<Address, u256>,
+        paused: bool,
+
+        percent_scale: u256,
+    }
+
+    event FlashLoan {
+        #[indexed]
+        borrower: Address,
+        #[indexed]
+        token: Address,
+        amount: u256,
+        fee: u256,
+    }
+
+    event LiquidityDeposited {
+        #[indexed]
+        provider: Address,
+        #[indexed]
+        token: Address,
+        amount: u256,
+    }
+
+    event LiquidityWithdrawn {
+        #[indexed]
+        provider: Address,
+        #[indexed]
+        token: Address,
+        amount: u256,
+    }
+
+    event FeesCollected {
+        #[indexed]
+        token: Address,
+        amount: u256,
+    }
+
+    event TokenAdded {
+        #[indexed]
+        token: Address,
+        fee_rate: u256,
+    }
+
+    error FlashLoanActive {}
+    error FlashLoanFailed { borrower: Address, token: Address }
+    error InsufficientPoolBalance { available: u256, requested: u256 }
+    error TokenNotSupported { token: Address }
+    error RepaymentInsufficient { expected: u256, actual: u256 }
+    error NotOwner {}
+    error Paused {}
+    error ZeroAmount {}
+    error MaxFlashExceeded { max: u256, requested: u256 }
+    error InsufficientLpDeposit { available: u256, requested: u256 }
+
+    #[constructor]
+    pub fn init(default_fee_rate: u256) {
+        self.owner = msg.sender;
+        self.fee_recipient = msg.sender;
+        self.default_fee_rate = default_fee_rate;
+        self.paused = false;
+        self.active_loan = false;
+        self.percent_scale = 1000000u256;
+    }
+
+    // --- Admin ---
+
+    pub fn add_token(token: Address, fee_rate: u256, max_amount: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.supported_tokens[token] = true;
+        self.token_list.push(token);
+        self.flash_fee_rate[token] = fee_rate;
+        self.max_flash_amount[token] = max_amount;
+        emit TokenAdded { token: token, fee_rate: fee_rate };
+    }
+
+    pub fn set_fee_rate(token: Address, fee_rate: u256) {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.flash_fee_rate[token] = fee_rate;
+    }
+
+    pub fn pause() {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.paused = true;
+    }
+
+    pub fn unpause() {
+        require!(msg.sender == self.owner, NotOwner {});
+        self.paused = false;
+    }
+
+    pub fn collect_fees(token: Address) {
+        require!(msg.sender == self.owner, NotOwner {});
+        let fees = self.accrued_fees[token];
+        self.accrued_fees[token] = 0u256;
+        IERC20::at(token).transfer(self.fee_recipient, fees);
+        emit FeesCollected { token: token, amount: fees };
+    }
+
+    // --- Liquidity provision ---
+
+    pub fn provide_liquidity(token: Address, amount: u256) {
+        require!(amount > 0u256, ZeroAmount {});
+        require!(self.supported_tokens[token], TokenNotSupported { token: token });
+
+        IERC20::at(token).transfer_from(msg.sender, address(self), amount);
+
+        self.lp_deposits[msg.sender][token] = self.lp_deposits[msg.sender][token] + amount;
+        self.total_lp_deposits[token] = self.total_lp_deposits[token] + amount;
+        self.pool_balances[token] = self.pool_balances[token] + amount;
+
+        emit LiquidityDeposited { provider: msg.sender, token: token, amount: amount };
+    }
+
+    pub fn withdraw_liquidity(token: Address, amount: u256) {
+        require!(amount > 0u256, ZeroAmount {});
+
+        let deposited = self.lp_deposits[msg.sender][token];
+        require!(deposited >= amount, InsufficientLpDeposit {
+            available: deposited,
+            requested: amount,
+        });
+
+        // Calculate proportional share of fees
+        let total_lp = self.total_lp_deposits[token];
+        let fee_share = if total_lp > 0u256 {
+            (self.accrued_fees[token] * deposited) / total_lp
+        } else {
+            0u256
+        };
+
+        self.lp_deposits[msg.sender][token] = deposited - amount;
+        self.total_lp_deposits[token] = total_lp - amount;
+        self.pool_balances[token] = self.pool_balances[token] - amount;
+
+        // Transfer principal + fee share
+        let total_withdrawal = amount + fee_share;
+        if fee_share > 0u256 {
+            self.accrued_fees[token] = self.accrued_fees[token] - fee_share;
+        }
+
+        IERC20::at(token).transfer(msg.sender, total_withdrawal);
+
+        emit LiquidityWithdrawn { provider: msg.sender, token: token, amount: total_withdrawal };
+    }
+
+    // --- Flash loan core ---
+
+    #[reentrant]
+    pub fn flash_loan(
+        borrower: Address,
+        token: Address,
+        amount: u256,
+        data: bytes,
+    ) {
+        require!(!self.paused, Paused {});
+        require!(!self.active_loan, FlashLoanActive {});
+        require!(amount > 0u256, ZeroAmount {});
+        require!(self.supported_tokens[token], TokenNotSupported { token: token });
+
+        let max = self.max_flash_amount[token];
+        require!(amount <= max, MaxFlashExceeded { max: max, requested: amount });
+
+        let pool_bal = self.pool_balances[token];
+        require!(pool_bal >= amount, InsufficientPoolBalance {
+            available: pool_bal,
+            requested: amount,
+        });
+
+        // Calculate fee
+        let fee_rate = self.flash_fee_rate[token];
+        let actual_rate = if fee_rate > 0u256 { fee_rate } else { self.default_fee_rate };
+        let fee = (amount * actual_rate) / self.percent_scale;
+
+        // Set active loan state
+        self.active_loan = true;
+        self.active_borrower = borrower;
+        self.active_token = token;
+        self.active_amount = amount;
+        self.active_fee = fee;
+
+        // Transfer tokens to borrower
+        IERC20::at(token).transfer(borrower, amount);
+
+        // Call borrower callback
+        let success = IFlashBorrower::at(borrower).on_flash_loan(
+            msg.sender,
+            token,
+            amount,
+            fee,
+            data,
+        );
+        require!(success, FlashLoanFailed { borrower: borrower, token: token });
+
+        // Verify repayment: borrower must have approved amount + fee
+        IERC20::at(token).transfer_from(borrower, address(self), amount + fee);
+
+        // Verify pool balance restored with fee
+        let new_balance = self.pool_balances[token] + fee;
+        self.pool_balances[token] = new_balance;
+        self.accrued_fees[token] = self.accrued_fees[token] + fee;
+
+        // Update statistics
+        self.total_flash_loans = self.total_flash_loans + 1u256;
+        self.total_volume[token] = self.total_volume[token] + amount;
+        self.total_fees_earned[token] = self.total_fees_earned[token] + fee;
+
+        // Clear active loan
+        self.active_loan = false;
+
+        emit FlashLoan { borrower: borrower, token: token, amount: amount, fee: fee };
+    }
+
+    // --- Views ---
+
+    #[view]
+    pub fn get_flash_fee(token: Address, amount: u256) -> u256 {
+        let fee_rate = self.flash_fee_rate[token];
+        let actual_rate = if fee_rate > 0u256 { fee_rate } else { self.default_fee_rate };
+        return (amount * actual_rate) / self.percent_scale;
+    }
+
+    #[view]
+    pub fn max_flash_loan(token: Address) -> u256 {
+        if !self.supported_tokens[token] {
+            return 0u256;
+        }
+        let pool_max = self.pool_balances[token];
+        let config_max = self.max_flash_amount[token];
+        if pool_max < config_max {
+            return pool_max;
+        }
+        return config_max;
+    }
+
+    #[view]
+    pub fn get_pool_balance(token: Address) -> u256 {
+        return self.pool_balances[token];
+    }
+
+    #[view]
+    pub fn get_total_flash_loans() -> u256 {
+        return self.total_flash_loans;
+    }
+
+    #[view]
+    pub fn get_total_volume(token: Address) -> u256 {
+        return self.total_volume[token];
+    }
+
+    #[view]
+    pub fn get_lp_deposit(user: Address, token: Address) -> u256 {
+        return self.lp_deposits[user][token];
+    }
+}
