@@ -67,9 +67,9 @@ fn build_config() -> PydeStarkConfig {
     let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
     let dft = Dft {};
     let fri_config = FriConfig {
-        log_blowup: 3,   // 8x blowup
-        num_queries: 24,  // ~100-bit security
-        proof_of_work_bits: 12,
+        log_blowup: 4,   // 16x blowup (supports constraint degree up to 16)
+        num_queries: 21,  // ~100-bit security with 16x blowup
+        proof_of_work_bits: 10,
         mmcs: challenge_mmcs,
     };
     let pcs = Pcs::new(dft, val_mmcs, fri_config);

@@ -18,7 +18,7 @@ use crate::prover::{self, PublicInputs, PydeProof};
 use crate::recorder;
 use crate::trace::ExecutionTrace;
 
-use pyde_vm::vm::{Outcome, Vm};
+use pyde_vm::vm::Vm;
 
 /// A single transaction to execute.
 #[derive(Clone)]

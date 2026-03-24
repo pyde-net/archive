@@ -14,11 +14,10 @@ use p3_field::{AbstractField, Field, PrimeField64};
 use p3_goldilocks::Goldilocks;
 
 use pyde_vm::cpu::Trap;
-use pyde_vm::isa::{DecodedInstruction, Opcode, sign_extend_18};
+use pyde_vm::isa::{sign_extend_18, Opcode};
 use pyde_vm::vm::{ExecResult, Outcome, Vm};
 
-use crate::constraint::opcodes;
-use crate::trace::{col, to_field, ExecutionTrace, TraceRow};
+use crate::trace::{col, ExecutionTrace, TraceRow};
 
 /// Record a full execution trace from a loaded VM.
 /// Returns the trace and the execution outcome.
@@ -41,7 +40,13 @@ pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
         let rs1 = decoded.rs1;
         let rs2_imm = decoded.rs2_or_imm;
 
-        // Capture pre-step state for operand resolution
+        // Capture pre-step state for operand resolution.
+        // op_a = gp[rs1] ALWAYS (matches the multiplexer constraint)
+        // op_b = gp[rs2] for register-register ops, sign_extend(imm) for immediate ops
+        //
+        // For BRANCH instructions (BEQ/BNE/BLT/BGE): the PVM compares gp[rd] vs gp[rs1].
+        // The multiplexer constrains op_a = gp[rs1]. The branch constraints in the AIR
+        // reference gp[rd] via the rd_sel multiplexer separately.
         let pre_op_a = vm.cpu.read_gp(rs1);
         let pre_op_b = if opcode.uses_immediate() {
             sign_extend_18(rs2_imm) as u64
@@ -55,7 +60,11 @@ pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
         let is_storage = is_storage_opcode(opcode);
 
         // Capture pre-step memory info for STORE/PUSH
-        let mem_addr = if is_mem { compute_mem_addr(vm, opcode, rs1, rs2_imm) } else { 0 };
+        let mem_addr = if is_mem {
+            compute_mem_addr(vm, opcode, rs1, rs2_imm)
+        } else {
+            0
+        };
 
         // Execute one step
         let step_result = vm.step();
@@ -93,9 +102,7 @@ pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
             let w = vm.cpu.read_wide(r as u8);
             let bytes = w.to_le_bytes();
             for limb in 0..4 {
-                let val = u64::from_le_bytes(
-                    bytes[limb * 8..(limb + 1) * 8].try_into().unwrap(),
-                );
+                let val = u64::from_le_bytes(bytes[limb * 8..(limb + 1) * 8].try_into().unwrap());
                 row.set_u64(col::wide(r, limb), val);
             }
         }
@@ -112,17 +119,40 @@ pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
         row.set_u64(col::OP_B, pre_op_b);
         row.set_u64(col::OP_RESULT, vm.cpu.read_gp(rd));
 
-        // op_aux depends on opcode
-        fill_op_aux(&mut row, opcode, pre_op_a, pre_op_b, vm.cpu.read_gp(rd), rs2_imm);
+        // op_aux depends on opcode.
+        // For branches: the comparison is gp[rd] vs gp[rs1], captured pre-step.
+        let branch_rd_val = if matches!(opcode, Opcode::Beq | Opcode::Bne | Opcode::Blt | Opcode::Bge) {
+            // Pre-step rd value (the first comparison operand for branches)
+            // Note: we need pre-step, but rd might have been overwritten by step.
+            // However, branches DON'T write to rd, so post-step gp[rd] = pre-step gp[rd].
+            vm.cpu.read_gp(rd)
+        } else {
+            0
+        };
+        fill_op_aux(
+            &mut row,
+            opcode,
+            pre_op_a,
+            pre_op_b,
+            vm.cpu.read_gp(rd),
+            rs2_imm,
+            branch_rd_val,
+        );
 
         // Gas
         row.set_u64(col::GAS_STEP, gas_step);
         row.set_u64(col::GAS_CUMULATIVE, gas_after);
 
         // Flags
-        if is_mem { row.set_flag(col::IS_MEMORY_OP); }
-        if is_storage { row.set_flag(col::IS_STORAGE_OP); }
-        if is_final { row.set_flag(col::IS_FINAL); }
+        if is_mem {
+            row.set_flag(col::IS_MEMORY_OP);
+        }
+        if is_storage {
+            row.set_flag(col::IS_STORAGE_OP);
+        }
+        if is_final {
+            row.set_flag(col::IS_FINAL);
+        }
 
         // Memory access
         if is_mem {
@@ -141,7 +171,12 @@ pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
         }
 
         // Branch taken + diff_inv
-        fill_branch_info(&mut row, opcode, pre_op_a, pre_op_b, vm.cpu.read_gp(rd));
+        // For branches: compare gp[rd] vs gp[rs1]. For comparisons: use op_a vs op_b.
+        if matches!(opcode, Opcode::Beq | Opcode::Bne | Opcode::Blt | Opcode::Bge) {
+            fill_branch_info(&mut row, opcode, branch_rd_val, pre_op_a, 0);
+        } else {
+            fill_branch_info(&mut row, opcode, pre_op_a, pre_op_b, vm.cpu.read_gp(rd));
+        }
 
         // Call depth
         row.set_u64(col::CALL_DEPTH, call_depth);
@@ -174,8 +209,10 @@ pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
 }
 
 fn is_memory_opcode(op: Opcode) -> bool {
-    matches!(op, Opcode::Load | Opcode::Store | Opcode::Push | Opcode::Pop
-        | Opcode::Wload | Opcode::Wstore)
+    matches!(
+        op,
+        Opcode::Load | Opcode::Store | Opcode::Push | Opcode::Pop | Opcode::Wload | Opcode::Wstore
+    )
 }
 
 fn is_storage_opcode(op: Opcode) -> bool {
@@ -190,7 +227,7 @@ fn compute_mem_addr(vm: &Vm, op: Opcode, rs1: u8, rs2_imm: u32) -> u64 {
             (base.wrapping_add(offset as u32)) as u64
         }
         Opcode::Push => vm.cpu.read_gp(2).wrapping_sub(8), // SP - 8
-        Opcode::Pop => vm.cpu.read_gp(2),                   // SP
+        Opcode::Pop => vm.cpu.read_gp(2),                  // SP
         Opcode::Wload | Opcode::Wstore => vm.cpu.read_gp(rs1) as u64,
         _ => 0,
     }
@@ -234,17 +271,42 @@ fn fill_mem_value(row: &mut TraceRow, vm: &Vm, op: Opcode, _addr: u64) {
 }
 
 fn fill_storage_access(row: &mut TraceRow, vm: &Vm, op: Opcode, rs1: u8, rs2_imm: u32) {
-    // Storage key comes from wide register (rs1 for SLOAD/SDELETE, rd for SSTORE)
-    // Storage value from/to wide register
     let is_write = matches!(op, Opcode::Sstore);
     if is_write {
         row.set_flag(col::STORAGE_IS_WRITE);
     }
-    // Placeholder: storage key/value filled from register state
-    // Full implementation needs SMT integration
+
+    // Storage key: derived from the register operands.
+    // SLOAD rd, rs1 → key = wide(rs1) or gp(rs1) depending on encoding
+    // SSTORE rs1, rd → key = wide(rs1), value = wide(rd)
+    // SDELETE rs1 → key = wide(rs1)
+    //
+    // For GP-mode storage (key from GP register as u64):
+    let key_val = vm.cpu.read_gp(rs1);
+    row.set_u64(col::storage_key(0), key_val);
+    // Higher key limbs = 0 for GP-mode
+
+    // Storage value: for SSTORE, capture the value being written
+    if is_write {
+        let rd = row.get(col::RD).as_canonical_u64() as u8;
+        // Value from wide register (rd) for wide-mode storage
+        let val = vm.cpu.read_wide(rd);
+        let bytes = val.to_le_bytes();
+        for i in 0..4 {
+            let limb = u64::from_le_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap());
+            row.set_u64(col::storage_val(i), limb);
+        }
+        row.set_u64(col::STORAGE_VAL_LEN, 32); // U256 = 32 bytes
+    } else {
+        // SLOAD: value is loaded post-step (result in register)
+        // The value is captured from the post-step register state
+        let result_val = vm.cpu.read_gp(row.get(col::RD).as_canonical_u64() as u8);
+        row.set_u64(col::storage_val(0), result_val);
+        row.set_u64(col::STORAGE_VAL_LEN, 8);
+    }
 }
 
-fn fill_op_aux(row: &mut TraceRow, op: Opcode, a: u64, b: u64, result: u64, rs2_imm: u32) {
+fn fill_op_aux(row: &mut TraceRow, op: Opcode, a: u64, b: u64, result: u64, rs2_imm: u32, branch_rd_val: u64) {
     match op {
         // DIV: op_aux = remainder (a % b)
         Opcode::Div => {
@@ -262,7 +324,8 @@ fn fill_op_aux(row: &mut TraceRow, op: Opcode, a: u64, b: u64, result: u64, rs2_
         }
         // LT: op_aux = comparison difference
         Opcode::Lt => {
-            if result == 1 { // a < b
+            if result == 1 {
+                // a < b
                 row.set_u64(col::OP_AUX, b.wrapping_sub(a).wrapping_sub(1));
             } else {
                 row.set_u64(col::OP_AUX, a.wrapping_sub(b));
@@ -270,7 +333,8 @@ fn fill_op_aux(row: &mut TraceRow, op: Opcode, a: u64, b: u64, result: u64, rs2_
         }
         // GT: op_aux = comparison difference
         Opcode::Gt => {
-            if result == 1 { // a > b
+            if result == 1 {
+                // a > b
                 row.set_u64(col::OP_AUX, a.wrapping_sub(b).wrapping_sub(1));
             } else {
                 row.set_u64(col::OP_AUX, b.wrapping_sub(a));
@@ -296,36 +360,39 @@ fn fill_op_aux(row: &mut TraceRow, op: Opcode, a: u64, b: u64, result: u64, rs2_
                 row.set_u64(col::OP_AUX, (sb.wrapping_sub(sa)) as u64);
             }
         }
-        // SHL: op_b = 2^shift_amount (for the constraint: result = op_a * op_b)
+        // SHL: op_aux = 2^shift_amount (for the constraint: result = op_a * op_aux)
         Opcode::Shl => {
             let shift = b & 63;
-            row.set_u64(col::OP_B, 1u64 << shift);
+            row.set_u64(col::OP_AUX, 1u64 << shift);
         }
-        // SHR/SAR: op_b = 2^shift, op_aux = remainder
+        // SHR/SAR: op_aux = 2^shift (for the constraint: op_a = result * op_aux + remainder)
+        // We need TWO aux values: the power and the remainder.
+        // Use op_aux for the power. The remainder = a - result * power, which the
+        // constraint can compute from op_a, result, and op_aux.
         Opcode::Shr | Opcode::Sar => {
             let shift = b & 63;
             let power = 1u64 << shift;
-            row.set_u64(col::OP_B, power);
-            if power != 0 {
-                row.set_u64(col::OP_AUX, a % power);
-            }
+            row.set_u64(col::OP_AUX, power);
         }
-        // BLT: op_aux = comparison difference for branch condition
+        // BLT: branch compares gp[rd] < gp[rs1]
+        // AIR constraint uses mux_rd (gp[rd]) and op_a (gp[rs1]).
         Opcode::Blt => {
-            // branch_taken is set in fill_branch_info
-            // op_aux needs the difference
-            if a < b { // taken
-                row.set_u64(col::OP_AUX, b.wrapping_sub(a).wrapping_sub(1));
+            let rd_val = branch_rd_val;
+            let rs1_val = a; // op_a = gp[rs1]
+            if rd_val < rs1_val {
+                row.set_u64(col::OP_AUX, rs1_val.wrapping_sub(rd_val).wrapping_sub(1));
             } else {
-                row.set_u64(col::OP_AUX, a.wrapping_sub(b));
+                row.set_u64(col::OP_AUX, rd_val.wrapping_sub(rs1_val));
             }
         }
-        // BGE: op_aux = comparison difference
+        // BGE: branch compares gp[rd] >= gp[rs1]
         Opcode::Bge => {
-            if a >= b { // taken
-                row.set_u64(col::OP_AUX, a.wrapping_sub(b));
+            let rd_val = branch_rd_val;
+            let rs1_val = a;
+            if rd_val >= rs1_val {
+                row.set_u64(col::OP_AUX, rd_val.wrapping_sub(rs1_val));
             } else {
-                row.set_u64(col::OP_AUX, b.wrapping_sub(a).wrapping_sub(1));
+                row.set_u64(col::OP_AUX, rs1_val.wrapping_sub(rd_val).wrapping_sub(1));
             }
         }
         _ => {}
@@ -334,7 +401,10 @@ fn fill_op_aux(row: &mut TraceRow, op: Opcode, a: u64, b: u64, result: u64, rs2_
 
 fn fill_branch_info(row: &mut TraceRow, op: Opcode, a: u64, b: u64, _result: u64) {
     let is_branch = matches!(op, Opcode::Beq | Opcode::Bne | Opcode::Blt | Opcode::Bge);
-    let is_comparison = matches!(op, Opcode::Eq | Opcode::Lt | Opcode::Gt | Opcode::Slt | Opcode::Sgt);
+    let is_comparison = matches!(
+        op,
+        Opcode::Eq | Opcode::Lt | Opcode::Gt | Opcode::Slt | Opcode::Sgt
+    );
 
     if is_branch {
         let taken = match op {
@@ -361,14 +431,36 @@ fn fill_branch_info(row: &mut TraceRow, op: Opcode, a: u64, b: u64, _result: u64
 }
 
 fn fill_wide_aux(row: &mut TraceRow, op: Opcode, vm: &Vm) {
+    // Wide arithmetic carry/quotient columns.
+    // The wide operands are in the wide register columns (post-step).
+    // We need the PRE-step operand values to compute carries, but we only
+    // have post-step state. The rd register has the result; rs1/rs2 may
+    // have been overwritten if rd == rs1 or rd == rs2.
+    //
+    // For the constraint, we need carry[i] ∈ {0,1} for WADD/WSUB.
+    // Since PVM uses CHECKED wide arithmetic (traps on overflow), for valid
+    // traces the carries represent actual limb overflows.
+    //
+    // We compute carries from the RESULT limbs and the known operand limbs.
+    // The recorder has access to the post-step VM state where:
+    //   wide(rd) = result of the operation
+    //   wide(rs1), wide(rs2) = source registers (may equal rd)
+    //
+    // For now: the carries default to 0 (from TraceRow::zero()).
+    // For CHECKED arithmetic, if no limb overflows, carries are 0.
+    // The boolean constraint carry * (1 - carry) = 0 is satisfied by 0.
+    //
+    // Full carry computation requires pre-step operand capture, which
+    // will be added when wide ops are tested end-to-end.
     match op {
-        Opcode::Wadd => {
-            // Carry bits for WADD: carry[i] = overflow from limb addition
-            // For checked arithmetic these should all be 0 or 1
-            // The actual carry depends on operand values which the VM computed
+        Opcode::Wadd | Opcode::Wsub => {
+            // Carries default to 0 — valid for checked arithmetic when
+            // limb additions don't overflow individually.
+            // TODO: compute actual carries from pre-step operand limbs
         }
-        Opcode::Wsub => {
-            // Borrow bits for WSUB
+        Opcode::Wdiv | Opcode::Wmod => {
+            // Quotient columns for WDIV/WMOD
+            // TODO: compute from pre-step operands
         }
         _ => {}
     }
@@ -377,6 +469,8 @@ fn fill_wide_aux(row: &mut TraceRow, op: Opcode, vm: &Vm) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constraint::opcodes;
+    use crate::trace::to_field;
     use pyde_vm::isa::encode;
 
     fn instr(op: Opcode, rd: u8, rs1: u8, imm: u32) -> [u8; 4] {
@@ -420,7 +514,7 @@ mod tests {
         let code = bytecode(&[
             &instr(Opcode::Addi, 1, 0, 10),
             &instr(Opcode::Addi, 2, 0, 20),
-            &instr(Opcode::Add, 3, 1, 2),  // r3 = r1 + r2 = 30
+            &instr(Opcode::Add, 3, 1, 2), // r3 = r1 + r2 = 30
             &instr(Opcode::Halt, 0, 0, 0),
         ]);
         let mut vm = Vm::with_gas_limit(100_000);
@@ -465,7 +559,7 @@ mod tests {
         let code = bytecode(&[
             &instr(Opcode::Addi, 1, 0, 100),
             &instr(Opcode::Addi, 2, 0, 7),
-            &instr(Opcode::Div, 3, 1, 2),  // r3 = 100 / 7 = 14, remainder = 2
+            &instr(Opcode::Div, 3, 1, 2), // r3 = 100 / 7 = 14, remainder = 2
             &instr(Opcode::Halt, 0, 0, 0),
         ]);
         let mut vm = Vm::with_gas_limit(100_000);
@@ -507,6 +601,153 @@ mod tests {
         vm.load(&code).unwrap();
 
         let (mut trace, _) = record_execution(&mut vm);
+        let proof = crate::prover::prove(&mut trace, &[]);
+        assert!(crate::prover::verify(&proof, &[]).is_ok());
+    }
+
+    #[test]
+    fn record_sub_prove_verify() {
+        let code = bytecode(&[
+            &instr(Opcode::Addi, 1, 0, 1000),
+            &instr(Opcode::Addi, 2, 0, 250),
+            &instr(Opcode::Sub, 3, 1, 2), // 1000 - 250 = 750
+            &instr(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(100_000);
+        vm.load(&code).unwrap();
+        let (mut trace, outcome) = record_execution(&mut vm);
+        assert_eq!(outcome, Outcome::Success);
+        let proof = crate::prover::prove(&mut trace, &[]);
+        assert!(crate::prover::verify(&proof, &[]).is_ok());
+    }
+
+    #[test]
+    fn record_mod_prove_verify() {
+        let code = bytecode(&[
+            &instr(Opcode::Addi, 1, 0, 100),
+            &instr(Opcode::Addi, 2, 0, 7),
+            &instr(Opcode::Mod, 3, 1, 2), // 100 % 7 = 2
+            &instr(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(100_000);
+        vm.load(&code).unwrap();
+        let (mut trace, _) = record_execution(&mut vm);
+        assert_eq!(trace.rows[2].get(col::OP_RESULT), to_field(2)); // 100 % 7
+        let proof = crate::prover::prove(&mut trace, &[]);
+        assert!(crate::prover::verify(&proof, &[]).is_ok());
+    }
+
+    #[test]
+    fn record_branch_prove_verify() {
+        // Test BEQ (taken) and sequential flow
+        let code = bytecode(&[
+            &instr(Opcode::Addi, 1, 0, 10),
+            &instr(Opcode::Addi, 2, 0, 5),
+            &instr(Opcode::Bge, 1, 2, 8), // 10 >= 5 → skip next
+            &instr(Opcode::Halt, 0, 0, 0), // skipped
+            &instr(Opcode::Addi, 3, 0, 99),
+            &instr(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(100_000);
+        vm.load(&code).unwrap();
+        let (mut trace, outcome) = record_execution(&mut vm);
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(vm.cpu.read_gp(3), 99); // branch was taken
+        let proof = crate::prover::prove(&mut trace, &[]);
+        assert!(crate::prover::verify(&proof, &[]).is_ok());
+    }
+
+    #[test]
+    fn record_memory_prove_verify() {
+        use pyde_vm::isa::{encode_mem_immediate, MemWidth};
+        let store_imm = encode_mem_immediate(0, MemWidth::W64);
+        let load_imm = encode_mem_immediate(0, MemWidth::W64);
+
+        let code = bytecode(&[
+            &instr(Opcode::Addi, 1, 0, 0x010000), // heap addr
+            &instr(Opcode::Addi, 2, 0, 42),
+            &instr(Opcode::Store, 2, 1, store_imm), // mem[heap] = 42
+            &instr(Opcode::Load, 3, 1, load_imm),   // r3 = mem[heap] = 42
+            &instr(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(100_000);
+        vm.load(&code).unwrap();
+        let (mut trace, outcome) = record_execution(&mut vm);
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(vm.cpu.read_gp(3), 42);
+
+        // Check memory flags in trace
+        assert_eq!(trace.rows[2].get(col::IS_MEMORY_OP), Goldilocks::one()); // STORE
+        assert_eq!(trace.rows[2].get(col::MEM_IS_WRITE), Goldilocks::one());
+        assert_eq!(trace.rows[3].get(col::IS_MEMORY_OP), Goldilocks::one()); // LOAD
+
+        let proof = crate::prover::prove(&mut trace, &[]);
+        assert!(crate::prover::verify(&proof, &[]).is_ok());
+    }
+
+    #[test]
+    fn record_shift_prove_verify() {
+        let code = bytecode(&[
+            &instr(Opcode::Addi, 1, 0, 100),
+            &instr(Opcode::Addi, 2, 0, 3),
+            &instr(Opcode::Shl, 3, 1, 2), // 100 << 3 = 800
+            &instr(Opcode::Shr, 4, 3, 2), // 800 >> 3 = 100
+            &instr(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(100_000);
+        vm.load(&code).unwrap();
+        let (mut trace, _) = record_execution(&mut vm);
+        assert_eq!(vm.cpu.read_gp(3), 800);
+        assert_eq!(vm.cpu.read_gp(4), 100);
+        let proof = crate::prover::prove(&mut trace, &[]);
+        assert!(crate::prover::verify(&proof, &[]).is_ok());
+    }
+
+    #[test]
+    fn record_comparison_prove_verify() {
+        let code = bytecode(&[
+            &instr(Opcode::Addi, 1, 0, 10),
+            &instr(Opcode::Addi, 2, 0, 20),
+            &instr(Opcode::Lt, 3, 1, 2), // 10 < 20 = 1
+            &instr(Opcode::Gt, 4, 1, 2), // 10 > 20 = 0
+            &instr(Opcode::Eq, 5, 1, 1), // 10 == 10 = 1 (comparing r1 with r1)
+            &instr(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(100_000);
+        vm.load(&code).unwrap();
+        let (mut trace, _) = record_execution(&mut vm);
+        assert_eq!(vm.cpu.read_gp(3), 1); // LT true
+        assert_eq!(vm.cpu.read_gp(4), 0); // GT false
+        assert_eq!(vm.cpu.read_gp(5), 1); // EQ true
+        let proof = crate::prover::prove(&mut trace, &[]);
+        assert!(crate::prover::verify(&proof, &[]).is_ok());
+    }
+
+    #[test]
+    fn record_mixed_program_prove_verify() {
+        // Token transfer simulation: arithmetic + comparison + branch + memory
+        use pyde_vm::isa::{encode_mem_immediate, MemWidth};
+        let store_imm = encode_mem_immediate(0, MemWidth::W64);
+
+        let code = bytecode(&[
+            &instr(Opcode::Addi, 1, 0, 1000),       // balance = 1000
+            &instr(Opcode::Addi, 2, 0, 250),        // amount = 250
+            &instr(Opcode::Sub, 3, 1, 2),           // new_balance = 750
+            &instr(Opcode::Addi, 4, 0, 500),        // recipient = 500
+            &instr(Opcode::Add, 5, 4, 2),           // recipient_new = 750
+            &instr(Opcode::Addi, 6, 0, 0x010000),   // heap addr
+            &instr(Opcode::Store, 3, 6, store_imm), // store new_balance
+            &instr(Opcode::Mul, 7, 3, 2),           // 750 * 250 = 187500
+            &instr(Opcode::Addi, 8, 0, 100),
+            &instr(Opcode::Div, 9, 7, 8),           // 187500 / 100 = 1875
+            &instr(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::with_gas_limit(100_000);
+        vm.load(&code).unwrap();
+        let (mut trace, outcome) = record_execution(&mut vm);
+        assert_eq!(outcome, Outcome::Success);
+        assert_eq!(vm.cpu.read_gp(9), 1875);
+
         let proof = crate::prover::prove(&mut trace, &[]);
         assert!(crate::prover::verify(&proof, &[]).is_ok());
     }
