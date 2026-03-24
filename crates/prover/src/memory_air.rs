@@ -187,9 +187,12 @@ pub fn verify_memory(
 }
 
 /// Extract memory accesses from an execution trace.
+/// For 64-bit ops (LOAD/STORE/PUSH/POP): one access with value = mem_val[0].
+/// For 256-bit ops (WLOAD/WSTORE): four accesses, one per limb.
 pub fn extract_memory_accesses(
     trace: &crate::trace::ExecutionTrace,
 ) -> Vec<MemoryAccess> {
+    use crate::constraint::opcodes;
     use crate::trace::col;
     use p3_field::PrimeField64;
 
@@ -197,12 +200,29 @@ pub fn extract_memory_accesses(
 
     for (step, row) in trace.rows.iter().enumerate() {
         if row.get(col::IS_MEMORY_OP) == Goldilocks::one() {
-            accesses.push(MemoryAccess {
-                addr: row.get(col::MEM_ADDR).as_canonical_u64(),
-                value: row.get(col::mem_val(0)).as_canonical_u64(),
-                is_write: row.get(col::MEM_IS_WRITE) == Goldilocks::one(),
-                timestamp: step as u64,
-            });
+            let opcode = row.get(col::OPCODE).as_canonical_u64();
+            let addr = row.get(col::MEM_ADDR).as_canonical_u64();
+            let is_write = row.get(col::MEM_IS_WRITE) == Goldilocks::one();
+
+            if opcode == opcodes::WLOAD || opcode == opcodes::WSTORE {
+                // 256-bit: capture all 4 limbs as separate accesses
+                for limb in 0..4 {
+                    accesses.push(MemoryAccess {
+                        addr: addr + (limb as u64 * 8), // each limb at 8-byte offset
+                        value: row.get(col::mem_val(limb)).as_canonical_u64(),
+                        is_write,
+                        timestamp: step as u64 * 4 + limb as u64, // unique timestamp per limb
+                    });
+                }
+            } else {
+                // 64-bit: single access
+                accesses.push(MemoryAccess {
+                    addr,
+                    value: row.get(col::mem_val(0)).as_canonical_u64(),
+                    is_write,
+                    timestamp: step as u64 * 4, // multiply by 4 to leave room for wide limbs
+                });
+            }
         }
     }
 

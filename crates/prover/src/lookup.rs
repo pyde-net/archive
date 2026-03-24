@@ -116,7 +116,7 @@ pub fn build_lookup_table() -> Vec<BusEntry> {
 }
 
 /// Collect bitwise lookup queries from execution trace data.
-/// Called by the multi-table prover to extract lookup bus entries.
+/// Handles both GP (64-bit) and wide (256-bit) bitwise operations.
 pub fn collect_bitwise_queries(
     opcode: u64,
     op_a: u64,
@@ -132,6 +132,25 @@ pub fn collect_bitwise_queries(
         _ => return None,
     };
     Some(decompose_gp_bitwise(op_a, op_b, result, op))
+}
+
+/// Collect wide bitwise lookup queries from trace row data.
+/// Wide ops decompose 4 limbs × 8 bytes = 32 queries per operation.
+pub fn collect_wide_bitwise_queries(
+    opcode: u64,
+    a_limbs: &[u64; 4],
+    b_limbs: &[u64; 4],
+    result_limbs: &[u64; 4],
+) -> Option<Vec<LookupQuery>> {
+    use crate::constraint::opcodes;
+    let op = match opcode {
+        opcodes::WAND => BitwiseOp::And,
+        opcodes::WOR => BitwiseOp::Or,
+        opcodes::WXOR => BitwiseOp::Xor,
+        opcodes::WNOT => BitwiseOp::Not,
+        _ => return None,
+    };
+    Some(decompose_wide_bitwise(a_limbs, b_limbs, result_limbs, op))
 }
 
 /// Verify bitwise operations via cross-table permutation.

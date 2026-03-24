@@ -118,6 +118,23 @@ pub fn extract_range_check_requests(
             });
         }
 
+        // SHR/SAR: verify shift result is valid u64
+        // remainder = op_a - result * 2^shift, must be non-negative and < 2^shift
+        if op == opcodes::SHR || op == opcodes::SAR {
+            // Range-check the result (must be valid u64)
+            requests.push(RangeCheckRequest {
+                value: row.get(col::OP_RESULT).as_canonical_u64(),
+            });
+            // Range-check the implicit remainder: op_a - result * op_aux
+            let op_a = row.get(col::OP_A).as_canonical_u64();
+            let result_val = row.get(col::OP_RESULT).as_canonical_u64();
+            let power = row.get(col::OP_AUX).as_canonical_u64();
+            if power != 0 {
+                let remainder = op_a.wrapping_sub(result_val.wrapping_mul(power));
+                requests.push(RangeCheckRequest { value: remainder });
+            }
+        }
+
         // Wide arithmetic carries
         if op == opcodes::WADD || op == opcodes::WSUB || op == opcodes::WMUL
             || op == opcodes::WDIV || op == opcodes::WMOD

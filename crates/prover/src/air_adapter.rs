@@ -560,11 +560,34 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         // These are verified via the logup lookup argument (Phase 3).
         // No polynomial constraints — correctness from the lookup table.
 
-        // ========== Syscalls verified via cross-table / public inputs ==========
-        // POSEIDON (0x30): hash result → Poseidon2 cross-table bus
-        // COMMIT (0x3A): value → public output transcript
-        // BLOCKHASH (0x25): result → public input
-        // CALLVALUE (0x24): wide result → public input
-        // These do not need polynomial constraints in the main AIR.
+        // ========== Syscalls: context reads verified externally ==========
+        //
+        // These opcodes read from the execution context (block header, tx data).
+        // Their results are verified by the VERIFIER checking against public inputs:
+        //
+        //   CALLER (0x23): result = tx.from (in public inputs)
+        //   CALLVALUE (0x24): wide result = tx.value (in public inputs)
+        //   BLOCKHASH (0x25): result = block_hash (in public inputs)
+        //   POSEIDON (0x30): hash result verified via hash_bus cross-table
+        //   COMMIT (0x3A): value committed to public output transcript
+        //   CREATE (0x28): address = Poseidon2(deployer, nonce) via hash_bus
+        //   CALLEXT (0x26): sub-execution verified via recursive proof
+        //   DELEGATE (0x27): sub-execution verified via recursive proof
+        //   LOG (0x2A): event data committed to log_root (not state-changing)
+        //
+        // The AIR ensures:
+        // 1. CALLER/BLOCKHASH results go to gp[rd] (via is_gp_write gate)
+        // 2. CALLVALUE results go to wide registers (set by recorder)
+        // 3. CALLEXT/DELEGATE increment call_depth (constrained above)
+        // 4. LOG does not modify storage (constrained above)
+        //
+        // What the VERIFIER must check (outside the AIR):
+        // - CALLER result == tx.from from the block header
+        // - CALLVALUE result == tx.value from the block header
+        // - BLOCKHASH result == the actual block hash at the requested height
+        // - POSEIDON inputs/outputs match the hash_bus cross-table
+        //
+        // These checks happen in verify_block_proof / verify_group_proof,
+        // not in polynomial constraints.
     }
 }

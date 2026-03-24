@@ -130,6 +130,26 @@ pub fn extract_hash_requests(
                 timestamp: step as u64,
             });
         }
+
+        // POSEIDON opcode (0x30): explicit hash instruction
+        if op == opcodes::POSEIDON {
+            // Input comes from memory (captured in mem_val columns)
+            let input_bytes: Vec<u8> = (0..4)
+                .flat_map(|i| row.get(col::mem_val(i)).as_canonical_u64().to_le_bytes().to_vec())
+                .collect();
+
+            let hash = pyde_crypto::poseidon2::poseidon2_hash(&input_bytes);
+            let hash_bytes = hash.to_bytes();
+            let output_limbs: [u64; 4] = core::array::from_fn(|i| {
+                u64::from_le_bytes(hash_bytes[i * 8..(i + 1) * 8].try_into().unwrap())
+            });
+
+            requests.push(HashRequest {
+                input: input_bytes,
+                output_limbs,
+                timestamp: step as u64,
+            });
+        }
     }
 
     requests
