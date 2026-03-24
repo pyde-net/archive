@@ -136,11 +136,40 @@ impl<'a> Lexer<'a> {
     }
 
     fn next_token(&mut self) -> Token {
-        // Skip whitespace and comments
+        // Skip whitespace and comments (but capture doc comments)
         loop {
             self.skip_whitespace();
             if self.pos + 1 < self.src.len() && self.src[self.pos] == b'/' {
                 if self.src[self.pos + 1] == b'/' {
+                    // Check for doc comment: ///
+                    if self.pos + 2 < self.src.len() && self.src[self.pos + 2] == b'/'
+                        && (self.pos + 3 >= self.src.len() || self.src[self.pos + 3] != b'/')
+                    {
+                        // Doc comment — return as token
+                        let start = self.pos;
+                        let start_line = self.line;
+                        let start_col = self.col;
+                        self.advance(); // /
+                        self.advance(); // /
+                        self.advance(); // /
+                        // Skip optional leading space
+                        if self.peek() == Some(b' ') {
+                            self.advance();
+                        }
+                        let content_start = self.pos;
+                        while let Some(ch) = self.peek() {
+                            if ch == b'\n' { break; }
+                            self.advance();
+                        }
+                        let content = std::str::from_utf8(&self.src[content_start..self.pos])
+                            .unwrap_or("")
+                            .to_string();
+                        return Token {
+                            kind: TokenKind::DocComment(content),
+                            span: self.make_span(start, start_line, start_col),
+                        };
+                    }
+                    // Regular line comment — skip
                     self.advance();
                     self.advance();
                     self.skip_line_comment();
@@ -585,7 +614,7 @@ mod tests {
     fn lex_all_keywords() {
         let src = "contract storage struct interface event error enum const \
                    fn pub let mut if else for while match return emit try \
-                   use module in as break continue self true false";
+                   use module in as break continue self type true false";
         let kinds = lex(src);
         assert_eq!(kinds, vec![
             TokenKind::Contract, TokenKind::Storage, TokenKind::Struct,
@@ -595,7 +624,8 @@ mod tests {
             TokenKind::For, TokenKind::While, TokenKind::Match, TokenKind::Return,
             TokenKind::Emit, TokenKind::Try, TokenKind::Use, TokenKind::Module,
             TokenKind::In, TokenKind::As, TokenKind::Break, TokenKind::Continue,
-            TokenKind::SelfKw, TokenKind::True, TokenKind::False, TokenKind::Eof,
+            TokenKind::SelfKw, TokenKind::TypeKw, TokenKind::True, TokenKind::False,
+            TokenKind::Eof,
         ]);
     }
 

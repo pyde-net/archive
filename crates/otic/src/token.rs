@@ -61,6 +61,7 @@ pub enum TokenKind {
     Break,
     Continue,
     SelfKw,    // `self`
+    TypeKw,    // `type` alias
 
     // === Attributes ===
     /// `#[...]` attribute (the content is stored as string)
@@ -131,6 +132,8 @@ pub enum TokenKind {
     Question,   // ?
 
     // === Special ===
+    /// Doc comment: `/// description text`
+    DocComment(String),
     /// End of file.
     Eof,
 }
@@ -166,6 +169,7 @@ impl TokenKind {
             "break" => Some(TokenKind::Break),
             "continue" => Some(TokenKind::Continue),
             "self" => Some(TokenKind::SelfKw),
+            "type" => Some(TokenKind::TypeKw),
             "true" => Some(TokenKind::True),
             "false" => Some(TokenKind::False),
             _ => None,
@@ -183,7 +187,7 @@ impl TokenKind {
             | TokenKind::For | TokenKind::While | TokenKind::Match | TokenKind::Return
             | TokenKind::Emit | TokenKind::Try | TokenKind::Use | TokenKind::Module
             | TokenKind::In | TokenKind::As | TokenKind::Break | TokenKind::Continue
-            | TokenKind::SelfKw | TokenKind::True | TokenKind::False
+            | TokenKind::SelfKw | TokenKind::TypeKw | TokenKind::True | TokenKind::False
         )
     }
 
@@ -271,6 +275,7 @@ impl TokenKind {
             TokenKind::Break => "break",
             TokenKind::Continue => "continue",
             TokenKind::SelfKw => "self",
+            TokenKind::TypeKw => "type",
             TokenKind::Enum => "enum",
             TokenKind::Const => "const",
             // Attributes
@@ -326,6 +331,7 @@ impl TokenKind {
             TokenKind::Underscore => "_",
             TokenKind::Question => "?",
             // Special
+            TokenKind::DocComment(_) => "doc comment",
             TokenKind::Eof => "end of file",
         }
     }
@@ -338,6 +344,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::StringLiteral(s) => write!(f, "\"{s}\""),
             TokenKind::Ident(s) => write!(f, "{s}"),
             TokenKind::Attribute(s) => write!(f, "#[{s}]"),
+            TokenKind::DocComment(s) => write!(f, "/// {s}"),
             _ => write!(f, "{}", self.description()),
         }
     }

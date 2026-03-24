@@ -281,7 +281,7 @@ contract NameRegistry {
         // Check for valid characters (simplified on-chain check)
         for i in 0..len {
             let c = name.char_at(i);
-            let valid = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+            let valid = (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95;
             require!(valid, InvalidName {});
         }
     }
