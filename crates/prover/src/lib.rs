@@ -22,5 +22,6 @@ pub mod trace;
 pub mod constraint;
 pub mod air_adapter;
 pub mod prover;
+pub mod recorder;
 pub mod cross_table;
 pub mod registry;
