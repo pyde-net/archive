@@ -27,6 +27,7 @@ pub mod lookup;
 pub mod memory_air;
 pub mod range_check;
 pub mod hash_bus;
+pub mod storage_proof;
 pub mod multi_table;
 pub mod pipeline;
 pub mod cross_table;
