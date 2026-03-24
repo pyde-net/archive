@@ -397,7 +397,7 @@ contract NftBattle {
         return 1; // Minimum 1 damage
     }
 
-    fn try_level_up(token_id: u256, mut fighter: Fighter) {
+    fn try_level_up(token_id: u256, fighter: Fighter) {
         while fighter.level < self.max_level {
             let required = self.level_xp_table[fighter.level + 1];
             if fighter.xp >= required {
