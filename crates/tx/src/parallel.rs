@@ -1,56 +1,94 @@
-//! Parallel execution scheduler: groups non-conflicting transactions
-//! for concurrent execution based on access list analysis.
+//! Conflict-based execution scheduler: groups conflicting transactions
+//! for sequential execution, enabling parallel proving between groups.
 //!
 //! Two transactions conflict if their access lists overlap with at least
-//! one write. Non-conflicting transactions can execute in parallel.
-//! Conflicting transactions fall back to sequential execution.
+//! one write. Transitively conflicting transactions are grouped together
+//! (connected components in the conflict graph).
 //!
-//! Algorithm:
-//! 1. Build conflict graph from access lists
-//! 2. Graph-color to produce non-conflicting groups
-//! 3. Groups execute in parallel; transactions within a group are independent
+//! ## Execution Model
+//!
+//! - Within a group: transactions execute SEQUENTIALLY (they conflict)
+//! - Between groups: fully PARALLEL (disjoint access lists)
+//! - All groups start from the SAME pre_state_root
+//!
+//! ## Algorithm
+//!
+//! 1. Build conflict graph from access lists (pairwise conflict detection)
+//! 2. Find connected components via union-find (O(n * alpha(n)))
+//! 3. Each component = one group of transitively conflicting transactions
 
 use crate::types::{AccessEntry, Transaction};
 use pyde_account::address::Address;
 use std::collections::{HashMap, HashSet};
 
-/// A group of non-conflicting transactions that can execute in parallel.
+/// A group of conflicting transactions that must execute sequentially.
+/// Different groups are independent and can be proven in parallel.
 #[derive(Clone, Debug)]
 pub struct ExecutionGroup {
     /// Indices into the original transaction list.
     pub tx_indices: Vec<usize>,
 }
 
-/// Result of scheduling: ordered groups for execution.
+/// Result of scheduling: conflict groups for parallel proving.
 #[derive(Clone, Debug)]
 pub struct ExecutionSchedule {
-    /// Groups in execution order. Each group runs in parallel internally,
-    /// groups execute sequentially.
+    /// Conflict groups. Each group executes sequentially internally.
+    /// Groups are independent and can execute/prove in parallel.
+    /// All groups start from the same pre_state_root.
     pub groups: Vec<ExecutionGroup>,
     /// Total number of transactions.
     pub total_txs: usize,
 }
 
 impl ExecutionSchedule {
-    /// Number of groups (sequential steps).
+    /// Number of groups (parallel proving units).
     pub fn group_count(&self) -> usize {
         self.groups.len()
     }
 
-    /// Maximum parallelism (largest group size).
-    pub fn max_parallelism(&self) -> usize {
+    /// Largest group size (bottleneck for sequential execution within a group).
+    pub fn max_group_size(&self) -> usize {
         self.groups.iter().map(|g| g.tx_indices.len()).max().unwrap_or(0)
     }
 }
 
-/// A storage key accessed by a transaction: (contract_address, storage_key).
-type StorageAccess = (Address, [u8; 32]);
+/// Union-Find data structure for connected components.
+struct UnionFind {
+    parent: Vec<usize>,
+    rank: Vec<usize>,
+}
 
-/// Access type: read-only or read-write.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AccessType {
-    Read,
-    Write,
+impl UnionFind {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+            rank: vec![0; n],
+        }
+    }
+
+    fn find(&mut self, x: usize) -> usize {
+        if self.parent[x] != x {
+            self.parent[x] = self.find(self.parent[x]); // path compression
+        }
+        self.parent[x]
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        // union by rank
+        if self.rank[ra] < self.rank[rb] {
+            self.parent[ra] = rb;
+        } else if self.rank[ra] > self.rank[rb] {
+            self.parent[rb] = ra;
+        } else {
+            self.parent[rb] = ra;
+            self.rank[ra] += 1;
+        }
+    }
 }
 
 /// Detect conflicts between two transactions based on their access lists.
@@ -108,10 +146,12 @@ pub fn conflicts(tx_a: &Transaction, tx_b: &Transaction) -> bool {
     false
 }
 
-/// Schedule transactions into parallel execution groups.
+/// Schedule transactions into conflict groups via connected components.
 ///
-/// Uses greedy graph coloring: for each transaction, assign it to the first
-/// group where it doesn't conflict with any existing transaction in that group.
+/// Finds connected components in the conflict graph using union-find.
+/// Each component = one group of transitively conflicting transactions
+/// that must execute sequentially. Groups are independent and can be
+/// proven in parallel from the same pre_state_root.
 pub fn schedule(txs: &[Transaction]) -> ExecutionSchedule {
     let n = txs.len();
     if n == 0 {
@@ -121,32 +161,29 @@ pub fn schedule(txs: &[Transaction]) -> ExecutionSchedule {
         };
     }
 
-    // Greedy coloring: assign each tx to the first compatible group
-    let mut groups: Vec<ExecutionGroup> = Vec::new();
+    // Build connected components via union-find
+    let mut uf = UnionFind::new(n);
 
     for i in 0..n {
-        let mut assigned = false;
-
-        for group in groups.iter_mut() {
-            // Check if tx[i] conflicts with any tx already in this group
-            let has_conflict = group
-                .tx_indices
-                .iter()
-                .any(|&j| conflicts(&txs[i], &txs[j]));
-
-            if !has_conflict {
-                group.tx_indices.push(i);
-                assigned = true;
-                break;
+        for j in (i + 1)..n {
+            if conflicts(&txs[i], &txs[j]) {
+                uf.union(i, j);
             }
         }
-
-        if !assigned {
-            groups.push(ExecutionGroup {
-                tx_indices: vec![i],
-            });
-        }
     }
+
+    // Collect components: root → tx indices
+    let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        components.entry(uf.find(i)).or_default().push(i);
+    }
+
+    // Convert to groups (sorted by first tx index for deterministic order)
+    let mut groups: Vec<ExecutionGroup> = components
+        .into_values()
+        .map(|tx_indices| ExecutionGroup { tx_indices })
+        .collect();
+    groups.sort_by_key(|g| g.tx_indices[0]);
 
     ExecutionSchedule {
         groups,
@@ -197,6 +234,7 @@ pub fn access_lists_conflict(a: &[AccessEntry], b: &[AccessEntry]) -> bool {
 
 /// Schedule from raw access lists (works for both Transaction and EncryptedTx).
 /// Each element in `access_lists` is the access list for one transaction.
+/// Uses connected components — same algorithm as `schedule()`.
 pub fn schedule_from_access_lists(access_lists: &[Vec<AccessEntry>]) -> ExecutionSchedule {
     let n = access_lists.len();
     if n == 0 {
@@ -206,30 +244,26 @@ pub fn schedule_from_access_lists(access_lists: &[Vec<AccessEntry>]) -> Executio
         };
     }
 
-    let mut groups: Vec<ExecutionGroup> = Vec::new();
+    let mut uf = UnionFind::new(n);
 
     for i in 0..n {
-        let mut assigned = false;
-
-        for group in groups.iter_mut() {
-            let has_conflict = group
-                .tx_indices
-                .iter()
-                .any(|&j| access_lists_conflict(&access_lists[i], &access_lists[j]));
-
-            if !has_conflict {
-                group.tx_indices.push(i);
-                assigned = true;
-                break;
+        for j in (i + 1)..n {
+            if access_lists_conflict(&access_lists[i], &access_lists[j]) {
+                uf.union(i, j);
             }
         }
-
-        if !assigned {
-            groups.push(ExecutionGroup {
-                tx_indices: vec![i],
-            });
-        }
     }
+
+    let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        components.entry(uf.find(i)).or_default().push(i);
+    }
+
+    let mut groups: Vec<ExecutionGroup> = components
+        .into_values()
+        .map(|tx_indices| ExecutionGroup { tx_indices })
+        .collect();
+    groups.sort_by_key(|g| g.tx_indices[0]);
 
     ExecutionSchedule {
         groups,
@@ -284,7 +318,7 @@ mod tests {
         }
     }
 
-    // ========== Task 0411: Conflict detection ==========
+    // ========== Conflict detection ==========
 
     #[test]
     fn no_conflict_different_keys() {
@@ -318,7 +352,6 @@ mod tests {
 
     #[test]
     fn no_conflict_read_read_same_key() {
-        // Two reads on same key = parallel safe
         let key = [0xAA; 32];
         let tx_a = make_tx_with_access(vec![read_access(0x01, &[key])]);
         let tx_b = make_tx_with_access(vec![read_access(0x01, &[key])]);
@@ -327,7 +360,6 @@ mod tests {
 
     #[test]
     fn conflict_read_write_same_key() {
-        // One reads, other writes same key = conflict
         let key = [0xAA; 32];
         let tx_a = make_tx_with_access(vec![read_access(0x01, &[key])]);
         let tx_b = make_tx_with_access(vec![write_access(0x01, &[key])]);
@@ -336,16 +368,16 @@ mod tests {
 
     #[test]
     fn no_conflict_same_address_different_write_keys() {
-        // Same contract, different write keys = parallel safe
         let tx_a = make_tx_with_access(vec![write_access(0x01, &[[0xAA; 32]])]);
         let tx_b = make_tx_with_access(vec![write_access(0x01, &[[0xBB; 32]])]);
         assert!(!conflicts(&tx_a, &tx_b));
     }
 
-    // ========== Task 0412: Transaction grouping ==========
+    // ========== Connected components grouping ==========
 
     #[test]
-    fn non_conflicting_in_same_group() {
+    fn non_conflicting_each_in_own_group() {
+        // Non-conflicting txs are independent → each in its own group
         let txs = vec![
             make_tx_with_access(vec![write_access(0x01, &[[0xAA; 32]])]),
             make_tx_with_access(vec![write_access(0x01, &[[0xBB; 32]])]),
@@ -353,28 +385,24 @@ mod tests {
         ];
 
         let schedule = schedule(&txs);
-        assert_eq!(schedule.group_count(), 1); // all non-conflicting
-        assert_eq!(schedule.max_parallelism(), 3);
+        // Each tx is independent → 3 separate groups (provable in parallel)
+        assert_eq!(schedule.group_count(), 3);
     }
 
-    // ========== Task 0417: Two non-conflicting execute in parallel ==========
-
     #[test]
-    fn two_non_conflicting_parallel() {
+    fn two_non_conflicting_separate_groups() {
         let txs = vec![
             make_tx_with_access(vec![write_access(0x01, &[[0x11; 32]])]),
             make_tx_with_access(vec![write_access(0x02, &[[0x22; 32]])]),
         ];
 
         let schedule = schedule(&txs);
-        assert_eq!(schedule.group_count(), 1);
-        assert_eq!(schedule.groups[0].tx_indices, vec![0, 1]);
+        // Independent → 2 groups (parallel provable)
+        assert_eq!(schedule.group_count(), 2);
     }
 
-    // ========== Task 0418: Two conflicting execute sequentially ==========
-
     #[test]
-    fn two_conflicting_sequential() {
+    fn two_conflicting_same_group() {
         let key = [0xAA; 32];
         let txs = vec![
             make_tx_with_access(vec![write_access(0x01, &[key])]),
@@ -382,45 +410,84 @@ mod tests {
         ];
 
         let schedule = schedule(&txs);
-        assert_eq!(schedule.group_count(), 2); // separate groups
-        assert_eq!(schedule.groups[0].tx_indices, vec![0]);
-        assert_eq!(schedule.groups[1].tx_indices, vec![1]);
+        // Conflicting → same group (sequential execution)
+        assert_eq!(schedule.group_count(), 1);
+        assert_eq!(schedule.groups[0].tx_indices, vec![0, 1]);
     }
 
-    // ========== Task 0416: Sequential fallback ==========
-
     #[test]
-    fn all_conflicting_fully_sequential() {
+    fn all_conflicting_single_group() {
         let key = [0xFF; 32];
         let txs: Vec<Transaction> = (0..5)
             .map(|_| make_tx_with_access(vec![write_access(0x01, &[key])]))
             .collect();
 
         let schedule = schedule(&txs);
-        assert_eq!(schedule.group_count(), 5); // each in its own group
+        // All conflict on same key → one group (all sequential)
+        assert_eq!(schedule.group_count(), 1);
+        assert_eq!(schedule.groups[0].tx_indices, vec![0, 1, 2, 3, 4]);
     }
 
-    // ========== Mixed scenario ==========
-
     #[test]
-    fn mixed_parallel_and_sequential() {
-        let key_shared = [0xAA; 32];
+    fn transitive_conflict_merged() {
+        // TX0 conflicts with TX1 (key A)
+        // TX1 conflicts with TX2 (key B)
+        // TX0 does NOT conflict with TX2 directly
+        // But transitively: TX0-TX1-TX2 are all in one component
+        let key_a = [0xAA; 32];
+        let key_b = [0xBB; 32];
         let txs = vec![
-            make_tx_with_access(vec![write_access(0x01, &[key_shared])]),     // group 0
-            make_tx_with_access(vec![write_access(0x01, &[key_shared])]),     // group 1 (conflicts with 0)
-            make_tx_with_access(vec![write_access(0x02, &[[0xBB; 32]])]),     // group 0 (no conflict)
-            make_tx_with_access(vec![write_access(0x03, &[[0xCC; 32]])]),     // group 0 (no conflict)
+            make_tx_with_access(vec![write_access(0x01, &[key_a])]),         // TX0: writes A
+            make_tx_with_access(vec![write_access(0x01, &[key_a, key_b])]),  // TX1: writes A, B
+            make_tx_with_access(vec![write_access(0x01, &[key_b])]),         // TX2: writes B
         ];
 
         let schedule = schedule(&txs);
-        // tx0 conflicts with tx1, so tx1 gets its own group
-        // tx2, tx3 don't conflict with tx0 → same group as tx0
-        assert_eq!(schedule.group_count(), 2);
-        assert_eq!(schedule.groups[0].tx_indices, vec![0, 2, 3]);
-        assert_eq!(schedule.groups[1].tx_indices, vec![1]);
+        // All transitively connected → one group
+        assert_eq!(schedule.group_count(), 1);
+        assert_eq!(schedule.groups[0].tx_indices, vec![0, 1, 2]);
     }
 
-    // ========== Task 0419: Same state root ==========
+    #[test]
+    fn mixed_conflict_and_independent() {
+        let key_shared = [0xAA; 32];
+        let txs = vec![
+            make_tx_with_access(vec![write_access(0x01, &[key_shared])]),     // TX0: conflicts with TX1
+            make_tx_with_access(vec![write_access(0x01, &[key_shared])]),     // TX1: conflicts with TX0
+            make_tx_with_access(vec![write_access(0x02, &[[0xBB; 32]])]),     // TX2: independent
+            make_tx_with_access(vec![write_access(0x03, &[[0xCC; 32]])]),     // TX3: independent
+        ];
+
+        let schedule = schedule(&txs);
+        // TX0+TX1 = one group, TX2 = own group, TX3 = own group → 3 groups
+        assert_eq!(schedule.group_count(), 3);
+        assert_eq!(schedule.groups[0].tx_indices, vec![0, 1]); // conflict group
+        assert_eq!(schedule.groups[1].tx_indices, vec![2]);     // independent
+        assert_eq!(schedule.groups[2].tx_indices, vec![3]);     // independent
+    }
+
+    #[test]
+    fn two_separate_conflict_clusters() {
+        // Cluster 1: TX0, TX1 conflict on key A
+        // Cluster 2: TX2, TX3 conflict on key B
+        // Clusters are independent
+        let key_a = [0xAA; 32];
+        let key_b = [0xBB; 32];
+        let txs = vec![
+            make_tx_with_access(vec![write_access(0x01, &[key_a])]),  // cluster 1
+            make_tx_with_access(vec![write_access(0x01, &[key_a])]),  // cluster 1
+            make_tx_with_access(vec![write_access(0x02, &[key_b])]),  // cluster 2
+            make_tx_with_access(vec![write_access(0x02, &[key_b])]),  // cluster 2
+        ];
+
+        let schedule = schedule(&txs);
+        // 2 independent clusters → 2 groups (provable in parallel)
+        assert_eq!(schedule.group_count(), 2);
+        assert_eq!(schedule.groups[0].tx_indices, vec![0, 1]);
+        assert_eq!(schedule.groups[1].tx_indices, vec![2, 3]);
+    }
+
+    // ========== Invariants ==========
 
     #[test]
     fn schedule_preserves_all_txs() {
@@ -442,12 +509,57 @@ mod tests {
         assert_eq!(all_indices, (0..10).collect::<Vec<_>>());
     }
 
-    // ========== Empty ==========
+    #[test]
+    fn groups_are_disjoint() {
+        let key = [0xAA; 32];
+        let txs = vec![
+            make_tx_with_access(vec![write_access(0x01, &[key])]),
+            make_tx_with_access(vec![write_access(0x01, &[key])]),
+            make_tx_with_access(vec![write_access(0x02, &[[0xBB; 32]])]),
+            make_tx_with_access(vec![write_access(0x03, &[[0xCC; 32]])]),
+        ];
+
+        let schedule = schedule(&txs);
+
+        // Verify no cross-group conflicts
+        for (i, g1) in schedule.groups.iter().enumerate() {
+            for g2 in schedule.groups.iter().skip(i + 1) {
+                for &a in &g1.tx_indices {
+                    for &b in &g2.tx_indices {
+                        assert!(!conflicts(&txs[a], &txs[b]),
+                            "tx {} and tx {} conflict but are in different groups", a, b);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn empty_schedule() {
         let schedule = schedule(&[]);
         assert_eq!(schedule.group_count(), 0);
         assert_eq!(schedule.total_txs, 0);
+    }
+
+    #[test]
+    fn single_tx() {
+        let txs = vec![
+            make_tx_with_access(vec![write_access(0x01, &[[0xAA; 32]])]),
+        ];
+        let schedule = schedule(&txs);
+        assert_eq!(schedule.group_count(), 1);
+        assert_eq!(schedule.groups[0].tx_indices, vec![0]);
+    }
+
+    #[test]
+    fn empty_access_lists_each_independent() {
+        // Txs with no access lists don't conflict with anything → each in own group
+        let txs = vec![
+            make_tx_with_access(vec![]),
+            make_tx_with_access(vec![]),
+            make_tx_with_access(vec![]),
+        ];
+        let schedule = schedule(&txs);
+        assert_eq!(schedule.group_count(), 3);
     }
 }
