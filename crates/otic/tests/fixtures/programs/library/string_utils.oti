@@ -28,12 +28,12 @@ pub fn equals(a: String, b: String) -> bool {
 
 /// Concatenates two strings.
 pub fn concat(a: String, b: String) -> String {
-    return a + b;
+    return a.concat(b);
 }
 
 /// Concatenates three strings.
 pub fn concat3(a: String, b: String, c: String) -> String {
-    return a + b + c;
+    return a.concat(b).concat(c);
 }
 
 /// Returns a substring from start index (inclusive) to end index (exclusive).
@@ -113,7 +113,7 @@ pub fn index_of(haystack: String, needle: String) -> u64 {
 pub fn pad_left(s: String, target_len: u64, pad: String) -> String {
     let mut result = s;
     while result.len() < target_len {
-        result = pad + result;
+        result = pad.concat(result);
     }
     return result;
 }
@@ -122,7 +122,7 @@ pub fn pad_left(s: String, target_len: u64, pad: String) -> String {
 pub fn pad_right(s: String, target_len: u64, pad: String) -> String {
     let mut result = s;
     while result.len() < target_len {
-        result = result + pad;
+        result = result.concat(pad);
     }
     return result;
 }
@@ -131,7 +131,7 @@ pub fn pad_right(s: String, target_len: u64, pad: String) -> String {
 pub fn repeat(s: String, n: u64) -> String {
     let mut result = "";
     for i in 0u64..n {
-        result = result + s;
+        result = result.concat(s);
     }
     return result;
 }
@@ -159,7 +159,7 @@ pub fn u256_to_string(value: u256) -> String {
             8u256 => "8",
             9u256 => "9",
         };
-        result = digit_char + result;
+        result = digit_char.concat(result);
         remaining = remaining / 10u256;
     }
 
@@ -193,7 +193,7 @@ fn nibble_to_hex(n: u8) -> String {
 pub fn byte_to_hex(b: u8) -> String {
     let high = nibble_to_hex(b / 16u8);
     let low = nibble_to_hex(b % 16u8);
-    return high + low;
+    return high.concat(low);
 }
 
 /// Converts an Address to its lowercase hex string with "0x" prefix.
@@ -201,7 +201,7 @@ pub fn address_to_hex_string(addr: Address) -> String {
     let raw: bytes = addr.to_bytes();
     let mut result = "0x";
     for i in 0u64..20u64 {
-        result = result + byte_to_hex(raw[i]);
+        result = result.concat(byte_to_hex(raw[i]));
     }
     return result;
 }
