@@ -111,8 +111,10 @@ pub fn extract_range_check_requests(
     for row in &trace.rows {
         let op = row.get(col::OPCODE).as_canonical_u64();
 
-        // Comparison diffs
-        if op == opcodes::LT || op == opcodes::GT || op == opcodes::SLT || op == opcodes::SGT {
+        // Comparison diffs (LT/GT/SLT/SGT AND branch comparisons BLT/BGE)
+        if op == opcodes::LT || op == opcodes::GT || op == opcodes::SLT || op == opcodes::SGT
+            || op == opcodes::BLT || op == opcodes::BGE
+        {
             requests.push(RangeCheckRequest {
                 value: row.get(col::OP_AUX).as_canonical_u64(),
             });

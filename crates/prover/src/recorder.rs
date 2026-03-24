@@ -324,8 +324,10 @@ fn fill_storage_access(row: &mut TraceRow, vm: &Vm, op: Opcode, rs1: u8, rs2_imm
         }
         row.set_u64(col::STORAGE_VAL_LEN, 32); // U256 = 32 bytes
     } else {
-        // SLOAD: value is loaded post-step (result in register)
-        // The value is captured from the post-step register state
+        // SLOAD: the VM loaded the value from storage into gp[rd].
+        // We capture gp[rd] post-step, which IS the loaded value.
+        // In production, the hash_bus cross-table verifies this value
+        // matches the Poseidon2 hash commitment in the state trie.
         let result_val = vm.cpu.read_gp(row.get(col::RD).as_canonical_u64() as u8);
         row.set_u64(col::storage_val(0), result_val);
         row.set_u64(col::STORAGE_VAL_LEN, 8);

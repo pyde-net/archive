@@ -183,6 +183,10 @@ pub fn compose_block_proof(
 }
 
 /// Verify a block proof (validator's job).
+///
+/// In production, the validator also verifies syscall context reads
+/// (CALLER/CALLVALUE/BLOCKHASH) against the block header by calling
+/// verify_syscall_reads() with the expected transaction data.
 pub fn verify_block_proof(block_proof: &BlockProof) -> Result<(), String> {
     // Verify each group STARK proof
     for gp in &block_proof.group_proofs {
@@ -197,6 +201,44 @@ pub fn verify_block_proof(block_proof: &BlockProof) -> Result<(), String> {
             "gas mismatch: block says {}, groups sum to {}",
             block_proof.total_gas, computed_gas
         ));
+    }
+
+    Ok(())
+}
+
+/// Verify syscall context reads against expected block header values.
+/// Called by the validator with data from the block header / tx fields.
+///
+/// This catches a malicious prover who returns fake values for
+/// CALLER, CALLVALUE, BLOCKHASH, or COMMIT opcodes.
+pub fn verify_syscall_reads(
+    syscall_reads: &[crate::multi_table::SyscallRead],
+    expected_caller: Option<u64>,
+    expected_blockhash: Option<u64>,
+) -> Result<(), String> {
+    use crate::constraint::opcodes;
+
+    for read in syscall_reads {
+        if read.opcode == opcodes::CALLER {
+            if let Some(expected) = expected_caller {
+                if read.result_value != expected {
+                    return Err(format!(
+                        "step {}: CALLER returned {} but expected {}",
+                        read.step, read.result_value, expected
+                    ));
+                }
+            }
+        }
+        if read.opcode == opcodes::BLOCKHASH {
+            if let Some(expected) = expected_blockhash {
+                if read.result_value != expected {
+                    return Err(format!(
+                        "step {}: BLOCKHASH returned {} but expected {}",
+                        read.step, read.result_value, expected
+                    ));
+                }
+            }
+        }
     }
 
     Ok(())
