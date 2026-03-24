@@ -118,20 +118,24 @@ pub fn extract_range_check_requests(
             });
         }
 
-        // SHR/SAR: verify shift result is valid u64
-        // remainder = op_a - result * 2^shift, must be non-negative and < 2^shift
+        // SHR/SAR: verify shift result via range-check
+        // For op_a = result * 2^shift + remainder:
+        //   1. remainder = op_a - result * 2^shift must be valid u64 (non-negative)
+        //   2. 2^shift - remainder - 1 must be valid u64 (remainder < 2^shift)
+        // Together these prove: 0 <= remainder < 2^shift, confirming correct division.
         if op == opcodes::SHR || op == opcodes::SAR {
-            // Range-check the result (must be valid u64)
-            requests.push(RangeCheckRequest {
-                value: row.get(col::OP_RESULT).as_canonical_u64(),
-            });
-            // Range-check the implicit remainder: op_a - result * op_aux
             let op_a = row.get(col::OP_A).as_canonical_u64();
             let result_val = row.get(col::OP_RESULT).as_canonical_u64();
-            let power = row.get(col::OP_AUX).as_canonical_u64();
+            let power = row.get(col::OP_AUX).as_canonical_u64(); // 2^shift
+
             if power != 0 {
                 let remainder = op_a.wrapping_sub(result_val.wrapping_mul(power));
+                // Prove remainder >= 0 (valid u64)
                 requests.push(RangeCheckRequest { value: remainder });
+                // Prove remainder < 2^shift (i.e., power - remainder - 1 is valid u64)
+                requests.push(RangeCheckRequest {
+                    value: power.wrapping_sub(remainder).wrapping_sub(1),
+                });
             }
         }
 

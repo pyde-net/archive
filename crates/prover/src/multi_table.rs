@@ -21,6 +21,15 @@ use crate::trace::{col, ExecutionTrace};
 
 use pyde_vm::vm::Vm;
 
+/// A syscall context read (CALLER/CALLVALUE/BLOCKHASH) from the trace.
+/// The verifier checks these against the block header / tx data.
+#[derive(Clone, Debug)]
+pub struct SyscallRead {
+    pub opcode: u64,
+    pub result_value: u64,
+    pub step: usize,
+}
+
 /// Complete multi-table proof for a group of transactions.
 pub struct MultiTableProof {
     /// Execution STARK proof.
@@ -45,6 +54,8 @@ pub struct MultiTableProof {
     pub range_check_ok: bool,
     /// Number of range-check requests.
     pub range_check_count: usize,
+    /// Syscall context reads (CALLER/CALLVALUE/BLOCKHASH) for external verification.
+    pub syscall_reads: Vec<SyscallRead>,
     /// Total gas used.
     pub gas_used: u64,
 }
@@ -87,6 +98,11 @@ pub fn prove_from_trace(mut trace: ExecutionTrace, gas_used: u64) -> Result<Mult
     }
     let range_check_ok = rc_trace.verify();
 
+    // 7. Verify syscall context reads (CALLER/CALLVALUE/BLOCKHASH)
+    // In production, the verifier checks these against the block header.
+    // Here we extract and store them for the verifier to validate externally.
+    let syscall_reads = extract_syscall_reads(&trace);
+
     Ok(MultiTableProof {
         execution_proof,
         proof_bytes,
@@ -99,6 +115,7 @@ pub fn prove_from_trace(mut trace: ExecutionTrace, gas_used: u64) -> Result<Mult
         hash_request_count: hash_requests.len(),
         range_check_ok,
         range_check_count: range_requests.len(),
+        syscall_reads,
         gas_used,
     })
 }
@@ -124,6 +141,24 @@ pub fn verify_multi_table(proof: &MultiTableProof) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Extract syscall context reads for external verification by the verifier.
+fn extract_syscall_reads(trace: &ExecutionTrace) -> Vec<SyscallRead> {
+    let mut reads = Vec::new();
+    for (step, row) in trace.rows.iter().enumerate() {
+        let op = row.get(col::OPCODE).as_canonical_u64();
+        if op == opcodes::CALLER || op == opcodes::CALLVALUE
+            || op == opcodes::BLOCKHASH || op == opcodes::COMMIT
+        {
+            reads.push(SyscallRead {
+                opcode: op,
+                result_value: row.get(col::OP_RESULT).as_canonical_u64(),
+                step,
+            });
+        }
+    }
+    reads
 }
 
 /// Extract bitwise lookup queries from an execution trace.

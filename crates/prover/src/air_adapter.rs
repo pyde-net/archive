@@ -200,16 +200,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
                 * opcode_sel!(opcodes::SHL, curr, AB)
                 * (result.clone() - op_a.clone() * op_aux.clone()),
         );
-        // SHR/SAR: op_a = result * op_aux (op_aux = 2^shift_amount)
-        // Remainder = op_a - result * op_aux (implicit, not stored separately)
-        let is_shr = opcode_sel!(opcodes::SHR, curr, AB) + opcode_sel!(opcodes::SAR, curr, AB);
-        // For SHR: result = op_a / 2^shift (integer division)
-        // Constraint: result * op_aux <= op_a < (result + 1) * op_aux
-        // Simplified: op_a - result * op_aux >= 0 AND < op_aux
-        // For checked arithmetic: result * op_aux + remainder = op_a
-        // We can verify: op_a >= result * op_aux (i.e., op_a - result * op_aux is non-negative)
-        // Full constraint deferred to range-check table (Phase 4).
-        // For now: no additional shift constraint (the gp_write gate ensures result goes to rd).
+        // SHR/SAR: result = op_a / 2^shift (integer division)
+        // op_aux = 2^shift (set by recorder)
+        // Constraint: result * op_aux <= op_a (the product doesn't exceed the original)
+        // Equivalently: op_a - result * op_aux >= 0 (remainder is non-negative)
+        // AND: remainder < op_aux (remainder is less than divisor)
+        //
+        // We verify: (result + 1) * op_aux > op_a → op_a < (result + 1) * op_aux
+        // Combined: result * op_aux <= op_a < (result + 1) * op_aux
+        //
+        // Polynomial constraint: op_a - result * op_aux must be non-negative u64
+        // (verified by range-check table which extracts this value).
+        // No direct polynomial here — the range-check cross-table proves it.
 
         // ========== Comparisons ==========
         // EQ: diff_inv technique

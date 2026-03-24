@@ -81,12 +81,15 @@ pub fn prove_group(group: &Group, pre_state_root: [u8; 32]) -> Result<GroupProof
         let (trace, outcome) = recorder::record_execution(&mut vm);
         total_gas += vm.gas_used_total;
 
-        // Append all rows to combined trace
+        // Append all rows to combined trace.
+        // TX boundaries are safe: each tx ends with is_final=1 (HALT/REVERT/trap),
+        // which gates ALL transition constraints via not_final=0. The next tx starts
+        // fresh with valid opcode bits and selectors. Gas/PC discontinuities at
+        // boundaries are invisible to the constraint system because not_final=0
+        // zeroes all transition expressions.
         for row in &trace.rows {
             combined_trace.push(row.clone());
         }
-
-        // Reverts and traps are still proven (the proof shows execution ended correctly)
     }
 
     let execution_rows = combined_trace.len();
