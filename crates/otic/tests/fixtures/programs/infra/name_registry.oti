@@ -252,7 +252,7 @@ contract NameRegistry {
         let child_hash = math::keccak256(parent_hash ^ math::keccak256_str(label));
         require!(self.names[child_hash].owner == Address::ZERO, SubdomainExists {});
 
-        let full_name = label + "." + parent.name;
+        let full_name = label.concat(".").concat(parent.name);
 
         self.names[child_hash] = NameEntry {
             name: full_name,
