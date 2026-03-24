@@ -1,14 +1,20 @@
-//! Thin AIR adapter: bridges our constraint evaluator to Plonky3's prove/verify.
+//! PVM AIR: constraint evaluation for Plonky3's STARK prover.
 //!
-//! Our constraints live in constraint.rs as plain Rust functions.
-//! Plonky3's prover needs an `Air<AB>` trait implementation.
-//! This module provides that bridge — it's a wrapper, not a reimplementation.
+//! Implements `Air<AB>` with all 64 PVM opcode constraints.
+//! Opcode constants are imported from `constraint::opcodes`.
+//!
+//! Constraint design:
+//! - Checked arithmetic → field arithmetic is exact (no limb decomposition)
+//! - Bitwise ops → verified via lookup table (logup, Phase 3)
+//! - Memory/storage consistency → verified via cross-table permutation (Phase 4)
+//! - Wide arithmetic → carry propagation with boolean carry constraints
 
 use p3_air::{Air, AirBuilder, BaseAir};
 use p3_field::AbstractField;
 use p3_goldilocks::Goldilocks;
 use p3_matrix::Matrix;
 
+use crate::constraint::opcodes;
 use crate::trace::col;
 
 /// Build opcode selector from 6 bits at the current row.
@@ -118,18 +124,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
                     * Into::<AB::Expr>::into(curr(col::gp(i)));
         }
         let result: AB::Expr = curr(col::OP_RESULT).into();
-        let is_gp_write = opcode_sel!(0x01, curr, AB) + opcode_sel!(0x02, curr, AB) // ADD, SUB
-            + opcode_sel!(0x03, curr, AB) + opcode_sel!(0x04, curr, AB) // MUL, DIV
-            + opcode_sel!(0x05, curr, AB) + opcode_sel!(0x0E, curr, AB) // MOD, ADDI
-            + opcode_sel!(0x06, curr, AB) + opcode_sel!(0x07, curr, AB) // AND, OR
-            + opcode_sel!(0x08, curr, AB) + opcode_sel!(0x0F, curr, AB) // XOR, NOT
-            + opcode_sel!(0x14, curr, AB) + opcode_sel!(0x15, curr, AB) // SHL, SHR
-            + opcode_sel!(0x16, curr, AB) // SAR
-            + opcode_sel!(0x34, curr, AB) + opcode_sel!(0x17, curr, AB) // EQ, LT
-            + opcode_sel!(0x33, curr, AB) + opcode_sel!(0x35, curr, AB) // GT, SLT
-            + opcode_sel!(0x36, curr, AB) + opcode_sel!(0x39, curr, AB) // SGT, FIELDMUL
-            + opcode_sel!(0x10, curr, AB) + opcode_sel!(0x13, curr, AB) // LOAD, POP
-            + opcode_sel!(0x3D, curr, AB) + opcode_sel!(0x23, curr, AB); // NARROW, CALLER
+        let is_gp_write = opcode_sel!(opcodes::ADD, curr, AB) + opcode_sel!(opcodes::SUB, curr, AB) // ADD, SUB
+            + opcode_sel!(opcodes::MUL, curr, AB) + opcode_sel!(opcodes::DIV, curr, AB) // MUL, DIV
+            + opcode_sel!(opcodes::MOD, curr, AB) + opcode_sel!(opcodes::ADDI, curr, AB) // MOD, ADDI
+            + opcode_sel!(opcodes::AND, curr, AB) + opcode_sel!(opcodes::OR, curr, AB) // AND, OR
+            + opcode_sel!(opcodes::XOR, curr, AB) + opcode_sel!(opcodes::NOT, curr, AB) // XOR, NOT
+            + opcode_sel!(opcodes::SHL, curr, AB) + opcode_sel!(opcodes::SHR, curr, AB) // SHL, SHR
+            + opcode_sel!(opcodes::SAR, curr, AB) // SAR
+            + opcode_sel!(opcodes::EQ, curr, AB) + opcode_sel!(opcodes::LT, curr, AB) // EQ, LT
+            + opcode_sel!(opcodes::GT, curr, AB) + opcode_sel!(opcodes::SLT, curr, AB) // GT, SLT
+            + opcode_sel!(opcodes::SGT, curr, AB) + opcode_sel!(opcodes::FIELDMUL, curr, AB) // SGT, FIELDMUL
+            + opcode_sel!(opcodes::LOAD, curr, AB) + opcode_sel!(opcodes::POP, curr, AB) // LOAD, POP
+            + opcode_sel!(opcodes::NARROW, curr, AB) + opcode_sel!(opcodes::CALLER, curr, AB); // NARROW, CALLER
         builder.assert_zero(is_gp_write * (mux_rd - result.clone()));
 
         // ========== Common expressions ==========
@@ -143,37 +149,37 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         // ========== Arithmetic ==========
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x01, curr, AB)
+                * opcode_sel!(opcodes::ADD, curr, AB)
                 * (result.clone() - op_a.clone() - op_b.clone()),
         );
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x02, curr, AB)
+                * opcode_sel!(opcodes::SUB, curr, AB)
                 * (result.clone() - op_a.clone() + op_b.clone()),
         );
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x03, curr, AB)
+                * opcode_sel!(opcodes::MUL, curr, AB)
                 * (result.clone() - op_a.clone() * op_b.clone()),
         );
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x04, curr, AB)
+                * opcode_sel!(opcodes::DIV, curr, AB)
                 * (op_a.clone() - result.clone() * op_b.clone() - op_aux.clone()),
         );
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x05, curr, AB)
+                * opcode_sel!(opcodes::MOD, curr, AB)
                 * (op_a.clone() - op_aux.clone() * op_b.clone() - result.clone()),
         );
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x0E, curr, AB)
+                * opcode_sel!(opcodes::ADDI, curr, AB)
                 * (result.clone() - op_a.clone() - op_b.clone()),
         );
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x39, curr, AB)
+                * opcode_sel!(opcodes::FIELDMUL, curr, AB)
                 * (result.clone() - op_a.clone() * op_b.clone()),
         );
 
@@ -181,11 +187,11 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         // SHL: result = op_a * op_b (recorder sets op_b = 2^shift_amount)
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x14, curr, AB)
+                * opcode_sel!(opcodes::SHL, curr, AB)
                 * (result.clone() - op_a.clone() * op_b.clone()),
         );
         // SHR/SAR: op_a = result * op_b + op_aux
-        let is_shr = opcode_sel!(0x15, curr, AB) + opcode_sel!(0x16, curr, AB);
+        let is_shr = opcode_sel!(opcodes::SHR, curr, AB) + opcode_sel!(opcodes::SAR, curr, AB);
         builder.assert_zero(
             not_final.clone()
                 * is_shr
@@ -194,7 +200,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
 
         // ========== Comparisons ==========
         // EQ: diff_inv technique
-        let is_eq: AB::Expr = opcode_sel!(0x34, curr, AB);
+        let is_eq: AB::Expr = opcode_sel!(opcodes::EQ, curr, AB);
         let diff = op_a.clone() - op_b.clone();
         builder.assert_zero(
             is_eq.clone() * (diff.clone() * diff_inv.clone() - AB::Expr::one() + result.clone()),
@@ -202,7 +208,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         builder.assert_zero(is_eq * (diff.clone() * result.clone()));
 
         // LT
-        let is_lt = opcode_sel!(0x17, curr, AB);
+        let is_lt = opcode_sel!(opcodes::LT, curr, AB);
         builder.assert_zero(is_lt.clone() * result.clone() * (AB::Expr::one() - result.clone()));
         builder.assert_zero(
             is_lt
@@ -213,7 +219,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         );
 
         // GT
-        let is_gt = opcode_sel!(0x33, curr, AB);
+        let is_gt = opcode_sel!(opcodes::GT, curr, AB);
         builder.assert_zero(is_gt.clone() * result.clone() * (AB::Expr::one() - result.clone()));
         builder.assert_zero(
             is_gt
@@ -225,34 +231,34 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
 
         // SLT/SGT/VERIFYSIG/WEQ/WLT: boolean
         builder.assert_zero(
-            opcode_sel!(0x35, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
+            opcode_sel!(opcodes::SLT, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
         );
         builder.assert_zero(
-            opcode_sel!(0x36, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
+            opcode_sel!(opcodes::SGT, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
         );
         builder.assert_zero(
-            opcode_sel!(0x31, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
+            opcode_sel!(opcodes::VERIFYSIG, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
         );
         builder.assert_zero(
-            opcode_sel!(0x00, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
+            opcode_sel!(opcodes::WEQ, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
         );
         builder.assert_zero(
-            opcode_sel!(0x3F, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
+            opcode_sel!(opcodes::WLT, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
         );
         // MERKLEVERIFY (0x32): boolean result
         builder.assert_zero(
-            opcode_sel!(0x32, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
+            opcode_sel!(opcodes::MERKLEVERIFY, curr, AB) * result.clone() * (AB::Expr::one() - result.clone()),
         );
 
         // ========== Memory ==========
         let mem_val0: AB::Expr = curr(col::mem_val(0)).into();
-        let is_load = opcode_sel!(0x10, curr, AB) + opcode_sel!(0x13, curr, AB);
+        let is_load = opcode_sel!(opcodes::LOAD, curr, AB) + opcode_sel!(opcodes::POP, curr, AB);
         builder.assert_zero(is_load.clone() * (result.clone() - mem_val0.clone()));
         builder.assert_zero(
             is_load * (AB::Expr::one() - Into::<AB::Expr>::into(curr(col::IS_MEMORY_OP))),
         );
 
-        let is_store = opcode_sel!(0x11, curr, AB) + opcode_sel!(0x12, curr, AB);
+        let is_store = opcode_sel!(opcodes::STORE, curr, AB) + opcode_sel!(opcodes::PUSH, curr, AB);
         builder.assert_zero(is_store.clone() * (op_a.clone() - mem_val0));
         builder.assert_zero(
             is_store.clone() * (AB::Expr::one() - Into::<AB::Expr>::into(curr(col::IS_MEMORY_OP))),
@@ -273,15 +279,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
 
         // WLOAD/WSTORE: must flag memory
         builder.assert_zero(
-            opcode_sel!(0x37, curr, AB)
+            opcode_sel!(opcodes::WLOAD, curr, AB)
                 * (AB::Expr::one() - Into::<AB::Expr>::into(curr(col::IS_MEMORY_OP))),
         );
         builder.assert_zero(
-            opcode_sel!(0x3B, curr, AB)
+            opcode_sel!(opcodes::WSTORE, curr, AB)
                 * (AB::Expr::one() - Into::<AB::Expr>::into(curr(col::IS_MEMORY_OP))),
         );
         builder.assert_zero(
-            opcode_sel!(0x3B, curr, AB)
+            opcode_sel!(opcodes::WSTORE, curr, AB)
                 * (AB::Expr::one() - Into::<AB::Expr>::into(curr(col::MEM_IS_WRITE))),
         );
 
@@ -302,24 +308,24 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
 
         // SLOAD/SSTORE/SDELETE must flag storage
         builder.assert_zero(
-            opcode_sel!(0x20, curr, AB)
+            opcode_sel!(opcodes::SLOAD, curr, AB)
                 * (AB::Expr::one() - Into::<AB::Expr>::into(curr(col::IS_STORAGE_OP))),
         );
         builder.assert_zero(
-            opcode_sel!(0x21, curr, AB)
+            opcode_sel!(opcodes::SSTORE, curr, AB)
                 * (AB::Expr::one() - Into::<AB::Expr>::into(curr(col::IS_STORAGE_OP))),
         );
         builder.assert_zero(
-            opcode_sel!(0x21, curr, AB)
+            opcode_sel!(opcodes::SSTORE, curr, AB)
                 * (AB::Expr::one() - Into::<AB::Expr>::into(curr(col::STORAGE_IS_WRITE))),
         );
         builder.assert_zero(
-            opcode_sel!(0x22, curr, AB)
+            opcode_sel!(opcodes::SDELETE, curr, AB)
                 * (AB::Expr::one() - Into::<AB::Expr>::into(curr(col::IS_STORAGE_OP))),
         );
         // LOG must not touch storage
         builder.assert_zero(
-            opcode_sel!(0x2A, curr, AB) * Into::<AB::Expr>::into(curr(col::IS_STORAGE_OP)),
+            opcode_sel!(opcodes::LOG, curr, AB) * Into::<AB::Expr>::into(curr(col::IS_STORAGE_OP)),
         );
 
         // ========== Gas ==========
@@ -332,13 +338,13 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
 
         // ========== Control flow ==========
         let four = AB::Expr::from_canonical_u64(4);
-        let is_branch = opcode_sel!(0x18, curr, AB)
-            + opcode_sel!(0x19, curr, AB)
-            + opcode_sel!(0x1A, curr, AB)
-            + opcode_sel!(0x1B, curr, AB)
-            + opcode_sel!(0x1C, curr, AB)
-            + opcode_sel!(0x1D, curr, AB)
-            + opcode_sel!(0x1E, curr, AB);
+        let is_branch = opcode_sel!(opcodes::JMP, curr, AB)
+            + opcode_sel!(opcodes::BEQ, curr, AB)
+            + opcode_sel!(opcodes::BNE, curr, AB)
+            + opcode_sel!(opcodes::BLT, curr, AB)
+            + opcode_sel!(opcodes::BGE, curr, AB)
+            + opcode_sel!(opcodes::CALL, curr, AB)
+            + opcode_sel!(opcodes::RET, curr, AB);
         let next_pc: AB::Expr = next(col::PC).into();
         let curr_pc: AB::Expr = curr(col::PC).into();
         builder.assert_zero(
@@ -350,7 +356,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         // BEQ
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x19, curr, AB)
+                * opcode_sel!(opcodes::BEQ, curr, AB)
                 * diff.clone()
                 * (next_pc.clone() - curr_pc.clone() - four.clone()),
         );
@@ -359,18 +365,18 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         let branch_taken: AB::Expr = curr(col::BRANCH_TAKEN).into();
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x1A, curr, AB)
+                * opcode_sel!(opcodes::BNE, curr, AB)
                 * (diff.clone() * diff_inv.clone() - branch_taken.clone()),
         );
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x1A, curr, AB)
+                * opcode_sel!(opcodes::BNE, curr, AB)
                 * (AB::Expr::one() - branch_taken.clone())
                 * (next_pc.clone() - curr_pc.clone() - four.clone()),
         );
 
         // BLT: branch_taken linked to comparison via op_aux
-        let is_blt = opcode_sel!(0x1B, curr, AB);
+        let is_blt = opcode_sel!(opcodes::BLT, curr, AB);
         builder.assert_zero(
             not_final.clone()
                 * is_blt.clone()
@@ -387,7 +393,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         );
 
         // BGE: branch_taken linked to comparison via op_aux
-        let is_bge = opcode_sel!(0x1C, curr, AB);
+        let is_bge = opcode_sel!(opcodes::BGE, curr, AB);
         builder.assert_zero(
             not_final.clone()
                 * is_bge.clone()
@@ -403,15 +409,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         );
 
         // HALT/REVERT/SELFDESTRUCT → is_final
-        builder.assert_zero(opcode_sel!(0x2C, curr, AB) * (AB::Expr::one() - is_final.clone()));
-        builder.assert_zero(opcode_sel!(0x2B, curr, AB) * (AB::Expr::one() - is_final.clone()));
-        builder.assert_zero(opcode_sel!(0x29, curr, AB) * (AB::Expr::one() - is_final.clone()));
+        builder.assert_zero(opcode_sel!(opcodes::HALT, curr, AB) * (AB::Expr::one() - is_final.clone()));
+        builder.assert_zero(opcode_sel!(opcodes::REVERT, curr, AB) * (AB::Expr::one() - is_final.clone()));
+        builder.assert_zero(opcode_sel!(opcodes::SELFDESTRUCT, curr, AB) * (AB::Expr::one() - is_final.clone()));
 
         // ========== Call/Ret ==========
         let call_depth: AB::Expr = curr(col::CALL_DEPTH).into();
         let next_depth: AB::Expr = next(col::CALL_DEPTH).into();
         let is_call_like =
-            opcode_sel!(0x1D, curr, AB) + opcode_sel!(0x26, curr, AB) + opcode_sel!(0x27, curr, AB);
+            opcode_sel!(opcodes::CALL, curr, AB) + opcode_sel!(opcodes::CALLEXT, curr, AB) + opcode_sel!(opcodes::DELEGATE, curr, AB);
         builder.assert_zero(
             not_final.clone()
                 * is_call_like.clone()
@@ -419,22 +425,22 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         );
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(0x1E, curr, AB)
+                * opcode_sel!(opcodes::RET, curr, AB)
                 * (next_depth.clone() - call_depth.clone() + AB::Expr::one()),
         );
-        let is_call_or_ret = is_call_like + opcode_sel!(0x1E, curr, AB);
+        let is_call_or_ret = is_call_like + opcode_sel!(opcodes::RET, curr, AB);
         builder.assert_zero(
             not_final.clone() * (AB::Expr::one() - is_call_or_ret) * (next_depth - call_depth),
         );
 
         // ASSERT
         builder.assert_zero(
-            opcode_sel!(0x38, curr, AB) * (op_a * diff_inv - AB::Expr::one() + is_final),
+            opcode_sel!(opcodes::ASSERT, curr, AB) * (op_a * diff_inv - AB::Expr::one() + is_final),
         );
 
         // WADD/WSUB carry booleans
-        let is_wadd = opcode_sel!(0x09, curr, AB);
-        let is_wsub = opcode_sel!(0x0A, curr, AB);
+        let is_wadd = opcode_sel!(opcodes::WADD, curr, AB);
+        let is_wsub = opcode_sel!(opcodes::WSUB, curr, AB);
         for i in 0..4 {
             let carry: AB::Expr = curr(col::wide_carry(i)).into();
             builder
