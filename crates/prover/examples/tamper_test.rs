@@ -392,6 +392,159 @@ fn main() {
     });
 
     // ================================================================
+    // BITWISE OPERATIONS
+    // Bitwise result correctness is verified via LOOKUP TABLE (cross-table),
+    // NOT by polynomial constraints. Tampering both OP_RESULT and gp[rd]
+    // passes polynomial constraints but fails lookup verification.
+    // Here we test that gp[rd] mismatch with OP_RESULT IS caught.
+    // ================================================================
+
+    let and_code = bytecode(&[
+        &instr(Opcode::Addi, 1, 0, 0xFF),
+        &instr(Opcode::Addi, 2, 0, 0x0F),
+        &instr(Opcode::And, 3, 1, 2),  // 0xFF & 0x0F = 0x0F
+        &instr(Opcode::Halt, 0, 0, 0),
+    ]);
+
+    tamper_test!("AND: tamper gp[rd] only (mismatch with OP_RESULT)", and_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[2].fields[col::gp(3)] = to_field(0xFF); // gp[rd] ≠ OP_RESULT
+    });
+
+    let or_code = bytecode(&[
+        &instr(Opcode::Addi, 1, 0, 0xF0),
+        &instr(Opcode::Addi, 2, 0, 0x0F),
+        &instr(Opcode::Or, 3, 1, 2),   // 0xF0 | 0x0F = 0xFF
+        &instr(Opcode::Halt, 0, 0, 0),
+    ]);
+
+    tamper_test!("OR: tamper gp[rd] only", or_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[2].fields[col::gp(3)] = to_field(0x00);
+    });
+
+    let xor_code = bytecode(&[
+        &instr(Opcode::Addi, 1, 0, 0xAA),
+        &instr(Opcode::Addi, 2, 0, 0x55),
+        &instr(Opcode::Xor, 3, 1, 2),
+        &instr(Opcode::Halt, 0, 0, 0),
+    ]);
+
+    tamper_test!("XOR: tamper gp[rd] only", xor_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[2].fields[col::gp(3)] = to_field(0x00);
+    });
+
+    let not_code = bytecode(&[
+        &instr(Opcode::Addi, 1, 0, 0),
+        &instr(Opcode::Not, 2, 1, 0),
+        &instr(Opcode::Halt, 0, 0, 0),
+    ]);
+
+    tamper_test!("NOT: tamper gp[rd] only", not_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[1].fields[col::gp(2)] = to_field(42);
+    });
+
+    // ================================================================
+    // STACK OPERATIONS (PUSH/POP)
+    // ================================================================
+
+    // PUSH/POP use the stack pointer (r2).
+    // Stack is at top of memory; use a valid stack address within 18-bit range.
+    let push_pop_code = bytecode(&[
+        &instr(Opcode::Addi, 2, 0, 0x30000),  // r2 = SP (within address space)
+        &instr(Opcode::Addi, 1, 0, 42),
+        &instr(Opcode::Push, 1, 0, 0),         // push r1 (42)
+        &instr(Opcode::Pop, 3, 0, 0),          // pop to r3
+        &instr(Opcode::Halt, 0, 0, 0),
+    ]);
+
+    tamper_test!("PUSH: remove memory flag", push_pop_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[2].fields[col::IS_MEMORY_OP] = Goldilocks::zero();
+    });
+
+    tamper_test!("POP: tamper loaded result", push_pop_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[3].set_u64(col::OP_RESULT, 999);
+        trace.rows[3].fields[col::gp(3)] = to_field(999);
+    });
+
+    // ================================================================
+    // STORAGE OPERATIONS (flag constraints)
+    // ================================================================
+
+    // SLOAD/SSTORE need the VM's storage system. We test the FLAG constraints:
+    // when IS_STORAGE_OP=0, all storage columns must be zero.
+    tamper_test!("STORAGE: inject fake storage on non-storage op", add_code.clone(), |trace: &mut ExecutionTrace| {
+        // Set storage columns on a non-storage row — should violate inactive constraint
+        trace.rows[0].set_u64(col::storage_key(0), 999);
+    });
+
+    // NOTE: Setting IS_STORAGE_OP=1 on a non-storage row passes polynomial constraints
+    // because the constraint only forces storage columns to zero when flag=0.
+    // There's no constraint that "flag=1 implies opcode is SLOAD/SSTORE/SDELETE."
+    // This is caught by the cross-table storage proof (Merkle path verification).
+
+    // ================================================================
+    // MEMORY INACTIVE CONSTRAINT
+    // ================================================================
+
+    tamper_test!("MEMORY INACTIVE: inject mem_val on non-memory op", add_code.clone(), |trace: &mut ExecutionTrace| {
+        // Set memory value columns on a non-memory row
+        trace.rows[0].set_u64(col::mem_val(0), 999);
+    });
+
+    tamper_test!("MEMORY INACTIVE: inject mem_addr on non-memory op", add_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[0].set_u64(col::MEM_ADDR, 0x010000);
+    });
+
+    // ================================================================
+    // BEQ (branch when equal)
+    // ================================================================
+
+    let beq_code = bytecode(&[
+        &instr(Opcode::Addi, 1, 0, 42),
+        &instr(Opcode::Addi, 2, 0, 42),
+        &instr(Opcode::Beq, 1, 2, 8),  // 42 == 42 → branch taken
+        &instr(Opcode::Halt, 0, 0, 0), // skipped
+        &instr(Opcode::Addi, 3, 0, 77),
+        &instr(Opcode::Halt, 0, 0, 0),
+    ]);
+
+    // BEQ: when operands are equal, branch is taken. If we change gp[rd] so
+    // they're NOT equal, the constraint branch_diff * (next_pc - pc - 4) must be 0.
+    // With branch_diff ≠ 0, next_pc MUST equal pc + 4 (sequential).
+    // But the trace shows a jump → constraint fails.
+    tamper_test!("BEQ: make operands unequal (break branch condition)", beq_code.clone(), |trace: &mut ExecutionTrace| {
+        // Change gp[rd=1] to make gp[rd] ≠ gp[rs1], breaking the equality
+        trace.rows[2].fields[col::gp(1)] = to_field(99); // gp[1] was 42, now 99
+    });
+
+    // ================================================================
+    // REVERT (termination)
+    // ================================================================
+
+    let revert_code = bytecode(&[
+        &instr(Opcode::Addi, 1, 0, 42),
+        &instr(Opcode::Revert, 0, 0, 0),
+    ]);
+
+    tamper_test!("REVERT: remove is_final flag", revert_code.clone(), |trace: &mut ExecutionTrace| {
+        let last = trace.rows.len() - 1;
+        trace.rows[last].fields[col::IS_FINAL] = Goldilocks::zero();
+    });
+
+    // ================================================================
+    // WIDE ARITHMETIC CARRY
+    // ================================================================
+
+    // WADD carry must be boolean (0 or 1). Test with non-boolean value.
+    // We can't easily execute WADD from bytecode without wide register setup,
+    // so we test the constraint directly by injecting a WADD row.
+    tamper_test!("WADD: non-boolean carry", add_code.clone(), |trace: &mut ExecutionTrace| {
+        // Inject WADD opcode on first row and set non-boolean carry
+        trace.rows[0].set_u64(col::OPCODE, 0x09); // WADD
+        trace.rows[0].set_opcode_bits(0x09);
+        trace.rows[0].set_u64(col::wide_carry(0), 5); // not boolean!
+    });
+
+    // ================================================================
     // SUMMARY
     // ================================================================
 
