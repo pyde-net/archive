@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Success);
 
         // Prove and verify
-        let proof = crate::prover::prove(&mut trace, &[]);
+        let proof = crate::prover::prove(&mut trace, &[]).unwrap();
         let result = crate::prover::verify(&proof, &[]);
         assert!(result.is_ok(), "Proof verification failed: {:?}", result);
     }
@@ -636,7 +636,7 @@ mod tests {
         vm.load(&code).unwrap();
 
         let (mut trace, _) = record_execution(&mut vm);
-        let proof = crate::prover::prove(&mut trace, &[]);
+        let proof = crate::prover::prove(&mut trace, &[]).unwrap();
         assert!(crate::prover::verify(&proof, &[]).is_ok());
     }
 
@@ -652,7 +652,7 @@ mod tests {
         vm.load(&code).unwrap();
 
         let (mut trace, _) = record_execution(&mut vm);
-        let proof = crate::prover::prove(&mut trace, &[]);
+        let proof = crate::prover::prove(&mut trace, &[]).unwrap();
         assert!(crate::prover::verify(&proof, &[]).is_ok());
     }
 
@@ -668,7 +668,7 @@ mod tests {
         vm.load(&code).unwrap();
         let (mut trace, outcome) = record_execution(&mut vm);
         assert_eq!(outcome, Outcome::Success);
-        let proof = crate::prover::prove(&mut trace, &[]);
+        let proof = crate::prover::prove(&mut trace, &[]).unwrap();
         assert!(crate::prover::verify(&proof, &[]).is_ok());
     }
 
@@ -684,7 +684,7 @@ mod tests {
         vm.load(&code).unwrap();
         let (mut trace, _) = record_execution(&mut vm);
         assert_eq!(trace.rows[2].get(col::OP_RESULT), to_field(2)); // 100 % 7
-        let proof = crate::prover::prove(&mut trace, &[]);
+        let proof = crate::prover::prove(&mut trace, &[]).unwrap();
         assert!(crate::prover::verify(&proof, &[]).is_ok());
     }
 
@@ -704,7 +704,7 @@ mod tests {
         let (mut trace, outcome) = record_execution(&mut vm);
         assert_eq!(outcome, Outcome::Success);
         assert_eq!(vm.cpu.read_gp(3), 99); // branch was taken
-        let proof = crate::prover::prove(&mut trace, &[]);
+        let proof = crate::prover::prove(&mut trace, &[]).unwrap();
         assert!(crate::prover::verify(&proof, &[]).is_ok());
     }
 
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(trace.rows[2].get(col::MEM_IS_WRITE), Goldilocks::one());
         assert_eq!(trace.rows[3].get(col::IS_MEMORY_OP), Goldilocks::one()); // LOAD
 
-        let proof = crate::prover::prove(&mut trace, &[]);
+        let proof = crate::prover::prove(&mut trace, &[]).unwrap();
         assert!(crate::prover::verify(&proof, &[]).is_ok());
     }
 
@@ -750,7 +750,7 @@ mod tests {
         let (mut trace, _) = record_execution(&mut vm);
         assert_eq!(vm.cpu.read_gp(3), 800);
         assert_eq!(vm.cpu.read_gp(4), 100);
-        let proof = crate::prover::prove(&mut trace, &[]);
+        let proof = crate::prover::prove(&mut trace, &[]).unwrap();
         assert!(crate::prover::verify(&proof, &[]).is_ok());
     }
 
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(vm.cpu.read_gp(3), 1); // LT true
         assert_eq!(vm.cpu.read_gp(4), 0); // GT false
         assert_eq!(vm.cpu.read_gp(5), 1); // EQ true
-        let proof = crate::prover::prove(&mut trace, &[]);
+        let proof = crate::prover::prove(&mut trace, &[]).unwrap();
         assert!(crate::prover::verify(&proof, &[]).is_ok());
     }
 
@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Success);
         assert_eq!(vm.cpu.read_gp(9), 1875);
 
-        let proof = crate::prover::prove(&mut trace, &[]);
+        let proof = crate::prover::prove(&mut trace, &[]).unwrap();
         assert!(crate::prover::verify(&proof, &[]).is_ok());
     }
 }

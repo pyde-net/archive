@@ -66,7 +66,7 @@ fn bench_prove(c: &mut Criterion) {
     c.bench_function("prove_medium_16instr", |b| {
         b.iter(|| {
             let mut t = trace.clone();
-            prover::prove(&mut t, &[])
+            prover::prove(&mut t, &[]).unwrap()
         })
     });
 }
@@ -76,7 +76,7 @@ fn bench_verify(c: &mut Criterion) {
     let mut vm = Vm::with_gas_limit(100_000);
     vm.load(&code).unwrap();
     let (mut trace, _) = recorder::record_execution(&mut vm);
-    let proof = prover::prove(&mut trace, &[]);
+    let proof = prover::prove(&mut trace, &[]).unwrap();
 
     c.bench_function("verify_medium_16instr", |b| {
         b.iter(|| prover::verify(&proof, &[]))

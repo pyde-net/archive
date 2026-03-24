@@ -95,7 +95,7 @@ pub fn prove_group(group: &Group, pre_state_root: [u8; 32]) -> Result<GroupProof
     let execution_rows = combined_trace.len();
 
     // Generate STARK proof for the combined trace
-    let proof = prover::prove(&mut combined_trace, &[]);
+    let proof = prover::prove(&mut combined_trace, &[]).map_err(|e| format!("prove failed: {e}"))?;
 
     // Serialize for transmission
     let proof_bytes = prover::serialize_proof(&proof)

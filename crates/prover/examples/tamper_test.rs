@@ -37,16 +37,16 @@ fn bytecode(instrs: &[&[u8; 4]]) -> Vec<u8> {
 /// verify error = proof generated but rejected by verifier.
 fn try_prove_verify(trace: &mut ExecutionTrace) -> Result<(), String> {
     let mut t = trace.clone();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let proof = prover::prove(&mut t, &[]);
-        prover::verify(&proof, &[]).map_err(|e| format!("{:?}", e))
-    }));
 
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(format!("verifier rejected: {}", e)),
-        Err(_) => Err("prover detected constraint violation".to_string()),
-    }
+    // prove() now validates constraints and returns Err on violation
+    let proof = match prover::prove(&mut t, &[]) {
+        Ok(p) => p,
+        Err(e) => return Err(format!("prover rejected: {}", e)),
+    };
+
+    // If prove() succeeded (should only happen with valid traces),
+    // verify the proof
+    prover::verify(&proof, &[]).map_err(|e| format!("verifier rejected: {:?}", e))
 }
 
 fn main() {
@@ -89,7 +89,7 @@ fn main() {
                     failed += 1;
                 }
                 Err(e) => {
-                    let short = if e.contains("prover detected") { "prover" } else { "verifier" };
+                    let short = if e.contains("prover rejected") { "prover refused" } else { "verifier rejected" };
                     println!("PASS [{}]", short);
                     passed += 1;
                 }

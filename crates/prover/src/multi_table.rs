@@ -77,7 +77,7 @@ pub fn prove_from_trace(mut trace: ExecutionTrace, gas_used: u64) -> Result<Mult
     let lookup_queries = extract_lookup_queries(&trace);
 
     // 2. Generate execution STARK proof
-    let execution_proof = prover::prove(&mut trace, &[]);
+    let execution_proof = prover::prove(&mut trace, &[]).map_err(|e| format!("prove failed: {e}"))?;
     let proof_bytes = prover::serialize_proof(&execution_proof)
         .map_err(|e| format!("serialize: {e}"))?;
 

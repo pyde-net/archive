@@ -81,16 +81,40 @@ fn build_challenger() -> Challenger {
 }
 
 /// Generate a STARK proof from an execution trace.
-pub fn prove(trace: &mut ExecutionTrace, public_values: &[Goldilocks]) -> PydeProof {
-    let config = build_config();
-    let air = PvmAir;
-    let mut challenger = build_challenger();
+/// Returns Err if the trace violates any constraint.
+/// The prover NEVER generates invalid proofs — it validates constraints
+/// and self-verifies before returning.
+pub fn prove(trace: &mut ExecutionTrace, public_values: &[Goldilocks]) -> Result<PydeProof, String> {
+    if trace.is_empty() {
+        return Err("empty trace".to_string());
+    }
 
     trace.pad_to_power_of_two();
-    let values = trace.to_row_major_values();
-    let matrix = RowMajorMatrix::new(values, col::NUM_COLUMNS);
 
-    stark_prove(&config, &air, &mut challenger, matrix, &public_values.to_vec())
+    // Generate the proof. In debug builds, p3-uni-stark's constraint checker
+    // panics on violations (caught below). In release builds, constraint
+    // violations produce invalid quotient polynomials that fail self-verification.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let config = build_config();
+        let air = PvmAir;
+        let mut challenger = build_challenger();
+        let values = trace.to_row_major_values();
+        let matrix = RowMajorMatrix::new(values, col::NUM_COLUMNS);
+        stark_prove(&config, &air, &mut challenger, matrix, &public_values.to_vec())
+    }));
+
+    let proof = match result {
+        Ok(p) => p,
+        Err(_) => return Err("constraint violation detected — invalid trace".to_string()),
+    };
+
+    // Self-verify: the prover checks its own proof before returning.
+    // This catches release-mode constraint violations that produce
+    // invalid FRI proofs (no debug panic, but verifier rejects).
+    verify(&proof, public_values)
+        .map_err(|_| "self-verification failed — trace has constraint violations".to_string())?;
+
+    Ok(proof)
 }
 
 /// Verify a STARK proof.
@@ -177,7 +201,7 @@ mod tests {
         }
         trace.push(make_halt_row(15 * 4, 16 * 3));
 
-        let proof = prove(&mut trace, &[]);
+        let proof = prove(&mut trace, &[]).unwrap();
         let result = verify(&proof, &[]);
         assert!(result.is_ok(), "Verification failed: {:?}", result);
     }
@@ -190,7 +214,7 @@ mod tests {
         }
         trace.push(make_halt_row(15 * 4, 16 * 3));
 
-        let proof = prove(&mut trace, &[]);
+        let proof = prove(&mut trace, &[]).unwrap();
         let bytes = serialize_proof(&proof).unwrap();
         let restored = deserialize_proof(&bytes).unwrap();
         assert!(verify(&restored, &[]).is_ok());
@@ -244,7 +268,7 @@ mod tests {
         // to set is_final on padding rows with correct selectors
         // trace has 4 rows, pad_to_power_of_two should keep it at 4
 
-        let proof = prove(&mut trace, &[]);
+        let proof = prove(&mut trace, &[]).unwrap();
         let result = verify(&proof, &[]);
         assert!(result.is_ok(), "ADD program verification failed: {:?}", result);
     }
