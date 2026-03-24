@@ -66,6 +66,29 @@ pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
             0
         };
 
+        // Capture pre-step wide operands for wide arithmetic carry computation
+        let is_wide_arith = matches!(opcode,
+            Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv | Opcode::Wmod
+        );
+        let (wide_a_limbs, wide_b_limbs) = if is_wide_arith {
+            let wa = vm.cpu.read_wide(rs1);
+            let wa_bytes = wa.to_le_bytes();
+            let a_limbs: [u64; 4] = core::array::from_fn(|i| {
+                u64::from_le_bytes(wa_bytes[i * 8..(i + 1) * 8].try_into().unwrap())
+            });
+
+            let ws2 = (rs2_imm & 0xF) as u8;
+            let wb = vm.cpu.read_wide(ws2);
+            let wb_bytes = wb.to_le_bytes();
+            let b_limbs: [u64; 4] = core::array::from_fn(|i| {
+                u64::from_le_bytes(wb_bytes[i * 8..(i + 1) * 8].try_into().unwrap())
+            });
+
+            (a_limbs, b_limbs)
+        } else {
+            ([0u64; 4], [0u64; 4])
+        };
+
         // Execute one step
         let step_result = vm.step();
 
@@ -187,7 +210,7 @@ pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
         }
 
         // Wide carry/quotient for wide arithmetic
-        fill_wide_aux(&mut row, opcode, vm);
+        fill_wide_aux(&mut row, opcode, &wide_a_limbs, &wide_b_limbs);
 
         trace.push(row);
 
@@ -430,37 +453,47 @@ fn fill_branch_info(row: &mut TraceRow, op: Opcode, a: u64, b: u64, _result: u64
     }
 }
 
-fn fill_wide_aux(row: &mut TraceRow, op: Opcode, vm: &Vm) {
-    // Wide arithmetic carry/quotient columns.
-    // The wide operands are in the wide register columns (post-step).
-    // We need the PRE-step operand values to compute carries, but we only
-    // have post-step state. The rd register has the result; rs1/rs2 may
-    // have been overwritten if rd == rs1 or rd == rs2.
-    //
-    // For the constraint, we need carry[i] ∈ {0,1} for WADD/WSUB.
-    // Since PVM uses CHECKED wide arithmetic (traps on overflow), for valid
-    // traces the carries represent actual limb overflows.
-    //
-    // We compute carries from the RESULT limbs and the known operand limbs.
-    // The recorder has access to the post-step VM state where:
-    //   wide(rd) = result of the operation
-    //   wide(rs1), wide(rs2) = source registers (may equal rd)
-    //
-    // For now: the carries default to 0 (from TraceRow::zero()).
-    // For CHECKED arithmetic, if no limb overflows, carries are 0.
-    // The boolean constraint carry * (1 - carry) = 0 is satisfied by 0.
-    //
-    // Full carry computation requires pre-step operand capture, which
-    // will be added when wide ops are tested end-to-end.
+fn fill_wide_aux(row: &mut TraceRow, op: Opcode, a_limbs: &[u64; 4], b_limbs: &[u64; 4]) {
     match op {
-        Opcode::Wadd | Opcode::Wsub => {
-            // Carries default to 0 — valid for checked arithmetic when
-            // limb additions don't overflow individually.
-            // TODO: compute actual carries from pre-step operand limbs
+        Opcode::Wadd => {
+            // WADD: per-limb addition with carry propagation
+            // result[i] = a[i] + b[i] + carry_in - carry_out * 2^64
+            let mut carry: u64 = 0;
+            for i in 0..4 {
+                let sum = a_limbs[i] as u128 + b_limbs[i] as u128 + carry as u128;
+                carry = (sum >> 64) as u64;
+                row.set_u64(col::wide_carry(i), carry);
+            }
         }
-        Opcode::Wdiv | Opcode::Wmod => {
-            // Quotient columns for WDIV/WMOD
-            // TODO: compute from pre-step operands
+        Opcode::Wsub => {
+            // WSUB: per-limb subtraction with borrow propagation
+            let mut borrow: u64 = 0;
+            for i in 0..4 {
+                let a = a_limbs[i] as u128;
+                let b = b_limbs[i] as u128 + borrow as u128;
+                borrow = if a < b { 1 } else { 0 };
+                row.set_u64(col::wide_carry(i), borrow);
+            }
+        }
+        Opcode::Wmul => {
+            // WMUL: carry from limb-0 product
+            let prod0 = a_limbs[0] as u128 * b_limbs[0] as u128;
+            row.set_u64(col::wide_carry(0), (prod0 >> 64) as u64);
+            // Higher limb carries are complex (schoolbook multiplication)
+            // For now: carry[1..3] = 0 (valid when products don't overflow per-limb)
+        }
+        Opcode::Wdiv => {
+            // WDIV: quotient = a / b, remainder in wide_quotient columns
+            // For limb-0: remainder[0] = a[0] % b[0] (when b fits in limb 0)
+            if b_limbs[0] != 0 {
+                row.set_u64(col::wide_quotient(0), a_limbs[0] % b_limbs[0]);
+            }
+        }
+        Opcode::Wmod => {
+            // WMOD: result = a % b, quotient in wide_quotient columns
+            if b_limbs[0] != 0 {
+                row.set_u64(col::wide_quotient(0), a_limbs[0] / b_limbs[0]);
+            }
         }
         _ => {}
     }
