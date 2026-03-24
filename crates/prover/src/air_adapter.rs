@@ -283,8 +283,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
             is_load * (AB::Expr::one() - Into::<AB::Expr>::into(curr(col::IS_MEMORY_OP))),
         );
 
+        // STORE rd, rs1, imm: stored value = gp[rd] (via rd_sel multiplexer)
         let is_store = opcode_sel!(opcodes::STORE, curr, AB) + opcode_sel!(opcodes::PUSH, curr, AB);
-        builder.assert_zero(is_store.clone() * (op_a.clone() - mem_val0));
+        let mut store_mux_rd = AB::Expr::zero();
+        for i in 0..16 {
+            store_mux_rd = store_mux_rd
+                + Into::<AB::Expr>::into(curr(col::rd_sel(i)))
+                    * Into::<AB::Expr>::into(curr(col::gp(i)));
+        }
+        builder.assert_zero(is_store.clone() * (store_mux_rd - mem_val0));
         builder.assert_zero(
             is_store.clone() * (AB::Expr::one() - Into::<AB::Expr>::into(curr(col::IS_MEMORY_OP))),
         );

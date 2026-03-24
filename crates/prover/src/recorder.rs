@@ -277,7 +277,10 @@ fn fill_mem_value(row: &mut TraceRow, vm: &Vm, op: Opcode, _addr: u64) {
             row.set_u64(col::mem_val(0), row.get(col::OP_RESULT).as_canonical_u64());
         }
         Opcode::Store | Opcode::Push => {
-            row.set_u64(col::mem_val(0), row.get(col::OP_A).as_canonical_u64());
+            // STORE rd, rs1, imm: stores gp[rd] (the value) to mem[gp[rs1] + offset]
+            // The stored value is gp[rd], captured post-step (STORE doesn't modify rd)
+            let rd = row.get(col::RD).as_canonical_u64() as u8;
+            row.set_u64(col::mem_val(0), vm.cpu.read_gp(rd));
         }
         Opcode::Wload | Opcode::Wstore => {
             // Wide memory: 4 limbs from the wide register
