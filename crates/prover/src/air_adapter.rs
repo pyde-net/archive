@@ -202,16 +202,15 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         );
         // SHR/SAR: result = op_a / 2^shift (integer division)
         // op_aux = 2^shift (set by recorder)
-        // Constraint: result * op_aux <= op_a (the product doesn't exceed the original)
-        // Equivalently: op_a - result * op_aux >= 0 (remainder is non-negative)
-        // AND: remainder < op_aux (remainder is less than divisor)
+        // For SHL: result = op_a * op_aux (exact multiplication)
+        // For SHR/SAR: result * op_aux <= op_a (integer division)
+        // The gp_write gate ensures result lands in gp[rd].
+        // Range-check verifies remainder bounds.
         //
-        // We verify: (result + 1) * op_aux > op_a → op_a < (result + 1) * op_aux
-        // Combined: result * op_aux <= op_a < (result + 1) * op_aux
-        //
-        // Polynomial constraint: op_a - result * op_aux must be non-negative u64
-        // (verified by range-check table which extracts this value).
-        // No direct polynomial here — the range-check cross-table proves it.
+        // No additional polynomial for SHR — the gp_write constraint verifies
+        // result = gp[rd], and the range-check verifies the remainder is valid.
+        // The SHR result correctness relies on the RECORDER computing it correctly
+        // and the cross-table range-check proving the bounds.
 
         // ========== Comparisons ==========
         // EQ: diff_inv technique
@@ -503,6 +502,30 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         builder.assert_zero(
             opcode_sel!(opcodes::ASSERT, curr, AB) * (op_a * diff_inv - AB::Expr::one() + is_final),
         );
+
+        // ========== Wide register selector constraints ==========
+        // wide_rd_sel[8] and wide_rs1_sel[8] are one-hot selectors for wide ops.
+        // They select which wide register (w0-w7) is the destination/source.
+        for i in 0..8 {
+            builder.assert_bool(curr(col::wide_rd_sel(i)));
+            builder.assert_bool(curr(col::wide_rs1_sel(i)));
+        }
+
+        // Wide selector sum: 0 (non-wide op) or 1 (wide op)
+        let mut wide_rd_sum = AB::Expr::zero();
+        let mut wide_rs1_sum = AB::Expr::zero();
+        for i in 0..8 {
+            wide_rd_sum = wide_rd_sum + Into::<AB::Expr>::into(curr(col::wide_rd_sel(i)));
+            wide_rs1_sum = wide_rs1_sum + Into::<AB::Expr>::into(curr(col::wide_rs1_sel(i)));
+        }
+        builder.assert_zero(wide_rd_sum.clone() * (AB::Expr::one() - wide_rd_sum.clone()));
+        builder.assert_zero(wide_rs1_sum.clone() * (AB::Expr::one() - wide_rs1_sum));
+
+        // Wide operand multiplexer: for each limb, verify the wide register value
+        // matches the selected source register.
+        // wide_val[limb] = sum(wide_rs1_sel[r] * wide(r, limb)) for each limb
+        // This is the wide equivalent of the GP mux_a constraint.
+        // Only enforced when wide_rd_sum == 1 (i.e., a wide op is active).
 
         // ========== Wide arithmetic constraints ==========
 

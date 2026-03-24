@@ -282,6 +282,116 @@ fn main() {
     });
 
     // ================================================================
+    // ADDITIONAL OPCODES
+    // ================================================================
+
+    // GT comparison
+    let gt_code = bytecode(&[
+        &instr(Opcode::Addi, 1, 0, 100),
+        &instr(Opcode::Addi, 2, 0, 50),
+        &instr(Opcode::Gt, 3, 1, 2),   // 100 > 50 = 1
+        &instr(Opcode::Halt, 0, 0, 0),
+    ]);
+
+    tamper_test!("GT: flip result (1 → 0)", gt_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[2].set_u64(col::OP_RESULT, 0);
+        trace.rows[2].fields[col::gp(3)] = to_field(0);
+    });
+
+    // SHR shift right
+    let shr_code = bytecode(&[
+        &instr(Opcode::Addi, 1, 0, 800),
+        &instr(Opcode::Addi, 2, 0, 3),
+        &instr(Opcode::Shr, 3, 1, 2),  // 800 >> 3 = 100
+        &instr(Opcode::Halt, 0, 0, 0),
+    ]);
+
+    // NOTE: SHR result correctness depends on cross-table range-check (not polynomial).
+    // Tampering both OP_RESULT and gp[rd] together will pass polynomial constraints
+    // but fail the range-check cross-table verification.
+    // Test: tamper ONLY gp[rd] without matching OP_RESULT — gp_write gate catches it.
+    tamper_test!("SHR: tamper gp[rd] without OP_RESULT", shr_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[2].fields[col::gp(3)] = to_field(200); // gp[rd] ≠ OP_RESULT
+    });
+
+    // ADDI immediate
+    tamper_test!("ADDI: tamper result (42 → 99)", add_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[0].set_u64(col::OP_RESULT, 99);
+        trace.rows[0].fields[col::gp(1)] = to_field(99);
+    });
+
+    // FIELDMUL
+    let fieldmul_code = bytecode(&[
+        &instr(Opcode::Addi, 1, 0, 7),
+        &instr(Opcode::Addi, 2, 0, 6),
+        &instr(Opcode::FieldMul, 3, 1, 2),  // 7 * 6 = 42
+        &instr(Opcode::Halt, 0, 0, 0),
+    ]);
+
+    tamper_test!("FIELDMUL: tamper result (42 → 99)", fieldmul_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[2].set_u64(col::OP_RESULT, 99);
+        trace.rows[2].fields[col::gp(3)] = to_field(99);
+    });
+
+    // BLT branch
+    let blt_code = bytecode(&[
+        &instr(Opcode::Addi, 1, 0, 5),
+        &instr(Opcode::Addi, 2, 0, 10),
+        &instr(Opcode::Blt, 1, 2, 8),  // 5 < 10 → skip
+        &instr(Opcode::Halt, 0, 0, 0), // skipped
+        &instr(Opcode::Addi, 3, 0, 77),
+        &instr(Opcode::Halt, 0, 0, 0),
+    ]);
+
+    tamper_test!("BLT: tamper op_aux", blt_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[2].set_u64(col::OP_AUX, 999);
+    });
+
+    // BNE: test with equal values (branch NOT taken, simpler to verify)
+    let bne_code = bytecode(&[
+        &instr(Opcode::Addi, 1, 0, 42),
+        &instr(Opcode::Addi, 2, 0, 42),
+        &instr(Opcode::Bne, 1, 2, 8),  // 42 == 42 → NOT taken, sequential
+        &instr(Opcode::Halt, 0, 0, 0), // executed (branch not taken)
+    ]);
+
+    tamper_test!("BNE: force branch_taken when equal", bne_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[2].fields[col::BRANCH_TAKEN] = Goldilocks::one();
+    });
+
+    // NOTE: diff_inv tamper when a==b is expected to PASS polynomial constraints
+    // (when diff=0, diff_inv is irrelevant). Caught by cross-table verification.
+
+    // NOTE: mem_addr tamper is expected to PASS polynomial constraints
+    // (address not constrained by AIR). Caught by memory bus cross-table.
+
+    // IS_MEMORY_OP flag tampering
+    tamper_test!("STORE: remove memory flag", mem_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[2].fields[col::IS_MEMORY_OP] = Goldilocks::zero();
+    });
+
+    // MEM_IS_WRITE flag tampering
+    tamper_test!("STORE: remove write flag", mem_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[2].fields[col::MEM_IS_WRITE] = Goldilocks::zero();
+    });
+
+    // NOTE: CALL/RET tests require valid function addresses in bytecode.
+    // The CALL instruction encoding needs careful offset calculation.
+    // Tested implicitly via pipeline.rs multi-tx tests.
+
+    // rs1_sel tampering (wrong source register)
+    tamper_test!("ADD: tamper rs1_sel (wrong source)", add_code.clone(), |trace: &mut ExecutionTrace| {
+        // ADD r3, r1, r2 — change rs1_sel to point to r5 instead of r1
+        for i in 0..16 { trace.rows[2].fields[col::rs1_sel(i)] = Goldilocks::zero(); }
+        trace.rows[2].fields[col::rs1_sel(5)] = Goldilocks::one();
+    });
+
+    // Wide selector boolean
+    tamper_test!("WIDE: non-boolean wide_rd_sel", add_code.clone(), |trace: &mut ExecutionTrace| {
+        trace.rows[0].fields[col::wide_rd_sel(0)] = to_field(2); // not boolean
+    });
+
+    // ================================================================
     // SUMMARY
     // ================================================================
 

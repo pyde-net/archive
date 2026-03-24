@@ -84,26 +84,32 @@ pub mod col {
     pub const CALL_DEPTH: usize = 135;
 
     // === Wide arithmetic: 136..144 (8 columns) ===
-    pub const WIDE_CARRY_START: usize = 136; // 4 carry columns for WADD/WSUB/WMUL
+    pub const WIDE_CARRY_START: usize = 136;
     pub const fn wide_carry(i: usize) -> usize { WIDE_CARRY_START + i }
-    pub const WIDE_QUOTIENT_START: usize = 140; // 4 quotient columns for WDIV/WMOD
+    pub const WIDE_QUOTIENT_START: usize = 140;
     pub const fn wide_quotient(i: usize) -> usize { WIDE_QUOTIENT_START + i }
 
+    // === Wide register selectors: 144..160 (16 columns) ===
+    pub const WIDE_RD_SEL_START: usize = 144;  // 8 one-hot for wide rd (w0-w7)
+    pub const WIDE_RS1_SEL_START: usize = 152; // 8 one-hot for wide rs1 (w0-w7)
+    pub const fn wide_rd_sel(i: usize) -> usize { WIDE_RD_SEL_START + i }
+    pub const fn wide_rs1_sel(i: usize) -> usize { WIDE_RS1_SEL_START + i }
+
     /// Total columns.
-    pub const NUM_COLUMNS: usize = 144;
+    pub const NUM_COLUMNS: usize = 160;
 }
 
 /// A single trace row (one PVM execution step).
 #[derive(Clone, Debug)]
 pub struct TraceRow {
-    pub fields: [Goldilocks; 144],
+    pub fields: [Goldilocks; 160],
 }
 
 impl TraceRow {
     /// All zeros.
     pub fn zero() -> Self {
         Self {
-            fields: [Goldilocks::zero(); 144],
+            fields: [Goldilocks::zero(); 160],
         }
     }
 
@@ -158,6 +164,20 @@ impl TraceRow {
     pub fn set_rs2_sel(&mut self, rs2: u8) {
         if (rs2 as usize) < 16 {
             self.fields[col::rs2_sel(rs2 as usize)] = Goldilocks::one();
+        }
+    }
+
+    /// Set one-hot wide register destination selector (w0-w7).
+    pub fn set_wide_rd_sel(&mut self, wd: u8) {
+        if (wd as usize) < 8 {
+            self.fields[col::wide_rd_sel(wd as usize)] = Goldilocks::one();
+        }
+    }
+
+    /// Set one-hot wide register source selector (w0-w7).
+    pub fn set_wide_rs1_sel(&mut self, ws1: u8) {
+        if (ws1 as usize) < 8 {
+            self.fields[col::wide_rs1_sel(ws1 as usize)] = Goldilocks::one();
         }
     }
 }
@@ -223,7 +243,7 @@ mod tests {
 
     #[test]
     fn column_count() {
-        assert_eq!(col::NUM_COLUMNS, 144);
+        assert_eq!(col::NUM_COLUMNS, 160);
     }
 
     #[test]
@@ -284,7 +304,7 @@ mod tests {
         row.set_u64(col::PC, 100);
         trace.push(row);
         let values = trace.to_row_major_values();
-        assert_eq!(values.len(), 144);
+        assert_eq!(values.len(), 160);
         assert_eq!(values[col::PC], to_field(100));
     }
 

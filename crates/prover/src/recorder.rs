@@ -137,6 +137,17 @@ pub fn record_execution(vm: &mut Vm) -> (ExecutionTrace, Outcome) {
             row.set_rs2_sel((rs2_imm & 0xF) as u8);
         }
 
+        // Wide register selectors for wide ops
+        let is_wide_op = matches!(opcode,
+            Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv | Opcode::Wmod
+            | Opcode::Wand | Opcode::Wor | Opcode::Wxor | Opcode::Wnot
+            | Opcode::Wmov | Opcode::Widen | Opcode::Wload | Opcode::Wstore
+        );
+        if is_wide_op {
+            row.set_wide_rd_sel(rd & 0x07);   // wide dest register
+            row.set_wide_rs1_sel(rs1 & 0x07); // wide source register
+        }
+
         // Operands
         row.set_u64(col::OP_A, pre_op_a);
         row.set_u64(col::OP_B, pre_op_b);
@@ -393,14 +404,16 @@ fn fill_op_aux(row: &mut TraceRow, op: Opcode, a: u64, b: u64, result: u64, rs2_
             let shift = b & 63;
             row.set_u64(col::OP_AUX, 1u64 << shift);
         }
-        // SHR/SAR: op_aux = 2^shift (for the constraint: op_a = result * op_aux + remainder)
-        // We need TWO aux values: the power and the remainder.
-        // Use op_aux for the power. The remainder = a - result * power, which the
-        // constraint can compute from op_a, result, and op_aux.
+        // SHR/SAR: op_aux = remainder (op_a % 2^shift)
+        // The constraint verifies result is correct by checking gp[rd] = result
+        // AND that result * 2^shift + remainder = op_a (via range-check cross-table).
+        // op_b still holds the original shift amount from the register.
         Opcode::Shr | Opcode::Sar => {
             let shift = b & 63;
             let power = 1u64 << shift;
-            row.set_u64(col::OP_AUX, power);
+            // remainder = op_a - result * 2^shift
+            // `result` parameter is gp[rd] post-step (the shift result)
+            row.set_u64(col::OP_AUX, a.wrapping_sub(result.wrapping_mul(power)));
         }
         // BLT: branch compares gp[rd] < gp[rs1]
         // AIR constraint uses mux_rd (gp[rd]) and op_a (gp[rs1]).
