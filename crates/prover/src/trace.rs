@@ -1,289 +1,190 @@
-//! Execution trace table for STARK proof generation.
+//! Execution trace: 128-column format for the custom STARK prover.
 //!
-//! The trace table captures every cycle of PVM execution. Each row
-//! represents one instruction execution with ~50-70 columns:
+//! Each row represents one PVM instruction execution. The trace captures
+//! post-step state: register values AFTER the instruction executes.
 //!
-//! - Program counter, opcode, decoded fields
-//! - 16 GP registers (r0-r15)
-//! - 8 wide registers (w0-w7), 4 limbs each = 32 columns
-//! - Memory read/write addresses and values
-//! - Storage read/write keys and values
-//! - Gas counter
-//! - Flags (overflow, zero, etc.)
-//!
-//! The Plonky3 AIR (Algebraic Intermediate Representation) defines
-//! constraints that each row must satisfy. The prover generates a
-//! STARK proof that the trace is valid.
+//! Design principles:
+//! - GP registers: 1 column each (checked arithmetic → field arithmetic is exact)
+//! - Wide registers: 4 limbs each (u256 needs limb decomposition, unavoidable)
+//! - No bit decomposition columns (bitwise ops use lookup tables instead)
+//! - No Merkle columns (verified via cross-table Poseidon2 bus)
 
 use p3_field::AbstractField;
 use p3_goldilocks::Goldilocks;
 
-/// Number of GP register columns (r0-r15).
-pub const NUM_GP_REGS: usize = 16;
+/// Number of GP registers.
+pub const NUM_GP: usize = 16;
+/// Number of wide registers.
+pub const NUM_WIDE: usize = 8;
+/// Limbs per wide register.
+pub const WIDE_LIMBS: usize = 4;
 
-/// Number of wide register columns (w0-w7, 4 u64 limbs each).
-pub const NUM_WIDE_LIMBS: usize = 8 * 4; // 32
+/// Column indices into the flattened trace row.
+pub mod col {
+    // === Control (5 columns) ===
+    pub const PC: usize = 0;
+    pub const OPCODE: usize = 1;
+    pub const RD: usize = 2;
+    pub const RS1: usize = 3;
+    pub const RS2_IMM: usize = 4;
 
-/// Trace row: one PVM execution step.
-///
-/// All values are Goldilocks field elements (u64 mod p).
+    // === GP registers: 5..21 (16 columns) ===
+    pub const GP_START: usize = 5;
+    pub const fn gp(i: usize) -> usize { GP_START + i }
+
+    // === Wide registers: 21..53 (8 × 4 = 32 columns) ===
+    pub const WIDE_START: usize = 21;
+    pub const fn wide(reg: usize, limb: usize) -> usize { WIDE_START + reg * 4 + limb }
+
+    // === Memory: 53..60 (7 columns) ===
+    pub const MEM_ADDR: usize = 53;
+    pub const MEM_VAL_START: usize = 54; // 4 limbs (for wide loads)
+    pub const fn mem_val(i: usize) -> usize { MEM_VAL_START + i }
+    pub const MEM_WIDTH: usize = 58;
+    pub const MEM_IS_WRITE: usize = 59;
+
+    // === Storage: 60..70 (10 columns) ===
+    pub const STORAGE_KEY_START: usize = 60; // 4 limbs
+    pub const fn storage_key(i: usize) -> usize { STORAGE_KEY_START + i }
+    pub const STORAGE_VAL_START: usize = 64; // 4 limbs
+    pub const fn storage_val(i: usize) -> usize { STORAGE_VAL_START + i }
+    pub const STORAGE_VAL_LEN: usize = 68;
+    pub const STORAGE_IS_WRITE: usize = 69;
+
+    // === Gas: 70..72 (2 columns) ===
+    pub const GAS_STEP: usize = 70;
+    pub const GAS_CUMULATIVE: usize = 71;
+
+    // === Flags: 72..75 (3 columns) ===
+    pub const IS_MEMORY_OP: usize = 72;
+    pub const IS_STORAGE_OP: usize = 73;
+    pub const IS_FINAL: usize = 74;
+
+    // === Opcode bits: 75..81 (6 columns) ===
+    pub const OPCODE_BITS_START: usize = 75;
+    pub const fn opcode_bit(i: usize) -> usize { OPCODE_BITS_START + i }
+
+    // === Operands: 81..85 (4 columns) ===
+    pub const OP_A: usize = 81;      // resolved first operand (gp[rs1])
+    pub const OP_B: usize = 82;      // resolved second operand (gp[rs2] or immediate)
+    pub const OP_RESULT: usize = 83;  // result written to gp[rd]
+    pub const OP_AUX: usize = 84;    // auxiliary: DIV remainder, MOD quotient, comparison diff, etc.
+
+    // === Register selectors: 85..133 (48 columns) ===
+    pub const RD_SEL_START: usize = 85;   // 16 one-hot for rd
+    pub const RS1_SEL_START: usize = 101;  // 16 one-hot for rs1
+    pub const RS2_SEL_START: usize = 117;  // 16 one-hot for rs2 (register-register ops)
+    pub const fn rd_sel(i: usize) -> usize { RD_SEL_START + i }
+    pub const fn rs1_sel(i: usize) -> usize { RS1_SEL_START + i }
+    pub const fn rs2_sel(i: usize) -> usize { RS2_SEL_START + i }
+
+    // === Branch/Call: 133..136 (3 columns) ===
+    pub const BRANCH_TAKEN: usize = 133;
+    pub const DIFF_INV: usize = 134;
+    pub const CALL_DEPTH: usize = 135;
+
+    // === Wide arithmetic: 136..144 (8 columns) ===
+    pub const WIDE_CARRY_START: usize = 136;
+    pub const fn wide_carry(i: usize) -> usize { WIDE_CARRY_START + i }
+    pub const WIDE_QUOTIENT_START: usize = 140;
+    pub const fn wide_quotient(i: usize) -> usize { WIDE_QUOTIENT_START + i }
+
+    // === Wide register selectors: 144..160 (16 columns) ===
+    pub const WIDE_RD_SEL_START: usize = 144;  // 8 one-hot for wide rd (w0-w7)
+    pub const WIDE_RS1_SEL_START: usize = 152; // 8 one-hot for wide rs1 (w0-w7)
+    pub const fn wide_rd_sel(i: usize) -> usize { WIDE_RD_SEL_START + i }
+    pub const fn wide_rs1_sel(i: usize) -> usize { WIDE_RS1_SEL_START + i }
+
+    /// Total columns.
+    pub const NUM_COLUMNS: usize = 160;
+}
+
+/// A single trace row (one PVM execution step).
 #[derive(Clone, Debug)]
 pub struct TraceRow {
-    // === Control flow (5 columns) ===
-    /// Program counter.
-    pub pc: Goldilocks,
-    /// Opcode (as field element).
-    pub opcode: Goldilocks,
-    /// Decoded rd field.
-    pub rd: Goldilocks,
-    /// Decoded rs1 field.
-    pub rs1: Goldilocks,
-    /// Decoded rs2/imm field.
-    pub rs2_imm: Goldilocks,
-
-    // === GP registers (16 columns) ===
-    pub gp_regs: [Goldilocks; NUM_GP_REGS],
-
-    // === Wide registers (32 columns) ===
-    /// w0-w7, each split into 4 × u64 limbs for field compatibility.
-    pub wide_limbs: [Goldilocks; NUM_WIDE_LIMBS],
-
-    // === Memory (7 columns) ===
-    /// Memory address (read or write).
-    pub mem_addr: Goldilocks,
-    /// Memory value: 4 × u64 limbs.
-    /// - GP mode (width ≤ 8): val[0] = raw u64, val[1..3] = 0
-    /// - Bulk mode (width > 8): val[0..3] = Poseidon2(raw_bytes) hash limbs
-    ///   (actual bytes in auxiliary witness, AIR verifies hash)
-    pub mem_val: [Goldilocks; 4],
-    /// Memory access width in bytes (1, 2, 4, 8 for GP; or N for bulk writes).
-    pub mem_width: Goldilocks,
-    /// Memory is write (1) or read (0).
-    pub mem_is_write: Goldilocks,
-
-    // === Storage (10 columns) ===
-    /// Storage key: 4 × u64 limbs (U256, always fixed size).
-    pub storage_key: [Goldilocks; 4],
-    /// Storage value: 4 × u64 limbs. Interpretation derived from storage_val_len:
-    /// - len ≤ 8:  val[0] = raw u64, val[1..3] = 0
-    /// - len ≤ 32: val[0..3] = raw U256 limbs
-    /// - len > 32: val[0..3] = Poseidon2(raw_bytes) hash limbs
-    ///   (actual bytes in auxiliary witness, AIR verifies hash)
-    pub storage_val: [Goldilocks; 4],
-    /// Length of the raw storage value in bytes (same role as mem_width).
-    pub storage_val_len: Goldilocks,
-    /// Storage is write (1) or read (0).
-    pub storage_is_write: Goldilocks,
-
-    // === Gas (2 columns) ===
-    /// Gas used this step.
-    pub gas_step: Goldilocks,
-    /// Cumulative gas used.
-    pub gas_cumulative: Goldilocks,
-
-    // === Flags (3 columns) ===
-    /// Is this a memory instruction?
-    pub is_memory_op: Goldilocks,
-    /// Is this a storage instruction?
-    pub is_storage_op: Goldilocks,
-    /// Is this the last row (HALT/REVERT)?
-    pub is_final: Goldilocks,
-
-    // === Opcode bits (6 columns) ===
-    /// Binary decomposition of the opcode field (6 bits).
-    /// opcode = b0 + 2*b1 + 4*b2 + 8*b3 + 16*b4 + 32*b5
-    /// Used to build per-opcode selectors for AIR constraints.
-    pub opcode_bits: [Goldilocks; 6],
-
-    // === Operands (4 columns) ===
-    /// Resolved first operand value (gp[rs1] for register ops).
-    pub op_a: Goldilocks,
-    /// Resolved second operand value (gp[rs2] or sign_extend(imm)).
-    pub op_b: Goldilocks,
-    /// Result value (written to gp[rd] after this step).
-    pub op_result: Goldilocks,
-    /// Auxiliary quotient for MOD: op_a = quotient * op_b + result.
-    pub op_quotient: Goldilocks,
-
-    // === Register selectors (48 columns) ===
-    /// rd selector: rd_sel[i] = 1 if rd == i, else 0 (16 booleans).
-    pub rd_sel: [Goldilocks; 16],
-    /// rs1 selector: rs1_sel[i] = 1 if rs1 == i, else 0.
-    pub rs1_sel: [Goldilocks; 16],
-    /// rs2 selector: rs2_sel[i] = 1 if rs2 == i, else 0.
-    pub rs2_sel: [Goldilocks; 16],
-
-    // === Bit decomposition (128 columns) ===
-    /// Binary decomposition of op_a (64 bits).
-    pub op_a_bits: [Goldilocks; 64],
-    /// Binary decomposition of op_b (64 bits).
-    pub op_b_bits: [Goldilocks; 64],
-
-    // === Shift remainder (1 column) ===
-    /// Remainder for SHR: op_a = result * 2^shift + remainder.
-    /// 0 <= remainder < 2^shift.
-    pub shift_remainder: Goldilocks,
-
-    // === Wide operands (12 columns) ===
-    /// Wide op_a: 4 × u64 limbs (U256).
-    pub wide_op_a: [Goldilocks; 4],
-    /// Wide op_b: 4 × u64 limbs (U256).
-    pub wide_op_b: [Goldilocks; 4],
-    /// Wide result: 4 × u64 limbs (U256).
-    pub wide_result: [Goldilocks; 4],
-
-    // === Wide carry (4 columns) ===
-    /// Carry bits for WADD/WSUB between limbs.
-    /// carry[i] = overflow from limb i into limb i+1.
-    pub wide_carry: [Goldilocks; 4],
-
-    // === Wide quotient for WMOD (4 columns) ===
-    /// Wide quotient: wide_op_a = wide_quotient * wide_op_b + wide_result.
-    pub wide_quotient: [Goldilocks; 4],
-
-    // === Branch/Call (3 columns) ===
-    /// 1 if branch was taken, 0 if not taken.
-    pub branch_taken: Goldilocks,
-    /// Inverse of (op_a - op_b) for equality/inequality proofs.
-    /// When op_a != op_b: diff_inv = 1/(op_a - op_b).
-    /// When op_a == op_b: diff_inv = 0.
-    pub diff_inv: Goldilocks,
-    /// Current call stack depth (0 at top level).
-    pub call_depth: Goldilocks,
-
-    // === Wide bit decomposition (512 columns) ===
-    /// Binary decomposition of wide_op_a (256 bits = 4 limbs × 64 bits).
-    pub wide_a_bits: [Goldilocks; 256],
-    /// Binary decomposition of wide_op_b (256 bits).
-    pub wide_b_bits: [Goldilocks; 256],
-
-    // === Merkle proof (34 columns) ===
-    /// Merkle path: 32 sibling hashes (each as single Goldilocks element,
-    /// which is the Poseidon2 hash of the full 32-byte sibling compressed
-    /// to a field element). Max tree depth = 32 (covers 2^32 leaves).
-    pub merkle_path: [Goldilocks; 32],
-    /// Merkle path direction bits: 0 = left, 1 = right (32 bits for 32 levels).
-    /// merkle_dir[i] = 1 if the current node is the RIGHT child at level i.
-    pub merkle_dir: [Goldilocks; 32],
+    pub fields: [Goldilocks; 160],
 }
 
 impl TraceRow {
-    /// Total number of columns in the trace.
-    /// 5 control + 16 GP + 32 wide regs + 7 memory + 10 storage + 2 gas + 3 flags
-    /// + 6 opcode_bits + 4 operands + 48 reg selectors + 128 bit decomp
-    /// + 1 shift remainder + 12 wide operands + 4 wide carry + 4 wide quotient
-    /// + 3 branch/call + 512 wide bit decomp + 32 merkle path + 32 merkle dir = 861
-    pub const NUM_COLUMNS: usize = 5 + NUM_GP_REGS + NUM_WIDE_LIMBS + 7 + 10 + 2 + 3
-        + 6 + 4 + 48 + 128 + 1 + 12 + 4 + 4 + 3 + 512 + 32 + 32;
-
-    /// Create an empty trace row (all zeros).
+    /// All zeros.
     pub fn zero() -> Self {
         Self {
-            pc: Goldilocks::zero(),
-            opcode: Goldilocks::zero(),
-            rd: Goldilocks::zero(),
-            rs1: Goldilocks::zero(),
-            rs2_imm: Goldilocks::zero(),
-            gp_regs: [Goldilocks::zero(); NUM_GP_REGS],
-            wide_limbs: [Goldilocks::zero(); NUM_WIDE_LIMBS],
-            mem_addr: Goldilocks::zero(),
-            mem_val: [Goldilocks::zero(); 4],
-            mem_width: Goldilocks::zero(),
-            mem_is_write: Goldilocks::zero(),
-            storage_key: [Goldilocks::zero(); 4],
-            storage_val: [Goldilocks::zero(); 4],
-            storage_val_len: Goldilocks::zero(),
-            storage_is_write: Goldilocks::zero(),
-            gas_step: Goldilocks::zero(),
-            gas_cumulative: Goldilocks::zero(),
-            is_memory_op: Goldilocks::zero(),
-            is_storage_op: Goldilocks::zero(),
-            is_final: Goldilocks::zero(),
-            opcode_bits: [Goldilocks::zero(); 6],
-            op_a: Goldilocks::zero(),
-            op_b: Goldilocks::zero(),
-            op_result: Goldilocks::zero(),
-            op_quotient: Goldilocks::zero(),
-            rd_sel: [Goldilocks::zero(); 16],
-            rs1_sel: [Goldilocks::zero(); 16],
-            rs2_sel: [Goldilocks::zero(); 16],
-            op_a_bits: [Goldilocks::zero(); 64],
-            op_b_bits: [Goldilocks::zero(); 64],
-            shift_remainder: Goldilocks::zero(),
-            wide_op_a: [Goldilocks::zero(); 4],
-            wide_op_b: [Goldilocks::zero(); 4],
-            wide_result: [Goldilocks::zero(); 4],
-            wide_carry: [Goldilocks::zero(); 4],
-            wide_quotient: [Goldilocks::zero(); 4],
-            branch_taken: Goldilocks::zero(),
-            diff_inv: Goldilocks::zero(),
-            call_depth: Goldilocks::zero(),
-            wide_a_bits: [Goldilocks::zero(); 256],
-            wide_b_bits: [Goldilocks::zero(); 256],
-            merkle_path: [Goldilocks::zero(); 32],
-            merkle_dir: [Goldilocks::zero(); 32],
+            fields: [Goldilocks::zero(); 160],
         }
     }
 
-    /// Convert to a flat array of field elements (for Plonky3 matrix).
-    pub fn to_fields(&self) -> Vec<Goldilocks> {
-        let mut fields = Vec::with_capacity(Self::NUM_COLUMNS);
-        fields.push(self.pc);
-        fields.push(self.opcode);
-        fields.push(self.rd);
-        fields.push(self.rs1);
-        fields.push(self.rs2_imm);
-        fields.extend_from_slice(&self.gp_regs);
-        fields.extend_from_slice(&self.wide_limbs);
-        fields.push(self.mem_addr);
-        fields.extend_from_slice(&self.mem_val);
-        fields.push(self.mem_width);
-        fields.push(self.mem_is_write);
-        fields.extend_from_slice(&self.storage_key);
-        fields.extend_from_slice(&self.storage_val);
-        fields.push(self.storage_val_len);
-        fields.push(self.storage_is_write);
-        fields.push(self.gas_step);
-        fields.push(self.gas_cumulative);
-        fields.push(self.is_memory_op);
-        fields.push(self.is_storage_op);
-        fields.push(self.is_final);
-        fields.extend_from_slice(&self.opcode_bits);
-        fields.push(self.op_a);
-        fields.push(self.op_b);
-        fields.push(self.op_result);
-        fields.push(self.op_quotient);
-        fields.extend_from_slice(&self.rd_sel);
-        fields.extend_from_slice(&self.rs1_sel);
-        fields.extend_from_slice(&self.rs2_sel);
-        fields.extend_from_slice(&self.op_a_bits);
-        fields.extend_from_slice(&self.op_b_bits);
-        fields.push(self.shift_remainder);
-        fields.extend_from_slice(&self.wide_op_a);
-        fields.extend_from_slice(&self.wide_op_b);
-        fields.extend_from_slice(&self.wide_result);
-        fields.extend_from_slice(&self.wide_carry);
-        fields.extend_from_slice(&self.wide_quotient);
-        fields.push(self.branch_taken);
-        fields.push(self.diff_inv);
-        fields.push(self.call_depth);
-        fields.extend_from_slice(&self.wide_a_bits);
-        fields.extend_from_slice(&self.wide_b_bits);
-        fields.extend_from_slice(&self.merkle_path);
-        fields.extend_from_slice(&self.merkle_dir);
-        fields
+    /// Get a column value.
+    #[inline]
+    pub fn get(&self, col: usize) -> Goldilocks {
+        self.fields[col]
+    }
+
+    /// Set a column value.
+    #[inline]
+    pub fn set(&mut self, col: usize, val: Goldilocks) {
+        self.fields[col] = val;
+    }
+
+    /// Set from u64.
+    #[inline]
+    pub fn set_u64(&mut self, col: usize, val: u64) {
+        self.fields[col] = Goldilocks::from_canonical_u64(val);
+    }
+
+    /// Set a flag to 1.
+    #[inline]
+    pub fn set_flag(&mut self, col: usize) {
+        self.fields[col] = Goldilocks::one();
+    }
+
+    /// Set opcode bits from opcode value.
+    pub fn set_opcode_bits(&mut self, opcode: u64) {
+        for i in 0..6 {
+            self.fields[col::opcode_bit(i)] = if (opcode >> i) & 1 == 1 {
+                Goldilocks::one()
+            } else {
+                Goldilocks::zero()
+            };
+        }
+    }
+
+    /// Set one-hot register selector.
+    pub fn set_rd_sel(&mut self, rd: u8) {
+        if (rd as usize) < 16 {
+            self.fields[col::rd_sel(rd as usize)] = Goldilocks::one();
+        }
+    }
+
+    pub fn set_rs1_sel(&mut self, rs1: u8) {
+        if (rs1 as usize) < 16 {
+            self.fields[col::rs1_sel(rs1 as usize)] = Goldilocks::one();
+        }
+    }
+
+    pub fn set_rs2_sel(&mut self, rs2: u8) {
+        if (rs2 as usize) < 16 {
+            self.fields[col::rs2_sel(rs2 as usize)] = Goldilocks::one();
+        }
+    }
+
+    /// Set one-hot wide register destination selector (w0-w7).
+    pub fn set_wide_rd_sel(&mut self, wd: u8) {
+        if (wd as usize) < 8 {
+            self.fields[col::wide_rd_sel(wd as usize)] = Goldilocks::one();
+        }
+    }
+
+    /// Set one-hot wide register source selector (w0-w7).
+    pub fn set_wide_rs1_sel(&mut self, ws1: u8) {
+        if (ws1 as usize) < 8 {
+            self.fields[col::wide_rs1_sel(ws1 as usize)] = Goldilocks::one();
+        }
     }
 }
 
-/// Helper: convert a u64 to a Goldilocks field element.
-pub fn to_field(val: u64) -> Goldilocks {
-    Goldilocks::from_canonical_u64(val)
-}
-
-/// The full execution trace: a list of rows.
-#[derive(Clone, Debug)]
+/// The full execution trace.
+#[derive(Clone, Debug, Default)]
 pub struct ExecutionTrace {
-    /// Trace rows in execution order.
     pub rows: Vec<TraceRow>,
 }
 
@@ -292,18 +193,10 @@ impl ExecutionTrace {
         Self { rows: Vec::new() }
     }
 
-    pub fn with_capacity(n: usize) -> Self {
-        Self {
-            rows: Vec::with_capacity(n),
-        }
-    }
-
-    /// Add a row to the trace.
     pub fn push(&mut self, row: TraceRow) {
         self.rows.push(row);
     }
 
-    /// Number of execution steps.
     pub fn len(&self) -> usize {
         self.rows.len()
     }
@@ -312,29 +205,7 @@ impl ExecutionTrace {
         self.rows.is_empty()
     }
 
-    /// Convert the trace to a flat column-major matrix for Plonky3.
-    /// Returns Vec of columns, each column is Vec<Goldilocks>.
-    pub fn to_column_major(&self) -> Vec<Vec<Goldilocks>> {
-        if self.rows.is_empty() {
-            return vec![vec![]; TraceRow::NUM_COLUMNS];
-        }
-
-        let num_rows = self.rows.len();
-        let mut columns = vec![Vec::with_capacity(num_rows); TraceRow::NUM_COLUMNS];
-
-        for row in &self.rows {
-            let fields = row.to_fields();
-            for (col_idx, val) in fields.into_iter().enumerate() {
-                columns[col_idx].push(val);
-            }
-        }
-
-        columns
-    }
-
-    /// Pad the trace to a power of 2 (required by STARK provers).
-    /// Padded rows are marked is_final=1 so transition constraints
-    /// don't fire on them. Register selectors set to valid one-hot (rd=0, rs1=0).
+    /// Pad to next power of 2 with is_final=1 rows.
     pub fn pad_to_power_of_two(&mut self) {
         if self.rows.is_empty() {
             return;
@@ -342,20 +213,28 @@ impl ExecutionTrace {
         let target = self.rows.len().next_power_of_two();
         while self.rows.len() < target {
             let mut pad = TraceRow::zero();
-            pad.is_final = Goldilocks::one();
-            // Valid one-hot selectors: rd=0, rs1=0 (index 0 set)
-            pad.rd_sel[0] = Goldilocks::one();
-            pad.rs1_sel[0] = Goldilocks::one();
-            // rs2_sel all zero (sum=0, valid for immediate/no-op)
+            pad.set_flag(col::IS_FINAL);
+            // Valid one-hot selectors for padding
+            pad.fields[col::rd_sel(0)] = Goldilocks::one();
+            pad.fields[col::rs1_sel(0)] = Goldilocks::one();
             self.rows.push(pad);
         }
     }
+
+    /// Convert to flat row-major values for polynomial commitment.
+    pub fn to_row_major_values(&self) -> Vec<Goldilocks> {
+        let mut values = Vec::with_capacity(self.rows.len() * col::NUM_COLUMNS);
+        for row in &self.rows {
+            values.extend_from_slice(&row.fields);
+        }
+        values
+    }
 }
 
-impl Default for ExecutionTrace {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Helper: u64 → Goldilocks.
+#[inline]
+pub fn to_field(val: u64) -> Goldilocks {
+    Goldilocks::from_canonical_u64(val)
 }
 
 #[cfg(test)]
@@ -363,44 +242,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trace_row_column_count() {
-        assert_eq!(TraceRow::NUM_COLUMNS, 861);
+    fn column_count() {
+        assert_eq!(col::NUM_COLUMNS, 160);
     }
 
     #[test]
-    fn zero_row_all_zeros() {
+    fn zero_row() {
         let row = TraceRow::zero();
-        let fields = row.to_fields();
-        assert_eq!(fields.len(), 861);
-        for f in &fields {
-            assert_eq!(*f, Goldilocks::zero());
+        for i in 0..col::NUM_COLUMNS {
+            assert_eq!(row.get(i), Goldilocks::zero());
         }
     }
 
     #[test]
-    fn to_fields_preserves_values() {
+    fn set_and_get() {
         let mut row = TraceRow::zero();
-        row.pc = to_field(42);
-        row.opcode = to_field(7);
-        row.gp_regs[0] = to_field(100);
-        row.gas_cumulative = to_field(21000);
-
-        let fields = row.to_fields();
-        assert_eq!(fields[0], to_field(42)); // pc
-        assert_eq!(fields[1], to_field(7)); // opcode
-        assert_eq!(fields[5], to_field(100)); // gp_regs[0]
-                                              // gas_cumulative: 5 control + 16 gp + 32 wide + 7 mem + 10 storage + 1 gas_step = index 71
-        assert_eq!(fields[71], to_field(21000)); // gas_cumulative
+        row.set_u64(col::PC, 42);
+        row.set_u64(col::OPCODE, 0x01);
+        assert_eq!(row.get(col::PC), to_field(42));
+        assert_eq!(row.get(col::OPCODE), to_field(0x01));
     }
 
     #[test]
-    fn trace_push_and_len() {
-        let mut trace = ExecutionTrace::new();
-        assert!(trace.is_empty());
+    fn opcode_bits_decomposition() {
+        let mut row = TraceRow::zero();
+        row.set_opcode_bits(0x2C); // HALT = 0b101100
+        assert_eq!(row.get(col::opcode_bit(0)), Goldilocks::zero());  // bit 0 = 0
+        assert_eq!(row.get(col::opcode_bit(1)), Goldilocks::zero());  // bit 1 = 0
+        assert_eq!(row.get(col::opcode_bit(2)), Goldilocks::one());   // bit 2 = 1
+        assert_eq!(row.get(col::opcode_bit(3)), Goldilocks::one());   // bit 3 = 1
+        assert_eq!(row.get(col::opcode_bit(4)), Goldilocks::zero());  // bit 4 = 0
+        assert_eq!(row.get(col::opcode_bit(5)), Goldilocks::one());   // bit 5 = 1
+    }
 
-        trace.push(TraceRow::zero());
-        trace.push(TraceRow::zero());
-        assert_eq!(trace.len(), 2);
+    #[test]
+    fn register_selectors() {
+        let mut row = TraceRow::zero();
+        row.set_rd_sel(5);
+        row.set_rs1_sel(3);
+        assert_eq!(row.get(col::rd_sel(5)), Goldilocks::one());
+        assert_eq!(row.get(col::rd_sel(0)), Goldilocks::zero());
+        assert_eq!(row.get(col::rs1_sel(3)), Goldilocks::one());
     }
 
     #[test]
@@ -409,57 +291,31 @@ mod tests {
         for _ in 0..5 {
             trace.push(TraceRow::zero());
         }
-        assert_eq!(trace.len(), 5);
-
         trace.pad_to_power_of_two();
-        assert_eq!(trace.len(), 8); // next power of 2
+        assert_eq!(trace.len(), 8);
+        // Padding rows have is_final=1
+        assert_eq!(trace.rows[7].get(col::IS_FINAL), Goldilocks::one());
     }
 
     #[test]
-    fn pad_already_power_of_two() {
+    fn row_major_values() {
         let mut trace = ExecutionTrace::new();
-        for _ in 0..4 {
-            trace.push(TraceRow::zero());
-        }
-        trace.pad_to_power_of_two();
-        assert_eq!(trace.len(), 4); // already power of 2
+        let mut row = TraceRow::zero();
+        row.set_u64(col::PC, 100);
+        trace.push(row);
+        let values = trace.to_row_major_values();
+        assert_eq!(values.len(), 160);
+        assert_eq!(values[col::PC], to_field(100));
     }
 
     #[test]
-    fn column_major_conversion() {
-        let mut trace = ExecutionTrace::new();
-
-        let mut row1 = TraceRow::zero();
-        row1.pc = to_field(0);
-        row1.opcode = to_field(1);
-
-        let mut row2 = TraceRow::zero();
-        row2.pc = to_field(4);
-        row2.opcode = to_field(2);
-
-        trace.push(row1);
-        trace.push(row2);
-
-        let cols = trace.to_column_major();
-        assert_eq!(cols.len(), 861);
-        assert_eq!(cols[0].len(), 2); // 2 rows
-
-        // Column 0 = pc: [0, 4]
-        assert_eq!(cols[0][0], to_field(0));
-        assert_eq!(cols[0][1], to_field(4));
-
-        // Column 1 = opcode: [1, 2]
-        assert_eq!(cols[1][0], to_field(1));
-        assert_eq!(cols[1][1], to_field(2));
-    }
-
-    #[test]
-    fn empty_trace_column_major() {
-        let trace = ExecutionTrace::new();
-        let cols = trace.to_column_major();
-        assert_eq!(cols.len(), 861);
-        for col in &cols {
-            assert!(col.is_empty());
-        }
+    fn wide_register_indices() {
+        // w0 limb 0 = index 21, w0 limb 3 = index 24
+        assert_eq!(col::wide(0, 0), 21);
+        assert_eq!(col::wide(0, 3), 24);
+        // w7 limb 3 = last wide column = index 52
+        assert_eq!(col::wide(7, 3), 52);
+        // Next section (memory) starts at 53
+        assert_eq!(col::MEM_ADDR, 53);
     }
 }

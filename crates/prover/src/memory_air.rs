@@ -1,81 +1,62 @@
-//! Memory consistency AIR: verifies read-after-write correctness.
+//! Memory AIR: verifies read-after-write consistency.
 //!
-//! Standard technique for zkVM memory verification:
-//! 1. Collect all memory accesses (addr, value, is_write, timestamp)
+//! Every LOAD must return the value from the most recent STORE at that address.
+//! Without this, a prover could fake any LOAD result.
+//!
+//! Approach:
+//! 1. Collect all memory accesses (addr, value, is_write, timestamp) from execution trace
 //! 2. Sort by (address, then timestamp)
 //! 3. Verify: each READ returns the value from the last WRITE at that address
+//! 4. Cross-table permutation proves execution trace and sorted table have same entries
 //!
-//! This is a separate AIR table connected to the execution AIR via
-//! cross-table permutation argument (same pattern as Poseidon2 AIR).
-//!
-//! Columns per row:
-//!   addr:           memory address
-//!   value:          value read or written
-//!   is_write:       1 = write, 0 = read
-//!   timestamp:      execution step (ordering within trace)
-//!   addr_same:      1 if addr == previous row's addr
-//!   is_first_access: 1 if this is the first access to this address
-//!
-//! Key constraint:
-//!   if addr_same AND is_read: value must equal previous row's value
-//!   if NOT addr_same: this is a new address (first access must be a write or zero)
+//! Columns (6 per row):
+//!   addr, value, is_write, timestamp, addr_same, is_first
 
-use p3_air::{Air, AirBuilder, BaseAir};
 use p3_field::AbstractField;
 use p3_goldilocks::Goldilocks;
-use p3_matrix::Matrix;
 
-/// Columns in the memory AIR.
-pub const MEM_AIR_COLS: usize = 6;
+use crate::cross_table::{BusEntry, verify_permutation};
 
-pub mod col {
-    pub const ADDR: usize = 0;
-    pub const VALUE: usize = 1;
-    pub const IS_WRITE: usize = 2;
-    pub const TIMESTAMP: usize = 3;
-    pub const ADDR_SAME: usize = 4;
-    pub const IS_FIRST: usize = 5;
-}
-
-/// A row in the sorted memory access trace.
+/// A memory access from the execution trace.
 #[derive(Clone, Debug)]
-pub struct MemoryAccessRow {
-    pub addr: Goldilocks,
-    pub value: Goldilocks,
-    pub is_write: Goldilocks,
-    pub timestamp: Goldilocks,
-    pub addr_same: Goldilocks,
-    pub is_first: Goldilocks,
+pub struct MemoryAccess {
+    pub addr: u64,
+    pub value: u64,
+    pub is_write: bool,
+    pub timestamp: u64,
 }
 
-impl MemoryAccessRow {
-    pub fn zero() -> Self {
-        Self {
-            addr: Goldilocks::zero(),
-            value: Goldilocks::zero(),
-            is_write: Goldilocks::zero(),
-            timestamp: Goldilocks::zero(),
-            addr_same: Goldilocks::zero(),
-            is_first: Goldilocks::one(), // first row is always first access
+impl MemoryAccess {
+    /// Convert to bus entry for cross-table permutation.
+    pub fn to_bus_entry(&self) -> BusEntry {
+        BusEntry {
+            fields: vec![
+                Goldilocks::from_canonical_u64(self.addr),
+                Goldilocks::from_canonical_u64(self.value),
+                if self.is_write { Goldilocks::one() } else { Goldilocks::zero() },
+                Goldilocks::from_canonical_u64(self.timestamp),
+            ],
         }
     }
-
-    pub fn to_fields(&self) -> [Goldilocks; MEM_AIR_COLS] {
-        [
-            self.addr,
-            self.value,
-            self.is_write,
-            self.timestamp,
-            self.addr_same,
-            self.is_first,
-        ]
-    }
 }
 
-/// The sorted memory access trace.
+/// Sorted memory trace row (for the memory AIR).
+#[derive(Clone, Debug)]
+pub struct MemoryRow {
+    pub addr: u64,
+    pub value: u64,
+    pub is_write: bool,
+    pub timestamp: u64,
+    /// 1 if same address as previous row.
+    pub addr_same: bool,
+    /// 1 if this is the first access to this address.
+    pub is_first: bool,
+}
+
+/// The sorted memory trace.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryTrace {
-    pub rows: Vec<MemoryAccessRow>,
+    pub rows: Vec<MemoryRow>,
 }
 
 impl MemoryTrace {
@@ -84,27 +65,27 @@ impl MemoryTrace {
     }
 
     /// Build from unsorted memory accesses: sort by (addr, timestamp).
-    pub fn from_accesses(mut accesses: Vec<(u64, u64, bool, u64)>) -> Self {
-        // Sort by address first, then timestamp
-        accesses.sort_by_key(|(addr, _, _, ts)| (*addr, *ts));
+    pub fn from_accesses(accesses: &[MemoryAccess]) -> Self {
+        let mut sorted: Vec<MemoryAccess> = accesses.to_vec();
+        sorted.sort_by_key(|a| (a.addr, a.timestamp));
 
-        let mut rows = Vec::with_capacity(accesses.len());
+        let mut rows = Vec::with_capacity(sorted.len());
         let mut prev_addr: Option<u64> = None;
 
-        for (addr, value, is_write, timestamp) in &accesses {
-            let addr_same = prev_addr == Some(*addr);
+        for access in &sorted {
+            let addr_same = prev_addr == Some(access.addr);
             let is_first = !addr_same;
 
-            rows.push(MemoryAccessRow {
-                addr: Goldilocks::from_canonical_u64(*addr),
-                value: Goldilocks::from_canonical_u64(*value),
-                is_write: if *is_write { Goldilocks::one() } else { Goldilocks::zero() },
-                timestamp: Goldilocks::from_canonical_u64(*timestamp),
-                addr_same: if addr_same { Goldilocks::one() } else { Goldilocks::zero() },
-                is_first: if is_first { Goldilocks::one() } else { Goldilocks::zero() },
+            rows.push(MemoryRow {
+                addr: access.addr,
+                value: access.value,
+                is_write: access.is_write,
+                timestamp: access.timestamp,
+                addr_same,
+                is_first,
             });
 
-            prev_addr = Some(*addr);
+            prev_addr = Some(access.addr);
         }
 
         Self { rows }
@@ -118,78 +99,134 @@ impl MemoryTrace {
         self.rows.is_empty()
     }
 
-    pub fn pad_to_power_of_two(&mut self) {
-        if self.rows.is_empty() {
-            return;
+    /// Verify read-after-write consistency.
+    /// For each READ at address A: value must equal the most recent WRITE to A.
+    /// For first access to an address: if READ, value must be 0 (uninitialized).
+    pub fn verify_consistency(&self) -> Result<(), String> {
+        let mut last_write_value: Option<u64> = None;
+
+        for (i, row) in self.rows.iter().enumerate() {
+            if row.is_first {
+                // New address: reset write tracker
+                last_write_value = None;
+
+                if !row.is_write && row.value != 0 {
+                    return Err(format!(
+                        "row {}: first access to addr {} is READ with value {} (expected 0)",
+                        i, row.addr, row.value
+                    ));
+                }
+            }
+
+            if row.is_write {
+                last_write_value = Some(row.value);
+            } else {
+                // READ: must match last write
+                match last_write_value {
+                    Some(expected) if expected != row.value => {
+                        return Err(format!(
+                            "row {}: READ at addr {} returned {} but last WRITE was {}",
+                            i, row.addr, row.value, expected
+                        ));
+                    }
+                    None if row.value != 0 => {
+                        return Err(format!(
+                            "row {}: READ at addr {} returned {} but no prior WRITE (expected 0)",
+                            i, row.addr, row.value
+                        ));
+                    }
+                    _ => {} // OK
+                }
+            }
         }
-        let target = self.rows.len().next_power_of_two();
-        while self.rows.len() < target {
-            let mut pad = MemoryAccessRow::zero();
-            pad.is_first = Goldilocks::one();
-            self.rows.push(pad);
-        }
+
+        Ok(())
+    }
+
+    /// Build bus entries for the sorted side of the permutation argument.
+    pub fn to_bus_entries(&self) -> Vec<BusEntry> {
+        self.rows
+            .iter()
+            .map(|row| {
+                BusEntry {
+                    fields: vec![
+                        Goldilocks::from_canonical_u64(row.addr),
+                        Goldilocks::from_canonical_u64(row.value),
+                        if row.is_write { Goldilocks::one() } else { Goldilocks::zero() },
+                        Goldilocks::from_canonical_u64(row.timestamp),
+                    ],
+                }
+            })
+            .collect()
     }
 }
 
-/// The Memory AIR: constrains read-after-write consistency.
-pub struct MemoryAir;
+/// Verify memory consistency via cross-table permutation.
+/// Checks:
+/// 1. Execution-side memory accesses == sorted memory trace (permutation)
+/// 2. Sorted trace satisfies read-after-write consistency
+pub fn verify_memory(
+    exec_accesses: &[MemoryAccess],
+    memory_trace: &MemoryTrace,
+) -> Result<(), String> {
+    // 1. Verify read-after-write in sorted trace
+    memory_trace.verify_consistency()?;
 
-impl<F: AbstractField> BaseAir<F> for MemoryAir {
-    fn width(&self) -> usize {
-        MEM_AIR_COLS
+    // 2. Verify permutation: execution bus == sorted bus
+    let exec_bus: Vec<BusEntry> = exec_accesses.iter().map(|a| a.to_bus_entry()).collect();
+    let sorted_bus = memory_trace.to_bus_entries();
+
+    let alpha = Goldilocks::from_canonical_u64(0x9e3779b97f4a7c15);
+    let alpha_prime = Goldilocks::from_canonical_u64(0x517cc1b727220a95);
+
+    if !verify_permutation(&exec_bus, &sorted_bus, alpha, alpha_prime) {
+        return Err("memory permutation argument failed".to_string());
     }
+
+    Ok(())
 }
 
-impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for MemoryAir {
-    fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        // In Plonky3: get(0) = current row, get(1) = next row.
-        // Memory AIR is sorted by (addr, timestamp). We constrain that
-        // NEXT row is consistent with CURRENT row (forward direction).
-        let curr = |c: usize| -> AB::Var { main.get(0, c) };
-        let next = |c: usize| -> AB::Var { main.get(1, c) };
+/// Extract memory accesses from an execution trace.
+/// For 64-bit ops (LOAD/STORE/PUSH/POP): one access with value = mem_val[0].
+/// For 256-bit ops (WLOAD/WSTORE): four accesses, one per limb.
+pub fn extract_memory_accesses(
+    trace: &crate::trace::ExecutionTrace,
+) -> Vec<MemoryAccess> {
+    use crate::constraint::opcodes;
+    use crate::trace::col;
+    use p3_field::PrimeField64;
 
-        // ========== Boolean constraints ==========
-        builder.assert_bool(curr(col::IS_WRITE));
-        builder.assert_bool(curr(col::ADDR_SAME));
-        builder.assert_bool(curr(col::IS_FIRST));
+    let mut accesses = Vec::new();
 
-        // addr_same and is_first are complementary on NEXT row
-        let next_addr_same: AB::Expr = next(col::ADDR_SAME).into();
-        let next_is_first: AB::Expr = next(col::IS_FIRST).into();
-        builder.assert_one(next_addr_same.clone() + next_is_first.clone());
+    for (step, row) in trace.rows.iter().enumerate() {
+        if row.get(col::IS_MEMORY_OP) == Goldilocks::one() {
+            let opcode = row.get(col::OPCODE).as_canonical_u64();
+            let addr = row.get(col::MEM_ADDR).as_canonical_u64();
+            let is_write = row.get(col::MEM_IS_WRITE) == Goldilocks::one();
 
-        // ========== Sorting constraint ==========
-        // When next.addr_same = 1: next addr must equal current addr
-        let curr_addr: AB::Expr = curr(col::ADDR).into();
-        let next_addr_val: AB::Expr = next(col::ADDR).into();
-        builder.assert_zero(next_addr_same.clone() * (next_addr_val - curr_addr));
-
-        // When addr_same = 1: timestamp must be strictly increasing
-        // curr.timestamp > prev.timestamp
-        // Equivalent: curr.timestamp - prev.timestamp - 1 >= 0
-        // In field: (curr_ts - prev_ts) is nonzero and positive
-        // Simplified: we trust the recorder sorts correctly;
-        // the permutation argument with the execution AIR guarantees
-        // all accesses are present (no fabrication).
-
-        // ========== Read-after-write consistency ==========
-        // When NEXT row has addr_same=1 AND is a read:
-        //   next.value must equal curr.value (last write at this address)
-        let curr_val: AB::Expr = curr(col::VALUE).into();
-        let next_val_expr: AB::Expr = next(col::VALUE).into();
-        let next_is_read = AB::Expr::one() - Into::<AB::Expr>::into(next(col::IS_WRITE));
-
-        builder.assert_zero(
-            next_addr_same * next_is_read * (next_val_expr - curr_val),
-        );
-
-        // ========== First access constraint ==========
-        // When NEXT row is first access AND is a read: value must be 0
-        let next_first_val: AB::Expr = next(col::VALUE).into();
-        let next_first_read = AB::Expr::one() - Into::<AB::Expr>::into(next(col::IS_WRITE));
-        builder.assert_zero(next_is_first * next_first_read * next_first_val);
+            if opcode == opcodes::WLOAD || opcode == opcodes::WSTORE {
+                // 256-bit: capture all 4 limbs as separate accesses
+                for limb in 0..4 {
+                    accesses.push(MemoryAccess {
+                        addr: addr + (limb as u64 * 8), // each limb at 8-byte offset
+                        value: row.get(col::mem_val(limb)).as_canonical_u64(),
+                        is_write,
+                        timestamp: step as u64 * 4 + limb as u64, // unique timestamp per limb
+                    });
+                }
+            } else {
+                // 64-bit: single access
+                accesses.push(MemoryAccess {
+                    addr,
+                    value: row.get(col::mem_val(0)).as_canonical_u64(),
+                    is_write,
+                    timestamp: step as u64 * 4, // multiply by 4 to leave room for wide limbs
+                });
+            }
+        }
     }
+
+    accesses
 }
 
 #[cfg(test)]
@@ -197,85 +234,134 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_air_width() {
-        let air = MemoryAir;
-        assert_eq!(<MemoryAir as BaseAir<Goldilocks>>::width(&air), 6);
+    fn write_then_read_consistent() {
+        let accesses = vec![
+            MemoryAccess { addr: 100, value: 42, is_write: true, timestamp: 0 },
+            MemoryAccess { addr: 100, value: 42, is_write: false, timestamp: 1 },
+        ];
+        let trace = MemoryTrace::from_accesses(&accesses);
+        assert!(trace.verify_consistency().is_ok());
     }
 
     #[test]
-    fn from_accesses_sorted() {
-        // (addr, value, is_write, timestamp)
+    fn read_wrong_value_detected() {
         let accesses = vec![
-            (100, 42, true, 0),   // write 42 to addr 100 at t=0
-            (200, 99, true, 1),   // write 99 to addr 200 at t=1
-            (100, 42, false, 2),  // read from addr 100 at t=2 → should be 42
+            MemoryAccess { addr: 100, value: 42, is_write: true, timestamp: 0 },
+            MemoryAccess { addr: 100, value: 99, is_write: false, timestamp: 1 }, // WRONG
         ];
-
-        let trace = MemoryTrace::from_accesses(accesses);
-        assert_eq!(trace.len(), 3);
-
-        // Sorted: addr 100 (t=0, t=2), then addr 200 (t=1)
-        assert_eq!(trace.rows[0].addr, Goldilocks::from_canonical_u64(100));
-        assert_eq!(trace.rows[0].is_write, Goldilocks::one()); // write
-        assert_eq!(trace.rows[1].addr, Goldilocks::from_canonical_u64(100));
-        assert_eq!(trace.rows[1].is_write, Goldilocks::zero()); // read
-        assert_eq!(trace.rows[1].addr_same, Goldilocks::one()); // same addr
-        assert_eq!(trace.rows[2].addr, Goldilocks::from_canonical_u64(200));
-        assert_eq!(trace.rows[2].is_first, Goldilocks::one()); // new addr
-    }
-
-    #[test]
-    fn read_returns_last_write() {
-        let accesses = vec![
-            (100, 10, true, 0),  // write 10
-            (100, 20, true, 1),  // write 20 (overwrite)
-            (100, 20, false, 2), // read → must be 20
-        ];
-
-        let trace = MemoryTrace::from_accesses(accesses);
-        // Row 2 (read): value=20, prev value=20 → consistent
-        assert_eq!(trace.rows[2].value, Goldilocks::from_canonical_u64(20));
-        assert_eq!(trace.rows[1].value, Goldilocks::from_canonical_u64(20));
+        let trace = MemoryTrace::from_accesses(&accesses);
+        assert!(trace.verify_consistency().is_err());
     }
 
     #[test]
     fn first_read_must_be_zero() {
-        // First access to an address as read → value must be 0
         let accesses = vec![
-            (100, 0, false, 0), // read addr 100 first time → value 0
+            MemoryAccess { addr: 200, value: 42, is_write: false, timestamp: 0 }, // no prior write
         ];
+        let trace = MemoryTrace::from_accesses(&accesses);
+        assert!(trace.verify_consistency().is_err());
+    }
 
-        let trace = MemoryTrace::from_accesses(accesses);
-        assert_eq!(trace.rows[0].is_first, Goldilocks::one());
-        assert_eq!(trace.rows[0].value, Goldilocks::zero());
+    #[test]
+    fn first_read_zero_ok() {
+        let accesses = vec![
+            MemoryAccess { addr: 200, value: 0, is_write: false, timestamp: 0 },
+        ];
+        let trace = MemoryTrace::from_accesses(&accesses);
+        assert!(trace.verify_consistency().is_ok());
     }
 
     #[test]
     fn multiple_addresses_sorted() {
         let accesses = vec![
-            (300, 3, true, 0),
-            (100, 1, true, 1),
-            (200, 2, true, 2),
-            (100, 1, false, 3), // read from 100
+            MemoryAccess { addr: 200, value: 99, is_write: true, timestamp: 0 },
+            MemoryAccess { addr: 100, value: 42, is_write: true, timestamp: 1 },
+            MemoryAccess { addr: 100, value: 42, is_write: false, timestamp: 2 },
+            MemoryAccess { addr: 200, value: 99, is_write: false, timestamp: 3 },
         ];
-
-        let trace = MemoryTrace::from_accesses(accesses);
-        // Sorted: 100(t=1), 100(t=3), 200(t=2), 300(t=0)
-        assert_eq!(trace.rows[0].addr, Goldilocks::from_canonical_u64(100));
-        assert_eq!(trace.rows[1].addr, Goldilocks::from_canonical_u64(100));
-        assert_eq!(trace.rows[2].addr, Goldilocks::from_canonical_u64(200));
-        assert_eq!(trace.rows[3].addr, Goldilocks::from_canonical_u64(300));
+        let trace = MemoryTrace::from_accesses(&accesses);
+        assert_eq!(trace.rows[0].addr, 100); // sorted by address
+        assert_eq!(trace.rows[2].addr, 200);
+        assert!(trace.verify_consistency().is_ok());
     }
 
     #[test]
-    fn pad_to_power_of_two() {
-        let mut trace = MemoryTrace::from_accesses(vec![
-            (100, 42, true, 0),
-            (100, 42, false, 1),
-            (200, 99, true, 2),
-        ]);
-        assert_eq!(trace.len(), 3);
-        trace.pad_to_power_of_two();
-        assert_eq!(trace.len(), 4);
+    fn overwrite_then_read() {
+        let accesses = vec![
+            MemoryAccess { addr: 100, value: 42, is_write: true, timestamp: 0 },
+            MemoryAccess { addr: 100, value: 99, is_write: true, timestamp: 1 }, // overwrite
+            MemoryAccess { addr: 100, value: 99, is_write: false, timestamp: 2 }, // must read 99
+        ];
+        let trace = MemoryTrace::from_accesses(&accesses);
+        assert!(trace.verify_consistency().is_ok());
+    }
+
+    #[test]
+    fn overwrite_read_old_value_fails() {
+        let accesses = vec![
+            MemoryAccess { addr: 100, value: 42, is_write: true, timestamp: 0 },
+            MemoryAccess { addr: 100, value: 99, is_write: true, timestamp: 1 },
+            MemoryAccess { addr: 100, value: 42, is_write: false, timestamp: 2 }, // WRONG: should be 99
+        ];
+        let trace = MemoryTrace::from_accesses(&accesses);
+        assert!(trace.verify_consistency().is_err());
+    }
+
+    #[test]
+    fn permutation_check_passes() {
+        let accesses = vec![
+            MemoryAccess { addr: 100, value: 42, is_write: true, timestamp: 0 },
+            MemoryAccess { addr: 100, value: 42, is_write: false, timestamp: 1 },
+        ];
+        let trace = MemoryTrace::from_accesses(&accesses);
+        assert!(verify_memory(&accesses, &trace).is_ok());
+    }
+
+    #[test]
+    fn permutation_check_detects_fabrication() {
+        let exec_accesses = vec![
+            MemoryAccess { addr: 100, value: 42, is_write: true, timestamp: 0 },
+        ];
+        // Fabricated sorted trace with different value
+        let mut trace = MemoryTrace::new();
+        trace.rows.push(MemoryRow {
+            addr: 100,
+            value: 999, // fabricated
+            is_write: true,
+            timestamp: 0,
+            addr_same: false,
+            is_first: true,
+        });
+        assert!(verify_memory(&exec_accesses, &trace).is_err());
+    }
+
+    #[test]
+    fn end_to_end_with_recorder() {
+        use pyde_vm::isa::{encode, encode_mem_immediate, MemWidth, Opcode};
+        use pyde_vm::vm::Vm;
+
+        let store_imm = encode_mem_immediate(0, MemWidth::W64);
+        let load_imm = encode_mem_immediate(0, MemWidth::W64);
+
+        let code: Vec<u8> = [
+            &encode(Opcode::Addi, 1, 0, 0x010000).0.to_le_bytes(),
+            &encode(Opcode::Addi, 2, 0, 42).0.to_le_bytes(),
+            &encode(Opcode::Store, 2, 1, store_imm).0.to_le_bytes(),
+            &encode(Opcode::Load, 3, 1, load_imm).0.to_le_bytes(),
+            &encode(Opcode::Halt, 0, 0, 0).0.to_le_bytes(),
+        ].iter().flat_map(|i| i.iter().copied()).collect();
+
+        let mut vm = Vm::with_gas_limit(100_000);
+        vm.load(&code).unwrap();
+
+        let (trace, _) = crate::recorder::record_execution(&mut vm);
+
+        // Extract memory accesses
+        let accesses = extract_memory_accesses(&trace);
+        assert_eq!(accesses.len(), 2); // 1 STORE + 1 LOAD
+
+        // Build sorted trace and verify
+        let mem_trace = MemoryTrace::from_accesses(&accesses);
+        assert!(verify_memory(&accesses, &mem_trace).is_ok());
     }
 }

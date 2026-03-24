@@ -120,7 +120,9 @@ impl BlockHeader {
 pub struct BlockBody {
     /// Ordered list of transactions in this block.
     pub transactions: Vec<Transaction>,
-    /// Parallel execution schedule (groups of non-conflicting txs).
+    /// Conflict-based execution schedule. Each group contains transitively
+    /// conflicting txs (sequential within group). Groups are independent
+    /// and can be proven in parallel from the same pre_state_root.
     pub execution_schedule: ExecutionSchedule,
 }
 

@@ -223,28 +223,49 @@ mod tests {
     // ========== Task 0541: Parallel groups have no conflicts ==========
 
     #[test]
-    fn parallel_groups_no_conflicts() {
+    fn conflicting_txs_grouped_together() {
         let pk = make_pk();
         let mut pool = Mempool::new();
 
         let shared_key = [0xAA; 32];
 
-        // tx0 and tx1 write to same key → conflict
+        // tx0 and tx1 write to same key → conflict → same group
         add_tx(&mut pool, &pk, b"sender0", 0, 30_000,
             make_access(1, shared_key, true));
         add_tx(&mut pool, &pk, b"sender1", 0, 30_000,
             make_access(1, shared_key, true));
 
-        // tx2 touches a different key → no conflict
+        // tx2 touches a different key → independent → own group
         add_tx(&mut pool, &pk, b"sender2", 0, 30_000,
             make_access(2, [0xBB; 32], false));
 
         let block = build_block(&pool, 1_000_000, 0, &[0xCC; 32]);
         assert_eq!(block.transactions.len(), 3);
 
-        // tx0 and tx1 should be in different groups
-        // tx2 can be in either group
+        // Conflicting txs in same group, independent tx in separate group
+        // (VRF shuffle may reorder, so we check group count)
         assert!(block.execution_schedule.group_count() >= 2);
+
+        // Verify no cross-group conflicts
+        let groups = &block.execution_schedule.groups;
+        let access_lists: Vec<Vec<AccessEntry>> = block.transactions
+            .iter()
+            .map(|tx| tx.access_list.clone())
+            .collect();
+        for (i, g1) in groups.iter().enumerate() {
+            for g2 in groups.iter().skip(i + 1) {
+                for &a in &g1.tx_indices {
+                    for &b in &g2.tx_indices {
+                        assert!(
+                            !pyde_tx::parallel::access_lists_conflict(
+                                &access_lists[a], &access_lists[b]
+                            ),
+                            "cross-group conflict between tx {} and tx {}", a, b
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ========== VRF shuffle applied ==========
