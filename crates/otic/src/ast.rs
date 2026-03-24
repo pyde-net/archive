@@ -193,11 +193,60 @@ pub struct FunctionDef {
     pub span: Span,
 }
 
+impl FunctionDef {
+    pub fn is_view(&self) -> bool {
+        self.attributes.iter().any(|a| a.content == "view")
+    }
+
+    pub fn is_constructor(&self) -> bool {
+        self.attributes.iter().any(|a| a.content == "constructor")
+    }
+
+    pub fn is_reentrant(&self) -> bool {
+        self.attributes.iter().any(|a| a.content == "reentrant")
+    }
+
+    pub fn is_sponsored(&self) -> bool {
+        self.attributes.iter().any(|a| a.content.starts_with("sponsored"))
+    }
+
+    /// Returns the sponsorship kind: None, GasTank, or Paymaster(name).
+    pub fn sponsorship(&self) -> Option<Sponsorship> {
+        for attr in &self.attributes {
+            if attr.content == "sponsored" {
+                return Some(Sponsorship::GasTank);
+            }
+            if attr.content.starts_with("sponsored(") && attr.content.ends_with(')') {
+                let paymaster = &attr.content[10..attr.content.len() - 1];
+                return Some(Sponsorship::Paymaster(paymaster.to_string()));
+            }
+        }
+        None
+    }
+
+    pub fn is_test(&self) -> bool {
+        self.attributes.iter().any(|a| a.content == "test")
+    }
+
+    pub fn has_should_panic(&self) -> bool {
+        self.attributes.iter().any(|a| a.content.starts_with("should_panic"))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FnParam {
     pub name: Ident,
     pub ty: Type,
     pub span: Span,
+}
+
+/// Gas sponsorship kind for `#[sponsored]` functions.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Sponsorship {
+    /// `#[sponsored]` — gas from caller's gas tank
+    GasTank,
+    /// `#[sponsored(Paymaster)]` — gas paid by paymaster contract
+    Paymaster(String),
 }
 
 /// `#[constructor]`, `#[view]`, `#[sponsored(IPaymaster)]`, etc.
