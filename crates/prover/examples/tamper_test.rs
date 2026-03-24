@@ -28,7 +28,13 @@ fn bytecode(instrs: &[&[u8; 4]]) -> Vec<u8> {
 }
 
 /// Try to prove a trace. Returns Ok if proof verifies, Err if any step fails.
-/// Catches panics from p3-uni-stark's debug constraint checker.
+///
+/// In debug builds, p3-uni-stark's constraint checker panics on violations
+/// (proof never generated). In release builds, the proof IS generated but
+/// fails FRI verification (quotient polynomial not low-degree).
+///
+/// Both paths are caught: panic = constraint violation detected at prove time,
+/// verify error = proof generated but rejected by verifier.
 fn try_prove_verify(trace: &mut ExecutionTrace) -> Result<(), String> {
     let mut t = trace.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -38,8 +44,8 @@ fn try_prove_verify(trace: &mut ExecutionTrace) -> Result<(), String> {
 
     match result {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err("constraint check panicked (constraint violation detected)".to_string()),
+        Ok(Err(e)) => Err(format!("verifier rejected: {}", e)),
+        Err(_) => Err("prover detected constraint violation".to_string()),
     }
 }
 
@@ -82,8 +88,9 @@ fn main() {
                     println!("FAIL (tampered trace accepted!)");
                     failed += 1;
                 }
-                Err(_) => {
-                    println!("PASS (tampered trace correctly rejected)");
+                Err(e) => {
+                    let short = if e.contains("prover detected") { "prover" } else { "verifier" };
+                    println!("PASS [{}]", short);
                     passed += 1;
                 }
             }
