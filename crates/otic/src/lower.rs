@@ -979,10 +979,15 @@ impl Lowerer {
                 let end_label = self.func().alloc_label();
                 let dst = self.alloc_reg();
 
+                // Pre-allocate all arm labels to avoid collision with nested structures
+                let arm_labels: Vec<Label> = (0..arms.len())
+                    .map(|_| self.func().alloc_label())
+                    .collect();
+
                 for (i, arm) in arms.iter().enumerate() {
-                    let arm_label = Label(end_label.0 + 1 + i as u32);
+                    let arm_label = arm_labels[i];
                     let next_label = if i + 1 < arms.len() {
-                        Label(end_label.0 + 2 + i as u32)
+                        arm_labels[i + 1]
                     } else {
                         end_label
                     };

@@ -180,11 +180,11 @@ contract Multisig {
 
     pub fn confirm(tx_id: u256) {
         require!(self.owners[msg.sender], NotOwner {});
-        let tx = self.transactions[tx_id];
-        require!(tx.id == tx_id, TransactionNotFound {});
-        require!(!tx.executed, TransactionAlreadyExecuted {});
-        require!(!tx.revoked, TransactionRevokedErr {});
-        require!(block.timestamp <= tx.expires_at, TransactionExpired {});
+        let txn = self.transactions[tx_id];
+        require!(txn.id == tx_id, TransactionNotFound {});
+        require!(!txn.executed, TransactionAlreadyExecuted {});
+        require!(!txn.revoked, TransactionRevokedErr {});
+        require!(block.timestamp <= txn.expires_at, TransactionExpired {});
         require!(!self.confirmations[tx_id][msg.sender], AlreadyConfirmed {});
 
         self.confirmations[tx_id][msg.sender] = true;
@@ -195,9 +195,9 @@ contract Multisig {
 
     pub fn revoke_confirmation(tx_id: u256) {
         require!(self.owners[msg.sender], NotOwner {});
-        let tx = self.transactions[tx_id];
-        require!(tx.id == tx_id, TransactionNotFound {});
-        require!(!tx.executed, TransactionAlreadyExecuted {});
+        let txn = self.transactions[tx_id];
+        require!(txn.id == tx_id, TransactionNotFound {});
+        require!(!txn.executed, TransactionAlreadyExecuted {});
         require!(self.confirmations[tx_id][msg.sender], NotConfirmed {});
 
         self.confirmations[tx_id][msg.sender] = false;
@@ -208,11 +208,11 @@ contract Multisig {
 
     pub fn execute(tx_id: u256) {
         require!(self.owners[msg.sender], NotOwner {});
-        let tx = self.transactions[tx_id];
-        require!(tx.id == tx_id, TransactionNotFound {});
-        require!(!tx.executed, TransactionAlreadyExecuted {});
-        require!(!tx.revoked, TransactionRevokedErr {});
-        require!(block.timestamp <= tx.expires_at, TransactionExpired {});
+        let txn = self.transactions[tx_id];
+        require!(txn.id == tx_id, TransactionNotFound {});
+        require!(!txn.executed, TransactionAlreadyExecuted {});
+        require!(!txn.revoked, TransactionRevokedErr {});
+        require!(block.timestamp <= txn.expires_at, TransactionExpired {});
 
         let confirms = self.confirmation_count[tx_id];
         require!(confirms >= self.threshold, InsufficientConfirmations {
@@ -223,17 +223,17 @@ contract Multisig {
         self.transactions[tx_id].executed = true;
         self.nonce = self.nonce + 1;
 
-        raw_call!(tx.to, tx.value, tx.data);
+        raw_call!(txn.to, txn.value, txn.data);
 
         emit TransactionExecuted { tx_id: tx_id };
     }
 
     pub fn revoke_transaction(tx_id: u256) {
         require!(self.owners[msg.sender], NotOwner {});
-        let tx = self.transactions[tx_id];
-        require!(tx.id == tx_id, TransactionNotFound {});
-        require!(!tx.executed, TransactionAlreadyExecuted {});
-        require!(tx.submitted_by == msg.sender, NotOwner {});
+        let txn = self.transactions[tx_id];
+        require!(txn.id == tx_id, TransactionNotFound {});
+        require!(!txn.executed, TransactionAlreadyExecuted {});
+        require!(txn.submitted_by == msg.sender, NotOwner {});
 
         self.transactions[tx_id].revoked = true;
 

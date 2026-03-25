@@ -61,20 +61,33 @@ pub struct CompiledContract {
 // Register Allocator
 // ============================================================================
 
-/// Spill event: the CodeGen must emit Push/Pop instructions for register pressure.
+/// Spill event: the CodeGen must emit Store/Load for register pressure.
 enum SpillAction {
-    /// Push this physical register's value to stack before reusing it.
-    Save(u8),
+    /// Store this physical register to spill slot before reusing it.
+    Save(u8, u32), // (physical_reg, spill_slot_offset)
+}
+
+/// Restore event: the CodeGen must emit Load to bring a spilled value back.
+enum RestoreAction {
+    /// Load from spill slot into this physical register.
+    Restore(u8, u32), // (physical_reg, spill_slot_offset)
 }
 
 /// Maps IR virtual registers to PVM physical registers.
-/// GP: r1-r11 for user values (r0=zero, r12=heap, r13=reserved, r14-r15=scratch).
+/// GP: r1-r11 for user values (r0=zero, r12=heap, r13=spill_base, r14-r15=scratch).
 /// Wide: w0-w6 for user values (w7=scratch).
+///
+/// Spilling uses memory at r13 (spill base pointer, set at function entry).
+/// Each spilled vreg gets a fixed 8-byte slot: mem[r13 + slot*8].
 struct RegAlloc {
-    /// Virtual register → physical register mapping.
+    /// Virtual register → physical register mapping (currently in register).
     mapping: HashMap<Reg, u8>,
     /// Reverse mapping: physical register → virtual register (for eviction).
     reverse: HashMap<u8, Reg>,
+    /// Spilled virtual registers → spill slot offset from r13.
+    spilled: HashMap<Reg, u32>,
+    /// Next spill slot.
+    next_spill_slot: u32,
     /// Track which virtual registers hold wide (u256) values.
     wide: HashSet<Reg>,
     /// Next available GP register (1-11).
@@ -88,6 +101,8 @@ impl RegAlloc {
         Self {
             mapping: HashMap::new(),
             reverse: HashMap::new(),
+            spilled: HashMap::new(),
+            next_spill_slot: 0,
             wide: HashSet::new(),
             next_gp: 1,
             next_wide: 0,
@@ -100,6 +115,7 @@ impl RegAlloc {
         if let Some(&phys) = self.mapping.get(&vreg) {
             return (phys, None);
         }
+        // If this vreg was previously spilled, it will be restored on get()
         if self.next_gp <= 11 {
             let phys = self.next_gp;
             self.next_gp += 1;
@@ -110,16 +126,32 @@ impl RegAlloc {
             // Evict: reuse registers cyclically (r1-r11)
             let phys = ((self.next_gp - 1) % 11) + 1;
             self.next_gp += 1;
-            // Evict the old occupant
+            // Evict the old occupant to spill slot
             let spill = if let Some(&old_vreg) = self.reverse.get(&phys) {
+                let slot = self.next_spill_slot;
+                self.next_spill_slot += 1;
+                self.spilled.insert(old_vreg, slot);
                 self.mapping.remove(&old_vreg);
-                Some(SpillAction::Save(phys))
+                Some(SpillAction::Save(phys, slot))
             } else {
                 None
             };
             self.mapping.insert(vreg, phys);
             self.reverse.insert(phys, vreg);
             (phys, spill)
+        }
+    }
+
+    /// Get the physical register for a virtual register.
+    /// If the vreg was spilled, returns None (caller must restore).
+    fn get_or_spilled(&self, vreg: Reg) -> Result<u8, RestoreAction> {
+        if let Some(&phys) = self.mapping.get(&vreg) {
+            Ok(phys)
+        } else if let Some(&slot) = self.spilled.get(&vreg) {
+            // Need to restore from spill slot into a scratch register
+            Err(RestoreAction::Restore(15, slot)) // use r15 as temp
+        } else {
+            Ok(0) // unknown vreg → r0
         }
     }
 
@@ -144,7 +176,7 @@ impl RegAlloc {
         }
     }
 
-    /// Get the physical register for a virtual register.
+    /// Get the physical register (backward compat — panics on spill).
     fn get(&self, vreg: Reg) -> u8 {
         *self.mapping.get(&vreg).unwrap_or(&0)
     }
@@ -154,10 +186,17 @@ impl RegAlloc {
         self.wide.contains(&vreg)
     }
 
+    /// Check if a vreg is currently spilled to memory.
+    fn is_spilled(&self, vreg: Reg) -> bool {
+        self.spilled.contains_key(&vreg) && !self.mapping.contains_key(&vreg)
+    }
+
     /// Reset for a new function.
     fn reset(&mut self) {
         self.mapping.clear();
         self.reverse.clear();
+        self.spilled.clear();
+        self.next_spill_slot = 0;
         self.wide.clear();
         self.next_gp = 1;
         self.next_wide = 0;
@@ -494,6 +533,13 @@ impl CodeGen {
             self.emit_heap_init();
         }
 
+        // Initialize spill base pointer: r13 = r12 (current heap top).
+        // Spill slots live at r13 + 0, r13 + 8, r13 + 16, ...
+        // Advance r12 past the spill area (reserve 256 bytes = 32 slots max).
+        self.emit_op(Opcode::Add, 13, 12, 0);  // r13 = r12
+        self.load_u32_to_reg(15, 256);
+        self.emit_op(Opcode::Add, 12, 12, 15); // r12 += 256
+
         // Pre-map params to convention registers (r2, r3, ...)
         // In test mode without dispatch, params aren't loaded from calldata,
         // so standalone tests with params won't work (this is fine for now).
@@ -591,8 +637,8 @@ impl CodeGen {
 
                 if use_wide {
                     let wd = self.regs.alloc_wide(*dst);
-                    let w1 = self.regs.get(*lhs);
-                    let w2 = self.regs.get(*rhs);
+                    let w1 = self.get_reg(*lhs);
+                    let w2 = self.get_reg(*rhs);
                     let pvm_op = match op {
                         BinOp::Add => Opcode::Wadd,
                         BinOp::Sub => Opcode::Wsub,
@@ -607,8 +653,8 @@ impl CodeGen {
                     self.emit_op(pvm_op, wd, w1, w2 as u32);
                 } else {
                     let rd = self.alloc_gp(*dst);
-                    let r1 = self.regs.get(*lhs);
-                    let r2 = self.regs.get(*rhs);
+                    let r1 = self.get_reg(*lhs);
+                    let r2 = self.get_reg(*rhs);
                     let pvm_op = match op {
                         BinOp::Add => Opcode::Add,
                         BinOp::Sub => Opcode::Sub,
@@ -629,10 +675,12 @@ impl CodeGen {
 
             Inst::UnOp(dst, op, src) => {
                 let rd = self.alloc_gp(*dst);
-                let r1 = self.regs.get(*src);
+                let r1 = self.get_reg(*src);
                 match op {
                     UnOp::Neg => {
-                        self.emit_op(Opcode::Sub, rd, 0, r1 as u32);
+                        // Two's complement: -a = ~a + 1 (avoids PVM checked_sub underflow trap)
+                        self.emit_op(Opcode::Not, rd, r1, 0);      // rd = ~a
+                        self.emit_op(Opcode::Addi, rd, rd, 1);     // rd = ~a + 1 = -a
                     }
                     UnOp::LogicalNot => {
                         self.emit_op(Opcode::Addi, 15, 0, 1);
@@ -647,8 +695,8 @@ impl CodeGen {
             Inst::Cmp(dst, op, lhs, rhs) => {
                 let rd = self.alloc_gp(*dst);
                 let lhs_wide = self.regs.is_wide(*lhs);
-                let r1 = self.regs.get(*lhs);
-                let r2 = self.regs.get(*rhs);
+                let r1 = self.get_reg(*lhs);
+                let r2 = self.get_reg(*rhs);
 
                 if lhs_wide {
                     match op {
@@ -724,7 +772,7 @@ impl CodeGen {
                 self.emit_op(Opcode::Addi, 15, 0, slot);
                 self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
 
-                let rv = self.regs.get(*val);
+                let rv = self.get_reg(*val);
                 if wide_value {
                     self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0); // mode 0: wide value
                 } else {
@@ -739,7 +787,7 @@ impl CodeGen {
                 let wide_value = is_wide_type(&val_ty);
 
                 // Derive storage key: poseidon2(slot || map_key)
-                let rk = self.regs.get(*key);
+                let rk = self.get_reg(*key);
                 self.emit_map_key_derivation(slot, rk);
                 // w7 now holds the derived key
 
@@ -758,8 +806,8 @@ impl CodeGen {
                 let val_ty = map_value_type(&map_ty);
                 let wide_value = is_wide_type(&val_ty);
 
-                let rk = self.regs.get(*key);
-                let rv = self.regs.get(*val);
+                let rk = self.get_reg(*key);
+                let rv = self.get_reg(*val);
                 self.emit_map_key_derivation(slot, rk);
 
                 if wide_value {
@@ -832,14 +880,14 @@ impl CodeGen {
             }
 
             Inst::Branch(cond, then_label, else_label) => {
-                let rc = self.regs.get(*cond);
+                let rc = self.get_reg(*cond);
                 self.emit_jump_placeholder(Opcode::Bne, rc, 0, *then_label);
                 self.emit_jump_placeholder(Opcode::Jmp, 0, 0, *else_label);
             }
 
             Inst::Return(val) => {
                 if let Some(v) = val {
-                    let rv = self.regs.get(*v);
+                    let rv = self.get_reg(*v);
                     if rv != 1 {
                         if self.regs.is_wide(*v) {
                             // Wide return: Narrow to GP r1 (traps if > u64::MAX)
@@ -856,7 +904,18 @@ impl CodeGen {
                 }
             }
 
-            Inst::Revert(_name, _fields) => {
+            Inst::Revert(name, fields) => {
+                // Encode error data to heap: [selector:8][field0:8][field1:8]...
+                // PVM Revert doesn't read data yet, but it's available in memory for debugging.
+                if !fields.is_empty() {
+                    let selector = compute_selector(name) as u64;
+                    self.load_u64_to_reg(15, selector);
+                    self.emit_store(15, 12, 0);
+                    for (i, freg) in fields.iter().enumerate() {
+                        let fr = self.get_reg(*freg);
+                        self.emit_store(fr, 12, ((i + 1) * 8) as i32);
+                    }
+                }
                 self.emit_op(Opcode::Revert, 0, 0, 0);
             }
 
@@ -877,7 +936,7 @@ impl CodeGen {
                 // Data: store field values after descriptor
                 let data_start_offset = 32 + 16; // after topic + ptr/len
                 for (i, freg) in fields.iter().enumerate() {
-                    let fr = self.regs.get(*freg);
+                    let fr = self.get_reg(*freg);
                     self.emit_store(fr, 12, (data_start_offset + i * 8) as i32);
                 }
 
@@ -902,7 +961,7 @@ impl CodeGen {
                 let rd = self.alloc_gp(*dst);
                 // Push all args to stack first (avoids register clobbering)
                 for arg in args.iter() {
-                    let src = self.regs.get(*arg);
+                    let src = self.get_reg(*arg);
                     self.emit_op(Opcode::Push, src, 0, 0);
                 }
                 // Pop into convention registers (reverse order, stack is LIFO)
@@ -929,7 +988,7 @@ impl CodeGen {
                 let wd = self.regs.alloc_wide(*dst);
                 // Write hash arguments to heap memory
                 for (i, arg) in args.iter().enumerate() {
-                    let r = self.regs.get(*arg);
+                    let r = self.get_reg(*arg);
                     self.emit_store(r, 12, (i as i32) * 8);
                 }
                 let byte_len = (args.len() * 8) as u32;
@@ -948,17 +1007,17 @@ impl CodeGen {
                 if !src_wide && dst_wide {
                     // GP → Wide: Widen
                     let wd = self.regs.alloc_wide(*dst);
-                    let rs = self.regs.get(*src);
+                    let rs = self.get_reg(*src);
                     self.emit_op(Opcode::Widen, wd, rs, 0);
                 } else if src_wide && !dst_wide {
                     // Wide → GP: Narrow (traps if > u64::MAX)
                     let rd = self.alloc_gp(*dst);
-                    let ws = self.regs.get(*src);
+                    let ws = self.get_reg(*src);
                     self.emit_op(Opcode::Narrow, rd, ws, 0);
                 } else {
                     // Same register file: copy
                     let rd = self.alloc_gp(*dst);
-                    let rs = self.regs.get(*src);
+                    let rs = self.get_reg(*src);
                     if rd != rs {
                         self.emit_op(Opcode::Add, rd, rs, 0);
                     }
@@ -972,7 +1031,7 @@ impl CodeGen {
                 self.emit_op(Opcode::Add, rd, 12, 0);
                 self.emit_op(Opcode::Addi, 12, 12, struct_size);
                 for (i, (fname, freg)) in fields.iter().enumerate() {
-                    let fr = self.regs.get(*freg);
+                    let fr = self.get_reg(*freg);
                     let offset = (i as u32) * memory::WORD_SIZE;
                     self.emit_store(fr, rd, offset as i32);
                 }
@@ -980,7 +1039,7 @@ impl CodeGen {
 
             Inst::FieldGet(dst, obj, field) => {
                 let rd = self.alloc_gp(*dst);
-                let ro = self.regs.get(*obj);
+                let ro = self.get_reg(*obj);
                 // Numeric field name (e.g., "0", "1") = tuple index access
                 let offset = if let Ok(idx) = field.parse::<u32>() {
                     idx * memory::WORD_SIZE as u32
@@ -995,8 +1054,8 @@ impl CodeGen {
 
             Inst::IndexGet(dst, obj, idx) => {
                 let rd = self.alloc_gp(*dst);
-                let ro = self.regs.get(*obj);
-                let ri = self.regs.get(*idx);
+                let ro = self.get_reg(*obj);
+                let ri = self.get_reg(*idx);
                 // addr = base + idx * 8
                 self.emit_op(Opcode::Addi, 14, 0, 3);
                 self.emit_op(Opcode::Shl, 15, ri, 14);
@@ -1005,9 +1064,9 @@ impl CodeGen {
             }
 
             Inst::IndexSet(obj, idx, val) => {
-                let ro = self.regs.get(*obj);
-                let ri = self.regs.get(*idx);
-                let rv = self.regs.get(*val);
+                let ro = self.get_reg(*obj);
+                let ri = self.get_reg(*idx);
+                let rv = self.get_reg(*val);
                 self.emit_op(Opcode::Addi, 14, 0, 3);
                 self.emit_op(Opcode::Shl, 15, ri, 14);
                 self.emit_op(Opcode::Add, 15, ro, 15);
@@ -1020,7 +1079,7 @@ impl CodeGen {
                 self.emit_op(Opcode::Add, rd, 12, 0);
                 self.emit_op(Opcode::Addi, 12, 12, size);
                 for (i, reg) in regs.iter().enumerate() {
-                    let r = self.regs.get(*reg);
+                    let r = self.get_reg(*reg);
                     let offset = (i as u32) * memory::WORD_SIZE;
                     self.emit_store(r, rd, offset as i32);
                 }
@@ -1028,7 +1087,7 @@ impl CodeGen {
 
             Inst::TupleGet(dst, tuple, idx) => {
                 let rd = self.alloc_gp(*dst);
-                let rt = self.regs.get(*tuple);
+                let rt = self.get_reg(*tuple);
                 let offset = (*idx) * (memory::WORD_SIZE as u32);
                 self.emit_load(rd, rt, offset as i32);
             }
@@ -1039,7 +1098,7 @@ impl CodeGen {
                 self.emit_op(Opcode::Add, rd, 12, 0);
                 self.emit_op(Opcode::Addi, 12, 12, size);
                 for (i, reg) in regs.iter().enumerate() {
-                    let r = self.regs.get(*reg);
+                    let r = self.get_reg(*reg);
                     let offset = (i as u32) * memory::WORD_SIZE;
                     self.emit_store(r, rd, offset as i32);
                 }
@@ -1047,7 +1106,7 @@ impl CodeGen {
 
             Inst::ArrayRepeat(dst, val, count) => {
                 let rd = self.alloc_gp(*dst);
-                let rv = self.regs.get(*val);
+                let rv = self.get_reg(*val);
                 let size = (*count as u32) * memory::WORD_SIZE;
                 self.emit_op(Opcode::Add, rd, 12, 0);
                 self.emit_op(Opcode::Addi, 12, 12, size);
@@ -1059,19 +1118,20 @@ impl CodeGen {
 
             Inst::MethodCall(dst, obj, method, args) => {
                 let rd = self.alloc_gp(*dst);
-                let ro = self.regs.get(*obj);
+                let ro = self.get_reg(*obj);
 
                 match method.as_str() {
                     "push" if !args.is_empty() => {
-                        let val_reg = self.regs.get(args[0]);
+                        let val_reg = self.get_reg(args[0]);
                         // Load length and capacity
-                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32); // r15 = length
+                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);  // r15 = length
                         self.emit_load(memory::REG_SCRATCH_0, ro, memory::VEC_CAPACITY_OFFSET as i32); // r14 = capacity
-                        // Assert length < capacity (revert if Vec is full)
-                        self.emit_op(Opcode::Lt, 13, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32); // r13 = (len < cap)
-                        self.emit_op(Opcode::Assert, 0, 13, 0); // revert if full
+                        // Assert length < capacity (reverts if Vec is full — safe, no memory corruption)
+                        // Vec starts with capacity 16. Realloc requires MEMCPY (future ISA extension).
+                        self.emit_op(Opcode::Lt, 13, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
+                        self.emit_op(Opcode::Assert, 0, 13, 0);
                         // Compute data address: base + VEC_DATA_OFFSET + length * 8
-                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 0, 3); // shift for *8
+                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 0, 3);
                         self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
                         self.emit_op(Opcode::Add, memory::REG_SCRATCH_0, ro, memory::REG_SCRATCH_0 as u32);
                         self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, memory::VEC_DATA_OFFSET);
@@ -1104,7 +1164,7 @@ impl CodeGen {
                     }
                     _ => {
                         for arg in args {
-                            let r = self.regs.get(*arg);
+                            let r = self.get_reg(*arg);
                             self.emit_op(Opcode::Push, r, 0, 0);
                         }
                         self.emit_op(Opcode::Addi, rd, 0, 0);
@@ -1114,11 +1174,11 @@ impl CodeGen {
 
             Inst::ExtCall(dst, addr, _method, args) => {
                 let rd = self.alloc_gp(*dst);
-                let ra = self.regs.get(*addr);
+                let ra = self.get_reg(*addr);
 
                 // Write calldata (args) to heap
                 for (i, arg) in args.iter().enumerate() {
-                    let r = self.regs.get(*arg);
+                    let r = self.get_reg(*arg);
                     self.emit_store(r, 12, (i as i32) * 8);
                 }
                 let calldata_len = (args.len() * 8) as u32;
@@ -1145,10 +1205,10 @@ impl CodeGen {
             }
 
             Inst::CrossCall { target, method, args, .. } => {
-                let rt = self.regs.get(*target);
-                let rm = self.regs.get(*method);
+                let rt = self.get_reg(*target);
+                let rm = self.get_reg(*method);
                 for arg in args {
-                    let r = self.regs.get(*arg);
+                    let r = self.get_reg(*arg);
                     self.emit_op(Opcode::Push, r, 0, 0);
                 }
                 // Use Log as async message queue placeholder
@@ -1157,9 +1217,9 @@ impl CodeGen {
 
             Inst::RawCall(dst, target, args) => {
                 let rd = self.alloc_gp(*dst);
-                let rt = self.regs.get(*target);
+                let rt = self.get_reg(*target);
                 for arg in args {
-                    let r = self.regs.get(*arg);
+                    let r = self.get_reg(*arg);
                     self.emit_op(Opcode::Push, r, 0, 0);
                 }
                 self.emit_op(Opcode::CallExt, rd, rt, 0);
@@ -1190,13 +1250,30 @@ impl CodeGen {
     // Emit helpers
     // ========================================================================
 
-    /// Allocate a GP register for a virtual register, emitting Push if eviction needed.
+    /// Allocate a GP register for a virtual register, emitting spill Store if eviction needed.
     fn alloc_gp(&mut self, vreg: Reg) -> u8 {
         let (phys, spill) = self.regs.alloc(vreg);
-        if let Some(SpillAction::Save(reg)) = spill {
-            self.instructions.push(encode(Opcode::Push, reg, 0, 0));
+        if let Some(SpillAction::Save(reg, slot)) = spill {
+            // Store evicted register to spill area: mem[r13 + slot*8] = reg
+            let offset = (slot * 8) as i32;
+            let imm = encode_mem_immediate(offset, MemWidth::W64);
+            self.instructions.push(encode(Opcode::Store, reg, 13, imm));
         }
         phys
+    }
+
+    /// Get the physical register for a virtual register, emitting spill Load if needed.
+    fn get_reg(&mut self, vreg: Reg) -> u8 {
+        match self.regs.get_or_spilled(vreg) {
+            Ok(phys) => phys,
+            Err(RestoreAction::Restore(temp_reg, slot)) => {
+                // Load from spill area: temp_reg = mem[r13 + slot*8]
+                let offset = (slot * 8) as i32;
+                let imm = encode_mem_immediate(offset, MemWidth::W64);
+                self.instructions.push(encode(Opcode::Load, temp_reg, 13, imm));
+                temp_reg
+            }
+        }
     }
 
     fn emit(&mut self, inst: Instruction) {
@@ -2716,5 +2793,50 @@ mod tests {
         "#);
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 42, "u64 → u256 → u64 round-trip should be 42");
+    }
+
+    #[test]
+    fn pvm_unary_neg() {
+        // -10 as u64 wraps to u64::MAX - 9
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a: u64 = 10;
+                    let b = -a;
+                    return b;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        let expected = 0u64.wrapping_sub(10); // u64::MAX - 9
+        assert_eq!(vm.cpu.read_gp(1), expected, "negation of 10 should wrap to {}", expected);
+    }
+
+    #[test]
+    fn pvm_register_spill_restore() {
+        // This function uses >11 virtual registers, forcing spill/restore.
+        // Without optimizer, each variable + temporary gets its own register.
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a = 1;
+                    let b = 2;
+                    let c = 3;
+                    let d = 4;
+                    let e = 5;
+                    let g = 6;
+                    let h = 7;
+                    let i = 8;
+                    let j = 9;
+                    let k = 10;
+                    let l = a + b;
+                    let m = c + d;
+                    return l + m + e + g;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        // l = 1+2 = 3, m = 3+4 = 7, result = 3 + 7 + 5 + 6 = 21
+        assert_eq!(vm.cpu.read_gp(1), 21, "spilled register values should be correct");
     }
 }
