@@ -253,6 +253,10 @@ fn execute_in_pvm(
         block_number: block_ctx.height,
         timestamp: block_ctx.timestamp,
         gas_price: U256::from(block_ctx.base_fee as u64),
+        tx_nonce: tx.nonce,
+        tx_gas_limit: tx.gas_limit,
+        tx_hash: U256::ZERO,
+        block_proposer: [0u8; 32],
         block_hashes: vec![],
         balances: std::collections::HashMap::new(),
     };

@@ -44,6 +44,8 @@ pub mod env_gp {
     pub const BLOCK_NUMBER: u32 = 0;
     pub const TIMESTAMP: u32 = 1;
     pub const GAS_REMAINING: u32 = 2;
+    pub const TX_NONCE: u32 = 3;
+    pub const TX_GAS_LIMIT: u32 = 4;
 }
 
 /// Sub-codes for the `Callvalue` opcode (wide environment queries).
@@ -54,6 +56,8 @@ pub mod env_wide {
     pub const BALANCE: u32 = 2;
     pub const CALLER: u32 = 3;
     pub const ADDRESS: u32 = 4;
+    pub const TX_HASH: u32 = 5;
+    pub const BLOCK_PROPOSER: u32 = 6;
 }
 
 /// Execution context: caller info, block info, and balances.
@@ -71,6 +75,14 @@ pub struct ExecutionContext {
     pub timestamp: u64,
     /// Current base fee / gas price, 256-bit.
     pub gas_price: U256,
+    /// Transaction nonce.
+    pub tx_nonce: u64,
+    /// Transaction gas limit.
+    pub tx_gas_limit: u64,
+    /// Transaction hash (32 bytes).
+    pub tx_hash: U256,
+    /// Block proposer address (32 bytes).
+    pub block_proposer: Address,
     /// Recent block hashes (index 0 = most recent). Up to 256 entries.
     pub block_hashes: Vec<U256>,
     /// Balance lookup: address → balance.
@@ -86,6 +98,10 @@ impl Default for ExecutionContext {
             block_number: 0,
             timestamp: 0,
             gas_price: U256::ZERO,
+            tx_nonce: 0,
+            tx_gas_limit: 0,
+            tx_hash: U256::ZERO,
+            block_proposer: ZERO_ADDRESS,
             block_hashes: Vec::new(),
             balances: HashMap::new(),
         }
@@ -460,6 +476,18 @@ impl Vm {
                 return Ok(Some(ExecResult::Halt));
             }
             Opcode::Revert => {
+                // revert rs1, imm — optional revert data
+                // If rs1 != 0: pointer in gp[rs1], length in gp[imm & 0xF]
+                if d.rs1 != 0 {
+                    let ptr = self.cpu.read_gp(d.rs1) as u32;
+                    let len_reg = (d.rs2_or_imm & 0xF) as u8;
+                    let len = self.cpu.read_gp(len_reg) as usize;
+                    if len > 0 {
+                        if let Ok(data) = self.memory.checked_read_slice(ptr, len) {
+                            self.return_data = data;
+                        }
+                    }
+                }
                 return Ok(Some(ExecResult::Revert));
             }
 
@@ -596,6 +624,8 @@ impl Vm {
                     env_gp::BLOCK_NUMBER => self.ctx.block_number,
                     env_gp::TIMESTAMP => self.ctx.timestamp,
                     env_gp::GAS_REMAINING => self.gas_remaining(),
+                    env_gp::TX_NONCE => self.ctx.tx_nonce,
+                    env_gp::TX_GAS_LIMIT => self.ctx.tx_gas_limit,
                     _ => return Err(Trap::InvalidOpcode),
                 };
                 self.cpu.write_gp(d.rd, val);
@@ -614,6 +644,8 @@ impl Vm {
                     }
                     env_wide::CALLER => U256::from_le_bytes(self.ctx.caller),
                     env_wide::ADDRESS => U256::from_le_bytes(self.ctx.self_address),
+                    env_wide::TX_HASH => self.ctx.tx_hash,
+                    env_wide::BLOCK_PROPOSER => U256::from_le_bytes(self.ctx.block_proposer),
                     _ => return Err(Trap::InvalidOpcode),
                 };
                 self.cpu.write_wide(d.rd, val);
@@ -941,15 +973,21 @@ impl Vm {
                 }
                 self.pc += 4;
             }
-            Opcode::FieldMul => {
-                // field_mul rd, rs1, rs2 — modular multiplication over Goldilocks field
-                // p = 2^64 - 2^32 + 1 (Goldilocks prime)
-                let a = self.cpu.read_gp(d.rs1) as u128;
-                let rs2 = (d.rs2_or_imm & 0xF) as u8;
-                let b = self.cpu.read_gp(rs2) as u128;
-                const GOLDILOCKS_P: u128 = (1u128 << 64) - (1u128 << 32) + 1;
-                let result = ((a * b) % GOLDILOCKS_P) as u64;
-                self.cpu.write_gp(d.rd, result);
+            Opcode::Memcpy => {
+                // memcpy rd_dst, rs1_src, imm — bulk memory copy
+                // dst_ptr = gp[rd], src_ptr = gp[rs1], len = gp[imm & 0xF]
+                let dst_ptr = self.cpu.read_gp(d.rd) as u32;
+                let src_ptr = self.cpu.read_gp(d.rs1) as u32;
+                let len_reg = (d.rs2_or_imm & 0xF) as u8;
+                let len = self.cpu.read_gp(len_reg) as usize;
+                if len > 0 {
+                    let data = self.memory
+                        .checked_read_slice(src_ptr, len)
+                        .map_err(|_| Trap::MemoryFault)?;
+                    self.memory
+                        .checked_write_slice(dst_ptr, &data)
+                        .map_err(|_| Trap::MemoryFault)?;
+                }
                 self.pc += 4;
             }
             Opcode::Commit => {
@@ -1150,6 +1188,10 @@ impl Vm {
                 block_number: self.ctx.block_number,
                 timestamp: self.ctx.timestamp,
                 gas_price: self.ctx.gas_price,
+                tx_nonce: self.ctx.tx_nonce,
+                tx_gas_limit: self.ctx.tx_gas_limit,
+                tx_hash: self.ctx.tx_hash,
+                block_proposer: self.ctx.block_proposer,
                 block_hashes: self.ctx.block_hashes.clone(),
                 balances: self.ctx.balances.clone(),
             }
@@ -1157,10 +1199,14 @@ impl Vm {
             ExecutionContext {
                 caller: self.ctx.self_address,
                 self_address: target_addr,
-                call_value: U256::ZERO, // value transfer not yet implemented
+                call_value: U256::ZERO,
                 block_number: self.ctx.block_number,
                 timestamp: self.ctx.timestamp,
                 gas_price: self.ctx.gas_price,
+                tx_nonce: self.ctx.tx_nonce,
+                tx_gas_limit: self.ctx.tx_gas_limit,
+                tx_hash: self.ctx.tx_hash,
+                block_proposer: self.ctx.block_proposer,
                 block_hashes: self.ctx.block_hashes.clone(),
                 balances: self.ctx.balances.clone(),
             }

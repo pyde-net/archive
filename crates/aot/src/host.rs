@@ -387,10 +387,11 @@ pub extern "C" fn host_assert(_ctx: *mut VmCtx, val: u64) -> u64 {
     }
 }
 
-/// Host: field_mul rd = (a * b) mod Goldilocks prime. Returns result.
-pub extern "C" fn host_field_mul(_ctx: *mut VmCtx, a: u64, b: u64) -> u64 {
-    const GOLDILOCKS_P: u128 = (1u128 << 64) - (1u128 << 32) + 1;
-    ((a as u128 * b as u128) % GOLDILOCKS_P) as u64
+/// Host: memcpy — bulk memory copy. AOT placeholder (actual copy done via VM runtime).
+pub extern "C" fn host_memcpy(_ctx: *mut VmCtx, _dst: u64, _src: u64, _len: u64) -> u64 {
+    // In AOT mode, memcpy is handled by the VM runtime callback.
+    // This stub exists for symbol resolution.
+    0
 }
 
 /// List of all host function names and their function pointers, for
@@ -422,7 +423,7 @@ pub fn host_functions() -> Vec<(&'static str, *const u8)> {
         ("host_gasprice", host_gasprice as *const u8),
         ("host_balance", host_balance as *const u8),
         ("host_assert", host_assert as *const u8),
-        ("host_field_mul", host_field_mul as *const u8),
+        ("host_memcpy", host_memcpy as *const u8),
         ("host_checked_add", host_checked_add as *const u8),
         ("host_checked_sub", host_checked_sub as *const u8),
         ("host_checked_mul", host_checked_mul as *const u8),

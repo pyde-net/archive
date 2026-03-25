@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 pyde-vm = { path = "../pvm" }
+ethnum = "1.5.2"

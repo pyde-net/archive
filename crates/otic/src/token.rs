@@ -1,5 +1,7 @@
 //! Token types for the Otigen language.
 
+use ethnum::U256;
+
 /// Source location: line and column (both 1-based).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
@@ -21,7 +23,7 @@ pub struct Token {
 pub enum TokenKind {
     // === Literals ===
     /// Integer literal (decimal or hex): `42`, `0xFF`, `1_000_000`
-    IntLiteral(u128),
+    IntLiteral(U256),
     /// String literal: `"hello world"`
     StringLiteral(String),
     /// Boolean `true`

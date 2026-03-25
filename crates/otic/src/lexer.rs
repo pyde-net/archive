@@ -2,14 +2,15 @@
 //!
 //! Handles:
 //! - Keywords and identifiers
-//! - Integer literals (decimal, hex, with underscores)
+//! - Integer literals (decimal, hex, with underscores, up to 256-bit)
 //! - String literals with escape sequences
 //! - All operators and punctuation
 //! - Attributes (#[...])
-//! - Comments (// line, /* block */)
+//! - Comments (// line, /* block */, nested, doc)
 //! - Error recovery (skip to next valid token)
 //! - Source location tracking (line, column per token)
 
+use ethnum::U256;
 use crate::token::{Span, Token, TokenKind};
 
 /// A lexer error with source location.
@@ -510,19 +511,20 @@ impl<'a> Lexer<'a> {
             return self.lex_hex_number(start_line, start_col);
         }
 
-        let mut val: u128 = (first - b'0') as u128;
+        let mut val: U256 = U256::from((first - b'0') as u64);
         while let Some(ch) = self.peek() {
             match ch {
                 b'0'..=b'9' => {
                     self.advance();
-                    val = val.checked_mul(10).and_then(|v| v.checked_add((ch - b'0') as u128))
+                    val = val.checked_mul(U256::from(10u64))
+                        .and_then(|v| v.checked_add(U256::from((ch - b'0') as u64)))
                         .unwrap_or_else(|| {
                             self.errors.push(LexError {
-                                message: "integer literal overflow".into(),
+                                message: "integer literal overflow (max u256)".into(),
                                 line: start_line,
                                 col: start_col,
                             });
-                            0
+                            U256::ZERO
                         });
                 }
                 b'_' => { self.advance(); } // underscore separator
@@ -533,21 +535,22 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex_hex_number(&mut self, start_line: u32, start_col: u32) -> TokenKind {
-        let mut val: u128 = 0;
+        let mut val: U256 = U256::ZERO;
         let mut has_digits = false;
         while let Some(ch) = self.peek() {
             match ch {
                 b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => {
                     self.advance();
                     has_digits = true;
-                    val = val.checked_mul(16).and_then(|v| v.checked_add(hex_digit(ch) as u128))
+                    val = val.checked_mul(U256::from(16u64))
+                        .and_then(|v| v.checked_add(U256::from(hex_digit(ch) as u64)))
                         .unwrap_or_else(|| {
                             self.errors.push(LexError {
-                                message: "hex literal overflow".into(),
+                                message: "hex literal overflow (max u256)".into(),
                                 line: start_line,
                                 col: start_col,
                             });
-                            0
+                            U256::ZERO
                         });
                 }
                 b'_' => { self.advance(); }
@@ -661,10 +664,10 @@ mod tests {
     fn lex_decimal_integers() {
         let kinds = lex("0 42 1000 999999");
         assert_eq!(kinds, vec![
-            TokenKind::IntLiteral(0),
-            TokenKind::IntLiteral(42),
-            TokenKind::IntLiteral(1000),
-            TokenKind::IntLiteral(999999),
+            TokenKind::IntLiteral(U256::from(0u64)),
+            TokenKind::IntLiteral(U256::from(42u64)),
+            TokenKind::IntLiteral(U256::from(1000u64)),
+            TokenKind::IntLiteral(U256::from(999999u64)),
             TokenKind::Eof,
         ]);
     }
@@ -673,10 +676,10 @@ mod tests {
     fn lex_hex_integers() {
         let kinds = lex("0xFF 0x0 0xDEAD_BEEF 0xABCDEF");
         assert_eq!(kinds, vec![
-            TokenKind::IntLiteral(0xFF),
-            TokenKind::IntLiteral(0x0),
-            TokenKind::IntLiteral(0xDEAD_BEEF),
-            TokenKind::IntLiteral(0xABCDEF),
+            TokenKind::IntLiteral(U256::from(0xFFu64)),
+            TokenKind::IntLiteral(U256::from(0x0u64)),
+            TokenKind::IntLiteral(U256::from(0xDEAD_BEEFu64)),
+            TokenKind::IntLiteral(U256::from(0xABCDEFu64)),
             TokenKind::Eof,
         ]);
     }
@@ -685,8 +688,8 @@ mod tests {
     fn lex_underscored_numbers() {
         let kinds = lex("1_000_000 0xFF_FF");
         assert_eq!(kinds, vec![
-            TokenKind::IntLiteral(1_000_000),
-            TokenKind::IntLiteral(0xFFFF),
+            TokenKind::IntLiteral(U256::from(1_000_000u64)),
+            TokenKind::IntLiteral(U256::from(0xFFFFu64)),
             TokenKind::Eof,
         ]);
     }
@@ -968,9 +971,9 @@ contract Token {
     fn lex_range_expression() {
         let kinds = lex("0..10");
         assert_eq!(kinds, vec![
-            TokenKind::IntLiteral(0),
+            TokenKind::IntLiteral(U256::from(0u64)),
             TokenKind::DotDot,
-            TokenKind::IntLiteral(10),
+            TokenKind::IntLiteral(U256::from(10u64)),
             TokenKind::Eof,
         ]);
     }

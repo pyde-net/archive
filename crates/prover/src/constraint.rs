@@ -98,7 +98,7 @@ pub mod opcodes {
     pub const VERIFYSIG: u64 = 0x31;
     pub const MERKLEVERIFY: u64 = 0x32;
     pub const ASSERT: u64 = 0x38;
-    pub const FIELDMUL: u64 = 0x39;
+    pub const MEMCPY: u64 = 0x39;
     pub const COMMIT: u64 = 0x3A;
 }
 
@@ -123,7 +123,7 @@ mod tests {
         assert_eq!(opcodes::DIV, Opcode::Div as u64);
         assert_eq!(opcodes::MOD, Opcode::Mod as u64);
         assert_eq!(opcodes::ADDI, Opcode::Addi as u64);
-        assert_eq!(opcodes::FIELDMUL, Opcode::FieldMul as u64);
+        assert_eq!(opcodes::MEMCPY, Opcode::Memcpy as u64);
 
         // GP bitwise (7)
         assert_eq!(opcodes::AND, Opcode::And as u64);
@@ -211,7 +211,7 @@ mod tests {
         // Verify we have constants for all 64 real opcodes
         let all = [
             opcodes::ADD, opcodes::SUB, opcodes::MUL, opcodes::DIV, opcodes::MOD,
-            opcodes::ADDI, opcodes::FIELDMUL,
+            opcodes::ADDI, opcodes::MEMCPY,
             opcodes::AND, opcodes::OR, opcodes::XOR, opcodes::NOT,
             opcodes::SHL, opcodes::SHR, opcodes::SAR,
             opcodes::EQ, opcodes::LT, opcodes::GT, opcodes::SLT, opcodes::SGT,

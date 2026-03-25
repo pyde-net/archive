@@ -198,7 +198,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_assert = module.declare_function("host_assert", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     // (ctx, a, b) -> u64
-    let fn_field_mul = module.declare_function("host_field_mul", Linkage::Import, &sig_sload)
+    let fn_memcpy = module.declare_function("host_memcpy", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_wload(ctx, addr, wd) -> u64
@@ -279,7 +279,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_gasprice_ref = module.declare_func_in_func(fn_gasprice, &mut ctx.func);
     let fn_balance_ref = module.declare_func_in_func(fn_balance, &mut ctx.func);
     let fn_assert_ref = module.declare_func_in_func(fn_assert, &mut ctx.func);
-    let fn_field_mul_ref = module.declare_func_in_func(fn_field_mul, &mut ctx.func);
+    let fn_memcpy_ref = module.declare_func_in_func(fn_memcpy, &mut ctx.func);
 
     {
         let mut fn_builder_ctx = FunctionBuilderContext::new();
@@ -781,14 +781,14 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.seal_block(cont);
                         builder.switch_to_block(cont);
                     }
-                    Opcode::FieldMul => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let rs2 = (d.rs2_or_imm & 0xF) as u32;
-                        let b = builder.use_var(Variable::from_u32(rs2));
+                    Opcode::Memcpy => {
+                        // Memcpy handled by VM runtime call (AOT fallback)
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        let call = builder.ins().call(fn_field_mul_ref, &[vm_ctx, a, b]);
-                        let result = builder.inst_results(call)[0];
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), result); }
+                        let dst = builder.use_var(Variable::from_u32(d.rd as u32));
+                        let src = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let len_reg = (d.rs2_or_imm & 0xF) as u32;
+                        let len = builder.use_var(Variable::from_u32(len_reg));
+                        builder.ins().call(fn_memcpy_ref, &[vm_ctx, dst, src, len]);
                     }
                     Opcode::Commit => {
                         // Commit is captured from trace, no runtime effect

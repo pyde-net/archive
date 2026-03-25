@@ -134,7 +134,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
             + opcode_sel!(opcodes::SAR, curr, AB)
             + opcode_sel!(opcodes::EQ, curr, AB) + opcode_sel!(opcodes::LT, curr, AB)
             + opcode_sel!(opcodes::GT, curr, AB) + opcode_sel!(opcodes::SLT, curr, AB)
-            + opcode_sel!(opcodes::SGT, curr, AB) + opcode_sel!(opcodes::FIELDMUL, curr, AB)
+            + opcode_sel!(opcodes::SGT, curr, AB) + opcode_sel!(opcodes::MEMCPY, curr, AB)
             + opcode_sel!(opcodes::LOAD, curr, AB) + opcode_sel!(opcodes::POP, curr, AB)
             + opcode_sel!(opcodes::NARROW, curr, AB)
             + opcode_sel!(opcodes::CALLER, curr, AB)
@@ -189,7 +189,7 @@ impl<AB: AirBuilder<F = Goldilocks>> Air<AB> for PvmAir {
         );
         builder.assert_zero(
             not_final.clone()
-                * opcode_sel!(opcodes::FIELDMUL, curr, AB)
+                * opcode_sel!(opcodes::MEMCPY, curr, AB)
                 * (result.clone() - op_a.clone() * op_b.clone()),
         );
 

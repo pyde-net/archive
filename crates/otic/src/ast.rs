@@ -3,6 +3,7 @@
 //! Every node carries a `Span` for error reporting.
 
 use crate::token::Span;
+use ethnum::U256;
 
 // ============================================================================
 // Common
@@ -460,7 +461,7 @@ pub enum Expr {
 
 #[derive(Clone, Debug)]
 pub enum Literal {
-    Int(u128),
+    Int(U256),
     String(String),
     Bool(bool),
 }

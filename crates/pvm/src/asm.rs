@@ -379,7 +379,7 @@ fn mnemonic_to_opcode(s: &str) -> Option<Opcode> {
         "poseidon" => Some(Opcode::Poseidon),
         "verifysig" => Some(Opcode::VerifySig),
         "merkleverify" => Some(Opcode::MerkleVerify),
-        "fieldmul" => Some(Opcode::FieldMul),
+        "memcpy" => Some(Opcode::Memcpy),
         "commit" => Some(Opcode::Commit),
         _ => None,
     }
@@ -449,7 +449,7 @@ fn opcode_to_mnemonic(op: Opcode) -> &'static str {
         Opcode::Poseidon => "poseidon",
         Opcode::VerifySig => "verifysig",
         Opcode::MerkleVerify => "merkleverify",
-        Opcode::FieldMul => "fieldmul",
+        Opcode::Memcpy => "memcpy",
         Opcode::Commit => "commit",
         Opcode::Invalid => "invalid",
     }

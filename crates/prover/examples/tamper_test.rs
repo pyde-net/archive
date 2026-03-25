@@ -419,7 +419,7 @@ fn main() {
     let fieldmul_code = bytecode(&[
         &instr(Opcode::Addi, 1, 0, 7),
         &instr(Opcode::Addi, 2, 0, 6),
-        &instr(Opcode::FieldMul, 3, 1, 2), // 7 * 6 = 42
+        &instr(Opcode::Mul, 3, 1, 2), // 7 * 6 = 42
         &instr(Opcode::Halt, 0, 0, 0),
     ]);
 

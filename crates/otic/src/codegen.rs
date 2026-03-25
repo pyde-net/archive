@@ -21,6 +21,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ethnum::U256;
+
 use crate::ir::*;
 use crate::memory;
 use crate::types::Ty;
@@ -568,31 +570,33 @@ impl CodeGen {
                 match val {
                     IrConst::Int(v, ty) => {
                         let is_u256 = matches!(ty, Ty::U256 | Ty::I256);
-                        if is_u256 && *v > u64::MAX as u128 {
+                        if is_u256 && *v > U256::from(u64::MAX) {
                             // u256 large value → store all 32 bytes to heap, Wload
                             let wd = self.regs.alloc_wide(*dst);
-                            // Split u128 into 4 x u64 limbs (LE order)
-                            let limb0 = (*v & 0xFFFFFFFFFFFFFFFF) as u64;
-                            let limb1 = ((*v >> 64) & 0xFFFFFFFFFFFFFFFF) as u64;
-                            // u128 only holds 128 bits; limbs 2-3 are zero
+                            // Split U256 into 4 x u64 limbs (LE order)
+                            let limb0 = (v & U256::from(u64::MAX)).as_u64();
+                            let limb1 = ((v >> 64u32) & U256::from(u64::MAX)).as_u64();
+                            let limb2 = ((v >> 128u32) & U256::from(u64::MAX)).as_u64();
+                            let limb3 = ((v >> 192u32) & U256::from(u64::MAX)).as_u64();
                             self.load_u64_to_reg(15, limb0);
                             self.emit_store(15, 12, 0);   // heap[0..8] = limb0
                             self.load_u64_to_reg(15, limb1);
                             self.emit_store(15, 12, 8);   // heap[8..16] = limb1
-                            self.emit_op(Opcode::Addi, 15, 0, 0);
-                            self.emit_store(15, 12, 16);  // heap[16..24] = 0
-                            self.emit_store(15, 12, 24);  // heap[24..32] = 0
+                            self.load_u64_to_reg(15, limb2);
+                            self.emit_store(15, 12, 16);  // heap[16..24] = limb2
+                            self.load_u64_to_reg(15, limb3);
+                            self.emit_store(15, 12, 24);  // heap[24..32] = limb3
                             // Wload from heap into wide register
                             self.emit_op(Opcode::Wload, wd, 12, 0);
                             // Advance heap past the 32 bytes
                             self.emit_op(Opcode::Addi, 12, 12, 32);
-                        } else if *v <= 0x1FFFF as u128 {
+                        } else if *v <= U256::from(0x1FFFFu64) {
                             // Fits in 17-bit positive Addi (PVM sign-extends 18-bit immediate)
                             let rd = self.alloc_gp(*dst);
-                            self.emit_op(Opcode::Addi, rd, 0, *v as u32);
+                            self.emit_op(Opcode::Addi, rd, 0, v.as_u64() as u32);
                         } else {
                             let rd = self.alloc_gp(*dst);
-                            self.load_u64_to_reg(rd, *v as u64);
+                            self.load_u64_to_reg(rd, v.as_u64());
                         }
                     }
                     IrConst::Bool(b) => {
@@ -817,6 +821,44 @@ impl CodeGen {
                 }
             }
 
+            Inst::StorageNestedMapGet(dst, field, key1, key2) => {
+                let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
+                let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let val_ty = map_value_type(&map_value_type(&map_ty));
+                let wide_value = is_wide_type(&val_ty);
+
+                let rk1 = self.get_reg(*key1);
+                let rk2 = self.get_reg(*key2);
+                self.emit_nested_map_key_derivation(slot, rk1, rk2);
+                // w7 now holds the derived key
+
+                if wide_value {
+                    let wd = self.regs.alloc_wide(*dst);
+                    self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0);
+                } else {
+                    let rd = self.alloc_gp(*dst);
+                    self.emit_op(Opcode::Sload, rd, WIDE_SCRATCH, 2);
+                }
+            }
+
+            Inst::StorageNestedMapSet(field, key1, key2, val) => {
+                let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
+                let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let val_ty = map_value_type(&map_value_type(&map_ty));
+                let wide_value = is_wide_type(&val_ty);
+
+                let rk1 = self.get_reg(*key1);
+                let rk2 = self.get_reg(*key2);
+                let rv = self.get_reg(*val);
+                self.emit_nested_map_key_derivation(slot, rk1, rk2);
+
+                if wide_value {
+                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0);
+                } else {
+                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 2);
+                }
+            }
+
             // ==== Builtins (fixed: Callvalue → wide, Caller → GP) ====
 
             Inst::Builtin(dst, op) => {
@@ -844,8 +886,7 @@ impl CodeGen {
                     }
                     BuiltinOp::BlockProposer => {
                         let wd = self.regs.alloc_wide(*dst);
-                        self.emit_op(Opcode::Addi, 15, 0, 0);
-                        self.emit_op(Opcode::Widen, wd, 15, 0); // placeholder: zero address
+                        self.emit_op(Opcode::Callvalue, wd, 0, 6); // env_wide::BLOCK_PROPOSER
                     }
                     BuiltinOp::TxGasPrice => {
                         let wd = self.regs.alloc_wide(*dst);
@@ -853,16 +894,15 @@ impl CodeGen {
                     }
                     BuiltinOp::TxNonce => {
                         let rd = self.alloc_gp(*dst);
-                        self.emit_op(Opcode::Addi, rd, 0, 0); // placeholder
+                        self.emit_op(Opcode::Caller, rd, 0, 3); // env_gp::TX_NONCE
                     }
                     BuiltinOp::TxHash => {
                         let wd = self.regs.alloc_wide(*dst);
-                        self.emit_op(Opcode::Addi, 15, 0, 0);
-                        self.emit_op(Opcode::Widen, wd, 15, 0); // placeholder
+                        self.emit_op(Opcode::Callvalue, wd, 0, 5); // env_wide::TX_HASH
                     }
                     BuiltinOp::TxGasLimit => {
                         let rd = self.alloc_gp(*dst);
-                        self.emit_op(Opcode::Addi, rd, 0, 0); // placeholder
+                        self.emit_op(Opcode::Caller, rd, 0, 4); // env_gp::TX_GAS_LIMIT
                     }
                     BuiltinOp::AddressOfSelf => {
                         let wd = self.regs.alloc_wide(*dst);
@@ -906,17 +946,19 @@ impl CodeGen {
 
             Inst::Revert(name, fields) => {
                 // Encode error data to heap: [selector:8][field0:8][field1:8]...
-                // PVM Revert doesn't read data yet, but it's available in memory for debugging.
-                if !fields.is_empty() {
-                    let selector = compute_selector(name) as u64;
-                    self.load_u64_to_reg(15, selector);
-                    self.emit_store(15, 12, 0);
-                    for (i, freg) in fields.iter().enumerate() {
-                        let fr = self.get_reg(*freg);
-                        self.emit_store(fr, 12, ((i + 1) * 8) as i32);
-                    }
+                // Then pass pointer (r12) and length to PVM Revert opcode.
+                let total_len = (1 + fields.len()) * 8; // selector + fields
+                let selector = compute_selector(name) as u64;
+                self.load_u64_to_reg(15, selector);
+                self.emit_store(15, 12, 0);
+                for (i, freg) in fields.iter().enumerate() {
+                    let fr = self.get_reg(*freg);
+                    self.emit_store(fr, 12, ((i + 1) * 8) as i32);
                 }
-                self.emit_op(Opcode::Revert, 0, 0, 0);
+                // r14 = data length
+                self.emit_op(Opcode::Addi, 14, 0, total_len as u32);
+                // Revert rs1=r12 (pointer), imm[3:0]=r14 (length register)
+                self.emit_op(Opcode::Revert, 0, 12, 14);
             }
 
             Inst::Emit(name, fields) => {
@@ -1126,16 +1168,58 @@ impl CodeGen {
                         // Load length and capacity
                         self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);  // r15 = length
                         self.emit_load(memory::REG_SCRATCH_0, ro, memory::VEC_CAPACITY_OFFSET as i32); // r14 = capacity
-                        // Assert length < capacity (reverts if Vec is full — safe, no memory corruption)
-                        // Vec starts with capacity 16. Realloc requires MEMCPY (future ISA extension).
-                        self.emit_op(Opcode::Lt, 13, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
-                        self.emit_op(Opcode::Assert, 0, 13, 0);
-                        // Compute data address: base + VEC_DATA_OFFSET + length * 8
+
+                        // Branch: length < capacity → fast path, else → realloc
+                        let fast_label = self.alloc_label();
+                        let realloc_label = self.alloc_label();
+                        let write_label = self.alloc_label();
+
+                        self.emit_op(Opcode::Lt, 15, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
+                        self.emit_jump_placeholder(Opcode::Bne, 15, 0, fast_label);
+                        self.emit_jump_placeholder(Opcode::Jmp, 0, 0, realloc_label);
+
+                        // === Realloc: allocate 2x block, Memcpy old data, update pointer ===
+                        self.mark_label(realloc_label);
+                        // Step 1: compute new_cap = old_cap * 2 → r14
+                        self.emit_load(memory::REG_SCRATCH_0, ro, memory::VEC_CAPACITY_OFFSET as i32); // r14 = old cap
+                        self.emit_op(Opcode::Addi, 15, 0, 1);
+                        self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 15); // r14 = cap*2
+                        // Step 2: write new header at r12 (new base)
+                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32); // r15 = length
+                        self.emit_store(memory::REG_SCRATCH_1, 12, memory::VEC_LENGTH_OFFSET as i32); // new.length
+                        self.emit_store(memory::REG_SCRATCH_0, 12, memory::VEC_CAPACITY_OFFSET as i32); // new.capacity
+                        // Step 3: compute memcpy args — r13 = byte count, r14 = dst, r15 = src
+                        // r13 = length * 8
+                        self.emit_op(Opcode::Addi, 13, 0, 3);
+                        self.emit_op(Opcode::Shl, 13, memory::REG_SCRATCH_1, 13); // r13 = length * 8
+                        // r14 = new data start = r12 + 16
+                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 12, memory::VEC_DATA_OFFSET);
+                        // r15 = old data start = ro + 16
+                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_1, ro, memory::VEC_DATA_OFFSET);
+                        // Step 4: Memcpy rd=r14(dst), rs1=r15(src), imm[3:0]=13(len reg)
+                        self.emit_op(Opcode::Memcpy, memory::REG_SCRATCH_0, memory::REG_SCRATCH_1, 13);
+                        // Step 5: update ro and advance heap
+                        // Reload new_cap from new header for heap advance
+                        self.emit_load(memory::REG_SCRATCH_0, 12, memory::VEC_CAPACITY_OFFSET as i32); // r14 = new_cap
+                        self.emit_op(Opcode::Add, ro, 12, 0); // ro = new Vec base
+                        self.emit_op(Opcode::Addi, 15, 0, 3);
+                        self.emit_op(Opcode::Shl, 15, memory::REG_SCRATCH_0, 15); // r15 = new_cap * 8
+                        self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
+                        self.emit_op(Opcode::Add, 12, 12, 15); // r12 += header + data
+                        // Reload length for write
+                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
+                        self.emit_jump_placeholder(Opcode::Jmp, 0, 0, write_label);
+
+                        // === Fast path (no realloc) ===
+                        self.mark_label(fast_label);
+                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
+
+                        // === Write value at data[length] ===
+                        self.mark_label(write_label);
                         self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 0, 3);
                         self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
                         self.emit_op(Opcode::Add, memory::REG_SCRATCH_0, ro, memory::REG_SCRATCH_0 as u32);
                         self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, memory::VEC_DATA_OFFSET);
-                        // Store value
                         self.emit_store(val_reg, memory::REG_SCRATCH_0, 0);
                         // Increment length
                         self.emit_op(Opcode::Addi, memory::REG_SCRATCH_1, memory::REG_SCRATCH_1, 1);
@@ -1414,6 +1498,22 @@ impl CodeGen {
         self.emit_store(key_reg, 12, 8); // heap[8] = key
         // Hash 16 bytes: poseidon(mem[r12..r12+16])
         self.emit_op(Opcode::Addi, 14, 0, 16);  // r14 = 16 (byte length)
+        // Poseidon: w7 = hash(mem[r12..r12+r14])
+        self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
+    }
+
+    /// Derive a nested-map storage key: w7 = poseidon2(slot || key1 || key2).
+    /// Writes slot + key1 + key2 (24 bytes) to heap memory, hashes them, result in w7.
+    fn emit_nested_map_key_derivation(&mut self, slot: u32, key1_reg: u8, key2_reg: u8) {
+        // Store slot to heap
+        self.emit_op(Opcode::Addi, 15, 0, slot);
+        self.emit_store(15, 12, 0);       // heap[0] = slot
+        // Store key1 to heap
+        self.emit_store(key1_reg, 12, 8); // heap[8] = key1
+        // Store key2 to heap
+        self.emit_store(key2_reg, 12, 16); // heap[16] = key2
+        // Hash 24 bytes: poseidon(mem[r12..r12+24])
+        self.emit_op(Opcode::Addi, 14, 0, 24);  // r14 = 24 (byte length)
         // Poseidon: w7 = hash(mem[r12..r12+r14])
         self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
     }
@@ -2838,5 +2938,50 @@ mod tests {
         let vm = run_pvm(&compiled.bytecode);
         // l = 1+2 = 3, m = 3+4 = 7, result = 3 + 7 + 5 + 6 = 21
         assert_eq!(vm.cpu.read_gp(1), 21, "spilled register values should be correct");
+    }
+
+    #[test]
+    fn pvm_vec_push_loop() {
+        // Push 10 elements in a loop (within initial capacity)
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut v = Vec::new();
+                    for i in 0..10 {
+                        v.push(i);
+                    }
+                    return v.len();
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 10, "Vec should have 10 elements");
+    }
+
+    #[test]
+    fn pvm_vec_realloc() {
+        // Push 100 elements — exceeds initial capacity of 64, triggers Memcpy realloc
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut v = Vec::new();
+                    for i in 0..100 {
+                        v.push(i);
+                    }
+                    return v.len();
+                }
+            }
+        "#);
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        vm.load(&compiled.bytecode).unwrap();
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => { steps += 1; if steps > 50_000 { break; } }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(vm.cpu.read_gp(1), 100, "Vec should have 100 elements after realloc");
     }
 }

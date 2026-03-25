@@ -633,7 +633,7 @@ impl Parser {
         let size = match self.peek() {
             TokenKind::IntLiteral(_) => {
                 let tok = self.advance();
-                if let TokenKind::IntLiteral(v) = tok.kind { v as u64 } else { 0 }
+                if let TokenKind::IntLiteral(v) = tok.kind { v.as_u64() } else { 0 }
             }
             _ => {
                 self.error("expected array size".into());
@@ -1356,7 +1356,7 @@ impl Parser {
             let count = match self.peek() {
                 TokenKind::IntLiteral(_) => {
                     let tok = self.advance();
-                    if let TokenKind::IntLiteral(v) = tok.kind { v as u64 } else { 0 }
+                    if let TokenKind::IntLiteral(v) = tok.kind { v.as_u64() } else { 0 }
                 }
                 _ => {
                     self.error("expected array size literal".into());
@@ -1383,6 +1383,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethnum::U256;
     use crate::lexer::Lexer;
 
     fn parse(src: &str) -> (SourceFile, Vec<ParseError>) {
@@ -1753,7 +1754,7 @@ contract Token {
         if let Item::Contract(c) = &file.items[0] {
             if let ContractItem::Function(f) = &c.items[0] {
                 if let Stmt::Let(l) = &f.body.stmts[0] {
-                    assert!(matches!(l.initializer, Expr::Literal(Literal::Int(0), _)));
+                    assert!(matches!(&l.initializer, Expr::Literal(Literal::Int(v), _) if *v == U256::ZERO));
                 }
             }
         }
@@ -1767,7 +1768,7 @@ contract Token {
         if let Item::Contract(c) = &file.items[0] {
             if let ContractItem::Function(f) = &c.items[0] {
                 if let Stmt::Let(l) = &f.body.stmts[0] {
-                    assert!(matches!(l.initializer, Expr::Literal(Literal::Int(100_000_000), _)));
+                    assert!(matches!(&l.initializer, Expr::Literal(Literal::Int(v), _) if *v == U256::from(100_000_000u64)));
                 }
             }
         }
@@ -1884,7 +1885,7 @@ contract Token {
         if let Item::Contract(c) = &file.items[0] {
             if let ContractItem::Function(f) = &c.items[0] {
                 if let Stmt::Let(l) = &f.body.stmts[0] {
-                    assert!(matches!(l.initializer, Expr::Literal(Literal::Int(0), _)));
+                    assert!(matches!(&l.initializer, Expr::Literal(Literal::Int(v), _) if *v == U256::ZERO));
                 }
             }
         }

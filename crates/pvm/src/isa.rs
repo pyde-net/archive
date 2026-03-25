@@ -90,17 +90,13 @@ pub enum Opcode {
     VerifySig = 0x31,    // rd = verify_signature(msg, sig, pk)
     MerkleVerify = 0x32, // rd = verify_merkle_path(root, leaf, path)
 
-    // --- 3.4.6 ZK-Native ---
-    Assert = 0x38,   // if rs1 == 0 then revert
-    FieldMul = 0x39, // rd = rs1 * rs2 (mod field prime)
-    Commit = 0x3A,   // commit rd to public output
+    // --- 3.4.6 ZK-Native + Memory ---
+    Assert = 0x38,   // if rs1 == 0 then revert (provable assertion)
+    Memcpy = 0x39,   // copy gp[imm&0xF] bytes from mem[gp[rs1]] to mem[gp[rd]]
+    Commit = 0x3A,   // commit rd to public output (ZK prover)
 
-    // --- Bulk Memory Copy (Phase 9) ---
-    //
-    // Problem: no Mcopy instruction, and all 64 opcode slots are used.
-    //
-    // Solution: turn opcode 0x00 (currently Weq) into a gateway for new
-    // instructions. When the VM sees opcode 0x00, it looks at the imm field
+    // Note: FieldMul (0x39) was replaced by Memcpy in Phase 9.
+    // FieldMul can be re-added as a Commit replacement or via opcode gateway if needed.
     // to decide what to actually do:
     //
     //   0x00 + imm says "NOP"   → do nothing (all-zero instruction is safe)
@@ -183,7 +179,7 @@ impl Opcode {
             0x36 => Opcode::Sgt,
             0x37 => Opcode::Wload,
             0x38 => Opcode::Assert,
-            0x39 => Opcode::FieldMul,
+            0x39 => Opcode::Memcpy,
             0x3A => Opcode::Commit,
             0x3B => Opcode::Wstore,
             0x3C => Opcode::Wmov,
@@ -298,7 +294,7 @@ pub const ALL_OPCODES: &[Opcode] = &[
     Opcode::Sgt,
     Opcode::Wload,
     Opcode::Assert,
-    Opcode::FieldMul,
+    Opcode::Memcpy,
     Opcode::Commit,
     Opcode::Wstore,
     Opcode::Wmov,
@@ -541,9 +537,9 @@ pub fn gas_cost(op: Opcode) -> GasCost {
         Opcode::VerifySig => GasCost::new(5_000, 15_000),
         Opcode::MerkleVerify => GasCost::new(100, 400),
 
-        // ZK-native
+        // ZK-native + memory
         Opcode::Assert => GasCost::new(1, 1),
-        Opcode::FieldMul => GasCost::new(2, 3),
+        Opcode::Memcpy => GasCost::new(3, 2),  // base cost; dynamic cost added per byte in handler
         Opcode::Commit => GasCost::new(5, 5),
 
         // Wide comparisons
@@ -620,7 +616,7 @@ static TOTAL_GAS_TABLE: [u64; 64] = {
             0x36 => Some(GasCost::new(1, 3)),   // Sgt
             0x37 => Some(GasCost::new(4, 6)),   // Wload
             0x38 => Some(GasCost::new(1, 1)),   // Assert
-            0x39 => Some(GasCost::new(2, 3)),   // FieldMul
+            0x39 => Some(GasCost::new(3, 2)),   // Memcpy
             0x3A => Some(GasCost::new(5, 5)),   // Commit
             0x3B => Some(GasCost::new(4, 6)),   // Wstore
             0x3C => Some(GasCost::new(1, 1)),   // Wmov

@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use ethnum::U256;
+
 use crate::ast;
 use crate::ast::*;
 use crate::ir::{self, IrProgram, IrFunction, BasicBlock, Label, Reg, Inst, IrConst, BinOp, UnOp, CmpOp, BuiltinOp, StorageFieldDef};
@@ -31,7 +33,7 @@ struct Lowerer {
     /// Enum name → variant names (in order, discriminant = index).
     enum_defs: HashMap<String, Vec<String>>,
     /// Const name → (value, type) for inlining.
-    const_defs: HashMap<String, (u128, Ty)>,
+    const_defs: HashMap<String, (U256, Ty)>,
 }
 
 impl Lowerer {
@@ -435,8 +437,21 @@ impl Lowerer {
             Expr::FieldAccess(obj, field, _) if matches!(obj.as_ref(), Expr::SelfExpr(_)) => {
                 self.emit(Inst::StorageSet(field.name.clone(), value));
             }
+            // self.map[key1][key2] = value → storage.nested_map_set
             // self.map[key] = value → storage.map_set
             Expr::Index(obj, key, _) => {
+                // Check for nested: self.map[key1][key2]
+                if let Expr::Index(inner_obj, inner_key, _) = obj.as_ref() {
+                    if let Expr::FieldAccess(self_expr, field, _) = inner_obj.as_ref() {
+                        if matches!(self_expr.as_ref(), Expr::SelfExpr(_)) {
+                            let key1 = self.lower_expr(inner_key);
+                            let key2 = self.lower_expr(key);
+                            self.emit(Inst::StorageNestedMapSet(field.name.clone(), key1, key2, value));
+                            return;
+                        }
+                    }
+                }
+                // Single-level: self.map[key]
                 if let Expr::FieldAccess(inner_obj, field, _) = obj.as_ref() {
                     if matches!(inner_obj.as_ref(), Expr::SelfExpr(_)) {
                         let key_reg = self.lower_expr(key);
@@ -495,7 +510,7 @@ impl Lowerer {
         } else {
             let iter = self.lower_expr(&f.iterator);
             let zero = self.alloc_reg();
-            self.emit(Inst::Const(zero, IrConst::Int(0, Ty::U64)));
+            self.emit(Inst::Const(zero, IrConst::Int(U256::ZERO, Ty::U64)));
             (zero, iter)
         };
 
@@ -521,7 +536,7 @@ impl Lowerer {
 
         // Increment: loop_var = loop_var + 1 (overwrite same register)
         let one = self.alloc_reg();
-        self.emit(Inst::Const(one, IrConst::Int(1, Ty::U64)));
+        self.emit(Inst::Const(one, IrConst::Int(U256::from(1u64), Ty::U64)));
         self.emit(Inst::BinOp(loop_var, BinOp::Add, loop_var, one));
         self.emit(Inst::Jump(header_label));
 
@@ -701,7 +716,21 @@ impl Lowerer {
             }
 
             Expr::Index(obj, index, _) => {
-                // self.map[key] → storage.map_get
+                // self.map[key1][key2] → storage.nested_map_get (2-level)
+                if let Expr::Index(inner_obj, inner_idx, _) = obj.as_ref() {
+                    if let Expr::FieldAccess(self_expr, field, _) = inner_obj.as_ref() {
+                        if matches!(self_expr.as_ref(), Expr::SelfExpr(_))
+                            && self.storage_slots.contains_key(&field.name)
+                        {
+                            let key1 = self.lower_expr(inner_idx);
+                            let key2 = self.lower_expr(index);
+                            let dst = self.alloc_reg();
+                            self.emit(Inst::StorageNestedMapGet(dst, field.name.clone(), key1, key2));
+                            return dst;
+                        }
+                    }
+                }
+                // self.map[key] → storage.map_get (1-level)
                 if let Expr::FieldAccess(inner_obj, field, _) = obj.as_ref() {
                     if matches!(inner_obj.as_ref(), Expr::SelfExpr(_))
                         && self.storage_slots.contains_key(&field.name)
@@ -763,7 +792,7 @@ impl Lowerer {
                             let type_name = segments[0].name.as_str();
                             let member = segments[1].name.as_str();
                             if type_name == "Vec" && member == "new" {
-                                self.emit(Inst::MakeVec(dst, 16));
+                                self.emit(Inst::MakeVec(dst, 64));
                                 return dst;
                             }
                         }
@@ -793,14 +822,14 @@ impl Lowerer {
                     // Enum variant → discriminant integer
                     if let Some(variants) = self.enum_defs.get(type_name.as_str()).cloned() {
                         if let Some(idx) = variants.iter().position(|v| v == member) {
-                            self.emit(Inst::Const(dst, IrConst::Int(idx as u128, Ty::U8)));
+                            self.emit(Inst::Const(dst, IrConst::Int(U256::from(idx as u64), Ty::U8)));
                             return dst;
                         }
                     }
 
                     // Vec::new(), bytes::new(), etc.
                     if type_name == "Vec" && member == "new" {
-                        self.emit(Inst::MakeVec(dst, 16)); // initial capacity 16
+                        self.emit(Inst::MakeVec(dst, 64)); // initial capacity 16
                         return dst;
                     }
                     if type_name == "bytes" && (member == "new" || member == "empty") {
@@ -1017,7 +1046,7 @@ impl Lowerer {
                                 if let Some(variants) = self.enum_defs.get(enum_name.as_str()).cloned() {
                                     if let Some(idx) = variants.iter().position(|v| v == variant_name) {
                                         let pat_reg = self.alloc_reg();
-                                        self.emit(Inst::Const(pat_reg, IrConst::Int(idx as u128, Ty::U8)));
+                                        self.emit(Inst::Const(pat_reg, IrConst::Int(U256::from(idx as u64), Ty::U8)));
                                         let cmp = self.alloc_reg();
                                         self.emit(Inst::Cmp(cmp, CmpOp::Eq, scrut, pat_reg));
                                         self.emit(Inst::Branch(cmp, arm_label, next_label));
@@ -1305,12 +1334,12 @@ mod tests {
             .collect();
 
         // Active=0, Paused=1, Closed=2
-        let consts: Vec<u128> = all_insts.iter().filter_map(|i| {
+        let consts: Vec<U256> = all_insts.iter().filter_map(|i| {
             if let Inst::Const(_, IrConst::Int(v, _)) = i { Some(*v) } else { None }
         }).collect();
-        assert!(consts.contains(&0), "Active should be 0");
-        assert!(consts.contains(&1), "Paused should be 1");
-        assert!(consts.contains(&2), "Closed should be 2");
+        assert!(consts.contains(&U256::from(0u64)), "Active should be 0");
+        assert!(consts.contains(&U256::from(1u64)), "Paused should be 1");
+        assert!(consts.contains(&U256::from(2u64)), "Closed should be 2");
     }
 
     #[test]
@@ -1358,7 +1387,9 @@ mod tests {
             .collect();
 
         // Should inline 1000000, not emit a comment
-        assert!(all_insts.iter().any(|i| matches!(i, Inst::Const(_, IrConst::Int(1000000, _)))));
+        assert!(all_insts.iter().any(|i| {
+            if let Inst::Const(_, IrConst::Int(v, _)) = i { *v == U256::from(1000000u64) } else { false }
+        }));
         assert!(!all_insts.iter().any(|i| {
             if let Inst::Comment(msg) = i { msg.contains("MAX_SUPPLY") } else { false }
         }));

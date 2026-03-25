@@ -10,6 +10,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ethnum::U256;
+
 use crate::ir::*;
 use crate::types::Ty;
 
@@ -131,31 +133,31 @@ fn constant_fold(func: &mut IrFunction) {
     }
 }
 
-fn fold_binop(op: BinOp, lhs: u128, rhs: u128) -> Option<u128> {
+fn fold_binop(op: BinOp, lhs: U256, rhs: U256) -> Option<U256> {
     match op {
         BinOp::Add => lhs.checked_add(rhs),
         BinOp::Sub => lhs.checked_sub(rhs),
         BinOp::Mul => lhs.checked_mul(rhs),
         BinOp::Div => {
-            if rhs == 0 { None } else { Some(lhs / rhs) }
+            if rhs == U256::ZERO { None } else { Some(lhs / rhs) }
         }
         BinOp::Mod => {
-            if rhs == 0 { None } else { Some(lhs % rhs) }
+            if rhs == U256::ZERO { None } else { Some(lhs % rhs) }
         }
         BinOp::BitAnd => Some(lhs & rhs),
         BinOp::BitOr => Some(lhs | rhs),
         BinOp::BitXor => Some(lhs ^ rhs),
         BinOp::Shl => {
-            if rhs < 128 { lhs.checked_shl(rhs as u32) } else { None }
+            if rhs < U256::from(256u64) { Some(lhs << rhs.as_u64() as u32) } else { None }
         }
         BinOp::Shr => {
-            if rhs < 128 { Some(lhs >> rhs as u32) } else { Some(0) }
+            if rhs < U256::from(256u64) { Some(lhs >> rhs.as_u64() as u32) } else { Some(U256::ZERO) }
         }
         BinOp::LogicalAnd | BinOp::LogicalOr => None, // operate on bools, not ints
     }
 }
 
-fn fold_cmp(op: CmpOp, lhs: u128, rhs: u128) -> bool {
+fn fold_cmp(op: CmpOp, lhs: U256, rhs: U256) -> bool {
     match op {
         CmpOp::Eq => lhs == rhs,
         CmpOp::NotEq => lhs != rhs,
@@ -166,10 +168,10 @@ fn fold_cmp(op: CmpOp, lhs: u128, rhs: u128) -> bool {
     }
 }
 
-fn fold_unop(op: UnOp, val: u128) -> Option<u128> {
+fn fold_unop(op: UnOp, val: U256) -> Option<U256> {
     match op {
         UnOp::Neg => {
-            if val == 0 { Some(0) } else { None } // can't negate unsigned
+            if val == U256::ZERO { Some(U256::ZERO) } else { None } // can't negate unsigned
         }
         UnOp::BitNot => Some(!val),
         UnOp::LogicalNot => None, // handled separately for bools
@@ -288,6 +290,8 @@ fn collect_used_regs(inst: &Inst, used: &mut HashSet<Reg>) {
         Inst::StorageSet(_, val) => { used.insert(*val); }
         Inst::StorageMapGet(_, _, key) => { used.insert(*key); }
         Inst::StorageMapSet(_, key, val) => { used.insert(*key); used.insert(*val); }
+        Inst::StorageNestedMapGet(_, _, k1, k2) => { used.insert(*k1); used.insert(*k2); }
+        Inst::StorageNestedMapSet(_, k1, k2, val) => { used.insert(*k1); used.insert(*k2); used.insert(*val); }
         Inst::Builtin(_, _) => {}
         Inst::Call(_, _, args) => { for a in args { used.insert(*a); } }
         Inst::MethodCall(_, obj, _, args) => { used.insert(*obj); for a in args { used.insert(*a); } }
@@ -324,6 +328,7 @@ fn get_dest_reg(inst: &Inst) -> Option<Reg> {
         Inst::Const(dst, _) | Inst::BinOp(dst, _, _, _) | Inst::UnOp(dst, _, _)
         | Inst::Cmp(dst, _, _, _) | Inst::Cast(dst, _, _)
         | Inst::StorageGet(dst, _) | Inst::StorageMapGet(dst, _, _)
+        | Inst::StorageNestedMapGet(dst, _, _, _)
         | Inst::Builtin(dst, _) | Inst::Call(dst, _, _)
         | Inst::MethodCall(dst, _, _, _) | Inst::ExtCall(dst, _, _, _)
         | Inst::Hash(dst, _) | Inst::StructInit(dst, _, _)
@@ -340,6 +345,7 @@ fn get_dest_reg(inst: &Inst) -> Option<Reg> {
 fn has_side_effects(inst: &Inst) -> bool {
     matches!(inst,
         Inst::StorageSet(_, _) | Inst::StorageMapSet(_, _, _)
+        | Inst::StorageNestedMapSet(_, _, _, _)
         | Inst::IndexSet(_, _, _)
         | Inst::Emit(_, _) | Inst::Revert(_, _)
         | Inst::CrossCall { .. } | Inst::RawCall(_, _, _)
@@ -398,16 +404,16 @@ mod tests {
         "#);
 
         let func = &ir.functions[0];
-        let consts: Vec<u128> = func.blocks.iter()
+        let consts: Vec<U256> = func.blocks.iter()
             .flat_map(|b| b.instructions.iter())
             .filter_map(|i| {
                 if let Inst::Const(_, IrConst::Int(v, _)) = i { Some(*v) } else { None }
             })
             .collect();
 
-        assert!(consts.contains(&30), "10+20 should fold to 30, got: {:?}", consts);
-        assert!(consts.contains(&300), "100*3 should fold to 300");
-        assert!(consts.contains(&40), "50-10 should fold to 40");
+        assert!(consts.contains(&U256::from(30u64)), "10+20 should fold to 30, got: {:?}", consts);
+        assert!(consts.contains(&U256::from(300u64)), "100*3 should fold to 300");
+        assert!(consts.contains(&U256::from(40u64)), "50-10 should fold to 40");
     }
 
     #[test]
@@ -570,7 +576,7 @@ mod tests {
         let func = &ir.functions[0];
         // Due to how lowering works, (2+3) becomes Add(%0,%1) → Const(5),
         // then 5*4 might be foldable if both are in known map
-        let consts: Vec<u128> = func.blocks.iter()
+        let consts: Vec<U256> = func.blocks.iter()
             .flat_map(|b| b.instructions.iter())
             .filter_map(|i| {
                 if let Inst::Const(_, IrConst::Int(v, _)) = i { Some(*v) } else { None }
@@ -578,7 +584,7 @@ mod tests {
             .collect();
 
         // At minimum, 2+3=5 should be folded
-        assert!(consts.contains(&5) || consts.contains(&20),
+        assert!(consts.contains(&U256::from(5u64)) || consts.contains(&U256::from(20u64)),
             "nested constants should fold, got: {:?}", consts);
     }
 }

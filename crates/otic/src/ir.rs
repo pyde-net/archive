@@ -8,6 +8,7 @@
 use std::fmt;
 
 use crate::types::Ty;
+use ethnum::U256;
 
 /// A virtual register (unlimited, allocated to PVM regs later).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -247,6 +248,12 @@ pub enum Inst {
     /// `storage.map_set "map_name", %key, %val`
     StorageMapSet(String, Reg, Reg),
 
+    /// `%dst = storage.nested_map_get "map_name", %key1, %key2` (for self.map[a][b])
+    StorageNestedMapGet(Reg, String, Reg, Reg),
+
+    /// `storage.nested_map_set "map_name", %key1, %key2, %val`
+    StorageNestedMapSet(String, Reg, Reg, Reg),
+
     /// `%dst = builtin <name>` (msg.sender, block.timestamp, etc.)
     Builtin(Reg, BuiltinOp),
 
@@ -329,7 +336,7 @@ pub enum Inst {
 /// A constant value.
 #[derive(Clone, Debug)]
 pub enum IrConst {
-    Int(u128, Ty),       // integer with type
+    Int(U256, Ty),       // integer with type (full 256-bit range)
     Bool(bool),
     String(String),
     Address([u8; 32]),   // Address::ZERO etc.
@@ -456,6 +463,8 @@ impl fmt::Display for Inst {
             Inst::StorageSet(name, val) => write!(f, "storage.set \"{}\", {}", name, val),
             Inst::StorageMapGet(dst, name, key) => write!(f, "{} = storage.map_get \"{}\", {}", dst, name, key),
             Inst::StorageMapSet(name, key, val) => write!(f, "storage.map_set \"{}\", {}, {}", name, key, val),
+            Inst::StorageNestedMapGet(dst, name, k1, k2) => write!(f, "{} = storage.nested_map_get \"{}\"[{}][{}]", dst, name, k1, k2),
+            Inst::StorageNestedMapSet(name, k1, k2, val) => write!(f, "storage.nested_map_set \"{}\"[{}][{}] = {}", name, k1, k2, val),
             Inst::Builtin(dst, op) => write!(f, "{} = builtin.{:?}", dst, op),
             Inst::Call(dst, name, args) => {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
