@@ -946,7 +946,15 @@ impl Parser {
                 TokenKind::Dot => {
                     let span = self.peek_span();
                     self.advance();
-                    let field = self.expect_ident()?;
+                    // Accept identifier OR integer literal for tuple field access (t.0, t.1)
+                    let field = if let TokenKind::IntLiteral(n) = self.peek() {
+                        let name = n.to_string();
+                        let fspan = self.peek_span();
+                        self.advance();
+                        Ident { name, span: fspan }
+                    } else {
+                        self.expect_ident()?
+                    };
 
                     // Check for method call: expr.field(args)
                     if self.at(&TokenKind::LParen) {

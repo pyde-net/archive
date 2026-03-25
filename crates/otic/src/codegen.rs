@@ -61,12 +61,20 @@ pub struct CompiledContract {
 // Register Allocator
 // ============================================================================
 
+/// Spill event: the CodeGen must emit Push/Pop instructions for register pressure.
+enum SpillAction {
+    /// Push this physical register's value to stack before reusing it.
+    Save(u8),
+}
+
 /// Maps IR virtual registers to PVM physical registers.
 /// GP: r1-r11 for user values (r0=zero, r12=heap, r13=reserved, r14-r15=scratch).
 /// Wide: w0-w6 for user values (w7=scratch).
 struct RegAlloc {
     /// Virtual register → physical register mapping.
     mapping: HashMap<Reg, u8>,
+    /// Reverse mapping: physical register → virtual register (for eviction).
+    reverse: HashMap<u8, Reg>,
     /// Track which virtual registers hold wide (u256) values.
     wide: HashSet<Reg>,
     /// Next available GP register (1-11).
@@ -79,28 +87,39 @@ impl RegAlloc {
     fn new() -> Self {
         Self {
             mapping: HashMap::new(),
+            reverse: HashMap::new(),
             wide: HashSet::new(),
-            next_gp: 1, // r0 is zero register
+            next_gp: 1,
             next_wide: 0,
         }
     }
 
     /// Allocate a GP (64-bit) physical register.
-    fn alloc(&mut self, vreg: Reg) -> u8 {
+    /// Returns (physical_reg, optional spill action if eviction needed).
+    fn alloc(&mut self, vreg: Reg) -> (u8, Option<SpillAction>) {
         if let Some(&phys) = self.mapping.get(&vreg) {
-            return phys;
+            return (phys, None);
         }
         if self.next_gp <= 11 {
             let phys = self.next_gp;
             self.next_gp += 1;
             self.mapping.insert(vreg, phys);
-            phys
+            self.reverse.insert(phys, vreg);
+            (phys, None)
         } else {
-            // Wrap around (limitation: complex functions may get wrong results)
+            // Evict: reuse registers cyclically (r1-r11)
             let phys = ((self.next_gp - 1) % 11) + 1;
             self.next_gp += 1;
+            // Evict the old occupant
+            let spill = if let Some(&old_vreg) = self.reverse.get(&phys) {
+                self.mapping.remove(&old_vreg);
+                Some(SpillAction::Save(phys))
+            } else {
+                None
+            };
             self.mapping.insert(vreg, phys);
-            phys
+            self.reverse.insert(phys, vreg);
+            (phys, spill)
         }
     }
 
@@ -119,7 +138,7 @@ impl RegAlloc {
     /// Pre-map a virtual register to a specific physical register.
     fn pre_map(&mut self, vreg: Reg, phys: u8) {
         self.mapping.insert(vreg, phys);
-        // Advance next_gp past pre-mapped registers
+        self.reverse.insert(phys, vreg);
         if phys >= self.next_gp && phys <= 11 {
             self.next_gp = phys + 1;
         }
@@ -138,6 +157,7 @@ impl RegAlloc {
     /// Reset for a new function.
     fn reset(&mut self) {
         self.mapping.clear();
+        self.reverse.clear();
         self.wide.clear();
         self.next_gp = 1;
         self.next_wide = 0;
@@ -503,24 +523,34 @@ impl CodeGen {
                     IrConst::Int(v, ty) => {
                         let is_u256 = matches!(ty, Ty::U256 | Ty::I256);
                         if is_u256 && *v > u64::MAX as u128 {
-                            // u256 large value → wide register
+                            // u256 large value → store all 32 bytes to heap, Wload
                             let wd = self.regs.alloc_wide(*dst);
-                            // Load lower 64 bits into GP, widen, then load upper limbs
-                            let low64 = (*v & 0xFFFFFFFFFFFFFFFF) as u64;
-                            self.load_u64_to_reg(15, low64);
-                            self.emit_op(Opcode::Widen, wd, 15, 0);
-                            // TODO: upper 192 bits for truly large u256
+                            // Split u128 into 4 x u64 limbs (LE order)
+                            let limb0 = (*v & 0xFFFFFFFFFFFFFFFF) as u64;
+                            let limb1 = ((*v >> 64) & 0xFFFFFFFFFFFFFFFF) as u64;
+                            // u128 only holds 128 bits; limbs 2-3 are zero
+                            self.load_u64_to_reg(15, limb0);
+                            self.emit_store(15, 12, 0);   // heap[0..8] = limb0
+                            self.load_u64_to_reg(15, limb1);
+                            self.emit_store(15, 12, 8);   // heap[8..16] = limb1
+                            self.emit_op(Opcode::Addi, 15, 0, 0);
+                            self.emit_store(15, 12, 16);  // heap[16..24] = 0
+                            self.emit_store(15, 12, 24);  // heap[24..32] = 0
+                            // Wload from heap into wide register
+                            self.emit_op(Opcode::Wload, wd, 12, 0);
+                            // Advance heap past the 32 bytes
+                            self.emit_op(Opcode::Addi, 12, 12, 32);
                         } else if *v <= 0x1FFFF as u128 {
                             // Fits in 17-bit positive Addi (PVM sign-extends 18-bit immediate)
-                            let rd = self.regs.alloc(*dst);
+                            let rd = self.alloc_gp(*dst);
                             self.emit_op(Opcode::Addi, rd, 0, *v as u32);
                         } else {
-                            let rd = self.regs.alloc(*dst);
+                            let rd = self.alloc_gp(*dst);
                             self.load_u64_to_reg(rd, *v as u64);
                         }
                     }
                     IrConst::Bool(b) => {
-                        let rd = self.regs.alloc(*dst);
+                        let rd = self.alloc_gp(*dst);
                         self.emit_op(Opcode::Addi, rd, 0, if *b { 1 } else { 0 });
                     }
                     IrConst::Address(bytes) => {
@@ -548,7 +578,7 @@ impl CodeGen {
                     }
                     IrConst::Unit => {}
                     _ => {
-                        let rd = self.regs.alloc(*dst);
+                        let rd = self.alloc_gp(*dst);
                         self.emit_op(Opcode::Addi, rd, 0, 0);
                     }
                 }
@@ -576,7 +606,7 @@ impl CodeGen {
                     };
                     self.emit_op(pvm_op, wd, w1, w2 as u32);
                 } else {
-                    let rd = self.regs.alloc(*dst);
+                    let rd = self.alloc_gp(*dst);
                     let r1 = self.regs.get(*lhs);
                     let r2 = self.regs.get(*rhs);
                     let pvm_op = match op {
@@ -598,7 +628,7 @@ impl CodeGen {
             }
 
             Inst::UnOp(dst, op, src) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let r1 = self.regs.get(*src);
                 match op {
                     UnOp::Neg => {
@@ -615,7 +645,7 @@ impl CodeGen {
             }
 
             Inst::Cmp(dst, op, lhs, rhs) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let lhs_wide = self.regs.is_wide(*lhs);
                 let r1 = self.regs.get(*lhs);
                 let r2 = self.regs.get(*rhs);
@@ -680,7 +710,7 @@ impl CodeGen {
                     let wd = self.regs.alloc_wide(*dst);
                     self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0); // mode 0: wide value
                 } else {
-                    let rd = self.regs.alloc(*dst);
+                    let rd = self.alloc_gp(*dst);
                     self.emit_op(Opcode::Sload, rd, WIDE_SCRATCH, 2); // mode 2: GP value
                 }
             }
@@ -717,7 +747,7 @@ impl CodeGen {
                     let wd = self.regs.alloc_wide(*dst);
                     self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0);
                 } else {
-                    let rd = self.regs.alloc(*dst);
+                    let rd = self.alloc_gp(*dst);
                     self.emit_op(Opcode::Sload, rd, WIDE_SCRATCH, 2);
                 }
             }
@@ -753,15 +783,15 @@ impl CodeGen {
                     }
                     BuiltinOp::MsgData => {
                         // Calldata pointer is in r5
-                        let rd = self.regs.alloc(*dst);
+                        let rd = self.alloc_gp(*dst);
                         self.emit_op(Opcode::Add, rd, 5, 0); // rd = r5
                     }
                     BuiltinOp::BlockTimestamp => {
-                        let rd = self.regs.alloc(*dst);
+                        let rd = self.alloc_gp(*dst);
                         self.emit_op(Opcode::Caller, rd, 0, 1); // env_gp::TIMESTAMP
                     }
                     BuiltinOp::BlockHeight => {
-                        let rd = self.regs.alloc(*dst);
+                        let rd = self.alloc_gp(*dst);
                         self.emit_op(Opcode::Caller, rd, 0, 0); // env_gp::BLOCK_NUMBER
                     }
                     BuiltinOp::BlockProposer => {
@@ -774,7 +804,7 @@ impl CodeGen {
                         self.emit_op(Opcode::Callvalue, wd, 0, 1); // env_wide::GAS_PRICE
                     }
                     BuiltinOp::TxNonce => {
-                        let rd = self.regs.alloc(*dst);
+                        let rd = self.alloc_gp(*dst);
                         self.emit_op(Opcode::Addi, rd, 0, 0); // placeholder
                     }
                     BuiltinOp::TxHash => {
@@ -783,7 +813,7 @@ impl CodeGen {
                         self.emit_op(Opcode::Widen, wd, 15, 0); // placeholder
                     }
                     BuiltinOp::TxGasLimit => {
-                        let rd = self.regs.alloc(*dst);
+                        let rd = self.alloc_gp(*dst);
                         self.emit_op(Opcode::Addi, rd, 0, 0); // placeholder
                     }
                     BuiltinOp::AddressOfSelf => {
@@ -791,7 +821,7 @@ impl CodeGen {
                         self.emit_op(Opcode::Callvalue, wd, 0, 4); // env_wide::ADDRESS
                     }
                     BuiltinOp::GasRemaining => {
-                        let rd = self.regs.alloc(*dst);
+                        let rd = self.alloc_gp(*dst);
                         self.emit_op(Opcode::Caller, rd, 0, 2); // env_gp::GAS_REMAINING
                     }
                 }
@@ -869,7 +899,7 @@ impl CodeGen {
             }
 
             Inst::Call(dst, name, args) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 // Push all args to stack first (avoids register clobbering)
                 for arg in args.iter() {
                     let src = self.regs.get(*arg);
@@ -922,12 +952,12 @@ impl CodeGen {
                     self.emit_op(Opcode::Widen, wd, rs, 0);
                 } else if src_wide && !dst_wide {
                     // Wide → GP: Narrow (traps if > u64::MAX)
-                    let rd = self.regs.alloc(*dst);
+                    let rd = self.alloc_gp(*dst);
                     let ws = self.regs.get(*src);
                     self.emit_op(Opcode::Narrow, rd, ws, 0);
                 } else {
                     // Same register file: copy
-                    let rd = self.regs.alloc(*dst);
+                    let rd = self.alloc_gp(*dst);
                     let rs = self.regs.get(*src);
                     if rd != rs {
                         self.emit_op(Opcode::Add, rd, rs, 0);
@@ -936,7 +966,7 @@ impl CodeGen {
             }
 
             Inst::StructInit(dst, _name, fields) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let struct_size = (fields.len() as u32) * memory::WORD_SIZE;
                 // Allocate on heap: rd = heap_ptr; heap_ptr += struct_size
                 self.emit_op(Opcode::Add, rd, 12, 0);
@@ -949,7 +979,7 @@ impl CodeGen {
             }
 
             Inst::FieldGet(dst, obj, field) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let ro = self.regs.get(*obj);
                 // Numeric field name (e.g., "0", "1") = tuple index access
                 let offset = if let Ok(idx) = field.parse::<u32>() {
@@ -964,7 +994,7 @@ impl CodeGen {
             }
 
             Inst::IndexGet(dst, obj, idx) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let ro = self.regs.get(*obj);
                 let ri = self.regs.get(*idx);
                 // addr = base + idx * 8
@@ -985,7 +1015,7 @@ impl CodeGen {
             }
 
             Inst::MakeTuple(dst, regs) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let size = (regs.len() as u32) * memory::WORD_SIZE;
                 self.emit_op(Opcode::Add, rd, 12, 0);
                 self.emit_op(Opcode::Addi, 12, 12, size);
@@ -997,14 +1027,14 @@ impl CodeGen {
             }
 
             Inst::TupleGet(dst, tuple, idx) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let rt = self.regs.get(*tuple);
                 let offset = (*idx) * (memory::WORD_SIZE as u32);
                 self.emit_load(rd, rt, offset as i32);
             }
 
             Inst::MakeArray(dst, regs) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let size = (regs.len() as u32) * memory::WORD_SIZE;
                 self.emit_op(Opcode::Add, rd, 12, 0);
                 self.emit_op(Opcode::Addi, 12, 12, size);
@@ -1016,7 +1046,7 @@ impl CodeGen {
             }
 
             Inst::ArrayRepeat(dst, val, count) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let rv = self.regs.get(*val);
                 let size = (*count as u32) * memory::WORD_SIZE;
                 self.emit_op(Opcode::Add, rd, 12, 0);
@@ -1028,7 +1058,7 @@ impl CodeGen {
             }
 
             Inst::MethodCall(dst, obj, method, args) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let ro = self.regs.get(*obj);
 
                 match method.as_str() {
@@ -1078,7 +1108,7 @@ impl CodeGen {
             }
 
             Inst::ExtCall(dst, addr, _method, args) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let ra = self.regs.get(*addr);
 
                 // Write calldata (args) to heap
@@ -1121,7 +1151,7 @@ impl CodeGen {
             }
 
             Inst::RawCall(dst, target, args) => {
-                let rd = self.regs.alloc(*dst);
+                let rd = self.alloc_gp(*dst);
                 let rt = self.regs.get(*target);
                 for arg in args {
                     let r = self.regs.get(*arg);
@@ -1138,6 +1168,15 @@ impl CodeGen {
     // ========================================================================
     // Emit helpers
     // ========================================================================
+
+    /// Allocate a GP register for a virtual register, emitting Push if eviction needed.
+    fn alloc_gp(&mut self, vreg: Reg) -> u8 {
+        let (phys, spill) = self.regs.alloc(vreg);
+        if let Some(SpillAction::Save(reg)) = spill {
+            self.instructions.push(encode(Opcode::Push, reg, 0, 0));
+        }
+        phys
+    }
 
     fn emit(&mut self, inst: Instruction) {
         self.instructions.push(inst);
@@ -1760,7 +1799,6 @@ mod tests {
 
     #[test]
     fn pvm_tuple_destructuring() {
-        // Use tuple destructuring since parser doesn't support t.0/t.1 syntax yet
         let compiled = compile(r#"
             contract T {
                 pub fn f() -> u64 {
@@ -1771,6 +1809,21 @@ mod tests {
         "#);
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 20, "second tuple element should be 20");
+    }
+
+    #[test]
+    fn pvm_tuple_dot_access() {
+        // Test tuple .0/.1/.2 field access syntax
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let t = (10, 20, 30);
+                    return t.1;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 20, "t.1 should be 20");
     }
 
     // ========================================================================
@@ -2439,13 +2492,13 @@ mod tests {
     // ========================================================================
 
     #[test]
-    #[ignore] // Parser drops statements after emit!() — parser bug to fix separately
-    fn pvm_event_emit() {
+    fn pvm_event_emit_no_fields() {
+        // emit uses keyword syntax: `emit EventName { fields };` (NOT emit!())
         let compiled = compile_no_opt(r#"
             contract T {
                 event Ping {}
                 pub fn f() -> u64 {
-                    emit!(Ping {});
+                    emit Ping {};
                     return 1;
                 }
             }
@@ -2456,5 +2509,74 @@ mod tests {
         };
         let vm = run_pvm_with_context(&compiled.bytecode, ctx);
         assert_eq!(vm.cpu.read_gp(1), 1, "emit should not trap");
+    }
+
+    #[test]
+    fn pvm_event_emit_with_fields() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                event Transfer { from: u64, to: u64, amount: u64, }
+                pub fn f() -> u64 {
+                    emit Transfer { from: 1, to: 2, amount: 100 };
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [9u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "emit with fields should not trap");
+    }
+
+    // ========================================================================
+    // u256 large constants (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_u256_large_constant() {
+        // u256 value > u64::MAX: store to heap, Wload, use in storage
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage { big: u256, }
+                pub fn f() -> u64 {
+                    self.big = 340282366920938463463374607431768211455_u256;
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [10u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "u256 large constant should not trap");
+    }
+
+    // ========================================================================
+    // Register pressure (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_many_locals() {
+        // Test with many local variables (approaches register limit)
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a = 1;
+                    let b = 2;
+                    let c = 3;
+                    let d = 4;
+                    let e = 5;
+                    let g = 6;
+                    let h = 7;
+                    let i = 8;
+                    return a + b + c + d + e + g + h + i;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 36, "1+2+3+4+5+6+7+8=36");
     }
 }
