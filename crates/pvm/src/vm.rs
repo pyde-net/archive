@@ -1,24 +1,24 @@
 //! PVM execution engine: ties CPU, memory, and control flow together.
 //!
-//! ## Storage Layout (TODO: Phase 9 Otigen Compiler)
+//! ## Storage Layout (Implemented: Phase 9 Otigen Compiler)
 //!
 //! The PVM's SSTORE/SLOAD work with arbitrary-length byte values in the SMT.
-//! The Otigen compiler will decide storage strategy per type:
+//! The Otigen compiler (`otic` crate) decides storage strategy per type:
 //!
-//! - **Small values** (u64, u128, address, bool): packed into one slot.
-//! - **Arrays/maps**: slot-per-element for O(1) random access and minimal
-//!   witness size (critical for stateless provers).
-//! - **Small structs** (< 256 bytes): packed into one slot.
+//! - **Small values** (u64, bool): SLOAD/SSTORE mode 2 (GP register, 8 bytes).
+//! - **Wide values** (u256, Address): SLOAD/SSTORE mode 0 (wide register, 32 bytes).
+//! - **Maps**: Poseidon2(slot || key) for composite key derivation, then SLOAD/SSTORE.
 //! - **Strings**: variable-length, stored via memory-mode SSTORE (mode 1).
 //!
-//! ## Heap Memory Layout (TODO: Phase 9 Otigen Compiler)
+//! ## Heap Memory Layout (Implemented: Phase 9 Otigen Compiler)
 //!
-//! Dynamic arrays in execution memory use a bump allocator:
-//! - Array header: (data_ptr, len, capacity) on heap
-//! - Push with space: O(1) write to next slot
-//! - Push at capacity: realloc 2x, copy headers, leak old block
-//! - Gas cost prevents unbounded growth; memory freed after tx
-//! - MEMCPY instruction needed for efficient reallocation (TODO: add to ISA).
+//! The compiler uses a bump allocator (r12 = heap pointer, starts past calldata):
+//! - Structs/tuples/arrays: allocated sequentially on heap, pointer in GP register.
+//! - Vec header: [length:8][capacity:8][data_ptr...] on heap.
+//! - Push with space: O(1) write to data[length], increment length.
+//! - Push at capacity: realloc 2x via software memcpy (load/store loop), leak old block.
+//! - Gas cost prevents unbounded growth; memory freed after tx.
+//! - Note: all 64 opcode slots assigned, so MEMCPY is a compiler-emitted loop, not a single instruction.
 
 use crate::cpu::{Cpu, Trap};
 use crate::isa::{

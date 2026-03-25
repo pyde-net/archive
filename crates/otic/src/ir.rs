@@ -315,6 +315,9 @@ pub enum Inst {
     /// `%dst = phi [(@label, %reg), ...]` — SSA phi node (for optimization)
     Phi(Reg, Vec<(Label, Reg)>),
 
+    /// `%dst = make_vec capacity` — allocate a Vec on heap with given initial capacity.
+    MakeVec(Reg, u64),
+
     /// Comment / debug marker (stripped in codegen)
     Comment(String),
 }
@@ -513,6 +516,7 @@ impl fmt::Display for Inst {
                     .map(|(l, r)| format!("[{}: {}]", l, r)).collect();
                 write!(f, "{} = phi {}", dst, entries_str.join(", "))
             }
+            Inst::MakeVec(dst, cap) => write!(f, "{} = vec::new(cap={})", dst, cap),
             Inst::Comment(msg) => write!(f, "// {}", msg),
         }
     }

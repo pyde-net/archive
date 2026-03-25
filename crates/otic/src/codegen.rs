@@ -1064,10 +1064,14 @@ impl CodeGen {
                 match method.as_str() {
                     "push" if !args.is_empty() => {
                         let val_reg = self.regs.get(args[0]);
-                        // Load current length
-                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
+                        // Load length and capacity
+                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32); // r15 = length
+                        self.emit_load(memory::REG_SCRATCH_0, ro, memory::VEC_CAPACITY_OFFSET as i32); // r14 = capacity
+                        // Assert length < capacity (revert if Vec is full)
+                        self.emit_op(Opcode::Lt, 13, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32); // r13 = (len < cap)
+                        self.emit_op(Opcode::Assert, 0, 13, 0); // revert if full
                         // Compute data address: base + VEC_DATA_OFFSET + length * 8
-                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 0, 3);
+                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 0, 3); // shift for *8
                         self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
                         self.emit_op(Opcode::Add, memory::REG_SCRATCH_0, ro, memory::REG_SCRATCH_0 as u32);
                         self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, memory::VEC_DATA_OFFSET);
@@ -1078,9 +1082,10 @@ impl CodeGen {
                         self.emit_store(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
                     }
                     "pop" => {
-                        // Decrement length
+                        // Load length, assert > 0
                         self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
-                        // length - 1: Addi with sign-extended -1 (0x3FFFF in 18-bit = -1)
+                        self.emit_op(Opcode::Assert, 0, memory::REG_SCRATCH_1, 0); // revert if empty
+                        // Decrement length: Addi with sign-extended -1 (0x3FFFF in 18-bit = -1)
                         self.emit_op(Opcode::Addi, memory::REG_SCRATCH_1, memory::REG_SCRATCH_1, 0x3FFFF);
                         self.emit_store(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
                         // Load popped value from data[new_length]
@@ -1158,6 +1163,22 @@ impl CodeGen {
                     self.emit_op(Opcode::Push, r, 0, 0);
                 }
                 self.emit_op(Opcode::CallExt, rd, rt, 0);
+            }
+
+            Inst::MakeVec(dst, cap) => {
+                let rd = self.alloc_gp(*dst);
+                let total_size = 16 + (*cap as u32) * memory::WORD_SIZE; // header + data slots
+                // rd = current heap pointer (Vec base)
+                self.emit_op(Opcode::Add, rd, 12, 0);
+                // Store length = 0
+                self.emit_op(Opcode::Addi, 15, 0, 0);
+                self.emit_store(15, rd, memory::VEC_LENGTH_OFFSET as i32);
+                // Store capacity
+                self.load_u32_to_reg(15, *cap as u32);
+                self.emit_store(15, rd, memory::VEC_CAPACITY_OFFSET as i32);
+                // Advance heap past header + data slots
+                self.load_u32_to_reg(15, total_size);
+                self.emit_op(Opcode::Add, 12, 12, 15);
             }
 
             Inst::Comment(_) => {}
@@ -2609,6 +2630,76 @@ mod tests {
         let vm = run_pvm(&compiled.bytecode);
         // ~0 = u64::MAX (all bits set, > 100)
         assert_eq!(vm.cpu.read_gp(1), 1, "bitwise NOT of 0 should be max");
+    }
+
+    // ========================================================================
+    // Vec operations (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_vec_push_and_len() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut v = Vec::new();
+                    v.push(10);
+                    return v.len();
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1, "Vec should have 1 element after push");
+    }
+
+    #[test]
+    fn pvm_vec_push_and_pop() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut v = Vec::new();
+                    v.push(10);
+                    v.push(20);
+                    v.push(30);
+                    let last = v.pop();
+                    return last;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 30, "pop should return last pushed (30)");
+    }
+
+    #[test]
+    fn pvm_vec_is_empty() {
+        // Simplest Vec test: create and return length
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let v = Vec::new();
+                    return v.len();
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 0, "new Vec length should be 0");
+    }
+
+    #[test]
+    fn pvm_vec_push_pop_sequence() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut v = Vec::new();
+                    v.push(100);
+                    v.push(200);
+                    v.pop();
+                    v.push(300);
+                    return v.len();
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 2, "push push pop push → len 2");
     }
 
     #[test]

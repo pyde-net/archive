@@ -759,6 +759,14 @@ impl Lowerer {
                     }
                     // Path::call(args) — Vec::new(), IERC20::at(), etc.
                     Expr::Path(segments, _) => {
+                        if segments.len() == 2 {
+                            let type_name = segments[0].name.as_str();
+                            let member = segments[1].name.as_str();
+                            if type_name == "Vec" && member == "new" {
+                                self.emit(Inst::MakeVec(dst, 16));
+                                return dst;
+                            }
+                        }
                         let path = segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::");
                         self.emit(Inst::Call(dst, path, arg_regs));
                     }
@@ -792,7 +800,7 @@ impl Lowerer {
 
                     // Vec::new(), bytes::new(), etc.
                     if type_name == "Vec" && member == "new" {
-                        self.emit(Inst::Comment("Vec::new()".into()));
+                        self.emit(Inst::MakeVec(dst, 16)); // initial capacity 16
                         return dst;
                     }
                     if type_name == "bytes" && (member == "new" || member == "empty") {
