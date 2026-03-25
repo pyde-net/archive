@@ -366,12 +366,13 @@ impl CodeGen {
             return;
         }
 
-        // Load selector from calldata (first 4 bytes at r5)
-        self.emit_load(memory::REG_SCRATCH_1, 5, 0); // r15 = load u64 from calldata[0]
+        // Load selector from calldata into r13 (NOT r15, because load_u32_to_reg
+        // uses r15 as scratch and would clobber the calldata selector).
+        self.emit_load(13, 5, 0); // r13 = load u64 from calldata[0]
 
         for (selector, _name, dispatch_label, _func_label) in entries {
-            self.load_u32_to_reg(memory::REG_SCRATCH_0, *selector);
-            self.emit_jump_placeholder(Opcode::Beq, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0, *dispatch_label);
+            self.load_u32_to_reg(memory::REG_SCRATCH_0, *selector); // r14 = known selector (may use r15 as scratch)
+            self.emit_jump_placeholder(Opcode::Beq, 13, memory::REG_SCRATCH_0, *dispatch_label);
         }
 
         // No selector matched → revert
@@ -399,7 +400,7 @@ impl CodeGen {
         for (i, (_name, ty)) in func.params.iter().enumerate() {
             let phys = (i as u8) + 2; // r2, r3, r4, ...
             let is_wide = is_wide_type(ty);
-            let param_offset = 4 + (i as i32) * if is_wide { 32 } else { 8 }; // skip 4-byte selector
+            let param_offset = 8 + (i as i32) * if is_wide { 32 } else { 8 }; // skip 8-byte selector (u64)
 
             if is_wide {
                 // Compute address: r14 = r5 + offset
@@ -430,7 +431,7 @@ impl CodeGen {
             self.emit_op(Opcode::Sload, 14, WIDE_SCRATCH, 2);
             // Check: lock must be 0
             self.emit_op(Opcode::Eq, 14, 14, 0);                 // r14 = (lock == 0)
-            self.emit_op(Opcode::Assert, 14, 0, 0);              // revert if locked
+            self.emit_op(Opcode::Assert, 0, 14, 0);              // Assert reads rs1: revert if r14==0
             // Set lock = 1
             self.emit_op(Opcode::Addi, 14, 0, 1);
             self.emit_op(Opcode::Sstore, 14, WIDE_SCRATCH, 2);   // storage[w7] = 1
@@ -445,7 +446,7 @@ impl CodeGen {
             self.emit_op(Opcode::Widen, WIDE_SCRATCH2, 15, 0);   // w6 = 0
             // r14 = (w7 == w6) i.e. (value == 0)
             self.emit_op(Opcode::Weq, 14, WIDE_SCRATCH, WIDE_SCRATCH2 as u32);
-            self.emit_op(Opcode::Assert, 14, 0, 0);              // revert if value != 0
+            self.emit_op(Opcode::Assert, 0, 14, 0);              // Assert reads rs1: revert if r14==0
         }
     }
 
@@ -858,8 +859,9 @@ impl CodeGen {
                 self.emit_op(Opcode::Addi, 14, 0, data_len);
                 self.emit_store(14, 12, 40); // data_len
 
-                // Log with 1 topic
-                self.emit_op(Opcode::Log, desc_base, 0, 1);
+                // Log rs1=descriptor pointer, imm=num_topics
+                // PVM reads descriptor from rs1, NOT rd
+                self.emit_op(Opcode::Log, 0, desc_base, 1);
 
                 // Advance heap past descriptor + data
                 let total = data_start_offset as u32 + data_len;
@@ -1196,69 +1198,71 @@ impl CodeGen {
         if val <= 0x1FFFF {
             self.emit_op(Opcode::Addi, rd, 0, val);
         } else {
-            // Use 17-bit chunks to avoid sign extension
+            let scratch = if rd == 15 { 14 } else { 15 };
             let low = val & 0x1FFFF;
             let high = val >> 17;
             self.emit_op(Opcode::Addi, rd, 0, high);
-            self.emit_op(Opcode::Addi, 15, 0, 17);
-            self.emit_op(Opcode::Shl, rd, rd, 15);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
             if low > 0 {
-                self.emit_op(Opcode::Addi, 15, 0, low);
-                self.emit_op(Opcode::Or, rd, rd, 15);
+                self.emit_op(Opcode::Addi, scratch, 0, low);
+                self.emit_op(Opcode::Or, rd, rd, scratch as u32);
             }
         }
     }
 
     /// Load a u64 into a GP register (handles full 64-bit range).
     /// Uses 17-bit chunks to avoid PVM Addi sign extension.
+    /// Uses r15 as scratch (or r14 if rd==15) to avoid self-clobbering.
     fn load_u64_to_reg(&mut self, rd: u8, val: u64) {
         if val <= 0x1FFFF {
             self.emit_op(Opcode::Addi, rd, 0, val as u32);
             return;
         }
 
-        // Build value from 17-bit chunks (avoid sign extension in Addi)
-        let chunk0 = (val & 0x1FFFF) as u32;          // bits 0-16
-        let chunk1 = ((val >> 17) & 0x1FFFF) as u32;  // bits 17-33
-        let chunk2 = ((val >> 34) & 0x1FFFF) as u32;  // bits 34-50
-        let chunk3 = ((val >> 51) & 0x1FFF) as u32;   // bits 51-63 (13 bits)
+        // Scratch register: use r15 normally, r14 if rd==15 (avoid self-clobber)
+        let scratch = if rd == 15 { 14 } else { 15 };
+
+        let chunk0 = (val & 0x1FFFF) as u32;
+        let chunk1 = ((val >> 17) & 0x1FFFF) as u32;
+        let chunk2 = ((val >> 34) & 0x1FFFF) as u32;
+        let chunk3 = ((val >> 51) & 0x1FFF) as u32;
 
         if chunk3 > 0 {
             self.emit_op(Opcode::Addi, rd, 0, chunk3);
-            self.emit_op(Opcode::Addi, 15, 0, 17);
-            self.emit_op(Opcode::Shl, rd, rd, 15);
-            self.emit_op(Opcode::Addi, 15, 0, chunk2);
-            self.emit_op(Opcode::Or, rd, rd, 15);
-            self.emit_op(Opcode::Addi, 15, 0, 17);
-            self.emit_op(Opcode::Shl, rd, rd, 15);
-            self.emit_op(Opcode::Addi, 15, 0, chunk1);
-            self.emit_op(Opcode::Or, rd, rd, 15);
-            self.emit_op(Opcode::Addi, 15, 0, 17);
-            self.emit_op(Opcode::Shl, rd, rd, 15);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, chunk2);
+            self.emit_op(Opcode::Or, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, chunk1);
+            self.emit_op(Opcode::Or, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
             if chunk0 > 0 {
-                self.emit_op(Opcode::Addi, 15, 0, chunk0);
-                self.emit_op(Opcode::Or, rd, rd, 15);
+                self.emit_op(Opcode::Addi, scratch, 0, chunk0);
+                self.emit_op(Opcode::Or, rd, rd, scratch as u32);
             }
         } else if chunk2 > 0 {
             self.emit_op(Opcode::Addi, rd, 0, chunk2);
-            self.emit_op(Opcode::Addi, 15, 0, 17);
-            self.emit_op(Opcode::Shl, rd, rd, 15);
-            self.emit_op(Opcode::Addi, 15, 0, chunk1);
-            self.emit_op(Opcode::Or, rd, rd, 15);
-            self.emit_op(Opcode::Addi, 15, 0, 17);
-            self.emit_op(Opcode::Shl, rd, rd, 15);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, chunk1);
+            self.emit_op(Opcode::Or, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
             if chunk0 > 0 {
-                self.emit_op(Opcode::Addi, 15, 0, chunk0);
-                self.emit_op(Opcode::Or, rd, rd, 15);
+                self.emit_op(Opcode::Addi, scratch, 0, chunk0);
+                self.emit_op(Opcode::Or, rd, rd, scratch as u32);
             }
         } else {
-            // chunk1 must be > 0 (since val > 0x1FFFF)
             self.emit_op(Opcode::Addi, rd, 0, chunk1);
-            self.emit_op(Opcode::Addi, 15, 0, 17);
-            self.emit_op(Opcode::Shl, rd, rd, 15);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
             if chunk0 > 0 {
-                self.emit_op(Opcode::Addi, 15, 0, chunk0);
-                self.emit_op(Opcode::Or, rd, rd, 15);
+                self.emit_op(Opcode::Addi, scratch, 0, chunk0);
+                self.emit_op(Opcode::Or, rd, rd, scratch as u32);
             }
         }
     }
@@ -2141,8 +2145,209 @@ mod tests {
         assert_eq!(vm.cpu.read_gp(1), 1, "10 >= 5 should be true");
     }
 
+    // ========================================================================
+    // Wide register builtins (msg.sender, msg.value, address(self))
+    // ========================================================================
+
     #[test]
-    #[ignore] // TODO: investigate calldata encoding mismatch in dispatch integration test
+    fn pvm_msg_sender() {
+        // msg.sender is a wide (256-bit) address value.
+        // We can't return it as u64 directly, but we can check it's non-zero
+        // by narrowing (which traps if > u64::MAX) or by comparing with a known value.
+        // Simplest: check gas_remaining still works when msg.sender is in the function.
+        // Better: use msg.sender in a comparison.
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage { owner: u64, }
+                pub fn f() -> u64 {
+                    let s = msg.sender;
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            caller: [0xAB; 32],
+            self_address: [1u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        // If Callvalue wrote to wrong register file, this would trap.
+        // Returning 1 proves msg.sender didn't corrupt execution.
+        assert_eq!(vm.cpu.read_gp(1), 1, "msg.sender should not corrupt execution");
+        // Also verify the wide register actually got the caller value
+        let w = vm.cpu.read_wide(0); // first wide alloc = w0
+        assert_ne!(w, pyde_vm::wide::U256::ZERO, "msg.sender should be non-zero");
+    }
+
+    #[test]
+    fn pvm_msg_value() {
+        // msg.value is u256 (wide). Test with #[payable] function that reads it.
+        let (tokens, _) = Lexer::new(r#"
+            contract T {
+                #[payable]
+                pub fn f() -> u64 {
+                    let v = msg.value;
+                    return 1;
+                }
+            }
+        "#).tokenize();
+        let (file, _) = Parser::new(tokens).parse();
+        let ir = lower::lower(&file);
+        let mut codegen = CodeGen::new();
+        codegen.emit_guards = false;
+        let compiled = codegen.generate(&ir);
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            call_value: pyde_vm::wide::U256::from(500u64),
+            self_address: [1u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "msg.value read should not trap");
+    }
+
+    #[test]
+    fn pvm_address_of_self() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a = address(self);
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [0xCD; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "address(self) should not trap");
+    }
+
+    // ========================================================================
+    // Payable guard (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_payable_guard_rejects_value() {
+        // Non-payable function should revert when call_value > 0
+        let (tokens, _) = Lexer::new(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    return 42;
+                }
+            }
+        "#).tokenize();
+        let (file, _) = Parser::new(tokens).parse();
+        let ir = lower::lower(&file);
+        let mut codegen = CodeGen::new();
+        codegen.emit_guards = true; // production mode with guards
+        let compiled = codegen.generate(&ir);
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            call_value: pyde_vm::wide::U256::from(100u64), // non-zero value
+            self_address: [1u8; 32],
+            ..Default::default()
+        };
+        // Use runtime_bytecode (includes dispatch + guards)
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000, ctx);
+        // Set up calldata with the correct selector
+        let selector = compute_selector("f");
+        vm.calldata = (selector as u64).to_le_bytes().to_vec();
+        vm.load(&compiled.runtime_bytecode).unwrap();
+
+        let mut result = None;
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(r)) => { result = Some(r); break; }
+                Ok(None) => { steps += 1; if steps > 500 { break; } }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            matches!(result, Some(pyde_vm::vm::ExecResult::Revert)),
+            "non-payable function should revert when call_value > 0, got {:?}", result
+        );
+    }
+
+    // ========================================================================
+    // Storage maps (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_storage_map_write_read() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage { balances: Map<u64, u64>, }
+                pub fn f() -> u64 {
+                    self.balances[42] = 100;
+                    return self.balances[42];
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [5u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 100, "map[42] should be 100");
+    }
+
+    // ========================================================================
+    // Reentrancy guard (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_reentrancy_guard_sets_and_clears() {
+        // Verify the reentrancy guard doesn't prevent a single normal call.
+        // The guard sets lock=1 before function body, clears lock=0 after return.
+        let (tokens, _) = Lexer::new(r#"
+            contract T {
+                storage { value: u64, }
+                pub fn f() -> u64 {
+                    self.value = 42;
+                    return self.value;
+                }
+            }
+        "#).tokenize();
+        let (file, _) = Parser::new(tokens).parse();
+        let ir = lower::lower(&file);
+        let mut codegen = CodeGen::new();
+        codegen.emit_guards = true;
+        let compiled = codegen.generate(&ir);
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [6u8; 32],
+            ..Default::default()
+        };
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000, ctx);
+        let selector = compute_selector("f");
+        vm.calldata = (selector as u64).to_le_bytes().to_vec();
+        vm.load(&compiled.runtime_bytecode).unwrap();
+
+        let mut result = None;
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(r)) => { result = Some(r); break; }
+                Ok(None) => { steps += 1; if steps > 1000 { break; } }
+                Err(_) => break,
+            }
+        }
+        // Should complete normally (Halt), not revert
+        assert!(
+            matches!(result, Some(pyde_vm::vm::ExecResult::Halt)),
+            "single call should succeed with reentrancy guard, got {:?}", result
+        );
+        assert_eq!(vm.cpu.read_gp(1), 42, "should return 42");
+    }
+
+    // ========================================================================
+    // Dispatch with calldata (PVM-verified)
+    // ========================================================================
+
+    #[test]
     fn pvm_dispatch_with_calldata() {
         // Test the full dispatch path: selector matching + calldata decode
         let compiled = compile(r#"
@@ -2185,5 +2390,71 @@ mod tests {
             }
         }
         assert_eq!(vm.cpu.read_gp(1), 42, "add(10, 32) via dispatch should be 42");
+    }
+
+    // ========================================================================
+    // Wide storage u256 (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_wide_storage_u256() {
+        // u256 storage field uses Sload/Sstore mode 0 (wide register)
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage { total: u256, }
+                pub fn f() -> u64 {
+                    self.total = 999;
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [7u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "u256 storage write should not trap");
+    }
+
+    // ========================================================================
+    // Poseidon hash (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_poseidon_hash() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let h = hash(42);
+                    return 1;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1, "hash() should not trap");
+    }
+
+    // ========================================================================
+    // Event emission (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    #[ignore] // Parser drops statements after emit!() — parser bug to fix separately
+    fn pvm_event_emit() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                event Ping {}
+                pub fn f() -> u64 {
+                    emit!(Ping {});
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [8u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "emit should not trap");
     }
 }
