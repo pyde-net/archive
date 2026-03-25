@@ -158,7 +158,7 @@ impl Lowerer {
                         self.program.const_defs.push(ir::ConstDef {
                             name: c.name.name.clone(),
                             ty: Ty::U256,
-                            value: IrConst::Int(*v, Ty::U256),
+                            value: IrConst::Int(*v, Ty::U64),
                             is_pub: c.is_pub,
                         });
                     }
@@ -289,7 +289,7 @@ impl Lowerer {
                         self.program.const_defs.push(ir::ConstDef {
                             name: c.name.name.clone(),
                             ty: Ty::U256,
-                            value: IrConst::Int(*v, Ty::U256),
+                            value: IrConst::Int(*v, Ty::U64),
                             is_pub: c.is_pub,
                         });
                     }
@@ -449,11 +449,18 @@ impl Lowerer {
                 let key_reg = self.lower_expr(key);
                 self.emit(Inst::IndexSet(obj_reg, key_reg, value));
             }
-            // Local variable reassignment
+            // Local variable reassignment — emit a copy to the original register
             Expr::Ident(ident) => {
-                // Update the local binding to point to the new register
-                if let Some(scope) = self.locals.last_mut() {
-                    scope.insert(ident.name.clone(), value);
+                let existing_reg = self.lookup_local(&ident.name);
+                if let Some(existing) = existing_reg {
+                    if existing != value {
+                        // Copy: existing_reg = value (critical for loops)
+                        self.emit(Inst::Cast(existing, value, Ty::Unknown));
+                    }
+                } else {
+                    if let Some(scope) = self.locals.last_mut() {
+                        scope.insert(ident.name.clone(), value);
+                    }
                 }
             }
             _ => {
@@ -492,20 +499,18 @@ impl Lowerer {
             (zero, iter)
         };
 
-        // Initialize loop variable
-        let loop_var = self.alloc_reg();
-        self.emit(Inst::BinOp(loop_var, BinOp::Add, start, start)); // copy start
+        // Initialize loop variable (copy start value)
+        let loop_var = start; // directly use the start register
         self.push_scope();
         self.declare_local(&f.variable.name, loop_var);
 
         // Jump to header
         self.emit(Inst::Jump(header_label));
 
-        // Header: check condition
+        // Header: check condition (always uses loop_var register)
         self.func().push_block(header_label, "for.header".into());
         let cond = self.alloc_reg();
-        let current = self.lookup_local(&f.variable.name).unwrap_or(loop_var);
-        self.emit(Inst::Cmp(cond, CmpOp::Lt, current, end));
+        self.emit(Inst::Cmp(cond, CmpOp::Lt, loop_var, end));
         self.emit(Inst::Branch(cond, body_label, exit_label));
 
         // Body
@@ -514,13 +519,10 @@ impl Lowerer {
         self.lower_block(&f.body);
         self.loop_stack.pop();
 
-        // Increment
+        // Increment: loop_var = loop_var + 1 (overwrite same register)
         let one = self.alloc_reg();
         self.emit(Inst::Const(one, IrConst::Int(1, Ty::U64)));
-        let next = self.alloc_reg();
-        let current = self.lookup_local(&f.variable.name).unwrap_or(loop_var);
-        self.emit(Inst::BinOp(next, BinOp::Add, current, one));
-        self.declare_local(&f.variable.name, next);
+        self.emit(Inst::BinOp(loop_var, BinOp::Add, loop_var, one));
         self.emit(Inst::Jump(header_label));
 
         // Exit
@@ -562,7 +564,7 @@ impl Lowerer {
             Expr::Literal(lit, _) => {
                 let dst = self.alloc_reg();
                 let val = match lit {
-                    Literal::Int(v) => IrConst::Int(*v, Ty::U256),
+                    Literal::Int(v) => IrConst::Int(*v, Ty::U64),
                     Literal::String(s) => IrConst::String(s.clone()),
                     Literal::Bool(b) => IrConst::Bool(*b),
                 };
@@ -985,7 +987,7 @@ impl Lowerer {
                         Pattern::Literal(lit, _) => {
                             let pat_reg = self.alloc_reg();
                             let val = match lit {
-                                Literal::Int(v) => IrConst::Int(*v, Ty::U256),
+                                Literal::Int(v) => IrConst::Int(*v, Ty::U64),
                                 Literal::String(s) => IrConst::String(s.clone()),
                                 Literal::Bool(b) => IrConst::Bool(*b),
                             };
