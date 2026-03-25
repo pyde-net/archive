@@ -486,8 +486,8 @@ impl Lowerer {
         // → init loop var, check condition, body, increment, jump back
 
         let header_label = self.func().alloc_label();
-        let body_label = Label(header_label.0 + 1);
-        let exit_label = Label(header_label.0 + 2);
+        let body_label = self.func().alloc_label();
+        let exit_label = self.func().alloc_label();
 
         // Lower the range expression (start..end)
         let (start, end) = if let Expr::Binary(lhs, BinaryOp::Range, rhs, _) = &f.iterator {
@@ -532,8 +532,8 @@ impl Lowerer {
 
     fn lower_while(&mut self, w: &WhileStmt) {
         let header_label = self.func().alloc_label();
-        let body_label = Label(header_label.0 + 1);
-        let exit_label = Label(header_label.0 + 2);
+        let body_label = self.func().alloc_label();
+        let exit_label = self.func().alloc_label();
 
         self.emit(Inst::Jump(header_label));
 
@@ -814,7 +814,7 @@ impl Lowerer {
                             if let MacroArg::Positional(cond_expr) = &args[0] {
                                 let cond = self.lower_expr(cond_expr);
                                 let ok_label = self.func().alloc_label();
-                                let revert_label = Label(ok_label.0 + 1);
+                                let revert_label = self.func().alloc_label();
 
                                 self.emit(Inst::Branch(cond, ok_label, revert_label));
 
@@ -931,8 +931,8 @@ impl Lowerer {
             Expr::If(cond, then_block, else_clause, _) => {
                 let cond_reg = self.lower_expr(cond);
                 let then_label = self.func().alloc_label();
-                let else_label = Label(then_label.0 + 1);
-                let end_label = Label(then_label.0 + 2);
+                let else_label = self.func().alloc_label();
+                let end_label = self.func().alloc_label();
 
                 if else_clause.is_some() {
                     self.emit(Inst::Branch(cond_reg, then_label, else_label));
