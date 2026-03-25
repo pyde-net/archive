@@ -251,7 +251,65 @@ impl TypeChecker {
             Item::Interface(i) => self.collect_interface(i),
             Item::Error(e) => self.collect_error(e),
             Item::Function(f) => self.collect_func_sig(f),
+            Item::Use(u) => self.collect_std_import_sigs(u),
             _ => {}
+        }
+    }
+
+    /// Register function signatures for known std library imports.
+    fn collect_std_import_sigs(&mut self, import: &UseImport) {
+        if import.path.len() < 2 || import.path[0].name != "std" {
+            return;
+        }
+        let module = &import.path[1].name;
+
+        // Collect which items are imported
+        let imported_items: Vec<String> = if !import.items.is_empty() {
+            // Grouped: use std::math::{sqrt, pow};
+            import.items.iter().map(|i| i.name.clone()).collect()
+        } else if import.path.len() >= 3 {
+            // Single: use std::math::sqrt;
+            vec![import.path[2].name.clone()]
+        } else {
+            // Module: use std::math; — don't register standalone functions
+            // (they're called as math::sqrt(), handled by Path call)
+            return;
+        };
+
+        // Register each imported function with its known signature
+        for item_name in &imported_items {
+            if let Some((params, ret)) = self.get_std_fn_sig(module, item_name) {
+                self.env.func_sigs.insert(item_name.clone(), (params, ret));
+            }
+        }
+    }
+
+    /// Get the known signature of a standard library function.
+    fn get_std_fn_sig(&self, module: &str, func: &str) -> Option<(Vec<(String, Ty)>, Ty)> {
+        match (module, func) {
+            // std::math
+            ("math", "sqrt") => Some((vec![("x".into(), Ty::U256)], Ty::U256)),
+            ("math", "pow") => Some((vec![("base".into(), Ty::U256), ("exp".into(), Ty::U256)], Ty::U256)),
+            ("math", "min") => Some((vec![("a".into(), Ty::U256), ("b".into(), Ty::U256)], Ty::U256)),
+            ("math", "max") => Some((vec![("a".into(), Ty::U256), ("b".into(), Ty::U256)], Ty::U256)),
+            ("math", "clamp") => Some((vec![("x".into(), Ty::U256), ("lo".into(), Ty::U256), ("hi".into(), Ty::U256)], Ty::U256)),
+            ("math", "mul_div") => Some((vec![("a".into(), Ty::U256), ("b".into(), Ty::U256), ("c".into(), Ty::U256)], Ty::U256)),
+            // std::signature
+            ("signature", "verify") => Some((
+                vec![("message".into(), Ty::Array(Box::new(Ty::U8), 32)), ("sig".into(), Ty::Bytes), ("pubkey".into(), Ty::Bytes)],
+                Ty::Bool,
+            )),
+            ("signature", "recover") => Some((
+                vec![("message".into(), Ty::Array(Box::new(Ty::U8), 32)), ("sig".into(), Ty::Bytes)],
+                Ty::Address,
+            )),
+            // std::hash
+            ("hash", "poseidon2") => Some((vec![("data".into(), Ty::Bytes)], Ty::Array(Box::new(Ty::U8), 32))),
+            ("hash", "poseidon2_pair") => Some((
+                vec![("a".into(), Ty::Array(Box::new(Ty::U8), 32)), ("b".into(), Ty::Array(Box::new(Ty::U8), 32))],
+                Ty::Array(Box::new(Ty::U8), 32),
+            )),
+            _ => None,
         }
     }
 
@@ -682,6 +740,13 @@ impl TypeChecker {
                         return ty.clone();
                     }
                 }
+                // Address.balance → u256
+                if obj_ty == Ty::Address {
+                    match field.name.as_str() {
+                        "balance" => return Ty::U256,
+                        _ => {}
+                    }
+                }
                 // struct.field → field type
                 if let Ty::Struct(name) = &obj_ty {
                     if let Some(fields) = self.env.struct_defs.get(name) {
@@ -720,7 +785,56 @@ impl TypeChecker {
                             return Ty::Array(Box::new(Ty::U8), 32);
                         }
                         if ident.name == "address" {
+                            // address() only accepts self or Address-typed arguments
+                            if args.len() != 1 {
+                                self.error(
+                                    "address() takes exactly one argument".into(),
+                                    *span,
+                                );
+                            } else if let Some(arg) = args.first() {
+                                let is_self = matches!(arg, Expr::SelfExpr(_));
+                                let arg_ty = &arg_types[0];
+                                if !is_self && *arg_ty != Ty::Address
+                                    && *arg_ty != Ty::Unknown && *arg_ty != Ty::Error
+                                {
+                                    self.error(
+                                        format!(
+                                            "address() expects 'self' or an Address, found {}. Use Address::ZERO for zero address",
+                                            arg_ty
+                                        ),
+                                        *span,
+                                    );
+                                }
+                            }
                             return Ty::Address;
+                        }
+                        // sig_verify(message, signature, public_key) → bool
+                        if ident.name == "sig_verify" {
+                            if arg_types.len() != 3 {
+                                self.error(
+                                    format!("sig_verify() takes 3 arguments (message, signature, public_key), found {}", arg_types.len()),
+                                    *span,
+                                );
+                            }
+                            return Ty::Bool;
+                        }
+                        // sig_recover(message, signature) → Address
+                        if ident.name == "sig_recover" {
+                            if arg_types.len() != 2 {
+                                self.error(
+                                    format!("sig_recover() takes 2 arguments (message, signature), found {}", arg_types.len()),
+                                    *span,
+                                );
+                            }
+                            return Ty::Address;
+                        }
+                        // gas_remaining() → u64
+                        if ident.name == "gas_remaining" {
+                            return Ty::U64;
+                        }
+                        // bytes() constructor → bytes
+                        if ident.name == "bytes" {
+                            return Ty::Bytes;
                         }
                         // Local function — check args
                         if let Some((params, ret)) = self.env.func_sigs.get(&ident.name).cloned() {
@@ -739,34 +853,134 @@ impl TypeChecker {
                             }
                         }
                         // Common method return types
-                        match method.name.as_str() {
-                            // Collections
-                            "len" => Ty::U64,
-                            "push" | "pop" => Ty::Unit,
-                            "is_empty" => Ty::Bool,
-                            // String (minimal — only essentials for contracts)
-                            "concat" => obj_ty,  // String.concat() → String
-                            // Bytes
-                            "as_bytes" | "to_bytes" => Ty::Bytes,
-                            "append" => Ty::Unit, // bytes.append()
-                            // Math extension methods (use std::math)
+                        let is_math_method = matches!(method.name.as_str(),
                             "sqrt" | "pow" | "min" | "max" | "clamp"
                             | "mul_div" | "checked_add" | "checked_sub"
                             | "saturating_add" | "saturating_sub"
-                            | "wrapping_add" | "wrapping_sub" => obj_ty,
-                            _ => Ty::Unknown,
+                            | "wrapping_add" | "wrapping_sub"
+                        );
+
+                        // Math methods only work on numeric types
+                        if is_math_method {
+                            if !obj_ty.is_numeric() && obj_ty != Ty::Unknown && obj_ty != Ty::Error {
+                                self.error(
+                                    format!("'{}' can only be called on numeric types, found {}", method.name, obj_ty),
+                                    *span,
+                                );
+                                return Ty::Error;
+                            }
+                            return obj_ty;
+                        }
+
+                        match method.name.as_str() {
+                            // len() → u64 — only on Vec, Map, Array, String, bytes
+                            "len" => {
+                                let valid = matches!(obj_ty,
+                                    Ty::Vec(_) | Ty::Map(_, _) | Ty::Array(_, _)
+                                    | Ty::StringTy | Ty::Bytes | Ty::Unknown | Ty::Error
+                                );
+                                if !valid {
+                                    self.error(
+                                        format!("'len' can only be called on collections, String, or bytes, found {}", obj_ty),
+                                        *span,
+                                    );
+                                }
+                                Ty::U64
+                            }
+                            // push/pop → Unit — only on Vec
+                            "push" | "pop" => {
+                                if !matches!(obj_ty, Ty::Vec(_) | Ty::Unknown | Ty::Error) {
+                                    self.error(
+                                        format!("'{}' can only be called on Vec, found {}", method.name, obj_ty),
+                                        *span,
+                                    );
+                                }
+                                Ty::Unit
+                            }
+                            // is_empty() → bool — on Vec, Map, String, bytes
+                            "is_empty" => {
+                                let valid = matches!(obj_ty,
+                                    Ty::Vec(_) | Ty::Map(_, _) | Ty::StringTy
+                                    | Ty::Bytes | Ty::Unknown | Ty::Error
+                                );
+                                if !valid {
+                                    self.error(
+                                        format!("'is_empty' can only be called on collections, String, or bytes, found {}", obj_ty),
+                                        *span,
+                                    );
+                                }
+                                Ty::Bool
+                            }
+                            // concat() → same type — only on String or bytes
+                            "concat" => {
+                                if obj_ty != Ty::StringTy && obj_ty != Ty::Bytes
+                                    && obj_ty != Ty::Unknown && obj_ty != Ty::Error
+                                {
+                                    self.error(
+                                        format!("'concat' can only be called on String or bytes, found {}", obj_ty),
+                                        *span,
+                                    );
+                                }
+                                obj_ty
+                            }
+                            // as_bytes/to_bytes → bytes — on String, Address, numeric types
+                            "as_bytes" | "to_bytes" => {
+                                let valid = matches!(obj_ty,
+                                    Ty::StringTy | Ty::Address | Ty::Bytes | Ty::Unknown | Ty::Error
+                                ) || obj_ty.is_numeric();
+                                if !valid {
+                                    self.error(
+                                        format!("'{}' can only be called on String, Address, or numeric types, found {}", method.name, obj_ty),
+                                        *span,
+                                    );
+                                }
+                                Ty::Bytes
+                            }
+                            // append() → Unit — only on bytes or Vec
+                            "append" => {
+                                if !matches!(obj_ty, Ty::Bytes | Ty::Vec(_) | Ty::Unknown | Ty::Error) {
+                                    self.error(
+                                        format!("'append' can only be called on bytes or Vec, found {}", obj_ty),
+                                        *span,
+                                    );
+                                }
+                                Ty::Unit
+                            }
+                            // Unknown method — error only for primitives where we know all methods
+                            _ => {
+                                let is_primitive = obj_ty.is_numeric()
+                                    || matches!(obj_ty, Ty::Bool | Ty::Address);
+                                if is_primitive {
+                                    self.error(
+                                        format!("type {} has no method '{}'", obj_ty, method.name),
+                                        *span,
+                                    );
+                                    Ty::Error
+                                } else {
+                                    // String, bytes, Vec, Map, Array, Struct, Enum, Unknown
+                                    // — could be library-extended, user-defined, or cross-contract
+                                    Ty::Unknown
+                                }
+                            }
                         }
                     }
                     Expr::Path(segments, _) => {
-                        // Vec::new(), bytes::new(), etc.
                         if segments.len() == 2 {
                             match (segments[0].name.as_str(), segments[1].name.as_str()) {
+                                // Constructors
                                 ("Vec", "new") => Ty::Vec(Box::new(Ty::Unknown)),
-                                ("bytes", "new" | "empty") => Ty::Bytes,
-                                (iface_name, "at") => {
-                                    // Interface::at(addr) returns something call-able
-                                    Ty::Unknown
+                                ("bytes", "new" | "empty" | "from_hex") => Ty::Bytes,
+                                ("String", "new") => Ty::StringTy,
+                                // Interface::at(addr) → callable handle
+                                (_, "at") => Ty::Unknown,
+                                // std::signature module
+                                ("signature", "verify") => Ty::Bool,
+                                ("signature", "recover") => Ty::Address,
+                                // std::hash module (explicit forms)
+                                ("hash", "poseidon2" | "poseidon2_pair" | "poseidon2_many") => {
+                                    Ty::Array(Box::new(Ty::U8), 32)
                                 }
+                                // Module function calls default to Unknown
                                 _ => Ty::Unknown,
                             }
                         } else {
@@ -1622,5 +1836,245 @@ mod tests {
             }
         "#);
         assert!(errors[0].message.contains("use .concat() instead"));
+    }
+
+    // ========== Math method type enforcement ==========
+
+    #[test]
+    fn error_sqrt_on_string() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() {
+                    let x = "hello".sqrt();
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("can only be called on numeric types"));
+    }
+
+    #[test]
+    fn error_pow_on_bool() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() {
+                    let x = true.pow(3);
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("can only be called on numeric types"));
+    }
+
+    #[test]
+    fn check_sqrt_on_u256() {
+        check_ok(r#"
+            contract T {
+                pub fn f() {
+                    let x: u256 = 100;
+                    let root = x.sqrt();
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn error_concat_on_number() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() {
+                    let x: u256 = 100;
+                    let y = x.concat(200);
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("can only be called on String or bytes"));
+    }
+
+    #[test]
+    fn error_push_on_string() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() {
+                    let s = "hello";
+                    s.push("x");
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("'push' can only be called on Vec"));
+    }
+
+    #[test]
+    fn error_len_on_number() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() {
+                    let x: u256 = 100;
+                    let n = x.len();
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("'len' can only be called on collections"));
+    }
+
+    #[test]
+    fn error_is_empty_on_number() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() {
+                    let x: u256 = 100;
+                    let b = x.is_empty();
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("'is_empty' can only be called on collections"));
+    }
+
+    #[test]
+    fn error_append_on_string() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() {
+                    let s = "hello";
+                    s.append("x");
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("'append' can only be called on bytes or Vec"));
+    }
+
+    // ========== address() enforcement ==========
+
+    #[test]
+    fn check_address_self() {
+        check_ok(r#"
+            contract T {
+                pub fn f() {
+                    let addr = address(self);
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn error_address_integer() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() {
+                    let addr = address(0);
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("expects 'self' or an Address"));
+    }
+
+    #[test]
+    fn error_address_string() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() {
+                    let addr = address("hello");
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("expects 'self' or an Address"));
+    }
+
+    #[test]
+    fn check_address_of_address_var() {
+        // Passing an Address variable is fine (identity)
+        check_ok(r#"
+            contract T {
+                pub fn f() {
+                    let sender = msg.sender;
+                    let addr = address(sender);
+                }
+            }
+        "#);
+    }
+
+    // ========== Std import function validation ==========
+
+    #[test]
+    fn check_imported_sqrt_correct_args() {
+        check_ok(r#"
+            use std::math::sqrt;
+            contract T {
+                pub fn f() {
+                    let x = sqrt(100);
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn error_imported_sqrt_wrong_type() {
+        let errors = check_err(r#"
+            use std::math::sqrt;
+            contract T {
+                pub fn f() {
+                    let x = sqrt("hello");
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("argument 'x' expects u256, found String"));
+    }
+
+    #[test]
+    fn error_imported_sqrt_wrong_count() {
+        let errors = check_err(r#"
+            use std::math::sqrt;
+            contract T {
+                pub fn f() {
+                    let x = sqrt(1, 2);
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("expects 1 arguments, found 2"));
+    }
+
+    #[test]
+    fn check_imported_verify_correct() {
+        check_ok(r#"
+            use std::signature::verify;
+            contract T {
+                pub fn f() {
+                    let msg_hash: [u8; 32] = [0; 32];
+                    let sig: bytes = bytes("");
+                    let pk: bytes = bytes("");
+                    let valid = verify(msg_hash, sig, pk);
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn check_grouped_import_validation() {
+        check_ok(r#"
+            use std::math::{sqrt, pow};
+            contract T {
+                pub fn f() {
+                    let a = sqrt(100);
+                    let b = pow(2, 10);
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn check_valid_method_types() {
+        check_ok(r#"
+            contract T {
+                storage { items: Vec<u256>, data: bytes, }
+                pub fn f() {
+                    let n = self.items.len();
+                    let empty = self.items.is_empty();
+                    self.items.push(42);
+                    let b = self.data.len();
+                    self.data.append(self.data);
+                    let name = "hello";
+                    let full = name.concat(" world");
+                    let nb = name.as_bytes();
+                }
+            }
+        "#);
     }
 }

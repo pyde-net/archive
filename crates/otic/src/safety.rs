@@ -73,7 +73,7 @@ impl SafetyChecker {
         for item in &file.items {
             match item {
                 Item::Contract(c) => self.check_contract(c),
-                Item::Function(f) => self.check_function_attrs(f),
+                Item::Function(f) => self.check_top_level_function(f),
                 _ => {}
             }
         }
@@ -82,6 +82,31 @@ impl SafetyChecker {
 
     fn error(&mut self, message: String, span: Span) {
         self.errors.push(SafetyError { message, span });
+    }
+
+    // ========================================================================
+    // Top-level function checks
+    // ========================================================================
+
+    fn check_top_level_function(&mut self, func: &FunctionDef) {
+        // Contract-only attributes on top-level functions
+        let contract_only = ["constructor", "view", "sponsored", "reentrant"];
+        for attr in &func.attributes {
+            let name = attr.content.split('(').next().unwrap_or(&attr.content).trim();
+            if contract_only.contains(&name) {
+                self.error(
+                    format!("#[{}] can only be used on functions inside a contract", name),
+                    attr.span,
+                );
+            }
+            // #[test] and #[should_panic] are allowed on top-level functions
+            if !is_known_attribute(&attr.content) && name != "test" && name != "should_panic" {
+                self.error(
+                    format!("unknown attribute '#[{}]'", attr.content),
+                    attr.span,
+                );
+            }
+        }
     }
 
     // ========================================================================
@@ -942,6 +967,44 @@ mod tests {
                     return self.compute(self.balance);
                 }
             }
+        "#);
+    }
+
+    // ========== Top-level function attribute restrictions ==========
+
+    #[test]
+    fn error_constructor_outside_contract() {
+        let errors = check_err(r#"
+            #[constructor]
+            pub fn init() {}
+        "#);
+        assert!(errors[0].message.contains("can only be used on functions inside a contract"));
+    }
+
+    #[test]
+    fn error_view_outside_contract() {
+        let errors = check_err(r#"
+            #[view]
+            pub fn get() -> u256 { return 0; }
+        "#);
+        assert!(errors[0].message.contains("can only be used on functions inside a contract"));
+    }
+
+    #[test]
+    fn error_sponsored_outside_contract() {
+        let errors = check_err(r#"
+            #[sponsored]
+            pub fn transfer() {}
+        "#);
+        assert!(errors[0].message.contains("can only be used on functions inside a contract"));
+    }
+
+    #[test]
+    fn test_attribute_on_top_level_ok() {
+        // #[test] is allowed on top-level functions (module test functions)
+        check_ok(r#"
+            #[test]
+            fn test_something() {}
         "#);
     }
 

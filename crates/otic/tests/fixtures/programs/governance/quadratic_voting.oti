@@ -315,7 +315,7 @@ contract QuadraticVoting {
     #[view]
     pub fn votes_for_credits(credits: u256) -> u256 {
         // votes = floor(sqrt(credits))
-        return sqrt(credits);
+        return credits.sqrt();
     }
 
     // Calculate credits needed for a given number of votes
