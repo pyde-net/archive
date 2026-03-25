@@ -144,8 +144,8 @@ impl Resolver {
                 "bool", "Address", "String", "bytes",
                 "Vec", "Map",
             ],
-            builtin_fns: vec!["hash", "address", "sqrt"],
-            builtin_globals: vec!["msg", "block", "tx", "bytes"],
+            builtin_fns: vec!["hash", "address", "gas_remaining", "bytes", "sig_verify", "sig_recover"],
+            builtin_globals: vec!["msg", "block", "tx"],
         }
     }
 
@@ -447,11 +447,65 @@ impl Resolver {
         }
     }
 
+    /// Known standard library modules and their exports.
+    const STD_MODULES: &'static [(&'static str, &'static [&'static str])] = &[
+        ("math", &["sqrt", "pow", "min", "max", "clamp", "mul_div", "abs_diff", "average", "log10",
+                   "checked_add", "checked_sub", "saturating_add", "saturating_sub",
+                   "wrapping_add", "wrapping_sub"]),
+        ("hash", &["poseidon2", "poseidon2_pair", "poseidon2_many"]),
+        ("signature", &["verify", "recover"]),
+        ("token", &["IERC20", "IERC721", "INFT"]),
+    ];
+
     fn resolve_use(&mut self, import: &UseImport) {
-        // For now, just register the last segment as a known module.
-        // Full module resolution requires a module system / file system.
+        // Validate std:: imports
+        if import.path.len() >= 2 && import.path[0].name == "std" {
+            let module_name = &import.path[1].name;
+            let known_module = Self::STD_MODULES.iter().find(|(name, _)| name == module_name);
+
+            if known_module.is_none() {
+                self.error(
+                    format!("unknown standard library module 'std::{}'", module_name),
+                    import.path[1].span,
+                );
+                return;
+            }
+
+            // Validate specific imports: use std::math::sqrt;
+            if import.path.len() >= 3 {
+                let item_name = &import.path[2].name;
+                if let Some((_, exports)) = known_module {
+                    if !exports.contains(&item_name.as_str()) {
+                        self.error(
+                            format!("'{}' is not exported from 'std::{}'", item_name, module_name),
+                            import.path[2].span,
+                        );
+                        return;
+                    }
+                }
+            }
+
+            // Validate grouped imports: use std::math::{sqrt, pow};
+            if let Some((_, exports)) = known_module {
+                for item in &import.items {
+                    if !exports.contains(&item.name.as_str()) {
+                        self.error(
+                            format!("'{}' is not exported from 'std::{}'", item.name, module_name),
+                            item.span,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Register the module name (last path segment)
         if let Some(last) = import.path.last() {
             self.declare(&last.name, SymbolKind::Module, last.span);
+        }
+
+        // For grouped imports: register each imported item
+        for item in &import.items {
+            self.declare(&item.name, SymbolKind::Module, item.span);
         }
     }
 
@@ -1010,6 +1064,98 @@ mod tests {
                 }
             }
         "#);
+    }
+
+    #[test]
+    fn resolve_grouped_import() {
+        resolve_ok(r#"
+            use std::math::{sqrt, pow};
+            contract T {
+                pub fn f() {
+                    let x = sqrt(100);
+                    let y = pow(2, 10);
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn error_unknown_std_module() {
+        let errors = resolve_err(r#"
+            use std::banana;
+            contract T {}
+        "#);
+        assert!(errors[0].message.contains("unknown standard library module 'std::banana'"));
+    }
+
+    #[test]
+    fn error_unknown_std_export() {
+        let errors = resolve_err(r#"
+            use std::math::pineapple;
+            contract T {}
+        "#);
+        assert!(errors[0].message.contains("'pineapple' is not exported from 'std::math'"));
+    }
+
+    #[test]
+    fn error_unknown_grouped_export() {
+        let errors = resolve_err(r#"
+            use std::math::{sqrt, banana};
+            contract T {}
+        "#);
+        assert!(errors[0].message.contains("'banana' is not exported from 'std::math'"));
+    }
+
+    #[test]
+    fn error_standalone_sqrt_without_import() {
+        // sqrt(x) requires import — not a global function
+        let errors = resolve_err(r#"
+            contract T {
+                pub fn f() {
+                    let x = sqrt(100);
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("undefined variable 'sqrt'"));
+    }
+
+    #[test]
+    fn resolve_standalone_sqrt_with_import() {
+        // use std::math::sqrt; → sqrt(x) works
+        resolve_ok(r#"
+            use std::math::sqrt;
+            contract T {
+                pub fn f() {
+                    let x = sqrt(100);
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn resolve_method_sqrt_without_import() {
+        // x.sqrt() works on any numeric — no import needed
+        resolve_ok(r#"
+            contract T {
+                pub fn f() {
+                    let x: u256 = 100;
+                    let root = x.sqrt();
+                    let powered = x.pow(3);
+                    let clamped = x.min(50);
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn resolve_valid_std_imports() {
+        resolve_ok("use std::math;");
+        resolve_ok("use std::hash;");
+        resolve_ok("use std::signature;");
+        resolve_ok("use std::token;");
+        resolve_ok("use std::math::sqrt;");
+        resolve_ok("use std::signature::verify;");
+        resolve_ok("use std::hash::poseidon2;");
     }
 
     #[test]

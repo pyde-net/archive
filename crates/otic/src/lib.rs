@@ -10,3 +10,5 @@ pub mod resolve;
 pub mod types;
 pub mod typecheck;
 pub mod safety;
+pub mod ir;
+pub mod lower;

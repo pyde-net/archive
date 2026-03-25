@@ -40,10 +40,13 @@ pub enum Item {
     Function(FunctionDef),
 }
 
-/// `use std::math;` or `use std::token::IERC20;`
+/// `use std::math;` or `use std::token::IERC20;` or `use std::math::{sqrt, pow};`
 #[derive(Clone, Debug)]
 pub struct UseImport {
     pub path: Vec<Ident>,
+    /// Grouped imports: `use std::math::{sqrt, pow};` → items = ["sqrt", "pow"]
+    /// Empty for simple imports: `use std::math;`
+    pub items: Vec<Ident>,
     pub span: Span,
 }
 

@@ -261,10 +261,24 @@ impl Parser {
         self.expect(&TokenKind::Use)?;
         let mut path = vec![self.expect_ident()?];
         while self.eat(&TokenKind::ColonColon) {
+            // Check for grouped import: use std::math::{sqrt, pow};
+            if self.at(&TokenKind::LBrace) {
+                self.advance(); // eat {
+                let mut items = Vec::new();
+                while !self.at(&TokenKind::RBrace) && !self.at_eof() {
+                    items.push(self.expect_ident()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RBrace)?;
+                self.expect_semi()?;
+                return Ok(UseImport { path, items, span: start });
+            }
             path.push(self.expect_ident()?);
         }
         self.expect_semi()?;
-        Ok(UseImport { path, span: start })
+        Ok(UseImport { path, items: vec![], span: start })
     }
 
     fn parse_module(&mut self) -> Result<ModuleDef, ()> {
@@ -1385,6 +1399,23 @@ mod tests {
             assert_eq!(u.path.len(), 2);
             assert_eq!(u.path[0].name, "std");
             assert_eq!(u.path[1].name, "math");
+            assert!(u.items.is_empty());
+        } else {
+            panic!("expected Use");
+        }
+    }
+
+    #[test]
+    fn parse_grouped_import() {
+        let file = parse_ok("use std::math::{sqrt, pow, min};");
+        if let Item::Use(u) = &file.items[0] {
+            assert_eq!(u.path.len(), 2);
+            assert_eq!(u.path[0].name, "std");
+            assert_eq!(u.path[1].name, "math");
+            assert_eq!(u.items.len(), 3);
+            assert_eq!(u.items[0].name, "sqrt");
+            assert_eq!(u.items[1].name, "pow");
+            assert_eq!(u.items[2].name, "min");
         } else {
             panic!("expected Use");
         }
