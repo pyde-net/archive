@@ -749,7 +749,7 @@ impl TypeChecker {
     fn infer_expr(&mut self, expr: &Expr) -> Ty {
         match expr {
             Expr::Literal(lit, _) => match lit {
-                Literal::Int(_) => Ty::U256, // default integer type
+                Literal::Int(_) => Ty::U64, // default integer type (matches PVM GP register width)
                 Literal::String(_) => Ty::StringTy,
                 Literal::Bool(_) => Ty::Bool,
             },
@@ -1661,7 +1661,7 @@ mod tests {
     fn check_tuple_destructuring() {
         check_ok(r#"
             contract T {
-                pub fn get_pair() -> (u256, u256) {
+                pub fn get_pair() -> (u64, u64) {
                     return (1, 2);
                 }
                 pub fn f() {

@@ -301,6 +301,7 @@ fn collect_used_regs(inst: &Inst, used: &mut HashSet<Reg>) {
         Inst::TupleGet(_, tuple, _) => { used.insert(*tuple); }
         Inst::MakeArray(_, regs) => { for r in regs { used.insert(*r); } }
         Inst::ArrayRepeat(_, val, _) => { used.insert(*val); }
+        Inst::MakeVec(_, _) => {}
         Inst::Emit(_, fields) => { for r in fields { used.insert(*r); } }
         Inst::Revert(_, fields) => { for r in fields { used.insert(*r); } }
         Inst::CrossCall { target, method, args, .. } => {
@@ -329,6 +330,7 @@ fn get_dest_reg(inst: &Inst) -> Option<Reg> {
         | Inst::FieldGet(dst, _, _) | Inst::IndexGet(dst, _, _)
         | Inst::MakeTuple(dst, _) | Inst::TupleGet(dst, _, _)
         | Inst::MakeArray(dst, _) | Inst::ArrayRepeat(dst, _, _)
+        | Inst::MakeVec(dst, _)
         | Inst::RawCall(dst, _, _) | Inst::Phi(dst, _) => Some(*dst),
         _ => None,
     }

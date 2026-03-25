@@ -189,6 +189,31 @@ impl Resolver {
     }
 
     fn declare(&mut self, name: &str, kind: SymbolKind, span: Span) {
+        // Reject shadowing of all builtins: types, globals, and functions.
+        if matches!(kind, SymbolKind::LocalVar { .. } | SymbolKind::FnParam | SymbolKind::ForVar) {
+            if self.builtin_types.contains(&name) {
+                self.errors.push(ResolveError {
+                    message: format!("cannot shadow builtin type '{}'", name),
+                    span,
+                });
+                return;
+            }
+            if self.builtin_globals.contains(&name) {
+                self.errors.push(ResolveError {
+                    message: format!("cannot shadow builtin '{}'", name),
+                    span,
+                });
+                return;
+            }
+            if self.builtin_fns.contains(&name) {
+                self.errors.push(ResolveError {
+                    message: format!("cannot shadow builtin function '{}'", name),
+                    span,
+                });
+                return;
+            }
+        }
+
         let scope = self.scopes.last_mut().unwrap();
 
         if let Some(existing) = scope.symbols.get(name) {
@@ -1201,6 +1226,54 @@ mod tests {
             }
         "#);
         assert!(errors[0].message.contains("undefined variable 'undefined_var'"));
+    }
+
+    #[test]
+    fn error_shadow_builtin_type() {
+        let errors = resolve_err(r#"
+            contract T {
+                pub fn f() {
+                    let Vec = 5;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("cannot shadow builtin type 'Vec'"));
+    }
+
+    #[test]
+    fn error_shadow_builtin_type_map() {
+        let errors = resolve_err(r#"
+            contract T {
+                pub fn f() {
+                    let Map = 10;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("cannot shadow builtin type 'Map'"));
+    }
+
+    #[test]
+    fn error_shadow_builtin_msg() {
+        let errors = resolve_err(r#"
+            contract T {
+                pub fn f() {
+                    let msg = 10;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("cannot shadow builtin 'msg'"));
+    }
+
+    #[test]
+    fn error_shadow_builtin_tx() {
+        let errors = resolve_err(r#"
+            contract T {
+                pub fn f() {
+                    let tx = 10;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("cannot shadow builtin 'tx'"));
     }
 
     #[test]

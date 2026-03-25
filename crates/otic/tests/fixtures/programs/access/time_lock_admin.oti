@@ -296,8 +296,8 @@ contract TimeLockAdmin {
     fn compute_hash(target: Address, value: u256, data: bytes, salt: u64) -> [u8; 32] {
         // Simplified hash computation placeholder
         // In real implementation this would use keccak256 or poseidon
-        let mut hash: [u8; 32] = [0; 32];
-        return hash;
+        let mut result: [u8; 32] = [0; 32];
+        return result;
     }
 
     #[view]

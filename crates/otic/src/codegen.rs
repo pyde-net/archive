@@ -1,0 +1,2842 @@
+//! Code generation: OtiIR → PVM bytecode.
+//!
+//! Transforms the optimized IR into PVM instructions that can execute
+//! on the Pyde Virtual Machine.
+//!
+//! Architecture:
+//! - Linear scan register allocation (virtual → physical PVM registers)
+//! - Direct instruction selection (IR op → PVM opcode)
+//! - Two-pass: emit instructions with placeholder offsets, then resolve jumps
+//!
+//! PVM register conventions:
+//!   GP: r0=zero, r1=return, r2..r11=args/locals, r12=heap_ptr, r13=spill_base, r14-r15=scratch
+//!   Wide: w0..w6=user, w7=scratch
+//!
+//! Calling convention:
+//!   - Args in r2, r3, ..., r(1+N)
+//!   - Return value in r1
+//!   - All registers caller-clobbered
+//!   - Dispatch entries decode calldata → arg registers → Call → Halt
+//!   - All functions end with Ret (dispatch wrapper emits Halt)
+
+use std::collections::{HashMap, HashSet};
+
+use crate::ir::*;
+use crate::memory;
+use crate::types::Ty;
+
+use pyde_vm::isa::{encode, encode_mem_immediate, Opcode, Instruction, MemWidth};
+
+/// Reentrancy guard slot (well above user-defined storage slots).
+/// Must fit in 17-bit positive Addi (PVM sign-extends 18-bit immediate).
+const REENTRANCY_SLOT: u32 = 0x1FFFE;
+
+/// Wide scratch register index.
+const WIDE_SCRATCH: u8 = 7;
+/// Second wide scratch register index.
+const WIDE_SCRATCH2: u8 = 6;
+
+// ============================================================================
+// Output
+// ============================================================================
+
+/// The compiled output of a contract.
+#[derive(Clone, Debug)]
+pub struct CompiledContract {
+    /// Contract name.
+    pub name: String,
+    /// Full bytecode (constructor + runtime, 4 bytes per instruction).
+    pub bytecode: Vec<u8>,
+    /// Constructor bytecode (runs once at deploy, empty if no constructor).
+    pub constructor_bytecode: Vec<u8>,
+    /// Runtime bytecode (dispatch + functions, deployed on-chain).
+    pub runtime_bytecode: Vec<u8>,
+    /// Function selector → bytecode offset mapping (for ABI dispatch).
+    pub selectors: Vec<(u32, String, usize)>,
+    /// Number of instructions emitted.
+    pub instruction_count: usize,
+}
+
+// ============================================================================
+// Register Allocator
+// ============================================================================
+
+/// Spill event: the CodeGen must emit Store/Load for register pressure.
+enum SpillAction {
+    /// Store this physical register to spill slot before reusing it.
+    Save(u8, u32), // (physical_reg, spill_slot_offset)
+}
+
+/// Restore event: the CodeGen must emit Load to bring a spilled value back.
+enum RestoreAction {
+    /// Load from spill slot into this physical register.
+    Restore(u8, u32), // (physical_reg, spill_slot_offset)
+}
+
+/// Maps IR virtual registers to PVM physical registers.
+/// GP: r1-r11 for user values (r0=zero, r12=heap, r13=spill_base, r14-r15=scratch).
+/// Wide: w0-w6 for user values (w7=scratch).
+///
+/// Spilling uses memory at r13 (spill base pointer, set at function entry).
+/// Each spilled vreg gets a fixed 8-byte slot: mem[r13 + slot*8].
+struct RegAlloc {
+    /// Virtual register → physical register mapping (currently in register).
+    mapping: HashMap<Reg, u8>,
+    /// Reverse mapping: physical register → virtual register (for eviction).
+    reverse: HashMap<u8, Reg>,
+    /// Spilled virtual registers → spill slot offset from r13.
+    spilled: HashMap<Reg, u32>,
+    /// Next spill slot.
+    next_spill_slot: u32,
+    /// Track which virtual registers hold wide (u256) values.
+    wide: HashSet<Reg>,
+    /// Next available GP register (1-11).
+    next_gp: u8,
+    /// Next available wide register (0-6).
+    next_wide: u8,
+}
+
+impl RegAlloc {
+    fn new() -> Self {
+        Self {
+            mapping: HashMap::new(),
+            reverse: HashMap::new(),
+            spilled: HashMap::new(),
+            next_spill_slot: 0,
+            wide: HashSet::new(),
+            next_gp: 1,
+            next_wide: 0,
+        }
+    }
+
+    /// Allocate a GP (64-bit) physical register.
+    /// Returns (physical_reg, optional spill action if eviction needed).
+    fn alloc(&mut self, vreg: Reg) -> (u8, Option<SpillAction>) {
+        if let Some(&phys) = self.mapping.get(&vreg) {
+            return (phys, None);
+        }
+        // If this vreg was previously spilled, it will be restored on get()
+        if self.next_gp <= 11 {
+            let phys = self.next_gp;
+            self.next_gp += 1;
+            self.mapping.insert(vreg, phys);
+            self.reverse.insert(phys, vreg);
+            (phys, None)
+        } else {
+            // Evict: reuse registers cyclically (r1-r11)
+            let phys = ((self.next_gp - 1) % 11) + 1;
+            self.next_gp += 1;
+            // Evict the old occupant to spill slot
+            let spill = if let Some(&old_vreg) = self.reverse.get(&phys) {
+                let slot = self.next_spill_slot;
+                self.next_spill_slot += 1;
+                self.spilled.insert(old_vreg, slot);
+                self.mapping.remove(&old_vreg);
+                Some(SpillAction::Save(phys, slot))
+            } else {
+                None
+            };
+            self.mapping.insert(vreg, phys);
+            self.reverse.insert(phys, vreg);
+            (phys, spill)
+        }
+    }
+
+    /// Get the physical register for a virtual register.
+    /// If the vreg was spilled, returns None (caller must restore).
+    fn get_or_spilled(&self, vreg: Reg) -> Result<u8, RestoreAction> {
+        if let Some(&phys) = self.mapping.get(&vreg) {
+            Ok(phys)
+        } else if let Some(&slot) = self.spilled.get(&vreg) {
+            // Need to restore from spill slot into a scratch register
+            Err(RestoreAction::Restore(15, slot)) // use r15 as temp
+        } else {
+            Ok(0) // unknown vreg → r0
+        }
+    }
+
+    /// Allocate a wide (256-bit) register.
+    fn alloc_wide(&mut self, vreg: Reg) -> u8 {
+        if let Some(&phys) = self.mapping.get(&vreg) {
+            return phys;
+        }
+        let phys = self.next_wide.min(6);
+        self.next_wide += 1;
+        self.mapping.insert(vreg, phys);
+        self.wide.insert(vreg);
+        phys
+    }
+
+    /// Pre-map a virtual register to a specific physical register.
+    fn pre_map(&mut self, vreg: Reg, phys: u8) {
+        self.mapping.insert(vreg, phys);
+        self.reverse.insert(phys, vreg);
+        if phys >= self.next_gp && phys <= 11 {
+            self.next_gp = phys + 1;
+        }
+    }
+
+    /// Get the physical register (backward compat — panics on spill).
+    fn get(&self, vreg: Reg) -> u8 {
+        *self.mapping.get(&vreg).unwrap_or(&0)
+    }
+
+    /// Check if a register holds a wide (u256) value.
+    fn is_wide(&self, vreg: Reg) -> bool {
+        self.wide.contains(&vreg)
+    }
+
+    /// Check if a vreg is currently spilled to memory.
+    fn is_spilled(&self, vreg: Reg) -> bool {
+        self.spilled.contains_key(&vreg) && !self.mapping.contains_key(&vreg)
+    }
+
+    /// Reset for a new function.
+    fn reset(&mut self) {
+        self.mapping.clear();
+        self.reverse.clear();
+        self.spilled.clear();
+        self.next_spill_slot = 0;
+        self.wide.clear();
+        self.next_gp = 1;
+        self.next_wide = 0;
+    }
+}
+
+// ============================================================================
+// Code Generator
+// ============================================================================
+
+pub struct CodeGen {
+    /// Emitted instructions.
+    instructions: Vec<Instruction>,
+    /// Label → instruction index mapping (for jump resolution).
+    label_offsets: HashMap<Label, usize>,
+    /// Pending jump fixups: (instruction_index, target_label).
+    fixups: Vec<(usize, Label)>,
+    /// Register allocator.
+    regs: RegAlloc,
+    /// Whether current function has reentrancy guard (needs cleanup on return).
+    needs_guard_cleanup: bool,
+    /// Whether to emit runtime guards (disabled for testing).
+    emit_guards: bool,
+    /// Function name → label (for call resolution).
+    func_labels: HashMap<String, Label>,
+    /// Storage field name → slot index.
+    storage_slots: HashMap<String, u32>,
+    /// Storage field name → type (for GP vs wide Sload mode selection).
+    storage_types: HashMap<String, Ty>,
+    /// Struct name → ordered fields (for field offset computation).
+    struct_defs: HashMap<String, Vec<(String, Ty)>>,
+    /// Global field name → byte offset (built from struct_defs).
+    field_offsets: HashMap<String, u32>,
+    /// Label counter for generating unique labels.
+    label_counter: u32,
+}
+
+impl CodeGen {
+    pub fn new() -> Self {
+        Self {
+            instructions: Vec::new(),
+            label_offsets: HashMap::new(),
+            fixups: Vec::new(),
+            regs: RegAlloc::new(),
+            needs_guard_cleanup: false,
+            emit_guards: true,
+            func_labels: HashMap::new(),
+            storage_slots: HashMap::new(),
+            storage_types: HashMap::new(),
+            struct_defs: HashMap::new(),
+            field_offsets: HashMap::new(),
+            label_counter: 0,
+        }
+    }
+
+    fn alloc_label(&mut self) -> Label {
+        let l = Label(self.label_counter);
+        self.label_counter += 1;
+        l
+    }
+
+    /// Generate bytecode for an entire IR program.
+    pub fn generate(mut self, program: &IrProgram) -> CompiledContract {
+        let mut selectors = Vec::new();
+
+        // Set label_counter above all IR block labels to avoid collision
+        let max_ir_label = program.functions.iter()
+            .flat_map(|f| f.blocks.iter().map(|b| b.label.0))
+            .max()
+            .unwrap_or(0);
+        self.label_counter = max_ir_label + 100; // safe margin above IR labels
+
+        // Collect storage slot assignments and types
+        for field in &program.storage_fields {
+            self.storage_slots.insert(field.name.clone(), field.slot);
+            self.storage_types.insert(field.name.clone(), field.ty.clone());
+        }
+
+        // Build struct field offset map
+        for sdef in &program.struct_defs {
+            let mut offset = 0u32;
+            let mut fields = Vec::new();
+            for (fname, fty) in &sdef.fields {
+                self.field_offsets.insert(fname.clone(), offset);
+                fields.push((fname.clone(), fty.clone()));
+                offset += field_byte_size(fty);
+            }
+            self.struct_defs.insert(sdef.name.clone(), fields);
+        }
+
+        // Pre-pass: reserve labels for each function body + dispatch entry
+        let mut dispatch_entries: Vec<(u32, String, Label, Label)> = Vec::new(); // (selector, name, dispatch_label, func_label)
+
+        for func in &program.functions {
+            if func.is_test {
+                continue;
+            }
+            let func_label = self.alloc_label();
+            self.func_labels.insert(func.name.clone(), func_label);
+
+            if func.is_pub && !func.is_constructor {
+                let dispatch_label = self.alloc_label();
+                let selector = compute_selector(&func.name);
+                dispatch_entries.push((selector, func.name.clone(), dispatch_label, func_label));
+                selectors.push((selector, func.name.clone(), 0)); // offset filled later
+            }
+        }
+
+        // ====================================================================
+        // Emit constructor section
+        // ====================================================================
+        let constructor_start = self.current_offset();
+        for func in &program.functions {
+            if func.is_constructor {
+                // Init heap pointer: r12 = r5 + r4 + 8 (past calldata)
+                self.emit_heap_init();
+                // Decode calldata params into arg registers
+                self.emit_calldata_decode(func);
+                // Emit constructor body directly (no Call/Ret, just Halt at end)
+                self.gen_function(func, true);
+            }
+        }
+        let constructor_end = self.current_offset();
+
+        // ====================================================================
+        // Emit runtime section: dispatch table + dispatch entries + functions
+        // ====================================================================
+        let runtime_start = constructor_end;
+
+        // Dispatch table + entries (only in production mode, not test mode)
+        if self.emit_guards {
+            self.gen_dispatch_table(&dispatch_entries);
+
+            // Dispatch entries: decode calldata → Call function → Halt
+            for (_, name, dispatch_label, func_label) in &dispatch_entries {
+                self.mark_label(*dispatch_label);
+
+                let func = program.functions.iter().find(|f| f.name == *name).unwrap();
+
+                self.emit_heap_init();
+                self.emit_calldata_decode(func);
+                self.emit_function_guards(func);
+                self.emit_jump_placeholder(Opcode::Call, 0, 0, *func_label);
+                if func.is_pub && !func.is_view && !func.is_constructor && !func.is_reentrant {
+                    self.emit_reentrancy_cleanup();
+                }
+                self.emit_op(Opcode::Halt, 0, 0, 0);
+            }
+        }
+
+        // Function bodies
+        // In production mode, all functions use Ret (dispatch wrapper handles Halt).
+        // In test mode, emit Jmp to first pub function at start, only it gets Halt.
+        let first_pub_name = program.functions.iter()
+            .find(|f| !f.is_test && !f.is_constructor && f.is_pub)
+            .map(|f| f.name.clone());
+
+        // In test mode: if there are private functions before the first pub function,
+        // emit a Jmp to skip them. PVM always starts at PC=0.
+        if !self.emit_guards {
+            if let Some(ref pub_name) = first_pub_name {
+                if let Some(&pub_label) = self.func_labels.get(pub_name.as_str()) {
+                    // Check if first runtime function IS the pub function
+                    let first_runtime = program.functions.iter()
+                        .find(|f| !f.is_test && !f.is_constructor);
+                    if first_runtime.map(|f| &f.name) != first_pub_name.as_ref() {
+                        // Private functions come first — emit Jmp to pub function
+                        self.emit_jump_placeholder(Opcode::Jmp, 0, 0, pub_label);
+                    }
+                }
+            }
+        }
+
+        for func in &program.functions {
+            if func.is_test || func.is_constructor {
+                continue;
+            }
+            if let Some(&label) = self.func_labels.get(&func.name) {
+                self.mark_label(label);
+            }
+            let offset = self.current_offset();
+            for sel in &mut selectors {
+                if sel.1 == func.name {
+                    sel.2 = offset;
+                }
+            }
+            // In test mode: first pub function is entry (Halt), all others Ret.
+            // In production mode: all functions Ret (dispatch handles Halt).
+            let is_entry = !self.emit_guards && first_pub_name.as_ref() == Some(&func.name);
+            self.gen_function(func, is_entry);
+        }
+
+        // Resolve jump fixups
+        self.resolve_fixups();
+
+        // Convert to bytes
+        let all_bytes: Vec<u8> = self.instructions.iter()
+            .flat_map(|inst| inst.0.to_le_bytes())
+            .collect();
+
+        // Split into constructor and runtime sections
+        let constructor_bytes = if constructor_end > constructor_start {
+            all_bytes[constructor_start * 4..constructor_end * 4].to_vec()
+        } else {
+            vec![]
+        };
+
+        let runtime_bytes = all_bytes[runtime_start * 4..].to_vec();
+
+        CompiledContract {
+            name: program.contract_name.clone(),
+            bytecode: all_bytes,
+            constructor_bytecode: constructor_bytes,
+            runtime_bytecode: runtime_bytes,
+            selectors,
+            instruction_count: self.instructions.len(),
+        }
+    }
+
+    // ========================================================================
+    // Dispatch table: selector comparison
+    // ========================================================================
+
+    fn gen_dispatch_table(&mut self, entries: &[(u32, String, Label, Label)]) {
+        if entries.is_empty() {
+            return;
+        }
+
+        // Load selector from calldata into r13 (NOT r15, because load_u32_to_reg
+        // uses r15 as scratch and would clobber the calldata selector).
+        self.emit_load(13, 5, 0); // r13 = load u64 from calldata[0]
+
+        for (selector, _name, dispatch_label, _func_label) in entries {
+            self.load_u32_to_reg(memory::REG_SCRATCH_0, *selector); // r14 = known selector (may use r15 as scratch)
+            self.emit_jump_placeholder(Opcode::Beq, 13, memory::REG_SCRATCH_0, *dispatch_label);
+        }
+
+        // No selector matched → revert
+        self.emit_op(Opcode::Revert, 0, 0, 0);
+    }
+
+    // ========================================================================
+    // Calldata decode + heap init
+    // ========================================================================
+
+    /// Initialize heap pointer past calldata.
+    /// When calldata exists: r5=HEAP_START, r4=len, so r12 = r5 + r4 + 8.
+    /// When calldata is empty: PVM doesn't set r5/r4, so fallback to HEAP_START.
+    fn emit_heap_init(&mut self) {
+        // Load HEAP_START as base (always safe even without calldata)
+        self.load_u32_to_reg(12, memory::HEAP_START);
+        // If calldata exists, advance past it: r12 = max(HEAP_START, r5 + r4) + 8
+        // We add r4 (calldata len, 0 if none) to move past calldata
+        self.emit_op(Opcode::Add, 12, 12, 4);   // r12 += r4 (calldata length, 0 if empty)
+        self.emit_op(Opcode::Addi, 12, 12, 8);  // r12 += 8 (alignment gap)
+    }
+
+    /// Decode function params from calldata into arg registers (r2, r3, ...).
+    fn emit_calldata_decode(&mut self, func: &IrFunction) {
+        for (i, (_name, ty)) in func.params.iter().enumerate() {
+            let phys = (i as u8) + 2; // r2, r3, r4, ...
+            let is_wide = is_wide_type(ty);
+            let param_offset = 8 + (i as i32) * if is_wide { 32 } else { 8 }; // skip 8-byte selector (u64)
+
+            if is_wide {
+                // Compute address: r14 = r5 + offset
+                self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 5, param_offset as u32 & 0x3FFFF);
+                self.emit_op(Opcode::Wload, phys, memory::REG_SCRATCH_0, 0);
+                // Note: wide params go into wide register with same index
+            } else {
+                self.emit_load(phys, 5, param_offset);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Function guards (reentrancy, payable)
+    // ========================================================================
+
+    fn emit_function_guards(&mut self, func: &IrFunction) {
+        if !self.emit_guards {
+            return;
+        }
+
+        // Reentrancy guard: check lock, set lock
+        if func.is_pub && !func.is_view && !func.is_constructor && !func.is_reentrant {
+            // Widen reentrancy slot to wide scratch
+            self.emit_op(Opcode::Addi, 15, 0, REENTRANCY_SLOT);
+            self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);    // w7 = slot key
+            // Sload mode 2 (GP value): r14 = storage[w7]
+            self.emit_op(Opcode::Sload, 14, WIDE_SCRATCH, 2);
+            // Check: lock must be 0
+            self.emit_op(Opcode::Eq, 14, 14, 0);                 // r14 = (lock == 0)
+            self.emit_op(Opcode::Assert, 0, 14, 0);              // Assert reads rs1: revert if r14==0
+            // Set lock = 1
+            self.emit_op(Opcode::Addi, 14, 0, 1);
+            self.emit_op(Opcode::Sstore, 14, WIDE_SCRATCH, 2);   // storage[w7] = 1
+        }
+
+        // Payable guard: non-payable pub functions reject msg.value > 0
+        if func.is_pub && !func.is_payable && !func.is_constructor {
+            // w7 = msg.value (Callvalue writes to wide register)
+            self.emit_op(Opcode::Callvalue, WIDE_SCRATCH, 0, 0); // w7 = call_value
+            // w6 = 0 (for comparison)
+            self.emit_op(Opcode::Addi, 15, 0, 0);
+            self.emit_op(Opcode::Widen, WIDE_SCRATCH2, 15, 0);   // w6 = 0
+            // r14 = (w7 == w6) i.e. (value == 0)
+            self.emit_op(Opcode::Weq, 14, WIDE_SCRATCH, WIDE_SCRATCH2 as u32);
+            self.emit_op(Opcode::Assert, 0, 14, 0);              // Assert reads rs1: revert if r14==0
+        }
+    }
+
+    /// Emit reentrancy guard cleanup (clear lock).
+    fn emit_reentrancy_cleanup(&mut self) {
+        self.emit_op(Opcode::Addi, 15, 0, REENTRANCY_SLOT);
+        self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);     // w7 = slot key
+        self.emit_op(Opcode::Sstore, 0, WIDE_SCRATCH, 2);     // storage[w7] = r0 = 0
+    }
+
+    // ========================================================================
+    // Function body generation
+    // ========================================================================
+
+    /// Generate a function body.
+    /// `is_entry`: if true, emit Halt at end (constructor/standalone); if false, emit Ret.
+    fn gen_function(&mut self, func: &IrFunction, is_entry: bool) {
+        self.regs.reset();
+        self.needs_guard_cleanup = false;
+
+        // In test mode (no guards/dispatch), every function needs heap init
+        // because there's no dispatch wrapper to do it.
+        // In production mode, the dispatch wrapper handles heap init.
+        if !self.emit_guards {
+            self.emit_heap_init();
+        }
+
+        // Initialize spill base pointer: r13 = r12 (current heap top).
+        // Spill slots live at r13 + 0, r13 + 8, r13 + 16, ...
+        // Advance r12 past the spill area (reserve 256 bytes = 32 slots max).
+        self.emit_op(Opcode::Add, 13, 12, 0);  // r13 = r12
+        self.load_u32_to_reg(15, 256);
+        self.emit_op(Opcode::Add, 12, 12, 15); // r12 += 256
+
+        // Pre-map params to convention registers (r2, r3, ...)
+        // In test mode without dispatch, params aren't loaded from calldata,
+        // so standalone tests with params won't work (this is fine for now).
+        for (i, (_name, _ty)) in func.params.iter().enumerate() {
+            let vreg = Reg(i as u32);
+            let phys = (i as u8) + 2; // r2, r3, r4, ...
+            self.regs.pre_map(vreg, phys);
+        }
+
+        // Generate each basic block
+        for block in &func.blocks {
+            self.mark_label(block.label);
+            for inst in &block.instructions {
+                self.gen_instruction(inst, is_entry);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Instruction selection
+    // ========================================================================
+
+    fn gen_instruction(&mut self, inst: &Inst, is_entry: bool) {
+        match inst {
+            Inst::Const(dst, val) => {
+                match val {
+                    IrConst::Int(v, ty) => {
+                        let is_u256 = matches!(ty, Ty::U256 | Ty::I256);
+                        if is_u256 && *v > u64::MAX as u128 {
+                            // u256 large value → store all 32 bytes to heap, Wload
+                            let wd = self.regs.alloc_wide(*dst);
+                            // Split u128 into 4 x u64 limbs (LE order)
+                            let limb0 = (*v & 0xFFFFFFFFFFFFFFFF) as u64;
+                            let limb1 = ((*v >> 64) & 0xFFFFFFFFFFFFFFFF) as u64;
+                            // u128 only holds 128 bits; limbs 2-3 are zero
+                            self.load_u64_to_reg(15, limb0);
+                            self.emit_store(15, 12, 0);   // heap[0..8] = limb0
+                            self.load_u64_to_reg(15, limb1);
+                            self.emit_store(15, 12, 8);   // heap[8..16] = limb1
+                            self.emit_op(Opcode::Addi, 15, 0, 0);
+                            self.emit_store(15, 12, 16);  // heap[16..24] = 0
+                            self.emit_store(15, 12, 24);  // heap[24..32] = 0
+                            // Wload from heap into wide register
+                            self.emit_op(Opcode::Wload, wd, 12, 0);
+                            // Advance heap past the 32 bytes
+                            self.emit_op(Opcode::Addi, 12, 12, 32);
+                        } else if *v <= 0x1FFFF as u128 {
+                            // Fits in 17-bit positive Addi (PVM sign-extends 18-bit immediate)
+                            let rd = self.alloc_gp(*dst);
+                            self.emit_op(Opcode::Addi, rd, 0, *v as u32);
+                        } else {
+                            let rd = self.alloc_gp(*dst);
+                            self.load_u64_to_reg(rd, *v as u64);
+                        }
+                    }
+                    IrConst::Bool(b) => {
+                        let rd = self.alloc_gp(*dst);
+                        self.emit_op(Opcode::Addi, rd, 0, if *b { 1 } else { 0 });
+                    }
+                    IrConst::Address(bytes) => {
+                        // Addresses are 256-bit → wide register
+                        let wd = self.regs.alloc_wide(*dst);
+                        // Load address bytes to memory, then Wload
+                        // For zero address, just widen 0
+                        let all_zero = bytes.iter().all(|&b| b == 0);
+                        if all_zero {
+                            self.emit_op(Opcode::Addi, 15, 0, 0);
+                            self.emit_op(Opcode::Widen, wd, 15, 0);
+                        } else {
+                            // Store bytes to heap, Wload from heap
+                            for (i, chunk) in bytes.chunks(8).enumerate() {
+                                let mut buf = [0u8; 8];
+                                buf[..chunk.len()].copy_from_slice(chunk);
+                                let val = u64::from_le_bytes(buf);
+                                self.load_u64_to_reg(15, val);
+                                self.emit_store(15, 12, (i as i32) * 8);
+                            }
+                            self.emit_op(Opcode::Wload, wd, 12, 0);
+                            // Advance heap past the 32 bytes
+                            self.emit_op(Opcode::Addi, 12, 12, 32);
+                        }
+                    }
+                    IrConst::Unit => {}
+                    _ => {
+                        let rd = self.alloc_gp(*dst);
+                        self.emit_op(Opcode::Addi, rd, 0, 0);
+                    }
+                }
+            }
+
+            Inst::BinOp(dst, op, lhs, rhs) => {
+                let lhs_wide = self.regs.is_wide(*lhs);
+                let rhs_wide = self.regs.is_wide(*rhs);
+                let use_wide = lhs_wide || rhs_wide;
+
+                if use_wide {
+                    let wd = self.regs.alloc_wide(*dst);
+                    let w1 = self.get_reg(*lhs);
+                    let w2 = self.get_reg(*rhs);
+                    let pvm_op = match op {
+                        BinOp::Add => Opcode::Wadd,
+                        BinOp::Sub => Opcode::Wsub,
+                        BinOp::Mul => Opcode::Wmul,
+                        BinOp::Div => Opcode::Wdiv,
+                        BinOp::Mod => Opcode::Wmod,
+                        BinOp::BitAnd => Opcode::Wand,
+                        BinOp::BitOr => Opcode::Wor,
+                        BinOp::BitXor => Opcode::Wxor,
+                        _ => Opcode::Wadd, // shifts/logical on wide fallback
+                    };
+                    self.emit_op(pvm_op, wd, w1, w2 as u32);
+                } else {
+                    let rd = self.alloc_gp(*dst);
+                    let r1 = self.get_reg(*lhs);
+                    let r2 = self.get_reg(*rhs);
+                    let pvm_op = match op {
+                        BinOp::Add => Opcode::Add,
+                        BinOp::Sub => Opcode::Sub,
+                        BinOp::Mul => Opcode::Mul,
+                        BinOp::Div => Opcode::Div,
+                        BinOp::Mod => Opcode::Mod,
+                        BinOp::BitAnd => Opcode::And,
+                        BinOp::BitOr => Opcode::Or,
+                        BinOp::BitXor => Opcode::Xor,
+                        BinOp::Shl => Opcode::Shl,
+                        BinOp::Shr => Opcode::Shr,
+                        BinOp::LogicalAnd => Opcode::And,
+                        BinOp::LogicalOr => Opcode::Or,
+                    };
+                    self.emit_op(pvm_op, rd, r1, r2 as u32);
+                }
+            }
+
+            Inst::UnOp(dst, op, src) => {
+                let rd = self.alloc_gp(*dst);
+                let r1 = self.get_reg(*src);
+                match op {
+                    UnOp::Neg => {
+                        // Two's complement: -a = ~a + 1 (avoids PVM checked_sub underflow trap)
+                        self.emit_op(Opcode::Not, rd, r1, 0);      // rd = ~a
+                        self.emit_op(Opcode::Addi, rd, rd, 1);     // rd = ~a + 1 = -a
+                    }
+                    UnOp::LogicalNot => {
+                        self.emit_op(Opcode::Addi, 15, 0, 1);
+                        self.emit_op(Opcode::Xor, rd, r1, 15);
+                    }
+                    UnOp::BitNot => {
+                        self.emit_op(Opcode::Not, rd, r1, 0);
+                    }
+                }
+            }
+
+            Inst::Cmp(dst, op, lhs, rhs) => {
+                let rd = self.alloc_gp(*dst);
+                let lhs_wide = self.regs.is_wide(*lhs);
+                let r1 = self.get_reg(*lhs);
+                let r2 = self.get_reg(*rhs);
+
+                if lhs_wide {
+                    match op {
+                        CmpOp::Eq => self.emit_op(Opcode::Weq, rd, r1, r2 as u32),
+                        CmpOp::Lt => self.emit_op(Opcode::Wlt, rd, r1, r2 as u32),
+                        CmpOp::Gt => self.emit_op(Opcode::Wlt, rd, r2, r1 as u32),
+                        CmpOp::NotEq => {
+                            self.emit_op(Opcode::Weq, rd, r1, r2 as u32);
+                            self.emit_op(Opcode::Addi, 15, 0, 1);
+                            self.emit_op(Opcode::Xor, rd, rd, 15);
+                        }
+                        CmpOp::LtEq => {
+                            self.emit_op(Opcode::Wlt, rd, r2, r1 as u32); // gt
+                            self.emit_op(Opcode::Addi, 15, 0, 1);
+                            self.emit_op(Opcode::Xor, rd, rd, 15); // !gt = le
+                        }
+                        CmpOp::GtEq => {
+                            self.emit_op(Opcode::Wlt, rd, r1, r2 as u32); // lt
+                            self.emit_op(Opcode::Addi, 15, 0, 1);
+                            self.emit_op(Opcode::Xor, rd, rd, 15); // !lt = ge
+                        }
+                    }
+                } else {
+                    match op {
+                        CmpOp::Eq => self.emit_op(Opcode::Eq, rd, r1, r2 as u32),
+                        CmpOp::NotEq => {
+                            self.emit_op(Opcode::Eq, rd, r1, r2 as u32);
+                            self.emit_op(Opcode::Addi, 15, 0, 1);
+                            self.emit_op(Opcode::Xor, rd, rd, 15);
+                        }
+                        CmpOp::Lt => self.emit_op(Opcode::Lt, rd, r1, r2 as u32),
+                        CmpOp::Gt => self.emit_op(Opcode::Gt, rd, r1, r2 as u32),
+                        CmpOp::LtEq => {
+                            self.emit_op(Opcode::Gt, rd, r1, r2 as u32);
+                            self.emit_op(Opcode::Addi, 15, 0, 1);
+                            self.emit_op(Opcode::Xor, rd, rd, 15);
+                        }
+                        CmpOp::GtEq => {
+                            self.emit_op(Opcode::Lt, rd, r1, r2 as u32);
+                            self.emit_op(Opcode::Addi, 15, 0, 1);
+                            self.emit_op(Opcode::Xor, rd, rd, 15);
+                        }
+                    }
+                }
+            }
+
+            // ==== Storage operations (fixed: wide register keys + mode bits) ====
+
+            Inst::StorageGet(dst, field) => {
+                let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
+                let ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let wide_value = is_wide_type(&ty);
+
+                // Widen slot to wide scratch
+                self.emit_op(Opcode::Addi, 15, 0, slot);
+                self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
+
+                if wide_value {
+                    let wd = self.regs.alloc_wide(*dst);
+                    self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0); // mode 0: wide value
+                } else {
+                    let rd = self.alloc_gp(*dst);
+                    self.emit_op(Opcode::Sload, rd, WIDE_SCRATCH, 2); // mode 2: GP value
+                }
+            }
+
+            Inst::StorageSet(field, val) => {
+                let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
+                let ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let wide_value = is_wide_type(&ty);
+
+                // Widen slot to wide scratch
+                self.emit_op(Opcode::Addi, 15, 0, slot);
+                self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
+
+                let rv = self.get_reg(*val);
+                if wide_value {
+                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0); // mode 0: wide value
+                } else {
+                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 2); // mode 2: GP value
+                }
+            }
+
+            Inst::StorageMapGet(dst, field, key) => {
+                let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
+                let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let val_ty = map_value_type(&map_ty);
+                let wide_value = is_wide_type(&val_ty);
+
+                // Derive storage key: poseidon2(slot || map_key)
+                let rk = self.get_reg(*key);
+                self.emit_map_key_derivation(slot, rk);
+                // w7 now holds the derived key
+
+                if wide_value {
+                    let wd = self.regs.alloc_wide(*dst);
+                    self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0);
+                } else {
+                    let rd = self.alloc_gp(*dst);
+                    self.emit_op(Opcode::Sload, rd, WIDE_SCRATCH, 2);
+                }
+            }
+
+            Inst::StorageMapSet(field, key, val) => {
+                let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
+                let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let val_ty = map_value_type(&map_ty);
+                let wide_value = is_wide_type(&val_ty);
+
+                let rk = self.get_reg(*key);
+                let rv = self.get_reg(*val);
+                self.emit_map_key_derivation(slot, rk);
+
+                if wide_value {
+                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0);
+                } else {
+                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 2);
+                }
+            }
+
+            // ==== Builtins (fixed: Callvalue → wide, Caller → GP) ====
+
+            Inst::Builtin(dst, op) => {
+                match op {
+                    BuiltinOp::MsgSender => {
+                        let wd = self.regs.alloc_wide(*dst);
+                        self.emit_op(Opcode::Callvalue, wd, 0, 3); // env_wide::CALLER
+                    }
+                    BuiltinOp::MsgValue => {
+                        let wd = self.regs.alloc_wide(*dst);
+                        self.emit_op(Opcode::Callvalue, wd, 0, 0); // env_wide::CALL_VALUE
+                    }
+                    BuiltinOp::MsgData => {
+                        // Calldata pointer is in r5
+                        let rd = self.alloc_gp(*dst);
+                        self.emit_op(Opcode::Add, rd, 5, 0); // rd = r5
+                    }
+                    BuiltinOp::BlockTimestamp => {
+                        let rd = self.alloc_gp(*dst);
+                        self.emit_op(Opcode::Caller, rd, 0, 1); // env_gp::TIMESTAMP
+                    }
+                    BuiltinOp::BlockHeight => {
+                        let rd = self.alloc_gp(*dst);
+                        self.emit_op(Opcode::Caller, rd, 0, 0); // env_gp::BLOCK_NUMBER
+                    }
+                    BuiltinOp::BlockProposer => {
+                        let wd = self.regs.alloc_wide(*dst);
+                        self.emit_op(Opcode::Addi, 15, 0, 0);
+                        self.emit_op(Opcode::Widen, wd, 15, 0); // placeholder: zero address
+                    }
+                    BuiltinOp::TxGasPrice => {
+                        let wd = self.regs.alloc_wide(*dst);
+                        self.emit_op(Opcode::Callvalue, wd, 0, 1); // env_wide::GAS_PRICE
+                    }
+                    BuiltinOp::TxNonce => {
+                        let rd = self.alloc_gp(*dst);
+                        self.emit_op(Opcode::Addi, rd, 0, 0); // placeholder
+                    }
+                    BuiltinOp::TxHash => {
+                        let wd = self.regs.alloc_wide(*dst);
+                        self.emit_op(Opcode::Addi, 15, 0, 0);
+                        self.emit_op(Opcode::Widen, wd, 15, 0); // placeholder
+                    }
+                    BuiltinOp::TxGasLimit => {
+                        let rd = self.alloc_gp(*dst);
+                        self.emit_op(Opcode::Addi, rd, 0, 0); // placeholder
+                    }
+                    BuiltinOp::AddressOfSelf => {
+                        let wd = self.regs.alloc_wide(*dst);
+                        self.emit_op(Opcode::Callvalue, wd, 0, 4); // env_wide::ADDRESS
+                    }
+                    BuiltinOp::GasRemaining => {
+                        let rd = self.alloc_gp(*dst);
+                        self.emit_op(Opcode::Caller, rd, 0, 2); // env_gp::GAS_REMAINING
+                    }
+                }
+            }
+
+            Inst::Jump(label) => {
+                self.emit_jump_placeholder(Opcode::Jmp, 0, 0, *label);
+            }
+
+            Inst::Branch(cond, then_label, else_label) => {
+                let rc = self.get_reg(*cond);
+                self.emit_jump_placeholder(Opcode::Bne, rc, 0, *then_label);
+                self.emit_jump_placeholder(Opcode::Jmp, 0, 0, *else_label);
+            }
+
+            Inst::Return(val) => {
+                if let Some(v) = val {
+                    let rv = self.get_reg(*v);
+                    if rv != 1 {
+                        if self.regs.is_wide(*v) {
+                            // Wide return: Narrow to GP r1 (traps if > u64::MAX)
+                            self.emit_op(Opcode::Narrow, 1, rv, 0);
+                        } else {
+                            self.emit_op(Opcode::Add, 1, rv, 0);
+                        }
+                    }
+                }
+                if is_entry {
+                    self.emit_op(Opcode::Halt, 0, 0, 0);
+                } else {
+                    self.emit_op(Opcode::Ret, 0, 0, 0);
+                }
+            }
+
+            Inst::Revert(name, fields) => {
+                // Encode error data to heap: [selector:8][field0:8][field1:8]...
+                // PVM Revert doesn't read data yet, but it's available in memory for debugging.
+                if !fields.is_empty() {
+                    let selector = compute_selector(name) as u64;
+                    self.load_u64_to_reg(15, selector);
+                    self.emit_store(15, 12, 0);
+                    for (i, freg) in fields.iter().enumerate() {
+                        let fr = self.get_reg(*freg);
+                        self.emit_store(fr, 12, ((i + 1) * 8) as i32);
+                    }
+                }
+                self.emit_op(Opcode::Revert, 0, 0, 0);
+            }
+
+            Inst::Emit(name, fields) => {
+                // Write event descriptor to heap memory, then Log
+                // Layout: [topic0: 32 bytes (event name hash)] [data_ptr: 8] [data_len: 8]
+                let desc_base = 12; // r12 = heap pointer (descriptor start)
+
+                // Topic 0: hash of event name (simplified: FNV hash widened to 256-bit)
+                let name_hash = compute_selector(name) as u64;
+                self.load_u64_to_reg(15, name_hash);
+                self.emit_store(15, 12, 0);  // store low 8 bytes of topic
+                self.emit_op(Opcode::Addi, 15, 0, 0);
+                self.emit_store(15, 12, 8);  // zero upper bytes
+                self.emit_store(15, 12, 16);
+                self.emit_store(15, 12, 24);
+
+                // Data: store field values after descriptor
+                let data_start_offset = 32 + 16; // after topic + ptr/len
+                for (i, freg) in fields.iter().enumerate() {
+                    let fr = self.get_reg(*freg);
+                    self.emit_store(fr, 12, (data_start_offset + i * 8) as i32);
+                }
+
+                // Write data_ptr and data_len at offset 32
+                // data_ptr = r12 + data_start_offset
+                self.emit_op(Opcode::Addi, 14, 12, data_start_offset as u32);
+                self.emit_store(14, 12, 32); // data_ptr
+                let data_len = (fields.len() * 8) as u32;
+                self.emit_op(Opcode::Addi, 14, 0, data_len);
+                self.emit_store(14, 12, 40); // data_len
+
+                // Log rs1=descriptor pointer, imm=num_topics
+                // PVM reads descriptor from rs1, NOT rd
+                self.emit_op(Opcode::Log, 0, desc_base, 1);
+
+                // Advance heap past descriptor + data
+                let total = data_start_offset as u32 + data_len;
+                self.emit_op(Opcode::Addi, 12, 12, total);
+            }
+
+            Inst::Call(dst, name, args) => {
+                let rd = self.alloc_gp(*dst);
+                // Push all args to stack first (avoids register clobbering)
+                for arg in args.iter() {
+                    let src = self.get_reg(*arg);
+                    self.emit_op(Opcode::Push, src, 0, 0);
+                }
+                // Pop into convention registers (reverse order, stack is LIFO)
+                for i in (0..args.len()).rev() {
+                    let dst_phys = (i as u8) + 2;
+                    self.emit_op(Opcode::Pop, dst_phys, 0, 0);
+                }
+                // Call (PVM pushes return frame, jumps to target)
+                if let Some(&label) = self.func_labels.get(name.as_str()) {
+                    let offset = self.current_offset();
+                    self.emit_op(Opcode::Call, 0, 0, 0); // placeholder
+                    self.fixups.push((offset, label));
+                } else {
+                    // Unknown function (built-in or external) — placeholder
+                    self.emit_op(Opcode::Addi, rd, 0, 0);
+                }
+                // Return value in r1 → move to destination
+                if rd != 1 {
+                    self.emit_op(Opcode::Add, rd, 1, 0);
+                }
+            }
+
+            Inst::Hash(dst, args) => {
+                let wd = self.regs.alloc_wide(*dst);
+                // Write hash arguments to heap memory
+                for (i, arg) in args.iter().enumerate() {
+                    let r = self.get_reg(*arg);
+                    self.emit_store(r, 12, (i as i32) * 8);
+                }
+                let byte_len = (args.len() * 8) as u32;
+                // Set up Poseidon: wd = poseidon(mem[r12..r12+len])
+                // r14 = length in bytes
+                self.emit_op(Opcode::Addi, 14, 0, byte_len);
+                // Poseidon: encode(Poseidon, wd, base_reg, len_reg_index)
+                self.emit_op(Opcode::Poseidon, wd, 12, 14); // len_reg = r14
+                // Don't advance heap (temporary data, will be overwritten)
+            }
+
+            Inst::Cast(dst, src, ty) => {
+                let src_wide = self.regs.is_wide(*src);
+                let dst_wide = is_wide_type(ty);
+
+                if !src_wide && dst_wide {
+                    // GP → Wide: Widen
+                    let wd = self.regs.alloc_wide(*dst);
+                    let rs = self.get_reg(*src);
+                    self.emit_op(Opcode::Widen, wd, rs, 0);
+                } else if src_wide && !dst_wide {
+                    // Wide → GP: Narrow (traps if > u64::MAX)
+                    let rd = self.alloc_gp(*dst);
+                    let ws = self.get_reg(*src);
+                    self.emit_op(Opcode::Narrow, rd, ws, 0);
+                } else {
+                    // Same register file: copy
+                    let rd = self.alloc_gp(*dst);
+                    let rs = self.get_reg(*src);
+                    if rd != rs {
+                        self.emit_op(Opcode::Add, rd, rs, 0);
+                    }
+                }
+            }
+
+            Inst::StructInit(dst, _name, fields) => {
+                let rd = self.alloc_gp(*dst);
+                let struct_size = (fields.len() as u32) * memory::WORD_SIZE;
+                // Allocate on heap: rd = heap_ptr; heap_ptr += struct_size
+                self.emit_op(Opcode::Add, rd, 12, 0);
+                self.emit_op(Opcode::Addi, 12, 12, struct_size);
+                for (i, (fname, freg)) in fields.iter().enumerate() {
+                    let fr = self.get_reg(*freg);
+                    let offset = (i as u32) * memory::WORD_SIZE;
+                    self.emit_store(fr, rd, offset as i32);
+                }
+            }
+
+            Inst::FieldGet(dst, obj, field) => {
+                let rd = self.alloc_gp(*dst);
+                let ro = self.get_reg(*obj);
+                // Numeric field name (e.g., "0", "1") = tuple index access
+                let offset = if let Ok(idx) = field.parse::<u32>() {
+                    idx * memory::WORD_SIZE as u32
+                } else {
+                    // Named field: look up in struct_defs
+                    self.field_offsets.get(field.as_str())
+                        .copied()
+                        .unwrap_or(0)
+                };
+                self.emit_load(rd, ro, offset as i32);
+            }
+
+            Inst::IndexGet(dst, obj, idx) => {
+                let rd = self.alloc_gp(*dst);
+                let ro = self.get_reg(*obj);
+                let ri = self.get_reg(*idx);
+                // addr = base + idx * 8
+                self.emit_op(Opcode::Addi, 14, 0, 3);
+                self.emit_op(Opcode::Shl, 15, ri, 14);
+                self.emit_op(Opcode::Add, 15, ro, 15);
+                self.emit_load(rd, 15, 0);
+            }
+
+            Inst::IndexSet(obj, idx, val) => {
+                let ro = self.get_reg(*obj);
+                let ri = self.get_reg(*idx);
+                let rv = self.get_reg(*val);
+                self.emit_op(Opcode::Addi, 14, 0, 3);
+                self.emit_op(Opcode::Shl, 15, ri, 14);
+                self.emit_op(Opcode::Add, 15, ro, 15);
+                self.emit_store(rv, 15, 0);
+            }
+
+            Inst::MakeTuple(dst, regs) => {
+                let rd = self.alloc_gp(*dst);
+                let size = (regs.len() as u32) * memory::WORD_SIZE;
+                self.emit_op(Opcode::Add, rd, 12, 0);
+                self.emit_op(Opcode::Addi, 12, 12, size);
+                for (i, reg) in regs.iter().enumerate() {
+                    let r = self.get_reg(*reg);
+                    let offset = (i as u32) * memory::WORD_SIZE;
+                    self.emit_store(r, rd, offset as i32);
+                }
+            }
+
+            Inst::TupleGet(dst, tuple, idx) => {
+                let rd = self.alloc_gp(*dst);
+                let rt = self.get_reg(*tuple);
+                let offset = (*idx) * (memory::WORD_SIZE as u32);
+                self.emit_load(rd, rt, offset as i32);
+            }
+
+            Inst::MakeArray(dst, regs) => {
+                let rd = self.alloc_gp(*dst);
+                let size = (regs.len() as u32) * memory::WORD_SIZE;
+                self.emit_op(Opcode::Add, rd, 12, 0);
+                self.emit_op(Opcode::Addi, 12, 12, size);
+                for (i, reg) in regs.iter().enumerate() {
+                    let r = self.get_reg(*reg);
+                    let offset = (i as u32) * memory::WORD_SIZE;
+                    self.emit_store(r, rd, offset as i32);
+                }
+            }
+
+            Inst::ArrayRepeat(dst, val, count) => {
+                let rd = self.alloc_gp(*dst);
+                let rv = self.get_reg(*val);
+                let size = (*count as u32) * memory::WORD_SIZE;
+                self.emit_op(Opcode::Add, rd, 12, 0);
+                self.emit_op(Opcode::Addi, 12, 12, size);
+                for i in 0..*count {
+                    let offset = (i as u32) * memory::WORD_SIZE;
+                    self.emit_store(rv, rd, offset as i32);
+                }
+            }
+
+            Inst::MethodCall(dst, obj, method, args) => {
+                let rd = self.alloc_gp(*dst);
+                let ro = self.get_reg(*obj);
+
+                match method.as_str() {
+                    "push" if !args.is_empty() => {
+                        let val_reg = self.get_reg(args[0]);
+                        // Load length and capacity
+                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);  // r15 = length
+                        self.emit_load(memory::REG_SCRATCH_0, ro, memory::VEC_CAPACITY_OFFSET as i32); // r14 = capacity
+                        // Assert length < capacity (reverts if Vec is full — safe, no memory corruption)
+                        // Vec starts with capacity 16. Realloc requires MEMCPY (future ISA extension).
+                        self.emit_op(Opcode::Lt, 13, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
+                        self.emit_op(Opcode::Assert, 0, 13, 0);
+                        // Compute data address: base + VEC_DATA_OFFSET + length * 8
+                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 0, 3);
+                        self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
+                        self.emit_op(Opcode::Add, memory::REG_SCRATCH_0, ro, memory::REG_SCRATCH_0 as u32);
+                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, memory::VEC_DATA_OFFSET);
+                        // Store value
+                        self.emit_store(val_reg, memory::REG_SCRATCH_0, 0);
+                        // Increment length
+                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_1, memory::REG_SCRATCH_1, 1);
+                        self.emit_store(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
+                    }
+                    "pop" => {
+                        // Load length, assert > 0
+                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
+                        self.emit_op(Opcode::Assert, 0, memory::REG_SCRATCH_1, 0); // revert if empty
+                        // Decrement length: Addi with sign-extended -1 (0x3FFFF in 18-bit = -1)
+                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_1, memory::REG_SCRATCH_1, 0x3FFFF);
+                        self.emit_store(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
+                        // Load popped value from data[new_length]
+                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 0, 3);
+                        self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
+                        self.emit_op(Opcode::Add, memory::REG_SCRATCH_0, ro, memory::REG_SCRATCH_0 as u32);
+                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, memory::VEC_DATA_OFFSET);
+                        self.emit_load(rd, memory::REG_SCRATCH_0, 0);
+                    }
+                    "len" => {
+                        self.emit_load(rd, ro, memory::VEC_LENGTH_OFFSET as i32);
+                    }
+                    "is_empty" => {
+                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
+                        self.emit_op(Opcode::Eq, rd, memory::REG_SCRATCH_1, 0);
+                    }
+                    _ => {
+                        for arg in args {
+                            let r = self.get_reg(*arg);
+                            self.emit_op(Opcode::Push, r, 0, 0);
+                        }
+                        self.emit_op(Opcode::Addi, rd, 0, 0);
+                    }
+                }
+            }
+
+            Inst::ExtCall(dst, addr, _method, args) => {
+                let rd = self.alloc_gp(*dst);
+                let ra = self.get_reg(*addr);
+
+                // Write calldata (args) to heap
+                for (i, arg) in args.iter().enumerate() {
+                    let r = self.get_reg(*arg);
+                    self.emit_store(r, 12, (i as i32) * 8);
+                }
+                let calldata_len = (args.len() * 8) as u32;
+
+                // Set up CallExt encoding:
+                // rd = target address (wide register)
+                // rs1 = calldata pointer GP register (r12 = heap)
+                // imm[3:0] = calldata length register
+                // imm[7:4] = gas register
+                // imm[11:8] = result register
+                self.emit_op(Opcode::Addi, 14, 0, calldata_len);  // r14 = calldata len
+                // Use r14 for len (14), r15 for gas (15), r13 for result (13)
+                self.emit_op(Opcode::Caller, 15, 0, 2);           // r15 = gas_remaining
+                let imm = (14 & 0xF)           // len_reg = r14
+                    | ((15 & 0xF) << 4)         // gas_reg = r15
+                    | ((13 & 0xF) << 8);        // result_reg = r13
+                self.emit_op(Opcode::CallExt, ra, 12, imm);
+
+                // Advance heap past calldata
+                self.emit_op(Opcode::Addi, 12, 12, calldata_len);
+
+                // Move result to destination
+                self.emit_op(Opcode::Add, rd, 13, 0);
+            }
+
+            Inst::CrossCall { target, method, args, .. } => {
+                let rt = self.get_reg(*target);
+                let rm = self.get_reg(*method);
+                for arg in args {
+                    let r = self.get_reg(*arg);
+                    self.emit_op(Opcode::Push, r, 0, 0);
+                }
+                // Use Log as async message queue placeholder
+                self.emit_op(Opcode::Log, rt, rm, 0);
+            }
+
+            Inst::RawCall(dst, target, args) => {
+                let rd = self.alloc_gp(*dst);
+                let rt = self.get_reg(*target);
+                for arg in args {
+                    let r = self.get_reg(*arg);
+                    self.emit_op(Opcode::Push, r, 0, 0);
+                }
+                self.emit_op(Opcode::CallExt, rd, rt, 0);
+            }
+
+            Inst::MakeVec(dst, cap) => {
+                let rd = self.alloc_gp(*dst);
+                let total_size = 16 + (*cap as u32) * memory::WORD_SIZE; // header + data slots
+                // rd = current heap pointer (Vec base)
+                self.emit_op(Opcode::Add, rd, 12, 0);
+                // Store length = 0
+                self.emit_op(Opcode::Addi, 15, 0, 0);
+                self.emit_store(15, rd, memory::VEC_LENGTH_OFFSET as i32);
+                // Store capacity
+                self.load_u32_to_reg(15, *cap as u32);
+                self.emit_store(15, rd, memory::VEC_CAPACITY_OFFSET as i32);
+                // Advance heap past header + data slots
+                self.load_u32_to_reg(15, total_size);
+                self.emit_op(Opcode::Add, 12, 12, 15);
+            }
+
+            Inst::Comment(_) => {}
+            Inst::Phi(_, _) => {}
+        }
+    }
+
+    // ========================================================================
+    // Emit helpers
+    // ========================================================================
+
+    /// Allocate a GP register for a virtual register, emitting spill Store if eviction needed.
+    fn alloc_gp(&mut self, vreg: Reg) -> u8 {
+        let (phys, spill) = self.regs.alloc(vreg);
+        if let Some(SpillAction::Save(reg, slot)) = spill {
+            // Store evicted register to spill area: mem[r13 + slot*8] = reg
+            let offset = (slot * 8) as i32;
+            let imm = encode_mem_immediate(offset, MemWidth::W64);
+            self.instructions.push(encode(Opcode::Store, reg, 13, imm));
+        }
+        phys
+    }
+
+    /// Get the physical register for a virtual register, emitting spill Load if needed.
+    fn get_reg(&mut self, vreg: Reg) -> u8 {
+        match self.regs.get_or_spilled(vreg) {
+            Ok(phys) => phys,
+            Err(RestoreAction::Restore(temp_reg, slot)) => {
+                // Load from spill area: temp_reg = mem[r13 + slot*8]
+                let offset = (slot * 8) as i32;
+                let imm = encode_mem_immediate(offset, MemWidth::W64);
+                self.instructions.push(encode(Opcode::Load, temp_reg, 13, imm));
+                temp_reg
+            }
+        }
+    }
+
+    fn emit(&mut self, inst: Instruction) {
+        self.instructions.push(inst);
+    }
+
+    fn emit_op(&mut self, op: Opcode, rd: u8, rs1: u8, rs2_or_imm: u32) {
+        self.emit(encode(op, rd, rs1, rs2_or_imm & 0x3FFFF));
+    }
+
+    fn emit_load(&mut self, rd: u8, base: u8, offset: i32) {
+        let imm = encode_mem_immediate(offset, MemWidth::W64);
+        self.emit(encode(Opcode::Load, rd, base, imm));
+    }
+
+    fn emit_store(&mut self, val: u8, base: u8, offset: i32) {
+        let imm = encode_mem_immediate(offset, MemWidth::W64);
+        self.emit(encode(Opcode::Store, val, base, imm));
+    }
+
+    fn current_offset(&self) -> usize {
+        self.instructions.len()
+    }
+
+    fn emit_jump_placeholder(&mut self, op: Opcode, rd: u8, rs1: u8, target: Label) {
+        let idx = self.current_offset();
+        self.emit_op(op, rd, rs1, 0);
+        self.fixups.push((idx, target));
+    }
+
+    fn mark_label(&mut self, label: Label) {
+        self.label_offsets.insert(label, self.current_offset());
+    }
+
+    fn resolve_fixups(&mut self) {
+        for (inst_idx, label) in &self.fixups {
+            if let Some(&target_offset) = self.label_offsets.get(label) {
+                let target_bytes = (target_offset * 4) as i32;
+                let inst_bytes = (*inst_idx * 4) as i32;
+                let relative_offset = target_bytes - inst_bytes;
+
+                let old = self.instructions[*inst_idx];
+                let opcode_bits = (old.0 >> 26) & 0x3F;
+                let rd_bits = (old.0 >> 22) & 0xF;
+                let rs1_bits = (old.0 >> 18) & 0xF;
+                let offset_bits = (relative_offset as u32) & 0x3FFFF;
+                let new_word = (opcode_bits << 26)
+                    | (rd_bits << 22)
+                    | (rs1_bits << 18)
+                    | offset_bits;
+                self.instructions[*inst_idx] = Instruction(new_word);
+            }
+        }
+    }
+
+    /// Load a u32 into a GP register (handles > 17-bit values).
+    /// PVM's Addi sign-extends the 18-bit immediate, so max positive is 0x1FFFF (131071).
+    fn load_u32_to_reg(&mut self, rd: u8, val: u32) {
+        if val <= 0x1FFFF {
+            self.emit_op(Opcode::Addi, rd, 0, val);
+        } else {
+            let scratch = if rd == 15 { 14 } else { 15 };
+            let low = val & 0x1FFFF;
+            let high = val >> 17;
+            self.emit_op(Opcode::Addi, rd, 0, high);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
+            if low > 0 {
+                self.emit_op(Opcode::Addi, scratch, 0, low);
+                self.emit_op(Opcode::Or, rd, rd, scratch as u32);
+            }
+        }
+    }
+
+    /// Load a u64 into a GP register (handles full 64-bit range).
+    /// Uses 17-bit chunks to avoid PVM Addi sign extension.
+    /// Uses r15 as scratch (or r14 if rd==15) to avoid self-clobbering.
+    fn load_u64_to_reg(&mut self, rd: u8, val: u64) {
+        if val <= 0x1FFFF {
+            self.emit_op(Opcode::Addi, rd, 0, val as u32);
+            return;
+        }
+
+        // Scratch register: use r15 normally, r14 if rd==15 (avoid self-clobber)
+        let scratch = if rd == 15 { 14 } else { 15 };
+
+        let chunk0 = (val & 0x1FFFF) as u32;
+        let chunk1 = ((val >> 17) & 0x1FFFF) as u32;
+        let chunk2 = ((val >> 34) & 0x1FFFF) as u32;
+        let chunk3 = ((val >> 51) & 0x1FFF) as u32;
+
+        if chunk3 > 0 {
+            self.emit_op(Opcode::Addi, rd, 0, chunk3);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, chunk2);
+            self.emit_op(Opcode::Or, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, chunk1);
+            self.emit_op(Opcode::Or, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
+            if chunk0 > 0 {
+                self.emit_op(Opcode::Addi, scratch, 0, chunk0);
+                self.emit_op(Opcode::Or, rd, rd, scratch as u32);
+            }
+        } else if chunk2 > 0 {
+            self.emit_op(Opcode::Addi, rd, 0, chunk2);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, chunk1);
+            self.emit_op(Opcode::Or, rd, rd, scratch as u32);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
+            if chunk0 > 0 {
+                self.emit_op(Opcode::Addi, scratch, 0, chunk0);
+                self.emit_op(Opcode::Or, rd, rd, scratch as u32);
+            }
+        } else {
+            self.emit_op(Opcode::Addi, rd, 0, chunk1);
+            self.emit_op(Opcode::Addi, scratch, 0, 17);
+            self.emit_op(Opcode::Shl, rd, rd, scratch as u32);
+            if chunk0 > 0 {
+                self.emit_op(Opcode::Addi, scratch, 0, chunk0);
+                self.emit_op(Opcode::Or, rd, rd, scratch as u32);
+            }
+        }
+    }
+
+    /// Derive a map storage key: w7 = poseidon2(slot || key).
+    /// Writes slot + key to heap memory, hashes them, result in w7.
+    fn emit_map_key_derivation(&mut self, slot: u32, key_reg: u8) {
+        // Store slot to heap
+        self.emit_op(Opcode::Addi, 15, 0, slot);
+        self.emit_store(15, 12, 0);   // heap[0] = slot
+        // Store key to heap
+        self.emit_store(key_reg, 12, 8); // heap[8] = key
+        // Hash 16 bytes: poseidon(mem[r12..r12+16])
+        self.emit_op(Opcode::Addi, 14, 0, 16);  // r14 = 16 (byte length)
+        // Poseidon: w7 = hash(mem[r12..r12+r14])
+        self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
+    }
+}
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+/// Check if a type uses wide (256-bit) register.
+fn is_wide_type(ty: &Ty) -> bool {
+    matches!(ty, Ty::U256 | Ty::I256 | Ty::Address | Ty::Bytes)
+}
+
+/// Extract value type from a Map type.
+fn map_value_type(ty: &Ty) -> Ty {
+    if let Ty::Map(_, v) = ty {
+        *v.clone()
+    } else {
+        Ty::U64
+    }
+}
+
+/// Compute byte size of a struct field.
+fn field_byte_size(ty: &Ty) -> u32 {
+    if is_wide_type(ty) {
+        memory::WIDE_SIZE
+    } else {
+        memory::WORD_SIZE
+    }
+}
+
+/// Compute a function selector (FNV-1a hash of name).
+fn compute_selector(name: &str) -> u32 {
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in name.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+    use crate::lower;
+    use crate::optimize;
+
+    fn compile(src: &str) -> CompiledContract {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (file, _) = Parser::new(tokens).parse();
+        let mut ir = lower::lower(&file);
+        optimize::optimize(&mut ir);
+        let mut codegen = CodeGen::new();
+        codegen.emit_guards = false;
+        codegen.generate(&ir)
+    }
+
+    fn compile_no_opt(src: &str) -> CompiledContract {
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (file, _) = Parser::new(tokens).parse();
+        let ir = lower::lower(&file);
+        let mut codegen = CodeGen::new();
+        codegen.emit_guards = false;
+        codegen.generate(&ir)
+    }
+
+    fn run_pvm(bytecode: &[u8]) -> pyde_vm::vm::Vm {
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(100_000);
+        vm.load(bytecode).unwrap();
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => { steps += 1; if steps > 1000 { break; } }
+                Err(_) => break,
+            }
+        }
+        vm
+    }
+
+    fn run_pvm_with_context(bytecode: &[u8], ctx: pyde_vm::vm::ExecutionContext) -> pyde_vm::vm::Vm {
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000, ctx);
+        vm.load(bytecode).unwrap();
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => { steps += 1; if steps > 1000 { break; } }
+                Err(_) => break,
+            }
+        }
+        vm
+    }
+
+    // ========================================================================
+    // Basic PVM-verified tests (arithmetic, branches, loops)
+    // ========================================================================
+
+    #[test]
+    fn pvm_return_42() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 { return 42; }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 42);
+    }
+
+    #[test]
+    fn pvm_arithmetic() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a = 10;
+                    let b = 20;
+                    return a + b;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 30);
+    }
+
+    #[test]
+    fn pvm_subtraction() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a = 100;
+                    let b = 37;
+                    return a - b;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 63);
+    }
+
+    #[test]
+    fn pvm_multiplication() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    return 7 * 6;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 42);
+    }
+
+    #[test]
+    fn pvm_division() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    return 100 / 3;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 33);
+    }
+
+    #[test]
+    fn pvm_modulo() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    return 100 % 7;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 2);
+    }
+
+    #[test]
+    fn pvm_comparison_gt() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    if 10 > 5 { return 1; }
+                    return 0;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1);
+    }
+
+    #[test]
+    fn pvm_comparison_lt() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    if 3 < 7 { return 1; }
+                    return 0;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1);
+    }
+
+    #[test]
+    fn pvm_comparison_eq() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    if 42 == 42 { return 1; }
+                    return 0;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1);
+    }
+
+    #[test]
+    fn pvm_comparison_neq() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    if 42 != 43 { return 1; }
+                    return 0;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1);
+    }
+
+    #[test]
+    fn pvm_multiple_branches() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let x = 15;
+                    if x > 20 { return 1; }
+                    if x > 10 { return 2; }
+                    return 3;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 2);
+    }
+
+    #[test]
+    fn pvm_nested_arithmetic() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a = 100;
+                    let b = 30;
+                    let c = a - b;
+                    let d = c * 2;
+                    return d;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 140);
+    }
+
+    // ========================================================================
+    // Loops (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_for_loop() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut x = 0;
+                    for i in 0..3 {
+                        x = x + 1;
+                    }
+                    return x;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 3);
+    }
+
+    #[test]
+    fn pvm_while_loop() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut x = 1;
+                    while x < 100 {
+                        x = x * 2;
+                    }
+                    return x;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 128);
+    }
+
+    #[test]
+    fn pvm_mutable_var() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut x = 10;
+                    x = x + 5;
+                    x = x * 2;
+                    return x;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 30);
+    }
+
+    // ========================================================================
+    // Unary operations (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_logical_not() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let x = !true;
+                    if x { return 1; }
+                    return 0;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 0);
+    }
+
+    #[test]
+    fn pvm_bitwise_ops() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a: u64 = 0xFF;
+                    let b: u64 = 0x0F;
+                    return a & b;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 0x0F);
+    }
+
+    // ========================================================================
+    // Revert (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_revert() {
+        let compiled = compile(r#"
+            contract T {
+                error Fail {}
+                pub fn f() -> u64 {
+                    revert!(Fail {});
+                }
+            }
+        "#);
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(100_000);
+        vm.load(&compiled.bytecode).unwrap();
+        let mut result = None;
+        loop {
+            match vm.step() {
+                Ok(Some(r)) => { result = Some(r); break; }
+                Ok(None) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(matches!(result, Some(pyde_vm::vm::ExecResult::Revert)));
+    }
+
+    // ========================================================================
+    // Gas remaining builtin (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_gas_remaining() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 { return gas_remaining(); }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert!(vm.cpu.read_gp(1) > 0);
+    }
+
+    // ========================================================================
+    // Storage operations (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_storage_write_read() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage { value: u64, }
+                pub fn f() -> u64 {
+                    self.value = 42;
+                    return self.value;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [1u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 42, "storage write+read should return 42");
+    }
+
+    #[test]
+    fn pvm_storage_multiple_fields() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage { a: u64, b: u64, }
+                pub fn f() -> u64 {
+                    self.a = 10;
+                    self.b = 20;
+                    return self.a + self.b;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [2u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 30, "a + b should be 30");
+    }
+
+    // ========================================================================
+    // Struct operations (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_struct_init_field_access() {
+        let compiled = compile(r#"
+            contract T {
+                struct Point { x: u64, y: u64, }
+                pub fn f() -> u64 {
+                    let p = Point { x: 10, y: 20 };
+                    return p.x;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 10, "p.x should be 10");
+    }
+
+    #[test]
+    fn pvm_struct_second_field() {
+        let compiled = compile(r#"
+            contract T {
+                struct Point { x: u64, y: u64, }
+                pub fn f() -> u64 {
+                    let p = Point { x: 10, y: 20 };
+                    return p.y;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 20, "p.y should be 20");
+    }
+
+    // ========================================================================
+    // Tuple operations (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_tuple_destructuring() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let (a, b, c) = (10, 20, 30);
+                    return b;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 20, "second tuple element should be 20");
+    }
+
+    #[test]
+    fn pvm_tuple_dot_access() {
+        // Test tuple .0/.1/.2 field access syntax
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let t = (10, 20, 30);
+                    return t.1;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 20, "t.1 should be 20");
+    }
+
+    // ========================================================================
+    // Array operations (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_array_index() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let arr = [10, 20, 30];
+                    return arr[2];
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 30, "arr[2] should be 30");
+    }
+
+    // ========================================================================
+    // Large constants (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_large_constant_18bit() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    return 262143;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 262143, "max 18-bit value");
+    }
+
+    #[test]
+    fn pvm_large_constant_32bit() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    return 1000000;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1000000, "1 million");
+    }
+
+    #[test]
+    fn pvm_large_constant_max_u64() {
+        // Test with a value that requires all 4 chunks
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    return 1152921504606846975;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1152921504606846975u64);
+    }
+
+    // ========================================================================
+    // Cast operations (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_cast_gp_copy() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a: u64 = 42;
+                    let b = a as u64;
+                    return b;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 42);
+    }
+
+    // ========================================================================
+    // Block context builtins (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_block_timestamp() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    return block.timestamp;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            timestamp: 1234567890,
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1234567890);
+    }
+
+    #[test]
+    fn pvm_block_height() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    return block.height;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            block_number: 42,
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 42);
+    }
+
+    // ========================================================================
+    // Function dispatch + selectors
+    // ========================================================================
+
+    #[test]
+    fn codegen_selectors() {
+        let compiled = compile(r#"
+            contract T {
+                #[constructor]
+                pub fn init() {}
+                pub fn transfer() {}
+                pub fn balance_of() -> u64 { return 0; }
+                fn internal_helper() {}
+            }
+        "#);
+        assert_eq!(compiled.selectors.len(), 2);
+        let names: Vec<&str> = compiled.selectors.iter().map(|s| s.1.as_str()).collect();
+        assert!(names.contains(&"transfer"));
+        assert!(names.contains(&"balance_of"));
+    }
+
+    #[test]
+    fn codegen_produces_valid_bytecode() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 { return 42; }
+            }
+        "#);
+        assert_eq!(compiled.bytecode.len(), compiled.instruction_count * 4);
+        assert!(compiled.bytecode.len() > 0);
+    }
+
+    #[test]
+    fn codegen_minimal_contract() {
+        let compiled = compile(r#"
+            contract Token {
+                storage { supply: u256, }
+                #[constructor]
+                pub fn init() { self.supply = 1000; }
+                #[view]
+                pub fn get_supply() -> u256 { return self.supply; }
+            }
+        "#);
+        assert_eq!(compiled.name, "Token");
+        assert!(compiled.bytecode.len() > 0);
+        assert_eq!(compiled.selectors.len(), 1);
+        assert_eq!(compiled.selectors[0].1, "get_supply");
+    }
+
+    // ========================================================================
+    // Additional PVM-verified tests for remaining features
+    // ========================================================================
+
+    #[test]
+    fn pvm_bitwise_or_xor_shl_shr() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a: u64 = 0x0F;
+                    let b: u64 = 0xF0;
+                    let c = a | b;
+                    if c == 255 { return 1; }
+                    return 0;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1, "0x0F | 0xF0 = 0xFF = 255");
+    }
+
+    #[test]
+    fn pvm_shift_left() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a: u64 = 1;
+                    let b: u64 = 10;
+                    return a << b;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1024, "1 << 10 = 1024");
+    }
+
+    #[test]
+    fn pvm_shift_right() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a: u64 = 1024;
+                    let b: u64 = 3;
+                    return a >> b;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 128, "1024 >> 3 = 128");
+    }
+
+    #[test]
+    fn pvm_index_set() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut arr = [10, 20, 30];
+                    arr[1] = 99;
+                    return arr[1];
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 99, "arr[1] after set should be 99");
+    }
+
+    #[test]
+    fn pvm_internal_function_call() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                fn add(a: u64, b: u64) -> u64 {
+                    return a + b;
+                }
+                pub fn f() -> u64 {
+                    return add(10, 32);
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 42, "add(10, 32) should be 42");
+    }
+
+    #[test]
+    fn pvm_storage_accumulate() {
+        // Write, read, modify, write back, read again
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage { counter: u64, }
+                pub fn f() -> u64 {
+                    self.counter = 10;
+                    let x = self.counter;
+                    self.counter = x + 5;
+                    return self.counter;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [3u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 15, "counter should be 10+5=15");
+    }
+
+    #[test]
+    fn pvm_struct_three_fields() {
+        let compiled = compile(r#"
+            contract T {
+                struct Color { r: u64, g: u64, b: u64, }
+                pub fn f() -> u64 {
+                    let c = Color { r: 255, g: 128, b: 64 };
+                    return c.r + c.g + c.b;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 447, "255 + 128 + 64 = 447");
+    }
+
+    #[test]
+    fn pvm_array_sum_loop() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let arr = [10, 20, 30, 40];
+                    let mut sum = 0;
+                    for i in 0..4 {
+                        sum = sum + arr[i];
+                    }
+                    return sum;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 100, "10+20+30+40=100");
+    }
+
+    #[test]
+    fn pvm_nested_if_else() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let x = 50;
+                    if x > 100 {
+                        return 1;
+                    } else {
+                        if x > 25 {
+                            return 2;
+                        } else {
+                            return 3;
+                        }
+                    }
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 2, "50 > 25 but not > 100 → 2");
+    }
+
+    #[test]
+    fn pvm_for_loop_sum() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut sum = 0;
+                    for i in 0..10 {
+                        sum = sum + i;
+                    }
+                    return sum;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 45, "0+1+2+...+9 = 45");
+    }
+
+    #[test]
+    fn pvm_comparison_lteq() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    if 5 <= 5 { return 1; }
+                    return 0;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1, "5 <= 5 should be true");
+    }
+
+    #[test]
+    fn pvm_comparison_gteq() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    if 10 >= 5 { return 1; }
+                    return 0;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1, "10 >= 5 should be true");
+    }
+
+    // ========================================================================
+    // Wide register builtins (msg.sender, msg.value, address(self))
+    // ========================================================================
+
+    #[test]
+    fn pvm_msg_sender() {
+        // msg.sender is a wide (256-bit) address value.
+        // We can't return it as u64 directly, but we can check it's non-zero
+        // by narrowing (which traps if > u64::MAX) or by comparing with a known value.
+        // Simplest: check gas_remaining still works when msg.sender is in the function.
+        // Better: use msg.sender in a comparison.
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage { owner: u64, }
+                pub fn f() -> u64 {
+                    let s = msg.sender;
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            caller: [0xAB; 32],
+            self_address: [1u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        // If Callvalue wrote to wrong register file, this would trap.
+        // Returning 1 proves msg.sender didn't corrupt execution.
+        assert_eq!(vm.cpu.read_gp(1), 1, "msg.sender should not corrupt execution");
+        // Also verify the wide register actually got the caller value
+        let w = vm.cpu.read_wide(0); // first wide alloc = w0
+        assert_ne!(w, pyde_vm::wide::U256::ZERO, "msg.sender should be non-zero");
+    }
+
+    #[test]
+    fn pvm_msg_value() {
+        // msg.value is u256 (wide). Test with #[payable] function that reads it.
+        let (tokens, _) = Lexer::new(r#"
+            contract T {
+                #[payable]
+                pub fn f() -> u64 {
+                    let v = msg.value;
+                    return 1;
+                }
+            }
+        "#).tokenize();
+        let (file, _) = Parser::new(tokens).parse();
+        let ir = lower::lower(&file);
+        let mut codegen = CodeGen::new();
+        codegen.emit_guards = false;
+        let compiled = codegen.generate(&ir);
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            call_value: pyde_vm::wide::U256::from(500u64),
+            self_address: [1u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "msg.value read should not trap");
+    }
+
+    #[test]
+    fn pvm_address_of_self() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a = address(self);
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [0xCD; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "address(self) should not trap");
+    }
+
+    // ========================================================================
+    // Payable guard (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_payable_guard_rejects_value() {
+        // Non-payable function should revert when call_value > 0
+        let (tokens, _) = Lexer::new(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    return 42;
+                }
+            }
+        "#).tokenize();
+        let (file, _) = Parser::new(tokens).parse();
+        let ir = lower::lower(&file);
+        let mut codegen = CodeGen::new();
+        codegen.emit_guards = true; // production mode with guards
+        let compiled = codegen.generate(&ir);
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            call_value: pyde_vm::wide::U256::from(100u64), // non-zero value
+            self_address: [1u8; 32],
+            ..Default::default()
+        };
+        // Use runtime_bytecode (includes dispatch + guards)
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000, ctx);
+        // Set up calldata with the correct selector
+        let selector = compute_selector("f");
+        vm.calldata = (selector as u64).to_le_bytes().to_vec();
+        vm.load(&compiled.runtime_bytecode).unwrap();
+
+        let mut result = None;
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(r)) => { result = Some(r); break; }
+                Ok(None) => { steps += 1; if steps > 500 { break; } }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            matches!(result, Some(pyde_vm::vm::ExecResult::Revert)),
+            "non-payable function should revert when call_value > 0, got {:?}", result
+        );
+    }
+
+    // ========================================================================
+    // Storage maps (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_storage_map_write_read() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage { balances: Map<u64, u64>, }
+                pub fn f() -> u64 {
+                    self.balances[42] = 100;
+                    return self.balances[42];
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [5u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 100, "map[42] should be 100");
+    }
+
+    // ========================================================================
+    // Reentrancy guard (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_reentrancy_guard_sets_and_clears() {
+        // Verify the reentrancy guard doesn't prevent a single normal call.
+        // The guard sets lock=1 before function body, clears lock=0 after return.
+        let (tokens, _) = Lexer::new(r#"
+            contract T {
+                storage { value: u64, }
+                pub fn f() -> u64 {
+                    self.value = 42;
+                    return self.value;
+                }
+            }
+        "#).tokenize();
+        let (file, _) = Parser::new(tokens).parse();
+        let ir = lower::lower(&file);
+        let mut codegen = CodeGen::new();
+        codegen.emit_guards = true;
+        let compiled = codegen.generate(&ir);
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [6u8; 32],
+            ..Default::default()
+        };
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000, ctx);
+        let selector = compute_selector("f");
+        vm.calldata = (selector as u64).to_le_bytes().to_vec();
+        vm.load(&compiled.runtime_bytecode).unwrap();
+
+        let mut result = None;
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(r)) => { result = Some(r); break; }
+                Ok(None) => { steps += 1; if steps > 1000 { break; } }
+                Err(_) => break,
+            }
+        }
+        // Should complete normally (Halt), not revert
+        assert!(
+            matches!(result, Some(pyde_vm::vm::ExecResult::Halt)),
+            "single call should succeed with reentrancy guard, got {:?}", result
+        );
+        assert_eq!(vm.cpu.read_gp(1), 42, "should return 42");
+    }
+
+    // ========================================================================
+    // Dispatch with calldata (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_dispatch_with_calldata() {
+        // Test the full dispatch path: selector matching + calldata decode
+        let compiled = compile(r#"
+            contract T {
+                pub fn add(a: u64, b: u64) -> u64 {
+                    return a + b;
+                }
+            }
+        "#);
+        // Build calldata: [selector(8 bytes)] [arg0(8 bytes)] [arg1(8 bytes)]
+        let selector = compute_selector("add");
+        let mut calldata = Vec::new();
+        calldata.extend_from_slice(&(selector as u64).to_le_bytes()); // 8 bytes selector
+        calldata.extend_from_slice(&10u64.to_le_bytes());            // arg0 = 10
+        calldata.extend_from_slice(&32u64.to_le_bytes());            // arg1 = 32
+
+        let mut codegen = CodeGen::new();
+        codegen.emit_guards = true; // production mode with dispatch
+        let (tokens, _) = Lexer::new(r#"
+            contract T {
+                pub fn add(a: u64, b: u64) -> u64 {
+                    return a + b;
+                }
+            }
+        "#).tokenize();
+        let (file, _) = Parser::new(tokens).parse();
+        let ir = lower::lower(&file);
+        let compiled = codegen.generate(&ir);
+
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(100_000);
+        vm.calldata = calldata;
+        vm.load(&compiled.runtime_bytecode).unwrap();
+
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => { steps += 1; if steps > 500 { break; } }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(vm.cpu.read_gp(1), 42, "add(10, 32) via dispatch should be 42");
+    }
+
+    // ========================================================================
+    // Wide storage u256 (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_wide_storage_u256() {
+        // u256 storage field uses Sload/Sstore mode 0 (wide register)
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage { total: u256, }
+                pub fn f() -> u64 {
+                    self.total = 999;
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [7u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "u256 storage write should not trap");
+    }
+
+    // ========================================================================
+    // Poseidon hash (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_poseidon_hash() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let h = hash(42);
+                    return 1;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1, "hash() should not trap");
+    }
+
+    // ========================================================================
+    // Event emission (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_event_emit_no_fields() {
+        // emit uses keyword syntax: `emit EventName { fields };` (NOT emit!())
+        let compiled = compile_no_opt(r#"
+            contract T {
+                event Ping {}
+                pub fn f() -> u64 {
+                    emit Ping {};
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [8u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "emit should not trap");
+    }
+
+    #[test]
+    fn pvm_event_emit_with_fields() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                event Transfer { from: u64, to: u64, amount: u64, }
+                pub fn f() -> u64 {
+                    emit Transfer { from: 1, to: 2, amount: 100 };
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [9u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "emit with fields should not trap");
+    }
+
+    // ========================================================================
+    // u256 large constants (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_u256_large_constant() {
+        // u256 value > u64::MAX: store to heap, Wload, use in storage
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage { big: u256, }
+                pub fn f() -> u64 {
+                    self.big = 340282366920938463463374607431768211455_u256;
+                    return 1;
+                }
+            }
+        "#);
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: [10u8; 32],
+            ..Default::default()
+        };
+        let vm = run_pvm_with_context(&compiled.bytecode, ctx);
+        assert_eq!(vm.cpu.read_gp(1), 1, "u256 large constant should not trap");
+    }
+
+    // ========================================================================
+    // Register pressure (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_many_locals_optimized() {
+        // Optimizer folds constants, so this fits in few registers
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a = 1;
+                    let b = 2;
+                    let c = 3;
+                    let d = 4;
+                    let e = 5;
+                    let g = 6;
+                    let h = 7;
+                    let i = 8;
+                    return a + b + c + d + e + g + h + i;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 36, "1+2+3+4+5+6+7+8=36");
+    }
+
+    #[test]
+    fn pvm_array_repeat() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let arr = [0; 5];
+                    return arr[3];
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 0, "repeated array should have 0 at index 3");
+    }
+
+    #[test]
+    fn pvm_bitwise_not() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a: u64 = 0;
+                    let b = ~a;
+                    if b > 100 { return 1; }
+                    return 0;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        // ~0 = u64::MAX (all bits set, > 100)
+        assert_eq!(vm.cpu.read_gp(1), 1, "bitwise NOT of 0 should be max");
+    }
+
+    // ========================================================================
+    // Vec operations (PVM-verified)
+    // ========================================================================
+
+    #[test]
+    fn pvm_vec_push_and_len() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut v = Vec::new();
+                    v.push(10);
+                    return v.len();
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 1, "Vec should have 1 element after push");
+    }
+
+    #[test]
+    fn pvm_vec_push_and_pop() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut v = Vec::new();
+                    v.push(10);
+                    v.push(20);
+                    v.push(30);
+                    let last = v.pop();
+                    return last;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 30, "pop should return last pushed (30)");
+    }
+
+    #[test]
+    fn pvm_vec_is_empty() {
+        // Simplest Vec test: create and return length
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let v = Vec::new();
+                    return v.len();
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 0, "new Vec length should be 0");
+    }
+
+    #[test]
+    fn pvm_vec_push_pop_sequence() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let mut v = Vec::new();
+                    v.push(100);
+                    v.push(200);
+                    v.pop();
+                    v.push(300);
+                    return v.len();
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 2, "push push pop push → len 2");
+    }
+
+    #[test]
+    fn pvm_cast_widen_narrow() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a: u64 = 42;
+                    let b = a as u256;
+                    let c = b as u64;
+                    return c;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 42, "u64 → u256 → u64 round-trip should be 42");
+    }
+
+    #[test]
+    fn pvm_unary_neg() {
+        // -10 as u64 wraps to u64::MAX - 9
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a: u64 = 10;
+                    let b = -a;
+                    return b;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        let expected = 0u64.wrapping_sub(10); // u64::MAX - 9
+        assert_eq!(vm.cpu.read_gp(1), expected, "negation of 10 should wrap to {}", expected);
+    }
+
+    #[test]
+    fn pvm_register_spill_restore() {
+        // This function uses >11 virtual registers, forcing spill/restore.
+        // Without optimizer, each variable + temporary gets its own register.
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a = 1;
+                    let b = 2;
+                    let c = 3;
+                    let d = 4;
+                    let e = 5;
+                    let g = 6;
+                    let h = 7;
+                    let i = 8;
+                    let j = 9;
+                    let k = 10;
+                    let l = a + b;
+                    let m = c + d;
+                    return l + m + e + g;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        // l = 1+2 = 3, m = 3+4 = 7, result = 3 + 7 + 5 + 6 = 21
+        assert_eq!(vm.cpu.read_gp(1), 21, "spilled register values should be correct");
+    }
+}

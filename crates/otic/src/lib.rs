@@ -13,3 +13,5 @@ pub mod safety;
 pub mod ir;
 pub mod lower;
 pub mod optimize;
+pub mod memory;
+pub mod codegen;

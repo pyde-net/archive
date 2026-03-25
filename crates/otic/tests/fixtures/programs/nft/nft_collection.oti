@@ -170,10 +170,10 @@ contract NFTCollection {
         }
     }
 
-    pub fn set_provenance_hash(hash: u256) {
+    pub fn set_provenance_hash(prov_hash: u256) {
         require!(msg.sender == self.owner, NotContractOwner {});
-        self.provenance_hash = hash;
-        emit ProvenanceSet { hash: hash };
+        self.provenance_hash = prov_hash;
+        emit ProvenanceSet { hash: prov_hash };
     }
 
     pub fn reveal(base_uri: String) {

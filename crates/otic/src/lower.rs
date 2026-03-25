@@ -158,7 +158,7 @@ impl Lowerer {
                         self.program.const_defs.push(ir::ConstDef {
                             name: c.name.name.clone(),
                             ty: Ty::U256,
-                            value: IrConst::Int(*v, Ty::U256),
+                            value: IrConst::Int(*v, Ty::U64),
                             is_pub: c.is_pub,
                         });
                     }
@@ -289,7 +289,7 @@ impl Lowerer {
                         self.program.const_defs.push(ir::ConstDef {
                             name: c.name.name.clone(),
                             ty: Ty::U256,
-                            value: IrConst::Int(*v, Ty::U256),
+                            value: IrConst::Int(*v, Ty::U64),
                             is_pub: c.is_pub,
                         });
                     }
@@ -449,11 +449,18 @@ impl Lowerer {
                 let key_reg = self.lower_expr(key);
                 self.emit(Inst::IndexSet(obj_reg, key_reg, value));
             }
-            // Local variable reassignment
+            // Local variable reassignment — emit a copy to the original register
             Expr::Ident(ident) => {
-                // Update the local binding to point to the new register
-                if let Some(scope) = self.locals.last_mut() {
-                    scope.insert(ident.name.clone(), value);
+                let existing_reg = self.lookup_local(&ident.name);
+                if let Some(existing) = existing_reg {
+                    if existing != value {
+                        // Copy: existing_reg = value (critical for loops)
+                        self.emit(Inst::Cast(existing, value, Ty::Unknown));
+                    }
+                } else {
+                    if let Some(scope) = self.locals.last_mut() {
+                        scope.insert(ident.name.clone(), value);
+                    }
                 }
             }
             _ => {
@@ -479,8 +486,8 @@ impl Lowerer {
         // → init loop var, check condition, body, increment, jump back
 
         let header_label = self.func().alloc_label();
-        let body_label = Label(header_label.0 + 1);
-        let exit_label = Label(header_label.0 + 2);
+        let body_label = self.func().alloc_label();
+        let exit_label = self.func().alloc_label();
 
         // Lower the range expression (start..end)
         let (start, end) = if let Expr::Binary(lhs, BinaryOp::Range, rhs, _) = &f.iterator {
@@ -492,20 +499,18 @@ impl Lowerer {
             (zero, iter)
         };
 
-        // Initialize loop variable
-        let loop_var = self.alloc_reg();
-        self.emit(Inst::BinOp(loop_var, BinOp::Add, start, start)); // copy start
+        // Initialize loop variable (copy start value)
+        let loop_var = start; // directly use the start register
         self.push_scope();
         self.declare_local(&f.variable.name, loop_var);
 
         // Jump to header
         self.emit(Inst::Jump(header_label));
 
-        // Header: check condition
+        // Header: check condition (always uses loop_var register)
         self.func().push_block(header_label, "for.header".into());
         let cond = self.alloc_reg();
-        let current = self.lookup_local(&f.variable.name).unwrap_or(loop_var);
-        self.emit(Inst::Cmp(cond, CmpOp::Lt, current, end));
+        self.emit(Inst::Cmp(cond, CmpOp::Lt, loop_var, end));
         self.emit(Inst::Branch(cond, body_label, exit_label));
 
         // Body
@@ -514,13 +519,10 @@ impl Lowerer {
         self.lower_block(&f.body);
         self.loop_stack.pop();
 
-        // Increment
+        // Increment: loop_var = loop_var + 1 (overwrite same register)
         let one = self.alloc_reg();
         self.emit(Inst::Const(one, IrConst::Int(1, Ty::U64)));
-        let next = self.alloc_reg();
-        let current = self.lookup_local(&f.variable.name).unwrap_or(loop_var);
-        self.emit(Inst::BinOp(next, BinOp::Add, current, one));
-        self.declare_local(&f.variable.name, next);
+        self.emit(Inst::BinOp(loop_var, BinOp::Add, loop_var, one));
         self.emit(Inst::Jump(header_label));
 
         // Exit
@@ -530,8 +532,8 @@ impl Lowerer {
 
     fn lower_while(&mut self, w: &WhileStmt) {
         let header_label = self.func().alloc_label();
-        let body_label = Label(header_label.0 + 1);
-        let exit_label = Label(header_label.0 + 2);
+        let body_label = self.func().alloc_label();
+        let exit_label = self.func().alloc_label();
 
         self.emit(Inst::Jump(header_label));
 
@@ -562,7 +564,7 @@ impl Lowerer {
             Expr::Literal(lit, _) => {
                 let dst = self.alloc_reg();
                 let val = match lit {
-                    Literal::Int(v) => IrConst::Int(*v, Ty::U256),
+                    Literal::Int(v) => IrConst::Int(*v, Ty::U64),
                     Literal::String(s) => IrConst::String(s.clone()),
                     Literal::Bool(b) => IrConst::Bool(*b),
                 };
@@ -757,6 +759,14 @@ impl Lowerer {
                     }
                     // Path::call(args) — Vec::new(), IERC20::at(), etc.
                     Expr::Path(segments, _) => {
+                        if segments.len() == 2 {
+                            let type_name = segments[0].name.as_str();
+                            let member = segments[1].name.as_str();
+                            if type_name == "Vec" && member == "new" {
+                                self.emit(Inst::MakeVec(dst, 16));
+                                return dst;
+                            }
+                        }
                         let path = segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::");
                         self.emit(Inst::Call(dst, path, arg_regs));
                     }
@@ -790,7 +800,7 @@ impl Lowerer {
 
                     // Vec::new(), bytes::new(), etc.
                     if type_name == "Vec" && member == "new" {
-                        self.emit(Inst::Comment("Vec::new()".into()));
+                        self.emit(Inst::MakeVec(dst, 16)); // initial capacity 16
                         return dst;
                     }
                     if type_name == "bytes" && (member == "new" || member == "empty") {
@@ -812,7 +822,7 @@ impl Lowerer {
                             if let MacroArg::Positional(cond_expr) = &args[0] {
                                 let cond = self.lower_expr(cond_expr);
                                 let ok_label = self.func().alloc_label();
-                                let revert_label = Label(ok_label.0 + 1);
+                                let revert_label = self.func().alloc_label();
 
                                 self.emit(Inst::Branch(cond, ok_label, revert_label));
 
@@ -929,8 +939,8 @@ impl Lowerer {
             Expr::If(cond, then_block, else_clause, _) => {
                 let cond_reg = self.lower_expr(cond);
                 let then_label = self.func().alloc_label();
-                let else_label = Label(then_label.0 + 1);
-                let end_label = Label(then_label.0 + 2);
+                let else_label = self.func().alloc_label();
+                let end_label = self.func().alloc_label();
 
                 if else_clause.is_some() {
                     self.emit(Inst::Branch(cond_reg, then_label, else_label));
@@ -969,10 +979,15 @@ impl Lowerer {
                 let end_label = self.func().alloc_label();
                 let dst = self.alloc_reg();
 
+                // Pre-allocate all arm labels to avoid collision with nested structures
+                let arm_labels: Vec<Label> = (0..arms.len())
+                    .map(|_| self.func().alloc_label())
+                    .collect();
+
                 for (i, arm) in arms.iter().enumerate() {
-                    let arm_label = Label(end_label.0 + 1 + i as u32);
+                    let arm_label = arm_labels[i];
                     let next_label = if i + 1 < arms.len() {
-                        Label(end_label.0 + 2 + i as u32)
+                        arm_labels[i + 1]
                     } else {
                         end_label
                     };
@@ -985,7 +1000,7 @@ impl Lowerer {
                         Pattern::Literal(lit, _) => {
                             let pat_reg = self.alloc_reg();
                             let val = match lit {
-                                Literal::Int(v) => IrConst::Int(*v, Ty::U256),
+                                Literal::Int(v) => IrConst::Int(*v, Ty::U64),
                                 Literal::String(s) => IrConst::String(s.clone()),
                                 Literal::Bool(b) => IrConst::Bool(*b),
                             };
