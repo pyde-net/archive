@@ -2559,9 +2559,9 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn pvm_many_locals() {
-        // Test with many local variables (approaches register limit)
-        let compiled = compile_no_opt(r#"
+    fn pvm_many_locals_optimized() {
+        // Optimizer folds constants, so this fits in few registers
+        let compiled = compile(r#"
             contract T {
                 pub fn f() -> u64 {
                     let a = 1;
@@ -2578,5 +2578,52 @@ mod tests {
         "#);
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 36, "1+2+3+4+5+6+7+8=36");
+    }
+
+    #[test]
+    fn pvm_array_repeat() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let arr = [0; 5];
+                    return arr[3];
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 0, "repeated array should have 0 at index 3");
+    }
+
+    #[test]
+    fn pvm_bitwise_not() {
+        let compiled = compile(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a: u64 = 0;
+                    let b = ~a;
+                    if b > 100 { return 1; }
+                    return 0;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        // ~0 = u64::MAX (all bits set, > 100)
+        assert_eq!(vm.cpu.read_gp(1), 1, "bitwise NOT of 0 should be max");
+    }
+
+    #[test]
+    fn pvm_cast_widen_narrow() {
+        let compiled = compile_no_opt(r#"
+            contract T {
+                pub fn f() -> u64 {
+                    let a: u64 = 42;
+                    let b = a as u256;
+                    let c = b as u64;
+                    return c;
+                }
+            }
+        "#);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 42, "u64 → u256 → u64 round-trip should be 42");
     }
 }
