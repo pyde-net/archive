@@ -2,8 +2,6 @@
 // Gas sponsorship for gasless UX
 
 use std::token::IERC20;
-use std::signature;
-
 interface IPaymaster {
     fn validate_and_pay(user: Address, function_sig: bytes, gas_cost: u256) -> bool;
     fn balance_of(user: Address) -> u256;
@@ -217,8 +215,8 @@ contract GaslessToken {
         let message_hash = hash(message_bytes);
 
         // Verify signature
-        let valid = signature::verify(message_hash, meta.signature, meta.public_key);
-        let recovered = signature::recover(message_hash, meta.signature);
+        let valid = sig_verify(message_hash, meta.signature, meta.public_key);
+        let recovered = sig_recover(message_hash, meta.signature);
         require!(valid && recovered == meta.from, InvalidSignature {});
 
         // Execute transfer
@@ -256,7 +254,7 @@ contract GaslessToken {
         message_bytes.append(data.deadline.to_bytes());
 
         let message_hash = hash(message_bytes);
-        let valid = signature::verify(message_hash, data.signature, bytes::new());
+        let valid = sig_verify(message_hash, data.signature, bytes::new());
         require!(valid, InvalidSignature {});
 
         self.allowances[data.owner][data.spender] = data.value;

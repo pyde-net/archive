@@ -1,8 +1,6 @@
 // Exercises bytes manipulation, hash operations, signature verification,
 // fixed arrays, and complex type compositions
 
-use std::signature;
-
 contract VerifiedMessaging {
     struct Message {
         id: u256,
@@ -139,7 +137,7 @@ contract VerifiedMessaging {
         rotation_message.append(identity.key_rotation_nonce.to_bytes());
 
         let message_hash = hash(rotation_message);
-        let valid = signature::verify(message_hash, rotation_sig, identity.public_key);
+        let valid = sig_verify(message_hash, rotation_sig, identity.public_key);
         require!(valid, InvalidSignature { signer: msg.sender });
 
         self.identities[msg.sender].public_key = new_public_key;
@@ -188,7 +186,7 @@ contract VerifiedMessaging {
         sig_message.append(self.nonces[msg.sender].to_bytes());
 
         let sig_hash = hash(sig_message);
-        let valid = signature::verify(sig_hash, sig, identity.public_key);
+        let valid = sig_verify(sig_hash, sig, identity.public_key);
         require!(valid, InvalidSignature { signer: msg.sender });
 
         let id = self.next_message_id;

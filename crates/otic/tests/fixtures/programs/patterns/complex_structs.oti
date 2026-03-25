@@ -1,7 +1,5 @@
 // Complex struct patterns: nested structs, arrays, bytes, strings
 
-use std::signature;
-
 contract DocumentVault {
     struct Document {
         id: u256,
@@ -167,8 +165,8 @@ contract DocumentVault {
 
         // Verify the signature over the content hash
         let message = doc.content_hash;
-        let valid = signature::verify(message, sig, public_key);
-        let signer = signature::recover(message, sig);
+        let valid = sig_verify(message, sig, public_key);
+        let signer = sig_recover(message, sig);
         require!(valid, InvalidSignature { signer: msg.sender });
 
         // Check no duplicate signature from same signer
@@ -272,7 +270,7 @@ contract DocumentVault {
         for i in 0..doc.signatures.len() {
             if doc.signatures[i].signer == signer {
                 let record = doc.signatures[i];
-                let valid = signature::verify(
+                let valid = sig_verify(
                     doc.content_hash,
                     record.signature,
                     record.public_key,
