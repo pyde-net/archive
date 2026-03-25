@@ -112,6 +112,7 @@ contract RockPaperScissors {
         self.min_wager = min_wager;
     }
 
+    #[payable]
     pub fn create_game(commit_blocks: u64, reveal_blocks: u64) -> u64 {
         require!(msg.value >= self.min_wager, BelowMinWager { min: self.min_wager });
 
@@ -144,6 +145,7 @@ contract RockPaperScissors {
         return game_id;
     }
 
+    #[payable]
     pub fn join_game(game_id: u64) {
         let mut game = self.games[game_id];
         require!(game.player1 != Address::ZERO, GameNotFound {});

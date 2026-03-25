@@ -200,6 +200,7 @@ contract Raffle {
         return raffle_id;
     }
 
+    #[payable]
     pub fn buy_tickets(raffle_id: u64, quantity: u64) {
         require!(quantity > 0, ZeroQuantity {});
         let mut raffle = self.raffles[raffle_id];

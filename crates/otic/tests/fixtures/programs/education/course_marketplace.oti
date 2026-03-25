@@ -183,6 +183,7 @@ contract CourseMarketplace {
         return course_id;
     }
 
+    #[payable]
     #[reentrant]
     pub fn enroll(course_id: u32) {
         let course = self.courses[course_id];

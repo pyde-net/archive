@@ -2,6 +2,11 @@
 use std::math;
 use std::token::IERC20;
 
+interface IWPYDE {
+    fn deposit();
+    fn withdraw(amount: u256);
+}
+
 interface IAmmPool {
     fn swap(token_in: Address, amount_in: u256, min_amount_out: u256) -> u256;
     fn get_amount_out(token_in: Address, amount_in: u256) -> u256;
@@ -296,6 +301,7 @@ contract SwapRouter {
 
     // --- Native token swaps ---
 
+    #[payable]
     pub fn swap_native_for_token(
         token_out: Address,
         min_amount_out: u256,
@@ -305,8 +311,8 @@ contract SwapRouter {
         let amount_in = msg.value;
         require!(amount_in > 0u256, ZeroAmount {});
 
-        // Wrap native token
-        raw_call!(self.wpyde, amount_in, "deposit()");
+        // Wrap native token — payable external call
+        IWPYDE::at_payable(self.wpyde, amount_in).deposit();
 
         let net_amount = self.deduct_router_fee(self.wpyde, amount_in);
 

@@ -94,12 +94,14 @@ contract CoinFlip {
         self.paused = false;
     }
 
+    #[payable]
     pub fn deposit_bankroll() {
         require!(!self.paused, Paused {});
         self.bankroll = self.bankroll + msg.value;
         emit BankrollAdded { depositor: msg.sender, amount: msg.value };
     }
 
+    #[payable]
     pub fn place_flip(choice: bool, server_commit: u256) {
         require!(!self.paused, Paused {});
         require!(msg.value >= self.min_bet, BetTooSmall { min: self.min_bet });

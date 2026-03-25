@@ -200,6 +200,7 @@ contract NftBattle {
         };
     }
 
+    #[payable]
     pub fn enter_battle(token_id: u256) {
         require!(!self.paused, Paused {});
         let fighter = self.fighters[token_id];

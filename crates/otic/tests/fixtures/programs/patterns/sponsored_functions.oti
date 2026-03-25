@@ -264,6 +264,7 @@ contract GaslessToken {
     }
 
     // Deposit to gas tank for sponsored transactions
+    #[payable]
     pub fn deposit_gas_tank() {
         require!(msg.value > 0, InsufficientGasTank { available: 0 });
         self.gas_tank_deposits[msg.sender] += msg.value;

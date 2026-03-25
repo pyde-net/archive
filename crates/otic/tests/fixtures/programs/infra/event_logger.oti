@@ -194,6 +194,7 @@ contract EventLogger {
         return schema_id;
     }
 
+    #[payable]
     pub fn log(namespace_id: u64, topic: u256, data: bytes) -> u64 {
         let ns = self.namespaces[namespace_id];
         require!(ns.active, NamespaceNotFound {});
@@ -258,6 +259,7 @@ contract EventLogger {
     }
 
     // Batch log: emit multiple logs in one transaction
+    #[payable]
     pub fn batch_log(
         namespace_id: u64,
         topics: Vec<u256>,

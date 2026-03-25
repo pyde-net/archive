@@ -172,6 +172,7 @@ contract Invoice {
     }
 
     // Pay an invoice (full or partial)
+    #[payable]
     pub fn pay_invoice(invoice_id: u64, amount: u256, tx_reference: String) {
         let mut inv = self.invoices[invoice_id];
         require!(inv.vendor != Address::ZERO, InvoiceNotFound {});

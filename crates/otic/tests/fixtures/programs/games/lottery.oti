@@ -99,6 +99,7 @@ contract Lottery {
         };
     }
 
+    #[payable]
     pub fn buy_tickets(quantity: u64) {
         require!(self.round_open, RoundNotOpen {});
         require!(block.height <= self.round_deadline, DeadlinePassed {});

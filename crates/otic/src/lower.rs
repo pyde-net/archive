@@ -319,6 +319,7 @@ impl Lowerer {
         ir_func.is_constructor = func.is_constructor();
         ir_func.is_view = func.is_view();
         ir_func.is_reentrant = func.is_reentrant();
+        ir_func.is_payable = func.is_payable();
         ir_func.is_test = func.is_test();
         ir_func.sponsorship = func.sponsorship();
         ir_func.doc = func.doc.clone();

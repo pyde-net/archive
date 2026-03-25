@@ -107,6 +107,7 @@ contract NFTCollection {
         self.royalty_bps = DEFAULT_ROYALTY_BPS;
     }
 
+    #[payable]
     pub fn mint(quantity: u256) {
         require!(quantity > 0, ZeroQuantity {});
         require!(self.phase != MintPhase::Paused, MintPaused {});

@@ -437,10 +437,68 @@ impl TypeChecker {
             .map(|t| self.resolve_type(t))
             .unwrap_or(Ty::Unit);
 
-        self.current_return_type = Some(ret_ty);
+        self.current_return_type = Some(ret_ty.clone());
         self.check_block(&func.body);
+
+        // Check that non-void functions have a return path
+        if ret_ty != Ty::Unit && ret_ty != Ty::Unknown {
+            if !self.block_has_return(&func.body) {
+                self.error(
+                    format!(
+                        "function '{}' must return {} but body may not return a value",
+                        func.name.name, ret_ty
+                    ),
+                    func.span,
+                );
+            }
+        }
+
         self.current_return_type = None;
         self.env.pop_scope();
+    }
+
+    /// Check if a block definitely returns or exits (simplified control flow check).
+    fn block_has_return(&self, block: &Block) -> bool {
+        // Check if ANY statement in the block is a definite exit
+        for stmt in &block.stmts {
+            if self.stmt_definitely_exits(stmt) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn stmt_definitely_exits(&self, stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Return(r) => r.value.is_some(),
+            Stmt::Expr(e) => {
+                match &e.expr {
+                    // revert!() always exits
+                    Expr::MacroCall(name, _, _) if name.name == "revert" => true,
+                    // if/else where both branches exit
+                    Expr::If(_, then_block, Some(else_clause), _) => {
+                        let then_exits = self.block_has_return(then_block);
+                        let else_exits = match else_clause {
+                            ElseClause::ElseBlock(b) => self.block_has_return(b),
+                            ElseClause::ElseIf(e) => {
+                                if let Expr::If(_, tb, ec, _) = e.as_ref() {
+                                    self.block_has_return(tb)
+                                        && ec.as_ref().map_or(false, |c| match c {
+                                            ElseClause::ElseBlock(b) => self.block_has_return(b),
+                                            _ => false,
+                                        })
+                                } else {
+                                    false
+                                }
+                            }
+                        };
+                        then_exits && else_exits
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     // ========================================================================
@@ -458,9 +516,9 @@ impl TypeChecker {
             Stmt::Let(l) => self.check_let(l),
             Stmt::Assign(a) => self.check_assign(a),
             Stmt::Return(r) => {
-                if let Some(ref val) = r.value {
-                    let ret_ty = self.infer_expr(val);
-                    if let Some(ref expected) = self.current_return_type {
+                if let Some(ref expected) = self.current_return_type.clone() {
+                    if let Some(ref val) = r.value {
+                        let ret_ty = self.infer_expr(val);
                         // Void function returning a value
                         if *expected == Ty::Unit {
                             self.error(
@@ -479,6 +537,14 @@ impl TypeChecker {
                         {
                             self.error(
                                 format!("return type mismatch: expected {}, found {}", expected, ret_ty),
+                                r.span,
+                            );
+                        }
+                    } else {
+                        // Bare return; in non-void function
+                        if *expected != Ty::Unit && *expected != Ty::Unknown {
+                            self.error(
+                                format!("function returns {} but 'return' has no value", expected),
                                 r.span,
                             );
                         }
@@ -732,12 +798,22 @@ impl TypeChecker {
                 }
             }
 
-            Expr::FieldAccess(obj, field, _) => {
+            Expr::FieldAccess(obj, field, span) => {
                 let obj_ty = self.infer_expr(obj);
                 // self.field → storage field type
                 if matches!(**obj, Expr::SelfExpr(_)) {
                     if let Some(ty) = self.env.storage_fields.get(&field.name) {
                         return ty.clone();
+                    }
+                    // Check if it's a known function (self.method accessed as value, not called)
+                    if !self.env.func_sigs.contains_key(&field.name)
+                        && !self.env.storage_fields.is_empty()
+                    {
+                        self.error(
+                            format!("'{}' is not a storage field or function in this contract", field.name),
+                            *span,
+                        );
+                        return Ty::Error;
                     }
                 }
                 // Address.balance → u256
@@ -972,7 +1048,18 @@ impl TypeChecker {
                                 ("bytes", "new" | "empty" | "from_hex") => Ty::Bytes,
                                 ("String", "new") => Ty::StringTy,
                                 // Interface::at(addr) → callable handle
+                                // Interface::at(addr) → callable handle (no value)
+                                // Interface::at_payable(addr, value) → callable handle (with value)
                                 (_, "at") => Ty::Unknown,
+                                (_, "at_payable") => {
+                                    if arg_types.len() != 2 {
+                                        self.error(
+                                            "at_payable() takes 2 arguments (address, value)".into(),
+                                            *span,
+                                        );
+                                    }
+                                    Ty::Unknown
+                                }
                                 // std::signature module
                                 ("signature", "verify") => Ty::Bool,
                                 ("signature", "recover") => Ty::Address,
@@ -1111,14 +1198,19 @@ impl TypeChecker {
                 Ty::Unknown // if as expression type needs more analysis
             }
 
-            Expr::Match(scrutinee, arms, _) => {
+            Expr::Match(scrutinee, arms, span) => {
                 let scrut_ty = self.infer_expr(scrutinee);
 
                 for arm in arms {
-                    // Check pattern compatibility with scrutinee
                     self.check_pattern(&arm.pattern, &scrut_ty);
                     self.infer_expr(&arm.body);
                 }
+
+                // Check match exhaustiveness for enums
+                if let Ty::Enum(enum_name) = &scrut_ty {
+                    self.check_match_exhaustiveness(enum_name, arms, *span);
+                }
+
                 Ty::Unknown
             }
 
@@ -1131,9 +1223,35 @@ impl TypeChecker {
                 Ty::Unknown
             }
 
-            Expr::Cast(expr, target_ty, _) => {
-                self.infer_expr(expr);
-                self.resolve_type(target_ty)
+            Expr::Cast(expr, target_ty, span) => {
+                let source_ty = self.infer_expr(expr);
+                let target = self.resolve_type(target_ty);
+
+                // Validate cast compatibility
+                if source_ty != Ty::Unknown && source_ty != Ty::Error
+                    && target != Ty::Unknown && target != Ty::Error
+                {
+                    let valid = match (&source_ty, &target) {
+                        // numeric → numeric (any direction)
+                        (s, t) if s.is_numeric() && t.is_numeric() => true,
+                        // bool ↔ numeric
+                        (Ty::Bool, t) if t.is_numeric() => true,
+                        (s, Ty::Bool) if s.is_numeric() => true,
+                        // numeric ↔ Address
+                        (s, Ty::Address) if s.is_numeric() => true,
+                        (Ty::Address, t) if t.is_numeric() => true,
+                        // same type (identity cast)
+                        (s, t) if s == t => true,
+                        _ => false,
+                    };
+                    if !valid {
+                        self.error(
+                            format!("cannot cast {} to {}", source_ty, target),
+                            *span,
+                        );
+                    }
+                }
+                target
             }
 
             Expr::Tuple(elements, _) => {
@@ -1339,6 +1457,46 @@ impl TypeChecker {
                         span,
                     );
                 }
+            }
+        }
+    }
+
+    /// Check that a match on an enum covers all variants (or has a wildcard).
+    fn check_match_exhaustiveness(&mut self, enum_name: &str, arms: &[MatchArm], span: Span) {
+        // If there's a wildcard pattern, it's exhaustive
+        let has_wildcard = arms.iter().any(|a| matches!(a.pattern, Pattern::Wildcard(_)));
+        if has_wildcard {
+            return;
+        }
+
+        // Get enum variants
+        if let Some(variants) = self.env.enum_defs.get(enum_name) {
+            let covered: std::collections::HashSet<String> = arms.iter()
+                .filter_map(|a| {
+                    if let Pattern::Path(segments, _) = &a.pattern {
+                        segments.last().map(|s| s.name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let missing: Vec<&String> = variants.iter()
+                .filter(|v| !covered.contains(*v))
+                .collect();
+
+            if !missing.is_empty() {
+                let missing_str = missing.iter()
+                    .map(|v| format!("{}::{}", enum_name, v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.error(
+                    format!(
+                        "non-exhaustive match: missing variants {}. Add them or use _ wildcard",
+                        missing_str
+                    ),
+                    span,
+                );
             }
         }
     }
@@ -2054,6 +2212,236 @@ mod tests {
                 pub fn f() {
                     let a = sqrt(100);
                     let b = pow(2, 10);
+                }
+            }
+        "#);
+    }
+
+    // ========== Cast validation ==========
+
+    #[test]
+    fn check_valid_casts() {
+        check_ok(r#"
+            contract T {
+                pub fn f() {
+                    let a: u64 = 42;
+                    let b = a as u256;
+                    let c = b as u64;
+                    let d = a as i64;
+                    let e = true as u256;
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn error_cast_string_to_int() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() {
+                    let x = "hello" as u256;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("cannot cast String to u256"));
+    }
+
+    #[test]
+    fn error_cast_bool_to_string() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() {
+                    let x = true as String;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("cannot cast bool to String"));
+    }
+
+    // ========== Match exhaustiveness ==========
+
+    #[test]
+    fn check_exhaustive_match_with_wildcard() {
+        check_ok(r#"
+            contract T {
+                enum Status { Active, Paused, Closed }
+                pub fn f() {
+                    let s = Status::Active;
+                    match s {
+                        Status::Active => { let x = 1; },
+                        _ => { let x = 0; },
+                    }
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn check_exhaustive_match_all_variants() {
+        check_ok(r#"
+            contract T {
+                enum Status { Active, Paused }
+                pub fn f() {
+                    let s = Status::Active;
+                    match s {
+                        Status::Active => { let x = 1; },
+                        Status::Paused => { let x = 2; },
+                    }
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn error_non_exhaustive_match() {
+        let errors = check_err(r#"
+            contract T {
+                enum Status { Active, Paused, Closed }
+                pub fn f() {
+                    let s = Status::Active;
+                    match s {
+                        Status::Active => { let x = 1; },
+                    }
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("non-exhaustive match"));
+        assert!(errors[0].message.contains("Paused"));
+        assert!(errors[0].message.contains("Closed"));
+    }
+
+    // ========== Missing return ==========
+
+    #[test]
+    fn check_function_with_return() {
+        check_ok(r#"
+            contract T {
+                pub fn f() -> u256 {
+                    return 42;
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn error_missing_return() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() -> u256 {
+                    let x = 42;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("must return"));
+    }
+
+    #[test]
+    fn check_return_after_loop() {
+        // Return after loop is fine — loop might not execute
+        check_ok(r#"
+            contract T {
+                pub fn find(items: Vec<u256>, target: u256) -> u256 {
+                    for i in 0..10 {
+                        if i == target {
+                            return i;
+                        }
+                    }
+                    return 0;
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn check_revert_after_loop() {
+        // Revert after loop is a valid exit path
+        check_ok(r#"
+            contract T {
+                error NotFound {}
+                pub fn find(items: Vec<u256>, target: u256) -> u256 {
+                    for i in 0..10 {
+                        if i == target {
+                            return i;
+                        }
+                    }
+                    revert!(NotFound {});
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn error_return_only_inside_loop() {
+        // Return only inside loop — loop might not execute
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() -> u256 {
+                    for i in 0..10 {
+                        return i;
+                    }
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("must return"));
+    }
+
+    #[test]
+    fn error_bare_return_in_non_void() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn f() -> u256 {
+                    return;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("'return' has no value"));
+    }
+
+    #[test]
+    fn error_undefined_storage_field() {
+        let errors = check_err(r#"
+            contract T {
+                storage { balance: u256, }
+                pub fn f() {
+                    let x = self.nonexistent;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("not a storage field or function"));
+    }
+
+    #[test]
+    fn error_assign_undefined_storage_field() {
+        let errors = check_err(r#"
+            contract T {
+                storage { balance: u256, }
+                pub fn f() {
+                    self.fake = 100;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("not a storage field or function"));
+    }
+
+    #[test]
+    fn check_bare_return_in_void_ok() {
+        // return; in void function is fine (early exit)
+        check_ok(r#"
+            contract T {
+                pub fn f() {
+                    if true { return; }
+                    let x = 42;
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn check_void_function_no_return_needed() {
+        check_ok(r#"
+            contract T {
+                pub fn f() {
+                    let x = 42;
                 }
             }
         "#);

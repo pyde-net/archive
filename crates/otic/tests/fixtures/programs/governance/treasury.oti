@@ -142,6 +142,7 @@ contract Treasury {
     }
 
     // Accept native currency
+    #[payable]
     pub fn deposit() {
         require!(!self.paused, Paused {});
         emit Deposited { sender: msg.sender, token: Address::ZERO, amount: msg.value };

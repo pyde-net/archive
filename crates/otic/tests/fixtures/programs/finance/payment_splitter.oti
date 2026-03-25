@@ -98,6 +98,7 @@ contract PaymentSplitter {
     }
 
     // Accept payments
+    #[payable]
     #[reentrant]
     pub fn deposit() {
         require!(msg.value > 0, NothingToPay {});

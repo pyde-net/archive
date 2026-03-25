@@ -160,6 +160,7 @@ contract ClinicalTrial {
         self.next_trial_id = 1;
     }
 
+    #[payable]
     pub fn create_trial(
         protocol_hash: u256,
         title_hash: u256,

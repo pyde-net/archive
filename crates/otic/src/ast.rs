@@ -209,6 +209,10 @@ impl FunctionDef {
         self.attributes.iter().any(|a| a.content == "reentrant")
     }
 
+    pub fn is_payable(&self) -> bool {
+        self.attributes.iter().any(|a| a.content == "payable")
+    }
+
     pub fn is_sponsored(&self) -> bool {
         self.attributes.iter().any(|a| a.content.starts_with("sponsored"))
     }

@@ -293,6 +293,7 @@ contract FeeManager {
     }
 
     // Collect fee on a transaction (called by integrated contracts)
+    #[payable]
     pub fn collect_fee(payer: Address, token: Address, amount: u256) -> u256 {
         require!(!self.paused, ContractPaused {});
         require!(amount > 0, ZeroAmount {});
