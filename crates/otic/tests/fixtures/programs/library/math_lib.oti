@@ -191,7 +191,7 @@ pub fn log10(x: u256) -> u256 {
 
 #[test]
 fn test_sqrt_perfect_square() {
-    let result = sqrt(25u256);
+    let result = 25u256.sqrt();
     require!(result == 5u256, Overflow {});
 }
 
