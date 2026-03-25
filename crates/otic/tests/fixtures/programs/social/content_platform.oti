@@ -128,6 +128,7 @@ contract ContentPlatform {
         return content_id;
     }
 
+    #[payable]
     pub fn purchase_content(content_id: u64) {
         let content = self.content_registry[content_id];
         require!(content.active, ContentInactive {});
@@ -152,6 +153,7 @@ contract ContentPlatform {
         emit ContentPurchased { content_id: content_id, buyer: msg.sender, price: content.price };
     }
 
+    #[payable]
     pub fn subscribe(creator: Address, tier: u8, months: u8) {
         require!(tier >= 1 && tier <= 3, InvalidTier { tier: tier });
 

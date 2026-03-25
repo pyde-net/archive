@@ -177,6 +177,7 @@ contract NFTRental {
         emit RentalListingCancelled { listing_id: listing_id };
     }
 
+    #[payable]
     pub fn rent(listing_id: u256, duration: u64) {
         let listing = self.rental_listings[listing_id];
         require!(listing.active, ListingNotActive {});

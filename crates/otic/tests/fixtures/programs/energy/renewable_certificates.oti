@@ -266,6 +266,7 @@ contract RECRegistry {
         return sale_id;
     }
 
+    #[payable]
     #[reentrant]
     pub fn buy_bundle(sale_id: u64) {
         let sale = self.bundled_sales[sale_id];

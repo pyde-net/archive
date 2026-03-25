@@ -86,6 +86,7 @@ contract WrappedToken {
 
     // --- Wrap / Unwrap ---
 
+    #[payable]
     #[sponsored]
     pub fn deposit() {
         self.require_not_paused();
@@ -127,6 +128,7 @@ contract WrappedToken {
     }
 
     // Deposit and transfer in one step
+    #[payable]
     pub fn deposit_to(to: Address) {
         self.require_not_paused();
         require!(to != Address::ZERO, TransferToZeroAddress {});

@@ -242,6 +242,7 @@ contract SmartAgreement {
         self.obligation_counts[agreement_id][party] = idx + 1;
     }
 
+    #[payable]
     pub fn sign_agreement(agreement_id: u64, signature_hash: u256, ip_hash: u256) {
         require!(self.is_party(agreement_id, msg.sender), NotParty {});
         require!(self.agreements[agreement_id].status == 1, AgreementNotActive {});

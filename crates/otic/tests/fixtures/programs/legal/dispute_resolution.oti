@@ -147,6 +147,7 @@ contract DisputeResolution {
         self.resolution_deadline_days = deadline_days;
     }
 
+    #[payable]
     pub fn register_arbitrator(specialty: u8) {
         require!(msg.value >= self.stake_amount, InsufficientStake {});
 
@@ -162,6 +163,7 @@ contract DisputeResolution {
         self.arbitrator_list.push(msg.sender);
     }
 
+    #[payable]
     pub fn file_dispute(
         respondent: Address,
         category: u8,
@@ -202,6 +204,7 @@ contract DisputeResolution {
         return dispute_id;
     }
 
+    #[payable]
     pub fn respond_to_dispute(dispute_id: u64) {
         let dispute = self.disputes[dispute_id];
         require!(msg.sender == dispute.respondent, NotParty {});
@@ -315,6 +318,7 @@ contract DisputeResolution {
         }
     }
 
+    #[payable]
     pub fn file_appeal(dispute_id: u64, grounds_hash: u256) {
         let dispute = self.disputes[dispute_id];
         require!(dispute.status == 3, CannotAppeal {});

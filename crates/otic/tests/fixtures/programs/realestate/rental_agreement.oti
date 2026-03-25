@@ -181,6 +181,7 @@ contract RentalAgreement {
         return lease_id;
     }
 
+    #[payable]
     pub fn pay_deposit(lease_id: u64) {
         let lease = self.leases[lease_id];
         require!(lease.tenant == msg.sender, NotTenant {});
@@ -197,6 +198,7 @@ contract RentalAgreement {
         emit DepositPaid { lease_id: lease_id, amount: msg.value };
     }
 
+    #[payable]
     #[reentrant]
     pub fn pay_rent(lease_id: u64) {
         let lease = self.leases[lease_id];

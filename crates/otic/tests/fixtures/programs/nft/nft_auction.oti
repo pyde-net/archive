@@ -142,6 +142,7 @@ contract NFTAuction {
         };
     }
 
+    #[payable]
     pub fn bid(auction_id: u256) {
         let auction = self.auctions[auction_id];
         require!(!auction.settled && !auction.cancelled, AuctionNotActive {});

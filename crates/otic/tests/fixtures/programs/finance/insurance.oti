@@ -176,12 +176,14 @@ contract Insurance {
     }
 
     // Fund the insurance pool
+    #[payable]
     pub fn fund_pool() {
         require!(msg.value > 0, ZeroAmount {});
         self.pool_balance = self.pool_balance + msg.value;
         emit PoolFunded { funder: msg.sender, amount: msg.value };
     }
 
+    #[payable]
     pub fn purchase_policy(
         coverage_amount: u256,
         duration_seconds: u64,
@@ -241,6 +243,7 @@ contract Insurance {
         return policy_id;
     }
 
+    #[payable]
     pub fn pay_premium(policy_id: u64) {
         let mut policy = self.policies[policy_id];
         require!(policy.holder != Address::ZERO, PolicyNotFound {});

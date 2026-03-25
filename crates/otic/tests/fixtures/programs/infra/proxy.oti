@@ -215,6 +215,7 @@ contract UpgradeableProxy {
     }
 
     // Delegate with value forwarding
+    #[payable]
     pub fn delegate_with_value(call_data: bytes) -> bytes {
         require!(self.initialized, NotInitialized {});
         require!(!self.paused, IsPaused {});

@@ -163,6 +163,7 @@ contract Crowdfund {
         });
     }
 
+    #[payable]
     pub fn contribute() {
         require!(self.status == CampaignStatus::Active, CampaignNotActive {});
         require!(block.timestamp <= self.deadline, DeadlinePassed {});

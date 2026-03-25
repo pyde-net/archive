@@ -140,6 +140,7 @@ contract PredictionMarket {
         return market_id;
     }
 
+    #[payable]
     pub fn place_bet(market_id: u64, is_yes: bool) {
         let market = self.markets[market_id];
         require!(market.creator != Address::ZERO, MarketNotFound {});

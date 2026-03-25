@@ -152,6 +152,7 @@ contract ShippingContract {
         self.tariff_rates[country_code] = rate_bps;
     }
 
+    #[payable]
     #[reentrant]
     pub fn create_order(
         recipient: Address,
@@ -204,6 +205,7 @@ contract ShippingContract {
         return order_id;
     }
 
+    #[payable]
     pub fn purchase_insurance(order_id: u64, coverage_amount: u256) {
         let order = self.orders[order_id];
         require!(order.shipper == msg.sender, NotShipper {});

@@ -156,6 +156,7 @@ contract TippingPlatform {
         }
     }
 
+    #[payable]
     #[reentrant]
     pub fn tip_native(creator: Address, message_hash: u256) {
         require!(!self.paused, ContractPaused {});

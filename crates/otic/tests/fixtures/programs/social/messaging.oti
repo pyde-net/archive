@@ -170,6 +170,7 @@ contract Messaging {
         return thread_id;
     }
 
+    #[payable]
     #[reentrant]
     pub fn send_message(thread_id: u64, ciphertext_hash: u256, nonce: u256, reply_to: u64) {
         require!(thread_id > 0 && thread_id < self.next_thread_id, ThreadNotFound { thread_id: thread_id });

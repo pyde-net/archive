@@ -202,6 +202,7 @@ contract EnergyTrading {
         return order_id;
     }
 
+    #[payable]
     pub fn place_buy_order(quantity_kwh: u256, max_price_per_kwh: u256, duration_hours: u64) -> u64 {
         require!(self.consumer_profiles[msg.sender].registered, ConsumerNotRegistered {});
 

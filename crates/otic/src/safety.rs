@@ -38,6 +38,7 @@ impl std::fmt::Display for SafetyError {
 const KNOWN_ATTRIBUTES: &[&str] = &[
     "constructor",
     "view",
+    "payable",
     "sponsored",
     "reentrant",
     "indexed",
@@ -90,7 +91,7 @@ impl SafetyChecker {
 
     fn check_top_level_function(&mut self, func: &FunctionDef) {
         // Contract-only attributes on top-level functions
-        let contract_only = ["constructor", "view", "sponsored", "reentrant"];
+        let contract_only = ["constructor", "view", "payable", "sponsored", "reentrant"];
         for attr in &func.attributes {
             let name = attr.content.split('(').next().unwrap_or(&attr.content).trim();
             if contract_only.contains(&name) {
@@ -150,6 +151,7 @@ impl SafetyChecker {
                 self.check_function_attrs(f);
                 self.check_view_purity_transitive(f, &purity_map);
                 self.check_constructor_rules(f);
+                self.check_payable_rules(f);
                 self.check_cross_call_callbacks(f);
             }
         }
@@ -166,6 +168,7 @@ impl SafetyChecker {
         let mut has_view = false;
         let mut has_sponsored = false;
         let mut has_reentrant = false;
+        let mut has_payable = false;
         let mut has_test = false;
 
         for attr in &func.attributes {
@@ -198,6 +201,9 @@ impl SafetyChecker {
                 "reentrant" => {
                     has_reentrant = true;
                 }
+                "payable" => {
+                    has_payable = true;
+                }
                 "test" => {
                     has_test = true;
                 }
@@ -229,6 +235,12 @@ impl SafetyChecker {
         if has_view && has_reentrant {
             self.error(
                 "#[view] and #[reentrant] cannot be combined (view functions don't need reentrancy guards)".into(),
+                func.span,
+            );
+        }
+        if has_view && has_payable {
+            self.error(
+                "#[view] and #[payable] cannot be combined (view functions cannot receive value)".into(),
                 func.span,
             );
         }
@@ -531,6 +543,123 @@ impl SafetyChecker {
             Expr::Index(obj, _, _) => {
                 self.is_storage_access(obj)
             }
+            _ => false,
+        }
+    }
+
+    // ========================================================================
+    // #[constructor] rules
+    // ========================================================================
+
+    // ========================================================================
+    // #[payable] — msg.value access enforcement
+    // ========================================================================
+
+    fn check_payable_rules(&mut self, func: &FunctionDef) {
+        // Skip payable or constructor functions — they can access msg.value
+        if func.is_payable() || func.is_constructor() {
+            return;
+        }
+
+        // Scan for msg.value access
+        if self.block_accesses_msg_value(&func.body) {
+            self.error(
+                format!(
+                    "function '{}' accesses msg.value but is not marked #[payable]",
+                    func.name.name
+                ),
+                func.span,
+            );
+        }
+    }
+
+    fn block_accesses_msg_value(&self, block: &Block) -> bool {
+        for stmt in &block.stmts {
+            if self.stmt_accesses_msg_value(stmt) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn stmt_accesses_msg_value(&self, stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Let(l) => self.expr_accesses_msg_value(&l.initializer),
+            Stmt::Assign(a) => {
+                self.expr_accesses_msg_value(&a.target)
+                    || self.expr_accesses_msg_value(&a.value)
+            }
+            Stmt::Return(r) => {
+                r.value.as_ref().map_or(false, |v| self.expr_accesses_msg_value(v))
+            }
+            Stmt::Emit(e) => {
+                e.fields.iter().any(|f| self.expr_accesses_msg_value(&f.value))
+            }
+            Stmt::For(f) => {
+                self.expr_accesses_msg_value(&f.iterator)
+                    || self.block_accesses_msg_value(&f.body)
+            }
+            Stmt::While(w) => {
+                self.expr_accesses_msg_value(&w.condition)
+                    || self.block_accesses_msg_value(&w.body)
+            }
+            Stmt::Expr(e) => self.expr_accesses_msg_value(&e.expr),
+            _ => false,
+        }
+    }
+
+    fn expr_accesses_msg_value(&self, expr: &Expr) -> bool {
+        match expr {
+            // msg.value → this is what we're looking for
+            Expr::FieldAccess(obj, field, _) => {
+                if let Expr::Ident(ident) = obj.as_ref() {
+                    if ident.name == "msg" && field.name == "value" {
+                        return true;
+                    }
+                }
+                self.expr_accesses_msg_value(obj)
+            }
+            // Recurse into subexpressions
+            Expr::Binary(lhs, _, rhs, _) => {
+                self.expr_accesses_msg_value(lhs) || self.expr_accesses_msg_value(rhs)
+            }
+            Expr::Unary(_, operand, _) => self.expr_accesses_msg_value(operand),
+            Expr::Index(obj, idx, _) => {
+                self.expr_accesses_msg_value(obj) || self.expr_accesses_msg_value(idx)
+            }
+            Expr::Call(callee, args, _) => {
+                self.expr_accesses_msg_value(callee)
+                    || args.iter().any(|a| self.expr_accesses_msg_value(a))
+            }
+            Expr::If(cond, then_block, else_clause, _) => {
+                self.expr_accesses_msg_value(cond)
+                    || self.block_accesses_msg_value(then_block)
+                    || else_clause.as_ref().map_or(false, |c| match c {
+                        ElseClause::ElseBlock(b) => self.block_accesses_msg_value(b),
+                        ElseClause::ElseIf(e) => self.expr_accesses_msg_value(e),
+                    })
+            }
+            Expr::Match(scrut, arms, _) => {
+                self.expr_accesses_msg_value(scrut)
+                    || arms.iter().any(|a| self.expr_accesses_msg_value(&a.body))
+            }
+            Expr::Block(block) => self.block_accesses_msg_value(block),
+            Expr::MacroCall(_, args, _) => {
+                args.iter().any(|a| match a {
+                    MacroArg::Positional(e) => self.expr_accesses_msg_value(e),
+                    MacroArg::Named(_, e) => self.expr_accesses_msg_value(e),
+                })
+            }
+            Expr::StructInit(_, fields, _) => {
+                fields.iter().any(|f| self.expr_accesses_msg_value(&f.value))
+            }
+            Expr::Cast(inner, _, _) | Expr::Try(inner, _) => {
+                self.expr_accesses_msg_value(inner)
+            }
+            Expr::Tuple(elems, _) | Expr::ArrayLiteral(elems, _) => {
+                elems.iter().any(|e| self.expr_accesses_msg_value(e))
+            }
+            Expr::ArrayRepeat(val, _, _) => self.expr_accesses_msg_value(val),
             _ => false,
         }
     }
@@ -965,6 +1094,87 @@ mod tests {
                 #[view]
                 pub fn get() -> u256 {
                     return self.compute(self.balance);
+                }
+            }
+        "#);
+    }
+
+    // ========== msg.value payable enforcement ==========
+
+    #[test]
+    fn check_payable_function_accesses_msg_value() {
+        check_ok(r#"
+            contract T {
+                storage { deposits: Map<Address, u256>, }
+                #[payable]
+                pub fn deposit() {
+                    self.deposits[msg.sender] = self.deposits[msg.sender] + msg.value;
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn error_non_payable_accesses_msg_value() {
+        let errors = check_err(r#"
+            contract T {
+                pub fn bad() {
+                    let amount = msg.value;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("not marked #[payable]"));
+    }
+
+    #[test]
+    fn check_constructor_accesses_msg_value() {
+        // Constructors can access msg.value (initial funding)
+        check_ok(r#"
+            contract T {
+                storage { initial_funding: u256, }
+                #[constructor]
+                pub fn init() {
+                    self.initial_funding = msg.value;
+                }
+            }
+        "#);
+    }
+
+    #[test]
+    fn error_non_payable_nested_msg_value() {
+        // msg.value buried in a nested expression
+        let errors = check_err(r#"
+            contract T {
+                storage { x: u256, }
+                pub fn bad() {
+                    self.x = msg.value + 100;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("not marked #[payable]"));
+    }
+
+    #[test]
+    fn error_non_payable_msg_value_in_require() {
+        let errors = check_err(r#"
+            contract T {
+                error NoValue {}
+                pub fn bad() {
+                    require!(msg.value > 0, NoValue {});
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("not marked #[payable]"));
+    }
+
+    #[test]
+    fn check_msg_sender_without_payable() {
+        // msg.sender is fine without #[payable] — only msg.value is restricted
+        check_ok(r#"
+            contract T {
+                storage { owner: Address, }
+                pub fn f() {
+                    self.owner = msg.sender;
                 }
             }
         "#);

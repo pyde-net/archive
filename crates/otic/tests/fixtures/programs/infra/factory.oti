@@ -192,6 +192,7 @@ contract ContractFactory {
         };
     }
 
+    #[payable]
     pub fn deploy(
         template_id: u64,
         constructor_args: bytes,

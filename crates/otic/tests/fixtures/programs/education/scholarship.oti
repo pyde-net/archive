@@ -149,6 +149,7 @@ contract ScholarshipFund {
         self.reviewers[reviewer] = true;
     }
 
+    #[payable]
     pub fn create_scholarship(
         name_hash: u256,
         criteria_hash: u256,

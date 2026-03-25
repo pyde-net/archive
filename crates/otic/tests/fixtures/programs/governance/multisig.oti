@@ -127,6 +127,7 @@ contract Multisig {
     }
 
     // Accept native currency deposits
+    #[payable]
     #[sponsored]
     pub fn deposit() {
         emit Deposited { sender: msg.sender, amount: msg.value };

@@ -114,6 +114,7 @@ contract NameRegistry {
         self.name_count = 0;
     }
 
+    #[payable]
     pub fn register(name: String, duration_blocks: u64) {
         require!(duration_blocks >= self.min_registration_blocks, DurationTooShort { min: self.min_registration_blocks });
         self.validate_name(name);
@@ -161,6 +162,7 @@ contract NameRegistry {
         };
     }
 
+    #[payable]
     pub fn renew(name_hash: u256, additional_blocks: u64) {
         let mut entry = self.names[name_hash];
         require!(entry.owner != Address::ZERO, NameNotFound {});

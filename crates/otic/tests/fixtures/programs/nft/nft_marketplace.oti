@@ -155,6 +155,7 @@ contract NFTMarketplace {
         };
     }
 
+    #[payable]
     pub fn buy(listing_id: u256) {
         let listing = self.listings[listing_id];
         require!(listing.active, ListingNotActive {});
@@ -199,6 +200,7 @@ contract NFTMarketplace {
         emit ListingCancelled { listing_id: listing_id };
     }
 
+    #[payable]
     pub fn make_offer(nft_contract: Address, token_id: u256, expiry: u64) {
         require!(msg.value > 0, ZeroPrice {});
         require!(expiry > block.timestamp, OfferExpired {});

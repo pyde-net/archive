@@ -260,6 +260,7 @@ contract PropertyDeedRegistry {
         emit LienReleased { deed_id: deed_id, lien_index: lien_index };
     }
 
+    #[payable]
     pub fn pay_property_tax(deed_id: u64) {
         require!(self.deeds[deed_id].active, DeedInactive {});
         let tax = self.property_taxes[deed_id];

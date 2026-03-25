@@ -115,6 +115,7 @@ contract ChessWager {
         self.accumulated_fees = 0;
     }
 
+    #[payable]
     pub fn create_challenge(time_control: u32) -> u64 {
         require!(
             msg.value >= self.min_wager && msg.value <= self.max_wager,
@@ -155,6 +156,7 @@ contract ChessWager {
         return match_id;
     }
 
+    #[payable]
     pub fn accept_challenge(match_id: u64) {
         let mut m = self.matches[match_id];
         require!(m.white != Address::ZERO, MatchNotFound {});
