@@ -40,12 +40,12 @@ impl Hasher for Poseidon2Hasher {
         // For internal nodes (exactly two H256 children = 64 bytes),
         // use poseidon2_pair for efficient two-to-one Merkle hashing.
         if self.buf.len() == 64 {
-            let left = pyde_crypto::hash::Hash256::new(
-                self.buf[..32].try_into().unwrap(),
-            );
-            let right = pyde_crypto::hash::Hash256::new(
-                self.buf[32..].try_into().unwrap(),
-            );
+            let mut left_bytes = [0u8; 32];
+            left_bytes.copy_from_slice(&self.buf[..32]);
+            let left = pyde_crypto::hash::Hash256::new(left_bytes);
+            let mut right_bytes = [0u8; 32];
+            right_bytes.copy_from_slice(&self.buf[32..]);
+            let right = pyde_crypto::hash::Hash256::new(right_bytes);
             let hash = poseidon2_pair(left, right);
             return H256::from(hash.to_bytes());
         }

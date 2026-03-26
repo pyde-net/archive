@@ -214,7 +214,11 @@ impl RocksDBBackend {
     /// Open a temporary database (for testing).
     pub fn open_tmp() -> Result<Self, BackendError> {
         let dir = tempfile::tempdir().map_err(|e| BackendError::Io(e.to_string()))?;
-        Self::open(dir.keep().to_str().unwrap())
+        let path = dir.keep();
+        let path_str = path
+            .to_str()
+            .ok_or(BackendError::Io("invalid UTF-8 in temp path".into()))?;
+        Self::open(path_str)
     }
 
     fn branch_key_bytes(bk: &BranchKey) -> Vec<u8> {
@@ -327,14 +331,13 @@ pub struct CachedBackend<S> {
 impl<S> CachedBackend<S> {
     /// Create a new cached wrapper with the given capacity.
     pub fn new(inner: S, capacity: usize) -> Self {
+        let effective_capacity = capacity.max(1);
+        let cap = std::num::NonZeroUsize::new(effective_capacity)
+            .expect("max(1) is always nonzero");
         Self {
             inner,
-            branch_cache: RefCell::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(capacity).unwrap(),
-            )),
-            leaf_cache: RefCell::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(capacity).unwrap(),
-            )),
+            branch_cache: RefCell::new(lru::LruCache::new(cap)),
+            leaf_cache: RefCell::new(lru::LruCache::new(cap)),
             hits: RefCell::new(0),
             misses: RefCell::new(0),
         }

@@ -94,7 +94,8 @@ pub fn generate_witnesses(smt: &PydeSMT, access_keys: &[Key]) -> Result<BlockWit
 /// Returns true if the proof verifies. The validator calls this before executing.
 pub fn verify_witnesses(witness: &BlockWitness) -> bool {
     if witness.entries.is_empty() {
-        return true;
+        // Empty witness is only valid if proof is also empty
+        return witness.proof.is_empty();
     }
 
     let proof = CompiledProof::from_bytes(witness.proof.clone());
