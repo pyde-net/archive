@@ -76,7 +76,9 @@ pub fn load_nonce(smt: &PydeSMT, address: &Address) -> NonceState {
     let key = keys::nonce_key(address);
     match smt.get(&key) {
         Some(bytes) if bytes.len() >= 10 => {
-            NonceState::from_bytes(&bytes[..10].try_into().unwrap())
+            let mut nonce_bytes = [0u8; 10];
+            nonce_bytes.copy_from_slice(&bytes[..10]);
+            NonceState::from_bytes(&nonce_bytes)
         }
         _ => NonceState::new(),
     }
@@ -145,6 +147,11 @@ pub fn execute_transaction(
         .map_err(|e| PipelineError::ExecutionFailed(format!("nonce error: {:?}", e)))?;
 
     // 4. Pre-execution: deduct max gas
+    // NOTE: When fee_payer is Paymaster, no pre-charge happens here.
+    // Paymaster gas charges are enforced by the paymaster contract itself
+    // (via a validation call that checks and debits the paymaster's deposit),
+    // not by the pipeline.  The pipeline only pre-charges Sender and GasTank
+    // fee payers; paymaster settlement is deferred to the contract layer.
     let mut gas_tank_balance = sender.gas_tank;
     pre_execution_charge(tx, &mut sender.balance, &mut gas_tank_balance, block_ctx.base_fee)
         .map_err(|e| PipelineError::ExecutionFailed(e))?;

@@ -151,6 +151,9 @@ pub fn post_execution_refund(
     let actual_refund = gas_refund_from_sdelete.min(max_refund);
     let effective_gas = gas_used - actual_refund;
 
+    // Clamp gas_used to gas_limit to prevent underflow (e.g. from
+    // over-reported PVM metering).
+    let gas_used = gas_used.min(gas_limit);
     // Refund unused gas (gas_limit - gas_used) + SDELETE refund
     let unused_gas = gas_limit - gas_used;
     let total_refund_gas = unused_gas + actual_refund;

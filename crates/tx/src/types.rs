@@ -300,38 +300,49 @@ fn deserialize_access_list(data: &[u8]) -> Result<Vec<AccessEntry>, &'static str
     if data.len() < 4 {
         return Err("access list too short: missing entry count");
     }
-    let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let mut count_bytes = [0u8; 4];
+    count_bytes.copy_from_slice(&data[0..4]);
+    let count = u32::from_le_bytes(count_bytes) as usize;
     let mut entries = Vec::with_capacity(count);
     let mut offset = 4;
     for _ in 0..count {
         if offset + 36 > data.len() {
             return Err("access list truncated: incomplete entry header");
         }
-        let address: Address = data[offset..offset + 32].try_into().unwrap();
+        let mut address = [0u8; 32];
+        address.copy_from_slice(&data[offset..offset + 32]);
         offset += 32;
         // Reads
-        let num_reads = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let mut nr_bytes = [0u8; 4];
+        nr_bytes.copy_from_slice(&data[offset..offset + 4]);
+        let num_reads = u32::from_le_bytes(nr_bytes) as usize;
         offset += 4;
         let mut reads = Vec::with_capacity(num_reads);
         for _ in 0..num_reads {
             if offset + 32 > data.len() {
                 return Err("access list truncated: incomplete read key");
             }
-            reads.push(data[offset..offset + 32].try_into().unwrap());
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&data[offset..offset + 32]);
+            reads.push(key);
             offset += 32;
         }
         // Writes
         if offset + 4 > data.len() {
             return Err("access list truncated: missing write count");
         }
-        let num_writes = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let mut nw_bytes = [0u8; 4];
+        nw_bytes.copy_from_slice(&data[offset..offset + 4]);
+        let num_writes = u32::from_le_bytes(nw_bytes) as usize;
         offset += 4;
         let mut writes = Vec::with_capacity(num_writes);
         for _ in 0..num_writes {
             if offset + 32 > data.len() {
                 return Err("access list truncated: incomplete write key");
             }
-            writes.push(data[offset..offset + 32].try_into().unwrap());
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&data[offset..offset + 32]);
+            writes.push(key);
             offset += 32;
         }
         entries.push(AccessEntry { address, reads, writes });
