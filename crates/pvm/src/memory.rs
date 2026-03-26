@@ -95,10 +95,8 @@ impl Memory {
     /// Ensure a page is physically allocated. Returns a mutable reference to the page data.
     #[inline]
     fn ensure_page(&mut self, page_idx: usize) -> &mut [u8; PAGE_SIZE] {
-        if self.pages[page_idx].is_none() {
-            self.pages[page_idx] = Some(Box::new([0u8; PAGE_SIZE]));
-        }
-        self.pages[page_idx].as_mut().unwrap()
+        let page = self.pages[page_idx].get_or_insert_with(|| Box::new([0u8; PAGE_SIZE]));
+        page
     }
 
     /// Read a byte from a page (returns 0 if page not materialized).

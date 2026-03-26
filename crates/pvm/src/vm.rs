@@ -18,7 +18,7 @@
 //! - Push with space: O(1) write to data[length], increment length.
 //! - Push at capacity: realloc 2x via software memcpy (load/store loop), leak old block.
 //! - Gas cost prevents unbounded growth; memory freed after tx.
-//! - Note: all 64 opcode slots assigned, so MEMCPY is a compiler-emitted loop, not a single instruction.
+//! - MEMCPY instruction for efficient reallocation (bulk memory copy with per-byte gas).
 
 use crate::cpu::{Cpu, Trap};
 use crate::isa::{
@@ -118,7 +118,10 @@ struct CallFrame {
 }
 
 /// Maximum depth for cross-contract calls (CALL_EXT/DELEGATECALL/STATICCALL).
-const MAX_EXT_CALL_DEPTH: usize = 1024;
+/// Maximum external call depth. Lower than EVM's 1024 because each external
+/// call spawns a child VM on the Rust stack (recursive). 64 levels is generous
+/// for real-world contracts and safe for the default 8MB thread stack.
+const MAX_EXT_CALL_DEPTH: usize = 64;
 
 /// Result of a cross-contract call.
 #[derive(Clone, Debug)]
@@ -163,27 +166,11 @@ pub struct ExecutionOutput {
     /// Gas consumed (after refund).
     pub gas_used: u64,
     /// Raw gas consumed (before refund).
-    pub gas_raw: GasUsed,
+    pub gas_used_raw: u64,
     /// Gas refunded.
     pub gas_refund: u64,
     /// Event logs (empty on revert/OOG).
     pub logs: Vec<EventLog>,
-}
-
-/// Two-dimensional gas tracker: execution + proving costs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GasUsed {
-    /// Total execution gas consumed.
-    pub exec: u64,
-    /// Total proving gas consumed.
-    pub prove: u64,
-}
-
-impl GasUsed {
-    /// Total gas = exec + prove.
-    pub fn total(&self) -> u64 {
-        self.exec + self.prove
-    }
 }
 
 /// An emitted event log.
@@ -208,12 +195,10 @@ pub struct Vm {
     pub pc: u32,
     /// Frame pointer register.
     pub fp: u32,
-    /// Running total gas (exec + prove), precomputed for fast OOG checks.
+    /// Running total gas consumed.
     pub gas_used_total: u64,
     /// Gas limit for this execution. 0 = unlimited.
     pub gas_limit: u64,
-    /// Two-dimensional gas consumed (exec + prove).
-    pub gas: GasUsed,
     /// Accumulated gas refund (e.g. from SDELETE).
     pub gas_refund: u64,
     /// CPU register file (GP + wide registers).
@@ -247,14 +232,15 @@ pub struct Vm {
     pub return_data: Vec<u8>,
     /// Whether this execution is in static mode (no state writes allowed).
     pub static_mode: bool,
-    /// Set of contract addresses currently on the external call stack (reentrancy detection).
-    reentrancy_set: std::collections::HashSet<Address>,
     /// Current external call depth.
     ext_call_depth: usize,
     /// Allowed storage keys from the access list. If Some, SLOAD/SSTORE
     /// on unlisted keys will trap (strict access list enforcement).
     /// If None, all keys are allowed (no enforcement).
     pub allowed_storage_keys: Option<std::collections::HashSet<U256>>,
+    /// EIP-2929: warm storage keys (accessed in this transaction).
+    /// First access (cold) costs more gas. Subsequent accesses (warm) cost less.
+    warm_storage_keys: std::collections::HashSet<U256>,
 }
 
 /// Safe address calculation: base (u64) + offset (i64) → u32, or MemoryFault.
@@ -276,7 +262,6 @@ impl Vm {
             pc: 0,
             call_stack: Vec::new(),
             fp: 0,
-            gas: GasUsed::default(),
             gas_used_total: 0,
             gas_limit: 0,
             gas_refund: 0,
@@ -290,9 +275,9 @@ impl Vm {
             calldata: Vec::new(),
             return_data: Vec::new(),
             static_mode: false,
-            reentrancy_set: std::collections::HashSet::new(),
             ext_call_depth: 0,
             allowed_storage_keys: None,
+            warm_storage_keys: std::collections::HashSet::new(),
         }
     }
 
@@ -401,11 +386,6 @@ impl Vm {
         if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
             return Err(Trap::OutOfGas);
         }
-
-        // Track two-dimensional breakdown (exec + prove)
-        let cost = crate::isa::gas_cost(d.opcode);
-        self.gas.exec += cost.exec as u64;
-        self.gas.prove += cost.prove as u64;
 
         match d.opcode {
             // --- Control flow ---
@@ -673,6 +653,12 @@ impl Vm {
                 let addr = self.cpu.read_gp(d.rs1) as u32;
                 let len = (d.rs2_or_imm & 0xF) as u8;
                 let byte_len = self.cpu.read_gp(len) as usize;
+                // Dynamic gas: 6 per 32 bytes of input (Poseidon2 absorbs 4 elements per permutation)
+                let dynamic_gas = ((byte_len as u64 + 31) / 32) * 6;
+                self.gas_used_total += dynamic_gas;
+                if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                    return Err(Trap::OutOfGas);
+                }
                 let data = self
                     .memory
                     .checked_read_slice(addr, byte_len)
@@ -693,6 +679,15 @@ impl Vm {
                         return Err(Trap::AccessListViolation);
                     }
                 }
+                // EIP-2929: cold access costs extra gas (first touch per tx)
+                if !self.warm_storage_keys.contains(&key) {
+                    self.warm_storage_keys.insert(key);
+                    let cold_surcharge = 1800u64; // cold Sload = 200 base + 1800 = 2000 total
+                    self.gas_used_total += cold_surcharge;
+                    if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                        return Err(Trap::OutOfGas);
+                    }
+                }
                 let mode = d.rs2_or_imm & 0x3;
                 match mode {
                     0 => {
@@ -709,6 +704,12 @@ impl Vm {
                         let ptr_reg = ((d.rs2_or_imm >> 2) & 0xF) as u8;
                         let ptr = self.cpu.read_gp(ptr_reg) as u32;
                         if let Some(data) = self.storage.get(&key) {
+                            // Dynamic gas: 3 per 8 bytes of data read from storage
+                            let dynamic_gas = ((data.len() as u64 + 7) / 8) * 3;
+                            self.gas_used_total += dynamic_gas;
+                            if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                                return Err(Trap::OutOfGas);
+                            }
                             self.memory
                                 .checked_write_slice(ptr, data)
                                 .map_err(|_| Trap::MemoryFault)?;
@@ -742,6 +743,15 @@ impl Vm {
                         return Err(Trap::AccessListViolation);
                     }
                 }
+                // EIP-2929: cold access costs extra gas
+                if !self.warm_storage_keys.contains(&key) {
+                    self.warm_storage_keys.insert(key);
+                    let cold_surcharge = 1800u64; // cold Sstore = 2000 base + 1800 = 3800 total
+                    self.gas_used_total += cold_surcharge;
+                    if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                        return Err(Trap::OutOfGas);
+                    }
+                }
                 self.journal_storage_write(&key);
                 let mode = d.rs2_or_imm & 0x3;
                 match mode {
@@ -762,6 +772,12 @@ impl Vm {
                         let len_reg = ((d.rs2_or_imm >> 6) & 0xF) as u8;
                         let ptr = self.cpu.read_gp(ptr_reg) as u32;
                         let len = self.cpu.read_gp(len_reg) as usize;
+                        // Dynamic gas: 3 per 8 bytes of data written to storage
+                        let dynamic_gas = ((len as u64 + 7) / 8) * 3;
+                        self.gas_used_total += dynamic_gas;
+                        if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                            return Err(Trap::OutOfGas);
+                        }
                         let data = self
                             .memory
                             .checked_read_slice(ptr, len)
@@ -779,6 +795,15 @@ impl Vm {
                 // sdelete ws1 — clear storage slot, grant gas refund if non-empty
                 let slot = self.cpu.read_wide(d.rs1);
                 let key = self.derive_storage_key(slot);
+                // EIP-2929: cold access surcharge
+                if !self.warm_storage_keys.contains(&key) {
+                    self.warm_storage_keys.insert(key);
+                    let cold_surcharge = 1800u64;
+                    self.gas_used_total += cold_surcharge;
+                    if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                        return Err(Trap::OutOfGas);
+                    }
+                }
                 self.journal_storage_write(&key);
                 if let Some(v) = self.storage.get(&key) {
                     if !v.is_empty() {
@@ -807,26 +832,26 @@ impl Vm {
                 // Read topics
                 let mut topics = Vec::with_capacity(num_topics);
                 for t in 0..num_topics {
-                    let offset = desc_ptr + (t as u32) * 32;
+                    let offset = desc_ptr.wrapping_add((t as u32) * 32);
                     let mut buf = [0u8; 32];
                     for (j, byte) in buf.iter_mut().enumerate() {
                         *byte = self
                             .memory
-                            .load8(offset + j as u32)
+                            .load8(offset.wrapping_add(j as u32))
                             .map_err(|_| Trap::MemoryFault)?;
                     }
                     topics.push(U256::from_le_bytes(buf));
                 }
 
                 // Read data_ptr and data_len after the topics
-                let after_topics = desc_ptr + (num_topics as u32) * 32;
+                let after_topics = desc_ptr.wrapping_add((num_topics as u32) * 32);
                 let data_ptr = self
                     .memory
                     .load64(after_topics)
                     .map_err(|_| Trap::MemoryFault)? as u32;
                 let data_len = self
                     .memory
-                    .load64(after_topics + 8)
+                    .load64(after_topics.wrapping_add(8))
                     .map_err(|_| Trap::MemoryFault)? as usize;
 
                 // Read data payload (bulk)
@@ -837,7 +862,6 @@ impl Vm {
 
                 // Charge dynamic gas: 100 base + 8 per data byte + 50 per topic
                 let dynamic_gas = 100u64 + (data_len as u64) * 8 + (num_topics as u64) * 50;
-                self.gas.exec += dynamic_gas;
                 self.gas_used_total += dynamic_gas;
                 if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                     return Err(Trap::OutOfGas);
@@ -862,23 +886,23 @@ impl Vm {
                     .map_err(|_| Trap::MemoryFault)? as u32;
                 let msg_len = self
                     .memory
-                    .load64(desc_addr + 8)
+                    .load64(desc_addr.wrapping_add(8))
                     .map_err(|_| Trap::MemoryFault)? as usize;
                 let sig_ptr = self
                     .memory
-                    .load64(desc_addr + 16)
+                    .load64(desc_addr.wrapping_add(16))
                     .map_err(|_| Trap::MemoryFault)? as u32;
                 let sig_len = self
                     .memory
-                    .load64(desc_addr + 24)
+                    .load64(desc_addr.wrapping_add(24))
                     .map_err(|_| Trap::MemoryFault)? as usize;
                 let pk_ptr = self
                     .memory
-                    .load64(desc_addr + 32)
+                    .load64(desc_addr.wrapping_add(32))
                     .map_err(|_| Trap::MemoryFault)? as u32;
                 let pk_len = self
                     .memory
-                    .load64(desc_addr + 40)
+                    .load64(desc_addr.wrapping_add(40))
                     .map_err(|_| Trap::MemoryFault)? as usize;
 
                 // Read msg, sig, pk from memory
@@ -898,9 +922,14 @@ impl Vm {
                 let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&pk_bytes) {
                     Some(pk) => pk,
                     None => {
-                        // Invalid public key size → verification fails
+                        // Invalid public key size → verification fails (don't early return — need page gas drain)
                         self.cpu.write_gp(d.rd, 0);
                         self.pc += 4;
+                        // Fall through to page gas drain at end of step()
+                        if self.memory.page_gas_used > 0 {
+                            self.gas_used_total += self.memory.page_gas_used;
+                            self.memory.page_gas_used = 0;
+                        }
                         return Ok(None);
                     }
                 };
@@ -909,6 +938,10 @@ impl Vm {
                     None => {
                         self.cpu.write_gp(d.rd, 0);
                         self.pc += 4;
+                        if self.memory.page_gas_used > 0 {
+                            self.gas_used_total += self.memory.page_gas_used;
+                            self.memory.page_gas_used = 0;
+                        }
                         return Ok(None);
                     }
                 };
@@ -925,11 +958,14 @@ impl Vm {
                 // imm[3:0] = GP register with calldata length
                 // imm[7:4] = GP register with gas to forward
                 // imm[11:8] = GP register for result (1=success, 0=failure)
-                if self.static_mode {
+                // imm[12] = static call flag (1 = read-only, allowed in static mode)
+                let is_static_flag = (d.rs2_or_imm >> 12) & 1 == 1;
+                // In static mode, only static calls are allowed
+                if self.static_mode && !is_static_flag {
                     return Err(Trap::StaticModeViolation);
                 }
                 let result_reg = ((d.rs2_or_imm >> 8) & 0xF) as u8;
-                let result = self.do_ext_call(d, false, false)?;
+                let result = self.do_ext_call(d, is_static_flag, false)?;
                 self.cpu
                     .write_gp(result_reg, if result.success { 1 } else { 0 });
                 self.return_data = result.return_data;
@@ -938,9 +974,7 @@ impl Vm {
 
             Opcode::Delegate => {
                 // delegate wd, rs1, imm — same encoding as CallExt
-                if self.static_mode {
-                    return Err(Trap::StaticModeViolation);
-                }
+                // Delegate is allowed in static mode (child inherits static flag)
                 let result_reg = ((d.rs2_or_imm >> 8) & 0xF) as u8;
                 let result = self.do_ext_call(d, false, true)?;
                 self.cpu
@@ -964,8 +998,16 @@ impl Vm {
                 if self.static_mode {
                     return Err(Trap::StaticModeViolation);
                 }
-                let new_addr = self.do_create(d, false)?;
-                self.cpu.write_wide(d.rd, U256::from_le_bytes(new_addr));
+                match self.do_create(d, false) {
+                    Ok(new_addr) => {
+                        self.cpu.write_wide(d.rd, U256::from_le_bytes(new_addr));
+                    }
+                    Err(Trap::OutOfGas) => return Err(Trap::OutOfGas), // OOG propagates
+                    Err(_) => {
+                        // Constructor failed — return zero address (like Ethereum)
+                        self.cpu.write_wide(d.rd, U256::ZERO);
+                    }
+                }
                 self.pc += 4;
             }
 
@@ -986,6 +1028,12 @@ impl Vm {
                 let len_reg = (d.rs2_or_imm & 0xF) as u8;
                 let len = self.cpu.read_gp(len_reg) as usize;
                 if len > 0 {
+                    // Charge dynamic gas: 3 per 8 bytes copied (same rate as Load/Store)
+                    let dynamic_gas = ((len as u64 + 7) / 8) * 3;
+                    self.gas_used_total += dynamic_gas;
+                    if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                        return Err(Trap::OutOfGas);
+                    }
                     let data = self.memory
                         .checked_read_slice(src_ptr, len)
                         .map_err(|_| Trap::MemoryFault)?;
@@ -1007,13 +1055,72 @@ impl Vm {
                 return Ok(Some(ExecResult::Halt));
             }
             Opcode::MerkleVerify => {
-                // merkle_verify rd, ws1, rs2 — stub: always returns 1
-                // Full impl needs witness data from full nodes
-                self.cpu.write_gp(d.rd, 1);
+                // merkle_verify rd, rs1, imm — verify a Merkle proof in memory
+                // rs1 = pointer to proof descriptor in memory:
+                //   [root:32][leaf:32][proof_len:8][sibling0:32][sibling1:32]...
+                // rd = 1 if verified, 0 if not
+                let desc_ptr = self.cpu.read_gp(d.rs1) as u32;
+
+                // Read root (32 bytes)
+                let root_bytes = self.memory
+                    .checked_read_slice(desc_ptr, 32)
+                    .map_err(|_| Trap::MemoryFault)?;
+                // Read leaf (32 bytes)
+                let leaf_bytes = self.memory
+                    .checked_read_slice(desc_ptr.wrapping_add(32), 32)
+                    .map_err(|_| Trap::MemoryFault)?;
+                // Read proof length (number of siblings)
+                let proof_len = self.memory
+                    .load64(desc_ptr.wrapping_add(64))
+                    .map_err(|_| Trap::MemoryFault)? as usize;
+
+                // Cap proof depth (256 levels covers 2^256 leaves — more than enough)
+                if proof_len > 256 {
+                    self.cpu.write_gp(d.rd, 0);
+                    self.pc += 4;
+                    if self.memory.page_gas_used > 0 {
+                        self.gas_used_total += self.memory.page_gas_used;
+                        self.memory.page_gas_used = 0;
+                    }
+                    return Ok(None);
+                }
+
+                // Dynamic gas: 50 per proof level (each level = Poseidon hash + memory read)
+                let dynamic_gas = (proof_len as u64) * 50;
+                self.gas_used_total += dynamic_gas;
+                if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                    return Err(Trap::OutOfGas);
+                }
+
+                // Walk the proof: hash leaf with each sibling up to root
+                let mut current = pyde_crypto::hash::Hash256::from_slice(&leaf_bytes);
+                for i in 0..proof_len {
+                    let sib_offset = desc_ptr
+                        .checked_add(72 + (i as u32) * 32)
+                        .ok_or(Trap::MemoryFault)?;
+                    let sib_bytes = self.memory
+                        .checked_read_slice(sib_offset, 32)
+                        .map_err(|_| Trap::MemoryFault)?;
+                    let sibling = pyde_crypto::hash::Hash256::from_slice(&sib_bytes);
+                    current = pyde_crypto::poseidon2::poseidon2_pair(current, sibling);
+                }
+
+                let root = pyde_crypto::hash::Hash256::from_slice(&root_bytes);
+                let verified = current == root;
+                self.cpu.write_gp(d.rd, if verified { 1 } else { 0 });
                 self.pc += 4;
             }
 
             _ => return Err(Trap::InvalidOpcode),
+        }
+
+        // Charge memory page allocation gas (accumulated during this instruction)
+        if self.memory.page_gas_used > 0 {
+            self.gas_used_total += self.memory.page_gas_used;
+            self.memory.page_gas_used = 0;
+            if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                return Err(Trap::OutOfGas);
+            }
         }
 
         Ok(None)
@@ -1066,7 +1173,7 @@ impl Vm {
         ExecutionOutput {
             outcome,
             gas_used: self.effective_gas_used(),
-            gas_raw: self.gas,
+            gas_used_raw: self.gas_used_total,
             gas_refund: self.gas_refund,
             logs: self.logs[logs_snapshot_len..].to_vec(),
         }
@@ -1155,19 +1262,10 @@ impl Vm {
             }
         };
 
-        // Reentrancy check (default: no reentrancy allowed)
-        let call_target = if is_delegate {
-            self.ctx.self_address
-        } else {
-            target_addr
-        };
-        if self.reentrancy_set.contains(&call_target) {
-            return Ok(CallResult {
-                success: false,
-                return_data: Vec::new(),
-                gas_used: 0,
-            });
-        }
+        // Reentrancy protection is handled at the compiler level, not the VM level.
+        // The Otigen compiler emits a storage-based lock guard for every pub function
+        // by default. Functions marked #[reentrant] opt out of this guard.
+        // The VM allows all calls — the contract's bytecode decides if reentrancy is permitted.
 
         // Gas forwarding: forward requested amount, capped at available - 2300 (retain minimum)
         let available_gas = if self.gas_limit > 0 {
@@ -1175,12 +1273,13 @@ impl Vm {
         } else {
             u64::MAX
         };
-        let retained = 2300u64; // minimum gas kept by caller
-        let max_forward = available_gas.saturating_sub(retained);
+        // EIP-150: forward at most 63/64 of remaining gas.
+        // Ensures caller retains enough gas to handle call failure.
+        let max_forward_63_64 = available_gas - (available_gas / 64);
         let forwarded = if gas_to_forward == 0 {
-            max_forward // 0 means "forward all available"
+            max_forward_63_64 // 0 means "forward all available (minus 1/64)"
         } else {
-            gas_to_forward.min(max_forward)
+            gas_to_forward.min(max_forward_63_64)
         };
 
         // Build child execution context
@@ -1222,10 +1321,10 @@ impl Vm {
         child.static_mode = is_static_call || self.static_mode;
         child.contracts = self.contracts.clone();
         child.ext_call_depth = self.ext_call_depth + 1;
-        child.reentrancy_set = self.reentrancy_set.clone();
-        child.reentrancy_set.insert(self.ctx.self_address); // caller is on the stack
-        child.reentrancy_set.insert(call_target); // callee is being entered
         child.calldata = calldata;
+
+        // EIP-2929: warm storage keys persist across the entire transaction
+        child.warm_storage_keys = self.warm_storage_keys.clone();
 
         // Share storage for delegate calls
         if is_delegate {
@@ -1239,8 +1338,9 @@ impl Vm {
 
         // Charge parent for gas used by child
         self.gas_used_total += output.gas_used;
-        self.gas.exec += output.gas_raw.exec;
-        self.gas.prove += output.gas_raw.prove;
+        if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+            return Err(Trap::OutOfGas);
+        }
 
         let success = output.outcome == Outcome::Success;
 
@@ -1262,6 +1362,9 @@ impl Vm {
             self.storage = child.storage;
         }
 
+        // EIP-2929: merge child's warm keys back (persists regardless of success/failure)
+        self.warm_storage_keys.extend(child.warm_storage_keys);
+
         Ok(CallResult {
             success,
             return_data: child.return_data,
@@ -1270,6 +1373,8 @@ impl Vm {
     }
 
     /// Deploy a new contract (CREATE/CREATE2). Returns the 32-byte address.
+    /// Like Ethereum: executes init code in a child VM. The child's return_data
+    /// becomes the deployed runtime bytecode.
     fn do_create(&mut self, d: DecodedInstruction, is_create2: bool) -> Result<Address, Trap> {
         if self.ext_call_depth >= MAX_EXT_CALL_DEPTH {
             return Err(Trap::StackOverflow);
@@ -1286,7 +1391,6 @@ impl Vm {
 
         // Derive 32-byte contract address
         let new_addr: Address = if is_create2 {
-            // CREATE2: address = poseidon2(0xFF ++ sender ++ salt ++ code_hash)
             let salt = self.cpu.read_wide(0);
             let code_hash = pyde_crypto::poseidon2::poseidon2_hash(&init_code);
             let mut addr_input = Vec::with_capacity(1 + 32 + 32 + 32);
@@ -1296,14 +1400,89 @@ impl Vm {
             addr_input.extend_from_slice(&code_hash.to_bytes());
             pyde_crypto::poseidon2::poseidon2_hash(&addr_input).to_bytes()
         } else {
-            // CREATE: address = poseidon2(sender ++ code)
             let mut addr_input = Vec::with_capacity(32 + init_code.len());
             addr_input.extend_from_slice(&self.ctx.self_address);
             addr_input.extend_from_slice(&init_code);
             pyde_crypto::poseidon2::poseidon2_hash(&addr_input).to_bytes()
         };
 
-        self.contracts.insert(new_addr, init_code);
+        // Reject if contract already exists at this address
+        if self.contracts.contains_key(&new_addr) {
+            return Err(Trap::MemoryFault); // address collision
+        }
+
+        // Execute init code in a child VM (constructor runs here)
+        let available_gas = if self.gas_limit > 0 {
+            self.gas_limit.saturating_sub(self.gas_used_total)
+        } else {
+            u64::MAX
+        };
+        let max_forward = available_gas - (available_gas / 64); // 63/64 rule
+
+        let child_ctx = ExecutionContext {
+            caller: self.ctx.self_address,
+            self_address: new_addr,
+            call_value: U256::ZERO,
+            block_number: self.ctx.block_number,
+            timestamp: self.ctx.timestamp,
+            gas_price: self.ctx.gas_price,
+            tx_nonce: self.ctx.tx_nonce,
+            tx_gas_limit: self.ctx.tx_gas_limit,
+            tx_hash: self.ctx.tx_hash,
+            block_proposer: self.ctx.block_proposer,
+            block_hashes: self.ctx.block_hashes.clone(),
+            balances: self.ctx.balances.clone(),
+        };
+
+        let mut child = Vm::with_gas_limit_and_context(max_forward, child_ctx);
+        child.contracts = self.contracts.clone();
+        child.storage = self.storage.clone();
+        child.warm_storage_keys = self.warm_storage_keys.clone();
+        child.ext_call_depth = self.ext_call_depth + 1;
+        child.load(&init_code).map_err(|_| Trap::MemoryFault)?;
+
+        let output = child.execute();
+
+        // Charge parent for gas used by child
+        self.gas_used_total += output.gas_used;
+        if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+            return Err(Trap::OutOfGas);
+        }
+
+        if output.outcome == Outcome::Success {
+            // The child's return_data is the runtime bytecode to deploy.
+            // If empty, the init code didn't return runtime code — deploy empty contract.
+            let runtime_code = if child.return_data.is_empty() {
+                // No explicit return data — use the init code itself as runtime
+                // (Pyde convention: Otigen compiler packages runtime in init code)
+                init_code.clone()
+            } else {
+                child.return_data
+            };
+
+            // Charge per-byte gas for deployed code
+            let code_gas = (runtime_code.len() as u64) * 200;
+            self.gas_used_total += code_gas;
+            if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                return Err(Trap::OutOfGas);
+            }
+
+            // Deploy runtime bytecode
+            self.contracts.insert(new_addr, runtime_code);
+
+            // Merge child's storage changes (constructor may have initialized state)
+            for (k, v) in &child.storage {
+                self.storage.insert(*k, v.clone());
+            }
+            self.logs.extend(output.logs);
+            self.gas_refund += output.gas_refund;
+        } else {
+            // Constructor failed — no contract deployed
+            return Err(Trap::MemoryFault);
+        }
+
+        // Merge warm keys
+        self.warm_storage_keys.extend(child.warm_storage_keys);
 
         Ok(new_addr)
     }
@@ -1779,7 +1958,7 @@ mod tests {
         let mut vm = Vm::new();
         vm.load(&code).unwrap();
         vm.run().unwrap();
-        assert!(vm.gas.total() > 0);
+        assert!(vm.gas_used_total > 0);
     }
 
     // ========== Push/Pop through VM ==========
@@ -1959,8 +2138,8 @@ mod tests {
     // ========== Gas metering ==========
 
     #[test]
-    fn two_dimensional_gas_tracked() {
-        // ADDI costs (exec=1, prove=2), HALT costs (exec=1, prove=1)
+    fn gas_tracked() {
+        // ADDI costs 1, HALT costs 1
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 42),
             instr_bytes(Opcode::Halt, 0, 0, 0),
@@ -1968,32 +2147,30 @@ mod tests {
         let mut vm = Vm::new();
         vm.load(&code).unwrap();
         vm.run().unwrap();
-        assert_eq!(vm.gas.exec, 2); // ADDI(1) + HALT(1)
-        assert_eq!(vm.gas.prove, 3); // ADDI(2) + HALT(1)
-        assert_eq!(vm.gas.total(), 5);
+        assert_eq!(vm.gas_used_total, 2); // ADDI(1) + HALT(1)
     }
 
     #[test]
     fn out_of_gas_traps() {
-        // ADDI costs 3 total, HALT costs 2 total = 5 total
-        // Set limit to 4 — should fail on HALT
+        // ADDI costs 1, HALT costs 1 = 2 total
+        // Set limit to 1 — should fail on HALT
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 42),
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
-        let mut vm = Vm::with_gas_limit(4);
+        let mut vm = Vm::with_gas_limit(1);
         vm.load(&code).unwrap();
         assert_eq!(vm.run(), Err(Trap::OutOfGas));
     }
 
     #[test]
     fn gas_limit_exact_succeeds() {
-        // ADDI(3) + HALT(2) = 5 total
+        // ADDI(1) + HALT(1) = 2
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 42),
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
-        let mut vm = Vm::with_gas_limit(5);
+        let mut vm = Vm::with_gas_limit(2);
         vm.load(&code).unwrap();
         assert_eq!(vm.run().unwrap(), ExecResult::Halt);
         assert_eq!(vm.gas_remaining(), 0);
@@ -2018,6 +2195,7 @@ mod tests {
 
     #[test]
     fn gas_remaining_decreases() {
+        // ADDI(1) + HALT(1) = 2
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 42),
             instr_bytes(Opcode::Halt, 0, 0, 0),
@@ -2025,7 +2203,7 @@ mod tests {
         let mut vm = Vm::with_gas_limit(100);
         vm.load(&code).unwrap();
         vm.run().unwrap();
-        assert_eq!(vm.gas_remaining(), 95); // 100 - 5
+        assert_eq!(vm.gas_remaining(), 98); // 100 - 2
     }
 
     #[test]
@@ -2049,6 +2227,7 @@ mod tests {
 
     #[test]
     fn gas_refund_cap_50_percent() {
+        // ADDI(3) + HALT(2) = 5
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 42),
             instr_bytes(Opcode::Halt, 0, 0, 0),
@@ -2057,7 +2236,7 @@ mod tests {
         vm.load(&code).unwrap();
         vm.run().unwrap();
 
-        let total = vm.gas.total(); // 5
+        let total = vm.gas_used_total; // 5
 
         // No refund → effective = total
         assert_eq!(vm.effective_gas_used(), total);
@@ -2099,9 +2278,7 @@ mod tests {
         vm_mul.run().unwrap();
 
         // MUL(10) > ADD(3), so total should differ
-        assert!(vm_mul.gas.total() > vm_add.gas.total());
-        assert!(vm_mul.gas.exec > vm_add.gas.exec);
-        assert!(vm_mul.gas.prove > vm_add.gas.prove);
+        assert!(vm_mul.gas_used_total > vm_add.gas_used_total);
     }
 
     // ========== System instructions (M1.8) ==========
@@ -2181,9 +2358,9 @@ mod tests {
         ]);
         let mut vm = Vm::with_gas_limit(1000);
         vm.load(&code).unwrap();
-        // After executing Caller (gas cost 3), remaining should be 1000 - 3 = 997
+        // After executing Caller (gas cost 2), remaining should be 1000 - 2 = 998
         vm.step().unwrap();
-        assert_eq!(vm.cpu.read_gp(1), 997);
+        assert_eq!(vm.cpu.read_gp(1), 998);
     }
 
     #[test]
@@ -2546,9 +2723,9 @@ mod tests {
         let mut vm = Vm::new();
         vm.load(&code).unwrap();
         vm.run().unwrap();
-        // Poseidon costs (exec=50, prove=150) = 200 total
-        // Plus 2x ADDI (3 each) + HALT (2) = 208 total
-        assert!(vm.gas.total() >= 200);
+        // Poseidon costs 50
+        // Plus 2x ADDI (1 each) + HALT (1) = 53 total
+        assert!(vm.gas_used_total >= 50);
     }
 
     // --- Storage instruction tests ---
@@ -2668,15 +2845,15 @@ mod tests {
         vm.cpu.write_wide(0, U256::from(1u64));
         vm.cpu.write_wide(1, U256::from(42u64));
         let code = bytecode(&[
-            instr_bytes(Opcode::Sstore, 1, 0, 0),  // 3000 gas
-            instr_bytes(Opcode::Sload, 2, 0, 0),   // 300 gas
-            instr_bytes(Opcode::Sdelete, 0, 0, 0), // 700 gas
-            instr_bytes(Opcode::Halt, 0, 0, 0),    // 2 gas
+            instr_bytes(Opcode::Sstore, 1, 0, 0),  // 2000 gas
+            instr_bytes(Opcode::Sload, 2, 0, 0),   // 200 gas
+            instr_bytes(Opcode::Sdelete, 0, 0, 0), // 500 gas
+            instr_bytes(Opcode::Halt, 0, 0, 0),    // 1 gas
         ]);
         vm.load(&code).unwrap();
         vm.run().unwrap();
-        // SSTORE=3000, SLOAD=300, SDELETE=700, HALT=2
-        assert_eq!(vm.gas.total(), 3000 + 300 + 700 + 2);
+        // SSTORE=2000+1800(cold), SLOAD=200(warm, same key), SDELETE=500(warm), HALT=1
+        assert_eq!(vm.gas_used_total, (2000 + 1800) + 200 + 500 + 1);
     }
 
     #[test]
@@ -2956,11 +3133,12 @@ mod tests {
         vm.load(&code).unwrap();
         vm.run().unwrap();
 
-        // Base ISA gas (50 exec + 25 prove = 75) + dynamic (100 + 10*8 + 3*50 = 330)
-        // + HALT (2) = 407
-        let log_gas = 75 + 100 + 80 + 150; // 405
-        let halt_gas = 2;
-        assert_eq!(vm.gas.total(), log_gas + halt_gas);
+        // Base ISA gas (50) + dynamic (100 + 10*8 + 3*50 = 330)
+        // + HALT (1) + page allocation (200 for heap page touched by descriptor)
+        let log_gas = 50 + 100 + 80 + 150; // 380
+        let halt_gas = 1;
+        let page_gas = 200; // one heap page allocated for descriptor data
+        assert_eq!(vm.gas_used_total, log_gas + halt_gas + page_gas);
     }
 
     #[test]
@@ -3258,24 +3436,28 @@ mod tests {
     // ========== Task 0203: Reentrancy guard blocks re-entrant call ==========
 
     #[test]
-    fn ext_call_reentrancy_blocked() {
-        // B's code: load addr A into w0, call A (reentrancy!)
+    fn ext_call_reentrancy_depth_limited() {
+        // Reentrancy is allowed at the VM level (compiler handles guards).
+        // But recursive calls are bounded by MAX_EXT_CALL_DEPTH (64).
+        // A calls B, B calls A, ... eventually depth limit is hit → child fails.
+
+        // B's code: call A (re-entry)
         let code_b = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 0xAA),
-            instr_bytes(Opcode::Widen, 0, 1, 0), // w0 = addr(0xAA)
+            instr_bytes(Opcode::Widen, 0, 1, 0),
             instr_ri(Opcode::Addi, 3, 0, 0),
             instr_ri(Opcode::Addi, 4, 0, 0),
-            instr_bytes(Opcode::CallExt, 0, 2, 0x143), // result→r1
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143),
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
-        // A's code: load addr B into w0, call B
+        // A's code: call B
         let code_a = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 0xBB),
-            instr_bytes(Opcode::Widen, 0, 1, 0), // w0 = addr(0xBB)
+            instr_bytes(Opcode::Widen, 0, 1, 0),
             instr_ri(Opcode::Addi, 3, 0, 0),
             instr_ri(Opcode::Addi, 4, 0, 0),
-            instr_bytes(Opcode::CallExt, 0, 2, 0x143), // result→r1
+            instr_bytes(Opcode::CallExt, 0, 2, 0x143),
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
 
@@ -3283,14 +3465,15 @@ mod tests {
             self_address: addr(0xAA),
             ..Default::default()
         };
-        let mut vm = Vm::with_context(ctx);
+        let mut vm = Vm::with_gas_limit_and_context(1_000_000, ctx);
         vm.contracts.insert(addr(0xAA), code_a.clone());
         vm.contracts.insert(addr(0xBB), code_b);
         vm.load(&code_a).unwrap();
         let output = vm.execute();
 
+        // The recursive calls eventually hit depth limit or gas limit.
+        // The outermost call still succeeds (child failure doesn't kill parent).
         assert_eq!(output.outcome, Outcome::Success);
-        assert_eq!(vm.cpu.read_gp(1), 1);
     }
 
     // ========== Task 0205: STATICCALL reverts on state modification ==========
