@@ -62,6 +62,9 @@ pub fn validate_signature(
         }
 
         AuthKeys::MultiSig { keys, threshold } => {
+            // Multi-sig uses positional matching: signatures[i] corresponds to keys[i].
+            // Non-signers provide an empty signature at their position.
+            // Callers must ensure signatures are ordered to match the key list.
             if signatures.len() < *threshold as usize {
                 return AuthResult::Invalid;
             }

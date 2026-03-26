@@ -98,9 +98,14 @@ impl NonceState {
 
     /// Deserialize from 10 bytes.
     pub fn from_bytes(data: &[u8; 10]) -> Self {
-        let base = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        let used = u16::from_le_bytes(data[8..10].try_into().unwrap());
-        Self { base, used }
+        let mut base_bytes = [0u8; 8];
+        base_bytes.copy_from_slice(&data[0..8]);
+        let mut used_bytes = [0u8; 2];
+        used_bytes.copy_from_slice(&data[8..10]);
+        Self {
+            base: u64::from_le_bytes(base_bytes),
+            used: u16::from_le_bytes(used_bytes),
+        }
     }
 }
 
