@@ -54,16 +54,16 @@ impl BlockWitness {
 ///
 /// The full node calls this before sending the block to validators.
 /// All keys get a single compiled Merkle proof (shared siblings deduplicated).
-pub fn generate_witnesses(smt: &PydeSMT, access_keys: &[Key]) -> BlockWitness {
+pub fn generate_witnesses(smt: &PydeSMT, access_keys: &[Key]) -> Result<BlockWitness, &'static str> {
     let pre_root = smt.root();
 
     if access_keys.is_empty() {
-        return BlockWitness {
+        return Ok(BlockWitness {
             entries: Vec::new(),
             proof: Vec::new(),
             pre_state_root: pre_root,
             post_state_root: H256::zero(),
-        };
+        });
     }
 
     // Collect current values
@@ -77,15 +77,15 @@ pub fn generate_witnesses(smt: &PydeSMT, access_keys: &[Key]) -> BlockWitness {
 
     // Generate single batch proof for all keys
     let keys_vec: Vec<Key> = access_keys.to_vec();
-    let proof = smt.prove(keys_vec.clone());
-    let compiled = proof.compile(keys_vec);
+    let proof = smt.prove(keys_vec.clone())?;
+    let compiled = proof.compile(keys_vec)?;
 
-    BlockWitness {
+    Ok(BlockWitness {
         entries,
         proof: compiled.to_bytes(),
         pre_state_root: pre_root,
         post_state_root: H256::zero(),
-    }
+    })
 }
 
 /// Verify a block witness: check that the batch proof is valid
@@ -124,7 +124,7 @@ pub fn witness_to_state_map(witness: &BlockWitness) -> std::collections::HashMap
 ///
 /// `diffs` is a list of (key, new_value) pairs. Empty value = deletion.
 /// Returns the new root after applying all diffs.
-pub fn compute_post_state_root(smt: &mut PydeSMT, diffs: Vec<(Key, Vec<u8>)>) -> H256 {
+pub fn compute_post_state_root(smt: &mut PydeSMT, diffs: Vec<(Key, Vec<u8>)>) -> Result<H256, &'static str> {
     smt.update_all(diffs)
 }
 
@@ -139,9 +139,9 @@ mod tests {
     fn witness_single_read() {
         let mut smt = PydeSMT::new();
         let key = key_from_seed(1);
-        smt.insert(key, b"balance_100".to_vec());
+        smt.insert(key, b"balance_100".to_vec()).unwrap();
 
-        let witness = generate_witnesses(&smt, &[key]);
+        let witness = generate_witnesses(&smt, &[key]).unwrap();
         assert_eq!(witness.len(), 1);
         assert_eq!(witness.entries[0].key, key);
         assert_eq!(witness.entries[0].value, b"balance_100");
@@ -154,13 +154,13 @@ mod tests {
     fn witness_storage_write() {
         let mut smt = PydeSMT::new();
         let key = key_from_seed(1);
-        smt.insert(key, b"old_value".to_vec());
+        smt.insert(key, b"old_value".to_vec()).unwrap();
 
-        let witness = generate_witnesses(&smt, &[key]);
+        let witness = generate_witnesses(&smt, &[key]).unwrap();
         assert_eq!(witness.entries[0].value, b"old_value");
 
         // Apply write — root changes
-        smt.insert(key, b"new_value".to_vec());
+        smt.insert(key, b"new_value".to_vec()).unwrap();
         assert_ne!(smt.root(), witness.pre_state_root);
     }
 
@@ -169,10 +169,10 @@ mod tests {
     #[test]
     fn witness_absent_key() {
         let mut smt = PydeSMT::new();
-        smt.insert(key_from_seed(1), b"exists".to_vec());
+        smt.insert(key_from_seed(1), b"exists".to_vec()).unwrap();
 
         let missing = key_from_seed(999);
-        let witness = generate_witnesses(&smt, &[missing]);
+        let witness = generate_witnesses(&smt, &[missing]).unwrap();
         assert!(witness.entries[0].value.is_empty());
     }
 
@@ -182,11 +182,11 @@ mod tests {
     fn witness_verification_passes() {
         let mut smt = PydeSMT::new();
         for i in 0..10u64 {
-            smt.insert(key_from_seed(i), format!("val_{i}").into_bytes());
+            smt.insert(key_from_seed(i), format!("val_{i}").into_bytes()).unwrap();
         }
         let keys: Vec<Key> = (0..10).map(|i| key_from_seed(i)).collect();
 
-        let witness = generate_witnesses(&smt, &keys);
+        let witness = generate_witnesses(&smt, &keys).unwrap();
         assert!(verify_witnesses(&witness));
     }
 
@@ -194,9 +194,9 @@ mod tests {
     fn witness_verification_fails_with_wrong_root() {
         let mut smt = PydeSMT::new();
         let key = key_from_seed(1);
-        smt.insert(key, b"data".to_vec());
+        smt.insert(key, b"data".to_vec()).unwrap();
 
-        let mut witness = generate_witnesses(&smt, &[key]);
+        let mut witness = generate_witnesses(&smt, &[key]).unwrap();
         witness.pre_state_root = H256::from([0xFFu8; 32]);
         assert!(!verify_witnesses(&witness));
     }
@@ -208,10 +208,10 @@ mod tests {
         let mut smt = PydeSMT::new();
         let keys: Vec<Key> = (0..10).map(|i| key_from_seed(i)).collect();
         for (i, k) in keys.iter().enumerate() {
-            smt.insert(*k, format!("val_{i}").into_bytes());
+            smt.insert(*k, format!("val_{i}").into_bytes()).unwrap();
         }
 
-        let witness = generate_witnesses(&smt, &keys);
+        let witness = generate_witnesses(&smt, &keys).unwrap();
         let state_map = witness_to_state_map(&witness);
 
         for (i, k) in keys.iter().enumerate() {
@@ -225,16 +225,16 @@ mod tests {
         let mut smt = PydeSMT::new();
         let key1 = key_from_seed(1);
         let key2 = key_from_seed(2);
-        smt.insert(key1, b"a".to_vec());
-        smt.insert(key2, b"b".to_vec());
+        smt.insert(key1, b"a".to_vec()).unwrap();
+        smt.insert(key2, b"b".to_vec()).unwrap();
 
         let mut smt_clone = PydeSMT::new();
-        smt_clone.insert(key1, b"a".to_vec());
-        smt_clone.insert(key2, b"b".to_vec());
+        smt_clone.insert(key1, b"a".to_vec()).unwrap();
+        smt_clone.insert(key2, b"b".to_vec()).unwrap();
 
         let diffs = vec![(key1, b"new_a".to_vec())];
-        let post_root = compute_post_state_root(&mut smt, diffs);
-        smt_clone.insert(key1, b"new_a".to_vec());
+        let post_root = compute_post_state_root(&mut smt, diffs).unwrap();
+        smt_clone.insert(key1, b"new_a".to_vec()).unwrap();
 
         assert_eq!(post_root, smt_clone.root());
     }
@@ -246,17 +246,17 @@ mod tests {
         let mut smt = PydeSMT::new();
         let keys: Vec<Key> = (0..100).map(|i| key_from_seed(i)).collect();
         for (i, k) in keys.iter().enumerate() {
-            smt.insert(*k, format!("v{i}").into_bytes());
+            smt.insert(*k, format!("v{i}").into_bytes()).unwrap();
         }
 
         // Batch witness (single proof)
-        let batch = generate_witnesses(&smt, &keys);
+        let batch = generate_witnesses(&smt, &keys).unwrap();
         let batch_size = batch.size_bytes();
 
         // Individual witnesses (100 separate proofs)
         let mut individual_size = 0;
         for k in &keys {
-            let w = generate_witnesses(&smt, &[*k]);
+            let w = generate_witnesses(&smt, &[*k]).unwrap();
             individual_size += w.size_bytes();
         }
 
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn empty_access_list() {
         let smt = PydeSMT::new();
-        let witness = generate_witnesses(&smt, &[]);
+        let witness = generate_witnesses(&smt, &[]).unwrap();
         assert!(witness.is_empty());
         assert!(verify_witnesses(&witness));
     }

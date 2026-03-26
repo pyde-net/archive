@@ -106,15 +106,15 @@ pub fn create_vote(
     voter_index: u8,
     voter_address: Address,
     voter_sk: &pyde_crypto::falcon::FalconSecretKey,
-) -> Option<ConsensusMessage> {
+) -> Result<Option<ConsensusMessage>, &'static str> {
     // Safety: don't double-vote
     if header.slot <= state.last_voted_slot {
-        return None;
+        return Ok(None);
     }
 
     // Safety: proposal must extend our highest QC
     if header.qc_previous.slot < state.highest_qc.slot {
-        return None;
+        return Ok(None);
     }
 
     // Update highest QC if proposal's QC is newer
@@ -128,17 +128,18 @@ pub fn create_vote(
     let mut vote_msg = Vec::with_capacity(40);
     vote_msg.extend_from_slice(&header.slot.to_le_bytes());
     vote_msg.extend_from_slice(&block_hash);
-    let sig = pyde_crypto::falcon::falcon_sign(voter_sk, &vote_msg);
+    let sig = pyde_crypto::falcon::falcon_sign(voter_sk, &vote_msg)
+        .map_err(|_| "vote signing failed")?;
 
     state.last_voted_slot = header.slot;
 
-    Some(ConsensusMessage::Vote {
+    Ok(Some(ConsensusMessage::Vote {
         slot: header.slot,
         block_hash,
         voter_index,
         voter_address,
         signature: sig.as_bytes().to_vec(),
-    })
+    }))
 }
 
 /// Verify a vote message against a validator's public key.
@@ -158,7 +159,10 @@ pub fn verify_vote(vote: &ConsensusMessage, public_key: &[u8]) -> bool {
             let mut vote_msg = Vec::with_capacity(40);
             vote_msg.extend_from_slice(&slot.to_le_bytes());
             vote_msg.extend_from_slice(block_hash);
-            let sig = FalconSignature::from_bytes(signature);
+            let sig = match FalconSignature::from_bytes(signature) {
+                Some(s) => s,
+                None => return false,
+            };
             falcon_verify(&pk, &vote_msg, &sig)
         }
         _ => false,
@@ -263,19 +267,20 @@ pub fn create_timeout(
     voter_index: u8,
     voter_address: Address,
     voter_sk: &pyde_crypto::falcon::FalconSecretKey,
-) -> ConsensusMessage {
+) -> Result<ConsensusMessage, &'static str> {
     let mut msg = Vec::new();
     msg.extend_from_slice(b"timeout");
     msg.extend_from_slice(&slot.to_le_bytes());
-    let sig = pyde_crypto::falcon::falcon_sign(voter_sk, &msg);
+    let sig = pyde_crypto::falcon::falcon_sign(voter_sk, &msg)
+        .map_err(|_| "timeout signing failed")?;
 
-    ConsensusMessage::Timeout {
+    Ok(ConsensusMessage::Timeout {
         slot,
         voter_index,
         voter_address,
         highest_qc: state.highest_qc.clone(),
         signature: sig.as_bytes().to_vec(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -309,14 +314,14 @@ mod tests {
     #[test]
     fn happy_path_vote_and_qc() {
         let mut state = ConsensusState::new();
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
         let header = make_header(1, 0);
 
         // Create vote
-        let vote = create_vote(&mut state, &header, 0, addr, &sk).unwrap();
+        let vote = create_vote(&mut state, &header, 0, addr, &sk).unwrap().unwrap();
         assert!(matches!(vote, ConsensusMessage::Vote { .. }));
 
         // Verify vote
@@ -335,14 +340,14 @@ mod tests {
 
         // Generate 86 valid votes (signature covers slot || block_hash)
         for i in 0..86u8 {
-            let (pk, sk) = falcon_keygen();
+            let (pk, sk) = falcon_keygen().unwrap();
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
             let mut vote_msg = Vec::with_capacity(40);
             vote_msg.extend_from_slice(&5u64.to_le_bytes());
             vote_msg.extend_from_slice(&block_hash);
-            let sig = pyde_crypto::falcon::falcon_sign(&sk, &vote_msg);
+            let sig = pyde_crypto::falcon::falcon_sign(&sk, &vote_msg).unwrap();
             votes.push(ConsensusMessage::Vote {
                 slot: 5,
                 block_hash,
@@ -377,14 +382,14 @@ mod tests {
 
         // Only 85 votes (need 86)
         for i in 0..85u8 {
-            let (pk, sk) = falcon_keygen();
+            let (pk, sk) = falcon_keygen().unwrap();
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
             let mut vote_msg = Vec::with_capacity(40);
             vote_msg.extend_from_slice(&5u64.to_le_bytes());
             vote_msg.extend_from_slice(&block_hash);
-            let sig = pyde_crypto::falcon::falcon_sign(&sk, &vote_msg);
+            let sig = pyde_crypto::falcon::falcon_sign(&sk, &vote_msg).unwrap();
             votes.push(ConsensusMessage::Vote {
                 slot: 5,
                 block_hash,
@@ -446,31 +451,31 @@ mod tests {
     #[test]
     fn no_double_vote() {
         let mut state = ConsensusState::new();
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let addr = derive_eoa_address(pk.as_bytes());
 
         let header = make_header(1, 0);
-        let vote1 = create_vote(&mut state, &header, 0, addr, &sk);
+        let vote1 = create_vote(&mut state, &header, 0, addr, &sk).unwrap();
         assert!(vote1.is_some());
 
         // Try voting again for same slot
-        let vote2 = create_vote(&mut state, &header, 0, addr, &sk);
+        let vote2 = create_vote(&mut state, &header, 0, addr, &sk).unwrap();
         assert!(vote2.is_none()); // rejected
     }
 
     #[test]
     fn vote_rejected_for_old_slot() {
         let mut state = ConsensusState::new();
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let addr = derive_eoa_address(pk.as_bytes());
 
         // Vote for slot 5
         let header5 = make_header(5, 4);
-        create_vote(&mut state, &header5, 0, addr, &sk).unwrap();
+        create_vote(&mut state, &header5, 0, addr, &sk).unwrap().unwrap();
 
         // Try to vote for slot 3 (old)
         let header3 = make_header(3, 2);
-        let vote = create_vote(&mut state, &header3, 0, addr, &sk);
+        let vote = create_vote(&mut state, &header3, 0, addr, &sk).unwrap();
         assert!(vote.is_none());
     }
 
@@ -479,13 +484,13 @@ mod tests {
     #[test]
     fn vote_updates_highest_qc() {
         let mut state = ConsensusState::new();
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let addr = derive_eoa_address(pk.as_bytes());
 
         assert_eq!(state.highest_qc.slot, 0);
 
         let header = make_header(5, 4); // QC for slot 4
-        create_vote(&mut state, &header, 0, addr, &sk).unwrap();
+        create_vote(&mut state, &header, 0, addr, &sk).unwrap().unwrap();
 
         assert_eq!(state.highest_qc.slot, 4);
     }
@@ -495,10 +500,10 @@ mod tests {
     #[test]
     fn timeout_message_created() {
         let state = ConsensusState::new();
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let addr = derive_eoa_address(pk.as_bytes());
 
-        let timeout = create_timeout(&state, 5, 0, addr, &sk);
+        let timeout = create_timeout(&state, 5, 0, addr, &sk).unwrap();
         assert!(matches!(timeout, ConsensusMessage::Timeout { slot: 5, .. }));
     }
 }

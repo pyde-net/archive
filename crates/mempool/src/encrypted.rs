@@ -105,7 +105,7 @@ pub fn encrypt_transaction(
     value: u128,
     calldata: &[u8],
     committee_pk: &ThresholdPublicKey,
-) -> EncryptedTx {
+) -> Result<EncryptedTx, &'static str> {
     // Build plaintext payload: to || value || calldata
     let mut payload = Vec::with_capacity(48 + calldata.len()); // to(32) + value(16) + calldata
     payload.extend_from_slice(to);
@@ -113,9 +113,10 @@ pub fn encrypt_transaction(
     payload.extend_from_slice(calldata);
 
     // Encrypt using threshold Kyber
-    let ciphertext = threshold::threshold_encrypt(committee_pk, &payload);
+    let ciphertext = threshold::threshold_encrypt(committee_pk, &payload)
+        .map_err(|_| "threshold encryption failed")?;
 
-    EncryptedTx {
+    Ok(EncryptedTx {
         sender,
         nonce,
         gas_limit,
@@ -125,7 +126,7 @@ pub fn encrypt_transaction(
         signature,
         ciphertext,
         hash_cache: None,
-    }
+    })
 }
 
 /// Decrypt an encrypted transaction's payload using combined decryption shares.
@@ -157,7 +158,7 @@ mod tests {
     use pyde_account::address::derive_eoa_address;
 
     fn make_threshold_keys() -> (ThresholdPublicKey, Vec<KeyShare>) {
-        threshold::threshold_keygen(3, 2) // 2-of-3
+        threshold::threshold_keygen(3, 2).unwrap() // 2-of-3
     }
 
     #[test]
@@ -178,7 +179,8 @@ mod tests {
             1_000_000,
             b"swap(TOKEN_X, 500)",
             &pk,
-        );
+        )
+        .unwrap();
 
         // Plaintext fields visible
         assert_eq!(enc_tx.sender, sender);
@@ -208,7 +210,8 @@ mod tests {
 
         let enc_tx = encrypt_transaction(
             sender, 0, 21_000, vec![], None, 1, vec![], &to, 100, b"", &pk,
-        );
+        )
+        .unwrap();
 
         // Only 1 share (need 2)
         let dec_shares = vec![
@@ -226,7 +229,8 @@ mod tests {
 
         let enc_tx = encrypt_transaction(
             sender, 0, 21_000, vec![], None, 1, vec![], &to, 100, b"", &pk,
-        );
+        )
+        .unwrap();
 
         assert_eq!(enc_tx.hash(), enc_tx.hash());
     }
@@ -239,7 +243,8 @@ mod tests {
 
         let enc_tx = encrypt_transaction(
             sender, 0, 21_000, vec![], Some(100), 1, vec![], &to, 0, b"", &pk,
-        );
+        )
+        .unwrap();
 
         assert!(!enc_tx.is_expired(99));
         assert!(enc_tx.is_expired(100));
@@ -254,7 +259,8 @@ mod tests {
 
         let enc_tx = encrypt_transaction(
             sender, 0, 21_000, vec![], None, 1, vec![], &to, 0, b"", &pk,
-        );
+        )
+        .unwrap();
 
         assert!(!enc_tx.is_expired(u64::MAX));
     }
@@ -267,12 +273,14 @@ mod tests {
 
         let small_tx = encrypt_transaction(
             sender, 0, 21_000, vec![], None, 1, vec![], &to, 0, b"", &pk,
-        );
+        )
+        .unwrap();
         assert!(!small_tx.is_oversized());
 
         let big_tx = encrypt_transaction(
             sender, 0, 21_000, vec![], None, 1, vec![], &to, 0, &vec![0xFF; 200_000], &pk,
-        );
+        )
+        .unwrap();
         assert!(big_tx.is_oversized());
     }
 }

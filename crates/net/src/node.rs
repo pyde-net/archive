@@ -68,15 +68,13 @@ pub fn create_node(config: &NetworkConfig, local_key: identity::Keypair) -> Resu
                 .validation_mode(gossipsub::ValidationMode::Strict)
                 .max_transmit_size(256 * 1024) // 256KB max message
                 .build()
-                .map_err(|e| format!("gossipsub config error: {e}"))
-                .expect("valid gossipsub config");
+                .map_err(|e| format!("gossipsub config error: {e}"))?;
 
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
             )
-            .map_err(|e| format!("gossipsub error: {e}"))
-            .expect("valid gossipsub");
+            .map_err(|e| format!("gossipsub error: {e}"))?;
 
             // Kademlia
             let kademlia = kad::Behaviour::new(
@@ -90,11 +88,11 @@ pub fn create_node(config: &NetworkConfig, local_key: identity::Keypair) -> Resu
                 key.public(),
             ));
 
-            PydeBehaviour {
+            Ok(PydeBehaviour {
                 gossipsub,
                 kademlia,
                 identify,
-            }
+            })
         })
         .map_err(|e| format!("behaviour error: {e}"))?
         .with_swarm_config(|cfg| {

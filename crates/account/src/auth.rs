@@ -50,7 +50,10 @@ pub fn validate_signature(
                 Some(pk) => pk,
                 None => return AuthResult::Invalid,
             };
-            let sig = FalconSignature::from_bytes(&signatures[0]);
+            let sig = match FalconSignature::from_bytes(&signatures[0]) {
+                Some(s) => s,
+                None => return AuthResult::Invalid,
+            };
             if falcon_verify(&pk, message, &sig) {
                 AuthResult::Valid
             } else {
@@ -75,7 +78,10 @@ pub fn validate_signature(
                     Some(pk) => pk,
                     None => continue,
                 };
-                let sig = FalconSignature::from_bytes(&signatures[i]);
+                let sig = match FalconSignature::from_bytes(&signatures[i]) {
+                    Some(s) => s,
+                    None => continue,
+                };
                 if falcon_verify(&pk, message, &sig) {
                     valid_count += 1;
                 }
@@ -133,7 +139,7 @@ mod tests {
     use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
 
     fn make_eoa_with_real_key() -> (Account, pyde_crypto::falcon::FalconSecretKey) {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let account = Account::new_eoa(&pk_bytes);
         (account, sk)
@@ -145,7 +151,7 @@ mod tests {
     fn falcon_single_key_valid() {
         let (account, sk) = make_eoa_with_real_key();
         let message = b"transfer 100 PYDE to Bob";
-        let sig = falcon_sign(&sk, message);
+        let sig = falcon_sign(&sk, message).unwrap();
         let sig_bytes = sig.as_bytes().to_vec();
 
         let result = validate_signature(&account, message, &[sig_bytes]);
@@ -155,7 +161,7 @@ mod tests {
     #[test]
     fn falcon_single_key_wrong_message() {
         let (account, sk) = make_eoa_with_real_key();
-        let sig = falcon_sign(&sk, b"correct message");
+        let sig = falcon_sign(&sk, b"correct message").unwrap();
         let sig_bytes = sig.as_bytes().to_vec();
 
         let result = validate_signature(&account, b"wrong message", &[sig_bytes]);
@@ -180,9 +186,9 @@ mod tests {
 
     #[test]
     fn multisig_2_of_3_valid() {
-        let (pk1, sk1) = falcon_keygen();
-        let (pk2, sk2) = falcon_keygen();
-        let (pk3, _sk3) = falcon_keygen();
+        let (pk1, sk1) = falcon_keygen().unwrap();
+        let (pk2, sk2) = falcon_keygen().unwrap();
+        let (pk3, _sk3) = falcon_keygen().unwrap();
 
         let mut account = Account::new_eoa(&pk1.as_bytes().to_vec());
         account.auth_keys = AuthKeys::MultiSig {
@@ -191,8 +197,8 @@ mod tests {
         };
 
         let message = b"multisig tx";
-        let sig1 = falcon_sign(&sk1, message).as_bytes().to_vec();
-        let sig2 = falcon_sign(&sk2, message).as_bytes().to_vec();
+        let sig1 = falcon_sign(&sk1, message).unwrap().as_bytes().to_vec();
+        let sig2 = falcon_sign(&sk2, message).unwrap().as_bytes().to_vec();
 
         // 2 of 3 signatures — should pass
         let result = validate_signature(&account, message, &[sig1, sig2, vec![]]);
@@ -201,9 +207,9 @@ mod tests {
 
     #[test]
     fn multisig_insufficient_signatures() {
-        let (pk1, sk1) = falcon_keygen();
-        let (pk2, _sk2) = falcon_keygen();
-        let (pk3, _sk3) = falcon_keygen();
+        let (pk1, sk1) = falcon_keygen().unwrap();
+        let (pk2, _sk2) = falcon_keygen().unwrap();
+        let (pk3, _sk3) = falcon_keygen().unwrap();
 
         let mut account = Account::new_eoa(&pk1.as_bytes().to_vec());
         account.auth_keys = AuthKeys::MultiSig {
@@ -212,7 +218,7 @@ mod tests {
         };
 
         let message = b"multisig tx";
-        let sig1 = falcon_sign(&sk1, message).as_bytes().to_vec();
+        let sig1 = falcon_sign(&sk1, message).unwrap().as_bytes().to_vec();
 
         // Only 1 signature — threshold is 2
         let result = validate_signature(&account, message, &[sig1]);
@@ -224,11 +230,11 @@ mod tests {
     #[test]
     fn key_rotation_succeeds() {
         let (account, sk) = make_eoa_with_real_key();
-        let (new_pk, _new_sk) = falcon_keygen();
+        let (new_pk, _new_sk) = falcon_keygen().unwrap();
         let new_keys = AuthKeys::Single(new_pk.as_bytes().to_vec());
 
         let rotation_msg = build_rotation_message(&account, &new_keys);
-        let sig = falcon_sign(&sk, &rotation_msg).as_bytes().to_vec();
+        let sig = falcon_sign(&sk, &rotation_msg).unwrap().as_bytes().to_vec();
 
         let updated = rotate_keys(&account, new_keys.clone(), &[sig], &rotation_msg).unwrap();
         assert_eq!(updated.auth_keys, new_keys);
@@ -239,17 +245,17 @@ mod tests {
     #[test]
     fn old_key_invalid_after_rotation() {
         let (account, sk) = make_eoa_with_real_key();
-        let (new_pk, _new_sk) = falcon_keygen();
+        let (new_pk, _new_sk) = falcon_keygen().unwrap();
         let new_keys = AuthKeys::Single(new_pk.as_bytes().to_vec());
 
         let rotation_msg = build_rotation_message(&account, &new_keys);
-        let sig = falcon_sign(&sk, &rotation_msg).as_bytes().to_vec();
+        let sig = falcon_sign(&sk, &rotation_msg).unwrap().as_bytes().to_vec();
 
         let updated = rotate_keys(&account, new_keys, &[sig], &rotation_msg).unwrap();
 
         // Old key can no longer sign for this account
         let msg = b"transaction after rotation";
-        let old_sig = falcon_sign(&sk, msg).as_bytes().to_vec();
+        let old_sig = falcon_sign(&sk, msg).unwrap().as_bytes().to_vec();
         let result = validate_signature(&updated, msg, &[old_sig]);
         assert_eq!(result, AuthResult::Invalid);
     }
@@ -257,12 +263,12 @@ mod tests {
     #[test]
     fn rotation_with_wrong_key_fails() {
         let (account, _sk) = make_eoa_with_real_key();
-        let (_wrong_pk, wrong_sk) = falcon_keygen();
-        let (new_pk, _new_sk) = falcon_keygen();
+        let (_wrong_pk, wrong_sk) = falcon_keygen().unwrap();
+        let (new_pk, _new_sk) = falcon_keygen().unwrap();
         let new_keys = AuthKeys::Single(new_pk.as_bytes().to_vec());
 
         let rotation_msg = build_rotation_message(&account, &new_keys);
-        let wrong_sig = falcon_sign(&wrong_sk, &rotation_msg).as_bytes().to_vec();
+        let wrong_sig = falcon_sign(&wrong_sk, &rotation_msg).unwrap().as_bytes().to_vec();
 
         let result = rotate_keys(&account, new_keys, &[wrong_sig], &rotation_msg);
         assert!(result.is_none());

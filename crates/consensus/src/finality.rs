@@ -121,18 +121,18 @@ pub fn create_finality_vote(
     voter_index: u8,
     voter_address: Address,
     voter_sk: &FalconSecretKey,
-) -> FinalityVote {
+) -> Result<FinalityVote, &'static str> {
     let msg = finality_sign_message(slot, &block_hash, &state_root);
-    let sig = falcon_sign(voter_sk, &msg);
+    let sig = falcon_sign(voter_sk, &msg).map_err(|_| "finality vote signing failed")?;
 
-    FinalityVote {
+    Ok(FinalityVote {
         slot,
         block_hash,
         state_root,
         voter_index,
         voter_address,
         signature: sig.as_bytes().to_vec(),
-    }
+    })
 }
 
 /// Verify a finality vote.
@@ -142,7 +142,10 @@ pub fn verify_finality_vote(vote: &FinalityVote, public_key: &[u8]) -> bool {
         None => return false,
     };
     let msg = finality_sign_message(vote.slot, &vote.block_hash, &vote.state_root);
-    let sig = FalconSignature::from_bytes(&vote.signature);
+    let sig = match FalconSignature::from_bytes(&vote.signature) {
+        Some(s) => s,
+        None => return false,
+    };
     falcon_verify(&pk, &msg, &sig)
 }
 
@@ -366,11 +369,11 @@ mod tests {
         let state_root = [0xCC; 32];
 
         for i in 0..86u8 {
-            let (pk, sk) = falcon_keygen();
+            let (pk, sk) = falcon_keygen().unwrap();
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let vote = create_finality_vote(5, block_hash, state_root, i, addr, &sk);
+            let vote = create_finality_vote(5, block_hash, state_root, i, addr, &sk).unwrap();
             votes.push(vote);
             keys.push(pk_bytes);
         }
@@ -390,11 +393,11 @@ mod tests {
         let mut keys = Vec::new();
 
         for i in 0..85u8 {
-            let (pk, sk) = falcon_keygen();
+            let (pk, sk) = falcon_keygen().unwrap();
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], i, addr, &sk);
+            let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], i, addr, &sk).unwrap();
             votes.push(vote);
             keys.push(pk_bytes);
         }
@@ -409,21 +412,21 @@ mod tests {
 
     #[test]
     fn finality_vote_verified() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
-        let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], 0, addr, &sk);
+        let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], 0, addr, &sk).unwrap();
         assert!(verify_finality_vote(&vote, &pk_bytes));
     }
 
     #[test]
     fn finality_vote_wrong_key_rejected() {
-        let (pk1, sk1) = falcon_keygen();
-        let (pk2, _sk2) = falcon_keygen();
+        let (pk1, sk1) = falcon_keygen().unwrap();
+        let (pk2, _sk2) = falcon_keygen().unwrap();
         let addr = derive_eoa_address(pk1.as_bytes());
 
-        let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], 0, addr, &sk1);
+        let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], 0, addr, &sk1).unwrap();
         assert!(!verify_finality_vote(&vote, pk2.as_bytes()));
     }
 

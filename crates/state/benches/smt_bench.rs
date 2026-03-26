@@ -17,7 +17,7 @@ fn bench_insert() {
 
         let start = Instant::now();
         for (k, v) in &pairs {
-            smt.insert(*k, v.clone());
+            smt.insert(*k, v.clone()).unwrap();
         }
         let elapsed = start.elapsed();
 
@@ -35,7 +35,7 @@ fn bench_get() {
     let mut smt = PydeSMT::new();
     let keys: Vec<_> = (0..10_000).map(|i| key_from_seed(i)).collect();
     for (i, k) in keys.iter().enumerate() {
-        smt.insert(*k, format!("v{i}").into_bytes());
+        smt.insert(*k, format!("v{i}").into_bytes()).unwrap();
     }
 
     let iterations = 10_000u64;
@@ -54,7 +54,7 @@ fn bench_proof() {
     let mut smt = PydeSMT::new();
     let keys: Vec<_> = (0..1_000).map(|i| key_from_seed(i)).collect();
     for (i, k) in keys.iter().enumerate() {
-        smt.insert(*k, format!("v{i}").into_bytes());
+        smt.insert(*k, format!("v{i}").into_bytes()).unwrap();
     }
 
     let root = smt.root();
@@ -62,7 +62,7 @@ fn bench_proof() {
 
     let start = Instant::now();
     for i in 0..iterations {
-        std::hint::black_box(smt.prove(vec![keys[i as usize % keys.len()]]));
+        std::hint::black_box(smt.prove(vec![keys[i as usize % keys.len()]]).unwrap());
     }
     let elapsed = start.elapsed();
     let us_per_proof = elapsed.as_micros() as f64 / iterations as f64;
@@ -70,7 +70,7 @@ fn bench_proof() {
 
     let key = keys[0];
     let value = b"v0".to_vec();
-    let proof = smt.prove(vec![key]);
+    let proof = smt.prove(vec![key]).unwrap();
 
     let start = Instant::now();
     for _ in 0..iterations {
@@ -91,7 +91,7 @@ fn bench_batch_insert() {
 
         let mut smt = PydeSMT::new();
         let start = Instant::now();
-        smt.update_all(pairs);
+        smt.update_all(pairs).unwrap();
         let elapsed = start.elapsed();
 
         let ops_sec = count as f64 / elapsed.as_secs_f64();
@@ -152,7 +152,7 @@ fn bench_update_all_scaling() {
             .collect();
 
         let start = Instant::now();
-        smt.update_all(entries);
+        smt.update_all(entries).unwrap();
         let elapsed = start.elapsed();
 
         let ops_sec = count as f64 / elapsed.as_secs_f64();
@@ -171,14 +171,14 @@ fn bench_witness() {
     let mut smt = PydeSMT::new();
     let keys: Vec<_> = (0..1_000).map(|i| key_from_seed(i)).collect();
     for (i, k) in keys.iter().enumerate() {
-        smt.insert(*k, format!("v{i}").into_bytes());
+        smt.insert(*k, format!("v{i}").into_bytes()).unwrap();
     }
 
     // Generation
     for count in [10u64, 100, 1_000] {
         let access_keys: Vec<_> = keys[..count as usize].to_vec();
         let start = Instant::now();
-        let witness = pyde_state::witness::generate_witnesses(&smt, &access_keys);
+        let witness = pyde_state::witness::generate_witnesses(&smt, &access_keys).unwrap();
         let elapsed = start.elapsed();
         let us = elapsed.as_micros() as f64;
         let size = witness.size_bytes();
@@ -206,7 +206,7 @@ fn bench_snapshot() {
         let mut smt = PydeSMT::new();
         let keys: Vec<_> = (0..count).map(|i| key_from_seed(i)).collect();
         for (i, k) in keys.iter().enumerate() {
-            smt.insert(*k, format!("v{i}").into_bytes());
+            smt.insert(*k, format!("v{i}").into_bytes()).unwrap();
         }
 
         let start = Instant::now();
@@ -214,7 +214,7 @@ fn bench_snapshot() {
         let create_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let start = Instant::now();
-        let restored = pyde_state::snapshot::restore_snapshot(&snapshot);
+        let restored = pyde_state::snapshot::restore_snapshot(&snapshot).unwrap();
         let restore_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         assert_eq!(restored.root(), smt.root());

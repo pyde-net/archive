@@ -5,13 +5,13 @@ use pyde_crypto::vrf::{vrf_prove, vrf_verify};
 
 fn bench_prove() {
     println!("=== VRF prove ===\n");
-    let (_pk, sk) = falcon_keygen();
+    let (pk, sk) = falcon_keygen().unwrap();
     let input = b"benchmark vrf input";
     let iterations = 1_000;
 
     let start = Instant::now();
     for _ in 0..iterations {
-        std::hint::black_box(vrf_prove(&sk, std::hint::black_box(input)));
+        std::hint::black_box(vrf_prove(&pk, &sk, std::hint::black_box(input)));
     }
     let elapsed = start.elapsed();
     println!(
@@ -23,9 +23,9 @@ fn bench_prove() {
 
 fn bench_verify() {
     println!("\n=== VRF verify ===\n");
-    let (pk, sk) = falcon_keygen();
+    let (pk, sk) = falcon_keygen().unwrap();
     let input = b"benchmark vrf verify";
-    let (output, proof) = vrf_prove(&sk, input);
+    let (output, proof) = vrf_prove(&pk, &sk, input);
     let iterations = 1_000;
 
     let start = Instant::now();

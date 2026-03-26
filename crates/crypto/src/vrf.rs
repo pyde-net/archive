@@ -54,9 +54,11 @@ fn compute_vrf_output(sk: &FalconSecretKey, input: &[u8]) -> VrfOutput {
 }
 
 /// Build the message that gets signed/verified for the VRF proof.
-fn build_proof_message(input: &[u8], output: &VrfOutput) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(VRF_DOMAIN_PROOF.len() + input.len() + 32);
+/// Includes the public key to bind the output to a specific key.
+fn build_proof_message(pk: &FalconPublicKey, input: &[u8], output: &VrfOutput) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(VRF_DOMAIN_PROOF.len() + pk.as_bytes().len() + input.len() + 32);
     msg.extend_from_slice(VRF_DOMAIN_PROOF);
+    msg.extend_from_slice(pk.as_bytes());
     msg.extend_from_slice(input);
     msg.extend_from_slice(output.as_bytes());
     msg
@@ -64,12 +66,12 @@ fn build_proof_message(input: &[u8], output: &VrfOutput) -> Vec<u8> {
 
 /// Generate a VRF output and proof.
 /// The output is deterministic given (sk, input).
-/// The proof is a FALCON signature over (input || output).
-pub fn vrf_prove(sk: &FalconSecretKey, input: &[u8]) -> (VrfOutput, VrfProof) {
+/// The proof is a FALCON signature over (pk || input || output).
+pub fn vrf_prove(pk: &FalconPublicKey, sk: &FalconSecretKey, input: &[u8]) -> Result<(VrfOutput, VrfProof), &'static str> {
     let output = compute_vrf_output(sk, input);
-    let proof_msg = build_proof_message(input, &output);
-    let sig = falcon_sign(sk, &proof_msg);
-    (output, VrfProof(sig.to_vec()))
+    let proof_msg = build_proof_message(pk, input, &output);
+    let sig = falcon_sign(sk, &proof_msg)?;
+    Ok((output, VrfProof(sig.to_vec())))
 }
 
 /// Verify a VRF output and proof against a public key.
@@ -80,8 +82,11 @@ pub fn vrf_verify(
     output: &VrfOutput,
     proof: &VrfProof,
 ) -> bool {
-    let proof_msg = build_proof_message(input, output);
-    let sig = crate::falcon::FalconSignature::from_bytes(&proof.0);
+    let sig = match crate::falcon::FalconSignature::from_bytes(&proof.0) {
+        Some(s) => s,
+        None => return false,
+    };
+    let proof_msg = build_proof_message(pk, input, output);
     falcon_verify(pk, &proof_msg, &sig)
 }
 
@@ -92,53 +97,53 @@ mod tests {
 
     #[test]
     fn vrf_prove_verify_roundtrip() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let input = b"test vrf input";
-        let (output, proof) = vrf_prove(&sk, input);
+        let (output, proof) = vrf_prove(&pk, &sk, input).unwrap();
         assert!(vrf_verify(&pk, input, &output, &proof));
     }
 
     #[test]
     fn vrf_deterministic_output() {
-        let (_pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let input = b"deterministic test";
-        let (output1, _proof1) = vrf_prove(&sk, input);
-        let (output2, _proof2) = vrf_prove(&sk, input);
+        let (output1, _proof1) = vrf_prove(&pk, &sk, input).unwrap();
+        let (output2, _proof2) = vrf_prove(&pk, &sk, input).unwrap();
         assert_eq!(output1, output2, "VRF output must be deterministic");
     }
 
     #[test]
     fn vrf_different_keys_different_outputs() {
-        let (_pk1, sk1) = falcon_keygen();
-        let (_pk2, sk2) = falcon_keygen();
+        let (pk1, sk1) = falcon_keygen().unwrap();
+        let (pk2, sk2) = falcon_keygen().unwrap();
         let input = b"same input different keys";
-        let (output1, _) = vrf_prove(&sk1, input);
-        let (output2, _) = vrf_prove(&sk2, input);
+        let (output1, _) = vrf_prove(&pk1, &sk1, input).unwrap();
+        let (output2, _) = vrf_prove(&pk2, &sk2, input).unwrap();
         assert_ne!(output1, output2);
     }
 
     #[test]
     fn vrf_different_inputs_different_outputs() {
-        let (_pk, sk) = falcon_keygen();
-        let (output1, _) = vrf_prove(&sk, b"input A");
-        let (output2, _) = vrf_prove(&sk, b"input B");
+        let (pk, sk) = falcon_keygen().unwrap();
+        let (output1, _) = vrf_prove(&pk, &sk, b"input A").unwrap();
+        let (output2, _) = vrf_prove(&pk, &sk, b"input B").unwrap();
         assert_ne!(output1, output2);
     }
 
     #[test]
     fn vrf_wrong_key_verify_fails() {
-        let (_pk1, sk1) = falcon_keygen();
-        let (pk2, _sk2) = falcon_keygen();
+        let (pk1, sk1) = falcon_keygen().unwrap();
+        let (pk2, _sk2) = falcon_keygen().unwrap();
         let input = b"wrong key test";
-        let (output, proof) = vrf_prove(&sk1, input);
+        let (output, proof) = vrf_prove(&pk1, &sk1, input).unwrap();
         assert!(!vrf_verify(&pk2, input, &output, &proof));
     }
 
     #[test]
     fn vrf_tampered_output_fails() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let input = b"tamper test";
-        let (_output, proof) = vrf_prove(&sk, input);
+        let (_output, proof) = vrf_prove(&pk, &sk, input).unwrap();
 
         // Create a fake output
         let fake_output = VrfOutput(poseidon2_hash(b"fake"));
@@ -147,21 +152,21 @@ mod tests {
 
     #[test]
     fn vrf_wrong_input_fails() {
-        let (pk, sk) = falcon_keygen();
-        let (output, proof) = vrf_prove(&sk, b"correct input");
+        let (pk, sk) = falcon_keygen().unwrap();
+        let (output, proof) = vrf_prove(&pk, &sk, b"correct input").unwrap();
         assert!(!vrf_verify(&pk, b"wrong input", &output, &proof));
     }
 
     #[test]
     fn vrf_output_distribution() {
         // Chi-squared test: generate many VRF outputs and check byte distribution
-        let (_pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let num_samples = 256;
         let mut byte_counts = [0u32; 256];
 
         for i in 0..num_samples {
             let input = (i as u64).to_le_bytes();
-            let (output, _) = vrf_prove(&sk, &input);
+            let (output, _) = vrf_prove(&pk, &sk, &input).unwrap();
             for &byte in output.as_bytes().iter() {
                 byte_counts[byte as usize] += 1;
             }

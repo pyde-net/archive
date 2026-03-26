@@ -7,7 +7,7 @@ fn bench_keygen() {
     let iterations = 100;
     let start = Instant::now();
     for _ in 0..iterations {
-        std::hint::black_box(falcon_keygen());
+        std::hint::black_box(falcon_keygen().unwrap());
     }
     let elapsed = start.elapsed();
     println!(
@@ -19,7 +19,7 @@ fn bench_keygen() {
 
 fn bench_sign() {
     println!("\n=== FALCON-512 sign ===\n");
-    let (_pk, sk) = falcon_keygen();
+    let (_pk, sk) = falcon_keygen().unwrap();
     let msg = b"benchmark message for signing";
     let iterations = 1_000;
 
@@ -37,9 +37,9 @@ fn bench_sign() {
 
 fn bench_verify() {
     println!("\n=== FALCON-512 verify (single) ===\n");
-    let (pk, sk) = falcon_keygen();
+    let (pk, sk) = falcon_keygen().unwrap();
     let msg = b"benchmark message for verification";
-    let sig = falcon_sign(&sk, msg);
+    let sig = falcon_sign(&sk, msg).unwrap();
     let iterations = 1_000;
 
     let start = Instant::now();
@@ -60,13 +60,13 @@ fn bench_verify() {
 
 fn bench_batch_verify() {
     println!("\n=== FALCON-512 batch verify ===\n");
-    let (pk, sk) = falcon_keygen();
+    let (pk, sk) = falcon_keygen().unwrap();
 
     for count in [100, 1000] {
         let msgs: Vec<Vec<u8>> = (0..count)
             .map(|i| format!("message {}", i).into_bytes())
             .collect();
-        let sigs: Vec<_> = msgs.iter().map(|m| falcon_sign(&sk, m)).collect();
+        let sigs: Vec<_> = msgs.iter().map(|m| falcon_sign(&sk, m).unwrap()).collect();
         let items: Vec<_> = msgs
             .iter()
             .zip(sigs.iter())

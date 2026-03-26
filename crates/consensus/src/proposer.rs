@@ -56,24 +56,26 @@ pub struct ProposerCandidate {
 
 /// Compute a validator's proposer candidacy for a given slot.
 ///
-/// Each validator calls this locally with their secret key.
+/// Each validator calls this locally with their keypair.
 /// Returns their candidate (output, proof, score).
 pub fn compute_candidacy(
+    public_key: &FalconPublicKey,
     secret_key: &FalconSecretKey,
     epoch_randomness: &[u8; 32],
     slot: u64,
     address: Address,
-) -> ProposerCandidate {
+) -> Result<ProposerCandidate, &'static str> {
     let input = vrf_input(epoch_randomness, slot);
-    let (output, proof) = vrf_prove(secret_key, &input);
+    let (output, proof) = vrf_prove(public_key, secret_key, &input)
+        .map_err(|_| "VRF prove failed — invalid keypair")?;
     let score = score_from_output(&output);
 
-    ProposerCandidate {
+    Ok(ProposerCandidate {
         address,
         vrf_output: output,
         vrf_proof: proof,
         score,
-    }
+    })
 }
 
 /// Verify a proposer candidate's VRF proof.
@@ -126,10 +128,10 @@ mod tests {
     use pyde_crypto::falcon::falcon_keygen;
 
     fn make_candidate(slot: u64, randomness: &[u8; 32]) -> (ProposerCandidate, Vec<u8>) {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
-        let candidate = compute_candidacy(&sk, randomness, slot, addr);
+        let candidate = compute_candidacy(&pk, &sk, randomness, slot, addr).unwrap();
         (candidate, pk_bytes)
     }
 
@@ -137,13 +139,13 @@ mod tests {
 
     #[test]
     fn proposer_selection_deterministic() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
         let randomness = [0xAA; 32];
 
-        let c1 = compute_candidacy(&sk, &randomness, 100, addr);
-        let c2 = compute_candidacy(&sk, &randomness, 100, addr);
+        let c1 = compute_candidacy(&pk, &sk, &randomness, 100, addr).unwrap();
+        let c2 = compute_candidacy(&pk, &sk, &randomness, 100, addr).unwrap();
 
         assert_eq!(c1.score, c2.score);
         assert_eq!(c1.vrf_output.as_bytes(), c2.vrf_output.as_bytes());
@@ -153,13 +155,13 @@ mod tests {
 
     #[test]
     fn different_slots_different_scores() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
         let randomness = [0xAA; 32];
 
-        let c1 = compute_candidacy(&sk, &randomness, 100, addr);
-        let c2 = compute_candidacy(&sk, &randomness, 101, addr);
+        let c1 = compute_candidacy(&pk, &sk, &randomness, 100, addr).unwrap();
+        let c2 = compute_candidacy(&pk, &sk, &randomness, 101, addr).unwrap();
 
         // Scores should differ (with overwhelming probability)
         assert_ne!(c1.score, c2.score);
@@ -167,12 +169,12 @@ mod tests {
 
     #[test]
     fn different_randomness_different_scores() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
-        let c1 = compute_candidacy(&sk, &[0xAA; 32], 100, addr);
-        let c2 = compute_candidacy(&sk, &[0xBB; 32], 100, addr);
+        let c1 = compute_candidacy(&pk, &sk, &[0xAA; 32], 100, addr).unwrap();
+        let c2 = compute_candidacy(&pk, &sk, &[0xBB; 32], 100, addr).unwrap();
 
         assert_ne!(c1.score, c2.score);
     }
@@ -195,7 +197,7 @@ mod tests {
     #[test]
     fn wrong_key_rejected() {
         let (candidate, _pk_bytes) = make_candidate(100, &[0xAA; 32]);
-        let (pk2, _sk2) = falcon_keygen();
+        let (pk2, _sk2) = falcon_keygen().unwrap();
         // Verify with wrong public key
         assert!(!verify_candidacy(&candidate, pk2.as_bytes(), &[0xAA; 32], 100));
     }
