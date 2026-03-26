@@ -15,3 +15,6 @@ pub mod lower;
 pub mod optimize;
 pub mod memory;
 pub mod codegen;
+pub mod abi;
+pub mod pyc;
+pub mod diagnostic;
