@@ -155,9 +155,7 @@ pub enum Outcome {
 
 /// Full execution output returned by `execute()`.
 ///
-/// No trace is captured here — full nodes don't need it.
-/// Provers use `pyde_prover::recorder::record_execution()` for full
-/// 66-column STARK trace capture.
+/// No trace is captured here — validators execute transactions directly.
 #[derive(Clone, Debug)]
 pub struct ExecutionOutput {
     /// High-level outcome.
@@ -964,7 +962,7 @@ impl Vm {
                 self.pc += 4;
             }
 
-            // --- ZK-native instructions ---
+            // --- Assertions + Memory ---
             Opcode::Assert => {
                 // assert rs1 — if rs1 == 0, revert (provable assertion)
                 let val = self.cpu.read_gp(d.rs1);
@@ -991,7 +989,7 @@ impl Vm {
                 self.pc += 4;
             }
             Opcode::Commit => {
-                // commit rd — write rd value to public output (ZK prover captures from trace)
+                // commit rd — reserved for future use
                 self.pc += 4;
             }
             Opcode::Selfdestruct => {
@@ -1023,8 +1021,8 @@ impl Vm {
         }
     }
 
-    /// Execute with full state management: journaled rollback on revert/OOG,
-    /// execution trace recording for ZK provers, and detailed output.
+    /// Execute with full state management: journaled rollback on revert/OOG
+    /// and detailed output.
     pub fn execute(&mut self) -> ExecutionOutput {
         self.storage_journal.clear();
         self.storage_journal_keys.clear();
@@ -3170,8 +3168,7 @@ mod tests {
         assert_eq!(balance, 50);
     }
 
-    // Trace recording moved to pyde-prover::recorder (record_execution).
-    // Full nodes use lean execute() with no trace overhead.
+    // Validators execute transactions directly with no trace overhead.
 
     #[test]
     fn execute_success_preserves_storage_and_logs() {

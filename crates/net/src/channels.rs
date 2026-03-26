@@ -1,11 +1,10 @@
 //! Message channels: typed gossipsub message handling with validation.
 //!
-//! 5 channels per spec:
+//! 4 channels per spec:
 //! 1. Consensus — validator votes, view changes (validators only)
 //! 2. Transactions — encrypted transactions from users
 //! 3. Blocks — proposed blocks and scheduled blocks
-//! 4. Proofs — ZK proofs from provers
-//! 5. Sync — state sync and witness delivery
+//! 4. Sync — state sync and witness delivery
 //!
 //! Each channel has message validation and deduplication.
 
@@ -18,7 +17,6 @@ pub enum Channel {
     Consensus,
     Transactions,
     Blocks,
-    Proofs,
     Sync,
 }
 
@@ -29,14 +27,13 @@ impl Channel {
             Channel::Consensus => "pyde/consensus/1",
             Channel::Transactions => "pyde/transactions/1",
             Channel::Blocks => "pyde/blocks/1",
-            Channel::Proofs => "pyde/proofs/1",
             Channel::Sync => "pyde/sync/1",
         }
     }
 
     /// Whether this channel is validator-only.
     pub fn validator_only(&self) -> bool {
-        matches!(self, Channel::Consensus | Channel::Proofs)
+        matches!(self, Channel::Consensus)
     }
 
     /// From topic string.
@@ -45,7 +42,6 @@ impl Channel {
             "pyde/consensus/1" => Some(Channel::Consensus),
             "pyde/transactions/1" => Some(Channel::Transactions),
             "pyde/blocks/1" => Some(Channel::Blocks),
-            "pyde/proofs/1" => Some(Channel::Proofs),
             "pyde/sync/1" => Some(Channel::Sync),
             _ => None,
         }
@@ -57,7 +53,6 @@ impl Channel {
             Channel::Consensus,
             Channel::Transactions,
             Channel::Blocks,
-            Channel::Proofs,
             Channel::Sync,
         ]
     }
@@ -105,7 +100,6 @@ pub fn validate_message(msg: &NetworkMessage, is_validator_peer: bool) -> Valida
         Channel::Consensus => 64 * 1024,       // 64KB (votes, view changes)
         Channel::Transactions => 128 * 1024,    // 128KB (encrypted txs)
         Channel::Blocks => 4 * 1024 * 1024,     // 4MB (full blocks)
-        Channel::Proofs => 16 * 1024 * 1024,     // 16MB (ZK proofs)
         Channel::Sync => 8 * 1024 * 1024,        // 8MB (state chunks)
     };
 
@@ -194,7 +188,7 @@ mod tests {
 
     #[test]
     fn all_channels_count() {
-        assert_eq!(Channel::all().len(), 5);
+        assert_eq!(Channel::all().len(), 4);
     }
 
     #[test]
@@ -212,7 +206,6 @@ mod tests {
     #[test]
     fn validator_only_channels() {
         assert!(Channel::Consensus.validator_only());
-        assert!(Channel::Proofs.validator_only());
         assert!(!Channel::Transactions.validator_only());
         assert!(!Channel::Blocks.validator_only());
         assert!(!Channel::Sync.validator_only());

@@ -88,7 +88,7 @@ pub struct BlockHeader {
     /// State root after executing all transactions.
     /// NOTE: Empty at proposal time (txs encrypted, can't compute).
     /// Set by full nodes after optimistic execution at soft finality.
-    /// Proven correct by the STARK proof and committed in HardFinalityCert.
+    /// Verified by validator re-execution and committed in HardFinalityCert.
     pub state_root: [u8; 32],
     /// Block timestamp (Unix milliseconds).
     pub timestamp: u64,
@@ -99,7 +99,7 @@ impl BlockHeader {
     ///
     /// Includes all fields that uniquely identify this block's CONTENT.
     /// Does NOT include state_root — it's unknown at proposal time (txs encrypted)
-    /// and committed separately via HardFinalityCert after STARK proof.
+    /// and committed separately via HardFinalityCert after validator re-execution.
     /// Excludes QC signatures/bitmap (large, and QC slot+hash suffice).
     pub fn hash(&self) -> [u8; 32] {
         let mut buf = Vec::with_capacity(192); // 8+8+32+32+32+32+8+32 = 184

@@ -10,6 +10,5 @@ members = [
     "crates/consensus",
     "crates/mempool",
     "crates/net",
-    "crates/prover",
     "crates/otic",
 ]

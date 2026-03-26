@@ -769,7 +769,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), z); }
                     }
 
-                    // --- ZK-native (host calls) ---
+                    // --- Assertions + Memory (host calls) ---
                     Opcode::Assert => {
                         let val = builder.use_var(Variable::from_u32(d.rs1 as u32));
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));

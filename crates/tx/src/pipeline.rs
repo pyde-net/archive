@@ -7,7 +7,7 @@
 //! 4. Value transfer: sender → recipient
 //! 5. PVM execution (contract call or deployment)
 //! 6. Post-execution: refund unused gas, apply SDELETE refunds
-//! 7. Fee distribution: 70% burn, 15% validator, 15% prover
+//! 7. Fee distribution: 80% burn, 20% validator
 //! 8. Update accounts in State SMT
 //! 9. Generate receipt
 
@@ -37,7 +37,6 @@ pub struct BlockContext {
     pub block_gas_limit: u64,
     pub chain_id: u64,
     pub validator_address: Address,
-    pub prover_address: Address,
 }
 
 /// Pipeline execution error.
@@ -208,14 +207,10 @@ pub fn execute_transaction(
     // 8. Fee distribution
     let fee_dist = distribute_fee(effective_gas, block_ctx.base_fee);
 
-    // Credit validator and prover
+    // Credit validator
     let mut validator_account = load_account(smt, &block_ctx.validator_address);
     validator_account.balance += fee_dist.validator;
     store_account(smt, &validator_account);
-
-    let mut prover_account = load_account(smt, &block_ctx.prover_address);
-    prover_account.balance += fee_dist.prover;
-    store_account(smt, &prover_account);
 
     // 9. Save updated accounts
     store_account(smt, &sender);
@@ -298,7 +293,6 @@ mod tests {
             block_gas_limit: 400_000_000,
             chain_id: 1,
             validator_address: derive_eoa_address(b"validator"),
-            prover_address: derive_eoa_address(b"prover"),
         }
     }
 
@@ -415,7 +409,7 @@ mod tests {
     // ========== Fee distribution ==========
 
     #[test]
-    fn fees_distributed_to_validator_and_prover() {
+    fn fees_distributed_to_validator() {
         let (pk, sk) = falcon_keygen();
         let pk_bytes = pk.as_bytes().to_vec();
         let mut smt = PydeSMT::new();
@@ -428,14 +422,11 @@ mod tests {
         let receipt = execute_transaction(&tx, &mut smt, &block_ctx).unwrap();
 
         assert!(receipt.fee_validator > 0);
-        assert!(receipt.fee_prover > 0);
         assert!(receipt.fee_burned > 0);
 
-        // Validator and prover accounts should have received fees
+        // Validator account should have received fees
         let validator = load_account(&smt, &block_ctx.validator_address);
-        let prover = load_account(&smt, &block_ctx.prover_address);
         assert_eq!(validator.balance, receipt.fee_validator);
-        assert_eq!(prover.balance, receipt.fee_prover);
     }
 
     // ========== State persistence ==========

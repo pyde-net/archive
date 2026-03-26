@@ -1,9 +1,7 @@
 //! `pyde-aot`: Ahead-of-Time compiler for PVM bytecode.
 //!
 //! Compiles PVM bytecode to native machine code via Cranelift at deploy time.
-//! The compiled binary is stored alongside the bytecode on-chain. Provers
-//! execute the native code for speed; the ZK proof still certifies bytecode
-//! semantics.
+//! The compiled binary runs natively for maximum execution speed.
 
 pub mod analysis;
 pub mod codegen;

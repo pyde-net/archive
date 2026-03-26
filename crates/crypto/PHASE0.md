@@ -3,7 +3,7 @@
 Phase 0 builds every cryptographic primitive that the Pyde blockchain needs. It lives
 in a single Rust crate (`pyde-crypto`) that is compiled as `#![no_std]` with
 `extern crate alloc`. The `no_std` constraint is deliberate: every function in this
-crate must eventually run inside a ZK circuit (the stateless provers), so nothing here
+crate must work in constrained environments (no_std, embedded, WASM), so nothing here
 can depend on the operating system, file I/O, or the standard library's random number
 generator at the type level.
 
@@ -38,10 +38,10 @@ benches/
 ### What it is
 
 Poseidon2 is an **algebraic hash function** — it operates natively over finite field
-elements rather than bytes. This makes it extremely efficient inside ZK proving systems
-(STARK/SNARK), because the prover only needs to constrain field multiplications and
-additions, not bit manipulations. For Pyde, this is the hash used for Merkle trees,
-transaction hashing, state commitments, and all internal hashing.
+elements rather than bytes. This makes it extremely efficient for Merkle tree hashing,
+because the computation is pure field multiplications and additions, not bit
+manipulations. For Pyde, this is the hash used for Merkle trees, transaction hashing,
+state commitments, and all internal hashing.
 
 ### The field: Goldilocks
 
@@ -52,7 +52,7 @@ This prime is special because:
 - Modular reduction is extremely fast (no general-purpose division needed — just
   shifts and adds)
 - It has a large power-of-two subgroup (2^32-th roots of unity exist), which enables
-  fast NTT/FFT for polynomial operations in the prover
+  fast NTT/FFT for polynomial operations
 
 We use the Plonky3 (`p3-goldilocks`) implementation of this field, which provides
 battle-tested, optimized field arithmetic.
@@ -450,8 +450,7 @@ the 1281-byte secret key). Verification is fast at ~20 us.
 
 All dependencies use `default-features = false` where applicable to maintain `no_std`
 compatibility. The `getrandom` feature is enabled for FALCON and ML-KEM so they can
-access OS-level randomness for key generation and signing (this is acceptable because
-keygen/signing happens in the node binary, not inside the ZK prover).
+access OS-level randomness for key generation and signing.
 
 ---
 
@@ -473,7 +472,7 @@ keygen/signing happens in the node binary, not inside the ZK prover).
 
 With these primitives complete, Pyde has:
 
-- **Poseidon2**: ZK-friendly hashing for Merkle trees, state roots, transaction IDs
+- **Poseidon2**: Efficient algebraic hashing for Merkle trees, state roots, transaction IDs
 - **FALCON**: Post-quantum signatures for validator attestations and block proposals
 - **Kyber + Threshold**: Post-quantum encrypted transaction pool for MEV protection
 - **PSS**: Long-term security against slow key compromise across epochs

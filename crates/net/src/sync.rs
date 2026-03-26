@@ -3,7 +3,7 @@
 //! Pull-based request/response protocol per Chapter 12:
 //! - Chain sync: header-first, download blocks in ranges
 //! - State sync: snapshot download + Merkle verification
-//! - Witness sync: deliver state witnesses to provers
+//! - Witness sync: deliver state witnesses for verification
 //! - Epoch data: validator set transitions
 
 /// Sync request types (node → peer).
@@ -19,7 +19,7 @@ pub enum SyncRequest {
         start_slot: u64,
         count: u32,
     },
-    /// Request state witnesses for a block (prover → full node).
+    /// Request state witnesses for a block.
     GetStateWitnesses {
         block_hash: [u8; 32],
     },

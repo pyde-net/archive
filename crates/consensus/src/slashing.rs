@@ -9,25 +9,14 @@
 //! | Liveness == 0%        | 10% + forced unbond  | Completely absent for entire epoch          |
 //! | Invalid block proposal| 50% (5,000 PYDE)    | Proposing block with invalid structure     |
 //! | Decryption withholding| 2% per offense      | Failing to provide decryption shares       |
-//! | Invalid proof (prover)| 100% of bond (1K)   | Prover submits invalid STARK proof         |
 //!
 //! Evidence submitter receives 10% finder's fee from slashed stake.
 //! No time limit on evidence — previous epoch evidence is still valid.
-//!
-//! ## Prover Slashing (TODO: Phase 8)
-//!
-//! Provers don't stake — they post a **bond** of 1,000 PYDE. The prover
-//! registry and bond management will be implemented in Phase 8 (ZK Proving).
-//! `slash_invalid_proof` computes the slash amounts; actual bond deduction
-//! requires the prover registry.
 
 use crate::block::BlockHeader;
 use crate::validator::{Validator, ValidatorSet, ValidatorStatus, VALIDATOR_STAKE};
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{falcon_verify, FalconPublicKey, FalconSignature};
-
-/// Prover bond amount (in quanta, 1,000 PYDE).
-pub const PROVER_BOND: u128 = 1_000_000_000_000;
 
 /// Finder's fee percentage (10% of slashed amount).
 pub const FINDER_FEE_PERCENT: u128 = 10;
@@ -53,13 +42,12 @@ pub enum SlashingOffense {
     LivenessAbsent,   // 0% participation
     InvalidProposal,
     DecryptionWithholding,
-    InvalidProof,     // prover offense
 }
 
 /// The result of processing a slashing event.
 #[derive(Clone, Debug)]
 pub struct SlashResult {
-    /// Address of the slashed validator/prover.
+    /// Address of the slashed validator.
     pub offender: Address,
     /// Amount burned.
     pub amount_burned: u128,
@@ -112,21 +100,6 @@ impl LivenessReport {
     }
 }
 
-/// Invalid proof evidence: prover submitted a proof that doesn't verify.
-#[derive(Clone, Debug)]
-pub struct InvalidProofEvidence {
-    /// Slot the proof was for.
-    pub slot: u64,
-    /// Block hash the proof claimed to cover.
-    pub block_hash: [u8; 32],
-    /// The invalid proof hash.
-    pub proof_hash: [u8; 32],
-    /// Prover's address.
-    pub prover: Address,
-    /// Submitter's address (receives finder's fee).
-    pub submitter: Address,
-}
-
 // ========== Verification ==========
 
 /// Verify double-sign evidence.
@@ -173,7 +146,6 @@ fn compute_slash(stake: u128, offense: &SlashingOffense) -> (u128, u128) {
         SlashingOffense::LivenessAbsent => LIVENESS_SLASH_ABSENT,
         SlashingOffense::InvalidProposal => INVALID_PROPOSAL_SLASH,
         SlashingOffense::DecryptionWithholding => DECRYPTION_WITHHOLD_SLASH,
-        SlashingOffense::InvalidProof => 100, // 100% of prover bond
     };
 
     let slash_amount = stake * slash_percent / 100;
@@ -227,20 +199,6 @@ pub fn slash_liveness(report: &LivenessReport) -> Option<SlashResult> {
         forced_unbonding,
         offense,
     })
-}
-
-/// Process invalid proof slashing (prover offense).
-pub fn slash_invalid_proof(evidence: &InvalidProofEvidence) -> SlashResult {
-    let (burned, finder_fee) = compute_slash(PROVER_BOND, &SlashingOffense::InvalidProof);
-
-    SlashResult {
-        offender: evidence.prover,
-        amount_burned: burned,
-        finder_fee,
-        ejected: true,
-        forced_unbonding: false,
-        offense: SlashingOffense::InvalidProof,
-    }
 }
 
 /// Apply a slash result to the validator set.
@@ -484,26 +442,6 @@ mod tests {
         // 10% of 10K PYDE
         let expected_total = VALIDATOR_STAKE / 10;
         assert_eq!(result.amount_burned + result.finder_fee, expected_total);
-    }
-
-    // ========== Task 0514: Invalid proof slashes prover ==========
-
-    #[test]
-    fn invalid_proof_slashes_prover_bond() {
-        let evidence = InvalidProofEvidence {
-            slot: 50,
-            block_hash: [0xAA; 32],
-            proof_hash: [0xBB; 32],
-            prover: derive_eoa_address(b"bad_prover"),
-            submitter: derive_eoa_address(b"finder"),
-        };
-
-        let result = slash_invalid_proof(&evidence);
-        assert_eq!(result.offense, SlashingOffense::InvalidProof);
-        assert!(result.ejected);
-        // 100% of 1K PYDE bond
-        assert_eq!(result.amount_burned + result.finder_fee, PROVER_BOND);
-        assert_eq!(result.finder_fee, PROVER_BOND / 10);
     }
 
     // ========== Finder's fee ==========

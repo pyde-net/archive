@@ -1,5 +1,5 @@
 //! Sparse Merkle Tree backed by the Nervos `sparse-merkle-tree` crate
-//! with Poseidon2 hashing (Goldilocks field, ZK-friendly).
+//! with Poseidon2 hashing (Goldilocks field, efficient for Merkle trees).
 //!
 //! The tree has a fixed depth of 256 levels. Keys are 256-bit hashes used
 //! as paths through the tree. Empty subtrees use precomputed constant hashes.
@@ -38,7 +38,7 @@ impl Hasher for Poseidon2Hasher {
 
     fn finish(self) -> H256 {
         // For internal nodes (exactly two H256 children = 64 bytes),
-        // use poseidon2_pair for consistency with the ZK circuit.
+        // use poseidon2_pair for efficient two-to-one Merkle hashing.
         if self.buf.len() == 64 {
             let left = pyde_crypto::hash::Hash256::new(
                 self.buf[..32].try_into().unwrap(),

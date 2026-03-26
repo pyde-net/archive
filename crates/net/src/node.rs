@@ -23,7 +23,7 @@ use std::time::Duration;
 /// The combined network behaviour for Pyde nodes.
 #[derive(NetworkBehaviour)]
 pub struct PydeBehaviour {
-    /// Gossipsub for message propagation (5 channels).
+    /// Gossipsub for message propagation (4 channels).
     pub gossipsub: gossipsub::Behaviour,
     /// Kademlia DHT for peer discovery.
     pub kademlia: kad::Behaviour<MemoryStore>,
@@ -105,7 +105,7 @@ pub fn create_node(config: &NetworkConfig, local_key: identity::Keypair) -> Resu
     Ok((swarm, local_peer_id))
 }
 
-/// The 5 gossipsub topic names for Pyde's message channels.
+/// The 4 gossipsub topic names for Pyde's message channels.
 pub mod topics {
     use libp2p::gossipsub::IdentTopic;
 
@@ -124,11 +124,6 @@ pub mod topics {
         IdentTopic::new("pyde/blocks/1")
     }
 
-    /// ZK proofs from provers.
-    pub fn proofs() -> IdentTopic {
-        IdentTopic::new("pyde/proofs/1")
-    }
-
     /// State sync and witness delivery.
     pub fn sync() -> IdentTopic {
         IdentTopic::new("pyde/sync/1")
@@ -136,7 +131,7 @@ pub mod topics {
 
     /// All topic names.
     pub fn all() -> Vec<IdentTopic> {
-        vec![consensus(), transactions(), blocks(), proofs(), sync()]
+        vec![consensus(), transactions(), blocks(), sync()]
     }
 }
 
@@ -162,17 +157,12 @@ pub fn subscribe_topics(
         .subscribe(&topics::sync())
         .map_err(|e| format!("subscribe error: {e}"))?;
 
-    // Validators also subscribe to consensus and proofs
+    // Validators also subscribe to consensus
     if is_validator {
         swarm
             .behaviour_mut()
             .gossipsub
             .subscribe(&topics::consensus())
-            .map_err(|e| format!("subscribe error: {e}"))?;
-        swarm
-            .behaviour_mut()
-            .gossipsub
-            .subscribe(&topics::proofs())
             .map_err(|e| format!("subscribe error: {e}"))?;
     }
 
@@ -195,7 +185,7 @@ mod tests {
 
     #[test]
     fn topic_count() {
-        assert_eq!(topics::all().len(), 5);
+        assert_eq!(topics::all().len(), 4);
     }
 
     #[tokio::test]

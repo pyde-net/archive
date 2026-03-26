@@ -90,13 +90,10 @@ pub enum Opcode {
     VerifySig = 0x31,    // rd = verify_signature(msg, sig, pk)
     MerkleVerify = 0x32, // rd = verify_merkle_path(root, leaf, path)
 
-    // --- 3.4.6 ZK-Native + Memory ---
-    Assert = 0x38,   // if rs1 == 0 then revert (provable assertion)
+    // --- 3.4.6 Assertions + Memory ---
+    Assert = 0x38,   // if rs1 == 0 then revert (assertion)
     Memcpy = 0x39,   // copy gp[imm&0xF] bytes from mem[gp[rs1]] to mem[gp[rd]]
-    Commit = 0x3A,   // commit rd to public output (ZK prover)
-
-    // Note: FieldMul (0x39) was replaced by Memcpy in Phase 9.
-    // FieldMul can be re-added as a Commit replacement or via opcode gateway if needed.
+    Commit = 0x3A,   // reserved for future use
     // to decide what to actually do:
     //
     //   0x00 + imm says "NOP"   → do nothing (all-zero instruction is safe)
@@ -443,12 +440,12 @@ pub fn encode_mem_immediate(offset: i32, width: MemWidth) -> u32 {
 
 // --- Gas Table ---
 
-/// Two-dimensional gas cost: execution + proving.
+/// Two-dimensional gas cost: execution + computational weight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GasCost {
     /// Execution cost (1 gas ~ 1 ns of reference CPU time).
     pub exec: u32,
-    /// Proving cost (1 gas ~ 10 STARK constraints).
+    /// Computational weight (secondary cost dimension for resource metering).
     pub prove: u32,
 }
 
@@ -537,7 +534,7 @@ pub fn gas_cost(op: Opcode) -> GasCost {
         Opcode::VerifySig => GasCost::new(5_000, 15_000),
         Opcode::MerkleVerify => GasCost::new(100, 400),
 
-        // ZK-native + memory
+        // Assertions + memory
         Opcode::Assert => GasCost::new(1, 1),
         Opcode::Memcpy => GasCost::new(3, 2),  // base cost; dynamic cost added per byte in handler
         Opcode::Commit => GasCost::new(5, 5),

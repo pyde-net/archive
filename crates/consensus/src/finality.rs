@@ -3,62 +3,17 @@
 //! **Soft finality (~400ms)**: block has a valid QC (86+ votes).
 //! - Content finality: transactions and ordering locked.
 //! - No rollback under honest majority (<1/3 malicious).
-//! - Full nodes execute optimistically → state changes applied here.
+//! - Full nodes execute optimistically — state changes applied here.
 //! - Use cases: payments, DEX orders, game state, social.
 //!
-//! **Hard finality (~2.5s)**: soft finality + STARK proof + 86+ finality signatures.
-//! - Execution correctness: mathematically proven state transition.
-//! - Irreversibility: cannot revert without breaking STARK assumptions.
-//! - State_root committed by the STARK proof, not the block proposer
-//!   (proposer can't compute state_root because txs are encrypted at proposal time).
+//! **Hard finality (~2.5s)**: soft finality + 86+ finality signatures.
+//! - Execution correctness: validators attest to the committed state root.
+//! - Irreversibility: cannot revert without breaking BFT assumptions.
 //! - Use cases: bridge transfers, large settlements, governance.
-//!
-//! **Proof failure does NOT mean state is wrong:**
-//! - Execution is deterministic — same inputs always produce same result.
-//! - A failed proof means the PROVER failed, not the state.
-//! - Full nodes computed state correctly at soft finality regardless.
-//! - The proof is for light clients, bridges, and hard finality anchor.
-//!
-//! **Unproven window:** if provers fall behind, block production adapts:
-//! - 0-100 unproven blocks: normal operation (400ms block time)
-//! - 100-500 unproven blocks: slowed production (800ms block time)
-//! - 500+ unproven blocks: empty blocks only (no new txs, chain liveness preserved)
-//! - Provers can catch up retroactively by proving backlog blocks.
 
 use crate::block::{QuorumCert, QUORUM_THRESHOLD};
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature};
-
-/// Max unproven blocks before production slows (doubled block time).
-pub const MAX_UNPROVEN_WINDOW: u64 = 100;
-
-/// Max unproven blocks before production pauses (empty blocks only).
-pub const MAX_UNPROVEN_CRITICAL: u64 = 500;
-
-/// Block time when in slowed mode (ms).
-pub const SLOWED_BLOCK_TIME_MS: u64 = 800;
-
-/// Production mode based on unproven backlog.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProductionMode {
-    /// Normal: 400ms block time, full transactions.
-    Normal,
-    /// Slowed: 800ms block time, full transactions. Provers catching up.
-    Slowed,
-    /// Paused: empty blocks only. Provers critically behind.
-    Paused,
-}
-
-/// Determine production mode from unproven block count.
-pub fn production_mode(unproven_count: u64) -> ProductionMode {
-    if unproven_count >= MAX_UNPROVEN_CRITICAL {
-        ProductionMode::Paused
-    } else if unproven_count >= MAX_UNPROVEN_WINDOW {
-        ProductionMode::Slowed
-    } else {
-        ProductionMode::Normal
-    }
-}
 
 /// Finality level for a block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -67,7 +22,7 @@ pub enum FinalityLevel {
     None,
     /// Soft finality: QC with 86+ votes exists.
     Soft,
-    /// Hard finality: soft + ZK proof verified + 86+ finality signatures.
+    /// Hard finality: soft + 86+ finality signatures.
     Hard,
 }
 
@@ -86,20 +41,18 @@ pub struct FinalityStatus {
     pub hard_cert: Option<HardFinalityCert>,
 }
 
-/// Hard finality certificate: proof that the block's state transition is correct.
+/// Hard finality certificate: validators attest to the block's state transition.
 #[derive(Clone, Debug)]
 pub struct HardFinalityCert {
     /// Slot of the block.
     pub slot: u64,
     /// Block hash.
     pub block_hash: [u8; 32],
-    /// The STARK proof hash (proof itself stored separately).
-    pub proof_hash: [u8; 32],
-    /// State root after execution (proven correct by the STARK).
+    /// State root after execution.
     pub state_root: [u8; 32],
     /// 128-bit bitmap of which validators signed the finality cert.
     pub voter_bitmap: u128,
-    /// FALCON signatures from validators who verified the proof.
+    /// FALCON signatures from validators who attested to finality.
     pub signatures: Vec<Vec<u8>>,
 }
 
@@ -113,12 +66,11 @@ impl HardFinalityCert {
     }
 }
 
-/// A finality vote: validator attests that a ZK proof is valid for a block.
+/// A finality vote: validator attests to a block's state transition.
 #[derive(Clone, Debug)]
 pub struct FinalityVote {
     pub slot: u64,
     pub block_hash: [u8; 32],
-    pub proof_hash: [u8; 32],
     pub state_root: [u8; 32],
     pub voter_index: u8,
     pub voter_address: Address,
@@ -126,12 +78,11 @@ pub struct FinalityVote {
 }
 
 /// Build the message validators sign for hard finality.
-fn finality_sign_message(slot: u64, block_hash: &[u8; 32], proof_hash: &[u8; 32], state_root: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(117); // "hard_finality"(13) + slot(8) + 3×hash(96)
+fn finality_sign_message(slot: u64, block_hash: &[u8; 32], state_root: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(85); // "hard_finality"(13) + slot(8) + 2×hash(64)
     msg.extend_from_slice(b"hard_finality");
     msg.extend_from_slice(&slot.to_le_bytes());
     msg.extend_from_slice(block_hash);
-    msg.extend_from_slice(proof_hash);
     msg.extend_from_slice(state_root);
     msg
 }
@@ -162,23 +113,21 @@ pub fn soft_finality_status(slot: u64, block_hash: [u8; 32], qc: &QuorumCert) ->
 
 // ========== Hard Finality ==========
 
-/// Create a finality vote after verifying a ZK proof.
+/// Create a finality vote attesting to a block's state transition.
 pub fn create_finality_vote(
     slot: u64,
     block_hash: [u8; 32],
-    proof_hash: [u8; 32],
     state_root: [u8; 32],
     voter_index: u8,
     voter_address: Address,
     voter_sk: &FalconSecretKey,
 ) -> FinalityVote {
-    let msg = finality_sign_message(slot, &block_hash, &proof_hash, &state_root);
+    let msg = finality_sign_message(slot, &block_hash, &state_root);
     let sig = falcon_sign(voter_sk, &msg);
 
     FinalityVote {
         slot,
         block_hash,
-        proof_hash,
         state_root,
         voter_index,
         voter_address,
@@ -192,7 +141,7 @@ pub fn verify_finality_vote(vote: &FinalityVote, public_key: &[u8]) -> bool {
         Some(pk) => pk,
         None => return false,
     };
-    let msg = finality_sign_message(vote.slot, &vote.block_hash, &vote.proof_hash, &vote.state_root);
+    let msg = finality_sign_message(vote.slot, &vote.block_hash, &vote.state_root);
     let sig = FalconSignature::from_bytes(&vote.signature);
     falcon_verify(&pk, &msg, &sig)
 }
@@ -201,7 +150,6 @@ pub fn verify_finality_vote(vote: &FinalityVote, public_key: &[u8]) -> bool {
 pub fn try_form_hard_finality(
     slot: u64,
     block_hash: [u8; 32],
-    proof_hash: [u8; 32],
     state_root: [u8; 32],
     votes: &[FinalityVote],
     committee_keys: &[Vec<u8>],
@@ -214,7 +162,7 @@ pub fn try_form_hard_finality(
         if vote.slot != slot || vote.block_hash != block_hash {
             continue;
         }
-        if vote.proof_hash != proof_hash || vote.state_root != state_root {
+        if vote.state_root != state_root {
             continue;
         }
 
@@ -239,7 +187,6 @@ pub fn try_form_hard_finality(
         Some(HardFinalityCert {
             slot,
             block_hash,
-            proof_hash,
             state_root,
             voter_bitmap,
             signatures,
@@ -284,14 +231,9 @@ impl FinalityTracker {
         }
     }
 
-    /// Number of blocks with soft finality but no hard finality.
-    pub fn unproven_count(&self) -> u64 {
+    /// Number of blocks with soft finality but no hard finality yet.
+    pub fn unconfirmed_count(&self) -> u64 {
         self.highest_soft_slot.saturating_sub(self.highest_hard_slot)
-    }
-
-    /// Current production mode based on unproven backlog.
-    pub fn production_mode(&self) -> ProductionMode {
-        production_mode(self.unproven_count())
     }
 
     /// Record soft finality for a block.
@@ -306,7 +248,6 @@ impl FinalityTracker {
     }
 
     /// Record hard finality and create a checkpoint.
-    /// The state_root is committed by the STARK proof, not the block proposer.
     pub fn record_hard_finality(&mut self, cert: HardFinalityCert) {
         if cert.slot > self.highest_hard_slot {
             self.highest_hard_slot = cert.slot;
@@ -414,7 +355,7 @@ mod tests {
         assert!(check_soft_finality(&qc)); // instant
     }
 
-    // ========== Task 0503: Hard finality after proof ==========
+    // ========== Task 0503: Hard finality with quorum ==========
 
     #[test]
     fn hard_finality_with_86_votes() {
@@ -422,7 +363,6 @@ mod tests {
         let mut keys = Vec::new();
 
         let block_hash = [0xAA; 32];
-        let proof_hash = [0xBB; 32];
         let state_root = [0xCC; 32];
 
         for i in 0..86u8 {
@@ -430,7 +370,7 @@ mod tests {
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let vote = create_finality_vote(5, block_hash, proof_hash, state_root, i, addr, &sk);
+            let vote = create_finality_vote(5, block_hash, state_root, i, addr, &sk);
             votes.push(vote);
             keys.push(pk_bytes);
         }
@@ -439,7 +379,7 @@ mod tests {
             keys.push(vec![0; 897]);
         }
 
-        let cert = try_form_hard_finality(5, block_hash, proof_hash, state_root, &votes, &keys);
+        let cert = try_form_hard_finality(5, block_hash, state_root, &votes, &keys);
         assert!(cert.is_some());
         assert!(cert.unwrap().has_quorum());
     }
@@ -454,7 +394,7 @@ mod tests {
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let vote = create_finality_vote(5, [0xAA; 32], [0xBB; 32], [0xCC; 32], i, addr, &sk);
+            let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], i, addr, &sk);
             votes.push(vote);
             keys.push(pk_bytes);
         }
@@ -463,7 +403,7 @@ mod tests {
             keys.push(vec![0; 897]);
         }
 
-        let cert = try_form_hard_finality(5, [0xAA; 32], [0xBB; 32], [0xCC; 32], &votes, &keys);
+        let cert = try_form_hard_finality(5, [0xAA; 32], [0xCC; 32], &votes, &keys);
         assert!(cert.is_none());
     }
 
@@ -473,7 +413,7 @@ mod tests {
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
-        let vote = create_finality_vote(5, [0xAA; 32], [0xBB; 32], [0xCC; 32], 0, addr, &sk);
+        let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], 0, addr, &sk);
         assert!(verify_finality_vote(&vote, &pk_bytes));
     }
 
@@ -483,7 +423,7 @@ mod tests {
         let (pk2, _sk2) = falcon_keygen();
         let addr = derive_eoa_address(pk1.as_bytes());
 
-        let vote = create_finality_vote(5, [0xAA; 32], [0xBB; 32], [0xCC; 32], 0, addr, &sk1);
+        let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], 0, addr, &sk1);
         assert!(!verify_finality_vote(&vote, pk2.as_bytes()));
     }
 
@@ -500,7 +440,6 @@ mod tests {
         let cert = HardFinalityCert {
             slot: 50,
             block_hash: [0xAA; 32],
-            proof_hash: [0xBB; 32],
             state_root: [0xCC; 32],
             voter_bitmap: (1u128 << 86) - 1,
             signatures: vec![],
@@ -524,7 +463,6 @@ mod tests {
         let cert = HardFinalityCert {
             slot: 100,
             block_hash: [0xAA; 32],
-            proof_hash: [0xBB; 32],
             state_root: [0xCC; 32],
             voter_bitmap: (1u128 << 86) - 1,
             signatures: vec![],
@@ -553,7 +491,6 @@ mod tests {
         let cert = HardFinalityCert {
             slot: 10,
             block_hash: [0xAA; 32],
-            proof_hash: [0xBB; 32],
             state_root: [0xCC; 32],
             voter_bitmap: (1u128 << 86) - 1,
             signatures: vec![],
@@ -582,7 +519,6 @@ mod tests {
         let cert = HardFinalityCert {
             slot: 10,
             block_hash: [10; 32],
-            proof_hash: [0xBB; 32],
             state_root: [0xCC; 32],
             voter_bitmap: (1u128 << 86) - 1,
             signatures: vec![],
@@ -594,71 +530,49 @@ mod tests {
         assert_eq!(tracker.pending[0].slot, 15);
     }
 
-    // ========== Unproven window ==========
+    // ========== Unconfirmed count ==========
 
     #[test]
-    fn unproven_count_tracks_gap() {
+    fn unconfirmed_count_tracks_gap() {
         let mut tracker = FinalityTracker::new();
 
         // Soft finality for slots 1-50
         for slot in 1..=50 {
             tracker.record_soft_finality(slot, [slot as u8; 32], make_qc(slot, 90));
         }
-        assert_eq!(tracker.unproven_count(), 50);
+        assert_eq!(tracker.unconfirmed_count(), 50);
 
         // Hard finality for slot 20
         let cert = HardFinalityCert {
             slot: 20,
             block_hash: [20; 32],
-            proof_hash: [0xBB; 32],
             state_root: [0xCC; 32],
             voter_bitmap: (1u128 << 86) - 1,
             signatures: vec![],
         };
         tracker.record_hard_finality(cert);
-        assert_eq!(tracker.unproven_count(), 30); // 50 - 20
+        assert_eq!(tracker.unconfirmed_count(), 30); // 50 - 20
     }
 
     #[test]
-    fn production_mode_normal() {
-        assert_eq!(production_mode(0), ProductionMode::Normal);
-        assert_eq!(production_mode(99), ProductionMode::Normal);
-    }
-
-    #[test]
-    fn production_mode_slowed() {
-        assert_eq!(production_mode(100), ProductionMode::Slowed);
-        assert_eq!(production_mode(499), ProductionMode::Slowed);
-    }
-
-    #[test]
-    fn production_mode_paused() {
-        assert_eq!(production_mode(500), ProductionMode::Paused);
-        assert_eq!(production_mode(1000), ProductionMode::Paused);
-    }
-
-    #[test]
-    fn tracker_production_mode() {
+    fn tracker_hard_finality_catches_up() {
         let mut tracker = FinalityTracker::new();
-        assert_eq!(tracker.production_mode(), ProductionMode::Normal);
 
         // Soft finality races ahead
         for slot in 1..=150 {
             tracker.record_soft_finality(slot, [slot as u8; 32], make_qc(slot, 90));
         }
-        assert_eq!(tracker.production_mode(), ProductionMode::Slowed);
+        assert_eq!(tracker.unconfirmed_count(), 150);
 
         // Hard finality catches up
         let cert = HardFinalityCert {
             slot: 100,
             block_hash: [100; 32],
-            proof_hash: [0xBB; 32],
             state_root: [0xCC; 32],
             voter_bitmap: (1u128 << 86) - 1,
             signatures: vec![],
         };
         tracker.record_hard_finality(cert);
-        assert_eq!(tracker.unproven_count(), 50); // 150 - 100
-        assert_eq!(tracker.production_mode(), ProductionMode::Normal);
+        assert_eq!(tracker.unconfirmed_count(), 50); // 150 - 100
     }
 }

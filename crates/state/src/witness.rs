@@ -1,8 +1,8 @@
 //! State witnesses: Merkle proofs for stateless execution.
 //!
 //! Full nodes generate witnesses (Merkle paths for accessed storage slots).
-//! Provers receive witnesses, verify them against the pre-state root,
-//! execute transactions, and compute the post-state root.
+//! Validators use witnesses for stateless verification against the pre-state
+//! root, re-execute transactions, and compute the post-state root.
 //!
 //! Uses batch Merkle proofs: one proof for all accessed keys, deduplicating
 //! shared siblings. This reduces witness size from O(N * depth) to
@@ -52,7 +52,7 @@ impl BlockWitness {
 
 /// Generate a block witness from an access list using a single batch proof.
 ///
-/// The full node calls this before sending the block to provers.
+/// The full node calls this before sending the block to validators.
 /// All keys get a single compiled Merkle proof (shared siblings deduplicated).
 pub fn generate_witnesses(smt: &PydeSMT, access_keys: &[Key]) -> BlockWitness {
     let pre_root = smt.root();
@@ -91,7 +91,7 @@ pub fn generate_witnesses(smt: &PydeSMT, access_keys: &[Key]) -> BlockWitness {
 /// Verify a block witness: check that the batch proof is valid
 /// against the pre-state root for all entries.
 ///
-/// Returns true if the proof verifies. The prover calls this before executing.
+/// Returns true if the proof verifies. The validator calls this before executing.
 pub fn verify_witnesses(witness: &BlockWitness) -> bool {
     if witness.entries.is_empty() {
         return true;
@@ -109,7 +109,7 @@ pub fn verify_witnesses(witness: &BlockWitness) -> bool {
 }
 
 /// Build a key→value map from witnesses for use during execution.
-/// The prover uses this instead of querying the full state.
+/// Stateless validators use this instead of querying the full state.
 pub fn witness_to_state_map(witness: &BlockWitness) -> std::collections::HashMap<Key, Vec<u8>> {
     let mut map = std::collections::HashMap::new();
     for entry in &witness.entries {

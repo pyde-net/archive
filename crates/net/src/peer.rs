@@ -19,9 +19,7 @@ pub enum PeerRole {
     Validator,
     /// Full node (stores state, relays txs, serves RPC).
     FullNode,
-    /// Prover node (generates ZK proofs).
-    Prover,
-    /// Light client (verifies proofs only).
+    /// Light client (header-only verification).
     LightClient,
     /// Unknown (not yet identified).
     Unknown,
