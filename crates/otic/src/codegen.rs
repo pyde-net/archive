@@ -221,7 +221,7 @@ pub struct CodeGen {
     /// Whether current function has reentrancy guard (needs cleanup on return).
     needs_guard_cleanup: bool,
     /// Whether to emit runtime guards (disabled for testing).
-    emit_guards: bool,
+    pub emit_guards: bool,
     /// Function name → label (for call resolution).
     func_labels: HashMap<String, Label>,
     /// Storage field name → slot index.
@@ -1547,7 +1547,7 @@ fn field_byte_size(ty: &Ty) -> u32 {
 }
 
 /// Compute a function selector (FNV-1a hash of name).
-fn compute_selector(name: &str) -> u32 {
+pub fn compute_selector(name: &str) -> u32 {
     let mut hash: u32 = 0x811c9dc5;
     for byte in name.bytes() {
         hash ^= byte as u32;

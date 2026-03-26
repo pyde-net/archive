@@ -367,7 +367,12 @@ impl Parser {
             let ty = self.parse_type()?;
             let fspan = fname.span;
             fields.push(StorageField { name: fname, ty, span: fspan });
-            self.eat(&TokenKind::Comma);
+            // Require comma between fields (trailing comma before } is optional)
+            if !self.at(&TokenKind::RBrace) {
+                self.expect(&TokenKind::Comma)?;
+            } else {
+                self.eat(&TokenKind::Comma); // allow trailing comma
+            }
         }
 
         self.expect(&TokenKind::RBrace)?;
@@ -392,7 +397,11 @@ impl Parser {
             let ty = self.parse_type()?;
             let fspan = fname.span;
             fields.push(EventField { name: fname, ty, indexed, span: fspan });
-            self.eat(&TokenKind::Comma);
+            if !self.at(&TokenKind::RBrace) {
+                self.expect(&TokenKind::Comma)?;
+            } else {
+                self.eat(&TokenKind::Comma);
+            }
         }
 
         self.expect(&TokenKind::RBrace)?;
@@ -412,7 +421,11 @@ impl Parser {
             let ty = self.parse_type()?;
             let fspan = fname.span;
             fields.push(StructField { name: fname, ty, span: fspan });
-            self.eat(&TokenKind::Comma);
+            if !self.at(&TokenKind::RBrace) {
+                self.expect(&TokenKind::Comma)?;
+            } else {
+                self.eat(&TokenKind::Comma);
+            }
         }
 
         self.expect(&TokenKind::RBrace)?;
@@ -432,7 +445,11 @@ impl Parser {
             let ty = self.parse_type()?;
             let fspan = fname.span;
             fields.push(StructField { name: fname, ty, span: fspan });
-            self.eat(&TokenKind::Comma);
+            if !self.at(&TokenKind::RBrace) {
+                self.expect(&TokenKind::Comma)?;
+            } else {
+                self.eat(&TokenKind::Comma);
+            }
         }
 
         self.expect(&TokenKind::RBrace)?;
@@ -452,7 +469,11 @@ impl Parser {
             if self.eat(&TokenKind::Eq) {
                 self.parse_expr()?; // consume the value expression
             }
-            self.eat(&TokenKind::Comma);
+            if !self.at(&TokenKind::RBrace) {
+                self.expect(&TokenKind::Comma)?;
+            } else {
+                self.eat(&TokenKind::Comma);
+            }
         }
 
         self.expect(&TokenKind::RBrace)?;
@@ -779,7 +800,11 @@ impl Parser {
             let value = self.parse_expr()?;
             let fspan = fname.span;
             fields.push(FieldInit { name: fname, value, span: fspan });
-            self.eat(&TokenKind::Comma);
+            if !self.at(&TokenKind::RBrace) {
+                self.expect(&TokenKind::Comma)?;
+            } else {
+                self.eat(&TokenKind::Comma);
+            }
         }
 
         self.expect(&TokenKind::RBrace)?;
