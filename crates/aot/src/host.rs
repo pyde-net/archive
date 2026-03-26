@@ -228,7 +228,9 @@ pub extern "C" fn host_narrow(ctx: *mut VmCtx, ws1: u64, trap_out: *mut u64) -> 
         }
         return 0;
     }
-    u64::from_le_bytes(bytes[..8].try_into().unwrap())
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(buf)
 }
 
 /// Host: widen (GP → wide). Takes the GP value directly from AOT, writes to wide register.
@@ -304,15 +306,50 @@ pub extern "C" fn host_checked_mod(a: u64, b: u64, trap_out: *mut u64) -> u64 {
 
 // ── Event operations ───────────────────────────────────────────────────
 
-/// Host: emit log event. Returns 0 on success, 1 on static mode violation, 2 on fault.
+/// Host: emit log event. Returns 0 on success, 1 on static mode violation or fault.
 pub extern "C" fn host_log(ctx: *mut VmCtx, desc_ptr: u64, num_topics: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
     if vm.static_mode {
         return 1;
     }
-    // Delegate to VM's existing LOG logic would require refactoring.
-    // For now, return 0 (success stub — full implementation deferred to
-    // when LOG is factored into a callable helper on Vm).
+    let desc_ptr = desc_ptr as u32;
+    let num_topics = num_topics as usize;
+    if num_topics > 4 {
+        return 1;
+    }
+
+    let mut topics = Vec::new();
+    for t in 0..num_topics {
+        let offset = desc_ptr.wrapping_add((t as u32) * 32);
+        let mut buf = [0u8; 32];
+        for j in 0..32u32 {
+            match vm.memory.load8(offset.wrapping_add(j)) {
+                Ok(b) => buf[j as usize] = b,
+                Err(_) => return 1,
+            }
+        }
+        topics.push(pyde_vm::wide::U256::from_le_bytes(buf));
+    }
+
+    let after_topics = desc_ptr.wrapping_add((num_topics as u32) * 32);
+    let data_ptr = match vm.memory.load64(after_topics) {
+        Ok(v) => v as u32,
+        Err(_) => return 1,
+    };
+    let data_len = match vm.memory.load64(after_topics.wrapping_add(8)) {
+        Ok(v) => v as usize,
+        Err(_) => return 1,
+    };
+    let data = match vm.memory.checked_read_slice(data_ptr, data_len) {
+        Ok(d) => d,
+        Err(_) => return 1,
+    };
+
+    vm.logs.push(pyde_vm::vm::EventLog {
+        address: vm.ctx.self_address,
+        topics,
+        data,
+    });
     0
 }
 
@@ -387,11 +424,20 @@ pub extern "C" fn host_assert(_ctx: *mut VmCtx, val: u64) -> u64 {
     }
 }
 
-/// Host: memcpy — bulk memory copy. AOT placeholder (actual copy done via VM runtime).
-pub extern "C" fn host_memcpy(_ctx: *mut VmCtx, _dst: u64, _src: u64, _len: u64) -> u64 {
-    // In AOT mode, memcpy is handled by the VM runtime callback.
-    // This stub exists for symbol resolution.
-    0
+/// Host: memcpy — bulk memory copy. Returns 0 on success, 1 on fault.
+pub extern "C" fn host_memcpy(ctx: *mut VmCtx, dst: u64, src: u64, len: u64) -> u64 {
+    let vm = unsafe { &mut *ctx };
+    let len = len as usize;
+    if len == 0 {
+        return 0;
+    }
+    match vm.memory.checked_read_slice(src as u32, len) {
+        Ok(data) => match vm.memory.checked_write_slice(dst as u32, &data) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        },
+        Err(_) => 1,
+    }
 }
 
 /// List of all host function names and their function pointers, for

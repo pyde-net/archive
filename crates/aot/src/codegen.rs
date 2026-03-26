@@ -73,7 +73,9 @@ const VAR_VM_CTX: u32 = 19;
 /// Compile an analyzed program to native code.
 pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> {
     let mut flag_builder = settings::builder();
-    flag_builder.set("opt_level", "speed").unwrap();
+    flag_builder
+        .set("opt_level", "speed")
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     let isa_builder = cranelift_native::builder()
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     let isa = isa_builder
@@ -131,6 +133,10 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
 
     // host_sstore(ctx, ws_slot, wd) -> u64
     let fn_sstore = module.declare_function("host_sstore", Linkage::Import, &sig_sload)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+
+    // host_sstoreg(ctx, ws_slot, value) -> u64 (same signature as sload: ctx + 2 args)
+    let fn_sstoreg = module.declare_function("host_sstoreg", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_sdelete(ctx, ws_slot) -> u64 / host_sloadg(ctx, ws_slot) -> u64
@@ -255,6 +261,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_store_ref = module.declare_func_in_func(fn_store, &mut ctx.func);
     let fn_sload_ref = module.declare_func_in_func(fn_sload, &mut ctx.func);
     let fn_sstore_ref = module.declare_func_in_func(fn_sstore, &mut ctx.func);
+    let fn_sstoreg_ref = module.declare_func_in_func(fn_sstoreg, &mut ctx.func);
     let fn_sdelete_ref = module.declare_func_in_func(fn_sdelete, &mut ctx.func);
     let fn_sloadg_ref = module.declare_func_in_func(fn_sloadg, &mut ctx.func);
     let fn_poseidon_ref = module.declare_func_in_func(fn_poseidon, &mut ctx.func);
@@ -642,10 +649,27 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         }
                     }
                     Opcode::Sstore => {
+                        let mode = d.rs2_or_imm & 0x3;
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let ws_slot = builder.ins().iconst(I64, d.rs1 as i64);
-                        let wd = builder.ins().iconst(I64, d.rd as i64);
-                        let call = builder.ins().call(fn_sstore_ref, &[vm_ctx, ws_slot, wd]);
+                        let call = match mode {
+                            0 => {
+                                // Wide register mode: sstore ws_slot, wd
+                                let wd = builder.ins().iconst(I64, d.rd as i64);
+                                builder.ins().call(fn_sstore_ref, &[vm_ctx, ws_slot, wd])
+                            }
+                            2 => {
+                                // GP register mode: sstoreg ws_slot, rd
+                                let rd_val = builder.use_var(Variable::from_u32(d.rd as u32));
+                                builder.ins().call(fn_sstoreg_ref, &[vm_ctx, ws_slot, rd_val])
+                            }
+                            _ => {
+                                // Mode 1 (memory) not yet implemented → trap
+                                builder.ins().jump(trap_block, &[]);
+                                terminated = true;
+                                continue;
+                            }
+                        };
                         let result = builder.inst_results(call)[0];
                         // result = 1 means static mode violation → trap
                         let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
