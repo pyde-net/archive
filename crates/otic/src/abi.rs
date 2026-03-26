@@ -26,6 +26,7 @@ pub struct AbiFn {
     pub is_view: bool,
     pub is_payable: bool,
     pub is_constructor: bool,
+    pub is_reentrant: bool,
     pub doc: Option<String>,
 }
 
@@ -96,6 +97,7 @@ pub fn generate_abi(program: &IrProgram) -> ContractAbi {
                 is_view: func.is_view,
                 is_payable: func.is_payable,
                 is_constructor: func.is_constructor,
+                is_reentrant: func.is_reentrant,
                 doc: func.doc.clone(),
             });
         }
@@ -180,11 +182,12 @@ pub fn abi_to_json(abi: &ContractAbi) -> String {
         out.push_str(&format!("      \"returns\": \"{}\",\n", f.return_type));
         out.push_str(&format!("      \"view\": {},\n", f.is_view));
         out.push_str(&format!("      \"payable\": {},\n", f.is_payable));
-        out.push_str(&format!("      \"constructor\": {}", f.is_constructor));
+        out.push_str(&format!("      \"constructor\": {},\n", f.is_constructor));
+        out.push_str(&format!("      \"reentrant\": {}", f.is_reentrant));
         if let Some(ref doc) = f.doc {
             out.push_str(&format!(
                 ",\n      \"doc\": \"{}\"",
-                doc.replace('"', "\\\"")
+                doc.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "")
             ));
         }
         out.push('\n');
@@ -215,7 +218,7 @@ pub fn abi_to_json(abi: &ContractAbi) -> String {
         if let Some(ref doc) = e.doc {
             out.push_str(&format!(
                 ",\n      \"doc\": \"{}\"",
-                doc.replace('"', "\\\"")
+                doc.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "")
             ));
         }
         out.push('\n');
@@ -246,7 +249,7 @@ pub fn abi_to_json(abi: &ContractAbi) -> String {
         if let Some(ref doc) = e.doc {
             out.push_str(&format!(
                 ",\n      \"doc\": \"{}\"",
-                doc.replace('"', "\\\"")
+                doc.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "")
             ));
         }
         out.push('\n');
@@ -527,7 +530,7 @@ mod tests {
         // Run the runtime bytecode on PVM with calldata
         let selector = compute_selector("add");
         let mut calldata = Vec::new();
-        calldata.extend_from_slice(&(selector as u64).to_le_bytes());
+        calldata.extend_from_slice(&selector.to_le_bytes()); // 4-byte selector
         calldata.extend_from_slice(&10u64.to_le_bytes());
         calldata.extend_from_slice(&32u64.to_le_bytes());
 

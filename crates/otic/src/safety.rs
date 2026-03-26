@@ -232,6 +232,12 @@ impl SafetyChecker {
                 func.span,
             );
         }
+        if has_constructor && has_reentrant {
+            self.error(
+                "#[constructor] and #[reentrant] cannot be combined (constructors run once at deploy)".into(),
+                func.span,
+            );
+        }
         if has_view && has_reentrant {
             self.error(
                 "#[view] and #[reentrant] cannot be combined (view functions don't need reentrancy guards)".into(),
@@ -241,6 +247,14 @@ impl SafetyChecker {
         if has_view && has_payable {
             self.error(
                 "#[view] and #[payable] cannot be combined (view functions cannot receive value)".into(),
+                func.span,
+            );
+        }
+
+        // View functions must have a return type (otherwise they're useless)
+        if has_view && func.return_type.is_none() {
+            self.error(
+                "#[view] function must have a return type (view functions read and return data)".into(),
                 func.span,
             );
         }
@@ -849,8 +863,9 @@ mod tests {
             contract T {
                 storage { balance: u256, }
                 #[view]
-                pub fn bad() {
+                pub fn bad() -> u64 {
                     self.balance = 100;
+                    return 0;
                 }
             }
         "#);
@@ -863,8 +878,9 @@ mod tests {
             contract T {
                 event Transfer { amount: u256, }
                 #[view]
-                pub fn bad() {
+                pub fn bad() -> u64 {
                     emit Transfer { amount: 100 };
+                    return 0;
                 }
             }
         "#);
@@ -876,8 +892,9 @@ mod tests {
         let errors = check_err(r#"
             contract T {
                 #[view]
-                pub fn bad() {
+                pub fn bad() -> u64 {
                     cross_call!(target: "oracle", method: "get_price", args: (1,));
+                    return 0;
                 }
             }
         "#);
@@ -890,12 +907,27 @@ mod tests {
             contract T {
                 storage { balances: Map<Address, u256>, }
                 #[view]
-                pub fn bad() {
+                pub fn bad() -> u64 {
                     self.balances[msg.sender] = 100;
+                    return 0;
                 }
             }
         "#);
         assert!(errors[0].message.contains("cannot modify storage"));
+    }
+
+    #[test]
+    fn error_view_no_return_type() {
+        let errors = check_err(r#"
+            contract T {
+                storage { x: u64, }
+                #[view]
+                pub fn bad() {
+                    let a = self.x;
+                }
+            }
+        "#);
+        assert!(errors[0].message.contains("must have a return type"));
     }
 
     // ========== Attribute conflicts ==========
@@ -1062,8 +1094,9 @@ mod tests {
             contract T {
                 storage { items: Vec<u256>, }
                 #[view]
-                pub fn bad() {
+                pub fn bad() -> u64 {
                     self.items.push(42);
+                    return 0;
                 }
             }
         "#);
@@ -1075,8 +1108,9 @@ mod tests {
         let errors = check_err(r#"
             contract T {
                 #[view]
-                pub fn bad() {
+                pub fn bad() -> u64 {
                     raw_call!(msg.sender, 0);
+                    return 0;
                 }
             }
         "#);

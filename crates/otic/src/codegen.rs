@@ -427,9 +427,10 @@ impl CodeGen {
             return;
         }
 
-        // Load selector from calldata into r13 (NOT r15, because load_u32_to_reg
-        // uses r15 as scratch and would clobber the calldata selector).
-        self.emit_load(13, 5, 0); // r13 = load u64 from calldata[0]
+        // Load 4-byte selector from calldata into r13 (u32 load, like Solidity).
+        // NOT r15, because load_u32_to_reg uses r15 as scratch.
+        let imm = encode_mem_immediate(0, MemWidth::W32);
+        self.emit(encode(Opcode::Load, 13, 5, imm)); // r13 = load u32 from calldata[0]
 
         for (selector, _name, dispatch_label, _func_label) in entries {
             self.load_u32_to_reg(memory::REG_SCRATCH_0, *selector); // r14 = known selector (may use r15 as scratch)
@@ -461,7 +462,7 @@ impl CodeGen {
         for (i, (_name, ty)) in func.params.iter().enumerate() {
             let phys = (i as u8) + 2; // r2, r3, r4, ...
             let is_wide = is_wide_type(ty);
-            let param_offset = 8 + (i as i32) * if is_wide { 32 } else { 8 }; // skip 8-byte selector (u64)
+            let param_offset = 4 + (i as i32) * if is_wide { 32 } else { 8 }; // skip 4-byte selector
 
             if is_wide {
                 // Compute address: r14 = r5 + offset
@@ -2504,7 +2505,7 @@ mod tests {
         let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000, ctx);
         // Set up calldata with the correct selector
         let selector = compute_selector("f");
-        vm.calldata = (selector as u64).to_le_bytes().to_vec();
+        vm.calldata = selector.to_le_bytes().to_vec();
         vm.load(&compiled.runtime_bytecode).unwrap();
 
         let mut result = None;
@@ -2574,7 +2575,7 @@ mod tests {
         };
         let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000, ctx);
         let selector = compute_selector("f");
-        vm.calldata = (selector as u64).to_le_bytes().to_vec();
+        vm.calldata = selector.to_le_bytes().to_vec();
         vm.load(&compiled.runtime_bytecode).unwrap();
 
         let mut result = None;
@@ -2608,12 +2609,12 @@ mod tests {
                 }
             }
         "#);
-        // Build calldata: [selector(8 bytes)] [arg0(8 bytes)] [arg1(8 bytes)]
+        // Build calldata: [selector(4 bytes)] [arg0(8 bytes)] [arg1(8 bytes)]
         let selector = compute_selector("add");
         let mut calldata = Vec::new();
-        calldata.extend_from_slice(&(selector as u64).to_le_bytes()); // 8 bytes selector
-        calldata.extend_from_slice(&10u64.to_le_bytes());            // arg0 = 10
-        calldata.extend_from_slice(&32u64.to_le_bytes());            // arg1 = 32
+        calldata.extend_from_slice(&selector.to_le_bytes()); // 4 bytes selector
+        calldata.extend_from_slice(&10u64.to_le_bytes());    // arg0 = 10
+        calldata.extend_from_slice(&32u64.to_le_bytes());    // arg1 = 32
 
         let mut codegen = CodeGen::new();
         codegen.emit_guards = true; // production mode with dispatch
