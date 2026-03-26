@@ -54,18 +54,20 @@ pub fn create_snapshot(smt: &PydeSMT, all_keys: &[Key]) -> Snapshot {
 }
 
 /// Restore a full SMT from a snapshot.
-pub fn restore_snapshot(snapshot: &Snapshot) -> PydeSMT {
+pub fn restore_snapshot(snapshot: &Snapshot) -> Result<PydeSMT, &'static str> {
     let mut smt = PydeSMT::new();
     if !snapshot.entries.is_empty() {
-        smt.update_all(snapshot.entries.clone());
+        smt.update_all(snapshot.entries.clone())?;
     }
-    smt
+    Ok(smt)
 }
 
 /// Verify that a restored snapshot produces the expected root.
 pub fn verify_snapshot(snapshot: &Snapshot) -> bool {
-    let smt = restore_snapshot(snapshot);
-    smt.root() == snapshot.root
+    match restore_snapshot(snapshot) {
+        Ok(smt) => smt.root() == snapshot.root,
+        Err(_) => false,
+    }
 }
 
 /// Create an incremental snapshot: diff between old state and new state.
@@ -106,12 +108,12 @@ pub fn create_incremental(
 /// Apply an incremental snapshot to an SMT.
 /// Returns the new root, or None if the SMT's current root doesn't match
 /// the snapshot's from_root (indicating the diffs don't apply to this state).
-pub fn apply_incremental(smt: &mut PydeSMT, inc: &IncrementalSnapshot) -> Option<H256> {
+pub fn apply_incremental(smt: &mut PydeSMT, inc: &IncrementalSnapshot) -> Result<Option<H256>, &'static str> {
     // Validate that the current state matches the snapshot's base state
     if smt.root() != inc.from_root {
-        return None;
+        return Ok(None);
     }
-    Some(smt.update_all(inc.diffs.clone()))
+    Ok(Some(smt.update_all(inc.diffs.clone())?))
 }
 
 /// Split a snapshot into chunks of `chunk_size` entries each.
@@ -183,7 +185,7 @@ mod tests {
         let mut smt = PydeSMT::new();
         let keys: Vec<Key> = (0..count).map(|i| key_from_seed(i)).collect();
         for (i, k) in keys.iter().enumerate() {
-            smt.insert(*k, format!("val_{i}").into_bytes());
+            smt.insert(*k, format!("val_{i}").into_bytes()).unwrap();
         }
         (smt, keys)
     }
@@ -199,7 +201,7 @@ mod tests {
         assert_eq!(snapshot.root, original_root);
         assert_eq!(snapshot.entries.len(), 100);
 
-        let restored = restore_snapshot(&snapshot);
+        let restored = restore_snapshot(&snapshot).unwrap();
         assert_eq!(restored.root(), original_root);
 
         // Verify all values match
@@ -233,14 +235,14 @@ mod tests {
         // Clone and modify
         let mut new_smt = PydeSMT::new();
         for (i, k) in old_keys.iter().enumerate() {
-            new_smt.insert(*k, format!("val_{i}").into_bytes());
+            new_smt.insert(*k, format!("val_{i}").into_bytes()).unwrap();
         }
         // Change one key
         let changed_key = old_keys[0];
-        new_smt.insert(changed_key, b"new_value".to_vec());
+        new_smt.insert(changed_key, b"new_value".to_vec()).unwrap();
         // Add one key
         let new_key = key_from_seed(999);
-        new_smt.insert(new_key, b"added".to_vec());
+        new_smt.insert(new_key, b"added".to_vec()).unwrap();
 
         let mut all_new_keys = old_keys.clone();
         all_new_keys.push(new_key);
@@ -251,7 +253,7 @@ mod tests {
         assert!(!inc.diffs.is_empty());
 
         // Apply incremental to old SMT
-        let result_root = apply_incremental(&mut old_smt, &inc).expect("from_root should match");
+        let result_root = apply_incremental(&mut old_smt, &inc).unwrap().expect("from_root should match");
         assert_eq!(result_root, new_smt.root());
     }
 
@@ -262,7 +264,7 @@ mod tests {
         let mut new_smt = PydeSMT::new();
         // Copy all except key[0]
         for (i, k) in old_keys.iter().enumerate().skip(1) {
-            new_smt.insert(*k, format!("val_{i}").into_bytes());
+            new_smt.insert(*k, format!("val_{i}").into_bytes()).unwrap();
         }
 
         let new_keys: Vec<Key> = old_keys[1..].to_vec();

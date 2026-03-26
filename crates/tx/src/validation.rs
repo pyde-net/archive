@@ -230,7 +230,7 @@ mod tests {
     use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
 
     fn make_valid_tx_and_account() -> (Transaction, Account, NonceState) {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let account = Account {
             balance: 1_000_000_000_000, // plenty
@@ -254,7 +254,7 @@ mod tests {
         };
 
         let tx_hash = tx.hash();
-        tx.signature = falcon_sign(&sk, &tx_hash).as_bytes().to_vec();
+        tx.signature = falcon_sign(&sk, &tx_hash).unwrap().as_bytes().to_vec();
 
         (tx, account, nonce_state)
     }
@@ -302,7 +302,7 @@ mod tests {
         let (mut tx, account, nonce) = make_valid_tx_and_account();
         tx.nonce = 100; // way outside [0, 15]
         // Re-sign with correct hash
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let account = Account {
             balance: 1_000_000_000_000,
@@ -310,7 +310,7 @@ mod tests {
         };
         tx.from = account.address;
         let tx_hash = tx.hash();
-        tx.signature = falcon_sign(&sk, &tx_hash).as_bytes().to_vec();
+        tx.signature = falcon_sign(&sk, &tx_hash).unwrap().as_bytes().to_vec();
 
         let ctx = default_ctx();
         let err = validate_transaction(&tx, &account, &nonce, &ctx).unwrap_err();
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn insufficient_balance_rejected() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let account = Account {
             balance: 100, // way too low
@@ -344,7 +344,7 @@ mod tests {
             tx_type: TransactionType::Standard,
         };
         let tx_hash = tx.hash();
-        tx.signature = falcon_sign(&sk, &tx_hash).as_bytes().to_vec();
+        tx.signature = falcon_sign(&sk, &tx_hash).unwrap().as_bytes().to_vec();
 
         let ctx = default_ctx(); // base_fee = 1000, so 21000 * 1000 = 21M > 100
         let err = validate_transaction(&tx, &account, &nonce, &ctx).unwrap_err();
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn paymaster_skips_balance_check() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let account = Account {
             balance: 0, // zero balance
@@ -376,7 +376,7 @@ mod tests {
             tx_type: TransactionType::Standard,
         };
         let tx_hash = tx.hash();
-        tx.signature = falcon_sign(&sk, &tx_hash).as_bytes().to_vec();
+        tx.signature = falcon_sign(&sk, &tx_hash).unwrap().as_bytes().to_vec();
 
         let ctx = default_ctx();
         assert!(validate_transaction(&tx, &account, &nonce, &ctx).is_ok());
@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     fn expired_deadline_rejected() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let account = Account {
             balance: 1_000_000_000_000,
@@ -409,7 +409,7 @@ mod tests {
             tx_type: TransactionType::Standard,
         };
         let tx_hash = tx.hash();
-        tx.signature = falcon_sign(&sk, &tx_hash).as_bytes().to_vec();
+        tx.signature = falcon_sign(&sk, &tx_hash).unwrap().as_bytes().to_vec();
 
         let ctx = default_ctx(); // block_height = 100 > deadline 50
         let err = validate_transaction(&tx, &account, &nonce, &ctx).unwrap_err();
@@ -421,7 +421,7 @@ mod tests {
         let (tx, account, nonce) = make_valid_tx_and_account();
         let mut tx = tx;
         // Need to re-sign with deadline
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let account = Account {
             balance: 1_000_000_000_000,
@@ -430,7 +430,7 @@ mod tests {
         tx.from = account.address;
         tx.deadline = Some(999); // future
         let tx_hash = tx.hash();
-        tx.signature = falcon_sign(&sk, &tx_hash).as_bytes().to_vec();
+        tx.signature = falcon_sign(&sk, &tx_hash).unwrap().as_bytes().to_vec();
 
         let ctx = default_ctx();
         assert!(validate_transaction(&tx, &account, &NonceState::new(), &ctx).is_ok());

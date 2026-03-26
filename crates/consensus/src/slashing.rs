@@ -128,8 +128,14 @@ pub fn verify_double_sign(evidence: &DoubleSignEvidence, public_key: &[u8]) -> b
         None => return false,
     };
 
-    let sig_1 = FalconSignature::from_bytes(&evidence.signature_1);
-    let sig_2 = FalconSignature::from_bytes(&evidence.signature_2);
+    let sig_1 = match FalconSignature::from_bytes(&evidence.signature_1) {
+        Some(s) => s,
+        None => return false,
+    };
+    let sig_2 = match FalconSignature::from_bytes(&evidence.signature_2) {
+        Some(s) => s,
+        None => return false,
+    };
 
     falcon_verify(&pk, &hash_1, &sig_1) && falcon_verify(&pk, &hash_2, &sig_2)
 }
@@ -277,15 +283,15 @@ mod tests {
 
     #[test]
     fn double_sign_detected_and_slashed() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
         let header_1 = make_header(100, 1_000_000);
         let header_2 = make_header(100, 2_000_000); // same slot, different timestamp → different hash
 
-        let sig_1 = falcon_sign(&sk, &header_1.hash());
-        let sig_2 = falcon_sign(&sk, &header_2.hash());
+        let sig_1 = falcon_sign(&sk, &header_1.hash()).unwrap();
+        let sig_2 = falcon_sign(&sk, &header_2.hash()).unwrap();
 
         let evidence = DoubleSignEvidence {
             slot: 100,
@@ -313,12 +319,12 @@ mod tests {
 
     #[test]
     fn same_block_twice_rejected() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
         let header = make_header(100, 1_000_000);
-        let sig = falcon_sign(&sk, &header.hash());
+        let sig = falcon_sign(&sk, &header.hash()).unwrap();
 
         let evidence = DoubleSignEvidence {
             slot: 100,
@@ -336,15 +342,15 @@ mod tests {
 
     #[test]
     fn wrong_signer_key_rejected() {
-        let (pk1, sk1) = falcon_keygen();
-        let (pk2, _sk2) = falcon_keygen();
+        let (pk1, sk1) = falcon_keygen().unwrap();
+        let (pk2, _sk2) = falcon_keygen().unwrap();
         let addr = derive_eoa_address(pk1.as_bytes());
 
         let header_1 = make_header(100, 1_000_000);
         let header_2 = make_header(100, 2_000_000);
 
-        let sig_1 = falcon_sign(&sk1, &header_1.hash());
-        let sig_2 = falcon_sign(&sk1, &header_2.hash());
+        let sig_1 = falcon_sign(&sk1, &header_1.hash()).unwrap();
+        let sig_2 = falcon_sign(&sk1, &header_2.hash()).unwrap();
 
         let evidence = DoubleSignEvidence {
             slot: 100,
@@ -362,15 +368,15 @@ mod tests {
 
     #[test]
     fn wrong_slot_rejected() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
         let header_1 = make_header(100, 1_000_000);
         let header_2 = make_header(101, 2_000_000); // different slot!
 
-        let sig_1 = falcon_sign(&sk, &header_1.hash());
-        let sig_2 = falcon_sign(&sk, &header_2.hash());
+        let sig_1 = falcon_sign(&sk, &header_1.hash()).unwrap();
+        let sig_2 = falcon_sign(&sk, &header_2.hash()).unwrap();
 
         let evidence = DoubleSignEvidence {
             slot: 100,
@@ -448,15 +454,15 @@ mod tests {
 
     #[test]
     fn finder_fee_is_10_percent() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
         let header_1 = make_header(100, 1_000_000);
         let header_2 = make_header(100, 2_000_000);
 
-        let sig_1 = falcon_sign(&sk, &header_1.hash());
-        let sig_2 = falcon_sign(&sk, &header_2.hash());
+        let sig_1 = falcon_sign(&sk, &header_1.hash()).unwrap();
+        let sig_2 = falcon_sign(&sk, &header_2.hash()).unwrap();
 
         let evidence = DoubleSignEvidence {
             slot: 100,
@@ -477,7 +483,7 @@ mod tests {
 
     #[test]
     fn apply_double_sign_slash_reduces_stake_and_ejects() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
@@ -487,8 +493,8 @@ mod tests {
 
         let header_1 = make_header(100, 1_000_000);
         let header_2 = make_header(100, 2_000_000);
-        let sig_1 = falcon_sign(&sk, &header_1.hash());
-        let sig_2 = falcon_sign(&sk, &header_2.hash());
+        let sig_1 = falcon_sign(&sk, &header_1.hash()).unwrap();
+        let sig_2 = falcon_sign(&sk, &header_2.hash()).unwrap();
 
         let evidence = DoubleSignEvidence {
             slot: 100,

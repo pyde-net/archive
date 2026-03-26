@@ -162,7 +162,10 @@ impl Transaction {
             Some(pk) => pk,
             None => return false,
         };
-        let sig = FalconSignature::from_bytes(&self.signature);
+        let sig = match FalconSignature::from_bytes(&self.signature) {
+            Some(s) => s,
+            None => return false,
+        };
         let tx_hash = self.hash();
         falcon_verify(&pk, &tx_hash, &sig)
     }
@@ -448,13 +451,13 @@ mod tests {
 
     #[test]
     fn valid_signature_passes() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let mut tx = make_test_tx();
         tx.from = derive_eoa_address(&pk_bytes);
 
         let tx_hash = tx.hash();
-        tx.signature = falcon_sign(&sk, &tx_hash).as_bytes().to_vec();
+        tx.signature = falcon_sign(&sk, &tx_hash).unwrap().as_bytes().to_vec();
 
         assert!(tx.verify_signature(&pk_bytes));
     }
@@ -463,13 +466,13 @@ mod tests {
 
     #[test]
     fn tampered_value_fails_verification() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let mut tx = make_test_tx();
         tx.from = derive_eoa_address(&pk_bytes);
 
         let tx_hash = tx.hash();
-        tx.signature = falcon_sign(&sk, &tx_hash).as_bytes().to_vec();
+        tx.signature = falcon_sign(&sk, &tx_hash).unwrap().as_bytes().to_vec();
 
         // Tamper
         tx.value = 999_999;
@@ -478,12 +481,12 @@ mod tests {
 
     #[test]
     fn wrong_key_fails_verification() {
-        let (pk1, sk1) = falcon_keygen();
-        let (pk2, _sk2) = falcon_keygen();
+        let (pk1, sk1) = falcon_keygen().unwrap();
+        let (pk2, _sk2) = falcon_keygen().unwrap();
         let mut tx = make_test_tx();
 
         let tx_hash = tx.hash();
-        tx.signature = falcon_sign(&sk1, &tx_hash).as_bytes().to_vec();
+        tx.signature = falcon_sign(&sk1, &tx_hash).unwrap().as_bytes().to_vec();
 
         // Verify with wrong key
         assert!(!tx.verify_signature(pk2.as_bytes()));

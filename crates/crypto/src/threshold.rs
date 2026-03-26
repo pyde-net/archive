@@ -194,11 +194,11 @@ fn xor_bytes(data: &[u8], keystream: &[u8]) -> Vec<u8> {
 
 /// Generate a threshold keypair: committee public key + n key shares.
 /// Returns (ThresholdPublicKey, Vec<KeyShare>) where each KeyShare belongs to one validator.
-pub fn threshold_keygen(n: usize, threshold: usize) -> (ThresholdPublicKey, Vec<KeyShare>) {
-    assert!(threshold <= n, "threshold must be <= n");
-    assert!(threshold >= 1, "threshold must be >= 1");
+pub fn threshold_keygen(n: usize, threshold: usize) -> Result<(ThresholdPublicKey, Vec<KeyShare>), &'static str> {
+    if threshold > n { return Err("threshold must be <= n"); }
+    if threshold < 1 { return Err("threshold must be >= 1"); }
 
-    let (pk, sk) = kyber_keygen();
+    let (pk, sk) = kyber_keygen()?;
 
     // Convert 64-byte seed to 8 Goldilocks elements
     let seed_bytes = sk.as_bytes();
@@ -239,21 +239,21 @@ pub fn threshold_keygen(n: usize, threshold: usize) -> (ThresholdPublicKey, Vec<
         threshold,
     };
 
-    (tpk, key_shares)
+    Ok((tpk, key_shares))
 }
 
 /// Encrypt a message using the committee's threshold public key.
-pub fn threshold_encrypt(tpk: &ThresholdPublicKey, msg: &[u8]) -> ThresholdCiphertext {
-    let (kyber_ct, ss) = kyber_encapsulate(&tpk.kyber_pk);
+pub fn threshold_encrypt(tpk: &ThresholdPublicKey, msg: &[u8]) -> Result<ThresholdCiphertext, &'static str> {
+    let (kyber_ct, ss) = kyber_encapsulate(&tpk.kyber_pk)?;
     let keystream = derive_keystream(&ss, msg.len());
     let encrypted_msg = xor_bytes(msg, &keystream);
     let mac = compute_mac(&ss, &encrypted_msg);
 
-    ThresholdCiphertext {
+    Ok(ThresholdCiphertext {
         kyber_ct,
         encrypted_msg,
         mac,
-    }
+    })
 }
 
 /// Generate a decryption share from a validator's key share.
@@ -326,7 +326,7 @@ pub fn combine_shares(
     let sk = KyberSecretKey::from_bytes(&seed_bytes).ok_or("invalid reconstructed seed")?;
 
     // Decapsulate to get shared secret
-    let ss = kyber_decapsulate(&sk, &ct.kyber_ct);
+    let ss = kyber_decapsulate(&sk, &ct.kyber_ct).map_err(|_| "Kyber-768 decapsulation failed")?;
 
     // Verify MAC
     let expected_mac = compute_mac(&ss, &ct.encrypted_msg);
@@ -457,17 +457,21 @@ pub fn pss_refresh(
     let t = epoch_material.threshold;
     let new_epoch = epoch_material.epoch + 1;
 
-    // Each validator generates a refresh contribution
+    // Each validator generates a refresh contribution using fresh entropy
     let contributions: Vec<RefreshContribution> = old_shares
         .iter()
         .map(|ks| {
-            // Use hash of share data as entropy for the contribution
-            let share_entropy: Vec<u8> = ks
-                .shares
-                .iter()
-                .flat_map(|s| gl_to_u64(*s).to_le_bytes())
-                .collect();
-            generate_refresh_contribution(ks.index, n, t, new_epoch, &share_entropy)
+            // Generate fresh entropy from epoch, validator index, and random field element
+            let fresh_random = random_goldilocks(
+                &new_epoch.to_le_bytes(),
+                ks.index * 7919, // prime multiplier for extra mixing
+            );
+            let mut entropy_input = Vec::with_capacity(24);
+            entropy_input.extend_from_slice(&new_epoch.to_le_bytes());
+            entropy_input.extend_from_slice(&(ks.index as u64).to_le_bytes());
+            entropy_input.extend_from_slice(&gl_to_u64(fresh_random).to_le_bytes());
+            let fresh_entropy = poseidon2_hash(&entropy_input);
+            generate_refresh_contribution(ks.index, n, t, new_epoch, fresh_entropy.as_bytes())
         })
         .collect();
 
@@ -497,14 +501,14 @@ mod tests {
     const T: usize = 85;
 
     fn setup() -> (ThresholdPublicKey, Vec<KeyShare>) {
-        threshold_keygen(N, T)
+        threshold_keygen(N, T).unwrap()
     }
 
     #[test]
     fn encrypt_decrypt_with_threshold_plus_one() {
         let (tpk, shares) = setup();
         let msg = b"hello threshold kyber";
-        let ct = threshold_encrypt(&tpk, msg);
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         let dec_shares: Vec<DecryptionShare> = shares[..T + 1]
             .iter()
@@ -519,7 +523,7 @@ mod tests {
     fn encrypt_decrypt_with_exact_threshold() {
         let (tpk, shares) = setup();
         let msg = b"exact threshold test";
-        let ct = threshold_encrypt(&tpk, msg);
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         let dec_shares: Vec<DecryptionShare> = shares[..T]
             .iter()
@@ -534,7 +538,7 @@ mod tests {
     fn insufficient_shares_fails() {
         let (tpk, shares) = setup();
         let msg = b"not enough shares";
-        let ct = threshold_encrypt(&tpk, msg);
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         let dec_shares: Vec<DecryptionShare> = shares[..T - 1]
             .iter()
@@ -549,7 +553,7 @@ mod tests {
     fn duplicate_shares_rejected() {
         let (tpk, shares) = setup();
         let msg = b"duplicate test";
-        let ct = threshold_encrypt(&tpk, msg);
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         let mut dec_shares: Vec<DecryptionShare> = shares[..T - 1]
             .iter()
@@ -565,9 +569,9 @@ mod tests {
     #[test]
     fn wrong_shares_produce_bad_mac() {
         let (tpk, _shares) = setup();
-        let (_tpk2, shares2) = threshold_keygen(N, T);
+        let (_tpk2, shares2) = threshold_keygen(N, T).unwrap();
         let msg = b"wrong shares test";
-        let ct = threshold_encrypt(&tpk, msg);
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         // Use shares from a different committee
         let dec_shares: Vec<DecryptionShare> = shares2[..T]
@@ -583,7 +587,7 @@ mod tests {
     fn any_subset_of_shares_works() {
         let (tpk, shares) = setup();
         let msg = b"any subset works";
-        let ct = threshold_encrypt(&tpk, msg);
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         // Use last T shares instead of first T
         let dec_shares: Vec<DecryptionShare> = shares[N - T..]
@@ -599,7 +603,7 @@ mod tests {
     fn empty_message() {
         let (tpk, shares) = setup();
         let msg = b"";
-        let ct = threshold_encrypt(&tpk, msg);
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         let dec_shares: Vec<DecryptionShare> = shares[..T]
             .iter()
@@ -612,9 +616,9 @@ mod tests {
 
     #[test]
     fn large_message() {
-        let (tpk, shares) = threshold_keygen(5, 3); // smaller for speed
+        let (tpk, shares) = threshold_keygen(5, 3).unwrap(); // smaller for speed
         let msg = vec![0xABu8; 10_000];
-        let ct = threshold_encrypt(&tpk, &msg);
+        let ct = threshold_encrypt(&tpk, &msg).unwrap();
 
         let dec_shares: Vec<DecryptionShare> = shares[..3]
             .iter()
@@ -654,7 +658,7 @@ mod tests {
     // --- PSS tests ---
 
     fn setup_epoch(n: usize, t: usize) -> (EpochKeyMaterial, Vec<KeyShare>) {
-        let (tpk, shares) = threshold_keygen(n, t);
+        let (tpk, shares) = threshold_keygen(n, t).unwrap();
         let epoch_material = EpochKeyMaterial {
             epoch: 0,
             n,
@@ -668,7 +672,7 @@ mod tests {
     fn pss_refreshed_shares_decrypt_old_ciphertext() {
         let (epoch_mat, shares) = setup_epoch(5, 3);
         let msg = b"encrypted before refresh";
-        let ct = threshold_encrypt(&epoch_mat.tpk, msg);
+        let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
         // Refresh shares
         let (_new_epoch, new_shares) = pss_refresh(&epoch_mat, &shares);
@@ -691,7 +695,7 @@ mod tests {
 
         // Encrypt with the same public key (it doesn't change)
         let msg = b"encrypted after refresh";
-        let ct = threshold_encrypt(&new_epoch.tpk, msg);
+        let ct = threshold_encrypt(&new_epoch.tpk, msg).unwrap();
 
         // New shares should work
         let dec_shares_new: Vec<DecryptionShare> = new_shares[..3]
@@ -716,7 +720,7 @@ mod tests {
     fn pss_mixed_old_new_shares_fail() {
         let (epoch_mat, shares) = setup_epoch(5, 3);
         let msg = b"mixed shares test";
-        let ct = threshold_encrypt(&epoch_mat.tpk, msg);
+        let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
         let (_new_epoch, new_shares) = pss_refresh(&epoch_mat, &shares);
 
@@ -738,7 +742,7 @@ mod tests {
     fn pss_multiple_refreshes() {
         let (epoch_mat, shares) = setup_epoch(5, 3);
         let msg = b"multi-refresh test";
-        let ct = threshold_encrypt(&epoch_mat.tpk, msg);
+        let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
         // Refresh multiple times
         let (epoch1, shares1) = pss_refresh(&epoch_mat, &shares);
@@ -759,19 +763,23 @@ mod tests {
         let (epoch_mat, shares) = setup_epoch(5, 3);
         let new_epoch = epoch_mat.epoch + 1;
 
-        // Generate contributions
+        // Generate contributions using fresh entropy
         for ks in &shares {
-            let share_entropy: Vec<u8> = ks
-                .shares
-                .iter()
-                .flat_map(|s| gl_to_u64(*s).to_le_bytes())
-                .collect();
+            let fresh_random = random_goldilocks(
+                &new_epoch.to_le_bytes(),
+                ks.index * 7919,
+            );
+            let mut entropy_input = Vec::with_capacity(24);
+            entropy_input.extend_from_slice(&new_epoch.to_le_bytes());
+            entropy_input.extend_from_slice(&(ks.index as u64).to_le_bytes());
+            entropy_input.extend_from_slice(&gl_to_u64(fresh_random).to_le_bytes());
+            let fresh_entropy = poseidon2_hash(&entropy_input);
             let contrib = generate_refresh_contribution(
                 ks.index,
                 epoch_mat.n,
                 epoch_mat.threshold,
                 new_epoch,
-                &share_entropy,
+                fresh_entropy.as_bytes(),
             );
             assert!(verify_refresh_contribution(&contrib, epoch_mat.threshold));
         }
@@ -781,7 +789,7 @@ mod tests {
     fn pss_any_subset_after_refresh() {
         let (epoch_mat, shares) = setup_epoch(10, 7);
         let msg = b"any subset after refresh";
-        let ct = threshold_encrypt(&epoch_mat.tpk, msg);
+        let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
         let (_new_epoch, new_shares) = pss_refresh(&epoch_mat, &shares);
 

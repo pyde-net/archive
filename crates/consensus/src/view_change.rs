@@ -122,17 +122,17 @@ pub fn create_view_change(
     voter_index: u8,
     voter_address: Address,
     voter_sk: &FalconSecretKey,
-) -> ViewChangeMessage {
+) -> Result<ViewChangeMessage, &'static str> {
     let msg = view_change_sign_message(slot);
-    let sig = falcon_sign(voter_sk, &msg);
+    let sig = falcon_sign(voter_sk, &msg).map_err(|_| "view change signing failed")?;
 
-    ViewChangeMessage {
+    Ok(ViewChangeMessage {
         slot,
         highest_qc: highest_qc.clone(),
         voter_index,
         voter_address,
         signature: sig.as_bytes().to_vec(),
-    }
+    })
 }
 
 /// Verify a view change message.
@@ -142,7 +142,10 @@ pub fn verify_view_change(msg: &ViewChangeMessage, public_key: &[u8]) -> bool {
         None => return false,
     };
     let sign_msg = view_change_sign_message(msg.slot);
-    let sig = FalconSignature::from_bytes(&msg.signature);
+    let sig = match FalconSignature::from_bytes(&msg.signature) {
+        Some(s) => s,
+        None => return false,
+    };
     falcon_verify(&pk, &sign_msg, &sig)
 }
 
@@ -237,24 +240,24 @@ mod tests {
 
     #[test]
     fn view_change_message_created_and_verified() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
         let qc = QuorumCert::empty();
 
-        let msg = create_view_change(5, &qc, 0, addr, &sk);
+        let msg = create_view_change(5, &qc, 0, addr, &sk).unwrap();
         assert_eq!(msg.slot, 5);
         assert!(verify_view_change(&msg, &pk_bytes));
     }
 
     #[test]
     fn view_change_wrong_key_rejected() {
-        let (pk1, sk1) = falcon_keygen();
-        let (pk2, _sk2) = falcon_keygen();
+        let (pk1, sk1) = falcon_keygen().unwrap();
+        let (pk2, _sk2) = falcon_keygen().unwrap();
         let addr = derive_eoa_address(pk1.as_bytes());
         let qc = QuorumCert::empty();
 
-        let msg = create_view_change(5, &qc, 0, addr, &sk1);
+        let msg = create_view_change(5, &qc, 0, addr, &sk1).unwrap();
         assert!(!verify_view_change(&msg, pk2.as_bytes()));
     }
 
@@ -264,12 +267,12 @@ mod tests {
         let mut keys = Vec::new();
 
         for i in 0..86u8 {
-            let (pk, sk) = falcon_keygen();
+            let (pk, sk) = falcon_keygen().unwrap();
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
             let qc = QuorumCert::empty();
 
-            let msg = create_view_change(10, &qc, i, addr, &sk);
+            let msg = create_view_change(10, &qc, i, addr, &sk).unwrap();
             messages.push(msg);
             keys.push(pk_bytes);
         }
@@ -289,11 +292,11 @@ mod tests {
         let mut keys = Vec::new();
 
         for i in 0..85u8 {
-            let (pk, sk) = falcon_keygen();
+            let (pk, sk) = falcon_keygen().unwrap();
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let msg = create_view_change(10, &QuorumCert::empty(), i, addr, &sk);
+            let msg = create_view_change(10, &QuorumCert::empty(), i, addr, &sk).unwrap();
             messages.push(msg);
             keys.push(pk_bytes);
         }
@@ -342,7 +345,7 @@ mod tests {
         let mut keys = Vec::new();
 
         for i in 0..86u8 {
-            let (pk, sk) = falcon_keygen();
+            let (pk, sk) = falcon_keygen().unwrap();
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
@@ -354,7 +357,7 @@ mod tests {
                 signatures: vec![],
             };
 
-            let msg = create_view_change(100, &qc, i, addr, &sk);
+            let msg = create_view_change(100, &qc, i, addr, &sk).unwrap();
             messages.push(msg);
             keys.push(pk_bytes);
         }

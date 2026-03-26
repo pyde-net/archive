@@ -904,7 +904,14 @@ impl Vm {
                         return Ok(None);
                     }
                 };
-                let sig = pyde_crypto::falcon::FalconSignature::from_bytes(&sig_bytes);
+                let sig = match pyde_crypto::falcon::FalconSignature::from_bytes(&sig_bytes) {
+                    Some(s) => s,
+                    None => {
+                        self.cpu.write_gp(d.rd, 0);
+                        self.pc += 4;
+                        return Ok(None);
+                    }
+                };
                 let valid = pyde_crypto::falcon::falcon_verify(&pk, &msg, &sig);
                 self.cpu.write_gp(d.rd, if valid { 1 } else { 0 });
                 self.pc += 4;
@@ -2406,9 +2413,9 @@ mod tests {
     #[test]
     fn verifysig_valid_signature() {
         let heap = crate::memory::HEAP_START;
-        let (pk, sk) = pyde_crypto::falcon::falcon_keygen();
+        let (pk, sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
         let msg = b"test message";
-        let sig = pyde_crypto::falcon::falcon_sign(&sk, msg);
+        let sig = pyde_crypto::falcon::falcon_sign(&sk, msg).unwrap();
 
         let mut vm = Vm::new();
 
@@ -2455,9 +2462,9 @@ mod tests {
     #[test]
     fn verifysig_invalid_signature() {
         let heap = crate::memory::HEAP_START;
-        let (pk, sk) = pyde_crypto::falcon::falcon_keygen();
+        let (pk, sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
         let msg = b"test message";
-        let sig = pyde_crypto::falcon::falcon_sign(&sk, msg);
+        let sig = pyde_crypto::falcon::falcon_sign(&sk, msg).unwrap();
 
         let mut vm = Vm::new();
 

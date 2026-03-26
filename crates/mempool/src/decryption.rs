@@ -166,7 +166,7 @@ mod tests {
     use pyde_tx::types::AccessEntry;
 
     fn make_keys(n: usize, t: usize) -> (threshold::ThresholdPublicKey, Vec<KeyShare>) {
-        threshold::threshold_keygen(n, t)
+        threshold::threshold_keygen(n, t).unwrap()
     }
 
     fn dummy_access_list() -> Vec<AccessEntry> {
@@ -188,6 +188,7 @@ mod tests {
             sender, 0, 100_000, dummy_access_list(), None, 1,
             vec![0xAA; 666], &to, value, calldata, pk,
         )
+        .unwrap()
     }
 
     // ========== Task 0526: Successful decryption with 85 shares ==========
@@ -292,7 +293,8 @@ mod tests {
         let enc_tx = encrypt_transaction(
             sender, 42, 500_000, dummy_access_list(), Some(1_000_000), 7,
             vec![0xAA; 666], &to, 999, b"data", &pk,
-        );
+        )
+        .unwrap();
 
         let mut decryptor = BlockDecryptor::new(vec![enc_tx], 2);
         for ks in key_shares.iter().take(2) {

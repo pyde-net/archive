@@ -117,43 +117,43 @@ impl PydeSMT {
     }
 
     /// Insert or update a key-value pair. Returns the new root.
-    pub fn insert(&mut self, key: Key, value: Vec<u8>) -> H256 {
+    pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<H256, &'static str> {
         self.inner
             .update(key, SmtValue(value))
-            .expect("SMT update failed");
-        self.root()
+            .map_err(|_| "SMT update failed")?;
+        Ok(self.root())
     }
 
     /// Delete a key (set value to zero). Returns true if key existed.
-    pub fn delete(&mut self, key: &Key) -> bool {
+    pub fn delete(&mut self, key: &Key) -> Result<bool, &'static str> {
         let existed = self.get(key).is_some();
         if existed {
             self.inner
                 .update(*key, SmtValue::zero())
-                .expect("SMT delete failed");
+                .map_err(|_| "SMT delete failed")?;
         }
-        existed
+        Ok(existed)
     }
 
     /// Batch insert/update multiple key-value pairs. Returns the new root.
-    pub fn update_all(&mut self, entries: Vec<(Key, Vec<u8>)>) -> H256 {
+    pub fn update_all(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<H256, &'static str> {
         let leaves: Vec<(Key, SmtValue)> = entries
             .into_iter()
             .map(|(k, v)| (k, SmtValue(v)))
             .collect();
         self.inner
             .update_all(leaves)
-            .expect("SMT batch update failed");
-        self.root()
+            .map_err(|_| "SMT batch update failed")?;
+        Ok(self.root())
     }
 
     /// Generate a Merkle proof for one or more keys.
-    pub fn prove(&self, keys: Vec<Key>) -> MerkleProof {
+    pub fn prove(&self, keys: Vec<Key>) -> Result<MerkleProof, &'static str> {
         let proof = self
             .inner
             .merkle_proof(keys.clone())
-            .expect("SMT proof generation failed");
-        MerkleProof { inner: proof }
+            .map_err(|_| "SMT proof generation failed")?;
+        Ok(MerkleProof { inner: proof })
     }
 
     /// Whether the tree is empty (root == zero).
@@ -175,12 +175,12 @@ pub struct MerkleProof {
 
 impl MerkleProof {
     /// Compile this proof into a more compact representation for serialization.
-    pub fn compile(self, keys: Vec<Key>) -> CompiledProof {
+    pub fn compile(self, keys: Vec<Key>) -> Result<CompiledProof, &'static str> {
         let compiled = self
             .inner
             .compile(keys)
-            .expect("proof compilation failed");
-        CompiledProof { inner: compiled }
+            .map_err(|_| "proof compilation failed")?;
+        Ok(CompiledProof { inner: compiled })
     }
 
     /// Verify this proof against a root hash and expected leaves.
@@ -266,7 +266,7 @@ mod tests {
     fn insert_and_get_single() {
         let mut smt = PydeSMT::new();
         let key = key_from_seed(1);
-        smt.insert(key, b"hello".to_vec());
+        smt.insert(key, b"hello".to_vec()).unwrap();
         assert_eq!(smt.get(&key), Some(b"hello".to_vec()));
     }
 
@@ -286,7 +286,7 @@ mod tests {
             .collect();
 
         for (k, v) in &pairs {
-            smt.insert(*k, v.clone());
+            smt.insert(*k, v.clone()).unwrap();
         }
 
         for (k, v) in &pairs {
@@ -300,15 +300,15 @@ mod tests {
     fn delete_key_removes_it() {
         let mut smt = PydeSMT::new();
         let key = key_from_seed(42);
-        smt.insert(key, b"data".to_vec());
-        assert!(smt.delete(&key));
+        smt.insert(key, b"data".to_vec()).unwrap();
+        assert!(smt.delete(&key).unwrap());
         assert_eq!(smt.get(&key), None);
     }
 
     #[test]
     fn delete_nonexistent_returns_false() {
         let mut smt = PydeSMT::new();
-        assert!(!smt.delete(&key_from_seed(99)));
+        assert!(!smt.delete(&key_from_seed(99)).unwrap());
     }
 
     // ========== Task 0279: Root changes after insert ==========
@@ -317,7 +317,7 @@ mod tests {
     fn root_changes_after_insert() {
         let mut smt = PydeSMT::new();
         let root_before = smt.root();
-        smt.insert(key_from_seed(1), b"test".to_vec());
+        smt.insert(key_from_seed(1), b"test".to_vec()).unwrap();
         assert_ne!(root_before, smt.root());
     }
 
@@ -326,10 +326,10 @@ mod tests {
         let key = key_from_seed(1);
 
         let mut smt1 = PydeSMT::new();
-        smt1.insert(key, b"aaa".to_vec());
+        smt1.insert(key, b"aaa".to_vec()).unwrap();
 
         let mut smt2 = PydeSMT::new();
-        smt2.insert(key, b"bbb".to_vec());
+        smt2.insert(key, b"bbb".to_vec()).unwrap();
 
         assert_ne!(smt1.root(), smt2.root());
     }
@@ -342,10 +342,10 @@ mod tests {
         let empty_root = smt.root();
 
         let key = key_from_seed(1);
-        smt.insert(key, b"temp".to_vec());
+        smt.insert(key, b"temp".to_vec()).unwrap();
         assert_ne!(smt.root(), empty_root);
 
-        smt.delete(&key);
+        smt.delete(&key).unwrap();
         assert_eq!(smt.root(), empty_root);
     }
 
@@ -356,10 +356,10 @@ mod tests {
         let mut smt = PydeSMT::new();
         let key = key_from_seed(1);
         let value = b"value".to_vec();
-        smt.insert(key, value.clone());
+        smt.insert(key, value.clone()).unwrap();
 
         let root = smt.root();
-        let proof = smt.prove(vec![key]);
+        let proof = smt.prove(vec![key]).unwrap();
         assert!(proof.verify(root, vec![(key, value)]));
     }
 
@@ -371,12 +371,12 @@ mod tests {
             .collect();
 
         for (k, v) in &entries {
-            smt.insert(*k, v.clone());
+            smt.insert(*k, v.clone()).unwrap();
         }
 
         let root = smt.root();
         let keys: Vec<Key> = entries.iter().map(|(k, _)| *k).collect();
-        let proof = smt.prove(keys);
+        let proof = smt.prove(keys).unwrap();
         assert!(proof.verify(root, entries));
     }
 
@@ -385,11 +385,11 @@ mod tests {
     #[test]
     fn merkle_proof_nonexistence() {
         let mut smt = PydeSMT::new();
-        smt.insert(key_from_seed(1), b"exists".to_vec());
+        smt.insert(key_from_seed(1), b"exists".to_vec()).unwrap();
 
         let root = smt.root();
         let missing = key_from_seed(999);
-        let proof = smt.prove(vec![missing]);
+        let proof = smt.prove(vec![missing]).unwrap();
         assert!(proof.verify_absence(root, vec![missing]));
     }
 
@@ -401,15 +401,15 @@ mod tests {
         let key = key_from_seed(1);
 
         let mut smt1 = PydeSMT::new();
-        smt1.insert(key, b"real".to_vec());
+        smt1.insert(key, b"real".to_vec()).unwrap();
 
         let mut smt2 = PydeSMT::new();
-        smt2.insert(key, b"fake".to_vec());
+        smt2.insert(key, b"fake".to_vec()).unwrap();
 
         assert_ne!(smt1.root(), smt2.root());
 
         // The correct proof verifies against the correct root
-        let proof = smt1.prove(vec![key]);
+        let proof = smt1.prove(vec![key]).unwrap();
         assert!(proof.verify(smt1.root(), vec![(key, b"real".to_vec())]));
     }
 
@@ -419,15 +419,15 @@ mod tests {
         let value = b"data".to_vec();
 
         let mut smt = PydeSMT::new();
-        smt.insert(key, value.clone());
+        smt.insert(key, value.clone()).unwrap();
         let root = smt.root();
 
         // Proof verifies against correct root
-        let proof = smt.prove(vec![key]);
+        let proof = smt.prove(vec![key]).unwrap();
         assert!(proof.verify(root, vec![(key, value.clone())]));
 
         // Mutating the tree changes the root
-        smt.insert(key, b"changed".to_vec());
+        smt.insert(key, b"changed".to_vec()).unwrap();
         assert_ne!(root, smt.root());
     }
 
@@ -437,8 +437,8 @@ mod tests {
     fn insert_overwrite() {
         let mut smt = PydeSMT::new();
         let key = key_from_seed(1);
-        smt.insert(key, b"first".to_vec());
-        smt.insert(key, b"second".to_vec());
+        smt.insert(key, b"first".to_vec()).unwrap();
+        smt.insert(key, b"second".to_vec()).unwrap();
         assert_eq!(smt.get(&key), Some(b"second".to_vec()));
     }
 
@@ -448,12 +448,12 @@ mod tests {
         let k2 = key_from_seed(2);
 
         let mut smt1 = PydeSMT::new();
-        smt1.insert(k1, b"a".to_vec());
-        smt1.insert(k2, b"b".to_vec());
+        smt1.insert(k1, b"a".to_vec()).unwrap();
+        smt1.insert(k2, b"b".to_vec()).unwrap();
 
         let mut smt2 = PydeSMT::new();
-        smt2.insert(k2, b"b".to_vec());
-        smt2.insert(k1, b"a".to_vec());
+        smt2.insert(k2, b"b".to_vec()).unwrap();
+        smt2.insert(k1, b"a".to_vec()).unwrap();
 
         assert_eq!(smt1.root(), smt2.root());
     }
@@ -465,7 +465,7 @@ mod tests {
             .map(|i| (key_from_seed(i), format!("v{i}").into_bytes()))
             .collect();
 
-        smt.update_all(entries.clone());
+        smt.update_all(entries.clone()).unwrap();
 
         for (k, v) in &entries {
             assert_eq!(smt.get(k), Some(v.clone()));
@@ -482,10 +482,10 @@ mod tests {
     fn verify_rejects_tampered_value() {
         let mut smt = PydeSMT::new();
         let key = key_from_seed(1);
-        smt.insert(key, b"real".to_vec());
+        smt.insert(key, b"real".to_vec()).unwrap();
 
         let root = smt.root();
-        let proof = smt.prove(vec![key]);
+        let proof = smt.prove(vec![key]).unwrap();
 
         // Correct value passes
         assert!(proof.verify(root, vec![(key, b"real".to_vec())]));
@@ -498,10 +498,10 @@ mod tests {
         let mut smt = PydeSMT::new();
         let key = key_from_seed(1);
         let value = b"data".to_vec();
-        smt.insert(key, value.clone());
+        smt.insert(key, value.clone()).unwrap();
 
         let root = smt.root();
-        let proof = smt.prove(vec![key]);
+        let proof = smt.prove(vec![key]).unwrap();
 
         // Correct root passes
         assert!(proof.verify(root, vec![(key, value.clone())]));
@@ -517,11 +517,11 @@ mod tests {
         let mut smt = PydeSMT::new();
         let key = key_from_seed(1);
         let value = b"value".to_vec();
-        smt.insert(key, value.clone());
+        smt.insert(key, value.clone()).unwrap();
 
         let root = smt.root();
-        let proof = smt.prove(vec![key]);
-        let compiled = proof.compile(vec![key]);
+        let proof = smt.prove(vec![key]).unwrap();
+        let compiled = proof.compile(vec![key]).unwrap();
 
         assert!(compiled.verify(root, vec![(key, value.clone())]));
         assert!(!compiled.verify(root, vec![(key, b"wrong".to_vec())]));

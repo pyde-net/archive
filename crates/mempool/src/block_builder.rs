@@ -144,7 +144,7 @@ mod tests {
     use pyde_tx::types::AccessEntry;
 
     fn make_pk() -> threshold::ThresholdPublicKey {
-        let (pk, _) = threshold::threshold_keygen(3, 2);
+        let (pk, _) = threshold::threshold_keygen(3, 2).unwrap();
         pk
     }
 
@@ -173,7 +173,8 @@ mod tests {
         let to = derive_eoa_address(b"to");
         let tx = encrypt_transaction(
             sender, nonce, gas, access_list, None, 1, dummy_sig(), &to, 0, b"", pk,
-        );
+        )
+        .unwrap();
         pool.add(tx).unwrap();
     }
 

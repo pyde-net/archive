@@ -64,9 +64,11 @@ pub fn load_account(smt: &PydeSMT, address: &Address) -> Account {
 }
 
 /// Store an account into the SMT.
-pub fn store_account(smt: &mut PydeSMT, account: &Account) {
+pub fn store_account(smt: &mut PydeSMT, account: &Account) -> Result<(), PipelineError> {
     let key = keys::balance_key(&account.address);
-    smt.insert(key, account.to_bytes());
+    smt.insert(key, account.to_bytes())
+        .map_err(|e| PipelineError::StateError(e.to_string()))?;
+    Ok(())
 }
 
 /// Load a nonce state for an account. Returns default if not found.
@@ -81,9 +83,11 @@ pub fn load_nonce(smt: &PydeSMT, address: &Address) -> NonceState {
 }
 
 /// Store a nonce state into the SMT.
-pub fn store_nonce(smt: &mut PydeSMT, address: &Address, nonce: &NonceState) {
+pub fn store_nonce(smt: &mut PydeSMT, address: &Address, nonce: &NonceState) -> Result<(), PipelineError> {
     let key = keys::nonce_key(address);
-    smt.insert(key, nonce.to_bytes().to_vec());
+    smt.insert(key, nonce.to_bytes().to_vec())
+        .map_err(|e| PipelineError::StateError(e.to_string()))?;
+    Ok(())
 }
 
 /// Load contract code from the SMT.
@@ -93,9 +97,11 @@ pub fn load_code(smt: &PydeSMT, address: &Address) -> Option<Vec<u8>> {
 }
 
 /// Store contract code into the SMT.
-pub fn store_code(smt: &mut PydeSMT, address: &Address, code: &[u8]) {
+pub fn store_code(smt: &mut PydeSMT, address: &Address, code: &[u8]) -> Result<(), PipelineError> {
     let key = keys::code_key(address);
-    smt.insert(key, code.to_vec());
+    smt.insert(key, code.to_vec())
+        .map_err(|e| PipelineError::StateError(e.to_string()))?;
+    Ok(())
 }
 
 fn empty_account(address: &Address) -> Account {
@@ -169,10 +175,10 @@ pub fn execute_transaction(
                 &tx.from,
                 sender.nonce,
             );
-            store_code(smt, &new_addr, &tx.data);
+            store_code(smt, &new_addr, &tx.data)?;
 
             let contract = Account::new_contract(new_addr, &tx.data);
-            store_account(smt, &contract);
+            store_account(smt, &contract)?;
 
             (true, 32_000u64, 0u64, vec![])
         }
@@ -210,12 +216,12 @@ pub fn execute_transaction(
     // Credit validator
     let mut validator_account = load_account(smt, &block_ctx.validator_address);
     validator_account.balance += fee_dist.validator;
-    store_account(smt, &validator_account);
+    store_account(smt, &validator_account)?;
 
     // 9. Save updated accounts
-    store_account(smt, &sender);
-    store_account(smt, &recipient);
-    store_nonce(smt, &tx.from, &nonce_state);
+    store_account(smt, &sender)?;
+    store_account(smt, &recipient)?;
+    store_nonce(smt, &tx.from, &nonce_state)?;
 
     // 10. Generate receipt
     let state_root = smt.root();
@@ -319,7 +325,7 @@ mod tests {
             tx_type: TransactionType::Standard,
         };
         let hash = tx.hash();
-        tx.signature = falcon_sign(sk, &hash).as_bytes().to_vec();
+        tx.signature = falcon_sign(sk, &hash).unwrap().as_bytes().to_vec();
         tx
     }
 
@@ -327,8 +333,8 @@ mod tests {
         let addr = derive_eoa_address(pk_bytes);
         let mut account = Account::new_eoa(pk_bytes);
         account.balance = balance;
-        store_account(smt, &account);
-        store_nonce(smt, &addr, &NonceState::new());
+        store_account(smt, &account).unwrap();
+        store_nonce(smt, &addr, &NonceState::new()).unwrap();
         addr
     }
 
@@ -336,7 +342,7 @@ mod tests {
 
     #[test]
     fn simple_transfer_updates_balances() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let mut smt = PydeSMT::new();
         let block_ctx = make_block_ctx();
@@ -359,7 +365,7 @@ mod tests {
 
     #[test]
     fn nonce_consumed_after_execution() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let mut smt = PydeSMT::new();
         let block_ctx = make_block_ctx();
@@ -379,7 +385,7 @@ mod tests {
 
     #[test]
     fn contract_deployment() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let mut smt = PydeSMT::new();
         let block_ctx = make_block_ctx();
@@ -391,7 +397,7 @@ mod tests {
         tx.data = b"contract bytecode here".to_vec();
         // Re-sign with new fields
         let hash = tx.hash();
-        tx.signature = falcon_sign(&sk, &hash).as_bytes().to_vec();
+        tx.signature = falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
 
         let receipt = execute_transaction(&tx, &mut smt, &block_ctx).unwrap();
         assert!(receipt.success);
@@ -410,7 +416,7 @@ mod tests {
 
     #[test]
     fn fees_distributed_to_validator() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let mut smt = PydeSMT::new();
         let block_ctx = make_block_ctx();
@@ -433,7 +439,7 @@ mod tests {
 
     #[test]
     fn state_root_changes_after_tx() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let mut smt = PydeSMT::new();
         let block_ctx = make_block_ctx();
@@ -451,7 +457,7 @@ mod tests {
 
     #[test]
     fn insufficient_balance_rejected() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let mut smt = PydeSMT::new();
         let block_ctx = make_block_ctx();
@@ -465,7 +471,7 @@ mod tests {
 
     #[test]
     fn multiple_txs_sequential() {
-        let (pk, sk) = falcon_keygen();
+        let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let mut smt = PydeSMT::new();
         let block_ctx = make_block_ctx();

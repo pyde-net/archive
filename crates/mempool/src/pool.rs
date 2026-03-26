@@ -204,7 +204,10 @@ impl Mempool {
             Some(pk) => pk,
             None => return false,
         };
-        let sig = FalconSignature::from_bytes(&tx.signature);
+        let sig = match FalconSignature::from_bytes(&tx.signature) {
+            Some(s) => s,
+            None => return false,
+        };
         falcon_verify(&pk, &tx.hash(), &sig)
     }
 
@@ -296,7 +299,7 @@ mod tests {
     use pyde_crypto::threshold;
 
     fn make_pk() -> threshold::ThresholdPublicKey {
-        let (pk, _) = threshold::threshold_keygen(3, 2);
+        let (pk, _) = threshold::threshold_keygen(3, 2).unwrap();
         pk
     }
 
@@ -317,7 +320,7 @@ mod tests {
     fn make_enc_tx(pk: &threshold::ThresholdPublicKey, gas: u64, nonce: u64) -> EncryptedTx {
         let sender = derive_eoa_address(&nonce.to_le_bytes());
         let to = derive_eoa_address(b"to");
-        encrypt_transaction(sender, nonce, gas, dummy_access_list(), None, 1, dummy_signature(), &to, 0, b"", pk)
+        encrypt_transaction(sender, nonce, gas, dummy_access_list(), None, 1, dummy_signature(), &to, 0, b"", pk).unwrap()
     }
 
     fn make_enc_tx_with_deadline(
@@ -328,7 +331,7 @@ mod tests {
     ) -> EncryptedTx {
         let sender = derive_eoa_address(&nonce.to_le_bytes());
         let to = derive_eoa_address(b"to");
-        encrypt_transaction(sender, nonce, gas, dummy_access_list(), Some(deadline), 1, dummy_signature(), &to, 0, b"", pk)
+        encrypt_transaction(sender, nonce, gas, dummy_access_list(), Some(deadline), 1, dummy_signature(), &to, 0, b"", pk).unwrap()
     }
 
     // ========== Task 0520: Encrypted tx stored in mempool ==========
@@ -392,7 +395,8 @@ mod tests {
             sender, 0, 50_000, dummy_access_list(), None, 1,
             vec![], // empty sig
             &to, 0, b"", &pk,
-        );
+        )
+        .unwrap();
         assert_eq!(pool.add(tx), Err(MempoolError::InvalidSignature));
     }
 
@@ -406,7 +410,8 @@ mod tests {
         let tx = encrypt_transaction(
             sender, 0, 50_000, vec![], None, 1, // empty access list
             dummy_signature(), &to, 0, b"", &pk,
-        );
+        )
+        .unwrap();
         assert_eq!(pool.add(tx), Err(MempoolError::MissingAccessList));
     }
 
