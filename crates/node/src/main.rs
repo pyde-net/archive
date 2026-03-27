@@ -8,6 +8,7 @@ mod node;
 mod shutdown;
 mod genesis;
 mod rpc;
+mod slot_clock;
 mod state_manager;
 mod sync;
 mod tx_relay;
