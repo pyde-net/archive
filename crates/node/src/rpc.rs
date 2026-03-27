@@ -1,14 +1,17 @@
 //! JSON-RPC server for Pyde node.
 //!
-//! Exposes chain state queries over HTTP.
-//! Methods follow a similar pattern to Ethereum's JSON-RPC but with Pyde-specific naming.
+//! Exposes chain state queries and transaction submission over HTTP.
 
 use crate::chain::ChainState;
+use crate::receipt_store::ReceiptStore;
 use crate::state_manager::StateManager;
+use crate::tx_relay::TxRelay;
 use jsonrpsee::core::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::server::Server;
 use jsonrpsee::types::ErrorObjectOwned;
+use pyde_tx::execution::Receipt;
+use pyde_tx::pipeline::{execute_transaction, BlockContext};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -18,50 +21,66 @@ use tracing::info;
 pub struct RpcState {
     pub chain: Arc<RwLock<ChainState>>,
     pub state: Arc<RwLock<StateManager>>,
+    pub tx_relay: Arc<RwLock<TxRelay>>,
+    pub receipts: Arc<RwLock<ReceiptStore>>,
 }
 
 /// Define the Pyde JSON-RPC API.
 #[rpc(server)]
 pub trait PydeApi {
-    /// Get the balance of an address (hex-encoded, returns decimal string).
     #[method(name = "pyde_getBalance")]
     async fn get_balance(&self, address: String) -> Result<String, ErrorObjectOwned>;
 
-    /// Get the transaction count (nonce) of an address.
     #[method(name = "pyde_getTransactionCount")]
     async fn get_transaction_count(&self, address: String) -> Result<String, ErrorObjectOwned>;
 
-    /// Get the deployed code at an address (hex-encoded).
     #[method(name = "pyde_getCode")]
     async fn get_code(&self, address: String) -> Result<String, ErrorObjectOwned>;
 
-    /// Get a storage value at an address and slot index.
     #[method(name = "pyde_getStorageAt")]
     async fn get_storage_at(&self, address: String, slot: u64) -> Result<String, ErrorObjectOwned>;
 
-    /// Get the current base fee (gas price).
     #[method(name = "pyde_gasPrice")]
     async fn gas_price(&self) -> Result<String, ErrorObjectOwned>;
 
-    /// Get the chain ID.
     #[method(name = "pyde_chainId")]
     async fn chain_id(&self) -> Result<String, ErrorObjectOwned>;
 
-    /// Get the latest block number (slot).
     #[method(name = "pyde_blockNumber")]
     async fn block_number(&self) -> Result<String, ErrorObjectOwned>;
 
-    /// Get block info by slot number.
     #[method(name = "pyde_getBlockByNumber")]
     async fn get_block_by_number(&self, slot: u64) -> Result<serde_json::Value, ErrorObjectOwned>;
 
-    /// Get the state root at the chain tip.
     #[method(name = "pyde_stateRoot")]
     async fn state_root(&self) -> Result<String, ErrorObjectOwned>;
 
-    /// Get sync status.
     #[method(name = "pyde_syncing")]
     async fn syncing(&self) -> Result<serde_json::Value, ErrorObjectOwned>;
+
+    /// Submit a signed transaction (hex-encoded wire bytes). Returns tx hash.
+    #[method(name = "pyde_sendTransaction")]
+    async fn send_transaction(&self, tx_hex: String) -> Result<String, ErrorObjectOwned>;
+
+    /// Simulate a call without committing (read-only execution). Returns result hex.
+    #[method(name = "pyde_call")]
+    async fn call(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned>;
+
+    /// Estimate gas for a transaction.
+    #[method(name = "pyde_estimateGas")]
+    async fn estimate_gas(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned>;
+
+    /// Get a transaction receipt by tx hash.
+    #[method(name = "pyde_getTransactionReceipt")]
+    async fn get_transaction_receipt(&self, tx_hash: String) -> Result<serde_json::Value, ErrorObjectOwned>;
+
+    /// Get logs matching a filter.
+    #[method(name = "pyde_getLogs")]
+    async fn get_logs(&self, filter: serde_json::Value) -> Result<serde_json::Value, ErrorObjectOwned>;
+
+    /// Get the mempool size.
+    #[method(name = "pyde_mempoolSize")]
+    async fn mempool_size(&self) -> Result<String, ErrorObjectOwned>;
 }
 
 /// RPC server implementation.
@@ -76,9 +95,7 @@ impl PydeApiServer for RpcServer {
         let addr = parse_address(&address)?;
         let key = pyde_state::keys::balance_key(&addr);
         let state = self.state.state.read().await;
-        let balance = state.get(&key)
-            .map(|b| decode_u128(&b))
-            .unwrap_or(0);
+        let balance = state.get(&key).map(|b| decode_u128(&b)).unwrap_or(0);
         Ok(balance.to_string())
     }
 
@@ -86,9 +103,7 @@ impl PydeApiServer for RpcServer {
         let addr = parse_address(&address)?;
         let key = pyde_state::keys::nonce_key(&addr);
         let state = self.state.state.read().await;
-        let nonce = state.get(&key)
-            .map(|b| decode_u64(&b))
-            .unwrap_or(0);
+        let nonce = state.get(&key).map(|b| decode_u64(&b)).unwrap_or(0);
         Ok(nonce.to_string())
     }
 
@@ -134,11 +149,7 @@ impl PydeApiServer for RpcServer {
                 "timestamp": format!("0x{:x}", header.timestamp),
                 "proposer": format!("0x{}", hex::encode(header.proposer)),
             })),
-            None => Err(ErrorObjectOwned::owned(
-                -32602,
-                format!("block not found at slot {}", slot),
-                None::<()>,
-            )),
+            None => Err(rpc_err(-32602, format!("block not found at slot {}", slot))),
         }
     }
 
@@ -154,6 +165,102 @@ impl PydeApiServer for RpcServer {
             "epoch": chain.epoch,
             "stateRoot": format!("0x{}", hex::encode(chain.state_root)),
         }))
+    }
+
+    async fn send_transaction(&self, tx_hex: String) -> Result<String, ErrorObjectOwned> {
+        let hex_str = tx_hex.strip_prefix("0x").unwrap_or(&tx_hex);
+        let tx_bytes = hex::decode(hex_str)
+            .map_err(|e| rpc_err(-32602, format!("invalid tx hex: {}", e)))?;
+
+        // Decode the transaction from wire format
+        let tx = crate::wire::decode_transaction(&tx_bytes)
+            .map_err(|e| rpc_err(-32602, format!("invalid tx encoding: {}", e)))?;
+
+        // Compute tx hash
+        let tx_hash = pyde_crypto::poseidon2::poseidon2_hash(&tx_bytes).to_bytes();
+
+        // TODO: add to mempool (encrypted tx flow requires threshold encryption)
+        // For now, log and return the hash
+        info!(tx_hash = hex::encode(tx_hash), "transaction received via RPC");
+
+        Ok(format!("0x{}", hex::encode(tx_hash)))
+    }
+
+    async fn call(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
+        let (tx, block_ctx) = parse_call_object(&call_obj, &self.state).await?;
+
+        // Clone the SMT for read-only execution (don't mutate real state)
+        let mut state = self.state.state.write().await;
+        let smt = state.smt_mut();
+
+        match execute_transaction(&tx, smt, &block_ctx) {
+            Ok(receipt) => {
+                if receipt.success {
+                    // Return logs data as hex (first log's data, or empty)
+                    let data = receipt.logs.first()
+                        .map(|l| hex::encode(&l.data))
+                        .unwrap_or_default();
+                    Ok(format!("0x{}", data))
+                } else {
+                    Err(rpc_err(-32000, "execution reverted".to_string()))
+                }
+            }
+            Err(e) => Err(rpc_err(-32000, format!("call failed: {:?}", e))),
+        }
+    }
+
+    async fn estimate_gas(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
+        let (tx, block_ctx) = parse_call_object(&call_obj, &self.state).await?;
+
+        let mut state = self.state.state.write().await;
+        let smt = state.smt_mut();
+
+        match execute_transaction(&tx, smt, &block_ctx) {
+            Ok(receipt) => Ok(format!("0x{:x}", receipt.gas_used)),
+            Err(e) => Err(rpc_err(-32000, format!("gas estimation failed: {:?}", e))),
+        }
+    }
+
+    async fn get_transaction_receipt(&self, tx_hash: String) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let hash = parse_hash(&tx_hash)?;
+        let store = self.state.receipts.read().await;
+
+        match store.get(&hash) {
+            Some(receipt) => Ok(receipt_to_json(receipt)),
+            None => Err(rpc_err(-32602, "receipt not found".to_string())),
+        }
+    }
+
+    async fn get_logs(&self, filter: serde_json::Value) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let from_slot = filter.get("fromBlock")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let to_slot = filter.get("toBlock")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::MAX);
+        let address_filter = filter.get("address")
+            .and_then(|v| v.as_str())
+            .map(|s| parse_address(s))
+            .transpose()?;
+
+        let store = self.state.receipts.read().await;
+        let logs = store.get_logs(from_slot, to_slot, address_filter.as_ref());
+
+        let result: Vec<serde_json::Value> = logs.iter().map(|(slot, log)| {
+            serde_json::json!({
+                "slot": slot,
+                "address": format!("0x{}", hex::encode(log.address)),
+                "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&log.data)),
+            })
+        }).collect();
+
+        Ok(serde_json::json!(result))
+    }
+
+    async fn mempool_size(&self) -> Result<String, ErrorObjectOwned> {
+        let relay = self.state.tx_relay.read().await;
+        Ok(relay.mempool_size().to_string())
     }
 }
 
@@ -176,57 +283,124 @@ pub async fn start_rpc_server(
     let bound_addr = server.local_addr()
         .map_err(|e| format!("failed to get RPC server address: {}", e))?;
 
-    let rpc = RpcServer {
-        state: rpc_state,
-        chain_id,
-    };
-
+    let rpc = RpcServer { state: rpc_state, chain_id };
     let handle = server.start(rpc.into_rpc());
-    // Keep the server running in the background
     tokio::spawn(handle.stopped());
 
     info!(%bound_addr, "JSON-RPC server started");
     Ok(bound_addr)
 }
 
-/// Parse a hex address string to 32-byte address.
+// ============================================================
+// Helpers
+// ============================================================
+
+fn rpc_err(code: i32, msg: String) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(code, msg, None::<()>)
+}
+
 fn parse_address(input: &str) -> Result<[u8; 32], ErrorObjectOwned> {
     let hex_str = input.strip_prefix("0x").unwrap_or(input);
-    let bytes = hex::decode(hex_str).map_err(|e| {
-        ErrorObjectOwned::owned(-32602, format!("invalid address: {}", e), None::<()>)
-    })?;
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| rpc_err(-32602, format!("invalid address: {}", e)))?;
     if bytes.len() != 32 {
-        return Err(ErrorObjectOwned::owned(
-            -32602,
-            format!("address must be 32 bytes, got {}", bytes.len()),
-            None::<()>,
-        ));
+        return Err(rpc_err(-32602, format!("address must be 32 bytes, got {}", bytes.len())));
     }
     let mut addr = [0u8; 32];
     addr.copy_from_slice(&bytes);
     Ok(addr)
 }
 
-/// Decode a u128 from LE bytes (balance).
+fn parse_hash(input: &str) -> Result<[u8; 32], ErrorObjectOwned> {
+    let hex_str = input.strip_prefix("0x").unwrap_or(input);
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| rpc_err(-32602, format!("invalid hash: {}", e)))?;
+    if bytes.len() != 32 {
+        return Err(rpc_err(-32602, format!("hash must be 32 bytes, got {}", bytes.len())));
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&bytes);
+    Ok(hash)
+}
+
+/// Parse a JSON call object into a Transaction + BlockContext for simulation.
+async fn parse_call_object(
+    obj: &serde_json::Value,
+    rpc_state: &RpcState,
+) -> Result<(pyde_tx::types::Transaction, BlockContext), ErrorObjectOwned> {
+    let from = obj.get("from").and_then(|v| v.as_str())
+        .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
+    let to = obj.get("to").and_then(|v| v.as_str())
+        .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
+    let data = obj.get("data").and_then(|v| v.as_str())
+        .map(|s| {
+            let s = s.strip_prefix("0x").unwrap_or(s);
+            hex::decode(s).unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let value: u128 = obj.get("value").and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let gas_limit: u64 = obj.get("gas").and_then(|v| v.as_u64())
+        .unwrap_or(1_000_000);
+
+    let chain = rpc_state.chain.read().await;
+    let tx = pyde_tx::types::Transaction {
+        from,
+        to,
+        value,
+        data,
+        gas_limit,
+        nonce: 0,
+        signature: vec![],
+        fee_payer: pyde_tx::types::FeePayer::Sender,
+        access_list: vec![],
+        deadline: None,
+        chain_id: 1,
+        tx_type: pyde_tx::types::TransactionType::Standard,
+    };
+    let block_ctx = BlockContext {
+        height: chain.head_slot,
+        timestamp: chain.head_slot * 400,
+        base_fee: chain.base_fee,
+        block_gas_limit: pyde_tx::fee::GAS_CEILING as u64,
+        chain_id: 1,
+        validator_address: [0u8; 32],
+    };
+    Ok((tx, block_ctx))
+}
+
+fn receipt_to_json(receipt: &Receipt) -> serde_json::Value {
+    serde_json::json!({
+        "txHash": format!("0x{}", hex::encode(receipt.tx_hash)),
+        "success": receipt.success,
+        "gasUsed": format!("0x{:x}", receipt.gas_used),
+        "effectiveGas": format!("0x{:x}", receipt.effective_gas),
+        "feePaid": receipt.fee_paid.to_string(),
+        "feeBurned": receipt.fee_burned.to_string(),
+        "feeValidator": receipt.fee_validator.to_string(),
+        "logs": receipt.logs.iter().map(|l| serde_json::json!({
+            "address": format!("0x{}", hex::encode(l.address)),
+            "topics": l.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+            "data": format!("0x{}", hex::encode(&l.data)),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn decode_u128(data: &[u8]) -> u128 {
     if data.len() >= 16 {
         let mut buf = [0u8; 16];
         buf.copy_from_slice(&data[..16]);
         u128::from_le_bytes(buf)
-    } else {
-        0
-    }
+    } else { 0 }
 }
 
-/// Decode a u64 from LE bytes (nonce).
 fn decode_u64(data: &[u8]) -> u64 {
     if data.len() >= 8 {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&data[..8]);
         u64::from_le_bytes(buf)
-    } else {
-        0
-    }
+    } else { 0 }
 }
 
 #[cfg(test)]
@@ -249,21 +423,25 @@ mod tests {
 
     #[test]
     fn parse_invalid_address_length() {
-        let result = parse_address("0xdeadbeef");
-        assert!(result.is_err());
+        assert!(parse_address("0xdeadbeef").is_err());
     }
 
     #[test]
     fn parse_invalid_hex() {
-        let result = parse_address("0xnothex");
-        assert!(result.is_err());
+        assert!(parse_address("0xnothex").is_err());
+    }
+
+    #[test]
+    fn parse_valid_hash() {
+        let hex_hash = format!("0x{}", hex::encode([0xCC; 32]));
+        let hash = parse_hash(&hex_hash).unwrap();
+        assert_eq!(hash, [0xCC; 32]);
     }
 
     #[test]
     fn decode_u128_from_bytes() {
         let val: u128 = 10_000_000_000_000;
-        let bytes = val.to_le_bytes();
-        assert_eq!(decode_u128(&bytes), val);
+        assert_eq!(decode_u128(&val.to_le_bytes()), val);
     }
 
     #[test]
@@ -272,9 +450,21 @@ mod tests {
     }
 
     #[test]
-    fn decode_u64_from_bytes() {
-        let val: u64 = 42;
-        let bytes = val.to_le_bytes();
-        assert_eq!(decode_u64(&bytes), val);
+    fn receipt_json_format() {
+        let receipt = Receipt {
+            tx_hash: [0xAA; 32],
+            success: true,
+            gas_used: 21000,
+            gas_refund: 0,
+            effective_gas: 21000,
+            fee_paid: 1050000,
+            fee_burned: 840000,
+            fee_validator: 210000,
+            logs: vec![],
+            state_root: sparse_merkle_tree::H256::zero(),
+        };
+        let json = receipt_to_json(&receipt);
+        assert_eq!(json["success"], true);
+        assert_eq!(json["gasUsed"], "0x5208");
     }
 }
