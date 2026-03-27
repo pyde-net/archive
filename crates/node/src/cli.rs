@@ -47,6 +47,9 @@ pub enum Command {
 
     /// Print default configuration.
     DefaultConfig,
+
+    /// Print default devnet genesis configuration.
+    DefaultGenesis,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]

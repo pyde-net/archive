@@ -36,6 +36,15 @@ run-config:
 default-config:
 	cargo run -p pyde-node -- default-config
 
+# Print default devnet genesis
+default-genesis:
+	cargo run -p pyde-node -- default-genesis
+
+# Generate a genesis file
+gen-genesis:
+	cargo run -p pyde-node -- default-genesis > genesis.toml
+	@echo "Genesis written to genesis.toml"
+
 # Generate a config file
 gen-config:
 	cargo run -p pyde-node -- default-config > pyde.toml
@@ -78,7 +87,9 @@ help:
 	@echo "  make run-json         Run with JSON log output"
 	@echo "  make run-config CONFIG=pyde.toml  Run from config file"
 	@echo "  make default-config   Print default config to stdout"
+	@echo "  make default-genesis  Print default devnet genesis to stdout"
 	@echo "  make gen-config       Write default config to pyde.toml"
+	@echo "  make gen-genesis      Write default genesis to genesis.toml"
 	@echo "  make test             Run all tests"
 	@echo "  make test-crate CRATE=pyde-vm  Run tests for one crate"
 	@echo "  make check            Check compilation"

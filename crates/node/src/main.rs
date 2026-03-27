@@ -6,6 +6,7 @@ mod logging;
 mod metrics;
 mod node;
 mod shutdown;
+mod genesis;
 mod rpc;
 mod state_manager;
 mod sync;
@@ -25,6 +26,9 @@ fn main() {
     match cli.command {
         Command::DefaultConfig => {
             print!("{}", NodeConfig::default().to_toml());
+        }
+        Command::DefaultGenesis => {
+            print!("{}", genesis::devnet_genesis().to_toml());
         }
         Command::Run {
             role,
