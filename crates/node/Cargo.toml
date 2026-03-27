@@ -46,3 +46,10 @@ jsonrpsee = { version = "0.24", features = ["server", "macros"] }
 directories = "5"
 hex = "0.4"
 sparse-merkle-tree = "0.6"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+
+[[bench]]
+name = "rpc_bench"
+harness = false
