@@ -18,3 +18,4 @@ pub mod node;
 pub mod peer;
 pub mod propagation;
 pub mod sync;
+pub mod sync_protocol;

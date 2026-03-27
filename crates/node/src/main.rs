@@ -7,6 +7,7 @@ mod metrics;
 mod node;
 mod shutdown;
 mod state_manager;
+mod sync;
 mod tx_relay;
 mod validator;
 
