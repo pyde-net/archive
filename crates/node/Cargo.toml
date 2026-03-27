@@ -1,0 +1,42 @@
+[package]
+name = "pyde-node"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pyde"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crates
+pyde-crypto = { path = "../crypto" }
+pyde-vm = { path = "../pvm" }
+pyde-aot = { path = "../aot" }
+pyde-state = { path = "../state" }
+pyde-account = { path = "../account" }
+pyde-tx = { path = "../tx" }
+pyde-consensus = { path = "../consensus" }
+pyde-mempool = { path = "../mempool" }
+pyde-net = { path = "../net" }
+libp2p = { version = "0.54", features = ["quic", "gossipsub", "kad", "noise", "yamux", "tokio", "macros", "identify"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Misc
+directories = "5"

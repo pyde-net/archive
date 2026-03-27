@@ -11,4 +11,5 @@ members = [
     "crates/mempool",
     "crates/net",
     "crates/otic",
+    "crates/node",
 ]
