@@ -40,3 +40,4 @@ metrics-exporter-prometheus = "0.16"
 
 # Misc
 directories = "5"
+hex = "0.4"
