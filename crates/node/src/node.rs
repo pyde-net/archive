@@ -1,12 +1,20 @@
+use crate::block_processor::BlockProcessor;
+use crate::chain::ChainState;
 use crate::config::NodeConfig;
 use crate::shutdown::ShutdownSignal;
+use crate::state_manager::StateManager;
+use crate::tx_relay::TxRelay;
 use libp2p::futures::StreamExt;
+use libp2p::gossipsub;
+use libp2p::swarm::SwarmEvent;
+use pyde_net::channels::Channel;
 use pyde_net::config::NetworkConfig;
 use pyde_net::node::{
     create_node, generate_keypair, keypair_from_bytes, keypair_to_bytes, subscribe_topics,
+    PydeBehaviourEvent,
 };
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// The main Pyde node. Owns all subsystems.
 pub struct PydeNode {
@@ -39,12 +47,29 @@ impl PydeNode {
         std::fs::create_dir_all(datadir)
             .map_err(|e| format!("failed to create datadir {}: {}", datadir.display(), e))?;
 
-        // Load or generate node identity (persistent across restarts)
+        // --- Initialize subsystems ---
+
+        // 1. State storage (RocksDB + SMT)
+        let mut state = StateManager::open(datadir, self.config.storage.cache_size)?;
+        info!(
+            state_root = hex::encode(state.root()),
+            empty = state.is_empty(),
+            "state loaded"
+        );
+
+        // 2. Chain state tracker
+        let mut chain = ChainState::genesis(state.root());
+        info!(head_slot = chain.head_slot, "chain initialized");
+
+        // 3. Transaction relay / mempool
+        let mut tx_relay = TxRelay::new();
+
+        // 4. Load or generate node identity (persistent across restarts)
         let keypair = load_or_generate_identity(datadir)?;
         let peer_id = libp2p::PeerId::from(keypair.public());
         info!(%peer_id, "node identity loaded");
 
-        // Build network config from node config
+        // 5. Build network config from node config
         let net_config = NetworkConfig {
             port: self.config.network.port,
             max_peers: self.config.network.max_peers,
@@ -56,15 +81,15 @@ impl PydeNode {
             is_validator,
         };
 
-        // Create libp2p swarm
+        // 6. Create libp2p swarm
         let (mut swarm, local_peer_id) = create_node(&net_config, keypair)?;
         info!(%local_peer_id, port = self.config.network.port, "P2P transport ready");
 
-        // Subscribe to gossipsub topics
+        // 7. Subscribe to gossipsub topics
         subscribe_topics(&mut swarm, is_validator)?;
         info!("gossipsub topics subscribed");
 
-        // Listen on all interfaces
+        // 8. Listen on all interfaces
         let listen_addr: libp2p::Multiaddr =
             format!("/ip4/0.0.0.0/udp/{}/quic-v1", self.config.network.port)
                 .parse()
@@ -73,7 +98,7 @@ impl PydeNode {
             .listen_on(listen_addr)
             .map_err(|e| format!("failed to listen: {}", e))?;
 
-        // Start metrics if enabled
+        // 9. Start metrics if enabled
         if self.config.metrics.enabled {
             match crate::metrics::init(self.config.metrics.port) {
                 Ok(addr) => info!(%addr, "prometheus metrics server started"),
@@ -87,13 +112,34 @@ impl PydeNode {
             "node started — waiting for peers"
         );
 
-        // Main event loop
+        // --- Main event loop ---
         let mut shutdown_rx = self.shutdown.subscribe();
+
+        // Periodic maintenance timer (every 10 seconds)
+        let mut maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(10));
 
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => {
-                    self.handle_swarm_event(event).await;
+                    handle_swarm_event(
+                        event,
+                        &mut chain,
+                        &mut state,
+                        &mut tx_relay,
+                    );
+                }
+                _ = maintenance_interval.tick() => {
+                    // Periodic maintenance
+                    tx_relay.prune_expired();
+                    crate::metrics::record_mempool(tx_relay.mempool_size());
+                    let peer_count = swarm.connected_peers().count();
+                    crate::metrics::record_peers(peer_count);
+                    debug!(
+                        peers = peer_count,
+                        mempool = tx_relay.mempool_size(),
+                        head = chain.head_slot,
+                        "maintenance tick"
+                    );
                 }
                 _ = shutdown_rx.recv() => {
                     info!("shutdown signal received, stopping node...");
@@ -102,16 +148,83 @@ impl PydeNode {
             }
         }
 
-        info!("node stopped cleanly");
+        info!(
+            head_slot = chain.head_slot,
+            state_root = hex::encode(chain.state_root),
+            "node stopped cleanly"
+        );
         Ok(())
     }
+}
 
-    async fn handle_swarm_event(
-        &self,
-        _event: libp2p::swarm::SwarmEvent<pyde_net::node::PydeBehaviourEvent>,
-    ) {
-        // Event handling will be implemented in M10.2/M10.4
-        // For now, the skeleton just processes events to keep the swarm alive
+/// Handle a libp2p swarm event.
+fn handle_swarm_event(
+    event: SwarmEvent<PydeBehaviourEvent>,
+    chain: &mut ChainState,
+    state: &mut StateManager,
+    tx_relay: &mut TxRelay,
+) {
+    match event {
+        // --- Gossipsub message received ---
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Gossipsub(
+            gossipsub::Event::Message { message, .. },
+        )) => {
+            let topic = message.topic.to_string();
+            let channel = Channel::from_topic(&topic);
+
+            match channel {
+                Some(Channel::Transactions) => {
+                    debug!(bytes = message.data.len(), "received tx gossip");
+                    // Tx deserialization will be wired when we have a serialization
+                    // format for EncryptedTx over the wire. For now, log receipt.
+                }
+                Some(Channel::Blocks) => {
+                    debug!(bytes = message.data.len(), "received block gossip");
+                    // Block deserialization and processing will be wired when we have
+                    // a serialization format for blocks over the wire.
+                }
+                Some(Channel::Consensus) => {
+                    debug!(bytes = message.data.len(), "received consensus message");
+                    // Consensus message handling is M10.2 (validator role).
+                }
+                Some(Channel::Sync) => {
+                    debug!(bytes = message.data.len(), "received sync message");
+                }
+                None => {
+                    debug!(topic, "received message on unknown topic");
+                }
+            }
+        }
+
+        // --- Peer connected ---
+        SwarmEvent::ConnectionEstablished {
+            peer_id, endpoint, ..
+        } => {
+            info!(
+                %peer_id,
+                addr = %endpoint.get_remote_address(),
+                "peer connected"
+            );
+        }
+
+        // --- Peer disconnected ---
+        SwarmEvent::ConnectionClosed {
+            peer_id, cause, ..
+        } => {
+            info!(
+                %peer_id,
+                cause = ?cause,
+                "peer disconnected"
+            );
+        }
+
+        // --- Listening on address ---
+        SwarmEvent::NewListenAddr { address, .. } => {
+            info!(%address, "listening on");
+        }
+
+        // All other events
+        _ => {}
     }
 }
 

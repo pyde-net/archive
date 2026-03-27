@@ -1,9 +1,13 @@
+mod block_processor;
+mod chain;
 mod cli;
 mod config;
 mod logging;
 mod metrics;
 mod node;
 mod shutdown;
+mod state_manager;
+mod tx_relay;
 
 use clap::Parser;
 use cli::{Cli, Command};
