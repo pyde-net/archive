@@ -1,6 +1,7 @@
 use crate::block_processor::BlockProcessor;
 use crate::chain::ChainState;
 use crate::config::NodeConfig;
+use crate::receipt_store::ReceiptStore;
 use crate::rpc::{self, RpcState};
 use crate::shutdown::ShutdownSignal;
 use crate::slot_clock::SlotClock;
@@ -94,8 +95,9 @@ impl PydeNode {
         let chain = Arc::new(RwLock::new(chain));
         let state = Arc::new(RwLock::new(state));
 
-        // 3. Transaction relay / mempool
-        let mut tx_relay = TxRelay::new();
+        // 3. Transaction relay / mempool + receipt store
+        let tx_relay = Arc::new(RwLock::new(TxRelay::new()));
+        let receipts = Arc::new(RwLock::new(ReceiptStore::new()));
 
         // 4. Chain sync
         let mut chain_sync = ChainSync::new();
@@ -192,6 +194,8 @@ impl PydeNode {
             let rpc_state = Arc::new(RpcState {
                 chain: chain.clone(),
                 state: state.clone(),
+                tx_relay: tx_relay.clone(),
+                receipts: receipts.clone(),
             });
             match rpc::start_rpc_server(
                 &self.config.rpc.listen,
@@ -229,11 +233,12 @@ impl PydeNode {
                     let action = {
                         let mut chain_w = chain.write().await;
                         let mut state_w = state.write().await;
+                        let mut tx_relay_w = tx_relay.write().await;
                         handle_swarm_event(
                             event,
                             &mut chain_w,
                             &mut state_w,
-                            &mut tx_relay,
+                            &mut tx_relay_w,
                             &mut chain_sync,
                             &mut validator_engine,
                         )
@@ -307,14 +312,17 @@ impl PydeNode {
                 }
                 _ = maintenance_interval.tick() => {
                     // Periodic maintenance
-                    tx_relay.prune_expired();
-                    crate::metrics::record_mempool(tx_relay.mempool_size());
+                    let mut tx_relay_w = tx_relay.write().await;
+                    tx_relay_w.prune_expired();
+                    let mempool_size = tx_relay_w.mempool_size();
+                    drop(tx_relay_w);
+                    crate::metrics::record_mempool(mempool_size);
                     let peer_count = swarm.connected_peers().count();
                     crate::metrics::record_peers(peer_count);
                     let head = chain.read().await.head_slot;
                     debug!(
                         peers = peer_count,
-                        mempool = tx_relay.mempool_size(),
+                        mempool = mempool_size,
                         head,
                         syncing = chain_sync.is_syncing(),
                         behind = chain_sync.manager.slots_behind(),

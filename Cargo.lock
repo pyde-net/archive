@@ -3367,6 +3367,7 @@ dependencies = [
  "pyde-vm",
  "serde",
  "serde_json",
+ "sparse-merkle-tree",
  "tokio",
  "toml",
  "tracing",

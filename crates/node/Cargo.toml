@@ -45,3 +45,4 @@ jsonrpsee = { version = "0.24", features = ["server", "macros"] }
 # Misc
 directories = "5"
 hex = "0.4"
+sparse-merkle-tree = "0.6"

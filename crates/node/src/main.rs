@@ -7,6 +7,7 @@ mod metrics;
 mod node;
 mod shutdown;
 mod genesis;
+mod receipt_store;
 mod rpc;
 mod slot_clock;
 mod state_manager;
