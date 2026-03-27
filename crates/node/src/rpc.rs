@@ -52,6 +52,10 @@ pub trait PydeApi {
     #[method(name = "pyde_getBlockByNumber")]
     async fn get_block_by_number(&self, slot: u64) -> Result<serde_json::Value, ErrorObjectOwned>;
 
+    /// Get block info by block hash.
+    #[method(name = "pyde_getBlockByHash")]
+    async fn get_block_by_hash(&self, hash: String) -> Result<serde_json::Value, ErrorObjectOwned>;
+
     #[method(name = "pyde_stateRoot")]
     async fn state_root(&self) -> Result<String, ErrorObjectOwned>;
 
@@ -150,6 +154,24 @@ impl PydeApiServer for RpcServer {
                 "proposer": format!("0x{}", hex::encode(header.proposer)),
             })),
             None => Err(rpc_err(-32602, format!("block not found at slot {}", slot))),
+        }
+    }
+
+    async fn get_block_by_hash(&self, hash: String) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let block_hash = parse_hash(&hash)?;
+        let chain = self.state.chain.read().await;
+        match chain.header_by_hash(&block_hash) {
+            Some(header) => Ok(serde_json::json!({
+                "slot": header.slot,
+                "epoch": header.epoch,
+                "parentHash": format!("0x{}", hex::encode(header.parent_hash)),
+                "stateRoot": format!("0x{}", hex::encode(header.state_root)),
+                "txRoot": format!("0x{}", hex::encode(header.tx_root)),
+                "timestamp": format!("0x{:x}", header.timestamp),
+                "proposer": format!("0x{}", hex::encode(header.proposer)),
+                "hash": format!("0x{}", hex::encode(block_hash)),
+            })),
+            None => Err(rpc_err(-32602, "block not found for hash".to_string())),
         }
     }
 

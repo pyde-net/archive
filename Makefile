@@ -66,6 +66,10 @@ check:
 fmt:
 	cargo fmt --all
 
+# Benchmark RPC (requires running node: make run-full)
+bench-rpc:
+	cargo bench -p pyde-node
+
 # Lint
 clippy:
 	cargo clippy --workspace --all-targets
@@ -92,6 +96,7 @@ help:
 	@echo "  make gen-genesis      Write default genesis to genesis.toml"
 	@echo "  make test             Run all tests"
 	@echo "  make test-crate CRATE=pyde-vm  Run tests for one crate"
+	@echo "  make bench-rpc        Benchmark RPC (requires running node)"
 	@echo "  make check            Check compilation"
 	@echo "  make fmt              Format code"
 	@echo "  make clippy           Run linter"

@@ -12,6 +12,8 @@ pub struct ChainState {
     pub state_root: [u8; 32],
     /// Recent block headers (slot → header) for finality checks.
     pub headers: HashMap<u64, BlockHeader>,
+    /// Block hash → slot index (for getBlockByHash lookups).
+    pub hash_to_slot: HashMap<[u8; 32], u64>,
     /// Genesis block hash.
     pub genesis_hash: [u8; 32],
     /// Base fee for EIP-1559 gas pricing.
@@ -26,6 +28,7 @@ impl ChainState {
             epoch: 0,
             state_root,
             headers: HashMap::new(),
+            hash_to_slot: HashMap::new(),
             genesis_hash: [0u8; 32],
             base_fee: pyde_tx::fee::GENESIS_BASE_FEE,
         }
@@ -39,6 +42,8 @@ impl ChainState {
         self.head_slot = slot;
         self.epoch = epoch;
         self.state_root = header.state_root;
+        let block_hash = header.hash();
+        self.hash_to_slot.insert(block_hash, slot);
         self.headers.insert(slot, header);
 
         // Prune headers older than 2 epochs to bound memory.
@@ -46,6 +51,7 @@ impl ChainState {
         if epoch >= 2 {
             let prune_before = (epoch - 1) * EPOCH_LENGTH;
             self.headers.retain(|s, _| *s >= prune_before);
+            self.hash_to_slot.retain(|_, s| *s >= prune_before);
         }
 
         info!(slot, epoch, "chain head advanced");
@@ -54,6 +60,11 @@ impl ChainState {
     /// Get the header for a slot.
     pub fn header(&self, slot: u64) -> Option<&BlockHeader> {
         self.headers.get(&slot)
+    }
+
+    /// Get the header by block hash.
+    pub fn header_by_hash(&self, hash: &[u8; 32]) -> Option<&BlockHeader> {
+        self.hash_to_slot.get(hash).and_then(|s| self.headers.get(s))
     }
 
     /// Whether we're at genesis (no blocks processed yet).
@@ -120,5 +131,21 @@ mod tests {
         assert!(chain.header(999).is_none());  // epoch 0, pruned
         assert!(chain.header(1000).is_some()); // epoch 1, kept
         assert!(chain.header(2500).is_some()); // epoch 2, kept
+    }
+
+    #[test]
+    fn lookup_by_hash() {
+        let mut chain = ChainState::genesis([0; 32]);
+        let header = dummy_header(1, [0; 32]);
+        let hash = header.hash();
+        chain.advance(header);
+
+        // Lookup by hash should find the same header
+        let found = chain.header_by_hash(&hash);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().slot, 1);
+
+        // Unknown hash returns None
+        assert!(chain.header_by_hash(&[0xFF; 32]).is_none());
     }
 }
