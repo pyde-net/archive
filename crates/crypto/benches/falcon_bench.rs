@@ -25,7 +25,7 @@ fn bench_sign() {
 
     let start = Instant::now();
     for _ in 0..iterations {
-        std::hint::black_box(falcon_sign(&sk, std::hint::black_box(msg)));
+        let _ = std::hint::black_box(falcon_sign(&sk, std::hint::black_box(msg)));
     }
     let elapsed = start.elapsed();
     println!(

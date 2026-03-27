@@ -26,7 +26,7 @@ fn bench_keygen() {
 
 fn bench_encrypt() {
     println!("\n=== Threshold Kyber encrypt ===\n");
-    let (tpk, _shares) = threshold_keygen(128, 85);
+    let (tpk, _shares) = threshold_keygen(128, 85).unwrap();
     let msg = b"benchmark message for threshold encryption";
     let iterations = 100;
 
@@ -46,9 +46,9 @@ fn bench_decrypt() {
     println!("\n=== Threshold Kyber decrypt (combine_shares) ===\n");
 
     for (n, t) in [(5, 3), (10, 7), (128, 85)] {
-        let (tpk, shares) = threshold_keygen(n, t);
+        let (tpk, shares) = threshold_keygen(n, t).unwrap();
         let msg = b"benchmark message for threshold decryption";
-        let ct = threshold_encrypt(&tpk, msg);
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         let dec_shares: Vec<_> = shares[..t]
             .iter()
@@ -80,7 +80,7 @@ fn bench_pss_refresh() {
     println!("\n=== PSS Refresh ===\n");
 
     for (n, t) in [(5, 3), (10, 7), (128, 85)] {
-        let (tpk, shares) = threshold_keygen(n, t);
+        let (tpk, shares) = threshold_keygen(n, t).unwrap();
         let epoch_mat = EpochKeyMaterial {
             epoch: 0,
             n,

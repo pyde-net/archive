@@ -25,7 +25,7 @@ fn bench_verify() {
     println!("\n=== VRF verify ===\n");
     let (pk, sk) = falcon_keygen().unwrap();
     let input = b"benchmark vrf verify";
-    let (output, proof) = vrf_prove(&pk, &sk, input);
+    let (output, proof) = vrf_prove(&pk, &sk, input).unwrap();
     let iterations = 1_000;
 
     let start = Instant::now();
