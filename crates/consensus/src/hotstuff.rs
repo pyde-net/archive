@@ -232,32 +232,39 @@ pub fn try_form_qc(
 /// - There is a QC for slot S+1 that chains back to the block at slot S
 ///   (the QC at S+1 must reference the block_hash certified by the QC at S)
 /// (Two consecutive chained QCs = finality)
+/// Check if a block at `block_slot` is finalized per pipelined HotStuff.
+/// Requires: QC at slot S with quorum, AND QC at slot S+1 with quorum
+/// where the S+1 block chains back to the S block (parent_hash matches).
+///
+/// `headers` maps slot → BlockHeader for chain verification.
 pub fn is_finalized(
     block_slot: u64,
     qc_chain: &[QuorumCert],
+    headers: &std::collections::HashMap<u64, crate::block::BlockHeader>,
 ) -> bool {
     // Find a valid QC for block_slot
-    let qc_for_block = qc_chain.iter().find(|qc| qc.slot == block_slot && qc.has_quorum());
-
-    let qc_for_block = match qc_for_block {
+    let qc_for_block = match qc_chain.iter().find(|qc| qc.slot == block_slot && qc.has_quorum()) {
         Some(qc) => qc,
         None => return false,
     };
 
-    // Find a valid QC for block_slot+1 that chains back to block_slot's certified block.
-    // The QC at slot S+1 must reference (via block_hash) the block that was certified
-    // at slot S. We verify the chain by checking that the next QC's block_hash is
-    // not the zero hash and that the next QC exists with quorum.
-    // NOTE: Full chaining verification (next QC's block references this QC) requires
-    // BlockHeader access. Here we verify consecutive slots both have quorum QCs
-    // and that the first QC certifies a real block (non-zero hash).
-    let has_qc_for_next = qc_chain.iter().any(|qc| {
-        qc.slot == block_slot + 1
-            && qc.has_quorum()
-            && qc_for_block.block_hash != [0u8; 32]
-    });
+    // The QC must certify a real block (non-zero hash)
+    if qc_for_block.block_hash == [0u8; 32] {
+        return false;
+    }
 
-    has_qc_for_next
+    // Find a valid QC for block_slot+1
+    let qc_for_next = match qc_chain.iter().find(|qc| qc.slot == block_slot + 1 && qc.has_quorum()) {
+        Some(qc) => qc,
+        None => return false,
+    };
+
+    // Verify chain linking: the block at slot+1 must reference the block at slot as parent
+    if let Some(next_header) = headers.get(&(block_slot + 1)) {
+        next_header.parent_hash == qc_for_block.block_hash && qc_for_next.block_hash != [0u8; 32]
+    } else {
+        false // can't verify chain without the header
+    }
 }
 
 /// Create a timeout message when no valid proposal received within the timeout period.
@@ -412,7 +419,12 @@ mod tests {
 
     #[test]
     fn pipelined_finality() {
-        // Block at slot 5 is finalized when QCs exist for slot 5 and slot 6
+        use std::collections::HashMap;
+        use crate::block::BlockHeader;
+        use pyde_account::address::ZERO_ADDRESS;
+
+        // Block at slot 5 is finalized when QCs exist for slot 5 and slot 6,
+        // AND the block at slot 6 chains to the block at slot 5.
         let qc_5 = QuorumCert {
             slot: 5,
             block_hash: [0xAA; 32],
@@ -426,9 +438,41 @@ mod tests {
             signatures: vec![],
         };
 
-        assert!(is_finalized(5, &[qc_5.clone(), qc_6.clone()]));
-        assert!(!is_finalized(5, &[qc_5.clone()])); // missing QC for slot 6
-        assert!(!is_finalized(5, &[qc_6.clone()])); // missing QC for slot 5
+        // Block at slot 6 has parent_hash = block at slot 5's hash
+        let header_6 = BlockHeader {
+            slot: 6,
+            epoch: 0,
+            parent_hash: [0xAA; 32], // chains to block 5
+            proposer: ZERO_ADDRESS,
+            vrf_proof: vec![],
+            qc_previous: qc_5.clone(),
+            tx_root: [0; 32],
+            state_root: [0; 32],
+            timestamp: 0,
+        };
+
+        let mut headers = HashMap::new();
+        headers.insert(6, header_6);
+
+        assert!(is_finalized(5, &[qc_5.clone(), qc_6.clone()], &headers));
+        assert!(!is_finalized(5, &[qc_5.clone()], &headers)); // missing QC for slot 6
+        assert!(!is_finalized(5, &[qc_6.clone()], &headers)); // missing QC for slot 5
+
+        // Unrelated block at slot 6 (wrong parent) should NOT finalize
+        let header_6_bad = BlockHeader {
+            slot: 6,
+            epoch: 0,
+            parent_hash: [0xCC; 32], // does NOT chain to block 5
+            proposer: ZERO_ADDRESS,
+            vrf_proof: vec![],
+            qc_previous: QuorumCert::empty(),
+            tx_root: [0; 32],
+            state_root: [0; 32],
+            timestamp: 0,
+        };
+        let mut bad_headers = HashMap::new();
+        bad_headers.insert(6, header_6_bad);
+        assert!(!is_finalized(5, &[qc_5.clone(), qc_6.clone()], &bad_headers));
     }
 
     // ========== Task 0487: QC requires 86/128 ==========

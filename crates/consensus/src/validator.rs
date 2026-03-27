@@ -217,7 +217,9 @@ impl ValidatorSet {
                 buf.extend_from_slice(&epoch.to_le_bytes());
                 buf.extend_from_slice(&v.address);
                 let hash = poseidon2_hash(&buf).to_bytes();
-                let score = u64::from_le_bytes(hash[..8].try_into().unwrap());
+                let mut score_bytes = [0u8; 8];
+                score_bytes.copy_from_slice(&hash[..8]);
+                let score = u64::from_le_bytes(score_bytes);
                 (score, v)
             })
             .collect();

@@ -39,6 +39,13 @@ pub enum AsmError {
     ImmediateRange(String),
 }
 
+/// Wrap encode_immediate with assembler error context.
+fn asm_encode_imm(val: i32, line: usize) -> Result<u32, AsmError> {
+    encode_immediate(val).ok_or_else(|| {
+        AsmError::ImmediateRange(format!("line {}: immediate {} out of 18-bit range", line, val))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tokens
 // ---------------------------------------------------------------------------
@@ -732,7 +739,12 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, AsmError> {
                         line, abs_addr
                     )));
                 }
-                let word = encode(Opcode::Addi, *rd, 0, encode_immediate(abs_i32));
+                let imm_bits = encode_immediate(abs_i32).ok_or_else(|| {
+                    AsmError::ImmediateRange(format!(
+                        "line {}: immediate {} out of 18-bit range", line, abs_i32
+                    ))
+                })?;
+                let word = encode(Opcode::Addi, *rd, 0, imm_bits);
                 bytecode.extend_from_slice(&word.0.to_le_bytes());
             }
         }
@@ -863,7 +875,11 @@ fn encode_instr(
         let rd = expect_gp(&ops[0], line, "rd")?;
         let rs1 = expect_gp(&ops[1], line, "rs1")?;
         let offset = expect_imm_or_label(&ops[2], pc, labels, line)?;
-        let imm = encode_mem_immediate(offset, width);
+        let imm = encode_mem_immediate(offset, width).ok_or_else(|| {
+            AsmError::ImmediateRange(format!(
+                "line {}: memory offset {} out of 16-bit range", line, offset
+            ))
+        })?;
         return Ok(encode(actual_op, rd, rs1, imm));
     }
 
@@ -943,7 +959,7 @@ fn encode_instr(
             let rd = expect_gp(&ops[0], line, "rd")?;
             let rs1 = expect_gp(&ops[1], line, "rs1")?;
             let imm = expect_imm_or_label(&ops[2], pc, labels, line)?;
-            Ok(encode(pi.opcode, rd, rs1, encode_immediate(imm)))
+            Ok(encode(pi.opcode, rd, rs1, asm_encode_imm(imm, line)?))
         }
 
         // --- Unary: not rd, rs1 ---
@@ -1026,7 +1042,7 @@ fn encode_instr(
             } else {
                 0
             };
-            Ok(encode(pi.opcode, wd, rs1, encode_immediate(imm)))
+            Ok(encode(pi.opcode, wd, rs1, asm_encode_imm(imm, line)?))
         }
 
         // --- WSTORE: wstore ws, rs1, imm ---
@@ -1044,7 +1060,7 @@ fn encode_instr(
             } else {
                 0
             };
-            Ok(encode(pi.opcode, ws, rs1, encode_immediate(imm)))
+            Ok(encode(pi.opcode, ws, rs1, asm_encode_imm(imm, line)?))
         }
 
         // --- Push/Pop: push rd / pop rd ---
@@ -1068,7 +1084,7 @@ fn encode_instr(
                 });
             }
             let imm = expect_imm_or_label(&ops[0], pc, labels, line)?;
-            Ok(encode(pi.opcode, 0, 0, encode_immediate(imm)))
+            Ok(encode(pi.opcode, 0, 0, asm_encode_imm(imm, line)?))
         }
 
         // --- Branches: beq rd, rs1, imm/label ---
@@ -1085,7 +1101,7 @@ fn encode_instr(
             let rd = expect_gp(&ops[0], line, "rs1")?;
             let rs1 = expect_gp(&ops[1], line, "rs2")?;
             let imm = expect_imm_or_label(&ops[2], pc, labels, line)?;
-            Ok(encode(pi.opcode, rd, rs1, encode_immediate(imm)))
+            Ok(encode(pi.opcode, rd, rs1, asm_encode_imm(imm, line)?))
         }
 
         // --- CALL: call imm/label ---
@@ -1097,7 +1113,7 @@ fn encode_instr(
                 });
             }
             let imm = expect_imm_or_label(&ops[0], pc, labels, line)?;
-            Ok(encode(pi.opcode, 0, 0, encode_immediate(imm)))
+            Ok(encode(pi.opcode, 0, 0, asm_encode_imm(imm, line)?))
         }
 
         // --- No operand: ret, halt, revert ---

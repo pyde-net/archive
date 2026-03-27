@@ -380,14 +380,12 @@ pub fn sign_extend_18(raw: u32) -> i32 {
 }
 
 /// Encode a signed immediate into the 18-bit field.
-/// Panics if the value is out of range [-131072, 131071].
-pub fn encode_immediate(val: i32) -> u32 {
-    assert!(
-        (-131072..=131071).contains(&val),
-        "immediate {} out of 18-bit signed range",
-        val
-    );
-    (val as u32) & RS2_IMM_MASK
+/// Returns None if the value is out of range [-131072, 131071].
+pub fn encode_immediate(val: i32) -> Option<u32> {
+    if !(-131072..=131071).contains(&val) {
+        return None;
+    }
+    Some((val as u32) & RS2_IMM_MASK)
 }
 
 // --- Width-encoded memory access ---
@@ -427,15 +425,13 @@ pub fn decode_mem_offset(raw: u32) -> i32 {
 }
 
 /// Encode a memory immediate: 16-bit signed offset + 2-bit width.
-/// Panics if offset is out of range [-32768, 32767].
-pub fn encode_mem_immediate(offset: i32, width: MemWidth) -> u32 {
-    assert!(
-        (-32768..=32767).contains(&offset),
-        "memory offset {} out of 16-bit signed range",
-        offset
-    );
+/// Returns None if offset is out of range [-32768, 32767].
+pub fn encode_mem_immediate(offset: i32, width: MemWidth) -> Option<u32> {
+    if !(-32768..=32767).contains(&offset) {
+        return None;
+    }
     let offset_bits = (offset as u32) & 0xFFFF;
-    ((offset_bits << 2) | (width as u32)) & RS2_IMM_MASK
+    Some(((offset_bits << 2) | (width as u32)) & RS2_IMM_MASK)
 }
 
 // --- Gas Table ---
@@ -735,13 +731,13 @@ mod tests {
         // Min negative: -2^17 = -131072, encoded as 0x20000
         assert_eq!(sign_extend_18(0x20000), -131072);
         // -42 in 18-bit = 0x3FFD6
-        assert_eq!(sign_extend_18(encode_immediate(-42)), -42);
+        assert_eq!(sign_extend_18(encode_immediate(-42).unwrap()), -42);
     }
 
     #[test]
     fn sign_extend_roundtrip() {
         for val in [-131072, -1000, -1, 0, 1, 1000, 131071] {
-            let encoded = encode_immediate(val);
+            let encoded = encode_immediate(val).unwrap();
             let decoded = sign_extend_18(encoded);
             assert_eq!(decoded, val, "roundtrip failed for {}", val);
         }
@@ -757,15 +753,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "out of 18-bit signed range")]
     fn encode_immediate_overflow() {
-        encode_immediate(131072); // max + 1
+        assert!(encode_immediate(131072).is_none()); // max + 1
     }
 
     #[test]
-    #[should_panic(expected = "out of 18-bit signed range")]
     fn encode_immediate_underflow() {
-        encode_immediate(-131073); // min - 1
+        assert!(encode_immediate(-131073).is_none()); // min - 1
     }
 
     // --- Task 0084: register field bounds ---

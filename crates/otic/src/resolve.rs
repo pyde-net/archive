@@ -214,7 +214,7 @@ impl Resolver {
             }
         }
 
-        let scope = self.scopes.last_mut().unwrap();
+        let scope = self.scopes.last_mut().expect("resolver has no scope");
 
         if let Some(existing) = scope.symbols.get(name) {
             // Events, errors, functions, and storage fields are separate namespaces.

@@ -312,7 +312,7 @@ mod tests {
 
     fn exec_ri(cpu: &mut Cpu, op: Opcode, rd: u8, rs1: u8, imm: i32) -> Result<(), Trap> {
         use crate::isa::{encode, encode_immediate};
-        cpu.exec_alu(encode(op, rd, rs1, encode_immediate(imm)))
+        cpu.exec_alu(encode(op, rd, rs1, encode_immediate(imm).unwrap()))
     }
 
     fn exec_wide_rr(cpu: &mut Cpu, op: Opcode, wd: u8, ws1: u8, ws2: u8) -> Result<(), Trap> {

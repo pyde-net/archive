@@ -1531,12 +1531,12 @@ mod tests {
     }
 
     fn instr_ri(op: Opcode, rd: u8, rs1: u8, imm: i32) -> [u8; 4] {
-        encode(op, rd, rs1, encode_immediate(imm)).0.to_le_bytes()
+        encode(op, rd, rs1, encode_immediate(imm).unwrap()).0.to_le_bytes()
     }
 
     /// Helper: encode a LOAD/STORE instruction with width and offset.
     fn instr_mem(op: Opcode, rd: u8, rs1: u8, offset: i32, width: MemWidth) -> [u8; 4] {
-        encode(op, rd, rs1, encode_mem_immediate(offset, width))
+        encode(op, rd, rs1, encode_mem_immediate(offset, width).unwrap())
             .0
             .to_le_bytes()
     }

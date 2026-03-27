@@ -31,21 +31,21 @@ pub struct BlockDecryptor {
 impl BlockDecryptor {
     /// Create a new decryptor for a set of encrypted transactions.
     ///
-    /// # Panics
-    /// Panics if `threshold` is 0 or greater than 128 (committee size).
-    pub fn new(encrypted_txs: Vec<EncryptedTx>, threshold: usize) -> Self {
-        assert!(
-            threshold >= 1 && threshold <= 128,
-            "decryption threshold must be in [1, 128], got {}",
-            threshold
-        );
+    /// Returns an error if `threshold` is 0 or greater than 128 (committee size).
+    pub fn new(encrypted_txs: Vec<EncryptedTx>, threshold: usize) -> Result<Self, String> {
+        if threshold < 1 || threshold > 128 {
+            return Err(format!(
+                "decryption threshold must be in [1, 128], got {}",
+                threshold
+            ));
+        }
         let n = encrypted_txs.len();
-        Self {
+        Ok(Self {
             encrypted_txs,
             shares: vec![Vec::new(); n],
             threshold,
             decrypted: vec![false; n],
-        }
+        })
     }
 
     /// Number of transactions to decrypt.
@@ -199,7 +199,7 @@ mod tests {
         let to = derive_eoa_address(b"recipient");
         let enc_tx = make_enc_tx(&pk, to, 5_000, b"transfer()");
 
-        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 85);
+        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 85).unwrap();
 
         // Add 85 shares
         for ks in key_shares.iter().take(85) {
@@ -221,7 +221,7 @@ mod tests {
         let to = derive_eoa_address(b"recipient");
         let enc_tx = make_enc_tx(&pk, to, 100, b"");
 
-        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 85);
+        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 85).unwrap();
 
         // Only 84 shares
         for ks in key_shares.iter().take(84) {
@@ -240,7 +240,7 @@ mod tests {
         let to = derive_eoa_address(b"recipient");
         let enc_tx = make_enc_tx(&pk, to, 100, b"");
 
-        let mut decryptor = BlockDecryptor::new(vec![enc_tx.clone()], 2);
+        let mut decryptor = BlockDecryptor::new(vec![enc_tx.clone()], 2).unwrap();
 
         // Add same share twice
         let share = generate_decryption_share(&key_shares[0], &enc_tx.ciphertext);
@@ -263,7 +263,7 @@ mod tests {
             make_enc_tx(&pk, to2, 2_000, b"call_b"),
         ];
 
-        let mut decryptor = BlockDecryptor::new(txs, 2);
+        let mut decryptor = BlockDecryptor::new(txs, 2).unwrap();
 
         // Add 2 members' shares for all txs
         for ks in key_shares.iter().take(2) {
@@ -296,7 +296,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 2);
+        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 2).unwrap();
         for ks in key_shares.iter().take(2) {
             decryptor.add_member_shares(ks);
         }
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn out_of_bounds_tx_index() {
-        let decryptor = BlockDecryptor::new(vec![], 2);
+        let decryptor = BlockDecryptor::new(vec![], 2).unwrap();
         assert!(!decryptor.can_decrypt(0));
         assert_eq!(decryptor.share_count(99), 0);
     }
@@ -329,7 +329,7 @@ mod tests {
         let share = generate_decryption_share(&key_shares[0], &enc_tx.ciphertext);
 
         // Empty decryptor — index 0 is out of bounds
-        let mut decryptor = BlockDecryptor::new(vec![], 2);
+        let mut decryptor = BlockDecryptor::new(vec![], 2).unwrap();
         assert!(!decryptor.add_share(0, share));
     }
 }

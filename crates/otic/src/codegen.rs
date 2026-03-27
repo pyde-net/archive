@@ -336,7 +336,8 @@ impl CodeGen {
             for (_, name, dispatch_label, func_label) in &dispatch_entries {
                 self.mark_label(*dispatch_label);
 
-                let func = program.functions.iter().find(|f| f.name == *name).unwrap();
+                let func = program.functions.iter().find(|f| f.name == *name)
+                    .expect("dispatch entry references non-existent function");
 
                 self.emit_heap_init();
                 self.emit_calldata_decode(func);
@@ -429,7 +430,7 @@ impl CodeGen {
 
         // Load 4-byte selector from calldata into r13 (u32 load, like Solidity).
         // NOT r15, because load_u32_to_reg uses r15 as scratch.
-        let imm = encode_mem_immediate(0, MemWidth::W32);
+        let imm = encode_mem_immediate(0, MemWidth::W32).unwrap();
         self.emit(encode(Opcode::Load, 13, 5, imm)); // r13 = load u32 from calldata[0]
 
         for (selector, _name, dispatch_label, _func_label) in entries {
@@ -1341,7 +1342,7 @@ impl CodeGen {
         if let Some(SpillAction::Save(reg, slot)) = spill {
             // Store evicted register to spill area: mem[r13 + slot*8] = reg
             let offset = (slot * 8) as i32;
-            let imm = encode_mem_immediate(offset, MemWidth::W64);
+            let imm = encode_mem_immediate(offset, MemWidth::W64).unwrap();
             self.instructions.push(encode(Opcode::Store, reg, 13, imm));
         }
         phys
@@ -1354,7 +1355,7 @@ impl CodeGen {
             Err(RestoreAction::Restore(temp_reg, slot)) => {
                 // Load from spill area: temp_reg = mem[r13 + slot*8]
                 let offset = (slot * 8) as i32;
-                let imm = encode_mem_immediate(offset, MemWidth::W64);
+                let imm = encode_mem_immediate(offset, MemWidth::W64).unwrap();
                 self.instructions.push(encode(Opcode::Load, temp_reg, 13, imm));
                 temp_reg
             }
@@ -1370,12 +1371,12 @@ impl CodeGen {
     }
 
     fn emit_load(&mut self, rd: u8, base: u8, offset: i32) {
-        let imm = encode_mem_immediate(offset, MemWidth::W64);
+        let imm = encode_mem_immediate(offset, MemWidth::W64).unwrap();
         self.emit(encode(Opcode::Load, rd, base, imm));
     }
 
     fn emit_store(&mut self, val: u8, base: u8, offset: i32) {
-        let imm = encode_mem_immediate(offset, MemWidth::W64);
+        let imm = encode_mem_immediate(offset, MemWidth::W64).unwrap();
         self.emit(encode(Opcode::Store, val, base, imm));
     }
 

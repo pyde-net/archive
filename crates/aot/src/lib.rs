@@ -27,7 +27,7 @@ mod tests {
     }
 
     fn instr_ri(op: Opcode, rd: u8, rs1: u8, imm: i32) -> [u8; 4] {
-        encode(op, rd, rs1, encode_immediate(imm)).0.to_le_bytes()
+        encode(op, rd, rs1, encode_immediate(imm).unwrap()).0.to_le_bytes()
     }
 
     fn bytecode(instrs: &[[u8; 4]]) -> Vec<u8> {

@@ -43,7 +43,9 @@ fn random_goldilocks(entropy: &[u8], index: usize) -> Goldilocks {
     input.extend_from_slice(&(index as u64).to_le_bytes());
     let hash = poseidon2_hash(&input);
     let bytes = hash.as_bytes();
-    let val = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let mut val_bytes = [0u8; 8];
+    val_bytes.copy_from_slice(&bytes[0..8]);
+    let val = u64::from_le_bytes(val_bytes);
     gl(val)
 }
 
@@ -204,7 +206,8 @@ pub fn threshold_keygen(n: usize, threshold: usize) -> Result<(ThresholdPublicKe
     let seed_bytes = sk.as_bytes();
     let seed_elements: Vec<Goldilocks> = (0..SEED_ELEMENTS)
         .map(|i| {
-            let chunk: [u8; 8] = seed_bytes[i * 8..(i + 1) * 8].try_into().unwrap();
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&seed_bytes[i * 8..(i + 1) * 8]);
             gl(u64::from_le_bytes(chunk))
         })
         .collect();

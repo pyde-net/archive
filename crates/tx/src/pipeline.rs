@@ -257,10 +257,10 @@ fn execute_in_pvm(
     let ctx = ExecutionContext {
         caller: tx.from,
         self_address: tx.to,
-        call_value: U256::from(tx.value as u64),
+        call_value: U256::from(tx.value),
         block_number: block_ctx.height,
         timestamp: block_ctx.timestamp,
-        gas_price: U256::from(block_ctx.base_fee as u64),
+        gas_price: U256::from(block_ctx.base_fee),
         tx_nonce: tx.nonce,
         tx_gas_limit: tx.gas_limit,
         tx_hash: U256::ZERO,

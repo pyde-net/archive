@@ -78,11 +78,15 @@ fn bytes_to_elements(data: &[u8]) -> Vec<Goldilocks> {
 
 fn hash256_to_elements(hash: &Hash256) -> [Goldilocks; 4] {
     let b = hash.as_bytes();
+    let mut c0 = [0u8; 8]; c0.copy_from_slice(&b[0..8]);
+    let mut c1 = [0u8; 8]; c1.copy_from_slice(&b[8..16]);
+    let mut c2 = [0u8; 8]; c2.copy_from_slice(&b[16..24]);
+    let mut c3 = [0u8; 8]; c3.copy_from_slice(&b[24..32]);
     [
-        u64_to_goldilocks(u64::from_le_bytes(b[0..8].try_into().unwrap())),
-        u64_to_goldilocks(u64::from_le_bytes(b[8..16].try_into().unwrap())),
-        u64_to_goldilocks(u64::from_le_bytes(b[16..24].try_into().unwrap())),
-        u64_to_goldilocks(u64::from_le_bytes(b[24..32].try_into().unwrap())),
+        u64_to_goldilocks(u64::from_le_bytes(c0)),
+        u64_to_goldilocks(u64::from_le_bytes(c1)),
+        u64_to_goldilocks(u64::from_le_bytes(c2)),
+        u64_to_goldilocks(u64::from_le_bytes(c3)),
     ]
 }
 

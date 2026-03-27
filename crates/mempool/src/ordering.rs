@@ -26,7 +26,9 @@ fn prng_at(seed: &[u8; 32], index: usize) -> u64 {
     buf.extend_from_slice(seed);
     buf.extend_from_slice(&(index as u64).to_le_bytes());
     let hash = poseidon2_hash(&buf).to_bytes();
-    u64::from_le_bytes(hash[..8].try_into().unwrap())
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash[..8]);
+    u64::from_le_bytes(bytes)
 }
 
 /// Fisher-Yates shuffle: deterministic, uniform, O(n).

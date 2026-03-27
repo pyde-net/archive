@@ -347,7 +347,7 @@ impl Lowerer {
         }
 
         self.pop_scope();
-        let ir_func = self.current_fn.take().unwrap();
+        let ir_func = self.current_fn.take().expect("lower_function called without active function");
         self.program.functions.push(ir_func);
     }
 

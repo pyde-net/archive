@@ -184,7 +184,7 @@ impl IrFunction {
     }
 
     pub fn current_block(&mut self) -> &mut BasicBlock {
-        self.blocks.last_mut().unwrap()
+        self.blocks.last_mut().expect("IR function has no blocks")
     }
 
     pub fn push_block(&mut self, label: Label, name: String) {

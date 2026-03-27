@@ -214,7 +214,10 @@ fn cmd_test(path: &str) {
 
         // Run on PVM
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
-        vm.load(&compiled.bytecode).unwrap();
+        if let Err(e) = vm.load(&compiled.bytecode) {
+            eprintln!("failed to load bytecode: {:?}", e);
+            std::process::exit(1);
+        }
 
         let mut steps = 0;
         let mut result = None;

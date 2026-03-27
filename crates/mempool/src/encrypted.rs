@@ -44,8 +44,6 @@ pub struct EncryptedTx {
     /// Threshold-encrypted payload: contains to, value, calldata.
     pub ciphertext: ThresholdCiphertext,
 
-    /// Cached hash (computed lazily).
-    hash_cache: Option<[u8; 32]>,
 }
 
 impl EncryptedTx {
@@ -63,9 +61,6 @@ impl EncryptedTx {
 
     /// Hash of the encrypted transaction (for deduplication and tx_root).
     pub fn hash(&self) -> [u8; 32] {
-        if let Some(h) = self.hash_cache {
-            return h;
-        }
         let mut buf = Vec::with_capacity(96); // sender(32) + nonce(8) + gas(8) + chain(8) + ct_hash(32)
         buf.extend_from_slice(&self.sender);
         buf.extend_from_slice(&self.nonce.to_le_bytes());
@@ -125,7 +120,6 @@ pub fn encrypt_transaction(
         chain_id,
         signature,
         ciphertext,
-        hash_cache: None,
     })
 }
 
@@ -146,7 +140,9 @@ pub fn decrypt_payload(
     let mut to = [0u8; 32];
     to.copy_from_slice(&plaintext[..32]);
 
-    let value = u128::from_le_bytes(plaintext[32..48].try_into().unwrap());
+    let mut value_bytes = [0u8; 16];
+    value_bytes.copy_from_slice(&plaintext[32..48]);
+    let value = u128::from_le_bytes(value_bytes);
     let calldata = plaintext[48..].to_vec();
 
     Ok((to, value, calldata))

@@ -270,10 +270,10 @@ impl FinalityTracker {
             }
         }
 
+        let checkpoint_slot = checkpoint.slot;
         self.latest_checkpoint = Some(checkpoint);
 
         // Prune pending entries at or before the checkpoint
-        let checkpoint_slot = self.latest_checkpoint.as_ref().unwrap().slot;
         self.pending.retain(|s| s.slot > checkpoint_slot);
     }
 

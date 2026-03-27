@@ -38,7 +38,9 @@ fn vrf_input(epoch_randomness: &[u8; 32], slot: u64) -> Vec<u8> {
 
 /// Extract a u64 score from a VRF output (first 8 bytes, little-endian).
 fn score_from_output(output: &VrfOutput) -> u64 {
-    u64::from_le_bytes(output.as_bytes()[..8].try_into().unwrap())
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&output.as_bytes()[..8]);
+    u64::from_le_bytes(buf)
 }
 
 /// A proposer candidate: validator address + VRF output + proof.

@@ -1193,10 +1193,10 @@ impl Parser {
                 // Lookahead: is it `ident: expr` (named) or just `expr` (positional)?
                 let saved = self.pos;
                 let ident = self.expect_ident().ok();
-                if self.at(&TokenKind::Colon) && ident.is_some() {
+                if let (true, Some(name)) = (self.at(&TokenKind::Colon), ident) {
                     self.advance(); // eat :
                     let value = self.parse_expr()?;
-                    args.push(MacroArg::Named(ident.unwrap(), value));
+                    args.push(MacroArg::Named(name, value));
                 } else {
                     // Backtrack — it's a positional expression
                     self.pos = saved;
