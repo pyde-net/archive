@@ -3,10 +3,12 @@ use crate::chain::ChainState;
 use crate::config::NodeConfig;
 use crate::rpc::{self, RpcState};
 use crate::shutdown::ShutdownSignal;
+use crate::slot_clock::SlotClock;
 use crate::state_manager::StateManager;
 use crate::sync::ChainSync;
 use crate::tx_relay::TxRelay;
 use crate::validator::{ValidatorEngine, ValidatorIdentity, verify_stake};
+use crate::wire;
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub;
 use libp2p::request_response;
@@ -99,7 +101,8 @@ impl PydeNode {
         let mut chain_sync = ChainSync::new();
         chain_sync.manager.local_tip = chain.read().await.head_slot;
 
-        // 5. Validator engine (only for validator role)
+        // 5. Validator engine + identity (only for validator role)
+        let mut validator_identity: Option<ValidatorIdentity> = None;
         let mut validator_engine: Option<ValidatorEngine> = if is_validator {
             // Load validator FALCON signing key (required for validator role)
             let identity = load_validator_identity(datadir)?;
@@ -134,8 +137,9 @@ impl PydeNode {
                 }
             }
 
-            let mut engine = ValidatorEngine::new([0u8; 32]);
+            let engine = ValidatorEngine::new([0u8; 32]);
             info!("validator consensus engine initialized");
+            validator_identity = Some(identity);
             Some(engine)
         } else {
             None
@@ -209,7 +213,12 @@ impl PydeNode {
         // --- Main event loop ---
         let mut shutdown_rx = self.shutdown.subscribe();
 
+        // Slot clock for block timing
+        let slot_clock = SlotClock::new(0); // genesis timestamp 0 = start now
+        let mut last_slot = slot_clock.current_slot();
+
         // Periodic timers
+        let mut slot_interval = tokio::time::interval(std::time::Duration::from_millis(100)); // check slot every 100ms
         let mut maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
@@ -241,6 +250,52 @@ impl PydeNode {
                         }
                         PostEventAction::ContinueSync => {
                             chain_sync.request_next_batch(&mut swarm);
+                        }
+                    }
+                }
+                _ = slot_interval.tick() => {
+                    let current_slot = slot_clock.current_slot();
+                    if current_slot > last_slot {
+                        last_slot = current_slot;
+
+                        // New slot — validator block production
+                        if let Some(engine) = validator_engine.as_mut() {
+                            engine.advance_slot();
+
+                            if let Some(identity) = validator_identity.as_ref() {
+                                // Check if we're the proposer
+                                if let Some(candidate) = engine.check_proposer(identity) {
+                                    info!(
+                                        slot = current_slot,
+                                        score = candidate.score,
+                                        "selected as proposer — building block"
+                                    );
+
+                                    // Build block from mempool
+                                    let chain_r = chain.read().await;
+                                    let block = engine.build_proposal(
+                                        identity,
+                                        chain_r.state_root,
+                                        chain_r.state_root, // state_root = pre-state (unknown post until execution)
+                                        [0u8; 32],          // tx_root computed after tx selection
+                                        candidate.vrf_proof.as_bytes().to_vec(),
+                                        vec![],             // txs from mempool — wired when decryption flow is complete
+                                        pyde_tx::parallel::ExecutionSchedule { groups: vec![], total_txs: 0 },
+                                    );
+                                    drop(chain_r);
+
+                                    // Encode and broadcast via gossipsub
+                                    let block_bytes = wire::encode_block(&block);
+                                    let topic = pyde_net::node::topics::blocks();
+                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, block_bytes) {
+                                        warn!(slot = current_slot, error = %e, "failed to publish block");
+                                    } else {
+                                        info!(slot = current_slot, "block proposal broadcast");
+                                    }
+                                }
+                            }
+
+                            debug!(slot = current_slot, "slot tick");
                         }
                     }
                 }
@@ -318,6 +373,24 @@ fn handle_swarm_event(
                 }
                 Some(Channel::Blocks) => {
                     debug!(bytes = message.data.len(), "received block gossip");
+                    // Decode and process the block
+                    match wire::decode_block(&message.data) {
+                        Ok(block) => {
+                            let slot = block.header.slot;
+                            match BlockProcessor::process_full_block(chain, state, &block) {
+                                Ok((tx_count, gas_used, _receipts)) => {
+                                    chain_sync.on_block_processed(slot);
+                                    info!(slot, tx_count, gas_used, "block received and processed");
+                                }
+                                Err(e) => {
+                                    debug!(slot, error = %e, "block rejected");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = e, "failed to decode block from gossip");
+                        }
+                    }
                 }
                 Some(Channel::Consensus) => {
                     if let Some(_engine) = validator_engine.as_mut() {
