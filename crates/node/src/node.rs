@@ -57,14 +57,34 @@ impl PydeNode {
         // --- Initialize subsystems ---
 
         // 1. State storage (RocksDB + SMT)
-        let state = StateManager::open(datadir, self.config.storage.cache_size)?;
-        info!(
-            state_root = hex::encode(state.root()),
-            empty = state.is_empty(),
-            "state loaded"
-        );
+        let mut state = StateManager::open(datadir, self.config.storage.cache_size)?;
 
-        // 2. Chain state tracker
+        // 2. Apply genesis if state is empty (first start)
+        if state.is_empty() {
+            let genesis_path = datadir.join("genesis.toml");
+            let genesis_config = if genesis_path.exists() {
+                crate::genesis::GenesisConfig::load(&genesis_path)?
+            } else {
+                info!("no genesis.toml found, using devnet defaults");
+                let config = crate::genesis::devnet_genesis();
+                // Write default genesis for reference
+                let _ = std::fs::write(&genesis_path, config.to_toml());
+                config
+            };
+            let genesis_block = crate::genesis::initialize_genesis(&mut state, &genesis_config)?;
+            info!(
+                state_root = hex::encode(state.root()),
+                slot = genesis_block.slot(),
+                "genesis block created"
+            );
+        } else {
+            info!(
+                state_root = hex::encode(state.root()),
+                "state loaded from disk"
+            );
+        }
+
+        // 3. Chain state tracker
         let chain = ChainState::genesis(state.root());
         info!(head_slot = chain.head_slot, "chain initialized");
 
