@@ -77,4 +77,14 @@ impl StateManager {
     pub fn is_empty(&self) -> bool {
         self.smt.is_empty()
     }
+
+    /// Get mutable access to the underlying SMT (for tx execution pipeline).
+    pub fn smt_mut(&mut self) -> &mut PydeSMT {
+        &mut self.smt
+    }
+
+    /// Refresh the cached root after SMT mutations (e.g., after tx execution).
+    pub fn refresh_root(&mut self) {
+        self.root = self.smt.root().as_slice().try_into().unwrap_or([0u8; 32]);
+    }
 }
