@@ -1,6 +1,7 @@
 use crate::block_processor::BlockProcessor;
 use crate::chain::ChainState;
 use crate::config::NodeConfig;
+use crate::rpc::{self, RpcState};
 use crate::shutdown::ShutdownSignal;
 use crate::state_manager::StateManager;
 use crate::sync::ChainSync;
@@ -18,6 +19,8 @@ use pyde_net::node::{
     PydeBehaviour, PydeBehaviourEvent,
 };
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 /// The main Pyde node. Owns all subsystems.
@@ -54,7 +57,7 @@ impl PydeNode {
         // --- Initialize subsystems ---
 
         // 1. State storage (RocksDB + SMT)
-        let mut state = StateManager::open(datadir, self.config.storage.cache_size)?;
+        let state = StateManager::open(datadir, self.config.storage.cache_size)?;
         info!(
             state_root = hex::encode(state.root()),
             empty = state.is_empty(),
@@ -62,15 +65,19 @@ impl PydeNode {
         );
 
         // 2. Chain state tracker
-        let mut chain = ChainState::genesis(state.root());
+        let chain = ChainState::genesis(state.root());
         info!(head_slot = chain.head_slot, "chain initialized");
+
+        // Wrap in Arc<RwLock> for RPC sharing
+        let chain = Arc::new(RwLock::new(chain));
+        let state = Arc::new(RwLock::new(state));
 
         // 3. Transaction relay / mempool
         let mut tx_relay = TxRelay::new();
 
         // 4. Chain sync
         let mut chain_sync = ChainSync::new();
-        chain_sync.manager.local_tip = chain.head_slot;
+        chain_sync.manager.local_tip = chain.read().await.head_slot;
 
         // 5. Validator engine (only for validator role)
         let mut validator_engine: Option<ValidatorEngine> = if is_validator {
@@ -82,26 +89,29 @@ impl PydeNode {
             );
 
             // Check stake if state is available (non-genesis)
-            if !state.is_empty() {
-                let balance_key = pyde_state::keys::balance_key(&identity.address);
-                let balance = state.get(&balance_key)
-                    .map(|b| {
-                        if b.len() >= 16 {
-                            let mut buf = [0u8; 16];
-                            buf.copy_from_slice(&b[..16]);
-                            u128::from_le_bytes(buf)
-                        } else {
-                            0u128
-                        }
-                    })
-                    .unwrap_or(0);
+            {
+                let state_guard = state.read().await;
+                if !state_guard.is_empty() {
+                    let balance_key = pyde_state::keys::balance_key(&identity.address);
+                    let balance = state_guard.get(&balance_key)
+                        .map(|b| {
+                            if b.len() >= 16 {
+                                let mut buf = [0u8; 16];
+                                buf.copy_from_slice(&b[..16]);
+                                u128::from_le_bytes(buf)
+                            } else {
+                                0u128
+                            }
+                        })
+                        .unwrap_or(0);
 
-                verify_stake(balance).map_err(|e| {
-                    format!("cannot start as validator: {}", e)
-                })?;
-                info!(balance, "validator stake verified");
-            } else {
-                warn!("state is empty (genesis) — stake verification deferred until chain syncs");
+                    verify_stake(balance).map_err(|e| {
+                        format!("cannot start as validator: {}", e)
+                    })?;
+                    info!(balance, "validator stake verified");
+                } else {
+                    warn!("state is empty (genesis) — stake verification deferred until chain syncs");
+                }
             }
 
             let mut engine = ValidatorEngine::new([0u8; 32]);
@@ -153,6 +163,23 @@ impl PydeNode {
             }
         }
 
+        // 10. Start RPC server if enabled
+        if self.config.rpc.enabled {
+            let rpc_state = Arc::new(RpcState {
+                chain: chain.clone(),
+                state: state.clone(),
+            });
+            match rpc::start_rpc_server(
+                &self.config.rpc.listen,
+                self.config.rpc.port,
+                rpc_state,
+                self.config.node.chain_id,
+            ).await {
+                Ok(addr) => info!(%addr, "JSON-RPC server started"),
+                Err(e) => warn!("RPC server disabled: {}", e),
+            }
+        }
+
         info!(
             role = role_str,
             port = self.config.network.port,
@@ -170,14 +197,18 @@ impl PydeNode {
             tokio::select! {
                 event = swarm.select_next_some() => {
                     // Process event, collecting any actions that need the swarm
-                    let action = handle_swarm_event(
-                        event,
-                        &mut chain,
-                        &mut state,
-                        &mut tx_relay,
-                        &mut chain_sync,
-                        &mut validator_engine,
-                    );
+                    let action = {
+                        let mut chain_w = chain.write().await;
+                        let mut state_w = state.write().await;
+                        handle_swarm_event(
+                            event,
+                            &mut chain_w,
+                            &mut state_w,
+                            &mut tx_relay,
+                            &mut chain_sync,
+                            &mut validator_engine,
+                        )
+                    };
 
                     // Execute post-event actions that need swarm access
                     match action {
@@ -205,10 +236,11 @@ impl PydeNode {
                     crate::metrics::record_mempool(tx_relay.mempool_size());
                     let peer_count = swarm.connected_peers().count();
                     crate::metrics::record_peers(peer_count);
+                    let head = chain.read().await.head_slot;
                     debug!(
                         peers = peer_count,
                         mempool = tx_relay.mempool_size(),
-                        head = chain.head_slot,
+                        head,
                         syncing = chain_sync.is_syncing(),
                         behind = chain_sync.manager.slots_behind(),
                         "maintenance tick"
@@ -221,11 +253,14 @@ impl PydeNode {
             }
         }
 
-        info!(
-            head_slot = chain.head_slot,
-            state_root = hex::encode(chain.state_root),
-            "node stopped cleanly"
-        );
+        {
+            let chain_r = chain.read().await;
+            info!(
+                head_slot = chain_r.head_slot,
+                state_root = hex::encode(chain_r.state_root),
+                "node stopped cleanly"
+            );
+        }
         Ok(())
     }
 }

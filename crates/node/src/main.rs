@@ -6,6 +6,7 @@ mod logging;
 mod metrics;
 mod node;
 mod shutdown;
+mod rpc;
 mod state_manager;
 mod sync;
 mod tx_relay;
