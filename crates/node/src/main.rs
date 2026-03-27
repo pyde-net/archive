@@ -8,6 +8,7 @@ mod node;
 mod shutdown;
 mod state_manager;
 mod tx_relay;
+mod validator;
 
 use clap::Parser;
 use cli::{Cli, Command};

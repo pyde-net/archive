@@ -4,6 +4,7 @@ use crate::config::NodeConfig;
 use crate::shutdown::ShutdownSignal;
 use crate::state_manager::StateManager;
 use crate::tx_relay::TxRelay;
+use crate::validator::{ValidatorEngine, ValidatorIdentity, verify_stake};
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub;
 use libp2p::swarm::SwarmEvent;
@@ -64,7 +65,18 @@ impl PydeNode {
         // 3. Transaction relay / mempool
         let mut tx_relay = TxRelay::new();
 
-        // 4. Load or generate node identity (persistent across restarts)
+        // 4. Validator engine (only for validator role)
+        let mut validator_engine: Option<ValidatorEngine> = if is_validator {
+            let mut engine = ValidatorEngine::new([0u8; 32]); // epoch randomness set at epoch boundary
+            // Validator key loading is deferred until the validator registers on-chain
+            // and receives their committee assignment. For now, initialize the engine.
+            info!("validator consensus engine initialized");
+            Some(engine)
+        } else {
+            None
+        };
+
+        // 5. Load or generate node identity (persistent across restarts)
         let keypair = load_or_generate_identity(datadir)?;
         let peer_id = libp2p::PeerId::from(keypair.public());
         info!(%peer_id, "node identity loaded");
@@ -126,6 +138,7 @@ impl PydeNode {
                         &mut chain,
                         &mut state,
                         &mut tx_relay,
+                        &mut validator_engine,
                     );
                 }
                 _ = maintenance_interval.tick() => {
@@ -163,6 +176,7 @@ fn handle_swarm_event(
     chain: &mut ChainState,
     state: &mut StateManager,
     tx_relay: &mut TxRelay,
+    validator_engine: &mut Option<ValidatorEngine>,
 ) {
     match event {
         // --- Gossipsub message received ---
@@ -175,17 +189,24 @@ fn handle_swarm_event(
             match channel {
                 Some(Channel::Transactions) => {
                     debug!(bytes = message.data.len(), "received tx gossip");
-                    // Tx deserialization will be wired when we have a serialization
-                    // format for EncryptedTx over the wire. For now, log receipt.
+                    // Tx deserialization will be wired when we have a wire format
+                    // for EncryptedTx. For now, log receipt.
                 }
                 Some(Channel::Blocks) => {
                     debug!(bytes = message.data.len(), "received block gossip");
                     // Block deserialization and processing will be wired when we have
-                    // a serialization format for blocks over the wire.
+                    // a wire format for blocks.
                 }
                 Some(Channel::Consensus) => {
-                    debug!(bytes = message.data.len(), "received consensus message");
-                    // Consensus message handling is M10.2 (validator role).
+                    if let Some(engine) = validator_engine.as_mut() {
+                        debug!(bytes = message.data.len(), "received consensus message");
+                        // Consensus message deserialization and dispatch:
+                        // - Proposal → engine.on_proposal()
+                        // - Vote → engine.on_vote()
+                        // - ViewChange → engine.on_view_change()
+                        // - FinalityVote → engine.on_finality_vote()
+                        // Wire format serialization is a Phase 10 integration task.
+                    }
                 }
                 Some(Channel::Sync) => {
                     debug!(bytes = message.data.len(), "received sync message");
