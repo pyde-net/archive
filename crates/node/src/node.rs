@@ -67,9 +67,37 @@ impl PydeNode {
 
         // 4. Validator engine (only for validator role)
         let mut validator_engine: Option<ValidatorEngine> = if is_validator {
-            let mut engine = ValidatorEngine::new([0u8; 32]); // epoch randomness set at epoch boundary
-            // Validator key loading is deferred until the validator registers on-chain
-            // and receives their committee assignment. For now, initialize the engine.
+            // Load validator FALCON signing key (required for validator role)
+            let identity = load_validator_identity(datadir)?;
+            info!(
+                address = hex::encode(identity.address),
+                "validator identity loaded"
+            );
+
+            // Check stake if state is available (non-genesis)
+            if !state.is_empty() {
+                let balance_key = pyde_state::keys::balance_key(&identity.address);
+                let balance = state.get(&balance_key)
+                    .map(|b| {
+                        if b.len() >= 16 {
+                            let mut buf = [0u8; 16];
+                            buf.copy_from_slice(&b[..16]);
+                            u128::from_le_bytes(buf)
+                        } else {
+                            0u128
+                        }
+                    })
+                    .unwrap_or(0);
+
+                verify_stake(balance).map_err(|e| {
+                    format!("cannot start as validator: {}", e)
+                })?;
+                info!(balance, "validator stake verified");
+            } else {
+                warn!("state is empty (genesis) — stake verification deferred until chain syncs");
+            }
+
+            let mut engine = ValidatorEngine::new([0u8; 32]);
             info!("validator consensus engine initialized");
             Some(engine)
         } else {
@@ -247,6 +275,62 @@ fn handle_swarm_event(
         // All other events
         _ => {}
     }
+}
+
+/// Load validator FALCON signing key from disk.
+/// Requires `validator.key` to exist in the data directory.
+/// Use `pyde keygen` to generate one (TODO: add keygen subcommand).
+/// For now, generates on first run if missing.
+fn load_validator_identity(datadir: &Path) -> Result<ValidatorIdentity, String> {
+    let key_path = datadir.join("validator.key");
+
+    let (pk, sk) = if key_path.exists() {
+        let bytes = std::fs::read(&key_path)
+            .map_err(|e| format!("failed to read {}: {}", key_path.display(), e))?;
+
+        // Format: pk_len(4 bytes LE) || pk_bytes || sk_bytes
+        if bytes.len() < 4 {
+            return Err("validator.key is corrupted (too short)".into());
+        }
+        let pk_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        if bytes.len() < 4 + pk_len {
+            return Err("validator.key is corrupted (pk truncated)".into());
+        }
+        let pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(&bytes[4..4 + pk_len])
+            .ok_or("validator.key has invalid public key")?;
+        let sk = pyde_crypto::falcon::FalconSecretKey::from_bytes(&bytes[4 + pk_len..])
+            .ok_or("validator.key has invalid secret key")?;
+        info!(path = %key_path.display(), "loaded validator signing key");
+        (pk, sk)
+    } else {
+        // Generate new validator key
+        let (pk, sk) = pyde_crypto::falcon::falcon_keygen()
+            .map_err(|e| format!("failed to generate validator key: {}", e))?;
+
+        // Serialize: pk_len || pk || sk
+        let pk_bytes = pk.as_bytes();
+        let sk_bytes = sk.as_bytes();
+        let mut buf = Vec::with_capacity(4 + pk_bytes.len() + sk_bytes.len());
+        buf.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(pk_bytes);
+        buf.extend_from_slice(sk_bytes);
+
+        std::fs::write(&key_path, &buf)
+            .map_err(|e| format!("failed to write {}: {}", key_path.display(), e))?;
+        info!(path = %key_path.display(), "generated new validator signing key");
+        (pk, sk)
+    };
+
+    let pk_bytes = pk.as_bytes().to_vec();
+    let address = pyde_account::address::derive_eoa_address(&pk_bytes);
+
+    Ok(ValidatorIdentity {
+        address,
+        public_key: pk,
+        secret_key: sk,
+        committee_index: 0, // assigned when joining committee
+        key_share: None,    // assigned at epoch boundary
+    })
 }
 
 /// Load node identity from disk, or generate and persist a new one.
