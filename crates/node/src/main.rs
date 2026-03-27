@@ -11,6 +11,7 @@ mod state_manager;
 mod sync;
 mod tx_relay;
 mod validator;
+pub mod wire;
 
 use clap::Parser;
 use cli::{Cli, Command};
