@@ -39,6 +39,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
+# RPC
+jsonrpsee = { version = "0.24", features = ["server", "macros"] }
+
 # Misc
 directories = "5"
 hex = "0.4"
