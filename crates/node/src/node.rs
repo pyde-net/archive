@@ -3,16 +3,19 @@ use crate::chain::ChainState;
 use crate::config::NodeConfig;
 use crate::shutdown::ShutdownSignal;
 use crate::state_manager::StateManager;
+use crate::sync::ChainSync;
 use crate::tx_relay::TxRelay;
 use crate::validator::{ValidatorEngine, ValidatorIdentity, verify_stake};
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub;
+use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
+use libp2p::PeerId;
 use pyde_net::channels::Channel;
 use pyde_net::config::NetworkConfig;
 use pyde_net::node::{
     create_node, generate_keypair, keypair_from_bytes, keypair_to_bytes, subscribe_topics,
-    PydeBehaviourEvent,
+    PydeBehaviour, PydeBehaviourEvent,
 };
 use std::path::Path;
 use tracing::{debug, info, warn};
@@ -65,7 +68,11 @@ impl PydeNode {
         // 3. Transaction relay / mempool
         let mut tx_relay = TxRelay::new();
 
-        // 4. Validator engine (only for validator role)
+        // 4. Chain sync
+        let mut chain_sync = ChainSync::new();
+        chain_sync.manager.local_tip = chain.head_slot;
+
+        // 5. Validator engine (only for validator role)
         let mut validator_engine: Option<ValidatorEngine> = if is_validator {
             // Load validator FALCON signing key (required for validator role)
             let identity = load_validator_identity(datadir)?;
@@ -155,19 +162,42 @@ impl PydeNode {
         // --- Main event loop ---
         let mut shutdown_rx = self.shutdown.subscribe();
 
-        // Periodic maintenance timer (every 10 seconds)
+        // Periodic timers
         let mut maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => {
-                    handle_swarm_event(
+                    // Process event, collecting any actions that need the swarm
+                    let action = handle_swarm_event(
                         event,
                         &mut chain,
                         &mut state,
                         &mut tx_relay,
+                        &mut chain_sync,
                         &mut validator_engine,
                     );
+
+                    // Execute post-event actions that need swarm access
+                    match action {
+                        PostEventAction::None => {}
+                        PostEventAction::RequestChainTip(peer) => {
+                            chain_sync.request_chain_tip(&mut swarm, peer);
+                        }
+                        PostEventAction::SendSyncResponse(channel, response) => {
+                            let _ = swarm.behaviour_mut().sync.send_response(channel, response);
+                        }
+                        PostEventAction::ContinueSync => {
+                            chain_sync.request_next_batch(&mut swarm);
+                        }
+                    }
+                }
+                _ = sync_interval.tick() => {
+                    // Try to sync if we're behind
+                    if chain_sync.is_syncing() {
+                        chain_sync.request_next_batch(&mut swarm);
+                    }
                 }
                 _ = maintenance_interval.tick() => {
                     // Periodic maintenance
@@ -179,6 +209,8 @@ impl PydeNode {
                         peers = peer_count,
                         mempool = tx_relay.mempool_size(),
                         head = chain.head_slot,
+                        syncing = chain_sync.is_syncing(),
+                        behind = chain_sync.manager.slots_behind(),
                         "maintenance tick"
                     );
                 }
@@ -198,14 +230,25 @@ impl PydeNode {
     }
 }
 
-/// Handle a libp2p swarm event.
+use pyde_net::sync_protocol::{SyncReq, SyncResp};
+
+/// Action to take after processing a swarm event (avoids borrow conflicts with swarm).
+enum PostEventAction {
+    None,
+    RequestChainTip(PeerId),
+    SendSyncResponse(request_response::ResponseChannel<SyncResp>, SyncResp),
+    ContinueSync,
+}
+
+/// Handle a libp2p swarm event. Returns an action that may need swarm access.
 fn handle_swarm_event(
     event: SwarmEvent<PydeBehaviourEvent>,
     chain: &mut ChainState,
     state: &mut StateManager,
     tx_relay: &mut TxRelay,
+    chain_sync: &mut ChainSync,
     validator_engine: &mut Option<ValidatorEngine>,
-) {
+) -> PostEventAction {
     match event {
         // --- Gossipsub message received ---
         SwarmEvent::Behaviour(PydeBehaviourEvent::Gossipsub(
@@ -217,23 +260,13 @@ fn handle_swarm_event(
             match channel {
                 Some(Channel::Transactions) => {
                     debug!(bytes = message.data.len(), "received tx gossip");
-                    // Tx deserialization will be wired when we have a wire format
-                    // for EncryptedTx. For now, log receipt.
                 }
                 Some(Channel::Blocks) => {
                     debug!(bytes = message.data.len(), "received block gossip");
-                    // Block deserialization and processing will be wired when we have
-                    // a wire format for blocks.
                 }
                 Some(Channel::Consensus) => {
-                    if let Some(engine) = validator_engine.as_mut() {
+                    if let Some(_engine) = validator_engine.as_mut() {
                         debug!(bytes = message.data.len(), "received consensus message");
-                        // Consensus message deserialization and dispatch:
-                        // - Proposal → engine.on_proposal()
-                        // - Vote → engine.on_vote()
-                        // - ViewChange → engine.on_view_change()
-                        // - FinalityVote → engine.on_finality_vote()
-                        // Wire format serialization is a Phase 10 integration task.
                     }
                 }
                 Some(Channel::Sync) => {
@@ -243,9 +276,45 @@ fn handle_swarm_event(
                     debug!(topic, "received message on unknown topic");
                 }
             }
+            PostEventAction::None
         }
 
-        // --- Peer connected ---
+        // --- Sync: inbound request from peer ---
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Sync(
+            request_response::Event::Message {
+                message: request_response::Message::Request { request, channel, .. },
+                peer,
+            },
+        )) => {
+            debug!(%peer, "inbound sync request");
+            let response = ChainSync::handle_inbound_request(&request, chain);
+            PostEventAction::SendSyncResponse(channel, response)
+        }
+
+        // --- Sync: response to our outbound request ---
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Sync(
+            request_response::Event::Message {
+                message: request_response::Message::Response { request_id, response },
+                ..
+            },
+        )) => {
+            chain_sync.on_response(request_id, response, chain, state);
+            if chain_sync.is_syncing() {
+                PostEventAction::ContinueSync
+            } else {
+                PostEventAction::None
+            }
+        }
+
+        // --- Sync request failed ---
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Sync(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            warn!(%peer, ?error, "sync request failed");
+            PostEventAction::None
+        }
+
+        // --- Peer connected: ask for their chain tip ---
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
         } => {
@@ -254,6 +323,7 @@ fn handle_swarm_event(
                 addr = %endpoint.get_remote_address(),
                 "peer connected"
             );
+            PostEventAction::RequestChainTip(peer_id)
         }
 
         // --- Peer disconnected ---
@@ -265,15 +335,17 @@ fn handle_swarm_event(
                 cause = ?cause,
                 "peer disconnected"
             );
+            PostEventAction::None
         }
 
         // --- Listening on address ---
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "listening on");
+            PostEventAction::None
         }
 
         // All other events
-        _ => {}
+        _ => PostEventAction::None,
     }
 }
 

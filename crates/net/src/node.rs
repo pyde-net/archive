@@ -11,10 +11,11 @@
 //! Both are isolated to this module — no changes needed above transport layer.
 
 use crate::config::NetworkConfig;
+use crate::sync_protocol::{self, SyncReq, SyncResp};
 use libp2p::{
     gossipsub, identify, identity,
     kad::{self, store::MemoryStore},
-    noise,
+    noise, request_response,
     swarm::NetworkBehaviour,
     Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
@@ -29,6 +30,8 @@ pub struct PydeBehaviour {
     pub kademlia: kad::Behaviour<MemoryStore>,
     /// Identify protocol (exchange peer info on connect).
     pub identify: identify::Behaviour,
+    /// Request-response for sync protocol (block download, chain tip queries).
+    pub sync: request_response::cbor::Behaviour<SyncReq, SyncResp>,
 }
 
 /// Generate a new node keypair. Call once on first run, then persist.
@@ -88,10 +91,14 @@ pub fn create_node(config: &NetworkConfig, local_key: identity::Keypair) -> Resu
                 key.public(),
             ));
 
+            // Sync request-response protocol
+            let sync = sync_protocol::sync_behaviour();
+
             Ok(PydeBehaviour {
                 gossipsub,
                 kademlia,
                 identify,
+                sync,
             })
         })
         .map_err(|e| format!("behaviour error: {e}"))?
