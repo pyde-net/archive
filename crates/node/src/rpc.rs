@@ -393,31 +393,28 @@ impl PydeApiServer for RpcServer {
 
         // Load contract storage from SMT (read-only, slots 0..64)
         // Use the VM's key derivation: poseidon2(slot_bytes ++ contract_address)
-        // Pre-load storage from manifest (known keys from previous writes)
-        let mut manifest_input = Vec::with_capacity(44);
-        manifest_input.extend_from_slice(b"storage_keys");
-        manifest_input.extend_from_slice(&to);
-        let manifest_key = sparse_merkle_tree::H256::from(
-            pyde_crypto::poseidon2::poseidon2_hash(&manifest_input).to_bytes()
-        );
-        if let Some(key_list) = state.get(&manifest_key) {
-            for chunk in key_list.chunks(32) {
-                if chunk.len() == 32 {
-                    let mut key_bytes = [0u8; 32];
-                    key_bytes.copy_from_slice(chunk);
-                    let vm_key = ethnum::U256::from_le_bytes(key_bytes);
-                    let smt_key = sparse_merkle_tree::H256::from(key_bytes);
-                    if let Some(value_bytes) = state.get(&smt_key) {
-                        vm.storage.insert(vm_key, value_bytes);
-                    }
-                }
-            }
-        }
         drop(state);
+
+        // Lazy storage: VM reads from SMT on demand during Sload.
+        // No manifest, no pre-loading — just query the database when needed.
+        let state_arc = self.state.state.clone();
+        vm.storage_backend = Some(Box::new(move |key: &ethnum::U256| {
+            let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            state_arc.try_read().ok()?.get(&smt_key)
+        }));
 
         if let Err(e) = vm.load(&code) {
             return Err(rpc_err(-32000, format!("failed to load code: {:?}", e)));
         }
+
+        // Debug: what key does the VM derive for slot 0?
+        let slot0_key = vm.derive_storage_key(ethnum::U256::ZERO);
+        let in_storage = vm.storage.contains_key(&slot0_key);
+        tracing::info!(
+            slot0_key = hex::encode(slot0_key.to_le_bytes()),
+            in_storage,
+            "pyde_call: slot 0 key check"
+        );
 
         let output = vm.execute();
         let success = output.outcome == pyde_vm::vm::Outcome::Success;

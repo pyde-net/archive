@@ -462,11 +462,14 @@ impl CodeGen {
     }
 
     /// Decode function params from calldata into arg registers (r2, r3, ...).
+    /// For regular functions, params start after the 4-byte selector.
+    /// For constructors, params start at offset 0 (no selector).
     fn emit_calldata_decode(&mut self, func: &IrFunction) {
+        let selector_skip = if func.is_constructor { 0 } else { 4 };
         for (i, (_name, ty)) in func.params.iter().enumerate() {
             let phys = (i as u8) + 2; // r2, r3, r4, ...
             let is_wide = is_wide_type(ty);
-            let param_offset = 4 + (i as i32) * if is_wide { 32 } else { 8 }; // skip 4-byte selector
+            let param_offset = selector_skip + (i as i32) * if is_wide { 32 } else { 8 };
 
             if is_wide {
                 // Compute address: r14 = r5 + offset
