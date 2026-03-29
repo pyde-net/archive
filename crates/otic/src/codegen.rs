@@ -1543,8 +1543,8 @@ impl CodeGen {
     /// Returns the number of bytes written.
     fn emit_key_store(&mut self, reg: u8, base: u8, offset: i32, wide: bool) -> u32 {
         if wide {
-            let imm = encode_mem_immediate(offset, MemWidth::W64).unwrap();
-            self.emit_op(Opcode::Wstore, reg, base, imm);
+            // Wstore takes a plain byte offset (sign-extended 18-bit), NOT encode_mem_immediate
+            self.emit_op(Opcode::Wstore, reg, base, (offset as u32) & 0x3FFFF);
             32
         } else {
             self.emit_store(reg, base, offset);
