@@ -247,14 +247,45 @@ impl PydeApiServer for RpcServer {
             pyde_tx::types::TransactionType::Standard
         };
 
+        // For deploy txs: encode constructor length prefix so pipeline can split.
+        // Format: constructor_len(4 LE) + constructor_bytes + runtime_bytes + constructor_args
+        let deploy_data = if tx_type == pyde_tx::types::TransactionType::Deploy {
+            let constructor_len = tx_obj.get("constructorLen")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let constructor_args_hex = tx_obj.get("constructorArgs")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let constructor_args = hex::decode(
+                constructor_args_hex.strip_prefix("0x").unwrap_or(constructor_args_hex)
+            ).unwrap_or_default();
+
+            // Compute runtime length (data = full bytecode = constructor + runtime)
+            let runtime_len = if constructor_len > 0 && data.len() > constructor_len as usize {
+                (data.len() - constructor_len as usize) as u32
+            } else {
+                data.len() as u32
+            };
+
+            // Format: constructor_len(4 LE) + runtime_len(4 LE) + constructor + runtime + args
+            let mut encoded = Vec::with_capacity(8 + data.len() + constructor_args.len());
+            encoded.extend_from_slice(&constructor_len.to_le_bytes());
+            encoded.extend_from_slice(&runtime_len.to_le_bytes());
+            encoded.extend_from_slice(&data);
+            encoded.extend_from_slice(&constructor_args);
+            encoded
+        } else {
+            data
+        };
+
         let tx = pyde_tx::types::Transaction {
             from,
             to,
             value,
-            data,
+            data: deploy_data,
             gas_limit,
             nonce,
-            signature: vec![],  // devnet: signature validation skipped for chain_id 31337
+            signature: vec![],
             fee_payer: pyde_tx::types::FeePayer::Sender,
             access_list: vec![],
             deadline: None,

@@ -178,17 +178,86 @@ pub fn execute_transaction(
             }
         }
         TransactionType::Deploy => {
-            // Contract deployment
+            // Contract deployment with constructor execution.
+            // tx.data format: constructor_len(4 LE) + constructor_bytes + runtime_bytes + constructor_args
+            // If constructor_len == 0: store tx.data[4..] as runtime (no constructor).
             let new_addr = pyde_account::address::derive_create_address(
                 &tx.from,
                 sender.nonce,
             );
-            store_code(smt, &new_addr, &tx.data)?;
 
-            let contract = Account::new_contract(new_addr, &tx.data);
-            store_account(smt, &contract)?;
+            let (runtime_code, gas_used) = if tx.data.len() >= 8 {
+                let mut clen_bytes = [0u8; 4];
+                clen_bytes.copy_from_slice(&tx.data[..4]);
+                let constructor_len = u32::from_le_bytes(clen_bytes) as usize;
 
-            (true, 32_000u64, 0u64, vec![])
+                let mut rlen_bytes = [0u8; 4];
+                rlen_bytes.copy_from_slice(&tx.data[4..8]);
+                let runtime_len = u32::from_le_bytes(rlen_bytes) as usize;
+
+                // Validate header: lengths must be sane and total must fit
+                if constructor_len > 0
+                    && runtime_len > 0
+                    && constructor_len + runtime_len <= tx.data.len()
+                    && tx.data.len() >= 8 + constructor_len + runtime_len
+                {
+                    let constructor = &tx.data[8..8 + constructor_len];
+                    let runtime = &tx.data[8 + constructor_len..8 + constructor_len + runtime_len];
+                    // Args for constructor come after runtime — extract if present
+                    // Actually, constructor args are encoded in calldata when running constructor.
+                    // For now, run constructor without args (init sets state).
+
+                    // Store runtime code first (constructor may reference self_address)
+                    store_code(smt, &new_addr, runtime)?;
+                    let contract = Account::new_contract(new_addr, runtime);
+                    store_account(smt, &contract)?;
+
+                    // Execute constructor.
+                    // Constructor args follow the runtime bytecode in the deploy data.
+                    // Format: [4-byte len][constructor][runtime][args]
+                    // Everything after constructor+runtime is the args.
+                    let header_plus_code = 8 + constructor_len + runtime_len;
+                    let constructor_args = if tx.data.len() > header_plus_code {
+                        tx.data[header_plus_code..].to_vec()
+                    } else {
+                        vec![]
+                    };
+                    let mut constructor_tx = tx.clone();
+                    constructor_tx.to = new_addr;
+                    constructor_tx.data = constructor_args;
+                    tracing::debug!(
+                        constructor_len,
+                        runtime_len = runtime.len(),
+                        args_len = constructor_tx.data.len(),
+                        contract = hex::encode(new_addr),
+                        "executing constructor"
+                    );
+                    let (success, gas, _, logs) = execute_in_pvm(
+                        &constructor_tx, &sender, constructor, smt, block_ctx,
+                    );
+                    if !success {
+                        tracing::warn!(gas, "constructor execution failed (reverted or trapped)");
+                    } else {
+                        tracing::info!(gas, "constructor executed successfully");
+                    }
+
+                    (runtime.to_vec(), 32_000 + gas)
+                } else {
+                    // No valid header — store all data as runtime (raw deploy)
+                    store_code(smt, &new_addr, &tx.data)?;
+                    let contract = Account::new_contract(new_addr, &tx.data);
+                    store_account(smt, &contract)?;
+                    (tx.data.clone(), 32_000u64)
+                }
+            } else {
+                // Fallback: store all data as code
+                store_code(smt, &new_addr, &tx.data)?;
+                let contract = Account::new_contract(new_addr, &tx.data);
+                store_account(smt, &contract)?;
+                (tx.data.clone(), 32_000u64)
+            };
+
+            (true, gas_used, 0u64, vec![])
         }
         _ => {
             // Simple transfer or batch (batch deferred)
