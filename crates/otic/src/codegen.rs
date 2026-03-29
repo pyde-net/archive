@@ -234,6 +234,8 @@ pub struct CodeGen {
     field_offsets: HashMap<String, u32>,
     /// Label counter for generating unique labels.
     label_counter: u32,
+    /// Current function's IR label → codegen label remapping.
+    current_label_remap: Option<HashMap<Label, Label>>,
 }
 
 impl CodeGen {
@@ -251,7 +253,15 @@ impl CodeGen {
             struct_defs: HashMap::new(),
             field_offsets: HashMap::new(),
             label_counter: 0,
+            current_label_remap: None,
         }
+    }
+
+    /// Remap an IR label to a unique codegen label (prevents cross-function collisions).
+    fn remap_label(&self, label: Label) -> Label {
+        self.current_label_remap.as_ref()
+            .and_then(|m| m.get(&label).copied())
+            .unwrap_or(label)
     }
 
     fn alloc_label(&mut self) -> Label {
@@ -537,6 +547,15 @@ impl CodeGen {
         self.regs.reset();
         self.needs_guard_cleanup = false;
 
+        // Remap IR labels to unique codegen labels to prevent cross-function collisions.
+        // IR labels (L0, L1, L2, ...) restart per function, but codegen label_offsets is global.
+        // Without remapping, a later function's L0 overwrites an earlier function's L0.
+        let mut label_remap: HashMap<Label, Label> = HashMap::new();
+        for block in &func.blocks {
+            let unique = self.alloc_label();
+            label_remap.insert(block.label, unique);
+        }
+
         // In test mode (no guards/dispatch), every function needs heap init
         // because there's no dispatch wrapper to do it.
         // In production mode, the dispatch wrapper handles heap init.
@@ -560,13 +579,19 @@ impl CodeGen {
             self.regs.pre_map(vreg, phys);
         }
 
+        // Store label remap for use in gen_instruction
+        self.current_label_remap = Some(label_remap);
+
         // Generate each basic block
         for block in &func.blocks {
-            self.mark_label(block.label);
+            let mapped = self.remap_label(block.label);
+            self.mark_label(mapped);
             for inst in &block.instructions {
                 self.gen_instruction(inst, is_entry);
             }
         }
+
+        self.current_label_remap = None;
     }
 
     // ========================================================================
@@ -936,13 +961,16 @@ impl CodeGen {
             }
 
             Inst::Jump(label) => {
-                self.emit_jump_placeholder(Opcode::Jmp, 0, 0, *label);
+                let mapped = self.remap_label(*label);
+                self.emit_jump_placeholder(Opcode::Jmp, 0, 0, mapped);
             }
 
             Inst::Branch(cond, then_label, else_label) => {
                 let rc = self.get_reg(*cond);
-                self.emit_jump_placeholder(Opcode::Bne, rc, 0, *then_label);
-                self.emit_jump_placeholder(Opcode::Jmp, 0, 0, *else_label);
+                let mapped_then = self.remap_label(*then_label);
+                let mapped_else = self.remap_label(*else_label);
+                self.emit_jump_placeholder(Opcode::Bne, rc, 0, mapped_then);
+                self.emit_jump_placeholder(Opcode::Jmp, 0, 0, mapped_else);
             }
 
             Inst::Return(val) => {
