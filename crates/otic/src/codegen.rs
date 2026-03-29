@@ -465,19 +465,20 @@ impl CodeGen {
     /// For regular functions, params start after the 4-byte selector.
     /// For constructors, params start at offset 0 (no selector).
     fn emit_calldata_decode(&mut self, func: &IrFunction) {
-        let selector_skip = if func.is_constructor { 0 } else { 4 };
+        let selector_skip = if func.is_constructor { 0i32 } else { 4 };
+        let mut param_offset = selector_skip;
         for (i, (_name, ty)) in func.params.iter().enumerate() {
             let phys = (i as u8) + 2; // r2, r3, r4, ...
             let is_wide = is_wide_type(ty);
-            let param_offset = selector_skip + (i as i32) * if is_wide { 32 } else { 8 };
 
             if is_wide {
                 // Compute address: r14 = r5 + offset
                 self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 5, param_offset as u32 & 0x3FFFF);
                 self.emit_op(Opcode::Wload, phys, memory::REG_SCRATCH_0, 0);
-                // Note: wide params go into wide register with same index
+                param_offset += 32;
             } else {
                 self.emit_load(phys, 5, param_offset);
+                param_offset += 8;
             }
         }
     }
@@ -795,13 +796,13 @@ impl CodeGen {
             Inst::StorageMapGet(dst, field, key) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
                 let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let key_ty = map_key_type(&map_ty);
                 let val_ty = map_value_type(&map_ty);
+                let key_wide = is_wide_type(&key_ty);
                 let wide_value = is_wide_type(&val_ty);
 
-                // Derive storage key: poseidon2(slot || map_key)
                 let rk = self.get_reg(*key);
-                self.emit_map_key_derivation(slot, rk);
-                // w7 now holds the derived key
+                self.emit_map_key_derivation(slot, rk, key_wide);
 
                 if wide_value {
                     let wd = self.regs.alloc_wide(*dst);
@@ -815,12 +816,14 @@ impl CodeGen {
             Inst::StorageMapSet(field, key, val) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
                 let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let key_ty = map_key_type(&map_ty);
                 let val_ty = map_value_type(&map_ty);
+                let key_wide = is_wide_type(&key_ty);
                 let wide_value = is_wide_type(&val_ty);
 
                 let rk = self.get_reg(*key);
                 let rv = self.get_reg(*val);
-                self.emit_map_key_derivation(slot, rk);
+                self.emit_map_key_derivation(slot, rk, key_wide);
 
                 if wide_value {
                     self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0);
@@ -832,13 +835,17 @@ impl CodeGen {
             Inst::StorageNestedMapGet(dst, field, key1, key2) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
                 let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
-                let val_ty = map_value_type(&map_value_type(&map_ty));
+                let key1_ty = map_key_type(&map_ty);
+                let inner_map_ty = map_value_type(&map_ty);
+                let key2_ty = map_key_type(&inner_map_ty);
+                let val_ty = map_value_type(&inner_map_ty);
+                let key1_wide = is_wide_type(&key1_ty);
+                let key2_wide = is_wide_type(&key2_ty);
                 let wide_value = is_wide_type(&val_ty);
 
                 let rk1 = self.get_reg(*key1);
                 let rk2 = self.get_reg(*key2);
-                self.emit_nested_map_key_derivation(slot, rk1, rk2);
-                // w7 now holds the derived key
+                self.emit_nested_map_key_derivation(slot, rk1, key1_wide, rk2, key2_wide);
 
                 if wide_value {
                     let wd = self.regs.alloc_wide(*dst);
@@ -852,13 +859,18 @@ impl CodeGen {
             Inst::StorageNestedMapSet(field, key1, key2, val) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
                 let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
-                let val_ty = map_value_type(&map_value_type(&map_ty));
+                let key1_ty = map_key_type(&map_ty);
+                let inner_map_ty = map_value_type(&map_ty);
+                let key2_ty = map_key_type(&inner_map_ty);
+                let val_ty = map_value_type(&inner_map_ty);
+                let key1_wide = is_wide_type(&key1_ty);
+                let key2_wide = is_wide_type(&key2_ty);
                 let wide_value = is_wide_type(&val_ty);
 
                 let rk1 = self.get_reg(*key1);
                 let rk2 = self.get_reg(*key2);
                 let rv = self.get_reg(*val);
-                self.emit_nested_map_key_derivation(slot, rk1, rk2);
+                self.emit_nested_map_key_derivation(slot, rk1, key1_wide, rk2, key2_wide);
 
                 if wide_value {
                     self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0);
@@ -1498,31 +1510,56 @@ impl CodeGen {
 
     /// Derive a map storage key: w7 = poseidon2(slot || key).
     /// Writes slot + key to heap memory, hashes them, result in w7.
-    fn emit_map_key_derivation(&mut self, slot: u32, key_reg: u8) {
-        // Store slot to heap
+    /// Store a register value to heap at the given offset.
+    /// Uses Wstore for wide types (32 bytes), Store for GP types (8 bytes).
+    /// Returns the number of bytes written.
+    fn emit_key_store(&mut self, reg: u8, base: u8, offset: i32, wide: bool) -> u32 {
+        if wide {
+            let imm = encode_mem_immediate(offset, MemWidth::W64).unwrap();
+            self.emit_op(Opcode::Wstore, reg, base, imm);
+            32
+        } else {
+            self.emit_store(reg, base, offset);
+            8
+        }
+    }
+
+    /// Derive a map storage key: w7 = poseidon2(slot || key).
+    /// Handles any key type (GP or wide).
+    fn emit_map_key_derivation(&mut self, slot: u32, key_reg: u8, key_wide: bool) {
+        let mut offset = 0i32;
+        // Store slot (8 bytes)
         self.emit_op(Opcode::Addi, 15, 0, slot);
-        self.emit_store(15, 12, 0);   // heap[0] = slot
-        // Store key to heap
-        self.emit_store(key_reg, 12, 8); // heap[8] = key
-        // Hash 16 bytes: poseidon(mem[r12..r12+16])
-        self.emit_op(Opcode::Addi, 14, 0, 16);  // r14 = 16 (byte length)
-        // Poseidon: w7 = hash(mem[r12..r12+r14])
+        self.emit_store(15, 12, offset);
+        offset += 8;
+        // Store key
+        let key_size = self.emit_key_store(key_reg, 12, offset, key_wide);
+        offset += key_size as i32;
+        // Hash: poseidon(mem[r12..r12+total])
+        self.emit_op(Opcode::Addi, 14, 0, offset as u32);
         self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
     }
 
     /// Derive a nested-map storage key: w7 = poseidon2(slot || key1 || key2).
-    /// Writes slot + key1 + key2 (24 bytes) to heap memory, hashes them, result in w7.
-    fn emit_nested_map_key_derivation(&mut self, slot: u32, key1_reg: u8, key2_reg: u8) {
-        // Store slot to heap
+    /// Handles any combination of key types.
+    fn emit_nested_map_key_derivation(
+        &mut self, slot: u32,
+        key1_reg: u8, key1_wide: bool,
+        key2_reg: u8, key2_wide: bool,
+    ) {
+        let mut offset = 0i32;
+        // Store slot (8 bytes)
         self.emit_op(Opcode::Addi, 15, 0, slot);
-        self.emit_store(15, 12, 0);       // heap[0] = slot
-        // Store key1 to heap
-        self.emit_store(key1_reg, 12, 8); // heap[8] = key1
-        // Store key2 to heap
-        self.emit_store(key2_reg, 12, 16); // heap[16] = key2
-        // Hash 24 bytes: poseidon(mem[r12..r12+24])
-        self.emit_op(Opcode::Addi, 14, 0, 24);  // r14 = 24 (byte length)
-        // Poseidon: w7 = hash(mem[r12..r12+r14])
+        self.emit_store(15, 12, offset);
+        offset += 8;
+        // Store key1
+        let k1_size = self.emit_key_store(key1_reg, 12, offset, key1_wide);
+        offset += k1_size as i32;
+        // Store key2
+        let k2_size = self.emit_key_store(key2_reg, 12, offset, key2_wide);
+        offset += k2_size as i32;
+        // Hash
+        self.emit_op(Opcode::Addi, 14, 0, offset as u32);
         self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
     }
 }
@@ -1543,6 +1580,20 @@ fn map_value_type(ty: &Ty) -> Ty {
     } else {
         Ty::U64
     }
+}
+
+/// Extract key type from a Map type.
+fn map_key_type(ty: &Ty) -> Ty {
+    if let Ty::Map(k, _) = ty {
+        *k.clone()
+    } else {
+        Ty::U64
+    }
+}
+
+/// Byte size of a type for storage key derivation.
+fn key_byte_size(ty: &Ty) -> u32 {
+    if is_wide_type(ty) { 32 } else { 8 }
 }
 
 /// Compute byte size of a struct field.

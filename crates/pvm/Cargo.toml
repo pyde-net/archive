@@ -7,6 +7,7 @@ edition = "2021"
 ethnum = "1.5.2"
 pyde-crypto = { path = "../crypto" }
 thiserror = "2"
+tracing = "0.1"
 
 [[bench]]
 name = "interpreter_bench"
