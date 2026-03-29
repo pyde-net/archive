@@ -32,7 +32,7 @@ impl BlockProcessor {
             timestamp: block.header.timestamp,
             base_fee: chain.base_fee,
             block_gas_limit: pyde_tx::fee::GAS_CEILING as u64,
-            chain_id: 1, // TODO: from config
+            chain_id: chain.chain_id,
             validator_address: block.header.proposer,
         };
 
@@ -83,7 +83,7 @@ impl BlockProcessor {
         // 7. Record metrics
         crate::metrics::record_block(slot, tx_count, total_gas, elapsed_ms);
 
-        info!(
+        debug!(
             slot,
             txs = tx_count,
             gas = total_gas,
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn process_genesis_block() {
-        let mut chain = ChainState::genesis([0u8; 32]);
+        let mut chain = ChainState::genesis([0u8; 32], 31337);
         let mut state =
             StateManager::open(&std::env::temp_dir().join("pyde-test-bp2-genesis"), 1024).unwrap();
 
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn reject_old_slot() {
-        let mut chain = ChainState::genesis([0u8; 32]);
+        let mut chain = ChainState::genesis([0u8; 32], 31337);
         let mut state =
             StateManager::open(&std::env::temp_dir().join("pyde-test-bp2-old"), 1024).unwrap();
 
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn sequential_blocks() {
-        let mut chain = ChainState::genesis([0u8; 32]);
+        let mut chain = ChainState::genesis([0u8; 32], 31337);
         let mut state =
             StateManager::open(&std::env::temp_dir().join("pyde-test-bp2-seq"), 1024).unwrap();
 
@@ -221,7 +221,7 @@ mod tests {
         let config = devnet_genesis();
         let _genesis = initialize_genesis(&mut state, &config).unwrap();
 
-        let mut chain = ChainState::genesis(state.root());
+        let mut chain = ChainState::genesis(state.root(), 31337);
 
         // Account 0x0101...01 has 1M PYDE from genesis
         let sender = [0x01; 32];

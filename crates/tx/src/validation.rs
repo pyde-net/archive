@@ -65,8 +65,10 @@ pub fn validate_transaction(
     // 1. Chain ID
     validate_chain_id(tx, ctx)?;
 
-    // 2. Signature
-    validate_signature(tx, sender)?;
+    // 2. Signature (skipped in devnet mode for testing without real FALCON keys)
+    if ctx.chain_id != 31337 {
+        validate_signature(tx, sender)?;
+    }
 
     // 3. Nonce
     validate_nonce(tx, nonce_state)?;

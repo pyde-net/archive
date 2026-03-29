@@ -247,11 +247,12 @@ pub fn execute_transaction(
 }
 
 /// Execute contract code in the PVM.
+/// Loads contract storage from SMT before execution and persists changes after.
 fn execute_in_pvm(
     tx: &Transaction,
     sender: &Account,
     code: &[u8],
-    smt: &PydeSMT,
+    smt: &mut PydeSMT,
     block_ctx: &BlockContext,
 ) -> (bool, u64, u64, Vec<LogEntry>) {
     let ctx = ExecutionContext {
@@ -272,13 +273,34 @@ fn execute_in_pvm(
     let mut vm = Vm::with_gas_limit_and_context(tx.gas_limit, ctx);
     vm.calldata = tx.data.clone();
 
+    // Load contract storage from SMT into VM.
+    // The VM derives storage keys as: poseidon2(slot_bytes ++ contract_address)
+    // We scan slots 0..64 using the same derivation.
+    let contract_addr = tx.to;
+    for slot in 0u64..64 {
+        let vm_key = vm.derive_storage_key(U256::from(slot));
+        let smt_key = H256::from(vm_key.to_le_bytes());
+        if let Some(value_bytes) = smt.get(&smt_key) {
+            vm.storage.insert(vm_key, value_bytes);
+        }
+    }
+
     if vm.load(code).is_err() {
         return (false, tx.gas_limit, 0, vec![]);
     }
 
     let output = vm.execute();
-
     let success = output.outcome == Outcome::Success;
+
+    // Persist VM storage changes back to SMT.
+    // Use the derived key directly (same as what the VM uses internally).
+    if success {
+        for (vm_key, value_bytes) in &vm.storage {
+            let smt_key = H256::from(vm_key.to_le_bytes());
+            let _ = smt.insert(smt_key, value_bytes.clone());
+        }
+    }
+
     let logs = output
         .logs
         .iter()

@@ -23,6 +23,11 @@ pub struct RpcState {
     pub state: Arc<RwLock<StateManager>>,
     pub tx_relay: Arc<RwLock<TxRelay>>,
     pub receipts: Arc<RwLock<ReceiptStore>>,
+    /// Plain transaction queue (devnet mode — no threshold encryption).
+    /// Proposer drains this to build blocks.
+    pub pending_txs: Arc<RwLock<Vec<pyde_tx::types::Transaction>>>,
+    /// Committee threshold public key for encrypting transactions (MEV protection).
+    pub threshold_pk: Option<pyde_crypto::threshold::ThresholdPublicKey>,
 }
 
 /// Define the Pyde JSON-RPC API.
@@ -62,9 +67,14 @@ pub trait PydeApi {
     #[method(name = "pyde_syncing")]
     async fn syncing(&self) -> Result<serde_json::Value, ErrorObjectOwned>;
 
-    /// Submit a signed transaction (hex-encoded wire bytes). Returns tx hash.
+    /// Submit a transaction as JSON object. Returns tx hash.
+    /// Fields: from, to, value (decimal string), data (hex), gas (number), nonce (number).
     #[method(name = "pyde_sendTransaction")]
-    async fn send_transaction(&self, tx_hex: String) -> Result<String, ErrorObjectOwned>;
+    async fn send_transaction(&self, tx_obj: serde_json::Value) -> Result<String, ErrorObjectOwned>;
+
+    /// Submit a raw wire-encoded transaction (hex string). Returns tx hash.
+    #[method(name = "pyde_sendRawTransaction")]
+    async fn send_raw_transaction(&self, tx_hex: String) -> Result<String, ErrorObjectOwned>;
 
     /// Simulate a call without committing (read-only execution). Returns result hex.
     #[method(name = "pyde_call")]
@@ -85,6 +95,12 @@ pub trait PydeApi {
     /// Get the mempool size.
     #[method(name = "pyde_mempoolSize")]
     async fn mempool_size(&self) -> Result<String, ErrorObjectOwned>;
+
+    /// Submit a transaction for threshold encryption and mempool inclusion.
+    /// Accepts a JSON object with: from, to, value, data, gas, nonce, signature.
+    /// The node encrypts it with the committee's threshold public key before adding to mempool.
+    #[method(name = "pyde_sendEncryptedTransaction")]
+    async fn send_encrypted_transaction(&self, tx_obj: serde_json::Value) -> Result<String, ErrorObjectOwned>;
 }
 
 /// RPC server implementation.
@@ -99,15 +115,29 @@ impl PydeApiServer for RpcServer {
         let addr = parse_address(&address)?;
         let key = pyde_state::keys::balance_key(&addr);
         let state = self.state.state.read().await;
-        let balance = state.get(&key).map(|b| decode_u128(&b)).unwrap_or(0);
+        let balance = state.get(&key)
+            .and_then(|b| read_account_balance(&b))
+            .unwrap_or(0);
         Ok(balance.to_string())
     }
 
     async fn get_transaction_count(&self, address: String) -> Result<String, ErrorObjectOwned> {
         let addr = parse_address(&address)?;
+        // Nonce is stored separately at nonce_key (NonceState: base u64 + bitmap u16)
         let key = pyde_state::keys::nonce_key(&addr);
         let state = self.state.state.read().await;
-        let nonce = state.get(&key).map(|b| decode_u64(&b)).unwrap_or(0);
+        let nonce = state.get(&key)
+            .map(|b| {
+                if b.len() >= 10 {
+                    let ns = pyde_account::nonce::NonceState::from_bytes(
+                        &<[u8; 10]>::try_from(&b[..10]).unwrap_or([0u8; 10])
+                    );
+                    ns.base
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
         Ok(nonce.to_string())
     }
 
@@ -189,58 +219,209 @@ impl PydeApiServer for RpcServer {
         }))
     }
 
-    async fn send_transaction(&self, tx_hex: String) -> Result<String, ErrorObjectOwned> {
+    async fn send_transaction(&self, tx_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
+        let from = tx_obj.get("from").and_then(|v| v.as_str())
+            .map(parse_address).transpose()?
+            .ok_or_else(|| rpc_err(-32602, "missing 'from' field".into()))?;
+        let to = tx_obj.get("to").and_then(|v| v.as_str())
+            .map(parse_address).transpose()?
+            .unwrap_or([0u8; 32]);
+        let value: u128 = tx_obj.get("value").and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let data_hex = tx_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let data = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex))
+            .unwrap_or_default();
+        let gas_limit: u64 = tx_obj.get("gas").and_then(|v| v.as_u64())
+            .unwrap_or(21_000);
+        let nonce: u64 = tx_obj.get("nonce").and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let chain_r = self.state.chain.read().await;
+        let chain_id = chain_r.chain_id;
+        drop(chain_r);
+
+        let tx_type = if to == [0u8; 32] {
+            pyde_tx::types::TransactionType::Deploy
+        } else {
+            pyde_tx::types::TransactionType::Standard
+        };
+
+        let tx = pyde_tx::types::Transaction {
+            from,
+            to,
+            value,
+            data,
+            gas_limit,
+            nonce,
+            signature: vec![],  // devnet: signature validation skipped for chain_id 31337
+            fee_payer: pyde_tx::types::FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id,
+            tx_type,
+        };
+
+        // Compute tx hash
+        let tx_bytes = crate::wire::encode_transaction(&tx);
+        let tx_hash = pyde_crypto::poseidon2::poseidon2_hash(&tx_bytes).to_bytes();
+
+        // For deploy txs, compute the contract address
+        let contract_address = if tx_type == pyde_tx::types::TransactionType::Deploy {
+            let addr = pyde_account::address::derive_create_address(&from, nonce);
+            Some(format!("0x{}", hex::encode(addr)))
+        } else {
+            None
+        };
+
+        // Add to pending tx queue
+        let mut pending = self.state.pending_txs.write().await;
+        pending.push(tx);
+        let queue_size = pending.len();
+        drop(pending);
+
+        info!(
+            tx_hash = hex::encode(tx_hash),
+            queue_size,
+            contract = ?contract_address,
+            "transaction accepted into pending queue"
+        );
+
+        // Return tx hash + contract address for deploys
+        if let Some(addr) = contract_address {
+            Ok(serde_json::json!({
+                "txHash": format!("0x{}", hex::encode(tx_hash)),
+                "contractAddress": addr,
+            }).to_string())
+        } else {
+            Ok(format!("0x{}", hex::encode(tx_hash)))
+        }
+    }
+
+    async fn send_raw_transaction(&self, tx_hex: String) -> Result<String, ErrorObjectOwned> {
         let hex_str = tx_hex.strip_prefix("0x").unwrap_or(&tx_hex);
         let tx_bytes = hex::decode(hex_str)
             .map_err(|e| rpc_err(-32602, format!("invalid tx hex: {}", e)))?;
-
-        // Decode the transaction from wire format
         let tx = crate::wire::decode_transaction(&tx_bytes)
             .map_err(|e| rpc_err(-32602, format!("invalid tx encoding: {}", e)))?;
-
-        // Compute tx hash
         let tx_hash = pyde_crypto::poseidon2::poseidon2_hash(&tx_bytes).to_bytes();
 
-        // TODO: add to mempool (encrypted tx flow requires threshold encryption)
-        // For now, log and return the hash
-        info!(tx_hash = hex::encode(tx_hash), "transaction received via RPC");
+        let mut pending = self.state.pending_txs.write().await;
+        pending.push(tx);
+        drop(pending);
 
         Ok(format!("0x{}", hex::encode(tx_hash)))
     }
 
     async fn call(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
-        let (tx, block_ctx) = parse_call_object(&call_obj, &self.state).await?;
+        let from = call_obj.get("from").and_then(|v| v.as_str())
+            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
+        let to = call_obj.get("to").and_then(|v| v.as_str())
+            .map(parse_address).transpose()?
+            .ok_or_else(|| rpc_err(-32602, "missing 'to' for call".into()))?;
+        let data_hex = call_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let calldata = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex))
+            .unwrap_or_default();
+        let gas_limit: u64 = call_obj.get("gas").and_then(|v| v.as_u64())
+            .unwrap_or(1_000_000);
 
-        // Clone the SMT for read-only execution (don't mutate real state)
-        let mut state = self.state.state.write().await;
-        let smt = state.smt_mut();
+        // Load contract code
+        let state = self.state.state.read().await;
+        let code_key = pyde_state::keys::code_key(&to);
+        let code = state.get(&code_key)
+            .ok_or_else(|| rpc_err(-32000, "no code at address".into()))?;
+        drop(state);
 
-        match execute_transaction(&tx, smt, &block_ctx) {
-            Ok(receipt) => {
-                if receipt.success {
-                    // Return logs data as hex (first log's data, or empty)
-                    let data = receipt.logs.first()
-                        .map(|l| hex::encode(&l.data))
-                        .unwrap_or_default();
-                    Ok(format!("0x{}", data))
-                } else {
-                    Err(rpc_err(-32000, "execution reverted".to_string()))
-                }
+        // Run PVM directly — no validation, no nonce/balance checks
+        let ctx = pyde_vm::vm::ExecutionContext {
+            caller: from,
+            self_address: to,
+            call_value: ethnum::U256::ZERO,
+            block_number: 0,
+            timestamp: 0,
+            gas_price: ethnum::U256::ZERO,
+            tx_nonce: 0,
+            tx_gas_limit: gas_limit,
+            tx_hash: ethnum::U256::ZERO,
+            block_proposer: [0u8; 32],
+            block_hashes: vec![],
+            balances: std::collections::HashMap::new(),
+        };
+
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(gas_limit, ctx);
+        vm.calldata = calldata;
+
+        // Load contract storage from SMT (read-only, slots 0..64)
+        // Use the VM's key derivation: poseidon2(slot_bytes ++ contract_address)
+        let state = self.state.state.read().await;
+        for slot in 0u64..64 {
+            let vm_key = vm.derive_storage_key(ethnum::U256::from(slot));
+            let smt_key = sparse_merkle_tree::H256::from(vm_key.to_le_bytes());
+            if let Some(value_bytes) = state.get(&smt_key) {
+                vm.storage.insert(vm_key, value_bytes);
             }
-            Err(e) => Err(rpc_err(-32000, format!("call failed: {:?}", e))),
+        }
+        drop(state);
+
+        if let Err(e) = vm.load(&code) {
+            return Err(rpc_err(-32000, format!("failed to load code: {:?}", e)));
+        }
+
+        let output = vm.execute();
+        let success = output.outcome == pyde_vm::vm::Outcome::Success;
+
+        if success {
+            Ok(format!("0x{:x}", output.gas_used))
+        } else {
+            Err(rpc_err(-32000, format!("execution failed: {:?}", output.outcome)))
         }
     }
 
     async fn estimate_gas(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
-        let (tx, block_ctx) = parse_call_object(&call_obj, &self.state).await?;
+        // Run the same as call but return gas used
+        let from = call_obj.get("from").and_then(|v| v.as_str())
+            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
+        let to = call_obj.get("to").and_then(|v| v.as_str())
+            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
+        let data_hex = call_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let calldata = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex))
+            .unwrap_or_default();
+        let gas_limit: u64 = call_obj.get("gas").and_then(|v| v.as_u64())
+            .unwrap_or(1_000_000);
 
-        let mut state = self.state.state.write().await;
-        let smt = state.smt_mut();
-
-        match execute_transaction(&tx, smt, &block_ctx) {
-            Ok(receipt) => Ok(format!("0x{:x}", receipt.gas_used)),
-            Err(e) => Err(rpc_err(-32000, format!("gas estimation failed: {:?}", e))),
+        if to == [0u8; 32] {
+            // Deploy estimation
+            return Ok(format!("0x{:x}", 32_000 + calldata.len() as u64 * 16));
         }
+
+        let state = self.state.state.read().await;
+        let code_key = pyde_state::keys::code_key(&to);
+        let code = match state.get(&code_key) {
+            Some(c) => c,
+            None => return Ok(format!("0x{:x}", 21_000)), // simple transfer
+        };
+        drop(state);
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            caller: from,
+            self_address: to,
+            call_value: ethnum::U256::ZERO,
+            block_number: 0,
+            timestamp: 0,
+            gas_price: ethnum::U256::ZERO,
+            tx_nonce: 0,
+            tx_gas_limit: gas_limit,
+            tx_hash: ethnum::U256::ZERO,
+            block_proposer: [0u8; 32],
+            block_hashes: vec![],
+            balances: std::collections::HashMap::new(),
+        };
+
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(gas_limit, ctx);
+        vm.calldata = calldata;
+        let _ = vm.load(&code);
+        let output = vm.execute();
+        Ok(format!("0x{:x}", output.gas_used))
     }
 
     async fn get_transaction_receipt(&self, tx_hash: String) -> Result<serde_json::Value, ErrorObjectOwned> {
@@ -283,6 +464,58 @@ impl PydeApiServer for RpcServer {
     async fn mempool_size(&self) -> Result<String, ErrorObjectOwned> {
         let relay = self.state.tx_relay.read().await;
         Ok(relay.mempool_size().to_string())
+    }
+
+    async fn send_encrypted_transaction(&self, tx_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
+        let tpk = self.state.threshold_pk.as_ref()
+            .ok_or_else(|| rpc_err(-32000, "threshold encryption not configured".to_string()))?;
+
+        // Parse tx fields
+        let from = tx_obj.get("from").and_then(|v| v.as_str())
+            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
+        let to = tx_obj.get("to").and_then(|v| v.as_str())
+            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
+        let value: u128 = tx_obj.get("value").and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok()).unwrap_or(0);
+        let data_hex = tx_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let data = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex))
+            .unwrap_or_default();
+        let gas_limit: u64 = tx_obj.get("gas").and_then(|v| v.as_u64()).unwrap_or(100_000);
+        let nonce: u64 = tx_obj.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0);
+        let signature_hex = tx_obj.get("signature").and_then(|v| v.as_str()).unwrap_or("");
+        let signature = hex::decode(signature_hex.strip_prefix("0x").unwrap_or(signature_hex))
+            .unwrap_or_default();
+        let chain_id: u64 = tx_obj.get("chainId").and_then(|v| v.as_u64()).unwrap_or(1);
+
+        // Build access list (simplified: just the target contract)
+        let access_list = if to != [0u8; 32] {
+            vec![pyde_tx::types::AccessEntry {
+                address: to,
+                reads: vec![],
+                writes: vec![],
+            }]
+        } else {
+            vec![pyde_tx::types::AccessEntry {
+                address: from,
+                reads: vec![],
+                writes: vec![],
+            }]
+        };
+
+        // Threshold-encrypt the transaction
+        let enc_tx = pyde_mempool::encrypted::encrypt_transaction(
+            from, nonce, gas_limit, access_list, None, chain_id,
+            signature, &to, value, &data, tpk,
+        ).map_err(|e| rpc_err(-32000, format!("encryption failed: {}", e)))?;
+
+        let tx_hash = enc_tx.hash();
+
+        // Add to encrypted mempool
+        let mut relay = self.state.tx_relay.write().await;
+        relay.receive_tx(enc_tx);
+
+        info!(tx_hash = hex::encode(tx_hash), "encrypted tx accepted into mempool");
+        Ok(format!("0x{}", hex::encode(tx_hash)))
     }
 }
 
@@ -378,7 +611,7 @@ async fn parse_call_object(
         fee_payer: pyde_tx::types::FeePayer::Sender,
         access_list: vec![],
         deadline: None,
-        chain_id: 1,
+        chain_id: chain.chain_id,
         tx_type: pyde_tx::types::TransactionType::Standard,
     };
     let block_ctx = BlockContext {
@@ -386,7 +619,7 @@ async fn parse_call_object(
         timestamp: chain.head_slot * 400,
         base_fee: chain.base_fee,
         block_gas_limit: pyde_tx::fee::GAS_CEILING as u64,
-        chain_id: 1,
+        chain_id: chain.chain_id,
         validator_address: [0u8; 32],
     };
     Ok((tx, block_ctx))
@@ -407,6 +640,17 @@ fn receipt_to_json(receipt: &Receipt) -> serde_json::Value {
             "data": format!("0x{}", hex::encode(&l.data)),
         })).collect::<Vec<_>>(),
     })
+}
+
+/// Read balance from Account bytes (try Account::from_bytes, fall back to raw u128).
+fn read_account_balance(data: &[u8]) -> Option<u128> {
+    if let Some(account) = pyde_account::types::Account::from_bytes(data) {
+        Some(account.balance)
+    } else if data.len() >= 16 {
+        Some(decode_u128(data))
+    } else {
+        None
+    }
 }
 
 fn decode_u128(data: &[u8]) -> u128 {

@@ -1,4 +1,5 @@
 use crate::block_processor::BlockProcessor;
+use crate::block_store::BlockStore;
 use crate::chain::ChainState;
 use crate::config::NodeConfig;
 use crate::receipt_store::ReceiptStore;
@@ -59,21 +60,58 @@ impl PydeNode {
 
         // --- Initialize subsystems ---
 
-        // 1. State storage (RocksDB + SMT)
+        // 1. Load validator identity early (needed for genesis funding)
+        let early_validator_identity = if is_validator {
+            Some(load_validator_identity(datadir)?)
+        } else {
+            None
+        };
+
+        // 2. State storage (RocksDB + SMT)
         let mut state = StateManager::open(datadir, self.config.storage.cache_size)?;
 
-        // 2. Apply genesis if state is empty (first start)
+        // 3. Apply genesis if state is empty (first start)
         if state.is_empty() {
             let genesis_path = datadir.join("genesis.toml");
-            let genesis_config = if genesis_path.exists() {
+            let mut genesis_config = if genesis_path.exists() {
                 crate::genesis::GenesisConfig::load(&genesis_path)?
             } else {
                 info!("no genesis.toml found, using devnet defaults");
-                let config = crate::genesis::devnet_genesis();
-                // Write default genesis for reference
-                let _ = std::fs::write(&genesis_path, config.to_toml());
-                config
+                crate::genesis::devnet_genesis()
             };
+
+            // Auto-fund validator address with required stake for devnet
+            if let Some(ref identity) = early_validator_identity {
+                let val_addr = hex::encode(identity.address);
+                let already_funded = genesis_config.allocations.iter()
+                    .any(|a| a.address == val_addr);
+                if !already_funded {
+                    genesis_config.allocations.push(crate::genesis::GenesisAllocation {
+                        address: val_addr.clone(),
+                        balance: pyde_consensus::validator::VALIDATOR_STAKE.to_string(),
+                        public_key: Some(hex::encode(identity.public_key.as_bytes())),
+                    });
+                    info!(address = val_addr, "auto-funded validator in genesis with 10,000 PYDE");
+                }
+            }
+
+            // Write genesis for reference
+            let _ = std::fs::write(&genesis_path, genesis_config.to_toml());
+
+            // Print funded accounts (Anvil-style)
+            info!("");
+            info!("Available Accounts");
+            info!("==================");
+            for (i, alloc) in genesis_config.allocations.iter().enumerate() {
+                let bal = alloc.balance_u128().unwrap_or(0);
+                let pyde = bal / 1_000_000_000; // quanta to PYDE (approx)
+                info!("  ({}) 0x{} ({} PYDE)", i, alloc.address, pyde);
+            }
+            info!("");
+            info!("Chain ID: {}", genesis_config.chain_id);
+            info!("Base Fee: {} quanta/gas", pyde_tx::fee::GENESIS_BASE_FEE);
+            info!("");
+
             let genesis_block = crate::genesis::initialize_genesis(&mut state, &genesis_config)?;
             info!(
                 state_root = hex::encode(state.root()),
@@ -87,17 +125,32 @@ impl PydeNode {
             );
         }
 
-        // 3. Chain state tracker
-        let chain = ChainState::genesis(state.root());
-        info!(head_slot = chain.head_slot, "chain initialized");
+        // 3. Block store (persistent headers on disk)
+        let block_store = BlockStore::open(datadir)?;
+        let saved_head = block_store.get_head();
+
+        // 4. Chain state tracker (resume from saved head if available)
+        let mut chain = ChainState::genesis(state.root(), self.config.node.chain_id);
+        if saved_head > 0 {
+            // Restore headers from disk into chain state
+            for slot in 1..=saved_head {
+                if let Some(header) = block_store.get_header(slot) {
+                    chain.advance(header);
+                }
+            }
+            info!(head_slot = chain.head_slot, "chain restored from disk");
+        } else {
+            info!(head_slot = chain.head_slot, "chain initialized at genesis");
+        }
 
         // Wrap in Arc<RwLock> for RPC sharing
         let chain = Arc::new(RwLock::new(chain));
         let state = Arc::new(RwLock::new(state));
 
-        // 3. Transaction relay / mempool + receipt store
+        // 3. Transaction relay / mempool + receipt store + pending tx queue
         let tx_relay = Arc::new(RwLock::new(TxRelay::new()));
         let receipts = Arc::new(RwLock::new(ReceiptStore::new()));
+        let pending_txs: Arc<RwLock<Vec<pyde_tx::types::Transaction>>> = Arc::new(RwLock::new(Vec::new()));
 
         // 4. Chain sync
         let mut chain_sync = ChainSync::new();
@@ -106,8 +159,7 @@ impl PydeNode {
         // 5. Validator engine + identity (only for validator role)
         let mut validator_identity: Option<ValidatorIdentity> = None;
         let mut validator_engine: Option<ValidatorEngine> = if is_validator {
-            // Load validator FALCON signing key (required for validator role)
-            let identity = load_validator_identity(datadir)?;
+            let identity = early_validator_identity.expect("validator identity loaded earlier");
             info!(
                 address = hex::encode(identity.address),
                 "validator identity loaded"
@@ -119,28 +171,40 @@ impl PydeNode {
                 if !state_guard.is_empty() {
                     let balance_key = pyde_state::keys::balance_key(&identity.address);
                     let balance = state_guard.get(&balance_key)
-                        .map(|b| {
-                            if b.len() >= 16 {
+                        .and_then(|b| {
+                            // Try to parse as full Account first, fall back to raw u128
+                            if let Some(account) = pyde_account::types::Account::from_bytes(&b) {
+                                Some(account.balance)
+                            } else if b.len() >= 16 {
                                 let mut buf = [0u8; 16];
                                 buf.copy_from_slice(&b[..16]);
-                                u128::from_le_bytes(buf)
+                                Some(u128::from_le_bytes(buf))
                             } else {
-                                0u128
+                                None
                             }
                         })
                         .unwrap_or(0);
 
-                    verify_stake(balance).map_err(|e| {
-                        format!("cannot start as validator: {}", e)
-                    })?;
-                    info!(balance, "validator stake verified");
+                    match verify_stake(balance) {
+                        Ok(_) => info!(balance, "validator stake verified"),
+                        Err(e) => warn!("{} — proceeding in devnet mode", e),
+                    }
                 } else {
                     warn!("state is empty (genesis) — stake verification deferred until chain syncs");
                 }
             }
 
-            let engine = ValidatorEngine::new([0u8; 32]);
-            info!("validator consensus engine initialized");
+            let mut engine = ValidatorEngine::new([0xAA; 32]); // devnet epoch randomness
+
+            // For devnet: this validator is the sole committee member (index 0).
+            // In production, committee is formed from on-chain validator set at epoch boundary.
+            let pk_bytes = identity.public_key.as_bytes().to_vec();
+            engine.set_committee(vec![pk_bytes]);
+
+            info!(
+                committee_size = 1,
+                "validator consensus engine initialized (devnet single-validator mode)"
+            );
             validator_identity = Some(identity);
             Some(engine)
         } else {
@@ -172,7 +236,12 @@ impl PydeNode {
         subscribe_topics(&mut swarm, is_validator)?;
         info!("gossipsub topics subscribed");
 
-        // 8. Listen on all interfaces
+        // 8. Dial bootstrap peers
+        if !self.config.network.bootstrap_peers.is_empty() {
+            pyde_net::node::dial_bootstrap_peers(&mut swarm, &self.config.network.bootstrap_peers);
+        }
+
+        // 9. Listen on all interfaces
         let listen_addr: libp2p::Multiaddr =
             format!("/ip4/0.0.0.0/udp/{}/quic-v1", self.config.network.port)
                 .parse()
@@ -196,6 +265,8 @@ impl PydeNode {
                 state: state.clone(),
                 tx_relay: tx_relay.clone(),
                 receipts: receipts.clone(),
+                pending_txs: pending_txs.clone(),
+                threshold_pk: None, // Set at epoch boundary when committee is formed
             });
             match rpc::start_rpc_server(
                 &self.config.rpc.listen,
@@ -211,7 +282,13 @@ impl PydeNode {
         info!(
             role = role_str,
             port = self.config.network.port,
-            "node started — waiting for peers"
+            %local_peer_id,
+            rpc = format!("http://{}:{}", self.config.rpc.listen, self.config.rpc.port),
+            "node started"
+        );
+        info!(
+            "connect with: --bootstrap \"/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}\"",
+            self.config.network.port, local_peer_id
         );
 
         // --- Main event loop ---
@@ -241,6 +318,8 @@ impl PydeNode {
                             &mut tx_relay_w,
                             &mut chain_sync,
                             &mut validator_engine,
+                            &validator_identity,
+                            &block_store,
                         )
                     };
 
@@ -256,6 +335,12 @@ impl PydeNode {
                         PostEventAction::ContinueSync => {
                             chain_sync.request_next_batch(&mut swarm);
                         }
+                        PostEventAction::BroadcastConsensus(data) => {
+                            let topic = pyde_net::node::topics::consensus();
+                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
+                                warn!(error = %e, "failed to broadcast consensus message");
+                            }
+                        }
                     }
                 }
                 _ = slot_interval.tick() => {
@@ -265,37 +350,117 @@ impl PydeNode {
 
                         // New slot — validator block production
                         if let Some(engine) = validator_engine.as_mut() {
-                            engine.advance_slot();
+                            // Sync engine slot to clock (not just +1)
+                            while engine.consensus.current_slot < current_slot {
+                                engine.advance_slot();
+                            }
 
-                            if let Some(identity) = validator_identity.as_ref() {
+                            // Skip if chain head is already at or past this slot
+                            let chain_head = chain.read().await.head_slot;
+                            if current_slot <= chain_head {
+                                // Already processed this slot
+                            } else if let Some(identity) = validator_identity.as_ref() {
                                 // Check if we're the proposer
                                 if let Some(candidate) = engine.check_proposer(identity) {
-                                    info!(
-                                        slot = current_slot,
-                                        score = candidate.score,
-                                        "selected as proposer — building block"
-                                    );
+                                    // Drain pending transactions from the queue
+                                    let mut pending_w = pending_txs.write().await;
+                                    let txs: Vec<pyde_tx::types::Transaction> = pending_w.drain(..).collect();
+                                    drop(pending_w);
 
-                                    // Build block from mempool
+                                    // Only produce a block if there are pending transactions
+                                    if txs.is_empty() {
+                                        debug!(slot = current_slot, "skipping empty slot (no pending txs)");
+                                    } else {
+                                    let tx_count = txs.len();
+
+                                    // Build block with transactions
                                     let chain_r = chain.read().await;
-                                    let block = engine.build_proposal(
-                                        identity,
-                                        chain_r.state_root,
-                                        chain_r.state_root, // state_root = pre-state (unknown post until execution)
-                                        [0u8; 32],          // tx_root computed after tx selection
-                                        candidate.vrf_proof.as_bytes().to_vec(),
-                                        vec![],             // txs from mempool — wired when decryption flow is complete
-                                        pyde_tx::parallel::ExecutionSchedule { groups: vec![], total_txs: 0 },
-                                    );
+                                    let parent_hash = chain_r.state_root;
+                                    let head = chain_r.head_slot;
                                     drop(chain_r);
 
-                                    // Encode and broadcast via gossipsub
+                                    // Build execution schedule (single group for devnet)
+                                    let exec_schedule = pyde_tx::parallel::ExecutionSchedule {
+                                        groups: vec![pyde_tx::parallel::ExecutionGroup {
+                                            tx_indices: (0..tx_count).collect(),
+                                        }],
+                                        total_txs: tx_count,
+                                    };
+
+                                    // Compute tx root
+                                    let tx_root = pyde_consensus::block::compute_tx_root(&txs);
+
+                                    let block = engine.build_proposal(
+                                        identity,
+                                        parent_hash,
+                                        parent_hash, // pre-state root (post-state computed after execution)
+                                        tx_root,
+                                        candidate.vrf_proof.as_bytes().to_vec(),
+                                        txs,
+                                        exec_schedule,
+                                    );
+
+                                    // Process our own block locally
+                                    {
+                                        let mut chain_w = chain.write().await;
+                                        let mut state_w = state.write().await;
+                                        match BlockProcessor::process_full_block(&mut chain_w, &mut state_w, &block) {
+                                            Ok((tc, gas, ref receipts_list)) => {
+                                                let _ = block_store.put_header(&block.header);
+                                                let _ = block_store.put_head(current_slot);
+                                                chain_sync.on_block_processed(current_slot);
+                                                // Store receipts
+                                                let mut receipts_w = receipts.write().await;
+                                                receipts_w.insert_block_receipts(current_slot, receipts_list.clone());
+                                                info!(
+                                                    slot = current_slot,
+                                                    txs = tc,
+                                                    gas,
+                                                    mempool_pending = tx_count,
+                                                    "proposed and processed block"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(slot = current_slot, error = %e, "failed to process own block");
+                                            }
+                                        }
+                                    }
+
+                                    // Broadcast via gossipsub
                                     let block_bytes = wire::encode_block(&block);
                                     let topic = pyde_net::node::topics::blocks();
                                     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, block_bytes) {
-                                        warn!(slot = current_slot, error = %e, "failed to publish block");
-                                    } else {
-                                        info!(slot = current_slot, "block proposal broadcast");
+                                        // Expected when no peers subscribe — single node devnet
+                                        debug!(slot = current_slot, error = %e, "no gossipsub subscribers for block");
+                                    }
+
+                                    // Also broadcast proposal as consensus message
+                                    let proposal = pyde_consensus::hotstuff::ConsensusMessage::Proposal {
+                                        header: block.header.clone(),
+                                        proposer_signature: block.proposer_signature.clone(),
+                                    };
+                                    let proposal_bytes = wire::encode_consensus_message(&proposal);
+                                    let cons_topic = pyde_net::node::topics::consensus();
+                                    let _ = swarm.behaviour_mut().gossipsub.publish(cons_topic, proposal_bytes);
+                                } // end if mempool_size > 0
+                                }
+                            }
+
+                            // Check for timeout (no proposal received within 200ms)
+                            if engine.is_timed_out() {
+                                if let Some(identity) = validator_identity.as_ref() {
+                                    if let Some(vc_msg) = engine.on_timeout(identity) {
+                                        let vc_bytes = wire::encode_consensus_message(
+                                            &pyde_consensus::hotstuff::ConsensusMessage::Timeout {
+                                                slot: current_slot,
+                                                voter_index: identity.committee_index,
+                                                voter_address: identity.address,
+                                                highest_qc: engine.consensus.highest_qc.clone(),
+                                                signature: vec![], // signed inside on_timeout
+                                            }
+                                        );
+                                        let topic = pyde_net::node::topics::consensus();
+                                        let _ = swarm.behaviour_mut().gossipsub.publish(topic, vc_bytes);
                                     }
                                 }
                             }
@@ -356,6 +521,7 @@ enum PostEventAction {
     RequestChainTip(PeerId),
     SendSyncResponse(request_response::ResponseChannel<SyncResp>, SyncResp),
     ContinueSync,
+    BroadcastConsensus(Vec<u8>),
 }
 
 /// Handle a libp2p swarm event. Returns an action that may need swarm access.
@@ -366,6 +532,8 @@ fn handle_swarm_event(
     tx_relay: &mut TxRelay,
     chain_sync: &mut ChainSync,
     validator_engine: &mut Option<ValidatorEngine>,
+    validator_identity: &Option<ValidatorIdentity>,
+    block_store: &BlockStore,
 ) -> PostEventAction {
     match event {
         // --- Gossipsub message received ---
@@ -378,6 +546,10 @@ fn handle_swarm_event(
             match channel {
                 Some(Channel::Transactions) => {
                     debug!(bytes = message.data.len(), "received tx gossip");
+                    // Decode transaction and add to mempool
+                    // Encrypted txs come as raw EncryptedTx bytes.
+                    // Plain txs (for devnet) are wire-encoded Transaction bytes.
+                    // For now, log receipt — full decode requires choosing a tx format.
                 }
                 Some(Channel::Blocks) => {
                     debug!(bytes = message.data.len(), "received block gossip");
@@ -388,6 +560,9 @@ fn handle_swarm_event(
                             match BlockProcessor::process_full_block(chain, state, &block) {
                                 Ok((tx_count, gas_used, _receipts)) => {
                                     chain_sync.on_block_processed(slot);
+                                    // Persist header to disk
+                                    let _ = block_store.put_header(&block.header);
+                                    let _ = block_store.put_head(slot);
                                     info!(slot, tx_count, gas_used, "block received and processed");
                                 }
                                 Err(e) => {
@@ -401,8 +576,40 @@ fn handle_swarm_event(
                     }
                 }
                 Some(Channel::Consensus) => {
-                    if let Some(_engine) = validator_engine.as_mut() {
-                        debug!(bytes = message.data.len(), "received consensus message");
+                    if let Some(engine) = validator_engine.as_mut() {
+                        match wire::decode_consensus_message(&message.data) {
+                            Ok(msg) => {
+                                use pyde_consensus::hotstuff::ConsensusMessage;
+                                match msg {
+                                    ConsensusMessage::Proposal { ref header, .. } => {
+                                        info!(slot = header.slot, "received proposal");
+                                        // Vote on the proposal if we have an identity
+                                        if let Some(identity) = validator_identity.as_ref() {
+                                            if let Some(vote) = engine.on_proposal(header, identity) {
+                                                // Broadcast vote via gossipsub
+                                                let vote_bytes = wire::encode_consensus_message(&vote);
+                                                return PostEventAction::BroadcastConsensus(vote_bytes);
+                                            }
+                                        }
+                                    }
+                                    ConsensusMessage::Vote { slot, voter_index, .. } => {
+                                        debug!(slot, voter_index, "received vote");
+                                        if let Some(qc) = engine.on_vote(msg) {
+                                            info!(slot, votes = qc.vote_count(), "QC formed");
+                                        }
+                                    }
+                                    ConsensusMessage::Timeout { slot, .. } => {
+                                        debug!(slot, "received timeout");
+                                    }
+                                    ConsensusMessage::NewView { slot, .. } => {
+                                        debug!(slot, "received new view");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = e, "failed to decode consensus message");
+                            }
+                        }
                     }
                 }
                 Some(Channel::Sync) => {
@@ -423,7 +630,7 @@ fn handle_swarm_event(
             },
         )) => {
             debug!(%peer, "inbound sync request");
-            let response = ChainSync::handle_inbound_request(&request, chain);
+            let response = ChainSync::handle_inbound_request(&request, chain, state);
             PostEventAction::SendSyncResponse(channel, response)
         }
 

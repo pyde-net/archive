@@ -1,4 +1,5 @@
 mod block_processor;
+mod block_store;
 mod chain;
 mod cli;
 mod config;
@@ -40,6 +41,7 @@ fn main() {
             log_level,
             log_json,
             metrics_port,
+            rpc_port,
             bootstrap,
         } => {
             // Load config from file (if provided) or use defaults
@@ -64,6 +66,7 @@ fn main() {
                 Some(metrics_port),
                 &bootstrap,
             );
+            config.rpc.port = rpc_port;
 
             // Initialize logging first
             logging::init(&config.logging.level, config.logging.json);

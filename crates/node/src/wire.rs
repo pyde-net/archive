@@ -20,6 +20,46 @@ pub mod tag {
     pub const CONSENSUS_VOTE: u8 = 0x11;
     pub const CONSENSUS_TIMEOUT: u8 = 0x12;
     pub const CONSENSUS_NEW_VIEW: u8 = 0x13;
+    pub const DECRYPTION_SHARES: u8 = 0x20;
+}
+
+/// Decryption share broadcast message.
+/// Sent by each committee member after QC is formed for a block.
+#[derive(Clone, Debug)]
+pub struct DecryptionShareMsg {
+    /// Slot this share is for.
+    pub slot: u64,
+    /// Voter/committee member index.
+    pub member_index: u8,
+    /// One share per encrypted tx in the block.
+    /// Each share is the raw bytes of the DecryptionShare.
+    pub shares: Vec<Vec<u8>>,
+}
+
+pub fn encode_decryption_shares(msg: &DecryptionShareMsg) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(tag::DECRYPTION_SHARES);
+    enc.u64(msg.slot);
+    enc.u8(msg.member_index);
+    enc.u16(msg.shares.len() as u16);
+    for share in &msg.shares {
+        enc.var_bytes(share);
+    }
+    enc.finish()
+}
+
+pub fn decode_decryption_shares(data: &[u8]) -> Result<DecryptionShareMsg, &'static str> {
+    let mut dec = Decoder::new(data);
+    let msg_tag = dec.u8()?;
+    if msg_tag != tag::DECRYPTION_SHARES { return Err("not a decryption shares message"); }
+    let slot = dec.u64()?;
+    let member_index = dec.u8()?;
+    let count = dec.u16()? as usize;
+    let mut shares = Vec::with_capacity(count);
+    for _ in 0..count {
+        shares.push(dec.var_bytes()?);
+    }
+    Ok(DecryptionShareMsg { slot, member_index, shares })
 }
 
 // ============================================================
