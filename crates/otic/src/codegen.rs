@@ -2648,6 +2648,42 @@ mod tests {
         assert_eq!(vm.cpu.read_gp(1), 42, "add(10, 32) via dispatch should be 42");
     }
 
+    #[test]
+    fn pvm_storage_increment_persists() {
+        // Verify that increment() actually writes to vm.storage
+        let (tokens, _) = Lexer::new(r#"
+            contract Counter {
+                storage { count: u64 }
+                pub fn increment() { self.count = self.count + 1; }
+                pub fn get_count() -> u64 { return self.count; }
+            }
+        "#).tokenize();
+        let (file, _) = Parser::new(tokens).parse();
+        let ir = lower::lower(&file);
+        let mut codegen = CodeGen::new();
+        codegen.emit_guards = true;
+        let compiled = codegen.generate(&ir);
+
+        // Run increment()
+        let selector = compute_selector("increment");
+        let calldata = selector.to_be_bytes().to_vec();
+
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(500_000);
+        vm.calldata = calldata;
+        vm.load(&compiled.runtime_bytecode).unwrap();
+        let output = vm.execute();
+
+        println!("outcome: {:?}", output.outcome);
+        println!("gas: {}", output.gas_used);
+        println!("storage entries: {}", vm.storage.len());
+        for (k, v) in &vm.storage {
+            println!("  key={} value_bytes={:?}", k, &v[..v.len().min(16)]);
+        }
+
+        assert_eq!(output.outcome, pyde_vm::vm::Outcome::Success, "increment should succeed");
+        assert!(vm.storage.len() > 0, "vm.storage should have entries after Sstore");
+    }
+
     // ========================================================================
     // Wide storage u256 (PVM-verified)
     // ========================================================================

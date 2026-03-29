@@ -3508,11 +3508,13 @@ dependencies = [
 name = "pyde-tx"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "pyde-account",
  "pyde-crypto",
  "pyde-state",
  "pyde-vm",
  "sparse-merkle-tree",
+ "tracing",
 ]
 
 [[package]]

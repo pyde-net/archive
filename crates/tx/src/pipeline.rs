@@ -167,11 +167,12 @@ pub fn execute_transaction(
             // Contract call
             match load_code(smt, &tx.to) {
                 Some(code) => {
+                    tracing::debug!(to = hex::encode(tx.to), code_len = code.len(), "executing contract call in PVM");
                     let result = execute_in_pvm(tx, &sender, &code, smt, block_ctx);
                     result
                 }
                 None => {
-                    // Simple transfer (no code at recipient)
+                    tracing::debug!(to = hex::encode(tx.to), "simple transfer (no code at recipient)");
                     (true, 21_000u64, 0u64, vec![])
                 }
             }
@@ -273,15 +274,23 @@ fn execute_in_pvm(
     let mut vm = Vm::with_gas_limit_and_context(tx.gas_limit, ctx);
     vm.calldata = tx.data.clone();
 
-    // Load contract storage from SMT into VM.
-    // The VM derives storage keys as: poseidon2(slot_bytes ++ contract_address)
-    // We scan slots 0..64 using the same derivation.
+    // Load contract storage from SMT into VM using the storage manifest.
     let contract_addr = tx.to;
-    for slot in 0u64..64 {
-        let vm_key = vm.derive_storage_key(U256::from(slot));
-        let smt_key = H256::from(vm_key.to_le_bytes());
-        if let Some(value_bytes) = smt.get(&smt_key) {
-            vm.storage.insert(vm_key, value_bytes);
+    let mut manifest_input = Vec::with_capacity(44);
+    manifest_input.extend_from_slice(b"storage_keys");
+    manifest_input.extend_from_slice(&contract_addr);
+    let manifest_key = H256::from(pyde_crypto::poseidon2::poseidon2_hash(&manifest_input).to_bytes());
+    if let Some(key_list) = smt.get(&manifest_key) {
+        for chunk in key_list.chunks(32) {
+            if chunk.len() == 32 {
+                let mut key_bytes = [0u8; 32];
+                key_bytes.copy_from_slice(chunk);
+                let vm_key = U256::from_le_bytes(key_bytes);
+                let smt_key = H256::from(key_bytes);
+                if let Some(value_bytes) = smt.get(&smt_key) {
+                    vm.storage.insert(vm_key, value_bytes);
+                }
+            }
         }
     }
 
@@ -292,12 +301,32 @@ fn execute_in_pvm(
     let output = vm.execute();
     let success = output.outcome == Outcome::Success;
 
+    tracing::debug!(
+        success,
+        gas = output.gas_used,
+        storage_entries = vm.storage.len(),
+        "execute_in_pvm completed"
+    );
+
     // Persist VM storage changes back to SMT.
     // Use the derived key directly (same as what the VM uses internally).
     if success && !vm.storage.is_empty() {
+        let mut key_list: Vec<u8> = Vec::new();
         for (vm_key, value_bytes) in &vm.storage {
-            let smt_key = H256::from(vm_key.to_le_bytes());
-            let _ = smt.insert(smt_key, value_bytes.clone());
+            let key_bytes = vm_key.to_le_bytes();
+            let smt_key = H256::from(key_bytes);
+            if let Err(e) = smt.insert(smt_key, value_bytes.clone()) {
+                tracing::warn!(error = e, "failed to persist storage entry");
+            }
+            key_list.extend_from_slice(&key_bytes);
+        }
+        // Storage manifest: list of all VM storage keys for this contract
+        let mut manifest_input = Vec::with_capacity(44);
+        manifest_input.extend_from_slice(b"storage_keys");
+        manifest_input.extend_from_slice(&contract_addr);
+        let manifest_key = H256::from(pyde_crypto::poseidon2::poseidon2_hash(&manifest_input).to_bytes());
+        if let Err(e) = smt.insert(manifest_key, key_list) {
+            tracing::warn!(error = e, "failed to persist storage manifest");
         }
     }
 
