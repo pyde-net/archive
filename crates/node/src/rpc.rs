@@ -297,9 +297,19 @@ impl PydeApiServer for RpcServer {
         let tx_bytes = crate::wire::encode_transaction(&tx);
         let tx_hash = pyde_crypto::poseidon2::poseidon2_hash(&tx_bytes).to_bytes();
 
-        // For deploy txs, compute the contract address
+        // For deploy txs, compute the contract address.
+        // Use Account.nonce (always 0 in devnet since pipeline doesn't increment Account.nonce).
+        // This matches what the pipeline uses: derive_create_address(&from, sender.nonce).
         let contract_address = if tx_type == pyde_tx::types::TransactionType::Deploy {
-            let addr = pyde_account::address::derive_create_address(&from, nonce);
+            // Read the account nonce from state (matches pipeline's sender.nonce)
+            let state = self.state.state.read().await;
+            let balance_key = pyde_state::keys::balance_key(&from);
+            let account_nonce = state.get(&balance_key)
+                .and_then(|b| pyde_account::types::Account::from_bytes(&b))
+                .map(|a| a.nonce)
+                .unwrap_or(0);
+            drop(state);
+            let addr = pyde_account::address::derive_create_address(&from, account_nonce);
             Some(format!("0x{}", hex::encode(addr)))
         } else {
             None
@@ -356,12 +366,11 @@ impl PydeApiServer for RpcServer {
         let gas_limit: u64 = call_obj.get("gas").and_then(|v| v.as_u64())
             .unwrap_or(1_000_000);
 
-        // Load contract code
+        // Load contract code and keep state alive for lazy storage loading
         let state = self.state.state.read().await;
         let code_key = pyde_state::keys::code_key(&to);
         let code = state.get(&code_key)
             .ok_or_else(|| rpc_err(-32000, "no code at address".into()))?;
-        drop(state);
 
         // Run PVM directly — no validation, no nonce/balance checks
         let ctx = pyde_vm::vm::ExecutionContext {
@@ -384,8 +393,7 @@ impl PydeApiServer for RpcServer {
 
         // Load contract storage from SMT (read-only, slots 0..64)
         // Use the VM's key derivation: poseidon2(slot_bytes ++ contract_address)
-        // Load contract storage keys from manifest, then load values.
-        let state = self.state.state.read().await;
+        // Pre-load storage from manifest (known keys from previous writes)
         let mut manifest_input = Vec::with_capacity(44);
         manifest_input.extend_from_slice(b"storage_keys");
         manifest_input.extend_from_slice(&to);

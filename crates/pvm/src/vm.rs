@@ -214,6 +214,9 @@ pub struct Vm {
     pub ctx: ExecutionContext,
     /// Key-value storage overlay (derived_key → variable-length bytes).
     pub storage: HashMap<U256, Vec<u8>>,
+    /// Optional storage backend for lazy loading (e.g., from SMT).
+    /// Called when Sload encounters a key not in the overlay.
+    pub storage_backend: Option<Box<dyn Fn(&U256) -> Option<Vec<u8>>>>,
 
     // --- Cold: accessed infrequently ---
     /// Internal call stack for CALL/RET within a contract.
@@ -267,6 +270,7 @@ impl Vm {
             gas_refund: 0,
             ctx: ExecutionContext::default(),
             storage: HashMap::new(),
+            storage_backend: None,
             logs: Vec::new(),
             storage_journal: Vec::new(),
             storage_journal_keys: std::collections::HashSet::new(),
@@ -688,12 +692,32 @@ impl Vm {
                         return Err(Trap::OutOfGas);
                     }
                 }
+                // Lazy storage load: check overlay first, then backend
+                let storage_value = self.storage.get(&key).cloned().or_else(|| {
+                    if let Some(ref backend) = self.storage_backend {
+                        let val = backend(&key);
+                        // Cache in overlay for future reads
+                        if let Some(ref v) = val {
+                            // Can't borrow self.storage mutably here, cache after match
+                        }
+                        val
+                    } else {
+                        None
+                    }
+                });
+                // Cache backend result in overlay
+                if !self.storage.contains_key(&key) {
+                    if let Some(ref val) = storage_value {
+                        self.storage.insert(key, val.clone());
+                    }
+                }
+
                 let mode = d.rs2_or_imm & 0x3;
                 match mode {
                     0 => {
                         // Wide register mode: sload wd, ws1
                         let mut buf = [0u8; 32];
-                        if let Some(data) = self.storage.get(&key) {
+                        if let Some(data) = storage_value.as_ref() {
                             let len = data.len().min(32);
                             buf[..len].copy_from_slice(&data[..len]);
                         }
@@ -703,8 +727,7 @@ impl Vm {
                         // Memory mode: sloadb rd_len, ws1, rs_ptr
                         let ptr_reg = ((d.rs2_or_imm >> 2) & 0xF) as u8;
                         let ptr = self.cpu.read_gp(ptr_reg) as u32;
-                        if let Some(data) = self.storage.get(&key) {
-                            // Dynamic gas: 3 per 8 bytes of data read from storage
+                        if let Some(data) = storage_value.as_ref() {
                             let dynamic_gas = ((data.len() as u64 + 7) / 8) * 3;
                             self.gas_used_total += dynamic_gas;
                             if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
@@ -721,7 +744,7 @@ impl Vm {
                     2 => {
                         // GP register mode: sloadg rd, ws1
                         let mut buf = [0u8; 8];
-                        if let Some(data) = self.storage.get(&key) {
+                        if let Some(data) = storage_value.as_ref() {
                             let len = data.len().min(8);
                             buf[..len].copy_from_slice(&data[..len]);
                         }
