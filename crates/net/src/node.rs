@@ -140,6 +140,36 @@ pub mod topics {
     }
 }
 
+/// Dial bootstrap peers and add them to Kademlia.
+pub fn dial_bootstrap_peers(
+    swarm: &mut Swarm<PydeBehaviour>,
+    bootstrap_peers: &[String],
+) {
+    for addr_str in bootstrap_peers {
+        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+            // Extract PeerId from the multiaddr
+            let peer_id = addr.iter().find_map(|proto| {
+                if let libp2p::multiaddr::Protocol::P2p(id) = proto {
+                    Some(id)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(peer_id) = peer_id {
+                // Add to Kademlia routing table
+                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                // Dial the peer
+                if let Err(e) = swarm.dial(addr) {
+                    tracing::warn!(%peer_id, error = %e, "failed to dial bootstrap peer");
+                } else {
+                    tracing::info!(%peer_id, "dialing bootstrap peer");
+                }
+            }
+        }
+    }
+}
+
 /// Subscribe a swarm to the appropriate topics based on node role.
 pub fn subscribe_topics(
     swarm: &mut Swarm<PydeBehaviour>,

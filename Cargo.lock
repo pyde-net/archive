@@ -3467,6 +3467,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "directories",
+ "ethnum",
  "hex",
  "jsonrpsee",
  "libp2p",
@@ -3482,6 +3483,7 @@ dependencies = [
  "pyde-tx",
  "pyde-vm",
  "reqwest",
+ "rocksdb",
  "serde",
  "serde_json",
  "sparse-merkle-tree",

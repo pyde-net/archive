@@ -25,6 +25,8 @@ pub enum SyncReq {
         start_slot: u64,
         count: u32,
     },
+    /// Request a full state snapshot at the peer's current state root.
+    GetStateSnapshot,
 }
 
 /// Sync response from peer.
@@ -39,6 +41,12 @@ pub enum SyncResp {
     Blocks(Vec<Vec<u8>>),
     /// Block headers only.
     Headers(Vec<Vec<u8>>),
+    /// Full state snapshot: Vec<(key_bytes, value_bytes)>.
+    StateSnapshot {
+        state_root: [u8; 32],
+        head_slot: u64,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    },
     /// Peer doesn't have the requested data.
     NotFound,
 }

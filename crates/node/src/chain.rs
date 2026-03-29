@@ -1,6 +1,6 @@
 use pyde_consensus::block::{BlockHeader, QuorumCert, EPOCH_LENGTH};
 use std::collections::HashMap;
-use tracing::info;
+use tracing::debug;
 
 /// Tracks the chain head and recent block headers.
 pub struct ChainState {
@@ -18,11 +18,13 @@ pub struct ChainState {
     pub genesis_hash: [u8; 32],
     /// Base fee for EIP-1559 gas pricing.
     pub base_fee: u128,
+    /// Chain ID.
+    pub chain_id: u64,
 }
 
 impl ChainState {
     /// Initialize at genesis.
-    pub fn genesis(state_root: [u8; 32]) -> Self {
+    pub fn genesis(state_root: [u8; 32], chain_id: u64) -> Self {
         Self {
             head_slot: 0,
             epoch: 0,
@@ -31,6 +33,7 @@ impl ChainState {
             hash_to_slot: HashMap::new(),
             genesis_hash: [0u8; 32],
             base_fee: pyde_tx::fee::GENESIS_BASE_FEE,
+            chain_id,
         }
     }
 
@@ -54,7 +57,7 @@ impl ChainState {
             self.hash_to_slot.retain(|_, s| *s >= prune_before);
         }
 
-        info!(slot, epoch, "chain head advanced");
+        debug!(slot, epoch, "chain head advanced");
     }
 
     /// Get the header for a slot.
@@ -99,7 +102,7 @@ mod tests {
 
     #[test]
     fn genesis_state() {
-        let chain = ChainState::genesis([0xAA; 32]);
+        let chain = ChainState::genesis([0xAA; 32], 1);
         assert!(chain.is_genesis());
         assert_eq!(chain.head_slot, 0);
         assert_eq!(chain.state_root, [0xAA; 32]);
@@ -107,7 +110,7 @@ mod tests {
 
     #[test]
     fn advance_updates_head() {
-        let mut chain = ChainState::genesis([0; 32]);
+        let mut chain = ChainState::genesis([0; 32], 1);
         let header = dummy_header(1, [0; 32]);
         chain.advance(header);
 
@@ -119,7 +122,7 @@ mod tests {
 
     #[test]
     fn old_headers_pruned() {
-        let mut chain = ChainState::genesis([0; 32]);
+        let mut chain = ChainState::genesis([0; 32], 1);
 
         // Add headers across 3 epochs (EPOCH_LENGTH = 1000)
         for slot in 1..=2500 {
@@ -135,7 +138,7 @@ mod tests {
 
     #[test]
     fn lookup_by_hash() {
-        let mut chain = ChainState::genesis([0; 32]);
+        let mut chain = ChainState::genesis([0; 32], 1);
         let header = dummy_header(1, [0; 32]);
         let hash = header.hash();
         chain.advance(header);

@@ -42,6 +42,12 @@ metrics-exporter-prometheus = "0.16"
 # RPC
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
 
+# Storage
+rocksdb = "0.24"
+
+# VM types
+ethnum = "1.5.2"
+
 # Misc
 directories = "5"
 hex = "0.4"

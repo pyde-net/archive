@@ -14,7 +14,7 @@ use pyde_consensus::block::{genesis_block, Block};
 use pyde_tx::fee::GENESIS_BASE_FEE;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Genesis configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +36,9 @@ pub struct GenesisAllocation {
     pub address: String,
     /// Balance in quanta as string (10^9 quanta = 1 PYDE). String to avoid TOML u128 limitation.
     pub balance: String,
+    /// Optional hex-encoded FALCON-512 public key (sets auth_keys for tx signing).
+    #[serde(default)]
+    pub public_key: Option<String>,
 }
 
 impl GenesisAllocation {
@@ -58,6 +61,15 @@ impl GenesisValidator {
     pub fn stake_u128(&self) -> Result<u128, String> {
         self.stake.parse::<u128>().map_err(|e| format!("invalid stake '{}': {}", self.stake, e))
     }
+}
+
+/// Threshold encryption config for MEV protection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThresholdConfig {
+    /// Number of committee members.
+    pub n: usize,
+    /// Threshold for decryption (85 of 128 in production).
+    pub threshold: usize,
 }
 
 impl Default for GenesisConfig {
@@ -103,16 +115,41 @@ pub fn initialize_genesis(
     for alloc in &config.allocations {
         let address = parse_hex_address(&alloc.address)?;
         let balance = alloc.balance_u128()?;
-        let key = pyde_state::keys::balance_key(&address);
-        entries.push((key, balance.to_le_bytes().to_vec()));
-        total_supply = total_supply.checked_add(balance)
-            .ok_or("genesis total supply overflow")?;
 
-        info!(
+        // Always store as full Account struct so the tx pipeline can read it correctly.
+        let mut account = if let Some(pk_hex) = &alloc.public_key {
+            let pk_bytes = hex::decode(pk_hex.strip_prefix("0x").unwrap_or(pk_hex))
+                .map_err(|e| format!("invalid public key hex: {}", e))?;
+            let mut a = pyde_account::types::Account::new_eoa(&pk_bytes);
+            a.address = address;
+            a
+        } else {
+            // No auth_keys — create a bare EOA (can receive, devnet can send with sig skip)
+            pyde_account::types::Account {
+                address,
+                nonce: 0,
+                balance: 0,
+                code_hash: sparse_merkle_tree::H256::zero(),
+                storage_root: sparse_merkle_tree::H256::zero(),
+                account_type: pyde_account::types::AccountType::EOA,
+                auth_keys: pyde_account::types::AuthKeys::None,
+                gas_tank: 0,
+                key_nonce: 0,
+            }
+        };
+        account.balance = balance;
+
+        let key = pyde_state::keys::balance_key(&address);
+        entries.push((key, account.to_bytes()));
+        debug!(
             address = alloc.address,
             balance,
+            has_auth_keys = alloc.public_key.is_some(),
             "genesis allocation"
         );
+
+        total_supply = total_supply.checked_add(balance)
+            .ok_or("genesis total supply overflow")?;
     }
 
     // 2. Write validator stakes as balances (included in total supply)
@@ -120,12 +157,23 @@ pub fn initialize_genesis(
         let address = parse_hex_address(&val.address)?;
         let stake = val.stake_u128()?;
 
+        let mut account = pyde_account::types::Account {
+            address,
+            nonce: 0,
+            balance: stake,
+            code_hash: sparse_merkle_tree::H256::zero(),
+            storage_root: sparse_merkle_tree::H256::zero(),
+            account_type: pyde_account::types::AccountType::EOA,
+            auth_keys: pyde_account::types::AuthKeys::None,
+            gas_tank: 0,
+            key_nonce: 0,
+        };
         let balance_key = pyde_state::keys::balance_key(&address);
-        entries.push((balance_key, stake.to_le_bytes().to_vec()));
+        entries.push((balance_key, account.to_bytes()));
         total_supply = total_supply.checked_add(stake)
             .ok_or("genesis total supply overflow")?;
 
-        info!(
+        debug!(
             address = val.address,
             stake,
             "genesis validator"
@@ -151,14 +199,15 @@ pub fn initialize_genesis(
 /// Create a default devnet genesis config with pre-funded accounts.
 pub fn devnet_genesis() -> GenesisConfig {
     // 10 pre-funded accounts for development (each gets 1M PYDE)
-    let one_million_pyde = "1000000000000000"; // 1M PYDE in quanta (10^15)
+    let one_hundred_million_pyde = "100000000000000000"; // 100M PYDE in quanta (10^17)
 
     let mut allocations = Vec::new();
     for i in 0u8..10 {
         let address = hex::encode([i + 1; 32]);
         allocations.push(GenesisAllocation {
             address,
-            balance: one_million_pyde.to_string(),
+            balance: one_hundred_million_pyde.to_string(),
+            public_key: None,
         });
     }
 
@@ -215,14 +264,13 @@ mod tests {
         assert_eq!(block.slot(), 0);
         assert!(!state.is_empty());
 
-        // Verify first account has balance
+        // Verify first account has balance (stored as full Account struct)
         let addr = parse_hex_address(&config.allocations[0].address).unwrap();
         let key = pyde_state::keys::balance_key(&addr);
-        let balance_bytes = state.get(&key).expect("balance should exist");
-        let mut buf = [0u8; 16];
-        buf.copy_from_slice(&balance_bytes[..16]);
-        let balance = u128::from_le_bytes(buf);
-        assert_eq!(balance, 1_000_000_000_000_000); // 1M PYDE
+        let account_bytes = state.get(&key).expect("account should exist");
+        let account = pyde_account::types::Account::from_bytes(&account_bytes)
+            .expect("should be a valid Account");
+        assert_eq!(account.balance, 100_000_000_000_000_000); // 100M PYDE
     }
 
     #[test]

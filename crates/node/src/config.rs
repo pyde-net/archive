@@ -35,7 +35,7 @@ impl Default for NodeSection {
     fn default() -> Self {
         Self {
             role: "full".into(),
-            chain_id: 1,
+            chain_id: 31337,
             datadir: default_datadir(),
         }
     }

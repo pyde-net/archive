@@ -135,6 +135,27 @@ impl ChainSync {
         debug!(%peer, "requested chain tip");
     }
 
+    /// Request a state snapshot from a peer (for fast sync when far behind).
+    pub fn request_state_snapshot(
+        &mut self,
+        swarm: &mut Swarm<PydeBehaviour>,
+    ) -> bool {
+        let peer = match swarm.connected_peers().next() {
+            Some(p) => *p,
+            None => return false,
+        };
+        let request_id = swarm
+            .behaviour_mut()
+            .sync
+            .send_request(&peer, SyncReq::GetStateSnapshot);
+        self.pending.insert(request_id, peer);
+        info!(%peer, "requested state snapshot");
+        true
+    }
+
+    /// Threshold: if behind by more than this many slots, use snapshot sync.
+    pub const SNAPSHOT_THRESHOLD: u64 = 1000;
+
     /// Handle a sync response from a peer.
     /// Returns the number of blocks processed.
     pub fn on_response(
@@ -157,10 +178,7 @@ impl ChainSync {
                 let mut processed = 0u64;
 
                 for data in &block_data {
-                    // Deserialize block header from the data.
-                    // For now, we use a minimal format: slot(8) || parent_hash(32) || state_root(32) || tx_root(32)
-                    // Full serialization will be expanded later.
-                    if let Some(header) = deserialize_block_header(data) {
+                    if let Ok(header) = crate::wire::decode_block_header(data) {
                         match BlockProcessor::process_block(chain, state, header, &[]) {
                             Ok(_) => {
                                 self.manager.advance_local_tip(chain.head_slot);
@@ -189,6 +207,41 @@ impl ChainSync {
                 debug!("received headers (not used in block sync)");
                 0
             }
+            SyncResp::StateSnapshot { state_root, head_slot, entries } => {
+                let count = entries.len();
+                info!(
+                    entries = count,
+                    head_slot,
+                    state_root = hex::encode(state_root),
+                    "received state snapshot"
+                );
+
+                match state.import_snapshot(entries) {
+                    Ok(imported_root) => {
+                        if imported_root == state_root {
+                            self.manager.advance_local_tip(head_slot);
+                            if !self.initial_sync_done {
+                                self.initial_sync_done = true;
+                            }
+                            info!(
+                                head_slot,
+                                entries = count,
+                                "state snapshot applied — node synced"
+                            );
+                        } else {
+                            warn!(
+                                expected = hex::encode(state_root),
+                                got = hex::encode(imported_root),
+                                "state root mismatch after snapshot import"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to import state snapshot");
+                    }
+                }
+                0
+            }
             SyncResp::NotFound => {
                 warn!("peer doesn't have requested blocks");
                 0
@@ -201,6 +254,7 @@ impl ChainSync {
     pub fn handle_inbound_request(
         req: &SyncReq,
         chain: &ChainState,
+        state: &StateManager,
     ) -> SyncResp {
         match req {
             SyncReq::GetChainTip => {
@@ -210,14 +264,13 @@ impl ChainSync {
                 }
             }
             SyncReq::GetBlocks { start_slot, count } => {
-                // Serialize block headers from our chain state.
-                // We serve what we have in our header cache.
+                // Serialize full block headers using the wire format.
                 let mut blocks = Vec::new();
                 for slot in *start_slot..(*start_slot + *count as u64) {
                     if let Some(header) = chain.header(slot) {
-                        blocks.push(serialize_block_header(header));
+                        blocks.push(crate::wire::encode_block_header(header));
                     } else {
-                        break; // stop at first missing slot
+                        break;
                     }
                 }
                 if blocks.is_empty() {
@@ -230,7 +283,7 @@ impl ChainSync {
                 let mut headers = Vec::new();
                 for slot in *start_slot..(*start_slot + *count as u64) {
                     if let Some(header) = chain.header(slot) {
-                        headers.push(serialize_block_header(header));
+                        headers.push(crate::wire::encode_block_header(header));
                     } else {
                         break;
                     }
@@ -241,6 +294,18 @@ impl ChainSync {
                     SyncResp::Headers(headers)
                 }
             }
+            SyncReq::GetStateSnapshot => {
+                let entries = state.export_snapshot();
+                if entries.is_empty() {
+                    SyncResp::NotFound
+                } else {
+                    SyncResp::StateSnapshot {
+                        state_root: state.root(),
+                        head_slot: chain.head_slot,
+                        entries,
+                    }
+                }
+            }
         }
     }
 
@@ -248,59 +313,6 @@ impl ChainSync {
     pub fn is_syncing(&self) -> bool {
         self.manager.needs_sync()
     }
-}
-
-/// Minimal block header serialization.
-/// Format: slot(8) || epoch(8) || parent_hash(32) || state_root(32) || tx_root(32) || timestamp(8)
-fn serialize_block_header(header: &pyde_consensus::block::BlockHeader) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(120);
-    buf.extend_from_slice(&header.slot.to_le_bytes());
-    buf.extend_from_slice(&header.epoch.to_le_bytes());
-    buf.extend_from_slice(&header.parent_hash);
-    buf.extend_from_slice(&header.state_root);
-    buf.extend_from_slice(&header.tx_root);
-    buf.extend_from_slice(&header.timestamp.to_le_bytes());
-    buf
-}
-
-/// Minimal block header deserialization.
-fn deserialize_block_header(data: &[u8]) -> Option<pyde_consensus::block::BlockHeader> {
-    if data.len() < 120 {
-        return None;
-    }
-
-    let mut slot_bytes = [0u8; 8];
-    slot_bytes.copy_from_slice(&data[0..8]);
-    let slot = u64::from_le_bytes(slot_bytes);
-
-    let mut epoch_bytes = [0u8; 8];
-    epoch_bytes.copy_from_slice(&data[8..16]);
-    let epoch = u64::from_le_bytes(epoch_bytes);
-
-    let mut parent_hash = [0u8; 32];
-    parent_hash.copy_from_slice(&data[16..48]);
-
-    let mut state_root = [0u8; 32];
-    state_root.copy_from_slice(&data[48..80]);
-
-    let mut tx_root = [0u8; 32];
-    tx_root.copy_from_slice(&data[80..112]);
-
-    let mut ts_bytes = [0u8; 8];
-    ts_bytes.copy_from_slice(&data[112..120]);
-    let timestamp = u64::from_le_bytes(ts_bytes);
-
-    Some(pyde_consensus::block::BlockHeader {
-        slot,
-        epoch,
-        parent_hash,
-        state_root,
-        tx_root,
-        timestamp,
-        proposer: pyde_account::address::ZERO_ADDRESS,
-        vrf_proof: vec![],
-        qc_previous: pyde_consensus::block::QuorumCert::empty(),
-    })
 }
 
 #[cfg(test)]
@@ -324,10 +336,10 @@ mod tests {
     }
 
     #[test]
-    fn header_serialization_roundtrip() {
+    fn header_wire_roundtrip() {
         let header = dummy_header(42);
-        let bytes = serialize_block_header(&header);
-        let restored = deserialize_block_header(&bytes).unwrap();
+        let bytes = crate::wire::encode_block_header(&header);
+        let restored = crate::wire::decode_block_header(&bytes).unwrap();
 
         assert_eq!(restored.slot, 42);
         assert_eq!(restored.epoch, 0);
@@ -337,8 +349,8 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_too_short_returns_none() {
-        assert!(deserialize_block_header(&[0u8; 50]).is_none());
+    fn decode_too_short_returns_err() {
+        assert!(crate::wire::decode_block_header(&[0u8; 5]).is_err());
     }
 
     #[test]
@@ -368,12 +380,19 @@ mod tests {
         assert!(sync.initial_sync_done);
     }
 
+    fn make_state(name: &str) -> StateManager {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        StateManager::open(&dir, 1024).unwrap()
+    }
+
     #[test]
     fn handle_chain_tip_request() {
-        let mut chain = ChainState::genesis([0u8; 32]);
+        let mut chain = ChainState::genesis([0u8; 32], 1);
         chain.advance(dummy_header(10));
+        let state = make_state("pyde-sync-tip");
 
-        let resp = ChainSync::handle_inbound_request(&SyncReq::GetChainTip, &chain);
+        let resp = ChainSync::handle_inbound_request(&SyncReq::GetChainTip, &chain, &state);
         match resp {
             SyncResp::ChainTip { slot, .. } => assert_eq!(slot, 10),
             _ => panic!("expected ChainTip response"),
@@ -382,20 +401,21 @@ mod tests {
 
     #[test]
     fn handle_get_blocks_request() {
-        let mut chain = ChainState::genesis([0u8; 32]);
+        let mut chain = ChainState::genesis([0u8; 32], 1);
         for slot in 1..=5 {
             chain.advance(dummy_header(slot));
         }
+        let state = make_state("pyde-sync-blocks");
 
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetBlocks { start_slot: 1, count: 3 },
             &chain,
+            &state,
         );
         match resp {
             SyncResp::Blocks(blocks) => {
                 assert_eq!(blocks.len(), 3);
-                // Verify first block deserializes to slot 1
-                let h = deserialize_block_header(&blocks[0]).unwrap();
+                let h = crate::wire::decode_block_header(&blocks[0]).unwrap();
                 assert_eq!(h.slot, 1);
             }
             _ => panic!("expected Blocks response"),
@@ -404,15 +424,42 @@ mod tests {
 
     #[test]
     fn handle_get_blocks_not_found() {
-        let chain = ChainState::genesis([0u8; 32]);
+        let chain = ChainState::genesis([0u8; 32], 1);
+        let state = make_state("pyde-sync-notfound");
 
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetBlocks { start_slot: 100, count: 10 },
             &chain,
+            &state,
         );
         match resp {
             SyncResp::NotFound => {}
             _ => panic!("expected NotFound"),
+        }
+    }
+
+    #[test]
+    fn handle_state_snapshot_request() {
+        let mut chain = ChainState::genesis([0u8; 32], 1);
+        chain.advance(dummy_header(5));
+        let mut state = make_state("pyde-sync-snapshot");
+
+        // Insert some state
+        let key = pyde_state::keys::balance_key(&[0x01; 32]);
+        state.insert(key, 42u128.to_le_bytes().to_vec()).unwrap();
+
+        let resp = ChainSync::handle_inbound_request(
+            &SyncReq::GetStateSnapshot,
+            &chain,
+            &state,
+        );
+        match resp {
+            SyncResp::StateSnapshot { state_root, head_slot, entries } => {
+                assert_eq!(head_slot, 5);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(state_root, state.root());
+            }
+            _ => panic!("expected StateSnapshot"),
         }
     }
 }

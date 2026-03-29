@@ -40,6 +40,10 @@ pub enum Command {
         #[arg(long, default_value = "9090")]
         metrics_port: u16,
 
+        /// JSON-RPC port.
+        #[arg(long, default_value = "8545")]
+        rpc_port: u16,
+
         /// Bootstrap peer addresses (multiaddr).
         #[arg(long)]
         bootstrap: Vec<String>,
