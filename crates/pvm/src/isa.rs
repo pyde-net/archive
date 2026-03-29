@@ -35,6 +35,9 @@ pub enum Opcode {
     Wor = 0x2E,  // wd = ws1 | ws2
     Wxor = 0x2F, // wd = ws1 ^ ws2
     Wnot = 0x1F, // wd = ~ws1
+    /// Wide shift: wd = ws1 << amount (if imm&1==0) or ws1 >> amount (if imm&1==1).
+    /// Shift amount from GP register indexed by imm bits [4:1].
+    Wshift = 0x3A,
 
     // --- Extended Arithmetic (from gas table / roadmap) ---
     Addi = 0x0E, // rd = rs1 + sign_extend(imm)
@@ -93,17 +96,7 @@ pub enum Opcode {
     // --- 3.4.6 Assertions + Memory ---
     Assert = 0x38,   // if rs1 == 0 then revert (assertion)
     Memcpy = 0x39,   // copy gp[imm&0xF] bytes from mem[gp[rs1]] to mem[gp[rd]]
-    Commit = 0x3A,   // reserved for future use
-    // to decide what to actually do:
-    //
-    //   0x00 + imm says "NOP"   → do nothing (all-zero instruction is safe)
-    //   0x00 + imm says "Weq"   → wide equal (same as current Weq)
-    //   0x00 + imm says "Mcopy" → bulk memory copy (new!)
-    //   0x00 + imm says "Mset"  → bulk memory set (new!)
-    //   ... room for 60 more future instructions
-    //
-    // This gives us 64 new instructions without changing the 32-bit encoding.
-    //
+    // 0x3A is now Wshift (wide shift); see definition above.
     // Until Phase 9, bulk writes use a WSTORE loop:
     //   for each 32-byte chunk: WSTORE to heap, advance pointer
     //   ~N/32 instructions for N bytes (not N instructions)
@@ -167,6 +160,7 @@ impl Opcode {
             0x2D => Opcode::Wand,
             0x2E => Opcode::Wor,
             0x2F => Opcode::Wxor,
+            0x3A => Opcode::Wshift,
             0x30 => Opcode::Poseidon,
             0x31 => Opcode::VerifySig,
             0x32 => Opcode::MerkleVerify,
@@ -177,7 +171,7 @@ impl Opcode {
             0x37 => Opcode::Wload,
             0x38 => Opcode::Assert,
             0x39 => Opcode::Memcpy,
-            0x3A => Opcode::Commit,
+            // 0x3A handled above (Wshift)
             0x3B => Opcode::Wstore,
             0x3C => Opcode::Wmov,
             0x3D => Opcode::Narrow,
@@ -206,6 +200,7 @@ impl Opcode {
                 | Opcode::Wor
                 | Opcode::Wxor
                 | Opcode::Wnot
+                | Opcode::Wshift
                 | Opcode::Wload
                 | Opcode::Wstore
                 | Opcode::Wmov
@@ -252,6 +247,7 @@ pub const ALL_OPCODES: &[Opcode] = &[
     Opcode::Wor,
     Opcode::Wxor,
     Opcode::Wnot,
+    Opcode::Wshift,
     Opcode::Addi,
     Opcode::Not,
     Opcode::Load,
@@ -292,7 +288,6 @@ pub const ALL_OPCODES: &[Opcode] = &[
     Opcode::Wload,
     Opcode::Assert,
     Opcode::Memcpy,
-    Opcode::Commit,
     Opcode::Wstore,
     Opcode::Wmov,
     Opcode::Narrow,
@@ -484,6 +479,7 @@ pub fn gas_cost(op: Opcode) -> GasCost {
         Opcode::Wor => GasCost::new(2),
         Opcode::Wxor => GasCost::new(2),
         Opcode::Wnot => GasCost::new(2),
+        Opcode::Wshift => GasCost::new(2),
         Opcode::Wmov => GasCost::new(1),
         Opcode::Narrow => GasCost::new(1),
         Opcode::Widen => GasCost::new(1),
@@ -528,7 +524,6 @@ pub fn gas_cost(op: Opcode) -> GasCost {
         // Assertions + memory
         Opcode::Assert => GasCost::new(1),
         Opcode::Memcpy => GasCost::new(3),  // base cost; + 3 per 8 bytes dynamic in handler
-        Opcode::Commit => GasCost::new(5),
 
         // Wide comparisons
         Opcode::Weq => GasCost::new(2),
@@ -595,6 +590,7 @@ static TOTAL_GAS_TABLE: [u64; 64] = {
             0x2D => Some(GasCost::new(2)),       // Wand
             0x2E => Some(GasCost::new(2)),       // Wor
             0x2F => Some(GasCost::new(2)),       // Wxor
+            0x3A => Some(GasCost::new(2)),       // Wshift
             0x30 => Some(GasCost::new(50)),      // Poseidon
             0x31 => Some(GasCost::new(5_000)),   // VerifySig
             0x32 => Some(GasCost::new(100)),     // MerkleVerify
@@ -605,7 +601,6 @@ static TOTAL_GAS_TABLE: [u64; 64] = {
             0x37 => Some(GasCost::new(4)),       // Wload
             0x38 => Some(GasCost::new(1)),       // Assert
             0x39 => Some(GasCost::new(3)),       // Memcpy
-            0x3A => Some(GasCost::new(5)),       // Commit
             0x3B => Some(GasCost::new(4)),       // Wstore
             0x3C => Some(GasCost::new(1)),       // Wmov
             0x3D => Some(GasCost::new(1)),       // Narrow

@@ -198,15 +198,17 @@ pub fn initialize_genesis(
 
 /// Create a default devnet genesis config with pre-funded accounts.
 pub fn devnet_genesis() -> GenesisConfig {
-    // 10 pre-funded accounts for development (each gets 1M PYDE)
-    let one_hundred_million_pyde = "100000000000000000"; // 100M PYDE in quanta (10^17)
+    // 10 pre-funded accounts for development (each gets 10B PYDE)
+    // Must be large enough to cover gas_limit * base_fee for contract deploys.
+    // base_fee = 50 gwei, deploy gas ~500K → cost ~25M PYDE in quanta.
+    let ten_billion_pyde = "10000000000000000000"; // 10B PYDE in quanta (10^19)
 
     let mut allocations = Vec::new();
     for i in 0u8..10 {
         let address = hex::encode([i + 1; 32]);
         allocations.push(GenesisAllocation {
             address,
-            balance: one_hundred_million_pyde.to_string(),
+            balance: ten_billion_pyde.to_string(),
             public_key: None,
         });
     }
@@ -270,7 +272,7 @@ mod tests {
         let account_bytes = state.get(&key).expect("account should exist");
         let account = pyde_account::types::Account::from_bytes(&account_bytes)
             .expect("should be a valid Account");
-        assert_eq!(account.balance, 100_000_000_000_000_000); // 100M PYDE
+        assert_eq!(account.balance, 10_000_000_000_000_000_000u128); // 10B PYDE
     }
 
     #[test]

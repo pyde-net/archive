@@ -216,7 +216,8 @@ pub struct Vm {
     pub storage: HashMap<U256, Vec<u8>>,
     /// Optional storage backend for lazy loading (e.g., from SMT).
     /// Called when Sload encounters a key not in the overlay.
-    pub storage_backend: Option<Box<dyn Fn(&U256) -> Option<Vec<u8>>>>,
+    /// Arc-wrapped so child VMs (cross-contract calls) can share the same backend.
+    pub storage_backend: Option<std::sync::Arc<dyn Fn(&U256) -> Option<Vec<u8>>>>,
 
     // --- Cold: accessed infrequently ---
     /// Internal call stack for CALL/RET within a contract.
@@ -229,6 +230,10 @@ pub struct Vm {
     storage_journal_keys: std::collections::HashSet<U256>,
     /// Contract registry: address → deployed bytecode.
     pub contracts: HashMap<Address, Vec<u8>>,
+    /// Optional code backend for lazy loading contract bytecode (e.g., from SMT).
+    /// Called by CallExt/Create when the target contract isn't in `contracts`.
+    /// Arc-wrapped so child VMs (cross-contract calls) can share the same backend.
+    pub code_backend: Option<std::sync::Arc<dyn Fn(&Address) -> Option<Vec<u8>>>>,
     /// Calldata: input bytes passed to this contract.
     pub calldata: Vec<u8>,
     /// Return data from the last external call.
@@ -276,6 +281,7 @@ impl Vm {
             storage_journal_keys: std::collections::HashSet::new(),
             decoded_cache: Vec::new(),
             contracts: HashMap::new(),
+            code_backend: None,
             calldata: Vec::new(),
             return_data: Vec::new(),
             static_mode: false,
@@ -507,6 +513,7 @@ impl Vm {
             | Opcode::Wor
             | Opcode::Wxor
             | Opcode::Wnot
+            | Opcode::Wshift
             | Opcode::Wmov
             | Opcode::Narrow
             | Opcode::Widen
@@ -991,6 +998,13 @@ impl Vm {
                 let result = self.do_ext_call(d, is_static_flag, false)?;
                 self.cpu
                     .write_gp(result_reg, if result.success { 1 } else { 0 });
+                // Write child's return value to r1 (function return convention)
+                if result.success && result.return_data.len() >= 8 {
+                    let val = u64::from_le_bytes(
+                        result.return_data[..8].try_into().unwrap_or([0; 8])
+                    );
+                    self.cpu.write_gp(1, val);
+                }
                 self.return_data = result.return_data;
                 self.pc += 4;
             }
@@ -1064,10 +1078,6 @@ impl Vm {
                         .checked_write_slice(dst_ptr, &data)
                         .map_err(|_| Trap::MemoryFault)?;
                 }
-                self.pc += 4;
-            }
-            Opcode::Commit => {
-                // commit rd — reserved for future use
                 self.pc += 4;
             }
             Opcode::Selfdestruct => {
@@ -1272,16 +1282,32 @@ impl Vm {
             .checked_read_slice(calldata_ptr, calldata_len)
             .map_err(|_| Trap::MemoryFault)?;
 
-        // Look up target contract bytecode
+        // Look up target contract bytecode (local registry, then lazy backend)
         let bytecode = match self.contracts.get(&target_addr) {
             Some(code) => code.clone(),
             None => {
-                // No contract at target address — call fails
-                return Ok(CallResult {
-                    success: false,
-                    return_data: Vec::new(),
-                    gas_used: 0,
-                });
+                // Try lazy code backend (e.g., load from SMT)
+                if let Some(ref backend) = self.code_backend {
+                    match backend(&target_addr) {
+                        Some(code) => {
+                            self.contracts.insert(target_addr, code.clone());
+                            code
+                        }
+                        None => {
+                            return Ok(CallResult {
+                                success: false,
+                                return_data: Vec::new(),
+                                gas_used: 0,
+                            });
+                        }
+                    }
+                } else {
+                    return Ok(CallResult {
+                        success: false,
+                        return_data: Vec::new(),
+                        gas_used: 0,
+                    });
+                }
             }
         };
 
@@ -1343,18 +1369,20 @@ impl Vm {
         let mut child = Vm::with_gas_limit_and_context(forwarded, child_ctx);
         child.static_mode = is_static_call || self.static_mode;
         child.contracts = self.contracts.clone();
+        child.storage_backend = self.storage_backend.clone();
+        child.code_backend = self.code_backend.clone();
         child.ext_call_depth = self.ext_call_depth + 1;
         child.calldata = calldata;
 
         // EIP-2929: warm storage keys persist across the entire transaction
         child.warm_storage_keys = self.warm_storage_keys.clone();
 
-        // Share storage for delegate calls
+        // Share storage for delegate calls; start fresh for regular calls
         if is_delegate {
             child.storage = std::mem::take(&mut self.storage);
-        } else {
-            child.storage = self.storage.clone();
         }
+        // Regular calls: child starts with empty storage overlay.
+        // The storage_backend (shared via Arc) loads values on demand.
 
         child.load(&bytecode).map_err(|_| Trap::MemoryFault)?;
         let output = child.execute();
@@ -1388,9 +1416,19 @@ impl Vm {
         // EIP-2929: merge child's warm keys back (persists regardless of success/failure)
         self.warm_storage_keys.extend(child.warm_storage_keys);
 
+        // Return data: if child has explicit return_data, use it.
+        // Otherwise, capture the child's r1 (function return value convention).
+        let return_data = if !child.return_data.is_empty() {
+            child.return_data
+        } else if success {
+            child.cpu.read_gp(1).to_le_bytes().to_vec()
+        } else {
+            Vec::new()
+        };
+
         Ok(CallResult {
             success,
-            return_data: child.return_data,
+            return_data,
             gas_used: output.gas_used,
         })
     }
@@ -3453,7 +3491,8 @@ mod tests {
         let output = vm.execute();
 
         assert_eq!(output.outcome, Outcome::Success);
-        assert_eq!(vm.cpu.read_gp(1), 1); // call succeeded
+        // After CallExt, r1 = child's return value (callee puts 42 in r1)
+        assert_eq!(vm.cpu.read_gp(1), 42);
     }
 
     // ========== Task 0203: Reentrancy guard blocks re-entrant call ==========
@@ -3569,7 +3608,9 @@ mod tests {
         let output = vm.execute();
 
         assert_eq!(output.outcome, Outcome::Success);
-        assert_eq!(vm.cpu.read_gp(1), 1); // B→C succeeded
+        // C returns r1=0 (no explicit return), B returns r1=0 (child's return)
+        // The call chain succeeded — check outcome, not r1 value
+        assert_eq!(vm.cpu.read_gp(1), 0); // C had no return value → r1=0
     }
 
     // ========== Task 0207: Call with insufficient gas → revert child only ==========
@@ -3809,6 +3850,7 @@ mod tests {
         let output = vm.execute();
 
         assert_eq!(output.outcome, Outcome::Success);
-        assert_eq!(vm.cpu.read_gp(1), 1); // call succeeded
+        // r1 = child's return value (callee loaded calldata[0]=99 into r1)
+        assert_eq!(vm.cpu.read_gp(1), 99);
     }
 }

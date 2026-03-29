@@ -3018,7 +3018,9 @@ name = "otic"
 version = "0.1.0"
 dependencies = [
  "ethnum",
+ "pyde-state",
  "pyde-vm",
+ "sparse-merkle-tree",
 ]
 
 [[package]]
@@ -3508,7 +3510,9 @@ dependencies = [
 name = "pyde-tx"
 version = "0.1.0"
 dependencies = [
+ "ethnum",
  "hex",
+ "otic",
  "pyde-account",
  "pyde-crypto",
  "pyde-state",

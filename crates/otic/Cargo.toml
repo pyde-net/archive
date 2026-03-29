@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 pyde-vm = { path = "../pvm" }
 ethnum = "1.5.2"
+
+[dev-dependencies]
+pyde-state = { path = "../state" }
+sparse-merkle-tree = "0.6"

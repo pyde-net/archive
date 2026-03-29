@@ -353,6 +353,7 @@ fn mnemonic_to_opcode(s: &str) -> Option<Opcode> {
         "wor" => Some(Opcode::Wor),
         "wxor" => Some(Opcode::Wxor),
         "wnot" => Some(Opcode::Wnot),
+        "wshift" => Some(Opcode::Wshift),
         "wmov" => Some(Opcode::Wmov),
         "narrow" => Some(Opcode::Narrow),
         "widen" => Some(Opcode::Widen),
@@ -387,7 +388,6 @@ fn mnemonic_to_opcode(s: &str) -> Option<Opcode> {
         "verifysig" => Some(Opcode::VerifySig),
         "merkleverify" => Some(Opcode::MerkleVerify),
         "memcpy" => Some(Opcode::Memcpy),
-        "commit" => Some(Opcode::Commit),
         _ => None,
     }
 }
@@ -421,6 +421,7 @@ fn opcode_to_mnemonic(op: Opcode) -> &'static str {
         Opcode::Wor => "wor",
         Opcode::Wxor => "wxor",
         Opcode::Wnot => "wnot",
+        Opcode::Wshift => "wshift",
         Opcode::Wmov => "wmov",
         Opcode::Narrow => "narrow",
         Opcode::Widen => "widen",
@@ -457,7 +458,6 @@ fn opcode_to_mnemonic(op: Opcode) -> &'static str {
         Opcode::VerifySig => "verifysig",
         Opcode::MerkleVerify => "merkleverify",
         Opcode::Memcpy => "memcpy",
-        Opcode::Commit => "commit",
         Opcode::Invalid => "invalid",
     }
 }

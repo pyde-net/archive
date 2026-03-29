@@ -11,3 +11,7 @@ pyde-state = { path = "../state" }
 sparse-merkle-tree = "0.6"
 tracing = "0.1"
 hex = "0.4"
+ethnum = "1.5.2"
+
+[dev-dependencies]
+otic = { path = "../otic" }

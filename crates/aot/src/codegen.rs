@@ -814,9 +814,6 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let len = builder.use_var(Variable::from_u32(len_reg));
                         builder.ins().call(fn_memcpy_ref, &[vm_ctx, dst, src, len]);
                     }
-                    Opcode::Commit => {
-                        // Commit is captured from trace, no runtime effect
-                    }
                     Opcode::Selfdestruct => {
                         // Selfdestruct halts execution after clearing storage
                         builder.ins().jump(success_block, &[]);
