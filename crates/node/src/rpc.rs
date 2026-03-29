@@ -371,7 +371,9 @@ impl PydeApiServer for RpcServer {
         let success = output.outcome == pyde_vm::vm::Outcome::Success;
 
         if success {
-            Ok(format!("0x{:x}", output.gas_used))
+            // Return value is in r0 (PVM convention for function return)
+            let return_value = vm.cpu.read_gp(0);
+            Ok(format!("0x{:x}", return_value))
         } else {
             Err(rpc_err(-32000, format!("execution failed: {:?}", output.outcome)))
         }

@@ -294,7 +294,7 @@ fn execute_in_pvm(
 
     // Persist VM storage changes back to SMT.
     // Use the derived key directly (same as what the VM uses internally).
-    if success {
+    if success && !vm.storage.is_empty() {
         for (vm_key, value_bytes) in &vm.storage {
             let smt_key = H256::from(vm_key.to_le_bytes());
             let _ = smt.insert(smt_key, value_bytes.clone());
