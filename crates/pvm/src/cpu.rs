@@ -252,6 +252,20 @@ impl Cpu {
                 let ws1 = self.read_wide(d.rs1);
                 self.write_wide(d.rd, !ws1);
             }
+            Opcode::Wshift => {
+                let ws1 = self.read_wide(d.rs1);
+                let dir = d.rs2_or_imm & 1; // 0=left, 1=right
+                let shift_reg = ((d.rs2_or_imm >> 1) & 0xF) as u8;
+                let shift = self.read_gp(shift_reg) as u32;
+                let result = if shift >= 256 {
+                    U256::ZERO
+                } else if dir == 0 {
+                    ws1 << shift
+                } else {
+                    ws1 >> shift
+                };
+                self.write_wide(d.rd, result);
+            }
             Opcode::Wmov => {
                 let ws1 = self.read_wide(d.rs1);
                 self.write_wide(d.rd, ws1);

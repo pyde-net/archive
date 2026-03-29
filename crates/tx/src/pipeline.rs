@@ -168,8 +168,7 @@ pub fn execute_transaction(
             match load_code(smt, &tx.to) {
                 Some(code) => {
                     tracing::debug!(to = hex::encode(tx.to), code_len = code.len(), "executing contract call in PVM");
-                    let result = execute_in_pvm(tx, &sender, &code, smt, block_ctx);
-                    result
+                    execute_in_pvm(tx, &sender, &code, smt, block_ctx)
                 }
                 None => {
                     tracing::debug!(to = hex::encode(tx.to), "simple transfer (no code at recipient)");
@@ -185,6 +184,8 @@ pub fn execute_transaction(
                 &tx.from,
                 sender.nonce,
             );
+            // Increment sender nonce so the next deploy gets a different address
+            sender.nonce += 1;
 
             let (runtime_code, gas_used) = if tx.data.len() >= 8 {
                 let mut clen_bytes = [0u8; 4];
@@ -347,11 +348,17 @@ fn execute_in_pvm(
     // During execution, SMT is only read (writes go to vm.storage overlay).
     // SAFETY: smt is not mutated during vm.execute(). The pointer is valid for
     // the duration of execute_in_pvm. The closure is dropped before smt is mutated again.
-    let contract_addr = tx.to;
     let smt_ptr = smt as *const PydeSMT;
-    vm.storage_backend = Some(Box::new(move |key: &U256| {
+    vm.storage_backend = Some(std::sync::Arc::new(move |key: &U256| {
         let smt_key = H256::from(key.to_le_bytes());
         unsafe { (*smt_ptr).get(&smt_key) }
+    }));
+
+    // Code backend: lazy-load target contract bytecode for cross-contract calls.
+    let smt_ptr2 = smt as *const PydeSMT;
+    vm.code_backend = Some(std::sync::Arc::new(move |addr: &pyde_account::address::Address| {
+        let code_key = pyde_state::keys::code_key(addr);
+        unsafe { (*smt_ptr2).get(&code_key) }
     }));
 
     if vm.load(code).is_err() {
@@ -372,6 +379,7 @@ fn execute_in_pvm(
     // Use the derived key directly (same as what the VM uses internally).
     // Drop the storage backend before writing back (releases the read pointer)
     vm.storage_backend = None;
+    vm.code_backend = None;
 
     // Persist VM storage changes to SMT
     if success && !vm.storage.is_empty() {
@@ -600,5 +608,184 @@ mod tests {
 
         let nonce = load_nonce(&smt, &sender_addr);
         assert_eq!(nonce.base, 3);
+    }
+
+    /// Full pipeline test: deploy contract, call set_balance x4, call batch_reward,
+    /// then verify balance(20) == 41700. Reproduces the E2E discrepancy.
+    #[test]
+    fn pipeline_batch_reward_storage_integrity() {
+        let src = r#"
+            contract T {
+                storage {
+                    balances: Map<u64, u64>,
+                    fee_rate: u64,
+                    owner_id: u64,
+                }
+                pub fn setup() {
+                    self.fee_rate = 10;
+                    self.owner_id = 1;
+                    self.balances[1] = 0;
+                }
+                pub fn set_balance(user: u64, amount: u64) {
+                    self.balances[user] = amount;
+                }
+                #[reentrant]
+                pub fn batch_reward(u1: u64, u2: u64, u3: u64, reward: u64) -> u64 {
+                    let b1 = self.balances[u1];
+                    let b2 = self.balances[u2];
+                    let b3 = self.balances[u3];
+                    let rate = self.fee_rate;
+                    let total = reward * 3;
+                    let tax = total * rate / 100;
+                    let per_user = (total - tax) / 3;
+                    self.balances[u1] = b1 + per_user;
+                    self.balances[u2] = b2 + per_user;
+                    self.balances[u3] = b3 + per_user;
+                    let oid = self.owner_id;
+                    let owner_bal = self.balances[oid];
+                    self.balances[oid] = owner_bal + tax;
+                    return per_user;
+                }
+                #[view]
+                pub fn get_balance(user: u64) -> u64 { return self.balances[user]; }
+            }
+        "#;
+
+        // Compile WITH optimization (matches CLI: otic build)
+        let (tokens, _) = otic::lexer::Lexer::new(src).tokenize();
+        let (file, _) = otic::parser::Parser::new(tokens).parse();
+        let mut ir = otic::lower::lower(&file);
+        otic::optimize::optimize(&mut ir);
+        let codegen = otic::codegen::CodeGen::new();
+        let contract = codegen.generate(&ir);
+
+        let mut smt = PydeSMT::new();
+        let contract_addr = [0x42u8; 32];
+
+        // Store contract code in SMT
+        store_code(&mut smt, &contract_addr, &contract.runtime_bytecode).unwrap();
+        let contract_account = Account::new_contract(contract_addr, &contract.runtime_bytecode);
+        store_account(&mut smt, &contract_account).unwrap();
+
+        // Create sender account with huge balance
+        let sender_addr = [0x01u8; 32];
+        let mut sender = Account {
+            address: sender_addr,
+            nonce: 0,
+            balance: 10_000_000_000_000_000_000u128,
+            code_hash: sparse_merkle_tree::H256::zero(),
+            storage_root: sparse_merkle_tree::H256::zero(),
+            account_type: pyde_account::types::AccountType::EOA,
+            auth_keys: pyde_account::types::AuthKeys::None,
+            gas_tank: 0,
+            key_nonce: 0,
+        };
+        store_account(&mut smt, &sender).unwrap();
+        store_nonce(&mut smt, &sender_addr, &pyde_account::nonce::NonceState::new()).unwrap();
+
+        // Also create validator account
+        let validator_addr = [0xFFu8; 32];
+        let validator = Account {
+            address: validator_addr,
+            balance: 0,
+            ..sender.clone()
+        };
+        store_account(&mut smt, &validator).unwrap();
+
+        let block_ctx = BlockContext {
+            height: 1,
+            timestamp: 1000,
+            base_fee: 50_000_000_000, // match node genesis: 50 gwei
+            block_gas_limit: 400_000_000,
+            chain_id: 31337,
+            validator_address: validator_addr,
+        };
+
+        let sel = |name: &str| -> u32 { otic::codegen::compute_selector(name) };
+
+        // Helper: send a tx through the pipeline
+        let mut nonce_counter = 0u64;
+        let mut send = |smt: &mut PydeSMT, calldata: Vec<u8>| {
+            let tx = Transaction {
+                from: sender_addr,
+                to: contract_addr,
+                value: 0,
+                data: calldata,
+                gas_limit: 500_000,
+                nonce: nonce_counter,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
+                access_list: vec![],
+                deadline: None,
+                chain_id: 31337,
+                tx_type: TransactionType::Standard,
+            };
+            nonce_counter += 1;
+            let result = execute_transaction(&tx, smt, &block_ctx);
+            match result {
+                Ok(receipt) => assert!(receipt.success, "tx failed: nonce={}", tx.nonce),
+                Err(e) => panic!("pipeline error: {:?}", e),
+            }
+        };
+
+        // Helper: pyde_call equivalent (read-only)
+        let call = |smt: &PydeSMT, calldata: Vec<u8>| -> u64 {
+            let ctx = pyde_vm::vm::ExecutionContext {
+                self_address: contract_addr,
+                caller: sender_addr,
+                ..Default::default()
+            };
+            let code = load_code(smt, &contract_addr).expect("no code");
+            let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(10_000_000, ctx);
+            let smt_ptr = smt as *const PydeSMT;
+            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+                let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+                unsafe { (*smt_ptr).get(&smt_key) }
+            }));
+            vm.calldata = calldata;
+            vm.load(&code).unwrap();
+            let output = vm.execute();
+            assert_eq!(output.outcome, pyde_vm::vm::Outcome::Success, "call failed");
+            vm.cpu.read_gp(1)
+        };
+
+        let enc_u64 = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        let mut cd = |name: &str, args: &[u64]| -> Vec<u8> {
+            let mut data = sel(name).to_be_bytes().to_vec();
+            for a in args { data.extend_from_slice(&a.to_le_bytes()); }
+            data
+        };
+
+        // Run: setup, set_balance x4, batch_reward
+        send(&mut smt, cd("setup", &[]));
+        send(&mut smt, cd("set_balance", &[10, 38000]));
+        send(&mut smt, cd("set_balance", &[20, 39000]));
+        send(&mut smt, cd("set_balance", &[30, 21800]));
+        send(&mut smt, cd("set_balance", &[1, 1200]));
+
+        // Verify pre-batch balances
+        assert_eq!(call(&smt, cd("get_balance", &[10])), 38000, "pre-batch bal(10)");
+        assert_eq!(call(&smt, cd("get_balance", &[20])), 39000, "pre-batch bal(20)");
+        assert_eq!(call(&smt, cd("get_balance", &[30])), 21800, "pre-batch bal(30)");
+        assert_eq!(call(&smt, cd("get_balance", &[1])), 1200, "pre-batch bal(1)");
+
+        // Run batch_reward
+        send(&mut smt, cd("batch_reward", &[10, 20, 30, 3000]));
+
+        // Verify post-batch balances
+        let b10 = call(&smt, cd("get_balance", &[10]));
+        let b20 = call(&smt, cd("get_balance", &[20]));
+        let b30 = call(&smt, cd("get_balance", &[30]));
+        let b1 = call(&smt, cd("get_balance", &[1]));
+
+        eprintln!("bal(10)={b10} (want 40700)");
+        eprintln!("bal(20)={b20} (want 41700)");
+        eprintln!("bal(30)={b30} (want 24500)");
+        eprintln!("bal(1)={b1} (want 2100)");
+
+        assert_eq!(b10, 40700, "bal(10) = 38000 + 2700");
+        assert_eq!(b20, 41700, "bal(20) = 39000 + 2700");
+        assert_eq!(b30, 24500, "bal(30) = 21800 + 2700");
+        assert_eq!(b1, 2100, "bal(1) = 1200 + 900");
     }
 }

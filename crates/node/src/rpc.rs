@@ -366,11 +366,20 @@ impl PydeApiServer for RpcServer {
         let gas_limit: u64 = call_obj.get("gas").and_then(|v| v.as_u64())
             .unwrap_or(1_000_000);
 
-        // Load contract code and keep state alive for lazy storage loading
-        let state = self.state.state.read().await;
+        // Acquire an OWNED read lock that lives for the entire call execution.
+        // This prevents the block processor from modifying state mid-read.
+        // Previously, we dropped the lock before PVM execution and used try_read()
+        // per Sload, which could fail if the block processor held a write lock,
+        // causing stale zero values to be cached in the VM overlay.
+        let state_guard = Arc::clone(&self.state.state).read_owned().await;
+
         let code_key = pyde_state::keys::code_key(&to);
-        let code = state.get(&code_key)
+        let code = state_guard.get(&code_key)
             .ok_or_else(|| rpc_err(-32000, "no code at address".into()))?;
+
+        // Acquire second read guard for code backend BEFORE creating VM
+        // (both guards must be obtained before any non-Send value exists across await)
+        let code_guard = Arc::clone(&self.state.state).read_owned().await;
 
         // Run PVM directly — no validation, no nonce/balance checks
         let ctx = pyde_vm::vm::ExecutionContext {
@@ -391,36 +400,25 @@ impl PydeApiServer for RpcServer {
         let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(gas_limit, ctx);
         vm.calldata = calldata;
 
-        // Load contract storage from SMT (read-only, slots 0..64)
-        // Use the VM's key derivation: poseidon2(slot_bytes ++ contract_address)
-        drop(state);
-
-        // Lazy storage: VM reads from SMT on demand during Sload.
-        // No manifest, no pre-loading — just query the database when needed.
-        let state_arc = self.state.state.clone();
-        vm.storage_backend = Some(Box::new(move |key: &ethnum::U256| {
-            let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
-            state_arc.try_read().ok()?.get(&smt_key)
-        }));
-
         if let Err(e) = vm.load(&code) {
             return Err(rpc_err(-32000, format!("failed to load code: {:?}", e)));
         }
 
-        // Debug: what key does the VM derive for slot 0?
-        let slot0_key = vm.derive_storage_key(ethnum::U256::ZERO);
-        let in_storage = vm.storage.contains_key(&slot0_key);
-        tracing::info!(
-            slot0_key = hex::encode(slot0_key.to_le_bytes()),
-            in_storage,
-            "pyde_call: slot 0 key check"
-        );
+        // Lazy storage backend (owned guard — no stale reads)
+        vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            state_guard.get(&smt_key)
+        }));
+        // Code backend for cross-contract calls (CallExt)
+        vm.code_backend = Some(std::sync::Arc::new(move |addr: &[u8; 32]| {
+            let ck = pyde_state::keys::code_key(addr);
+            code_guard.get(&ck)
+        }));
 
         let output = vm.execute();
         let success = output.outcome == pyde_vm::vm::Outcome::Success;
 
         if success {
-            // Return value is in r1 (PVM codegen convention for function return)
             let return_value = vm.cpu.read_gp(1);
             Ok(format!("0x{:x}", return_value))
         } else {
@@ -445,13 +443,12 @@ impl PydeApiServer for RpcServer {
             return Ok(format!("0x{:x}", 32_000 + calldata.len() as u64 * 16));
         }
 
-        let state = self.state.state.read().await;
+        let state_guard = Arc::clone(&self.state.state).read_owned().await;
         let code_key = pyde_state::keys::code_key(&to);
-        let code = match state.get(&code_key) {
+        let code = match state_guard.get(&code_key) {
             Some(c) => c,
             None => return Ok(format!("0x{:x}", 21_000)), // simple transfer
         };
-        drop(state);
 
         let ctx = pyde_vm::vm::ExecutionContext {
             caller: from,
@@ -471,6 +468,11 @@ impl PydeApiServer for RpcServer {
         let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(gas_limit, ctx);
         vm.calldata = calldata;
         let _ = vm.load(&code);
+        // Hold read lock for entire execution via owned guard
+        vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            state_guard.get(&smt_key)
+        }));
         let output = vm.execute();
         Ok(format!("0x{:x}", output.gas_used))
     }

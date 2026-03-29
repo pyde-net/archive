@@ -474,20 +474,32 @@ impl CodeGen {
     /// Decode function params from calldata into arg registers (r2, r3, ...).
     /// For regular functions, params start after the 4-byte selector.
     /// For constructors, params start at offset 0 (no selector).
+    ///
+    /// IMPORTANT: r4 = calldata length, r5 = calldata pointer (set by PVM).
+    /// Params are mapped to r2, r3, r4, r5, r6, ... which OVERWRITES r4/r5.
+    /// We save the calldata pointer to r14 first, then decode using r14 as base.
     fn emit_calldata_decode(&mut self, func: &IrFunction) {
+        if func.params.is_empty() {
+            return;
+        }
         let selector_skip = if func.is_constructor { 0i32 } else { 4 };
         let mut param_offset = selector_skip;
+
+        // Save calldata pointer to r14 before decoding overwrites r5
+        self.emit_op(Opcode::Add, memory::REG_SCRATCH_0, 5, 0); // r14 = r5
+
         for (i, (_name, ty)) in func.params.iter().enumerate() {
             let phys = (i as u8) + 2; // r2, r3, r4, ...
             let is_wide = is_wide_type(ty);
 
             if is_wide {
-                // Compute address: r14 = r5 + offset
-                self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 5, param_offset as u32 & 0x3FFFF);
-                self.emit_op(Opcode::Wload, phys, memory::REG_SCRATCH_0, 0);
+                // Compute address: r15 = r14 + offset
+                self.emit_op(Opcode::Addi, 15, memory::REG_SCRATCH_0, param_offset as u32 & 0x3FFFF);
+                self.emit_op(Opcode::Wload, phys, 15, 0);
                 param_offset += 32;
             } else {
-                self.emit_load(phys, 5, param_offset);
+                // Load from r14 (saved calldata ptr) instead of r5
+                self.emit_load(phys, memory::REG_SCRATCH_0, param_offset);
                 param_offset += 8;
             }
         }
@@ -674,25 +686,38 @@ impl CodeGen {
                 let use_wide = lhs_wide || rhs_wide;
 
                 if use_wide {
-                    let wd = self.regs.alloc_wide(*dst);
-                    let w1 = self.get_reg(*lhs);
-                    let w2 = self.get_reg(*rhs);
-                    let pvm_op = match op {
-                        BinOp::Add => Opcode::Wadd,
-                        BinOp::Sub => Opcode::Wsub,
-                        BinOp::Mul => Opcode::Wmul,
-                        BinOp::Div => Opcode::Wdiv,
-                        BinOp::Mod => Opcode::Wmod,
-                        BinOp::BitAnd => Opcode::Wand,
-                        BinOp::BitOr => Opcode::Wor,
-                        BinOp::BitXor => Opcode::Wxor,
-                        _ => Opcode::Wadd, // shifts/logical on wide fallback
-                    };
-                    self.emit_op(pvm_op, wd, w1, w2 as u32);
+                    if matches!(op, BinOp::Shl | BinOp::Shr) {
+                        // Wide shift: shift amount is a GP value, not wide.
+                        let wd = self.regs.alloc_wide(*dst);
+                        let w1 = self.get_reg(*lhs);
+                        let shift_reg = self.get_reg_to(*rhs, 14);
+                        let dir = if matches!(op, BinOp::Shr) { 1u32 } else { 0u32 };
+                        let imm = (shift_reg as u32) << 1 | dir;
+                        self.emit_op(Opcode::Wshift, wd, w1, imm);
+                    } else {
+                        let wd = self.regs.alloc_wide(*dst);
+                        let w1 = self.get_reg(*lhs);
+                        let w2 = self.get_reg(*rhs);
+                        let pvm_op = match op {
+                            BinOp::Add => Opcode::Wadd,
+                            BinOp::Sub => Opcode::Wsub,
+                            BinOp::Mul => Opcode::Wmul,
+                            BinOp::Div => Opcode::Wdiv,
+                            BinOp::Mod => Opcode::Wmod,
+                            BinOp::BitAnd => Opcode::Wand,
+                            BinOp::BitOr => Opcode::Wor,
+                            BinOp::BitXor => Opcode::Wxor,
+                            BinOp::LogicalAnd => Opcode::Wand,
+                            BinOp::LogicalOr => Opcode::Wor,
+                            BinOp::Shl | BinOp::Shr => unreachable!(),
+                        };
+                        self.emit_op(pvm_op, wd, w1, w2 as u32);
+                    }
                 } else {
                     let rd = self.alloc_gp(*dst);
-                    let r1 = self.get_reg(*lhs);
-                    let r2 = self.get_reg(*rhs);
+                    // Use different restore targets so both operands survive if both spilled
+                    let r1 = self.get_reg_to(*lhs, 15);
+                    let r2 = self.get_reg_to(*rhs, 14);
                     let pvm_op = match op {
                         BinOp::Add => Opcode::Add,
                         BinOp::Sub => Opcode::Sub,
@@ -733,8 +758,9 @@ impl CodeGen {
             Inst::Cmp(dst, op, lhs, rhs) => {
                 let rd = self.alloc_gp(*dst);
                 let lhs_wide = self.regs.is_wide(*lhs);
-                let r1 = self.get_reg(*lhs);
-                let r2 = self.get_reg(*rhs);
+                // Use different restore targets so both operands survive if both spilled
+                let r1 = self.get_reg_to(*lhs, 15);
+                let r2 = self.get_reg_to(*rhs, 14);
 
                 if lhs_wide {
                     match op {
@@ -846,9 +872,12 @@ impl CodeGen {
                 let key_wide = is_wide_type(&key_ty);
                 let wide_value = is_wide_type(&val_ty);
 
+                // Get key and derive storage key FIRST
                 let rk = self.get_reg(*key);
-                let rv = self.get_reg(*val);
                 self.emit_map_key_derivation(slot, rk, key_wide);
+                // Get val AFTER derivation — derivation clobbers r14/r15,
+                // so getting val before would lose it if val was spilled to r15.
+                let rv = self.get_reg(*val);
 
                 if wide_value {
                     self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0);
@@ -868,9 +897,20 @@ impl CodeGen {
                 let key2_wide = is_wide_type(&key2_ty);
                 let wide_value = is_wide_type(&val_ty);
 
+                // Interleave get_reg with immediate heap writes to prevent
+                // r15 clobbering when both keys are spilled.
+                // Each key is stored to heap right after get_reg, before the next get_reg.
                 let rk1 = self.get_reg(*key1);
+                let k1_size = self.emit_key_store(rk1, 12, 8, key1_wide);
                 let rk2 = self.get_reg(*key2);
-                self.emit_nested_map_key_derivation(slot, rk1, key1_wide, rk2, key2_wide);
+                let k2_offset = 8 + k1_size as i32;
+                let k2_size = self.emit_key_store(rk2, 12, k2_offset, key2_wide);
+                // Now safe to clobber r15 for slot
+                self.emit_op(Opcode::Addi, 15, 0, slot);
+                self.emit_store(15, 12, 0);
+                let total = 8 + k1_size + k2_size;
+                self.emit_op(Opcode::Addi, 14, 0, total);
+                self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
 
                 if wide_value {
                     let wd = self.regs.alloc_wide(*dst);
@@ -892,11 +932,21 @@ impl CodeGen {
                 let key2_wide = is_wide_type(&key2_ty);
                 let wide_value = is_wide_type(&val_ty);
 
+                // Interleave get_reg with immediate heap writes (same as NestedMapGet)
                 let rk1 = self.get_reg(*key1);
+                let k1_size = self.emit_key_store(rk1, 12, 8, key1_wide);
                 let rk2 = self.get_reg(*key2);
-                let rv = self.get_reg(*val);
-                self.emit_nested_map_key_derivation(slot, rk1, key1_wide, rk2, key2_wide);
+                let k2_offset = 8 + k1_size as i32;
+                let k2_size = self.emit_key_store(rk2, 12, k2_offset, key2_wide);
+                // Now safe to clobber r15 for slot
+                self.emit_op(Opcode::Addi, 15, 0, slot);
+                self.emit_store(15, 12, 0);
+                let total = 8 + k1_size + k2_size;
+                self.emit_op(Opcode::Addi, 14, 0, total);
+                self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
 
+                // Get val AFTER derivation — derivation clobbers r14/r15
+                let rv = self.get_reg(*val);
                 if wide_value {
                     self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0);
                 } else {
@@ -1304,25 +1354,30 @@ impl CodeGen {
                 }
             }
 
-            Inst::ExtCall(dst, addr, _method, args) => {
+            Inst::ExtCall(dst, addr, method, args) => {
                 let rd = self.alloc_gp(*dst);
                 let ra = self.get_reg(*addr);
 
-                // Write calldata (args) to heap
+                // Write calldata to heap: [selector(4 BE bytes)][arg0(8 LE)][arg1(8 LE)]...
+                // Selector: FNV-1a hash stored as BE bytes in calldata (dispatch
+                // loads with W32 LE and compares against selector.swap_bytes()).
+                let selector = compute_selector(method);
+                // Store selector bytes in BE order to match the dispatch convention
+                let sel_be = selector.to_be_bytes();
+                let sel_as_le_u32 = u32::from_le_bytes(sel_be); // reinterpret BE bytes as LE u32
+                self.load_u32_to_reg(15, sel_as_le_u32);
+                let sel_imm = encode_mem_immediate(0, MemWidth::W32).unwrap();
+                self.emit(encode(Opcode::Store, 15, 12, sel_imm));
+
+                // Write args after selector (offset 4)
                 for (i, arg) in args.iter().enumerate() {
                     let r = self.get_reg(*arg);
-                    self.emit_store(r, 12, (i as i32) * 8);
+                    self.emit_store(r, 12, 4 + (i as i32) * 8);
                 }
-                let calldata_len = (args.len() * 8) as u32;
+                let calldata_len = 4 + (args.len() as u32) * 8;
 
-                // Set up CallExt encoding:
-                // rd = target address (wide register)
-                // rs1 = calldata pointer GP register (r12 = heap)
-                // imm[3:0] = calldata length register
-                // imm[7:4] = gas register
-                // imm[11:8] = result register
+                // Set up CallExt: rd=target(wide), rs1=calldata_ptr(r12), imm=len/gas/result
                 self.emit_op(Opcode::Addi, 14, 0, calldata_len);  // r14 = calldata len
-                // Use r14 for len (14), r15 for gas (15), r13 for result (13)
                 self.emit_op(Opcode::Caller, 15, 0, 2);           // r15 = gas_remaining
                 let imm = (14 & 0xF)           // len_reg = r14
                     | ((15 & 0xF) << 4)         // gas_reg = r15
@@ -1332,8 +1387,10 @@ impl CodeGen {
                 // Advance heap past calldata
                 self.emit_op(Opcode::Addi, 12, 12, calldata_len);
 
-                // Move result to destination
-                self.emit_op(Opcode::Add, rd, 13, 0);
+                // After CallExt, r1 = child's return value (set by PVM convention)
+                if rd != 1 {
+                    self.emit_op(Opcode::Add, rd, 1, 0);
+                }
             }
 
             Inst::CrossCall { target, method, args, .. } => {
@@ -1349,12 +1406,38 @@ impl CodeGen {
 
             Inst::RawCall(dst, target, args) => {
                 let rd = self.alloc_gp(*dst);
+                // Target is an Address (wide register)
                 let rt = self.get_reg(*target);
-                for arg in args {
+
+                // Write calldata (args) to heap memory at r12
+                for (i, arg) in args.iter().enumerate() {
                     let r = self.get_reg(*arg);
-                    self.emit_op(Opcode::Push, r, 0, 0);
+                    if self.regs.is_wide(*arg) {
+                        self.emit_op(Opcode::Wstore, r, 12, (i as u32 * 32) & 0x3FFFF);
+                    } else {
+                        self.emit_store(r, 12, (i as i32) * 8);
+                    }
                 }
-                self.emit_op(Opcode::CallExt, rd, rt, 0);
+                let calldata_len = (args.len() * 8) as u32;
+
+                // Set up CallExt encoding:
+                // rd = target address (wide register)
+                // rs1 = calldata pointer (r12 = heap)
+                // imm[3:0] = len register, imm[7:4] = gas register, imm[11:8] = result register
+                self.emit_op(Opcode::Addi, 14, 0, calldata_len);  // r14 = calldata len
+                self.emit_op(Opcode::Caller, 15, 0, 2);           // r15 = gas_remaining
+                let imm = (14 & 0xF)           // len_reg = r14
+                    | ((15 & 0xF) << 4)         // gas_reg = r15
+                    | ((13 & 0xF) << 8);        // result_reg = r13
+                self.emit_op(Opcode::CallExt, rt, 12, imm);
+
+                // Advance heap past calldata
+                self.emit_op(Opcode::Addi, 12, 12, calldata_len);
+
+                // After CallExt, r1 = child's return value
+                if rd != 1 {
+                    self.emit_op(Opcode::Add, rd, 1, 0);
+                }
             }
 
             Inst::MakeVec(dst, cap) => {
@@ -1395,15 +1478,23 @@ impl CodeGen {
     }
 
     /// Get the physical register for a virtual register, emitting spill Load if needed.
+    /// Restores to r15 by default. Use `get_reg_to` when you need a different target
+    /// (e.g., when two operands might both be spilled and would clobber each other).
     fn get_reg(&mut self, vreg: Reg) -> u8 {
+        self.get_reg_to(vreg, 15)
+    }
+
+    /// Get the physical register for a virtual register, restoring to `restore_to` if spilled.
+    /// Use different restore targets when an instruction has multiple source operands
+    /// that could both be spilled (prevents second restore from clobbering the first).
+    fn get_reg_to(&mut self, vreg: Reg, restore_to: u8) -> u8 {
         match self.regs.get_or_spilled(vreg) {
             Ok(phys) => phys,
-            Err(RestoreAction::Restore(temp_reg, slot)) => {
-                // Load from spill area: temp_reg = mem[r13 + slot*8]
+            Err(RestoreAction::Restore(_, slot)) => {
                 let offset = (slot * 8) as i32;
                 let imm = encode_mem_immediate(offset, MemWidth::W64).unwrap();
-                self.instructions.push(encode(Opcode::Load, temp_reg, 13, imm));
-                temp_reg
+                self.instructions.push(encode(Opcode::Load, restore_to, 13, imm));
+                restore_to
             }
         }
     }
@@ -1554,42 +1645,23 @@ impl CodeGen {
 
     /// Derive a map storage key: w7 = poseidon2(slot || key).
     /// Handles any key type (GP or wide).
+    ///
+    /// CRITICAL: Writes key to heap FIRST (at offset 8), then slot (at offset 0).
+    /// key_reg might be r15 (spilled register restore target), and the slot load
+    /// clobbers r15. By consuming key_reg first, we avoid losing the key value.
+    /// Memory layout is unchanged: [slot:0-8][key:8-N].
     fn emit_map_key_derivation(&mut self, slot: u32, key_reg: u8, key_wide: bool) {
-        let mut offset = 0i32;
-        // Store slot (8 bytes)
+        // Store key FIRST at offset 8 — key_reg might be r15, consumed before clobber
+        let key_size = self.emit_key_store(key_reg, 12, 8, key_wide);
+        // Now safe to clobber r15 for slot
         self.emit_op(Opcode::Addi, 15, 0, slot);
-        self.emit_store(15, 12, offset);
-        offset += 8;
-        // Store key
-        let key_size = self.emit_key_store(key_reg, 12, offset, key_wide);
-        offset += key_size as i32;
-        // Hash: poseidon(mem[r12..r12+total])
-        self.emit_op(Opcode::Addi, 14, 0, offset as u32);
+        self.emit_store(15, 12, 0);
+        // Hash: poseidon(heap[r12..r12+8+key_size])
+        let total = 8 + key_size;
+        self.emit_op(Opcode::Addi, 14, 0, total);
         self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
     }
 
-    /// Derive a nested-map storage key: w7 = poseidon2(slot || key1 || key2).
-    /// Handles any combination of key types.
-    fn emit_nested_map_key_derivation(
-        &mut self, slot: u32,
-        key1_reg: u8, key1_wide: bool,
-        key2_reg: u8, key2_wide: bool,
-    ) {
-        let mut offset = 0i32;
-        // Store slot (8 bytes)
-        self.emit_op(Opcode::Addi, 15, 0, slot);
-        self.emit_store(15, 12, offset);
-        offset += 8;
-        // Store key1
-        let k1_size = self.emit_key_store(key1_reg, 12, offset, key1_wide);
-        offset += k1_size as i32;
-        // Store key2
-        let k2_size = self.emit_key_store(key2_reg, 12, offset, key2_wide);
-        offset += k2_size as i32;
-        // Hash
-        self.emit_op(Opcode::Addi, 14, 0, offset as u32);
-        self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
-    }
 }
 
 // ============================================================================
@@ -1617,11 +1689,6 @@ fn map_key_type(ty: &Ty) -> Ty {
     } else {
         Ty::U64
     }
-}
-
-/// Byte size of a type for storage key derivation.
-fn key_byte_size(ty: &Ty) -> u32 {
-    if is_wide_type(ty) { 32 } else { 8 }
 }
 
 /// Compute byte size of a struct field.
@@ -3106,5 +3173,551 @@ mod tests {
             }
         }
         assert_eq!(vm.cpu.read_gp(1), 100, "Vec should have 100 elements after realloc");
+    }
+
+    #[test]
+    fn pvm_map_set_under_register_pressure() {
+        // This test creates enough local variables to exhaust GP registers (r1-r11),
+        // forcing the register allocator to spill. Then does map set/get to verify
+        // spilled key/val registers are correctly handled in storage operations.
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage {
+                    data: Map<u64, u64>,
+                    count: u64,
+                }
+                pub fn f() -> u64 {
+                    // Create enough locals to exhaust registers and force spilling
+                    let a = 1;
+                    let b = 2;
+                    let c = 3;
+                    let d = 4;
+                    let e = 5;
+                    let f = 6;
+                    let g = 7;
+                    let h = 8;
+                    let i = 9;
+                    let j = 10;
+                    let k = 11;
+                    let l = 12;
+
+                    // Map set with key and val likely spilled
+                    self.data[a] = b;
+                    self.data[c] = d;
+                    self.data[e] = f;
+
+                    // Read back — key is likely spilled
+                    let r1 = self.data[a];
+                    let r2 = self.data[c];
+                    let r3 = self.data[e];
+
+                    // Use all the locals to prevent optimizer from eliminating them
+                    self.count = a + b + c + d + e + f + g + h + i + j + k + l;
+
+                    return r1 + r2 + r3;
+                }
+            }
+        "#);
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        vm.load(&compiled.bytecode).unwrap();
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => { steps += 1; if steps > 10_000 { break; } }
+                Err(e) => { panic!("PVM error: {:?}", e); }
+            }
+        }
+        // data[1]=2, data[3]=4, data[5]=6 → r1+r2+r3 = 2+4+6 = 12
+        assert_eq!(vm.cpu.read_gp(1), 12,
+            "Map operations under register pressure must preserve correct key/val");
+    }
+
+    #[test]
+    fn pvm_map_set_bool_under_pressure() {
+        // Regression test: map set of false (0) must not be confused with
+        // a clobbered register that happens to be 0.
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage {
+                    flags: Map<u64, bool>,
+                    a: u64,
+                    b: u64,
+                    c: u64,
+                    d: u64,
+                    e: u64,
+                    f: u64,
+                }
+                pub fn f() -> u64 {
+                    let x = 1;
+                    let y = 2;
+                    let z = 3;
+                    self.a = x;
+                    self.b = y;
+                    self.c = z;
+                    self.d = 4;
+                    self.e = 5;
+                    self.f = 6;
+
+                    // Set flag to true
+                    self.flags[x] = true;
+                    let v1 = self.flags[x];
+
+                    // Set flag to false (the value false=0 must survive register pressure)
+                    self.flags[x] = false;
+                    let v2 = self.flags[x];
+
+                    // v1 should be 1 (true), v2 should be 0 (false)
+                    if v1 == true {
+                        if v2 == false {
+                            return 99;
+                        }
+                    }
+                    return 0;
+                }
+            }
+        "#);
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        vm.load(&compiled.bytecode).unwrap();
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => { steps += 1; if steps > 10_000 { break; } }
+                Err(e) => { panic!("PVM error: {:?}", e); }
+            }
+        }
+        assert_eq!(vm.cpu.read_gp(1), 99,
+            "Bool map set(false) must work under register pressure");
+    }
+
+    #[test]
+    fn pvm_marketplace_buy_pattern() {
+        // Regression test for the Marketplace buy_item pattern:
+        // Multiple map reads/writes in a single function under heavy register pressure.
+        // This is the exact pattern that was broken: read multiple map fields for an item,
+        // compute fees, update balances, flip active flag.
+        let compiled = compile_no_opt(r#"
+            contract Marketplace {
+                storage {
+                    item_prices: Map<u64, u64>,
+                    item_sellers: Map<u64, u64>,
+                    item_active: Map<u64, bool>,
+                    balances: Map<u64, u64>,
+                    fee_percent: u64,
+                    owner: u64,
+                    total_fees: u64,
+                }
+
+                pub fn test_buy() -> u64 {
+                    // Setup: list an item
+                    let item_id = 1;
+                    let seller = 42;
+                    let price = 1000;
+                    let fee_pct = 5;
+                    let the_owner = 99;
+                    self.fee_percent = fee_pct;
+                    self.owner = the_owner;
+
+                    self.item_prices[item_id] = price;
+                    self.item_sellers[item_id] = seller;
+                    self.item_active[item_id] = true;
+
+                    // Buy: read item fields
+                    let p = self.item_prices[item_id];
+                    let s = self.item_sellers[item_id];
+                    let active = self.item_active[item_id];
+
+                    // Compute fee
+                    let fp = self.fee_percent;
+                    let fee = p * fp / 100;
+                    let seller_amount = p - fee;
+
+                    // Update balances
+                    let old_bal = self.balances[s];
+                    self.balances[s] = old_bal + seller_amount;
+
+                    let old_fee_bal = self.balances[the_owner];
+                    self.balances[the_owner] = old_fee_bal + fee;
+
+                    // Flip active to false
+                    self.item_active[item_id] = false;
+                    self.total_fees = fee;
+
+                    // Verify everything
+                    let final_active = self.item_active[item_id];
+                    let seller_bal = self.balances[s];
+                    let owner_bal = self.balances[the_owner];
+                    let stored_fee = self.total_fees;
+
+                    // active=0, seller_bal=950, owner_bal=50, stored_fee=50
+                    // Encode as: active*10000 + stored_fee*100 + (seller_bal - 900)
+                    // Expected: 0*10000 + 50*100 + 50 = 5050
+                    if final_active == false {
+                        if seller_bal == 950 {
+                            if owner_bal == 50 {
+                                return 5050;
+                            }
+                        }
+                    }
+                    return 0;
+                }
+            }
+        "#);
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
+        vm.load(&compiled.bytecode).unwrap();
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => { steps += 1; if steps > 100_000 { break; } }
+                Err(e) => { panic!("PVM error: {:?}", e); }
+            }
+        }
+        assert_eq!(vm.cpu.read_gp(1), 5050,
+            "Marketplace buy pattern: active flipped, balances correct, fees computed");
+    }
+
+    #[test]
+    fn pvm_batch_reward_register_pressure() {
+        // Reproduces the batch_reward pattern from the E2E StressTest:
+        // 4 params, 3 map reads, fee math, 4 map writes — extreme register pressure.
+        // This was producing off-by-16 for the second user's balance.
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage {
+                    balances: Map<u64, u64>,
+                    fee_rate: u64,
+                    owner_id: u64,
+                }
+                pub fn f() -> u64 {
+                    self.fee_rate = 10;
+                    self.owner_id = 1;
+                    self.balances[1] = 1200;
+                    self.balances[10] = 38000;
+                    self.balances[20] = 39000;
+                    self.balances[30] = 21800;
+
+                    let b1 = self.balances[10];
+                    let b2 = self.balances[20];
+                    let b3 = self.balances[30];
+                    let rate = self.fee_rate;
+                    let total = 3000 * 3;
+                    let tax = total * rate / 100;
+                    let per_user = (total - tax) / 3;
+
+                    self.balances[10] = b1 + per_user;
+                    self.balances[20] = b2 + per_user;
+                    self.balances[30] = b3 + per_user;
+
+                    let oid = self.owner_id;
+                    let owner_bal = self.balances[oid];
+                    self.balances[oid] = owner_bal + tax;
+
+                    // Verify all balances
+                    let r1 = self.balances[10];
+                    let r2 = self.balances[20];
+                    let r3 = self.balances[30];
+                    let r4 = self.balances[1];
+                    return r1 + r2 + r3 + r4;
+                }
+            }
+        "#);
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
+        vm.load(&compiled.bytecode).unwrap();
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => { steps += 1; if steps > 100_000 { break; } }
+                Err(e) => { panic!("PVM error: {:?}", e); }
+            }
+        }
+        // b10=38000+2700=40700, b20=39000+2700=41700, b30=21800+2700=24500, b1=1200+900=2100
+        // total = 40700+41700+24500+2100 = 109000
+        assert_eq!(vm.cpu.read_gp(1), 109000,
+            "batch reward: all balances must be exact");
+    }
+
+    #[test]
+    fn pvm_batch_reward_with_guards() {
+        // Same as above but with guards enabled (production dispatch mode).
+        // This matches the E2E execution path.
+        let src = r#"
+            contract T {
+                storage {
+                    balances: Map<u64, u64>,
+                    fee_rate: u64,
+                    owner_id: u64,
+                }
+
+                pub fn setup() {
+                    self.fee_rate = 10;
+                    self.owner_id = 1;
+                    self.balances[1] = 1200;
+                    self.balances[10] = 38000;
+                    self.balances[20] = 39000;
+                    self.balances[30] = 21800;
+                }
+
+                pub fn batch_reward(u1: u64, u2: u64, u3: u64, reward: u64) -> u64 {
+                    let b1 = self.balances[u1];
+                    let b2 = self.balances[u2];
+                    let b3 = self.balances[u3];
+                    let rate = self.fee_rate;
+                    let total = reward * 3;
+                    let tax = total * rate / 100;
+                    let per_user = (total - tax) / 3;
+
+                    self.balances[u1] = b1 + per_user;
+                    self.balances[u2] = b2 + per_user;
+                    self.balances[u3] = b3 + per_user;
+
+                    let oid = self.owner_id;
+                    let owner_bal = self.balances[oid];
+                    self.balances[oid] = owner_bal + tax;
+
+                    return per_user;
+                }
+
+                #[view]
+                pub fn get_balance(user_id: u64) -> u64 {
+                    return self.balances[user_id];
+                }
+            }
+        "#;
+
+        // Compile WITH guards (production mode)
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let ir = crate::lower::lower(&file);
+        let codegen = CodeGen::new(); // emit_guards = true (default)
+        let contract = codegen.generate(&ir);
+
+        // Step 1: Run setup() to initialize storage
+        let setup_sel = compute_selector("setup");
+        let mut calldata = setup_sel.to_be_bytes().to_vec();
+
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
+        vm.calldata = calldata;
+        vm.load(&contract.runtime_bytecode).unwrap();
+        let output = vm.execute();
+        assert_eq!(output.outcome, pyde_vm::vm::Outcome::Success, "setup must succeed");
+
+        // Step 2: Run batch_reward(10, 20, 30, 3000)
+        let batch_sel = compute_selector("batch_reward");
+        calldata = batch_sel.to_be_bytes().to_vec();
+        calldata.extend_from_slice(&10u64.to_le_bytes());
+        calldata.extend_from_slice(&20u64.to_le_bytes());
+        calldata.extend_from_slice(&30u64.to_le_bytes());
+        calldata.extend_from_slice(&3000u64.to_le_bytes());
+
+        let mut vm2 = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
+        // Copy storage from setup
+        vm2.storage = vm.storage.clone();
+        vm2.calldata = calldata;
+        vm2.load(&contract.runtime_bytecode).unwrap();
+        let output2 = vm2.execute();
+        assert_eq!(output2.outcome, pyde_vm::vm::Outcome::Success, "batch_reward must succeed");
+
+        // per_user = (9000 - 900) / 3 = 2700
+        assert_eq!(vm2.cpu.read_gp(1), 2700, "per_user return value");
+
+        // Step 3: Read balances via get_balance
+        let get_sel = compute_selector("get_balance");
+
+        // Check user20 balance
+        let mut calldata20 = get_sel.to_be_bytes().to_vec();
+        calldata20.extend_from_slice(&20u64.to_le_bytes());
+
+        let mut vm3 = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
+        vm3.storage = vm2.storage.clone();
+        vm3.calldata = calldata20;
+        vm3.load(&contract.runtime_bytecode).unwrap();
+        let output3 = vm3.execute();
+        assert_eq!(output3.outcome, pyde_vm::vm::Outcome::Success, "get_balance must succeed");
+        assert_eq!(vm3.cpu.read_gp(1), 41700, "user20 balance = 39000 + 2700 = 41700");
+
+        // Check user10 balance
+        let mut calldata10 = get_sel.to_be_bytes().to_vec();
+        calldata10.extend_from_slice(&10u64.to_le_bytes());
+
+        let mut vm4 = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
+        vm4.storage = vm2.storage.clone();
+        vm4.calldata = calldata10;
+        vm4.load(&contract.runtime_bytecode).unwrap();
+        let output4 = vm4.execute();
+        assert_eq!(output4.outcome, pyde_vm::vm::Outcome::Success);
+        assert_eq!(vm4.cpu.read_gp(1), 40700, "user10 balance = 38000 + 2700 = 40700");
+    }
+
+    #[test]
+    fn pvm_batch_reward_smt_roundtrip() {
+        // Tests the exact E2E path: setup → persist to SMT → load from SMT → batch_reward
+        let src = r#"
+            contract T {
+                storage {
+                    balances: Map<u64, u64>,
+                    fee_rate: u64,
+                    owner_id: u64,
+                }
+                pub fn setup() {
+                    self.fee_rate = 10;
+                    self.owner_id = 1;
+                    self.balances[1] = 0;
+                }
+                pub fn set_balance(user: u64, amount: u64) {
+                    self.balances[user] = amount;
+                }
+                #[reentrant]
+                pub fn batch_reward(u1: u64, u2: u64, u3: u64, reward: u64) -> u64 {
+                    let b1 = self.balances[u1];
+                    let b2 = self.balances[u2];
+                    let b3 = self.balances[u3];
+                    let rate = self.fee_rate;
+                    let total = reward * 3;
+                    let tax = total * rate / 100;
+                    let per_user = (total - tax) / 3;
+                    self.balances[u1] = b1 + per_user;
+                    self.balances[u2] = b2 + per_user;
+                    self.balances[u3] = b3 + per_user;
+                    let oid = self.owner_id;
+                    let owner_bal = self.balances[oid];
+                    self.balances[oid] = owner_bal + tax;
+                    return per_user;
+                }
+                #[view]
+                pub fn get_balance(user: u64) -> u64 { return self.balances[user]; }
+            }
+        "#;
+
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let ir = crate::lower::lower(&file);
+        let codegen = CodeGen::new();
+        let contract = codegen.generate(&ir);
+
+        let contract_addr = [0x42u8; 32]; // fixed contract address
+
+        // Helper: run a function on the runtime bytecode with calldata
+        // CRITICAL: all VMs must use the same contract_addr for consistent storage keys
+        let run = |calldata: Vec<u8>| -> pyde_vm::vm::Vm {
+            let ctx = pyde_vm::vm::ExecutionContext {
+                self_address: contract_addr,
+                ..Default::default()
+            };
+            let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(10_000_000, ctx);
+            vm.calldata = calldata;
+            vm.load(&contract.runtime_bytecode).unwrap();
+            let _ = vm.execute();
+            vm
+        };
+
+        // Helper: persist vm.storage to SMT, return SMT
+        let persist = |vm: &pyde_vm::vm::Vm, smt: &mut pyde_state::smt::PydeSMT| {
+            for (key, value) in &vm.storage {
+                let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+                let _ = smt.insert(smt_key, value.clone());
+            }
+        };
+
+        // Helper: create a lazy backend from SMT
+        let load_from_smt = |smt: &pyde_state::smt::PydeSMT,
+                              storage: &mut std::collections::HashMap<ethnum::U256, Vec<u8>>,
+                              keys: &[ethnum::U256]| {
+            for key in keys {
+                let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+                if let Some(val) = smt.get(&smt_key) {
+                    storage.insert(*key, val);
+                }
+            }
+        };
+
+        let mut smt = pyde_state::smt::PydeSMT::new();
+
+        // Step 1: Setup (acts as constructor)
+        let setup_sel = compute_selector("setup");
+        let vm0 = run(setup_sel.to_be_bytes().to_vec());
+        persist(&vm0, &mut smt);
+
+        // Step 2: set_balance(10, 38000)
+        let set_sel = compute_selector("set_balance");
+        let mut cd = set_sel.to_be_bytes().to_vec();
+        cd.extend_from_slice(&10u64.to_le_bytes());
+        cd.extend_from_slice(&38000u64.to_le_bytes());
+        let vm1 = run(cd);
+        // Merge with SMT: load existing, add new
+        persist(&vm1, &mut smt);
+
+        // Step 3: set_balance(20, 39000)
+        let mut cd = set_sel.to_be_bytes().to_vec();
+        cd.extend_from_slice(&20u64.to_le_bytes());
+        cd.extend_from_slice(&39000u64.to_le_bytes());
+        let vm2 = run(cd);
+        persist(&vm2, &mut smt);
+
+        // Step 4: set_balance(30, 21800)
+        let mut cd = set_sel.to_be_bytes().to_vec();
+        cd.extend_from_slice(&30u64.to_le_bytes());
+        cd.extend_from_slice(&21800u64.to_le_bytes());
+        let vm3 = run(cd);
+        persist(&vm3, &mut smt);
+
+        // Step 5: set_balance(1, 1200)
+        let mut cd = set_sel.to_be_bytes().to_vec();
+        cd.extend_from_slice(&1u64.to_le_bytes());
+        cd.extend_from_slice(&1200u64.to_le_bytes());
+        let vm4 = run(cd);
+        persist(&vm4, &mut smt);
+
+        // Step 6: batch_reward(10, 20, 30, 3000) with lazy SMT backend
+        let batch_sel = compute_selector("batch_reward");
+        let mut cd = batch_sel.to_be_bytes().to_vec();
+        cd.extend_from_slice(&10u64.to_le_bytes());
+        cd.extend_from_slice(&20u64.to_le_bytes());
+        cd.extend_from_slice(&30u64.to_le_bytes());
+        cd.extend_from_slice(&3000u64.to_le_bytes());
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: contract_addr,
+            ..Default::default()
+        };
+        let mut vm5 = pyde_vm::vm::Vm::with_gas_limit_and_context(10_000_000, ctx);
+        // Use lazy storage backend (same as pipeline)
+        let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+        vm5.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            unsafe { (*smt_ptr).get(&smt_key) }
+        }));
+        vm5.calldata = cd;
+        vm5.load(&contract.runtime_bytecode).unwrap();
+        let output = vm5.execute();
+        assert_eq!(output.outcome, pyde_vm::vm::Outcome::Success, "batch_reward must succeed");
+        assert_eq!(vm5.cpu.read_gp(1), 2700, "per_user = 2700");
+
+        // Persist and read back
+        vm5.storage_backend = None;
+        persist(&vm5, &mut smt);
+
+        // Step 7: get_balance(20) via lazy backend
+        let get_sel = compute_selector("get_balance");
+        let mut cd = get_sel.to_be_bytes().to_vec();
+        cd.extend_from_slice(&20u64.to_le_bytes());
+
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: contract_addr,
+            ..Default::default()
+        };
+        let mut vm6 = pyde_vm::vm::Vm::with_gas_limit_and_context(10_000_000, ctx2);
+        let smt_ptr2 = &smt as *const pyde_state::smt::PydeSMT;
+        vm6.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            unsafe { (*smt_ptr2).get(&smt_key) }
+        }));
+        vm6.calldata = cd;
+        vm6.load(&contract.runtime_bytecode).unwrap();
+        let output6 = vm6.execute();
+        assert_eq!(output6.outcome, pyde_vm::vm::Outcome::Success);
+        assert_eq!(vm6.cpu.read_gp(1), 41700, "bal(20) = 39000 + 2700 = 41700");
     }
 }

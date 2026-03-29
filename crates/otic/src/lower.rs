@@ -939,12 +939,46 @@ impl Lowerer {
                         dst
                     }
                     "raw_call" => {
-                        let arg_regs: Vec<Reg> = args.iter().filter_map(|a| {
-                            if let MacroArg::Positional(e) = a { Some(self.lower_expr(e)) } else { None }
+                        // raw_call!(target, "method_name", arg1, arg2, ...)
+                        // arg[0] = target address (Address expr)
+                        // arg[1] = method name (string literal) — optional
+                        // arg[2..] = actual parameters
+                        let positional: Vec<&Expr> = args.iter().filter_map(|a| {
+                            if let MacroArg::Positional(e) = a { Some(e) } else { None }
                         }).collect();
+
                         let dst = self.alloc_reg();
-                        let target = arg_regs.first().copied().unwrap_or(Reg(0));
-                        self.emit(Inst::RawCall(dst, target, arg_regs[1..].to_vec()));
+                        if positional.is_empty() {
+                            self.emit(Inst::Const(dst, IrConst::Int(ethnum::U256::ZERO, crate::types::Ty::U64)));
+                            return dst;
+                        }
+
+                        let target = self.lower_expr(positional[0]);
+
+                        // Try to extract method name from arg[1] if it's a string literal
+                        let method_name = if positional.len() > 1 {
+                            if let Expr::Literal(crate::ast::Literal::String(s), _) = positional[1] {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        // Lower remaining args (skip target and method string)
+                        let param_start = if method_name.is_some() { 2 } else { 1 };
+                        let param_regs: Vec<Reg> = positional[param_start..].iter()
+                            .map(|e| self.lower_expr(e))
+                            .collect();
+
+                        if let Some(method) = method_name {
+                            // Emit as ExtCall with the method name (codegen writes selector)
+                            self.emit(Inst::ExtCall(dst, target, method, param_regs));
+                        } else {
+                            // No method name: emit as raw call (no selector)
+                            self.emit(Inst::RawCall(dst, target, param_regs));
+                        }
                         dst
                     }
                     _ => {
