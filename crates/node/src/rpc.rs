@@ -353,12 +353,25 @@ impl PydeApiServer for RpcServer {
 
         // Load contract storage from SMT (read-only, slots 0..64)
         // Use the VM's key derivation: poseidon2(slot_bytes ++ contract_address)
+        // Load contract storage keys from manifest, then load values.
         let state = self.state.state.read().await;
-        for slot in 0u64..64 {
-            let vm_key = vm.derive_storage_key(ethnum::U256::from(slot));
-            let smt_key = sparse_merkle_tree::H256::from(vm_key.to_le_bytes());
-            if let Some(value_bytes) = state.get(&smt_key) {
-                vm.storage.insert(vm_key, value_bytes);
+        let mut manifest_input = Vec::with_capacity(44);
+        manifest_input.extend_from_slice(b"storage_keys");
+        manifest_input.extend_from_slice(&to);
+        let manifest_key = sparse_merkle_tree::H256::from(
+            pyde_crypto::poseidon2::poseidon2_hash(&manifest_input).to_bytes()
+        );
+        if let Some(key_list) = state.get(&manifest_key) {
+            for chunk in key_list.chunks(32) {
+                if chunk.len() == 32 {
+                    let mut key_bytes = [0u8; 32];
+                    key_bytes.copy_from_slice(chunk);
+                    let vm_key = ethnum::U256::from_le_bytes(key_bytes);
+                    let smt_key = sparse_merkle_tree::H256::from(key_bytes);
+                    if let Some(value_bytes) = state.get(&smt_key) {
+                        vm.storage.insert(vm_key, value_bytes);
+                    }
+                }
             }
         }
         drop(state);
@@ -371,8 +384,8 @@ impl PydeApiServer for RpcServer {
         let success = output.outcome == pyde_vm::vm::Outcome::Success;
 
         if success {
-            // Return value is in r0 (PVM convention for function return)
-            let return_value = vm.cpu.read_gp(0);
+            // Return value is in r1 (PVM codegen convention for function return)
+            let return_value = vm.cpu.read_gp(1);
             Ok(format!("0x{:x}", return_value))
         } else {
             Err(rpc_err(-32000, format!("execution failed: {:?}", output.outcome)))
