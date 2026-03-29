@@ -434,7 +434,10 @@ impl CodeGen {
         self.emit(encode(Opcode::Load, 13, 5, imm)); // r13 = load u32 from calldata[0]
 
         for (selector, _name, dispatch_label, _func_label) in entries {
-            self.load_u32_to_reg(memory::REG_SCRATCH_0, *selector); // r14 = known selector (may use r15 as scratch)
+            // Selector bytes are BE in calldata (e.g., [0x38, 0x12, 0xe7, 0x3e]).
+            // Load W32 reads them as LE u32, so we compare against the LE interpretation.
+            let selector_le = (*selector).swap_bytes();
+            self.load_u32_to_reg(memory::REG_SCRATCH_0, selector_le);
             self.emit_jump_placeholder(Opcode::Beq, 13, memory::REG_SCRATCH_0, *dispatch_label);
         }
 
@@ -2506,7 +2509,7 @@ mod tests {
         let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000, ctx);
         // Set up calldata with the correct selector
         let selector = compute_selector("f");
-        vm.calldata = selector.to_le_bytes().to_vec();
+        vm.calldata = selector.to_be_bytes().to_vec();
         vm.load(&compiled.runtime_bytecode).unwrap();
 
         let mut result = None;
@@ -2576,7 +2579,7 @@ mod tests {
         };
         let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000, ctx);
         let selector = compute_selector("f");
-        vm.calldata = selector.to_le_bytes().to_vec();
+        vm.calldata = selector.to_be_bytes().to_vec();
         vm.load(&compiled.runtime_bytecode).unwrap();
 
         let mut result = None;
@@ -2613,7 +2616,7 @@ mod tests {
         // Build calldata: [selector(4 bytes)] [arg0(8 bytes)] [arg1(8 bytes)]
         let selector = compute_selector("add");
         let mut calldata = Vec::new();
-        calldata.extend_from_slice(&selector.to_le_bytes()); // 4 bytes selector
+        calldata.extend_from_slice(&selector.to_be_bytes()); // 4 bytes selector (BE, like Ethereum)
         calldata.extend_from_slice(&10u64.to_le_bytes());    // arg0 = 10
         calldata.extend_from_slice(&32u64.to_le_bytes());    // arg1 = 32
 

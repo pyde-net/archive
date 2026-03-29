@@ -530,7 +530,7 @@ mod tests {
         // Run the runtime bytecode on PVM with calldata
         let selector = compute_selector("add");
         let mut calldata = Vec::new();
-        calldata.extend_from_slice(&selector.to_le_bytes()); // 4-byte selector
+        calldata.extend_from_slice(&selector.to_be_bytes()); // 4-byte selector (BE, like Ethereum)
         calldata.extend_from_slice(&10u64.to_le_bytes());
         calldata.extend_from_slice(&32u64.to_le_bytes());
 
