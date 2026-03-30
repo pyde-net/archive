@@ -35,6 +35,10 @@ fn constant_fold(func: &mut IrFunction) {
     let mut known: HashMap<Reg, IrConst> = HashMap::new();
 
     for block in &mut func.blocks {
+        // Clear known constants at block boundaries — prevents incorrect
+        // folding across loop back-edges (e.g., i=0; loop { i = i + 1 }
+        // would incorrectly fold i+1 as 0+1=1 on every iteration).
+        known.clear();
         for inst in &mut block.instructions {
             match inst {
                 // Track known constants
