@@ -364,7 +364,7 @@ impl PydeApiServer for RpcServer {
         let calldata = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex))
             .unwrap_or_default();
         let gas_limit: u64 = call_obj.get("gas").and_then(|v| v.as_u64())
-            .unwrap_or(1_000_000);
+            .unwrap_or(100_000_000); // 100M default — Vec deserialization + loops need headroom
 
         // Acquire an OWNED read lock that lives for the entire call execution.
         // This prevents the block processor from modifying state mid-read.

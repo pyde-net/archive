@@ -929,9 +929,20 @@ impl CodeGen {
                 let val_ty = map_value_type(&map_ty);
                 let key_wide = is_wide_type(&key_ty);
 
+                // For blob types, save val to stack BEFORE key derivation
+                // (derivation clobbers r14/r15, and val may be in a spilled register)
+                if is_blob_type(&val_ty) {
+                    let rv_early = self.get_reg(*val);
+                    self.emit_op(Opcode::Push, rv_early, 0, 0); // save val on stack
+                }
                 let rk = self.get_reg(*key);
                 self.emit_map_key_derivation(slot, rk, key_wide);
-                let rv = self.get_reg(*val);
+                let rv = if is_blob_type(&val_ty) {
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // restore val to r15
+                    15u8
+                } else {
+                    self.get_reg(*val)
+                };
 
                 if is_blob_type(&val_ty) {
                     // Borsh-serialize: save buffer_start on stack (emit_serialize clobbers r14/r15)
@@ -1257,27 +1268,44 @@ impl CodeGen {
 
             Inst::IndexGet(dst, obj, idx) => {
                 let rd = self.alloc_gp(*dst);
-                let ro = self.get_reg(*obj);
-                let ri = self.get_reg(*idx);
+                // Use different restore targets for obj and idx
+                let ro = self.get_reg_to(*obj, 15);
+                let ri = self.get_reg_to(*idx, 14);
                 // addr = base + VEC_DATA_OFFSET + idx * 8
-                // Vec layout: [length:8][capacity:8][data...], data starts at offset 16
                 self.emit_op(Opcode::Addi, 14, 0, 3);
-                self.emit_op(Opcode::Shl, 15, ri, 14);
-                self.emit_op(Opcode::Add, 15, ro, 15);
+                self.emit_op(Opcode::Shl, 14, ri, 14);      // r14 = idx * 8
+                self.emit_op(Opcode::Add, 15, ro, 14);       // r15 = base + idx*8
                 self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
                 self.emit_load(rd, 15, 0);
             }
 
             Inst::IndexSet(obj, idx, val) => {
-                let ro = self.get_reg(*obj);
-                let ri = self.get_reg(*idx);
-                let rv = self.get_reg(*val);
-                // addr = base + VEC_DATA_OFFSET + idx * 8
+                // Get all three with different targets, save val on stack
+                let ro = self.get_reg_to(*obj, 15);
+                let ri = self.get_reg_to(*idx, 14);
+                self.emit_op(Opcode::Push, ro, 0, 0);    // save base
+                let rv = self.get_reg(*val);              // might clobber ro
+                self.emit_op(Opcode::Push, rv, 0, 0);    // save val
+                self.emit_op(Opcode::Pop, 14, 0, 0);     // r14 = val
+                // Compute address
+                self.emit_op(Opcode::Pop, 15, 0, 0);     // r15 = base
+                // ri might have been clobbered — but we only need idx*8.
+                // Recompute: we lost ri. Need to re-get idx.
+                // Actually: ri = r14 from get_reg_to. But r14 was overwritten by Pop.
+                // This is getting circular. Let me just push idx too.
+                // Restart with clean Push/Pop approach:
+                self.emit_op(Opcode::Push, 14, 0, 0);    // push val back
+                self.emit_op(Opcode::Push, 15, 0, 0);    // push base back
+                // Now stack: [val, base]
+                // Re-get idx
+                let ri2 = self.get_reg_to(*idx, 14);
                 self.emit_op(Opcode::Addi, 14, 0, 3);
-                self.emit_op(Opcode::Shl, 15, ri, 14);
-                self.emit_op(Opcode::Add, 15, ro, 15);
+                self.emit_op(Opcode::Shl, 14, ri2, 14);  // r14 = idx * 8
+                self.emit_op(Opcode::Pop, 15, 0, 0);     // r15 = base
+                self.emit_op(Opcode::Add, 15, 15, 14);   // r15 = base + idx*8
                 self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
-                self.emit_store(rv, 15, 0);
+                self.emit_op(Opcode::Pop, 14, 0, 0);     // r14 = val
+                self.emit_store(14, 15, 0);
             }
 
             Inst::MakeTuple(dst, regs) => {
@@ -1340,8 +1368,11 @@ impl CodeGen {
 
                 match method.as_str() {
                     "push" if !args.is_empty() => {
-                        let val_reg = self.get_reg(args[0]);
-                        // Load length and capacity
+                        // Use get_reg_to to put val in r14 (not r15), keeping ro safe
+                        let val_reg = self.get_reg_to(args[0], 14);
+                        // Save val on stack (r14 gets clobbered by capacity load below)
+                        self.emit_op(Opcode::Push, val_reg, 0, 0);
+                        // Load length and capacity (uses r15 and r14 as scratch)
                         self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);  // r15 = length
                         self.emit_load(memory::REG_SCRATCH_0, ro, memory::VEC_CAPACITY_OFFSET as i32); // r14 = capacity
 
@@ -1354,52 +1385,49 @@ impl CodeGen {
                         self.emit_jump_placeholder(Opcode::Bne, 15, 0, fast_label);
                         self.emit_jump_placeholder(Opcode::Jmp, 0, 0, realloc_label);
 
-                        // === Realloc: allocate 2x block, Memcpy old data, update pointer ===
+                        // === Realloc ===
                         self.mark_label(realloc_label);
-                        // Step 1: compute new_cap = old_cap * 2 → r14
-                        self.emit_load(memory::REG_SCRATCH_0, ro, memory::VEC_CAPACITY_OFFSET as i32); // r14 = old cap
+                        self.emit_load(memory::REG_SCRATCH_0, ro, memory::VEC_CAPACITY_OFFSET as i32);
                         self.emit_op(Opcode::Addi, 15, 0, 1);
-                        self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 15); // r14 = cap*2
-                        // Step 2: write new header at r12 (new base)
-                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32); // r15 = length
-                        self.emit_store(memory::REG_SCRATCH_1, 12, memory::VEC_LENGTH_OFFSET as i32); // new.length
-                        self.emit_store(memory::REG_SCRATCH_0, 12, memory::VEC_CAPACITY_OFFSET as i32); // new.capacity
-                        // Step 3: compute memcpy args — r13 = byte count, r14 = dst, r15 = src
-                        // r13 = length * 8
-                        self.emit_op(Opcode::Addi, 13, 0, 3);
-                        self.emit_op(Opcode::Shl, 13, memory::REG_SCRATCH_1, 13); // r13 = length * 8
-                        // r14 = new data start = r12 + 16
-                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 12, memory::VEC_DATA_OFFSET);
-                        // r15 = old data start = ro + 16
-                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_1, ro, memory::VEC_DATA_OFFSET);
-                        // Step 4: Memcpy rd=r14(dst), rs1=r15(src), imm[3:0]=13(len reg)
-                        self.emit_op(Opcode::Memcpy, memory::REG_SCRATCH_0, memory::REG_SCRATCH_1, 13);
-                        // Step 5: update ro and advance heap
-                        // Reload new_cap from new header for heap advance
-                        self.emit_load(memory::REG_SCRATCH_0, 12, memory::VEC_CAPACITY_OFFSET as i32); // r14 = new_cap
-                        self.emit_op(Opcode::Add, ro, 12, 0); // ro = new Vec base
+                        self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 15);
+                        self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
+                        self.emit_store(memory::REG_SCRATCH_1, 12, memory::VEC_LENGTH_OFFSET as i32);
+                        self.emit_store(memory::REG_SCRATCH_0, 12, memory::VEC_CAPACITY_OFFSET as i32);
+                        // Memcpy old data (avoid r13)
+                        self.emit_op(Opcode::Addi, 14, 0, 3);
+                        self.emit_op(Opcode::Shl, 14, memory::REG_SCRATCH_1, 14);
+                        self.emit_op(Opcode::Addi, 15, 12, memory::VEC_DATA_OFFSET);
+                        self.emit_op(Opcode::Push, ro, 0, 0);
+                        self.emit_op(Opcode::Addi, ro, ro, memory::VEC_DATA_OFFSET);
+                        self.emit_op(Opcode::Memcpy, 15, ro, 14);
+                        self.emit_op(Opcode::Pop, ro, 0, 0);
+                        // Update ro and advance heap
+                        self.emit_load(memory::REG_SCRATCH_0, 12, memory::VEC_CAPACITY_OFFSET as i32);
+                        self.emit_op(Opcode::Add, ro, 12, 0);
                         self.emit_op(Opcode::Addi, 15, 0, 3);
-                        self.emit_op(Opcode::Shl, 15, memory::REG_SCRATCH_0, 15); // r15 = new_cap * 8
+                        self.emit_op(Opcode::Shl, 15, memory::REG_SCRATCH_0, 15);
                         self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
-                        self.emit_op(Opcode::Add, 12, 12, 15); // r12 += header + data
-                        // Reload length for write
+                        self.emit_op(Opcode::Add, 12, 12, 15);
                         self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
                         self.emit_jump_placeholder(Opcode::Jmp, 0, 0, write_label);
 
-                        // === Fast path (no realloc) ===
+                        // === Fast path ===
                         self.mark_label(fast_label);
                         self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
 
-                        // === Write value at data[length] ===
+                        // === Write value ===
                         self.mark_label(write_label);
+                        // r15 = length. Compute address, increment length, then pop val and store.
                         self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 0, 3);
                         self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
                         self.emit_op(Opcode::Add, memory::REG_SCRATCH_0, ro, memory::REG_SCRATCH_0 as u32);
                         self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, memory::VEC_DATA_OFFSET);
-                        self.emit_store(val_reg, memory::REG_SCRATCH_0, 0);
-                        // Increment length
+                        // Increment length first (r15 still has it)
                         self.emit_op(Opcode::Addi, memory::REG_SCRATCH_1, memory::REG_SCRATCH_1, 1);
                         self.emit_store(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
+                        // Pop saved val and write
+                        self.emit_op(Opcode::Pop, memory::REG_SCRATCH_1, 0, 0);
+                        self.emit_store(memory::REG_SCRATCH_1, memory::REG_SCRATCH_0, 0);
                     }
                     "pop" => {
                         // Load length, assert > 0
@@ -1799,6 +1827,8 @@ impl CodeGen {
             self.emit_op(Opcode::Add, 12, 12, 14);       // r12 += aligned size
         } else if let Ty::Vec(elem_ty) = ty {
             let elem_size = serialized_elem_size(elem_ty);
+            // Save val_reg on stack (it may be r14/r15 which get clobbered)
+            self.emit_op(Opcode::Push, val_reg, 0, 0);
             // Write count prefix
             self.emit_load(14, val_reg, 0);               // r14 = element count
             self.emit_store(14, 12, 0);                    // write count
@@ -1807,18 +1837,20 @@ impl CodeGen {
             match elem_size {
                 Some(8) => {
                     // Vec of GP-sized elements: bulk Memcpy count*8 bytes
+                    self.emit_op(Opcode::Pop, 15, 0, 0);     // r15 = vec base (saved)
+                    self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET); // r15 = data ptr
+                    self.emit_op(Opcode::Push, 15, 0, 0);    // save data ptr
                     self.emit_op(Opcode::Addi, 15, 0, 3);
                     self.emit_op(Opcode::Shl, 14, 14, 15);   // r14 = count * 8
-                    self.emit_op(Opcode::Addi, 15, val_reg, memory::VEC_DATA_OFFSET); // r15 = data ptr
+                    self.emit_op(Opcode::Pop, 15, 0, 0);     // r15 = data ptr
                     self.emit_op(Opcode::Memcpy, 12, 15, 14); // copy data
                     self.emit_op(Opcode::Add, 12, 12, 14);    // advance r12
                 }
                 Some(32) => {
                     // Vec of wide elements: loop with Wload/Wstore
-                    // Spill loop state to high offsets in spill area
-                    // r13+200 = loop counter (i), r13+208 = count, r13+216 = src_ptr
+                    self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = vec base (saved)
                     self.emit_store(14, 13, 208);              // spill count
-                    self.emit_op(Opcode::Addi, 15, val_reg, memory::VEC_DATA_OFFSET);
+                    self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
                     self.emit_store(15, 13, 216);              // spill src_ptr
                     self.emit_op(Opcode::Addi, 14, 0, 0);     // i = 0
                     self.emit_store(14, 13, 200);              // spill i
@@ -1849,15 +1881,48 @@ impl CodeGen {
                     self.mark_label(done_label);
                 }
                 None => {
-                    // TODO Phase B: Vec of variable-size elements (Vec<String>, Vec<Vec<T>>).
-                    // For now, write count prefix only; element data is skipped.
-                    // Future: loop calling emit_serialize recursively for each element pointer.
+                    // Vec of variable-size elements (Vec<String>, Vec<Vec<T>>, Vec<Struct>).
+                    // Stack-based countdown loop. At each iteration top-of-stack = [src_ptr, remaining].
+                    // No GP registers are used for persistent state — only stack.
+                    self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = vec base (saved from Push earlier)
+                    self.emit_load(14, 15, 0);                 // r14 = count from vec header
+                    self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET); // r15 = data start
+                    // Push initial state: [src_ptr, remaining]
+                    self.emit_op(Opcode::Push, 14, 0, 0);     // push remaining = count
+                    self.emit_op(Opcode::Push, 15, 0, 0);     // push src_ptr
+
+                    let loop_label = self.alloc_label();
+                    let done_label = self.alloc_label();
+                    self.mark_label(loop_label);
+
+                    // Pop state
+                    self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = src_ptr
+                    self.emit_op(Opcode::Pop, 14, 0, 0);      // r14 = remaining
+                    self.emit_jump_placeholder(Opcode::Beq, 14, 0, done_label);
+
+                    // Decrement remaining, advance src_ptr, push updated state BEFORE serialize
+                    self.emit_op(Opcode::Addi, 14, 14, 0x3FFFF); // r14 = remaining - 1 (twos complement -1)
+                    self.emit_op(Opcode::Push, 14, 0, 0);     // push remaining-1
+                    self.emit_op(Opcode::Addi, 14, 15, 8);    // r14 = src_ptr + 8
+                    self.emit_op(Opcode::Push, 14, 0, 0);     // push new src_ptr
+                    // Load element pointer from OLD src_ptr (r15)
+                    self.emit_load(14, 15, 0);                 // r14 = *src_ptr
+
+                    // Recursively serialize (clobbers r14, r15, but stack has the state)
+                    let elem_ty_clone = (**elem_ty).clone();
+                    self.emit_serialize(&elem_ty_clone, 14);
+
+                    self.emit_jump_placeholder(Opcode::Jmp, 0, 0, loop_label);
+                    self.mark_label(done_label);
                 }
                 Some(_) => {
                     // 16-byte elements (u128/i128): bulk Memcpy count*16 bytes
-                    self.emit_op(Opcode::Addi, 15, 0, 4);     // shift by 4 = multiply by 16
+                    self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = vec base (saved)
+                    self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
+                    self.emit_op(Opcode::Push, 15, 0, 0);     // save data ptr
+                    self.emit_op(Opcode::Addi, 15, 0, 4);     // shift by 4
                     self.emit_op(Opcode::Shl, 14, 14, 15);    // r14 = count * 16
-                    self.emit_op(Opcode::Addi, 15, val_reg, memory::VEC_DATA_OFFSET);
+                    self.emit_op(Opcode::Pop, 15, 0, 0);      // data ptr
                     self.emit_op(Opcode::Memcpy, 12, 15, 14);
                     self.emit_op(Opcode::Add, 12, 12, 14);
                 }
@@ -1866,9 +1931,11 @@ impl CodeGen {
             // Struct: serialize field-by-field (all GP fields → flat Memcpy)
             if let Some(fields) = self.struct_defs.get(name).cloned() {
                 let byte_size = (fields.len() as u32) * memory::WORD_SIZE;
-                // val_reg = struct base pointer. Memcpy fields to buffer.
-                self.emit_op(Opcode::Addi, 14, 0, byte_size);   // r14 = byte count
-                self.emit_op(Opcode::Memcpy, 12, val_reg, 14);  // copy struct → buffer
+                // Save val_reg to stack (Memcpy setup clobbers r14/r15)
+                self.emit_op(Opcode::Push, val_reg, 0, 0);
+                self.emit_op(Opcode::Pop, 15, 0, 0);            // r15 = struct base
+                self.load_u32_to_reg(14, byte_size);             // r14 = byte count
+                self.emit_op(Opcode::Memcpy, 12, 15, 14);       // copy struct → buffer
                 self.emit_op(Opcode::Add, 12, 12, 14);          // advance r12
             }
         } else {
@@ -1959,9 +2026,54 @@ impl CodeGen {
                     self.emit_load(src_reg, 13, 216);
                 }
                 None => {
-                    // TODO Phase B: Vec of variable-size elements (Vec<String>, Vec<Vec<T>>).
-                    // For now, only count prefix is read; element data deserialization is skipped.
-                    // Future: loop calling emit_deserialize recursively for each element.
+                    // Vec of variable-size elements: loop deserialize each into Vec data slots.
+                    // Each data slot holds a pointer (8 bytes) to the deserialized object.
+                    self.emit_store(14, 13, 208);               // spill count
+                    self.emit_store(src_reg, 13, 216);          // spill src_reg
+                    // r13+224 = dst_data_ptr (where to write element pointers in Vec data)
+                    self.emit_op(Opcode::Add, 14, 12, 0);      // r14 = data start = r12
+                    self.emit_store(14, 13, 224);
+                    // Reserve space for pointer array: count * 8 bytes
+                    self.emit_load(14, 13, 208);                // r14 = count
+                    self.emit_op(Opcode::Addi, 15, 0, 3);
+                    self.emit_op(Opcode::Shl, 14, 14, 15);     // r14 = count * 8
+                    self.emit_op(Opcode::Add, 12, 12, 14);     // r12 past pointer array
+
+                    self.emit_op(Opcode::Addi, 14, 0, 0);      // i = 0
+                    self.emit_store(14, 13, 200);
+
+                    let loop_label = self.alloc_label();
+                    let done_label = self.alloc_label();
+                    self.mark_label(loop_label);
+
+                    self.emit_load(14, 13, 200);                // r14 = i
+                    self.emit_load(15, 13, 208);                // r15 = count
+                    self.emit_jump_placeholder(Opcode::Beq, 14, 15, done_label);
+
+                    // Deserialize element from src into heap at r12
+                    // The deserialized object's base pointer will be r12 (before deserialize advances it)
+                    self.emit_op(Opcode::Push, 12, 0, 0);       // save elem_ptr = r12
+                    self.emit_load(src_reg, 13, 216);            // restore src_reg
+                    let elem_ty_clone = (**elem_ty).clone();
+                    // Use r14 as temp dst for deserialize (we just need r12 to be the base)
+                    self.emit_deserialize(&elem_ty_clone, src_reg, 14);
+                    self.emit_store(src_reg, 13, 216);           // save updated src_reg
+
+                    // Store element pointer into Vec data array
+                    self.emit_op(Opcode::Pop, 15, 0, 0);        // r15 = elem_ptr
+                    self.emit_load(14, 13, 224);                 // r14 = dst_data_ptr
+                    self.emit_store(15, 14, 0);                  // *dst_data_ptr = elem_ptr
+                    self.emit_op(Opcode::Addi, 14, 14, 8);
+                    self.emit_store(14, 13, 224);                // advance dst_data_ptr
+
+                    // i++
+                    self.emit_load(14, 13, 200);
+                    self.emit_op(Opcode::Addi, 14, 14, 1);
+                    self.emit_store(14, 13, 200);
+                    self.emit_jump_placeholder(Opcode::Jmp, 0, 0, loop_label);
+
+                    self.mark_label(done_label);
+                    self.emit_load(src_reg, 13, 216);            // restore final src_reg
                 }
                 Some(_) => {
                     // 16-byte elements: bulk Memcpy count*16
@@ -1976,12 +2088,13 @@ impl CodeGen {
             // Struct: deserialize by copying flat bytes to heap
             if let Some(fields) = self.struct_defs.get(name).cloned() {
                 let byte_size = (fields.len() as u32) * memory::WORD_SIZE;
-                // dst_reg = struct base at r12
-                self.emit_op(Opcode::Add, dst_reg, 12, 0);
-                self.emit_op(Opcode::Addi, 14, 0, byte_size);
+                // Save struct base pointer (r12) to stack, then use r14 for byte_size
+                self.emit_op(Opcode::Push, 12, 0, 0);           // push struct base = r12
+                self.load_u32_to_reg(14, byte_size);
                 self.emit_op(Opcode::Memcpy, 12, src_reg, 14);  // copy buffer → heap
                 self.emit_op(Opcode::Add, src_reg, src_reg, 14); // advance src
                 self.emit_op(Opcode::Add, 12, 12, 14);           // advance heap
+                self.emit_op(Opcode::Pop, dst_reg, 0, 0);       // dst_reg = struct base
             }
         } else {
             // GP types: 8 bytes via Load
@@ -2042,7 +2155,8 @@ fn serialized_elem_size(ty: &Ty) -> Option<u32> {
         | Ty::Bool | Ty::Enum(_) => Some(8),
         Ty::U128 | Ty::I128 => Some(16),
         Ty::U256 | Ty::I256 | Ty::Address => Some(32),
-        Ty::StringTy | Ty::Bytes | Ty::Vec(_) => None,
+        // Variable-size types: need recursive serialization
+        Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_) => None,
         _ => Some(8),
     }
 }
@@ -4066,5 +4180,388 @@ mod tests {
         let output6 = vm6.execute();
         assert_eq!(output6.outcome, pyde_vm::vm::Outcome::Success);
         assert_eq!(vm6.cpu.read_gp(1), 41700, "bal(20) = 39000 + 2700 = 41700");
+    }
+
+    #[test]
+    fn pvm_vec_vec_storage() {
+        // Vec<Vec<u64>> serialize + store: 2 inner Vecs with 3 elements each
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage {
+                    data: Map<u64, Vec<Vec<u64>>>,
+                    step: u64,
+                }
+                pub fn store_it() -> u64 {
+                    self.step = 1;
+                    let mut r1 = Vec::new();
+                    r1.push(1);
+                    r1.push(2);
+                    r1.push(3);
+                    self.step = 2;
+                    let mut r2 = Vec::new();
+                    r2.push(4);
+                    r2.push(5);
+                    r2.push(6);
+                    self.step = 3;
+                    let mut m = Vec::new();
+                    m.push(r1);
+                    m.push(r2);
+                    self.step = 4;
+                    self.data[1] = m;
+                    self.step = 5;
+                    return 5;
+                }
+            }
+        "#);
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
+        vm.load(&compiled.bytecode).unwrap();
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 200_000 { panic!("too many steps at step {}", steps); }
+                    // Print last 10 instructions before fault (around step 180-190)
+                    if steps >= 150 && steps <= 245 {
+                        let pc = vm.pc as usize;
+                        if pc + 4 <= compiled.bytecode.len() {
+                            let w = u32::from_le_bytes(compiled.bytecode[pc..pc+4].try_into().unwrap());
+                            let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
+                            eprintln!("  step={} PC={} {:?} rd={} rs1={} imm={:#x} | r14={:#x} r15={:#x}",
+                                steps, pc, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
+                                vm.cpu.read_gp(14), vm.cpu.read_gp(15));
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Decode the faulting instruction
+                    let pc = vm.pc as usize;
+                    let instr_word = if pc + 4 <= compiled.bytecode.len() {
+                        u32::from_le_bytes(compiled.bytecode[pc..pc+4].try_into().unwrap())
+                    } else { 0 };
+                    let decoded = pyde_vm::isa::decode(pyde_vm::isa::Instruction(instr_word));
+                    panic!("PVM trap at step {}, PC={} (instr {}): {:?}\n  opcode={:?} rd={} rs1={} imm={:#x}\n  r1={:#x} r2={:#x} r3={:#x} r4={:#x} r5={:#x}\n  r6={:#x} r7={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}\n  r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                        steps, pc, pc/4, e,
+                        decoded.opcode, decoded.rd, decoded.rs1, decoded.rs2_or_imm,
+                        vm.cpu.read_gp(1), vm.cpu.read_gp(2), vm.cpu.read_gp(3),
+                        vm.cpu.read_gp(4), vm.cpu.read_gp(5), vm.cpu.read_gp(6),
+                        vm.cpu.read_gp(7), vm.cpu.read_gp(8), vm.cpu.read_gp(9),
+                        vm.cpu.read_gp(10), vm.cpu.read_gp(11),
+                        vm.cpu.read_gp(12), vm.cpu.read_gp(13),
+                        vm.cpu.read_gp(14), vm.cpu.read_gp(15));
+                }
+            }
+        }
+        assert_eq!(vm.cpu.read_gp(1), 5, "should complete store_it");
+    }
+
+    #[test]
+    fn pvm_while_loop_over_vec() {
+        // While loop iterating over a Vec — tests that IndexGet doesn't
+        // clobber the loop counter or length registers.
+        let compiled = compile_no_opt(r#"
+            contract T {
+                storage {}
+                pub fn sum_vec() -> u64 {
+                    let mut v = Vec::new();
+                    v.push(10);
+                    v.push(20);
+                    v.push(30);
+                    v.push(40);
+                    v.push(50);
+                    let mut total = 0;
+                    let mut i = 0;
+                    let len = v.len();
+                    while i < len {
+                        total = total + v[i];
+                        i = i + 1;
+                    }
+                    return total;
+                }
+            }
+        "#);
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
+        vm.load(&compiled.bytecode).unwrap();
+        let mut steps = 0;
+        loop {
+            match vm.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 50_000 { panic!("infinite loop at step {}", steps); }
+                }
+                Err(e) => {
+                    let pc = vm.pc as usize;
+                    let instr_word = if pc + 4 <= compiled.bytecode.len() {
+                        u32::from_le_bytes(compiled.bytecode[pc..pc+4].try_into().unwrap())
+                    } else { 0 };
+                    let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(instr_word));
+                    panic!("PVM error at step {}, PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}\n  r1={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                        steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
+                        vm.cpu.read_gp(1), vm.cpu.read_gp(12), vm.cpu.read_gp(13),
+                        vm.cpu.read_gp(14), vm.cpu.read_gp(15));
+                }
+            }
+        }
+        assert_eq!(vm.cpu.read_gp(1), 150, "sum = 10+20+30+40+50 = 150");
+    }
+
+    #[test]
+    fn pvm_while_loop_production_mode() {
+        // Same test but WITH guards (production dispatch mode)
+        let src = r#"
+            contract T {
+                storage {
+                    data: Map<u64, Vec<u64>>,
+                }
+                pub fn store_and_sum() -> u64 {
+                    let mut v = Vec::new();
+                    v.push(10);
+                    v.push(20);
+                    v.push(30);
+                    v.push(40);
+                    v.push(50);
+                    self.data[1] = v;
+
+                    let loaded = self.data[1];
+                    let mut total = 0;
+                    let mut i = 0;
+                    let len = loaded.len();
+                    while i < len {
+                        total = total + loaded[i];
+                        i = i + 1;
+                    }
+                    return total;
+                }
+            }
+        "#;
+        // Compile WITH guards (production mode)
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let ir = crate::lower::lower(&file);
+        let codegen = CodeGen::new(); // emit_guards = true
+        let contract = codegen.generate(&ir);
+
+        // Build calldata with selector
+        let sel = compute_selector("store_and_sum");
+        let calldata = sel.to_be_bytes().to_vec();
+
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(100_000_000);
+        vm.calldata = calldata;
+        vm.load(&contract.runtime_bytecode).unwrap();
+        let mut steps = 0u64;
+        loop {
+            match vm.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 500_000 {
+                        // Dump register state to diagnose infinite loop
+                        panic!("infinite loop at step {}. r1={} r2={} r3={} r4={} r5={} r6={} r7={} r8={} r9={} r10={} r11={}",
+                            steps,
+                            vm.cpu.read_gp(1), vm.cpu.read_gp(2), vm.cpu.read_gp(3),
+                            vm.cpu.read_gp(4), vm.cpu.read_gp(5), vm.cpu.read_gp(6),
+                            vm.cpu.read_gp(7), vm.cpu.read_gp(8), vm.cpu.read_gp(9),
+                            vm.cpu.read_gp(10), vm.cpu.read_gp(11));
+                    }
+                }
+                Err(e) => {
+                    let pc = vm.pc as usize;
+                    let w = u32::from_le_bytes(contract.runtime_bytecode[pc..pc+4].try_into().unwrap_or([0;4]));
+                    let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
+                    panic!("PVM trap at step {}, PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}",
+                        steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm);
+                }
+            }
+        }
+        assert_eq!(vm.cpu.read_gp(1), 150, "production mode sum");
+    }
+
+    #[test]
+    fn pvm_while_loop_deserialized_vec() {
+        // Test: store Vec in one execution, load + iterate in another (via SMT).
+        // This reproduces the E2E failure where the deserialized Vec causes an infinite loop.
+        let src = r#"
+            contract T {
+                storage { data: Map<u64, Vec<u64>>, }
+                pub fn store_vec() {
+                    let mut v = Vec::new();
+                    v.push(10); v.push(20); v.push(30);
+                    self.data[1] = v;
+                }
+                #[view]
+                pub fn sum_vec() -> u64 {
+                    let v = self.data[1];
+                    let mut t = 0;
+                    let mut i = 0;
+                    let len = v.len();
+                    while i < len { t = t + v[i]; i = i + 1; }
+                    return t;
+                }
+            }
+        "#;
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let ir = crate::lower::lower(&file);
+        let codegen = CodeGen::new();
+        let contract = codegen.generate(&ir);
+
+        let contract_addr = [0x42u8; 32];
+
+        // Step 1: store_vec
+        let store_sel = compute_selector("store_vec");
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: contract_addr,
+            ..Default::default()
+        };
+        let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+        vm1.calldata = store_sel.to_be_bytes().to_vec();
+        vm1.load(&contract.runtime_bytecode).unwrap();
+        let out1 = vm1.execute();
+        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_vec must succeed");
+
+        // Persist to SMT
+        let mut smt = pyde_state::smt::PydeSMT::new();
+        for (key, val) in &vm1.storage {
+            let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            let _ = smt.insert(smt_key, val.clone());
+        }
+
+        // Step 2: sum_vec via lazy backend
+        let sum_sel = compute_selector("sum_vec");
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: contract_addr,
+            ..Default::default()
+        };
+        let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
+        vm2.calldata = sum_sel.to_be_bytes().to_vec();
+        let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            unsafe { (*smt_ptr).get(&smt_key) }
+        }));
+        vm2.load(&contract.runtime_bytecode).unwrap();
+
+        let mut steps = 0u64;
+        loop {
+            match vm2.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 500_000 {
+                        panic!("infinite loop at step {} in sum_vec. PC={}",
+                            steps, vm2.pc);
+                    }
+                }
+                Err(e) => panic!("trap at step {}: {:?}", steps, e),
+            }
+        }
+        assert_eq!(vm2.cpu.read_gp(1), 60, "sum = 10+20+30 = 60");
+    }
+
+    #[test]
+    fn pvm_while_loop_many_functions() {
+        // Reproduce E2E: contract with many functions, compile with optimizer,
+        // store Vec then read+sum via SMT in separate execution.
+        let src = r#"
+            contract T {
+                struct Profile { score: u64, level: u64, badges: u64, }
+                storage {
+                    profiles: Map<u64, Vec<Profile>>,
+                    matrix: Map<u64, Vec<Vec<u64>>>,
+                    nums: Map<u64, Vec<u64>>,
+                    count: u64,
+                }
+                pub fn store_vec(id: u64) -> u64 {
+                    let mut v = Vec::new(); v.push(10); v.push(20); v.push(30); v.push(40); v.push(50);
+                    self.nums[id] = v; let c = self.count; self.count = c + 1; return 5;
+                }
+                pub fn read_vec_len(id: u64) -> u64 { let v = self.nums[id]; return v.len(); }
+                pub fn read_vec_elem(id: u64, idx: u64) -> u64 { let v = self.nums[id]; return v[idx]; }
+                pub fn read_vec_sum(id: u64) -> u64 {
+                    let v = self.nums[id]; let mut t = 0; let mut i = 0; let len = v.len();
+                    while i < len { t = t + v[i]; i = i + 1; } return t;
+                }
+                pub fn store_profiles(id: u64) -> u64 {
+                    let mut p = Vec::new();
+                    p.push(Profile { score: 100, level: 5, badges: 3 });
+                    p.push(Profile { score: 200, level: 10, badges: 7 });
+                    self.profiles[id] = p; let c = self.count; self.count = c + 1; return 2;
+                }
+                pub fn read_profile_score(id: u64, idx: u64) -> u64 { let p = self.profiles[id]; let s = p[idx]; return s.score; }
+                pub fn read_profile_level(id: u64, idx: u64) -> u64 { let p = self.profiles[id]; let s = p[idx]; return s.level; }
+                pub fn store_matrix(id: u64) -> u64 {
+                    let mut r1 = Vec::new(); r1.push(1); r1.push(2); r1.push(3);
+                    let mut r2 = Vec::new(); r2.push(4); r2.push(5); r2.push(6);
+                    let mut m = Vec::new(); m.push(r1); m.push(r2);
+                    self.matrix[id] = m; let c = self.count; self.count = c + 1; return 2;
+                }
+                pub fn read_matrix(id: u64, row: u64, col: u64) -> u64 { let m = self.matrix[id]; let r = m[row]; return r[col]; }
+                #[view] pub fn get_count() -> u64 { return self.count; }
+            }
+        "#;
+        // Compile WITH optimizer (matching CLI)
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let mut ir = crate::lower::lower(&file);
+        crate::optimize::optimize(&mut ir);
+        let codegen = CodeGen::new();
+        let contract = codegen.generate(&ir);
+
+        let contract_addr = [0x42u8; 32];
+
+        // Step 1: store_vec(1)
+        let sel = compute_selector("store_vec");
+        let mut cd = sel.to_be_bytes().to_vec();
+        cd.extend_from_slice(&1u64.to_le_bytes());
+        let ctx = pyde_vm::vm::ExecutionContext { self_address: contract_addr, ..Default::default() };
+        let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+        vm1.calldata = cd;
+        vm1.load(&contract.runtime_bytecode).unwrap();
+        let out1 = vm1.execute();
+        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_vec failed");
+
+        // Persist to SMT
+        let mut smt = pyde_state::smt::PydeSMT::new();
+        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+
+        // Step 2: read_vec_sum(1) via lazy backend
+        let sel2 = compute_selector("read_vec_sum");
+        let mut cd2 = sel2.to_be_bytes().to_vec();
+        cd2.extend_from_slice(&1u64.to_le_bytes());
+        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: contract_addr, ..Default::default() };
+        let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
+        vm2.calldata = cd2;
+        let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            unsafe { (*smt_ptr).get(&sk) }
+        }));
+        vm2.load(&contract.runtime_bytecode).unwrap();
+        let mut steps = 0u64;
+        loop {
+            match vm2.step() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 1_000_000 { panic!("infinite loop at step {}", steps); }
+                    // Trace last 20 steps before cutoff
+                    if steps >= 999_980 {
+                        let pc = vm2.pc as usize;
+                        if pc + 4 <= contract.runtime_bytecode.len() {
+                            let w = u32::from_le_bytes(contract.runtime_bytecode[pc..pc+4].try_into().unwrap());
+                            let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
+                            eprintln!("  s={} PC={} {:?} rd={} rs1={} imm={:#x} r1={} r2={} r14={:#x} r15={:#x}",
+                                steps, pc, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
+                                vm2.cpu.read_gp(1), vm2.cpu.read_gp(2),
+                                vm2.cpu.read_gp(14), vm2.cpu.read_gp(15));
+                        }
+                    }
+                }
+                Err(e) => panic!("trap at step {}: {:?}", steps, e),
+            }
+        }
+        assert_eq!(vm2.cpu.read_gp(1), 150, "sum = 10+20+30+40+50 = 150 (many-function contract)");
     }
 }
