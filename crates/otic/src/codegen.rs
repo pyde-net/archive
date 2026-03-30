@@ -829,13 +829,29 @@ impl CodeGen {
             Inst::StorageGet(dst, field) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
                 let ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
-                let wide_value = is_wide_type(&ty);
 
                 // Widen slot to wide scratch
                 self.emit_op(Opcode::Addi, 15, 0, slot);
                 self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
 
-                if wide_value {
+                if is_blob_type(&ty) {
+                    // Borsh-deserialize: Sload blob to heap, then deserialize into typed value
+                    let rd = self.alloc_gp(*dst);
+                    let imm = 1 | ((12 & 0xF) << 2); // mode=1, ptr_reg=r12
+                    self.emit_op(Opcode::Sload, 15, WIDE_SCRATCH, imm); // r15 = byte_len, data at r12
+                    // Save r11, use as read cursor
+                    self.emit_op(Opcode::Push, 11, 0, 0);
+                    self.emit_op(Opcode::Add, 11, 12, 0);     // r11 = read cursor = data start
+                    // Advance r12 past loaded data (align to 8)
+                    self.emit_op(Opcode::Addi, 15, 15, 7);
+                    self.emit_op(Opcode::Addi, 14, 0, 3);
+                    self.emit_op(Opcode::Shr, 15, 15, 14);
+                    self.emit_op(Opcode::Shl, 15, 15, 14);
+                    self.emit_op(Opcode::Add, 12, 12, 15);
+                    // Deserialize from r11 into rd
+                    self.emit_deserialize(&ty, 11, rd);
+                    self.emit_op(Opcode::Pop, 11, 0, 0);      // restore r11
+                } else if is_wide_type(&ty) {
                     let wd = self.regs.alloc_wide(*dst);
                     self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0); // mode 0: wide value
                 } else {
@@ -847,14 +863,22 @@ impl CodeGen {
             Inst::StorageSet(field, val) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
                 let ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
-                let wide_value = is_wide_type(&ty);
 
                 // Widen slot to wide scratch
                 self.emit_op(Opcode::Addi, 15, 0, slot);
                 self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
 
                 let rv = self.get_reg(*val);
-                if wide_value {
+                if is_blob_type(&ty) {
+                    // Save buffer_start on stack (emit_serialize clobbers r14/r15)
+                    self.emit_op(Opcode::Push, 12, 0, 0);
+                    self.emit_serialize(&ty, rv);
+                    self.emit_op(Opcode::Pop, 14, 0, 0);      // r14 = buffer_start
+                    self.emit_op(Opcode::Sub, 15, 12, 14);    // r15 = byte_count
+                    let imm = 1 | ((14 & 0xF) << 2) | ((15 & 0xF) << 6);
+                    self.emit_op(Opcode::Sstore, 0, WIDE_SCRATCH, imm);
+                    self.emit_op(Opcode::Add, 12, 14, 0);     // reclaim buffer
+                } else if is_wide_type(&ty) {
                     self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0); // mode 0: wide value
                 } else {
                     self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 2); // mode 2: GP value
@@ -872,7 +896,24 @@ impl CodeGen {
                 let rk = self.get_reg(*key);
                 self.emit_map_key_derivation(slot, rk, key_wide);
 
-                if wide_value {
+                if is_blob_type(&val_ty) {
+                    // Borsh-deserialize: Sload blob, then deserialize into typed value
+                    let rd = self.alloc_gp(*dst);
+                    let imm = 1 | ((12 & 0xF) << 2);
+                    self.emit_op(Opcode::Sload, 15, WIDE_SCRATCH, imm); // r15 = byte_len, data at r12
+                    // Save r11, use as read cursor
+                    self.emit_op(Opcode::Push, 11, 0, 0);
+                    self.emit_op(Opcode::Add, 11, 12, 0);     // r11 = read cursor
+                    // Advance r12 past loaded data (align to 8)
+                    self.emit_op(Opcode::Addi, 15, 15, 7);
+                    self.emit_op(Opcode::Addi, 14, 0, 3);
+                    self.emit_op(Opcode::Shr, 15, 15, 14);
+                    self.emit_op(Opcode::Shl, 15, 15, 14);
+                    self.emit_op(Opcode::Add, 12, 12, 15);
+                    // Deserialize from r11 into rd
+                    self.emit_deserialize(&val_ty, 11, rd);
+                    self.emit_op(Opcode::Pop, 11, 0, 0);      // restore r11
+                } else if is_wide_type(&val_ty) {
                     let wd = self.regs.alloc_wide(*dst);
                     self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0);
                 } else {
@@ -887,16 +928,21 @@ impl CodeGen {
                 let key_ty = map_key_type(&map_ty);
                 let val_ty = map_value_type(&map_ty);
                 let key_wide = is_wide_type(&key_ty);
-                let wide_value = is_wide_type(&val_ty);
 
-                // Get key and derive storage key FIRST
                 let rk = self.get_reg(*key);
                 self.emit_map_key_derivation(slot, rk, key_wide);
-                // Get val AFTER derivation — derivation clobbers r14/r15,
-                // so getting val before would lose it if val was spilled to r15.
                 let rv = self.get_reg(*val);
 
-                if wide_value {
+                if is_blob_type(&val_ty) {
+                    // Borsh-serialize: save buffer_start on stack (emit_serialize clobbers r14/r15)
+                    self.emit_op(Opcode::Push, 12, 0, 0);     // push buffer_start = current r12
+                    self.emit_serialize(&val_ty, rv);
+                    self.emit_op(Opcode::Pop, 14, 0, 0);      // r14 = buffer_start
+                    self.emit_op(Opcode::Sub, 15, 12, 14);    // r15 = byte_count
+                    let imm = 1 | ((14 & 0xF) << 2) | ((15 & 0xF) << 6);
+                    self.emit_op(Opcode::Sstore, 0, WIDE_SCRATCH, imm);
+                    self.emit_op(Opcode::Add, 12, 14, 0);     // reclaim buffer
+                } else if is_wide_type(&val_ty) {
                     self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0);
                 } else {
                     self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 2);
@@ -1213,10 +1259,12 @@ impl CodeGen {
                 let rd = self.alloc_gp(*dst);
                 let ro = self.get_reg(*obj);
                 let ri = self.get_reg(*idx);
-                // addr = base + idx * 8
+                // addr = base + VEC_DATA_OFFSET + idx * 8
+                // Vec layout: [length:8][capacity:8][data...], data starts at offset 16
                 self.emit_op(Opcode::Addi, 14, 0, 3);
                 self.emit_op(Opcode::Shl, 15, ri, 14);
                 self.emit_op(Opcode::Add, 15, ro, 15);
+                self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
                 self.emit_load(rd, 15, 0);
             }
 
@@ -1224,9 +1272,11 @@ impl CodeGen {
                 let ro = self.get_reg(*obj);
                 let ri = self.get_reg(*idx);
                 let rv = self.get_reg(*val);
+                // addr = base + VEC_DATA_OFFSET + idx * 8
                 self.emit_op(Opcode::Addi, 14, 0, 3);
                 self.emit_op(Opcode::Shl, 15, ri, 14);
                 self.emit_op(Opcode::Add, 15, ro, 15);
+                self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
                 self.emit_store(rv, 15, 0);
             }
 
@@ -1251,12 +1301,19 @@ impl CodeGen {
 
             Inst::MakeArray(dst, regs) => {
                 let rd = self.alloc_gp(*dst);
-                let size = (regs.len() as u32) * memory::WORD_SIZE;
+                // Reserve header (16 bytes) + data, matching Vec layout for IndexGet
+                let data_size = (regs.len() as u32) * memory::WORD_SIZE;
+                let total = memory::VEC_DATA_OFFSET as u32 + data_size;
                 self.emit_op(Opcode::Add, rd, 12, 0);
-                self.emit_op(Opcode::Addi, 12, 12, size);
+                self.emit_op(Opcode::Addi, 12, 12, total);
+                // Write length/capacity header
+                self.load_u32_to_reg(15, regs.len() as u32);
+                self.emit_store(15, rd, 0);  // length
+                self.emit_store(15, rd, 8);  // capacity
+                // Write elements at VEC_DATA_OFFSET
                 for (i, reg) in regs.iter().enumerate() {
                     let r = self.get_reg(*reg);
-                    let offset = (i as u32) * memory::WORD_SIZE;
+                    let offset = memory::VEC_DATA_OFFSET as u32 + (i as u32) * memory::WORD_SIZE;
                     self.emit_store(r, rd, offset as i32);
                 }
             }
@@ -1264,11 +1321,15 @@ impl CodeGen {
             Inst::ArrayRepeat(dst, val, count) => {
                 let rd = self.alloc_gp(*dst);
                 let rv = self.get_reg(*val);
-                let size = (*count as u32) * memory::WORD_SIZE;
+                let data_size = (*count as u32) * memory::WORD_SIZE;
+                let total = memory::VEC_DATA_OFFSET as u32 + data_size;
                 self.emit_op(Opcode::Add, rd, 12, 0);
-                self.emit_op(Opcode::Addi, 12, 12, size);
+                self.emit_op(Opcode::Addi, 12, 12, total);
+                self.load_u32_to_reg(15, *count as u32);
+                self.emit_store(15, rd, 0);  // length
+                self.emit_store(15, rd, 8);  // capacity
                 for i in 0..*count {
-                    let offset = (i as u32) * memory::WORD_SIZE;
+                    let offset = memory::VEC_DATA_OFFSET as u32 + (i as u32) * memory::WORD_SIZE;
                     self.emit_store(rv, rd, offset as i32);
                 }
             }
@@ -1711,6 +1772,224 @@ impl CodeGen {
         self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
     }
 
+    // ========================================================================
+    // Borsh-style serialization (Phase A: GP + String + Vec<fixed>)
+    // ========================================================================
+
+    /// Serialize a value in `val_reg` to heap at r12, advancing r12.
+    /// Produces a packed byte stream: GP→8B, wide→32B, String→[len:8][data], Vec→[count:8][data].
+    fn emit_serialize(&mut self, ty: &Ty, val_reg: u8) {
+        if is_wide_type(ty) {
+            // Wide types (u256, i256, Address): 32 bytes via Wstore
+            self.emit_op(Opcode::Wstore, val_reg, 12, 0);
+            self.emit_op(Opcode::Addi, 12, 12, 32);
+        } else if matches!(ty, Ty::StringTy | Ty::Bytes) {
+            // String/Bytes: val_reg points to Vec layout [len:8][cap:8][data...]
+            // Serialize as [byte_len:8][data bytes padded to 8-alignment]
+            self.emit_load(14, val_reg, 0);              // r14 = element count (byte_len for String)
+            self.emit_store(14, 12, 0);                   // write byte_len prefix
+            self.emit_op(Opcode::Addi, 12, 12, 8);       // advance past prefix
+            self.emit_op(Opcode::Addi, 15, val_reg, memory::VEC_DATA_OFFSET); // r15 = data ptr
+            self.emit_op(Opcode::Memcpy, 12, 15, 14);    // Memcpy dst=r12, src=r15, len=r14
+            // Advance r12 by align8(byte_len): r12 += (byte_len + 7) & ~7
+            self.emit_op(Opcode::Addi, 14, 14, 7);
+            self.emit_op(Opcode::Addi, 15, 0, 3);        // shift amount = 3
+            self.emit_op(Opcode::Shr, 14, 14, 15);       // r14 = (len+7) >> 3
+            self.emit_op(Opcode::Shl, 14, 14, 15);       // r14 = ((len+7) >> 3) << 3 = align8
+            self.emit_op(Opcode::Add, 12, 12, 14);       // r12 += aligned size
+        } else if let Ty::Vec(elem_ty) = ty {
+            let elem_size = serialized_elem_size(elem_ty);
+            // Write count prefix
+            self.emit_load(14, val_reg, 0);               // r14 = element count
+            self.emit_store(14, 12, 0);                    // write count
+            self.emit_op(Opcode::Addi, 12, 12, 8);        // advance past count prefix
+
+            match elem_size {
+                Some(8) => {
+                    // Vec of GP-sized elements: bulk Memcpy count*8 bytes
+                    self.emit_op(Opcode::Addi, 15, 0, 3);
+                    self.emit_op(Opcode::Shl, 14, 14, 15);   // r14 = count * 8
+                    self.emit_op(Opcode::Addi, 15, val_reg, memory::VEC_DATA_OFFSET); // r15 = data ptr
+                    self.emit_op(Opcode::Memcpy, 12, 15, 14); // copy data
+                    self.emit_op(Opcode::Add, 12, 12, 14);    // advance r12
+                }
+                Some(32) => {
+                    // Vec of wide elements: loop with Wload/Wstore
+                    // Spill loop state to high offsets in spill area
+                    // r13+200 = loop counter (i), r13+208 = count, r13+216 = src_ptr
+                    self.emit_store(14, 13, 208);              // spill count
+                    self.emit_op(Opcode::Addi, 15, val_reg, memory::VEC_DATA_OFFSET);
+                    self.emit_store(15, 13, 216);              // spill src_ptr
+                    self.emit_op(Opcode::Addi, 14, 0, 0);     // i = 0
+                    self.emit_store(14, 13, 200);              // spill i
+
+                    let loop_label = self.alloc_label();
+                    let done_label = self.alloc_label();
+                    self.mark_label(loop_label);
+
+                    // Check i < count
+                    self.emit_load(14, 13, 200);               // r14 = i
+                    self.emit_load(15, 13, 208);               // r15 = count
+                    self.emit_jump_placeholder(Opcode::Beq, 14, 15, done_label); // if i == count → done
+
+                    // Load src_ptr, Wload element, Wstore to r12
+                    self.emit_load(15, 13, 216);               // r15 = src_ptr
+                    self.emit_op(Opcode::Wload, WIDE_SCRATCH2, 15, 0); // w6 = *src_ptr
+                    self.emit_op(Opcode::Wstore, WIDE_SCRATCH2, 12, 0); // *r12 = w6
+                    self.emit_op(Opcode::Addi, 12, 12, 32);   // r12 += 32
+                    self.emit_op(Opcode::Addi, 15, 15, 32);   // src_ptr += 32
+                    self.emit_store(15, 13, 216);              // update src_ptr
+
+                    // i++
+                    self.emit_load(14, 13, 200);
+                    self.emit_op(Opcode::Addi, 14, 14, 1);
+                    self.emit_store(14, 13, 200);
+                    self.emit_jump_placeholder(Opcode::Jmp, 0, 0, loop_label);
+
+                    self.mark_label(done_label);
+                }
+                None => {
+                    // TODO Phase B: Vec of variable-size elements (Vec<String>, Vec<Vec<T>>).
+                    // For now, write count prefix only; element data is skipped.
+                    // Future: loop calling emit_serialize recursively for each element pointer.
+                }
+                Some(_) => {
+                    // 16-byte elements (u128/i128): bulk Memcpy count*16 bytes
+                    self.emit_op(Opcode::Addi, 15, 0, 4);     // shift by 4 = multiply by 16
+                    self.emit_op(Opcode::Shl, 14, 14, 15);    // r14 = count * 16
+                    self.emit_op(Opcode::Addi, 15, val_reg, memory::VEC_DATA_OFFSET);
+                    self.emit_op(Opcode::Memcpy, 12, 15, 14);
+                    self.emit_op(Opcode::Add, 12, 12, 14);
+                }
+            }
+        } else if let Ty::Struct(name) = ty {
+            // Struct: serialize field-by-field (all GP fields → flat Memcpy)
+            if let Some(fields) = self.struct_defs.get(name).cloned() {
+                let byte_size = (fields.len() as u32) * memory::WORD_SIZE;
+                // val_reg = struct base pointer. Memcpy fields to buffer.
+                self.emit_op(Opcode::Addi, 14, 0, byte_size);   // r14 = byte count
+                self.emit_op(Opcode::Memcpy, 12, val_reg, 14);  // copy struct → buffer
+                self.emit_op(Opcode::Add, 12, 12, 14);          // advance r12
+            }
+        } else {
+            // GP types (u8-u64, bool, Enum, etc.): 8 bytes via Store
+            self.emit_store(val_reg, 12, 0);
+            self.emit_op(Opcode::Addi, 12, 12, 8);
+        }
+    }
+
+    /// Deserialize from mem[src_reg] into dst_reg, advancing src_reg.
+    /// Allocates new heap structures at r12 for variable-length types.
+    fn emit_deserialize(&mut self, ty: &Ty, src_reg: u8, dst_reg: u8) {
+        if is_wide_type(ty) {
+            // Wide types: 32 bytes via Wload
+            self.emit_op(Opcode::Wload, dst_reg, src_reg, 0);
+            self.emit_op(Opcode::Addi, src_reg, src_reg, 32);
+        } else if matches!(ty, Ty::StringTy | Ty::Bytes) {
+            // String/Bytes: read [byte_len:8][data...]
+            // Build Vec layout at r12: [len:8][cap:8][data...]
+            // dst_reg = base of new Vec = r12
+            self.emit_op(Opcode::Add, dst_reg, 12, 0);       // dst = r12 (Vec base)
+            self.emit_load(14, src_reg, 0);                    // r14 = byte_len
+            self.emit_op(Opcode::Addi, src_reg, src_reg, 8);  // advance past length prefix
+            // Write Vec header
+            self.emit_store(14, 12, 0);                        // header.length = byte_len
+            self.emit_store(14, 12, 8);                        // header.capacity = byte_len
+            self.emit_op(Opcode::Addi, 12, 12, memory::VEC_DATA_OFFSET); // skip header
+            // Memcpy data from src to r12
+            self.emit_op(Opcode::Memcpy, 12, src_reg, 14);    // copy byte_len bytes
+            // Advance src_reg by align8(byte_len)
+            self.emit_op(Opcode::Addi, 15, 14, 7);            // r15 = byte_len + 7
+            self.emit_op(Opcode::Addi, 14, 0, 3);             // shift = 3
+            self.emit_op(Opcode::Shr, 15, 15, 14);            // r15 = (byte_len+7) >> 3
+            self.emit_op(Opcode::Shl, 15, 15, 14);            // r15 = align8(byte_len)
+            self.emit_op(Opcode::Add, src_reg, src_reg, 15);  // src_reg += aligned
+            // Advance r12 past data
+            self.emit_op(Opcode::Add, 12, 12, 15);            // r12 += aligned
+        } else if let Ty::Vec(elem_ty) = ty {
+            let elem_size = serialized_elem_size(elem_ty);
+            // dst_reg = base of new Vec = r12
+            self.emit_op(Opcode::Add, dst_reg, 12, 0);        // dst = Vec base
+            self.emit_load(14, src_reg, 0);                     // r14 = count
+            self.emit_op(Opcode::Addi, src_reg, src_reg, 8);   // advance past count prefix
+            // Write Vec header
+            self.emit_store(14, 12, 0);                         // header.length = count
+            self.emit_store(14, 12, 8);                         // header.capacity = count
+            self.emit_op(Opcode::Addi, 12, 12, memory::VEC_DATA_OFFSET); // skip header
+
+            match elem_size {
+                Some(8) => {
+                    // Vec<GP>: bulk Memcpy count*8 bytes
+                    self.emit_op(Opcode::Addi, 15, 0, 3);
+                    self.emit_op(Opcode::Shl, 14, 14, 15);     // r14 = count * 8
+                    self.emit_op(Opcode::Memcpy, 12, src_reg, 14); // copy data
+                    self.emit_op(Opcode::Add, src_reg, src_reg, 14); // advance src
+                    self.emit_op(Opcode::Add, 12, 12, 14);     // advance r12
+                }
+                Some(32) => {
+                    // Vec<wide>: loop Wload/Wstore
+                    // Spill state: r13+200=i, r13+208=count, r13+216=src_reg value
+                    self.emit_store(14, 13, 208);               // spill count
+                    self.emit_store(src_reg, 13, 216);          // spill src_reg
+                    self.emit_op(Opcode::Addi, 14, 0, 0);      // i = 0
+                    self.emit_store(14, 13, 200);               // spill i
+
+                    let loop_label = self.alloc_label();
+                    let done_label = self.alloc_label();
+                    self.mark_label(loop_label);
+
+                    self.emit_load(14, 13, 200);                // r14 = i
+                    self.emit_load(15, 13, 208);                // r15 = count
+                    self.emit_jump_placeholder(Opcode::Beq, 14, 15, done_label);
+
+                    self.emit_load(15, 13, 216);                // r15 = src ptr
+                    self.emit_op(Opcode::Wload, WIDE_SCRATCH2, 15, 0);
+                    self.emit_op(Opcode::Wstore, WIDE_SCRATCH2, 12, 0);
+                    self.emit_op(Opcode::Addi, 12, 12, 32);
+                    self.emit_op(Opcode::Addi, 15, 15, 32);
+                    self.emit_store(15, 13, 216);               // update src ptr
+
+                    self.emit_load(14, 13, 200);
+                    self.emit_op(Opcode::Addi, 14, 14, 1);
+                    self.emit_store(14, 13, 200);
+                    self.emit_jump_placeholder(Opcode::Jmp, 0, 0, loop_label);
+
+                    self.mark_label(done_label);
+                    // Restore src_reg to final position
+                    self.emit_load(src_reg, 13, 216);
+                }
+                None => {
+                    // TODO Phase B: Vec of variable-size elements (Vec<String>, Vec<Vec<T>>).
+                    // For now, only count prefix is read; element data deserialization is skipped.
+                    // Future: loop calling emit_deserialize recursively for each element.
+                }
+                Some(_) => {
+                    // 16-byte elements: bulk Memcpy count*16
+                    self.emit_op(Opcode::Addi, 15, 0, 4);      // shift = 4
+                    self.emit_op(Opcode::Shl, 14, 14, 15);     // r14 = count * 16
+                    self.emit_op(Opcode::Memcpy, 12, src_reg, 14);
+                    self.emit_op(Opcode::Add, src_reg, src_reg, 14);
+                    self.emit_op(Opcode::Add, 12, 12, 14);
+                }
+            }
+        } else if let Ty::Struct(name) = ty {
+            // Struct: deserialize by copying flat bytes to heap
+            if let Some(fields) = self.struct_defs.get(name).cloned() {
+                let byte_size = (fields.len() as u32) * memory::WORD_SIZE;
+                // dst_reg = struct base at r12
+                self.emit_op(Opcode::Add, dst_reg, 12, 0);
+                self.emit_op(Opcode::Addi, 14, 0, byte_size);
+                self.emit_op(Opcode::Memcpy, 12, src_reg, 14);  // copy buffer → heap
+                self.emit_op(Opcode::Add, src_reg, src_reg, 14); // advance src
+                self.emit_op(Opcode::Add, 12, 12, 14);           // advance heap
+            }
+        } else {
+            // GP types: 8 bytes via Load
+            self.emit_load(dst_reg, src_reg, 0);
+            self.emit_op(Opcode::Addi, src_reg, src_reg, 8);
+        }
+    }
+
 }
 
 // ============================================================================
@@ -1719,7 +1998,12 @@ impl CodeGen {
 
 /// Check if a type uses wide (256-bit) register.
 fn is_wide_type(ty: &Ty) -> bool {
-    matches!(ty, Ty::U256 | Ty::I256 | Ty::Address | Ty::Bytes)
+    matches!(ty, Ty::U256 | Ty::I256 | Ty::Address)
+}
+
+/// Whether a type is variable-length (stored via Sload/Sstore mode 1: memory blob).
+fn is_blob_type(ty: &Ty) -> bool {
+    matches!(ty, Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_))
 }
 
 /// Extract value type from a Map type.
@@ -1746,6 +2030,20 @@ fn field_byte_size(ty: &Ty) -> u32 {
         memory::WIDE_SIZE
     } else {
         memory::WORD_SIZE
+    }
+}
+
+/// Return the fixed serialized element size for a type, or None for variable-length types.
+/// Used by Borsh-style serialization to decide between memcpy (fixed) and loop (variable).
+fn serialized_elem_size(ty: &Ty) -> Option<u32> {
+    match ty {
+        Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64
+        | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64
+        | Ty::Bool | Ty::Enum(_) => Some(8),
+        Ty::U128 | Ty::I128 => Some(16),
+        Ty::U256 | Ty::I256 | Ty::Address => Some(32),
+        Ty::StringTy | Ty::Bytes | Ty::Vec(_) => None,
+        _ => Some(8),
     }
 }
 
