@@ -92,6 +92,9 @@ impl Ty {
                 }
                 false
             }
+            // Enum → numeric: enums are discriminant integers
+            _ if matches!(self, Ty::Enum(_)) && target.is_numeric() => true,
+            _ if self.is_numeric() && matches!(target, Ty::Enum(_)) => true,
             _ => false,
         }
     }
@@ -103,11 +106,19 @@ impl Ty {
         if matches!(self, Ty::Unknown) || matches!(other, Ty::Unknown) { return true; }
         // Numeric types are comparable (implicit widening happens)
         if self.is_numeric() && other.is_numeric() { return true; }
+        // Enums are comparable with numerics (discriminant comparison)
+        if (matches!(self, Ty::Enum(_)) && other.is_numeric())
+            || (self.is_numeric() && matches!(other, Ty::Enum(_))) { return true; }
         // Arrays of same size with compatible elements
         if let (Ty::Array(a, n1), Ty::Array(b, n2)) = (self, other) {
             return n1 == n2 && a.is_comparable_with(b);
         }
         false
+    }
+
+    /// Whether this is an enum type.
+    pub fn is_enum(&self) -> bool {
+        matches!(self, Ty::Enum(_))
     }
 
     /// Whether a type can be used as a map key.
