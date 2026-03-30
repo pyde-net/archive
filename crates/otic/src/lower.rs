@@ -19,6 +19,19 @@ pub fn lower(file: &SourceFile) -> IrProgram {
     lowerer.program
 }
 
+/// Lower with a registry of previously compiled contracts.
+/// Used for multi-contract files where `create!(ContractName, args)` references
+/// another contract's bytecode.
+pub fn lower_with_contracts(
+    file: &SourceFile,
+    compiled: &HashMap<String, Vec<u8>>,
+) -> IrProgram {
+    let mut lowerer = Lowerer::new();
+    lowerer.compiled_contracts = compiled.clone();
+    lowerer.lower_file(file);
+    lowerer.program
+}
+
 struct Lowerer {
     program: IrProgram,
     /// Current function being lowered.
@@ -34,6 +47,9 @@ struct Lowerer {
     enum_defs: HashMap<String, Vec<String>>,
     /// Const name → (value, type) for inlining.
     const_defs: HashMap<String, (U256, Ty)>,
+    /// Compiled contract bytecodes for `create!` embedding.
+    /// Maps contract name → deploy-format bytes [clen:4][rlen:4][constructor][runtime].
+    compiled_contracts: HashMap<String, Vec<u8>>,
 }
 
 impl Lowerer {
@@ -58,6 +74,7 @@ impl Lowerer {
             next_slot: 0,
             loop_stack: Vec::new(),
             enum_defs: HashMap::new(),
+            compiled_contracts: HashMap::new(),
             const_defs: HashMap::new(),
         }
     }
@@ -979,6 +996,47 @@ impl Lowerer {
                             // No method name: emit as raw call (no selector)
                             self.emit(Inst::RawCall(dst, target, param_regs));
                         }
+                        dst
+                    }
+                    "create" => {
+                        // create!(ContractName, arg1, arg2, ...) → Address
+                        // Embeds the named contract's bytecode and deploys it.
+                        // Constructor runs automatically with the provided args.
+                        let positional: Vec<&Expr> = args.iter().filter_map(|a| {
+                            if let MacroArg::Positional(e) = a { Some(e) } else { None }
+                        }).collect();
+
+                        let dst = self.alloc_reg();
+
+                        // First arg must be a contract name (path expression)
+                        let contract_name = if let Some(Expr::Path(segments, _)) = positional.first() {
+                            segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::")
+                        } else {
+                            self.emit(Inst::Comment("create! requires a contract name".into()));
+                            return dst;
+                        };
+
+                        // Look up compiled bytecode
+                        let deploy_bytes = match self.compiled_contracts.get(&contract_name) {
+                            Some(bytes) => bytes.clone(),
+                            None => {
+                                self.emit(Inst::Comment(format!("create!: contract '{}' not found in registry", contract_name)));
+                                return dst;
+                            }
+                        };
+
+                        // Lower constructor args (positional[1..])
+                        let arg_regs: Vec<Reg> = positional[1..].iter()
+                            .map(|e| self.lower_expr(e))
+                            .collect();
+
+                        // Emit: store deploy bytes as a constant blob
+                        let blob_reg = self.alloc_reg();
+                        self.emit(Inst::Const(blob_reg, IrConst::Bytes(deploy_bytes)));
+
+                        // CreateContract(dst, blob_reg, [arg_regs...])
+                        // The codegen will write blob + args to heap and emit Create.
+                        self.emit(Inst::CreateContract(dst, blob_reg, arg_regs));
                         dst
                     }
                     _ => {

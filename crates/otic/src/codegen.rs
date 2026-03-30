@@ -672,6 +672,23 @@ impl CodeGen {
                             self.emit_op(Opcode::Addi, 12, 12, 32);
                         }
                     }
+                    IrConst::Bytes(data) => {
+                        // Write raw bytes to heap, set dst = heap pointer
+                        let rd = self.alloc_gp(*dst);
+                        self.emit_op(Opcode::Add, rd, 12, 0); // rd = current heap ptr
+                        // Write bytes in 8-byte chunks
+                        for (i, chunk) in data.chunks(8).enumerate() {
+                            let mut buf = [0u8; 8];
+                            buf[..chunk.len()].copy_from_slice(chunk);
+                            let val = u64::from_le_bytes(buf);
+                            self.load_u64_to_reg(15, val);
+                            self.emit_store(15, 12, (i as i32) * 8);
+                        }
+                        // Advance heap past the data (aligned to 8)
+                        let aligned = ((data.len() + 7) / 8) * 8;
+                        self.load_u32_to_reg(15, aligned as u32);
+                        self.emit_op(Opcode::Add, 12, 12, 15);
+                    }
                     IrConst::Unit => {}
                     _ => {
                         let rd = self.alloc_gp(*dst);
@@ -1438,6 +1455,38 @@ impl CodeGen {
                 if rd != 1 {
                     self.emit_op(Opcode::Add, rd, 1, 0);
                 }
+            }
+
+            Inst::CreateContract(dst, blob_reg, args) => {
+                // The blob register holds an IrConst::Bytes value.
+                // At codegen time, the Const handler has already written the blob to heap.
+                // blob_reg points to the heap location of the deploy-format bytes.
+                // We need to: write constructor args after the blob, then Create.
+                let wd = self.regs.alloc_wide(*dst);
+                let rb = self.get_reg(*blob_reg); // GP reg with blob heap pointer
+
+                // The Const(blob_reg, Bytes(data)) handler writes data to heap[r12]
+                // and sets blob_reg = r12, then advances r12.
+                // Now r12 is right after the blob — perfect for appending args.
+
+                // Write constructor args (LE u64 each) after the blob
+                for (i, arg) in args.iter().enumerate() {
+                    let ra = self.get_reg(*arg);
+                    self.emit_store(ra, 12, (i as i32) * 8);
+                }
+                let args_size = (args.len() as u32) * 8;
+
+                // Total length = blob_size (r12 - rb) + args_size
+                // r14 = r12 - rb (blob size)
+                self.emit_op(Opcode::Sub, 14, 12, rb as u32);
+                // r14 += args_size (total deploy data length)
+                if args_size > 0 {
+                    self.emit_op(Opcode::Addi, 14, 14, args_size);
+                    self.emit_op(Opcode::Addi, 12, 12, args_size); // advance heap past args
+                }
+
+                // Create: wd = new address, rs1 = blob pointer, imm[3:0] = length register (r14)
+                self.emit_op(Opcode::Create, wd, rb, 14 & 0xF);
             }
 
             Inst::MakeVec(dst, cap) => {
