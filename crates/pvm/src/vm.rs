@@ -1497,7 +1497,9 @@ impl Vm {
 
         let mut child = Vm::with_gas_limit_and_context(max_forward, child_ctx);
         child.contracts = self.contracts.clone();
-        child.storage = self.storage.clone();
+        child.storage_backend = self.storage_backend.clone();
+        child.code_backend = self.code_backend.clone();
+        // New contract starts with empty storage (backend loads on demand)
         child.warm_storage_keys = self.warm_storage_keys.clone();
         child.ext_call_depth = self.ext_call_depth + 1;
         child.load(&init_code).map_err(|_| Trap::MemoryFault)?;
