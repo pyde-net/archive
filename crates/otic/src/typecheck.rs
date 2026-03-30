@@ -651,6 +651,9 @@ impl TypeChecker {
                         && !self.is_int_literal_compatible(&a.value, &target_ty)
                         && !value_ty.can_widen_to(&target_ty)
                         && !(target_ty.is_numeric() && value_ty.is_numeric()) // allow numeric narrowing
+                        && !(target_ty.is_enum() && value_ty.is_enum()) // same-kind enum assignment
+                        && !(target_ty.is_numeric() && value_ty.is_enum()) // Enum → numeric
+                        && !(target_ty.is_enum() && value_ty.is_numeric()) // numeric → Enum
                         && !self.is_compatible_init(&value_ty, &target_ty)
                     {
                         self.error(
@@ -1240,6 +1243,9 @@ impl TypeChecker {
                         // numeric ↔ Address
                         (s, Ty::Address) if s.is_numeric() => true,
                         (Ty::Address, t) if t.is_numeric() => true,
+                        // enum ↔ numeric (discriminant cast)
+                        (Ty::Enum(_), t) if t.is_numeric() => true,
+                        (s, Ty::Enum(_)) if s.is_numeric() => true,
                         // same type (identity cast)
                         (s, t) if s == t => true,
                         _ => false,

@@ -19,6 +19,19 @@ pub fn lower(file: &SourceFile) -> IrProgram {
     lowerer.program
 }
 
+/// Lower with a registry of previously compiled contracts.
+/// Used for multi-contract files where `create!(ContractName, args)` references
+/// another contract's bytecode.
+pub fn lower_with_contracts(
+    file: &SourceFile,
+    compiled: &HashMap<String, Vec<u8>>,
+) -> IrProgram {
+    let mut lowerer = Lowerer::new();
+    lowerer.compiled_contracts = compiled.clone();
+    lowerer.lower_file(file);
+    lowerer.program
+}
+
 struct Lowerer {
     program: IrProgram,
     /// Current function being lowered.
@@ -34,6 +47,9 @@ struct Lowerer {
     enum_defs: HashMap<String, Vec<String>>,
     /// Const name → (value, type) for inlining.
     const_defs: HashMap<String, (U256, Ty)>,
+    /// Compiled contract bytecodes for `create!` embedding.
+    /// Maps contract name → deploy-format bytes [clen:4][rlen:4][constructor][runtime].
+    compiled_contracts: HashMap<String, Vec<u8>>,
 }
 
 impl Lowerer {
@@ -58,6 +74,7 @@ impl Lowerer {
             next_slot: 0,
             loop_stack: Vec::new(),
             enum_defs: HashMap::new(),
+            compiled_contracts: HashMap::new(),
             const_defs: HashMap::new(),
         }
     }
@@ -981,6 +998,47 @@ impl Lowerer {
                         }
                         dst
                     }
+                    "create" => {
+                        // create!(ContractName, arg1, arg2, ...) → Address
+                        // Embeds the named contract's bytecode and deploys it.
+                        // Constructor runs automatically with the provided args.
+                        let positional: Vec<&Expr> = args.iter().filter_map(|a| {
+                            if let MacroArg::Positional(e) = a { Some(e) } else { None }
+                        }).collect();
+
+                        let dst = self.alloc_reg();
+
+                        // First arg must be a contract name (path expression)
+                        let contract_name = if let Some(Expr::Path(segments, _)) = positional.first() {
+                            segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::")
+                        } else {
+                            self.emit(Inst::Comment("create! requires a contract name".into()));
+                            return dst;
+                        };
+
+                        // Look up compiled bytecode
+                        let deploy_bytes = match self.compiled_contracts.get(&contract_name) {
+                            Some(bytes) => bytes.clone(),
+                            None => {
+                                self.emit(Inst::Comment(format!("create!: contract '{}' not found in registry", contract_name)));
+                                return dst;
+                            }
+                        };
+
+                        // Lower constructor args (positional[1..])
+                        let arg_regs: Vec<Reg> = positional[1..].iter()
+                            .map(|e| self.lower_expr(e))
+                            .collect();
+
+                        // Emit: store deploy bytes as a constant blob
+                        let blob_reg = self.alloc_reg();
+                        self.emit(Inst::Const(blob_reg, IrConst::Bytes(deploy_bytes)));
+
+                        // CreateContract(dst, blob_reg, [arg_regs...])
+                        // The codegen will write blob + args to heap and emit Create.
+                        self.emit(Inst::CreateContract(dst, blob_reg, arg_regs));
+                        dst
+                    }
                     _ => {
                         let dst = self.alloc_reg();
                         self.emit(Inst::Comment(format!("unknown macro: {}!", name.name)));
@@ -1042,23 +1100,34 @@ impl Lowerer {
                 let end_label = self.func().alloc_label();
                 let dst = self.alloc_reg();
 
-                // Pre-allocate all arm labels to avoid collision with nested structures
-                let arm_labels: Vec<Label> = (0..arms.len())
+                // Allocate SEPARATE check and body labels for each arm.
+                // Pattern check emits Branch(cmp, body_label, next_check_label).
+                // This ensures a failed match jumps to the NEXT pattern check,
+                // not the next arm's body.
+                let check_labels: Vec<Label> = (0..arms.len())
+                    .map(|_| self.func().alloc_label())
+                    .collect();
+                let body_labels: Vec<Label> = (0..arms.len())
                     .map(|_| self.func().alloc_label())
                     .collect();
 
+                // Jump to first check
+                self.emit(Inst::Jump(check_labels[0]));
+
+                // Emit all pattern checks
                 for (i, arm) in arms.iter().enumerate() {
-                    let arm_label = arm_labels[i];
-                    let next_label = if i + 1 < arms.len() {
-                        arm_labels[i + 1]
+                    let body_label = body_labels[i];
+                    let next_check = if i + 1 < arms.len() {
+                        check_labels[i + 1]
                     } else {
-                        end_label
+                        end_label // no match → fall to end
                     };
 
-                    // Check pattern
+                    self.func().push_block(check_labels[i], format!("match.check{}", i));
+
                     match &arm.pattern {
                         Pattern::Wildcard(_) => {
-                            self.emit(Inst::Jump(arm_label));
+                            self.emit(Inst::Jump(body_label));
                         }
                         Pattern::Literal(lit, _) => {
                             let pat_reg = self.alloc_reg();
@@ -1070,10 +1139,9 @@ impl Lowerer {
                             self.emit(Inst::Const(pat_reg, val));
                             let cmp = self.alloc_reg();
                             self.emit(Inst::Cmp(cmp, CmpOp::Eq, scrut, pat_reg));
-                            self.emit(Inst::Branch(cmp, arm_label, next_label));
+                            self.emit(Inst::Branch(cmp, body_label, next_check));
                         }
                         Pattern::Path(segments, _) => {
-                            // Enum variant → compare scrutinee against discriminant
                             if segments.len() == 2 {
                                 let enum_name = &segments[0].name;
                                 let variant_name = &segments[1].name;
@@ -1083,17 +1151,15 @@ impl Lowerer {
                                         self.emit(Inst::Const(pat_reg, IrConst::Int(U256::from(idx as u64), Ty::U8)));
                                         let cmp = self.alloc_reg();
                                         self.emit(Inst::Cmp(cmp, CmpOp::Eq, scrut, pat_reg));
-                                        self.emit(Inst::Branch(cmp, arm_label, next_label));
+                                        self.emit(Inst::Branch(cmp, body_label, next_check));
                                     } else {
-                                        self.emit(Inst::Jump(arm_label));
+                                        self.emit(Inst::Jump(body_label));
                                     }
                                 } else {
-                                    // Unknown enum — fall through (could be a single-segment catch-all)
-                                    self.emit(Inst::Jump(arm_label));
+                                    self.emit(Inst::Jump(body_label));
                                 }
                             } else {
-                                // Single-segment path — catch-all variable binding
-                                self.emit(Inst::Jump(arm_label));
+                                self.emit(Inst::Jump(body_label));
                             }
                         }
                         Pattern::Range(start, end_lit, _) => {
@@ -1109,13 +1175,16 @@ impl Lowerer {
                             self.emit(Inst::Cmp(ge, CmpOp::GtEq, scrut, start_reg));
                             self.emit(Inst::Cmp(lt, CmpOp::Lt, scrut, end_reg));
                             self.emit(Inst::BinOp(in_range, BinOp::LogicalAnd, ge, lt));
-                            self.emit(Inst::Branch(in_range, arm_label, next_label));
+                            self.emit(Inst::Branch(in_range, body_label, next_check));
                         }
                     }
+                }
 
-                    // Arm body
-                    self.func().push_block(arm_label, format!("match.arm{}", i));
-                    self.lower_expr(&arm.body);
+                // Emit all arm bodies
+                for (i, arm) in arms.iter().enumerate() {
+                    self.func().push_block(body_labels[i], format!("match.arm{}", i));
+                    let arm_result = self.lower_expr(&arm.body);
+                    self.emit(Inst::Cast(dst, arm_result, Ty::U64));
                     self.emit(Inst::Jump(end_label));
                 }
 

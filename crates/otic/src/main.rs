@@ -147,34 +147,58 @@ fn run_frontend(path: &str) -> (otic::ast::SourceFile, String) {
 // ============================================================================
 
 fn cmd_build(path: &str) {
-    let (file, _src) = run_frontend(path);
+    let (_file, _src) = run_frontend(path);
+    let src = read_source(path);
 
-    // Lower → optimize → codegen
-    let mut ir = otic::lower::lower(&file);
-    otic::optimize::optimize(&mut ir);
-    let abi = otic::abi::generate_abi(&ir);
-    let codegen = otic::codegen::CodeGen::new();
-    let contract = codegen.generate(&ir);
+    // Multi-contract compilation: compile all contracts in the file.
+    // Later contracts can reference earlier ones via create!(ContractName, args).
+    let results = otic::compile_all(&src);
 
-    // Generate JSON artifact (readable in any editor)
-    let artifact = otic::abi::artifact_to_json(&abi, &contract);
-
-    // Write .json artifact
-    let json_path = Path::new(path).with_extension("json");
-    if let Err(e) = fs::write(&json_path, &artifact) {
-        eprintln!("error: could not write '{}': {}", json_path.display(), e);
+    if results.is_empty() {
+        eprintln!("error: no contracts found in {}", path);
         process::exit(1);
     }
 
-    println!("  compiled {} → {}", path, json_path.display());
-    println!("  contract:    {}", contract.name);
-    println!("  bytecode:    {} bytes ({} instructions)",
-        contract.bytecode.len(), contract.instruction_count);
-    println!("  constructor: {} bytes", contract.constructor_bytecode.len());
-    println!("  runtime:     {} bytes", contract.runtime_bytecode.len());
-    println!("  functions:   {}", abi.functions.len());
-    println!("  events:      {}", abi.events.len());
-    println!("  storage:     {} fields", abi.storage.len());
+    for (name, contract) in &results {
+        // Generate IR for ABI (single-contract lower for ABI generation)
+        let (tokens, _) = otic::lexer::Lexer::new(&src).tokenize();
+        let (file, _) = otic::parser::Parser::new(tokens).parse();
+        // Build single-contract file for ABI
+        let mut single = otic::ast::SourceFile { items: Vec::new() };
+        for item in &file.items {
+            match item {
+                otic::ast::Item::Contract(c) if c.name.name == *name => single.items.push(item.clone()),
+                otic::ast::Item::Contract(_) => {}
+                _ => single.items.push(item.clone()),
+            }
+        }
+        let ir = otic::lower::lower(&single);
+        let abi = otic::abi::generate_abi(&ir);
+        let artifact = otic::abi::artifact_to_json(&abi, contract);
+
+        // Write .json artifact (use contract name for multi-contract files)
+        let json_path = if results.len() == 1 {
+            Path::new(path).with_extension("json")
+        } else {
+            let stem = Path::new(path).file_stem().unwrap_or_default().to_str().unwrap_or("out");
+            Path::new(path).with_file_name(format!("{}_{}.json", stem, name.to_lowercase()))
+        };
+        if let Err(e) = fs::write(&json_path, &artifact) {
+            eprintln!("error: could not write '{}': {}", json_path.display(), e);
+            process::exit(1);
+        }
+
+        println!("  compiled {} → {}", path, json_path.display());
+        println!("  contract:    {}", contract.name);
+        println!("  bytecode:    {} bytes ({} instructions)",
+            contract.bytecode.len(), contract.instruction_count);
+        println!("  constructor: {} bytes", contract.constructor_bytecode.len());
+        println!("  runtime:     {} bytes", contract.runtime_bytecode.len());
+        println!("  functions:   {}", abi.functions.len());
+        println!("  events:      {}", abi.events.len());
+        println!("  storage:     {} fields", abi.storage.len());
+        println!();
+    }
 }
 
 fn cmd_check(path: &str) {

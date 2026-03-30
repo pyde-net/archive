@@ -1472,13 +1472,39 @@ impl Vm {
             return Err(Trap::MemoryFault); // address collision
         }
 
-        // Execute init code in a child VM (constructor runs here)
+        // Parse deploy format: [clen:4 LE][rlen:4 LE][constructor][runtime][args]
+        // If the header is valid, split into constructor + runtime + args.
+        // Constructor runs in a child VM. Runtime is deployed.
+        // If no valid header, use init_code as both constructor and runtime (legacy).
+        let (constructor, runtime, constructor_args) = if init_code.len() >= 8 {
+            let clen = u32::from_le_bytes(
+                init_code[..4].try_into().unwrap_or([0; 4])
+            ) as usize;
+            let rlen = u32::from_le_bytes(
+                init_code[4..8].try_into().unwrap_or([0; 4])
+            ) as usize;
+            if clen > 0 && rlen > 0 && 8 + clen + rlen <= init_code.len() {
+                let c = init_code[8..8 + clen].to_vec();
+                let r = init_code[8 + clen..8 + clen + rlen].to_vec();
+                let args = if init_code.len() > 8 + clen + rlen {
+                    init_code[8 + clen + rlen..].to_vec()
+                } else {
+                    vec![]
+                };
+                (Some(c), r, args)
+            } else {
+                (None, init_code.clone(), vec![])
+            }
+        } else {
+            (None, init_code.clone(), vec![])
+        };
+
         let available_gas = if self.gas_limit > 0 {
             self.gas_limit.saturating_sub(self.gas_used_total)
         } else {
             u64::MAX
         };
-        let max_forward = available_gas - (available_gas / 64); // 63/64 rule
+        let max_forward = available_gas - (available_gas / 64);
 
         let child_ctx = ExecutionContext {
             caller: self.ctx.self_address,
@@ -1495,55 +1521,43 @@ impl Vm {
             balances: self.ctx.balances.clone(),
         };
 
-        let mut child = Vm::with_gas_limit_and_context(max_forward, child_ctx);
-        child.contracts = self.contracts.clone();
-        child.storage = self.storage.clone();
-        child.warm_storage_keys = self.warm_storage_keys.clone();
-        child.ext_call_depth = self.ext_call_depth + 1;
-        child.load(&init_code).map_err(|_| Trap::MemoryFault)?;
+        // Run constructor if present
+        if let Some(ref constructor_code) = constructor {
+            let mut child = Vm::with_gas_limit_and_context(max_forward, child_ctx.clone());
+            child.contracts = self.contracts.clone();
+            child.storage_backend = self.storage_backend.clone();
+            child.code_backend = self.code_backend.clone();
+            child.warm_storage_keys = self.warm_storage_keys.clone();
+            child.ext_call_depth = self.ext_call_depth + 1;
+            child.calldata = constructor_args;
+            child.load(constructor_code).map_err(|_| Trap::MemoryFault)?;
 
-        let output = child.execute();
+            let output = child.execute();
+            self.gas_used_total += output.gas_used;
+            if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                return Err(Trap::OutOfGas);
+            }
+            if output.outcome != Outcome::Success {
+                return Err(Trap::MemoryFault); // constructor failed
+            }
+            // Merge constructor's storage writes
+            for (k, v) in &child.storage {
+                self.storage.insert(*k, v.clone());
+            }
+            self.warm_storage_keys.extend(child.warm_storage_keys);
+        }
 
-        // Charge parent for gas used by child
-        self.gas_used_total += output.gas_used;
+        let runtime_code = runtime;
+
+        // Charge per-byte gas for deployed code
+        let code_gas = (runtime_code.len() as u64) * 200;
+        self.gas_used_total += code_gas;
         if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
             return Err(Trap::OutOfGas);
         }
 
-        if output.outcome == Outcome::Success {
-            // The child's return_data is the runtime bytecode to deploy.
-            // If empty, the init code didn't return runtime code — deploy empty contract.
-            let runtime_code = if child.return_data.is_empty() {
-                // No explicit return data — use the init code itself as runtime
-                // (Pyde convention: Otigen compiler packages runtime in init code)
-                init_code.clone()
-            } else {
-                child.return_data
-            };
-
-            // Charge per-byte gas for deployed code
-            let code_gas = (runtime_code.len() as u64) * 200;
-            self.gas_used_total += code_gas;
-            if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
-                return Err(Trap::OutOfGas);
-            }
-
-            // Deploy runtime bytecode
-            self.contracts.insert(new_addr, runtime_code);
-
-            // Merge child's storage changes (constructor may have initialized state)
-            for (k, v) in &child.storage {
-                self.storage.insert(*k, v.clone());
-            }
-            self.logs.extend(output.logs);
-            self.gas_refund += output.gas_refund;
-        } else {
-            // Constructor failed — no contract deployed
-            return Err(Trap::MemoryFault);
-        }
-
-        // Merge warm keys
-        self.warm_storage_keys.extend(child.warm_storage_keys);
+        // Deploy runtime bytecode
+        self.contracts.insert(new_addr, runtime_code);
 
         Ok(new_addr)
     }

@@ -310,6 +310,10 @@ pub enum Inst {
     /// `raw_call %target, %value, %data`
     RawCall(Reg, Reg, Vec<Reg>),
 
+    /// `%addr = create %deploy_blob, [constructor_args...]` — deploy a new contract.
+    /// deploy_blob holds the deploy-format bytes. Returns Address.
+    CreateContract(Reg, Reg, Vec<Reg>),
+
     /// `br @label` — unconditional jump
     Jump(Label),
 
@@ -515,6 +519,10 @@ impl fmt::Display for Inst {
             Inst::RawCall(dst, target, args) => {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
                 write!(f, "{} = raw_call {}({})", dst, target, args_str.join(", "))
+            }
+            Inst::CreateContract(dst, blob, args) => {
+                let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
+                write!(f, "{} = create({}, [{}])", dst, blob, args_str.join(", "))
             }
             Inst::Jump(label) => write!(f, "jump {}", label),
             Inst::Branch(cond, then_l, else_l) => write!(f, "br {}, {}, {}", cond, then_l, else_l),

@@ -313,6 +313,7 @@ fn collect_used_regs(inst: &Inst, used: &mut HashSet<Reg>) {
             for a in args { used.insert(*a); }
         }
         Inst::RawCall(_, target, args) => { used.insert(*target); for a in args { used.insert(*a); } }
+        Inst::CreateContract(_, blob, args) => { used.insert(*blob); for a in args { used.insert(*a); } }
         Inst::Jump(_) => {}
         Inst::Branch(cond, _, _) => { used.insert(*cond); }
         Inst::Return(Some(val)) => { used.insert(*val); }
@@ -336,7 +337,7 @@ fn get_dest_reg(inst: &Inst) -> Option<Reg> {
         | Inst::MakeTuple(dst, _) | Inst::TupleGet(dst, _, _)
         | Inst::MakeArray(dst, _) | Inst::ArrayRepeat(dst, _, _)
         | Inst::MakeVec(dst, _)
-        | Inst::RawCall(dst, _, _) | Inst::Phi(dst, _) => Some(*dst),
+        | Inst::RawCall(dst, _, _) | Inst::CreateContract(dst, _, _) | Inst::Phi(dst, _) => Some(*dst),
         _ => None,
     }
 }
@@ -348,7 +349,7 @@ fn has_side_effects(inst: &Inst) -> bool {
         | Inst::StorageNestedMapSet(_, _, _, _)
         | Inst::IndexSet(_, _, _)
         | Inst::Emit(_, _) | Inst::Revert(_, _)
-        | Inst::CrossCall { .. } | Inst::RawCall(_, _, _)
+        | Inst::CrossCall { .. } | Inst::RawCall(_, _, _) | Inst::CreateContract(_, _, _)
         | Inst::Call(_, _, _) | Inst::MethodCall(_, _, _, _) | Inst::ExtCall(_, _, _, _)
         | Inst::Jump(_) | Inst::Branch(_, _, _) | Inst::Return(_)
     )

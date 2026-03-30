@@ -389,6 +389,19 @@ fn execute_in_pvm(
         }
     }
 
+    // Persist any contracts created via CREATE opcode (factory pattern)
+    if success {
+        for (addr, code) in &vm.contracts {
+            let code_key = pyde_state::keys::code_key(addr);
+            // Only persist if not already in SMT (newly created)
+            if smt.get(&code_key).is_none() {
+                let _ = smt.insert(code_key, code.clone());
+                let contract_account = Account::new_contract(*addr, code);
+                let _ = store_account(smt, &contract_account);
+            }
+        }
+    }
+
     let logs = output
         .logs
         .iter()
