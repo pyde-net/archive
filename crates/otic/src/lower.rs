@@ -1042,23 +1042,34 @@ impl Lowerer {
                 let end_label = self.func().alloc_label();
                 let dst = self.alloc_reg();
 
-                // Pre-allocate all arm labels to avoid collision with nested structures
-                let arm_labels: Vec<Label> = (0..arms.len())
+                // Allocate SEPARATE check and body labels for each arm.
+                // Pattern check emits Branch(cmp, body_label, next_check_label).
+                // This ensures a failed match jumps to the NEXT pattern check,
+                // not the next arm's body.
+                let check_labels: Vec<Label> = (0..arms.len())
+                    .map(|_| self.func().alloc_label())
+                    .collect();
+                let body_labels: Vec<Label> = (0..arms.len())
                     .map(|_| self.func().alloc_label())
                     .collect();
 
+                // Jump to first check
+                self.emit(Inst::Jump(check_labels[0]));
+
+                // Emit all pattern checks
                 for (i, arm) in arms.iter().enumerate() {
-                    let arm_label = arm_labels[i];
-                    let next_label = if i + 1 < arms.len() {
-                        arm_labels[i + 1]
+                    let body_label = body_labels[i];
+                    let next_check = if i + 1 < arms.len() {
+                        check_labels[i + 1]
                     } else {
-                        end_label
+                        end_label // no match → fall to end
                     };
 
-                    // Check pattern
+                    self.func().push_block(check_labels[i], format!("match.check{}", i));
+
                     match &arm.pattern {
                         Pattern::Wildcard(_) => {
-                            self.emit(Inst::Jump(arm_label));
+                            self.emit(Inst::Jump(body_label));
                         }
                         Pattern::Literal(lit, _) => {
                             let pat_reg = self.alloc_reg();
@@ -1070,10 +1081,9 @@ impl Lowerer {
                             self.emit(Inst::Const(pat_reg, val));
                             let cmp = self.alloc_reg();
                             self.emit(Inst::Cmp(cmp, CmpOp::Eq, scrut, pat_reg));
-                            self.emit(Inst::Branch(cmp, arm_label, next_label));
+                            self.emit(Inst::Branch(cmp, body_label, next_check));
                         }
                         Pattern::Path(segments, _) => {
-                            // Enum variant → compare scrutinee against discriminant
                             if segments.len() == 2 {
                                 let enum_name = &segments[0].name;
                                 let variant_name = &segments[1].name;
@@ -1083,17 +1093,15 @@ impl Lowerer {
                                         self.emit(Inst::Const(pat_reg, IrConst::Int(U256::from(idx as u64), Ty::U8)));
                                         let cmp = self.alloc_reg();
                                         self.emit(Inst::Cmp(cmp, CmpOp::Eq, scrut, pat_reg));
-                                        self.emit(Inst::Branch(cmp, arm_label, next_label));
+                                        self.emit(Inst::Branch(cmp, body_label, next_check));
                                     } else {
-                                        self.emit(Inst::Jump(arm_label));
+                                        self.emit(Inst::Jump(body_label));
                                     }
                                 } else {
-                                    // Unknown enum — fall through (could be a single-segment catch-all)
-                                    self.emit(Inst::Jump(arm_label));
+                                    self.emit(Inst::Jump(body_label));
                                 }
                             } else {
-                                // Single-segment path — catch-all variable binding
-                                self.emit(Inst::Jump(arm_label));
+                                self.emit(Inst::Jump(body_label));
                             }
                         }
                         Pattern::Range(start, end_lit, _) => {
@@ -1109,13 +1117,16 @@ impl Lowerer {
                             self.emit(Inst::Cmp(ge, CmpOp::GtEq, scrut, start_reg));
                             self.emit(Inst::Cmp(lt, CmpOp::Lt, scrut, end_reg));
                             self.emit(Inst::BinOp(in_range, BinOp::LogicalAnd, ge, lt));
-                            self.emit(Inst::Branch(in_range, arm_label, next_label));
+                            self.emit(Inst::Branch(in_range, body_label, next_check));
                         }
                     }
+                }
 
-                    // Arm body
-                    self.func().push_block(arm_label, format!("match.arm{}", i));
-                    self.lower_expr(&arm.body);
+                // Emit all arm bodies
+                for (i, arm) in arms.iter().enumerate() {
+                    self.func().push_block(body_labels[i], format!("match.arm{}", i));
+                    let arm_result = self.lower_expr(&arm.body);
+                    self.emit(Inst::Cast(dst, arm_result, Ty::U64));
                     self.emit(Inst::Jump(end_label));
                 }
 
