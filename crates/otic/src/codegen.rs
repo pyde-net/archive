@@ -1464,13 +1464,17 @@ impl CodeGen {
                     let (offset, field_ty) = self.lookup_field(name, fname);
                     let fr = self.get_reg(*freg);
                     if let Ty::Struct(inner) = &field_ty {
-                        // Inline nested struct: Memcpy from fr (pointer to temp alloc)
-                        // into rd+offset (inline slot in parent).
+                        // Inline nested struct: Memcpy from temp alloc into rd+offset.
+                        // Get fr AFTER computing dst to avoid r15 clobber (get_reg
+                        // may load from spill into r15, which Addi would overwrite).
                         let copy_size = self.compute_struct_size(inner);
                         self.emit_op(Opcode::Push, rd, 0, 0);
-                        self.emit_op(Opcode::Addi, 15, rd, offset);  // dst = rd + offset
-                        self.load_u32_to_reg(14, copy_size);
-                        self.emit_op(Opcode::Memcpy, 15, fr, 14);
+                        self.emit_op(Opcode::Addi, 15, rd, offset);  // r15 = dst
+                        self.emit_op(Opcode::Push, 11, 0, 0);        // save r11
+                        self.load_u32_to_reg(11, copy_size);          // r11 = byte count
+                        let fr2 = self.get_reg_to(*freg, 14);         // r14 = src (after dst computed)
+                        self.emit_op(Opcode::Memcpy, 15, fr2, 11);   // dst=r15, src=r14, len=r11
+                        self.emit_op(Opcode::Pop, 11, 0, 0);         // restore r11
                         self.emit_op(Opcode::Pop, rd, 0, 0);
                     } else {
                         // GP/wide field: typed store at computed offset
@@ -6704,8 +6708,16 @@ mod tests {
                 struct Stats { hp: u8, mp: u8, level: u32, xp: u64, }
                 enum Role { Admin, User, Guest, }
                 struct Player { name: String, age: u64, role: Role, stats: Stats, items: Vec<String>, scores: Vec<u64>, }
-                storage { players: Map<u64, Player>, }
+                storage { extra: Map<u64, u64>, names2: Map<u64, String>, tags2: Map<u64, Vec<String>>, matrix2: Map<u64, Vec<Vec<u64>>>, players: Map<u64, Player>, }
                 pub fn store_player() {
+                    // Many prior storage writes (high vreg count before Player creation)
+                    self.extra[1] = 42;
+                    self.names2[1] = "hello";
+                    let mut t = Vec::new(); t.push("a"); t.push("b"); t.push("c"); self.tags2[1] = t;
+                    let mut r1 = Vec::new(); r1.push(1); r1.push(2); r1.push(3);
+                    let mut r2 = Vec::new(); r2.push(4); r2.push(5); r2.push(6);
+                    let mut m = Vec::new(); m.push(r1); m.push(r2); self.matrix2[1] = m;
+                    // NOW create packed Player with many fields
                     let stats = Stats { hp: 100, mp: 50, level: 5, xp: 9999 };
                     let mut items = Vec::new(); items.push("sword"); items.push("shield");
                     let mut scores = Vec::new(); scores.push(10); scores.push(20);
