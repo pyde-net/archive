@@ -239,7 +239,13 @@ impl Lowerer {
             ast::Type::Array(elem, size, _) => Ty::Array(Box::new(self.resolve_ty(elem)), *size),
             ast::Type::Vec(elem, _) => Ty::Vec(Box::new(self.resolve_ty(elem))),
             ast::Type::Map(key, val, _) => Ty::Map(Box::new(self.resolve_ty(key)), Box::new(self.resolve_ty(val))),
-            ast::Type::Named(ident) => Ty::Struct(ident.name.clone()),
+            ast::Type::Named(ident) => {
+                if self.enum_defs.contains_key(&ident.name) {
+                    Ty::Enum(ident.name.clone())
+                } else {
+                    Ty::Struct(ident.name.clone())
+                }
+            }
             ast::Type::Tuple(types, _) => Ty::Tuple(types.iter().map(|t| self.resolve_ty(t)).collect()),
         }
     }

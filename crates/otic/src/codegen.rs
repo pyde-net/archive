@@ -6374,4 +6374,387 @@ mod tests {
         assert_eq!(run("get_tags_count"), 3, "tags count");
         assert_eq!(run("get_score_sum"), 60, "scores 10+20+30");
     }
+
+    // ========================================================================
+    // Compiler hardening: test every untested feature
+    // ========================================================================
+
+    #[test]
+    fn hardening_nested_vec_vec_u64() {
+        // Vec<Vec<u64>> in storage round-trip
+        let src = r#"
+            contract T {
+                storage { matrix: Map<u64, Vec<Vec<u64>>>, }
+                pub fn store_matrix() {
+                    let mut row1 = Vec::new(); row1.push(1); row1.push(2); row1.push(3);
+                    let mut row2 = Vec::new(); row2.push(4); row2.push(5); row2.push(6);
+                    let mut m = Vec::new(); m.push(row1); m.push(row2);
+                    self.matrix[1] = m;
+                }
+                pub fn sum_matrix() -> u64 {
+                    let m = self.matrix[1];
+                    let mut total = 0;
+                    let mut i = 0;
+                    let rows = m.len();
+                    while i < rows {
+                        let row = m[i];
+                        let mut j = 0;
+                        let cols = row.len();
+                        while j < cols {
+                            total = total + row[j];
+                            j = j + 1;
+                        }
+                        i = i + 1;
+                    }
+                    return total;
+                }
+            }
+        "#;
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let mut ir = crate::lower::lower(&file);
+        crate::optimize::optimize(&mut ir);
+        let contract = CodeGen::new().generate(&ir);
+        let addr = [0xE1u8; 32];
+
+        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+        vm1.calldata = compute_selector("store_matrix").to_be_bytes().to_vec();
+        vm1.load(&contract.runtime_bytecode).unwrap();
+        let out1 = vm1.execute();
+        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_matrix failed");
+
+        let mut smt = pyde_state::smt::PydeSMT::new();
+        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+
+        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
+        vm2.calldata = compute_selector("sum_matrix").to_be_bytes().to_vec();
+        let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+        vm2.load(&contract.runtime_bytecode).unwrap();
+        let out2 = vm2.execute();
+        assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success, "sum_matrix failed: {:?}", out2.outcome);
+        assert_eq!(vm2.cpu.read_gp(1), 21, "matrix sum: 1+2+3+4+5+6 = 21");
+    }
+
+    #[test]
+    fn hardening_u256_in_struct() {
+        // Struct with u256 (Address) field — packed layout puts it at 32 bytes
+        let src = r#"
+            contract T {
+                storage { wallets: Map<u64, Address>, }
+                pub fn store_addr() {
+                    let a = address(self);
+                    self.wallets[1] = a;
+                }
+                pub fn check_addr() -> u64 {
+                    let a = self.wallets[1];
+                    let s = address(self);
+                    if a == s { return 1; }
+                    return 0;
+                }
+            }
+        "#;
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let mut ir = crate::lower::lower(&file);
+        crate::optimize::optimize(&mut ir);
+        let contract = CodeGen::new().generate(&ir);
+        let addr = [0xF0u8; 32];
+
+        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+        vm1.calldata = compute_selector("store_addr").to_be_bytes().to_vec();
+        vm1.load(&contract.runtime_bytecode).unwrap();
+        let out1 = vm1.execute();
+        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_addr failed");
+
+        let mut smt = pyde_state::smt::PydeSMT::new();
+        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+
+        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
+        vm2.calldata = compute_selector("check_addr").to_be_bytes().to_vec();
+        let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+        vm2.load(&contract.runtime_bytecode).unwrap();
+        let out2 = vm2.execute();
+        assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success, "check_addr failed");
+        assert_eq!(vm2.cpu.read_gp(1), 1, "stored address should match self");
+    }
+
+    #[test]
+    fn hardening_empty_vec_and_string() {
+        // Edge cases: empty Vec, empty String
+        let src = r#"
+            contract T {
+                storage { items: Map<u64, Vec<u64>>, name: Map<u64, String>, }
+                pub fn store_empty() {
+                    let v = Vec::new();
+                    self.items[1] = v;
+                    self.name[1] = "";
+                }
+                pub fn check_empty() -> u64 {
+                    let v = self.items[1];
+                    let n = self.name[1];
+                    return v.len() + n.len();
+                }
+            }
+        "#;
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let mut ir = crate::lower::lower(&file);
+        crate::optimize::optimize(&mut ir);
+        let contract = CodeGen::new().generate(&ir);
+        let addr = [0xE2u8; 32];
+
+        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+        vm1.calldata = compute_selector("store_empty").to_be_bytes().to_vec();
+        vm1.load(&contract.runtime_bytecode).unwrap();
+        let out1 = vm1.execute();
+        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_empty failed");
+
+        let mut smt = pyde_state::smt::PydeSMT::new();
+        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+
+        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
+        vm2.calldata = compute_selector("check_empty").to_be_bytes().to_vec();
+        let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+        vm2.load(&contract.runtime_bytecode).unwrap();
+        let out2 = vm2.execute();
+        assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success, "check_empty failed");
+        assert_eq!(vm2.cpu.read_gp(1), 0, "empty vec + empty string = 0 total len");
+    }
+
+    #[test]
+    fn hardening_multiple_storage_writes() {
+        // Multiple storage map writes in one transaction
+        let src = r#"
+            contract T {
+                storage { balances: Map<u64, u64>, counter: u64, }
+                pub fn batch_write() {
+                    self.balances[1] = 100;
+                    self.balances[2] = 200;
+                    self.balances[3] = 300;
+                    self.counter = 3;
+                }
+                pub fn total() -> u64 {
+                    return self.balances[1] + self.balances[2] + self.balances[3] + self.counter;
+                }
+            }
+        "#;
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let mut ir = crate::lower::lower(&file);
+        crate::optimize::optimize(&mut ir);
+        let contract = CodeGen::new().generate(&ir);
+        let addr = [0xE3u8; 32];
+
+        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+        vm1.calldata = compute_selector("batch_write").to_be_bytes().to_vec();
+        vm1.load(&contract.runtime_bytecode).unwrap();
+        let out1 = vm1.execute();
+        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "batch_write failed");
+
+        let mut smt = pyde_state::smt::PydeSMT::new();
+        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+
+        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
+        vm2.calldata = compute_selector("total").to_be_bytes().to_vec();
+        let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+        vm2.load(&contract.runtime_bytecode).unwrap();
+        let out2 = vm2.execute();
+        assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success, "total failed");
+        assert_eq!(vm2.cpu.read_gp(1), 603, "100+200+300+3 = 603");
+    }
+
+    #[test]
+    fn hardening_many_locals_stress() {
+        // Stress test: 20+ local variables forcing many Push/Pop borrows
+        let src = r#"
+            contract T {
+                storage {}
+                pub fn stress() -> u64 {
+                    let a = 1; let b = 2; let c = 3; let d = 4; let e = 5;
+                    let f = 6; let g = 7; let h = 8; let i = 9; let j = 10;
+                    let k = 11; let l = 12; let m = 13; let n = 14; let o = 15;
+                    let p = 16; let q = 17; let r = 18; let s = 19; let t = 20;
+                    return a+b+c+d+e+f+g+h+i+j+k+l+m+n+o+p+q+r+s+t;
+                }
+            }
+        "#;
+        let compiled = compile_no_opt(src);
+        let vm = run_pvm(&compiled.bytecode);
+        assert_eq!(vm.cpu.read_gp(1), 210, "sum 1..20 = 210");
+    }
+
+    #[test]
+    fn hardening_enum_storage() {
+        // Enum in storage, args, computation
+        let src = r#"
+            contract T {
+                enum Status { Active, Paused, Closed, }
+                storage { state: Map<u64, Status>, }
+                pub fn set_paused() {
+                    self.state[1] = Status::Paused;
+                }
+                pub fn get_status() -> u64 {
+                    let s = self.state[1];
+                    return s as u64;
+                }
+            }
+        "#;
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let mut ir = crate::lower::lower(&file);
+        crate::optimize::optimize(&mut ir);
+        let contract = CodeGen::new().generate(&ir);
+        let addr = [0xE4u8; 32];
+
+        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+        vm1.calldata = compute_selector("set_paused").to_be_bytes().to_vec();
+        vm1.load(&contract.runtime_bytecode).unwrap();
+        let out1 = vm1.execute();
+        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "set_status failed");
+
+        let mut smt = pyde_state::smt::PydeSMT::new();
+        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+
+        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
+        vm2.calldata = compute_selector("get_status").to_be_bytes().to_vec();
+        let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+        vm2.load(&contract.runtime_bytecode).unwrap();
+        let out2 = vm2.execute();
+        assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success, "get_status failed");
+        assert_eq!(vm2.cpu.read_gp(1), 1, "status should be Paused (1)");
+    }
+
+    #[test]
+    fn hardening_struct_with_address() {
+        // Struct with Address (u256) field — tests packed layout with wide inline
+        let src = r#"
+            contract T {
+                struct Wallet { owner: Address, balance: u64, label: String, }
+                storage { wallets: Map<u64, Wallet>, }
+                pub fn store_wallet() {
+                    let w = Wallet { owner: msg.sender, balance: 1000, label: "main" };
+                    self.wallets[1] = w;
+                }
+                pub fn get_balance() -> u64 {
+                    let w = self.wallets[1];
+                    return w.balance;
+                }
+                pub fn get_label_len() -> u64 {
+                    let w = self.wallets[1];
+                    return w.label.len();
+                }
+            }
+        "#;
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let mut ir = crate::lower::lower(&file);
+        crate::optimize::optimize(&mut ir);
+        let contract = CodeGen::new().generate(&ir);
+        let addr = [0xE5u8; 32];
+        let caller = [0xABu8; 32];
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr, caller, call_value: ethnum::U256::ZERO, ..Default::default()
+        };
+        let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+        vm1.calldata = compute_selector("store_wallet").to_be_bytes().to_vec();
+        vm1.load(&contract.runtime_bytecode).unwrap();
+        let out1 = vm1.execute();
+        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_wallet failed");
+
+        let mut smt = pyde_state::smt::PydeSMT::new();
+        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+
+        let run = |sel: &str| -> u64 {
+            let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, caller, call_value: ethnum::U256::ZERO, ..Default::default() };
+            let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+            vm.calldata = compute_selector(sel).to_be_bytes().to_vec();
+            let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+            vm.load(&contract.runtime_bytecode).unwrap();
+            let out = vm.execute();
+            assert_eq!(out.outcome, pyde_vm::vm::Outcome::Success, "{} failed", sel);
+            vm.cpu.read_gp(1)
+        };
+
+        assert_eq!(run("get_balance"), 1000, "balance should be 1000");
+        assert_eq!(run("get_label_len"), 4, "label 'main' = 4 bytes");
+    }
+
+    #[test]
+    fn hardening_packed_stats_in_player() {
+        // Focused: packed Stats{u8,u8,u32,u64} nested in Player with String+Vec
+        let src = r#"
+            contract T {
+                struct Stats { hp: u8, mp: u8, level: u32, xp: u64, }
+                enum Role { Admin, User, Guest, }
+                struct Player { name: String, age: u64, role: Role, stats: Stats, items: Vec<String>, scores: Vec<u64>, }
+                storage { players: Map<u64, Player>, }
+                pub fn store_player() {
+                    let stats = Stats { hp: 100, mp: 50, level: 5, xp: 9999 };
+                    let mut items = Vec::new(); items.push("sword"); items.push("shield");
+                    let mut scores = Vec::new(); scores.push(10); scores.push(20);
+                    let p = Player { name: "bob", age: 25, role: Role::Admin, stats: stats, items: items, scores: scores };
+                    self.players[1] = p;
+                }
+                pub fn get_hp() -> u64 { let p = self.players[1]; return p.stats.hp; }
+                pub fn get_xp() -> u64 { let p = self.players[1]; return p.stats.xp; }
+                pub fn get_age() -> u64 { let p = self.players[1]; return p.age; }
+                pub fn get_score_sum() -> u64 {
+                    let p = self.players[1];
+                    let mut t=0; let mut i=0; let l=p.scores.len();
+                    while i<l { t=t+p.scores[i]; i=i+1; }
+                    return t;
+                }
+            }
+        "#;
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let mut ir = crate::lower::lower(&file);
+        crate::optimize::optimize(&mut ir);
+        let contract = CodeGen::new().generate(&ir);
+        let addr = [0xF1u8; 32];
+
+        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+        vm1.calldata = compute_selector("store_player").to_be_bytes().to_vec();
+        vm1.load(&contract.runtime_bytecode).unwrap();
+        let out1 = vm1.execute();
+        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_player failed");
+
+        let mut smt = pyde_state::smt::PydeSMT::new();
+        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+
+        let run = |sel: &str| -> u64 {
+            let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+            let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+            vm.calldata = compute_selector(sel).to_be_bytes().to_vec();
+            let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+            vm.load(&contract.runtime_bytecode).unwrap();
+            let out = vm.execute();
+            assert_eq!(out.outcome, pyde_vm::vm::Outcome::Success, "{} failed", sel);
+            vm.cpu.read_gp(1)
+        };
+
+        assert_eq!(run("get_age"), 25, "age");
+        assert_eq!(run("get_hp"), 100, "hp");
+        assert_eq!(run("get_xp"), 9999, "xp");
+        assert_eq!(run("get_score_sum"), 30, "scores 10+20");
+    }
 }
