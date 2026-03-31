@@ -79,7 +79,7 @@ impl Lowerer {
             local_types: vec![HashMap::new()],
             storage_slots: HashMap::new(),
             storage_types: HashMap::new(),
-            next_slot: 1, // start from 1: slot 0 would collide with SMT default leaf
+            next_slot: 0,
             loop_stack: Vec::new(),
             enum_defs: HashMap::new(),
             struct_field_defs: HashMap::new(),
@@ -240,10 +240,20 @@ impl Lowerer {
             ast::Type::Vec(elem, _) => Ty::Vec(Box::new(self.resolve_ty(elem))),
             ast::Type::Map(key, val, _) => Ty::Map(Box::new(self.resolve_ty(key)), Box::new(self.resolve_ty(val))),
             ast::Type::Named(ident) => {
-                if self.enum_defs.contains_key(&ident.name) {
-                    Ty::Enum(ident.name.clone())
-                } else {
-                    Ty::Struct(ident.name.clone())
+                // Check for primitive type names (parser may emit Named instead of Primitive for casts)
+                match ident.name.as_str() {
+                    "u8" => Ty::U8, "u16" => Ty::U16, "u32" => Ty::U32, "u64" => Ty::U64,
+                    "u128" => Ty::U128, "u256" => Ty::U256,
+                    "i8" => Ty::I8, "i16" => Ty::I16, "i32" => Ty::I32, "i64" => Ty::I64,
+                    "i128" => Ty::I128, "i256" => Ty::I256,
+                    "bool" => Ty::Bool, "Address" => Ty::Address, "String" => Ty::StringTy,
+                    _ => {
+                        if self.enum_defs.contains_key(&ident.name) {
+                            Ty::Enum(ident.name.clone())
+                        } else {
+                            Ty::Struct(ident.name.clone())
+                        }
+                    }
                 }
             }
             ast::Type::Tuple(types, _) => Ty::Tuple(types.iter().map(|t| self.resolve_ty(t)).collect()),
@@ -1320,10 +1330,11 @@ impl Lowerer {
                 dst
             }
 
-            Expr::Cast(inner, _ty, _) => {
+            Expr::Cast(inner, ty, _) => {
                 let src = self.lower_expr(inner);
                 let dst = self.alloc_reg();
-                self.emit(Inst::Cast(dst, src, Ty::Unknown));
+                let target_ty = self.resolve_ty(ty);
+                self.emit(Inst::Cast(dst, src, target_ty));
                 dst
             }
 

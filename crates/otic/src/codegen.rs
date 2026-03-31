@@ -27,7 +27,7 @@ use crate::ir::*;
 use crate::memory;
 use crate::types::Ty;
 
-use pyde_vm::isa::{encode, encode_mem_immediate, Opcode, Instruction, MemWidth};
+use pyde_vm::isa::{encode, encode_mem_immediate, Instruction, MemWidth, Opcode};
 
 /// Reentrancy guard slot (well above user-defined storage slots).
 /// Must fit in 17-bit positive Addi (PVM sign-extends 18-bit immediate).
@@ -282,7 +282,8 @@ impl CodeGen {
 
     /// Remap an IR label to a unique codegen label (prevents cross-function collisions).
     fn remap_label(&self, label: Label) -> Label {
-        self.current_label_remap.as_ref()
+        self.current_label_remap
+            .as_ref()
             .and_then(|m| m.get(&label).copied())
             .unwrap_or(label)
     }
@@ -298,7 +299,9 @@ impl CodeGen {
         let mut selectors = Vec::new();
 
         // Set label_counter above all IR block labels to avoid collision
-        let max_ir_label = program.functions.iter()
+        let max_ir_label = program
+            .functions
+            .iter()
             .flat_map(|f| f.blocks.iter().map(|b| b.label.0))
             .max()
             .unwrap_or(0);
@@ -307,12 +310,15 @@ impl CodeGen {
         // Collect storage slot assignments and types
         for field in &program.storage_fields {
             self.storage_slots.insert(field.name.clone(), field.slot);
-            self.storage_types.insert(field.name.clone(), field.ty.clone());
+            self.storage_types
+                .insert(field.name.clone(), field.ty.clone());
         }
 
         // Build struct definitions first (needed for recursive field_byte_size)
         for sdef in &program.struct_defs {
-            let fields: Vec<(String, Ty)> = sdef.fields.iter()
+            let fields: Vec<(String, Ty)> = sdef
+                .fields
+                .iter()
                 .map(|(fname, fty)| (fname.clone(), fty.clone()))
                 .collect();
             self.struct_defs.insert(sdef.name.clone(), fields);
@@ -380,7 +386,10 @@ impl CodeGen {
             for (_, name, dispatch_label, func_label) in &dispatch_entries {
                 self.mark_label(*dispatch_label);
 
-                let func = program.functions.iter().find(|f| f.name == *name)
+                let func = program
+                    .functions
+                    .iter()
+                    .find(|f| f.name == *name)
                     .expect("dispatch entry references non-existent function");
 
                 self.emit_heap_init();
@@ -402,7 +411,9 @@ impl CodeGen {
         // Function bodies
         // In production mode, all functions use Ret (dispatch wrapper handles Halt).
         // In test mode, emit Jmp to first pub function at start, only it gets Halt.
-        let first_pub_name = program.functions.iter()
+        let first_pub_name = program
+            .functions
+            .iter()
             .find(|f| !f.is_test && !f.is_constructor && f.is_pub)
             .map(|f| f.name.clone());
 
@@ -412,7 +423,9 @@ impl CodeGen {
             if let Some(ref pub_name) = first_pub_name {
                 if let Some(&pub_label) = self.func_labels.get(pub_name.as_str()) {
                     // Check if first runtime function IS the pub function
-                    let first_runtime = program.functions.iter()
+                    let first_runtime = program
+                        .functions
+                        .iter()
                         .find(|f| !f.is_test && !f.is_constructor);
                     if first_runtime.map(|f| &f.name) != first_pub_name.as_ref() {
                         // Private functions come first — emit Jmp to pub function
@@ -445,7 +458,9 @@ impl CodeGen {
         self.resolve_fixups();
 
         // Convert to bytes
-        let all_bytes: Vec<u8> = self.instructions.iter()
+        let all_bytes: Vec<u8> = self
+            .instructions
+            .iter()
             .flat_map(|inst| inst.0.to_le_bytes())
             .collect();
 
@@ -521,7 +536,10 @@ impl CodeGen {
     /// Compute total byte size of a struct with inline nested structs.
     fn compute_struct_size(&self, name: &str) -> u32 {
         if let Some(fields) = self.struct_defs.get(name) {
-            fields.iter().map(|(_, fty)| self.field_byte_size(fty)).sum()
+            fields
+                .iter()
+                .map(|(_, fty)| self.field_byte_size(fty))
+                .sum()
         } else {
             memory::WORD_SIZE // fallback
         }
@@ -539,7 +557,8 @@ impl CodeGen {
 
     /// Look up a field's (offset, type) from the struct-scoped field_offsets.
     fn lookup_field(&self, struct_name: &str, field_name: &str) -> (u32, Ty) {
-        self.field_offsets.get(struct_name)
+        self.field_offsets
+            .get(struct_name)
             .and_then(|m| m.get(field_name))
             .cloned()
             .unwrap_or((0, Ty::U64))
@@ -553,8 +572,8 @@ impl CodeGen {
         self.load_u32_to_reg(12, memory::HEAP_START);
         // If calldata exists, advance past it: r12 = max(HEAP_START, r5 + r4) + 8
         // We add r4 (calldata len, 0 if none) to move past calldata
-        self.emit_op(Opcode::Add, 12, 12, 4);   // r12 += r4 (calldata length, 0 if empty)
-        self.emit_op(Opcode::Addi, 12, 12, 8);  // r12 += 8 (alignment gap)
+        self.emit_op(Opcode::Add, 12, 12, 4); // r12 += r4 (calldata length, 0 if empty)
+        self.emit_op(Opcode::Addi, 12, 12, 8); // r12 += 8 (alignment gap)
     }
 
     /// Decode function params from calldata into arg registers (r2, r3, ...).
@@ -576,7 +595,12 @@ impl CodeGen {
         if has_blob {
             // Dynamic calldata decode: use a runtime cursor register.
             // r14 = current calldata cursor (advances at runtime for each param).
-            self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 5, selector_skip as u32 & 0x3FFFF);
+            self.emit_op(
+                Opcode::Addi,
+                memory::REG_SCRATCH_0,
+                5,
+                selector_skip as u32 & 0x3FFFF,
+            );
 
             for (i, (_name, ty)) in func.params.iter().enumerate() {
                 let phys = (i as u8) + 2;
@@ -587,9 +611,14 @@ impl CodeGen {
                     // Same approach as the Struct calldata path (proven working).
                     self.emit_op(Opcode::Push, memory::REG_SCRATCH_0, 0, 0); // save cursor
 
-                    self.emit_load(15, memory::REG_SCRATCH_0, 0);  // r15 = byte_len
-                    self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 8);
-                    self.emit_op(Opcode::Push, 12, 0, 0);          // save buffer_start
+                    self.emit_load(15, memory::REG_SCRATCH_0, 0); // r15 = byte_len
+                    self.emit_op(
+                        Opcode::Addi,
+                        memory::REG_SCRATCH_0,
+                        memory::REG_SCRATCH_0,
+                        8,
+                    );
+                    self.emit_op(Opcode::Push, 12, 0, 0); // save buffer_start
                     self.emit_op(Opcode::Memcpy, 12, memory::REG_SCRATCH_0, 15);
                     // Advance heap past buffer (aligned)
                     self.emit_op(Opcode::Addi, 14, 15, 7);
@@ -600,38 +629,53 @@ impl CodeGen {
                     // Stack: [old_cursor, buffer_start]
 
                     // Unflatten: use r11 as read cursor
-                    self.emit_op(Opcode::Push, 11, 0, 0);          // save r11
-                    // Stack: [old_cursor, buffer_start, r11_saved]
-                    self.emit_op(Opcode::Pop, 15, 0, 0);           // r15 = r11_saved
-                    self.emit_op(Opcode::Pop, 11, 0, 0);           // r11 = buffer_start
-                    self.emit_op(Opcode::Push, 15, 0, 0);          // push r11_saved back
-                    // Stack: [old_cursor, r11_saved]
+                    self.emit_op(Opcode::Push, 11, 0, 0); // save r11
+                                                          // Stack: [old_cursor, buffer_start, r11_saved]
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = r11_saved
+                    self.emit_op(Opcode::Pop, 11, 0, 0); // r11 = buffer_start
+                    self.emit_op(Opcode::Push, 15, 0, 0); // push r11_saved back
+                                                          // Stack: [old_cursor, r11_saved]
 
                     let ty_clone = ty.clone();
                     self.emit_unflatten(&ty_clone, 11, phys);
 
-                    self.emit_op(Opcode::Pop, 11, 0, 0);           // restore r11
-                    // Stack: [old_cursor]
+                    self.emit_op(Opcode::Pop, 11, 0, 0); // restore r11
+                                                         // Stack: [old_cursor]
 
                     // Advance calldata cursor: old_cursor + 8 + align8(byte_len)
                     self.emit_op(Opcode::Pop, memory::REG_SCRATCH_0, 0, 0);
-                    self.emit_load(15, memory::REG_SCRATCH_0, 0);  // re-read byte_len
+                    self.emit_load(15, memory::REG_SCRATCH_0, 0); // re-read byte_len
                     self.emit_op(Opcode::Addi, 14, 15, 7);
                     self.emit_op(Opcode::Addi, 15, 0, 3);
                     self.emit_op(Opcode::Shr, 14, 14, 15);
                     self.emit_op(Opcode::Shl, 14, 14, 15);
-                    self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 8);
-                    self.emit_op(Opcode::Add, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 14);
+                    self.emit_op(
+                        Opcode::Addi,
+                        memory::REG_SCRATCH_0,
+                        memory::REG_SCRATCH_0,
+                        8,
+                    );
+                    self.emit_op(
+                        Opcode::Add,
+                        memory::REG_SCRATCH_0,
+                        memory::REG_SCRATCH_0,
+                        14,
+                    );
                 } else if matches!(ty, Ty::StringTy | Ty::Bytes) {
                     // String/bytes: calldata has [byte_len:8 LE][data bytes]
                     // Build Vec on heap directly (format unchanged)
-                    self.emit_op(Opcode::Add, phys, 12, 0);  // phys = Vec base = r12
+                    self.emit_op(Opcode::Add, phys, 12, 0); // phys = Vec base = r12
                     self.emit_load(15, memory::REG_SCRATCH_0, 0); // r15 = byte_len
-                    self.emit_store(15, 12, 0);               // header.length
-                    self.emit_store(15, 12, 8);               // header.capacity
+                    self.emit_store(15, 12, 0); // header.length
+                    self.emit_store(15, 12, 8); // header.capacity
                     self.emit_op(Opcode::Addi, 12, 12, memory::VEC_DATA_OFFSET);
                     self.emit_op(Opcode::Push, memory::REG_SCRATCH_0, 0, 0);
-                    self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 8);
+                    self.emit_op(
+                        Opcode::Addi,
+                        memory::REG_SCRATCH_0,
+                        memory::REG_SCRATCH_0,
+                        8,
+                    );
                     self.emit_op(Opcode::Memcpy, 12, memory::REG_SCRATCH_0, 15);
                     self.emit_op(Opcode::Addi, 14, 15, 7);
                     self.emit_op(Opcode::Addi, 15, 0, 3);
@@ -639,14 +683,34 @@ impl CodeGen {
                     self.emit_op(Opcode::Shl, 14, 14, 15);
                     self.emit_op(Opcode::Add, 12, 12, 14);
                     self.emit_op(Opcode::Pop, memory::REG_SCRATCH_0, 0, 0);
-                    self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 8);
-                    self.emit_op(Opcode::Add, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 14);
+                    self.emit_op(
+                        Opcode::Addi,
+                        memory::REG_SCRATCH_0,
+                        memory::REG_SCRATCH_0,
+                        8,
+                    );
+                    self.emit_op(
+                        Opcode::Add,
+                        memory::REG_SCRATCH_0,
+                        memory::REG_SCRATCH_0,
+                        14,
+                    );
                 } else if is_wide_type(ty) {
                     self.emit_op(Opcode::Wload, phys, memory::REG_SCRATCH_0, 0);
-                    self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 32);
+                    self.emit_op(
+                        Opcode::Addi,
+                        memory::REG_SCRATCH_0,
+                        memory::REG_SCRATCH_0,
+                        32,
+                    );
                 } else {
                     self.emit_load(phys, memory::REG_SCRATCH_0, 0);
-                    self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 8);
+                    self.emit_op(
+                        Opcode::Addi,
+                        memory::REG_SCRATCH_0,
+                        memory::REG_SCRATCH_0,
+                        8,
+                    );
                 }
             }
         } else {
@@ -658,7 +722,12 @@ impl CodeGen {
                 let phys = (i as u8) + 2;
 
                 if is_wide_type(ty) {
-                    self.emit_op(Opcode::Addi, 15, memory::REG_SCRATCH_0, param_offset as u32 & 0x3FFFF);
+                    self.emit_op(
+                        Opcode::Addi,
+                        15,
+                        memory::REG_SCRATCH_0,
+                        param_offset as u32 & 0x3FFFF,
+                    );
                     self.emit_op(Opcode::Wload, phys, 15, 0);
                     param_offset += 32;
                 } else {
@@ -682,35 +751,35 @@ impl CodeGen {
         if func.is_pub && !func.is_view && !func.is_constructor && !func.is_reentrant {
             // Widen reentrancy slot to wide scratch
             self.emit_op(Opcode::Addi, 15, 0, REENTRANCY_SLOT);
-            self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);    // w7 = slot key
-            // Sload mode 2 (GP value): r14 = storage[w7]
+            self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0); // w7 = slot key
+                                                              // Sload mode 2 (GP value): r14 = storage[w7]
             self.emit_op(Opcode::Sload, 14, WIDE_SCRATCH, 2);
             // Check: lock must be 0
-            self.emit_op(Opcode::Eq, 14, 14, 0);                 // r14 = (lock == 0)
-            self.emit_op(Opcode::Assert, 0, 14, 0);              // Assert reads rs1: revert if r14==0
-            // Set lock = 1
+            self.emit_op(Opcode::Eq, 14, 14, 0); // r14 = (lock == 0)
+            self.emit_op(Opcode::Assert, 0, 14, 0); // Assert reads rs1: revert if r14==0
+                                                    // Set lock = 1
             self.emit_op(Opcode::Addi, 14, 0, 1);
-            self.emit_op(Opcode::Sstore, 14, WIDE_SCRATCH, 2);   // storage[w7] = 1
+            self.emit_op(Opcode::Sstore, 14, WIDE_SCRATCH, 2); // storage[w7] = 1
         }
 
         // Payable guard: non-payable pub functions reject msg.value > 0
         if func.is_pub && !func.is_payable && !func.is_constructor {
             // w7 = msg.value (Callvalue writes to wide register)
             self.emit_op(Opcode::Callvalue, WIDE_SCRATCH, 0, 0); // w7 = call_value
-            // w6 = 0 (for comparison)
+                                                                 // w6 = 0 (for comparison)
             self.emit_op(Opcode::Addi, 15, 0, 0);
-            self.emit_op(Opcode::Widen, WIDE_SCRATCH2, 15, 0);   // w6 = 0
-            // r14 = (w7 == w6) i.e. (value == 0)
+            self.emit_op(Opcode::Widen, WIDE_SCRATCH2, 15, 0); // w6 = 0
+                                                               // r14 = (w7 == w6) i.e. (value == 0)
             self.emit_op(Opcode::Weq, 14, WIDE_SCRATCH, WIDE_SCRATCH2 as u32);
-            self.emit_op(Opcode::Assert, 0, 14, 0);              // Assert reads rs1: revert if r14==0
+            self.emit_op(Opcode::Assert, 0, 14, 0); // Assert reads rs1: revert if r14==0
         }
     }
 
     /// Emit reentrancy guard cleanup (clear lock).
     fn emit_reentrancy_cleanup(&mut self) {
         self.emit_op(Opcode::Addi, 15, 0, REENTRANCY_SLOT);
-        self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);     // w7 = slot key
-        self.emit_op(Opcode::Sstore, 0, WIDE_SCRATCH, 2);     // storage[w7] = r0 = 0
+        self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0); // w7 = slot key
+        self.emit_op(Opcode::Sstore, 0, WIDE_SCRATCH, 2); // storage[w7] = r0 = 0
     }
 
     // ========================================================================
@@ -744,7 +813,7 @@ impl CodeGen {
         // Spill slots live at r13 + 0, r13 + 8, ... (up to ~56 slots).
         // Serialize/deserialize loop state lives at r13 + LOOP_STATE_BASE.
         // Advance r12 past the entire reserved area.
-        self.emit_op(Opcode::Add, 13, 12, 0);  // r13 = r12
+        self.emit_op(Opcode::Add, 13, 12, 0); // r13 = r12
         self.load_u32_to_reg(15, SPILL_AREA_TOTAL);
         self.emit_op(Opcode::Add, 12, 12, 15); // r12 += SPILL_AREA_TOTAL
 
@@ -797,14 +866,14 @@ impl CodeGen {
                             let limb2 = ((v >> 128u32) & U256::from(u64::MAX)).as_u64();
                             let limb3 = ((v >> 192u32) & U256::from(u64::MAX)).as_u64();
                             self.load_u64_to_reg(15, limb0);
-                            self.emit_store(15, 12, 0);   // heap[0..8] = limb0
+                            self.emit_store(15, 12, 0); // heap[0..8] = limb0
                             self.load_u64_to_reg(15, limb1);
-                            self.emit_store(15, 12, 8);   // heap[8..16] = limb1
+                            self.emit_store(15, 12, 8); // heap[8..16] = limb1
                             self.load_u64_to_reg(15, limb2);
-                            self.emit_store(15, 12, 16);  // heap[16..24] = limb2
+                            self.emit_store(15, 12, 16); // heap[16..24] = limb2
                             self.load_u64_to_reg(15, limb3);
-                            self.emit_store(15, 12, 24);  // heap[24..32] = limb3
-                            // Wload from heap into wide register
+                            self.emit_store(15, 12, 24); // heap[24..32] = limb3
+                                                         // Wload from heap into wide register
                             self.emit_op(Opcode::Wload, wd, 12, 0);
                             // Advance heap past the 32 bytes
                             self.emit_op(Opcode::Addi, 12, 12, 32);
@@ -848,7 +917,7 @@ impl CodeGen {
                         // Write raw bytes to heap, set dst = heap pointer
                         let rd = self.alloc_gp(*dst);
                         self.emit_op(Opcode::Add, rd, 12, 0); // rd = current heap ptr
-                        // Write bytes in 8-byte chunks
+                                                              // Write bytes in 8-byte chunks
                         for (i, chunk) in data.chunks(8).enumerate() {
                             let mut buf = [0u8; 8];
                             buf[..chunk.len()].copy_from_slice(chunk);
@@ -868,15 +937,19 @@ impl CodeGen {
                         let byte_len = s.len() as u32;
                         // Write header
                         self.load_u32_to_reg(15, byte_len);
-                        self.emit_store(15, 12, 0);  // length = byte_len
-                        self.emit_store(15, 12, 8);  // capacity = byte_len
-                        // Write string bytes after header
+                        self.emit_store(15, 12, 0); // length = byte_len
+                        self.emit_store(15, 12, 8); // capacity = byte_len
+                                                    // Write string bytes after header
                         for (i, chunk) in s.as_bytes().chunks(8).enumerate() {
                             let mut buf = [0u8; 8];
                             buf[..chunk.len()].copy_from_slice(chunk);
                             let val = u64::from_le_bytes(buf);
                             self.load_u64_to_reg(15, val);
-                            self.emit_store(15, 12, (memory::VEC_DATA_OFFSET as i32) + (i as i32) * 8);
+                            self.emit_store(
+                                15,
+                                12,
+                                (memory::VEC_DATA_OFFSET as i32) + (i as i32) * 8,
+                            );
                         }
                         // Advance heap past header + data (aligned)
                         let total = memory::VEC_DATA_OFFSET as u32 + ((byte_len + 7) / 8) * 8;
@@ -954,11 +1027,11 @@ impl CodeGen {
                 match op {
                     UnOp::Neg => {
                         // Two's complement: -a = ~a + 1 (avoids PVM checked_sub underflow trap)
-                        self.emit_op(Opcode::Not, rd, r1, 0);      // rd = ~a
-                        self.emit_op(Opcode::Addi, rd, rd, 1);     // rd = ~a + 1 = -a
+                        self.emit_op(Opcode::Not, rd, r1, 0); // rd = ~a
+                        self.emit_op(Opcode::Addi, rd, rd, 1); // rd = ~a + 1 = -a
                     }
                     UnOp::LogicalNot => {
-                        self.emit_op(Opcode::Addi, 15, 0, 1);      // r15 = 1 (safe: r1 ∈ {r1-r11, r14})
+                        self.emit_op(Opcode::Addi, 15, 0, 1); // r15 = 1 (safe: r1 ∈ {r1-r11, r14})
                         self.emit_op(Opcode::Xor, rd, r1, 15);
                     }
                     UnOp::BitNot => {
@@ -1020,10 +1093,13 @@ impl CodeGen {
             }
 
             // ==== Storage operations (fixed: wide register keys + mode bits) ====
-
             Inst::StorageGet(dst, field) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
-                let ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let ty = self
+                    .storage_types
+                    .get(field.as_str())
+                    .cloned()
+                    .unwrap_or(Ty::U64);
 
                 // Widen slot to wide scratch
                 self.emit_op(Opcode::Addi, 15, 0, slot);
@@ -1034,10 +1110,10 @@ impl CodeGen {
                     let rd = self.alloc_gp(*dst);
                     let imm = 1 | ((12 & 0xF) << 2); // mode=1, ptr_reg=r12
                     self.emit_op(Opcode::Sload, 15, WIDE_SCRATCH, imm); // r15 = byte_len, data at r12
-                    // Save r11, use as read cursor
+                                                                        // Save r11, use as read cursor
                     self.emit_op(Opcode::Push, 11, 0, 0);
-                    self.emit_op(Opcode::Add, 11, 12, 0);     // r11 = read cursor = data start
-                    // Advance r12 past loaded data (align to 8)
+                    self.emit_op(Opcode::Add, 11, 12, 0); // r11 = read cursor = data start
+                                                          // Advance r12 past loaded data (align to 8)
                     self.emit_op(Opcode::Addi, 15, 15, 7);
                     self.emit_op(Opcode::Addi, 14, 0, 3);
                     self.emit_op(Opcode::Shr, 15, 15, 14);
@@ -1045,7 +1121,7 @@ impl CodeGen {
                     self.emit_op(Opcode::Add, 12, 12, 15);
                     // Unflatten from r11 into rd
                     self.emit_unflatten(&ty, 11, rd);
-                    self.emit_op(Opcode::Pop, 11, 0, 0);      // restore r11
+                    self.emit_op(Opcode::Pop, 11, 0, 0); // restore r11
                 } else if is_wide_type(&ty) {
                     let wd = self.regs.alloc_wide(*dst);
                     self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0); // mode 0: wide value
@@ -1057,7 +1133,11 @@ impl CodeGen {
 
             Inst::StorageSet(field, val) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
-                let ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let ty = self
+                    .storage_types
+                    .get(field.as_str())
+                    .cloned()
+                    .unwrap_or(Ty::U64);
 
                 // Widen slot to wide scratch
                 self.emit_op(Opcode::Addi, 15, 0, slot);
@@ -1068,11 +1148,11 @@ impl CodeGen {
                     // Save buffer_start on stack (emit_flatten clobbers r14/r15)
                     self.emit_op(Opcode::Push, 12, 0, 0);
                     self.emit_flatten(&ty, rv);
-                    self.emit_op(Opcode::Pop, 14, 0, 0);      // r14 = buffer_start
-                    self.emit_op(Opcode::Sub, 15, 12, 14);    // r15 = byte_count
+                    self.emit_op(Opcode::Pop, 14, 0, 0); // r14 = buffer_start
+                    self.emit_op(Opcode::Sub, 15, 12, 14); // r15 = byte_count
                     let imm = 1 | ((14 & 0xF) << 2) | ((15 & 0xF) << 6);
                     self.emit_op(Opcode::Sstore, 0, WIDE_SCRATCH, imm);
-                    self.emit_op(Opcode::Add, 12, 14, 0);     // reclaim buffer
+                    self.emit_op(Opcode::Add, 12, 14, 0); // reclaim buffer
                 } else if is_wide_type(&ty) {
                     self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0); // mode 0: wide value
                 } else {
@@ -1082,7 +1162,11 @@ impl CodeGen {
 
             Inst::StorageMapGet(dst, field, key) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
-                let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let map_ty = self
+                    .storage_types
+                    .get(field.as_str())
+                    .cloned()
+                    .unwrap_or(Ty::U64);
                 let key_ty = map_key_type(&map_ty);
                 let val_ty = map_value_type(&map_ty);
                 let key_wide = is_wide_type(&key_ty);
@@ -1096,10 +1180,10 @@ impl CodeGen {
                     let rd = self.alloc_gp(*dst);
                     let imm = 1 | ((12 & 0xF) << 2);
                     self.emit_op(Opcode::Sload, 15, WIDE_SCRATCH, imm); // r15 = byte_len, data at r12
-                    // Save r11, use as read cursor
+                                                                        // Save r11, use as read cursor
                     self.emit_op(Opcode::Push, 11, 0, 0);
-                    self.emit_op(Opcode::Add, 11, 12, 0);     // r11 = read cursor
-                    // Advance r12 past loaded data (align to 8)
+                    self.emit_op(Opcode::Add, 11, 12, 0); // r11 = read cursor
+                                                          // Advance r12 past loaded data (align to 8)
                     self.emit_op(Opcode::Addi, 15, 15, 7);
                     self.emit_op(Opcode::Addi, 14, 0, 3);
                     self.emit_op(Opcode::Shr, 15, 15, 14);
@@ -1107,7 +1191,7 @@ impl CodeGen {
                     self.emit_op(Opcode::Add, 12, 12, 15);
                     // Unflatten from r11 into rd
                     self.emit_unflatten(&val_ty, 11, rd);
-                    self.emit_op(Opcode::Pop, 11, 0, 0);      // restore r11
+                    self.emit_op(Opcode::Pop, 11, 0, 0); // restore r11
                 } else if is_wide_type(&val_ty) {
                     let wd = self.regs.alloc_wide(*dst);
                     self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0);
@@ -1119,7 +1203,11 @@ impl CodeGen {
 
             Inst::StorageMapSet(field, key, val) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
-                let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let map_ty = self
+                    .storage_types
+                    .get(field.as_str())
+                    .cloned()
+                    .unwrap_or(Ty::U64);
                 let key_ty = map_key_type(&map_ty);
                 let val_ty = map_value_type(&map_ty);
                 let key_wide = is_wide_type(&key_ty);
@@ -1141,13 +1229,13 @@ impl CodeGen {
 
                 if is_blob_type(&val_ty) {
                     // Flatten: save buffer_start on stack
-                    self.emit_op(Opcode::Push, 12, 0, 0);     // push buffer_start = current r12
+                    self.emit_op(Opcode::Push, 12, 0, 0); // push buffer_start = current r12
                     self.emit_flatten(&val_ty, rv);
-                    self.emit_op(Opcode::Pop, 14, 0, 0);      // r14 = buffer_start
-                    self.emit_op(Opcode::Sub, 15, 12, 14);    // r15 = byte_count
+                    self.emit_op(Opcode::Pop, 14, 0, 0); // r14 = buffer_start
+                    self.emit_op(Opcode::Sub, 15, 12, 14); // r15 = byte_count
                     let imm = 1 | ((14 & 0xF) << 2) | ((15 & 0xF) << 6);
                     self.emit_op(Opcode::Sstore, 0, WIDE_SCRATCH, imm);
-                    self.emit_op(Opcode::Add, 12, 14, 0);     // reclaim buffer
+                    self.emit_op(Opcode::Add, 12, 14, 0); // reclaim buffer
                 } else if is_wide_type(&val_ty) {
                     self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0);
                 } else {
@@ -1157,7 +1245,11 @@ impl CodeGen {
 
             Inst::StorageNestedMapGet(dst, field, key1, key2) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
-                let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let map_ty = self
+                    .storage_types
+                    .get(field.as_str())
+                    .cloned()
+                    .unwrap_or(Ty::U64);
                 let key1_ty = map_key_type(&map_ty);
                 let inner_map_ty = map_value_type(&map_ty);
                 let key2_ty = map_key_type(&inner_map_ty);
@@ -1192,7 +1284,11 @@ impl CodeGen {
 
             Inst::StorageNestedMapSet(field, key1, key2, val) => {
                 let slot = self.storage_slots.get(field.as_str()).copied().unwrap_or(0);
-                let map_ty = self.storage_types.get(field.as_str()).cloned().unwrap_or(Ty::U64);
+                let map_ty = self
+                    .storage_types
+                    .get(field.as_str())
+                    .cloned()
+                    .unwrap_or(Ty::U64);
                 let key1_ty = map_key_type(&map_ty);
                 let inner_map_ty = map_value_type(&map_ty);
                 let key2_ty = map_key_type(&inner_map_ty);
@@ -1224,7 +1320,6 @@ impl CodeGen {
             }
 
             // ==== Builtins (fixed: Callvalue → wide, Caller → GP) ====
-
             Inst::Builtin(dst, op) => {
                 match op {
                     BuiltinOp::MsgSender => {
@@ -1300,11 +1395,11 @@ impl CodeGen {
                         // set r1 = buffer_start, r2 = byte_length.
                         // The RPC handler reads vm.memory[r1..r1+r2] for the full result.
                         let rv = self.get_reg(*v);
-                        self.emit_op(Opcode::Push, 12, 0, 0);     // save buffer_start = current r12
+                        self.emit_op(Opcode::Push, 12, 0, 0); // save buffer_start = current r12
                         self.emit_flatten(&ret_ty, rv);
-                        self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = buffer_start
-                        self.emit_op(Opcode::Sub, 2, 12, 15);     // r2 = byte_length = r12 - buffer_start
-                        self.emit_op(Opcode::Add, 1, 15, 0);      // r1 = buffer_start
+                        self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = buffer_start
+                        self.emit_op(Opcode::Sub, 2, 12, 15); // r2 = byte_length = r12 - buffer_start
+                        self.emit_op(Opcode::Add, 1, 15, 0); // r1 = buffer_start
                     } else {
                         let rv = self.get_reg(*v);
                         if self.regs.is_wide(*v) {
@@ -1355,9 +1450,9 @@ impl CodeGen {
                 // Topic 0: hash of event name (simplified: FNV hash widened to 256-bit)
                 let name_hash = compute_selector(name) as u64;
                 self.load_u64_to_reg(15, name_hash);
-                self.emit_store(15, 12, 0);  // store low 8 bytes of topic
+                self.emit_store(15, 12, 0); // store low 8 bytes of topic
                 self.emit_op(Opcode::Addi, 15, 0, 0);
-                self.emit_store(15, 12, 8);  // zero upper bytes
+                self.emit_store(15, 12, 8); // zero upper bytes
                 self.emit_store(15, 12, 16);
                 self.emit_store(15, 12, 24);
 
@@ -1425,7 +1520,7 @@ impl CodeGen {
                 self.emit_op(Opcode::Addi, 14, 0, byte_len);
                 // Poseidon: encode(Poseidon, wd, base_reg, len_reg_index)
                 self.emit_op(Opcode::Poseidon, wd, 12, 14); // len_reg = r14
-                // Don't advance heap (temporary data, will be overwritten)
+                                                            // Don't advance heap (temporary data, will be overwritten)
             }
 
             Inst::Cast(dst, src, ty) => {
@@ -1472,12 +1567,12 @@ impl CodeGen {
                         // may load from spill into r15, which Addi would overwrite).
                         let copy_size = self.compute_struct_size(inner);
                         self.emit_op(Opcode::Push, rd, 0, 0);
-                        self.emit_op(Opcode::Addi, 15, rd, offset);  // r15 = dst
-                        self.emit_op(Opcode::Push, 11, 0, 0);        // save r11
-                        self.load_u32_to_reg(11, copy_size);          // r11 = byte count
-                        let fr2 = self.get_reg_to(*freg, 14);         // r14 = src (after dst computed)
-                        self.emit_op(Opcode::Memcpy, 15, fr2, 11);   // dst=r15, src=r14, len=r11
-                        self.emit_op(Opcode::Pop, 11, 0, 0);         // restore r11
+                        self.emit_op(Opcode::Addi, 15, rd, offset); // r15 = dst
+                        self.emit_op(Opcode::Push, 11, 0, 0); // save r11
+                        self.load_u32_to_reg(11, copy_size); // r11 = byte count
+                        let fr2 = self.get_reg_to(*freg, 14); // r14 = src (after dst computed)
+                        self.emit_op(Opcode::Memcpy, 15, fr2, 11); // dst=r15, src=r14, len=r11
+                        self.emit_op(Opcode::Pop, 11, 0, 0); // restore r11
                         self.emit_op(Opcode::Pop, rd, 0, 0);
                     } else {
                         // GP/wide field: typed store at computed offset
@@ -1522,11 +1617,11 @@ impl CodeGen {
                 let rd = self.alloc_gp(*dst);
                 // With write-through, get_reg_to always re-loads from spill,
                 // so each call gets the correct value regardless of prior clobbers.
-                let ri = self.get_reg_to(*idx, 14);          // r14 = idx
-                self.emit_op(Opcode::Addi, 15, 0, 3);       // r15 = 3
-                self.emit_op(Opcode::Shl, 14, ri, 15);      // r14 = idx * 8
-                let ro = self.get_reg_to(*obj, 15);          // r15 = base (re-loaded from spill)
-                self.emit_op(Opcode::Add, 15, ro, 14);      // r15 = base + idx*8
+                let ri = self.get_reg_to(*idx, 14); // r14 = idx
+                self.emit_op(Opcode::Addi, 15, 0, 3); // r15 = 3
+                self.emit_op(Opcode::Shl, 14, ri, 15); // r14 = idx * 8
+                let ro = self.get_reg_to(*obj, 15); // r15 = base (re-loaded from spill)
+                self.emit_op(Opcode::Add, 15, ro, 14); // r15 = base + idx*8
                 self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
                 self.emit_load(rd, 15, 0);
             }
@@ -1534,14 +1629,14 @@ impl CodeGen {
             Inst::IndexSet(obj, idx, val) => {
                 // With write-through, get_reg_to re-loads from spill each call,
                 // so sequential calls are safe without Push/Pop.
-                let ri = self.get_reg_to(*idx, 14);          // r14 = idx
-                self.emit_op(Opcode::Addi, 15, 0, 3);       // r15 = 3
-                self.emit_op(Opcode::Shl, 14, ri, 15);      // r14 = idx * 8
-                let ro = self.get_reg_to(*obj, 15);          // r15 = base (re-loaded)
-                self.emit_op(Opcode::Add, 15, ro, 14);      // r15 = base + idx*8
+                let ri = self.get_reg_to(*idx, 14); // r14 = idx
+                self.emit_op(Opcode::Addi, 15, 0, 3); // r15 = 3
+                self.emit_op(Opcode::Shl, 14, ri, 15); // r14 = idx * 8
+                let ro = self.get_reg_to(*obj, 15); // r15 = base (re-loaded)
+                self.emit_op(Opcode::Add, 15, ro, 14); // r15 = base + idx*8
                 self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
-                let rv = self.get_reg_to(*val, 14);          // r14 = val (re-loaded)
-                self.emit_store(rv, 15, 0);                  // data[idx] = val
+                let rv = self.get_reg_to(*val, 14); // r14 = val (re-loaded)
+                self.emit_store(rv, 15, 0); // data[idx] = val
             }
 
             Inst::MakeTuple(dst, regs) => {
@@ -1572,9 +1667,9 @@ impl CodeGen {
                 self.emit_op(Opcode::Addi, 12, 12, total);
                 // Write length/capacity header
                 self.load_u32_to_reg(15, regs.len() as u32);
-                self.emit_store(15, rd, 0);  // length
-                self.emit_store(15, rd, 8);  // capacity
-                // Write elements at VEC_DATA_OFFSET
+                self.emit_store(15, rd, 0); // length
+                self.emit_store(15, rd, 8); // capacity
+                                            // Write elements at VEC_DATA_OFFSET
                 for (i, reg) in regs.iter().enumerate() {
                     let r = self.get_reg(*reg);
                     let offset = memory::VEC_DATA_OFFSET as u32 + (i as u32) * memory::WORD_SIZE;
@@ -1592,10 +1687,10 @@ impl CodeGen {
                 self.emit_op(Opcode::Add, rd, 12, 0);
                 self.emit_op(Opcode::Addi, 12, 12, total);
                 self.load_u32_to_reg(15, *count as u32);
-                self.emit_store(15, rd, 0);  // length
-                self.emit_store(15, rd, 8);  // capacity
-                // Restore val from stack
-                self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = val (restored)
+                self.emit_store(15, rd, 0); // length
+                self.emit_store(15, rd, 8); // capacity
+                                            // Restore val from stack
+                self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = val (restored)
                 for i in 0..*count {
                     let offset = memory::VEC_DATA_OFFSET as u32 + (i as u32) * memory::WORD_SIZE;
                     self.emit_store(15, rd, offset as i32);
@@ -1614,21 +1709,30 @@ impl CodeGen {
                         const PUSH_OBJ_SPILL: i32 = LOOP_STATE_BASE + 32;
 
                         let val_reg = self.get_reg_to(args[0], 14);
-                        self.emit_op(Opcode::Push, val_reg, 0, 0);  // save val on stack
-                        self.emit_store(ro, 13, PUSH_OBJ_SPILL);    // save Vec base
+                        self.emit_op(Opcode::Push, val_reg, 0, 0); // save val on stack
+                        self.emit_store(ro, 13, PUSH_OBJ_SPILL); // save Vec base
 
                         // Load length (r15) and capacity (r14) from base
                         // Load base once, read both fields before base register is clobbered.
-                        self.emit_load(15, 13, PUSH_OBJ_SPILL);  // r15 = base
-                        self.emit_load(memory::REG_SCRATCH_0, 15, memory::VEC_CAPACITY_OFFSET as i32); // r14 = cap
-                        self.emit_load(memory::REG_SCRATCH_1, 15, memory::VEC_LENGTH_OFFSET as i32);   // r15 = len (clobbers base, OK)
+                        self.emit_load(15, 13, PUSH_OBJ_SPILL); // r15 = base
+                        self.emit_load(
+                            memory::REG_SCRATCH_0,
+                            15,
+                            memory::VEC_CAPACITY_OFFSET as i32,
+                        ); // r14 = cap
+                        self.emit_load(memory::REG_SCRATCH_1, 15, memory::VEC_LENGTH_OFFSET as i32); // r15 = len (clobbers base, OK)
 
                         let fast_label = self.alloc_label();
                         let realloc_label = self.alloc_label();
                         let write_label = self.alloc_label();
 
                         // Branch: len < cap → fast path, else → realloc
-                        self.emit_op(Opcode::Lt, 15, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
+                        self.emit_op(
+                            Opcode::Lt,
+                            15,
+                            memory::REG_SCRATCH_1,
+                            memory::REG_SCRATCH_0 as u32,
+                        );
                         self.emit_jump_placeholder(Opcode::Bne, 15, 0, fast_label);
                         self.emit_jump_placeholder(Opcode::Jmp, 0, 0, realloc_label);
 
@@ -1636,49 +1740,74 @@ impl CodeGen {
                         self.mark_label(realloc_label);
                         // New capacity = old_cap * 2
                         self.emit_load(15, 13, PUSH_OBJ_SPILL);
-                        self.emit_load(memory::REG_SCRATCH_0, 15, memory::VEC_CAPACITY_OFFSET as i32);
+                        self.emit_load(
+                            memory::REG_SCRATCH_0,
+                            15,
+                            memory::VEC_CAPACITY_OFFSET as i32,
+                        );
                         self.emit_op(Opcode::Addi, 15, 0, 1);
-                        self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, 15); // r14 = cap*2
-                        // Read old length
+                        self.emit_op(
+                            Opcode::Shl,
+                            memory::REG_SCRATCH_0,
+                            memory::REG_SCRATCH_0,
+                            15,
+                        ); // r14 = cap*2
+                           // Read old length
                         self.emit_load(15, 13, PUSH_OBJ_SPILL);
                         self.emit_load(memory::REG_SCRATCH_1, 15, memory::VEC_LENGTH_OFFSET as i32); // r15 = len
-                        // Write new header at r12 (new allocation)
-                        self.emit_store(memory::REG_SCRATCH_1, 12, memory::VEC_LENGTH_OFFSET as i32);
-                        self.emit_store(memory::REG_SCRATCH_0, 12, memory::VEC_CAPACITY_OFFSET as i32);
+                                                                                                     // Write new header at r12 (new allocation)
+                        self.emit_store(
+                            memory::REG_SCRATCH_1,
+                            12,
+                            memory::VEC_LENGTH_OFFSET as i32,
+                        );
+                        self.emit_store(
+                            memory::REG_SCRATCH_0,
+                            12,
+                            memory::VEC_CAPACITY_OFFSET as i32,
+                        );
                         // Memcpy old data: count = len*8, src = old_base+16, dst = r12+16
                         self.emit_op(Opcode::Addi, 14, 0, 3);
                         self.emit_op(Opcode::Shl, 14, memory::REG_SCRATCH_1, 14); // r14 = len*8
                         self.emit_op(Opcode::Addi, 15, 12, memory::VEC_DATA_OFFSET); // r15 = new data ptr
-                        self.emit_op(Opcode::Push, 15, 0, 0);   // save new data ptr
+                        self.emit_op(Opcode::Push, 15, 0, 0); // save new data ptr
                         self.emit_load(15, 13, PUSH_OBJ_SPILL);
                         self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET); // r15 = old data ptr
                         self.emit_op(Opcode::Pop, memory::REG_SCRATCH_0, 0, 0); // r14_tmp = new data ptr (actually into r14... let me use stack properly)
-                        // Stack juggle: need Memcpy(new_data, old_data, len*8)
-                        // r15 = old data ptr, r14 = len*8, need new_data_ptr
-                        self.emit_op(Opcode::Push, 14, 0, 0);   // save len*8
-                        self.emit_op(Opcode::Push, 15, 0, 0);   // save old_data
+                                                                                // Stack juggle: need Memcpy(new_data, old_data, len*8)
+                                                                                // r15 = old data ptr, r14 = len*8, need new_data_ptr
+                        self.emit_op(Opcode::Push, 14, 0, 0); // save len*8
+                        self.emit_op(Opcode::Push, 15, 0, 0); // save old_data
                         self.emit_op(Opcode::Addi, 15, 12, memory::VEC_DATA_OFFSET); // r15 = new data
-                        self.emit_op(Opcode::Pop, 14, 0, 0);    // r14 = old_data (src)
+                        self.emit_op(Opcode::Pop, 14, 0, 0); // r14 = old_data (src)
                         self.emit_op(Opcode::Pop, memory::REG_SCRATCH_0, 0, 0); // ... need 3 regs for Memcpy
-                        // Use r11 for len
+                                                                                // Use r11 for len
                         self.emit_op(Opcode::Push, 11, 0, 0);
                         self.emit_op(Opcode::Addi, 11, 0, 3);
                         self.emit_load(memory::REG_SCRATCH_0, 13, PUSH_OBJ_SPILL);
-                        self.emit_load(memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, memory::VEC_LENGTH_OFFSET as i32);
+                        self.emit_load(
+                            memory::REG_SCRATCH_0,
+                            memory::REG_SCRATCH_0,
+                            memory::VEC_LENGTH_OFFSET as i32,
+                        );
                         self.emit_op(Opcode::Shl, 11, memory::REG_SCRATCH_0, 11); // r11 = len*8
                         self.emit_load(14, 13, PUSH_OBJ_SPILL);
                         self.emit_op(Opcode::Addi, 14, 14, memory::VEC_DATA_OFFSET); // r14 = old data
                         self.emit_op(Opcode::Addi, 15, 12, memory::VEC_DATA_OFFSET); // r15 = new data
                         self.emit_op(Opcode::Memcpy, 15, 14, 11); // copy old→new
-                        self.emit_op(Opcode::Pop, 11, 0, 0);    // restore r11
-                        // Update base to new allocation, advance heap
+                        self.emit_op(Opcode::Pop, 11, 0, 0); // restore r11
+                                                             // Update base to new allocation, advance heap
                         self.emit_store(12, 13, PUSH_OBJ_SPILL); // base = r12 (new alloc)
-                        self.emit_load(memory::REG_SCRATCH_0, 12, memory::VEC_CAPACITY_OFFSET as i32);
+                        self.emit_load(
+                            memory::REG_SCRATCH_0,
+                            12,
+                            memory::VEC_CAPACITY_OFFSET as i32,
+                        );
                         self.emit_op(Opcode::Addi, 15, 0, 3);
                         self.emit_op(Opcode::Shl, 15, memory::REG_SCRATCH_0, 15); // r15 = cap*8
                         self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
-                        self.emit_op(Opcode::Add, 12, 12, 15);  // r12 past new allocation
-                        // Load len for write path
+                        self.emit_op(Opcode::Add, 12, 12, 15); // r12 past new allocation
+                                                               // Load len for write path
                         self.emit_load(15, 13, PUSH_OBJ_SPILL);
                         self.emit_load(memory::REG_SCRATCH_1, 15, memory::VEC_LENGTH_OFFSET as i32);
                         self.emit_jump_placeholder(Opcode::Jmp, 0, 0, write_label);
@@ -1692,19 +1821,48 @@ impl CodeGen {
                         self.mark_label(write_label);
                         // r15 (REG_SCRATCH_1) = len from fast/realloc path.
                         // First: increment length and store it (before r15 gets clobbered)
-                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_1, memory::REG_SCRATCH_1, 1); // r15 = len+1
+                        self.emit_op(
+                            Opcode::Addi,
+                            memory::REG_SCRATCH_1,
+                            memory::REG_SCRATCH_1,
+                            1,
+                        ); // r15 = len+1
                         self.emit_op(Opcode::Push, memory::REG_SCRATCH_1, 0, 0); // save new_len
                         self.emit_load(memory::REG_SCRATCH_0, 13, PUSH_OBJ_SPILL); // r14 = base
-                        self.emit_op(Opcode::Pop, memory::REG_SCRATCH_1, 0, 0);    // r15 = new_len
-                        self.emit_store(memory::REG_SCRATCH_1, memory::REG_SCRATCH_0, memory::VEC_LENGTH_OFFSET as i32);
+                        self.emit_op(Opcode::Pop, memory::REG_SCRATCH_1, 0, 0); // r15 = new_len
+                        self.emit_store(
+                            memory::REG_SCRATCH_1,
+                            memory::REG_SCRATCH_0,
+                            memory::VEC_LENGTH_OFFSET as i32,
+                        );
                         // Compute write addr = base + VEC_DATA_OFFSET + old_len*8
                         // old_len = new_len - 1
-                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_1, memory::REG_SCRATCH_1, 0x3FFFF); // r15 = old_len (-1)
-                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 0, 3);   // r14 = 3
-                        self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32); // r14 = old_len*8
-                        self.emit_load(15, 13, PUSH_OBJ_SPILL);                    // r15 = base
-                        self.emit_op(Opcode::Add, memory::REG_SCRATCH_0, 15, memory::REG_SCRATCH_0 as u32); // r14 = base+old_len*8
-                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, memory::VEC_DATA_OFFSET);
+                        self.emit_op(
+                            Opcode::Addi,
+                            memory::REG_SCRATCH_1,
+                            memory::REG_SCRATCH_1,
+                            0x3FFFF,
+                        ); // r15 = old_len (-1)
+                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 0, 3); // r14 = 3
+                        self.emit_op(
+                            Opcode::Shl,
+                            memory::REG_SCRATCH_0,
+                            memory::REG_SCRATCH_1,
+                            memory::REG_SCRATCH_0 as u32,
+                        ); // r14 = old_len*8
+                        self.emit_load(15, 13, PUSH_OBJ_SPILL); // r15 = base
+                        self.emit_op(
+                            Opcode::Add,
+                            memory::REG_SCRATCH_0,
+                            15,
+                            memory::REG_SCRATCH_0 as u32,
+                        ); // r14 = base+old_len*8
+                        self.emit_op(
+                            Opcode::Addi,
+                            memory::REG_SCRATCH_0,
+                            memory::REG_SCRATCH_0,
+                            memory::VEC_DATA_OFFSET,
+                        );
                         // Pop val and write
                         self.emit_op(Opcode::Pop, memory::REG_SCRATCH_1, 0, 0);
                         self.emit_store(memory::REG_SCRATCH_1, memory::REG_SCRATCH_0, 0);
@@ -1723,14 +1881,38 @@ impl CodeGen {
                         // Load length, assert > 0
                         self.emit_load(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
                         self.emit_op(Opcode::Assert, 0, memory::REG_SCRATCH_1, 0); // revert if empty
-                        // Decrement length: Addi with sign-extended -1 (0x3FFFF in 18-bit = -1)
-                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_1, memory::REG_SCRATCH_1, 0x3FFFF);
-                        self.emit_store(memory::REG_SCRATCH_1, ro, memory::VEC_LENGTH_OFFSET as i32);
+                                                                                   // Decrement length: Addi with sign-extended -1 (0x3FFFF in 18-bit = -1)
+                        self.emit_op(
+                            Opcode::Addi,
+                            memory::REG_SCRATCH_1,
+                            memory::REG_SCRATCH_1,
+                            0x3FFFF,
+                        );
+                        self.emit_store(
+                            memory::REG_SCRATCH_1,
+                            ro,
+                            memory::VEC_LENGTH_OFFSET as i32,
+                        );
                         // Load popped value from data[new_length]
                         self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, 0, 3);
-                        self.emit_op(Opcode::Shl, memory::REG_SCRATCH_0, memory::REG_SCRATCH_1, memory::REG_SCRATCH_0 as u32);
-                        self.emit_op(Opcode::Add, memory::REG_SCRATCH_0, ro, memory::REG_SCRATCH_0 as u32);
-                        self.emit_op(Opcode::Addi, memory::REG_SCRATCH_0, memory::REG_SCRATCH_0, memory::VEC_DATA_OFFSET);
+                        self.emit_op(
+                            Opcode::Shl,
+                            memory::REG_SCRATCH_0,
+                            memory::REG_SCRATCH_1,
+                            memory::REG_SCRATCH_0 as u32,
+                        );
+                        self.emit_op(
+                            Opcode::Add,
+                            memory::REG_SCRATCH_0,
+                            ro,
+                            memory::REG_SCRATCH_0 as u32,
+                        );
+                        self.emit_op(
+                            Opcode::Addi,
+                            memory::REG_SCRATCH_0,
+                            memory::REG_SCRATCH_0,
+                            memory::VEC_DATA_OFFSET,
+                        );
                         self.emit_load(rd, memory::REG_SCRATCH_0, 0);
                     }
                     "len" => {
@@ -1773,11 +1955,11 @@ impl CodeGen {
                 let calldata_len = 4 + (args.len() as u32) * 8;
 
                 // Set up CallExt: rd=target(wide), rs1=calldata_ptr(r12), imm=len/gas/result
-                self.emit_op(Opcode::Addi, 14, 0, calldata_len);  // r14 = calldata len
-                self.emit_op(Opcode::Caller, 15, 0, 2);           // r15 = gas_remaining
+                self.emit_op(Opcode::Addi, 14, 0, calldata_len); // r14 = calldata len
+                self.emit_op(Opcode::Caller, 15, 0, 2); // r15 = gas_remaining
                 let imm = (14 & 0xF)           // len_reg = r14
                     | ((15 & 0xF) << 4)         // gas_reg = r15
-                    | ((13 & 0xF) << 8);        // result_reg = r13
+                    | ((13 & 0xF) << 8); // result_reg = r13
                 self.emit_op(Opcode::CallExt, ra, 12, imm);
 
                 // Advance heap past calldata
@@ -1789,7 +1971,12 @@ impl CodeGen {
                 }
             }
 
-            Inst::CrossCall { target, method, args, .. } => {
+            Inst::CrossCall {
+                target,
+                method,
+                args,
+                ..
+            } => {
                 // Use different restore targets so both survive if both spilled
                 let rt = self.get_reg_to(*target, 15);
                 let rm = self.get_reg_to(*method, 14);
@@ -1821,11 +2008,11 @@ impl CodeGen {
                 // rd = target address (wide register)
                 // rs1 = calldata pointer (r12 = heap)
                 // imm[3:0] = len register, imm[7:4] = gas register, imm[11:8] = result register
-                self.emit_op(Opcode::Addi, 14, 0, calldata_len);  // r14 = calldata len
-                self.emit_op(Opcode::Caller, 15, 0, 2);           // r15 = gas_remaining
+                self.emit_op(Opcode::Addi, 14, 0, calldata_len); // r14 = calldata len
+                self.emit_op(Opcode::Caller, 15, 0, 2); // r15 = gas_remaining
                 let imm = (14 & 0xF)           // len_reg = r14
                     | ((15 & 0xF) << 4)         // gas_reg = r15
-                    | ((13 & 0xF) << 8);        // result_reg = r13
+                    | ((13 & 0xF) << 8); // result_reg = r13
                 self.emit_op(Opcode::CallExt, rt, 12, imm);
 
                 // Advance heap past calldata
@@ -1844,7 +2031,7 @@ impl CodeGen {
                 // We need to: write constructor args after the blob, then Create.
                 let wd = self.regs.alloc_wide(*dst);
                 let rb = self.get_reg(*blob_reg); // GP reg with blob heap pointer
-                // Save blob pointer to stack — args loop's get_reg calls may clobber r15
+                                                  // Save blob pointer to stack — args loop's get_reg calls may clobber r15
                 self.emit_op(Opcode::Push, rb, 0, 0);
 
                 // The Const(blob_reg, Bytes(data)) handler writes data to heap[r12]
@@ -1859,7 +2046,7 @@ impl CodeGen {
                 let args_size = (args.len() as u32) * 8;
 
                 // Restore blob pointer from stack
-                self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = blob pointer (restored)
+                self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = blob pointer (restored)
 
                 // Total length = blob_size (r12 - rb) + args_size
                 // r14 = r12 - r15 (blob size)
@@ -1877,7 +2064,7 @@ impl CodeGen {
             Inst::MakeVec(dst, cap) => {
                 let rd = self.alloc_gp(*dst);
                 let total_size = 16 + (*cap as u32) * memory::WORD_SIZE; // header + data slots
-                // rd = current heap pointer (Vec base)
+                                                                         // rd = current heap pointer (Vec base)
                 self.emit_op(Opcode::Add, rd, 12, 0);
                 // Store length = 0
                 self.emit_op(Opcode::Addi, 15, 0, 0);
@@ -2059,10 +2246,8 @@ impl CodeGen {
                 let rd_bits = (old.0 >> 22) & 0xF;
                 let rs1_bits = (old.0 >> 18) & 0xF;
                 let offset_bits = (relative_offset as u32) & 0x3FFFF;
-                let new_word = (opcode_bits << 26)
-                    | (rd_bits << 22)
-                    | (rs1_bits << 18)
-                    | offset_bits;
+                let new_word =
+                    (opcode_bits << 26) | (rd_bits << 22) | (rs1_bits << 18) | offset_bits;
                 self.instructions[*inst_idx] = Instruction(new_word);
             }
         }
@@ -2189,64 +2374,64 @@ impl CodeGen {
             // String/Bytes: val_reg points to Vec layout [len:8][cap:8][data...]
             // Save val_reg (might be r14 which gets clobbered by byte_len load)
             self.emit_op(Opcode::Push, val_reg, 0, 0);
-            self.emit_load(14, val_reg, 0);              // r14 = byte_len
-            self.emit_store(14, 12, 0);                   // write byte_len prefix
-            self.emit_op(Opcode::Addi, 12, 12, 8);       // advance past prefix
-            self.emit_op(Opcode::Pop, 15, 0, 0);         // r15 = val_reg (string base)
+            self.emit_load(14, val_reg, 0); // r14 = byte_len
+            self.emit_store(14, 12, 0); // write byte_len prefix
+            self.emit_op(Opcode::Addi, 12, 12, 8); // advance past prefix
+            self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = val_reg (string base)
             self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET); // r15 = data ptr
-            self.emit_op(Opcode::Memcpy, 12, 15, 14);    // Memcpy dst=r12, src=r15, len=r14
-            // Advance r12 by align8(byte_len): r12 += (byte_len + 7) & ~7
+            self.emit_op(Opcode::Memcpy, 12, 15, 14); // Memcpy dst=r12, src=r15, len=r14
+                                                      // Advance r12 by align8(byte_len): r12 += (byte_len + 7) & ~7
             self.emit_op(Opcode::Addi, 14, 14, 7);
-            self.emit_op(Opcode::Addi, 15, 0, 3);        // shift amount = 3
-            self.emit_op(Opcode::Shr, 14, 14, 15);       // r14 = (len+7) >> 3
-            self.emit_op(Opcode::Shl, 14, 14, 15);       // r14 = ((len+7) >> 3) << 3 = align8
-            self.emit_op(Opcode::Add, 12, 12, 14);       // r12 += aligned size
+            self.emit_op(Opcode::Addi, 15, 0, 3); // shift amount = 3
+            self.emit_op(Opcode::Shr, 14, 14, 15); // r14 = (len+7) >> 3
+            self.emit_op(Opcode::Shl, 14, 14, 15); // r14 = ((len+7) >> 3) << 3 = align8
+            self.emit_op(Opcode::Add, 12, 12, 14); // r12 += aligned size
         } else if let Ty::Vec(elem_ty) = ty {
             let elem_size = serialized_elem_size(elem_ty);
             // Save val_reg on stack (it may be r14/r15 which get clobbered)
             self.emit_op(Opcode::Push, val_reg, 0, 0);
             // Write count prefix
-            self.emit_load(14, val_reg, 0);               // r14 = element count
-            self.emit_store(14, 12, 0);                    // write count
-            self.emit_op(Opcode::Addi, 12, 12, 8);        // advance past count prefix
+            self.emit_load(14, val_reg, 0); // r14 = element count
+            self.emit_store(14, 12, 0); // write count
+            self.emit_op(Opcode::Addi, 12, 12, 8); // advance past count prefix
 
             match elem_size {
                 Some(8) => {
                     // Vec of GP-sized elements: bulk Memcpy count*8 bytes
-                    self.emit_op(Opcode::Pop, 15, 0, 0);     // r15 = vec base (saved)
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = vec base (saved)
                     self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET); // r15 = data ptr
-                    self.emit_op(Opcode::Push, 15, 0, 0);    // save data ptr
+                    self.emit_op(Opcode::Push, 15, 0, 0); // save data ptr
                     self.emit_op(Opcode::Addi, 15, 0, 3);
-                    self.emit_op(Opcode::Shl, 14, 14, 15);   // r14 = count * 8
-                    self.emit_op(Opcode::Pop, 15, 0, 0);     // r15 = data ptr
+                    self.emit_op(Opcode::Shl, 14, 14, 15); // r14 = count * 8
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = data ptr
                     self.emit_op(Opcode::Memcpy, 12, 15, 14); // copy data
-                    self.emit_op(Opcode::Add, 12, 12, 14);    // advance r12
+                    self.emit_op(Opcode::Add, 12, 12, 14); // advance r12
                 }
                 Some(32) => {
                     // Vec of wide elements: loop with Wload/Wstore
-                    self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = vec base (saved)
-                    self.emit_store(14, 13, LOOP_STATE_BASE + 8);              // spill count
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = vec base (saved)
+                    self.emit_store(14, 13, LOOP_STATE_BASE + 8); // spill count
                     self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
-                    self.emit_store(15, 13, LOOP_STATE_BASE + 16);              // spill src_ptr
-                    self.emit_op(Opcode::Addi, 14, 0, 0);     // i = 0
-                    self.emit_store(14, 13, LOOP_STATE_BASE);              // spill i
+                    self.emit_store(15, 13, LOOP_STATE_BASE + 16); // spill src_ptr
+                    self.emit_op(Opcode::Addi, 14, 0, 0); // i = 0
+                    self.emit_store(14, 13, LOOP_STATE_BASE); // spill i
 
                     let loop_label = self.alloc_label();
                     let done_label = self.alloc_label();
                     self.mark_label(loop_label);
 
                     // Check i < count
-                    self.emit_load(14, 13, LOOP_STATE_BASE);               // r14 = i
-                    self.emit_load(15, 13, LOOP_STATE_BASE + 8);               // r15 = count
+                    self.emit_load(14, 13, LOOP_STATE_BASE); // r14 = i
+                    self.emit_load(15, 13, LOOP_STATE_BASE + 8); // r15 = count
                     self.emit_jump_placeholder(Opcode::Beq, 14, 15, done_label); // if i == count → done
 
                     // Load src_ptr, Wload element, Wstore to r12
-                    self.emit_load(15, 13, LOOP_STATE_BASE + 16);               // r15 = src_ptr
+                    self.emit_load(15, 13, LOOP_STATE_BASE + 16); // r15 = src_ptr
                     self.emit_op(Opcode::Wload, WIDE_SCRATCH2, 15, 0); // w6 = *src_ptr
                     self.emit_op(Opcode::Wstore, WIDE_SCRATCH2, 12, 0); // *r12 = w6
-                    self.emit_op(Opcode::Addi, 12, 12, 32);   // r12 += 32
-                    self.emit_op(Opcode::Addi, 15, 15, 32);   // src_ptr += 32
-                    self.emit_store(15, 13, LOOP_STATE_BASE + 16);              // update src_ptr
+                    self.emit_op(Opcode::Addi, 12, 12, 32); // r12 += 32
+                    self.emit_op(Opcode::Addi, 15, 15, 32); // src_ptr += 32
+                    self.emit_store(15, 13, LOOP_STATE_BASE + 16); // update src_ptr
 
                     // i++
                     self.emit_load(14, 13, LOOP_STATE_BASE);
@@ -2260,29 +2445,29 @@ impl CodeGen {
                     // Vec of variable-size elements (Vec<String>, Vec<Vec<T>>, Vec<Struct>).
                     // Stack-based countdown loop. At each iteration top-of-stack = [src_ptr, remaining].
                     // No GP registers are used for persistent state — only stack.
-                    self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = vec base (saved from Push earlier)
-                    self.emit_load(14, 15, 0);                 // r14 = count from vec header
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = vec base (saved from Push earlier)
+                    self.emit_load(14, 15, 0); // r14 = count from vec header
                     self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET); // r15 = data start
-                    // Push initial state: [src_ptr, remaining]
-                    self.emit_op(Opcode::Push, 14, 0, 0);     // push remaining = count
-                    self.emit_op(Opcode::Push, 15, 0, 0);     // push src_ptr
+                                                                                 // Push initial state: [src_ptr, remaining]
+                    self.emit_op(Opcode::Push, 14, 0, 0); // push remaining = count
+                    self.emit_op(Opcode::Push, 15, 0, 0); // push src_ptr
 
                     let loop_label = self.alloc_label();
                     let done_label = self.alloc_label();
                     self.mark_label(loop_label);
 
                     // Pop state
-                    self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = src_ptr
-                    self.emit_op(Opcode::Pop, 14, 0, 0);      // r14 = remaining
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = src_ptr
+                    self.emit_op(Opcode::Pop, 14, 0, 0); // r14 = remaining
                     self.emit_jump_placeholder(Opcode::Beq, 14, 0, done_label);
 
                     // Decrement remaining, advance src_ptr, push updated state BEFORE serialize
                     self.emit_op(Opcode::Addi, 14, 14, 0x3FFFF); // r14 = remaining - 1 (twos complement -1)
-                    self.emit_op(Opcode::Push, 14, 0, 0);     // push remaining-1
-                    self.emit_op(Opcode::Addi, 14, 15, 8);    // r14 = src_ptr + 8
-                    self.emit_op(Opcode::Push, 14, 0, 0);     // push new src_ptr
-                    // Load element pointer from OLD src_ptr (r15)
-                    self.emit_load(14, 15, 0);                 // r14 = *src_ptr
+                    self.emit_op(Opcode::Push, 14, 0, 0); // push remaining-1
+                    self.emit_op(Opcode::Addi, 14, 15, 8); // r14 = src_ptr + 8
+                    self.emit_op(Opcode::Push, 14, 0, 0); // push new src_ptr
+                                                          // Load element pointer from OLD src_ptr (r15)
+                    self.emit_load(14, 15, 0); // r14 = *src_ptr
 
                     // Recursively serialize (clobbers r14, r15, but stack has the state)
                     let elem_ty_clone = (**elem_ty).clone();
@@ -2293,12 +2478,12 @@ impl CodeGen {
                 }
                 Some(_) => {
                     // 16-byte elements (u128/i128): bulk Memcpy count*16 bytes
-                    self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = vec base (saved)
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = vec base (saved)
                     self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
-                    self.emit_op(Opcode::Push, 15, 0, 0);     // save data ptr
-                    self.emit_op(Opcode::Addi, 15, 0, 4);     // shift by 4
-                    self.emit_op(Opcode::Shl, 14, 14, 15);    // r14 = count * 16
-                    self.emit_op(Opcode::Pop, 15, 0, 0);      // data ptr
+                    self.emit_op(Opcode::Push, 15, 0, 0); // save data ptr
+                    self.emit_op(Opcode::Addi, 15, 0, 4); // shift by 4
+                    self.emit_op(Opcode::Shl, 14, 14, 15); // r14 = count * 16
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // data ptr
                     self.emit_op(Opcode::Memcpy, 12, 15, 14);
                     self.emit_op(Opcode::Add, 12, 12, 14);
                 }
@@ -2306,7 +2491,9 @@ impl CodeGen {
         } else if let Ty::Struct(name) = ty {
             // Struct: serialize field-by-field, recursing into nested structs.
             if let Some(fields) = self.struct_defs.get(name).cloned() {
-                let has_nested = fields.iter().any(|(_, fty)| matches!(fty, Ty::Struct(_)) || is_blob_type(fty));
+                let has_nested = fields
+                    .iter()
+                    .any(|(_, fty)| matches!(fty, Ty::Struct(_)) || is_blob_type(fty));
                 if has_nested {
                     // Recursive: serialize each field individually.
                     // Push val_reg (struct base) before each field, Pop AFTER serialize
@@ -2359,10 +2546,10 @@ impl CodeGen {
             // String/Bytes: val_reg → Vec layout [len:8][cap:8][data...]
             // Write [byte_len:8][data padded to 8]
             self.emit_op(Opcode::Push, val_reg, 0, 0);
-            self.emit_load(14, val_reg, 0);              // r14 = byte_len
-            self.emit_store(14, 12, 0);                   // write byte_len prefix
+            self.emit_load(14, val_reg, 0); // r14 = byte_len
+            self.emit_store(14, 12, 0); // write byte_len prefix
             self.emit_op(Opcode::Addi, 12, 12, 8);
-            self.emit_op(Opcode::Pop, 15, 0, 0);         // r15 = string base
+            self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = string base
             self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
             self.emit_op(Opcode::Memcpy, 12, 15, 14);
             // Advance r12 by align8(byte_len)
@@ -2376,64 +2563,70 @@ impl CodeGen {
             let elem_size = flat_elem_size(elem_ty, &defs);
             // Save val_reg (may be r14/r15), then Pop to r15 for safe field access
             self.emit_op(Opcode::Push, val_reg, 0, 0);
-            self.emit_op(Opcode::Pop, 15, 0, 0);          // r15 = vec base (safe)
-            self.emit_op(Opcode::Push, 15, 0, 0);         // push back for later use
-            // Write [len:8][cap:8] header
-            self.emit_load(14, 15, memory::VEC_LENGTH_OFFSET as i32);  // r14 = len
-            self.emit_store(14, 12, 0);                    // write len
-            self.emit_op(Opcode::Push, 14, 0, 0);         // save len
+            self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = vec base (safe)
+            self.emit_op(Opcode::Push, 15, 0, 0); // push back for later use
+                                                  // Write [len:8][cap:8] header
+            self.emit_load(14, 15, memory::VEC_LENGTH_OFFSET as i32); // r14 = len
+            self.emit_store(14, 12, 0); // write len
+            self.emit_op(Opcode::Push, 14, 0, 0); // save len
             self.emit_load(14, 15, memory::VEC_CAPACITY_OFFSET as i32); // r14 = cap
-            self.emit_store(14, 12, 8);                    // write cap
-            self.emit_op(Opcode::Pop, 14, 0, 0);          // restore r14 = len (count)
-            self.emit_op(Opcode::Addi, 12, 12, 16);       // advance past 16-byte header
-            // r14 = count for the element loop below
+            self.emit_store(14, 12, 8); // write cap
+            self.emit_op(Opcode::Pop, 14, 0, 0); // restore r14 = len (count)
+            self.emit_op(Opcode::Addi, 12, 12, 16); // advance past 16-byte header
+                                                    // r14 = count for the element loop below
 
             match elem_size {
                 Some(sz) if sz == 8 || sz == 16 || sz == 32 => {
                     // Fixed-size elements: bulk Memcpy count * sz bytes
-                    self.emit_op(Opcode::Pop, 15, 0, 0);     // r15 = vec base
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = vec base
                     self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
-                    self.emit_op(Opcode::Push, 15, 0, 0);    // save data ptr
-                    let shift = if sz == 8 { 3 } else if sz == 16 { 4 } else { 5 };
+                    self.emit_op(Opcode::Push, 15, 0, 0); // save data ptr
+                    let shift = if sz == 8 {
+                        3
+                    } else if sz == 16 {
+                        4
+                    } else {
+                        5
+                    };
                     self.emit_op(Opcode::Addi, 15, 0, shift);
-                    self.emit_op(Opcode::Shl, 14, 14, 15);   // r14 = count * sz
-                    self.emit_op(Opcode::Pop, 15, 0, 0);     // r15 = data ptr
+                    self.emit_op(Opcode::Shl, 14, 14, 15); // r14 = count * sz
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = data ptr
                     self.emit_op(Opcode::Memcpy, 12, 15, 14);
                     self.emit_op(Opcode::Add, 12, 12, 14);
                 }
                 Some(sz) => {
                     // Fixed-size struct elements: bulk Memcpy count * sz bytes
                     // sz is not a power of 2, so compute count * sz via multiply
-                    self.emit_op(Opcode::Pop, 15, 0, 0);     // r15 = vec base
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = vec base
                     self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
                     self.emit_op(Opcode::Push, 15, 0, 0);
                     self.load_u32_to_reg(15, sz);
-                    self.emit_op(Opcode::Mul, 14, 14, 15);   // r14 = count * sz
+                    self.emit_op(Opcode::Mul, 14, 14, 15); // r14 = count * sz
                     self.emit_op(Opcode::Pop, 15, 0, 0);
                     self.emit_op(Opcode::Memcpy, 12, 15, 14);
                     self.emit_op(Opcode::Add, 12, 12, 14);
                 }
                 None => {
                     // Variable-size elements: stack-based countdown loop
-                    self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = vec base
-                    self.emit_load(14, 15, 0);                 // r14 = count
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = vec base
+                    self.emit_load(14, 15, 0); // r14 = count
                     self.emit_op(Opcode::Addi, 15, 15, memory::VEC_DATA_OFFSET);
-                    self.emit_op(Opcode::Push, 14, 0, 0);     // push remaining
-                    self.emit_op(Opcode::Push, 15, 0, 0);     // push src_ptr
+                    self.emit_op(Opcode::Push, 14, 0, 0); // push remaining
+                    self.emit_op(Opcode::Push, 15, 0, 0); // push src_ptr
 
                     let loop_label = self.alloc_label();
                     let done_label = self.alloc_label();
                     self.mark_label(loop_label);
 
-                    self.emit_op(Opcode::Pop, 15, 0, 0);      // r15 = src_ptr
-                    self.emit_op(Opcode::Pop, 14, 0, 0);      // r14 = remaining
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = src_ptr
+                    self.emit_op(Opcode::Pop, 14, 0, 0); // r14 = remaining
                     self.emit_jump_placeholder(Opcode::Beq, 14, 0, done_label);
 
                     self.emit_op(Opcode::Addi, 14, 14, 0x3FFFF); // remaining--
                     self.emit_op(Opcode::Push, 14, 0, 0);
-                    self.emit_op(Opcode::Addi, 14, 15, 8);    // new src_ptr
+                    self.emit_op(Opcode::Addi, 14, 15, 8); // new src_ptr
                     self.emit_op(Opcode::Push, 14, 0, 0);
-                    self.emit_load(14, 15, 0);                 // r14 = *src_ptr (element ptr)
+                    self.emit_load(14, 15, 0); // r14 = *src_ptr (element ptr)
 
                     let elem_ty_clone = (**elem_ty).clone();
                     self.emit_flatten(&elem_ty_clone, 14);
@@ -2446,7 +2639,8 @@ impl CodeGen {
             // Struct: ALWAYS recursive field-by-field with actual byte offsets.
             // For inline nested structs, use Addi (interior pointer) instead of Load.
             if let Some(fields) = self.struct_defs.get(name).cloned() {
-                let offsets: Vec<(u32, Ty)> = fields.iter()
+                let offsets: Vec<(u32, Ty)> = fields
+                    .iter()
                     .map(|(fname, _)| self.lookup_field(name, fname))
                     .collect();
                 for (offset, fty) in &offsets {
@@ -2487,13 +2681,15 @@ impl CodeGen {
             self.emit_op(Opcode::Addi, src_reg, src_reg, 32);
         } else if matches!(ty, Ty::StringTy | Ty::Bytes) {
             // String: read [byte_len:8][data...], build Vec layout on heap
-            self.emit_op(Opcode::Add, dst_reg, 12, 0);       // dst = Vec base
+            self.emit_op(Opcode::Add, dst_reg, 12, 0); // dst = Vec base
             let dst_saved = dst_reg == 14 || dst_reg == 15;
-            if dst_saved { self.emit_op(Opcode::Push, dst_reg, 0, 0); }
-            self.emit_load(14, src_reg, 0);                    // r14 = byte_len
+            if dst_saved {
+                self.emit_op(Opcode::Push, dst_reg, 0, 0);
+            }
+            self.emit_load(14, src_reg, 0); // r14 = byte_len
             self.emit_op(Opcode::Addi, src_reg, src_reg, 8);
-            self.emit_store(14, 12, 0);                        // header.length
-            self.emit_store(14, 12, 8);                        // header.capacity
+            self.emit_store(14, 12, 0); // header.length
+            self.emit_store(14, 12, 8); // header.capacity
             self.emit_op(Opcode::Addi, 12, 12, memory::VEC_DATA_OFFSET);
             self.emit_op(Opcode::Memcpy, 12, src_reg, 14);
             // Advance src and r12 by align8(byte_len)
@@ -2503,57 +2699,67 @@ impl CodeGen {
             self.emit_op(Opcode::Shl, 15, 15, 14);
             self.emit_op(Opcode::Add, src_reg, src_reg, 15);
             self.emit_op(Opcode::Add, 12, 12, 15);
-            if dst_saved { self.emit_op(Opcode::Pop, dst_reg, 0, 0); }
+            if dst_saved {
+                self.emit_op(Opcode::Pop, dst_reg, 0, 0);
+            }
         } else if let Ty::Vec(elem_ty) = ty {
             let defs = self.struct_defs.clone();
             let elem_size = flat_elem_size(elem_ty, &defs);
             // dst = Vec base on heap
             self.emit_op(Opcode::Add, dst_reg, 12, 0);
             let dst_saved = dst_reg == 14 || dst_reg == 15;
-            if dst_saved { self.emit_op(Opcode::Push, dst_reg, 0, 0); }
+            if dst_saved {
+                self.emit_op(Opcode::Push, dst_reg, 0, 0);
+            }
             // Read [len:8][cap:8] from flat wire
-            self.emit_load(14, src_reg, 0);                    // r14 = len
+            self.emit_load(14, src_reg, 0); // r14 = len
             self.emit_op(Opcode::Addi, src_reg, src_reg, 8);
-            self.emit_load(15, src_reg, 0);                    // r15 = cap
+            self.emit_load(15, src_reg, 0); // r15 = cap
             self.emit_op(Opcode::Addi, src_reg, src_reg, 8);
             // Write Vec header on heap
-            self.emit_store(14, 12, 0);                        // header.length = len
-            self.emit_store(15, 12, 8);                        // header.capacity = cap
+            self.emit_store(14, 12, 0); // header.length = len
+            self.emit_store(15, 12, 8); // header.capacity = cap
             self.emit_op(Opcode::Addi, 12, 12, memory::VEC_DATA_OFFSET);
 
             match elem_size {
                 Some(sz) if sz == 8 || sz == 16 || sz == 32 => {
                     // Fixed-size elements: bulk Memcpy
-                    let shift = if sz == 8 { 3 } else if sz == 16 { 4 } else { 5 };
+                    let shift = if sz == 8 {
+                        3
+                    } else if sz == 16 {
+                        4
+                    } else {
+                        5
+                    };
                     self.emit_op(Opcode::Addi, 15, 0, shift);
-                    self.emit_op(Opcode::Shl, 14, 14, 15);     // r14 = count * sz
+                    self.emit_op(Opcode::Shl, 14, 14, 15); // r14 = count * sz
                     self.emit_op(Opcode::Memcpy, 12, src_reg, 14);
                     self.emit_op(Opcode::Add, src_reg, src_reg, 14);
                     self.emit_op(Opcode::Add, 12, 12, 14);
                 }
                 Some(sz) => {
                     // Fixed-size struct elements: bulk Memcpy count * sz
-                    self.emit_op(Opcode::Push, 14, 0, 0);      // save count
+                    self.emit_op(Opcode::Push, 14, 0, 0); // save count
                     self.load_u32_to_reg(15, sz);
                     self.emit_op(Opcode::Pop, 14, 0, 0);
-                    self.emit_op(Opcode::Mul, 14, 14, 15);     // r14 = count * sz
+                    self.emit_op(Opcode::Mul, 14, 14, 15); // r14 = count * sz
                     self.emit_op(Opcode::Memcpy, 12, src_reg, 14);
                     self.emit_op(Opcode::Add, src_reg, src_reg, 14);
                     self.emit_op(Opcode::Add, 12, 12, 14);
                 }
                 None => {
                     // Variable-size elements: loop unflatten each into Vec data slots
-                    self.emit_store(14, 13, LOOP_STATE_BASE + 8);  // spill count
+                    self.emit_store(14, 13, LOOP_STATE_BASE + 8); // spill count
                     self.emit_store(src_reg, 13, LOOP_STATE_BASE + 16); // spill src_reg
-                    self.emit_op(Opcode::Add, 14, 12, 0);      // r14 = data start
+                    self.emit_op(Opcode::Add, 14, 12, 0); // r14 = data start
                     self.emit_store(14, 13, LOOP_STATE_BASE + 24); // spill dst_data_ptr
-                    // Reserve pointer array: count * 8
+                                                                   // Reserve pointer array: count * 8
                     self.emit_load(14, 13, LOOP_STATE_BASE + 8);
                     self.emit_op(Opcode::Addi, 15, 0, 3);
                     self.emit_op(Opcode::Shl, 14, 14, 15);
                     self.emit_op(Opcode::Add, 12, 12, 14);
 
-                    self.emit_op(Opcode::Addi, 14, 0, 0);      // i = 0
+                    self.emit_op(Opcode::Addi, 14, 0, 0); // i = 0
                     self.emit_store(14, 13, LOOP_STATE_BASE);
 
                     let loop_label = self.alloc_label();
@@ -2564,13 +2770,13 @@ impl CodeGen {
                     self.emit_load(15, 13, LOOP_STATE_BASE + 8);
                     self.emit_jump_placeholder(Opcode::Beq, 14, 15, done_label);
 
-                    self.emit_op(Opcode::Push, 12, 0, 0);      // save elem_ptr
+                    self.emit_op(Opcode::Push, 12, 0, 0); // save elem_ptr
                     self.emit_load(src_reg, 13, LOOP_STATE_BASE + 16);
                     let elem_ty_clone = (**elem_ty).clone();
                     self.emit_unflatten(&elem_ty_clone, src_reg, 14);
                     self.emit_store(src_reg, 13, LOOP_STATE_BASE + 16);
 
-                    self.emit_op(Opcode::Pop, 15, 0, 0);       // r15 = elem_ptr
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = elem_ptr
                     self.emit_load(14, 13, LOOP_STATE_BASE + 24);
                     self.emit_store(15, 14, 0);
                     self.emit_op(Opcode::Addi, 14, 14, 8);
@@ -2585,13 +2791,15 @@ impl CodeGen {
                     self.emit_load(src_reg, 13, LOOP_STATE_BASE + 16);
                 }
             }
-            if dst_saved { self.emit_op(Opcode::Pop, dst_reg, 0, 0); }
+            if dst_saved {
+                self.emit_op(Opcode::Pop, dst_reg, 0, 0);
+            }
         } else if let Ty::Struct(name) = ty {
             // Struct: ALWAYS recursive — allocate struct on heap with actual inline size,
             // unflatten each field at its actual byte offset.
             if let Some(fields) = self.struct_defs.get(name).cloned() {
                 let struct_size = self.compute_struct_size(name);
-                self.emit_op(Opcode::Push, 12, 0, 0);         // push struct base = r12
+                self.emit_op(Opcode::Push, 12, 0, 0); // push struct base = r12
                 if struct_size <= 0x1FFFF {
                     self.emit_op(Opcode::Addi, 12, 12, struct_size);
                 } else {
@@ -2599,7 +2807,8 @@ impl CodeGen {
                     self.emit_op(Opcode::Add, 12, 12, 15);
                 }
 
-                let offsets: Vec<(u32, Ty)> = fields.iter()
+                let offsets: Vec<(u32, Ty)> = fields
+                    .iter()
                     .map(|(fname, _)| self.lookup_field(name, fname))
                     .collect();
                 for (offset, fty) in &offsets {
@@ -2608,10 +2817,10 @@ impl CodeGen {
                         // then Memcpy into parent's inline slot at struct_base + offset.
                         let inner_size = self.field_byte_size(fty);
                         self.emit_unflatten(fty, src_reg, 14); // r14 = temp alloc ptr (src)
-                        self.emit_op(Opcode::Pop, 15, 0, 0);  // r15 = struct_base (peek)
+                        self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = struct_base (peek)
                         self.emit_op(Opcode::Push, 15, 0, 0);
                         self.emit_op(Opcode::Addi, 15, 15, *offset); // r15 = dst
-                        // Borrow r11 for len
+                                                                     // Borrow r11 for len
                         self.emit_op(Opcode::Push, 11, 0, 0);
                         self.load_u32_to_reg(11, inner_size);
                         self.emit_op(Opcode::Memcpy, 15, 14, 11); // dst=r15, src=r14, len=r11
@@ -2620,18 +2829,18 @@ impl CodeGen {
                         // Wide field: unflatten into wide register, Wstore at offset
                         let wd = WIDE_SCRATCH2; // w6
                         self.emit_unflatten(fty, src_reg, wd);
-                        self.emit_op(Opcode::Pop, 15, 0, 0);  // peek struct base
+                        self.emit_op(Opcode::Pop, 15, 0, 0); // peek struct base
                         self.emit_op(Opcode::Push, 15, 0, 0);
                         self.emit_store_typed(wd, 15, *offset as i32, fty);
                     } else {
                         // GP field or pointer: unflatten returns value in r14, typed store
                         self.emit_unflatten(fty, src_reg, 14);
-                        self.emit_op(Opcode::Pop, 15, 0, 0);  // peek struct base
+                        self.emit_op(Opcode::Pop, 15, 0, 0); // peek struct base
                         self.emit_op(Opcode::Push, 15, 0, 0);
                         self.emit_store_typed(14, 15, *offset as i32, fty);
                     }
                 }
-                self.emit_op(Opcode::Pop, dst_reg, 0, 0);     // dst = struct base
+                self.emit_op(Opcode::Pop, dst_reg, 0, 0); // dst = struct base
             }
         } else {
             // GP types: 8 bytes
@@ -2651,79 +2860,79 @@ impl CodeGen {
             // String/Bytes: read [byte_len:8][data...]
             // Build Vec layout at r12: [len:8][cap:8][data...]
             // dst_reg = base of new Vec = r12
-            self.emit_op(Opcode::Add, dst_reg, 12, 0);       // dst = r12 (Vec base)
-            // Save dst_reg if it conflicts with scratch
+            self.emit_op(Opcode::Add, dst_reg, 12, 0); // dst = r12 (Vec base)
+                                                       // Save dst_reg if it conflicts with scratch
             let dst_saved = dst_reg == 14 || dst_reg == 15;
             if dst_saved {
                 self.emit_op(Opcode::Push, dst_reg, 0, 0);
             }
-            self.emit_load(14, src_reg, 0);                    // r14 = byte_len
-            self.emit_op(Opcode::Addi, src_reg, src_reg, 8);  // advance past length prefix
-            // Write Vec header
-            self.emit_store(14, 12, 0);                        // header.length = byte_len
-            self.emit_store(14, 12, 8);                        // header.capacity = byte_len
+            self.emit_load(14, src_reg, 0); // r14 = byte_len
+            self.emit_op(Opcode::Addi, src_reg, src_reg, 8); // advance past length prefix
+                                                             // Write Vec header
+            self.emit_store(14, 12, 0); // header.length = byte_len
+            self.emit_store(14, 12, 8); // header.capacity = byte_len
             self.emit_op(Opcode::Addi, 12, 12, memory::VEC_DATA_OFFSET); // skip header
-            // Memcpy data from src to r12
-            self.emit_op(Opcode::Memcpy, 12, src_reg, 14);    // copy byte_len bytes
-            // Advance src_reg by align8(byte_len)
-            self.emit_op(Opcode::Addi, 15, 14, 7);            // r15 = byte_len + 7
-            self.emit_op(Opcode::Addi, 14, 0, 3);             // shift = 3
-            self.emit_op(Opcode::Shr, 15, 15, 14);            // r15 = (byte_len+7) >> 3
-            self.emit_op(Opcode::Shl, 15, 15, 14);            // r15 = align8(byte_len)
-            self.emit_op(Opcode::Add, src_reg, src_reg, 15);  // src_reg += aligned
-            // Advance r12 past data
-            self.emit_op(Opcode::Add, 12, 12, 15);            // r12 += aligned
+                                                                         // Memcpy data from src to r12
+            self.emit_op(Opcode::Memcpy, 12, src_reg, 14); // copy byte_len bytes
+                                                           // Advance src_reg by align8(byte_len)
+            self.emit_op(Opcode::Addi, 15, 14, 7); // r15 = byte_len + 7
+            self.emit_op(Opcode::Addi, 14, 0, 3); // shift = 3
+            self.emit_op(Opcode::Shr, 15, 15, 14); // r15 = (byte_len+7) >> 3
+            self.emit_op(Opcode::Shl, 15, 15, 14); // r15 = align8(byte_len)
+            self.emit_op(Opcode::Add, src_reg, src_reg, 15); // src_reg += aligned
+                                                             // Advance r12 past data
+            self.emit_op(Opcode::Add, 12, 12, 15); // r12 += aligned
             if dst_saved {
                 self.emit_op(Opcode::Pop, dst_reg, 0, 0);
             }
         } else if let Ty::Vec(elem_ty) = ty {
             let elem_size = serialized_elem_size(elem_ty);
             // dst_reg = base of new Vec = r12
-            self.emit_op(Opcode::Add, dst_reg, 12, 0);        // dst = Vec base
-            // Save dst_reg if it's a scratch register (r14/r15) — scratch gets
-            // clobbered during header setup and element processing below.
+            self.emit_op(Opcode::Add, dst_reg, 12, 0); // dst = Vec base
+                                                       // Save dst_reg if it's a scratch register (r14/r15) — scratch gets
+                                                       // clobbered during header setup and element processing below.
             let dst_saved = dst_reg == 14 || dst_reg == 15;
             if dst_saved {
                 self.emit_op(Opcode::Push, dst_reg, 0, 0);
             }
-            self.emit_load(14, src_reg, 0);                     // r14 = count
-            self.emit_op(Opcode::Addi, src_reg, src_reg, 8);   // advance past count prefix
-            // Write Vec header
-            self.emit_store(14, 12, 0);                         // header.length = count
-            self.emit_store(14, 12, 8);                         // header.capacity = count
+            self.emit_load(14, src_reg, 0); // r14 = count
+            self.emit_op(Opcode::Addi, src_reg, src_reg, 8); // advance past count prefix
+                                                             // Write Vec header
+            self.emit_store(14, 12, 0); // header.length = count
+            self.emit_store(14, 12, 8); // header.capacity = count
             self.emit_op(Opcode::Addi, 12, 12, memory::VEC_DATA_OFFSET); // skip header
 
             match elem_size {
                 Some(8) => {
                     // Vec<GP>: bulk Memcpy count*8 bytes
                     self.emit_op(Opcode::Addi, 15, 0, 3);
-                    self.emit_op(Opcode::Shl, 14, 14, 15);     // r14 = count * 8
+                    self.emit_op(Opcode::Shl, 14, 14, 15); // r14 = count * 8
                     self.emit_op(Opcode::Memcpy, 12, src_reg, 14); // copy data
                     self.emit_op(Opcode::Add, src_reg, src_reg, 14); // advance src
-                    self.emit_op(Opcode::Add, 12, 12, 14);     // advance r12
+                    self.emit_op(Opcode::Add, 12, 12, 14); // advance r12
                 }
                 Some(32) => {
                     // Vec<wide>: loop Wload/Wstore
                     // Spill state at r13+LOOP_STATE_BASE: +0=i, +8=count, +16=src_reg
-                    self.emit_store(14, 13, LOOP_STATE_BASE + 8);               // spill count
-                    self.emit_store(src_reg, 13, LOOP_STATE_BASE + 16);          // spill src_reg
-                    self.emit_op(Opcode::Addi, 14, 0, 0);      // i = 0
-                    self.emit_store(14, 13, LOOP_STATE_BASE);               // spill i
+                    self.emit_store(14, 13, LOOP_STATE_BASE + 8); // spill count
+                    self.emit_store(src_reg, 13, LOOP_STATE_BASE + 16); // spill src_reg
+                    self.emit_op(Opcode::Addi, 14, 0, 0); // i = 0
+                    self.emit_store(14, 13, LOOP_STATE_BASE); // spill i
 
                     let loop_label = self.alloc_label();
                     let done_label = self.alloc_label();
                     self.mark_label(loop_label);
 
-                    self.emit_load(14, 13, LOOP_STATE_BASE);                // r14 = i
-                    self.emit_load(15, 13, LOOP_STATE_BASE + 8);                // r15 = count
+                    self.emit_load(14, 13, LOOP_STATE_BASE); // r14 = i
+                    self.emit_load(15, 13, LOOP_STATE_BASE + 8); // r15 = count
                     self.emit_jump_placeholder(Opcode::Beq, 14, 15, done_label);
 
-                    self.emit_load(15, 13, LOOP_STATE_BASE + 16);                // r15 = src ptr
+                    self.emit_load(15, 13, LOOP_STATE_BASE + 16); // r15 = src ptr
                     self.emit_op(Opcode::Wload, WIDE_SCRATCH2, 15, 0);
                     self.emit_op(Opcode::Wstore, WIDE_SCRATCH2, 12, 0);
                     self.emit_op(Opcode::Addi, 12, 12, 32);
                     self.emit_op(Opcode::Addi, 15, 15, 32);
-                    self.emit_store(15, 13, LOOP_STATE_BASE + 16);               // update src ptr
+                    self.emit_store(15, 13, LOOP_STATE_BASE + 16); // update src ptr
 
                     self.emit_load(14, 13, LOOP_STATE_BASE);
                     self.emit_op(Opcode::Addi, 14, 14, 1);
@@ -2737,43 +2946,43 @@ impl CodeGen {
                 None => {
                     // Vec of variable-size elements: loop deserialize each into Vec data slots.
                     // Each data slot holds a pointer (8 bytes) to the deserialized object.
-                    self.emit_store(14, 13, LOOP_STATE_BASE + 8);               // spill count
-                    self.emit_store(src_reg, 13, LOOP_STATE_BASE + 16);          // spill src_reg
-                    // r13+224 = dst_data_ptr (where to write element pointers in Vec data)
-                    self.emit_op(Opcode::Add, 14, 12, 0);      // r14 = data start = r12
+                    self.emit_store(14, 13, LOOP_STATE_BASE + 8); // spill count
+                    self.emit_store(src_reg, 13, LOOP_STATE_BASE + 16); // spill src_reg
+                                                                        // r13+224 = dst_data_ptr (where to write element pointers in Vec data)
+                    self.emit_op(Opcode::Add, 14, 12, 0); // r14 = data start = r12
                     self.emit_store(14, 13, LOOP_STATE_BASE + 24);
                     // Reserve space for pointer array: count * 8 bytes
-                    self.emit_load(14, 13, LOOP_STATE_BASE + 8);                // r14 = count
+                    self.emit_load(14, 13, LOOP_STATE_BASE + 8); // r14 = count
                     self.emit_op(Opcode::Addi, 15, 0, 3);
-                    self.emit_op(Opcode::Shl, 14, 14, 15);     // r14 = count * 8
-                    self.emit_op(Opcode::Add, 12, 12, 14);     // r12 past pointer array
+                    self.emit_op(Opcode::Shl, 14, 14, 15); // r14 = count * 8
+                    self.emit_op(Opcode::Add, 12, 12, 14); // r12 past pointer array
 
-                    self.emit_op(Opcode::Addi, 14, 0, 0);      // i = 0
+                    self.emit_op(Opcode::Addi, 14, 0, 0); // i = 0
                     self.emit_store(14, 13, LOOP_STATE_BASE);
 
                     let loop_label = self.alloc_label();
                     let done_label = self.alloc_label();
                     self.mark_label(loop_label);
 
-                    self.emit_load(14, 13, LOOP_STATE_BASE);                // r14 = i
-                    self.emit_load(15, 13, LOOP_STATE_BASE + 8);                // r15 = count
+                    self.emit_load(14, 13, LOOP_STATE_BASE); // r14 = i
+                    self.emit_load(15, 13, LOOP_STATE_BASE + 8); // r15 = count
                     self.emit_jump_placeholder(Opcode::Beq, 14, 15, done_label);
 
                     // Deserialize element from src into heap at r12
                     // The deserialized object's base pointer will be r12 (before deserialize advances it)
-                    self.emit_op(Opcode::Push, 12, 0, 0);       // save elem_ptr = r12
-                    self.emit_load(src_reg, 13, LOOP_STATE_BASE + 16);            // restore src_reg
+                    self.emit_op(Opcode::Push, 12, 0, 0); // save elem_ptr = r12
+                    self.emit_load(src_reg, 13, LOOP_STATE_BASE + 16); // restore src_reg
                     let elem_ty_clone = (**elem_ty).clone();
                     // Use r14 as temp dst for deserialize (we just need r12 to be the base)
                     self.emit_deserialize(&elem_ty_clone, src_reg, 14);
-                    self.emit_store(src_reg, 13, LOOP_STATE_BASE + 16);           // save updated src_reg
+                    self.emit_store(src_reg, 13, LOOP_STATE_BASE + 16); // save updated src_reg
 
                     // Store element pointer into Vec data array
-                    self.emit_op(Opcode::Pop, 15, 0, 0);        // r15 = elem_ptr
-                    self.emit_load(14, 13, LOOP_STATE_BASE + 24);                 // r14 = dst_data_ptr
-                    self.emit_store(15, 14, 0);                  // *dst_data_ptr = elem_ptr
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = elem_ptr
+                    self.emit_load(14, 13, LOOP_STATE_BASE + 24); // r14 = dst_data_ptr
+                    self.emit_store(15, 14, 0); // *dst_data_ptr = elem_ptr
                     self.emit_op(Opcode::Addi, 14, 14, 8);
-                    self.emit_store(14, 13, LOOP_STATE_BASE + 24);                // advance dst_data_ptr
+                    self.emit_store(14, 13, LOOP_STATE_BASE + 24); // advance dst_data_ptr
 
                     // i++
                     self.emit_load(14, 13, LOOP_STATE_BASE);
@@ -2782,12 +2991,12 @@ impl CodeGen {
                     self.emit_jump_placeholder(Opcode::Jmp, 0, 0, loop_label);
 
                     self.mark_label(done_label);
-                    self.emit_load(src_reg, 13, LOOP_STATE_BASE + 16);            // restore final src_reg
+                    self.emit_load(src_reg, 13, LOOP_STATE_BASE + 16); // restore final src_reg
                 }
                 Some(_) => {
                     // 16-byte elements: bulk Memcpy count*16
-                    self.emit_op(Opcode::Addi, 15, 0, 4);      // shift = 4
-                    self.emit_op(Opcode::Shl, 14, 14, 15);     // r14 = count * 16
+                    self.emit_op(Opcode::Addi, 15, 0, 4); // shift = 4
+                    self.emit_op(Opcode::Shl, 14, 14, 15); // r14 = count * 16
                     self.emit_op(Opcode::Memcpy, 12, src_reg, 14);
                     self.emit_op(Opcode::Add, src_reg, src_reg, 14);
                     self.emit_op(Opcode::Add, 12, 12, 14);
@@ -2799,10 +3008,12 @@ impl CodeGen {
             }
         } else if let Ty::Struct(name) = ty {
             if let Some(fields) = self.struct_defs.get(name).cloned() {
-                let has_nested = fields.iter().any(|(_, fty)| matches!(fty, Ty::Struct(_)) || is_blob_type(fty));
+                let has_nested = fields
+                    .iter()
+                    .any(|(_, fty)| matches!(fty, Ty::Struct(_)) || is_blob_type(fty));
                 if has_nested {
                     // Recursive: allocate struct on heap, deserialize each field
-                    self.emit_op(Opcode::Push, 12, 0, 0);       // push struct base = r12
+                    self.emit_op(Opcode::Push, 12, 0, 0); // push struct base = r12
                     let field_count = fields.len() as u32;
                     let struct_size = field_count * memory::WORD_SIZE;
                     self.emit_op(Opcode::Addi, 12, 12, struct_size); // reserve struct space
@@ -2812,21 +3023,21 @@ impl CodeGen {
                         // Deserialize field from src into temp register, then store to struct
                         if is_wide_type(&fty) {
                             self.emit_deserialize(&fty, src_reg, 14); // wide → but we use 14 as GP temp
-                            // For wide fields in struct, store the wide value at struct+offset
-                            // Actually wide fields need 32 bytes but struct layout uses 8 per field (pointer)
-                            // This is a limitation — skip for now
-                            self.emit_op(Opcode::Pop, 15, 0, 0);     // peek struct base
+                                                                      // For wide fields in struct, store the wide value at struct+offset
+                                                                      // Actually wide fields need 32 bytes but struct layout uses 8 per field (pointer)
+                                                                      // This is a limitation — skip for now
+                            self.emit_op(Opcode::Pop, 15, 0, 0); // peek struct base
                             self.emit_op(Opcode::Push, 15, 0, 0);
                             self.emit_store(14, 15, offset as i32);
                         } else {
                             self.emit_deserialize(&fty, src_reg, 14);
                             // Store field value/pointer at struct[offset]
-                            self.emit_op(Opcode::Pop, 15, 0, 0);     // peek struct base
+                            self.emit_op(Opcode::Pop, 15, 0, 0); // peek struct base
                             self.emit_op(Opcode::Push, 15, 0, 0);
                             self.emit_store(14, 15, offset as i32);
                         }
                     }
-                    self.emit_op(Opcode::Pop, dst_reg, 0, 0);   // dst = struct base
+                    self.emit_op(Opcode::Pop, dst_reg, 0, 0); // dst = struct base
                 } else {
                     // Flat: all GP fields, bulk Memcpy
                     let byte_size = (fields.len() as u32) * memory::WORD_SIZE;
@@ -2844,7 +3055,6 @@ impl CodeGen {
             self.emit_op(Opcode::Addi, src_reg, src_reg, 8);
         }
     }
-
 }
 
 // ============================================================================
@@ -2902,9 +3112,16 @@ fn field_byte_size(ty: &Ty) -> u32 {
 /// Used by Borsh-style serialization to decide between memcpy (fixed) and loop (variable).
 fn serialized_elem_size(ty: &Ty) -> Option<u32> {
     match ty {
-        Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64
-        | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64
-        | Ty::Bool | Ty::Enum(_) => Some(8),
+        Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::U64
+        | Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::I64
+        | Ty::Bool
+        | Ty::Enum(_) => Some(8),
         Ty::U128 | Ty::I128 => Some(16),
         Ty::U256 | Ty::I256 | Ty::Address => Some(32),
         // Variable-size types: need recursive serialization
@@ -2923,9 +3140,16 @@ fn serialized_elem_size(ty: &Ty) -> Option<u32> {
 /// returns `Some(N*8)` for all-fixed-field structs (enabling bulk copy for Vec<Struct>).
 fn flat_elem_size(ty: &Ty, struct_defs: &HashMap<String, Vec<(String, Ty)>>) -> Option<u32> {
     match ty {
-        Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64
-        | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64
-        | Ty::Bool | Ty::Enum(_) => Some(8),
+        Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::U64
+        | Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::I64
+        | Ty::Bool
+        | Ty::Enum(_) => Some(8),
         Ty::U128 | Ty::I128 => Some(16),
         Ty::U256 | Ty::I256 | Ty::Address => Some(32),
         Ty::StringTy | Ty::Bytes | Ty::Vec(_) => None, // variable due to inline data
@@ -2951,9 +3175,9 @@ pub fn compute_selector(name: &str) -> u32 {
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
-    use crate::parser::Parser;
     use crate::lower;
     use crate::optimize;
+    use crate::parser::Parser;
 
     fn compile(src: &str) -> CompiledContract {
         let (tokens, _) = Lexer::new(src).tokenize();
@@ -2981,21 +3205,34 @@ mod tests {
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 1000 { break; } }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 1000 {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
         vm
     }
 
-    fn run_pvm_with_context(bytecode: &[u8], ctx: pyde_vm::vm::ExecutionContext) -> pyde_vm::vm::Vm {
+    fn run_pvm_with_context(
+        bytecode: &[u8],
+        ctx: pyde_vm::vm::ExecutionContext,
+    ) -> pyde_vm::vm::Vm {
         let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000, ctx);
         vm.load(bytecode).unwrap();
         let mut steps = 0;
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 1000 { break; } }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 1000 {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
@@ -3008,18 +3245,21 @@ mod tests {
 
     #[test]
     fn pvm_return_42() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 { return 42; }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 42);
     }
 
     #[test]
     fn pvm_arithmetic() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a = 10;
@@ -3027,14 +3267,16 @@ mod tests {
                     return a + b;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 30);
     }
 
     #[test]
     fn pvm_subtraction() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a = 100;
@@ -3042,109 +3284,125 @@ mod tests {
                     return a - b;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 63);
     }
 
     #[test]
     fn pvm_multiplication() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     return 7 * 6;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 42);
     }
 
     #[test]
     fn pvm_division() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     return 100 / 3;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 33);
     }
 
     #[test]
     fn pvm_modulo() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     return 100 % 7;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 2);
     }
 
     #[test]
     fn pvm_comparison_gt() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     if 10 > 5 { return 1; }
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1);
     }
 
     #[test]
     fn pvm_comparison_lt() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     if 3 < 7 { return 1; }
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1);
     }
 
     #[test]
     fn pvm_comparison_eq() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     if 42 == 42 { return 1; }
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1);
     }
 
     #[test]
     fn pvm_comparison_neq() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     if 42 != 43 { return 1; }
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1);
     }
 
     #[test]
     fn pvm_multiple_branches() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let x = 15;
@@ -3153,14 +3411,16 @@ mod tests {
                     return 3;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 2);
     }
 
     #[test]
     fn pvm_nested_arithmetic() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a = 100;
@@ -3170,7 +3430,8 @@ mod tests {
                     return d;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 140);
     }
@@ -3181,7 +3442,8 @@ mod tests {
 
     #[test]
     fn pvm_for_loop() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let mut x = 0;
@@ -3191,14 +3453,16 @@ mod tests {
                     return x;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 3);
     }
 
     #[test]
     fn pvm_while_loop() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let mut x = 1;
@@ -3208,14 +3472,16 @@ mod tests {
                     return x;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 128);
     }
 
     #[test]
     fn pvm_mutable_var() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let mut x = 10;
@@ -3224,7 +3490,8 @@ mod tests {
                     return x;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 30);
     }
@@ -3235,7 +3502,8 @@ mod tests {
 
     #[test]
     fn pvm_logical_not() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let x = !true;
@@ -3243,14 +3511,16 @@ mod tests {
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 0);
     }
 
     #[test]
     fn pvm_bitwise_ops() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a: u64 = 0xFF;
@@ -3258,7 +3528,8 @@ mod tests {
                     return a & b;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 0x0F);
     }
@@ -3269,20 +3540,25 @@ mod tests {
 
     #[test]
     fn pvm_revert() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 error Fail {}
                 pub fn f() -> u64 {
                     revert!(Fail {});
                 }
             }
-        "#);
+        "#,
+        );
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(100_000);
         vm.load(&compiled.bytecode).unwrap();
         let mut result = None;
         loop {
             match vm.step() {
-                Ok(Some(r)) => { result = Some(r); break; }
+                Ok(Some(r)) => {
+                    result = Some(r);
+                    break;
+                }
                 Ok(None) => continue,
                 Err(_) => break,
             }
@@ -3296,11 +3572,13 @@ mod tests {
 
     #[test]
     fn pvm_gas_remaining() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 { return gas_remaining(); }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert!(vm.cpu.read_gp(1) > 0);
     }
@@ -3311,7 +3589,8 @@ mod tests {
 
     #[test]
     fn pvm_storage_write_read() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage { value: u64, }
                 pub fn f() -> u64 {
@@ -3319,7 +3598,8 @@ mod tests {
                     return self.value;
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             self_address: [1u8; 32],
             ..Default::default()
@@ -3330,7 +3610,8 @@ mod tests {
 
     #[test]
     fn pvm_storage_multiple_fields() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage { a: u64, b: u64, }
                 pub fn f() -> u64 {
@@ -3339,7 +3620,8 @@ mod tests {
                     return self.a + self.b;
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             self_address: [2u8; 32],
             ..Default::default()
@@ -3354,7 +3636,8 @@ mod tests {
 
     #[test]
     fn pvm_struct_init_field_access() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 struct Point { x: u64, y: u64, }
                 pub fn f() -> u64 {
@@ -3362,14 +3645,16 @@ mod tests {
                     return p.x;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 10, "p.x should be 10");
     }
 
     #[test]
     fn pvm_struct_second_field() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 struct Point { x: u64, y: u64, }
                 pub fn f() -> u64 {
@@ -3377,7 +3662,8 @@ mod tests {
                     return p.y;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 20, "p.y should be 20");
     }
@@ -3388,14 +3674,16 @@ mod tests {
 
     #[test]
     fn pvm_tuple_destructuring() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let (a, b, c) = (10, 20, 30);
                     return b;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 20, "second tuple element should be 20");
     }
@@ -3403,14 +3691,16 @@ mod tests {
     #[test]
     fn pvm_tuple_dot_access() {
         // Test tuple .0/.1/.2 field access syntax
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let t = (10, 20, 30);
                     return t.1;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 20, "t.1 should be 20");
     }
@@ -3421,14 +3711,16 @@ mod tests {
 
     #[test]
     fn pvm_array_index() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let arr = [10, 20, 30];
                     return arr[2];
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 30, "arr[2] should be 30");
     }
@@ -3439,26 +3731,30 @@ mod tests {
 
     #[test]
     fn pvm_large_constant_18bit() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     return 262143;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 262143, "max 18-bit value");
     }
 
     #[test]
     fn pvm_large_constant_32bit() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     return 1000000;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1000000, "1 million");
     }
@@ -3466,13 +3762,15 @@ mod tests {
     #[test]
     fn pvm_large_constant_max_u64() {
         // Test with a value that requires all 4 chunks
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     return 1152921504606846975;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1152921504606846975u64);
     }
@@ -3483,7 +3781,8 @@ mod tests {
 
     #[test]
     fn pvm_cast_gp_copy() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a: u64 = 42;
@@ -3491,7 +3790,8 @@ mod tests {
                     return b;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 42);
     }
@@ -3502,13 +3802,15 @@ mod tests {
 
     #[test]
     fn pvm_block_timestamp() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     return block.timestamp;
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             timestamp: 1234567890,
             ..Default::default()
@@ -3519,13 +3821,15 @@ mod tests {
 
     #[test]
     fn pvm_block_height() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     return block.height;
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             block_number: 42,
             ..Default::default()
@@ -3540,7 +3844,8 @@ mod tests {
 
     #[test]
     fn codegen_selectors() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 #[constructor]
                 pub fn init() {}
@@ -3548,7 +3853,8 @@ mod tests {
                 pub fn balance_of() -> u64 { return 0; }
                 fn internal_helper() {}
             }
-        "#);
+        "#,
+        );
         assert_eq!(compiled.selectors.len(), 2);
         let names: Vec<&str> = compiled.selectors.iter().map(|s| s.1.as_str()).collect();
         assert!(names.contains(&"transfer"));
@@ -3557,18 +3863,21 @@ mod tests {
 
     #[test]
     fn codegen_produces_valid_bytecode() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 { return 42; }
             }
-        "#);
+        "#,
+        );
         assert_eq!(compiled.bytecode.len(), compiled.instruction_count * 4);
         assert!(compiled.bytecode.len() > 0);
     }
 
     #[test]
     fn codegen_minimal_contract() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract Token {
                 storage { supply: u256, }
                 #[constructor]
@@ -3576,7 +3885,8 @@ mod tests {
                 #[view]
                 pub fn get_supply() -> u256 { return self.supply; }
             }
-        "#);
+        "#,
+        );
         assert_eq!(compiled.name, "Token");
         assert!(compiled.bytecode.len() > 0);
         assert_eq!(compiled.selectors.len(), 1);
@@ -3589,7 +3899,8 @@ mod tests {
 
     #[test]
     fn pvm_bitwise_or_xor_shl_shr() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a: u64 = 0x0F;
@@ -3599,14 +3910,16 @@ mod tests {
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1, "0x0F | 0xF0 = 0xFF = 255");
     }
 
     #[test]
     fn pvm_shift_left() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a: u64 = 1;
@@ -3614,14 +3927,16 @@ mod tests {
                     return a << b;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1024, "1 << 10 = 1024");
     }
 
     #[test]
     fn pvm_shift_right() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a: u64 = 1024;
@@ -3629,14 +3944,16 @@ mod tests {
                     return a >> b;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 128, "1024 >> 3 = 128");
     }
 
     #[test]
     fn pvm_index_set() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let mut arr = [10, 20, 30];
@@ -3644,14 +3961,16 @@ mod tests {
                     return arr[1];
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 99, "arr[1] after set should be 99");
     }
 
     #[test]
     fn pvm_internal_function_call() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 fn add(a: u64, b: u64) -> u64 {
                     return a + b;
@@ -3660,7 +3979,8 @@ mod tests {
                     return add(10, 32);
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 42, "add(10, 32) should be 42");
     }
@@ -3668,7 +3988,8 @@ mod tests {
     #[test]
     fn pvm_storage_accumulate() {
         // Write, read, modify, write back, read again
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage { counter: u64, }
                 pub fn f() -> u64 {
@@ -3678,7 +3999,8 @@ mod tests {
                     return self.counter;
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             self_address: [3u8; 32],
             ..Default::default()
@@ -3689,7 +4011,8 @@ mod tests {
 
     #[test]
     fn pvm_struct_three_fields() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 struct Color { r: u64, g: u64, b: u64, }
                 pub fn f() -> u64 {
@@ -3697,14 +4020,16 @@ mod tests {
                     return c.r + c.g + c.b;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 447, "255 + 128 + 64 = 447");
     }
 
     #[test]
     fn pvm_array_sum_loop() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let arr = [10, 20, 30, 40];
@@ -3715,14 +4040,16 @@ mod tests {
                     return sum;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 100, "10+20+30+40=100");
     }
 
     #[test]
     fn pvm_nested_if_else() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let x = 50;
@@ -3737,14 +4064,16 @@ mod tests {
                     }
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 2, "50 > 25 but not > 100 → 2");
     }
 
     #[test]
     fn pvm_for_loop_sum() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let mut sum = 0;
@@ -3754,35 +4083,40 @@ mod tests {
                     return sum;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 45, "0+1+2+...+9 = 45");
     }
 
     #[test]
     fn pvm_comparison_lteq() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     if 5 <= 5 { return 1; }
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1, "5 <= 5 should be true");
     }
 
     #[test]
     fn pvm_comparison_gteq() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     if 10 >= 5 { return 1; }
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1, "10 >= 5 should be true");
     }
@@ -3798,7 +4132,8 @@ mod tests {
         // by narrowing (which traps if > u64::MAX) or by comparing with a known value.
         // Simplest: check gas_remaining still works when msg.sender is in the function.
         // Better: use msg.sender in a comparison.
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage { owner: u64, }
                 pub fn f() -> u64 {
@@ -3806,7 +4141,8 @@ mod tests {
                     return 1;
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             caller: [0xAB; 32],
             self_address: [1u8; 32],
@@ -3815,16 +4151,25 @@ mod tests {
         let vm = run_pvm_with_context(&compiled.bytecode, ctx);
         // If Callvalue wrote to wrong register file, this would trap.
         // Returning 1 proves msg.sender didn't corrupt execution.
-        assert_eq!(vm.cpu.read_gp(1), 1, "msg.sender should not corrupt execution");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            1,
+            "msg.sender should not corrupt execution"
+        );
         // Also verify the wide register actually got the caller value
         let w = vm.cpu.read_wide(0); // first wide alloc = w0
-        assert_ne!(w, pyde_vm::wide::U256::ZERO, "msg.sender should be non-zero");
+        assert_ne!(
+            w,
+            pyde_vm::wide::U256::ZERO,
+            "msg.sender should be non-zero"
+        );
     }
 
     #[test]
     fn pvm_msg_value() {
         // msg.value is u256 (wide). Test with #[payable] function that reads it.
-        let (tokens, _) = Lexer::new(r#"
+        let (tokens, _) = Lexer::new(
+            r#"
             contract T {
                 #[payable]
                 pub fn f() -> u64 {
@@ -3832,7 +4177,9 @@ mod tests {
                     return 1;
                 }
             }
-        "#).tokenize();
+        "#,
+        )
+        .tokenize();
         let (file, _) = Parser::new(tokens).parse();
         let ir = lower::lower(&file);
         let mut codegen = CodeGen::new();
@@ -3850,14 +4197,16 @@ mod tests {
 
     #[test]
     fn pvm_address_of_self() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a = address(self);
                     return 1;
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             self_address: [0xCD; 32],
             ..Default::default()
@@ -3873,13 +4222,16 @@ mod tests {
     #[test]
     fn pvm_payable_guard_rejects_value() {
         // Non-payable function should revert when call_value > 0
-        let (tokens, _) = Lexer::new(r#"
+        let (tokens, _) = Lexer::new(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     return 42;
                 }
             }
-        "#).tokenize();
+        "#,
+        )
+        .tokenize();
         let (file, _) = Parser::new(tokens).parse();
         let ir = lower::lower(&file);
         let mut codegen = CodeGen::new();
@@ -3902,14 +4254,23 @@ mod tests {
         let mut steps = 0;
         loop {
             match vm.step() {
-                Ok(Some(r)) => { result = Some(r); break; }
-                Ok(None) => { steps += 1; if steps > 500 { break; } }
+                Ok(Some(r)) => {
+                    result = Some(r);
+                    break;
+                }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 500 {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
         assert!(
             matches!(result, Some(pyde_vm::vm::ExecResult::Revert)),
-            "non-payable function should revert when call_value > 0, got {:?}", result
+            "non-payable function should revert when call_value > 0, got {:?}",
+            result
         );
     }
 
@@ -3919,7 +4280,8 @@ mod tests {
 
     #[test]
     fn pvm_storage_map_write_read() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage { balances: Map<u64, u64>, }
                 pub fn f() -> u64 {
@@ -3927,7 +4289,8 @@ mod tests {
                     return self.balances[42];
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             self_address: [5u8; 32],
             ..Default::default()
@@ -3944,7 +4307,8 @@ mod tests {
     fn pvm_reentrancy_guard_sets_and_clears() {
         // Verify the reentrancy guard doesn't prevent a single normal call.
         // The guard sets lock=1 before function body, clears lock=0 after return.
-        let (tokens, _) = Lexer::new(r#"
+        let (tokens, _) = Lexer::new(
+            r#"
             contract T {
                 storage { value: u64, }
                 pub fn f() -> u64 {
@@ -3952,7 +4316,9 @@ mod tests {
                     return self.value;
                 }
             }
-        "#).tokenize();
+        "#,
+        )
+        .tokenize();
         let (file, _) = Parser::new(tokens).parse();
         let ir = lower::lower(&file);
         let mut codegen = CodeGen::new();
@@ -3972,15 +4338,24 @@ mod tests {
         let mut steps = 0;
         loop {
             match vm.step() {
-                Ok(Some(r)) => { result = Some(r); break; }
-                Ok(None) => { steps += 1; if steps > 1000 { break; } }
+                Ok(Some(r)) => {
+                    result = Some(r);
+                    break;
+                }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 1000 {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
         // Should complete normally (Halt), not revert
         assert!(
             matches!(result, Some(pyde_vm::vm::ExecResult::Halt)),
-            "single call should succeed with reentrancy guard, got {:?}", result
+            "single call should succeed with reentrancy guard, got {:?}",
+            result
         );
         assert_eq!(vm.cpu.read_gp(1), 42, "should return 42");
     }
@@ -3992,29 +4367,34 @@ mod tests {
     #[test]
     fn pvm_dispatch_with_calldata() {
         // Test the full dispatch path: selector matching + calldata decode
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn add(a: u64, b: u64) -> u64 {
                     return a + b;
                 }
             }
-        "#);
+        "#,
+        );
         // Build calldata: [selector(4 bytes)] [arg0(8 bytes)] [arg1(8 bytes)]
         let selector = compute_selector("add");
         let mut calldata = Vec::new();
         calldata.extend_from_slice(&selector.to_be_bytes()); // 4 bytes selector (BE, like Ethereum)
-        calldata.extend_from_slice(&10u64.to_le_bytes());    // arg0 = 10
-        calldata.extend_from_slice(&32u64.to_le_bytes());    // arg1 = 32
+        calldata.extend_from_slice(&10u64.to_le_bytes()); // arg0 = 10
+        calldata.extend_from_slice(&32u64.to_le_bytes()); // arg1 = 32
 
         let mut codegen = CodeGen::new();
         codegen.emit_guards = true; // production mode with dispatch
-        let (tokens, _) = Lexer::new(r#"
+        let (tokens, _) = Lexer::new(
+            r#"
             contract T {
                 pub fn add(a: u64, b: u64) -> u64 {
                     return a + b;
                 }
             }
-        "#).tokenize();
+        "#,
+        )
+        .tokenize();
         let (file, _) = Parser::new(tokens).parse();
         let ir = lower::lower(&file);
         let compiled = codegen.generate(&ir);
@@ -4027,23 +4407,35 @@ mod tests {
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 500 { break; } }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 500 {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
-        assert_eq!(vm.cpu.read_gp(1), 42, "add(10, 32) via dispatch should be 42");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            42,
+            "add(10, 32) via dispatch should be 42"
+        );
     }
 
     #[test]
     fn pvm_storage_increment_persists() {
         // Verify that increment() actually writes to vm.storage
-        let (tokens, _) = Lexer::new(r#"
+        let (tokens, _) = Lexer::new(
+            r#"
             contract Counter {
                 storage { count: u64 }
                 pub fn increment() { self.count = self.count + 1; }
                 pub fn get_count() -> u64 { return self.count; }
             }
-        "#).tokenize();
+        "#,
+        )
+        .tokenize();
         let (file, _) = Parser::new(tokens).parse();
         let ir = lower::lower(&file);
         let mut codegen = CodeGen::new();
@@ -4066,8 +4458,15 @@ mod tests {
             println!("  key={} value_bytes={:?}", k, &v[..v.len().min(16)]);
         }
 
-        assert_eq!(output.outcome, pyde_vm::vm::Outcome::Success, "increment should succeed");
-        assert!(vm.storage.len() > 0, "vm.storage should have entries after Sstore");
+        assert_eq!(
+            output.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "increment should succeed"
+        );
+        assert!(
+            vm.storage.len() > 0,
+            "vm.storage should have entries after Sstore"
+        );
     }
 
     // ========================================================================
@@ -4077,7 +4476,8 @@ mod tests {
     #[test]
     fn pvm_wide_storage_u256() {
         // u256 storage field uses Sload/Sstore mode 0 (wide register)
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage { total: u256, }
                 pub fn f() -> u64 {
@@ -4085,7 +4485,8 @@ mod tests {
                     return 1;
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             self_address: [7u8; 32],
             ..Default::default()
@@ -4100,14 +4501,16 @@ mod tests {
 
     #[test]
     fn pvm_poseidon_hash() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let h = hash(42);
                     return 1;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1, "hash() should not trap");
     }
@@ -4119,7 +4522,8 @@ mod tests {
     #[test]
     fn pvm_event_emit_no_fields() {
         // emit uses keyword syntax: `emit EventName { fields };` (NOT emit!())
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 event Ping {}
                 pub fn f() -> u64 {
@@ -4127,7 +4531,8 @@ mod tests {
                     return 1;
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             self_address: [8u8; 32],
             ..Default::default()
@@ -4138,7 +4543,8 @@ mod tests {
 
     #[test]
     fn pvm_event_emit_with_fields() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 event Transfer { from: u64, to: u64, amount: u64, }
                 pub fn f() -> u64 {
@@ -4146,7 +4552,8 @@ mod tests {
                     return 1;
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             self_address: [9u8; 32],
             ..Default::default()
@@ -4162,7 +4569,8 @@ mod tests {
     #[test]
     fn pvm_u256_large_constant() {
         // u256 value > u64::MAX: store to heap, Wload, use in storage
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage { big: u256, }
                 pub fn f() -> u64 {
@@ -4170,7 +4578,8 @@ mod tests {
                     return 1;
                 }
             }
-        "#);
+        "#,
+        );
         let ctx = pyde_vm::vm::ExecutionContext {
             self_address: [10u8; 32],
             ..Default::default()
@@ -4186,7 +4595,8 @@ mod tests {
     #[test]
     fn pvm_many_locals_optimized() {
         // Optimizer folds constants, so this fits in few registers
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a = 1;
@@ -4200,28 +4610,36 @@ mod tests {
                     return a + b + c + d + e + g + h + i;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 36, "1+2+3+4+5+6+7+8=36");
     }
 
     #[test]
     fn pvm_array_repeat() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let arr = [0; 5];
                     return arr[3];
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
-        assert_eq!(vm.cpu.read_gp(1), 0, "repeated array should have 0 at index 3");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            0,
+            "repeated array should have 0 at index 3"
+        );
     }
 
     #[test]
     fn pvm_bitwise_not() {
-        let compiled = compile(r#"
+        let compiled = compile(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a: u64 = 0;
@@ -4230,7 +4648,8 @@ mod tests {
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         // ~0 = u64::MAX (all bits set, > 100)
         assert_eq!(vm.cpu.read_gp(1), 1, "bitwise NOT of 0 should be max");
@@ -4242,7 +4661,8 @@ mod tests {
 
     #[test]
     fn pvm_vec_push_and_len() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let mut v = Vec::new();
@@ -4250,14 +4670,16 @@ mod tests {
                     return v.len();
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 1, "Vec should have 1 element after push");
     }
 
     #[test]
     fn pvm_vec_push_and_pop() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let mut v = Vec::new();
@@ -4268,7 +4690,8 @@ mod tests {
                     return last;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 30, "pop should return last pushed (30)");
     }
@@ -4276,21 +4699,24 @@ mod tests {
     #[test]
     fn pvm_vec_is_empty() {
         // Simplest Vec test: create and return length
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let v = Vec::new();
                     return v.len();
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 0, "new Vec length should be 0");
     }
 
     #[test]
     fn pvm_vec_push_pop_sequence() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let mut v = Vec::new();
@@ -4301,14 +4727,16 @@ mod tests {
                     return v.len();
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 2, "push push pop push → len 2");
     }
 
     #[test]
     fn pvm_cast_widen_narrow() {
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a: u64 = 42;
@@ -4317,15 +4745,21 @@ mod tests {
                     return c;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
-        assert_eq!(vm.cpu.read_gp(1), 42, "u64 → u256 → u64 round-trip should be 42");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            42,
+            "u64 → u256 → u64 round-trip should be 42"
+        );
     }
 
     #[test]
     fn pvm_unary_neg() {
         // -10 as u64 wraps to u64::MAX - 9
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a: u64 = 10;
@@ -4333,17 +4767,24 @@ mod tests {
                     return b;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         let expected = 0u64.wrapping_sub(10); // u64::MAX - 9
-        assert_eq!(vm.cpu.read_gp(1), expected, "negation of 10 should wrap to {}", expected);
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            expected,
+            "negation of 10 should wrap to {}",
+            expected
+        );
     }
 
     #[test]
     fn pvm_register_spill_restore() {
         // This function uses >11 virtual registers, forcing spill/restore.
         // Without optimizer, each variable + temporary gets its own register.
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let a = 1;
@@ -4361,16 +4802,22 @@ mod tests {
                     return l + m + e + g;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         // l = 1+2 = 3, m = 3+4 = 7, result = 3 + 7 + 5 + 6 = 21
-        assert_eq!(vm.cpu.read_gp(1), 21, "spilled register values should be correct");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            21,
+            "spilled register values should be correct"
+        );
     }
 
     #[test]
     fn pvm_vec_push_loop() {
         // Push 10 elements in a loop (within initial capacity)
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let mut v = Vec::new();
@@ -4380,7 +4827,8 @@ mod tests {
                     return v.len();
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         assert_eq!(vm.cpu.read_gp(1), 10, "Vec should have 10 elements");
     }
@@ -4388,7 +4836,8 @@ mod tests {
     #[test]
     fn pvm_vec_realloc() {
         // Push 100 elements — exceeds initial capacity of 64, triggers Memcpy realloc
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 pub fn f() -> u64 {
                     let mut v = Vec::new();
@@ -4398,18 +4847,28 @@ mod tests {
                     return v.len();
                 }
             }
-        "#);
+        "#,
+        );
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
         vm.load(&compiled.bytecode).unwrap();
         let mut steps = 0;
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 50_000 { break; } }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 50_000 {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
-        assert_eq!(vm.cpu.read_gp(1), 100, "Vec should have 100 elements after realloc");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            100,
+            "Vec should have 100 elements after realloc"
+        );
     }
 
     #[test]
@@ -4417,7 +4876,8 @@ mod tests {
         // This test creates enough local variables to exhaust GP registers (r1-r11),
         // forcing the register allocator to spill. Then does map set/get to verify
         // spilled key/val registers are correctly handled in storage operations.
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage {
                     data: Map<u64, u64>,
@@ -4454,27 +4914,39 @@ mod tests {
                     return r1 + r2 + r3;
                 }
             }
-        "#);
+        "#,
+        );
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
         vm.load(&compiled.bytecode).unwrap();
         let mut steps = 0;
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 10_000 { break; } }
-                Err(e) => { panic!("PVM error: {:?}", e); }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 10_000 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    panic!("PVM error: {:?}", e);
+                }
             }
         }
         // data[1]=2, data[3]=4, data[5]=6 → r1+r2+r3 = 2+4+6 = 12
-        assert_eq!(vm.cpu.read_gp(1), 12,
-            "Map operations under register pressure must preserve correct key/val");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            12,
+            "Map operations under register pressure must preserve correct key/val"
+        );
     }
 
     #[test]
     fn pvm_map_set_bool_under_pressure() {
         // Regression test: map set of false (0) must not be confused with
         // a clobbered register that happens to be 0.
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage {
                     flags: Map<u64, bool>,
@@ -4513,19 +4985,30 @@ mod tests {
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
         vm.load(&compiled.bytecode).unwrap();
         let mut steps = 0;
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 10_000 { break; } }
-                Err(e) => { panic!("PVM error: {:?}", e); }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 10_000 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    panic!("PVM error: {:?}", e);
+                }
             }
         }
-        assert_eq!(vm.cpu.read_gp(1), 99,
-            "Bool map set(false) must work under register pressure");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            99,
+            "Bool map set(false) must work under register pressure"
+        );
     }
 
     #[test]
@@ -4534,7 +5017,8 @@ mod tests {
         // Multiple map reads/writes in a single function under heavy register pressure.
         // This is the exact pattern that was broken: read multiple map fields for an item,
         // compute fees, update balances, flip active flag.
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract Marketplace {
                 storage {
                     item_prices: Map<u64, u64>,
@@ -4600,19 +5084,30 @@ mod tests {
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
         vm.load(&compiled.bytecode).unwrap();
         let mut steps = 0;
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 100_000 { break; } }
-                Err(e) => { panic!("PVM error: {:?}", e); }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 100_000 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    panic!("PVM error: {:?}", e);
+                }
             }
         }
-        assert_eq!(vm.cpu.read_gp(1), 5050,
-            "Marketplace buy pattern: active flipped, balances correct, fees computed");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            5050,
+            "Marketplace buy pattern: active flipped, balances correct, fees computed"
+        );
     }
 
     #[test]
@@ -4620,7 +5115,8 @@ mod tests {
         // Reproduces the batch_reward pattern from the E2E StressTest:
         // 4 params, 3 map reads, fee math, 4 map writes — extreme register pressure.
         // This was producing off-by-16 for the second user's balance.
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage {
                     balances: Map<u64, u64>,
@@ -4659,21 +5155,32 @@ mod tests {
                     return r1 + r2 + r3 + r4;
                 }
             }
-        "#);
+        "#,
+        );
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
         vm.load(&compiled.bytecode).unwrap();
         let mut steps = 0;
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 100_000 { break; } }
-                Err(e) => { panic!("PVM error: {:?}", e); }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 100_000 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    panic!("PVM error: {:?}", e);
+                }
             }
         }
         // b10=38000+2700=40700, b20=39000+2700=41700, b30=21800+2700=24500, b1=1200+900=2100
         // total = 40700+41700+24500+2100 = 109000
-        assert_eq!(vm.cpu.read_gp(1), 109000,
-            "batch reward: all balances must be exact");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            109000,
+            "batch reward: all balances must be exact"
+        );
     }
 
     #[test]
@@ -4739,7 +5246,11 @@ mod tests {
         vm.calldata = calldata;
         vm.load(&contract.runtime_bytecode).unwrap();
         let output = vm.execute();
-        assert_eq!(output.outcome, pyde_vm::vm::Outcome::Success, "setup must succeed");
+        assert_eq!(
+            output.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "setup must succeed"
+        );
 
         // Step 2: Run batch_reward(10, 20, 30, 3000)
         let batch_sel = compute_selector("batch_reward");
@@ -4755,7 +5266,11 @@ mod tests {
         vm2.calldata = calldata;
         vm2.load(&contract.runtime_bytecode).unwrap();
         let output2 = vm2.execute();
-        assert_eq!(output2.outcome, pyde_vm::vm::Outcome::Success, "batch_reward must succeed");
+        assert_eq!(
+            output2.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "batch_reward must succeed"
+        );
 
         // per_user = (9000 - 900) / 3 = 2700
         assert_eq!(vm2.cpu.read_gp(1), 2700, "per_user return value");
@@ -4772,8 +5287,16 @@ mod tests {
         vm3.calldata = calldata20;
         vm3.load(&contract.runtime_bytecode).unwrap();
         let output3 = vm3.execute();
-        assert_eq!(output3.outcome, pyde_vm::vm::Outcome::Success, "get_balance must succeed");
-        assert_eq!(vm3.cpu.read_gp(1), 41700, "user20 balance = 39000 + 2700 = 41700");
+        assert_eq!(
+            output3.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "get_balance must succeed"
+        );
+        assert_eq!(
+            vm3.cpu.read_gp(1),
+            41700,
+            "user20 balance = 39000 + 2700 = 41700"
+        );
 
         // Check user10 balance
         let mut calldata10 = get_sel.to_be_bytes().to_vec();
@@ -4785,7 +5308,11 @@ mod tests {
         vm4.load(&contract.runtime_bytecode).unwrap();
         let output4 = vm4.execute();
         assert_eq!(output4.outcome, pyde_vm::vm::Outcome::Success);
-        assert_eq!(vm4.cpu.read_gp(1), 40700, "user10 balance = 38000 + 2700 = 40700");
+        assert_eq!(
+            vm4.cpu.read_gp(1),
+            40700,
+            "user10 balance = 38000 + 2700 = 40700"
+        );
     }
 
     #[test]
@@ -4860,8 +5387,8 @@ mod tests {
 
         // Helper: create a lazy backend from SMT
         let load_from_smt = |smt: &pyde_state::smt::PydeSMT,
-                              storage: &mut std::collections::HashMap<ethnum::U256, Vec<u8>>,
-                              keys: &[ethnum::U256]| {
+                             storage: &mut std::collections::HashMap<ethnum::U256, Vec<u8>>,
+                             keys: &[ethnum::U256]| {
             for key in keys {
                 let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
                 if let Some(val) = smt.get(&smt_key) {
@@ -4929,7 +5456,11 @@ mod tests {
         vm5.calldata = cd;
         vm5.load(&contract.runtime_bytecode).unwrap();
         let output = vm5.execute();
-        assert_eq!(output.outcome, pyde_vm::vm::Outcome::Success, "batch_reward must succeed");
+        assert_eq!(
+            output.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "batch_reward must succeed"
+        );
         assert_eq!(vm5.cpu.read_gp(1), 2700, "per_user = 2700");
 
         // Persist and read back
@@ -4961,7 +5492,8 @@ mod tests {
     #[test]
     fn pvm_vec_vec_storage() {
         // Vec<Vec<u64>> serialize + store: 2 inner Vecs with 3 elements each
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage {
                     data: Map<u64, Vec<Vec<u64>>>,
@@ -4988,7 +5520,8 @@ mod tests {
                     return 5;
                 }
             }
-        "#);
+        "#,
+        );
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
         vm.load(&compiled.bytecode).unwrap();
         let mut steps = 0;
@@ -4997,16 +5530,28 @@ mod tests {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     steps += 1;
-                    if steps > 200_000 { panic!("too many steps at step {}", steps); }
+                    if steps > 200_000 {
+                        panic!("too many steps at step {}", steps);
+                    }
                     // Print last 10 instructions before fault (around step 180-190)
                     if steps >= 150 && steps <= 245 {
                         let pc = vm.pc as usize;
                         if pc + 4 <= compiled.bytecode.len() {
-                            let w = u32::from_le_bytes(compiled.bytecode[pc..pc+4].try_into().unwrap());
+                            let w = u32::from_le_bytes(
+                                compiled.bytecode[pc..pc + 4].try_into().unwrap(),
+                            );
                             let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
-                            eprintln!("  step={} PC={} {:?} rd={} rs1={} imm={:#x} | r14={:#x} r15={:#x}",
-                                steps, pc, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
-                                vm.cpu.read_gp(14), vm.cpu.read_gp(15));
+                            eprintln!(
+                                "  step={} PC={} {:?} rd={} rs1={} imm={:#x} | r14={:#x} r15={:#x}",
+                                steps,
+                                pc,
+                                d.opcode,
+                                d.rd,
+                                d.rs1,
+                                d.rs2_or_imm,
+                                vm.cpu.read_gp(14),
+                                vm.cpu.read_gp(15)
+                            );
                         }
                     }
                 }
@@ -5014,8 +5559,10 @@ mod tests {
                     // Decode the faulting instruction
                     let pc = vm.pc as usize;
                     let instr_word = if pc + 4 <= compiled.bytecode.len() {
-                        u32::from_le_bytes(compiled.bytecode[pc..pc+4].try_into().unwrap())
-                    } else { 0 };
+                        u32::from_le_bytes(compiled.bytecode[pc..pc + 4].try_into().unwrap())
+                    } else {
+                        0
+                    };
                     let decoded = pyde_vm::isa::decode(pyde_vm::isa::Instruction(instr_word));
                     panic!("PVM trap at step {}, PC={} (instr {}): {:?}\n  opcode={:?} rd={} rs1={} imm={:#x}\n  r1={:#x} r2={:#x} r3={:#x} r4={:#x} r5={:#x}\n  r6={:#x} r7={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}\n  r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
                         steps, pc, pc/4, e,
@@ -5036,7 +5583,8 @@ mod tests {
     fn pvm_while_loop_over_vec() {
         // While loop iterating over a Vec — tests that IndexGet doesn't
         // clobber the loop counter or length registers.
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage {}
                 pub fn sum_vec() -> u64 {
@@ -5056,7 +5604,8 @@ mod tests {
                     return total;
                 }
             }
-        "#);
+        "#,
+        );
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
         vm.load(&compiled.bytecode).unwrap();
         let mut steps = 0;
@@ -5065,13 +5614,17 @@ mod tests {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     steps += 1;
-                    if steps > 50_000 { panic!("infinite loop at step {}", steps); }
+                    if steps > 50_000 {
+                        panic!("infinite loop at step {}", steps);
+                    }
                 }
                 Err(e) => {
                     let pc = vm.pc as usize;
                     let instr_word = if pc + 4 <= compiled.bytecode.len() {
-                        u32::from_le_bytes(compiled.bytecode[pc..pc+4].try_into().unwrap())
-                    } else { 0 };
+                        u32::from_le_bytes(compiled.bytecode[pc..pc + 4].try_into().unwrap())
+                    } else {
+                        0
+                    };
                     let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(instr_word));
                     panic!("PVM error at step {}, PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}\n  r1={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
                         steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
@@ -5144,10 +5697,16 @@ mod tests {
                 }
                 Err(e) => {
                     let pc = vm.pc as usize;
-                    let w = u32::from_le_bytes(contract.runtime_bytecode[pc..pc+4].try_into().unwrap_or([0;4]));
+                    let w = u32::from_le_bytes(
+                        contract.runtime_bytecode[pc..pc + 4]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    );
                     let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
-                    panic!("PVM trap at step {}, PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}",
-                        steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm);
+                    panic!(
+                        "PVM trap at step {}, PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}",
+                        steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm
+                    );
                 }
             }
         }
@@ -5195,7 +5754,11 @@ mod tests {
         vm1.calldata = store_sel.to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_vec must succeed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_vec must succeed"
+        );
 
         // Persist to SMT
         let mut smt = pyde_state::smt::PydeSMT::new();
@@ -5226,8 +5789,7 @@ mod tests {
                 Ok(None) => {
                     steps += 1;
                     if steps > 500_000 {
-                        panic!("infinite loop at step {} in sum_vec. PC={}",
-                            steps, vm2.pc);
+                        panic!("infinite loop at step {} in sum_vec. PC={}", steps, vm2.pc);
                     }
                 }
                 Err(e) => panic!("trap at step {}: {:?}", steps, e),
@@ -5291,22 +5853,35 @@ mod tests {
         let sel = compute_selector("store_vec");
         let mut cd = sel.to_be_bytes().to_vec();
         cd.extend_from_slice(&1u64.to_le_bytes());
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: contract_addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: contract_addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = cd;
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_vec failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_vec failed"
+        );
 
         // Persist to SMT
         let mut smt = pyde_state::smt::PydeSMT::new();
-        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+        for (k, v) in &vm1.storage {
+            let sk = sparse_merkle_tree::H256::from(k.to_le_bytes());
+            let _ = smt.insert(sk, v.clone());
+        }
 
         // Step 2: read_vec_sum(1) via lazy backend
         let sel2 = compute_selector("read_vec_sum");
         let mut cd2 = sel2.to_be_bytes().to_vec();
         cd2.extend_from_slice(&1u64.to_le_bytes());
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: contract_addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: contract_addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = cd2;
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
@@ -5321,12 +5896,16 @@ mod tests {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     steps += 1;
-                    if steps > 1_000_000 { panic!("infinite loop at step {}", steps); }
+                    if steps > 1_000_000 {
+                        panic!("infinite loop at step {}", steps);
+                    }
                     // Trace last 20 steps before cutoff
                     if steps >= 999_980 {
                         let pc = vm2.pc as usize;
                         if pc + 4 <= contract.runtime_bytecode.len() {
-                            let w = u32::from_le_bytes(contract.runtime_bytecode[pc..pc+4].try_into().unwrap());
+                            let w = u32::from_le_bytes(
+                                contract.runtime_bytecode[pc..pc + 4].try_into().unwrap(),
+                            );
                             let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
                             eprintln!("  s={} PC={} {:?} rd={} rs1={} imm={:#x} r1={} r2={} r14={:#x} r15={:#x}",
                                 steps, pc, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
@@ -5338,13 +5917,18 @@ mod tests {
                 Err(e) => panic!("trap at step {}: {:?}", steps, e),
             }
         }
-        assert_eq!(vm2.cpu.read_gp(1), 150, "sum = 10+20+30+40+50 = 150 (many-function contract)");
+        assert_eq!(
+            vm2.cpu.read_gp(1),
+            150,
+            "sum = 10+20+30+40+50 = 150 (many-function contract)"
+        );
     }
 
     #[test]
     fn pvm_vec_string_storage() {
         // Vec<String> storage: store vec of strings, read back lengths
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage {
                     tags: Map<u64, Vec<String>>,
@@ -5361,15 +5945,23 @@ mod tests {
                     return v.len();
                 }
             }
-        "#);
+        "#,
+        );
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
         vm.load(&compiled.bytecode).unwrap();
         let mut steps = 0;
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 200_000 { panic!("too many steps"); } }
-                Err(e) => { panic!("PVM error at step {}: {:?}", steps, e); }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 200_000 {
+                        panic!("too many steps");
+                    }
+                }
+                Err(e) => {
+                    panic!("PVM error at step {}: {:?}", steps, e);
+                }
             }
         }
         assert_eq!(vm.cpu.read_gp(1), 2, "stored 2 strings");
@@ -5378,7 +5970,8 @@ mod tests {
     #[test]
     fn pvm_string_storage() {
         // Test String storage: store a string, read it back, check length
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage {
                     names: Map<u64, String>,
@@ -5393,15 +5986,23 @@ mod tests {
                     return s.len();
                 }
             }
-        "#);
+        "#,
+        );
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(10_000_000);
         vm.load(&compiled.bytecode).unwrap();
         let mut steps = 0;
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 100_000 { panic!("too many steps"); } }
-                Err(e) => { panic!("PVM error at step {}: {:?}", steps, e); }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 100_000 {
+                        panic!("too many steps");
+                    }
+                }
+                Err(e) => {
+                    panic!("PVM error at step {}: {:?}", steps, e);
+                }
             }
         }
         // "hello world" = 11 chars
@@ -5446,7 +6047,10 @@ mod tests {
         let addr = [0x42u8; 32];
 
         // Setup
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("setup").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
@@ -5460,7 +6064,10 @@ mod tests {
         }
 
         // Rank
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = compute_selector("rank").to_be_bytes().to_vec();
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
@@ -5481,7 +6088,11 @@ mod tests {
                 }
                 Err(e) => {
                     let pc = vm2.pc as usize;
-                    let w = u32::from_le_bytes(contract.runtime_bytecode[pc..pc+4].try_into().unwrap_or([0;4]));
+                    let w = u32::from_le_bytes(
+                        contract.runtime_bytecode[pc..pc + 4]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    );
                     let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
                     panic!("trap at step {} PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}\n  r1={:#x} r2={:#x} r3={:#x} r4={:#x} r5={:#x} r6={:#x} r7={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}\n  r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
                         steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
@@ -5537,7 +6148,10 @@ mod tests {
         let addr = [0x55u8; 32];
 
         // Run create_hero
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("create_hero").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
@@ -5547,11 +6161,17 @@ mod tests {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     steps += 1;
-                    if steps > 1_000_000 { panic!("infinite loop"); }
+                    if steps > 1_000_000 {
+                        panic!("infinite loop");
+                    }
                 }
                 Err(e) => {
                     let pc = vm1.pc as usize;
-                    let w = u32::from_le_bytes(contract.runtime_bytecode[pc..pc+4].try_into().unwrap_or([0;4]));
+                    let w = u32::from_le_bytes(
+                        contract.runtime_bytecode[pc..pc + 4]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    );
                     let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
                     panic!("create_hero trap at step {} PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}\n  r1={:#x} r2={:#x} r3={:#x} r4={:#x} r5={:#x} r6={:#x} r7={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x}\n  r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
                         steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
@@ -5573,7 +6193,10 @@ mod tests {
         }
 
         // Run hero_power
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = compute_selector("hero_power").to_be_bytes().to_vec();
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
@@ -5588,11 +6211,17 @@ mod tests {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     steps += 1;
-                    if steps > 1_000_000 { panic!("infinite loop at step {}", steps); }
+                    if steps > 1_000_000 {
+                        panic!("infinite loop at step {}", steps);
+                    }
                 }
                 Err(e) => {
                     let pc = vm2.pc as usize;
-                    let w = u32::from_le_bytes(contract.runtime_bytecode[pc..pc+4].try_into().unwrap_or([0;4]));
+                    let w = u32::from_le_bytes(
+                        contract.runtime_bytecode[pc..pc + 4]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    );
                     let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
                     panic!("trap at step {} PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}\n  r1={:#x} r2={:#x} r3={:#x} r4={:#x} r5={:#x} r6={:#x} r7={:#x} r8={:#x}\n  r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
                         steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
@@ -5667,7 +6296,7 @@ mod tests {
         let mut calldata = store_sel.to_be_bytes().to_vec();
         // Blob prefix: byte_len = 48
         calldata.extend_from_slice(&56u64.to_le_bytes()); // flat: id(8)+score(8)+len(8)+cap(8)+3*tag(24)=56
-        // id = 42
+                                                          // id = 42
         calldata.extend_from_slice(&42u64.to_le_bytes());
         // score = 99
         calldata.extend_from_slice(&99u64.to_le_bytes());
@@ -5678,13 +6307,20 @@ mod tests {
         calldata.extend_from_slice(&20u64.to_le_bytes());
         calldata.extend_from_slice(&30u64.to_le_bytes());
 
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = calldata;
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success,
-            "store_profile failed: {:?}", out1.outcome);
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_profile failed: {:?}",
+            out1.outcome
+        );
 
         // Persist storage
         let mut smt = pyde_state::smt::PydeSMT::new();
@@ -5698,7 +6334,10 @@ mod tests {
         let mut cd2 = score_sel.to_be_bytes().to_vec();
         cd2.extend_from_slice(&42u64.to_le_bytes());
 
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = cd2;
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
@@ -5708,7 +6347,11 @@ mod tests {
         }));
         vm2.load(&contract.runtime_bytecode).unwrap();
         let out2 = vm2.execute();
-        assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success, "get_score failed");
+        assert_eq!(
+            out2.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "get_score failed"
+        );
         assert_eq!(vm2.cpu.read_gp(1), 99, "score should be 99");
 
         // === Step 3: Call tag_sum(42) — loop over Vec field from stored struct ===
@@ -5716,7 +6359,10 @@ mod tests {
         let mut cd3 = tag_sel.to_be_bytes().to_vec();
         cd3.extend_from_slice(&42u64.to_le_bytes());
 
-        let ctx3 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx3 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm3 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx3);
         vm3.calldata = cd3;
         let smt_ptr3 = &smt as *const pyde_state::smt::PydeSMT;
@@ -5726,7 +6372,11 @@ mod tests {
         }));
         vm3.load(&contract.runtime_bytecode).unwrap();
         let out3 = vm3.execute();
-        assert_eq!(out3.outcome, pyde_vm::vm::Outcome::Success, "tag_sum failed");
+        assert_eq!(
+            out3.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "tag_sum failed"
+        );
         assert_eq!(vm3.cpu.read_gp(1), 60, "tag_sum should be 10+20+30=60");
 
         // === Step 4: Call load_profile(42) — struct RETURN (blob serialization) ===
@@ -5734,7 +6384,10 @@ mod tests {
         let mut cd4 = load_sel.to_be_bytes().to_vec();
         cd4.extend_from_slice(&42u64.to_le_bytes());
 
-        let ctx4 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx4 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm4 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx4);
         vm4.calldata = cd4;
         let smt_ptr4 = &smt as *const pyde_state::smt::PydeSMT;
@@ -5744,14 +6397,21 @@ mod tests {
         }));
         vm4.load(&contract.runtime_bytecode).unwrap();
         let out4 = vm4.execute();
-        assert_eq!(out4.outcome, pyde_vm::vm::Outcome::Success, "load_profile failed");
+        assert_eq!(
+            out4.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "load_profile failed"
+        );
 
         // r1 = buffer pointer, r2 = byte length of Borsh-serialized Profile
         let r1 = vm4.cpu.read_gp(1) as usize;
         let r2 = vm4.cpu.read_gp(2) as usize;
         assert!(r2 > 0, "r2 should be > 0 for blob return");
         // Flat format: [id:8][score:8][len:8][cap:8][tag0:8][tag1:8][tag2:8] = 56 bytes
-        assert_eq!(r2, 56, "flat Profile should be 56 bytes (id+score+len+cap+3*tag)");
+        assert_eq!(
+            r2, 56,
+            "flat Profile should be 56 bytes (id+score+len+cap+3*tag)"
+        );
         let blob = vm4.memory.load_bytes(r1, r2);
         let id = u64::from_le_bytes(blob[0..8].try_into().unwrap());
         let score = u64::from_le_bytes(blob[8..16].try_into().unwrap());
@@ -5819,7 +6479,12 @@ mod tests {
             vm.calldata = compute_selector(sel_name).to_be_bytes().to_vec();
             vm.load(&compiled.runtime_bytecode).unwrap();
             let out = vm.execute();
-            assert_eq!(out.outcome, pyde_vm::vm::Outcome::Success, "{} failed", sel_name);
+            assert_eq!(
+                out.outcome,
+                pyde_vm::vm::Outcome::Success,
+                "{} failed",
+                sel_name
+            );
             (vm.cpu.read_gp(1), vm.cpu.read_wide(0))
         };
 
@@ -5837,7 +6502,11 @@ mod tests {
         assert_eq!(r1, 100_000_000, "tx.gas_limit");
 
         let (r1, _) = run("get_gas_remaining", &ctx);
-        assert!(r1 > 0 && r1 <= 10_000_000, "gas_remaining should be >0, got {}", r1);
+        assert!(
+            r1 > 0 && r1 <= 10_000_000,
+            "gas_remaining should be >0, got {}",
+            r1
+        );
 
         // Wide globals (returned in w0, with low 64 bits in r1)
         let (_, w0) = run("get_msg_sender", &ctx);
@@ -5863,7 +6532,8 @@ mod tests {
     fn pvm_packed_struct_mixed_field_sizes() {
         // Test packed layout: u8 (1B) + u8 (1B) + u64 (8B) + u64 (8B) = 18 bytes total
         // Offsets: age@+0, level@+1, hp@+2, score@+10
-        let compiled = compile_no_opt(r#"
+        let compiled = compile_no_opt(
+            r#"
             contract T {
                 storage {}
                 struct Char { age: u8, level: u8, hp: u64, score: u64, }
@@ -5876,10 +6546,15 @@ mod tests {
                     return a + l + h + s;
                 }
             }
-        "#);
+        "#,
+        );
         let vm = run_pvm(&compiled.bytecode);
         // 25 + 10 + 1000 + 9999 = 11034
-        assert_eq!(vm.cpu.read_gp(1), 11034, "packed struct field access: 25+10+1000+9999");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            11034,
+            "packed struct field access: 25+10+1000+9999"
+        );
     }
 
     #[test]
@@ -5909,12 +6584,19 @@ mod tests {
         let addr = [0x88u8; 32];
 
         // Store
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("store_stats").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_stats failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_stats failed"
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
         for (k, v) in &vm1.storage {
@@ -5923,7 +6605,10 @@ mod tests {
         }
 
         // Read
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = compute_selector("read_stats").to_be_bytes().to_vec();
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
@@ -5936,10 +6621,19 @@ mod tests {
         loop {
             match vm2.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 1_000_000 { panic!("infinite loop"); } }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 1_000_000 {
+                        panic!("infinite loop");
+                    }
+                }
                 Err(e) => {
                     let pc = vm2.pc as usize;
-                    let w = u32::from_le_bytes(contract.runtime_bytecode[pc..pc+4].try_into().unwrap_or([0;4]));
+                    let w = u32::from_le_bytes(
+                        contract.runtime_bytecode[pc..pc + 4]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    );
                     let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
                     panic!("trap at step {} PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}\n  r1={:#x} r2={:#x} r3={:#x} r4={:#x} r5={:#x} r6={:#x}\n  r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
                         steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
@@ -5951,7 +6645,11 @@ mod tests {
             }
         }
         // hp + mp * level = 100 + 50 * 5 = 350
-        assert_eq!(vm2.cpu.read_gp(1), 350, "packed struct storage roundtrip: 100 + 50*5");
+        assert_eq!(
+            vm2.cpu.read_gp(1),
+            350,
+            "packed struct storage roundtrip: 100 + 50*5"
+        );
     }
 
     #[test]
@@ -5992,7 +6690,10 @@ mod tests {
         let addr = [0x99u8; 32];
 
         // Create hero
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("create").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
@@ -6006,7 +6707,10 @@ mod tests {
         }
 
         // Read power
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = compute_selector("power").to_be_bytes().to_vec();
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
@@ -6019,10 +6723,19 @@ mod tests {
         loop {
             match vm2.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 1_000_000 { panic!("infinite loop"); } }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 1_000_000 {
+                        panic!("infinite loop");
+                    }
+                }
                 Err(e) => {
                     let pc = vm2.pc as usize;
-                    let w = u32::from_le_bytes(contract.runtime_bytecode[pc..pc+4].try_into().unwrap_or([0;4]));
+                    let w = u32::from_le_bytes(
+                        contract.runtime_bytecode[pc..pc + 4]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    );
                     let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
                     panic!("trap at step {} PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}\n  r1-r6: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n  r7-r11: {:#x} {:#x} {:#x} {:#x} {:#x}\n  r14={:#x} r15={:#x}",
                         steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
@@ -6035,7 +6748,11 @@ mod tests {
             }
         }
         // base = 100 + 50*5 = 350, bonus = 10+20+30+40+50 = 150, total = 500
-        assert_eq!(vm2.cpu.read_gp(1), 500, "packed hero power: 100+50*5+10+20+30+40+50");
+        assert_eq!(
+            vm2.cpu.read_gp(1),
+            500,
+            "packed hero power: 100+50*5+10+20+30+40+50"
+        );
     }
 
     #[test]
@@ -6075,12 +6792,19 @@ mod tests {
         let addr = [0xAAu8; 32];
 
         // Store
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("store_points").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_points failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_points failed"
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
         for (k, v) in &vm1.storage {
@@ -6089,7 +6813,10 @@ mod tests {
         }
 
         // Read
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = compute_selector("sum_points").to_be_bytes().to_vec();
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
@@ -6102,18 +6829,33 @@ mod tests {
         loop {
             match vm2.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 1_000_000 { panic!("infinite loop"); } }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 1_000_000 {
+                        panic!("infinite loop");
+                    }
+                }
                 Err(e) => {
                     let pc = vm2.pc as usize;
-                    let w = u32::from_le_bytes(contract.runtime_bytecode[pc..pc+4].try_into().unwrap_or([0;4]));
+                    let w = u32::from_le_bytes(
+                        contract.runtime_bytecode[pc..pc + 4]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    );
                     let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
-                    panic!("trap at step {} PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}",
-                        steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm);
+                    panic!(
+                        "trap at step {} PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}",
+                        steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm
+                    );
                 }
             }
         }
         // (10+20) + (30+40) + (50+60) = 210
-        assert_eq!(vm2.cpu.read_gp(1), 210, "Vec<Point> storage roundtrip: sum of x+y");
+        assert_eq!(
+            vm2.cpu.read_gp(1),
+            210,
+            "Vec<Point> storage roundtrip: sum of x+y"
+        );
     }
 
     #[test]
@@ -6145,9 +6887,9 @@ mod tests {
         let sel = compute_selector("sum_arg");
         let mut calldata = sel.to_be_bytes().to_vec();
         calldata.extend_from_slice(&48u64.to_le_bytes()); // byte_len = 48
-        calldata.extend_from_slice(&2u64.to_le_bytes());  // len = 2
-        calldata.extend_from_slice(&2u64.to_le_bytes());  // cap = 2
-        calldata.extend_from_slice(&5u64.to_le_bytes());  // p0.x = 5
+        calldata.extend_from_slice(&2u64.to_le_bytes()); // len = 2
+        calldata.extend_from_slice(&2u64.to_le_bytes()); // cap = 2
+        calldata.extend_from_slice(&5u64.to_le_bytes()); // p0.x = 5
         calldata.extend_from_slice(&10u64.to_le_bytes()); // p0.y = 10
         calldata.extend_from_slice(&20u64.to_le_bytes()); // p1.x = 20
         calldata.extend_from_slice(&40u64.to_le_bytes()); // p1.y = 40
@@ -6160,10 +6902,19 @@ mod tests {
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 1_000_000 { panic!("infinite loop"); } }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 1_000_000 {
+                        panic!("infinite loop");
+                    }
+                }
                 Err(e) => {
                     let pc = vm.pc as usize;
-                    let w = u32::from_le_bytes(contract.runtime_bytecode[pc..pc+4].try_into().unwrap_or([0;4]));
+                    let w = u32::from_le_bytes(
+                        contract.runtime_bytecode[pc..pc + 4]
+                            .try_into()
+                            .unwrap_or([0; 4]),
+                    );
                     let d = pyde_vm::isa::decode(pyde_vm::isa::Instruction(w));
                     panic!("trap at step {} PC={}: {:?}\n  {:?} rd={} rs1={} imm={:#x}\n  r1={:#x} r2={:#x} r3={:#x} r4={:#x} r5={:#x}\n  r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
                         steps, pc, e, d.opcode, d.rd, d.rs1, d.rs2_or_imm,
@@ -6231,12 +6982,20 @@ mod tests {
         let addr = [0xBBu8; 32];
 
         // Store
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("store_data").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_data failed: {:?}", out1.outcome);
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_data failed: {:?}",
+            out1.outcome
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
         for (k, v) in &vm1.storage {
@@ -6246,7 +7005,10 @@ mod tests {
 
         // Helper to run a function
         let run = |sel: &str| -> u64 {
-            let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+            let ctx = pyde_vm::vm::ExecutionContext {
+                self_address: addr,
+                ..Default::default()
+            };
             let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
             vm.calldata = compute_selector(sel).to_be_bytes().to_vec();
             let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
@@ -6294,22 +7056,38 @@ mod tests {
         let addr = [0xCCu8; 32];
 
         // Store
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("store_prof").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_prof failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_prof failed"
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
-        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+        for (k, v) in &vm1.storage {
+            let sk = sparse_merkle_tree::H256::from(k.to_le_bytes());
+            let _ = smt.insert(sk, v.clone());
+        }
 
         let run = |sel: &str| -> u64 {
-            let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+            let ctx = pyde_vm::vm::ExecutionContext {
+                self_address: addr,
+                ..Default::default()
+            };
             let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
             vm.calldata = compute_selector(sel).to_be_bytes().to_vec();
             let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
-            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+                let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+                unsafe { (*smt_ptr).get(&sk) }
+            }));
             vm.load(&contract.runtime_bytecode).unwrap();
             let out = vm.execute();
             assert_eq!(out.outcome, pyde_vm::vm::Outcome::Success, "{} failed", sel);
@@ -6351,22 +7129,38 @@ mod tests {
         let contract = CodeGen::new().generate(&ir);
         let addr = [0xDDu8; 32];
 
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("store_prof").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_prof failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_prof failed"
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
-        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+        for (k, v) in &vm1.storage {
+            let sk = sparse_merkle_tree::H256::from(k.to_le_bytes());
+            let _ = smt.insert(sk, v.clone());
+        }
 
         let run = |sel: &str| -> u64 {
-            let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+            let ctx = pyde_vm::vm::ExecutionContext {
+                self_address: addr,
+                ..Default::default()
+            };
             let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
             vm.calldata = compute_selector(sel).to_be_bytes().to_vec();
             let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
-            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+                let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+                unsafe { (*smt_ptr).get(&sk) }
+            }));
             vm.load(&contract.runtime_bytecode).unwrap();
             let out = vm.execute();
             assert_eq!(out.outcome, pyde_vm::vm::Outcome::Success, "{} failed", sel);
@@ -6374,7 +7168,12 @@ mod tests {
         };
 
         for (k, v) in &vm1.storage {
-            eprintln!("STORAGE key={}: {} bytes: {:02x?}", k, v.len(), &v[..v.len().min(80)]);
+            eprintln!(
+                "STORAGE key={}: {} bytes: {:02x?}",
+                k,
+                v.len(),
+                &v[..v.len().min(80)]
+            );
         }
         assert_eq!(run("get_age"), 30, "age");
         assert_eq!(run("get_name_len"), 5, "name 'alice' = 5 bytes");
@@ -6424,24 +7223,45 @@ mod tests {
         let contract = CodeGen::new().generate(&ir);
         let addr = [0xE1u8; 32];
 
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("store_matrix").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_matrix failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_matrix failed"
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
-        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+        for (k, v) in &vm1.storage {
+            let sk = sparse_merkle_tree::H256::from(k.to_le_bytes());
+            let _ = smt.insert(sk, v.clone());
+        }
 
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = compute_selector("sum_matrix").to_be_bytes().to_vec();
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
-        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            unsafe { (*smt_ptr).get(&sk) }
+        }));
         vm2.load(&contract.runtime_bytecode).unwrap();
         let out2 = vm2.execute();
-        assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success, "sum_matrix failed: {:?}", out2.outcome);
+        assert_eq!(
+            out2.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "sum_matrix failed: {:?}",
+            out2.outcome
+        );
         assert_eq!(vm2.cpu.read_gp(1), 21, "matrix sum: 1+2+3+4+5+6 = 21");
     }
 
@@ -6470,24 +7290,44 @@ mod tests {
         let contract = CodeGen::new().generate(&ir);
         let addr = [0xF0u8; 32];
 
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("store_addr").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_addr failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_addr failed"
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
-        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+        for (k, v) in &vm1.storage {
+            let sk = sparse_merkle_tree::H256::from(k.to_le_bytes());
+            let _ = smt.insert(sk, v.clone());
+        }
 
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = compute_selector("check_addr").to_be_bytes().to_vec();
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
-        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            unsafe { (*smt_ptr).get(&sk) }
+        }));
         vm2.load(&contract.runtime_bytecode).unwrap();
         let out2 = vm2.execute();
-        assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success, "check_addr failed");
+        assert_eq!(
+            out2.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "check_addr failed"
+        );
         assert_eq!(vm2.cpu.read_gp(1), 1, "stored address should match self");
     }
 
@@ -6516,25 +7356,49 @@ mod tests {
         let contract = CodeGen::new().generate(&ir);
         let addr = [0xE2u8; 32];
 
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("store_empty").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_empty failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_empty failed"
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
-        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+        for (k, v) in &vm1.storage {
+            let sk = sparse_merkle_tree::H256::from(k.to_le_bytes());
+            let _ = smt.insert(sk, v.clone());
+        }
 
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = compute_selector("check_empty").to_be_bytes().to_vec();
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
-        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            unsafe { (*smt_ptr).get(&sk) }
+        }));
         vm2.load(&contract.runtime_bytecode).unwrap();
         let out2 = vm2.execute();
-        assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success, "check_empty failed");
-        assert_eq!(vm2.cpu.read_gp(1), 0, "empty vec + empty string = 0 total len");
+        assert_eq!(
+            out2.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "check_empty failed"
+        );
+        assert_eq!(
+            vm2.cpu.read_gp(1),
+            0,
+            "empty vec + empty string = 0 total len"
+        );
     }
 
     #[test]
@@ -6561,21 +7425,37 @@ mod tests {
         let contract = CodeGen::new().generate(&ir);
         let addr = [0xE3u8; 32];
 
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("batch_write").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "batch_write failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "batch_write failed"
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
-        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+        for (k, v) in &vm1.storage {
+            let sk = sparse_merkle_tree::H256::from(k.to_le_bytes());
+            let _ = smt.insert(sk, v.clone());
+        }
 
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = compute_selector("total").to_be_bytes().to_vec();
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
-        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            unsafe { (*smt_ptr).get(&sk) }
+        }));
         vm2.load(&contract.runtime_bytecode).unwrap();
         let out2 = vm2.execute();
         assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success, "total failed");
@@ -6625,24 +7505,44 @@ mod tests {
         let contract = CodeGen::new().generate(&ir);
         let addr = [0xE4u8; 32];
 
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("set_paused").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "set_status failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "set_status failed"
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
-        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+        for (k, v) in &vm1.storage {
+            let sk = sparse_merkle_tree::H256::from(k.to_le_bytes());
+            let _ = smt.insert(sk, v.clone());
+        }
 
-        let ctx2 = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
         vm2.calldata = compute_selector("get_status").to_be_bytes().to_vec();
         let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
-        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            unsafe { (*smt_ptr).get(&sk) }
+        }));
         vm2.load(&contract.runtime_bytecode).unwrap();
         let out2 = vm2.execute();
-        assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success, "get_status failed");
+        assert_eq!(
+            out2.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "get_status failed"
+        );
         assert_eq!(vm2.cpu.read_gp(1), 1, "status should be Paused (1)");
     }
 
@@ -6676,23 +7576,41 @@ mod tests {
         let caller = [0xABu8; 32];
 
         let ctx = pyde_vm::vm::ExecutionContext {
-            self_address: addr, caller, call_value: ethnum::U256::ZERO, ..Default::default()
+            self_address: addr,
+            caller,
+            call_value: ethnum::U256::ZERO,
+            ..Default::default()
         };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("store_wallet").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_wallet failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_wallet failed"
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
-        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+        for (k, v) in &vm1.storage {
+            let sk = sparse_merkle_tree::H256::from(k.to_le_bytes());
+            let _ = smt.insert(sk, v.clone());
+        }
 
         let run = |sel: &str| -> u64 {
-            let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, caller, call_value: ethnum::U256::ZERO, ..Default::default() };
+            let ctx = pyde_vm::vm::ExecutionContext {
+                self_address: addr,
+                caller,
+                call_value: ethnum::U256::ZERO,
+                ..Default::default()
+            };
             let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
             vm.calldata = compute_selector(sel).to_be_bytes().to_vec();
             let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
-            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+                let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+                unsafe { (*smt_ptr).get(&sk) }
+            }));
             vm.load(&contract.runtime_bytecode).unwrap();
             let out = vm.execute();
             assert_eq!(out.outcome, pyde_vm::vm::Outcome::Success, "{} failed", sel);
@@ -6745,22 +7663,38 @@ mod tests {
         let contract = CodeGen::new().generate(&ir);
         let addr = [0xF1u8; 32];
 
-        let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
         let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
         vm1.calldata = compute_selector("store_player").to_be_bytes().to_vec();
         vm1.load(&contract.runtime_bytecode).unwrap();
         let out1 = vm1.execute();
-        assert_eq!(out1.outcome, pyde_vm::vm::Outcome::Success, "store_player failed");
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_player failed"
+        );
 
         let mut smt = pyde_state::smt::PydeSMT::new();
-        for (k, v) in &vm1.storage { let sk = sparse_merkle_tree::H256::from(k.to_le_bytes()); let _ = smt.insert(sk, v.clone()); }
+        for (k, v) in &vm1.storage {
+            let sk = sparse_merkle_tree::H256::from(k.to_le_bytes());
+            let _ = smt.insert(sk, v.clone());
+        }
 
         let run = |sel: &str| -> u64 {
-            let ctx = pyde_vm::vm::ExecutionContext { self_address: addr, ..Default::default() };
+            let ctx = pyde_vm::vm::ExecutionContext {
+                self_address: addr,
+                ..Default::default()
+            };
             let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
             vm.calldata = compute_selector(sel).to_be_bytes().to_vec();
             let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
-            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| { let sk = sparse_merkle_tree::H256::from(key.to_le_bytes()); unsafe { (*smt_ptr).get(&sk) } }));
+            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+                let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+                unsafe { (*smt_ptr).get(&sk) }
+            }));
             vm.load(&contract.runtime_bytecode).unwrap();
             let out = vm.execute();
             assert_eq!(out.outcome, pyde_vm::vm::Outcome::Success, "{} failed", sel);
@@ -6771,5 +7705,89 @@ mod tests {
         assert_eq!(run("get_hp"), 100, "hp");
         assert_eq!(run("get_xp"), 9999, "xp");
         assert_eq!(run("get_score_sum"), 30, "scores 10+20");
+    }
+
+    #[test]
+    fn hardening_u256_nonmap_storage() {
+        let src = r#"
+            contract T {
+                storage { supply: u256, count: u64, }
+                pub fn store_vals() {
+                    self.supply = 1000000 as u256;
+                    self.count = 7;
+                }
+                pub fn get_supply() -> u256 { return self.supply; }
+                pub fn get_count() -> u64 { return self.count; }
+            }
+        "#;
+        let (tokens, _) = crate::lexer::Lexer::new(src).tokenize();
+        let (file, _) = crate::parser::Parser::new(tokens).parse();
+        let mut ir = crate::lower::lower(&file);
+        crate::optimize::optimize(&mut ir);
+        let contract = CodeGen::new().generate(&ir);
+        let addr = [0xF2u8; 32];
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
+        let mut vm1 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+        vm1.calldata = compute_selector("store_vals").to_be_bytes().to_vec();
+        vm1.load(&contract.runtime_bytecode).unwrap();
+        let out1 = vm1.execute();
+        assert_eq!(
+            out1.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "store_vals failed"
+        );
+
+        let mut smt = pyde_state::smt::PydeSMT::new();
+        for (k, v) in &vm1.storage {
+            let sk = sparse_merkle_tree::H256::from(k.to_le_bytes());
+            let _ = smt.insert(sk, v.clone());
+        }
+
+        let run_gp = |sel: &str| -> u64 {
+            let ctx = pyde_vm::vm::ExecutionContext {
+                self_address: addr,
+                ..Default::default()
+            };
+            let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+            vm.calldata = compute_selector(sel).to_be_bytes().to_vec();
+            let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+            vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+                let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+                unsafe { (*smt_ptr).get(&sk) }
+            }));
+            vm.load(&contract.runtime_bytecode).unwrap();
+            let out = vm.execute();
+            assert_eq!(out.outcome, pyde_vm::vm::Outcome::Success, "{} failed", sel);
+            vm.cpu.read_gp(1)
+        };
+        assert_eq!(run_gp("get_count"), 7, "count should be 7");
+
+        let ctx2 = pyde_vm::vm::ExecutionContext {
+            self_address: addr,
+            ..Default::default()
+        };
+        let mut vm2 = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx2);
+        vm2.calldata = compute_selector("get_supply").to_be_bytes().to_vec();
+        let smt_ptr = &smt as *const pyde_state::smt::PydeSMT;
+        vm2.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let sk = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            unsafe { (*smt_ptr).get(&sk) }
+        }));
+        vm2.load(&contract.runtime_bytecode).unwrap();
+        let out2 = vm2.execute();
+        assert_eq!(
+            out2.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "get_supply failed"
+        );
+        assert_eq!(
+            vm2.cpu.read_wide(0),
+            ethnum::U256::from(1_000_000u64),
+            "supply should be 1000000"
+        );
     }
 }
