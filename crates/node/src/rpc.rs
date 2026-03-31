@@ -419,8 +419,27 @@ impl PydeApiServer for RpcServer {
         let success = output.outcome == pyde_vm::vm::Outcome::Success;
 
         if success {
-            let return_value = vm.cpu.read_gp(1);
-            Ok(format!("0x{:x}", return_value))
+            // Check r2 for blob return (Struct/Vec/String): r1=pointer, r2=byte_length
+            let r2 = vm.cpu.read_gp(2);
+            if r2 > 0 {
+                let r1 = vm.cpu.read_gp(1) as usize;
+                let len = r2 as usize;
+                // Read serialized blob from VM memory
+                let blob = vm.memory.load_bytes(r1, len);
+                Ok(format!("0x{}", hex::encode(blob)))
+            } else {
+                // Check wide register w0 for Address/u256 returns
+                let w0 = vm.cpu.read_wide(0);
+                if w0 != ethnum::U256::ZERO {
+                    // Wide return: format as full 32-byte hex
+                    let bytes = w0.to_le_bytes();
+                    Ok(format!("0x{}", hex::encode(bytes)))
+                } else {
+                    // GP return: r1
+                    let return_value = vm.cpu.read_gp(1);
+                    Ok(format!("0x{:x}", return_value))
+                }
+            }
         } else {
             Err(rpc_err(-32000, format!("execution failed: {:?}", output.outcome)))
         }

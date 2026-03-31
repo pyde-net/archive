@@ -272,8 +272,8 @@ pub enum Inst {
     /// `%dst = struct_init "name", [(field, reg)...]`
     StructInit(Reg, String, Vec<(String, Reg)>),
 
-    /// `%dst = field_get %obj, "field_name"`
-    FieldGet(Reg, Reg, String),
+    /// `%dst = field_get %obj, "struct_name", "field_name"`
+    FieldGet(Reg, Reg, String, String),
 
     /// `%dst = index_get %obj, %idx`
     IndexGet(Reg, Reg, Reg),
@@ -490,7 +490,10 @@ impl fmt::Display for Inst {
                 let fields_str: Vec<String> = fields.iter().map(|(n, r)| format!("{}: {}", n, r)).collect();
                 write!(f, "{} = {} {{ {} }}", dst, name, fields_str.join(", "))
             }
-            Inst::FieldGet(dst, obj, field) => write!(f, "{} = {}.{}", dst, obj, field),
+            Inst::FieldGet(dst, obj, sname, field) => {
+                if sname.is_empty() { write!(f, "{} = {}.{}", dst, obj, field) }
+                else { write!(f, "{} = {}:{}.{}", dst, obj, sname, field) }
+            }
             Inst::IndexGet(dst, obj, idx) => write!(f, "{} = {}[{}]", dst, obj, idx),
             Inst::IndexSet(obj, idx, val) => write!(f, "{}[{}] = {}", obj, idx, val),
             Inst::MakeTuple(dst, regs) => {
