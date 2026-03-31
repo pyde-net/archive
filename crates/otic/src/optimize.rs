@@ -302,7 +302,7 @@ fn collect_used_regs(inst: &Inst, used: &mut HashSet<Reg>) {
         Inst::ExtCall(_, addr, _, args) => { used.insert(*addr); for a in args { used.insert(*a); } }
         Inst::Hash(_, args) => { for a in args { used.insert(*a); } }
         Inst::StructInit(_, _, fields) => { for (_, r) in fields { used.insert(*r); } }
-        Inst::FieldGet(_, obj, _) => { used.insert(*obj); }
+        Inst::FieldGet(_, obj, _, _) => { used.insert(*obj); }
         Inst::IndexGet(_, obj, idx) => { used.insert(*obj); used.insert(*idx); }
         Inst::IndexSet(obj, idx, val) => { used.insert(*obj); used.insert(*idx); used.insert(*val); }
         Inst::MakeTuple(_, regs) => { for r in regs { used.insert(*r); } }
@@ -337,7 +337,7 @@ fn get_dest_reg(inst: &Inst) -> Option<Reg> {
         | Inst::Builtin(dst, _) | Inst::Call(dst, _, _)
         | Inst::MethodCall(dst, _, _, _) | Inst::ExtCall(dst, _, _, _)
         | Inst::Hash(dst, _) | Inst::StructInit(dst, _, _)
-        | Inst::FieldGet(dst, _, _) | Inst::IndexGet(dst, _, _)
+        | Inst::FieldGet(dst, _, _, _) | Inst::IndexGet(dst, _, _)
         | Inst::MakeTuple(dst, _) | Inst::TupleGet(dst, _, _)
         | Inst::MakeArray(dst, _) | Inst::ArrayRepeat(dst, _, _)
         | Inst::MakeVec(dst, _)

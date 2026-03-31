@@ -208,6 +208,11 @@ impl Memory {
         Ok(new_sp)
     }
 
+    /// Read a contiguous byte range from memory.
+    pub fn load_bytes(&self, addr: usize, len: usize) -> Vec<u8> {
+        (0..len).map(|i| self.read_byte((addr + i) as u32)).collect()
+    }
+
     // --- Byte-level load/store ---
 
     pub fn load8(&mut self, addr: u32) -> Result<u8, MemoryError> {

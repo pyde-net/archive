@@ -801,4 +801,117 @@ mod tests {
         assert_eq!(b30, 24500, "bal(30) = 21800 + 2700");
         assert_eq!(b1, 2100, "bal(1) = 1200 + 900");
     }
+
+    // ========== E2E: Otigen compile → deploy → call (struct + Vec + while loop) ==========
+
+    #[test]
+    fn e2e_rank_contract() {
+        // Compile the RankTest contract from source
+        let src = r#"
+            contract RankTest {
+                struct Player { id: u64, score: u64, }
+                storage {
+                    players: Map<u64, Player>,
+                    boards: Map<u64, Vec<u64>>,
+                }
+                #[constructor] pub fn init() {}
+                pub fn setup() {
+                    let p = Player { id: 1, score: 400 };
+                    self.players[1] = p;
+                    let mut b = Vec::new();
+                    b.push(100); b.push(200); b.push(300);
+                    self.boards[1] = b;
+                }
+                pub fn rank(pid: u64, bid: u64) -> u64 {
+                    let p = self.players[pid];
+                    let board = self.boards[bid];
+                    let score = p.score;
+                    let mut rank = 0;
+                    let mut i = 0;
+                    let len = board.len();
+                    while i < len {
+                        if board[i] > score { rank = rank + 1; }
+                        i = i + 1;
+                    }
+                    return rank + 1;
+                }
+            }
+        "#;
+
+        let (tokens, _) = otic::lexer::Lexer::new(src).tokenize();
+        let (file, _) = otic::parser::Parser::new(tokens).parse();
+        let mut ir = otic::lower::lower(&file);
+        otic::optimize::optimize(&mut ir);
+        let codegen = otic::codegen::CodeGen::new();
+        let contract = codegen.generate(&ir);
+
+        // Build deploy-format bytecode: [clen:4 LE][rlen:4 LE][constructor][runtime]
+        let clen = contract.constructor_bytecode.len() as u32;
+        let rlen = contract.runtime_bytecode.len() as u32;
+        let mut deploy_data = Vec::new();
+        deploy_data.extend_from_slice(&clen.to_le_bytes());
+        deploy_data.extend_from_slice(&rlen.to_le_bytes());
+        deploy_data.extend_from_slice(&contract.constructor_bytecode);
+        deploy_data.extend_from_slice(&contract.runtime_bytecode);
+
+        // Setup accounts and deploy
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let mut smt = PydeSMT::new();
+        let block_ctx = make_block_ctx();
+        let sender_addr = setup_funded_account(&mut smt, &pk_bytes, 1_000_000_000_000);
+        let contract_addr = pyde_account::address::derive_create_address(&sender_addr, 0);
+
+        // Deploy transaction
+        let mut deploy_tx = make_signed_tx(sender_addr, ZERO_ADDRESS, 0, 100_000_000, 0, &sk);
+        deploy_tx.tx_type = TransactionType::Deploy;
+        deploy_tx.data = deploy_data;
+        let hash = deploy_tx.hash();
+        deploy_tx.signature = falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+
+        let receipt = execute_transaction(&deploy_tx, &mut smt, &block_ctx).unwrap();
+        assert!(receipt.success, "deploy failed: {:?}", receipt);
+
+        // Verify contract code was stored
+        let code = load_code(&smt, &contract_addr);
+        assert!(code.is_some(), "contract code not found");
+        assert_eq!(code.unwrap(), contract.runtime_bytecode);
+
+        // Call setup() — populates storage with Player and board
+        let setup_sel = otic::codegen::compute_selector("setup");
+        let mut setup_tx = make_signed_tx(sender_addr, contract_addr, 0, 100_000_000, 1, &sk);
+        setup_tx.data = setup_sel.to_be_bytes().to_vec();
+        let hash = setup_tx.hash();
+        setup_tx.signature = falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+
+        let receipt = execute_transaction(&setup_tx, &mut smt, &block_ctx).unwrap();
+        assert!(receipt.success, "setup() failed: {:?}", receipt);
+
+        // Call rank(1, 1) via direct PVM execution (to read return value from r1)
+        // score=400, board=[100,200,300] — no entries > 400, so rank = 0+1 = 1
+        let rank_sel = otic::codegen::compute_selector("rank");
+        let mut calldata = rank_sel.to_be_bytes().to_vec();
+        calldata.extend_from_slice(&1u64.to_le_bytes()); // pid = 1
+        calldata.extend_from_slice(&1u64.to_le_bytes()); // bid = 1
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: contract_addr.into(),
+            ..Default::default()
+        };
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);
+        vm.calldata = calldata;
+
+        // Wire up storage backend to read from SMT
+        let smt_ptr = &smt as *const PydeSMT;
+        vm.storage_backend = Some(std::sync::Arc::new(move |key: &U256| {
+            let smt_key = H256::from(key.to_le_bytes());
+            unsafe { (*smt_ptr).get(&smt_key) }
+        }));
+
+        let runtime_code = load_code(&smt, &contract_addr).expect("runtime code");
+        vm.load(&runtime_code).unwrap();
+        let output = vm.execute();
+        assert_eq!(output.outcome, pyde_vm::vm::Outcome::Success, "rank() failed");
+        assert_eq!(vm.cpu.read_gp(1), 1, "rank should be 1 (no board entries > 400)");
+    }
 }

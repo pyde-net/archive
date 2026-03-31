@@ -38,8 +38,12 @@ struct Lowerer {
     current_fn: Option<IrFunction>,
     /// Variable name → register mapping (scoped).
     locals: Vec<HashMap<String, Reg>>,
+    /// Variable name → type (scoped, parallel to locals). For struct-aware FieldGet.
+    local_types: Vec<HashMap<String, Ty>>,
     /// Storage field name → slot index.
     storage_slots: HashMap<String, u32>,
+    /// Storage field name → type (for inferring struct types from Map<K, V> access).
+    storage_types: HashMap<String, Ty>,
     next_slot: u32,
     /// Loop label stack: (header_label, exit_label) for break/continue.
     loop_stack: Vec<(Label, Label)>,
@@ -47,6 +51,8 @@ struct Lowerer {
     enum_defs: HashMap<String, Vec<String>>,
     /// Const name → (value, type) for inlining.
     const_defs: HashMap<String, (U256, Ty)>,
+    /// Struct name → field definitions (for type lookups in FieldGet).
+    struct_field_defs: HashMap<String, Vec<(String, Ty)>>,
     /// Compiled contract bytecodes for `create!` embedding.
     /// Maps contract name → deploy-format bytes [clen:4][rlen:4][constructor][runtime].
     compiled_contracts: HashMap<String, Vec<u8>>,
@@ -70,10 +76,13 @@ impl Lowerer {
             },
             current_fn: None,
             locals: vec![HashMap::new()],
+            local_types: vec![HashMap::new()],
             storage_slots: HashMap::new(),
+            storage_types: HashMap::new(),
             next_slot: 0,
             loop_stack: Vec::new(),
             enum_defs: HashMap::new(),
+            struct_field_defs: HashMap::new(),
             compiled_contracts: HashMap::new(),
             const_defs: HashMap::new(),
         }
@@ -93,15 +102,23 @@ impl Lowerer {
 
     fn push_scope(&mut self) {
         self.locals.push(HashMap::new());
+        self.local_types.push(HashMap::new());
     }
 
     fn pop_scope(&mut self) {
         self.locals.pop();
+        self.local_types.pop();
     }
 
     fn declare_local(&mut self, name: &str, reg: Reg) {
         if let Some(scope) = self.locals.last_mut() {
             scope.insert(name.to_string(), reg);
+        }
+    }
+
+    fn declare_local_type(&mut self, name: &str, ty: Ty) {
+        if let Some(scope) = self.local_types.last_mut() {
+            scope.insert(name.to_string(), ty);
         }
     }
 
@@ -112,6 +129,90 @@ impl Lowerer {
             }
         }
         None
+    }
+
+    fn lookup_local_type(&self, name: &str) -> Option<Ty> {
+        for scope in self.local_types.iter().rev() {
+            if let Some(ty) = scope.get(name) {
+                return Some(ty.clone());
+            }
+        }
+        None
+    }
+
+    /// Infer the type of an expression (best-effort, for local_types tracking).
+    fn infer_expr_type(&self, expr: &ast::Expr) -> Option<Ty> {
+        use crate::ast::Expr;
+        match expr {
+            Expr::StructInit(path, _, _) => {
+                let name = path.last().map(|i| i.name.clone()).unwrap_or_default();
+                Some(Ty::Struct(name))
+            }
+            Expr::Ident(ident) => self.lookup_local_type(&ident.name),
+            Expr::FieldAccess(obj, field, _) => {
+                let parent = self.resolve_expr_struct_type(obj);
+                if !parent.is_empty() {
+                    if let Some(fields) = self.struct_field_defs.get(&parent) {
+                        for (fname, fty) in fields {
+                            if fname == &field.name {
+                                return Some(fty.clone());
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            // self.field[key] → infer value type from Map<K, V>
+            Expr::Index(obj, _, _) => {
+                if let Expr::FieldAccess(inner, field, _) = obj.as_ref() {
+                    if matches!(inner.as_ref(), Expr::SelfExpr(_)) {
+                        if let Some(map_ty) = self.storage_types.get(&field.name) {
+                            if let Ty::Map(_, val_ty) = map_ty {
+                                return Some(*val_ty.clone());
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve the struct type name for an expression (for FieldGet context).
+    /// Returns the struct name if the expression is known to be a struct type,
+    /// or empty string if unknown/non-struct.
+    fn resolve_expr_struct_type(&self, expr: &ast::Expr) -> String {
+        use crate::ast::Expr;
+        match expr {
+            Expr::Ident(ident) => {
+                // Look up variable type
+                if let Some(Ty::Struct(name)) = self.lookup_local_type(&ident.name) {
+                    name
+                } else {
+                    String::new()
+                }
+            }
+            Expr::FieldAccess(obj, field, _) => {
+                // Chained access: obj.field — determine the type of field
+                let parent_struct = self.resolve_expr_struct_type(obj);
+                if !parent_struct.is_empty() {
+                    // Look up the field's type in the parent struct
+                    if let Some(fields) = self.struct_field_defs.get(&parent_struct) {
+                        for (fname, fty) in fields {
+                            if fname == &field.name {
+                                if let Ty::Struct(inner) = fty {
+                                    return inner.clone();
+                                }
+                                return String::new();
+                            }
+                        }
+                    }
+                }
+                String::new()
+            }
+            _ => String::new(),
+        }
     }
 
     /// Convert an AST type to an IR type.
@@ -147,6 +248,7 @@ impl Lowerer {
         let slot = self.next_slot;
         self.next_slot += 1;
         self.storage_slots.insert(name.to_string(), slot);
+        self.storage_types.insert(name.to_string(), ty.clone());
         self.program.storage_fields.push(StorageFieldDef {
             name: name.to_string(),
             ty,
@@ -186,6 +288,7 @@ impl Lowerer {
                     let fields: Vec<(String, Ty)> = s.fields.iter()
                         .map(|f| (f.name.name.clone(), self.resolve_ty(&f.ty)))
                         .collect();
+                    self.struct_field_defs.insert(s.name.name.clone(), fields.clone());
                     self.program.struct_defs.push(ir::StructDef {
                         name: s.name.name.clone(),
                         fields,
@@ -265,6 +368,7 @@ impl Lowerer {
                     let fields: Vec<(String, Ty)> = s.fields.iter()
                         .map(|f| (f.name.name.clone(), self.resolve_ty(&f.ty)))
                         .collect();
+                    self.struct_field_defs.insert(s.name.name.clone(), fields.clone());
                     self.program.struct_defs.push(ir::StructDef {
                         name: s.name.name.clone(),
                         fields,
@@ -346,10 +450,11 @@ impl Lowerer {
         self.current_fn = Some(ir_func);
         self.push_scope();
 
-        // Declare parameters as local registers
-        for (name, _ty) in &params {
+        // Declare parameters as local registers (with type tracking)
+        for (name, ty) in &params {
             let reg = self.alloc_reg();
             self.declare_local(name, reg);
+            self.declare_local_type(name, ty.clone());
         }
 
         // Lower body
@@ -401,11 +506,18 @@ impl Lowerer {
     }
 
     fn lower_let(&mut self, l: &LetStmt) {
+        // Infer struct type from initializer for FieldGet context tracking
+        let inferred_ty = self.infer_expr_type(&l.initializer);
         let val = self.lower_expr(&l.initializer);
 
         match &l.binding {
             LetBinding::Name(name) => {
                 self.declare_local(&name.name, val);
+                if let Some(ty) = &l.ty {
+                    self.declare_local_type(&name.name, self.resolve_ty(ty));
+                } else if let Some(ty) = inferred_ty {
+                    self.declare_local_type(&name.name, ty);
+                }
             }
             LetBinding::Tuple(names, _) => {
                 // Destructure tuple into individual registers
@@ -721,14 +833,15 @@ impl Lowerer {
                 if field.name == "balance" {
                     let obj_reg = self.lower_expr(obj);
                     let dst = self.alloc_reg();
-                    self.emit(Inst::FieldGet(dst, obj_reg, "balance".into()));
+                    self.emit(Inst::FieldGet(dst, obj_reg, String::new(), "balance".into()));
                     return dst;
                 }
 
-                // obj.field → field_get
+                // obj.field → field_get with struct type context
+                let struct_name = self.resolve_expr_struct_type(obj);
                 let obj_reg = self.lower_expr(obj);
                 let dst = self.alloc_reg();
-                self.emit(Inst::FieldGet(dst, obj_reg, field.name.clone()));
+                self.emit(Inst::FieldGet(dst, obj_reg, struct_name, field.name.clone()));
                 dst
             }
 
