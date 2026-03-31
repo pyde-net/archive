@@ -79,7 +79,7 @@ impl Lowerer {
             local_types: vec![HashMap::new()],
             storage_slots: HashMap::new(),
             storage_types: HashMap::new(),
-            next_slot: 0,
+            next_slot: 1, // start from 1: slot 0 would collide with SMT default leaf
             loop_stack: Vec::new(),
             enum_defs: HashMap::new(),
             struct_field_defs: HashMap::new(),

@@ -749,12 +749,15 @@ impl CodeGen {
         self.emit_op(Opcode::Add, 12, 12, 15); // r12 += SPILL_AREA_TOTAL
 
         // Pre-map params to convention registers (r2, r3, ...)
-        // In test mode without dispatch, params aren't loaded from calldata,
-        // so standalone tests with params won't work (this is fine for now).
-        for (i, (_name, _ty)) in func.params.iter().enumerate() {
+        // Wide params (u256, Address) must also be marked in the wide set
+        // so that BinOp/Cmp/Return use the wide instruction path.
+        for (i, (_name, ty)) in func.params.iter().enumerate() {
             let vreg = Reg(i as u32);
             let phys = (i as u8) + 2; // r2, r3, r4, ...
             self.regs.pre_map(vreg, phys);
+            if is_wide_type(ty) {
+                self.regs.wide.insert(vreg);
+            }
         }
 
         // Store label remap for use in gen_instruction
