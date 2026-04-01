@@ -12,4 +12,5 @@ members = [
     "crates/net",
     "crates/otic",
     "crates/node",
+    "crates/pyde-dev",
 ]
