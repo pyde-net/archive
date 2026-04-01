@@ -1,4 +1,5 @@
 use crate::build;
+use crate::cheatcodes::{self, CheatcodeState};
 use crate::project;
 use std::collections::HashMap;
 use std::fs;
@@ -142,13 +143,14 @@ pub fn run(filter: Option<&str>) -> Result<(), String> {
             // Inject constructor storage (after load so it doesn't get cleared)
             vm.storage = snapshot;
 
-            // Execute
-            let output = vm.execute();
+            // Execute with cheatcode interception (fresh state per test)
+            let mut cheat_state = CheatcodeState::new();
+            let outcome = cheatcodes::execute_with_cheatcodes(&mut vm, &mut cheat_state);
             let gas = vm.gas_used_total;
 
             let ok = if meta.should_panic {
                 // Expected to revert
-                match output.outcome {
+                match outcome {
                     pyde_vm::vm::Outcome::Revert => {
                         // If expected_error specified, check revert data matches
                         if let Some(ref expected) = meta.expected_error {
@@ -170,13 +172,13 @@ pub fn run(filter: Option<&str>) -> Result<(), String> {
                         }
                     }
                     _ => {
-                        println!("    FAIL {} — expected revert but got {:?}", meta.name, output.outcome);
+                        println!("    FAIL {} — expected revert but got {:?}", meta.name, outcome);
                         false
                     }
                 }
             } else {
                 // Expected to succeed
-                match output.outcome {
+                match outcome {
                     pyde_vm::vm::Outcome::Success => true,
                     pyde_vm::vm::Outcome::Revert => {
                         // Decode error name from revert data using contract's error map

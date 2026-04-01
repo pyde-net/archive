@@ -74,7 +74,7 @@ pub fn execute_with_cheatcodes(vm: &mut Vm, cheat_state: &mut CheatcodeState) ->
     vm.clear_journal();
     let logs_start = vm.logs.len();
 
-    loop {
+    let result = loop {
         // Peek at current instruction before stepping
         let idx = (vm.pc / 4) as usize;
         let maybe_instr = vm.decoded_cache().get(idx).copied();
@@ -136,7 +136,11 @@ pub fn execute_with_cheatcodes(vm: &mut Vm, cheat_state: &mut CheatcodeState) ->
                 }
             }
         }
-    }
+    };
+
+    // Post-execution cleanup (matches vm.execute() behavior)
+    vm.clear_journal();
+    result
 }
 
 /// Handle a single cheatcode call. Returns true on success.
