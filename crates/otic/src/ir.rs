@@ -269,8 +269,8 @@ pub enum Inst {
     /// `%dst = method_call %obj, "method", [args...]`
     MethodCall(Reg, Reg, String, Vec<Reg>),
 
-    /// `ext_call %interface_addr, "method", [args...]`
-    ExtCall(Reg, Reg, String, Vec<Reg>),
+    /// `ext_call %interface_addr, "method", [args...], return_type`
+    ExtCall(Reg, Reg, String, Vec<Reg>, Ty),
 
     /// `%dst = hash [args...]`
     Hash(Reg, Vec<Reg>),
@@ -484,9 +484,9 @@ impl fmt::Display for Inst {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
                 write!(f, "{} = {}.{}({})", dst, obj, method, args_str.join(", "))
             }
-            Inst::ExtCall(dst, addr, method, args) => {
+            Inst::ExtCall(dst, addr, method, args, ret_ty) => {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
-                write!(f, "{} = ext_call {}, \"{}\"({})", dst, addr, method, args_str.join(", "))
+                write!(f, "{}: {} = ext_call {}, \"{}\"({})", dst, ret_ty, addr, method, args_str.join(", "))
             }
             Inst::Hash(dst, args) => {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();

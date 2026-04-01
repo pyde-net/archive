@@ -177,6 +177,22 @@ impl Lowerer {
         self.reg_types.get(&reg.0)
     }
 
+    /// Look up the return type of a method on a contract or interface.
+    /// Returns Ty::U64 as default if the method or type isn't found.
+    fn lookup_method_return_type(&self, type_name: &str, method_name: &str) -> Ty {
+        if let Some(fns) = self.contract_functions.get(type_name) {
+            if let Some((_, _, ret)) = fns.iter().find(|(n, _, _)| n == method_name) {
+                return ret.clone();
+            }
+        }
+        if let Some(fns) = self.interface_functions.get(type_name) {
+            if let Some((_, _, ret)) = fns.iter().find(|(n, _, _)| n == method_name) {
+                return ret.clone();
+            }
+        }
+        Ty::U64
+    }
+
     /// Infer the type of an expression (best-effort, for local_types tracking).
     fn infer_expr_type(&self, expr: &ast::Expr) -> Option<Ty> {
         use crate::ast::Expr;
@@ -1035,7 +1051,8 @@ impl Lowerer {
                             match obj_type {
                                 Some(Ty::Contract(ref name)) | Some(Ty::Interface(ref name)) => {
                                     // Typed contract/interface call → ExtCall
-                                    self.emit(Inst::ExtCall(dst, obj_reg, method.name.clone(), arg_regs));
+                                    let ret_ty = self.lookup_method_return_type(name, &method.name);
+                                    self.emit(Inst::ExtCall(dst, obj_reg, method.name.clone(), arg_regs, ret_ty));
                                 }
                                 _ => {
                                     self.emit(Inst::MethodCall(dst, obj_reg, method.name.clone(), arg_regs));
@@ -1271,7 +1288,8 @@ impl Lowerer {
 
                         if let Some(method) = method_name {
                             // Emit as ExtCall with the method name (codegen writes selector)
-                            self.emit(Inst::ExtCall(dst, target, method, param_regs));
+                            // No type info available for raw_call — default to GP return
+                            self.emit(Inst::ExtCall(dst, target, method, param_regs, Ty::U64));
                         } else {
                             // No method name: emit as raw call (no selector)
                             self.emit(Inst::RawCall(dst, target, param_regs));

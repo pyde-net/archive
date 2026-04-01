@@ -998,12 +998,29 @@ impl Vm {
                 let result = self.do_ext_call(d, is_static_flag, false)?;
                 self.cpu
                     .write_gp(result_reg, if result.success { 1 } else { 0 });
-                // Write child's return value to r1 (function return convention)
-                if result.success && result.return_data.len() >= 8 {
-                    let val = u64::from_le_bytes(
-                        result.return_data[..8].try_into().unwrap_or([0; 8])
-                    );
-                    self.cpu.write_gp(1, val);
+                if result.success && !result.return_data.is_empty() {
+                    if result.return_data.len() > 8 {
+                        // Wide/blob return: write return_data to parent heap (r12),
+                        // set r1 = heap ptr, r2 = length. Caller reads via Wload/memory.
+                        let heap = self.cpu.read_gp(12) as u32;
+                        if self.memory.checked_write_slice(heap, &result.return_data).is_ok() {
+                            self.cpu.write_gp(1, heap as u64);
+                            self.cpu.write_gp(2, result.return_data.len() as u64);
+                        } else {
+                            // Write failed (OOB) — fall back to GP convention
+                            let val = u64::from_le_bytes(
+                                result.return_data[..8].try_into().unwrap_or([0; 8])
+                            );
+                            self.cpu.write_gp(1, val);
+                            self.cpu.write_gp(2, 0);
+                        }
+                    } else {
+                        // GP return (≤ 8 bytes): r1 = value, r2 = 0
+                        let mut buf = [0u8; 8];
+                        buf[..result.return_data.len()].copy_from_slice(&result.return_data);
+                        self.cpu.write_gp(1, u64::from_le_bytes(buf));
+                        self.cpu.write_gp(2, 0);
+                    }
                 }
                 self.return_data = result.return_data;
                 self.pc += 4;
@@ -1422,12 +1439,30 @@ impl Vm {
         // EIP-2929: merge child's warm keys back (persists regardless of success/failure)
         self.warm_storage_keys.extend(child.warm_storage_keys);
 
-        // Return data: if child has explicit return_data, use it.
-        // Otherwise, capture the child's r1 (function return value convention).
+        // Return data: check multiple sources in priority order.
+        // 1. Explicit return_data (set by Revert or future explicit-return instructions)
+        // 2. Blob/wide return convention: r1 = pointer, r2 = length (> 0)
+        //    Used by u256/Address returns and struct/Vec/String returns.
+        // 3. GP return convention: r1 = 64-bit value (r2 == 0)
         let return_data = if !child.return_data.is_empty() {
             child.return_data
         } else if success {
-            child.cpu.read_gp(1).to_le_bytes().to_vec()
+            let r2 = child.cpu.read_gp(2);
+            if r2 > 0 {
+                // Blob/wide return: read r2 bytes from child memory at address r1
+                let ptr = child.cpu.read_gp(1) as u32;
+                let len = (r2 as usize).min(crate::memory::MEMORY_SIZE);
+                let end = (ptr as usize).saturating_add(len);
+                if end <= crate::memory::MEMORY_SIZE {
+                    child.memory.load_bytes(ptr as usize, len)
+                } else {
+                    // Out of bounds — fall back to GP return
+                    child.cpu.read_gp(1).to_le_bytes().to_vec()
+                }
+            } else {
+                // GP return: r1 as 8 LE bytes
+                child.cpu.read_gp(1).to_le_bytes().to_vec()
+            }
         } else {
             Vec::new()
         };

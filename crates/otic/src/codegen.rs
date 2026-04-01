@@ -1403,16 +1403,22 @@ impl CodeGen {
                     } else {
                         let rv = self.get_reg(*v);
                         if self.regs.is_wide(*v) {
+                            // Wide return (u256, Address): use blob convention
+                            // Write 32 bytes to heap, set r1 = ptr, r2 = 32
                             if rv != 0 {
                                 self.emit_op(Opcode::Wmov, 0, rv, 0);
                             }
-                            self.emit_op(Opcode::Wstore, 0, 12, 0);
-                            self.emit_load(1, 12, 0);
+                            self.emit_op(Opcode::Wstore, 0, 12, 0);  // mem[heap] = w0
+                            self.emit_op(Opcode::Add, 1, 12, 0);     // r1 = heap ptr
+                            self.emit_op(Opcode::Addi, 2, 0, 32);    // r2 = 32 bytes
                         } else if rv != 1 {
                             self.emit_op(Opcode::Add, 1, rv, 0);
+                            // Clear r2 AFTER rv→r1 copy so blob return check doesn't false-trigger
+                            self.emit_op(Opcode::Addi, 2, 0, 0);
+                        } else {
+                            // rv is already r1, just clear r2
+                            self.emit_op(Opcode::Addi, 2, 0, 0);
                         }
-                        // Clear r2 AFTER rv→r1 copy so blob return check doesn't false-trigger
-                        self.emit_op(Opcode::Addi, 2, 0, 0);
                     }
                 } else {
                     // Void return: clear r2 to prevent false blob detection
@@ -1932,8 +1938,8 @@ impl CodeGen {
                 }
             }
 
-            Inst::ExtCall(dst, addr, method, args) => {
-                let rd = self.alloc_gp(*dst);
+            Inst::ExtCall(dst, addr, method, args, ret_ty) => {
+                let wide_return = is_wide_type(ret_ty);
                 let ra = self.get_reg(*addr);
 
                 // Write calldata to heap: [selector(4 BE bytes)][arg0(8 LE)][arg1(8 LE)]...
@@ -1965,9 +1971,19 @@ impl CodeGen {
                 // Advance heap past calldata
                 self.emit_op(Opcode::Addi, 12, 12, calldata_len);
 
-                // After CallExt, r1 = child's return value (set by PVM convention)
-                if rd != 1 {
-                    self.emit_op(Opcode::Add, rd, 1, 0);
+                if wide_return {
+                    // Wide return (u256, Address): PVM wrote 32 bytes to parent heap
+                    // at r12 and set r1 = r12. Wload from r1 into destination.
+                    let wd = self.regs.alloc_wide(*dst);
+                    self.emit_op(Opcode::Wload, wd, 1, 0);
+                    // Advance heap past the 32-byte return data
+                    self.emit_op(Opcode::Addi, 12, 12, 32);
+                } else {
+                    // GP return (u64, bool, etc.): PVM set r1 = value
+                    let rd = self.alloc_gp(*dst);
+                    if rd != 1 {
+                        self.emit_op(Opcode::Add, rd, 1, 0);
+                    }
                 }
             }
 
