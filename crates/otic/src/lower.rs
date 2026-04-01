@@ -78,6 +78,8 @@ struct Lowerer {
     interface_functions: HashMap<String, Vec<(String, Vec<(String, Ty)>, Ty)>>,
     /// Contract name → public function signatures (for typed method dispatch).
     contract_functions: HashMap<String, Vec<(String, Vec<(String, Ty)>, Ty)>>,
+    /// Contract name → constructor param list (for deploy!/create! arg validation).
+    contract_constructors: HashMap<String, Vec<(String, Ty)>>,
     /// Register → type tracking for Contract/Interface typed handles.
     reg_types: HashMap<u32, Ty>,
 }
@@ -111,6 +113,7 @@ impl Lowerer {
             const_defs: HashMap::new(),
             interface_functions: HashMap::new(),
             contract_functions: HashMap::new(),
+            contract_constructors: HashMap::new(),
             reg_types: HashMap::new(),
         }
     }
@@ -440,6 +443,18 @@ impl Lowerer {
                 }
                 if !pub_fns.is_empty() {
                     self.contract_functions.insert(c.name.name.clone(), pub_fns);
+                }
+                // Collect constructor signature
+                for ci in &c.items {
+                    if let ContractItem::Function(f) = ci {
+                        if f.is_constructor() {
+                            let params: Vec<(String, Ty)> = f.params.iter()
+                                .map(|p| (p.name.name.clone(), self.resolve_ty(&p.ty)))
+                                .collect();
+                            self.contract_constructors.insert(c.name.name.clone(), params);
+                            break; // only one constructor per contract
+                        }
+                    }
                 }
             }
         }
@@ -1325,8 +1340,26 @@ impl Lowerer {
                             }
                         };
 
+                        // Validate constructor args against signature (if known)
+                        let user_args = &positional[1..];
+                        if let Some(ctor_params) = self.contract_constructors.get(&contract_name) {
+                            if user_args.len() != ctor_params.len() {
+                                self.emit(Inst::Comment(format!(
+                                    "deploy!: {}() expects {} args, got {}",
+                                    contract_name, ctor_params.len(), user_args.len()
+                                )));
+                            }
+                        }
+                        // No constructor defined but args provided
+                        if !self.contract_constructors.contains_key(&contract_name) && !user_args.is_empty() {
+                            self.emit(Inst::Comment(format!(
+                                "deploy!: {} has no constructor, but {} args provided",
+                                contract_name, user_args.len()
+                            )));
+                        }
+
                         // Lower constructor args (positional[1..])
-                        let arg_regs: Vec<Reg> = positional[1..].iter()
+                        let arg_regs: Vec<Reg> = user_args.iter()
                             .map(|e| self.lower_expr(e))
                             .collect();
 
