@@ -404,6 +404,30 @@ impl Lowerer {
             }
         }
 
+        // Pre-pass 2: collect contract pub fn signatures (enables typed dispatch
+        // regardless of contract declaration order in the file).
+        for item in &file.items {
+            if let Item::Contract(c) = item {
+                let mut pub_fns: Vec<(String, Vec<(String, Ty)>, Ty)> = Vec::new();
+                for ci in &c.items {
+                    if let ContractItem::Function(f) = ci {
+                        if f.is_pub && !f.is_constructor() && !f.is_test() {
+                            let params: Vec<(String, Ty)> = f.params.iter()
+                                .map(|p| (p.name.name.clone(), self.resolve_ty(&p.ty)))
+                                .collect();
+                            let ret = f.return_type.as_ref()
+                                .map(|t| self.resolve_ty(t))
+                                .unwrap_or(Ty::Unit);
+                            pub_fns.push((f.name.name.clone(), params, ret));
+                        }
+                    }
+                }
+                if !pub_fns.is_empty() {
+                    self.contract_functions.insert(c.name.name.clone(), pub_fns);
+                }
+            }
+        }
+
         // Main pass: lower contracts and functions
         for item in &file.items {
             match item {
