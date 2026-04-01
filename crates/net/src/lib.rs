@@ -13,6 +13,7 @@
 
 pub mod channels;
 pub mod config;
+pub mod ddos;
 pub mod discovery;
 pub mod node;
 pub mod peer;
