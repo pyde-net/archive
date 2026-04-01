@@ -13,6 +13,24 @@ use crate::ir::{self, IrProgram, IrFunction, BasicBlock, Label, Reg, Inst, IrCon
 use crate::types::Ty;
 
 /// Lower a source file into an IR program.
+/// Parse `#[should_panic(expected = "ErrorName")]` from attributes.
+/// Returns Some("ErrorName") if present, None otherwise.
+fn parse_expected_error(attrs: &[crate::ast::Attribute]) -> Option<String> {
+    for attr in attrs {
+        if attr.content.starts_with("should_panic") {
+            // #[should_panic(expected = "ErrorName")]
+            if let Some(start) = attr.content.find('"') {
+                if let Some(end) = attr.content[start + 1..].find('"') {
+                    return Some(attr.content[start + 1..start + 1 + end].to_string());
+                }
+            }
+            // #[should_panic] without expected — match any revert
+            return None;
+        }
+    }
+    None
+}
+
 pub fn lower(file: &SourceFile) -> IrProgram {
     let mut lowerer = Lowerer::new();
     lowerer.lower_file(file);
@@ -460,6 +478,8 @@ impl Lowerer {
         ir_func.is_reentrant = func.is_reentrant();
         ir_func.is_payable = func.is_payable();
         ir_func.is_test = func.is_test();
+        ir_func.should_panic = func.has_should_panic();
+        ir_func.expected_error = parse_expected_error(&func.attributes);
         ir_func.sponsorship = func.sponsorship();
         ir_func.doc = func.doc.clone();
 
@@ -1038,9 +1058,16 @@ impl Lowerer {
                     }
                     "revert" => {
                         if let Some(MacroArg::Positional(err_expr)) = args.first() {
-                            let err_regs = self.lower_error_expr(err_expr);
-                            self.emit(Inst::Revert(err_regs.0, err_regs.1));
+                            // revert!("message") — string literal becomes error name
+                            if let Expr::Literal(crate::ast::Literal::String(msg), _) = err_expr {
+                                self.emit(Inst::Revert(msg.clone(), vec![]));
+                            } else {
+                                // revert!(CustomError { fields }) — custom error type
+                                let err_regs = self.lower_error_expr(err_expr);
+                                self.emit(Inst::Revert(err_regs.0, err_regs.1));
+                            }
                         } else {
+                            // revert!() — bare revert with no data
                             self.emit(Inst::Revert("Error".into(), vec![]));
                         }
                         let dst = self.alloc_reg();

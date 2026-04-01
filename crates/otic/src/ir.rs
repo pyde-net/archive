@@ -143,6 +143,10 @@ pub struct IrFunction {
     pub is_reentrant: bool,
     pub is_payable: bool,
     pub is_test: bool,
+    /// If true, the test is expected to revert.
+    pub should_panic: bool,
+    /// Expected error name for should_panic (e.g., "InsufficientBalance").
+    pub expected_error: Option<String>,
     pub sponsorship: Option<crate::ast::Sponsorship>,
     pub doc: Option<String>,
     pub blocks: Vec<BasicBlock>,
@@ -163,6 +167,8 @@ impl IrFunction {
             is_reentrant: false,
             is_payable: false,
             is_test: false,
+            should_panic: false,
+            expected_error: None,
             sponsorship: None,
             doc: None,
             blocks: vec![BasicBlock::new(Label(0), "entry".into())],
