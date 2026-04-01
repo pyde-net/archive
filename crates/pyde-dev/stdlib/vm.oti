@@ -1,0 +1,33 @@
+/// Pyde VM cheatcodes for testing.
+///
+/// Usage:
+///   use std::vm;
+///   let vm_handle = Vm::at(0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC as Address);
+///   vm_handle.warp(1000);
+///   vm_handle.roll(42);
+///
+/// These calls are intercepted by the test runner. In production, calls to
+/// the cheatcode address are no-ops (target contract not found).
+
+interface Vm {
+    /// Set block.timestamp to the given value.
+    fn warp(timestamp: u64);
+
+    /// Set block.number to the given value.
+    fn roll(block_number: u64);
+
+    /// Spoof msg.sender for the next external call only.
+    fn prank(sender: Address);
+
+    /// Spoof msg.sender persistently until stopPrank() is called.
+    fn startPrank(sender: Address);
+
+    /// Clear any active prank.
+    fn stopPrank();
+
+    /// Set the balance of an address.
+    fn deal(account: Address, amount: u256);
+
+    /// Generate a deterministic address from a seed.
+    fn makeAddr(seed: u64) -> Address;
+}

@@ -1,0 +1,21 @@
+/// Math utilities.
+///
+/// Usage:
+///   use std::math::{min, max};
+///   let x = min(a, b);
+///
+/// Note: These are resolved as known stdlib functions by the compiler.
+/// The actual implementations are built into the compiler's codegen
+/// (no .oti source needed for execution). This file serves as
+/// documentation and type reference for the language server.
+
+interface Math {
+    fn min(a: u256, b: u256) -> u256;
+    fn max(a: u256, b: u256) -> u256;
+    fn sqrt(x: u256) -> u256;
+    fn pow(base: u256, exp: u256) -> u256;
+    fn clamp(value: u256, low: u256, high: u256) -> u256;
+    fn abs_diff(a: u256, b: u256) -> u256;
+    fn average(a: u256, b: u256) -> u256;
+    fn mul_div(a: u256, b: u256, denominator: u256) -> u256;
+}

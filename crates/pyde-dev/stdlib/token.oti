@@ -1,0 +1,20 @@
+/// Standard token interfaces.
+
+interface IERC20 {
+    fn totalSupply() -> u256;
+    fn balanceOf(account: Address) -> u256;
+    fn transfer(to: Address, amount: u256) -> bool;
+    fn allowance(owner: Address, spender: Address) -> u256;
+    fn approve(spender: Address, amount: u256) -> bool;
+    fn transferFrom(from: Address, to: Address, amount: u256) -> bool;
+}
+
+interface IERC721 {
+    fn balanceOf(owner: Address) -> u256;
+    fn ownerOf(tokenId: u256) -> Address;
+    fn transferFrom(from: Address, to: Address, tokenId: u256);
+    fn approve(to: Address, tokenId: u256);
+    fn getApproved(tokenId: u256) -> Address;
+    fn setApprovalForAll(operator: Address, approved: bool);
+    fn isApprovedForAll(owner: Address, operator: Address) -> bool;
+}
