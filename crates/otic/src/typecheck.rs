@@ -53,6 +53,8 @@ pub struct TypeEnv {
     error_defs: HashMap<String, Vec<(String, Ty)>>,
     /// Interface name → function sigs
     interface_defs: HashMap<String, Vec<(String, Vec<(String, Ty)>, Ty)>>,
+    /// Contract name → constructor param types (for deploy!/create! validation)
+    contract_constructors: HashMap<String, Vec<(String, Ty)>>,
 }
 
 impl TypeEnv {
@@ -68,6 +70,7 @@ impl TypeEnv {
             event_defs: HashMap::new(),
             error_defs: HashMap::new(),
             interface_defs: HashMap::new(),
+            contract_constructors: HashMap::new(),
         }
     }
 
@@ -369,7 +372,17 @@ impl TypeChecker {
                 ContractItem::TypeAlias(t) => self.collect_type_alias(t),
                 ContractItem::Event(e) => self.collect_event(e),
                 ContractItem::Error(e) => self.collect_error(e),
-                ContractItem::Function(f) => self.collect_func_sig(f),
+                ContractItem::Function(f) => {
+                    self.collect_func_sig(f);
+                    if f.is_constructor() {
+                        let params: Vec<(String, Ty)> = f.params.iter()
+                            .map(|p| (p.name.name.clone(), self.resolve_type(&p.ty)))
+                            .collect();
+                        self.env.contract_constructors.insert(
+                            contract.name.name.clone(), params,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1291,12 +1304,58 @@ impl TypeChecker {
                         // First arg is the contract name (path expression).
                         if let Some(MacroArg::Positional(first)) = args.first() {
                             if let Expr::Path(segments, _) = first {
-                                let name = segments
+                                let contract_name = segments
                                     .iter()
                                     .map(|s| s.name.as_str())
                                     .collect::<Vec<_>>()
                                     .join("::");
-                                Ty::Contract(name)
+
+                                // Validate constructor args (count + types)
+                                let user_arg_types = &arg_types[1..]; // skip contract name
+                                let ctor_params = self.env.contract_constructors.get(&contract_name).cloned();
+                                if let Some(ref params) = ctor_params {
+                                    if user_arg_types.len() != params.len() {
+                                        self.error(
+                                            format!(
+                                                "deploy!: {}() constructor expects {} args, got {}",
+                                                contract_name, params.len(), user_arg_types.len()
+                                            ),
+                                            *span,
+                                        );
+                                    } else {
+                                        // Check each arg type
+                                        for ((_param_name, param_ty), arg_ty) in
+                                            params.iter().zip(user_arg_types.iter())
+                                        {
+                                            if *arg_ty != Ty::Unknown
+                                                && *arg_ty != Ty::Error
+                                                && *param_ty != Ty::Unknown
+                                                && *arg_ty != *param_ty
+                                                && !arg_ty.can_widen_to(param_ty)
+                                                && !(arg_ty.is_numeric() && param_ty.is_numeric())
+                                            {
+                                                self.error(
+                                                    format!(
+                                                        "deploy!: {}() arg '{}' expects {}, got {}",
+                                                        contract_name, _param_name, param_ty, arg_ty
+                                                    ),
+                                                    *span,
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else if !user_arg_types.is_empty() {
+                                    // No constructor but args provided
+                                    self.error(
+                                        format!(
+                                            "deploy!: {} has no constructor, but {} args provided",
+                                            contract_name, user_arg_types.len()
+                                        ),
+                                        *span,
+                                    );
+                                }
+
+                                Ty::Contract(contract_name)
                             } else {
                                 self.error(
                                     "deploy! first argument must be a contract name".into(),

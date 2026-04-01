@@ -1033,6 +1033,28 @@ impl Vm {
                 let result = self.do_ext_call(d, false, true)?;
                 self.cpu
                     .write_gp(result_reg, if result.success { 1 } else { 0 });
+                // Same return convention as CallExt: wide/blob → heap, GP → r1
+                if result.success && !result.return_data.is_empty() {
+                    if result.return_data.len() > 8 {
+                        let heap = self.cpu.read_gp(12) as u32;
+                        if self.memory.checked_write_slice(heap, &result.return_data).is_ok() {
+                            self.cpu.write_gp(1, heap as u64);
+                            self.cpu.write_gp(2, result.return_data.len() as u64);
+                        } else {
+                            let mut buf = [0u8; 8];
+                            buf[..result.return_data.len().min(8)].copy_from_slice(
+                                &result.return_data[..result.return_data.len().min(8)],
+                            );
+                            self.cpu.write_gp(1, u64::from_le_bytes(buf));
+                            self.cpu.write_gp(2, 0);
+                        }
+                    } else {
+                        let mut buf = [0u8; 8];
+                        buf[..result.return_data.len()].copy_from_slice(&result.return_data);
+                        self.cpu.write_gp(1, u64::from_le_bytes(buf));
+                        self.cpu.write_gp(2, 0);
+                    }
+                }
                 self.return_data = result.return_data;
                 self.pc += 4;
             }
