@@ -1018,6 +1018,24 @@ impl Lowerer {
                         self.emit(Inst::Const(dst, IrConst::Unit));
                         dst
                     }
+                    "assert" => {
+                        // assert!(cond) → revert if cond is false (no error type needed)
+                        if let Some(MacroArg::Positional(cond_expr)) = args.first() {
+                            let cond = self.lower_expr(cond_expr);
+                            let ok_label = self.func().alloc_label();
+                            let revert_label = self.func().alloc_label();
+
+                            self.emit(Inst::Branch(cond, ok_label, revert_label));
+
+                            self.func().push_block(revert_label, "assert.fail".into());
+                            self.emit(Inst::Revert("AssertionFailed".into(), vec![]));
+
+                            self.func().push_block(ok_label, "assert.ok".into());
+                        }
+                        let dst = self.alloc_reg();
+                        self.emit(Inst::Const(dst, IrConst::Unit));
+                        dst
+                    }
                     "revert" => {
                         if let Some(MacroArg::Positional(err_expr)) = args.first() {
                             let err_regs = self.lower_error_expr(err_expr);
