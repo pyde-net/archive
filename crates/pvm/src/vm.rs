@@ -1253,6 +1253,12 @@ impl Vm {
         self.gas_used_total - refund
     }
 
+    /// Clear storage journal (for custom execution loops outside `execute()`).
+    pub fn clear_journal(&mut self) {
+        self.storage_journal.clear();
+        self.storage_journal_keys.clear();
+    }
+
     /// Execute an external contract call (CALL_EXT, DELEGATECALL, or STATICCALL).
     ///
     /// Spawns a child VM with the target contract's bytecode, forwards gas,
