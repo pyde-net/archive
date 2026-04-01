@@ -1254,10 +1254,12 @@ impl Lowerer {
                         }
                         dst
                     }
-                    "create" => {
-                        // create!(ContractName, arg1, arg2, ...) → Address
+                    "deploy" | "create" => {
+                        // deploy!(ContractName, arg1, arg2, ...) → Ty::Contract("ContractName")
+                        // create! is an alias for deploy!.
                         // Embeds the named contract's bytecode and deploys it.
                         // Constructor runs automatically with the provided args.
+                        // Returns a typed contract handle (enables c.method() dispatch).
                         let positional: Vec<&Expr> = args.iter().filter_map(|a| {
                             if let MacroArg::Positional(e) = a { Some(e) } else { None }
                         }).collect();
@@ -1268,7 +1270,7 @@ impl Lowerer {
                         let contract_name = if let Some(Expr::Path(segments, _)) = positional.first() {
                             segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::")
                         } else {
-                            self.emit(Inst::Comment("create! requires a contract name".into()));
+                            self.emit(Inst::Comment("deploy! requires a contract name".into()));
                             return dst;
                         };
 
@@ -1276,7 +1278,7 @@ impl Lowerer {
                         let deploy_bytes = match self.compiled_contracts.get(&contract_name) {
                             Some(bytes) => bytes.clone(),
                             None => {
-                                self.emit(Inst::Comment(format!("create!: contract '{}' not found in registry", contract_name)));
+                                self.emit(Inst::Comment(format!("deploy!: contract '{}' not found in registry", contract_name)));
                                 return dst;
                             }
                         };
@@ -1293,6 +1295,11 @@ impl Lowerer {
                         // CreateContract(dst, blob_reg, [arg_regs...])
                         // The codegen will write blob + args to heap and emit Create.
                         self.emit(Inst::CreateContract(dst, blob_reg, arg_regs));
+
+                        // Tag the result register as Ty::Contract so method calls
+                        // on the handle (e.g. c.increment()) resolve to ExtCall.
+                        self.set_local_type_for_reg(dst, Ty::Contract(contract_name.clone()));
+
                         dst
                     }
                     _ => {
