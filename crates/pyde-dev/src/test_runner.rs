@@ -10,7 +10,7 @@ pub fn run(filter: Option<&str>) -> Result<(), String> {
 
     // Build src/ contracts first (tests may depend on them)
     println!("  Building contracts...");
-    build::build_project(&config, &root)?;
+    let build_result = build::build_project(&config, &root)?;
     println!();
 
     // Find test files
@@ -55,8 +55,13 @@ pub fn run(filter: Option<&str>) -> Result<(), String> {
             continue;
         }
 
-        // Lower to IR — keep test functions but promote them to pub for dispatch
-        let mut ir = otic::lower::lower(&ast_file);
+        // Lower to IR with src/ contract context (bytecode + signatures for deploy!/dispatch)
+        let mut ir = otic::lower::lower_with_context(
+            &ast_file,
+            &build_result.compiled_registry,
+            &build_result.contract_functions,
+            &build_result.contract_constructors,
+        );
         otic::optimize::optimize(&mut ir);
 
         // Collect test function metadata before we modify the IR
