@@ -50,6 +50,27 @@ pub fn lower_with_contracts(
     lowerer.program
 }
 
+/// Lower with full external context: bytecode registry, function signatures,
+/// and constructor signatures. Used by the test runner for cross-file imports.
+pub fn lower_with_context(
+    file: &SourceFile,
+    compiled: &HashMap<String, Vec<u8>>,
+    ext_contract_functions: &HashMap<String, Vec<(String, Vec<(String, Ty)>, Ty)>>,
+    ext_contract_constructors: &HashMap<String, Vec<(String, Ty)>>,
+) -> IrProgram {
+    let mut lowerer = Lowerer::new();
+    lowerer.compiled_contracts = compiled.clone();
+    // Inject external contract signatures so typed dispatch works for imported contracts
+    for (name, fns) in ext_contract_functions {
+        lowerer.contract_functions.insert(name.clone(), fns.clone());
+    }
+    for (name, params) in ext_contract_constructors {
+        lowerer.contract_constructors.insert(name.clone(), params.clone());
+    }
+    lowerer.lower_file(file);
+    lowerer.program
+}
+
 struct Lowerer {
     program: IrProgram,
     /// Current function being lowered.
