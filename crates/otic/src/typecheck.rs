@@ -4,7 +4,7 @@
 //! Infers types for expressions, checks assignments, function calls,
 //! struct inits, emit statements, and casts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::token::Span;
@@ -55,6 +55,8 @@ pub struct TypeEnv {
     interface_defs: HashMap<String, Vec<(String, Vec<(String, Ty)>, Ty)>>,
     /// Contract name → constructor param types (for deploy!/create! validation)
     contract_constructors: HashMap<String, Vec<(String, Ty)>>,
+    /// Known contract names (for cast validation and type resolution)
+    contract_names: HashSet<String>,
 }
 
 impl TypeEnv {
@@ -71,6 +73,7 @@ impl TypeEnv {
             error_defs: HashMap::new(),
             interface_defs: HashMap::new(),
             contract_constructors: HashMap::new(),
+            contract_names: HashSet::new(),
         }
     }
 
@@ -217,6 +220,12 @@ impl TypeChecker {
                 if self.env.enum_defs.contains_key(&ident.name) {
                     return Ty::Enum(ident.name.clone());
                 }
+                if self.env.interface_defs.contains_key(&ident.name) {
+                    return Ty::Interface(ident.name.clone());
+                }
+                if self.env.contract_names.contains(&ident.name) {
+                    return Ty::Contract(ident.name.clone());
+                }
                 Ty::Unknown
             }
             Type::Tuple(types, _) => {
@@ -358,6 +367,7 @@ impl TypeChecker {
     }
 
     fn collect_contract_defs(&mut self, contract: &ContractDef) {
+        self.env.contract_names.insert(contract.name.name.clone());
         for item in &contract.items {
             match item {
                 ContractItem::Storage(s) => {
@@ -1497,6 +1507,17 @@ impl TypeChecker {
                         // enum ↔ numeric (discriminant cast)
                         (Ty::Enum(_), t) if t.is_numeric() => true,
                         (s, Ty::Enum(_)) if s.is_numeric() => true,
+                        // Contract/Interface → Address (strip type info)
+                        (Ty::Contract(_), Ty::Address) => true,
+                        (Ty::Interface(_), Ty::Address) => true,
+                        // Address → Contract/Interface (wrap with type info)
+                        (Ty::Address, Ty::Contract(_)) => true,
+                        (Ty::Address, Ty::Interface(_)) => true,
+                        // Contract/Interface ↔ Contract/Interface (re-cast)
+                        (Ty::Contract(_), Ty::Contract(_)) => true,
+                        (Ty::Interface(_), Ty::Interface(_)) => true,
+                        (Ty::Contract(_), Ty::Interface(_)) => true,
+                        (Ty::Interface(_), Ty::Contract(_)) => true,
                         // same type (identity cast)
                         (s, t) if s == t => true,
                         _ => false,

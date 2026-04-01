@@ -1543,8 +1543,15 @@ impl CodeGen {
                     let rd = self.alloc_gp(*dst);
                     let ws = self.get_reg(*src);
                     self.emit_op(Opcode::Narrow, rd, ws, 0);
+                } else if src_wide && dst_wide {
+                    // Wide → Wide: copy (e.g., Address ↔ Contract/Interface)
+                    let wd = self.regs.alloc_wide(*dst);
+                    let ws = self.get_reg(*src);
+                    if wd != ws {
+                        self.emit_op(Opcode::Wmov, wd, ws, 0);
+                    }
                 } else {
-                    // Same register file: copy
+                    // GP → GP: copy
                     let rd = self.alloc_gp(*dst);
                     let rs = self.get_reg(*src);
                     if rd != rs {
@@ -3079,7 +3086,7 @@ impl CodeGen {
 
 /// Check if a type uses wide (256-bit) register.
 fn is_wide_type(ty: &Ty) -> bool {
-    matches!(ty, Ty::U256 | Ty::I256 | Ty::Address)
+    matches!(ty, Ty::U256 | Ty::I256 | Ty::Address | Ty::Contract(_) | Ty::Interface(_))
 }
 
 /// Return the PVM MemWidth for a GP type (used by emit_load_typed / emit_store_typed).
