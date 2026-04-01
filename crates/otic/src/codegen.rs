@@ -1961,11 +1961,27 @@ impl CodeGen {
                 self.emit(encode(Opcode::Store, 15, 12, sel_imm));
 
                 // Write args after selector (offset 4)
-                for (i, arg) in args.iter().enumerate() {
+                // Wide args (Address, u256) get 32 bytes via Wstore.
+                // GP args get 8 bytes via Store.
+                let mut arg_offset: i32 = 4;
+                for arg in args.iter() {
                     let r = self.get_reg(*arg);
-                    self.emit_store(r, 12, 4 + (i as i32) * 8);
+                    if self.regs.is_wide(*arg) {
+                        // Wide arg: 32 bytes
+                        if arg_offset != 0 {
+                            self.emit_op(Opcode::Addi, 15, 12, arg_offset as u32 & 0x3FFFF);
+                            self.emit_op(Opcode::Wstore, r, 15, 0);
+                        } else {
+                            self.emit_op(Opcode::Wstore, r, 12, 0);
+                        }
+                        arg_offset += 32;
+                    } else {
+                        // GP arg: 8 bytes
+                        self.emit_store(r, 12, arg_offset);
+                        arg_offset += 8;
+                    }
                 }
-                let calldata_len = 4 + (args.len() as u32) * 8;
+                let calldata_len = arg_offset as u32;
 
                 // Set up CallExt: rd=target(wide), rs1=calldata_ptr(r12), imm=len/gas/result
                 self.emit_op(Opcode::Addi, 14, 0, calldata_len); // r14 = calldata len
@@ -2017,15 +2033,24 @@ impl CodeGen {
                 let rt = self.get_reg(*target);
 
                 // Write calldata (args) to heap memory at r12
-                for (i, arg) in args.iter().enumerate() {
+                // Wide args (Address, u256) get 32 bytes, GP args get 8 bytes.
+                let mut arg_offset: i32 = 0;
+                for arg in args.iter() {
                     let r = self.get_reg(*arg);
                     if self.regs.is_wide(*arg) {
-                        self.emit_op(Opcode::Wstore, r, 12, (i as u32 * 32) & 0x3FFFF);
+                        if arg_offset != 0 {
+                            self.emit_op(Opcode::Addi, 15, 12, arg_offset as u32 & 0x3FFFF);
+                            self.emit_op(Opcode::Wstore, r, 15, 0);
+                        } else {
+                            self.emit_op(Opcode::Wstore, r, 12, 0);
+                        }
+                        arg_offset += 32;
                     } else {
-                        self.emit_store(r, 12, (i as i32) * 8);
+                        self.emit_store(r, 12, arg_offset);
+                        arg_offset += 8;
                     }
                 }
-                let calldata_len = (args.len() * 8) as u32;
+                let calldata_len = arg_offset as u32;
 
                 // Set up CallExt encoding:
                 // rd = target address (wide register)
