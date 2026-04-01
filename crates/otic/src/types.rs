@@ -25,6 +25,9 @@ pub enum Ty {
     // Named types
     Struct(String),            // struct name
     Enum(String),              // enum name
+    // Contract/interface handles (address + typed method dispatch)
+    Contract(String),          // contract name — deploy!(Counter) returns this
+    Interface(String),         // interface name — IERC20::at(addr) returns this
     // Special
     Unit,                      // void / no return
     /// Used for type inference when we don't know yet.
@@ -163,6 +166,8 @@ impl fmt::Display for Ty {
             }
             Ty::Struct(name) => write!(f, "{}", name),
             Ty::Enum(name) => write!(f, "{}", name),
+            Ty::Contract(name) => write!(f, "{}", name),
+            Ty::Interface(name) => write!(f, "{}", name),
             Ty::Unit => write!(f, "()"),
             Ty::Unknown => write!(f, "?"),
             Ty::Error => write!(f, "<error>"),

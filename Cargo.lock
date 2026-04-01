@@ -3446,9 +3446,11 @@ name = "pyde-dev"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "ethnum",
  "glob",
  "hex",
  "otic",
+ "pyde-crypto",
  "pyde-vm",
  "reqwest",
  "serde",

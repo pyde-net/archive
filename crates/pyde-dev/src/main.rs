@@ -5,6 +5,7 @@ mod build;
 mod clean;
 mod test_runner;
 mod deploy;
+mod cheatcodes;
 
 use clap::Parser;
 use cli::{Cli, Command};
