@@ -30,6 +30,16 @@ pub fn run(name: &str) -> Result<(), String> {
     fs::write(root.join("test/Counter.test.oti"), STARTER_TEST)
         .map_err(|e| format!("cannot write Counter.test.oti: {}", e))?;
 
+    // Write standard library
+    fs::create_dir_all(root.join("lib/@std"))
+        .map_err(|e| format!("cannot create lib/@std/: {}", e))?;
+    fs::write(root.join("lib/@std/vm.oti"), STD_VM)
+        .map_err(|e| format!("cannot write vm.oti: {}", e))?;
+    fs::write(root.join("lib/@std/token.oti"), STD_TOKEN)
+        .map_err(|e| format!("cannot write token.oti: {}", e))?;
+    fs::write(root.join("lib/@std/math.oti"), STD_MATH)
+        .map_err(|e| format!("cannot write math.oti: {}", e))?;
+
     // Write .gitignore
     fs::write(root.join(".gitignore"), "out/\n")
         .map_err(|e| format!("cannot write .gitignore: {}", e))?;
@@ -44,6 +54,10 @@ pub fn run(name: &str) -> Result<(), String> {
     println!("  │   └── Counter.test.oti");
     println!("  ├── script/");
     println!("  └── lib/");
+    println!("      └── @std/");
+    println!("          ├── vm.oti");
+    println!("          ├── token.oti");
+    println!("          └── math.oti");
     println!();
     println!("  Get started:");
     println!("    cd {}", name);
@@ -52,6 +66,11 @@ pub fn run(name: &str) -> Result<(), String> {
 
     Ok(())
 }
+
+// Standard library files (embedded at compile time from stdlib/)
+const STD_VM: &str = include_str!("../stdlib/vm.oti");
+const STD_TOKEN: &str = include_str!("../stdlib/token.oti");
+const STD_MATH: &str = include_str!("../stdlib/math.oti");
 
 const STARTER_CONTRACT: &str = r#"contract Counter {
     storage {
@@ -77,43 +96,27 @@ const STARTER_CONTRACT: &str = r#"contract Counter {
 }
 "#;
 
-const STARTER_TEST: &str = r#"contract Counter {
-    storage {
-        count: u64,
-    }
+const STARTER_TEST: &str = r#"use counter::Counter;
 
-    #[constructor]
-    pub fn init() {
-        self.count = 0;
-    }
-
-    pub fn get_count() -> u64 {
-        return self.count;
-    }
-
-    pub fn increment() {
-        self.count = self.count + 1;
-    }
-
-    pub fn add(value: u64) {
-        self.count = self.count + value;
-    }
-
+contract CounterTest {
     #[test]
-    fn test_initial_count() {
-        assert!(self.count == 0);
+    fn test_deploy() {
+        let c = deploy!(Counter);
+        assert!(c.get_count() == 0);
     }
 
     #[test]
     fn test_increment() {
-        self.count = self.count + 1;
-        assert!(self.count == 1);
+        let c = deploy!(Counter);
+        c.increment();
+        assert!(c.get_count() == 1);
     }
 
     #[test]
-    fn test_add_five() {
-        self.count = self.count + 5;
-        assert!(self.count == 5);
+    fn test_add() {
+        let c = deploy!(Counter);
+        c.add(5);
+        assert!(c.get_count() == 5);
     }
 }
 "#;
