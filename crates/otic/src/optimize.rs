@@ -299,7 +299,7 @@ fn collect_used_regs(inst: &Inst, used: &mut HashSet<Reg>) {
         Inst::Builtin(_, _) => {}
         Inst::Call(_, _, args) => { for a in args { used.insert(*a); } }
         Inst::MethodCall(_, obj, _, args) => { used.insert(*obj); for a in args { used.insert(*a); } }
-        Inst::ExtCall(_, addr, _, args) => { used.insert(*addr); for a in args { used.insert(*a); } }
+        Inst::ExtCall(_, addr, _, args, _) => { used.insert(*addr); for a in args { used.insert(*a); } }
         Inst::Hash(_, args) => { for a in args { used.insert(*a); } }
         Inst::StructInit(_, _, fields) => { for (_, r) in fields { used.insert(*r); } }
         Inst::FieldGet(_, obj, _, _) => { used.insert(*obj); }
@@ -335,7 +335,7 @@ fn get_dest_reg(inst: &Inst) -> Option<Reg> {
         | Inst::StorageGet(dst, _) | Inst::StorageMapGet(dst, _, _)
         | Inst::StorageNestedMapGet(dst, _, _, _)
         | Inst::Builtin(dst, _) | Inst::Call(dst, _, _)
-        | Inst::MethodCall(dst, _, _, _) | Inst::ExtCall(dst, _, _, _)
+        | Inst::MethodCall(dst, _, _, _) | Inst::ExtCall(dst, _, _, _, _)
         | Inst::Hash(dst, _) | Inst::StructInit(dst, _, _)
         | Inst::FieldGet(dst, _, _, _) | Inst::IndexGet(dst, _, _)
         | Inst::MakeTuple(dst, _) | Inst::TupleGet(dst, _, _)
@@ -354,7 +354,7 @@ fn has_side_effects(inst: &Inst) -> bool {
         | Inst::IndexSet(_, _, _)
         | Inst::Emit(_, _) | Inst::Revert(_, _)
         | Inst::CrossCall { .. } | Inst::RawCall(_, _, _) | Inst::CreateContract(_, _, _)
-        | Inst::Call(_, _, _) | Inst::MethodCall(_, _, _, _) | Inst::ExtCall(_, _, _, _)
+        | Inst::Call(_, _, _) | Inst::MethodCall(_, _, _, _) | Inst::ExtCall(_, _, _, _, _)
         | Inst::Jump(_) | Inst::Branch(_, _, _) | Inst::Return(_)
     )
 }
