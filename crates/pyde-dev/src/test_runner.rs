@@ -35,6 +35,16 @@ pub fn run(filter: Option<&str>) -> Result<(), String> {
     let mut total_fail = 0u32;
     let mut total_skip = 0u32;
 
+    // Gas profiling: collect per-test gas usage for summary
+    struct GasEntry {
+        file: String,
+        test_name: String,
+        gas_used: u64,
+        passed: bool,
+    }
+    let mut gas_profile: Vec<GasEntry> = Vec::new();
+    let gas_limit: u64 = 100_000_000; // matches VM gas limit used below
+
     for file in &files {
         let source = fs::read_to_string(file)
             .map_err(|e| format!("cannot read {}: {}", file.display(), e))?;
@@ -208,6 +218,14 @@ pub fn run(filter: Option<&str>) -> Result<(), String> {
             } else {
                 total_fail += 1;
             }
+
+            // Collect for gas profile
+            gas_profile.push(GasEntry {
+                file: rel.to_string_lossy().to_string(),
+                test_name: meta.name.clone(),
+                gas_used: gas,
+                passed: ok,
+            });
         }
     }
 
@@ -217,6 +235,35 @@ pub fn run(filter: Option<&str>) -> Result<(), String> {
         "  {} passed, {} failed, {} skipped ({:.2}s)",
         total_pass, total_fail, total_skip, elapsed.as_secs_f64()
     );
+
+    // Gas profiling summary
+    if !gas_profile.is_empty() {
+        // Sort by gas used (descending — most expensive first)
+        gas_profile.sort_by(|a, b| b.gas_used.cmp(&a.gas_used));
+
+        let total_gas: u64 = gas_profile.iter().map(|e| e.gas_used).sum();
+        let max_name_len = gas_profile.iter().map(|e| e.test_name.len()).max().unwrap_or(20);
+        let col_width = max_name_len.max(20);
+
+        println!();
+        println!("  Gas Profile");
+        println!("  {:<col_width$}  {:>12}  {:>8}  {}", "Test", "Gas Used", "% Limit", "Status");
+        println!("  {}", "-".repeat(col_width + 30));
+        for entry in &gas_profile {
+            let pct = (entry.gas_used as f64 / gas_limit as f64) * 100.0;
+            let status = if entry.passed { "PASS" } else { "FAIL" };
+            println!(
+                "  {:<col_width$}  {:>12}  {:>7.2}%  {}",
+                entry.test_name, entry.gas_used, pct, status
+            );
+        }
+        println!("  {}", "-".repeat(col_width + 30));
+        println!("  {:<col_width$}  {:>12}", "Total", total_gas);
+        if gas_profile.len() > 1 {
+            let avg = total_gas / gas_profile.len() as u64;
+            println!("  {:<col_width$}  {:>12}", "Average", avg);
+        }
+    }
 
     if total_fail > 0 {
         Err(format!("{} test(s) failed", total_fail))
