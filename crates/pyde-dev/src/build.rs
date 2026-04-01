@@ -13,10 +13,20 @@ struct BuildCache {
     hashes: HashMap<String, String>,
 }
 
+/// Function signature: (name, params, return_type).
+pub type FnSig = (String, Vec<(String, otic::types::Ty)>, otic::types::Ty);
+
 /// Result of building the project.
 pub struct BuildResult {
     pub contracts: Vec<(String, String)>, // (contract_name, artifact_path)
     pub total_bytecode: usize,
+    /// Contract name → deploy-format bytes [clen:4][rlen:4][constructor][runtime].
+    /// Used by test runner for deploy!() and cross-contract calls.
+    pub compiled_registry: HashMap<String, Vec<u8>>,
+    /// Contract name → public function signatures (for typed method dispatch).
+    pub contract_functions: HashMap<String, Vec<FnSig>>,
+    /// Contract name → constructor param list (for deploy! arg validation).
+    pub contract_constructors: HashMap<String, Vec<(String, otic::types::Ty)>>,
 }
 
 pub fn run() -> Result<(), String> {
@@ -91,9 +101,14 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
 
     // Compile in dependency order
     let mut compiled_registry: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut contract_functions: HashMap<String, Vec<FnSig>> = HashMap::new();
+    let mut contract_constructors: HashMap<String, Vec<(String, otic::types::Ty)>> = HashMap::new();
     let mut result = BuildResult {
         contracts: Vec::new(),
         total_bytecode: 0,
+        compiled_registry: HashMap::new(),
+        contract_functions: HashMap::new(),
+        contract_constructors: HashMap::new(),
     };
     let mut had_errors = false;
 
@@ -104,7 +119,7 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
         // Skip if unchanged and all deps unchanged
         if !needs_rebuild.contains(&file_idx) {
             // Still register previously compiled contracts from artifacts
-            load_existing_artifacts(&out_dir, source, &mut compiled_registry, &mut result);
+            load_existing_artifacts(&out_dir, source, &mut compiled_registry, &mut contract_functions, &mut contract_constructors, &mut result);
             continue;
         }
 
@@ -137,6 +152,25 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
                 }
             }
             let ir = otic::lower::lower(&single);
+
+            // Extract function signatures for typed dispatch in test files
+            let mut pub_fns: Vec<FnSig> = Vec::new();
+            for func in &ir.functions {
+                if func.is_pub && !func.is_constructor && !func.is_test {
+                    pub_fns.push((
+                        func.name.clone(),
+                        func.params.clone(),
+                        func.return_ty.clone(),
+                    ));
+                }
+                if func.is_constructor {
+                    contract_constructors.insert(name.clone(), func.params.clone());
+                }
+            }
+            if !pub_fns.is_empty() {
+                contract_functions.insert(name.clone(), pub_fns);
+            }
+
             let abi = otic::abi::generate_abi(&ir);
             let artifact_json = otic::abi::artifact_to_json(&abi, contract);
 
@@ -173,6 +207,11 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
     if had_errors {
         return Err("build failed with errors".into());
     }
+
+    // Populate result with registry and signatures
+    result.compiled_registry = compiled_registry;
+    result.contract_functions = contract_functions;
+    result.contract_constructors = contract_constructors;
 
     // Save build cache
     save_cache(&cache_path, &new_cache);
@@ -289,20 +328,20 @@ fn build_dependency_graph(
                     continue;
                 }
 
-                // Resolve: `use Token;` → look for Token.oti in src/
-                // Resolve: `use subdir::Token;` → look for subdir/Token.oti
-                let import_name = import.path.last().map(|p| p.name.as_str()).unwrap_or("");
-                if let Some(&dep_idx) = name_to_idx.get(import_name) {
-                    if dep_idx != idx {
+                // Resolve: `use counter::Counter;` → first segment "counter" maps to counter.oti
+                // Resolve: `use counter::{Counter, Error};` → same, first segment
+                let module_name = import.path.first().map(|p| p.name.as_str()).unwrap_or("");
+                if let Some(&dep_idx) = name_to_idx.get(module_name) {
+                    if dep_idx != idx && !graph[idx].contains(&dep_idx) {
                         graph[idx].push(dep_idx);
                     }
-                } else if !import_name.is_empty() {
+                } else if !module_name.is_empty() {
                     let rel = path.strip_prefix(src_dir).unwrap_or(path);
                     return Err(format!(
                         "error in {}: cannot resolve import '{}' — no {}.oti found in src/",
                         rel.display(),
                         import.path.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join("::"),
-                        import_name,
+                        module_name,
                     ));
                 }
             }
@@ -413,19 +452,48 @@ fn mark_dependents(
 }
 
 /// Load existing artifacts for unchanged files to populate the compiled_registry.
+/// Also extracts function signatures from source for typed dispatch.
 fn load_existing_artifacts(
     out_dir: &Path,
     source: &str,
     registry: &mut HashMap<String, Vec<u8>>,
+    contract_functions: &mut HashMap<String, Vec<FnSig>>,
+    contract_constructors: &mut HashMap<String, Vec<(String, otic::types::Ty)>>,
     result: &mut BuildResult,
 ) {
-    // Quick parse to find contract names
+    // Quick parse to find contract names and extract signatures
     let (tokens, _) = otic::lexer::Lexer::new(source).tokenize();
     let (file, _) = otic::parser::Parser::new(tokens).parse();
 
     for item in &file.items {
         if let otic::ast::Item::Contract(c) = item {
             let name = &c.name.name;
+
+            // Extract function signatures from AST (no IR needed)
+            let ir = otic::lower::lower(&{
+                let mut single = otic::ast::SourceFile { items: Vec::new() };
+                for it in &file.items {
+                    match it {
+                        otic::ast::Item::Contract(cc) if cc.name.name == *name => single.items.push(it.clone()),
+                        otic::ast::Item::Contract(_) => {}
+                        _ => single.items.push(it.clone()),
+                    }
+                }
+                single
+            });
+            let mut pub_fns: Vec<FnSig> = Vec::new();
+            for func in &ir.functions {
+                if func.is_pub && !func.is_constructor && !func.is_test {
+                    pub_fns.push((func.name.clone(), func.params.clone(), func.return_ty.clone()));
+                }
+                if func.is_constructor {
+                    contract_constructors.insert(name.clone(), func.params.clone());
+                }
+            }
+            if !pub_fns.is_empty() {
+                contract_functions.insert(name.clone(), pub_fns);
+            }
+
             let artifact_path = out_dir.join(format!("{}.json", name));
             if artifact_path.exists() {
                 if let Ok(json_str) = fs::read_to_string(&artifact_path) {
