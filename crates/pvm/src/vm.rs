@@ -248,7 +248,8 @@ pub struct Vm {
     pub allowed_storage_keys: Option<std::collections::HashSet<U256>>,
     /// EIP-2929: warm storage keys (accessed in this transaction).
     /// First access (cold) costs more gas. Subsequent accesses (warm) cost less.
-    warm_storage_keys: std::collections::HashSet<U256>,
+    /// Public for pre-warming from access lists.
+    pub warm_storage_keys: std::collections::HashSet<U256>,
 }
 
 /// Safe address calculation: base (u64) + offset (i64) → u32, or MemoryFault.

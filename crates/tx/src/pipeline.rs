@@ -344,6 +344,18 @@ fn execute_in_pvm(
     let mut vm = Vm::with_gas_limit_and_context(tx.gas_limit, ctx);
     vm.calldata = tx.data.clone();
 
+    // Pre-derive storage keys from access list and set as allowed keys + warm keys.
+    // This avoids redundant Poseidon2 hashing during SLOAD/SSTORE and enforces
+    // access list bounds (strict mode: unlisted keys trap).
+    if !tx.access_list.is_empty() {
+        let (allowed, warm) = pre_derive_access_list_keys(&tx.access_list, &tx.to);
+        vm.allowed_storage_keys = Some(allowed);
+        for key in warm {
+            // Pre-warm all declared keys (EIP-2929: no cold surcharge)
+            vm.warm_storage_keys.insert(key);
+        }
+    }
+
     // Lazy storage backend: VM reads from SMT on demand during Sload.
     // During execution, SMT is only read (writes go to vm.storage overlay).
     // SAFETY: smt is not mutated during vm.execute(). The pointer is valid for
@@ -413,6 +425,77 @@ fn execute_in_pvm(
         .collect();
 
     (success, output.gas_used as u64, output.gas_refund, logs)
+}
+
+/// Execute a block of transactions using parallel group scheduling.
+///
+/// Groups are determined by the conflict scheduler (disjoint access lists).
+/// Within each group, transactions execute sequentially (they conflict).
+/// Between groups, execution is order-independent because the scheduler
+/// guarantees disjoint state access — groups never touch the same storage keys.
+///
+/// Currently executes groups sequentially on the shared SMT. True thread-level
+/// parallelism (per-group SMT clones or overlays) is a future optimization —
+/// the correctness guarantee is already provided by the conflict scheduler.
+///
+/// Returns receipts in the original transaction order.
+pub fn execute_block_parallel(
+    txs: &[Transaction],
+    schedule: &crate::parallel::ExecutionSchedule,
+    smt: &mut PydeSMT,
+    block_ctx: &BlockContext,
+) -> Result<Vec<Receipt>, PipelineError> {
+    let mut receipts: Vec<Option<Receipt>> = vec![None; txs.len()];
+
+    for group in &schedule.groups {
+        for &tx_idx in &group.tx_indices {
+            let tx = &txs[tx_idx];
+            let receipt = execute_transaction(tx, smt, block_ctx)?;
+            receipts[tx_idx] = Some(receipt);
+        }
+    }
+
+    let ordered: Vec<Receipt> = receipts.into_iter().map(|r| r.unwrap()).collect();
+    Ok(ordered)
+}
+
+/// Pre-derive storage keys from transaction access lists.
+///
+/// Converts raw 32-byte access list keys into the VM's derived U256 keys
+/// (Poseidon2 of slot || contract_address). Returns:
+/// - allowed: HashSet of all derived keys (for strict access list enforcement)
+/// - warm: Vec of all derived keys (for EIP-2929 pre-warming)
+///
+/// This avoids redundant Poseidon2 hashing during SLOAD/SSTORE execution.
+pub fn pre_derive_access_list_keys(
+    access_list: &[crate::types::AccessEntry],
+    contract_address: &Address,
+) -> (std::collections::HashSet<U256>, Vec<U256>) {
+    let mut allowed = std::collections::HashSet::new();
+    let mut warm = Vec::new();
+
+    for entry in access_list {
+        // Derive keys for each access entry's reads and writes
+        let target = if entry.address == ZERO_ADDRESS {
+            contract_address
+        } else {
+            &entry.address
+        };
+
+        for raw_key in entry.reads.iter().chain(entry.writes.iter()) {
+            let slot = U256::from_le_bytes(*raw_key);
+            // Derive storage key: Poseidon2(slot || target_address)
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&slot.to_le_bytes());
+            buf[32..64].copy_from_slice(target);
+            let hash = poseidon2_hash(&buf);
+            let derived = U256::from_le_bytes(hash.to_bytes());
+            allowed.insert(derived);
+            warm.push(derived);
+        }
+    }
+
+    (allowed, warm)
 }
 
 #[cfg(test)]
@@ -913,5 +996,67 @@ mod tests {
         let output = vm.execute();
         assert_eq!(output.outcome, pyde_vm::vm::Outcome::Success, "rank() failed");
         assert_eq!(vm.cpu.read_gp(1), 1, "rank should be 1 (no board entries > 400)");
+    }
+
+    // ========== Task 1183: Pre-derived keys match runtime-derived keys ==========
+
+    #[test]
+    fn pre_derived_keys_match_runtime_derived() {
+        // Verify that pre_derive_access_list_keys produces identical U256 keys
+        // to what the VM computes at runtime via derive_storage_key.
+        let contract_addr = derive_eoa_address(b"test_contract");
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: contract_addr,
+            ..Default::default()
+        };
+        let vm = pyde_vm::vm::Vm::with_gas_limit_and_context(0, ctx);
+
+        // Test several slot values
+        for slot_val in [0u64, 1, 42, 0xDEADBEEF, u64::MAX] {
+            let slot = U256::from(slot_val);
+            let runtime_key = vm.derive_storage_key(slot);
+
+            // Pre-derive via access list
+            let mut raw_key = [0u8; 32];
+            raw_key.copy_from_slice(&slot.to_le_bytes());
+            let access_entry = crate::types::AccessEntry {
+                address: ZERO_ADDRESS, // ZERO = use contract_address
+                reads: vec![raw_key],
+                writes: vec![],
+            };
+            let (allowed, _warm) = pre_derive_access_list_keys(&[access_entry], &contract_addr);
+
+            assert!(
+                allowed.contains(&runtime_key),
+                "pre-derived key for slot {} doesn't match runtime key", slot_val
+            );
+        }
+    }
+
+    #[test]
+    fn pre_derived_keys_cross_contract() {
+        // Access list entries with explicit contract address (not ZERO)
+        let target_addr = derive_eoa_address(b"target_contract");
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: target_addr,
+            ..Default::default()
+        };
+        let vm = pyde_vm::vm::Vm::with_gas_limit_and_context(0, ctx);
+
+        let slot = U256::from(7u64);
+        let runtime_key = vm.derive_storage_key(slot);
+
+        let mut raw_key = [0u8; 32];
+        raw_key.copy_from_slice(&slot.to_le_bytes());
+        let access_entry = crate::types::AccessEntry {
+            address: target_addr, // explicit address
+            reads: vec![],
+            writes: vec![raw_key],
+        };
+        let caller_addr = derive_eoa_address(b"caller");
+        let (allowed, warm) = pre_derive_access_list_keys(&[access_entry], &caller_addr);
+
+        assert!(allowed.contains(&runtime_key), "cross-contract key should match");
+        assert_eq!(warm.len(), 1);
     }
 }
