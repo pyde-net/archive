@@ -1354,8 +1354,10 @@ impl TypeChecker {
                                             }
                                         }
                                     }
-                                } else if !user_arg_types.is_empty() {
-                                    // No constructor but args provided
+                                } else if !user_arg_types.is_empty()
+                                    && self.env.contract_names.contains(&contract_name)
+                                {
+                                    // Known contract with no constructor but args provided
                                     self.error(
                                         format!(
                                             "deploy!: {} has no constructor, but {} args provided",
@@ -1364,6 +1366,8 @@ impl TypeChecker {
                                         *span,
                                     );
                                 }
+                                // For imported contracts not in contract_names, skip validation
+                                // (constructor signature unknown until build pipeline provides it)
 
                                 Ty::Contract(contract_name)
                             } else {
