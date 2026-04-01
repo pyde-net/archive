@@ -71,9 +71,15 @@ struct Lowerer {
     const_defs: HashMap<String, (U256, Ty)>,
     /// Struct name → field definitions (for type lookups in FieldGet).
     struct_field_defs: HashMap<String, Vec<(String, Ty)>>,
-    /// Compiled contract bytecodes for `create!` embedding.
+    /// Compiled contract bytecodes for `create!` / `deploy!` embedding.
     /// Maps contract name → deploy-format bytes [clen:4][rlen:4][constructor][runtime].
     compiled_contracts: HashMap<String, Vec<u8>>,
+    /// Interface name → function signatures (for typed method dispatch via ::at()).
+    interface_functions: HashMap<String, Vec<(String, Vec<(String, Ty)>, Ty)>>,
+    /// Contract name → public function signatures (for typed method dispatch).
+    contract_functions: HashMap<String, Vec<(String, Vec<(String, Ty)>, Ty)>>,
+    /// Register → type tracking for Contract/Interface typed handles.
+    reg_types: HashMap<u32, Ty>,
 }
 
 impl Lowerer {
@@ -103,6 +109,9 @@ impl Lowerer {
             struct_field_defs: HashMap::new(),
             compiled_contracts: HashMap::new(),
             const_defs: HashMap::new(),
+            interface_functions: HashMap::new(),
+            contract_functions: HashMap::new(),
+            reg_types: HashMap::new(),
         }
     }
 
@@ -156,6 +165,16 @@ impl Lowerer {
             }
         }
         None
+    }
+
+    /// Track a register's type (for Contract/Interface typed method dispatch).
+    fn set_local_type_for_reg(&mut self, reg: Reg, ty: Ty) {
+        self.reg_types.insert(reg.0, ty);
+    }
+
+    /// Look up the type of a register (Contract/Interface handles).
+    fn get_reg_type(&self, reg: Reg) -> Option<&Ty> {
+        self.reg_types.get(&reg.0)
     }
 
     /// Infer the type of an expression (best-effort, for local_types tracking).
@@ -268,6 +287,10 @@ impl Lowerer {
                     _ => {
                         if self.enum_defs.contains_key(&ident.name) {
                             Ty::Enum(ident.name.clone())
+                        } else if self.interface_functions.contains_key(&ident.name) {
+                            Ty::Interface(ident.name.clone())
+                        } else if self.contract_functions.contains_key(&ident.name) {
+                            Ty::Contract(ident.name.clone())
                         } else {
                             Ty::Struct(ident.name.clone())
                         }
@@ -336,6 +359,11 @@ impl Lowerer {
                             return_ty: f.return_type.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit),
                         })
                         .collect();
+                    // Register interface function signatures for typed method dispatch
+                    let sig_list: Vec<(String, Vec<(String, Ty)>, Ty)> = funcs.iter()
+                        .map(|f| (f.name.clone(), f.params.clone(), f.return_ty.clone()))
+                        .collect();
+                    self.interface_functions.insert(i.name.name.clone(), sig_list);
                     self.program.interface_defs.push(ir::InterfaceDef {
                         name: i.name.name.clone(),
                         functions: funcs,
@@ -455,6 +483,23 @@ impl Lowerer {
             }
         }
 
+        // Collect public function signatures for typed contract dispatch
+        let mut pub_fns: Vec<(String, Vec<(String, Ty)>, Ty)> = Vec::new();
+        for item in &contract.items {
+            if let ContractItem::Function(f) = item {
+                if f.is_pub && !f.is_constructor() && !f.is_test() {
+                    let params: Vec<(String, Ty)> = f.params.iter()
+                        .map(|p| (p.name.name.clone(), self.resolve_ty(&p.ty)))
+                        .collect();
+                    let ret = f.return_type.as_ref()
+                        .map(|t| self.resolve_ty(t))
+                        .unwrap_or(Ty::Unit);
+                    pub_fns.push((f.name.name.clone(), params, ret));
+                }
+            }
+        }
+        self.contract_functions.insert(contract.name.name.clone(), pub_fns);
+
         // Second pass: lower functions
         for item in &contract.items {
             if let ContractItem::Function(f) = item {
@@ -550,7 +595,11 @@ impl Lowerer {
             LetBinding::Name(name) => {
                 self.declare_local(&name.name, val);
                 if let Some(ty) = &l.ty {
-                    self.declare_local_type(&name.name, self.resolve_ty(ty));
+                    let resolved = self.resolve_ty(ty);
+                    self.declare_local_type(&name.name, resolved);
+                } else if let Some(ty) = self.get_reg_type(val).cloned() {
+                    // Propagate Contract/Interface type from register to variable name
+                    self.declare_local_type(&name.name, ty);
                 } else if let Some(ty) = inferred_ty {
                     self.declare_local_type(&name.name, ty);
                 }
@@ -949,7 +998,25 @@ impl Lowerer {
                             self.emit(Inst::Call(dst, method.name.clone(), arg_regs));
                         } else {
                             let obj_reg = self.lower_expr(obj);
-                            self.emit(Inst::MethodCall(dst, obj_reg, method.name.clone(), arg_regs));
+                            // Check if obj is a typed Contract/Interface handle
+                            let obj_type = self.get_reg_type(obj_reg).cloned()
+                                .or_else(|| {
+                                    // Also check local_types by variable name
+                                    if let Expr::Ident(ident) = obj.as_ref() {
+                                        self.lookup_local_type(&ident.name)
+                                    } else {
+                                        None
+                                    }
+                                });
+                            match obj_type {
+                                Some(Ty::Contract(ref name)) | Some(Ty::Interface(ref name)) => {
+                                    // Typed contract/interface call → ExtCall
+                                    self.emit(Inst::ExtCall(dst, obj_reg, method.name.clone(), arg_regs));
+                                }
+                                _ => {
+                                    self.emit(Inst::MethodCall(dst, obj_reg, method.name.clone(), arg_regs));
+                                }
+                            }
                         }
                     }
                     // Path::call(args) — Vec::new(), IERC20::at(), etc.
@@ -960,6 +1027,21 @@ impl Lowerer {
                             if type_name == "Vec" && member == "new" {
                                 self.emit(Inst::MakeVec(dst, 64));
                                 return dst;
+                            }
+                            // Interface::at(address) → typed interface handle
+                            if member == "at" && self.interface_functions.contains_key(type_name) {
+                                if let Some(addr_reg) = arg_regs.first() {
+                                    // at() is a no-op at runtime — just tracks the type
+                                    self.set_local_type_for_reg(*addr_reg, Ty::Interface(type_name.to_string()));
+                                    return *addr_reg;
+                                }
+                            }
+                            // Contract::at(address) → typed contract handle
+                            if member == "at" && self.contract_functions.contains_key(type_name) {
+                                if let Some(addr_reg) = arg_regs.first() {
+                                    self.set_local_type_for_reg(*addr_reg, Ty::Contract(type_name.to_string()));
+                                    return *addr_reg;
+                                }
                             }
                         }
                         let path = segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::");
