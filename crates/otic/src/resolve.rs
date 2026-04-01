@@ -71,6 +71,7 @@ pub enum SymbolKind {
     TypeAlias,
     Interface,
     InterfaceFn { interface_name: String },
+    Contract,
     LocalVar { is_mutable: bool },
     FnParam,
     ForVar,
@@ -269,7 +270,7 @@ impl Resolver {
             if let Some(sym) = scope.symbols.get(name) {
                 match sym.kind {
                     SymbolKind::Struct | SymbolKind::Enum | SymbolKind::TypeAlias
-                    | SymbolKind::Interface => return true,
+                    | SymbolKind::Interface | SymbolKind::Contract => return true,
                     _ => {}
                 }
             }
@@ -288,7 +289,7 @@ impl Resolver {
     fn declare_item(&mut self, item: &Item) {
         match item {
             Item::Contract(c) => {
-                self.declare(&c.name.name, SymbolKind::Struct, c.name.span);
+                self.declare(&c.name.name, SymbolKind::Contract, c.name.span);
             }
             Item::Struct(s) => {
                 self.declare(&s.name.name, SymbolKind::Struct, s.name.span);
@@ -521,16 +522,60 @@ impl Resolver {
                     }
                 }
             }
+
+            // Register std module and items, then return (don't fall through to non-std handling)
+            if let Some(last) = import.path.last() {
+                // Avoid re-declaring "std" — register the module name (e.g., "math")
+                // Skip if already declared (multiple imports from same std module).
+                if last.name != "std" && self.lookup(&last.name).is_none() {
+                    self.declare(&last.name, SymbolKind::Module, last.span);
+                }
+            }
+            for item in &import.items {
+                if self.lookup(&item.name).is_none() {
+                    self.declare(&item.name, SymbolKind::Module, item.span);
+                }
+            }
+            return;
         }
 
-        // Register the module name (last path segment)
+        // Non-std imports: file-based contract/type imports.
+        // Syntax mirrors Rust:
+        //   use counter::Counter;                      → path=["counter","Counter"], items=[]
+        //   use counter::{Counter, InsufficientBalance}; → path=["counter"], items=[...]
+        //   use counter::*;                             → future: glob import
+        //
+        // First path segment = module name (maps to src/<name>.oti in build pipeline).
+        // Remaining segments or grouped items = contract/error/struct names.
+        if import.path.len() >= 2 && import.items.is_empty() {
+            // Single import: use module::Item;
+            // Register module name (skip if already declared — multiple imports from same module).
+            if self.lookup(&import.path[0].name).is_none() {
+                self.declare(&import.path[0].name, SymbolKind::Module, import.path[0].span);
+            }
+            for segment in &import.path[1..] {
+                self.declare(&segment.name, SymbolKind::Contract, segment.span);
+            }
+            return;
+        }
+
+        if !import.items.is_empty() {
+            // Grouped import: use module::{Item1, Item2};
+            // Register module name (skip if already declared).
+            if let Some(first) = import.path.first() {
+                if self.lookup(&first.name).is_none() {
+                    self.declare(&first.name, SymbolKind::Module, first.span);
+                }
+            }
+            for item in &import.items {
+                self.declare(&item.name, SymbolKind::Contract, item.span);
+            }
+            return;
+        }
+
+        // Single module import: use module; (register module name only)
         if let Some(last) = import.path.last() {
             self.declare(&last.name, SymbolKind::Module, last.span);
-        }
-
-        // For grouped imports: register each imported item
-        for item in &import.items {
-            self.declare(&item.name, SymbolKind::Module, item.span);
         }
     }
 
