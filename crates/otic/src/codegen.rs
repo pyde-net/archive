@@ -4408,6 +4408,107 @@ mod tests {
         assert_eq!(vm.cpu.read_gp(1), 42, "should return 42");
     }
 
+    #[test]
+    fn pvm_reentrant_annotation_allows_reentry() {
+        // Task 0204: #[reentrant] function allows re-entry while normal pub fn blocks it.
+        //
+        // Contract T has:
+        //   pub fn guarded() — default reentrancy guard (should revert on re-entry)
+        //   #[reentrant] pub fn reentrant_ok() — no guard (should allow re-entry)
+        //
+        // Test: deploy T, register as its own callee, then simulate re-entry by
+        // having the reentrancy slot already locked (=1) before calling. A #[reentrant]
+        // function should succeed; a guarded function should revert.
+
+        let src = r#"
+            contract T {
+                storage { value: u64, }
+                pub fn guarded() -> u64 {
+                    self.value = 1;
+                    return self.value;
+                }
+                #[reentrant]
+                pub fn reentrant_ok() -> u64 {
+                    self.value = 2;
+                    return self.value;
+                }
+            }
+        "#;
+
+        let (tokens, _) = Lexer::new(src).tokenize();
+        let (file, _) = Parser::new(tokens).parse();
+        let ir = lower::lower(&file);
+        let mut codegen = CodeGen::new();
+        codegen.emit_guards = true;
+        let compiled = codegen.generate(&ir);
+
+        let self_addr = [7u8; 32];
+        let ctx = pyde_vm::vm::ExecutionContext {
+            self_address: self_addr,
+            ..Default::default()
+        };
+
+        // Derive the reentrancy lock storage key using the VM's own method
+        let lock_slot = ethnum::U256::from(REENTRANCY_SLOT as u64);
+        let derived_key = {
+            let tmp_vm = pyde_vm::vm::Vm::with_gas_limit_and_context(0, ctx.clone());
+            tmp_vm.derive_storage_key(lock_slot)
+        };
+
+        // --- Test 1: reentrant_ok() succeeds even when lock is already set ---
+        {
+            let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(200_000, ctx.clone());
+            let selector = compute_selector("reentrant_ok");
+            vm.calldata = selector.to_be_bytes().to_vec();
+            vm.load(&compiled.runtime_bytecode).unwrap();
+
+            // Pre-set the reentrancy lock to simulate re-entry
+            vm.storage.insert(derived_key, vec![1, 0, 0, 0, 0, 0, 0, 0]);
+
+            let output = vm.execute();
+            assert_eq!(
+                output.outcome,
+                pyde_vm::vm::Outcome::Success,
+                "#[reentrant] function should succeed even with lock set"
+            );
+            assert_eq!(vm.cpu.read_gp(1), 2, "should return 2");
+        }
+
+        // --- Test 2: guarded() reverts when lock is already set ---
+        {
+            let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(200_000, ctx.clone());
+            let selector = compute_selector("guarded");
+            vm.calldata = selector.to_be_bytes().to_vec();
+            vm.load(&compiled.runtime_bytecode).unwrap();
+
+            // Pre-set the reentrancy lock to simulate re-entry
+            vm.storage.insert(derived_key, vec![1, 0, 0, 0, 0, 0, 0, 0]);
+
+            let output = vm.execute();
+            assert_eq!(
+                output.outcome,
+                pyde_vm::vm::Outcome::Revert,
+                "guarded function should revert when lock is already set (re-entry blocked)"
+            );
+        }
+
+        // --- Test 3: guarded() succeeds when lock is NOT set (normal call) ---
+        {
+            let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(200_000, ctx.clone());
+            let selector = compute_selector("guarded");
+            vm.calldata = selector.to_be_bytes().to_vec();
+            vm.load(&compiled.runtime_bytecode).unwrap();
+
+            let output = vm.execute();
+            assert_eq!(
+                output.outcome,
+                pyde_vm::vm::Outcome::Success,
+                "guarded function should succeed on normal (non-reentrant) call"
+            );
+            assert_eq!(vm.cpu.read_gp(1), 1, "should return 1");
+        }
+    }
+
     // ========================================================================
     // Dispatch with calldata (PVM-verified)
     // ========================================================================
