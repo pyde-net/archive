@@ -94,6 +94,36 @@ impl BlockStore {
             })
             .unwrap_or(0)
     }
+
+    // ========================================================================
+    // Block body storage (task 1311 + 1313)
+    // ========================================================================
+
+    /// Store a full block (header + wire-encoded body) for the given slot.
+    /// The raw_bytes contain the full wire-encoded block for replay/sync.
+    pub fn put_block(&self, header: &BlockHeader, raw_bytes: &[u8]) -> Result<(), String> {
+        self.put_header(header)?;
+        // Full wire-encoded block at "b:{slot}" (for sync and replay)
+        let mut key = Vec::with_capacity(2 + 8);
+        key.extend_from_slice(b"b:");
+        key.extend_from_slice(&header.slot.to_le_bytes());
+        self.db.put(&key, raw_bytes)
+            .map_err(|e| format!("failed to store block data: {}", e))
+    }
+
+    /// Load the full wire-encoded block by slot.
+    /// Returns the raw bytes that can be decoded via wire::decode_block().
+    pub fn get_block_raw(&self, slot: u64) -> Option<Vec<u8>> {
+        let mut key = Vec::with_capacity(2 + 8);
+        key.extend_from_slice(b"b:");
+        key.extend_from_slice(&slot.to_le_bytes());
+        self.db.get(&key).ok()?.map(|bytes| bytes.to_vec())
+    }
+
+    /// Check if full block data exists for this slot.
+    pub fn has_block_data(&self, slot: u64) -> bool {
+        self.get_block_raw(slot).is_some()
+    }
 }
 
 #[cfg(test)]

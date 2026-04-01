@@ -260,6 +260,9 @@ impl PydeNode {
 
         // 10. Start RPC server if enabled
         if self.config.rpc.enabled {
+            let (new_heads_tx, _) = tokio::sync::broadcast::channel(256);
+            let (pending_tx_tx, _) = tokio::sync::broadcast::channel(4096);
+            let (logs_tx, _) = tokio::sync::broadcast::channel(1024);
             let rpc_state = Arc::new(RpcState {
                 chain: chain.clone(),
                 state: state.clone(),
@@ -267,6 +270,9 @@ impl PydeNode {
                 receipts: receipts.clone(),
                 pending_txs: pending_txs.clone(),
                 threshold_pk: None, // Set at epoch boundary when committee is formed
+                new_heads_tx,
+                pending_tx_tx,
+                logs_tx,
             });
             match rpc::start_rpc_server(
                 &self.config.rpc.listen,
@@ -340,6 +346,12 @@ impl PydeNode {
                             if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
                                 warn!(error = %e, "failed to broadcast consensus message");
                             }
+                        }
+                        PostEventAction::AcceptTransaction(tx) => {
+                            let tx_hash = tx.hash();
+                            let mut pending = pending_txs.write().await;
+                            pending.push(tx);
+                            debug!(tx_hash = hex::encode(tx_hash), pending = pending.len(), "tx accepted from gossip");
                         }
                     }
                 }
@@ -522,6 +534,7 @@ enum PostEventAction {
     SendSyncResponse(request_response::ResponseChannel<SyncResp>, SyncResp),
     ContinueSync,
     BroadcastConsensus(Vec<u8>),
+    AcceptTransaction(pyde_tx::types::Transaction),
 }
 
 /// Handle a libp2p swarm event. Returns an action that may need swarm access.
@@ -546,10 +559,17 @@ fn handle_swarm_event(
             match channel {
                 Some(Channel::Transactions) => {
                     debug!(bytes = message.data.len(), "received tx gossip");
-                    // Decode transaction and add to mempool
-                    // Encrypted txs come as raw EncryptedTx bytes.
-                    // Plain txs (for devnet) are wire-encoded Transaction bytes.
-                    // For now, log receipt — full decode requires choosing a tx format.
+                    // Decode wire-encoded transaction and add to pending queue
+                    match wire::decode_transaction(&message.data) {
+                        Ok(tx) => {
+                            let tx_hash = tx.hash();
+                            debug!(tx_hash = hex::encode(tx_hash), "decoded tx from gossip");
+                            return PostEventAction::AcceptTransaction(tx);
+                        }
+                        Err(e) => {
+                            debug!(error = e, "failed to decode tx from gossip");
+                        }
+                    }
                 }
                 Some(Channel::Blocks) => {
                     debug!(bytes = message.data.len(), "received block gossip");
@@ -560,8 +580,8 @@ fn handle_swarm_event(
                             match BlockProcessor::process_full_block(chain, state, &block) {
                                 Ok((tx_count, gas_used, _receipts)) => {
                                     chain_sync.on_block_processed(slot);
-                                    // Persist header to disk
-                                    let _ = block_store.put_header(&block.header);
+                                    // Persist full block (header + body) to disk
+                                    let _ = block_store.put_block(&block.header, &message.data);
                                     let _ = block_store.put_head(slot);
                                     info!(slot, tx_count, gas_used, "block received and processed");
                                 }

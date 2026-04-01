@@ -28,6 +28,12 @@ pub struct RpcState {
     pub pending_txs: Arc<RwLock<Vec<pyde_tx::types::Transaction>>>,
     /// Committee threshold public key for encrypting transactions (MEV protection).
     pub threshold_pk: Option<pyde_crypto::threshold::ThresholdPublicKey>,
+    /// Broadcast channel for new block headers (WebSocket subscriptions).
+    pub new_heads_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// Broadcast channel for pending transaction hashes.
+    pub pending_tx_tx: tokio::sync::broadcast::Sender<String>,
+    /// Broadcast channel for event logs.
+    pub logs_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
 /// Define the Pyde JSON-RPC API.
@@ -101,6 +107,22 @@ pub trait PydeApi {
     /// The node encrypts it with the committee's threshold public key before adding to mempool.
     #[method(name = "pyde_sendEncryptedTransaction")]
     async fn send_encrypted_transaction(&self, tx_obj: serde_json::Value) -> Result<String, ErrorObjectOwned>;
+
+    // ========================================================================
+    // WebSocket Subscriptions
+    // ========================================================================
+
+    /// Subscribe to new block headers. Fires each time a new block is committed.
+    #[subscription(name = "pyde_subscribe" => "pyde_subscription", item = serde_json::Value, unsubscribe = "pyde_unsubscribe")]
+    async fn subscribe_new_heads(&self) -> jsonrpsee::core::SubscriptionResult;
+
+    /// Subscribe to new pending transactions in the mempool.
+    #[subscription(name = "pyde_subscribePending" => "pyde_pendingSubscription", item = String, unsubscribe = "pyde_unsubscribePending")]
+    async fn subscribe_pending_transactions(&self) -> jsonrpsee::core::SubscriptionResult;
+
+    /// Subscribe to contract event logs matching a filter.
+    #[subscription(name = "pyde_subscribeLogs" => "pyde_logSubscription", item = serde_json::Value, unsubscribe = "pyde_unsubscribeLogs")]
+    async fn subscribe_logs(&self, filter: serde_json::Value) -> jsonrpsee::core::SubscriptionResult;
 }
 
 /// RPC server implementation.
@@ -588,6 +610,72 @@ impl PydeApiServer for RpcServer {
 
         info!(tx_hash = hex::encode(tx_hash), "encrypted tx accepted into mempool");
         Ok(format!("0x{}", hex::encode(tx_hash)))
+    }
+
+    // ========================================================================
+    // WebSocket Subscription Implementations
+    // ========================================================================
+
+    async fn subscribe_new_heads(
+        &self,
+        subscription_sink: jsonrpsee::PendingSubscriptionSink,
+    ) -> jsonrpsee::core::SubscriptionResult {
+        let sink = subscription_sink.accept().await?;
+        let mut rx = self.state.new_heads_tx.subscribe();
+        tokio::spawn(async move {
+            while let Ok(header) = rx.recv().await {
+                if sink.send(jsonrpsee::SubscriptionMessage::from_json(&header).unwrap()).await.is_err() {
+                    break; // client disconnected
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn subscribe_pending_transactions(
+        &self,
+        subscription_sink: jsonrpsee::PendingSubscriptionSink,
+    ) -> jsonrpsee::core::SubscriptionResult {
+        let sink = subscription_sink.accept().await?;
+        let mut rx = self.state.pending_tx_tx.subscribe();
+        tokio::spawn(async move {
+            while let Ok(tx_hash) = rx.recv().await {
+                if sink.send(jsonrpsee::SubscriptionMessage::from_json(&tx_hash).unwrap()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn subscribe_logs(
+        &self,
+        subscription_sink: jsonrpsee::PendingSubscriptionSink,
+        filter: serde_json::Value,
+    ) -> jsonrpsee::core::SubscriptionResult {
+        let sink = subscription_sink.accept().await?;
+        let mut rx = self.state.logs_tx.subscribe();
+        // Parse filter for address and topic matching
+        let filter_addr = filter.get("address")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase());
+        tokio::spawn(async move {
+            while let Ok(log) = rx.recv().await {
+                // Apply filter: if address specified, only send matching logs
+                if let Some(ref addr) = filter_addr {
+                    let log_addr = log.get("address")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_lowercase());
+                    if log_addr.as_deref() != Some(addr.as_str()) {
+                        continue;
+                    }
+                }
+                if sink.send(jsonrpsee::SubscriptionMessage::from_json(&log).unwrap()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(())
     }
 }
 
