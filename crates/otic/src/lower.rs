@@ -1543,7 +1543,14 @@ impl Lowerer {
                 let src = self.lower_expr(inner);
                 let dst = self.alloc_reg();
                 let target_ty = self.resolve_ty(ty);
-                self.emit(Inst::Cast(dst, src, target_ty));
+                self.emit(Inst::Cast(dst, src, target_ty.clone()));
+                // Propagate Contract/Interface type info for typed dispatch
+                match &target_ty {
+                    Ty::Contract(_) | Ty::Interface(_) => {
+                        self.set_local_type_for_reg(dst, target_ty);
+                    }
+                    _ => {}
+                }
                 dst
             }
 
