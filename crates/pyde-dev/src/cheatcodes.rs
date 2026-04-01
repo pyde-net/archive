@@ -147,78 +147,59 @@ fn handle_cheatcode(vm: &mut Vm, state: &mut CheatcodeState, calldata: &[u8]) ->
     // Selector is 4 bytes stored in BE order by codegen
     let selector = u32::from_be_bytes(calldata[..4].try_into().unwrap_or([0; 4]));
 
+    // Calldata layout: [selector:4 BE][args...]
+    // GP args (u64, bool): 8 bytes LE
+    // Wide args (Address, u256): 32 bytes LE
     if selector == selectors::warp() {
-        // warp(timestamp: u64) — calldata: [sel:4][timestamp:8 LE]
+        // warp(timestamp: u64) — [sel:4][timestamp:8 LE]
         if calldata.len() >= 12 {
             let ts = u64::from_le_bytes(calldata[4..12].try_into().unwrap_or([0; 8]));
             vm.ctx.timestamp = ts;
             return true;
         }
     } else if selector == selectors::roll() {
-        // roll(block_number: u64) — calldata: [sel:4][block_number:8 LE]
+        // roll(block_number: u64) — [sel:4][block_number:8 LE]
         if calldata.len() >= 12 {
             let bn = u64::from_le_bytes(calldata[4..12].try_into().unwrap_or([0; 8]));
             vm.ctx.block_number = bn;
             return true;
         }
     } else if selector == selectors::prank() {
-        // prank(address: Address) — calldata: [sel:4][address_ptr:8 LE]
-        // The address is in a wide register. Read it from the VM's wide reg file.
-        // The ExtCall encoding puts the target address in wd (rd field), and the
-        // first arg in calldata is a GP value. For Address args, the caller passes
-        // the address via wide register. We read from the first arg's wide reg.
-        if calldata.len() >= 12 {
-            // Read the Address from the first arg's wide register (w0-w6)
-            // The compiler puts Address args in wide registers and writes the
-            // GP index to calldata. For simplicity, read from calldata as a
-            // pointer and load from VM memory, OR read from wide reg directly.
-            // Since the arg is an Address (wide), the compiler serializes 8 bytes
-            // (the GP value) to calldata. The actual address is in a wide register.
-            // For cheatcodes, we need the wide value. Read it from the instruction context.
-            let arg_val = u64::from_le_bytes(calldata[4..12].try_into().unwrap_or([0; 8]));
-            // For now, treat the 8-byte value as a heap pointer where the address was written,
-            // or as a direct GP value. Since prank takes an Address, and the compiler
-            // writes GP values to calldata, we need a different approach for wide args.
-            // The cleanest solution: read the Address from vm memory at the arg value (heap ptr).
-            // Actually — the ExtCall calldata only writes GP values (8 bytes per arg via emit_store).
-            // For Address args, the compiler should widen and write 32 bytes. Let me check...
-            // For now, construct address from the 8-byte value (zero-extended to 32 bytes).
+        // prank(sender: Address) — [sel:4][address:32 LE]
+        if calldata.len() >= 36 {
             let mut addr = [0u8; 32];
-            addr[..8].copy_from_slice(&arg_val.to_le_bytes());
+            addr.copy_from_slice(&calldata[4..36]);
             state.prank_caller = Some(addr);
             state.prank_persistent = false;
             vm.ctx.caller = addr;
             return true;
         }
     } else if selector == selectors::start_prank() {
-        if calldata.len() >= 12 {
-            let arg_val = u64::from_le_bytes(calldata[4..12].try_into().unwrap_or([0; 8]));
+        // startPrank(sender: Address) — [sel:4][address:32 LE]
+        if calldata.len() >= 36 {
             let mut addr = [0u8; 32];
-            addr[..8].copy_from_slice(&arg_val.to_le_bytes());
+            addr.copy_from_slice(&calldata[4..36]);
             state.prank_caller = Some(addr);
             state.prank_persistent = true;
             vm.ctx.caller = addr;
             return true;
         }
     } else if selector == selectors::stop_prank() {
+        // stopPrank() — [sel:4] (no args)
         state.prank_caller = None;
         state.prank_persistent = false;
         return true;
     } else if selector == selectors::deal() {
-        // deal(address: Address, amount: u256)
-        // Both are wide but serialized as GP (8 bytes each) in calldata
-        if calldata.len() >= 20 {
-            let addr_val = u64::from_le_bytes(calldata[4..12].try_into().unwrap_or([0; 8]));
-            let amount_val = u64::from_le_bytes(calldata[12..20].try_into().unwrap_or([0; 8]));
+        // deal(account: Address, amount: u256) — [sel:4][address:32 LE][amount:32 LE]
+        if calldata.len() >= 68 {
             let mut addr = [0u8; 32];
-            addr[..8].copy_from_slice(&addr_val.to_le_bytes());
-            vm.ctx.balances.insert(addr, U256::from(amount_val));
+            addr.copy_from_slice(&calldata[4..36]);
+            let amount = U256::from_le_bytes(calldata[36..68].try_into().unwrap_or([0; 32]));
+            vm.ctx.balances.insert(addr, amount);
             return true;
         }
     } else if selector == selectors::make_addr() {
-        // makeAddr(label_len: u64) — label bytes follow in calldata
-        // Actually, String args are serialized differently (blob on heap).
-        // For simplicity, makeAddr takes a u64 seed and derives deterministically.
+        // makeAddr(seed: u64) — [sel:4][seed:8 LE]
         if calldata.len() >= 12 {
             let seed = u64::from_le_bytes(calldata[4..12].try_into().unwrap_or([0; 8]));
             let hash = pyde_crypto::poseidon2::poseidon2_hash(&seed.to_le_bytes());
