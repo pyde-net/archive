@@ -1,11 +1,13 @@
 use crate::build;
 use crate::cheatcodes::{self, CheatcodeState};
 use crate::project;
+use crate::trace::{self, ExecutionTrace, Verbosity};
 use std::collections::HashMap;
 use std::fs;
 use std::time::Instant;
 
-pub fn run(filter: Option<&str>) -> Result<(), String> {
+pub fn run(filter: Option<&str>, verbosity: u8) -> Result<(), String> {
+    let trace_verbosity = Verbosity::from_count(verbosity);
     let (config, root) = project::load_config()?;
 
     // Build src/ contracts first (tests may depend on them)
@@ -160,7 +162,12 @@ pub fn run(filter: Option<&str>) -> Result<(), String> {
 
             // Execute with cheatcode interception (fresh state per test)
             let mut cheat_state = CheatcodeState::new();
-            let outcome = cheatcodes::execute_with_cheatcodes(&mut vm, &mut cheat_state);
+            let mut exec_trace = ExecutionTrace::new();
+            let outcome = if trace_verbosity > Verbosity::Silent {
+                cheatcodes::execute_with_tracing(&mut vm, &mut cheat_state, &mut exec_trace)
+            } else {
+                cheatcodes::execute_with_cheatcodes(&mut vm, &mut cheat_state)
+            };
             let gas = vm.gas_used_total;
 
             let ok = if meta.should_panic {
@@ -217,6 +224,16 @@ pub fn run(filter: Option<&str>) -> Result<(), String> {
                 total_fail += 1;
             } else {
                 total_fail += 1;
+            }
+
+            // Print execution trace if verbosity enabled
+            if trace_verbosity > Verbosity::Silent && !exec_trace.is_empty() {
+                let tree = trace::build_tree(&exec_trace.events);
+                let formatted = trace::format_tree(&tree, trace_verbosity);
+                println!("    Traces:");
+                for line in formatted.lines() {
+                    println!("      {}", line);
+                }
             }
 
             // Collect for gas profile

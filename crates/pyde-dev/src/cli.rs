@@ -23,6 +23,11 @@ pub enum Command {
         /// Optional filter: only run tests matching this string.
         #[arg(short, long)]
         filter: Option<String>,
+
+        /// Verbosity level for execution traces.
+        /// -v = call tree, -vv = + storage, -vvv = + logs/full.
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbosity: u8,
     },
 
     /// Remove build artifacts (out/).
