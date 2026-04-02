@@ -29,9 +29,13 @@ use crate::types::Ty;
 
 use pyde_vm::isa::{encode, encode_mem_immediate, Instruction, MemWidth, Opcode};
 
-/// Reentrancy guard slot (well above user-defined storage slots).
-/// Must fit in 17-bit positive Addi (PVM sign-extends 18-bit immediate).
-const REENTRANCY_SLOT: u32 = 0x1FFFE;
+/// Reentrancy guard storage slot — 18-bit Addi encoding of -2.
+///
+/// At runtime, PVM sign-extends this to r15 = 0xFFFFFFFFFFFFFFFE (u64),
+/// then Widen produces U256(0xFFFFFFFFFFFFFFFE). User-defined storage slots
+/// count up from 0 via a u32 counter (max ~4 billion), so collision with
+/// this value (18 quintillion) is impossible.
+const REENTRANCY_SLOT: u32 = (-2i32 as u32) & 0x3FFFF;
 
 /// Wide scratch register index.
 const WIDE_SCRATCH: u8 = 7;
@@ -337,6 +341,8 @@ impl CodeGen {
 
         // Pre-pass: reserve labels for each function body + dispatch entry
         let mut dispatch_entries: Vec<(u32, String, Label, Label)> = Vec::new(); // (selector, name, dispatch_label, func_label)
+        let mut receive_label: Option<Label> = None;
+        let mut fallback_label: Option<Label> = None;
 
         for func in &program.functions {
             if func.is_test {
@@ -345,7 +351,15 @@ impl CodeGen {
             let func_label = self.alloc_label();
             self.func_labels.insert(func.name.clone(), func_label);
 
-            if func.is_pub && !func.is_constructor {
+            if func.is_receive {
+                let dispatch_label = self.alloc_label();
+                receive_label = Some(dispatch_label);
+                dispatch_entries.push((0, func.name.clone(), dispatch_label, func_label));
+            } else if func.is_fallback {
+                let dispatch_label = self.alloc_label();
+                fallback_label = Some(dispatch_label);
+                dispatch_entries.push((0, func.name.clone(), dispatch_label, func_label));
+            } else if func.is_pub && !func.is_constructor {
                 let dispatch_label = self.alloc_label();
                 let selector = compute_selector(&func.name);
                 dispatch_entries.push((selector, func.name.clone(), dispatch_label, func_label));
@@ -380,7 +394,7 @@ impl CodeGen {
 
         // Dispatch table + entries (only in production mode, not test mode)
         if self.emit_guards {
-            self.gen_dispatch_table(&dispatch_entries);
+            self.gen_dispatch_table(&dispatch_entries, receive_label, fallback_label);
 
             // Dispatch entries: decode calldata → Call function → Halt
             for (_, name, dispatch_label, func_label) in &dispatch_entries {
@@ -487,26 +501,64 @@ impl CodeGen {
     // Dispatch table: selector comparison
     // ========================================================================
 
-    fn gen_dispatch_table(&mut self, entries: &[(u32, String, Label, Label)]) {
-        if entries.is_empty() {
+    fn gen_dispatch_table(
+        &mut self,
+        entries: &[(u32, String, Label, Label)],
+        receive_label: Option<Label>,
+        fallback_label: Option<Label>,
+    ) {
+        if entries.is_empty() && receive_label.is_none() && fallback_label.is_none() {
             return;
         }
 
-        // Load 4-byte selector from calldata into r13 (u32 load, like Solidity).
-        // NOT r15, because load_u32_to_reg uses r15 as scratch.
+        // Step 1: Check for empty calldata + value > 0 → #[receive]
+        // r4 = calldata length (set by PVM loader). If 0 AND msg.value > 0 → receive.
+        // If calldata empty and value == 0 → fallback (or revert).
+        if receive_label.is_some() || fallback_label.is_some() {
+            let selector_check = self.alloc_label();
+            // Skip if calldata is not empty (r4 != 0 → go to selector matching)
+            self.emit_jump_placeholder(Opcode::Bne, 4, 0, selector_check);
+
+            // Calldata is empty — check msg.value
+            if let Some(recv_label) = receive_label {
+                // Load msg.value into w7, check if > 0
+                self.emit_op(Opcode::Callvalue, WIDE_SCRATCH, 0, 0); // w7 = msg.value
+                self.emit_op(Opcode::Addi, 15, 0, 0);
+                self.emit_op(Opcode::Widen, WIDE_SCRATCH2, 15, 0);  // w6 = 0
+                self.emit_op(Opcode::Weq, 15, WIDE_SCRATCH, WIDE_SCRATCH2 as u32); // r15 = (value == 0)
+                // If value != 0 (r15 == 0) → receive
+                self.emit_jump_placeholder(Opcode::Beq, 15, 0, recv_label);
+            }
+
+            // Calldata empty + value == 0 → fallback (or revert)
+            if let Some(fb_label) = fallback_label {
+                self.emit_jump_placeholder(Opcode::Jmp, 0, 0, fb_label);
+            } else {
+                self.emit_op(Opcode::Revert, 0, 0, 0);
+            }
+
+            self.mark_label(selector_check);
+        }
+
+        // Step 2: Load selector and match against dispatch entries
         let imm = encode_mem_immediate(0, MemWidth::W32).unwrap();
         self.emit(encode(Opcode::Load, 13, 5, imm)); // r13 = load u32 from calldata[0]
 
         for (selector, _name, dispatch_label, _func_label) in entries {
-            // Selector bytes are BE in calldata (e.g., [0x38, 0x12, 0xe7, 0x3e]).
-            // Load W32 reads them as LE u32, so we compare against the LE interpretation.
+            if *selector == 0 {
+                continue; // skip receive/fallback entries (selector=0)
+            }
             let selector_le = (*selector).swap_bytes();
             self.load_u32_to_reg(memory::REG_SCRATCH_0, selector_le);
             self.emit_jump_placeholder(Opcode::Beq, 13, memory::REG_SCRATCH_0, *dispatch_label);
         }
 
-        // No selector matched → revert
-        self.emit_op(Opcode::Revert, 0, 0, 0);
+        // Step 3: No selector matched → #[fallback] or revert
+        if let Some(fb_label) = fallback_label {
+            self.emit_jump_placeholder(Opcode::Jmp, 0, 0, fb_label);
+        } else {
+            self.emit_op(Opcode::Revert, 0, 0, 0);
+        }
     }
 
     // ========================================================================
@@ -4448,8 +4500,10 @@ mod tests {
             ..Default::default()
         };
 
-        // Derive the reentrancy lock storage key using the VM's own method
-        let lock_slot = ethnum::U256::from(REENTRANCY_SLOT as u64);
+        // Derive the reentrancy lock storage key using the VM's own method.
+        // REENTRANCY_SLOT is the raw 18-bit encoding of -2. The PVM sign-extends
+        // it to 0xFFFFFFFFFFFFFFFE (u64), then Widen gives U256 of that value.
+        let lock_slot = ethnum::U256::from((-2i64) as u64);
         let derived_key = {
             let tmp_vm = pyde_vm::vm::Vm::with_gas_limit_and_context(0, ctx.clone());
             tmp_vm.derive_storage_key(lock_slot)
