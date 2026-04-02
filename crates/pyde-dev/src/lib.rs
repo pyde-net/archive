@@ -6,3 +6,4 @@ pub mod deploy;
 pub mod init;
 pub mod project;
 pub mod test_runner;
+pub mod trace;

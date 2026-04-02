@@ -9,6 +9,7 @@
 use ethnum::U256;
 use pyde_vm::isa::Opcode;
 use pyde_vm::vm::{ExecResult, Outcome, Vm};
+use crate::trace::{ExecutionTrace, TraceEvent};
 
 /// Magic cheatcode address: 32 bytes of 0xCC.
 pub const CHEATCODE_ADDRESS: [u8; 32] = [0xCC; 32];
@@ -128,6 +129,161 @@ pub fn execute_with_cheatcodes(vm: &mut Vm, cheat_state: &mut CheatcodeState) ->
     };
 
     // Post-execution cleanup (matches vm.execute() behavior)
+    vm.clear_journal();
+    result
+}
+
+/// Execute VM with cheatcode interception AND trace recording.
+/// Same as execute_with_cheatcodes but also records trace events.
+pub fn execute_with_tracing(
+    vm: &mut Vm,
+    cheat_state: &mut CheatcodeState,
+    trace: &mut ExecutionTrace,
+) -> Outcome {
+    if let Some(ref addr) = cheat_state.prank_caller {
+        vm.ctx.caller = *addr;
+    }
+
+    vm.clear_journal();
+    let logs_start = vm.logs.len();
+    let mut call_depth: u32 = 0;
+
+    let result = loop {
+        let idx = (vm.pc / 4) as usize;
+        let maybe_instr = vm.decoded_cache().get(idx).copied();
+
+        if let Some(d) = maybe_instr {
+            // Record trace events BEFORE stepping
+            match d.opcode {
+                Opcode::CallExt => {
+                    let target: [u8; 32] = vm.cpu.read_wide(d.rd).to_le_bytes();
+
+                    // Cheatcode interception (same as execute_with_cheatcodes)
+                    if target == CHEATCODE_ADDRESS {
+                        let calldata_ptr = vm.cpu.read_gp(d.rs1) as u32;
+                        let len_reg = (d.rs2_or_imm & 0xF) as u8;
+                        let calldata_len = vm.cpu.read_gp(len_reg) as usize;
+                        let result_reg = ((d.rs2_or_imm >> 8) & 0xF) as u8;
+                        if let Ok(calldata) = vm.memory.checked_read_slice(calldata_ptr, calldata_len) {
+                            let success = handle_cheatcode(vm, cheat_state, &calldata);
+                            vm.cpu.write_gp(result_reg, if success { 1 } else { 0 });
+                        } else {
+                            vm.cpu.write_gp(result_reg, 0);
+                        }
+                        vm.pc += 4;
+                        continue;
+                    }
+
+                    // Record call trace
+                    let calldata_ptr = vm.cpu.read_gp(d.rs1) as u32;
+                    let selector = if let Ok(sel_bytes) = vm.memory.checked_read_slice(calldata_ptr, 4) {
+                        u32::from_be_bytes(sel_bytes[..4].try_into().unwrap_or([0; 4]))
+                    } else {
+                        0
+                    };
+                    trace.push(TraceEvent::Call {
+                        target,
+                        selector,
+                        function_name: format!("0x{:08x}", selector),
+                        gas_start: vm.gas_used_total,
+                        depth: call_depth,
+                    });
+                    call_depth += 1;
+                }
+                Opcode::Create => {
+                    trace.push(TraceEvent::Deploy {
+                        address: [0u8; 32], // filled after step
+                        code_size: 0,
+                        gas_used: 0,
+                        depth: call_depth,
+                    });
+                }
+                Opcode::Sload => {
+                    let slot = vm.cpu.read_wide(d.rs1);
+                    trace.push(TraceEvent::SLoad {
+                        key: slot,
+                        value: 0, // value unknown until after step
+                        depth: call_depth,
+                    });
+                }
+                Opcode::Sstore => {
+                    let slot = vm.cpu.read_wide(d.rs1);
+                    let mode = d.rs2_or_imm & 0x3;
+                    let value = if mode == 2 { vm.cpu.read_gp(d.rd) } else { 0 };
+                    trace.push(TraceEvent::SStore {
+                        key: slot,
+                        value,
+                        depth: call_depth,
+                    });
+                }
+                Opcode::Log => {
+                    trace.push(TraceEvent::Log {
+                        topic_count: d.rd,
+                        data_size: 0,
+                        depth: call_depth,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Normal step
+        match vm.step() {
+            Ok(Some(ExecResult::Halt)) => break Outcome::Success,
+            Ok(Some(ExecResult::Revert)) => {
+                trace.push(TraceEvent::Revert {
+                    error_selector: None,
+                    error_name: None,
+                    depth: call_depth,
+                });
+                vm.rollback_storage_pub();
+                vm.logs.truncate(logs_start);
+                vm.gas_refund = 0;
+                break Outcome::Revert;
+            }
+            Ok(None) => {
+                // After CallExt returns, record the return event
+                if let Some(d) = maybe_instr {
+                    if d.opcode == Opcode::CallExt {
+                        let target: [u8; 32] = vm.cpu.read_wide(d.rd).to_le_bytes();
+                        if target != CHEATCODE_ADDRESS {
+                            call_depth = call_depth.saturating_sub(1);
+                            let result_reg = ((d.rs2_or_imm >> 8) & 0xF) as u8;
+                            let success = vm.cpu.read_gp(result_reg) == 1;
+                            trace.push(TraceEvent::Return {
+                                success,
+                                gas_used: 0,
+                                return_value: vm.cpu.read_gp(1),
+                                depth: call_depth,
+                            });
+                        }
+                    }
+                }
+            }
+            Err(pyde_vm::cpu::Trap::OutOfGas) => {
+                vm.rollback_storage_pub();
+                vm.logs.truncate(logs_start);
+                vm.gas_refund = 0;
+                break Outcome::OutOfGas;
+            }
+            Err(trap) => {
+                vm.rollback_storage_pub();
+                vm.logs.truncate(logs_start);
+                vm.gas_refund = 0;
+                break Outcome::Trap(trap);
+            }
+        }
+
+        // Clear single-use prank
+        if let Some(d) = maybe_instr {
+            if d.opcode == Opcode::CallExt && !cheat_state.prank_persistent {
+                if cheat_state.prank_caller.is_some() {
+                    cheat_state.prank_caller = None;
+                }
+            }
+        }
+    };
+
     vm.clear_journal();
     result
 }

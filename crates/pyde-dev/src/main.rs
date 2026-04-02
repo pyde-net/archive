@@ -6,6 +6,7 @@ mod clean;
 mod test_runner;
 mod deploy;
 mod cheatcodes;
+mod trace;
 
 use clap::Parser;
 use cli::{Cli, Command};
@@ -17,7 +18,7 @@ fn main() {
     let result = match cli.command {
         Command::Init { name } => init::run(&name),
         Command::Build => build::run(),
-        Command::Test { filter } => test_runner::run(filter.as_deref()),
+        Command::Test { filter, verbosity } => test_runner::run(filter.as_deref(), verbosity),
         Command::Clean => clean::run(),
         Command::Deploy { network, contract, from } => {
             deploy::run(&network, contract.as_deref(), &from)
