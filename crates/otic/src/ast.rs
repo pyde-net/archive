@@ -280,8 +280,9 @@ pub enum Type {
     Vec(Box<Type>, Span),
     /// `Map<Address, u256>`
     Map(Box<Type>, Box<Type>, Span),
-    /// User-defined type: struct name, enum name
-    Named(Ident),
+    /// User-defined type: struct, enum, contract, interface, type alias.
+    /// Supports qualified paths: `types::TokenId`, `event::Deposit`.
+    Named(Vec<Ident>),
     /// `(u256, u256)`
     Tuple(Vec<Type>, Span),
 }
@@ -387,7 +388,8 @@ pub struct ReturnStmt {
 
 #[derive(Clone, Debug)]
 pub struct EmitStmt {
-    pub event_name: Ident,
+    /// Event name, possibly module-qualified: `Deposit` or `event::Deposit`.
+    pub event_name: Vec<Ident>,
     pub fields: Vec<FieldInit>,
     pub span: Span,
 }

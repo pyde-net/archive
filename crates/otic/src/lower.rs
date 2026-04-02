@@ -316,23 +316,25 @@ impl Lowerer {
             ast::Type::Array(elem, size, _) => Ty::Array(Box::new(self.resolve_ty(elem)), *size),
             ast::Type::Vec(elem, _) => Ty::Vec(Box::new(self.resolve_ty(elem))),
             ast::Type::Map(key, val, _) => Ty::Map(Box::new(self.resolve_ty(key)), Box::new(self.resolve_ty(val))),
-            ast::Type::Named(ident) => {
+            ast::Type::Named(path) => {
+                // Flatten qualified path: module::Type → just "Type"
+                let name = path.last().map(|i| i.name.as_str()).unwrap_or("");
                 // Check for primitive type names (parser may emit Named instead of Primitive for casts)
-                match ident.name.as_str() {
+                match name {
                     "u8" => Ty::U8, "u16" => Ty::U16, "u32" => Ty::U32, "u64" => Ty::U64,
                     "u128" => Ty::U128, "u256" => Ty::U256,
                     "i8" => Ty::I8, "i16" => Ty::I16, "i32" => Ty::I32, "i64" => Ty::I64,
                     "i128" => Ty::I128, "i256" => Ty::I256,
                     "bool" => Ty::Bool, "Address" => Ty::Address, "String" => Ty::StringTy,
                     _ => {
-                        if self.enum_defs.contains_key(&ident.name) {
-                            Ty::Enum(ident.name.clone())
-                        } else if self.interface_functions.contains_key(&ident.name) {
-                            Ty::Interface(ident.name.clone())
-                        } else if self.contract_functions.contains_key(&ident.name) {
-                            Ty::Contract(ident.name.clone())
+                        if self.enum_defs.contains_key(name) {
+                            Ty::Enum(name.to_string())
+                        } else if self.interface_functions.contains_key(name) {
+                            Ty::Interface(name.to_string())
+                        } else if self.contract_functions.contains_key(name) {
+                            Ty::Contract(name.to_string())
                         } else {
-                            Ty::Struct(ident.name.clone())
+                            Ty::Struct(name.to_string())
                         }
                     }
                 }
@@ -783,7 +785,9 @@ impl Lowerer {
         let field_regs: Vec<Reg> = e.fields.iter()
             .map(|f| self.lower_expr(&f.value))
             .collect();
-        self.emit(Inst::Emit(e.event_name.name.clone(), field_regs));
+        // Flatten qualified path: event::Deposit → "Deposit"
+        let event_name = e.event_name.last().map(|i| i.name.clone()).unwrap_or_default();
+        self.emit(Inst::Emit(event_name, field_regs));
     }
 
     fn lower_for(&mut self, f: &ForStmt) {

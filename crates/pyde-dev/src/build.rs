@@ -16,6 +16,45 @@ struct BuildCache {
 /// Function signature: (name, params, return_type).
 pub type FnSig = (String, Vec<(String, otic::types::Ty)>, otic::types::Ty);
 
+/// Exported symbols from a module (file).
+#[derive(Clone, Debug, Default)]
+pub struct ModuleExports {
+    /// Public contract names.
+    pub contracts: Vec<String>,
+    /// Public interface names.
+    pub interfaces: Vec<String>,
+    /// Event names (events are always public).
+    pub events: Vec<String>,
+    /// Error names (errors are always public).
+    pub errors: Vec<String>,
+    /// Public struct names.
+    pub structs: Vec<String>,
+    /// Enum names (enums are always public).
+    pub enums: Vec<String>,
+    /// Public constant names.
+    pub consts: Vec<String>,
+    /// Type alias names.
+    pub type_aliases: Vec<String>,
+    /// Public standalone function names (utility/helper functions outside contracts).
+    /// Contract pub methods are NOT included — they're ABI methods, not module exports.
+    pub functions: Vec<String>,
+}
+
+impl ModuleExports {
+    /// Check if a name is exported by this module.
+    pub fn has(&self, name: &str) -> bool {
+        self.contracts.iter().any(|n| n == name)
+            || self.interfaces.iter().any(|n| n == name)
+            || self.events.iter().any(|n| n == name)
+            || self.errors.iter().any(|n| n == name)
+            || self.structs.iter().any(|n| n == name)
+            || self.enums.iter().any(|n| n == name)
+            || self.consts.iter().any(|n| n == name)
+            || self.type_aliases.iter().any(|n| n == name)
+            || self.functions.iter().any(|n| n == name)
+    }
+}
+
 /// Result of building the project.
 pub struct BuildResult {
     pub contracts: Vec<(String, String)>, // (contract_name, artifact_path)
@@ -27,6 +66,8 @@ pub struct BuildResult {
     pub contract_functions: HashMap<String, Vec<FnSig>>,
     /// Contract name → constructor param list (for deploy! arg validation).
     pub contract_constructors: HashMap<String, Vec<(String, otic::types::Ty)>>,
+    /// Module path → exported symbols (for qualified access validation).
+    pub module_exports: HashMap<String, ModuleExports>,
 }
 
 pub fn run() -> Result<(), String> {
@@ -81,6 +122,54 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
     // Build dependency graph from `use` statements
     let dep_graph = build_dependency_graph(&sources, &src_dir)?;
 
+    // Pre-scan: collect module exports for qualified path validation
+    let mut module_exports: HashMap<String, ModuleExports> = HashMap::new();
+    for (path, source, _) in &sources {
+        let (tokens, _) = otic::lexer::Lexer::new(source).tokenize();
+        let (file, _) = otic::parser::Parser::new(tokens).parse();
+        let mut exports = ModuleExports::default();
+
+        for item in &file.items {
+            match item {
+                otic::ast::Item::Contract(c) => exports.contracts.push(c.name.name.clone()),
+                otic::ast::Item::Interface(i) => exports.interfaces.push(i.name.name.clone()),
+                otic::ast::Item::Struct(s) => exports.structs.push(s.name.name.clone()),
+                otic::ast::Item::Enum(e) => exports.enums.push(e.name.name.clone()),
+                otic::ast::Item::Error(e) => exports.errors.push(e.name.name.clone()),
+                otic::ast::Item::Const(c) if c.is_pub => exports.consts.push(c.name.name.clone()),
+                otic::ast::Item::TypeAlias(t) => exports.type_aliases.push(t.name.name.clone()),
+                // Only standalone pub functions are module-exportable (not contract methods)
+                otic::ast::Item::Function(f) if f.is_pub => exports.functions.push(f.name.name.clone()),
+                _ => {}
+            }
+            // Collect items from within contracts (events, errors, structs — NOT functions)
+            // Contract pub functions are ABI methods, not module-level exports.
+            // They're callable via deploy!() + typed dispatch, not via qualified paths.
+            if let otic::ast::Item::Contract(c) = item {
+                for ci in &c.items {
+                    match ci {
+                        otic::ast::ContractItem::Event(e) => exports.events.push(e.name.name.clone()),
+                        otic::ast::ContractItem::Error(e) => exports.errors.push(e.name.name.clone()),
+                        otic::ast::ContractItem::Struct(s) => exports.structs.push(s.name.name.clone()),
+                        otic::ast::ContractItem::Enum(e) => exports.enums.push(e.name.name.clone()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Register by both file stem and relative path
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            module_exports.insert(stem.to_string(), exports.clone());
+        }
+        if let Ok(rel) = path.strip_prefix(&src_dir) {
+            let rel_no_ext = rel.with_extension("");
+            if let Some(rel_str) = rel_no_ext.to_str() {
+                module_exports.insert(rel_str.replace('\\', "/"), exports);
+            }
+        }
+    }
+
     // Topological sort (detect cycles)
     let compile_order = topological_sort(&dep_graph, &sources)?;
 
@@ -106,12 +195,14 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
     let mut compiled_registry: HashMap<String, Vec<u8>> = HashMap::new();
     let mut contract_functions: HashMap<String, Vec<FnSig>> = HashMap::new();
     let mut contract_constructors: HashMap<String, Vec<(String, otic::types::Ty)>> = HashMap::new();
+    let mut module_exports: HashMap<String, ModuleExports> = HashMap::new();
     let mut result = BuildResult {
         contracts: Vec::new(),
         total_bytecode: 0,
         compiled_registry: HashMap::new(),
         contract_functions: HashMap::new(),
         contract_constructors: HashMap::new(),
+        module_exports: HashMap::new(),
     };
     let mut had_errors = false;
 
@@ -134,7 +225,7 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
         }
 
         // Run frontend: lex → parse → resolve → typecheck → safety
-        if let Err(msg) = run_frontend(path, source) {
+        if let Err(msg) = run_frontend(path, source, &module_exports) {
             eprintln!("{}", msg);
             had_errors = true;
             continue;
@@ -222,6 +313,7 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
     result.compiled_registry = compiled_registry;
     result.contract_functions = contract_functions;
     result.contract_constructors = contract_constructors;
+    result.module_exports = module_exports;
 
     // Save build cache
     save_cache(&cache_path, &new_cache);
@@ -233,7 +325,7 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
 }
 
 /// Run the otic frontend pipeline. Returns Err with formatted diagnostics on failure.
-fn run_frontend(path: &Path, source: &str) -> Result<(), String> {
+fn run_frontend(path: &Path, source: &str, module_exports: &HashMap<String, ModuleExports>) -> Result<(), String> {
     let path_str = path.to_string_lossy();
     let mut diagnostics = Vec::new();
 
@@ -265,7 +357,23 @@ fn run_frontend(path: &Path, source: &str) -> Result<(), String> {
         return Err(otic::diagnostic::format_diagnostics(&diagnostics, source));
     }
 
-    let resolve_result = otic::resolve::Resolver::new().resolve(&file);
+    // Convert ModuleExports to resolver's format (module_path → Vec<exported_name>)
+    let resolver_exports: otic::resolve::ExternalModuleExports = module_exports.iter()
+        .map(|(path, exports)| {
+            let mut names = Vec::new();
+            names.extend(exports.contracts.iter().cloned());
+            names.extend(exports.interfaces.iter().cloned());
+            names.extend(exports.events.iter().cloned());
+            names.extend(exports.errors.iter().cloned());
+            names.extend(exports.structs.iter().cloned());
+            names.extend(exports.enums.iter().cloned());
+            names.extend(exports.consts.iter().cloned());
+            names.extend(exports.type_aliases.iter().cloned());
+            names.extend(exports.functions.iter().cloned());
+            (path.clone(), names)
+        })
+        .collect();
+    let resolve_result = otic::resolve::Resolver::with_exports(resolver_exports).resolve(&file);
     for err in &resolve_result.errors {
         diagnostics.push(otic::diagnostic::Diagnostic {
             level: otic::diagnostic::Level::Error,

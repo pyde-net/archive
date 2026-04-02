@@ -632,10 +632,13 @@ impl Parser {
                         self.expect_gt()?;
                         Ok(Type::Map(Box::new(key), Box::new(val), span))
                     }
-                    // Named type (struct, enum, etc.)
+                    // Named type: struct, enum, contract, or qualified path (types::TokenId)
                     _ => {
-                        let ident = self.expect_ident()?;
-                        Ok(Type::Named(ident))
+                        let mut path = vec![self.expect_ident()?];
+                        while self.eat(&TokenKind::ColonColon) {
+                            path.push(self.expect_ident()?);
+                        }
+                        Ok(Type::Named(path))
                     }
                 }
             }
@@ -790,7 +793,11 @@ impl Parser {
     fn parse_emit_stmt(&mut self) -> Result<Stmt, ()> {
         let start = self.peek_span();
         self.expect(&TokenKind::Emit)?;
-        let event_name = self.expect_ident()?;
+        // Parse event name as a path: `Deposit` or `event::Deposit`
+        let mut event_name = vec![self.expect_ident()?];
+        while self.eat(&TokenKind::ColonColon) {
+            event_name.push(self.expect_ident()?);
+        }
         self.expect(&TokenKind::LBrace)?;
 
         let mut fields = Vec::new();
