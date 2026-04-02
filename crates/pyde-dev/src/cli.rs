@@ -30,6 +30,9 @@ pub enum Command {
         verbosity: u8,
     },
 
+    /// Generate documentation from source contracts.
+    Doc,
+
     /// Remove build artifacts (out/).
     Clean,
 
