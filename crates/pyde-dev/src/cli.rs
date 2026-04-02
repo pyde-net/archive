@@ -30,6 +30,9 @@ pub enum Command {
         verbosity: u8,
     },
 
+    /// Auto-format all .oti files in src/ and test/.
+    Fmt,
+
     /// Generate documentation from source contracts.
     Doc,
 

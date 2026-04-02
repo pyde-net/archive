@@ -4,6 +4,7 @@ mod init;
 mod build;
 mod clean;
 mod doc;
+mod fmt;
 mod test_runner;
 mod deploy;
 mod cheatcodes;
@@ -20,6 +21,7 @@ fn main() {
         Command::Init { name } => init::run(&name),
         Command::Build => build::run(),
         Command::Test { filter, verbosity } => test_runner::run(filter.as_deref(), verbosity),
+        Command::Fmt => fmt::run(),
         Command::Doc => doc::run(),
         Command::Clean => clean::run(),
         Command::Deploy { network, contract, from } => {
