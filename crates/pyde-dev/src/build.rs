@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// Build cache stored in out/.build-cache.json for incremental builds.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -47,7 +47,10 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
     let out_dir = root.join(&config.compiler.out);
 
     if !src_dir.exists() {
-        return Err(format!("source directory '{}' not found", src_dir.display()));
+        return Err(format!(
+            "source directory '{}' not found",
+            src_dir.display()
+        ));
     }
 
     // Find all .oti files
@@ -119,7 +122,14 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
         // Skip if unchanged and all deps unchanged
         if !needs_rebuild.contains(&file_idx) {
             // Still register previously compiled contracts from artifacts
-            load_existing_artifacts(&out_dir, source, &mut compiled_registry, &mut contract_functions, &mut contract_constructors, &mut result);
+            load_existing_artifacts(
+                &out_dir,
+                source,
+                &mut compiled_registry,
+                &mut contract_functions,
+                &mut contract_constructors,
+                &mut result,
+            );
             continue;
         }
 
@@ -306,43 +316,88 @@ fn build_dependency_graph(
     sources: &[(PathBuf, String, String)],
     src_dir: &Path,
 ) -> Result<Vec<Vec<usize>>, String> {
-    // Map stem name → file index for resolving `use Token;` → src/Token.oti
+    // Map module paths to file indices.
+    // Supports both flat (counter → src/counter.oti) and nested (events/event → src/events/event.oti).
     let mut name_to_idx: HashMap<String, usize> = HashMap::new();
     for (idx, (path, _, _)) in sources.iter().enumerate() {
+        // Register by file stem (flat: "counter")
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             name_to_idx.insert(stem.to_string(), idx);
+        }
+        // Register by relative path from src/ without extension (nested: "events/event")
+        if let Ok(rel) = path.strip_prefix(src_dir) {
+            let rel_no_ext = rel.with_extension("");
+            if let Some(rel_str) = rel_no_ext.to_str() {
+                // Normalize path separators to forward slash
+                let normalized = rel_str.replace('\\', "/");
+                name_to_idx.insert(normalized, idx);
+            }
         }
     }
 
     let mut graph: Vec<Vec<usize>> = vec![Vec::new(); sources.len()];
 
     for (idx, (path, source, _)) in sources.iter().enumerate() {
-        // Parse just enough to extract `use` statements
         let (tokens, _) = otic::lexer::Lexer::new(source).tokenize();
         let (file, _) = otic::parser::Parser::new(tokens).parse();
 
         for item in &file.items {
             if let otic::ast::Item::Use(import) = item {
-                // Skip std:: imports — those are stdlib, not project files
                 if !import.path.is_empty() && import.path[0].name == "std" {
                     continue;
                 }
 
-                // Resolve: `use counter::Counter;` → first segment "counter" maps to counter.oti
-                // Resolve: `use counter::{Counter, Error};` → same, first segment
-                let module_name = import.path.first().map(|p| p.name.as_str()).unwrap_or("");
-                if let Some(&dep_idx) = name_to_idx.get(module_name) {
+                // Build the module path from import segments.
+                // For grouped imports (items non-empty), ALL path segments are module path.
+                // For non-grouped, all segments except the last (item name) are module path.
+                let module_segments = if !import.items.is_empty() {
+                    // use events::event::{Deposit, Minted} → module = "events/event"
+                    import
+                        .path
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .collect::<Vec<_>>()
+                } else if import.path.len() >= 2 {
+                    // use events::event::Deposit → module = "events/event"
+                    import.path[..import.path.len() - 1]
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .collect::<Vec<_>>()
+                } else {
+                    import
+                        .path
+                        .iter()
+                        .map(|p| p.name.as_str())
+                        .collect::<Vec<_>>()
+                };
+
+                let module_path = module_segments.join("/");
+
+                if let Some(&dep_idx) = name_to_idx.get(&module_path) {
                     if dep_idx != idx && !graph[idx].contains(&dep_idx) {
                         graph[idx].push(dep_idx);
                     }
-                } else if !module_name.is_empty() {
-                    let rel = path.strip_prefix(src_dir).unwrap_or(path);
-                    return Err(format!(
-                        "error in {}: cannot resolve import '{}' — no {}.oti found in src/",
-                        rel.display(),
-                        import.path.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join("::"),
-                        module_name,
-                    ));
+                } else if !module_path.is_empty() {
+                    // Also try just the last segment (flat layout: counter.oti at src root)
+                    let last_segment = module_segments.last().copied().unwrap_or("");
+                    if let Some(&dep_idx) = name_to_idx.get(last_segment) {
+                        if dep_idx != idx && !graph[idx].contains(&dep_idx) {
+                            graph[idx].push(dep_idx);
+                        }
+                    } else {
+                        let rel = path.strip_prefix(src_dir).unwrap_or(path);
+                        return Err(format!(
+                            "error in {}: cannot resolve import '{}' — no {}.oti found in src/",
+                            rel.display(),
+                            import
+                                .path
+                                .iter()
+                                .map(|p| p.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("::"),
+                            module_path,
+                        ));
+                    }
                 }
             }
         }
@@ -413,9 +468,15 @@ fn topological_sort(
             .filter(|i| reverse_in_degree[*i] > 0)
             .map(|i| sources[i].0.as_path())
             .collect();
-        let names: Vec<String> = in_cycle.iter().map(|p| {
-            p.file_stem().unwrap_or_default().to_string_lossy().to_string()
-        }).collect();
+        let names: Vec<String> = in_cycle
+            .iter()
+            .map(|p| {
+                p.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
         return Err(format!(
             "circular import detected between: {}",
             names.join(" <-> ")
@@ -474,7 +535,9 @@ fn load_existing_artifacts(
                 let mut single = otic::ast::SourceFile { items: Vec::new() };
                 for it in &file.items {
                     match it {
-                        otic::ast::Item::Contract(cc) if cc.name.name == *name => single.items.push(it.clone()),
+                        otic::ast::Item::Contract(cc) if cc.name.name == *name => {
+                            single.items.push(it.clone())
+                        }
                         otic::ast::Item::Contract(_) => {}
                         _ => single.items.push(it.clone()),
                     }
@@ -484,7 +547,11 @@ fn load_existing_artifacts(
             let mut pub_fns: Vec<FnSig> = Vec::new();
             for func in &ir.functions {
                 if func.is_pub && !func.is_constructor && !func.is_test {
-                    pub_fns.push((func.name.clone(), func.params.clone(), func.return_ty.clone()));
+                    pub_fns.push((
+                        func.name.clone(),
+                        func.params.clone(),
+                        func.return_ty.clone(),
+                    ));
                 }
                 if func.is_constructor {
                     contract_constructors.insert(name.clone(), func.params.clone());
@@ -499,16 +566,19 @@ fn load_existing_artifacts(
                 if let Ok(json_str) = fs::read_to_string(&artifact_path) {
                     // Parse constructor + deployed bytecode from artifact
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                        let c_hex = val.get("constructorBytecode")
+                        let c_hex = val
+                            .get("constructorBytecode")
                             .and_then(|v| v.as_str())
                             .unwrap_or("0x")
                             .trim_start_matches("0x");
-                        let r_hex = val.get("deployedBytecode")
+                        let r_hex = val
+                            .get("deployedBytecode")
                             .and_then(|v| v.as_str())
                             .unwrap_or("0x")
                             .trim_start_matches("0x");
 
-                        if let (Ok(c_bytes), Ok(r_bytes)) = (hex::decode(c_hex), hex::decode(r_hex)) {
+                        if let (Ok(c_bytes), Ok(r_bytes)) = (hex::decode(c_hex), hex::decode(r_hex))
+                        {
                             let clen = c_bytes.len() as u32;
                             let rlen = r_bytes.len() as u32;
                             let mut deploy = Vec::with_capacity(8 + clen as usize + rlen as usize);
@@ -518,10 +588,9 @@ fn load_existing_artifacts(
                             deploy.extend_from_slice(&r_bytes);
                             registry.insert(name.clone(), deploy);
 
-                            result.contracts.push((
-                                name.clone(),
-                                artifact_path.to_string_lossy().to_string(),
-                            ));
+                            result
+                                .contracts
+                                .push((name.clone(), artifact_path.to_string_lossy().to_string()));
                             result.total_bytecode += c_bytes.len() + r_bytes.len();
 
                             // Print skip message
