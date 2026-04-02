@@ -239,6 +239,14 @@ impl FunctionDef {
     pub fn has_should_panic(&self) -> bool {
         self.attributes.iter().any(|a| a.content.starts_with("should_panic"))
     }
+
+    pub fn is_receive(&self) -> bool {
+        self.attributes.iter().any(|a| a.content == "receive")
+    }
+
+    pub fn is_fallback(&self) -> bool {
+        self.attributes.iter().any(|a| a.content == "fallback")
+    }
 }
 
 #[derive(Clone, Debug)]

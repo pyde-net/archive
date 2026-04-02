@@ -142,6 +142,8 @@ pub struct IrFunction {
     pub is_view: bool,
     pub is_reentrant: bool,
     pub is_payable: bool,
+    pub is_receive: bool,
+    pub is_fallback: bool,
     pub is_test: bool,
     /// If true, the test is expected to revert.
     pub should_panic: bool,
@@ -166,6 +168,8 @@ impl IrFunction {
             is_view: false,
             is_reentrant: false,
             is_payable: false,
+            is_receive: false,
+            is_fallback: false,
             is_test: false,
             should_panic: false,
             expected_error: None,

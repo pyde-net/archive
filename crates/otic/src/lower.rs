@@ -600,6 +600,8 @@ impl Lowerer {
         ir_func.is_view = func.is_view();
         ir_func.is_reentrant = func.is_reentrant();
         ir_func.is_payable = func.is_payable();
+        ir_func.is_receive = func.is_receive();
+        ir_func.is_fallback = func.is_fallback();
         ir_func.is_test = func.is_test();
         ir_func.should_panic = func.has_should_panic();
         ir_func.expected_error = parse_expected_error(&func.attributes);

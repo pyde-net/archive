@@ -44,6 +44,8 @@ const KNOWN_ATTRIBUTES: &[&str] = &[
     "indexed",
     "test",
     "should_panic",
+    "receive",
+    "fallback",
 ];
 
 /// Check if an attribute name (without args) is known.
@@ -142,6 +144,42 @@ impl SafetyChecker {
             }
         }
 
+        // Check for at most one #[receive]
+        let receives: Vec<&FunctionDef> = contract.items.iter()
+            .filter_map(|item| {
+                if let ContractItem::Function(f) = item {
+                    if f.is_receive() { return Some(f); }
+                }
+                None
+            })
+            .collect();
+        if receives.len() > 1 {
+            for recv in &receives[1..] {
+                self.error(
+                    "contract can only have one #[receive] function".into(),
+                    recv.span,
+                );
+            }
+        }
+
+        // Check for at most one #[fallback]
+        let fallbacks: Vec<&FunctionDef> = contract.items.iter()
+            .filter_map(|item| {
+                if let ContractItem::Function(f) = item {
+                    if f.is_fallback() { return Some(f); }
+                }
+                None
+            })
+            .collect();
+        if fallbacks.len() > 1 {
+            for fb in &fallbacks[1..] {
+                self.error(
+                    "contract can only have one #[fallback] function".into(),
+                    fb.span,
+                );
+            }
+        }
+
         // Build purity map: which functions are impure (modify state)?
         let purity_map = self.build_purity_map(&contract.items);
 
@@ -152,6 +190,8 @@ impl SafetyChecker {
                 self.check_view_purity_transitive(f, &purity_map);
                 self.check_constructor_rules(f);
                 self.check_payable_rules(f);
+                self.check_receive_rules(f);
+                self.check_fallback_rules(f);
                 self.check_cross_call_callbacks(f);
             }
         }
@@ -681,6 +721,93 @@ impl SafetyChecker {
     // ========================================================================
     // #[constructor] rules
     // ========================================================================
+
+    fn check_receive_rules(&mut self, func: &FunctionDef) {
+        if !func.is_receive() {
+            return;
+        }
+        // Cannot combine with #[constructor], #[view], #[test], or #[fallback]
+        if func.is_constructor() {
+            self.error("#[receive] cannot be combined with #[constructor]".into(), func.span);
+        }
+        if func.is_view() {
+            self.error("#[receive] cannot be combined with #[view]".into(), func.span);
+        }
+        if func.is_fallback() {
+            self.error("#[receive] cannot be combined with #[fallback]".into(), func.span);
+        }
+        if func.is_test() {
+            self.error("#[receive] cannot be combined with #[test]".into(), func.span);
+        }
+        // #[receive] must also be #[payable]
+        if !func.is_payable() {
+            self.error(
+                "#[receive] must also have #[payable] (it handles incoming value)".into(),
+                func.span,
+            );
+        }
+        // Must be pub (externally callable)
+        if !func.is_pub {
+            self.error(
+                "#[receive] must be a pub function".into(),
+                func.span,
+            );
+        }
+        // No parameters
+        if !func.params.is_empty() {
+            self.error(
+                "#[receive] cannot have parameters".into(),
+                func.span,
+            );
+        }
+        // No return type
+        if func.return_type.is_some() {
+            self.error(
+                "#[receive] cannot have a return type".into(),
+                func.span,
+            );
+        }
+    }
+
+    fn check_fallback_rules(&mut self, func: &FunctionDef) {
+        if !func.is_fallback() {
+            return;
+        }
+        // Cannot combine with #[constructor], #[view], #[test], or #[receive]
+        if func.is_constructor() {
+            self.error("#[fallback] cannot be combined with #[constructor]".into(), func.span);
+        }
+        if func.is_view() {
+            self.error("#[fallback] cannot be combined with #[view]".into(), func.span);
+        }
+        if func.is_receive() {
+            self.error("#[fallback] cannot be combined with #[receive]".into(), func.span);
+        }
+        if func.is_test() {
+            self.error("#[fallback] cannot be combined with #[test]".into(), func.span);
+        }
+        // Must be pub (externally callable)
+        if !func.is_pub {
+            self.error(
+                "#[fallback] must be a pub function".into(),
+                func.span,
+            );
+        }
+        // No parameters
+        if !func.params.is_empty() {
+            self.error(
+                "#[fallback] cannot have parameters".into(),
+                func.span,
+            );
+        }
+        // No return type
+        if func.return_type.is_some() {
+            self.error(
+                "#[fallback] cannot have a return type".into(),
+                func.span,
+            );
+        }
+    }
 
     fn check_constructor_rules(&mut self, func: &FunctionDef) {
         if !func.is_constructor() {
