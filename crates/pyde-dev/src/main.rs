@@ -3,6 +3,7 @@ mod project;
 mod init;
 mod build;
 mod clean;
+mod doc;
 mod test_runner;
 mod deploy;
 mod cheatcodes;
@@ -19,6 +20,7 @@ fn main() {
         Command::Init { name } => init::run(&name),
         Command::Build => build::run(),
         Command::Test { filter, verbosity } => test_runner::run(filter.as_deref(), verbosity),
+        Command::Doc => doc::run(),
         Command::Clean => clean::run(),
         Command::Deploy { network, contract, from } => {
             deploy::run(&network, contract.as_deref(), &from)
