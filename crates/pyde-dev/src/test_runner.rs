@@ -7,8 +7,11 @@ use std::fs;
 use std::time::Instant;
 
 pub fn run(filter: Option<&str>, verbosity: u8) -> Result<(), String> {
-    let trace_verbosity = Verbosity::from_count(verbosity);
     let (config, root) = project::load_config()?;
+
+    // Resolve verbosity: CLI flag overrides pyde.toml config
+    let effective_verbosity = if verbosity > 0 { verbosity } else { config.testing.verbosity };
+    let trace_verbosity = Verbosity::from_count(effective_verbosity);
 
     // Build src/ contracts first (tests may depend on them)
     println!("  Building contracts...");

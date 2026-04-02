@@ -8,7 +8,25 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub compiler: CompilerSection,
     #[serde(default)]
+    pub testing: TestSection,
+    #[serde(default)]
     pub networks: HashMap<String, NetworkConfig>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(default)]
+pub struct TestSection {
+    /// Default verbosity for execution traces (0=silent, 1=calls, 2=storage, 3=full).
+    /// CLI -v flag overrides this.
+    pub verbosity: u8,
+}
+
+impl Default for TestSection {
+    fn default() -> Self {
+        Self {
+            verbosity: 0,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -87,6 +105,9 @@ optimize = true
 src = "src"
 test = "test"
 out = "out"
+
+[testing]
+verbosity = 0    # 0=silent, 1=calls, 2=storage, 3=full traces
 
 [networks.devnet]
 rpc_url = "http://127.0.0.1:8545"
