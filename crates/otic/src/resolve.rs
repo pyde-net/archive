@@ -540,31 +540,37 @@ impl Resolver {
         }
 
         // Non-std imports: file-based contract/type imports.
-        // Syntax mirrors Rust:
-        //   use counter::Counter;                      → path=["counter","Counter"], items=[]
-        //   use counter::{Counter, InsufficientBalance}; → path=["counter"], items=[...]
-        //   use counter::*;                             → future: glob import
+        // Supports nested directory structure:
+        //   use counter::Counter;                         → src/counter.oti, import Counter
+        //   use events::event::{Deposit, Minted};         → src/events/event.oti, import Deposit + Minted
+        //   use events::event::Deposit;                   → src/events/event.oti, import Deposit
+        //   use utils::math::SafeMath;                    → src/utils/math.oti, import SafeMath
         //
-        // First path segment = module name (maps to src/<name>.oti in build pipeline).
-        // Remaining segments or grouped items = contract/error/struct names.
+        // Convention: path segments are the module path (maps to directory/file).
+        // For grouped imports (items non-empty), ALL path segments are module path.
+        // For non-grouped imports, the last PascalCase segment is the item name,
+        // everything before is the module path.
+
         if import.path.len() >= 2 && import.items.is_empty() {
-            // Single import: use module::Item;
-            // Register module name (skip if already declared — multiple imports from same module).
-            if self.lookup(&import.path[0].name).is_none() {
-                self.declare(&import.path[0].name, SymbolKind::Module, import.path[0].span);
+            // Single import: use module::path::Item;
+            // All preceding segments form the module path, last is the imported item.
+            for segment in &import.path[..import.path.len() - 1] {
+                if self.lookup(&segment.name).is_none() {
+                    self.declare(&segment.name, SymbolKind::Module, segment.span);
+                }
             }
-            for segment in &import.path[1..] {
-                self.declare(&segment.name, SymbolKind::Contract, segment.span);
-            }
+            // Last segment is the imported type/contract
+            let item = &import.path[import.path.len() - 1];
+            self.declare(&item.name, SymbolKind::Contract, item.span);
             return;
         }
 
         if !import.items.is_empty() {
-            // Grouped import: use module::{Item1, Item2};
-            // Register module name (skip if already declared).
-            if let Some(first) = import.path.first() {
-                if self.lookup(&first.name).is_none() {
-                    self.declare(&first.name, SymbolKind::Module, first.span);
+            // Grouped import: use module::path::{Item1, Item2};
+            // ALL path segments are module path.
+            for segment in &import.path {
+                if self.lookup(&segment.name).is_none() {
+                    self.declare(&segment.name, SymbolKind::Module, segment.span);
                 }
             }
             for item in &import.items {
