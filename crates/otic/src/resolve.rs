@@ -117,6 +117,11 @@ impl Scope {
 // Resolver
 // ============================================================================
 
+/// External module exports: module_path → set of exported symbol names.
+/// Used to validate qualified access (event::Deposit) and distinguish
+/// module imports from item imports.
+pub type ExternalModuleExports = HashMap<String, Vec<String>>;
+
 pub struct Resolver {
     scopes: Vec<Scope>,
     errors: Vec<ResolveError>,
@@ -130,6 +135,8 @@ pub struct Resolver {
     builtin_fns: Vec<&'static str>,
     /// Known built-in globals (msg, block, tx).
     builtin_globals: Vec<&'static str>,
+    /// External module exports for qualified path validation.
+    module_exports: ExternalModuleExports,
 }
 
 impl Resolver {
@@ -147,6 +154,15 @@ impl Resolver {
             ],
             builtin_fns: vec!["hash", "address", "gas_remaining", "bytes", "sig_verify", "sig_recover"],
             builtin_globals: vec!["msg", "block", "tx"],
+            module_exports: HashMap::new(),
+        }
+    }
+
+    /// Create a resolver with external module exports for qualified path validation.
+    pub fn with_exports(exports: ExternalModuleExports) -> Self {
+        Self {
+            module_exports: exports,
+            ..Self::new()
         }
     }
 
@@ -260,6 +276,18 @@ impl Resolver {
             }
         }
         None
+    }
+
+    /// Check if a module path exists in external exports.
+    fn is_known_module(&self, path: &str) -> bool {
+        self.module_exports.contains_key(path)
+    }
+
+    /// Check if an item is exported by a module.
+    fn is_exported(&self, module_path: &str, item_name: &str) -> bool {
+        self.module_exports.get(module_path)
+            .map(|exports| exports.iter().any(|e| e == item_name))
+            .unwrap_or(false)
     }
 
     fn is_type_defined(&self, name: &str) -> bool {
@@ -552,28 +580,66 @@ impl Resolver {
         // everything before is the module path.
 
         if import.path.len() >= 2 && import.items.is_empty() {
-            // Single import: use module::path::Item;
-            // All preceding segments form the module path, last is the imported item.
-            for segment in &import.path[..import.path.len() - 1] {
-                if self.lookup(&segment.name).is_none() {
-                    self.declare(&segment.name, SymbolKind::Module, segment.span);
+            // Check if the FULL path is a known module (module import: `use events::event;`)
+            // or the last segment is an item (item import: `use events::event::Deposit;`)
+            let full_path = import.path.iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join("/");
+            let all_but_last = import.path[..import.path.len() - 1].iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join("/");
+
+            if self.is_known_module(&full_path) {
+                // Module import: `use events::event;` — register all as Module
+                for segment in &import.path {
+                    if self.lookup(&segment.name).is_none() {
+                        self.declare(&segment.name, SymbolKind::Module, segment.span);
+                    }
                 }
+            } else {
+                // Item import: `use events::event::Deposit;` — last is item
+                for segment in &import.path[..import.path.len() - 1] {
+                    if self.lookup(&segment.name).is_none() {
+                        self.declare(&segment.name, SymbolKind::Module, segment.span);
+                    }
+                }
+                let item = &import.path[import.path.len() - 1];
+                // Validate the item is actually exported (if we know the module)
+                if !all_but_last.is_empty() && self.is_known_module(&all_but_last) {
+                    if !self.is_exported(&all_but_last, &item.name) {
+                        self.error(
+                            format!("'{}' is not exported from module '{}'", item.name, all_but_last.replace('/', "::")),
+                            item.span,
+                        );
+                    }
+                }
+                self.declare(&item.name, SymbolKind::Contract, item.span);
             }
-            // Last segment is the imported type/contract
-            let item = &import.path[import.path.len() - 1];
-            self.declare(&item.name, SymbolKind::Contract, item.span);
             return;
         }
 
         if !import.items.is_empty() {
             // Grouped import: use module::path::{Item1, Item2};
             // ALL path segments are module path.
+            let module_path = import.path.iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join("/");
             for segment in &import.path {
                 if self.lookup(&segment.name).is_none() {
                     self.declare(&segment.name, SymbolKind::Module, segment.span);
                 }
             }
             for item in &import.items {
+                // Validate each item is actually exported (if we know the module)
+                if self.is_known_module(&module_path) && !self.is_exported(&module_path, &item.name) {
+                    self.error(
+                        format!("'{}' is not exported from module '{}'", item.name, module_path.replace('/', "::")),
+                        item.span,
+                    );
+                }
                 self.declare(&item.name, SymbolKind::Contract, item.span);
             }
             return;
@@ -591,12 +657,22 @@ impl Resolver {
 
     fn resolve_type(&mut self, ty: &Type) {
         match ty {
-            Type::Named(ident) => {
-                if !self.is_type_defined(&ident.name) {
-                    self.error(
-                        format!("undefined type '{}'", ident.name),
-                        ident.span,
-                    );
+            Type::Named(path) => {
+                // For qualified paths (types::TokenId), check that at least the first
+                // segment is a known module or the last segment is a known type.
+                let name = path.last().map(|i| i.name.as_str()).unwrap_or("");
+                let span = path.last().map(|i| i.span).unwrap_or(path[0].span);
+                if path.len() == 1 {
+                    if !self.is_type_defined(name) {
+                        self.error(format!("undefined type '{}'", name), span);
+                    }
+                } else {
+                    // Qualified: check first segment is a known module
+                    let module = &path[0].name;
+                    if self.lookup(module).is_none() {
+                        self.error(format!("undefined module '{}'", module), path[0].span);
+                    }
+                    // The actual type resolution (module::Item → Item) happens in the lowerer
                 }
             }
             Type::Array(elem, _, _) => self.resolve_type(elem),
@@ -670,12 +746,20 @@ impl Resolver {
                 }
             }
             Stmt::Emit(e) => {
-                // Verify event name exists
-                if self.lookup(&e.event_name.name).is_none() {
-                    self.error(
-                        format!("undefined event '{}'", e.event_name.name),
-                        e.event_name.span,
-                    );
+                // Verify event name exists (simple or qualified)
+                let empty = String::new();
+                let event_name = e.event_name.last().map(|i| &i.name).unwrap_or(&empty);
+                let span = e.event_name.last().map(|i| i.span).unwrap_or(e.span);
+                if e.event_name.len() == 1 {
+                    if self.lookup(event_name).is_none() {
+                        self.error(format!("undefined event '{}'", event_name), span);
+                    }
+                } else {
+                    // Qualified: check first segment is a known module
+                    let module = &e.event_name[0].name;
+                    if self.lookup(module).is_none() {
+                        self.error(format!("undefined module '{}'", module), e.event_name[0].span);
+                    }
                 }
                 for field in &e.fields {
                     self.resolve_expr(&field.value);

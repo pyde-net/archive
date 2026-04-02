@@ -209,22 +209,25 @@ impl TypeChecker {
                 Box::new(self.resolve_type(key)),
                 Box::new(self.resolve_type(val)),
             ),
-            Type::Named(ident) => {
-                // Check type aliases first
-                if let Some(ty) = self.env.type_aliases.get(&ident.name) {
+            Type::Named(path) => {
+                // For qualified paths (module::Type), resolve the last segment.
+                // The module prefix is validated by the resolver; here we just
+                // need the concrete type name.
+                let name = path.last().map(|i| i.name.as_str()).unwrap_or("");
+                if let Some(ty) = self.env.type_aliases.get(name) {
                     return ty.clone();
                 }
-                if self.env.struct_defs.contains_key(&ident.name) {
-                    return Ty::Struct(ident.name.clone());
+                if self.env.struct_defs.contains_key(name) {
+                    return Ty::Struct(name.to_string());
                 }
-                if self.env.enum_defs.contains_key(&ident.name) {
-                    return Ty::Enum(ident.name.clone());
+                if self.env.enum_defs.contains_key(name) {
+                    return Ty::Enum(name.to_string());
                 }
-                if self.env.interface_defs.contains_key(&ident.name) {
-                    return Ty::Interface(ident.name.clone());
+                if self.env.interface_defs.contains_key(name) {
+                    return Ty::Interface(name.to_string());
                 }
-                if self.env.contract_names.contains(&ident.name) {
-                    return Ty::Contract(ident.name.clone());
+                if self.env.contract_names.contains(name) {
+                    return Ty::Contract(name.to_string());
                 }
                 Ty::Unknown
             }
@@ -799,13 +802,15 @@ impl TypeChecker {
     }
 
     fn check_emit(&mut self, e: &EmitStmt) {
-        if let Some(event_fields) = self.env.event_defs.get(&e.event_name.name).cloned() {
+        // Resolve qualified event name: event::Deposit → "Deposit"
+        let event_name = e.event_name.last().map(|i| i.name.as_str()).unwrap_or("");
+        if let Some(event_fields) = self.env.event_defs.get(event_name).cloned() {
             // Check field count
             if e.fields.len() != event_fields.len() {
                 self.error(
                     format!(
                         "event '{}' expects {} fields, found {}",
-                        e.event_name.name,
+                        event_name,
                         event_fields.len(),
                         e.fields.len()
                     ),
