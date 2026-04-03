@@ -33,6 +33,21 @@ pub enum Command {
     /// Auto-format all .oti files in src/ and test/.
     Fmt,
 
+    /// Run a deployment/migration script.
+    /// Format: `file.oti:ContractName` (e.g., `Deploy.oti:Erc20Deploy`).
+    Script {
+        /// Script file and optional contract: `file.oti` or `file.oti:ContractName`.
+        file: String,
+
+        /// Network name (must be defined in pyde.toml [networks]).
+        #[arg(short, long, default_value = "devnet")]
+        network: String,
+
+        /// Sender address (hex).
+        #[arg(long, default_value = "0x0101010101010101010101010101010101010101010101010101010101010101")]
+        from: String,
+    },
+
     /// Generate documentation from source contracts.
     Doc,
 

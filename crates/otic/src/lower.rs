@@ -196,6 +196,22 @@ impl Lowerer {
         self.reg_types.insert(reg.0, ty);
     }
 
+    /// If the argument is a hex literal, re-emit it as an Address constant
+    /// so the byte order is correct (hex digits = BE, PVM addresses = LE bytes).
+    fn ensure_address_bytes(&mut self, addr_reg: Reg, args: &[Expr]) -> Reg {
+        // Check if the first argument is an integer literal (hex address)
+        if let Some(Expr::Literal(Literal::Int(v), _)) = args.first() {
+            if *v > ethnum::U256::from(u64::MAX) {
+                // Convert numeric value to raw address bytes (BE → LE)
+                let be_bytes = v.to_be_bytes();
+                let new_reg = self.alloc_reg();
+                self.emit(Inst::Const(new_reg, IrConst::Address(be_bytes)));
+                return new_reg;
+            }
+        }
+        addr_reg
+    }
+
     /// Look up the type of a register (Contract/Interface handles).
     fn get_reg_type(&self, reg: Reg) -> Option<&Ty> {
         self.reg_types.get(&reg.0)
@@ -875,7 +891,13 @@ impl Lowerer {
             Expr::Literal(lit, _) => {
                 let dst = self.alloc_reg();
                 let val = match lit {
-                    Literal::Int(v) => IrConst::Int(*v, Ty::U64),
+                    Literal::Int(v) => {
+                        if *v > ethnum::U256::from(u64::MAX) {
+                            IrConst::Int(*v, Ty::U256)
+                        } else {
+                            IrConst::Int(*v, Ty::U64)
+                        }
+                    }
                     Literal::String(s) => IrConst::String(s.clone()),
                     Literal::Bool(b) => IrConst::Bool(*b),
                 };
@@ -1114,16 +1136,20 @@ impl Lowerer {
                             // Interface::at(address) → typed interface handle
                             if member == "at" && self.interface_functions.contains_key(type_name) {
                                 if let Some(addr_reg) = arg_regs.first() {
-                                    // at() is a no-op at runtime — just tracks the type
-                                    self.set_local_type_for_reg(*addr_reg, Ty::Interface(type_name.to_string()));
-                                    return *addr_reg;
+                                    // at() is a no-op at runtime — just tracks the type.
+                                    // If the arg is a hex literal, convert to address bytes
+                                    // so the byte order is correct (hex = BE, PVM = LE bytes).
+                                    let reg = self.ensure_address_bytes(*addr_reg, args);
+                                    self.set_local_type_for_reg(reg, Ty::Interface(type_name.to_string()));
+                                    return reg;
                                 }
                             }
                             // Contract::at(address) → typed contract handle
                             if member == "at" && self.contract_functions.contains_key(type_name) {
                                 if let Some(addr_reg) = arg_regs.first() {
-                                    self.set_local_type_for_reg(*addr_reg, Ty::Contract(type_name.to_string()));
-                                    return *addr_reg;
+                                    let reg = self.ensure_address_bytes(*addr_reg, args);
+                                    self.set_local_type_for_reg(reg, Ty::Contract(type_name.to_string()));
+                                    return reg;
                                 }
                             }
                         }
@@ -1350,9 +1376,11 @@ impl Lowerer {
 
                         let dst = self.alloc_reg();
 
-                        // First arg must be a contract name (path expression)
+                        // First arg must be a contract name (path or ident)
                         let contract_name = if let Some(Expr::Path(segments, _)) = positional.first() {
                             segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::")
+                        } else if let Some(Expr::Ident(ident)) = positional.first() {
+                            ident.name.clone()
                         } else {
                             self.emit(Inst::Comment("deploy! requires a contract name".into()));
                             return dst;
@@ -1497,7 +1525,13 @@ impl Lowerer {
                         Pattern::Literal(lit, _) => {
                             let pat_reg = self.alloc_reg();
                             let val = match lit {
-                                Literal::Int(v) => IrConst::Int(*v, Ty::U64),
+                                Literal::Int(v) => {
+                                    if *v > ethnum::U256::from(u64::MAX) {
+                                        IrConst::Int(*v, Ty::U256)
+                                    } else {
+                                        IrConst::Int(*v, Ty::U64)
+                                    }
+                                }
                                 Literal::String(s) => IrConst::String(s.clone()),
                                 Literal::Bool(b) => IrConst::Bool(*b),
                             };

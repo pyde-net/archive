@@ -132,22 +132,25 @@ pub fn run(network: &str, contract: Option<&str>, from: &str) -> Result<(), Stri
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Parse the result (may be nested JSON string)
-    let (tx_hash, contract_addr) = if let Ok(inner) =
-        serde_json::from_str::<serde_json::Value>(result_str)
-    {
-        let tx = inner
-            .get("txHash")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let addr = inner
-            .get("contractAddress")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        (tx.to_string(), addr.to_string())
+    // Extract tx hash from response
+    let tx_hash = if let Ok(inner) = serde_json::from_str::<serde_json::Value>(result_str) {
+        inner.get("txHash").and_then(|v| v.as_str())
+            .unwrap_or(result_str).to_string()
     } else {
-        (result_str.to_string(), "unknown".to_string())
+        result_str.to_string()
     };
+
+    // Poll receipt for the authoritative contract address
+    println!("  Waiting for receipt...");
+    let receipt = poll_receipt(&client, &net.rpc_url, &tx_hash)?;
+    let success = receipt.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !success {
+        return Err("deploy transaction reverted".into());
+    }
+    let contract_addr = receipt.get("returnData")
+        .and_then(|v| v.as_str())
+        .map(|s| if s.starts_with("0x") { s.to_string() } else { format!("0x{}", s) })
+        .unwrap_or_else(|| "unknown".to_string());
 
     println!();
     println!("  Deployed!");
@@ -155,6 +158,36 @@ pub fn run(network: &str, contract: Option<&str>, from: &str) -> Result<(), Stri
     println!("  Tx Hash:  {}", tx_hash);
 
     Ok(())
+}
+
+/// Poll `pyde_getTransactionReceipt` until the receipt is available.
+fn poll_receipt(
+    client: &reqwest::blocking::Client,
+    rpc_url: &str,
+    tx_hash: &str,
+) -> Result<serde_json::Value, String> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "pyde_getTransactionReceipt",
+        "params": [tx_hash]
+    });
+    for attempt in 0..50 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let resp = client.post(rpc_url).json(&body).send()
+            .map_err(|e| format!("RPC error polling receipt: {}", e))?;
+        let json: serde_json::Value = resp.json()
+            .map_err(|e| format!("invalid receipt response: {}", e))?;
+        if json.get("error").is_none() {
+            if let Some(result) = json.get("result") {
+                if !result.is_null() {
+                    return Ok(result.clone());
+                }
+            }
+        }
+    }
+    Err(format!("receipt not available after 5s for tx {}", tx_hash))
 }
 
 /// Get the current nonce for an address via RPC.

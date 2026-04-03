@@ -1267,11 +1267,19 @@ impl Vm {
     }
 
     /// Derive a storage key from a slot and the contract's address.
-    /// key = poseidon2(slot_bytes ++ address_bytes)
+    /// Uses domain-separated format matching `pyde_state::keys::storage_slot_key`:
+    /// key = Poseidon2(address || 0x04 || slot_bytes)
     pub fn derive_storage_key(&self, slot: U256) -> U256 {
-        let mut buf = [0u8; 64]; // 32 (slot) + 32 (address)
-        buf[..32].copy_from_slice(&slot.to_le_bytes());
-        buf[32..64].copy_from_slice(&self.ctx.self_address);
+        let slot_bytes = slot.to_le_bytes();
+        // Trim trailing zero bytes to match canonical encoding
+        // (u64 slots produce 8 bytes, full U256 slots produce 32)
+        let significant_len = 32 - slot_bytes.iter().rev().take_while(|&&b| b == 0).count();
+        let slot_len = significant_len.max(8); // at least 8 bytes (u64 width)
+
+        let mut buf = Vec::with_capacity(33 + slot_len);
+        buf.extend_from_slice(&self.ctx.self_address); // 32 bytes
+        buf.push(0x04); // STORAGE_SLOT discriminator
+        buf.extend_from_slice(&slot_bytes[..slot_len]);
         let hash = pyde_crypto::poseidon2::poseidon2_hash(&buf);
         U256::from_le_bytes(hash.to_bytes())
     }

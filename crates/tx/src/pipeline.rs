@@ -258,7 +258,7 @@ pub fn execute_transaction(
                 (tx.data.clone(), 32_000u64)
             };
 
-            (true, gas_used, 0u64, vec![], vec![])
+            (true, gas_used, 0u64, vec![], new_addr.to_vec())
         }
         _ => {
             // Simple transfer or batch (batch deferred)
@@ -507,10 +507,16 @@ pub fn pre_derive_access_list_keys(
 
         for raw_key in entry.reads.iter().chain(entry.writes.iter()) {
             let slot = U256::from_le_bytes(*raw_key);
-            // Derive storage key: Poseidon2(slot || target_address)
-            let mut buf = [0u8; 64];
-            buf[..32].copy_from_slice(&slot.to_le_bytes());
-            buf[32..64].copy_from_slice(target);
+            let slot_bytes = slot.to_le_bytes();
+            // Trim trailing zeros, minimum 8 bytes (u64 width)
+            let sig_len = 32 - slot_bytes.iter().rev().take_while(|&&b| b == 0).count();
+            let slot_len = sig_len.max(8);
+            // Derive storage key: Poseidon2(address || 0x04 || slot_bytes)
+            // Matches VM's derive_storage_key and pyde_state::keys::storage_slot_key
+            let mut buf = Vec::with_capacity(33 + slot_len);
+            buf.extend_from_slice(target);
+            buf.push(0x04); // STORAGE_SLOT discriminator
+            buf.extend_from_slice(&slot_bytes[..slot_len]);
             let hash = poseidon2_hash(&buf);
             let derived = U256::from_le_bytes(hash.to_bytes());
             allowed.insert(derived);
@@ -1221,5 +1227,79 @@ mod tests {
         let call_receipt = execute_transaction(&call_tx, &mut smt, &block_ctx).unwrap();
         assert!(call_receipt.success, "void call failed");
         // return_data exists (r1 value) but caller should ignore for void functions
+    }
+
+    #[test]
+    fn storage_slot_key_reads_correct_value_after_execution() {
+        // Deploy a contract, call set_value(42), then verify storage_slot_key can read it
+        let src = r#"
+            contract Counter {
+                storage { count: u64, }
+                #[constructor]
+                pub fn init() { self.count = 0; }
+                pub fn increment() { self.count = self.count + 1; }
+            }
+        "#;
+        let compiled = otic::compile_all(src);
+        let (_, contract) = &compiled[0];
+
+        let clen = contract.constructor_bytecode.len() as u32;
+        let rlen = contract.runtime_bytecode.len() as u32;
+        let mut deploy_data = Vec::new();
+        deploy_data.extend_from_slice(&clen.to_le_bytes());
+        deploy_data.extend_from_slice(&rlen.to_le_bytes());
+        deploy_data.extend_from_slice(&contract.constructor_bytecode);
+        deploy_data.extend_from_slice(&contract.runtime_bytecode);
+
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let mut smt = PydeSMT::new();
+        let block_ctx = make_block_ctx();
+        let sender_addr = setup_funded_account(&mut smt, &pk_bytes, 1_000_000_000_000);
+        let contract_addr = pyde_account::address::derive_create_address(&sender_addr, 0);
+
+        // Deploy
+        let deploy_tx = {
+            let mut tx = Transaction {
+                from: sender_addr, to: ZERO_ADDRESS, value: 0,
+                data: deploy_data, gas_limit: 100_000_000, nonce: 0,
+                signature: vec![], fee_payer: FeePayer::Sender,
+                access_list: vec![], deadline: None, chain_id: 1,
+                tx_type: TransactionType::Deploy,
+            };
+            let hash = tx.hash();
+            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+            tx
+        };
+        let deploy_receipt = execute_transaction(&deploy_tx, &mut smt, &block_ctx).unwrap();
+        assert!(deploy_receipt.success, "deploy failed");
+
+        // Call increment() 3 times
+        for i in 0..3u64 {
+            let selector = otic::codegen::compute_selector("increment");
+            let call_tx = {
+                let mut tx = Transaction {
+                    from: sender_addr, to: contract_addr, value: 0,
+                    data: selector.to_be_bytes().to_vec(), gas_limit: 100_000_000, nonce: 1 + i,
+                    signature: vec![], fee_payer: FeePayer::Sender,
+                    access_list: vec![], deadline: None, chain_id: 1,
+                    tx_type: TransactionType::Standard,
+                };
+                let hash = tx.hash();
+                tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+                tx
+            };
+            let receipt = execute_transaction(&call_tx, &mut smt, &block_ctx).unwrap();
+            assert!(receipt.success, "increment {} failed", i);
+        }
+
+        // Verify storage via storage_slot_key (same key get_storage_at RPC uses)
+        let storage_key = pyde_state::keys::storage_slot_key(&contract_addr, 0);
+        let value = smt.get(&storage_key);
+        assert!(value.is_some(), "storage_slot_key should find the value");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&value.unwrap()[..8]);
+        let count = u64::from_le_bytes(buf);
+        assert_eq!(count, 3, "count should be 3 after 3 increments");
     }
 }

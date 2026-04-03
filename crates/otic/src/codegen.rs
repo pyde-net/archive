@@ -2041,7 +2041,10 @@ impl CodeGen {
                 let imm = (14 & 0xF)           // len_reg = r14
                     | ((15 & 0xF) << 4)         // gas_reg = r15
                     | ((13 & 0xF) << 8); // result_reg = r13
+                // Save r13 (spill base) — CallExt overwrites it with success flag
+                self.emit_op(Opcode::Push, 13, 0, 0);
                 self.emit_op(Opcode::CallExt, ra, 12, imm);
+                self.emit_op(Opcode::Pop, 13, 0, 0); // restore spill base
 
                 // Advance heap past calldata
                 self.emit_op(Opcode::Addi, 12, 12, calldata_len);
@@ -2113,7 +2116,10 @@ impl CodeGen {
                 let imm = (14 & 0xF)           // len_reg = r14
                     | ((15 & 0xF) << 4)         // gas_reg = r15
                     | ((13 & 0xF) << 8); // result_reg = r13
+                // Save r13 (spill base) — CallExt overwrites it with success flag
+                self.emit_op(Opcode::Push, 13, 0, 0);
                 self.emit_op(Opcode::CallExt, rt, 12, imm);
+                self.emit_op(Opcode::Pop, 13, 0, 0); // restore spill base
 
                 // Advance heap past calldata
                 self.emit_op(Opcode::Addi, 12, 12, calldata_len);
