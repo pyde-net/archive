@@ -425,7 +425,28 @@ fn execute_in_pvm(
         })
         .collect();
 
-    let return_data = vm.return_data.clone();
+    // Capture return data: explicit return_data (from Revert/child calls) takes
+    // priority. Otherwise, read from r1/r2 (same convention as do_ext_call).
+    let return_data = if !vm.return_data.is_empty() {
+        vm.return_data.clone()
+    } else if success {
+        let r2 = vm.cpu.read_gp(2);
+        if r2 > 0 {
+            // Blob/wide return: r1 = pointer, r2 = length
+            let ptr = vm.cpu.read_gp(1) as usize;
+            let len = (r2 as usize).min(pyde_vm::memory::MEMORY_SIZE);
+            if ptr + len <= pyde_vm::memory::MEMORY_SIZE {
+                vm.memory.load_bytes(ptr, len)
+            } else {
+                vm.cpu.read_gp(1).to_le_bytes().to_vec()
+            }
+        } else {
+            // GP return: r1 = value (8 bytes LE)
+            vm.cpu.read_gp(1).to_le_bytes().to_vec()
+        }
+    } else {
+        vm.return_data.clone() // revert data
+    };
     (success, output.gas_used as u64, output.gas_refund, logs, return_data)
 }
 
