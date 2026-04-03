@@ -786,7 +786,7 @@ async fn parse_call_object(
 }
 
 fn receipt_to_json(receipt: &Receipt) -> serde_json::Value {
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "txHash": format!("0x{}", hex::encode(receipt.tx_hash)),
         "success": receipt.success,
         "gasUsed": format!("0x{:x}", receipt.gas_used),
@@ -799,7 +799,14 @@ fn receipt_to_json(receipt: &Receipt) -> serde_json::Value {
             "topics": l.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
             "data": format!("0x{}", hex::encode(&l.data)),
         })).collect::<Vec<_>>(),
-    })
+    });
+    // Include return_data if non-empty (ephemeral — not persisted to disk)
+    if !receipt.return_data.is_empty() {
+        json["returnData"] = serde_json::Value::String(
+            format!("0x{}", hex::encode(&receipt.return_data))
+        );
+    }
+    json
 }
 
 /// Read balance from Account bytes (try Account::from_bytes, fall back to raw u128).
@@ -888,6 +895,7 @@ mod tests {
             fee_validator: 210000,
             logs: vec![],
             state_root: sparse_merkle_tree::H256::zero(),
+            return_data: vec![],
         };
         let json = receipt_to_json(&receipt);
         assert_eq!(json["success"], true);

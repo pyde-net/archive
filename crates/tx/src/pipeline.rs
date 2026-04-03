@@ -162,7 +162,7 @@ pub fn execute_transaction(
         .map_err(|e| PipelineError::ExecutionFailed(e))?;
 
     // 6. PVM execution (if contract call or deployment)
-    let (success, gas_used, gas_refund, logs) = match tx.tx_type {
+    let (success, gas_used, gas_refund, logs, return_data) = match tx.tx_type {
         TransactionType::Standard if tx.to != ZERO_ADDRESS => {
             // Contract call
             match load_code(smt, &tx.to) {
@@ -172,7 +172,7 @@ pub fn execute_transaction(
                 }
                 None => {
                     tracing::debug!(to = hex::encode(tx.to), "simple transfer (no code at recipient)");
-                    (true, 21_000u64, 0u64, vec![])
+                    (true, 21_000u64, 0u64, vec![], vec![])
                 }
             }
         }
@@ -233,7 +233,7 @@ pub fn execute_transaction(
                         contract = hex::encode(new_addr),
                         "executing constructor"
                     );
-                    let (success, gas, _, logs) = execute_in_pvm(
+                    let (success, gas, _, logs, _) = execute_in_pvm(
                         &constructor_tx, &sender, constructor, smt, block_ctx,
                     );
                     if !success {
@@ -258,11 +258,11 @@ pub fn execute_transaction(
                 (tx.data.clone(), 32_000u64)
             };
 
-            (true, gas_used, 0u64, vec![])
+            (true, gas_used, 0u64, vec![], vec![])
         }
         _ => {
             // Simple transfer or batch (batch deferred)
-            (true, 21_000u64, 0u64, vec![])
+            (true, 21_000u64, 0u64, vec![], vec![])
         }
     };
 
@@ -312,6 +312,7 @@ pub fn execute_transaction(
         block_ctx.base_fee,
         logs,
         state_root,
+        return_data,
     );
 
     Ok(receipt)
@@ -325,7 +326,7 @@ fn execute_in_pvm(
     code: &[u8],
     smt: &mut PydeSMT,
     block_ctx: &BlockContext,
-) -> (bool, u64, u64, Vec<LogEntry>) {
+) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
     let ctx = ExecutionContext {
         caller: tx.from,
         self_address: tx.to,
@@ -374,7 +375,7 @@ fn execute_in_pvm(
     }));
 
     if vm.load(code).is_err() {
-        return (false, tx.gas_limit, 0, vec![]);
+        return (false, tx.gas_limit, 0, vec![], vec![]);
     }
 
     let output = vm.execute();
@@ -424,7 +425,8 @@ fn execute_in_pvm(
         })
         .collect();
 
-    (success, output.gas_used as u64, output.gas_refund, logs)
+    let return_data = vm.return_data.clone();
+    (success, output.gas_used as u64, output.gas_refund, logs, return_data)
 }
 
 /// Execute a block of transactions using parallel group scheduling.

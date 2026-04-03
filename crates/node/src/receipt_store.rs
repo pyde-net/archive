@@ -114,6 +114,7 @@ mod tests {
             fee_validator: 0,
             logs: vec![],
             state_root: H256::zero(),
+            return_data: vec![],
         }
     }
 
@@ -163,6 +164,7 @@ mod tests {
                 LogEntry { address: [0xDD; 32], topics: vec![], data: vec![4, 5] },
             ],
             state_root: H256::zero(),
+            return_data: vec![],
         };
         store.insert_block_receipts(5, vec![receipt]);
 
