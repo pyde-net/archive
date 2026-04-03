@@ -299,7 +299,7 @@ fn collect_used_regs(inst: &Inst, used: &mut HashSet<Reg>) {
         Inst::Builtin(_, _) => {}
         Inst::Call(_, _, args) => { for a in args { used.insert(*a); } }
         Inst::MethodCall(_, obj, _, args) => { used.insert(*obj); for a in args { used.insert(*a); } }
-        Inst::ExtCall(_, addr, _, args, _) => { used.insert(*addr); for a in args { used.insert(*a); } }
+        Inst::ExtCall(_, addr, _, args, _) => { used.insert(*addr); for (a, _) in args { used.insert(*a); } }
         Inst::Hash(_, args) => { for a in args { used.insert(*a); } }
         Inst::StructInit(_, _, fields) => { for (_, r) in fields { used.insert(*r); } }
         Inst::FieldGet(_, obj, _, _) => { used.insert(*obj); }
@@ -317,7 +317,7 @@ fn collect_used_regs(inst: &Inst, used: &mut HashSet<Reg>) {
             for a in args { used.insert(*a); }
         }
         Inst::RawCall(_, target, args) => { used.insert(*target); for a in args { used.insert(*a); } }
-        Inst::CreateContract(_, blob, args) => { used.insert(*blob); for a in args { used.insert(*a); } }
+        Inst::CreateContract(_, blob, args) => { used.insert(*blob); for (a, _) in args { used.insert(*a); } }
         Inst::Jump(_) => {}
         Inst::Branch(cond, _, _) => { used.insert(*cond); }
         Inst::Return(Some(val)) => { used.insert(*val); }

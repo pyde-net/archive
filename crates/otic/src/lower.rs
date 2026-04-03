@@ -233,6 +233,21 @@ impl Lowerer {
         Ty::U64
     }
 
+    /// Look up parameter types for a method on a contract or interface.
+    fn lookup_method_param_types(&self, type_name: &str, method_name: &str) -> Vec<Ty> {
+        if let Some(fns) = self.contract_functions.get(type_name) {
+            if let Some((_, params, _)) = fns.iter().find(|(n, _, _)| n == method_name) {
+                return params.iter().map(|(_, ty)| ty.clone()).collect();
+            }
+        }
+        if let Some(fns) = self.interface_functions.get(type_name) {
+            if let Some((_, params, _)) = fns.iter().find(|(n, _, _)| n == method_name) {
+                return params.iter().map(|(_, ty)| ty.clone()).collect();
+            }
+        }
+        vec![]
+    }
+
     /// Infer the type of an expression (best-effort, for local_types tracking).
     fn infer_expr_type(&self, expr: &ast::Expr) -> Option<Ty> {
         use crate::ast::Expr;
@@ -1116,7 +1131,11 @@ impl Lowerer {
                                 Some(Ty::Contract(ref name)) | Some(Ty::Interface(ref name)) => {
                                     // Typed contract/interface call → ExtCall
                                     let ret_ty = self.lookup_method_return_type(name, &method.name);
-                                    self.emit(Inst::ExtCall(dst, obj_reg, method.name.clone(), arg_regs, ret_ty));
+                                    let param_types = self.lookup_method_param_types(name, &method.name);
+                                    let typed_args: Vec<(Reg, Ty)> = arg_regs.iter().zip(
+                                        param_types.iter().chain(std::iter::repeat(&Ty::U64))
+                                    ).map(|(r, t)| (*r, t.clone())).collect();
+                                    self.emit(Inst::ExtCall(dst, obj_reg, method.name.clone(), typed_args, ret_ty));
                                 }
                                 _ => {
                                     self.emit(Inst::MethodCall(dst, obj_reg, method.name.clone(), arg_regs));
@@ -1356,8 +1375,10 @@ impl Lowerer {
 
                         if let Some(method) = method_name {
                             // Emit as ExtCall with the method name (codegen writes selector)
-                            // No type info available for raw_call — default to GP return
-                            self.emit(Inst::ExtCall(dst, target, method, param_regs, Ty::U64));
+                            // No type info available for raw_call — default args to GP
+                            let typed_params: Vec<(Reg, Ty)> = param_regs.iter()
+                                .map(|r| (*r, Ty::U64)).collect();
+                            self.emit(Inst::ExtCall(dst, target, method, typed_params, Ty::U64));
                         } else {
                             // No method name: emit as raw call (no selector)
                             self.emit(Inst::RawCall(dst, target, param_regs));
@@ -1413,18 +1434,22 @@ impl Lowerer {
                             )));
                         }
 
-                        // Lower constructor args (positional[1..])
+                        // Lower constructor args (positional[1..]) with type info
                         let arg_regs: Vec<Reg> = user_args.iter()
                             .map(|e| self.lower_expr(e))
                             .collect();
+                        let ctor_params = self.contract_constructors.get(&contract_name).cloned()
+                            .unwrap_or_default();
+                        let typed_args: Vec<(Reg, Ty)> = arg_regs.iter().zip(
+                            ctor_params.iter().map(|(_, ty)| ty).chain(std::iter::repeat(&Ty::U64))
+                        ).map(|(r, t)| (*r, t.clone())).collect();
 
                         // Emit: store deploy bytes as a constant blob
                         let blob_reg = self.alloc_reg();
                         self.emit(Inst::Const(blob_reg, IrConst::Bytes(deploy_bytes)));
 
-                        // CreateContract(dst, blob_reg, [arg_regs...])
-                        // The codegen will write blob + args to heap and emit Create.
-                        self.emit(Inst::CreateContract(dst, blob_reg, arg_regs));
+                        // CreateContract(dst, blob_reg, [(arg, type)...])
+                        self.emit(Inst::CreateContract(dst, blob_reg, typed_args));
 
                         // Tag the result register as Ty::Contract so method calls
                         // on the handle (e.g. c.increment()) resolve to ExtCall.

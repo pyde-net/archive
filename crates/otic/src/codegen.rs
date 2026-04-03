@@ -1999,27 +1999,34 @@ impl CodeGen {
 
             Inst::ExtCall(dst, addr, method, args, ret_ty) => {
                 let wide_return = is_wide_type(ret_ty);
+                let blob_return = matches!(ret_ty, Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_));
                 let ra = self.get_reg(*addr);
 
-                // Write calldata to heap: [selector(4 BE bytes)][arg0(8 LE)][arg1(8 LE)]...
-                // Selector: FNV-1a hash stored as BE bytes in calldata (dispatch
-                // loads with W32 LE and compares against selector.swap_bytes()).
+                // Save calldata start for dynamic length calculation
+                self.emit_op(Opcode::Push, 12, 0, 0); // save r12 = calldata start
+
+                // Write calldata to heap: [selector(4 BE bytes)][arg0][arg1]...
                 let selector = compute_selector(method);
-                // Store selector bytes in BE order to match the dispatch convention
                 let sel_be = selector.to_be_bytes();
-                let sel_as_le_u32 = u32::from_le_bytes(sel_be); // reinterpret BE bytes as LE u32
+                let sel_as_le_u32 = u32::from_le_bytes(sel_be);
                 self.load_u32_to_reg(15, sel_as_le_u32);
                 let sel_imm = encode_mem_immediate(0, MemWidth::W32).unwrap();
                 self.emit(encode(Opcode::Store, 15, 12, sel_imm));
 
                 // Write args after selector (offset 4)
-                // Wide args (Address, u256) get 32 bytes via Wstore.
-                // GP args get 8 bytes via Store.
+                // GP args: 8 bytes via Store. Wide args: 32 bytes via Wstore.
+                // Blob args (String, Vec, Struct, Bytes): [byte_len:8][flat data].
                 let mut arg_offset: i32 = 4;
-                for arg in args.iter() {
-                    let r = self.get_reg(*arg);
-                    if self.regs.is_wide(*arg) {
+                let mut has_blob_args = false;
+                for (arg, ty) in args.iter() {
+                    let is_blob = matches!(ty,
+                        Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_));
+                    if is_blob {
+                        has_blob_args = true;
+                    }
+                    if is_wide_type(ty) {
                         // Wide arg: 32 bytes
+                        let r = self.get_reg(*arg);
                         if arg_offset != 0 {
                             self.emit_op(Opcode::Addi, 15, 12, arg_offset as u32 & 0x3FFFF);
                             self.emit_op(Opcode::Wstore, r, 15, 0);
@@ -2027,16 +2034,75 @@ impl CodeGen {
                             self.emit_op(Opcode::Wstore, r, 12, 0);
                         }
                         arg_offset += 32;
+                    } else if matches!(ty, Ty::StringTy | Ty::Bytes) {
+                        // String/Bytes: emit_flatten already writes [byte_len:8][data]
+                        // which is exactly what the callee expects. No wrapping needed.
+                        if arg_offset > 0 {
+                            self.emit_op(Opcode::Addi, 12, 12, arg_offset as u32 & 0x3FFFF);
+                            arg_offset = 0;
+                        }
+                        // Move arg to safe register — emit_flatten clobbers r14/r15
+                        let r = self.get_reg(*arg);
+                        if r == 14 || r == 15 {
+                            self.emit_op(Opcode::Add, 11, r, 0);
+                            self.emit_flatten(ty, 11);
+                        } else {
+                            self.emit_flatten(ty, r);
+                        }
+                    } else if matches!(ty, Ty::Vec(_) | Ty::Struct(_)) {
+                        // Vec/Struct: callee expects [byte_len:8][flat data].
+                        // emit_flatten writes raw fields/elements (no byte_len prefix).
+                        // Wrap with byte_len placeholder → flatten → patch.
+                        if arg_offset > 0 {
+                            self.emit_op(Opcode::Addi, 12, 12, arg_offset as u32 & 0x3FFFF);
+                            arg_offset = 0;
+                        }
+                        // Move arg to safe register — emit_flatten clobbers r14/r15
+                        let r = self.get_reg(*arg);
+                        let safe_r = if r == 14 || r == 15 {
+                            self.emit_op(Opcode::Add, 11, r, 0); 11
+                        } else { r };
+                        self.emit_op(Opcode::Push, 12, 0, 0); // save start for byte_len patch
+                        self.emit_op(Opcode::Addi, 12, 12, 8); // skip byte_len placeholder
+                        self.emit_flatten(ty, safe_r);
+                        // Compute byte_len = r12 - (start + 8), patch it
+                        self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = start
+                        self.emit_op(Opcode::Addi, 14, 15, 8); // r14 = data_start
+                        self.emit_op(Opcode::Sub, 14, 12, 14); // r14 = byte_len
+                        self.emit_store(14, 15, 0); // patch byte_len at start
                     } else {
                         // GP arg: 8 bytes
+                        let r = self.get_reg(*arg);
                         self.emit_store(r, 12, arg_offset);
                         arg_offset += 8;
                     }
                 }
-                let calldata_len = arg_offset as u32;
+                // Compute calldata length: if blob args present, length is dynamic (r12 - start)
+                // Otherwise it's a compile-time constant.
+                if has_blob_args {
+                    // r12 is already past all data; calldata_len = r12 - calldata_start
+                    // We need the original calldata start (before selector). It was r12 at entry.
+                    // But r12 has been modified. Use a different approach:
+                    // We'll compute length via register at CallExt time.
+                    // For now, advance past any trailing fixed offset
+                    if arg_offset > 0 {
+                        self.emit_op(Opcode::Addi, 12, 12, arg_offset as u32 & 0x3FFFF);
+                    }
+                }
+                let static_calldata_len = if !has_blob_args { arg_offset as u32 } else { 0 };
 
                 // Set up CallExt: rd=target(wide), rs1=calldata_ptr(r12), imm=len/gas/result
-                self.emit_op(Opcode::Addi, 14, 0, calldata_len); // r14 = calldata len
+                // Pop the calldata start we saved before the selector write.
+                self.emit_op(Opcode::Pop, 14, 0, 0); // r14 = calldata_start
+                if has_blob_args {
+                    // Dynamic length: r14 = r12 - calldata_start
+                    self.emit_op(Opcode::Sub, 14, 12, 14); // r14 = total calldata len
+                    // Restore r12 to calldata start for the CallExt rs1 operand
+                    self.emit_op(Opcode::Sub, 12, 12, 14); // r12 = calldata start
+                } else {
+                    // Static length — r14 is the calldata_start (not needed), overwrite with len
+                    self.emit_op(Opcode::Addi, 14, 0, static_calldata_len);
+                }
                 self.emit_op(Opcode::Caller, 15, 0, 2); // r15 = gas_remaining
                 let imm = (14 & 0xF)           // len_reg = r14
                     | ((15 & 0xF) << 4)         // gas_reg = r15
@@ -2047,7 +2113,7 @@ impl CodeGen {
                 self.emit_op(Opcode::Pop, 13, 0, 0); // restore spill base
 
                 // Advance heap past calldata
-                self.emit_op(Opcode::Addi, 12, 12, calldata_len);
+                self.emit_op(Opcode::Add, 12, 12, 14); // r12 += calldata_len
 
                 if wide_return {
                     // Wide return (u256, Address): PVM wrote 32 bytes to parent heap
@@ -2056,6 +2122,16 @@ impl CodeGen {
                     self.emit_op(Opcode::Wload, wd, 1, 0);
                     // Advance heap past the 32-byte return data
                     self.emit_op(Opcode::Addi, 12, 12, 32);
+                } else if blob_return {
+                    // Blob return (String, Vec, Struct, Bytes): callee set r1=ptr, r2=len.
+                    // The blob data is in child memory — PVM's do_ext_call copied it to
+                    // parent heap at r12. Unflatten from (r1, r2) into destination.
+                    let rd = self.alloc_gp(*dst);
+                    // r1 = heap pointer to blob data, r2 = blob length
+                    // Set r12 past the blob for future allocations
+                    self.emit_op(Opcode::Add, 12, 1, 2); // r12 = r1 + r2
+                    // Unflatten from r1 into destination register
+                    self.emit_unflatten(ret_ty, rd, 1);
                 } else {
                     // GP return (u64, bool, etc.): PVM set r1 = value
                     let rd = self.alloc_gp(*dst);
@@ -2145,7 +2221,7 @@ impl CodeGen {
                 // Now r12 is right after the blob — perfect for appending args.
 
                 // Write constructor args (LE u64 each) after the blob
-                for (i, arg) in args.iter().enumerate() {
+                for (i, (arg, _ty)) in args.iter().enumerate() {
                     let ra = self.get_reg(*arg);
                     self.emit_store(ra, 12, (i as i32) * 8);
                 }

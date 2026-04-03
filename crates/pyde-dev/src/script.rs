@@ -298,43 +298,44 @@ fn execute_with_rpc_bridge(
                 // Match against build registry for the contract name
                 let contract_name = find_contract_name(&init_code, compiled_registry);
 
-                // Deploy data is already [clen(4 LE)][rlen(4 LE)][constructor][runtime][args].
-                // Extract clen so the RPC doesn't double-wrap the header.
+                // Deploy data is [clen(4 LE)][rlen(4 LE)][constructor][runtime][args].
+                // Split into code (constructor+runtime) and args for the RPC.
                 let constructor_len = if init_code.len() >= 4 {
                     u32::from_le_bytes(init_code[..4].try_into().unwrap_or([0; 4]))
-                } else {
-                    0
-                };
-                // Strip the [clen][rlen] header — RPC will re-add it
-                let raw_code = if init_code.len() >= 8 { &init_code[8..] } else { &init_code[..] };
-                let data_hex = hex::encode(raw_code);
-                // Constructor args come after constructor + runtime
+                } else { 0 };
                 let runtime_len = if init_code.len() >= 8 {
                     u32::from_le_bytes(init_code[4..8].try_into().unwrap_or([0; 4]))
+                } else { 0 };
+                let code_end = 8 + constructor_len as usize + runtime_len as usize;
+                // data = constructor + runtime ONLY (no args, no header)
+                let code_only = if init_code.len() >= code_end {
+                    &init_code[8..code_end]
+                } else if init_code.len() >= 8 {
+                    &init_code[8..]
                 } else {
-                    0
+                    &init_code[..]
                 };
-                let args_start = (constructor_len + runtime_len) as usize;
-                let constructor_args_hex = if args_start < raw_code.len() {
-                    hex::encode(&raw_code[args_start..])
+                // args = everything after constructor + runtime
+                let constructor_args = if init_code.len() > code_end {
+                    &init_code[code_end..]
                 } else {
-                    String::new()
+                    &[]
                 };
 
-                println!("    [{}] deploy {} ({} bytes)", tx_count, contract_name, raw_code.len());
+                println!("    [{}] deploy {} ({} bytes)", tx_count, contract_name, code_only.len());
 
                 let mut params = serde_json::json!({
                     "from": from,
                     "to": zero_addr,
-                    "data": format!("0x{}", data_hex),
+                    "data": format!("0x{}", hex::encode(code_only)),
                     "gas": 100_000_000,
                     "nonce": *nonce,
                     "value": "0",
                     "constructorLen": constructor_len,
                 });
-                if !constructor_args_hex.is_empty() {
+                if !constructor_args.is_empty() {
                     params["constructorArgs"] = serde_json::Value::String(
-                        format!("0x{}", constructor_args_hex)
+                        format!("0x{}", hex::encode(constructor_args))
                     );
                 }
 
@@ -511,17 +512,6 @@ fn execute_with_rpc_bridge(
                 return Ok(Outcome::OutOfGas);
             }
             Err(trap) => {
-                let pc = vm.pc;
-                let idx = (pc / 4) as usize;
-                let d_info = vm.decoded_cache().get(idx).map(|d| format!("{:?} rd={} rs1={} rs2={}", d.opcode, d.rd, d.rs1, d.rs2_or_imm));
-                eprintln!("  TRAP at pc={} (idx {}): {:?} instr={:?}", pc, idx, trap, d_info);
-                if let Some(d) = vm.decoded_cache().get(idx) {
-                    let base = vm.cpu.read_gp(d.rs1);
-                    let off = d.rs2_or_imm as i32 as i64;
-                    eprintln!("  Store target: r{}={:#x} + offset {} = {:#x}", d.rs1, base, off, base as i64 + off);
-                    eprintln!("  Store value: r{}={:#x}", d.rd, vm.cpu.read_gp(d.rd));
-                }
-                eprintln!("  r12(heap)={:#x}", vm.cpu.read_gp(12));
                 vm.clear_journal();
                 return Ok(Outcome::Trap(trap));
             }
