@@ -425,7 +425,28 @@ fn execute_in_pvm(
         })
         .collect();
 
-    let return_data = vm.return_data.clone();
+    // Capture return data: explicit return_data (from Revert/child calls) takes
+    // priority. Otherwise, read from r1/r2 (same convention as do_ext_call).
+    let return_data = if !vm.return_data.is_empty() {
+        vm.return_data.clone()
+    } else if success {
+        let r2 = vm.cpu.read_gp(2);
+        if r2 > 0 {
+            // Blob/wide return: r1 = pointer, r2 = length
+            let ptr = vm.cpu.read_gp(1) as usize;
+            let len = (r2 as usize).min(pyde_vm::memory::MEMORY_SIZE);
+            if ptr + len <= pyde_vm::memory::MEMORY_SIZE {
+                vm.memory.load_bytes(ptr, len)
+            } else {
+                vm.cpu.read_gp(1).to_le_bytes().to_vec()
+            }
+        } else {
+            // GP return: r1 = value (8 bytes LE)
+            vm.cpu.read_gp(1).to_le_bytes().to_vec()
+        }
+    } else {
+        vm.return_data.clone() // revert data
+    };
     (success, output.gas_used as u64, output.gas_refund, logs, return_data)
 }
 
@@ -1060,5 +1081,145 @@ mod tests {
 
         assert!(allowed.contains(&runtime_key), "cross-contract key should match");
         assert_eq!(warm.len(), 1);
+    }
+
+    // ========== Return data capture ==========
+
+    #[test]
+    fn return_data_captured_for_function_with_return_value() {
+        // Compile a contract with a function that returns a value
+        let src = r#"
+            contract Returner {
+                storage { value: u64, }
+                #[constructor]
+                pub fn init() { self.value = 42; }
+                pub fn get_value() -> u64 { return self.value; }
+            }
+        "#;
+        let compiled = otic::compile_all(src);
+        assert!(!compiled.is_empty());
+        let (_, contract) = &compiled[0];
+
+        // Build deploy data
+        let clen = contract.constructor_bytecode.len() as u32;
+        let rlen = contract.runtime_bytecode.len() as u32;
+        let mut deploy_data = Vec::new();
+        deploy_data.extend_from_slice(&clen.to_le_bytes());
+        deploy_data.extend_from_slice(&rlen.to_le_bytes());
+        deploy_data.extend_from_slice(&contract.constructor_bytecode);
+        deploy_data.extend_from_slice(&contract.runtime_bytecode);
+
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let mut smt = PydeSMT::new();
+        let block_ctx = make_block_ctx();
+        let sender_addr = setup_funded_account(&mut smt, &pk_bytes, 1_000_000_000_000);
+        let contract_addr = pyde_account::address::derive_create_address(&sender_addr, 0);
+
+        // Deploy — must set data BEFORE signing
+        let deploy_tx = {
+            let mut tx = Transaction {
+                from: sender_addr, to: ZERO_ADDRESS, value: 0,
+                data: deploy_data, gas_limit: 100_000_000, nonce: 0,
+                signature: vec![], fee_payer: FeePayer::Sender,
+                access_list: vec![], deadline: None, chain_id: 1,
+                tx_type: TransactionType::Deploy,
+            };
+            let hash = tx.hash();
+            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+            tx
+        };
+        let deploy_receipt = execute_transaction(&deploy_tx, &mut smt, &block_ctx).unwrap();
+        assert!(deploy_receipt.success, "deploy failed");
+
+        // Call get_value() — should return 42
+        let selector = otic::codegen::compute_selector("get_value");
+        let call_tx = {
+            let mut tx = Transaction {
+                from: sender_addr, to: contract_addr, value: 0,
+                data: selector.to_be_bytes().to_vec(), gas_limit: 100_000_000, nonce: 1,
+                signature: vec![], fee_payer: FeePayer::Sender,
+                access_list: vec![], deadline: None, chain_id: 1,
+                tx_type: TransactionType::Standard,
+            };
+            let hash = tx.hash();
+            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+            tx
+        };
+        let call_receipt = execute_transaction(&call_tx, &mut smt, &block_ctx).unwrap();
+        assert!(call_receipt.success, "call failed");
+
+        // return_data should contain 42 as u64 LE
+        assert!(!call_receipt.return_data.is_empty(), "return_data should not be empty");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&call_receipt.return_data[..8]);
+        let returned_value = u64::from_le_bytes(buf);
+        assert_eq!(returned_value, 42, "return_data should contain 42");
+    }
+
+    #[test]
+    fn return_data_empty_for_void_function_is_not_meaningful() {
+        // Compile a contract with a void function
+        let src = r#"
+            contract Setter {
+                storage { value: u64, }
+                #[constructor]
+                pub fn init() { self.value = 0; }
+                pub fn set_value(v: u64) { self.value = v; }
+            }
+        "#;
+        let compiled = otic::compile_all(src);
+        let (_, contract) = &compiled[0];
+
+        let clen = contract.constructor_bytecode.len() as u32;
+        let rlen = contract.runtime_bytecode.len() as u32;
+        let mut deploy_data = Vec::new();
+        deploy_data.extend_from_slice(&clen.to_le_bytes());
+        deploy_data.extend_from_slice(&rlen.to_le_bytes());
+        deploy_data.extend_from_slice(&contract.constructor_bytecode);
+        deploy_data.extend_from_slice(&contract.runtime_bytecode);
+
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let mut smt = PydeSMT::new();
+        let block_ctx = make_block_ctx();
+        let sender_addr = setup_funded_account(&mut smt, &pk_bytes, 1_000_000_000_000);
+        let contract_addr = pyde_account::address::derive_create_address(&sender_addr, 0);
+
+        // Deploy — must set data BEFORE signing
+        let deploy_tx = {
+            let mut tx = Transaction {
+                from: sender_addr, to: ZERO_ADDRESS, value: 0,
+                data: deploy_data, gas_limit: 100_000_000, nonce: 0,
+                signature: vec![], fee_payer: FeePayer::Sender,
+                access_list: vec![], deadline: None, chain_id: 1,
+                tx_type: TransactionType::Deploy,
+            };
+            let hash = tx.hash();
+            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+            tx
+        };
+        let deploy_receipt = execute_transaction(&deploy_tx, &mut smt, &block_ctx).unwrap();
+        assert!(deploy_receipt.success, "deploy failed");
+
+        // Call set_value(99) — void function
+        let selector = otic::codegen::compute_selector("set_value");
+        let mut calldata = selector.to_be_bytes().to_vec();
+        calldata.extend_from_slice(&99u64.to_le_bytes());
+        let call_tx = {
+            let mut tx = Transaction {
+                from: sender_addr, to: contract_addr, value: 0,
+                data: calldata, gas_limit: 100_000_000, nonce: 1,
+                signature: vec![], fee_payer: FeePayer::Sender,
+                access_list: vec![], deadline: None, chain_id: 1,
+                tx_type: TransactionType::Standard,
+            };
+            let hash = tx.hash();
+            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+            tx
+        };
+        let call_receipt = execute_transaction(&call_tx, &mut smt, &block_ctx).unwrap();
+        assert!(call_receipt.success, "void call failed");
+        // return_data exists (r1 value) but caller should ignore for void functions
     }
 }
