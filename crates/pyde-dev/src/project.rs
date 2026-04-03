@@ -23,9 +23,7 @@ pub struct TestSection {
 
 impl Default for TestSection {
     fn default() -> Self {
-        Self {
-            verbosity: 0,
-        }
+        Self { verbosity: 0 }
     }
 }
 
@@ -66,24 +64,32 @@ pub struct NetworkConfig {
     pub chain_id: u64,
 }
 
-fn default_true() -> bool { true }
-fn default_src() -> String { "src".into() }
-fn default_test() -> String { "test".into() }
-fn default_out() -> String { "out".into() }
+fn default_true() -> bool {
+    true
+}
+fn default_src() -> String {
+    "src".into()
+}
+fn default_test() -> String {
+    "test".into()
+}
+fn default_out() -> String {
+    "out".into()
+}
 
 /// Find pyde.toml by walking up from the current directory.
 /// Returns (config, project_root_dir).
 pub fn load_config() -> Result<(ProjectConfig, PathBuf), String> {
-    let mut dir = std::env::current_dir()
-        .map_err(|e| format!("cannot read current directory: {}", e))?;
+    let mut dir =
+        std::env::current_dir().map_err(|e| format!("cannot read current directory: {}", e))?;
 
     loop {
         let config_path = dir.join("pyde.toml");
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)
                 .map_err(|e| format!("cannot read {}: {}", config_path.display(), e))?;
-            let config: ProjectConfig = toml::from_str(&content)
-                .map_err(|e| format!("invalid pyde.toml: {}", e))?;
+            let config: ProjectConfig =
+                toml::from_str(&content).map_err(|e| format!("invalid pyde.toml: {}", e))?;
             return Ok((config, dir));
         }
         if !dir.pop() {

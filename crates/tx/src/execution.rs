@@ -42,6 +42,10 @@ pub struct Receipt {
     pub logs: Vec<LogEntry>,
     /// Post-execution state root (if available).
     pub state_root: H256,
+    /// Ephemeral return data from execution (NOT persisted to disk).
+    /// Available in the RPC response immediately after execution,
+    /// pruned with the receipt after MAX_RECEIPT_SLOTS.
+    pub return_data: Vec<u8>,
 }
 
 /// A log entry in the receipt.
@@ -184,6 +188,7 @@ pub fn generate_receipt(
     base_fee: u128,
     logs: Vec<LogEntry>,
     state_root: H256,
+    return_data: Vec<u8>,
 ) -> Receipt {
     let fee = distribute_fee(effective_gas, base_fee);
     Receipt {
@@ -197,6 +202,7 @@ pub fn generate_receipt(
         fee_validator: fee.validator,
         logs,
         state_root,
+        return_data,
     }
 }
 
@@ -378,6 +384,7 @@ mod tests {
             base_fee,
             logs.clone(),
             H256::zero(),
+            vec![],
         );
 
         assert!(receipt.success);
@@ -397,7 +404,7 @@ mod tests {
     fn failed_tx_receipt() {
         let tx = make_tx(0, 21_000);
         let receipt = generate_receipt(
-            &tx, false, 21_000, 0, 21_000, 100, vec![], H256::zero(),
+            &tx, false, 21_000, 0, 21_000, 100, vec![], H256::zero(), vec![],
         );
         assert!(!receipt.success);
         assert_eq!(receipt.gas_used, 21_000);
