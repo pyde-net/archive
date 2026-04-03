@@ -729,24 +729,29 @@ impl CodeGen {
                         8,
                     );
                     self.emit_op(Opcode::Memcpy, 12, memory::REG_SCRATCH_0, 15);
+                    // Compute align8(byte_len) and advance heap
                     self.emit_op(Opcode::Addi, 14, 15, 7);
                     self.emit_op(Opcode::Addi, 15, 0, 3);
                     self.emit_op(Opcode::Shr, 14, 14, 15);
                     self.emit_op(Opcode::Shl, 14, 14, 15);
                     self.emit_op(Opcode::Add, 12, 12, 14);
-                    self.emit_op(Opcode::Pop, memory::REG_SCRATCH_0, 0, 0);
+                    // Save align8(byte_len) before restoring cursor
+                    self.emit_op(Opcode::Push, 14, 0, 0);
+                    // Restore cursor: old_cursor + 8 (byte_len field) + align8 (data)
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = align8(byte_len)
+                    self.emit_op(Opcode::Pop, memory::REG_SCRATCH_0, 0, 0); // r14 = old cursor
                     self.emit_op(
                         Opcode::Addi,
                         memory::REG_SCRATCH_0,
                         memory::REG_SCRATCH_0,
                         8,
-                    );
+                    ); // cursor += 8 (past byte_len)
                     self.emit_op(
                         Opcode::Add,
                         memory::REG_SCRATCH_0,
                         memory::REG_SCRATCH_0,
-                        14,
-                    );
+                        15,
+                    ); // cursor += align8(byte_len)
                 } else if is_wide_type(ty) {
                     self.emit_op(Opcode::Wload, phys, memory::REG_SCRATCH_0, 0);
                     self.emit_op(
@@ -2025,13 +2030,21 @@ impl CodeGen {
                         has_blob_args = true;
                     }
                     if is_wide_type(ty) {
-                        // Wide arg: 32 bytes
+                        // Wide arg: 32 bytes via Wstore
                         let r = self.get_reg(*arg);
+                        // If the value is in a GP register (e.g., small u256 literal),
+                        // widen it to a wide register first.
+                        let wr = if !self.regs.is_wide(*arg) {
+                            self.emit_op(Opcode::Widen, WIDE_SCRATCH, r, 0);
+                            WIDE_SCRATCH
+                        } else {
+                            r
+                        };
                         if arg_offset != 0 {
                             self.emit_op(Opcode::Addi, 15, 12, arg_offset as u32 & 0x3FFFF);
-                            self.emit_op(Opcode::Wstore, r, 15, 0);
+                            self.emit_op(Opcode::Wstore, wr, 15, 0);
                         } else {
-                            self.emit_op(Opcode::Wstore, r, 12, 0);
+                            self.emit_op(Opcode::Wstore, wr, 12, 0);
                         }
                         arg_offset += 32;
                     } else if matches!(ty, Ty::StringTy | Ty::Bytes) {

@@ -418,26 +418,25 @@ impl PydeApiServer for RpcServer {
         let success = output.outcome == pyde_vm::vm::Outcome::Success;
 
         if success {
-            // Check r2 for blob return (Struct/Vec/String): r1=pointer, r2=byte_length
+            // Return value convention:
+            // - GP return (u64, bool): r1 = value, r2 = 0
+            // - Wide return (u256, Address): stored at heap, r1 = ptr, r2 = 32
+            // - Blob return (String, Vec, Struct): r1 = ptr, r2 = len
+            // Format: numeric values as BE hex (matches Ethereum convention).
             let r2 = vm.cpu.read_gp(2);
-            if r2 > 0 {
-                let r1 = vm.cpu.read_gp(1) as usize;
-                let len = r2 as usize;
-                // Read serialized blob from VM memory
-                let blob = vm.memory.load_bytes(r1, len);
+            let r1 = vm.cpu.read_gp(1);
+            if r2 == 32 {
+                // Wide return (u256/Address): 32 bytes on heap, return as BE hex
+                let blob = vm.memory.load_bytes(r1 as usize, 32);
+                let val = ethnum::U256::from_le_bytes(blob.try_into().unwrap_or([0u8; 32]));
+                Ok(format!("0x{:x}", val))
+            } else if r2 > 0 {
+                // Blob return (String, Vec, Struct): raw serialized bytes
+                let blob = vm.memory.load_bytes(r1 as usize, r2 as usize);
                 Ok(format!("0x{}", hex::encode(blob)))
             } else {
-                // Check wide register w0 for Address/u256 returns
-                let w0 = vm.cpu.read_wide(0);
-                if w0 != ethnum::U256::ZERO {
-                    // Wide return: format as full 32-byte hex
-                    let bytes = w0.to_le_bytes();
-                    Ok(format!("0x{}", hex::encode(bytes)))
-                } else {
-                    // GP return: r1
-                    let return_value = vm.cpu.read_gp(1);
-                    Ok(format!("0x{:x}", return_value))
-                }
+                // GP return: r1 as integer
+                Ok(format!("0x{:x}", r1))
             }
         } else {
             Err(rpc_err(-32000, format!("execution failed: {:?}", output.outcome)))
