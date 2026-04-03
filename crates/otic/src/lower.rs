@@ -196,6 +196,22 @@ impl Lowerer {
         self.reg_types.insert(reg.0, ty);
     }
 
+    /// If the argument is a hex literal, re-emit it as an Address constant
+    /// so the byte order is correct (hex digits = BE, PVM addresses = LE bytes).
+    fn ensure_address_bytes(&mut self, addr_reg: Reg, args: &[Expr]) -> Reg {
+        // Check if the first argument is an integer literal (hex address)
+        if let Some(Expr::Literal(Literal::Int(v), _)) = args.first() {
+            if *v > ethnum::U256::from(u64::MAX) {
+                // Convert numeric value to raw address bytes (BE → LE)
+                let be_bytes = v.to_be_bytes();
+                let new_reg = self.alloc_reg();
+                self.emit(Inst::Const(new_reg, IrConst::Address(be_bytes)));
+                return new_reg;
+            }
+        }
+        addr_reg
+    }
+
     /// Look up the type of a register (Contract/Interface handles).
     fn get_reg_type(&self, reg: Reg) -> Option<&Ty> {
         self.reg_types.get(&reg.0)
@@ -215,6 +231,21 @@ impl Lowerer {
             }
         }
         Ty::U64
+    }
+
+    /// Look up parameter types for a method on a contract or interface.
+    fn lookup_method_param_types(&self, type_name: &str, method_name: &str) -> Vec<Ty> {
+        if let Some(fns) = self.contract_functions.get(type_name) {
+            if let Some((_, params, _)) = fns.iter().find(|(n, _, _)| n == method_name) {
+                return params.iter().map(|(_, ty)| ty.clone()).collect();
+            }
+        }
+        if let Some(fns) = self.interface_functions.get(type_name) {
+            if let Some((_, params, _)) = fns.iter().find(|(n, _, _)| n == method_name) {
+                return params.iter().map(|(_, ty)| ty.clone()).collect();
+            }
+        }
+        vec![]
     }
 
     /// Infer the type of an expression (best-effort, for local_types tracking).
@@ -875,7 +906,13 @@ impl Lowerer {
             Expr::Literal(lit, _) => {
                 let dst = self.alloc_reg();
                 let val = match lit {
-                    Literal::Int(v) => IrConst::Int(*v, Ty::U64),
+                    Literal::Int(v) => {
+                        if *v > ethnum::U256::from(u64::MAX) {
+                            IrConst::Int(*v, Ty::U256)
+                        } else {
+                            IrConst::Int(*v, Ty::U64)
+                        }
+                    }
                     Literal::String(s) => IrConst::String(s.clone()),
                     Literal::Bool(b) => IrConst::Bool(*b),
                 };
@@ -1094,7 +1131,11 @@ impl Lowerer {
                                 Some(Ty::Contract(ref name)) | Some(Ty::Interface(ref name)) => {
                                     // Typed contract/interface call → ExtCall
                                     let ret_ty = self.lookup_method_return_type(name, &method.name);
-                                    self.emit(Inst::ExtCall(dst, obj_reg, method.name.clone(), arg_regs, ret_ty));
+                                    let param_types = self.lookup_method_param_types(name, &method.name);
+                                    let typed_args: Vec<(Reg, Ty)> = arg_regs.iter().zip(
+                                        param_types.iter().chain(std::iter::repeat(&Ty::U64))
+                                    ).map(|(r, t)| (*r, t.clone())).collect();
+                                    self.emit(Inst::ExtCall(dst, obj_reg, method.name.clone(), typed_args, ret_ty));
                                 }
                                 _ => {
                                     self.emit(Inst::MethodCall(dst, obj_reg, method.name.clone(), arg_regs));
@@ -1114,16 +1155,20 @@ impl Lowerer {
                             // Interface::at(address) → typed interface handle
                             if member == "at" && self.interface_functions.contains_key(type_name) {
                                 if let Some(addr_reg) = arg_regs.first() {
-                                    // at() is a no-op at runtime — just tracks the type
-                                    self.set_local_type_for_reg(*addr_reg, Ty::Interface(type_name.to_string()));
-                                    return *addr_reg;
+                                    // at() is a no-op at runtime — just tracks the type.
+                                    // If the arg is a hex literal, convert to address bytes
+                                    // so the byte order is correct (hex = BE, PVM = LE bytes).
+                                    let reg = self.ensure_address_bytes(*addr_reg, args);
+                                    self.set_local_type_for_reg(reg, Ty::Interface(type_name.to_string()));
+                                    return reg;
                                 }
                             }
                             // Contract::at(address) → typed contract handle
                             if member == "at" && self.contract_functions.contains_key(type_name) {
                                 if let Some(addr_reg) = arg_regs.first() {
-                                    self.set_local_type_for_reg(*addr_reg, Ty::Contract(type_name.to_string()));
-                                    return *addr_reg;
+                                    let reg = self.ensure_address_bytes(*addr_reg, args);
+                                    self.set_local_type_for_reg(reg, Ty::Contract(type_name.to_string()));
+                                    return reg;
                                 }
                             }
                         }
@@ -1330,8 +1375,10 @@ impl Lowerer {
 
                         if let Some(method) = method_name {
                             // Emit as ExtCall with the method name (codegen writes selector)
-                            // No type info available for raw_call — default to GP return
-                            self.emit(Inst::ExtCall(dst, target, method, param_regs, Ty::U64));
+                            // No type info available for raw_call — default args to GP
+                            let typed_params: Vec<(Reg, Ty)> = param_regs.iter()
+                                .map(|r| (*r, Ty::U64)).collect();
+                            self.emit(Inst::ExtCall(dst, target, method, typed_params, Ty::U64));
                         } else {
                             // No method name: emit as raw call (no selector)
                             self.emit(Inst::RawCall(dst, target, param_regs));
@@ -1350,9 +1397,11 @@ impl Lowerer {
 
                         let dst = self.alloc_reg();
 
-                        // First arg must be a contract name (path expression)
+                        // First arg must be a contract name (path or ident)
                         let contract_name = if let Some(Expr::Path(segments, _)) = positional.first() {
                             segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::")
+                        } else if let Some(Expr::Ident(ident)) = positional.first() {
+                            ident.name.clone()
                         } else {
                             self.emit(Inst::Comment("deploy! requires a contract name".into()));
                             return dst;
@@ -1385,18 +1434,22 @@ impl Lowerer {
                             )));
                         }
 
-                        // Lower constructor args (positional[1..])
+                        // Lower constructor args (positional[1..]) with type info
                         let arg_regs: Vec<Reg> = user_args.iter()
                             .map(|e| self.lower_expr(e))
                             .collect();
+                        let ctor_params = self.contract_constructors.get(&contract_name).cloned()
+                            .unwrap_or_default();
+                        let typed_args: Vec<(Reg, Ty)> = arg_regs.iter().zip(
+                            ctor_params.iter().map(|(_, ty)| ty).chain(std::iter::repeat(&Ty::U64))
+                        ).map(|(r, t)| (*r, t.clone())).collect();
 
                         // Emit: store deploy bytes as a constant blob
                         let blob_reg = self.alloc_reg();
                         self.emit(Inst::Const(blob_reg, IrConst::Bytes(deploy_bytes)));
 
-                        // CreateContract(dst, blob_reg, [arg_regs...])
-                        // The codegen will write blob + args to heap and emit Create.
-                        self.emit(Inst::CreateContract(dst, blob_reg, arg_regs));
+                        // CreateContract(dst, blob_reg, [(arg, type)...])
+                        self.emit(Inst::CreateContract(dst, blob_reg, typed_args));
 
                         // Tag the result register as Ty::Contract so method calls
                         // on the handle (e.g. c.increment()) resolve to ExtCall.
@@ -1497,7 +1550,13 @@ impl Lowerer {
                         Pattern::Literal(lit, _) => {
                             let pat_reg = self.alloc_reg();
                             let val = match lit {
-                                Literal::Int(v) => IrConst::Int(*v, Ty::U64),
+                                Literal::Int(v) => {
+                                    if *v > ethnum::U256::from(u64::MAX) {
+                                        IrConst::Int(*v, Ty::U256)
+                                    } else {
+                                        IrConst::Int(*v, Ty::U64)
+                                    }
+                                }
                                 Literal::String(s) => IrConst::String(s.clone()),
                                 Literal::Bool(b) => IrConst::Bool(*b),
                             };

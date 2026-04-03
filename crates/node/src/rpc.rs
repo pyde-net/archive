@@ -315,27 +315,8 @@ impl PydeApiServer for RpcServer {
             tx_type,
         };
 
-        // Compute tx hash
-        let tx_bytes = crate::wire::encode_transaction(&tx);
-        let tx_hash = pyde_crypto::poseidon2::poseidon2_hash(&tx_bytes).to_bytes();
-
-        // For deploy txs, compute the contract address.
-        // Use Account.nonce (always 0 in devnet since pipeline doesn't increment Account.nonce).
-        // This matches what the pipeline uses: derive_create_address(&from, sender.nonce).
-        let contract_address = if tx_type == pyde_tx::types::TransactionType::Deploy {
-            // Read the account nonce from state (matches pipeline's sender.nonce)
-            let state = self.state.state.read().await;
-            let balance_key = pyde_state::keys::balance_key(&from);
-            let account_nonce = state.get(&balance_key)
-                .and_then(|b| pyde_account::types::Account::from_bytes(&b))
-                .map(|a| a.nonce)
-                .unwrap_or(0);
-            drop(state);
-            let addr = pyde_account::address::derive_create_address(&from, account_nonce);
-            Some(format!("0x{}", hex::encode(addr)))
-        } else {
-            None
-        };
+        // Compute tx hash (must match tx.hash() used in receipt generation)
+        let tx_hash = tx.hash();
 
         // Add to pending tx queue
         let mut pending = self.state.pending_txs.write().await;
@@ -343,22 +324,18 @@ impl PydeApiServer for RpcServer {
         let queue_size = pending.len();
         drop(pending);
 
+        let tx_hash_hex = format!("0x{}", hex::encode(tx_hash));
         info!(
-            tx_hash = hex::encode(tx_hash),
+            tx_hash = %tx_hash_hex,
             queue_size,
-            contract = ?contract_address,
             "transaction accepted into pending queue"
         );
 
-        // Return tx hash + contract address for deploys
-        if let Some(addr) = contract_address {
-            Ok(serde_json::json!({
-                "txHash": format!("0x{}", hex::encode(tx_hash)),
-                "contractAddress": addr,
-            }).to_string())
-        } else {
-            Ok(format!("0x{}", hex::encode(tx_hash)))
-        }
+        // Return tx hash only. For deploys, the contract address is in the
+        // receipt's returnData (authoritative, computed at execution time).
+        Ok(serde_json::json!({
+            "txHash": tx_hash_hex,
+        }).to_string())
     }
 
     async fn send_raw_transaction(&self, tx_hex: String) -> Result<String, ErrorObjectOwned> {
@@ -367,7 +344,7 @@ impl PydeApiServer for RpcServer {
             .map_err(|e| rpc_err(-32602, format!("invalid tx hex: {}", e)))?;
         let tx = crate::wire::decode_transaction(&tx_bytes)
             .map_err(|e| rpc_err(-32602, format!("invalid tx encoding: {}", e)))?;
-        let tx_hash = pyde_crypto::poseidon2::poseidon2_hash(&tx_bytes).to_bytes();
+        let tx_hash = tx.hash();
 
         let mut pending = self.state.pending_txs.write().await;
         pending.push(tx);
@@ -441,26 +418,25 @@ impl PydeApiServer for RpcServer {
         let success = output.outcome == pyde_vm::vm::Outcome::Success;
 
         if success {
-            // Check r2 for blob return (Struct/Vec/String): r1=pointer, r2=byte_length
+            // Return value convention:
+            // - GP return (u64, bool): r1 = value, r2 = 0
+            // - Wide return (u256, Address): stored at heap, r1 = ptr, r2 = 32
+            // - Blob return (String, Vec, Struct): r1 = ptr, r2 = len
+            // Format: numeric values as BE hex (matches Ethereum convention).
             let r2 = vm.cpu.read_gp(2);
-            if r2 > 0 {
-                let r1 = vm.cpu.read_gp(1) as usize;
-                let len = r2 as usize;
-                // Read serialized blob from VM memory
-                let blob = vm.memory.load_bytes(r1, len);
+            let r1 = vm.cpu.read_gp(1);
+            if r2 == 32 {
+                // Wide return (u256/Address): 32 bytes on heap, return as BE hex
+                let blob = vm.memory.load_bytes(r1 as usize, 32);
+                let val = ethnum::U256::from_le_bytes(blob.try_into().unwrap_or([0u8; 32]));
+                Ok(format!("0x{:x}", val))
+            } else if r2 > 0 {
+                // Blob return (String, Vec, Struct): raw serialized bytes
+                let blob = vm.memory.load_bytes(r1 as usize, r2 as usize);
                 Ok(format!("0x{}", hex::encode(blob)))
             } else {
-                // Check wide register w0 for Address/u256 returns
-                let w0 = vm.cpu.read_wide(0);
-                if w0 != ethnum::U256::ZERO {
-                    // Wide return: format as full 32-byte hex
-                    let bytes = w0.to_le_bytes();
-                    Ok(format!("0x{}", hex::encode(bytes)))
-                } else {
-                    // GP return: r1
-                    let return_value = vm.cpu.read_gp(1);
-                    Ok(format!("0x{:x}", return_value))
-                }
+                // GP return: r1 as integer
+                Ok(format!("0x{:x}", r1))
             }
         } else {
             Err(rpc_err(-32000, format!("execution failed: {:?}", output.outcome)))
@@ -515,7 +491,29 @@ impl PydeApiServer for RpcServer {
             state_guard.get(&smt_key)
         }));
         let output = vm.execute();
-        Ok(format!("0x{:x}", output.gas_used))
+
+        // Return actual function output (not gas_used).
+        // Uses same r1/r2 convention as do_ext_call and pipeline return_data capture.
+        let return_data = if output.outcome == pyde_vm::vm::Outcome::Success {
+            let r2 = vm.cpu.read_gp(2);
+            if r2 > 0 {
+                // Blob/wide return: r1 = pointer, r2 = length
+                let ptr = vm.cpu.read_gp(1) as usize;
+                let len = (r2 as usize).min(pyde_vm::memory::MEMORY_SIZE);
+                if ptr + len <= pyde_vm::memory::MEMORY_SIZE {
+                    vm.memory.load_bytes(ptr, len)
+                } else {
+                    vm.cpu.read_gp(1).to_le_bytes().to_vec()
+                }
+            } else {
+                // GP return: r1 = value (8 bytes LE)
+                vm.cpu.read_gp(1).to_le_bytes().to_vec()
+            }
+        } else {
+            vec![]
+        };
+
+        Ok(format!("0x{}", hex::encode(&return_data)))
     }
 
     async fn get_transaction_receipt(&self, tx_hash: String) -> Result<serde_json::Value, ErrorObjectOwned> {
