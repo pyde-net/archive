@@ -306,10 +306,16 @@ fn execute_with_rpc_bridge(
                 let runtime_len = if init_code.len() >= 8 {
                     u32::from_le_bytes(init_code[4..8].try_into().unwrap_or([0; 4]))
                 } else { 0 };
-                let code_end = 8 + constructor_len as usize + runtime_len as usize;
+                // The blob constant is 8-byte aligned in PVM memory, so
+                // actual blob end may be up to 7 bytes past clen+rlen.
+                let raw_code_len = constructor_len as usize + runtime_len as usize;
+                let aligned_code_len = (raw_code_len + 7) & !7;
+                let code_end = 8 + aligned_code_len;
                 // data = constructor + runtime ONLY (no args, no header)
-                let code_only = if init_code.len() >= code_end {
-                    &init_code[8..code_end]
+                // Send the raw (unaligned) code to the RPC
+                let raw_end = 8 + raw_code_len;
+                let code_only = if init_code.len() >= raw_end {
+                    &init_code[8..raw_end]
                 } else if init_code.len() >= 8 {
                     &init_code[8..]
                 } else {

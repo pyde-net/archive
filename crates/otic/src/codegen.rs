@@ -2125,13 +2125,11 @@ impl CodeGen {
                 } else if blob_return {
                     // Blob return (String, Vec, Struct, Bytes): callee set r1=ptr, r2=len.
                     // The blob data is in child memory — PVM's do_ext_call copied it to
-                    // parent heap at r12. Unflatten from (r1, r2) into destination.
+                    // parent heap at r12. Unflatten from r1 (src) into rd (dst).
                     let rd = self.alloc_gp(*dst);
                     // r1 = heap pointer to blob data, r2 = blob length
-                    // Set r12 past the blob for future allocations
-                    self.emit_op(Opcode::Add, 12, 1, 2); // r12 = r1 + r2
-                    // Unflatten from r1 into destination register
-                    self.emit_unflatten(ret_ty, rd, 1);
+                    // Unflatten: src=r1 (blob pointer), dst=rd
+                    self.emit_unflatten(ret_ty, 1, rd);
                 } else {
                     // GP return (u64, bool, etc.): PVM set r1 = value
                     let rd = self.alloc_gp(*dst);
@@ -2220,23 +2218,64 @@ impl CodeGen {
                 // and sets blob_reg = r12, then advances r12.
                 // Now r12 is right after the blob — perfect for appending args.
 
-                // Write constructor args (LE u64 each) after the blob
-                for (i, (arg, _ty)) in args.iter().enumerate() {
-                    let ra = self.get_reg(*arg);
-                    self.emit_store(ra, 12, (i as i32) * 8);
-                }
-                let args_size = (args.len() as u32) * 8;
+                // Write constructor args after the blob.
+                // r12 points to right after the blob — append args here.
+                let has_blob_args = args.iter().any(|(_, ty)| matches!(ty,
+                    Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_)));
 
-                // Restore blob pointer from stack
-                self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = blob pointer (restored)
+                if !has_blob_args {
+                    // All fixed-size: use static offsets (original path)
+                    for (i, (arg, _ty)) in args.iter().enumerate() {
+                        let ra = self.get_reg(*arg);
+                        self.emit_store(ra, 12, (i as i32) * 8);
+                    }
+                    let args_size = (args.len() as u32) * 8;
 
-                // Total length = blob_size (r12 - rb) + args_size
-                // r14 = r12 - r15 (blob size)
-                self.emit_op(Opcode::Sub, 14, 12, 15);
-                // r14 += args_size (total deploy data length)
-                if args_size > 0 {
-                    self.emit_op(Opcode::Addi, 14, 14, args_size);
-                    self.emit_op(Opcode::Addi, 12, 12, args_size); // advance heap past args
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = blob pointer
+                    self.emit_op(Opcode::Sub, 14, 12, 15); // r14 = blob_size
+                    if args_size > 0 {
+                        self.emit_op(Opcode::Addi, 14, 14, args_size);
+                        self.emit_op(Opcode::Addi, 12, 12, args_size);
+                    }
+                } else {
+                    // Has blob args: get_reg for each arg FIRST (into safe regs
+                    // or stack), then serialize. emit_flatten clobbers r14/r15.
+                    // Strategy: push all arg values to stack, then pop and serialize.
+                    let mut arg_info: Vec<(Ty, bool)> = Vec::new();
+                    for (arg, ty) in args.iter().rev() {
+                        // Push args in reverse so first arg pops first
+                        let r = self.get_reg(*arg);
+                        self.emit_op(Opcode::Push, r, 0, 0);
+                        let is_blob = matches!(ty,
+                            Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_));
+                        arg_info.push((ty.clone(), is_blob));
+                    }
+                    arg_info.reverse(); // back to original order
+
+                    for (ty, is_blob) in &arg_info {
+                        // Pop arg value into r11 (safe from emit_flatten's r14/r15)
+                        self.emit_op(Opcode::Pop, 11, 0, 0);
+                        if matches!(ty, Ty::StringTy | Ty::Bytes) {
+                            self.emit_flatten(ty, 11);
+                        } else if matches!(ty, Ty::Vec(_) | Ty::Struct(_)) {
+                            // Wrap with byte_len prefix
+                            self.emit_op(Opcode::Push, 12, 0, 0); // save start
+                            self.emit_op(Opcode::Addi, 12, 12, 8);
+                            self.emit_flatten(ty, 11);
+                            self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = start
+                            self.emit_op(Opcode::Addi, 14, 15, 8);
+                            self.emit_op(Opcode::Sub, 14, 12, 14);
+                            self.emit_store(14, 15, 0);
+                        } else if !is_blob {
+                            // GP arg
+                            self.emit_store(11, 12, 0);
+                            self.emit_op(Opcode::Addi, 12, 12, 8);
+                        }
+                    }
+
+                    // Pop blob pointer, compute total length
+                    self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = blob pointer
+                    self.emit_op(Opcode::Sub, 14, 12, 15); // r14 = total length
                 }
 
                 // Create: wd = new address, rs1 = blob pointer (r15), imm[3:0] = length register (r14)
