@@ -95,6 +95,27 @@ pub enum Command {
         network: String,
     },
 
+    /// Wallet management.
+    #[command(subcommand)]
+    Wallet(WalletCommand),
+
+    /// Transfer native tokens to an address.
+    Transfer {
+        /// Recipient address (hex).
+        to: String,
+
+        /// Amount in quanta (1 PYDE = 10^9 quanta).
+        amount: u128,
+
+        /// Wallet name for signing.
+        #[arg(short, long)]
+        wallet: String,
+
+        /// Network name (must be defined in pyde.toml [networks]).
+        #[arg(short, long, default_value = "devnet")]
+        network: String,
+    },
+
     /// Generate documentation from source contracts.
     Doc,
 
@@ -112,12 +133,53 @@ pub enum Command {
         #[arg(short, long, default_value = "devnet")]
         network: String,
 
-        /// Sender address (hex).
+        /// Sender address (hex). Used when no --wallet is specified (devnet mode).
         #[arg(long, default_value = "0x0101010101010101010101010101010101010101010101010101010101010101")]
         from: String,
+
+        /// Wallet name for signing transactions.
+        #[arg(short, long)]
+        wallet: Option<String>,
 
         /// Verify the deployed bytecode matches local source after deploy.
         #[arg(long)]
         verify: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WalletCommand {
+    /// Generate a new FALCON-512 keypair.
+    Create {
+        /// Wallet name.
+        #[arg(short, long, default_value = "default")]
+        name: String,
+    },
+
+    /// Import an existing keypair (public + secret key hex).
+    Import {
+        /// Public key hex.
+        public_key: String,
+
+        /// Secret key hex.
+        secret_key: String,
+
+        /// Wallet name.
+        #[arg(short, long, default_value = "default")]
+        name: String,
+    },
+
+    /// List all wallets.
+    List,
+
+    /// Query wallet balance.
+    Balance {
+        /// Wallet name.
+        #[arg(short, long, default_value = "default")]
+        name: String,
+
+        /// Network name.
+        #[arg(long, default_value = "devnet")]
+        network: String,
     },
 }
