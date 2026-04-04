@@ -5,6 +5,7 @@ mod build;
 mod clean;
 mod doc;
 mod fmt;
+mod console;
 mod install;
 mod script;
 mod test_runner;
@@ -32,6 +33,7 @@ fn main() {
             }
         }
         Command::Remove { name } => install::remove(&name),
+        Command::Console { network, from } => console::run(&network, &from),
         Command::Verify { address, contract, network } => {
             verify::run(&address, contract.as_deref(), &network)
         }

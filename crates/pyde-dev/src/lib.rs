@@ -1,6 +1,7 @@
 pub mod build;
 pub mod cheatcodes;
 pub mod clean;
+pub mod console;
 pub mod cli;
 pub mod deploy;
 pub mod doc;

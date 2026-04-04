@@ -69,6 +69,17 @@ pub enum Command {
         name: String,
     },
 
+    /// Interactive console — connect to a network and call contracts.
+    Console {
+        /// Network name (must be defined in pyde.toml [networks]).
+        #[arg(short, long, default_value = "devnet")]
+        network: String,
+
+        /// Sender address (hex).
+        #[arg(long, default_value = "0x0101010101010101010101010101010101010101010101010101010101010101")]
+        from: String,
+    },
+
     /// Verify a deployed contract matches local source.
     /// Example: `pyde-dev verify 0xaddr src/Counter.oti:Counter --network devnet`
     Verify {
