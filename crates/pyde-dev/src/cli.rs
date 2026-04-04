@@ -48,6 +48,27 @@ pub enum Command {
         from: String,
     },
 
+    /// Install a package from a git URL, or restore all from pyde.lock.
+    /// Run with no arguments to restore all dependencies from the lock file.
+    Install {
+        /// Git repository URL (omit to restore all from pyde.lock).
+        url: Option<String>,
+
+        /// Branch, tag, or commit hash (default: main).
+        #[arg(short, long)]
+        rev: Option<String>,
+
+        /// Override package name (default: repo name from URL).
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+
+    /// Remove an installed package.
+    Remove {
+        /// Package name to remove.
+        name: String,
+    },
+
     /// Generate documentation from source contracts.
     Doc,
 

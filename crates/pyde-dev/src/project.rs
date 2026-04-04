@@ -11,6 +11,15 @@ pub struct ProjectConfig {
     pub testing: TestSection,
     #[serde(default)]
     pub networks: HashMap<String, NetworkConfig>,
+    #[serde(default)]
+    pub dependencies: HashMap<String, Dependency>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Dependency {
+    pub git: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
