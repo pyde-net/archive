@@ -13,3 +13,4 @@ pub mod script;
 pub mod test_runner;
 pub mod trace;
 pub mod verify;
+pub mod wallet;

@@ -11,11 +11,12 @@ mod script;
 mod test_runner;
 mod deploy;
 mod verify;
+mod wallet;
 mod cheatcodes;
 mod trace;
 
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, WalletCommand};
 use std::process;
 
 fn main() {
@@ -37,10 +38,21 @@ fn main() {
         Command::Verify { address, contract, network } => {
             verify::run(&address, contract.as_deref(), &network)
         }
+        Command::Wallet(cmd) => match cmd {
+            WalletCommand::Create { name } => wallet::cmd_create(&name),
+            WalletCommand::Import { public_key, secret_key, name } => {
+                wallet::cmd_import(&name, &public_key, &secret_key)
+            }
+            WalletCommand::List => wallet::cmd_list(),
+            WalletCommand::Balance { name, network } => wallet::cmd_balance(&name, &network),
+        },
+        Command::Transfer { to, amount, wallet: wallet_name, network } => {
+            wallet::cmd_transfer(&to, amount, &wallet_name, &network)
+        }
         Command::Fmt => fmt::run(),
         Command::Doc => doc::run(),
         Command::Clean => clean::run(),
-        Command::Deploy { network, contract, from, verify } => {
+        Command::Deploy { network, contract, from, wallet: _, verify } => {
             deploy::run(&network, contract.as_deref(), &from, verify)
         }
     };

@@ -342,7 +342,12 @@ impl PydeApiServer for RpcServer {
         let hex_str = tx_hex.strip_prefix("0x").unwrap_or(&tx_hex);
         let tx_bytes = hex::decode(hex_str)
             .map_err(|e| rpc_err(-32602, format!("invalid tx hex: {}", e)))?;
+        // Try wire format first, then Transaction::from_bytes (used by wallet CLI)
         let tx = crate::wire::decode_transaction(&tx_bytes)
+            .or_else(|_| {
+                pyde_tx::types::Transaction::from_bytes(&tx_bytes)
+                    .ok_or("invalid tx encoding")
+            })
             .map_err(|e| rpc_err(-32602, format!("invalid tx encoding: {}", e)))?;
         let tx_hash = tx.hash();
 
