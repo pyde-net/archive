@@ -299,6 +299,83 @@ fn rpc_call(
     Ok(json.get("result").cloned().unwrap_or(serde_json::Value::Null))
 }
 
+// ============================================================================
+// One-shot CLI commands (used by main.rs dispatch)
+// ============================================================================
+
+/// `pyde-dev call <address> <function>(<args>) --network devnet`
+pub fn cmd_call(address: &str, function: &str, network: &str) -> Result<(), String> {
+    let (config, _) = crate::project::load_config()?;
+    let net = config.networks.get(network)
+        .ok_or_else(|| format!("network '{}' not found in pyde.toml", network))?;
+
+    let (method, method_args) = parse_function(function)?;
+    let selector = compute_selector(&method);
+    let mut calldata = selector.to_be_bytes().to_vec();
+    for arg in &method_args {
+        calldata.extend_from_slice(&encode_arg(arg));
+    }
+
+    let client = reqwest::blocking::Client::new();
+    let params = serde_json::json!({
+        "from": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "to": address,
+        "data": format!("0x{}", hex::encode(&calldata)),
+    });
+    let result = rpc_call(&client, &net.rpc_url, "pyde_call", &[params])?;
+    let hex = result.as_str().unwrap_or("0x0");
+    let hex_clean = hex.trim_start_matches("0x");
+    if let Ok(val) = u128::from_str_radix(hex_clean, 16) {
+        println!("  {}", val);
+    } else {
+        println!("  {}", hex);
+    }
+    Ok(())
+}
+
+/// `pyde-dev tx <hash> --network devnet`
+pub fn cmd_tx(hash: &str, network: &str) -> Result<(), String> {
+    let (config, _) = crate::project::load_config()?;
+    let net = config.networks.get(network)
+        .ok_or_else(|| format!("network '{}' not found in pyde.toml", network))?;
+
+    let client = reqwest::blocking::Client::new();
+    let result = rpc_call(&client, &net.rpc_url, "pyde_getTransactionReceipt", &[json_str(hash)])?;
+
+    if result.is_null() {
+        println!("  Receipt not found (tx may be pending or invalid)");
+    } else {
+        let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+        let gas = result.get("gasUsed").and_then(|v| v.as_str()).unwrap_or("0");
+        let return_data = result.get("returnData").and_then(|v| v.as_str()).unwrap_or("");
+
+        println!("  Status:     {}", if success { "Success" } else { "Reverted" });
+        println!("  Gas Used:   {}", gas);
+        if !return_data.is_empty() && return_data != "0x" {
+            println!("  Return:     {}", return_data);
+        }
+        let fee_paid = result.get("feePaid").and_then(|v| v.as_str()).unwrap_or("0");
+        println!("  Fee Paid:   {} quanta", fee_paid);
+    }
+    Ok(())
+}
+
+/// Parse `method(arg1, arg2)` into (method, [args]).
+fn parse_function(input: &str) -> Result<(String, Vec<String>), String> {
+    if let Some(paren_start) = input.find('(') {
+        let method = input[..paren_start].trim().to_string();
+        let args_str = input[paren_start + 1..].trim_end_matches(')').trim();
+        let args = if args_str.is_empty() {
+            vec![]
+        } else {
+            args_str.split(',').map(|s| s.trim().to_string()).collect()
+        };
+        Ok((method, args))
+    } else {
+        Ok((input.trim().to_string(), vec![]))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

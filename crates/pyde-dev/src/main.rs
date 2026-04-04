@@ -49,6 +49,12 @@ fn main() {
         Command::Transfer { to, amount, wallet: wallet_name, network } => {
             wallet::cmd_transfer(&to, amount, &wallet_name, &network)
         }
+        Command::Call { address, function, network } => {
+            console::cmd_call(&address, &function, &network)
+        }
+        Command::Tx { hash, network } => {
+            console::cmd_tx(&hash, &network)
+        }
         Command::Fmt => fmt::run(),
         Command::Doc => doc::run(),
         Command::Clean => clean::run(),
