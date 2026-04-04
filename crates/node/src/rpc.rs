@@ -543,17 +543,57 @@ impl PydeApiServer for RpcServer {
             .map(|s| parse_address(s))
             .transpose()?;
 
+        // Topic filters: array of arrays. topics[i] matches log.topics[i].
+        // null/empty at position i means "any". Multiple values at position i means "OR".
+        let topic_filters: Vec<Vec<Vec<u8>>> = filter.get("topics")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().map(|entry| {
+                    if entry.is_null() {
+                        vec![] // match any
+                    } else if let Some(s) = entry.as_str() {
+                        // Single topic
+                        hex::decode(s.trim_start_matches("0x")).unwrap_or_default()
+                            .chunks(32).map(|c| c.to_vec()).collect::<Vec<_>>()
+                            .into_iter().take(1)
+                            .flat_map(|v| vec![v])
+                            .collect()
+                    } else if let Some(arr) = entry.as_array() {
+                        // OR list of topics
+                        arr.iter().filter_map(|t| {
+                            t.as_str().map(|s| hex::decode(s.trim_start_matches("0x")).unwrap_or_default())
+                        }).collect()
+                    } else {
+                        vec![]
+                    }
+                }).collect()
+            })
+            .unwrap_or_default();
+
         let store = self.state.receipts.read().await;
         let logs = store.get_logs(from_slot, to_slot, address_filter.as_ref());
 
-        let result: Vec<serde_json::Value> = logs.iter().map(|(slot, log)| {
-            serde_json::json!({
-                "slot": slot,
-                "address": format!("0x{}", hex::encode(log.address)),
-                "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
-                "data": format!("0x{}", hex::encode(&log.data)),
+        let result: Vec<serde_json::Value> = logs.iter()
+            .filter(|(_, log)| {
+                // Apply topic filters
+                for (i, filter_topics) in topic_filters.iter().enumerate() {
+                    if filter_topics.is_empty() { continue; } // null = match any
+                    if i >= log.topics.len() { return false; } // log has fewer topics
+                    let log_topic = &log.topics[i];
+                    if !filter_topics.iter().any(|ft| ft == log_topic) {
+                        return false; // no match at this position
+                    }
+                }
+                true
             })
-        }).collect();
+            .map(|(slot, log)| {
+                serde_json::json!({
+                    "slot": slot,
+                    "address": format!("0x{}", hex::encode(log.address)),
+                    "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+                    "data": format!("0x{}", hex::encode(&log.data)),
+                })
+            }).collect();
 
         Ok(serde_json::json!(result))
     }
