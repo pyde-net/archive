@@ -1431,12 +1431,13 @@ impl Vm {
         // EIP-2929: warm storage keys persist across the entire transaction
         child.warm_storage_keys = self.warm_storage_keys.clone();
 
-        // Share storage for delegate calls; start fresh for regular calls
+        // Storage sharing: child inherits parent's accumulated overlay so it sees
+        // writes from earlier calls in the same transaction (cross-contract visibility).
         if is_delegate {
             child.storage = std::mem::take(&mut self.storage);
+        } else {
+            child.storage = self.storage.clone();
         }
-        // Regular calls: child starts with empty storage overlay.
-        // The storage_backend (shared via Arc) loads values on demand.
 
         child.load(&bytecode).map_err(|_| Trap::MemoryFault)?;
         let output = child.execute();
