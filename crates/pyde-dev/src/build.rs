@@ -101,20 +101,35 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
         .filter_map(|r| r.ok())
         .collect();
 
-    // Also scan lib/*/src/**/*.oti for installed packages (skip @std)
+    // Scan installed packages in lib/ (skip @std).
+    // Each package may define its own src dir in pyde.toml — default is "src".
     let lib_dir = root.join("lib");
     if lib_dir.exists() {
-        let lib_pattern = format!("{}/**/src/**/*.oti", lib_dir.display());
-        let lib_files: Vec<PathBuf> = glob::glob(&lib_pattern)
-            .map_err(|e| format!("glob error: {}", e))?
-            .filter_map(|r| r.ok())
-            .filter(|p| {
-                // Skip @std/ (standard library, not compiled as source)
-                !p.to_string_lossy().contains("/@std/")
-                    && !p.to_string_lossy().contains("\\@std\\")
-            })
-            .collect();
-        files.extend(lib_files);
+        if let Ok(entries) = std::fs::read_dir(&lib_dir) {
+            for entry in entries.flatten() {
+                let pkg_path = entry.path();
+                if !pkg_path.is_dir() { continue; }
+                let pkg_name = entry.file_name().to_string_lossy().to_string();
+                if pkg_name.starts_with('@') { continue; } // skip @std
+
+                // Read package's pyde.toml for custom src dir
+                let pkg_src = project::load_config_from(&pkg_path.join("pyde.toml"))
+                    .ok()
+                    .flatten()
+                    .map(|c| c.compiler.src)
+                    .unwrap_or_else(|| "src".to_string());
+
+                let pkg_src_dir = pkg_path.join(&pkg_src);
+                if !pkg_src_dir.exists() { continue; }
+
+                let pattern = format!("{}/**/*.oti", pkg_src_dir.display());
+                let lib_files: Vec<PathBuf> = glob::glob(&pattern)
+                    .map_err(|e| format!("glob error: {}", e))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                files.extend(lib_files);
+            }
+        }
     }
 
     if files.is_empty() {
@@ -186,11 +201,13 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
         }
         // For lib packages: register as "package_name" so `use package::Contract` works.
         // Also register underscore variant (oti-math-lib → oti_math_lib).
+        // The package's src dir may be custom (not necessarily "src").
         if let Ok(rel) = path.strip_prefix(&lib_dir) {
             let components: Vec<&str> = rel.components()
                 .filter_map(|c| c.as_os_str().to_str())
                 .collect();
-            if components.len() >= 3 && components[1] == "src" {
+            // Layout: [pkg_name, src_dir_name, ...file.oti] — at least 3 components
+            if components.len() >= 3 {
                 let pkg = components[0];
                 let pkg_us = pkg.replace('-', "_");
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
@@ -486,13 +503,14 @@ fn build_dependency_graph(
                 name_to_idx.insert(normalized, idx);
             }
         }
-        // Register lib packages: lib/pkg/src/File.oti → "pkg" and "pkg/file"
+        // Register lib packages: lib/pkg/<src_dir>/File.oti → "pkg" and "pkg/file"
         // Also register underscore variant (oti-math-lib → oti_math_lib).
+        // The src dir may be custom (not necessarily "src").
         if let Ok(rel) = path.strip_prefix(lib_dir) {
             let components: Vec<&str> = rel.components()
                 .filter_map(|c| c.as_os_str().to_str())
                 .collect();
-            if components.len() >= 3 && components[1] == "src" {
+            if components.len() >= 3 {
                 let pkg = components[0];
                 let pkg_us = pkg.replace('-', "_");
                 name_to_idx.entry(pkg.to_string()).or_insert(idx);

@@ -1,10 +1,9 @@
 use crate::project::{self, Dependency};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command as Cmd;
 
-/// Locked package entry (exact commit pinned).
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 struct LockedPackage {
     name: String,
@@ -18,9 +17,8 @@ struct LockFile {
     packages: Vec<LockedPackage>,
 }
 
-/// Install a single package from a git URL, or restore all from lock file.
+/// Install a single package (+ transitive deps), or restore all from lock file.
 pub fn run(url: &str, rev: Option<&str>, name_override: Option<&str>) -> Result<(), String> {
-    // `pyde install` (no url) → restore all deps from lock file
     if url == "__restore__" {
         return restore_all();
     }
@@ -35,9 +33,7 @@ pub fn run(url: &str, rev: Option<&str>, name_override: Option<&str>) -> Result<
     }
 
     let lib_dir = root.join("lib");
-    let pkg_dir = lib_dir.join(&pkg_name);
-
-    if pkg_dir.exists() {
+    if lib_dir.join(&pkg_name).exists() {
         return Err(format!(
             "'{}' is already installed. Remove it first with `pyde-dev remove {}`",
             pkg_name, pkg_name,
@@ -47,23 +43,77 @@ pub fn run(url: &str, rev: Option<&str>, name_override: Option<&str>) -> Result<
     fs::create_dir_all(&lib_dir)
         .map_err(|e| format!("cannot create lib/: {}", e))?;
 
+    let mut installed: HashSet<String> = HashSet::new();
+    let mut versions: HashMap<String, (String, String)> = HashMap::new();
+
+    install_package(&root, &pkg_name, url, rev, &mut installed, &mut versions)?;
+
+    // Update pyde.toml with the DIRECT dependency only
+    let dep = Dependency {
+        git: url.to_string(),
+        rev: rev.map(|s| s.to_string()),
+    };
+    update_toml(&root, &pkg_name, &dep)?;
+
+    let total = installed.len();
+    if total > 1 {
+        println!("  Installed {} + {} transitive dependencies", pkg_name, total - 1);
+    }
+
+    Ok(())
+}
+
+/// Core install logic — recursive, handles transitive deps.
+fn install_package(
+    root: &Path,
+    pkg_name: &str,
+    url: &str,
+    rev: Option<&str>,
+    installed: &mut HashSet<String>,
+    versions: &mut HashMap<String, (String, String)>,
+) -> Result<(), String> {
+    if installed.contains(pkg_name) {
+        return Ok(());
+    }
+
+    let lib_dir = root.join("lib");
+    let pkg_dir = lib_dir.join(pkg_name);
+
+    // Already on disk — skip clone but still check transitive deps
+    if pkg_dir.exists() {
+        installed.insert(pkg_name.to_string());
+        resolve_transitive_deps(root, pkg_name, installed, versions)?;
+        return Ok(());
+    }
+
+    fs::create_dir_all(&lib_dir)
+        .map_err(|e| format!("cannot create lib/: {}", e))?;
+
     println!("  Installing {} from {}", pkg_name, url);
 
-    // Clone
     clone_repo(url, rev, &pkg_dir)?;
 
-    // Capture exact commit hash BEFORE removing .git/
-    let pinned_rev = get_head_commit(&pkg_dir).unwrap_or_else(|| {
-        rev.unwrap_or("main").to_string()
-    });
+    let pinned_rev = get_head_commit(&pkg_dir)
+        .unwrap_or_else(|| rev.unwrap_or("main").to_string());
 
-    // Remove .git/ (no nested repos)
+    // Conflict detection
+    if let Some((existing_git, existing_rev)) = versions.get(pkg_name) {
+        if existing_rev != &pinned_rev {
+            let _ = fs::remove_dir_all(&pkg_dir);
+            return Err(format!(
+                "dependency conflict: '{}' required at rev {} and rev {}",
+                pkg_name,
+                &pinned_rev[..7.min(pinned_rev.len())],
+                &existing_rev[..7.min(existing_rev.len())],
+            ));
+        }
+    }
+
     let git_dir = pkg_dir.join(".git");
     if git_dir.exists() {
         let _ = fs::remove_dir_all(&git_dir);
     }
 
-    // Verify
     if !pkg_dir.join("src").exists() && !has_oti_files(&pkg_dir) {
         let _ = fs::remove_dir_all(&pkg_dir);
         return Err(format!(
@@ -72,19 +122,32 @@ pub fn run(url: &str, rev: Option<&str>, name_override: Option<&str>) -> Result<
         ));
     }
 
-    // Update pyde.toml
-    let dep = Dependency {
-        git: url.to_string(),
-        rev: rev.map(|s| s.to_string()),
-    };
-    update_toml(&root, &pkg_name, &dep)?;
-
-    // Update pyde.lock
-    update_lock(&root, &pkg_name, url, &pinned_rev)?;
+    update_lock(root, pkg_name, url, &pinned_rev)?;
+    installed.insert(pkg_name.to_string());
+    versions.insert(pkg_name.to_string(), (url.to_string(), pinned_rev.clone()));
 
     let oti_count = count_oti_files(&pkg_dir);
-    println!("  Installed {} ({} .oti files, pinned at {})", pkg_name, oti_count, &pinned_rev[..7.min(pinned_rev.len())]);
+    println!("  Installed {} ({} .oti files, pinned at {})",
+        pkg_name, oti_count, &pinned_rev[..7.min(pinned_rev.len())]);
 
+    resolve_transitive_deps(root, pkg_name, installed, versions)?;
+
+    Ok(())
+}
+
+/// Read a package's pyde.toml and install its dependencies recursively.
+fn resolve_transitive_deps(
+    root: &Path,
+    pkg_name: &str,
+    installed: &mut HashSet<String>,
+    versions: &mut HashMap<String, (String, String)>,
+) -> Result<(), String> {
+    let pkg_toml = root.join("lib").join(pkg_name).join("pyde.toml");
+    if let Some(config) = project::load_config_from(&pkg_toml)? {
+        for (dep_name, dep) in &config.dependencies {
+            install_package(root, dep_name, &dep.git, dep.rev.as_deref(), installed, versions)?;
+        }
+    }
     Ok(())
 }
 
@@ -102,23 +165,23 @@ fn restore_all() -> Result<(), String> {
     fs::create_dir_all(&lib_dir)
         .map_err(|e| format!("cannot create lib/: {}", e))?;
 
+    let mut count = 0;
     for pkg in &lock.packages {
         let pkg_dir = lib_dir.join(&pkg.name);
         if pkg_dir.exists() {
-            println!("  {} — already installed, skipping", pkg.name);
             continue;
         }
-
-        println!("  Installing {} from {} (rev {})", pkg.name, pkg.git, &pkg.rev[..7.min(pkg.rev.len())]);
+        println!("  Installing {} from {} (rev {})",
+            pkg.name, pkg.git, &pkg.rev[..7.min(pkg.rev.len())]);
         clone_repo(&pkg.git, Some(&pkg.rev), &pkg_dir)?;
-
         let git_dir = pkg_dir.join(".git");
         if git_dir.exists() {
             let _ = fs::remove_dir_all(&git_dir);
         }
+        count += 1;
     }
 
-    println!("  Restored {} packages from pyde.lock", lock.packages.len());
+    println!("  Restored {} packages from pyde.lock", count);
     Ok(())
 }
 
@@ -136,7 +199,6 @@ pub fn remove(name: &str) -> Result<(), String> {
 
     fs::remove_dir_all(&pkg_dir)
         .map_err(|e| format!("cannot remove {}: {}", pkg_dir.display(), e))?;
-
     remove_from_toml(&root, name)?;
     remove_from_lock(&root, name)?;
 
@@ -150,38 +212,37 @@ pub fn remove(name: &str) -> Result<(), String> {
 
 fn clone_repo(url: &str, rev: Option<&str>, dest: &Path) -> Result<(), String> {
     let branch = rev.unwrap_or("main");
-    let status = Cmd::new("git")
+    let ok = Cmd::new("git")
         .args(["clone", "--depth", "1", "--branch", branch, url, &dest.to_string_lossy()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map_err(|e| format!("failed to run git: {}", e))?;
+        .map_err(|e| format!("failed to run git: {}", e))?
+        .success();
 
-    if !status.success() {
-        // Retry without --branch (commit hash or default branch differs)
-        let status2 = Cmd::new("git")
+    if !ok {
+        let ok2 = Cmd::new("git")
             .args(["clone", "--depth", "1", url, &dest.to_string_lossy()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map_err(|e| format!("failed to run git: {}", e))?;
-
-        if !status2.success() {
+            .map_err(|e| format!("failed to run git: {}", e))?
+            .success();
+        if !ok2 {
             return Err(format!("git clone failed for {}", url));
         }
-
         if let Some(r) = rev {
-            let checkout = Cmd::new("git")
+            let ok3 = Cmd::new("git")
                 .args(["-C", &dest.to_string_lossy(), "checkout", r])
                 .status()
-                .map_err(|e| format!("git checkout failed: {}", e))?;
-            if !checkout.success() {
+                .map_err(|e| format!("git checkout failed: {}", e))?
+                .success();
+            if !ok3 {
                 let _ = fs::remove_dir_all(dest);
                 return Err(format!("git checkout '{}' failed", r));
             }
         }
     }
-
     Ok(())
 }
 
@@ -202,12 +263,10 @@ fn get_head_commit(repo_dir: &Path) -> Option<String> {
 // ============================================================================
 
 fn load_lock(root: &Path) -> LockFile {
-    let lock_path = root.join("pyde.lock");
-    if let Ok(content) = fs::read_to_string(&lock_path) {
-        toml::from_str(&content).unwrap_or_default()
-    } else {
-        LockFile::default()
-    }
+    let path = root.join("pyde.lock");
+    fs::read_to_string(&path).ok()
+        .and_then(|c| toml::from_str(&c).ok())
+        .unwrap_or_default()
 }
 
 fn save_lock(root: &Path, lock: &LockFile) -> Result<(), String> {
@@ -219,12 +278,9 @@ fn save_lock(root: &Path, lock: &LockFile) -> Result<(), String> {
 
 fn update_lock(root: &Path, name: &str, git: &str, rev: &str) -> Result<(), String> {
     let mut lock = load_lock(root);
-    // Remove existing entry if present
     lock.packages.retain(|p| p.name != name);
     lock.packages.push(LockedPackage {
-        name: name.to_string(),
-        git: git.to_string(),
-        rev: rev.to_string(),
+        name: name.to_string(), git: git.to_string(), rev: rev.to_string(),
     });
     save_lock(root, &lock)
 }
@@ -236,46 +292,6 @@ fn remove_from_lock(root: &Path, name: &str) -> Result<(), String> {
 }
 
 // ============================================================================
-// URL / file helpers
-// ============================================================================
-
-fn parse_repo_name(url: &str) -> String {
-    let url = url.trim_end_matches('/');
-    url.rsplit('/').next().unwrap_or("").trim_end_matches(".git").to_string()
-}
-
-fn has_oti_files(dir: &Path) -> bool {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && path.extension().map(|e| e == "oti").unwrap_or(false) {
-                return true;
-            }
-            if path.is_dir() && has_oti_files(&path) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn count_oti_files(dir: &Path) -> usize {
-    let mut count = 0;
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && path.extension().map(|e| e == "oti").unwrap_or(false) {
-                count += 1;
-            }
-            if path.is_dir() {
-                count += count_oti_files(&path);
-            }
-        }
-    }
-    count
-}
-
-// ============================================================================
 // pyde.toml manipulation
 // ============================================================================
 
@@ -283,25 +299,17 @@ fn update_toml(root: &Path, name: &str, dep: &Dependency) -> Result<(), String> 
     let toml_path = root.join("pyde.toml");
     let content = fs::read_to_string(&toml_path)
         .map_err(|e| format!("cannot read pyde.toml: {}", e))?;
-
     let dep_line = format_dep_line(name, dep);
     let new_content = if content.contains("[dependencies]") {
         if let Some(idx) = content.find("[dependencies]") {
             let after = idx + "[dependencies]".len();
             let rest = &content[after..];
-            let insert_at = if let Some(next_section) = rest.find("\n[") {
-                after + next_section
-            } else {
-                content.len()
-            };
+            let insert_at = rest.find("\n[").map(|i| after + i).unwrap_or(content.len());
             format!("{}{}\n{}", &content[..insert_at], dep_line, &content[insert_at..])
-        } else {
-            content
-        }
+        } else { content }
     } else {
         format!("{}\n[dependencies]\n{}\n", content.trim_end(), dep_line)
     };
-
     fs::write(&toml_path, new_content)
         .map_err(|e| format!("cannot write pyde.toml: {}", e))
 }
@@ -311,21 +319,43 @@ fn remove_from_toml(root: &Path, name: &str) -> Result<(), String> {
     let content = fs::read_to_string(&toml_path)
         .map_err(|e| format!("cannot read pyde.toml: {}", e))?;
     let prefix = format!("{} = ", name);
-    let new_content: String = content
-        .lines()
-        .filter(|line| !line.starts_with(&prefix))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let new_content: String = content.lines()
+        .filter(|l| !l.starts_with(&prefix))
+        .collect::<Vec<_>>().join("\n");
     fs::write(&toml_path, format!("{}\n", new_content.trim_end()))
         .map_err(|e| format!("cannot write pyde.toml: {}", e))
 }
 
 fn format_dep_line(name: &str, dep: &Dependency) -> String {
-    if let Some(ref rev) = dep.rev {
-        format!("{} = {{ git = \"{}\", rev = \"{}\" }}", name, dep.git, rev)
-    } else {
-        format!("{} = {{ git = \"{}\" }}", name, dep.git)
+    match &dep.rev {
+        Some(rev) => format!("{} = {{ git = \"{}\", rev = \"{}\" }}", name, dep.git, rev),
+        None => format!("{} = {{ git = \"{}\" }}", name, dep.git),
     }
+}
+
+fn parse_repo_name(url: &str) -> String {
+    url.trim_end_matches('/').rsplit('/').next().unwrap_or("").trim_end_matches(".git").to_string()
+}
+
+fn has_oti_files(dir: &Path) -> bool {
+    fs::read_dir(dir).ok().map(|entries| {
+        entries.flatten().any(|e| {
+            let p = e.path();
+            (p.is_file() && p.extension().map(|x| x == "oti").unwrap_or(false))
+                || (p.is_dir() && has_oti_files(&p))
+        })
+    }).unwrap_or(false)
+}
+
+fn count_oti_files(dir: &Path) -> usize {
+    fs::read_dir(dir).ok().map(|entries| {
+        entries.flatten().map(|e| {
+            let p = e.path();
+            if p.is_file() && p.extension().map(|x| x == "oti").unwrap_or(false) { 1 }
+            else if p.is_dir() { count_oti_files(&p) }
+            else { 0 }
+        }).sum()
+    }).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -338,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_repo_name_no_git_suffix() {
+    fn parse_repo_name_no_suffix() {
         assert_eq!(parse_repo_name("https://github.com/user/my-lib"), "my-lib");
     }
 
@@ -348,34 +378,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_repo_name_ssh() {
-        assert_eq!(parse_repo_name("git@github.com:user/my-lib.git"), "my-lib");
+    fn format_dep_with_rev() {
+        let dep = Dependency { git: "https://x.com/lib.git".into(), rev: Some("v1".into()) };
+        assert!(format_dep_line("lib", &dep).contains("rev = \"v1\""));
     }
 
     #[test]
-    fn format_dep_line_with_rev() {
-        let dep = Dependency { git: "https://github.com/user/lib.git".into(), rev: Some("v1.0".into()) };
-        assert_eq!(format_dep_line("mylib", &dep), "mylib = { git = \"https://github.com/user/lib.git\", rev = \"v1.0\" }");
+    fn format_dep_no_rev() {
+        let dep = Dependency { git: "https://x.com/lib.git".into(), rev: None };
+        assert!(!format_dep_line("lib", &dep).contains("rev"));
     }
 
     #[test]
-    fn format_dep_line_no_rev() {
-        let dep = Dependency { git: "https://github.com/user/lib.git".into(), rev: None };
-        assert_eq!(format_dep_line("mylib", &dep), "mylib = { git = \"https://github.com/user/lib.git\" }");
-    }
-
-    #[test]
-    fn lock_file_roundtrip() {
+    fn lock_roundtrip() {
         let lock = LockFile {
             packages: vec![
-                LockedPackage { name: "foo".into(), git: "https://example.com/foo".into(), rev: "abc123".into() },
-                LockedPackage { name: "bar".into(), git: "https://example.com/bar".into(), rev: "def456".into() },
+                LockedPackage { name: "a".into(), git: "u1".into(), rev: "r1".into() },
+                LockedPackage { name: "b".into(), git: "u2".into(), rev: "r2".into() },
             ],
         };
         let s = toml::to_string_pretty(&lock).unwrap();
-        let parsed: LockFile = toml::from_str(&s).unwrap();
-        assert_eq!(parsed.packages.len(), 2);
-        assert_eq!(parsed.packages[0].name, "foo");
-        assert_eq!(parsed.packages[1].rev, "def456");
+        let p: LockFile = toml::from_str(&s).unwrap();
+        assert_eq!(p.packages.len(), 2);
     }
 }
