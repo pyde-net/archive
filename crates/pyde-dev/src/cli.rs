@@ -116,6 +116,31 @@ pub enum Command {
         network: String,
     },
 
+    /// Call a contract function (read-only, no signing needed).
+    /// Example: `pyde-dev call 0xaddr get_count() --network devnet`
+    Call {
+        /// Contract address (hex).
+        address: String,
+
+        /// Function call: `method()` or `method(arg1, arg2)`.
+        function: String,
+
+        /// Network name.
+        #[arg(short, long, default_value = "devnet")]
+        network: String,
+    },
+
+    /// Check transaction status/receipt.
+    /// Example: `pyde-dev tx 0xtxhash --network devnet`
+    Tx {
+        /// Transaction hash (hex).
+        hash: String,
+
+        /// Network name.
+        #[arg(short, long, default_value = "devnet")]
+        network: String,
+    },
+
     /// Generate documentation from source contracts.
     Doc,
 
