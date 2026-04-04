@@ -69,6 +69,21 @@ pub enum Command {
         name: String,
     },
 
+    /// Verify a deployed contract matches local source.
+    /// Example: `pyde-dev verify 0xaddr src/Counter.oti:Counter --network devnet`
+    Verify {
+        /// On-chain contract address (hex).
+        address: String,
+
+        /// Source file and contract: `file.oti:ContractName` or just `ContractName`.
+        /// Auto-detected if only one contract exists.
+        contract: Option<String>,
+
+        /// Network name (must be defined in pyde.toml [networks]).
+        #[arg(short, long, default_value = "devnet")]
+        network: String,
+    },
+
     /// Generate documentation from source contracts.
     Doc,
 
@@ -76,17 +91,22 @@ pub enum Command {
     Clean,
 
     /// Deploy a contract to a network.
+    /// Example: `pyde-dev deploy src/Counter.oti:Counter --network devnet --verify`
     Deploy {
+        /// Source file and contract: `file.oti:ContractName` or just `ContractName`.
+        /// Auto-detected if only one contract exists.
+        contract: Option<String>,
+
         /// Network name (must be defined in pyde.toml [networks]).
         #[arg(short, long, default_value = "devnet")]
         network: String,
 
-        /// Contract name to deploy (if multiple contracts exist).
-        #[arg(short, long)]
-        contract: Option<String>,
-
         /// Sender address (hex).
         #[arg(long, default_value = "0x0101010101010101010101010101010101010101010101010101010101010101")]
         from: String,
+
+        /// Verify the deployed bytecode matches local source after deploy.
+        #[arg(long)]
+        verify: bool,
     },
 }

@@ -9,6 +9,7 @@ mod install;
 mod script;
 mod test_runner;
 mod deploy;
+mod verify;
 mod cheatcodes;
 mod trace;
 
@@ -31,11 +32,14 @@ fn main() {
             }
         }
         Command::Remove { name } => install::remove(&name),
+        Command::Verify { address, contract, network } => {
+            verify::run(&address, contract.as_deref(), &network)
+        }
         Command::Fmt => fmt::run(),
         Command::Doc => doc::run(),
         Command::Clean => clean::run(),
-        Command::Deploy { network, contract, from } => {
-            deploy::run(&network, contract.as_deref(), &from)
+        Command::Deploy { network, contract, from, verify } => {
+            deploy::run(&network, contract.as_deref(), &from, verify)
         }
     };
 
