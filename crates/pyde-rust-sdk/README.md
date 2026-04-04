@@ -429,24 +429,57 @@ let data = DeployData::new(constructor_bytecode, runtime_bytecode)
     .build();
 ```
 
-### ABI-Aware Reads
+### ABI-Aware Contract (fromArtifact + connect)
 
-Load function signatures and get auto-decoded return values.
+The recommended way to interact with contracts — loads the full ABI including
+struct/enum definitions, validates args before broadcast, auto-encodes and decodes.
 
 ```rust
-// From build artifact JSON
-let contract = Contract::from_artifact("out/Counter.json", addr, &provider)?;
+use serde_json::json;
 
-// Or manual setup
-let mut contract = Contract::new(addr, &provider);
-contract.add_function("get_count", "u64", true);
-contract.add_function("get_name", "String", true);
-contract.add_function("is_active", "bool", true);
+// Load from build artifact (gets all functions, structs, enums)
+let contract = Contract::from_artifact("out/MyContract.json", addr, &provider)?
+    .connect(&wallet);
 
-// Auto-decoded based on registered return type
-let count = contract.read("get_count", &[]).await?;   // Value::U64(1)
-let name = contract.read("get_name", &[]).await?;     // Value::String("hello")
-let flag = contract.read("is_active", &[]).await?;    // Value::Bool(true)
+// Read — auto-decoded return value
+let count = contract.read("get_count", &json!({})).await?;    // Value::U64(42)
+let user = contract.read("get_user", &json!({})).await?;      // Value::Struct(...)
+let scores = contract.read("get_scores", &json!({})).await?;  // Value::Vec(...)
+
+// Write — validated, encoded, signed, sent, waited
+contract.write("deposit", &json!({"amount": 500}), 100_000_000).await?;
+
+contract.write("set_user", &json!({
+    "user": {"name": "alice", "age": 25, "active": true}
+}), 100_000_000).await?;
+
+contract.write("set_status", &json!({"status": "Active"}), 100_000_000).await?;
+
+contract.write("set_scores", &json!({"scores": [100, 200, 300]}), 100_000_000).await?;
+```
+
+### Arg Validation (before broadcast)
+
+```rust
+// Missing param → error
+contract.write("deposit", &json!({}), gas).await?;
+// Error: deposit(): missing required param 'amount' (u64)
+
+// Wrong type → error
+contract.write("deposit", &json!({"amount": "hello"}), gas).await?;
+// Error: deposit().amount: expected u64, got "hello"
+
+// Out of range → error
+contract.write("deposit", &json!({"amount": -1}), gas).await?;
+// Error: deposit().amount: value -1 out of range for u64 (0 to ...)
+
+// Missing struct field → error
+contract.write("set_user", &json!({"user": {"name": "alice"}}), gas).await?;
+// Error: set_user().user: missing field 'age' for struct UserInfo
+
+// Unknown enum variant → error
+contract.write("set_status", &json!({"status": "Unknown"}), gas).await?;
+// Error: set_status().status: unknown variant 'Unknown' for enum Status. Valid: Active, Banned
 ```
 
 ### The Value Enum
