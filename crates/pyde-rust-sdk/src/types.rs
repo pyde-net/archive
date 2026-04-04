@@ -57,6 +57,10 @@ pub struct LogFilter {
     pub to_block: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// Topic filters. Each entry is None (match any) or a list of hex values (OR match).
+    /// topics[0] = event signature hash, topics[1..3] = indexed params.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topics: Option<Vec<Option<Vec<String>>>>,
 }
 
 /// Block header info.
