@@ -244,6 +244,13 @@ fn save_keystore(name: &str, keystore: &Keystore) -> Result<(), String> {
     fs::create_dir_all(&dir)
         .map_err(|e| format!("cannot create wallet dir: {}", e))?;
 
+    // Set directory permissions to 700 (owner only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
+
     let path = dir.join(format!("{}.json", name));
     if path.exists() {
         return Err(format!("wallet '{}' already exists", name));
@@ -253,6 +260,13 @@ fn save_keystore(name: &str, keystore: &Keystore) -> Result<(), String> {
         .map_err(|e| format!("serialize error: {}", e))?;
     fs::write(&path, json)
         .map_err(|e| format!("cannot write keystore: {}", e))?;
+
+    // Set file permissions to 600 (owner read/write only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
 
     Ok(())
 }
@@ -277,6 +291,14 @@ pub fn prompt_password(prompt: &str) -> Result<String, String> {
         .read_line(&mut password)
         .map_err(|e| format!("cannot read password: {}", e))?;
     Ok(password.trim().to_string())
+}
+
+/// Load a wallet by name, prompt for password, return the address hex.
+/// Used by deploy/script/console when --wallet is specified.
+pub fn resolve_wallet_address(name: &str) -> Result<String, String> {
+    let password = prompt_password("  Enter wallet password: ")?;
+    let w = load(name, &password)?;
+    Ok(w.address_hex())
 }
 
 // ============================================================================

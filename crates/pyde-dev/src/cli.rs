@@ -43,9 +43,13 @@ pub enum Command {
         #[arg(short, long, default_value = "devnet")]
         network: String,
 
-        /// Sender address (hex).
+        /// Sender address (hex). Used when no --wallet specified (devnet mode).
         #[arg(long, default_value = "0x0101010101010101010101010101010101010101010101010101010101010101")]
         from: String,
+
+        /// Wallet name for signing transactions.
+        #[arg(short, long)]
+        wallet: Option<String>,
     },
 
     /// Install a package from a git URL, or restore all from pyde.lock.
@@ -75,9 +79,13 @@ pub enum Command {
         #[arg(short, long, default_value = "devnet")]
         network: String,
 
-        /// Sender address (hex).
+        /// Sender address (hex). Used when no --wallet specified (devnet mode).
         #[arg(long, default_value = "0x0101010101010101010101010101010101010101010101010101010101010101")]
         from: String,
+
+        /// Wallet name for signing send transactions.
+        #[arg(short, long)]
+        wallet: Option<String>,
     },
 
     /// Verify a deployed contract matches local source.

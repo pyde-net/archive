@@ -26,7 +26,10 @@ fn main() {
         Command::Init { name } => init::run(&name),
         Command::Build => build::run(),
         Command::Test { filter, verbosity } => test_runner::run(filter.as_deref(), verbosity),
-        Command::Script { file, network, from } => script::run(&file, &network, &from),
+        Command::Script { file, network, from, wallet: _wallet } => {
+            // TODO: when wallet is Some, sign txs in script runner
+            script::run(&file, &network, &from)
+        }
         Command::Install { url, rev, name } => {
             match url {
                 Some(u) => install::run(&u, rev.as_deref(), name.as_deref()),
@@ -34,7 +37,10 @@ fn main() {
             }
         }
         Command::Remove { name } => install::remove(&name),
-        Command::Console { network, from } => console::run(&network, &from),
+        Command::Console { network, from, wallet: _wallet } => {
+            // TODO: when wallet is Some, sign send txs in console
+            console::run(&network, &from)
+        }
         Command::Verify { address, contract, network } => {
             verify::run(&address, contract.as_deref(), &network)
         }
@@ -58,8 +64,15 @@ fn main() {
         Command::Fmt => fmt::run(),
         Command::Doc => doc::run(),
         Command::Clean => clean::run(),
-        Command::Deploy { network, contract, from, wallet: _, verify } => {
-            deploy::run(&network, contract.as_deref(), &from, verify)
+        Command::Deploy { network, contract, from, wallet, verify } => {
+            let effective_from = match wallet {
+                Some(ref w) => wallet::resolve_wallet_address(w),
+                None => Ok(from),
+            };
+            match effective_from {
+                Ok(addr) => deploy::run(&network, contract.as_deref(), &addr, verify),
+                Err(e) => Err(e),
+            }
         }
     };
 
