@@ -107,6 +107,19 @@ pub fn load_config() -> Result<(ProjectConfig, PathBuf), String> {
     }
 }
 
+/// Load a pyde.toml from a specific path (e.g., an installed package's config).
+/// Returns None if the file doesn't exist.
+pub fn load_config_from(toml_path: &std::path::Path) -> Result<Option<ProjectConfig>, String> {
+    if !toml_path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(toml_path)
+        .map_err(|e| format!("cannot read {}: {}", toml_path.display(), e))?;
+    let config: ProjectConfig =
+        toml::from_str(&content).map_err(|e| format!("invalid {}: {}", toml_path.display(), e))?;
+    Ok(Some(config))
+}
+
 /// Generate a default pyde.toml string for a new project.
 pub fn default_toml(name: &str) -> String {
     format!(
