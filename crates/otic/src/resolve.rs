@@ -879,7 +879,7 @@ impl Resolver {
 
             Expr::MacroCall(name, args, span) => {
                 // Built-in macros: require!, revert!, cross_call!, raw_call!
-                let known_macros = ["require", "revert", "assert", "cross_call", "raw_call", "create"];
+                let known_macros = ["require", "revert", "assert", "cross_call", "raw_call", "create", "deploy"];
                 if !known_macros.contains(&name.name.as_str()) {
                     self.error(
                         format!("unknown macro '{}!'", name.name),

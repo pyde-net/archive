@@ -41,8 +41,11 @@ pub fn run(name: &str) -> Result<(), String> {
         .map_err(|e| format!("cannot write math.oti: {}", e))?;
 
     // Write .gitignore
-    fs::write(root.join(".gitignore"), "out/\n")
-        .map_err(|e| format!("cannot write .gitignore: {}", e))?;
+    fs::write(
+        root.join(".gitignore"),
+        "# Build artifacts\nout/\n\n# Installed packages (restored via pyde install)\nlib/\n!lib/@std/\n",
+    )
+    .map_err(|e| format!("cannot write .gitignore: {}", e))?;
 
     println!("  Initialized project '{}'", name);
     println!();

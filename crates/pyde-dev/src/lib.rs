@@ -6,6 +6,7 @@ pub mod deploy;
 pub mod doc;
 pub mod fmt;
 pub mod init;
+pub mod install;
 pub mod project;
 pub mod script;
 pub mod test_runner;

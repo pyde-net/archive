@@ -94,12 +94,28 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
         ));
     }
 
-    // Find all .oti files
+    // Find all .oti files in src/
     let pattern = format!("{}/**/*.oti", src_dir.display());
-    let files: Vec<PathBuf> = glob::glob(&pattern)
+    let mut files: Vec<PathBuf> = glob::glob(&pattern)
         .map_err(|e| format!("glob error: {}", e))?
         .filter_map(|r| r.ok())
         .collect();
+
+    // Also scan lib/*/src/**/*.oti for installed packages (skip @std)
+    let lib_dir = root.join("lib");
+    if lib_dir.exists() {
+        let lib_pattern = format!("{}/**/src/**/*.oti", lib_dir.display());
+        let lib_files: Vec<PathBuf> = glob::glob(&lib_pattern)
+            .map_err(|e| format!("glob error: {}", e))?
+            .filter_map(|r| r.ok())
+            .filter(|p| {
+                // Skip @std/ (standard library, not compiled as source)
+                !p.to_string_lossy().contains("/@std/")
+                    && !p.to_string_lossy().contains("\\@std\\")
+            })
+            .collect();
+        files.extend(lib_files);
+    }
 
     if files.is_empty() {
         return Err(format!("no .oti files found in {}", src_dir.display()));
@@ -120,7 +136,7 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
     }
 
     // Build dependency graph from `use` statements
-    let dep_graph = build_dependency_graph(&sources, &src_dir)?;
+    let dep_graph = build_dependency_graph(&sources, &src_dir, &lib_dir)?;
 
     // Pre-scan: collect module exports for qualified path validation
     let mut module_exports: HashMap<String, ModuleExports> = HashMap::new();
@@ -165,7 +181,36 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
         if let Ok(rel) = path.strip_prefix(&src_dir) {
             let rel_no_ext = rel.with_extension("");
             if let Some(rel_str) = rel_no_ext.to_str() {
-                module_exports.insert(rel_str.replace('\\', "/"), exports);
+                module_exports.insert(rel_str.replace('\\', "/"), exports.clone());
+            }
+        }
+        // For lib packages: register as "package_name" so `use package::Contract` works.
+        // Also register underscore variant (oti-math-lib → oti_math_lib).
+        if let Ok(rel) = path.strip_prefix(&lib_dir) {
+            let components: Vec<&str> = rel.components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect();
+            if components.len() >= 3 && components[1] == "src" {
+                let pkg = components[0];
+                let pkg_us = pkg.replace('-', "_");
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    module_exports.entry(pkg.to_string())
+                        .or_insert_with(|| exports.clone());
+                    module_exports.entry(pkg_us.clone())
+                        .or_insert_with(|| exports.clone());
+                    if components.len() > 3 {
+                        let sub = components[2..components.len()-1].join("/");
+                        module_exports.insert(
+                            format!("{}/{}", pkg, sub),
+                            exports.clone(),
+                        );
+                    }
+                    // Also register "pkg_name/stem" for direct file access
+                    module_exports.insert(
+                        format!("{}/{}", pkg, stem),
+                        exports,
+                    );
+                }
             }
         }
     }
@@ -423,9 +468,10 @@ fn run_frontend(path: &Path, source: &str, module_exports: &HashMap<String, Modu
 fn build_dependency_graph(
     sources: &[(PathBuf, String, String)],
     src_dir: &Path,
+    lib_dir: &Path,
 ) -> Result<Vec<Vec<usize>>, String> {
     // Map module paths to file indices.
-    // Supports both flat (counter → src/counter.oti) and nested (events/event → src/events/event.oti).
+    // Supports flat (counter → src/counter.oti), nested (events/event), and lib packages.
     let mut name_to_idx: HashMap<String, usize> = HashMap::new();
     for (idx, (path, _, _)) in sources.iter().enumerate() {
         // Register by file stem (flat: "counter")
@@ -436,9 +482,25 @@ fn build_dependency_graph(
         if let Ok(rel) = path.strip_prefix(src_dir) {
             let rel_no_ext = rel.with_extension("");
             if let Some(rel_str) = rel_no_ext.to_str() {
-                // Normalize path separators to forward slash
                 let normalized = rel_str.replace('\\', "/");
                 name_to_idx.insert(normalized, idx);
+            }
+        }
+        // Register lib packages: lib/pkg/src/File.oti → "pkg" and "pkg/file"
+        // Also register underscore variant (oti-math-lib → oti_math_lib).
+        if let Ok(rel) = path.strip_prefix(lib_dir) {
+            let components: Vec<&str> = rel.components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .collect();
+            if components.len() >= 3 && components[1] == "src" {
+                let pkg = components[0];
+                let pkg_us = pkg.replace('-', "_");
+                name_to_idx.entry(pkg.to_string()).or_insert(idx);
+                name_to_idx.entry(pkg_us.clone()).or_insert(idx);
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    name_to_idx.insert(format!("{}/{}", pkg, stem), idx);
+                    name_to_idx.insert(format!("{}/{}", pkg_us, stem), idx);
+                }
             }
         }
     }
@@ -495,7 +557,7 @@ fn build_dependency_graph(
                     } else {
                         let rel = path.strip_prefix(src_dir).unwrap_or(path);
                         return Err(format!(
-                            "error in {}: cannot resolve import '{}' — no {}.oti found in src/",
+                            "error in {}: cannot resolve import '{}' — no {}.oti found in src/ or lib/",
                             rel.display(),
                             import
                                 .path

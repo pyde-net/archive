@@ -5,6 +5,7 @@ mod build;
 mod clean;
 mod doc;
 mod fmt;
+mod install;
 mod script;
 mod test_runner;
 mod deploy;
@@ -23,6 +24,13 @@ fn main() {
         Command::Build => build::run(),
         Command::Test { filter, verbosity } => test_runner::run(filter.as_deref(), verbosity),
         Command::Script { file, network, from } => script::run(&file, &network, &from),
+        Command::Install { url, rev, name } => {
+            match url {
+                Some(u) => install::run(&u, rev.as_deref(), name.as_deref()),
+                None => install::run("__restore__", None, None),
+            }
+        }
+        Command::Remove { name } => install::remove(&name),
         Command::Fmt => fmt::run(),
         Command::Doc => doc::run(),
         Command::Clean => clean::run(),

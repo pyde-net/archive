@@ -1318,12 +1318,14 @@ impl TypeChecker {
                         // deploy!(ContractName, args...) → Ty::Contract("ContractName")
                         // First arg is the contract name (path expression).
                         if let Some(MacroArg::Positional(first)) = args.first() {
-                            if let Expr::Path(segments, _) = first {
-                                let contract_name = segments
-                                    .iter()
-                                    .map(|s| s.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("::");
+                            let contract_name_opt = if let Expr::Path(segments, _) = first {
+                                Some(segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::"))
+                            } else if let Expr::Ident(ident) = first {
+                                Some(ident.name.clone())
+                            } else {
+                                None
+                            };
+                            if let Some(contract_name) = contract_name_opt {
 
                                 // Validate constructor args (count + types)
                                 let user_arg_types = &arg_types[1..]; // skip contract name
