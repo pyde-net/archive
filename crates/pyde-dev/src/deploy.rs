@@ -2,7 +2,7 @@ use crate::build;
 use crate::project;
 use std::fs;
 
-pub fn run(network: &str, contract: Option<&str>, from: &str) -> Result<(), String> {
+pub fn run(network: &str, contract: Option<&str>, from: &str, verify: bool) -> Result<(), String> {
     let (config, root) = project::load_config()?;
 
     // Get network config
@@ -23,48 +23,14 @@ pub fn run(network: &str, contract: Option<&str>, from: &str) -> Result<(), Stri
         })?
         .clone();
 
-    // Build if needed
+    // Build
     let out_dir = root.join(&config.compiler.out);
-    if !out_dir.exists() {
-        println!("  Building contracts first...");
-        build::build_project(&config, &root)?;
-        println!();
-    }
+    println!("  Building...");
+    build::build_project(&config, &root)?;
+    println!();
 
-    // Find the artifact to deploy
-    let artifact_path = if let Some(name) = contract {
-        let p = out_dir.join(format!("{}.json", name));
-        if !p.exists() {
-            return Err(format!("artifact not found: {}", p.display()));
-        }
-        p
-    } else {
-        // Auto-detect: find the first .json artifact in out/
-        let mut artifacts: Vec<_> = glob::glob(&format!("{}/*.json", out_dir.display()))
-            .map_err(|e| format!("glob error: {}", e))?
-            .filter_map(|r| r.ok())
-            .filter(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy() != ".build-cache.json")
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        if artifacts.is_empty() {
-            return Err("no compiled artifacts found in out/ — run `pyde-dev build` first".into());
-        }
-        if artifacts.len() > 1 {
-            let names: Vec<String> = artifacts
-                .iter()
-                .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-                .collect();
-            return Err(format!(
-                "multiple contracts found: {}. Use --contract <name> to specify which to deploy",
-                names.join(", ")
-            ));
-        }
-        artifacts.remove(0)
-    };
+    // Resolve artifact (supports path:ContractName or auto-detect)
+    let (artifact_path, _) = project::resolve_artifact(&out_dir, contract)?;
 
     // Read artifact
     let json_str = fs::read_to_string(&artifact_path)
@@ -156,6 +122,11 @@ pub fn run(network: &str, contract: Option<&str>, from: &str) -> Result<(), Stri
     println!("  Deployed!");
     println!("  Contract: {}", contract_addr);
     println!("  Tx Hash:  {}", tx_hash);
+
+    if verify {
+        println!();
+        crate::verify::run(&contract_addr, contract, network)?;
+    }
 
     Ok(())
 }

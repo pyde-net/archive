@@ -120,6 +120,69 @@ pub fn load_config_from(toml_path: &std::path::Path) -> Result<Option<ProjectCon
     Ok(Some(config))
 }
 
+/// Parse a `path:ContractName` specifier. Returns (contract_name, optional_source_path).
+/// Formats: `Counter`, `src/Counter.oti:Counter`, `src/v2/Counter.oti:Counter`.
+pub fn parse_contract_specifier(spec: &str) -> (String, Option<String>) {
+    if let Some(colon) = spec.rfind(':') {
+        let path = &spec[..colon];
+        let name = &spec[colon + 1..];
+        if !name.is_empty() && !path.is_empty() {
+            return (name.to_string(), Some(path.to_string()));
+        }
+    }
+    // No colon or malformed — treat entire string as contract name
+    (spec.to_string(), None)
+}
+
+/// Resolve a contract specifier to an artifact path in the output directory.
+/// If `spec` is None, auto-detects (errors if ambiguous).
+/// If `spec` is `path:Name`, compiles the specific file and uses that artifact.
+/// If `spec` is just `Name`, looks for `Name.json` in out/.
+pub fn resolve_artifact(
+    out_dir: &std::path::Path,
+    spec: Option<&str>,
+) -> Result<(std::path::PathBuf, String), String> {
+    if let Some(s) = spec {
+        let (name, _source_path) = parse_contract_specifier(s);
+        // Look for artifact by contract name
+        let p = out_dir.join(format!("{}.json", name));
+        if p.exists() {
+            return Ok((p, name));
+        }
+        return Err(format!("artifact not found: {} (run `pyde-dev build` first)", p.display()));
+    }
+
+    // Auto-detect: find .json artifacts in out/ (skip cache)
+    let mut artifacts: Vec<std::path::PathBuf> = glob::glob(&format!("{}/*.json", out_dir.display()))
+        .map_err(|e| format!("glob error: {}", e))?
+        .filter_map(|r| r.ok())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy() != ".build-cache.json")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if artifacts.is_empty() {
+        return Err("no compiled artifacts found — run `pyde-dev build` first".into());
+    }
+    if artifacts.len() > 1 {
+        let names: Vec<String> = artifacts
+            .iter()
+            .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .collect();
+        return Err(format!(
+            "multiple contracts found: {}. Specify with path:ContractName",
+            names.join(", ")
+        ));
+    }
+    let path = artifacts.remove(0);
+    let name = path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok((path, name))
+}
+
 /// Generate a default pyde.toml string for a new project.
 pub fn default_toml(name: &str) -> String {
     format!(
