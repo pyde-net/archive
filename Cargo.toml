@@ -14,4 +14,5 @@ members = [
     "crates/node",
     "crates/pyde-dev",
     "crates/pyde-rust-sdk",
+    "crates/pyde-crypto-wasm",
 ]
