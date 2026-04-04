@@ -15,6 +15,27 @@ pub struct ContractAbi {
     pub events: Vec<AbiEvent>,
     pub errors: Vec<AbiError>,
     pub storage: Vec<AbiStorageField>,
+    pub structs: Vec<AbiStruct>,
+    pub enums: Vec<AbiEnum>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AbiStruct {
+    pub name: String,
+    pub fields: Vec<AbiParam>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AbiEnum {
+    pub name: String,
+    pub variants: Vec<AbiEnumVariant>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AbiEnumVariant {
+    pub name: String,
+    pub discriminant: u32,
+    pub fields: Vec<AbiParam>,
 }
 
 #[derive(Clone, Debug)]
@@ -145,12 +166,39 @@ pub fn generate_abi(program: &IrProgram) -> ContractAbi {
         });
     }
 
+    // Structs
+    let mut structs = Vec::new();
+    for s in &program.struct_defs {
+        structs.push(AbiStruct {
+            name: s.name.clone(),
+            fields: s.fields.iter().map(|(name, ty)| AbiParam {
+                name: name.clone(),
+                ty: ty_to_string(ty),
+            }).collect(),
+        });
+    }
+
+    // Enums
+    let mut enums = Vec::new();
+    for e in &program.enum_defs {
+        enums.push(AbiEnum {
+            name: e.name.clone(),
+            variants: e.variants.iter().enumerate().map(|(i, name)| AbiEnumVariant {
+                name: name.clone(),
+                discriminant: i as u32,
+                fields: vec![], // simple enums have no associated data
+            }).collect(),
+        });
+    }
+
     ContractAbi {
         contract_name: program.contract_name.clone(),
         functions,
         events,
         errors,
         storage,
+        structs,
+        enums,
     }
 }
 
@@ -271,6 +319,38 @@ pub fn abi_to_json(abi: &ContractAbi) -> String {
         if i + 1 < abi.storage.len() {
             out.push(',');
         }
+        out.push('\n');
+    }
+    out.push_str("  ],\n");
+
+    // Structs
+    out.push_str("  \"structs\": [\n");
+    for (i, s) in abi.structs.iter().enumerate() {
+        out.push_str("    {\n");
+        out.push_str(&format!("      \"name\": \"{}\",\n", s.name));
+        out.push_str("      \"fields\": [");
+        for (j, f) in s.fields.iter().enumerate() {
+            out.push_str(&format!("{{\"name\":\"{}\",\"type\":\"{}\"}}", f.name, f.ty));
+            if j + 1 < s.fields.len() { out.push(','); }
+        }
+        out.push_str("]\n    }");
+        if i + 1 < abi.structs.len() { out.push(','); }
+        out.push('\n');
+    }
+    out.push_str("  ],\n");
+
+    // Enums
+    out.push_str("  \"enums\": [\n");
+    for (i, e) in abi.enums.iter().enumerate() {
+        out.push_str("    {\n");
+        out.push_str(&format!("      \"name\": \"{}\",\n", e.name));
+        out.push_str("      \"variants\": [");
+        for (j, v) in e.variants.iter().enumerate() {
+            out.push_str(&format!("{{\"name\":\"{}\",\"discriminant\":{}}}", v.name, v.discriminant));
+            if j + 1 < e.variants.len() { out.push(','); }
+        }
+        out.push_str("]\n    }");
+        if i + 1 < abi.enums.len() { out.push(','); }
         out.push('\n');
     }
     out.push_str("  ]\n");

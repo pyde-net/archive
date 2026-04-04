@@ -263,6 +263,31 @@ pub fn decode_value(data: &[u8], type_str: &str) -> Value {
             }
         }
         "" | "unit" | "()" => Value::Unit,
+        s if s.starts_with("Vec<") && s.ends_with('>') => {
+            // Vec<T>: [byte_len:8][count:8][cap:8][elements...]
+            if data.len() < 24 { return Value::Vec(vec![]); }
+            let _byte_len = u64::from_le_bytes(data[..8].try_into().unwrap_or([0; 8])) as usize;
+            let count = u64::from_le_bytes(data[8..16].try_into().unwrap_or([0; 8])) as usize;
+            let elem_type = &s[4..s.len() - 1]; // extract T from Vec<T>
+            let elem_size = match elem_type {
+                "u64" | "i64" | "bool" => 8,
+                "u128" | "i128" => 16,
+                "u256" | "i256" | "Address" => 32,
+                _ => 0, // variable-length elements not supported in auto-decode
+            };
+            if elem_size > 0 {
+                let mut elements = Vec::with_capacity(count);
+                for i in 0..count {
+                    let offset = 24 + i * elem_size;
+                    if offset + elem_size <= data.len() {
+                        elements.push(decode_value(&data[offset..], elem_type));
+                    }
+                }
+                Value::Vec(elements)
+            } else {
+                Value::Bytes(data.to_vec()) // fallback for variable-length elements
+            }
+        }
         _ => {
             // Unknown type — return raw bytes
             Value::Bytes(data.to_vec())

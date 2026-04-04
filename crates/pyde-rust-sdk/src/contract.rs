@@ -39,26 +39,117 @@ impl ContractCall {
         &self.method
     }
 
+    /// Unsigned 8-bit integer. Range: 0 to 255. Encoded as 8 bytes LE (zero-extended).
+    /// ```rust,ignore
+    /// ContractCall::new("set_level").arg_u8(100).build();
+    /// ```
+    pub fn arg_u8(self, val: u8) -> Self { self.arg_u64(val as u64) }
+
+    /// Unsigned 16-bit integer. Range: 0 to 65,535. Encoded as 8 bytes LE.
+    /// ```rust,ignore
+    /// ContractCall::new("set_port").arg_u16(8080).build();
+    /// ```
+    pub fn arg_u16(self, val: u16) -> Self { self.arg_u64(val as u64) }
+
+    /// Unsigned 32-bit integer. Range: 0 to 4,294,967,295. Encoded as 8 bytes LE.
+    /// ```rust,ignore
+    /// ContractCall::new("set_count").arg_u32(1_000_000).build();
+    /// ```
+    pub fn arg_u32(self, val: u32) -> Self { self.arg_u64(val as u64) }
+
+    /// Unsigned 64-bit integer. Range: 0 to 18,446,744,073,709,551,615. Encoded as 8 bytes LE.
+    /// ```rust,ignore
+    /// ContractCall::new("deposit").arg_u64(500).build();
+    /// ```
     pub fn arg_u64(mut self, val: u64) -> Self {
         self.args.extend_from_slice(&val.to_le_bytes());
         self
     }
 
+    /// Signed 8-bit integer. Range: -128 to 127. Sign-extended to 8 bytes LE.
+    /// ```rust,ignore
+    /// ContractCall::new("set_offset").arg_i8(-1).build();
+    /// ```
+    pub fn arg_i8(self, val: i8) -> Self { self.arg_u64(val as i64 as u64) }
+
+    /// Signed 16-bit integer. Range: -32,768 to 32,767. Sign-extended to 8 bytes LE.
+    /// ```rust,ignore
+    /// ContractCall::new("set_delta").arg_i16(-500).build();
+    /// ```
+    pub fn arg_i16(self, val: i16) -> Self { self.arg_u64(val as i64 as u64) }
+
+    /// Signed 32-bit integer. Range: -2,147,483,648 to 2,147,483,647. Sign-extended to 8 bytes LE.
+    /// ```rust,ignore
+    /// ContractCall::new("set_balance").arg_i32(-1_000_000).build();
+    /// ```
+    pub fn arg_i32(self, val: i32) -> Self { self.arg_u64(val as i64 as u64) }
+
+    /// Signed 64-bit integer. Range: -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807.
+    /// Encoded as 8 bytes LE (two's complement).
+    /// ```rust,ignore
+    /// ContractCall::new("set_reward").arg_i64(-42).build();
+    /// ```
+    pub fn arg_i64(self, val: i64) -> Self { self.arg_u64(val as u64) }
+
+    /// Boolean. Encoded as u64: true = 1, false = 0.
+    /// ```rust,ignore
+    /// ContractCall::new("set_active").arg_bool(true).build();
+    /// ```
     pub fn arg_bool(mut self, val: bool) -> Self {
         self.args.extend_from_slice(&(val as u64).to_le_bytes());
         self
     }
 
+    /// Unsigned 128-bit integer. Range: 0 to 2^128 - 1. Encoded as 16 bytes LE.
+    /// ```rust,ignore
+    /// ContractCall::new("set_supply").arg_u128(1_000_000_000_000_000_000).build();
+    /// ```
+    pub fn arg_u128(mut self, val: u128) -> Self {
+        self.args.extend_from_slice(&val.to_le_bytes());
+        self
+    }
+
+    /// Signed 128-bit integer. Range: -2^127 to 2^127 - 1. Encoded as 16 bytes LE.
+    /// ```rust,ignore
+    /// ContractCall::new("set_delta").arg_i128(-500_000_000_000).build();
+    /// ```
+    pub fn arg_i128(mut self, val: i128) -> Self {
+        self.args.extend_from_slice(&val.to_le_bytes());
+        self
+    }
+
+    /// Unsigned 256-bit integer. Range: 0 to 2^256 - 1. Encoded as 32 bytes LE.
+    /// ```rust,ignore
+    /// ContractCall::new("set_amount").arg_u256(U256::from(99u64)).build();
+    /// ```
     pub fn arg_u256(mut self, val: ethnum::U256) -> Self {
         self.args.extend_from_slice(&val.to_le_bytes());
         self
     }
 
+    /// Signed 256-bit integer. Range: -2^255 to 2^255 - 1. Encoded as 32 bytes LE.
+    /// ```rust,ignore
+    /// ContractCall::new("set_price").arg_i256(I256::from(-1i64)).build();
+    /// ```
+    pub fn arg_i256(mut self, val: ethnum::I256) -> Self {
+        self.args.extend_from_slice(&val.to_le_bytes());
+        self
+    }
+
+    /// 32-byte address. Encoded as raw 32 bytes.
+    /// ```rust,ignore
+    /// ContractCall::new("set_owner").arg_address(addr).build();
+    /// ```
     pub fn arg_address(mut self, val: Address) -> Self {
         self.args.extend_from_slice(&val);
         self
     }
 
+    /// Raw bytes. Appended directly (no length prefix).
+    /// For length-prefixed bytes, use `arg_string` or encode manually.
+    /// ```rust,ignore
+    /// ContractCall::new("set_data").arg_bytes(&[0xDE, 0xAD]).build();
+    /// ```
     pub fn arg_bytes(mut self, val: &[u8]) -> Self {
         self.args.extend_from_slice(val);
         self
@@ -72,6 +163,82 @@ impl ContractCall {
         // Pad to 8-byte alignment
         let padding = (8 - (bytes.len() % 8)) % 8;
         self.args.extend(std::iter::repeat(0u8).take(padding));
+        self
+    }
+
+    /// Encode a Vec<u64> argument: [byte_len:8][count:8][cap:8][elements...].
+    pub fn arg_vec_u64(mut self, vals: &[u64]) -> Self {
+        let data_len = 16 + vals.len() * 8; // count(8) + cap(8) + elements
+        self.args.extend_from_slice(&(data_len as u64).to_le_bytes()); // byte_len
+        self.args.extend_from_slice(&(vals.len() as u64).to_le_bytes()); // count
+        self.args.extend_from_slice(&(vals.len() as u64).to_le_bytes()); // cap
+        for v in vals {
+            self.args.extend_from_slice(&v.to_le_bytes());
+        }
+        self
+    }
+
+    /// Encode a Vec<bool> argument.
+    pub fn arg_vec_bool(self, vals: &[bool]) -> Self {
+        let u64_vals: Vec<u64> = vals.iter().map(|b| *b as u64).collect();
+        self.arg_vec_u64(&u64_vals)
+    }
+
+    /// Encode a Vec<Address> argument: [byte_len:8][count:8][cap:8][addr0:32][addr1:32]...
+    pub fn arg_vec_address(mut self, vals: &[[u8; 32]]) -> Self {
+        let data_len = 16 + vals.len() * 32;
+        self.args.extend_from_slice(&(data_len as u64).to_le_bytes());
+        self.args.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+        self.args.extend_from_slice(&(vals.len() as u64).to_le_bytes());
+        for v in vals {
+            self.args.extend_from_slice(v);
+        }
+        self
+    }
+
+    /// Encode a generic Vec: [byte_len:8][count:8][cap:8][elements...].
+    /// The closure writes all element data using any arg_* methods.
+    /// Works with any element type including strings, structs, nested vecs.
+    ///
+    /// ```rust,ignore
+    /// // Vec of strings
+    /// .arg_vec_of(2, |b| b.arg_string("alice").arg_string("bob"))
+    ///
+    /// // Vec of structs
+    /// .arg_vec_of(2, |b| b
+    ///     .arg_struct(|s| s.arg_string("alice").arg_u64(25))
+    ///     .arg_struct(|s| s.arg_string("bob").arg_u64(30)))
+    ///
+    /// // Vec of vecs (nested)
+    /// .arg_vec_of(2, |b| b
+    ///     .arg_vec_u64(&[1, 2, 3])
+    ///     .arg_vec_u64(&[4, 5]))
+    /// ```
+    pub fn arg_vec_of(mut self, count: usize, build_fn: impl FnOnce(ContractCall) -> ContractCall) -> Self {
+        let inner = build_fn(ContractCall::new("_vec_"));
+        let elements = &inner.args;
+        let data_len = 16 + elements.len(); // count(8) + cap(8) + elements
+        self.args.extend_from_slice(&(data_len as u64).to_le_bytes()); // byte_len
+        self.args.extend_from_slice(&(count as u64).to_le_bytes());    // count
+        self.args.extend_from_slice(&(count as u64).to_le_bytes());    // cap
+        self.args.extend_from_slice(elements);
+        self
+    }
+
+    /// Encode a struct argument: [byte_len:8][field0][field1]...
+    /// Build the struct fields using a closure that writes to a nested ContractCall.
+    pub fn arg_struct(mut self, build_fn: impl FnOnce(ContractCall) -> ContractCall) -> Self {
+        let inner = build_fn(ContractCall::new("_struct_"));
+        let fields = &inner.args;
+        self.args.extend_from_slice(&(fields.len() as u64).to_le_bytes()); // byte_len
+        self.args.extend_from_slice(fields);
+        self
+    }
+
+    /// Encode a tuple: sequential fields with no length prefix.
+    pub fn arg_tuple(mut self, build_fn: impl FnOnce(ContractCall) -> ContractCall) -> Self {
+        let inner = build_fn(ContractCall::new("_tuple_"));
+        self.args.extend_from_slice(&inner.args);
         self
     }
 
@@ -138,36 +305,38 @@ impl DeployData {
 // Decode helpers
 // ============================================================================
 
-/// Decode a u64 from return bytes (first 8 bytes LE).
+// Unsigned integers
 pub fn decode_u64(data: &[u8]) -> Option<u64> {
     if data.len() < 8 { return None; }
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&data[..8]);
-    Some(u64::from_le_bytes(buf))
+    Some(u64::from_le_bytes(data[..8].try_into().ok()?))
 }
-
-/// Decode a u128 from return bytes.
 pub fn decode_u128(data: &[u8]) -> Option<u128> {
     if data.len() < 16 { return None; }
-    let mut buf = [0u8; 16];
-    buf.copy_from_slice(&data[..16]);
-    Some(u128::from_le_bytes(buf))
+    Some(u128::from_le_bytes(data[..16].try_into().ok()?))
 }
-
-/// Decode a u256 from return bytes (32 bytes LE).
 pub fn decode_u256(data: &[u8]) -> Option<ethnum::U256> {
     if data.len() < 32 { return None; }
-    let mut buf = [0u8; 32];
-    buf.copy_from_slice(&data[..32]);
-    Some(ethnum::U256::from_le_bytes(buf))
+    Some(ethnum::U256::from_le_bytes(data[..32].try_into().ok()?))
 }
 
-/// Decode a bool from return bytes.
+// Signed integers
+pub fn decode_i64(data: &[u8]) -> Option<i64> {
+    if data.len() < 8 { return None; }
+    Some(i64::from_le_bytes(data[..8].try_into().ok()?))
+}
+pub fn decode_i128(data: &[u8]) -> Option<i128> {
+    if data.len() < 16 { return None; }
+    Some(i128::from_le_bytes(data[..16].try_into().ok()?))
+}
+pub fn decode_i256(data: &[u8]) -> Option<ethnum::I256> {
+    if data.len() < 32 { return None; }
+    Some(ethnum::I256::from_le_bytes(data[..32].try_into().ok()?))
+}
+
 pub fn decode_bool(data: &[u8]) -> Option<bool> {
     decode_u64(data).map(|v| v != 0)
 }
 
-/// Decode an address from return bytes (32 bytes).
 pub fn decode_address(data: &[u8]) -> Option<Address> {
     if data.len() < 32 { return None; }
     let mut addr = [0u8; 32];
@@ -175,14 +344,54 @@ pub fn decode_address(data: &[u8]) -> Option<Address> {
     Some(addr)
 }
 
-/// Decode a length-prefixed string from return bytes.
+/// Decode a length-prefixed string: [len:8 LE][utf8 bytes].
 pub fn decode_string(data: &[u8]) -> Option<String> {
-    if data.len() < 8 { return None; }
-    let mut len_buf = [0u8; 8];
-    len_buf.copy_from_slice(&data[..8]);
-    let len = u64::from_le_bytes(len_buf) as usize;
+    let len = decode_u64(data)? as usize;
     if data.len() < 8 + len { return None; }
     String::from_utf8(data[8..8 + len].to_vec()).ok()
+}
+
+/// Decode length-prefixed bytes: [len:8 LE][raw bytes].
+pub fn decode_bytes(data: &[u8]) -> Option<Vec<u8>> {
+    let len = decode_u64(data)? as usize;
+    if data.len() < 8 + len { return None; }
+    Some(data[8..8 + len].to_vec())
+}
+
+/// Decode Vec<u64>: [byte_len:8][count:8][cap:8][elements...].
+pub fn decode_vec_u64(data: &[u8]) -> Option<Vec<u64>> {
+    if data.len() < 24 { return None; }
+    let _byte_len = decode_u64(data)? as usize;
+    let count = decode_u64(&data[8..])? as usize;
+    let _cap = decode_u64(&data[16..])?;
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let offset = 24 + i * 8;
+        if data.len() < offset + 8 { return None; }
+        result.push(u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?));
+    }
+    Some(result)
+}
+
+/// Decode Vec<bool>: same layout as Vec<u64>.
+pub fn decode_vec_bool(data: &[u8]) -> Option<Vec<bool>> {
+    decode_vec_u64(data).map(|v| v.into_iter().map(|x| x != 0).collect())
+}
+
+/// Decode Vec<Address>: [byte_len:8][count:8][cap:8][addr0:32][addr1:32]...
+pub fn decode_vec_address(data: &[u8]) -> Option<Vec<Address>> {
+    if data.len() < 24 { return None; }
+    let _byte_len = decode_u64(data)? as usize;
+    let count = decode_u64(&data[8..])? as usize;
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let offset = 24 + i * 32;
+        if data.len() < offset + 32 { return None; }
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&data[offset..offset + 32]);
+        result.push(addr);
+    }
+    Some(result)
 }
 
 #[cfg(test)]

@@ -29,7 +29,11 @@ Rust SDK for interacting with the Pyde blockchain. Async RPC client, FALCON-512 
   - [Waiting for Receipts](#waiting-for-receipts)
 - [Contract Interaction](#contract-interaction)
   - [Building Calldata](#building-calldata)
+  - [Wide Types (u128, u256)](#wide-types-u128-u256)
   - [Multi-Arg Calls](#multi-arg-calls)
+  - [Vectors](#vectors)
+  - [Structs & Tuples](#structs--tuples)
+  - [Nested Types](#nested-types)
   - [Deploy Data with Constructor Args](#deploy-data-with-constructor-args)
   - [ABI-Aware Reads](#abi-aware-reads)
   - [The Value Enum](#the-value-enum)
@@ -290,25 +294,36 @@ let receipt = provider.send_and_wait(&signed_tx, 10_000).await?;
 
 ```rust
 // No args
-let data = ContractCall::new("increment").build();
+ContractCall::new("increment").build();
 
-// Single arg
-let data = ContractCall::new("deposit").arg_u64(500).build();
-
-// Boolean
-let data = ContractCall::new("set_active").arg_bool(true).build();
+// GP types (8 bytes)
+ContractCall::new("set_u8").arg_u8(255).build();
+ContractCall::new("set_u16").arg_u16(1000).build();
+ContractCall::new("set_u32").arg_u32(100000).build();
+ContractCall::new("set_u64").arg_u64(42).build();
+ContractCall::new("set_i64").arg_i64(-1).build();
+ContractCall::new("set_active").arg_bool(true).build();
 
 // Address (32 bytes)
-let data = ContractCall::new("set_owner").arg_address(owner_addr).build();
+ContractCall::new("set_owner").arg_address(owner_addr).build();
 
 // String (length-prefixed, 8-byte aligned)
-let data = ContractCall::new("set_name").arg_string("hello").build();
-
-// U256 (wide integer)
-let data = ContractCall::new("set_amount").arg_u256(U256::from(99u64)).build();
+ContractCall::new("set_name").arg_string("hello").build();
 
 // Raw bytes
-let data = ContractCall::new("set_data").arg_bytes(&[1, 2, 3]).build();
+ContractCall::new("set_data").arg_bytes(&[1, 2, 3]).build();
+```
+
+### Wide Types (u128, u256)
+
+```rust
+// u128 / i128 (16 bytes)
+ContractCall::new("set_amount").arg_u128(1_000_000_000_000).build();
+ContractCall::new("set_signed").arg_i128(-500).build();
+
+// u256 / i256 (32 bytes)
+ContractCall::new("set_big").arg_u256(U256::from(99u64)).build();
+ContractCall::new("set_signed_big").arg_i256(I256::from(-1i64)).build();
 ```
 
 ### Multi-Arg Calls
@@ -316,12 +331,92 @@ let data = ContractCall::new("set_data").arg_bytes(&[1, 2, 3]).build();
 Chain arguments in parameter order.
 
 ```rust
-let data = ContractCall::new("set_all")
+ContractCall::new("set_all")
     .arg_string("hello")
     .arg_u64(42)
     .arg_bool(true)
     .arg_u256(U256::from(99u64))
     .arg_address(some_addr)
+    .build();
+```
+
+### Vectors
+
+```rust
+// Vec<u64>
+ContractCall::new("set_scores").arg_vec_u64(&[100, 200, 300]).build();
+
+// Vec<bool>
+ContractCall::new("set_flags").arg_vec_bool(&[true, false, true]).build();
+
+// Vec<Address>
+ContractCall::new("set_addrs").arg_vec_address(&[addr1, addr2]).build();
+
+// Vec<String> — use arg_vec_of for any element type
+ContractCall::new("set_names")
+    .arg_vec_of(3, |b| b
+        .arg_string("alice")
+        .arg_string("bob")
+        .arg_string("charlie"))
+    .build();
+
+// Vec<u256>
+ContractCall::new("set_bigs")
+    .arg_vec_of(2, |b| b.arg_u256(U256::from(100u64)).arg_u256(U256::from(200u64)))
+    .build();
+```
+
+### Structs & Tuples
+
+```rust
+// Struct: [byte_len:8][fields...]
+ContractCall::new("set_user")
+    .arg_struct(|s| s
+        .arg_string("alice")
+        .arg_u64(25)
+        .arg_bool(true))
+    .build();
+
+// Tuple: sequential fields, no length prefix
+ContractCall::new("set_pair")
+    .arg_tuple(|t| t.arg_u64(1).arg_string("one"))
+    .build();
+```
+
+### Nested Types
+
+`arg_vec_of` and `arg_struct` are composable — nest arbitrarily.
+
+```rust
+// Vec<Struct>
+ContractCall::new("set_users")
+    .arg_vec_of(2, |b| b
+        .arg_struct(|s| s.arg_string("alice").arg_u64(25))
+        .arg_struct(|s| s.arg_string("bob").arg_u64(30)))
+    .build();
+
+// Vec<Vec<u64>>
+ContractCall::new("set_matrix")
+    .arg_vec_of(2, |b| b
+        .arg_vec_u64(&[1, 2, 3])
+        .arg_vec_u64(&[4, 5, 6]))
+    .build();
+
+// Vec<Tuple>
+ContractCall::new("set_pairs")
+    .arg_vec_of(2, |b| b
+        .arg_tuple(|t| t.arg_u64(1).arg_string("one"))
+        .arg_tuple(|t| t.arg_u64(2).arg_string("two")))
+    .build();
+
+// Struct containing Vec
+ContractCall::new("set_team")
+    .arg_struct(|s| s
+        .arg_string("Team Alpha")
+        .arg_vec_of(3, |b| b
+            .arg_string("alice")
+            .arg_string("bob")
+            .arg_string("charlie")))
     .build();
 ```
 

@@ -36,7 +36,12 @@ pub mod wallet;
 pub use abi::{Contract, Value};
 pub use client::Provider;
 pub use contract::{compute_selector, ContractCall, DeployData};
-pub use contract::{decode_address, decode_bool, decode_string, decode_u64, decode_u128, decode_u256};
+pub use contract::{
+    decode_address, decode_bool, decode_bytes, decode_string,
+    decode_u64, decode_u128, decode_u256,
+    decode_i64, decode_i128, decode_i256,
+    decode_vec_u64, decode_vec_bool, decode_vec_address,
+};
 pub use error::{Result, SdkError};
 pub use types::{format_address, parse_address, Address, Receipt, Log, LogFilter};
 pub use wallet::{Keystore, SignerProvider, Wallet};
