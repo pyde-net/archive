@@ -16,6 +16,7 @@ pub enum Value {
     U128(u128),
     I128(i128),
     U256(ethnum::U256),
+    I256(ethnum::I256),
     Bool(bool),
     Address([u8; 32]),
     String(String),
@@ -30,7 +31,9 @@ impl Value {
     pub fn as_u64(&self) -> Option<u64> { if let Value::U64(v) = self { Some(*v) } else { None } }
     pub fn as_i64(&self) -> Option<i64> { if let Value::I64(v) = self { Some(*v) } else { None } }
     pub fn as_u128(&self) -> Option<u128> { if let Value::U128(v) = self { Some(*v) } else { None } }
+    pub fn as_i128(&self) -> Option<i128> { if let Value::I128(v) = self { Some(*v) } else { None } }
     pub fn as_u256(&self) -> Option<ethnum::U256> { if let Value::U256(v) = self { Some(*v) } else { None } }
+    pub fn as_i256(&self) -> Option<ethnum::I256> { if let Value::I256(v) = self { Some(*v) } else { None } }
     pub fn as_bool(&self) -> Option<bool> { if let Value::Bool(v) = self { Some(*v) } else { None } }
     pub fn as_address(&self) -> Option<&[u8; 32]> { if let Value::Address(v) = self { Some(v) } else { None } }
     pub fn as_string(&self) -> Option<&str> { if let Value::String(v) = self { Some(v) } else { None } }
@@ -203,25 +206,37 @@ impl<'a> Contract<'a> {
 
     fn encode_value(&self, buf: &mut Vec<u8>, value: &serde_json::Value, ty: &str, path: &str) -> Result<()> {
         match ty {
-            "u8" | "u16" | "u32" | "u64" | "i8" | "i16" | "i32" | "i64" => {
-                let n = value.as_i64().or_else(|| value.as_u64().map(|v| v as i64))
+            "u8" | "u16" | "u32" | "u64" => {
+                let n = value.as_u64()
                     .ok_or_else(|| SdkError::InvalidResponse(format!("{}: expected {}, got {:?}", path, ty, value)))?;
-                self.validate_int_range(n as i128, ty, path)?;
-                if ty.starts_with('i') {
-                    buf.extend_from_slice(&(n as u64).to_le_bytes());
-                } else {
-                    buf.extend_from_slice(&(n as u64).to_le_bytes());
-                }
-            }
-            "u128" | "i128" => {
-                let n = parse_json_u128(value)
-                    .ok_or_else(|| SdkError::InvalidResponse(format!("{}: expected {}", path, ty)))?;
+                self.validate_uint_range(n, ty, path)?;
                 buf.extend_from_slice(&n.to_le_bytes());
             }
-            "u256" | "i256" => {
-                let n = parse_json_u128(value).unwrap_or(0) as u128;
-                let val = ethnum::U256::from(n);
-                buf.extend_from_slice(&val.to_le_bytes());
+            "i8" | "i16" | "i32" | "i64" => {
+                let n = value.as_i64()
+                    .ok_or_else(|| SdkError::InvalidResponse(format!("{}: expected {}, got {:?}", path, ty, value)))?;
+                self.validate_int_range(n, ty, path)?;
+                buf.extend_from_slice(&n.to_le_bytes());
+            }
+            "u128" => {
+                let n = parse_json_u128(value)
+                    .ok_or_else(|| SdkError::InvalidResponse(format!("{}: expected u128", path)))?;
+                buf.extend_from_slice(&n.to_le_bytes());
+            }
+            "i128" => {
+                let n = parse_json_i128(value)
+                    .ok_or_else(|| SdkError::InvalidResponse(format!("{}: expected i128", path)))?;
+                buf.extend_from_slice(&n.to_le_bytes());
+            }
+            "u256" => {
+                let n = parse_json_u256(value)
+                    .ok_or_else(|| SdkError::InvalidResponse(format!("{}: expected u256", path)))?;
+                buf.extend_from_slice(&n.to_le_bytes());
+            }
+            "i256" => {
+                let n = parse_json_i256(value)
+                    .ok_or_else(|| SdkError::InvalidResponse(format!("{}: expected i256", path)))?;
+                buf.extend_from_slice(&n.to_le_bytes());
             }
             "bool" => {
                 let b = value.as_bool()
@@ -240,6 +255,17 @@ impl<'a> Contract<'a> {
                 let bytes = s.as_bytes();
                 buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
                 buf.extend_from_slice(bytes);
+                let pad = (8 - (bytes.len() % 8)) % 8;
+                buf.extend(std::iter::repeat(0u8).take(pad));
+            }
+            "Bytes" | "bytes" => {
+                let s = value.as_str()
+                    .ok_or_else(|| SdkError::InvalidResponse(format!("{}: expected hex string for Bytes", path)))?;
+                let hex = s.trim_start_matches("0x");
+                let bytes = ::hex::decode(hex)
+                    .map_err(|e| SdkError::InvalidResponse(format!("{}: bad hex for Bytes: {}", path, e)))?;
+                buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                buf.extend_from_slice(&bytes);
                 let pad = (8 - (bytes.len() % 8)) % 8;
                 buf.extend(std::iter::repeat(0u8).take(pad));
             }
@@ -290,10 +316,21 @@ impl<'a> Contract<'a> {
         Ok(())
     }
 
-    fn validate_int_range(&self, n: i128, ty: &str, path: &str) -> Result<()> {
-        let (min, max): (i128, i128) = match ty {
-            "u8" => (0, 255), "u16" => (0, 65535), "u32" => (0, 4294967295), "u64" => (0, i64::MAX as i128),
-            "i8" => (-128, 127), "i16" => (-32768, 32767), "i32" => (-2147483648, 2147483647), "i64" => (i64::MIN as i128, i64::MAX as i128),
+    fn validate_uint_range(&self, n: u64, ty: &str, path: &str) -> Result<()> {
+        let max: u64 = match ty {
+            "u8" => 255, "u16" => 65535, "u32" => 4294967295, "u64" => u64::MAX,
+            _ => return Ok(()),
+        };
+        if n > max {
+            return Err(SdkError::InvalidResponse(format!("{}: value {} out of range for {} (0 to {})", path, n, ty, max)));
+        }
+        Ok(())
+    }
+
+    fn validate_int_range(&self, n: i64, ty: &str, path: &str) -> Result<()> {
+        let (min, max): (i64, i64) = match ty {
+            "i8" => (-128, 127), "i16" => (-32768, 32767),
+            "i32" => (-2147483648, 2147483647), "i64" => (i64::MIN, i64::MAX),
             _ => return Ok(()),
         };
         if n < min || n > max {
@@ -320,9 +357,17 @@ impl<'a> Contract<'a> {
                 if data.len() < offset + 16 { return (Value::U128(0), 16); }
                 (Value::U128(u128::from_le_bytes(data[offset..offset+16].try_into().unwrap())), 16)
             }
-            "u256" | "i256" => {
+            "i128" => {
+                if data.len() < offset + 16 { return (Value::I128(0), 16); }
+                (Value::I128(i128::from_le_bytes(data[offset..offset+16].try_into().unwrap())), 16)
+            }
+            "u256" => {
                 if data.len() < offset + 32 { return (Value::U256(ethnum::U256::ZERO), 32); }
                 (Value::U256(ethnum::U256::from_le_bytes(data[offset..offset+32].try_into().unwrap())), 32)
+            }
+            "i256" => {
+                if data.len() < offset + 32 { return (Value::I256(ethnum::I256::ZERO), 32); }
+                (Value::I256(ethnum::I256::from_le_bytes(data[offset..offset+32].try_into().unwrap())), 32)
             }
             "bool" => {
                 if data.len() < offset + 8 { return (Value::Bool(false), 8); }
@@ -337,20 +382,37 @@ impl<'a> Contract<'a> {
             "String" => {
                 if data.len() < offset + 8 { return (Value::String(String::new()), 8); }
                 let len = u64::from_le_bytes(data[offset..offset+8].try_into().unwrap()) as usize;
-                let s = if data.len() >= offset + 8 + len {
-                    std::string::String::from_utf8_lossy(&data[offset+8..offset+8+len]).to_string()
-                } else { String::new() };
+                let end = match (offset + 8).checked_add(len) {
+                    Some(e) if e <= data.len() => e,
+                    _ => return (Value::String(String::new()), 8),
+                };
+                let s = std::string::String::from_utf8_lossy(&data[offset+8..end]).to_string();
                 let aligned = 8 + len + ((8 - (len % 8)) % 8);
                 (Value::String(s), aligned)
+            }
+            "Bytes" | "bytes" => {
+                if data.len() < offset + 8 { return (Value::Bytes(vec![]), 8); }
+                let len = u64::from_le_bytes(data[offset..offset+8].try_into().unwrap()) as usize;
+                let end = match (offset + 8).checked_add(len) {
+                    Some(e) if e <= data.len() => e,
+                    _ => return (Value::Bytes(vec![]), 8),
+                };
+                let bytes = data[offset+8..end].to_vec();
+                let aligned = 8 + len + ((8 - (len % 8)) % 8);
+                (Value::Bytes(bytes), aligned)
             }
             _ if ty.starts_with("Vec<") && ty.ends_with('>') => {
                 let elem_type = &ty[4..ty.len()-1];
                 if data.len() < offset + 24 { return (Value::Vec(vec![]), 24); }
                 let byte_len = u64::from_le_bytes(data[offset..offset+8].try_into().unwrap()) as usize;
                 let count = u64::from_le_bytes(data[offset+8..offset+16].try_into().unwrap()) as usize;
+                // Clamp count to prevent OOM from malformed data
+                let max_elems = data.len().saturating_sub(offset + 24);
+                let safe_count = count.min(max_elems);
                 let mut cursor = offset + 24;
-                let mut items = Vec::with_capacity(count);
-                for _ in 0..count {
+                let mut items = Vec::with_capacity(safe_count);
+                for _ in 0..safe_count {
+                    if cursor >= data.len() { break; }
                     let (val, read) = self.decode_value(data, elem_type, cursor);
                     items.push(val);
                     cursor += read;
@@ -387,7 +449,48 @@ impl<'a> Contract<'a> {
 
 fn parse_json_u128(v: &serde_json::Value) -> Option<u128> {
     v.as_u64().map(|n| n as u128)
-        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .or_else(|| v.as_str().and_then(|s| {
+            if let Some(hex) = s.strip_prefix("0x") {
+                u128::from_str_radix(hex, 16).ok()
+            } else {
+                s.parse().ok()
+            }
+        }))
+}
+
+fn parse_json_i128(v: &serde_json::Value) -> Option<i128> {
+    v.as_i64().map(|n| n as i128)
+        .or_else(|| v.as_u64().map(|n| n as i128))
+        .or_else(|| v.as_str().and_then(|s| {
+            if let Some(hex) = s.strip_prefix("0x") {
+                u128::from_str_radix(hex, 16).ok().map(|n| n as i128)
+            } else {
+                s.parse().ok()
+            }
+        }))
+}
+
+fn parse_json_u256(v: &serde_json::Value) -> Option<ethnum::U256> {
+    v.as_u64().map(|n| ethnum::U256::from(n))
+        .or_else(|| v.as_str().and_then(|s| {
+            if let Some(hex) = s.strip_prefix("0x") {
+                ethnum::U256::from_str_radix(hex, 16).ok()
+            } else {
+                s.parse::<ethnum::U256>().ok()
+            }
+        }))
+}
+
+fn parse_json_i256(v: &serde_json::Value) -> Option<ethnum::I256> {
+    v.as_i64().map(|n| ethnum::I256::from(n))
+        .or_else(|| v.as_u64().map(|n| ethnum::I256::from(n as i128)))
+        .or_else(|| v.as_str().and_then(|s| {
+            if let Some(hex) = s.strip_prefix("0x") {
+                ethnum::U256::from_str_radix(hex, 16).ok().map(|n| ethnum::I256::from_le_bytes(n.to_le_bytes()))
+            } else {
+                s.parse::<ethnum::I256>().ok()
+            }
+        }))
 }
 
 #[cfg(test)]
@@ -433,9 +536,11 @@ mod tests {
     fn encode_validates_int_range() {
         let p = dummy_provider();
         let c = Contract::from_json(&test_abi_json(), [0; 32], &p).unwrap();
+        // Negative value for u64 → rejected as not a valid u64
         let r = c.encode_call("deposit", &serde_json::json!({"amount": -1}));
         assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("out of range"));
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("expected u64") || err.contains("out of range"), "got: {}", err);
     }
 
     #[test]
@@ -525,5 +630,81 @@ mod tests {
         let data = 1u64.to_le_bytes();
         let (v, _) = c.decode_value(&data, "Status", 0);
         assert_eq!(v.as_enum(), Some("Banned"));
+    }
+
+    #[test]
+    fn encode_u64_full_range() {
+        // u64::MAX should be accepted (was previously capped at i64::MAX)
+        let p = dummy_provider();
+        let json = test_abi_json();
+        let c = Contract::from_json(&json, [0; 32], &p).unwrap();
+        let r = c.encode_call("deposit", &serde_json::json!({"amount": u64::MAX}));
+        assert!(r.is_ok());
+        let data = r.unwrap();
+        let val = u64::from_le_bytes(data[4..12].try_into().unwrap());
+        assert_eq!(val, u64::MAX);
+    }
+
+    #[test]
+    fn encode_decode_i128() {
+        let p = dummy_provider();
+        let json = serde_json::json!({
+            "abi": {
+                "functions": [{"name":"set","params":[{"name":"v","type":"i128"}],"returns":"i128","view":false}],
+                "structs": [], "enums": [],
+            }
+        }).to_string();
+        let c = Contract::from_json(&json, [0; 32], &p).unwrap();
+        // Encode negative i128
+        let data = c.encode_call("set", &serde_json::json!({"v": -500})).unwrap();
+        // Decode it back
+        let (val, _) = c.decode_value(&data[4..], "i128", 0);
+        assert_eq!(val.as_i128(), Some(-500));
+    }
+
+    #[test]
+    fn encode_decode_u256() {
+        let p = dummy_provider();
+        let json = serde_json::json!({
+            "abi": {
+                "functions": [{"name":"set","params":[{"name":"v","type":"u256"}],"returns":"u256","view":false}],
+                "structs": [], "enums": [],
+            }
+        }).to_string();
+        let c = Contract::from_json(&json, [0; 32], &p).unwrap();
+        // u256 from hex string (above u128 range)
+        let big = "340282366920938463463374607431768211456"; // 2^128
+        let data = c.encode_call("set", &serde_json::json!({"v": big})).unwrap();
+        let (val, _) = c.decode_value(&data[4..], "u256", 0);
+        assert_eq!(val.as_u256(), Some(ethnum::U256::from(1u128) << 128));
+    }
+
+    #[test]
+    fn encode_decode_i256_negative() {
+        let p = dummy_provider();
+        let json = serde_json::json!({
+            "abi": {
+                "functions": [{"name":"set","params":[{"name":"v","type":"i256"}],"returns":"i256","view":false}],
+                "structs": [], "enums": [],
+            }
+        }).to_string();
+        let c = Contract::from_json(&json, [0; 32], &p).unwrap();
+        let data = c.encode_call("set", &serde_json::json!({"v": -1})).unwrap();
+        let (val, _) = c.decode_value(&data[4..], "i256", 0);
+        assert_eq!(val.as_i256(), Some(ethnum::I256::from(-1i64)));
+    }
+
+    #[test]
+    fn u128_rejects_negative() {
+        let p = dummy_provider();
+        let json = serde_json::json!({
+            "abi": {
+                "functions": [{"name":"set","params":[{"name":"v","type":"u128"}],"returns":"()","view":false}],
+                "structs": [], "enums": [],
+            }
+        }).to_string();
+        let c = Contract::from_json(&json, [0; 32], &p).unwrap();
+        let r = c.encode_call("set", &serde_json::json!({"v": -1}));
+        assert!(r.is_err());
     }
 }
