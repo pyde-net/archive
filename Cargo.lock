@@ -1302,11 +1302,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if 1.0.4",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.0",
  "wasip2",
  "wasip3",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3442,16 +3444,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyde-crypto-wasm"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "getrandom 0.4.2",
+ "hex",
+ "pyde-crypto",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "pyde-dev"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "clap",
  "ethnum",
  "glob",
  "hex",
  "otic",
+ "pyde-account",
  "pyde-crypto",
+ "pyde-tx",
  "pyde-vm",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
@@ -3495,6 +3515,7 @@ dependencies = [
  "libp2p",
  "metrics",
  "metrics-exporter-prometheus",
+ "otic",
  "pyde-account",
  "pyde-aot",
  "pyde-consensus",
@@ -3513,6 +3534,24 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pyde-rust-sdk"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "ethnum",
+ "hex",
+ "pyde-account",
+ "pyde-crypto",
+ "pyde-tx",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

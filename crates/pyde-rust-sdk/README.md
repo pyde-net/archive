@@ -46,6 +46,7 @@ Rust SDK for interacting with the Pyde blockchain. Async RPC client, FALCON-512 
   - [Keystore Encryption](#keystore-encryption)
   - [File Permissions](#file-permissions)
   - [Post-Quantum Cryptography](#post-quantum-cryptography)
+- [Utility Functions](#utility-functions)
 - [Architecture](#architecture)
 
 ---
@@ -65,7 +66,8 @@ tokio = { version = "1", features = ["full"] }
 ## Getting Started
 
 ```rust
-use pyde_rust_sdk::{Provider, Wallet, ContractCall};
+use pyde_rust_sdk::{Provider, Wallet, Contract};
+use serde_json::json;
 
 #[tokio::main]
 async fn main() -> pyde_rust_sdk::Result<()> {
@@ -81,8 +83,15 @@ async fn main() -> pyde_rust_sdk::Result<()> {
     println!("Balance: {} quanta", balance);
 
     // 4. Transfer tokens
-    let receipt = wallet.transfer(&provider, &recipient, 1_000_000).await?;
+    let to = pyde_rust_sdk::parse_address("0x00bb...")?;
+    let receipt = wallet.transfer(&provider, &to, 1_000_000).await?;
     println!("Tx hash: {}", receipt.tx_hash);
+
+    // 5. Interact with a contract (load ABI from build artifact)
+    let contract = Contract::from_artifact("out/Counter.json", addr, &provider)?
+        .connect(&wallet);
+    let count = contract.read("get_count", &json!({})).await?;
+    contract.write("increment", &json!({}), 100_000_000).await?;
 
     Ok(())
 }
@@ -138,15 +147,17 @@ if let Some(b) = block {
 Execute a contract function without creating a transaction. No gas consumed.
 
 ```rust
-let calldata = ContractCall::new("get_count").build();
+// Using Contract (recommended)
+let contract = Contract::from_artifact("out/Counter.json", addr, &provider)?;
+let count = contract.read("get_count", &json!({})).await?; // Value::U64(42)
+
+// Low-level (manual calldata)
 let result = provider.call(&contract_addr, &calldata).await?; // Vec<u8>
-let count = decode_u64(&result);  // Some(42)
 ```
 
 ### Gas Estimation
 
 ```rust
-let calldata = ContractCall::new("deposit").arg_u64(500).build();
 let gas = provider.estimate_gas(&contract_addr, &calldata).await?; // u64
 ```
 
@@ -240,13 +251,14 @@ println!("Fee: {} quanta", receipt.fee_paid);
 ### Calling a Contract Function
 
 ```rust
+// Using Contract (recommended — validates args against ABI)
+let contract = Contract::from_artifact("out/Contract.json", addr, &provider)?
+    .connect(&wallet);
+let receipt = contract.write("deposit", &json!({"amount": 500}), 100_000_000).await?;
+
+// Low-level (manual calldata + wallet)
 let calldata = ContractCall::new("deposit").arg_u64(500).build();
-let receipt = wallet.send_call(
-    &provider,
-    &contract_addr,
-    calldata,
-    100_000_000,  // gas limit
-).await?;
+let receipt = wallet.send_call(&provider, &contract_addr, calldata, 100_000_000).await?;
 ```
 
 ### Deploying a Contract
@@ -290,18 +302,29 @@ let receipt = provider.send_and_wait(&signed_tx, 10_000).await?;
 
 ## Contract Interaction
 
-### Building Calldata
+> **Recommended**: Use `Contract::from_artifact()` with `.read()` / `.write()` for ABI-aware
+> interaction with validation. The `ContractCall` builder below is for low-level / dynamic use
+> when you don't have an artifact.
+
+### Low-Level Calldata Builder
 
 ```rust
 // No args
 ContractCall::new("increment").build();
 
-// GP types (8 bytes)
+// Unsigned GP types (8 bytes LE, zero-extended)
 ContractCall::new("set_u8").arg_u8(255).build();
 ContractCall::new("set_u16").arg_u16(1000).build();
 ContractCall::new("set_u32").arg_u32(100000).build();
 ContractCall::new("set_u64").arg_u64(42).build();
-ContractCall::new("set_i64").arg_i64(-1).build();
+
+// Signed GP types (8 bytes LE, sign-extended)
+ContractCall::new("set_i8").arg_i8(-1).build();
+ContractCall::new("set_i16").arg_i16(-500).build();
+ContractCall::new("set_i32").arg_i32(-1_000_000).build();
+ContractCall::new("set_i64").arg_i64(-42).build();
+
+// Bool
 ContractCall::new("set_active").arg_bool(true).build();
 
 // Address (32 bytes)
@@ -437,9 +460,16 @@ struct/enum definitions, validates args before broadcast, auto-encodes and decod
 ```rust
 use serde_json::json;
 
-// Load from build artifact (gets all functions, structs, enums)
+// Load from build artifact file (gets all functions, structs, enums)
 let contract = Contract::from_artifact("out/MyContract.json", addr, &provider)?
     .connect(&wallet);
+
+// Or load from a raw ABI JSON string
+let contract = Contract::from_json(&abi_json_string, addr, &provider)?
+    .connect(&wallet);
+
+// Or create a minimal contract (no ABI — for low-level use)
+let contract = Contract::new(addr, &provider);
 
 // Read — auto-decoded return value
 let count = contract.read("get_count", &json!({})).await?;    // Value::U64(42)
@@ -489,23 +519,35 @@ Return values are decoded into a `Value` enum supporting all Pyde types.
 ```rust
 pub enum Value {
     U64(u64),
+    I64(i64),
     U128(u128),
+    I128(i128),
     U256(ethnum::U256),
+    I256(ethnum::I256),
     Bool(bool),
     Address([u8; 32]),
     String(String),
     Bytes(Vec<u8>),
     Vec(Vec<Value>),
     Struct(HashMap<String, Value>),
+    Enum(String),        // variant name
     Unit,
 }
 
-// Accessors
+// Accessors — each returns Option<T>
 value.as_u64()       // Option<u64>
-value.as_string()    // Option<&str>
+value.as_i64()       // Option<i64>
+value.as_u128()      // Option<u128>
+value.as_i128()      // Option<i128>
+value.as_u256()      // Option<U256>
+value.as_i256()      // Option<I256>
 value.as_bool()      // Option<bool>
+value.as_address()   // Option<&[u8; 32]>
+value.as_string()    // Option<&str>
+value.as_bytes()     // Option<&[u8]>
 value.as_vec()       // Option<&[Value]>
 value.as_struct()    // Option<&HashMap<String, Value>>
+value.as_enum()      // Option<&str>  (variant name)
 
 // Struct field access
 value.field("name")  // Option<&Value>
@@ -519,12 +561,26 @@ value.index(0)       // Option<&Value>
 Manual decoders for raw return bytes.
 
 ```rust
-let count = decode_u64(&bytes);     // Option<u64>
-let big = decode_u256(&bytes);      // Option<U256>
-let flag = decode_bool(&bytes);     // Option<bool>
-let addr = decode_address(&bytes);  // Option<[u8; 32]>
-let name = decode_string(&bytes);   // Option<String>
-let amt = decode_u128(&bytes);      // Option<u128>
+// GP integers
+let count = decode_u64(&bytes);      // Option<u64>
+let neg   = decode_i64(&bytes);      // Option<i64>
+
+// Wide integers
+let amt   = decode_u128(&bytes);     // Option<u128>
+let sneg  = decode_i128(&bytes);     // Option<i128>
+let big   = decode_u256(&bytes);     // Option<U256>
+let sbig  = decode_i256(&bytes);     // Option<I256>
+
+// Other types
+let flag  = decode_bool(&bytes);     // Option<bool>
+let addr  = decode_address(&bytes);  // Option<[u8; 32]>
+let name  = decode_string(&bytes);   // Option<String>
+let raw   = decode_bytes(&bytes);    // Option<Vec<u8>>
+
+// Vec decoders
+let nums  = decode_vec_u64(&bytes);     // Option<Vec<u64>>
+let flags = decode_vec_bool(&bytes);    // Option<Vec<bool>>
+let addrs = decode_vec_address(&bytes); // Option<Vec<[u8; 32]>>
 ```
 
 ---
@@ -668,6 +724,23 @@ All cryptographic operations are post-quantum safe:
 - **Signing**: FALCON-512 (lattice-based, NIST standard)
 - **Hashing**: Poseidon2 (ZK-friendly algebraic hash)
 - **Encryption**: AES-256-GCM (Grover-resistant at 128-bit equivalent)
+
+---
+
+## Utility Functions
+
+```rust
+use pyde_rust_sdk::{parse_address, format_address, compute_selector};
+
+// Parse a hex address string to [u8; 32]
+let addr = parse_address("0xaabb...")?;
+
+// Format a [u8; 32] address as 0x-prefixed hex
+let hex = format_address(&addr);  // "0xaabb..."
+
+// Compute FNV-1a function selector (same as Otigen compiler)
+let selector = compute_selector("get_count");  // 0xd9e32bf7
+```
 
 ---
 

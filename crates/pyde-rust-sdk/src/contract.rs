@@ -347,15 +347,17 @@ pub fn decode_address(data: &[u8]) -> Option<Address> {
 /// Decode a length-prefixed string: [len:8 LE][utf8 bytes].
 pub fn decode_string(data: &[u8]) -> Option<String> {
     let len = decode_u64(data)? as usize;
-    if data.len() < 8 + len { return None; }
-    String::from_utf8(data[8..8 + len].to_vec()).ok()
+    let total = 8_usize.checked_add(len)?;
+    if data.len() < total { return None; }
+    String::from_utf8(data[8..total].to_vec()).ok()
 }
 
 /// Decode length-prefixed bytes: [len:8 LE][raw bytes].
 pub fn decode_bytes(data: &[u8]) -> Option<Vec<u8>> {
     let len = decode_u64(data)? as usize;
-    if data.len() < 8 + len { return None; }
-    Some(data[8..8 + len].to_vec())
+    let total = 8_usize.checked_add(len)?;
+    if data.len() < total { return None; }
+    Some(data[8..total].to_vec())
 }
 
 /// Decode Vec<u64>: [byte_len:8][count:8][cap:8][elements...].
@@ -363,11 +365,12 @@ pub fn decode_vec_u64(data: &[u8]) -> Option<Vec<u64>> {
     if data.len() < 24 { return None; }
     let _byte_len = decode_u64(data)? as usize;
     let count = decode_u64(&data[8..])? as usize;
-    let _cap = decode_u64(&data[16..])?;
+    // Clamp count against physically available data to prevent OOM/overflow
+    let max_count = (data.len().saturating_sub(24)) / 8;
+    if count > max_count { return None; }
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let offset = 24 + i * 8;
-        if data.len() < offset + 8 { return None; }
         result.push(u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?));
     }
     Some(result)
@@ -383,10 +386,11 @@ pub fn decode_vec_address(data: &[u8]) -> Option<Vec<Address>> {
     if data.len() < 24 { return None; }
     let _byte_len = decode_u64(data)? as usize;
     let count = decode_u64(&data[8..])? as usize;
+    let max_count = (data.len().saturating_sub(24)) / 32;
+    if count > max_count { return None; }
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let offset = 24 + i * 32;
-        if data.len() < offset + 32 { return None; }
         let mut addr = [0u8; 32];
         addr.copy_from_slice(&data[offset..offset + 32]);
         result.push(addr);

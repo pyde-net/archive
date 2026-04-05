@@ -43,5 +43,5 @@ pub use contract::{
     decode_vec_u64, decode_vec_bool, decode_vec_address,
 };
 pub use error::{Result, SdkError};
-pub use types::{format_address, parse_address, Address, Receipt, Log, LogFilter};
+pub use types::{format_address, parse_address, Address, Receipt, Log, LogFilter, BlockHeader};
 pub use wallet::{Keystore, SignerProvider, Wallet};
