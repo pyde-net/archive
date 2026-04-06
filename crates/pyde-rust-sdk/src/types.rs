@@ -122,6 +122,14 @@ pub struct BlockHeader {
     pub tx_count: String,
 }
 
+/// Override params for call/estimate_gas.
+#[derive(Debug, Clone, Default)]
+pub struct CallOverrides {
+    pub from: Option<Address>,
+    pub value: Option<u128>,
+    pub gas_limit: Option<u64>,
+}
+
 /// Fee data from the network.
 #[derive(Debug, Clone)]
 pub struct FeeData {

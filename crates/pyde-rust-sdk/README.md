@@ -17,6 +17,7 @@ Rust SDK for interacting with the Pyde blockchain. Async RPC client, FALCON-512 
   - [Fee Data](#fee-data)
   - [Static Calls](#static-calls)
   - [Gas Estimation](#gas-estimation)
+  - [Batch RPC](#batch-rpc)
 - [Wallet](#wallet)
   - [Creating a Wallet](#creating-a-wallet)
   - [Restoring a Wallet](#restoring-a-wallet)
@@ -49,7 +50,9 @@ Rust SDK for interacting with the Pyde blockchain. Async RPC client, FALCON-512 
   - [Decoding Return Values](#decoding-return-values)
   - [Contract Events](#contract-events)
   - [Interface (Standalone ABI)](#interface-standalone-abi)
+  - [Populate Transaction](#populate-transaction)
 - [WebSocket Provider](#websocket-provider)
+- [Signer Trait](#signer-trait)
 - [Events & Logs](#events--logs)
 - [Error Handling](#error-handling)
   - [Error Variants](#error-variants)
@@ -193,7 +196,36 @@ let result = provider.call(&contract_addr, &calldata).await?; // Vec<u8>
 ### Gas Estimation
 
 ```rust
-let gas = provider.estimate_gas(&contract_addr, &calldata).await?; // u64
+// Basic
+let gas = provider.estimate_gas(&contract_addr, &calldata).await?;
+
+// With overrides (from, value, gas)
+let gas = provider.estimate_gas_with(&contract_addr, &calldata, Some(&CallOverrides {
+    from: Some(*wallet.address()),
+    value: Some(1_000_000),
+    ..Default::default()
+})).await?;
+```
+
+### Batch RPC
+
+Send multiple calls in a single HTTP request.
+
+```rust
+let results = provider.batch(&[
+    ("pyde_getBalance", &[json!(format_address(&addr))]),
+    ("pyde_getTransactionCount", &[json!(format_address(&addr))]),
+    ("pyde_chainId", &[]),
+]).await?;
+```
+
+The provider supports configurable timeout and retries:
+
+```rust
+let provider = Provider::with_options("http://127.0.0.1:8545", ProviderOptions {
+    timeout: std::time::Duration::from_secs(10),
+    retries: 3,
+});
 ```
 
 ---
@@ -785,6 +817,17 @@ let event = iface.parse_log(&raw_log);
 
 ---
 
+### Populate Transaction
+
+Build an unsigned transaction without sending.
+
+```rust
+let tx = contract.populate_transaction("deposit", Some(&json!({"amount": 500})), gas).await?;
+// Review or sign later: wallet.sign_transaction(&mut tx)?;
+```
+
+---
+
 ## WebSocket Provider
 
 Real-time subscriptions via WebSocket.
@@ -815,6 +858,30 @@ let balance = ws.get_balance(&addr).await?;
 // Cleanup
 ws.close().await;
 ```
+
+---
+
+## Signer Trait
+
+Abstract trait for custom signers (hardware wallets, remote signers).
+
+```rust
+use pyde_rust_sdk::Signer;
+
+struct HardwareSigner { /* ... */ }
+
+impl Signer for HardwareSigner {
+    fn address(&self) -> &Address { &self.addr }
+    fn sign_transaction(&self, tx: &mut Transaction) -> Result<()> {
+        // Your hardware wallet logic
+    }
+    fn sign(&self, message: &[u8; 32]) -> Result<Vec<u8>> {
+        // Your message signing logic
+    }
+}
+```
+
+`Wallet` implements the `Signer` trait.
 
 ---
 

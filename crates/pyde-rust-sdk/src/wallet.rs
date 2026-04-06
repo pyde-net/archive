@@ -287,6 +287,12 @@ impl<'a> SignerProvider<'a> {
 // Internal: send + check revert
 // ============================================================================
 
+impl crate::signer::Signer for Wallet {
+    fn address(&self) -> &Address { &self.address }
+    fn sign_transaction(&self, tx: &mut Transaction) -> Result<()> { self.sign_transaction(tx) }
+    fn sign(&self, message: &[u8; 32]) -> Result<Vec<u8>> { self.sign(message) }
+}
+
 async fn send_and_check(provider: &Provider, tx: &Transaction) -> Result<Receipt> {
     let receipt = provider.send_and_wait(tx, 10_000).await?;
     if !receipt.success {

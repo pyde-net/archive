@@ -1,18 +1,38 @@
 use crate::error::{Result, SdkError};
 use crate::types::*;
 
+/// Provider options for configuring HTTP behavior.
+pub struct ProviderOptions {
+    /// Request timeout (default: 30s).
+    pub timeout: std::time::Duration,
+    /// Number of retry attempts (default: 0).
+    pub retries: u32,
+}
+
+impl Default for ProviderOptions {
+    fn default() -> Self {
+        Self { timeout: std::time::Duration::from_secs(30), retries: 0 }
+    }
+}
+
 /// RPC client for interacting with a Pyde node.
 pub struct Provider {
     rpc_url: String,
     client: reqwest::Client,
+    retries: u32,
 }
 
 impl Provider {
     pub fn new(rpc_url: &str) -> Self {
-        Self {
-            rpc_url: rpc_url.to_string(),
-            client: reqwest::Client::new(),
-        }
+        Self::with_options(rpc_url, ProviderOptions::default())
+    }
+
+    pub fn with_options(rpc_url: &str, options: ProviderOptions) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(options.timeout)
+            .build()
+            .unwrap_or_default();
+        Self { rpc_url: rpc_url.to_string(), client, retries: options.retries }
     }
 
     // ========================================================================
@@ -76,22 +96,42 @@ impl Provider {
     // ========================================================================
 
     pub async fn call(&self, to: &Address, data: &[u8]) -> Result<Vec<u8>> {
-        let params = serde_json::json!({
-            "from": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        self.call_with(to, data, None).await
+    }
+
+    /// Static call with overrides (from, value, gas).
+    pub async fn call_with(&self, to: &Address, data: &[u8], overrides: Option<&CallOverrides>) -> Result<Vec<u8>> {
+        let mut params = serde_json::json!({
+            "from": overrides.and_then(|o| o.from.as_ref()).map(|a| format_address(a))
+                .unwrap_or_else(|| "0x".to_string() + &"00".repeat(32)),
             "to": format_address(to),
             "data": format!("0x{}", hex::encode(data)),
         });
+        if let Some(o) = overrides {
+            if let Some(v) = o.value { params["value"] = serde_json::json!(format!("0x{:x}", v)); }
+            if let Some(g) = o.gas_limit { params["gas"] = serde_json::json!(format!("0x{:x}", g)); }
+        }
         let result = self.rpc("pyde_call", &[params]).await?;
         let hex = result.as_str().unwrap_or("0x").trim_start_matches("0x");
         hex::decode(hex).map_err(|e| SdkError::InvalidResponse(format!("bad call result: {}", e)))
     }
 
     pub async fn estimate_gas(&self, to: &Address, data: &[u8]) -> Result<u64> {
-        let params = serde_json::json!({
-            "from": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        self.estimate_gas_with(to, data, None).await
+    }
+
+    /// Estimate gas with overrides (from, value, gas).
+    pub async fn estimate_gas_with(&self, to: &Address, data: &[u8], overrides: Option<&CallOverrides>) -> Result<u64> {
+        let mut params = serde_json::json!({
+            "from": overrides.and_then(|o| o.from.as_ref()).map(|a| format_address(a))
+                .unwrap_or_else(|| "0x".to_string() + &"00".repeat(32)),
             "to": format_address(to),
             "data": format!("0x{}", hex::encode(data)),
         });
+        if let Some(o) = overrides {
+            if let Some(v) = o.value { params["value"] = serde_json::json!(format!("0x{:x}", v)); }
+            if let Some(g) = o.gas_limit { params["gas"] = serde_json::json!(format!("0x{:x}", g)); }
+        }
         let result = self.rpc("pyde_estimateGas", &[params]).await?;
         parse_hex_u64(&result)
     }
@@ -180,6 +220,46 @@ impl Provider {
     // Internal RPC helper
     // ========================================================================
 
+    // ========================================================================
+    // Batch RPC
+    // ========================================================================
+
+    /// Send multiple RPC calls in a single HTTP request.
+    pub async fn batch(&self, calls: &[(&str, &[serde_json::Value])]) -> Result<Vec<serde_json::Value>> {
+        let bodies: Vec<_> = calls.iter().enumerate().map(|(i, (method, params))| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": i + 1,
+                "method": method,
+                "params": params,
+            })
+        }).collect();
+
+        let resp = self.client
+            .post(&self.rpc_url)
+            .json(&bodies)
+            .send()
+            .await
+            .map_err(|e| SdkError::Connection(e.to_string()))?;
+
+        let results: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| SdkError::InvalidResponse(e.to_string()))?;
+
+        results.into_iter().map(|r| {
+            if let Some(err) = r.get("error") {
+                Err(SdkError::Rpc(err.to_string()))
+            } else {
+                Ok(r.get("result").cloned().unwrap_or(serde_json::Value::Null))
+            }
+        }).collect()
+    }
+
+    // ========================================================================
+    // Internal RPC helper
+    // ========================================================================
+
     async fn rpc(&self, method: &str, params: &[serde_json::Value]) -> Result<serde_json::Value> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -187,9 +267,26 @@ impl Provider {
             "method": method,
             "params": params,
         });
+
+        let mut last_err = SdkError::Connection("no attempts".into());
+        for attempt in 0..=self.retries {
+            match self.do_rpc(&body).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    last_err = e;
+                    if attempt < self.retries {
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    async fn do_rpc(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
         let resp = self.client
             .post(&self.rpc_url)
-            .json(&body)
+            .json(body)
             .send()
             .await
             .map_err(|e| SdkError::Connection(e.to_string()))?;
