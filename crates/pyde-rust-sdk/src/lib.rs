@@ -31,10 +31,11 @@ pub mod contract;
 pub mod error;
 pub mod types;
 pub mod wallet;
+pub mod ws;
 
 // Top-level re-exports for convenience
-pub use abi::{Contract, ContractReceipt, Value};
-pub use client::Provider;
+pub use abi::{Contract, ContractReceipt, EventLog, Interface, Value};
+pub use client::{Provider, TransactionResponse};
 pub use contract::{compute_selector, ContractCall, DeployData};
 pub use contract::{
     decode_address, decode_bool, decode_bytes, decode_string,
@@ -51,3 +52,4 @@ pub use types::{
     Address, Receipt, Log, LogFilter, BlockHeader, FeeData,
 };
 pub use wallet::{Keystore, SignerProvider, Wallet};
+pub use ws::WsProvider;

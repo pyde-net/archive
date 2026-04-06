@@ -47,6 +47,9 @@ Rust SDK for interacting with the Pyde blockchain. Async RPC client, FALCON-512 
   - [Decoding Write Return Data](#decoding-write-return-data)
   - [The Value Enum](#the-value-enum)
   - [Decoding Return Values](#decoding-return-values)
+  - [Contract Events](#contract-events)
+  - [Interface (Standalone ABI)](#interface-standalone-abi)
+- [WebSocket Provider](#websocket-provider)
 - [Events & Logs](#events--logs)
 - [Error Handling](#error-handling)
   - [Error Variants](#error-variants)
@@ -741,6 +744,76 @@ let raw   = decode_bytes(&bytes);    // Option<Vec<u8>>
 let nums  = decode_vec_u64(&bytes);     // Option<Vec<u64>>
 let flags = decode_vec_bool(&bytes);    // Option<Vec<bool>>
 let addrs = decode_vec_address(&bytes); // Option<Vec<[u8; 32]>>
+```
+
+---
+
+### Contract Events
+
+Query and decode contract events using the ABI.
+
+```rust
+// Query historical events (decoded with named args)
+let transfers = contract.query_filter("Transfer", Some(0), Some(1000)).await?;
+for e in &transfers {
+    println!("{}: {:?}", e.name, e.args);
+}
+
+// Parse a single raw log
+let decoded = contract.parse_log(&raw_log);
+
+// Get topic0 hash for building custom filters
+let topic = contract.get_event_topic("Transfer");
+```
+
+### Interface (Standalone ABI)
+
+Encode/decode without a contract address or provider.
+
+```rust
+let iface = Interface::from_artifact("out/Counter.json")?;
+
+// Encode calldata
+let data = iface.encode_function_data("deposit", &json!({"amount": 500}))?;
+
+// Decode return value
+let val = iface.decode_function_result("get_count", &bytes);
+
+// Parse logs
+let event = iface.parse_log(&raw_log);
+```
+
+---
+
+## WebSocket Provider
+
+Real-time subscriptions via WebSocket.
+
+```rust
+let ws = WsProvider::connect("ws://127.0.0.1:8546").await?;
+
+// Subscribe to new block headers
+let mut blocks = ws.subscribe_new_heads().await?;
+tokio::spawn(async move {
+    while let Ok(header) = blocks.recv().await {
+        println!("New block: {}", header.slot);
+    }
+});
+
+// Subscribe to pending transactions
+let mut pending = ws.subscribe_pending_transactions().await?;
+
+// Subscribe to contract event logs
+let mut logs = ws.subscribe_logs(&LogFilter {
+    address: Some("0xcontract...".into()),
+    ..Default::default()
+}).await?;
+
+// Standard queries also work
+let balance = ws.get_balance(&addr).await?;
+
+// Cleanup
+ws.close().await;
 ```
 
 ---
