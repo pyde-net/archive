@@ -114,19 +114,20 @@ impl Provider {
     // Transaction submission
     // ========================================================================
 
-    /// Send a signed transaction. Returns the tx hash.
-    pub async fn send_transaction(&self, tx: &Transaction) -> Result<[u8; 32]> {
+    /// Send a signed transaction. Returns a TransactionResponse with hash and wait().
+    pub async fn send_transaction(&self, tx: &Transaction) -> Result<TransactionResponse<'_>> {
         let tx_bytes = tx.to_bytes();
         let result = self.rpc("pyde_sendRawTransaction", &[
             json_str(&format!("0x{}", hex::encode(&tx_bytes))),
         ]).await?;
-        parse_tx_hash(&result)
+        let hash = parse_tx_hash(&result)?;
+        Ok(TransactionResponse { hash, provider: self })
     }
 
     /// Send a signed transaction and wait for the receipt.
     pub async fn send_and_wait(&self, tx: &Transaction, timeout_ms: u64) -> Result<Receipt> {
-        let hash = self.send_transaction(tx).await?;
-        self.wait_for_receipt(&hash, timeout_ms).await
+        let tx_resp = self.send_transaction(tx).await?;
+        tx_resp.wait(timeout_ms).await
     }
 
     // ========================================================================
@@ -209,6 +210,25 @@ impl Provider {
 // ============================================================================
 // Parsing helpers
 // ============================================================================
+
+/// Pending transaction handle returned by send_transaction().
+pub struct TransactionResponse<'a> {
+    /// Transaction hash.
+    pub hash: [u8; 32],
+    provider: &'a Provider,
+}
+
+impl<'a> TransactionResponse<'a> {
+    /// Transaction hash as 0x-prefixed hex string.
+    pub fn hash_hex(&self) -> String {
+        format!("0x{}", hex::encode(self.hash))
+    }
+
+    /// Wait for the transaction to be included in a block.
+    pub async fn wait(&self, timeout_ms: u64) -> Result<Receipt> {
+        self.provider.wait_for_receipt(&self.hash, timeout_ms).await
+    }
+}
 
 fn json_str(s: &str) -> serde_json::Value {
     serde_json::Value::String(s.to_string())

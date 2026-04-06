@@ -1,7 +1,7 @@
 use crate::client::Provider;
 use crate::contract::compute_selector;
 use crate::error::{Result, SdkError};
-use crate::types::{Address, Receipt};
+use crate::types::{Address, Log, LogFilter, Receipt};
 use crate::wallet::Wallet;
 use std::collections::HashMap;
 
@@ -89,6 +89,30 @@ pub struct AbiEnumVariant {
     pub discriminant: u32,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AbiEvent {
+    pub name: String,
+    #[serde(default)]
+    pub fields: Vec<AbiEventField>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AbiEventField {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: String,
+    #[serde(default)]
+    pub indexed: bool,
+}
+
+/// Decoded event log with named args.
+#[derive(Debug, Clone)]
+pub struct EventLog {
+    pub name: String,
+    pub args: HashMap<String, Value>,
+    pub log: Log,
+}
+
 // ============================================================================
 // Contract — ABI-aware interface
 // ============================================================================
@@ -98,6 +122,8 @@ pub struct Contract<'a> {
     provider: &'a Provider,
     wallet: Option<&'a Wallet>,
     functions: HashMap<String, AbiFunction>,
+    events: HashMap<String, AbiEvent>,
+    events_by_topic: HashMap<String, AbiEvent>,
     structs: HashMap<String, AbiStructDef>,
     enums: HashMap<String, AbiEnumDef>,
 }
@@ -142,12 +168,25 @@ impl<'a> Contract<'a> {
             }
         }
 
-        Ok(Self { address, provider, wallet: None, functions, structs, enums })
+        let mut events = HashMap::new();
+        let mut events_by_topic = HashMap::new();
+        if let Some(evs) = abi.get("events").and_then(|v| v.as_array()) {
+            for ev in evs {
+                if let Ok(def) = serde_json::from_value::<AbiEvent>(ev.clone()) {
+                    let sel = compute_selector(&def.name);
+                    let topic0 = format!("0x{:08x}{}", sel, "0".repeat(56));
+                    events_by_topic.insert(topic0, def.clone());
+                    events.insert(def.name.clone(), def);
+                }
+            }
+        }
+
+        Ok(Self { address, provider, wallet: None, functions, events, events_by_topic, structs, enums })
     }
 
     /// Create minimal contract (no ABI).
     pub fn new(address: Address, provider: &'a Provider) -> Self {
-        Self { address, provider, wallet: None, functions: HashMap::new(), structs: HashMap::new(), enums: HashMap::new() }
+        Self { address, provider, wallet: None, functions: HashMap::new(), events: HashMap::new(), events_by_topic: HashMap::new(), structs: HashMap::new(), enums: HashMap::new() }
     }
 
     /// Bind a wallet for write operations.
@@ -224,6 +263,72 @@ impl<'a> Contract<'a> {
         let receipt = wallet.send_call_with_value(self.provider, &self.address, calldata, value, gas_limit).await?;
         let ret_type = self.functions.get(method).map(|f| f.returns.clone()).unwrap_or_default();
         Ok(ContractReceipt::new(receipt, ret_type))
+    }
+
+    // ========================================================================
+    // Events
+    // ========================================================================
+
+    /// Query historical event logs, decoded into typed EventLog objects.
+    pub async fn query_filter(&self, event_name: &str, from_block: Option<u64>, to_block: Option<u64>) -> Result<Vec<EventLog>> {
+        let ev = self.events.get(event_name)
+            .ok_or_else(|| SdkError::InvalidResponse(format!("Unknown event '{}'", event_name)))?;
+
+        let sel = compute_selector(event_name);
+        let topic0 = format!("0x{:08x}{}", sel, "0".repeat(56));
+
+        let logs = self.provider.get_logs(&LogFilter {
+            from_block,
+            to_block,
+            address: Some(crate::types::format_address(&self.address)),
+            topics: Some(vec![Some(vec![topic0])]),
+        }).await?;
+
+        Ok(logs.into_iter().map(|log| self.decode_event_log(ev, log)).collect())
+    }
+
+    /// Parse a raw Log into a decoded EventLog. Returns None if the event is unknown.
+    pub fn parse_log(&self, log: &Log) -> Option<EventLog> {
+        if log.topics.is_empty() { return None; }
+        let ev = self.events_by_topic.get(&log.topics[0])?;
+        Some(self.decode_event_log(ev, log.clone()))
+    }
+
+    /// Get the topic0 hash for an event name.
+    pub fn get_event_topic(&self, event_name: &str) -> String {
+        let sel = compute_selector(event_name);
+        format!("0x{:08x}{}", sel, "0".repeat(56))
+    }
+
+    fn decode_event_log(&self, ev: &AbiEvent, log: Log) -> EventLog {
+        let mut args = HashMap::new();
+        let data_hex = log.data.trim_start_matches("0x");
+        let data = hex::decode(data_hex).unwrap_or_default();
+
+        // Non-indexed fields in data
+        let mut offset = 0;
+        for field in &ev.fields {
+            if !field.indexed && offset < data.len() {
+                let (val, read) = self.decode_value(&data, &field.ty, offset);
+                args.insert(field.name.clone(), val);
+                offset += read;
+            }
+        }
+
+        // Indexed fields in topics[1..N]
+        let mut topic_idx = 1;
+        for field in &ev.fields {
+            if field.indexed && topic_idx < log.topics.len() {
+                let topic_hex = log.topics[topic_idx].trim_start_matches("0x");
+                if let Ok(topic_bytes) = hex::decode(topic_hex) {
+                    let (val, _) = self.decode_value(&topic_bytes, &field.ty, 0);
+                    args.insert(field.name.clone(), val);
+                }
+                topic_idx += 1;
+            }
+        }
+
+        EventLog { name: ev.name.clone(), args, log }
     }
 
     // ========================================================================
@@ -577,6 +682,59 @@ impl<'a> Contract<'a> {
 
 /// Parse comma-separated tuple types, handling nested generics.
 /// e.g. "u64, Vec<String>, (u8, bool)" → ["u64", "Vec<String>", "(u8, bool)"]
+// ============================================================================
+// Interface — standalone ABI encoder/decoder
+// ============================================================================
+
+/// Standalone ABI encoder/decoder (no contract address or provider needed).
+pub struct Interface {
+    json: String,
+}
+
+impl Interface {
+    /// Load from a build artifact JSON file.
+    pub fn from_artifact(path: &str) -> std::result::Result<Self, String> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| format!("read artifact: {}", e))?;
+        Ok(Self { json })
+    }
+
+    /// Load from ABI JSON string.
+    pub fn from_json(json: &str) -> Self {
+        Self { json: json.to_string() }
+    }
+
+    /// Encode a function call to calldata bytes.
+    pub fn encode_function_data(&self, method: &str, args: &serde_json::Value) -> Result<Vec<u8>> {
+        let provider = Provider::new("http://localhost:0");
+        let contract = Contract::from_json(&self.json, [0u8; 32], &provider)?;
+        contract.encode_call(method, args)
+    }
+
+    /// Decode function return data using the ABI return type.
+    pub fn decode_function_result(&self, method: &str, data: &[u8]) -> Option<Value> {
+        let provider = Provider::new("http://localhost:0");
+        let contract = Contract::from_json(&self.json, [0u8; 32], &provider).ok()?;
+        let fn_def = contract.functions.get(method)?;
+        let ret = fn_def.returns.as_str();
+        if ret == "()" || ret == "unit" { return None; }
+        Some(contract.decode_value(data, ret, 0).0)
+    }
+
+    /// Parse a raw Log into a decoded EventLog.
+    pub fn parse_log(&self, log: &Log) -> Option<EventLog> {
+        let provider = Provider::new("http://localhost:0");
+        let contract = Contract::from_json(&self.json, [0u8; 32], &provider).ok()?;
+        contract.parse_log(log)
+    }
+
+    /// Get the topic0 hash for an event name.
+    pub fn get_event_topic(&self, event_name: &str) -> String {
+        let sel = compute_selector(event_name);
+        format!("0x{:08x}{}", sel, "0".repeat(56))
+    }
+}
+
 // ============================================================================
 // ContractReceipt — receipt with ABI-aware return data decoding
 // ============================================================================

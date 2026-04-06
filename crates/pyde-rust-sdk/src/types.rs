@@ -94,7 +94,7 @@ pub struct Log {
 }
 
 /// Log filter for querying events.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogFilter {
     #[serde(skip_serializing_if = "Option::is_none")]
