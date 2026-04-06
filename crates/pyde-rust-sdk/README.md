@@ -1116,8 +1116,10 @@ crates/pyde-rust-sdk/
 │   ├── wallet.rs      — Wallet (keygen, keystore, signing)
 │   ├── abi.rs         — Contract (ABI-aware reads, Value enum)
 │   ├── contract.rs    — ContractCall/DeployData builders, decoders
-│   ├── types.rs       — Receipt, Log, Address, re-exports
-│   └── error.rs       — SdkError enum, Result type alias
+│   ├── types.rs       — Receipt, Log, Address, hex/unit utils
+│   ├── error.rs       — SdkError enum with codes, revert reason decoding
+│   ├── signer.rs      — Signer trait (Wallet implements it)
+│   └── ws.rs          — WebSocket provider with subscriptions
 ```
 
 Dependencies:

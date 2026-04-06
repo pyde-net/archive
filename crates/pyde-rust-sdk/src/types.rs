@@ -261,6 +261,7 @@ pub const PYDE_DECIMALS: u32 = 9;
 /// parse_units("100", 18)  // Ok(100_000_000_000_000_000_000)
 /// ```
 pub fn parse_units(value: &str, decimals: u32) -> std::result::Result<u128, String> {
+    if decimals > 38 { return Err(format!("decimals {} exceeds u128 precision (max 38)", decimals)); }
     let trimmed = value.trim();
     let negative = trimmed.starts_with('-');
     if negative {
@@ -297,6 +298,7 @@ pub fn parse_units(value: &str, decimals: u32) -> std::result::Result<u128, Stri
 /// format_units(1_000_000, 9)      // "0.001"
 /// ```
 pub fn format_units(value: u128, decimals: u32) -> String {
+    if decimals > 38 { return format!("{}", value); } // 10^39 overflows u128
     let divisor = 10u128.pow(decimals);
     let whole = value / divisor;
     let remainder = value % divisor;

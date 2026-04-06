@@ -107,6 +107,21 @@ impl Wallet {
         encrypt_keystore(&self.public_key, &self.secret_key, &self.address, password)
     }
 
+    /// Save wallet as encrypted keystore to a file.
+    pub fn save_keystore(&self, path: &std::path::Path, password: &str) -> Result<()> {
+        let keystore = self.to_keystore(password)?;
+        let json = serde_json::to_string_pretty(&keystore)
+            .map_err(|e| SdkError::Signing(format!("serialize: {}", e)))?;
+        std::fs::write(path, json)
+            .map_err(|e| SdkError::Signing(format!("write: {}", e)))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
     // ========================================================================
     // Accessors
     // ========================================================================
@@ -160,8 +175,7 @@ impl Wallet {
 
     /// Build, sign, send a native transfer. Returns receipt (errors on revert).
     pub async fn transfer(&self, provider: &Provider, to: &Address, amount: u128) -> Result<Receipt> {
-        let nonce = provider.get_nonce(&self.address).await?;
-        let chain_id = provider.get_chain_id().await?;
+        let (nonce, chain_id) = provider.get_nonce_and_chain_id(&self.address).await?;
 
         let mut tx = Transaction {
             from: self.address, to: *to, value: amount, data: vec![],
@@ -191,8 +205,7 @@ impl Wallet {
     pub async fn send_call_with_value(
         &self, provider: &Provider, to: &Address, data: Vec<u8>, value: u128, gas_limit: u64,
     ) -> Result<Receipt> {
-        let nonce = provider.get_nonce(&self.address).await?;
-        let chain_id = provider.get_chain_id().await?;
+        let (nonce, chain_id) = provider.get_nonce_and_chain_id(&self.address).await?;
 
         let mut tx = Transaction {
             from: self.address, to: *to, value, data,
@@ -225,8 +238,7 @@ impl Wallet {
     pub async fn deploy_with_value(
         &self, provider: &Provider, deploy_data: Vec<u8>, value: u128, gas_limit: u64,
     ) -> Result<Receipt> {
-        let nonce = provider.get_nonce(&self.address).await?;
-        let chain_id = provider.get_chain_id().await?;
+        let (nonce, chain_id) = provider.get_nonce_and_chain_id(&self.address).await?;
 
         let mut tx = Transaction {
             from: self.address, to: [0u8; 32], value, data: deploy_data,
