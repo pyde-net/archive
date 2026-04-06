@@ -77,7 +77,40 @@ impl PydeNode {
                 crate::genesis::GenesisConfig::load(&genesis_path)?
             } else {
                 info!("no genesis.toml found, using devnet defaults");
-                crate::genesis::devnet_genesis()
+                let (config, devnet_accounts) = crate::genesis::devnet_genesis();
+
+                // Print Anvil-style account info with private keys
+                info!("");
+                info!("==========================================");
+                info!("  Pyde Devnet");
+                info!("==========================================");
+                info!("");
+                info!("Available Accounts");
+                info!("==================");
+                for (i, acc) in devnet_accounts.iter().enumerate() {
+                    let pyde = acc.balance / 1_000_000_000;
+                    info!("  ({}) {} ({} PYDE)", i, acc.address_hex(), pyde);
+                }
+                info!("");
+                info!("Private Keys");
+                info!("==================");
+                for (i, acc) in devnet_accounts.iter().enumerate() {
+                    info!("  ({}) {}", i, acc.private_key_hex());
+                }
+                info!("");
+
+                // Save devnet keys for SDK usage
+                let keys_path = datadir.join("devnet-keys.json");
+                let keys_json: Vec<serde_json::Value> = devnet_accounts.iter().map(|acc| {
+                    serde_json::json!({
+                        "address": acc.address_hex(),
+                        "privateKey": acc.private_key_hex(),
+                        "balance": acc.balance.to_string(),
+                    })
+                }).collect();
+                let _ = std::fs::write(&keys_path, serde_json::to_string_pretty(&keys_json).unwrap_or_default());
+
+                config
             };
 
             // Auto-fund validator address with required stake for devnet
@@ -98,18 +131,9 @@ impl PydeNode {
             // Write genesis for reference
             let _ = std::fs::write(&genesis_path, genesis_config.to_toml());
 
-            // Print funded accounts (Anvil-style)
-            info!("");
-            info!("Available Accounts");
-            info!("==================");
-            for (i, alloc) in genesis_config.allocations.iter().enumerate() {
-                let bal = alloc.balance_u128().unwrap_or(0);
-                let pyde = bal / 1_000_000_000; // quanta to PYDE (approx)
-                info!("  ({}) 0x{} ({} PYDE)", i, alloc.address, pyde);
-            }
-            info!("");
             info!("Chain ID: {}", genesis_config.chain_id);
             info!("Base Fee: {} quanta/gas", pyde_tx::fee::GENESIS_BASE_FEE);
+            info!("==========================================");
             info!("");
 
             let genesis_block = crate::genesis::initialize_genesis(&mut state, &genesis_config)?;
