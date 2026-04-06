@@ -18,9 +18,12 @@ Rust SDK for interacting with the Pyde blockchain. Async RPC client, FALCON-512 
 - [Wallet](#wallet)
   - [Creating a Wallet](#creating-a-wallet)
   - [Restoring a Wallet](#restoring-a-wallet)
+  - [Provider Binding (connect)](#provider-binding-connect)
   - [Encrypted Keystore](#encrypted-keystore)
   - [Exporting Keys](#exporting-keys)
-  - [Signing Transactions](#signing-transactions)
+  - [Validation](#validation)
+  - [Signing](#signing)
+- [Address Utilities](#address-utilities)
 - [Transactions](#transactions)
   - [Sending a Transfer](#sending-a-transfer)
   - [Calling a Contract Function](#calling-a-contract-function)
@@ -35,7 +38,10 @@ Rust SDK for interacting with the Pyde blockchain. Async RPC client, FALCON-512 
   - [Structs & Tuples](#structs--tuples)
   - [Nested Types](#nested-types)
   - [Deploy Data with Constructor Args](#deploy-data-with-constructor-args)
-  - [ABI-Aware Reads](#abi-aware-reads)
+  - [ABI-Aware Contract (fromArtifact + connect)](#abi-aware-contract-fromartifact--connect)
+  - [Simulating Calls](#simulating-calls)
+  - [Gas Estimation (ABI-Aware)](#gas-estimation-abi-aware)
+  - [Payable Functions](#payable-functions)
   - [The Value Enum](#the-value-enum)
   - [Decoding Return Values](#decoding-return-values)
 - [Events & Logs](#events--logs)
@@ -47,6 +53,7 @@ Rust SDK for interacting with the Pyde blockchain. Async RPC client, FALCON-512 
   - [File Permissions](#file-permissions)
   - [Post-Quantum Cryptography](#post-quantum-cryptography)
 - [Utility Functions](#utility-functions)
+- [Unit Formatting](#unit-formatting)
 - [Architecture](#architecture)
 
 ---
@@ -90,8 +97,8 @@ async fn main() -> pyde_rust_sdk::Result<()> {
     // 5. Interact with a contract (load ABI from build artifact)
     let contract = Contract::from_artifact("out/Counter.json", addr, &provider)?
         .connect(&wallet);
-    let count = contract.read("get_count", &json!({})).await?;
-    contract.write("increment", &json!({}), 100_000_000).await?;
+    let count = contract.read("get_count", None).await?;
+    contract.write("increment", None, 100_000_000).await?;
 
     Ok(())
 }
@@ -149,7 +156,7 @@ Execute a contract function without creating a transaction. No gas consumed.
 ```rust
 // Using Contract (recommended)
 let contract = Contract::from_artifact("out/Counter.json", addr, &provider)?;
-let count = contract.read("get_count", &json!({})).await?; // Value::U64(42)
+let count = contract.read("get_count", None).await?; // Value::U64(42)
 
 // Low-level (manual calldata)
 let result = provider.call(&contract_addr, &calldata).await?; // Vec<u8>
@@ -191,6 +198,23 @@ let wallet = Wallet::from_keystore(Path::new("wallet.json"), "password")?;
 let wallet = Wallet::from_encrypted(&keystore, "password")?;
 ```
 
+### Provider Binding (connect)
+
+Bind a provider to the wallet for shorter method signatures.
+
+```rust
+let signer = wallet.connect(&provider);
+
+// Now call without passing provider
+let balance = signer.get_balance().await?;
+let nonce = signer.get_nonce().await?;
+let receipt = signer.transfer(&to, 1000).await?;
+let receipt = signer.send_call(&contract, data, gas).await?;
+let receipt = signer.send_call_with_value(&contract, data, value, gas).await?;
+let receipt = signer.deploy(deploy_data, gas).await?;
+let result = signer.call(&contract, &calldata).await?;
+```
+
 ### Encrypted Keystore
 
 Create and manage password-encrypted keystore files.
@@ -225,12 +249,57 @@ let restored = Wallet::from_private_key(&full)?;
 assert_eq!(wallet.address(), restored.address());
 ```
 
-### Signing Transactions
+### Validation
 
 ```rust
+// Validate a private key before importing
+Wallet::is_valid_private_key("0xabcdef...");  // true/false
+
+// Generate a random private key (without creating a full wallet)
+let pk = Wallet::generate_private_key()?;  // "0x..." (2178 bytes)
+let wallet = Wallet::from_private_key(&pk)?;
+```
+
+### Signing
+
+```rust
+// Sign a transaction in place
 let mut tx = Transaction { /* ... */ };
 wallet.sign_transaction(&mut tx)?;
-// tx.signature is now populated with FALCON-512 signature
+
+// Sign an arbitrary 32-byte message
+let msg = [0xAB; 32];
+let sig = wallet.sign(&msg)?;  // Vec<u8>
+```
+
+---
+
+## Address Utilities
+
+```rust
+use pyde_rust_sdk::{
+    parse_address, format_address, is_valid_address,
+    is_zero_address, address_eq, ZERO_ADDRESS,
+    is_valid_private_key,
+};
+
+// Zero address
+let zero = ZERO_ADDRESS;                          // [0u8; 32]
+assert!(is_zero_address(&zero));
+
+// Parse / format
+let addr = parse_address("0xaabb...")?;           // [u8; 32]
+let hex = format_address(&addr);                   // "0xaabb..."
+
+// Validation
+is_valid_address("0x" + &"ab".repeat(32));        // true
+is_valid_address("0xshort");                       // false
+
+// Equality
+address_eq(&addr1, &addr2);                        // bool
+
+// Private key validation
+is_valid_private_key("0x...");                     // true/false
 ```
 
 ---
@@ -254,7 +323,7 @@ println!("Fee: {} quanta", receipt.fee_paid);
 // Using Contract (recommended — validates args against ABI)
 let contract = Contract::from_artifact("out/Contract.json", addr, &provider)?
     .connect(&wallet);
-let receipt = contract.write("deposit", &json!({"amount": 500}), 100_000_000).await?;
+let receipt = contract.write("deposit", Some(&json!({"amount": 500})), 100_000_000).await?;
 
 // Low-level (manual calldata + wallet)
 let calldata = ContractCall::new("deposit").arg_u64(500).build();
@@ -264,13 +333,15 @@ let receipt = wallet.send_call(&provider, &contract_addr, calldata, 100_000_000)
 ### Deploying a Contract
 
 ```rust
-let deploy_data = DeployData::new(constructor_bytes, runtime_bytes)
-    .arg_u64(1000)   // constructor arg
-    .arg_u64(5)       // constructor arg
-    .build();
+let deploy_data = DeployData::from_artifact("out/Counter.json", &json!({
+    "initial_supply": 1000,
+}))?.build();
 
 let receipt = wallet.deploy(&provider, deploy_data, 100_000_000).await?;
-// Contract address in receipt.return_data
+let addr = receipt.contract_address(); // Option<[u8; 32]>
+
+// Deploy with value (payable constructor)
+let receipt = wallet.deploy_with_value(&provider, deploy_data, 1_000_000, 100_000_000).await?;
 ```
 
 ### SignerProvider (Convenience)
@@ -446,9 +517,24 @@ ContractCall::new("set_team")
 ### Deploy Data with Constructor Args
 
 ```rust
-let data = DeployData::new(constructor_bytecode, runtime_bytecode)
-    .arg_u64(initial_supply)
-    .arg_string("TokenName")
+// From artifact with named constructor args (recommended)
+let data = DeployData::from_artifact("out/Counter.json", &json!({
+    "initial_supply": 1000,
+    "name": "MyToken",
+    "owner": format!("0x{}", hex::encode(owner_addr)),
+}))?.build();
+
+// Constructor args are validated against the ABI
+DeployData::from_artifact("out/Counter.json", &json!({}))?;
+// Error: constructor: missing arg 'initial_supply' (u64)
+
+// No constructor args
+let data = DeployData::from_artifact("out/Simple.json", &json!({}))?.build();
+
+// From raw bytecodes with manual arg chaining (low-level)
+let data = DeployData::new(constructor_bytes, runtime_bytes)
+    .arg_u64(1000)
+    .arg_string("hello")
     .build();
 ```
 
@@ -472,43 +558,76 @@ let contract = Contract::from_json(&abi_json_string, addr, &provider)?
 let contract = Contract::new(addr, &provider);
 
 // Read — auto-decoded return value
-let count = contract.read("get_count", &json!({})).await?;    // Value::U64(42)
-let user = contract.read("get_user", &json!({})).await?;      // Value::Struct(...)
-let scores = contract.read("get_scores", &json!({})).await?;  // Value::Vec(...)
+let count = contract.read("get_count", None).await?;    // Value::U64(42)
+let user = contract.read("get_user", None).await?;      // Value::Struct(...)
+let scores = contract.read("get_scores", None).await?;  // Value::Vec(...)
 
 // Write — validated, encoded, signed, sent, waited
-contract.write("deposit", &json!({"amount": 500}), 100_000_000).await?;
+contract.write("deposit", Some(&json!({"amount": 500})), 100_000_000).await?;
 
-contract.write("set_user", &json!({
+contract.write("set_user", Some(&json!({
     "user": {"name": "alice", "age": 25, "active": true}
-}), 100_000_000).await?;
+})), 100_000_000).await?;
 
-contract.write("set_status", &json!({"status": "Active"}), 100_000_000).await?;
+contract.write("set_status", Some(&json!({"status": "Active"})), 100_000_000).await?;
 
-contract.write("set_scores", &json!({"scores": [100, 200, 300]}), 100_000_000).await?;
+contract.write("set_scores", Some(&json!({"scores": [100, 200, 300]})), 100_000_000).await?;
+```
+
+### Simulating Calls
+
+Static-call ANY function (view or setter) without sending a transaction.
+
+```rust
+// Simulate a setter to preview the return value
+let result = contract.simulate("deposit", Some(&json!({"amount": 500}))).await?;
+
+// Same as read() but the name makes intent clear for non-view functions
+let count = contract.simulate("get_count", None).await?;
+```
+
+### Gas Estimation (ABI-Aware)
+
+```rust
+let gas = contract.estimate_gas("deposit", Some(&json!({"amount": 500}))).await?;
+// Then use it:
+contract.write("deposit", Some(&json!({"amount": 500})), gas).await?;
+```
+
+### Payable Functions
+
+Send native tokens (value) with a contract call. Validates the `payable` attribute from the ABI.
+
+```rust
+// Send value with a payable function
+contract.write_with_value("deposit", Some(&json!({"amount": 500})), 1_000_000, gas).await?;
+
+// Non-payable function rejects value
+contract.write_with_value("withdraw", Some(&json!({"amount": 100})), 1, gas).await?;
+// Error: withdraw() is not payable — cannot send value
 ```
 
 ### Arg Validation (before broadcast)
 
 ```rust
 // Missing param → error
-contract.write("deposit", &json!({}), gas).await?;
+contract.write("deposit", None, gas).await?;
 // Error: deposit(): missing required param 'amount' (u64)
 
 // Wrong type → error
-contract.write("deposit", &json!({"amount": "hello"}), gas).await?;
+contract.write("deposit", Some(&json!({"amount": "hello"})), gas).await?;
 // Error: deposit().amount: expected u64, got "hello"
 
 // Out of range → error
-contract.write("deposit", &json!({"amount": -1}), gas).await?;
+contract.write("deposit", Some(&json!({"amount": -1})), gas).await?;
 // Error: deposit().amount: value -1 out of range for u64 (0 to ...)
 
 // Missing struct field → error
-contract.write("set_user", &json!({"user": {"name": "alice"}}), gas).await?;
+contract.write("set_user", Some(&json!({"user": {"name": "alice"}})), gas).await?;
 // Error: set_user().user: missing field 'age' for struct UserInfo
 
 // Unknown enum variant → error
-contract.write("set_status", &json!({"status": "Unknown"}), gas).await?;
+contract.write("set_status", Some(&json!({"status": "Unknown"})), gas).await?;
 // Error: set_status().status: unknown variant 'Unknown' for enum Status. Valid: Active, Banned
 ```
 
@@ -715,12 +834,14 @@ let wallet = Wallet::create_encrypted(Path::new("key.json"), "password")?;
 ### File Permissions
 
 On Unix systems, keystore files are automatically set to:
+
 - File: `600` (owner read/write only)
 - Directory: `700` (owner only)
 
 ### Post-Quantum Cryptography
 
 All cryptographic operations are post-quantum safe:
+
 - **Signing**: FALCON-512 (lattice-based, NIST standard)
 - **Hashing**: Poseidon2 (ZK-friendly algebraic hash)
 - **Encryption**: AES-256-GCM (Grover-resistant at 128-bit equivalent)
@@ -744,6 +865,34 @@ let selector = compute_selector("get_count");  // 0xd9e32bf7
 
 ---
 
+## Unit Formatting
+
+Convert between human-readable token amounts and raw integer units.
+1 PYDE = 10^9 quanta (default). Custom decimals supported.
+
+```rust
+use pyde_rust_sdk::{parse_units, format_units, parse_quanta, format_quanta};
+
+// Parse human-readable → raw (with custom decimals)
+let raw = parse_units("1.5", 9)?;    // 1_500_000_000
+let raw = parse_units("100", 18)?;   // 100_000_000_000_000_000_000
+let raw = parse_units("0.001", 9)?;  // 1_000_000
+
+// Format raw → human-readable
+let s = format_units(1_500_000_000, 9);   // "1.5"
+let s = format_units(1_000_000, 9);       // "0.001"
+
+// PYDE shortcuts (9 decimals)
+let raw = parse_quanta("2.5")?;           // 2_500_000_000
+let s = format_quanta(2_500_000_000);     // "2.5"
+
+// Custom token with 18 decimals
+let raw = parse_units("0.5", 18)?;
+let s = format_units(raw, 18);            // "0.5"
+```
+
+---
+
 ## Architecture
 
 ```
@@ -759,6 +908,7 @@ crates/pyde-rust-sdk/
 ```
 
 Dependencies:
+
 - **pyde-crypto** — FALCON-512 signatures, Poseidon2 hashing
 - **pyde-tx** — Transaction types, serialization, hashing
 - **pyde-account** — Address derivation

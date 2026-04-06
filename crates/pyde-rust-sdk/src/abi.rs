@@ -59,6 +59,8 @@ pub struct AbiFunction {
     #[serde(default)]
     pub view: bool,
     #[serde(default)]
+    pub payable: bool,
+    #[serde(default)]
     pub constructor: bool,
 }
 
@@ -156,17 +158,37 @@ impl<'a> Contract<'a> {
 
     pub fn address(&self) -> &Address { &self.address }
 
+    /// Encode a single value by ABI type. Used by DeployData for constructor args.
+    pub fn encode_value_public(&self, buf: &mut Vec<u8>, value: &serde_json::Value, ty: &str, path: &str) -> Result<()> {
+        self.encode_value(buf, value, ty, path)
+    }
+
     // ========================================================================
     // Read
     // ========================================================================
 
     /// Call a view function. Auto-encodes args, auto-decodes return.
-    pub async fn read(&self, method: &str, args: &serde_json::Value) -> Result<Value> {
-        let calldata = self.encode_call(method, args)?;
+    /// Pass `None` for functions that take no arguments.
+    pub async fn read(&self, method: &str, args: Option<&serde_json::Value>) -> Result<Value> {
+        let empty = serde_json::json!({});
+        let calldata = self.encode_call(method, args.unwrap_or(&empty))?;
         let result = self.provider.call(&self.address, &calldata).await?;
         let fn_def = self.functions.get(method);
         let ret_type = fn_def.map(|f| f.returns.as_str()).unwrap_or("u64");
         Ok(self.decode_value(&result, ret_type, 0).0)
+    }
+
+    /// Static-call ANY function (view or setter) without sending a tx.
+    /// Simulates execution and returns the decoded return value.
+    pub async fn simulate(&self, method: &str, args: Option<&serde_json::Value>) -> Result<Value> {
+        self.read(method, args).await
+    }
+
+    /// Estimate gas for a contract call using the ABI.
+    pub async fn estimate_gas(&self, method: &str, args: Option<&serde_json::Value>) -> Result<u64> {
+        let empty = serde_json::json!({});
+        let calldata = self.encode_call(method, args.unwrap_or(&empty))?;
+        self.provider.estimate_gas(&self.address, &calldata).await
     }
 
     // ========================================================================
@@ -174,12 +196,31 @@ impl<'a> Contract<'a> {
     // ========================================================================
 
     /// Send a state-changing tx. Validates args, encodes, signs, sends, waits.
-    pub async fn write(&self, method: &str, args: &serde_json::Value, gas_limit: u64) -> Result<Receipt> {
+    /// Pass `None` for functions that take no arguments.
+    pub async fn write(&self, method: &str, args: Option<&serde_json::Value>, gas_limit: u64) -> Result<Receipt> {
+        self.write_with_value(method, args, 0, gas_limit).await
+    }
+
+    /// Send a state-changing tx with native token value. Validates payable.
+    pub async fn write_with_value(
+        &self, method: &str, args: Option<&serde_json::Value>, value: u128, gas_limit: u64,
+    ) -> Result<Receipt> {
         let wallet = self.wallet.ok_or_else(|| SdkError::Signing(
             "No wallet connected. Use contract.connect(&wallet) first.".into()
         ))?;
-        let calldata = self.encode_call(method, args)?;
-        wallet.send_call(self.provider, &self.address, calldata, gas_limit).await
+        // Validate payable
+        if value > 0 {
+            if let Some(fn_def) = self.functions.get(method) {
+                if !fn_def.payable {
+                    return Err(SdkError::InvalidResponse(format!(
+                        "{}() is not payable — cannot send value", method
+                    )));
+                }
+            }
+        }
+        let empty = serde_json::json!({});
+        let calldata = self.encode_call(method, args.unwrap_or(&empty))?;
+        wallet.send_call_with_value(self.provider, &self.address, calldata, value, gas_limit).await
     }
 
     // ========================================================================
@@ -269,6 +310,41 @@ impl<'a> Contract<'a> {
                 let pad = (8 - (bytes.len() % 8)) % 8;
                 buf.extend(std::iter::repeat(0u8).take(pad));
             }
+            // Tuple "(T1, T2, ...)" — sequential fields, no length prefix
+            _ if ty.starts_with('(') && ty.ends_with(')') => {
+                let inner = &ty[1..ty.len() - 1];
+                if inner.is_empty() || inner == "()" {
+                    // Unit tuple — no bytes
+                } else {
+                    let types = parse_tuple_types(inner);
+                    let arr = value.as_array()
+                        .ok_or_else(|| SdkError::InvalidResponse(format!("{}: expected array for tuple {}", path, ty)))?;
+                    if arr.len() != types.len() {
+                        return Err(SdkError::InvalidResponse(format!(
+                            "{}: tuple {} expects {} elements, got {}", path, ty, types.len(), arr.len()
+                        )));
+                    }
+                    for (i, (v, t)) in arr.iter().zip(types.iter()).enumerate() {
+                        self.encode_value(buf, v, t, &format!("{}.{}", path, i))?;
+                    }
+                }
+            }
+            // Array "[T; N]" — N sequential elements, no length prefix
+            _ if ty.starts_with('[') && ty.ends_with(']') => {
+                let inner = &ty[1..ty.len() - 1];
+                let (elem_type, count) = parse_array_type(inner)
+                    .ok_or_else(|| SdkError::InvalidResponse(format!("{}: bad array type '{}'", path, ty)))?;
+                let arr = value.as_array()
+                    .ok_or_else(|| SdkError::InvalidResponse(format!("{}: expected array for {}", path, ty)))?;
+                if arr.len() != count {
+                    return Err(SdkError::InvalidResponse(format!(
+                        "{}: array {} expects {} elements, got {}", path, ty, count, arr.len()
+                    )));
+                }
+                for (i, v) in arr.iter().enumerate() {
+                    self.encode_value(buf, v, elem_type, &format!("{}[{}]", path, i))?;
+                }
+            }
             _ if ty.starts_with("Vec<") && ty.ends_with('>') => {
                 let arr = value.as_array()
                     .ok_or_else(|| SdkError::InvalidResponse(format!("{}: expected array for {}", path, ty)))?;
@@ -308,6 +384,14 @@ impl<'a> Contract<'a> {
                             def.variants.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", ")
                         )))?;
                     buf.extend_from_slice(&(variant.discriminant as u64).to_le_bytes());
+                }
+                // Unknown type name → treat as Address (Contract/Interface types are addresses)
+                else if let Some(s) = value.as_str() {
+                    let addr = crate::types::parse_address(s)
+                        .map_err(|_| SdkError::InvalidResponse(format!(
+                            "{}: unknown type '{}', tried as Address but got invalid hex", path, ty
+                        )))?;
+                    buf.extend_from_slice(&addr);
                 } else {
                     return Err(SdkError::InvalidResponse(format!("{}: unsupported type '{}'", path, ty)));
                 }
@@ -401,6 +485,40 @@ impl<'a> Contract<'a> {
                 let aligned = 8 + len + ((8 - (len % 8)) % 8);
                 (Value::Bytes(bytes), aligned)
             }
+            // Tuple "(T1, T2, ...)" — sequential decode
+            _ if ty.starts_with('(') && ty.ends_with(')') => {
+                let inner = &ty[1..ty.len()-1];
+                if inner.is_empty() || inner == "()" {
+                    (Value::Unit, 0)
+                } else {
+                    let types = parse_tuple_types(inner);
+                    let mut cursor = offset;
+                    let mut items = Vec::with_capacity(types.len());
+                    for t in &types {
+                        let (val, read) = self.decode_value(data, t, cursor);
+                        items.push(val);
+                        cursor += read;
+                    }
+                    (Value::Vec(items), cursor - offset)
+                }
+            }
+            // Array "[T; N]" — N sequential elements
+            _ if ty.starts_with('[') && ty.ends_with(']') => {
+                let inner = &ty[1..ty.len()-1];
+                if let Some((elem_type, count)) = parse_array_type(inner) {
+                    let mut cursor = offset;
+                    let mut items = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        if cursor >= data.len() { break; }
+                        let (val, read) = self.decode_value(data, elem_type, cursor);
+                        items.push(val);
+                        cursor += read;
+                    }
+                    (Value::Vec(items), cursor - offset)
+                } else {
+                    (Value::Bytes(data[offset..].to_vec()), data.len() - offset)
+                }
+            }
             _ if ty.starts_with("Vec<") && ty.ends_with('>') => {
                 let elem_type = &ty[4..ty.len()-1];
                 if data.len() < offset + 24 { return (Value::Vec(vec![]), 24); }
@@ -440,11 +558,51 @@ impl<'a> Contract<'a> {
                 } else if ty == "()" || ty == "unit" {
                     (Value::Unit, 0)
                 } else {
-                    (Value::Bytes(data[offset..].to_vec()), data.len() - offset)
+                    // Unknown type (Contract/Interface) → decode as Address (32 bytes)
+                    if data.len() >= offset + 32 {
+                        let mut addr = [0u8; 32];
+                        addr.copy_from_slice(&data[offset..offset+32]);
+                        (Value::Address(addr), 32)
+                    } else {
+                        (Value::Bytes(data[offset..].to_vec()), data.len() - offset)
+                    }
                 }
             }
         }
     }
+}
+
+/// Parse comma-separated tuple types, handling nested generics.
+/// e.g. "u64, Vec<String>, (u8, bool)" → ["u64", "Vec<String>", "(u8, bool)"]
+fn parse_tuple_types(s: &str) -> Vec<&str> {
+    let mut types = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                let t = s[start..i].trim();
+                if !t.is_empty() { types.push(t); }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let t = s[start..].trim();
+    if !t.is_empty() { types.push(t); }
+    types
+}
+
+/// Parse "[T; N]" inner string → (element_type, count).
+/// e.g. "u64; 3" → Some(("u64", 3))
+fn parse_array_type(s: &str) -> Option<(&str, usize)> {
+    let semi = s.rfind(';')?;
+    let elem = s[..semi].trim();
+    let count_str = s[semi + 1..].trim();
+    let count = count_str.parse().ok()?;
+    Some((elem, count))
 }
 
 fn parse_json_u128(v: &serde_json::Value) -> Option<u128> {
@@ -706,5 +864,68 @@ mod tests {
         let c = Contract::from_json(&json, [0; 32], &p).unwrap();
         let r = c.encode_call("set", &serde_json::json!({"v": -1}));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn encode_tuple() {
+        let p = dummy_provider();
+        let json = serde_json::json!({
+            "abi": {
+                "functions": [{"name":"set","params":[{"name":"pair","type":"(u64, bool)"}],"returns":"()","view":false}],
+                "structs": [], "enums": [],
+            }
+        }).to_string();
+        let c = Contract::from_json(&json, [0; 32], &p).unwrap();
+        let data = c.encode_call("set", &serde_json::json!({"pair": [42, true]})).unwrap();
+        assert_eq!(data.len(), 4 + 8 + 8); // selector + u64 + bool
+    }
+
+    #[test]
+    fn encode_decode_array() {
+        let p = dummy_provider();
+        let json = serde_json::json!({
+            "abi": {
+                "functions": [{"name":"set","params":[{"name":"arr","type":"[u64; 3]"}],"returns":"[u64; 3]","view":false}],
+                "structs": [], "enums": [],
+            }
+        }).to_string();
+        let c = Contract::from_json(&json, [0; 32], &p).unwrap();
+        let data = c.encode_call("set", &serde_json::json!({"arr": [10, 20, 30]})).unwrap();
+        assert_eq!(data.len(), 4 + 3 * 8); // selector + 3 u64s
+        // Decode it back
+        let (val, _) = c.decode_value(&data[4..], "[u64; 3]", 0);
+        let items = val.as_vec().unwrap();
+        assert_eq!(items[0].as_u64(), Some(10));
+        assert_eq!(items[2].as_u64(), Some(30));
+    }
+
+    #[test]
+    fn encode_array_wrong_length() {
+        let p = dummy_provider();
+        let json = serde_json::json!({
+            "abi": {
+                "functions": [{"name":"set","params":[{"name":"arr","type":"[u64; 3]"}],"returns":"()","view":false}],
+                "structs": [], "enums": [],
+            }
+        }).to_string();
+        let c = Contract::from_json(&json, [0; 32], &p).unwrap();
+        let r = c.encode_call("set", &serde_json::json!({"arr": [10, 20]}));
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("expects 3 elements"));
+    }
+
+    #[test]
+    fn encode_unknown_type_as_address() {
+        let p = dummy_provider();
+        let json = serde_json::json!({
+            "abi": {
+                "functions": [{"name":"set","params":[{"name":"c","type":"MyContract"}],"returns":"()","view":false}],
+                "structs": [], "enums": [],
+            }
+        }).to_string();
+        let c = Contract::from_json(&json, [0; 32], &p).unwrap();
+        let addr = format!("0x{}", "cc".repeat(32));
+        let data = c.encode_call("set", &serde_json::json!({"c": addr})).unwrap();
+        assert_eq!(data.len(), 4 + 32); // selector + address
     }
 }

@@ -123,3 +123,99 @@ pub fn parse_address(s: &str) -> Result<Address, crate::SdkError> {
 pub fn format_address(addr: &Address) -> String {
     format!("0x{}", hex::encode(addr))
 }
+
+/// The zero address (32 zero bytes).
+pub const ZERO_ADDRESS: Address = [0u8; 32];
+
+/// Check if an address is the zero address.
+pub fn is_zero_address(addr: &Address) -> bool {
+    *addr == ZERO_ADDRESS
+}
+
+/// Validate a hex address string without parsing it.
+pub fn is_valid_address(s: &str) -> bool {
+    let hex = s.trim_start_matches("0x");
+    hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Check if two addresses are equal.
+pub fn address_eq(a: &Address, b: &Address) -> bool {
+    a == b
+}
+
+/// Validate a FALCON-512 private key hex (pk + sk combined, 2178 bytes).
+pub fn is_valid_private_key(hex: &str) -> bool {
+    let clean = hex.trim_start_matches("0x");
+    clean.len() == (897 + 1281) * 2 && clean.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+// ============================================================================
+// Unit formatting (1 PYDE = 10^9 quanta)
+// ============================================================================
+
+/// Default decimals for PYDE.
+pub const PYDE_DECIMALS: u32 = 9;
+
+/// Parse a human-readable amount to raw integer units.
+///
+/// ```rust,ignore
+/// parse_units("1.5", 9)   // Ok(1_500_000_000)
+/// parse_units("100", 18)  // Ok(100_000_000_000_000_000_000)
+/// ```
+pub fn parse_units(value: &str, decimals: u32) -> std::result::Result<u128, String> {
+    let trimmed = value.trim();
+    let negative = trimmed.starts_with('-');
+    if negative {
+        return Err("Negative values not supported for u128 units".into());
+    }
+
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.len() > 2 { return Err(format!("Invalid numeric string: {}", value)); }
+
+    let whole = parts[0];
+    let fraction = if parts.len() == 2 { parts[1] } else { "" };
+
+    if fraction.len() > decimals as usize {
+        return Err(format!(
+            "Too many decimal places: \"{}\" has {} but only {} allowed",
+            value, fraction.len(), decimals
+        ));
+    }
+
+    // Validate chars
+    if !whole.chars().all(|c| c.is_ascii_digit()) || (!fraction.is_empty() && !fraction.chars().all(|c| c.is_ascii_digit())) {
+        return Err(format!("Invalid numeric string: {}", value));
+    }
+
+    let padded = format!("{:0<width$}", fraction, width = decimals as usize);
+    let combined = format!("{}{}", whole, padded);
+    combined.parse::<u128>().map_err(|e| format!("Overflow: {}", e))
+}
+
+/// Format raw integer units to a human-readable amount.
+///
+/// ```rust,ignore
+/// format_units(1_500_000_000, 9)  // "1.5"
+/// format_units(1_000_000, 9)      // "0.001"
+/// ```
+pub fn format_units(value: u128, decimals: u32) -> String {
+    let divisor = 10u128.pow(decimals);
+    let whole = value / divisor;
+    let remainder = value % divisor;
+
+    let frac_str = format!("{:0>width$}", remainder, width = decimals as usize);
+    let trimmed = frac_str.trim_end_matches('0');
+    let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
+
+    format!("{}.{}", whole, trimmed)
+}
+
+/// Parse PYDE to quanta (9 decimals). `parse_quanta("1.5")` → `Ok(1_500_000_000)`
+pub fn parse_quanta(value: &str) -> std::result::Result<u128, String> {
+    parse_units(value, PYDE_DECIMALS)
+}
+
+/// Format quanta to PYDE (9 decimals). `format_quanta(1_500_000_000)` → `"1.5"`
+pub fn format_quanta(value: u128) -> String {
+    format_units(value, PYDE_DECIMALS)
+}

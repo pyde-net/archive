@@ -253,6 +253,13 @@ impl ContractCall {
 /// Build deploy transaction data.
 ///
 /// ```rust,ignore
+/// // From artifact with named constructor args (recommended)
+/// let data = DeployData::from_artifact("out/Counter.json", &json!({
+///     "initial_supply": 1000,
+///     "name": "MyToken"
+/// }))?.build();
+///
+/// // From raw bytecodes with manual args
 /// let data = DeployData::new(constructor_bytes, runtime_bytes)
 ///     .arg_u64(1000)
 ///     .build();
@@ -268,22 +275,106 @@ impl DeployData {
         Self { constructor, runtime, args: Vec::new() }
     }
 
+    /// Load from artifact JSON file with ABI-validated constructor args.
+    /// Pass empty json!({}) if the constructor takes no args.
+    pub fn from_artifact(path: &str, args: &serde_json::Value) -> std::result::Result<Self, String> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| format!("read artifact: {}", e))?;
+        Self::from_json(&json, args)
+    }
+
+    /// Load from artifact JSON string with ABI-validated constructor args.
+    pub fn from_json(json: &str, args: &serde_json::Value) -> std::result::Result<Self, String> {
+        let v: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| format!("parse artifact: {}", e))?;
+        let constructor_hex = v.get("constructorBytecode")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'constructorBytecode' in artifact")?;
+        let runtime_hex = v.get("deployedBytecode")
+            .and_then(|v| v.as_str())
+            .ok_or("missing 'deployedBytecode' in artifact")?;
+        let constructor = hex::decode(constructor_hex.trim_start_matches("0x"))
+            .map_err(|e| format!("bad constructor hex: {}", e))?;
+        let runtime = hex::decode(runtime_hex.trim_start_matches("0x"))
+            .map_err(|e| format!("bad runtime hex: {}", e))?;
+
+        let mut deploy = Self::new(constructor, runtime);
+
+        // Encode constructor args from ABI if available
+        let abi = v.get("abi").unwrap_or(&v);
+        if let Some(fns) = abi.get("functions").and_then(|v| v.as_array()) {
+            if let Some(ctor) = fns.iter().find(|f| f.get("constructor").and_then(|v| v.as_bool()).unwrap_or(false)) {
+                if let Some(params) = ctor.get("params").and_then(|v| v.as_array()) {
+                    // Use a temporary Contract to leverage encode_value
+                    let provider = crate::client::Provider::new("http://localhost:0");
+                    let contract = crate::abi::Contract::from_json(json, [0u8; 32], &provider)
+                        .map_err(|e| format!("parse ABI: {}", e))?;
+                    for param in params {
+                        let name = param.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let ty = param.get("type").and_then(|v| v.as_str()).unwrap_or("u64");
+                        let val = args.get(name).ok_or_else(|| {
+                            format!("constructor: missing arg '{}' ({})", name, ty)
+                        })?;
+                        contract.encode_value_public(&mut deploy.args, val, ty, &format!("constructor.{}", name))
+                            .map_err(|e| format!("{}", e))?;
+                    }
+                }
+            }
+        }
+
+        Ok(deploy)
+    }
+
+    // GP integers (8 bytes LE)
+    pub fn arg_u8(self, val: u8) -> Self { self.arg_u64(val as u64) }
+    pub fn arg_u16(self, val: u16) -> Self { self.arg_u64(val as u64) }
+    pub fn arg_u32(self, val: u32) -> Self { self.arg_u64(val as u64) }
     pub fn arg_u64(mut self, val: u64) -> Self {
         self.args.extend_from_slice(&val.to_le_bytes());
         self
     }
-
+    pub fn arg_i8(self, val: i8) -> Self { self.arg_u64(val as i64 as u64) }
+    pub fn arg_i16(self, val: i16) -> Self { self.arg_u64(val as i64 as u64) }
+    pub fn arg_i32(self, val: i32) -> Self { self.arg_u64(val as i64 as u64) }
+    pub fn arg_i64(self, val: i64) -> Self { self.arg_u64(val as u64) }
     pub fn arg_bool(mut self, val: bool) -> Self {
         self.args.extend_from_slice(&(val as u64).to_le_bytes());
         self
     }
-
+    // Wide integers
+    pub fn arg_u128(mut self, val: u128) -> Self {
+        self.args.extend_from_slice(&val.to_le_bytes());
+        self
+    }
+    pub fn arg_i128(mut self, val: i128) -> Self {
+        self.args.extend_from_slice(&val.to_le_bytes());
+        self
+    }
+    pub fn arg_u256(mut self, val: ethnum::U256) -> Self {
+        self.args.extend_from_slice(&val.to_le_bytes());
+        self
+    }
+    pub fn arg_i256(mut self, val: ethnum::I256) -> Self {
+        self.args.extend_from_slice(&val.to_le_bytes());
+        self
+    }
+    // Address (32 bytes)
+    pub fn arg_address(mut self, val: crate::types::Address) -> Self {
+        self.args.extend_from_slice(&val);
+        self
+    }
+    // String (length-prefixed, 8-byte aligned)
     pub fn arg_string(mut self, val: &str) -> Self {
         let bytes = val.as_bytes();
         self.args.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         self.args.extend_from_slice(bytes);
         let padding = (8 - (bytes.len() % 8)) % 8;
         self.args.extend(std::iter::repeat(0u8).take(padding));
+        self
+    }
+    // Raw bytes
+    pub fn arg_bytes(mut self, val: &[u8]) -> Self {
+        self.args.extend_from_slice(val);
         self
     }
 
