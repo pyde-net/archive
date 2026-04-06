@@ -190,6 +190,18 @@ impl<'a> Contract<'a> {
         Self { address, provider, wallet: None, functions: HashMap::new(), events: HashMap::new(), events_by_topic: HashMap::new(), structs: HashMap::new(), enums: HashMap::new() }
     }
 
+    /// Register a function manually (when no artifact is available).
+    pub fn add_function(&mut self, name: &str, params: Vec<AbiParam>, returns: &str, view: bool, payable: bool) {
+        self.functions.insert(name.to_string(), AbiFunction {
+            name: name.to_string(),
+            params,
+            returns: returns.to_string(),
+            view,
+            payable,
+            constructor: false,
+        });
+    }
+
     /// Bind a wallet for write operations.
     pub fn connect(mut self, wallet: &'a Wallet) -> Self {
         self.wallet = Some(wallet);
@@ -263,7 +275,7 @@ impl<'a> Contract<'a> {
         let calldata = self.encode_call(method, args.unwrap_or(&empty))?;
         let receipt = wallet.send_call_with_value(self.provider, &self.address, calldata, value, gas_limit).await?;
         let ret_type = self.functions.get(method).map(|f| f.returns.clone()).unwrap_or_default();
-        Ok(ContractReceipt::new(receipt, ret_type))
+        Ok(ContractReceipt::new(receipt, ret_type, self.structs.clone(), self.enums.clone()))
     }
 
     // ========================================================================
@@ -280,8 +292,7 @@ impl<'a> Contract<'a> {
         ))?;
         let empty = serde_json::json!({});
         let calldata = self.encode_call(method, args.unwrap_or(&empty))?;
-        let nonce = self.provider.get_nonce(wallet.address()).await?;
-        let chain_id = self.provider.get_chain_id().await?;
+        let (nonce, chain_id) = self.provider.get_nonce_and_chain_id(wallet.address()).await?;
 
         Ok(Transaction {
             from: *wallet.address(),
@@ -722,7 +733,11 @@ impl<'a> Contract<'a> {
 
 /// Standalone ABI encoder/decoder (no contract address or provider needed).
 pub struct Interface {
-    json: String,
+    functions: HashMap<String, AbiFunction>,
+    events: HashMap<String, AbiEvent>,
+    events_by_topic: HashMap<String, AbiEvent>,
+    structs: HashMap<String, AbiStructDef>,
+    enums: HashMap<String, AbiEnumDef>,
 }
 
 impl Interface {
@@ -730,36 +745,59 @@ impl Interface {
     pub fn from_artifact(path: &str) -> std::result::Result<Self, String> {
         let json = std::fs::read_to_string(path)
             .map_err(|e| format!("read artifact: {}", e))?;
-        Ok(Self { json })
+        Self::from_json_str(&json).map_err(|e| format!("{}", e))
     }
 
     /// Load from ABI JSON string.
     pub fn from_json(json: &str) -> Self {
-        Self { json: json.to_string() }
+        Self::from_json_str(json).unwrap_or_else(|_| Self {
+            functions: HashMap::new(), events: HashMap::new(),
+            events_by_topic: HashMap::new(), structs: HashMap::new(), enums: HashMap::new(),
+        })
+    }
+
+    fn from_json_str(json: &str) -> Result<Self> {
+        let provider = Provider::new("http://localhost:0");
+        let contract = Contract::from_json(json, [0u8; 32], &provider)?;
+        Ok(Self {
+            functions: contract.functions.clone(),
+            events: contract.events.clone(),
+            events_by_topic: contract.events_by_topic.clone(),
+            structs: contract.structs.clone(),
+            enums: contract.enums.clone(),
+        })
+    }
+
+    fn make_contract(&self) -> Contract<'static> {
+        // SAFETY: We only use decode_value/encode_call which don't touch provider.
+        // The provider reference is never actually used in encoding/decoding.
+        let provider = Box::leak(Box::new(Provider::new("http://localhost:0")));
+        let mut c = Contract::new([0u8; 32], provider);
+        c.functions = self.functions.clone();
+        c.structs = self.structs.clone();
+        c.enums = self.enums.clone();
+        c
     }
 
     /// Encode a function call to calldata bytes.
     pub fn encode_function_data(&self, method: &str, args: &serde_json::Value) -> Result<Vec<u8>> {
-        let provider = Provider::new("http://localhost:0");
-        let contract = Contract::from_json(&self.json, [0u8; 32], &provider)?;
+        let contract = self.make_contract();
         contract.encode_call(method, args)
     }
 
     /// Decode function return data using the ABI return type.
     pub fn decode_function_result(&self, method: &str, data: &[u8]) -> Option<Value> {
-        let provider = Provider::new("http://localhost:0");
-        let contract = Contract::from_json(&self.json, [0u8; 32], &provider).ok()?;
-        let fn_def = contract.functions.get(method)?;
+        let fn_def = self.functions.get(method)?;
         let ret = fn_def.returns.as_str();
         if ret == "()" || ret == "unit" { return None; }
-        Some(contract.decode_value(data, ret, 0).0)
+        let c = self.make_contract();
+        Some(c.decode_value(data, ret, 0).0)
     }
 
     /// Parse a raw Log into a decoded EventLog.
     pub fn parse_log(&self, log: &Log) -> Option<EventLog> {
-        let provider = Provider::new("http://localhost:0");
-        let contract = Contract::from_json(&self.json, [0u8; 32], &provider).ok()?;
-        contract.parse_log(log)
+        let c = self.make_contract();
+        c.parse_log(log)
     }
 
     /// Get the topic0 hash for an event name.
@@ -778,22 +816,25 @@ impl Interface {
 pub struct ContractReceipt {
     pub receipt: Receipt,
     ret_type: String,
+    structs: HashMap<String, AbiStructDef>,
+    enums: HashMap<String, AbiEnumDef>,
 }
 
 impl ContractReceipt {
-    fn new(receipt: Receipt, ret_type: String) -> Self {
-        Self { receipt, ret_type }
+    fn new(receipt: Receipt, ret_type: String, structs: HashMap<String, AbiStructDef>, enums: HashMap<String, AbiEnumDef>) -> Self {
+        Self { receipt, ret_type, structs, enums }
     }
 
-    /// Decode returnData using the ABI return type.
+    /// Decode returnData using the ABI return type (including structs/enums).
     /// Returns None if returnData is absent (ephemeral — only available right after execution).
     pub fn decode_return_data(&self) -> Option<Value> {
         let bytes = self.receipt.return_bytes();
         if bytes.is_empty() { return None; }
         if self.ret_type.is_empty() || self.ret_type == "()" || self.ret_type == "unit" { return None; }
-        // Use a dummy contract for decoding (no ABI needed for primitive types)
         let provider = crate::client::Provider::new("http://localhost:0");
-        let contract = Contract::new([0u8; 32], &provider);
+        let mut contract = Contract::new([0u8; 32], &provider);
+        contract.structs = self.structs.clone();
+        contract.enums = self.enums.clone();
         Some(contract.decode_value(&bytes, &self.ret_type, 0).0)
     }
 }

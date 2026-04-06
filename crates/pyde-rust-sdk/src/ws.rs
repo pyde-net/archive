@@ -141,20 +141,23 @@ impl WsProvider {
 
     pub async fn get_balance(&self, address: &[u8; 32]) -> Result<u128> {
         let result = self.rpc("pyde_getBalance", &[serde_json::json!(format!("0x{}", hex::encode(address)))]).await?;
-        let s = result.get("result").and_then(|v| v.as_str()).unwrap_or("0x0");
-        Ok(u128::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0))
+        let s = result.as_str().unwrap_or("0x0");
+        u128::from_str_radix(s.trim_start_matches("0x"), 16)
+            .map_err(|e| SdkError::InvalidResponse(format!("bad balance: {}", e)))
     }
 
     pub async fn get_block_number(&self) -> Result<u64> {
         let result = self.rpc("pyde_blockNumber", &[]).await?;
-        let s = result.get("result").and_then(|v| v.as_str()).unwrap_or("0x0");
-        Ok(u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0))
+        let s = result.as_str().unwrap_or("0x0");
+        u64::from_str_radix(s.trim_start_matches("0x"), 16)
+            .map_err(|e| SdkError::InvalidResponse(format!("bad block number: {}", e)))
     }
 
     pub async fn get_chain_id(&self) -> Result<u64> {
         let result = self.rpc("pyde_chainId", &[]).await?;
-        let s = result.get("result").and_then(|v| v.as_str()).unwrap_or("0x0");
-        Ok(u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap_or(0))
+        let s = result.as_str().unwrap_or("0x0");
+        u64::from_str_radix(s.trim_start_matches("0x"), 16)
+            .map_err(|e| SdkError::InvalidResponse(format!("bad chain id: {}", e)))
     }
 
     // ========================================================================
@@ -199,6 +202,6 @@ impl WsProvider {
         if let Some(err) = result.get("error") {
             return Err(SdkError::Rpc(err.to_string()));
         }
-        Ok(result)
+        Ok(result.get("result").cloned().unwrap_or(serde_json::Value::Null))
     }
 }

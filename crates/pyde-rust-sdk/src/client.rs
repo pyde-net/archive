@@ -20,6 +20,7 @@ pub struct Provider {
     rpc_url: String,
     client: reqwest::Client,
     retries: u32,
+    cached_chain_id: std::sync::Mutex<Option<u64>>,
 }
 
 impl Provider {
@@ -32,7 +33,7 @@ impl Provider {
             .timeout(options.timeout)
             .build()
             .unwrap_or_default();
-        Self { rpc_url: rpc_url.to_string(), client, retries: options.retries }
+        Self { rpc_url: rpc_url.to_string(), client, retries: options.retries, cached_chain_id: std::sync::Mutex::new(None) }
     }
 
     // ========================================================================
@@ -56,8 +57,22 @@ impl Provider {
     }
 
     pub async fn get_chain_id(&self) -> Result<u64> {
+        if let Some(id) = *self.cached_chain_id.lock().unwrap() {
+            return Ok(id);
+        }
         let result = self.rpc("pyde_chainId", &[]).await?;
-        parse_hex_u64(&result)
+        let id = parse_hex_u64(&result)?;
+        *self.cached_chain_id.lock().unwrap() = Some(id);
+        Ok(id)
+    }
+
+    /// Fetch nonce and chainId in parallel (saves one round trip).
+    pub async fn get_nonce_and_chain_id(&self, address: &Address) -> Result<(u64, u64)> {
+        let (nonce, chain_id) = tokio::join!(
+            self.get_nonce(address),
+            self.get_chain_id()
+        );
+        Ok((nonce?, chain_id?))
     }
 
     pub async fn get_block_number(&self) -> Result<u64> {
@@ -242,10 +257,13 @@ impl Provider {
             .await
             .map_err(|e| SdkError::Connection(e.to_string()))?;
 
-        let results: Vec<serde_json::Value> = resp
+        let mut results: Vec<serde_json::Value> = resp
             .json()
             .await
             .map_err(|e| SdkError::InvalidResponse(e.to_string()))?;
+
+        // Sort by id to match request order (JSON-RPC allows arbitrary response order)
+        results.sort_by_key(|r| r.get("id").and_then(|v| v.as_u64()).unwrap_or(0));
 
         results.into_iter().map(|r| {
             if let Some(err) = r.get("error") {
