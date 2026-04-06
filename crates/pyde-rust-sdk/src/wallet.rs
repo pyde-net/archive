@@ -147,6 +147,13 @@ impl Wallet {
         Ok(())
     }
 
+    /// Sign an arbitrary 32-byte message. Returns signature bytes.
+    pub fn sign(&self, message: &[u8; 32]) -> Result<Vec<u8>> {
+        let sig = falcon_sign(&self.secret_key, message)
+            .map_err(|e| SdkError::Signing(format!("sign: {}", e)))?;
+        Ok(sig.as_bytes().to_vec())
+    }
+
     // ========================================================================
     // High-level helpers
     // ========================================================================
@@ -166,15 +173,29 @@ impl Wallet {
         send_and_check(provider, &tx).await
     }
 
+    /// Generate a random FALCON-512 private key hex (pk + sk combined).
+    /// Use with `Wallet::from_private_key()` to create a wallet later.
+    pub fn generate_private_key() -> Result<String> {
+        let wallet = Self::generate()?;
+        Ok(wallet.private_key_hex())
+    }
+
     /// Build, sign, send a contract call. Returns receipt (errors on revert).
     pub async fn send_call(
         &self, provider: &Provider, to: &Address, data: Vec<u8>, gas_limit: u64,
+    ) -> Result<Receipt> {
+        self.send_call_with_value(provider, to, data, 0, gas_limit).await
+    }
+
+    /// Build, sign, send a contract call with native token value.
+    pub async fn send_call_with_value(
+        &self, provider: &Provider, to: &Address, data: Vec<u8>, value: u128, gas_limit: u64,
     ) -> Result<Receipt> {
         let nonce = provider.get_nonce(&self.address).await?;
         let chain_id = provider.get_chain_id().await?;
 
         let mut tx = Transaction {
-            from: self.address, to: *to, value: 0, data,
+            from: self.address, to: *to, value, data,
             gas_limit, nonce, signature: vec![],
             fee_payer: FeePayer::Sender, access_list: vec![],
             deadline: None, chain_id, tx_type: TransactionType::Standard,
@@ -183,15 +204,32 @@ impl Wallet {
         send_and_check(provider, &tx).await
     }
 
+    /// Bind a provider for convenience. Returns a SignerProvider with shorter method signatures.
+    pub fn connect<'a>(&'a self, provider: &'a Provider) -> SignerProvider<'a> {
+        SignerProvider::new(self, provider)
+    }
+
+    /// Validate a FALCON-512 private key hex string (pk + sk, 2178 bytes).
+    pub fn is_valid_private_key(hex: &str) -> bool {
+        crate::types::is_valid_private_key(hex)
+    }
+
     /// Build, sign, send a contract deploy. Returns receipt (errors on revert).
     pub async fn deploy(
         &self, provider: &Provider, deploy_data: Vec<u8>, gas_limit: u64,
+    ) -> Result<Receipt> {
+        self.deploy_with_value(provider, deploy_data, 0, gas_limit).await
+    }
+
+    /// Build, sign, send a contract deploy with native token value (payable constructor).
+    pub async fn deploy_with_value(
+        &self, provider: &Provider, deploy_data: Vec<u8>, value: u128, gas_limit: u64,
     ) -> Result<Receipt> {
         let nonce = provider.get_nonce(&self.address).await?;
         let chain_id = provider.get_chain_id().await?;
 
         let mut tx = Transaction {
-            from: self.address, to: [0u8; 32], value: 0, data: deploy_data,
+            from: self.address, to: [0u8; 32], value, data: deploy_data,
             gas_limit, nonce, signature: vec![],
             fee_payer: FeePayer::Sender, access_list: vec![],
             deadline: None, chain_id, tx_type: TransactionType::Deploy,
@@ -220,8 +258,16 @@ impl<'a> SignerProvider<'a> {
         self.wallet.send_call(self.provider, to, data, gas_limit).await
     }
 
+    pub async fn send_call_with_value(&self, to: &Address, data: Vec<u8>, value: u128, gas_limit: u64) -> Result<Receipt> {
+        self.wallet.send_call_with_value(self.provider, to, data, value, gas_limit).await
+    }
+
     pub async fn deploy(&self, deploy_data: Vec<u8>, gas_limit: u64) -> Result<Receipt> {
         self.wallet.deploy(self.provider, deploy_data, gas_limit).await
+    }
+
+    pub async fn deploy_with_value(&self, deploy_data: Vec<u8>, value: u128, gas_limit: u64) -> Result<Receipt> {
+        self.wallet.deploy_with_value(self.provider, deploy_data, value, gas_limit).await
     }
 
     pub async fn get_balance(&self) -> Result<u128> {
@@ -407,5 +453,58 @@ mod tests {
         assert!(w.secret_key_hex().starts_with("0x"));
         assert_eq!(w.public_key_hex().len(), 2 + 897 * 2); // 0x + 897 bytes hex
         assert_eq!(w.secret_key_hex().len(), 2 + 1281 * 2); // 0x + 1281 bytes hex
+    }
+
+    #[test]
+    fn is_valid_private_key_check() {
+        let w = Wallet::generate().unwrap();
+        assert!(Wallet::is_valid_private_key(&w.private_key_hex()));
+        assert!(!Wallet::is_valid_private_key("0xdeadbeef"));
+        assert!(!Wallet::is_valid_private_key("not hex at all"));
+    }
+
+    #[test]
+    fn connect_returns_signer() {
+        let w = Wallet::generate().unwrap();
+        let p = crate::Provider::new("http://localhost:0");
+        let signer = w.connect(&p);
+        assert_eq!(signer.wallet.address(), w.address());
+    }
+
+    #[test]
+    fn address_utilities() {
+        use crate::types::*;
+        assert!(is_zero_address(&ZERO_ADDRESS));
+        assert!(!is_zero_address(&[0xAA; 32]));
+        let valid_addr = format!("0x{}", "ab".repeat(32));
+        assert!(is_valid_address(&valid_addr));
+        assert!(!is_valid_address("0xshort"));
+        let bad_addr = format!("0x{}", "zz".repeat(32));
+        assert!(!is_valid_address(&bad_addr));
+        assert!(address_eq(&[0xAA; 32], &[0xAA; 32]));
+        assert!(!address_eq(&[0xAA; 32], &[0xBB; 32]));
+    }
+
+    #[test]
+    fn unit_formatting() {
+        use crate::types::*;
+        // parse_units
+        assert_eq!(parse_units("100", 9).unwrap(), 100_000_000_000);
+        assert_eq!(parse_units("1.5", 9).unwrap(), 1_500_000_000);
+        assert_eq!(parse_units("0.001", 9).unwrap(), 1_000_000);
+        assert_eq!(parse_units("0", 9).unwrap(), 0);
+        assert!(parse_units("1.0000000001", 9).is_err()); // too many decimals
+        // format_units
+        assert_eq!(format_units(1_500_000_000, 9), "1.5");
+        assert_eq!(format_units(1_000_000, 9), "0.001");
+        assert_eq!(format_units(0, 9), "0.0");
+        assert_eq!(format_units(1_000_000_000, 9), "1.0");
+        // quanta shortcuts
+        assert_eq!(parse_quanta("2.5").unwrap(), 2_500_000_000);
+        assert_eq!(format_quanta(2_500_000_000), "2.5");
+        // custom decimals
+        assert_eq!(parse_units("1.0", 18).unwrap(), 1_000_000_000_000_000_000);
+        // roundtrip
+        assert_eq!(format_units(parse_units("123.456789", 9).unwrap(), 9), "123.456789");
     }
 }
