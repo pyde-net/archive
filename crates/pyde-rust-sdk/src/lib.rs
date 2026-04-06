@@ -31,11 +31,12 @@ pub mod contract;
 pub mod error;
 pub mod types;
 pub mod wallet;
+pub mod signer;
 pub mod ws;
 
 // Top-level re-exports for convenience
 pub use abi::{Contract, ContractReceipt, EventLog, Interface, Value};
-pub use client::{Provider, TransactionResponse};
+pub use client::{Provider, ProviderOptions, TransactionResponse};
 pub use contract::{compute_selector, ContractCall, DeployData};
 pub use contract::{
     decode_address, decode_bool, decode_bytes, decode_string,
@@ -49,7 +50,8 @@ pub use types::{
     is_valid_private_key, address_eq, ZERO_ADDRESS,
     parse_units, format_units, parse_quanta, format_quanta, PYDE_DECIMALS,
     is_hex_string, hexlify, get_bytes, to_be_hex, concat_bytes, zero_pad_value, strip_zeros, data_length,
-    Address, Receipt, Log, LogFilter, BlockHeader, FeeData,
+    Address, Receipt, Log, LogFilter, BlockHeader, FeeData, CallOverrides,
 };
+pub use signer::Signer;
 pub use wallet::{Keystore, SignerProvider, Wallet};
 pub use ws::WsProvider;

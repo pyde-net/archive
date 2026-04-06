@@ -2,6 +2,7 @@ use crate::client::Provider;
 use crate::contract::compute_selector;
 use crate::error::{Result, SdkError};
 use crate::types::{Address, Log, LogFilter, Receipt};
+use pyde_tx::types::{FeePayer, Transaction, TransactionType};
 use crate::wallet::Wallet;
 use std::collections::HashMap;
 
@@ -263,6 +264,39 @@ impl<'a> Contract<'a> {
         let receipt = wallet.send_call_with_value(self.provider, &self.address, calldata, value, gas_limit).await?;
         let ret_type = self.functions.get(method).map(|f| f.returns.clone()).unwrap_or_default();
         Ok(ContractReceipt::new(receipt, ret_type))
+    }
+
+    // ========================================================================
+    // Populate (build unsigned tx without sending)
+    // ========================================================================
+
+    /// Build an unsigned Transaction for a contract call without sending.
+    /// Useful for multisig, offline signing, or tx review.
+    pub async fn populate_transaction(
+        &self, method: &str, args: Option<&serde_json::Value>, gas_limit: u64,
+    ) -> Result<Transaction> {
+        let wallet = self.wallet.ok_or_else(|| SdkError::Signing(
+            "No wallet connected. Use contract.connect(&wallet) first.".into()
+        ))?;
+        let empty = serde_json::json!({});
+        let calldata = self.encode_call(method, args.unwrap_or(&empty))?;
+        let nonce = self.provider.get_nonce(wallet.address()).await?;
+        let chain_id = self.provider.get_chain_id().await?;
+
+        Ok(Transaction {
+            from: *wallet.address(),
+            to: self.address,
+            value: 0,
+            data: calldata,
+            gas_limit,
+            nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id,
+            tx_type: TransactionType::Standard,
+        })
     }
 
     // ========================================================================
