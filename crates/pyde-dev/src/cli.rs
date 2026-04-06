@@ -43,9 +43,9 @@ pub enum Command {
         #[arg(short, long, default_value = "devnet")]
         network: String,
 
-        /// Sender address (hex). Used when no --wallet specified (devnet mode).
-        #[arg(long, default_value = "0x0101010101010101010101010101010101010101010101010101010101010101")]
-        from: String,
+        /// Private key hex (pk+sk, 2178 bytes). Overrides wallet and devnet default.
+        #[arg(long)]
+        private_key: Option<String>,
 
         /// Wallet name for signing transactions.
         #[arg(short, long)]
@@ -79,9 +79,9 @@ pub enum Command {
         #[arg(short, long, default_value = "devnet")]
         network: String,
 
-        /// Sender address (hex). Used when no --wallet specified (devnet mode).
-        #[arg(long, default_value = "0x0101010101010101010101010101010101010101010101010101010101010101")]
-        from: String,
+        /// Private key hex (pk+sk, 2178 bytes). Overrides wallet and devnet default.
+        #[arg(long)]
+        private_key: Option<String>,
 
         /// Wallet name for signing send transactions.
         #[arg(short, long)]
@@ -138,6 +138,32 @@ pub enum Command {
         network: String,
     },
 
+    /// Send a state-changing transaction to a contract (signed).
+    /// Example: `pyde-dev send 0xaddr increment() --network devnet`
+    Send {
+        /// Contract address (hex).
+        address: String,
+
+        /// Function call: `method()` or `method(arg1, arg2)`.
+        function: String,
+
+        /// Network name.
+        #[arg(short, long, default_value = "devnet")]
+        network: String,
+
+        /// Native token value to send (in quanta). For payable functions.
+        #[arg(long, default_value = "0")]
+        value: u128,
+
+        /// Private key hex. Overrides wallet and devnet default.
+        #[arg(long)]
+        private_key: Option<String>,
+
+        /// Wallet name for signing.
+        #[arg(short, long)]
+        wallet: Option<String>,
+    },
+
     /// Check transaction status/receipt.
     /// Example: `pyde-dev tx 0xtxhash --network devnet`
     Tx {
@@ -166,9 +192,13 @@ pub enum Command {
         #[arg(short, long, default_value = "devnet")]
         network: String,
 
-        /// Sender address (hex). Used when no --wallet is specified (devnet mode).
-        #[arg(long, default_value = "0x0101010101010101010101010101010101010101010101010101010101010101")]
-        from: String,
+        /// Native token value to send with deploy (in quanta). For payable constructors.
+        #[arg(long, default_value = "0")]
+        value: u128,
+
+        /// Private key hex (pk+sk, 2178 bytes). Overrides wallet and devnet default.
+        #[arg(long)]
+        private_key: Option<String>,
 
         /// Wallet name for signing transactions.
         #[arg(short, long)]

@@ -1,8 +1,10 @@
 use crate::build;
 use crate::project;
+use crate::signer::Signer;
+use pyde_tx::types::*;
 use std::fs;
 
-pub fn run(network: &str, contract: Option<&str>, from: &str, verify: bool) -> Result<(), String> {
+pub fn run(network: &str, contract: Option<&str>, signer: &Signer, value: u128, verify: bool) -> Result<(), String> {
     let (config, root) = project::load_config()?;
 
     // Get network config
@@ -54,31 +56,49 @@ pub fn run(network: &str, contract: Option<&str>, from: &str, verify: bool) -> R
         .trim_start_matches("0x");
 
     let constructor_len = constructor_hex.len() / 2;
-    let full_bytecode = format!("{}{}", constructor_hex, runtime_hex);
+    let full_bytecode = hex::decode(format!("{}{}", constructor_hex, runtime_hex))
+        .map_err(|e| format!("invalid bytecode hex: {}", e))?;
 
     println!("  Deploying {} to {} ({})", contract_name, network, net.rpc_url);
     println!("  Constructor: {} bytes", constructor_len);
     println!("  Runtime:     {} bytes", runtime_hex.len() / 2);
-    println!("  From:        {}", from);
+    println!("  From:        {}", signer.address_hex());
 
-    // Send deploy transaction via JSON-RPC
-    let zero_addr = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    // Get nonce
+    let nonce = get_nonce(&net.rpc_url, &signer.address_hex())?;
+
+    // Build deploy transaction
+    let mut tx = Transaction {
+        from: signer.address,
+        to: [0u8; 32], // zero address = deploy
+        value,
+        data: full_bytecode,
+        gas_limit: 100_000_000,
+        nonce,
+        signature: vec![],
+        fee_payer: FeePayer::Sender,
+        access_list: vec![],
+        deadline: None,
+        chain_id: net.chain_id,
+        tx_type: TransactionType::Deploy,
+    };
+
+    // Sign with FALCON-512
+    println!("  Signing transaction...");
+    signer.sign_transaction(&mut tx)?;
+
+    // Serialize to wire format and send via pyde_sendRawTransaction
+    let tx_bytes = tx.to_bytes();
+    let tx_hex = format!("0x{}", hex::encode(&tx_bytes));
+
+    let client = reqwest::blocking::Client::new();
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "pyde_sendTransaction",
-        "params": [{
-            "from": from,
-            "to": zero_addr,
-            "data": format!("0x{}", full_bytecode),
-            "constructorLen": constructor_len,
-            "gas": 100_000_000,
-            "nonce": get_nonce(&net.rpc_url, from)?,
-            "value": "0"
-        }]
+        "method": "pyde_sendRawTransaction",
+        "params": [tx_hex]
     });
 
-    let client = reqwest::blocking::Client::new();
     let resp = client
         .post(&net.rpc_url)
         .json(&body)
@@ -98,7 +118,7 @@ pub fn run(network: &str, contract: Option<&str>, from: &str, verify: bool) -> R
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Extract tx hash from response
+    // Extract tx hash
     let tx_hash = if let Ok(inner) = serde_json::from_str::<serde_json::Value>(result_str) {
         inner.get("txHash").and_then(|v| v.as_str())
             .unwrap_or(result_str).to_string()
@@ -122,6 +142,7 @@ pub fn run(network: &str, contract: Option<&str>, from: &str, verify: bool) -> R
     println!("  Deployed!");
     println!("  Contract: {}", contract_addr);
     println!("  Tx Hash:  {}", tx_hash);
+    println!("  Signed:   ✓ (FALCON-512, verified by validator)");
 
     if verify {
         println!();

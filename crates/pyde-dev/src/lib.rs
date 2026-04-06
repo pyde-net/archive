@@ -10,6 +10,7 @@ pub mod init;
 pub mod install;
 pub mod project;
 pub mod script;
+pub mod signer;
 pub mod test_runner;
 pub mod trace;
 pub mod verify;

@@ -34,6 +34,8 @@ pub struct RpcState {
     pub pending_tx_tx: tokio::sync::broadcast::Sender<String>,
     /// Broadcast channel for event logs.
     pub logs_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// Dev mode: allows unsigned pyde_sendTransaction.
+    pub dev_mode: bool,
 }
 
 /// Define the Pyde JSON-RPC API.
@@ -242,6 +244,9 @@ impl PydeApiServer for RpcServer {
     }
 
     async fn send_transaction(&self, tx_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
+        if !self.state.dev_mode {
+            return Err(rpc_err(-32601, "pyde_sendTransaction is only available in dev mode (--dev). Use pyde_sendRawTransaction with a signed transaction.".into()));
+        }
         let from = tx_obj.get("from").and_then(|v| v.as_str())
             .map(parse_address).transpose()?
             .ok_or_else(|| rpc_err(-32602, "missing 'from' field".into()))?;

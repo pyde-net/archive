@@ -58,11 +58,25 @@ impl BlockProcessor {
                         slot,
                         tx_index = i,
                         error = ?e,
-                        "tx execution failed"
+                        "tx execution failed — storing failed receipt"
                     );
-                    // Failed txs still consume gas (up to gas_limit)
-                    // but we skip them for now — in production, we'd charge
-                    // and create a failed receipt
+                    // Create a failed receipt so callers know why the tx was rejected
+                    let tx_hash = tx.hash();
+                    let reason = format!("{:?}", e);
+                    let failed_receipt = pyde_tx::execution::Receipt {
+                        tx_hash,
+                        success: false,
+                        gas_used: 0,
+                        gas_refund: 0,
+                        effective_gas: 0,
+                        fee_paid: 0,
+                        fee_burned: 0,
+                        fee_validator: 0,
+                        return_data: reason.into_bytes(),
+                        logs: vec![],
+                        state_root: sparse_merkle_tree::H256::zero(),
+                    };
+                    receipts.push(failed_receipt);
                 }
             }
         }
@@ -246,7 +260,8 @@ mod tests {
         // Tx fails validation (dummy signature, no auth keys on genesis account)
         // but the block still processes — failed txs are skipped gracefully.
         // In production, genesis accounts need auth_keys set for real tx execution.
-        assert_eq!(receipts.len(), 0); // failed tx produces no receipt
+        assert_eq!(receipts.len(), 1); // failed tx now produces a failed receipt
+        assert!(!receipts[0].success);  // receipt marks failure
         assert_eq!(chain.head_slot, 1);
     }
 }

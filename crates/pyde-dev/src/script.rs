@@ -28,7 +28,8 @@ struct FnInfo {
 /// TODO(M11.4): Replace `--from` address with `--wallet`/`--keystore` once the
 /// wallet system is implemented (tasks 0914-0921). Currently uses bare address
 /// without transaction signing (devnet mode only).
-pub fn run(file: &str, network: &str, from: &str) -> Result<(), String> {
+pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<(), String> {
+    let from = &signer.address_hex();
     let (config, root) = project::load_config()?;
     let start = Instant::now();
 
@@ -238,6 +239,8 @@ pub fn run(file: &str, network: &str, from: &str) -> Result<(), String> {
         &sender_addr,
         &net.rpc_url,
         from,
+        signer,
+        &net,
         &mut nonce,
         &mut tx_count,
         &merged_registry,
@@ -270,6 +273,8 @@ fn execute_with_rpc_bridge(
     script_addr: &[u8; 32],
     rpc_url: &str,
     from: &str,
+    signer: &crate::signer::Signer,
+    net: &crate::project::NetworkConfig,
     nonce: &mut u64,
     tx_count: &mut u32,
     compiled_registry: &std::collections::HashMap<String, Vec<u8>>,
@@ -330,25 +335,34 @@ fn execute_with_rpc_bridge(
 
                 println!("    [{}] deploy {} ({} bytes)", tx_count, contract_name, code_only.len());
 
-                let mut params = serde_json::json!({
-                    "from": from,
-                    "to": zero_addr,
-                    "data": format!("0x{}", hex::encode(code_only)),
-                    "gas": 100_000_000,
-                    "nonce": *nonce,
-                    "value": "0",
-                    "constructorLen": constructor_len,
-                });
+                // Build deploy data: [constructor_bytecode][runtime_bytecode][args]
+                let mut deploy_data = code_only.to_vec();
                 if !constructor_args.is_empty() {
-                    params["constructorArgs"] = serde_json::Value::String(
-                        format!("0x{}", hex::encode(constructor_args))
-                    );
+                    deploy_data.extend_from_slice(constructor_args);
                 }
+
+                // Build and sign deploy transaction
+                let mut tx = pyde_tx::types::Transaction {
+                    from: signer.address,
+                    to: [0u8; 32],
+                    value: 0,
+                    data: deploy_data,
+                    gas_limit: 100_000_000,
+                    nonce: *nonce,
+                    signature: vec![],
+                    fee_payer: pyde_tx::types::FeePayer::Sender,
+                    access_list: vec![],
+                    deadline: None,
+                    chain_id: net.chain_id,
+                    tx_type: pyde_tx::types::TransactionType::Deploy,
+                };
+                signer.sign_transaction(&mut tx)?;
+                let tx_hex = format!("0x{}", hex::encode(tx.to_bytes()));
 
                 let body = serde_json::json!({
                     "jsonrpc": "2.0", "id": *tx_count + 1,
-                    "method": "pyde_sendTransaction",
-                    "params": [params]
+                    "method": "pyde_sendRawTransaction",
+                    "params": [tx_hex]
                 });
 
                 let resp = client.post(rpc_url).json(&body).send()
@@ -451,20 +465,37 @@ fn execute_with_rpc_bridge(
                         }
                         // View calls don't consume nonce
                     } else {
-                        // State-changing call: pyde_sendTransaction
+                        // State-changing call: signed pyde_sendRawTransaction
                         println!("    [{}] {}.{}()", tx_count, &target_hex[..10], fn_name);
+
+                        let to_bytes = hex::decode(target_hex.strip_prefix("0x").unwrap_or(&target_hex))
+                            .unwrap_or_default();
+                        let mut to_addr = [0u8; 32];
+                        if to_bytes.len() == 32 { to_addr.copy_from_slice(&to_bytes); }
+                        let calldata_bytes = hex::decode(calldata_hex.strip_prefix("0x").unwrap_or(&calldata_hex))
+                            .unwrap_or_default();
+
+                        let mut tx = pyde_tx::types::Transaction {
+                            from: signer.address,
+                            to: to_addr,
+                            value: 0,
+                            data: calldata_bytes,
+                            gas_limit: 100_000_000,
+                            nonce: *nonce,
+                            signature: vec![],
+                            fee_payer: pyde_tx::types::FeePayer::Sender,
+                            access_list: vec![],
+                            deadline: None,
+                            chain_id: net.chain_id,
+                            tx_type: pyde_tx::types::TransactionType::Standard,
+                        };
+                        signer.sign_transaction(&mut tx)?;
+                        let tx_hex_raw = format!("0x{}", hex::encode(tx.to_bytes()));
 
                         let body = serde_json::json!({
                             "jsonrpc": "2.0", "id": *tx_count + 1,
-                            "method": "pyde_sendTransaction",
-                            "params": [{
-                                "from": from,
-                                "to": target_hex,
-                                "data": calldata_hex,
-                                "gas": 100_000_000,
-                                "nonce": *nonce,
-                                "value": "0"
-                            }]
+                            "method": "pyde_sendRawTransaction",
+                            "params": [tx_hex_raw]
                         });
 
                         let resp = client.post(rpc_url).json(&body).send()

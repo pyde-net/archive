@@ -226,8 +226,9 @@ pub fn devnet_genesis() -> (GenesisConfig, Vec<DevnetAccount>) {
     use pyde_account::address::derive_eoa_address;
     use pyde_crypto::falcon::falcon_keygen;
 
-    // 10M PYDE per account in quanta (10,000,000 × 10^9)
-    let ten_million_pyde: u128 = 10_000_000 * 1_000_000_000;
+    // 10B PYDE per account in quanta (10,000,000,000 × 10^9)
+    // Must cover: gas_limit(100M) × base_fee(50 gwei) = 5B PYDE per tx
+    let funding_per_account: u128 = 10_000_000_000 * 1_000_000_000;
 
     let mut allocations = Vec::new();
     let mut accounts = Vec::new();
@@ -238,7 +239,7 @@ pub fn devnet_genesis() -> (GenesisConfig, Vec<DevnetAccount>) {
 
         allocations.push(GenesisAllocation {
             address: hex::encode(address),
-            balance: ten_million_pyde.to_string(),
+            balance: funding_per_account.to_string(),
             public_key: Some(hex::encode(pk.as_bytes())),
         });
 
@@ -246,7 +247,7 @@ pub fn devnet_genesis() -> (GenesisConfig, Vec<DevnetAccount>) {
             address,
             public_key: pk,
             secret_key: sk,
-            balance: ten_million_pyde,
+            balance: funding_per_account,
         });
     }
 
@@ -297,9 +298,9 @@ mod tests {
     #[test]
     fn devnet_genesis_balance_correct() {
         let (_, accounts) = devnet_genesis();
-        let ten_million_pyde: u128 = 10_000_000 * 1_000_000_000;
+        let expected: u128 = 10_000_000_000 * 1_000_000_000;
         for acc in &accounts {
-            assert_eq!(acc.balance, ten_million_pyde);
+            assert_eq!(acc.balance, expected);
         }
     }
 
@@ -331,8 +332,8 @@ mod tests {
         let account_bytes = state.get(&key).expect("account should exist");
         let account = pyde_account::types::Account::from_bytes(&account_bytes)
             .expect("should be a valid Account");
-        let ten_million_pyde: u128 = 10_000_000 * 1_000_000_000;
-        assert_eq!(account.balance, ten_million_pyde);
+        let expected: u128 = 10_000_000_000 * 1_000_000_000;
+        assert_eq!(account.balance, expected);
     }
 
     #[test]

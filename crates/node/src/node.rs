@@ -297,6 +297,7 @@ impl PydeNode {
                 new_heads_tx,
                 pending_tx_tx,
                 logs_tx,
+                dev_mode: self.config.node.dev_mode,
             });
             match rpc::start_rpc_server(
                 &self.config.rpc.listen,

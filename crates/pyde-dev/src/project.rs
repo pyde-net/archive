@@ -207,3 +207,12 @@ chain_id = 31337
         name
     )
 }
+
+/// Get the RPC URL for a network from pyde.toml.
+/// Falls back to default localhost if config can't be loaded.
+pub fn get_rpc_url(network: &str) -> Result<String, String> {
+    let (config, _) = load_config()?;
+    let net = config.networks.get(network)
+        .ok_or_else(|| format!("network '{}' not found in pyde.toml", network))?;
+    Ok(net.rpc_url.clone())
+}

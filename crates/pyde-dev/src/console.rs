@@ -16,7 +16,8 @@ use std::io::{self, BufRead, Write};
 /// Supported arg types: u64, hex (0x...), bool (true/false), strings ("...").
 /// Complex types (structs, arrays, Vec) are not yet supported — use `pyde script`
 /// for those. TODO: load contract ABI from artifacts for type-aware encoding.
-pub fn run(network: &str, from: &str) -> Result<(), String> {
+pub fn run(network: &str, signer: &crate::signer::Signer) -> Result<(), String> {
+    let from = &signer.address_hex();
     let (config, _) = project::load_config()?;
 
     let net = config
@@ -58,7 +59,7 @@ pub fn run(network: &str, from: &str) -> Result<(), String> {
             continue;
         }
 
-        match handle_command(&client, &net.rpc_url, from, &mut nonce, line) {
+        match handle_command(&client, &net.rpc_url, from, signer, &net, &mut nonce, line) {
             Ok(true) => break, // exit
             Ok(false) => {}
             Err(e) => eprintln!("  error: {}", e),
@@ -73,6 +74,8 @@ fn handle_command(
     client: &reqwest::blocking::Client,
     rpc_url: &str,
     from: &str,
+    signer: &crate::signer::Signer,
+    net: &crate::project::NetworkConfig,
     nonce: &mut u64,
     line: &str,
 ) -> Result<bool, String> {
@@ -163,29 +166,33 @@ fn handle_command(
 
         "send" => {
             let (addr, method, method_args) = parse_call_args(args)?;
+            let to = parse_hex_address(&addr)?;
             let selector = compute_selector(&method);
             let mut calldata = selector.to_be_bytes().to_vec();
             for arg in &method_args {
                 calldata.extend_from_slice(&encode_arg(arg));
             }
-            let calldata_hex = format!("0x{}", hex::encode(&calldata));
 
-            let params = serde_json::json!({
-                "from": from,
-                "to": addr,
-                "data": calldata_hex,
-                "gas": 100_000_000,
-                "nonce": *nonce,
-                "value": "0",
-            });
-            let result = rpc_call(client, rpc_url, "pyde_sendTransaction", &[params])?;
-            let tx_hash = if let Some(obj) = result.as_str() {
-                if let Ok(inner) = serde_json::from_str::<serde_json::Value>(obj) {
-                    inner.get("txHash").and_then(|v| v.as_str())
-                        .unwrap_or(obj).to_string()
-                } else { obj.to_string() }
-            } else { result.to_string() };
-            println!("  tx: {}", tx_hash);
+            // Build, sign, and send transaction
+            let mut tx = pyde_tx::types::Transaction {
+                from: signer.address,
+                to,
+                value: 0,
+                data: calldata,
+                gas_limit: 100_000_000,
+                nonce: *nonce,
+                signature: vec![],
+                fee_payer: pyde_tx::types::FeePayer::Sender,
+                access_list: vec![],
+                deadline: None,
+                chain_id: net.chain_id,
+                tx_type: pyde_tx::types::TransactionType::Standard,
+            };
+            signer.sign_transaction(&mut tx)?;
+            let tx_hex = format!("0x{}", hex::encode(tx.to_bytes()));
+            let result = rpc_call(client, rpc_url, "pyde_sendRawTransaction", &[serde_json::json!(tx_hex)])?;
+            let tx_hash = result.as_str().unwrap_or("").to_string();
+            println!("  tx: {} (signed ✓)", tx_hash);
             *nonce += 1;
         }
 
@@ -198,6 +205,15 @@ fn handle_command(
 }
 
 /// Parse `<address> <method>(<arg1>, <arg2>)` into components.
+fn parse_hex_address(s: &str) -> Result<[u8; 32], String> {
+    let hex = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(hex).map_err(|e| format!("invalid address hex: {}", e))?;
+    if bytes.len() != 32 { return Err(format!("address must be 32 bytes, got {}", bytes.len())); }
+    let mut addr = [0u8; 32];
+    addr.copy_from_slice(&bytes);
+    Ok(addr)
+}
+
 fn parse_call_args(input: &str) -> Result<(String, String, Vec<String>), String> {
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     if parts.len() < 2 {
@@ -331,6 +347,77 @@ pub fn cmd_call(address: &str, function: &str, network: &str) -> Result<(), Stri
         println!("  {}", hex);
     }
     Ok(())
+}
+
+/// `pyde-dev send <address> <function> --network devnet`
+/// Signed state-changing transaction.
+pub fn cmd_send(address: &str, function: &str, network: &str, signer: &crate::signer::Signer, value: u128) -> Result<(), String> {
+    let (config, _) = crate::project::load_config()?;
+    let net = config.networks.get(network)
+        .ok_or_else(|| format!("network '{}' not found in pyde.toml", network))?;
+
+    let to = parse_hex_address(address)?;
+    let (method, method_args) = parse_function(function)?;
+    let selector = compute_selector(&method);
+    let mut calldata = selector.to_be_bytes().to_vec();
+    for arg in &method_args {
+        calldata.extend_from_slice(&encode_arg(arg));
+    }
+
+    // Get nonce
+    let client = reqwest::blocking::Client::new();
+    let nonce_result = rpc_call(&client, &net.rpc_url, "pyde_getTransactionCount", &[serde_json::json!(signer.address_hex())])?;
+    let nonce: u64 = nonce_result.as_str().unwrap_or("0").parse().unwrap_or(0);
+
+    // Build and sign
+    let mut tx = pyde_tx::types::Transaction {
+        from: signer.address,
+        to,
+        value,
+        data: calldata,
+        gas_limit: 100_000_000,
+        nonce,
+        signature: vec![],
+        fee_payer: pyde_tx::types::FeePayer::Sender,
+        access_list: vec![],
+        deadline: None,
+        chain_id: net.chain_id,
+        tx_type: pyde_tx::types::TransactionType::Standard,
+    };
+    signer.sign_transaction(&mut tx)?;
+
+    // Send signed tx
+    let tx_hex = format!("0x{}", hex::encode(tx.to_bytes()));
+    let result = rpc_call(&client, &net.rpc_url, "pyde_sendRawTransaction", &[serde_json::json!(tx_hex)])?;
+    let tx_hash = result.as_str().unwrap_or("").to_string();
+
+    println!("  Tx Hash: {} (signed ✓)", tx_hash);
+    println!("  From:    {}", signer.address_hex());
+    println!("  To:      {}", address);
+    println!("  Method:  {}", method);
+
+    // Wait for receipt
+    let receipt_body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "pyde_getTransactionReceipt",
+        "params": [tx_hash]
+    });
+    for attempt in 0..50 {
+        if attempt > 0 { std::thread::sleep(std::time::Duration::from_millis(100)); }
+        let resp = client.post(&net.rpc_url).json(&receipt_body).send()
+            .map_err(|e| format!("RPC error: {}", e))?;
+        let json: serde_json::Value = resp.json().map_err(|e| format!("invalid response: {}", e))?;
+        if let Some(result) = json.get("result") {
+            if !result.is_null() {
+                let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                println!("  Success: {}", success);
+                let gas = result.get("gasUsed").and_then(|v| v.as_str()).unwrap_or("0");
+                println!("  Gas:     {}", gas);
+                return if success { Ok(()) } else { Err("transaction reverted".into()) };
+            }
+        }
+    }
+    Err("receipt not available after 5s".into())
 }
 
 /// `pyde-dev tx <hash> --network devnet`
