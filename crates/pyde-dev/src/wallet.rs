@@ -26,7 +26,7 @@ pub struct Wallet {
     pub name: String,
     pub address: [u8; 32],
     pub public_key: FalconPublicKey,
-    secret_key: FalconSecretKey,
+    pub(crate) secret_key: FalconSecretKey,
 }
 
 impl Wallet {

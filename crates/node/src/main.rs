@@ -43,6 +43,7 @@ fn main() {
             log_json,
             metrics_port,
             rpc_port,
+            dev,
             bootstrap,
         } => {
             // Load config from file (if provided) or use defaults
@@ -68,6 +69,7 @@ fn main() {
                 &bootstrap,
             );
             config.rpc.port = rpc_port;
+            if dev { config.node.dev_mode = true; }
 
             // Initialize logging first
             logging::init(&config.logging.level, config.logging.json);

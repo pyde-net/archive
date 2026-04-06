@@ -44,6 +44,10 @@ pub enum Command {
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
 
+        /// Enable dev mode (allows unsigned pyde_sendTransaction, auto-mine).
+        #[arg(long)]
+        dev: bool,
+
         /// Bootstrap peer addresses (multiaddr).
         #[arg(long)]
         bootstrap: Vec<String>,

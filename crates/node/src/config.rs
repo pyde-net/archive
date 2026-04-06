@@ -29,6 +29,9 @@ pub struct NodeSection {
     pub chain_id: u64,
     /// Data directory for state, keys, etc.
     pub datadir: PathBuf,
+    /// Dev mode: allows unsigned pyde_sendTransaction.
+    #[serde(default)]
+    pub dev_mode: bool,
 }
 
 impl Default for NodeSection {
@@ -37,6 +40,7 @@ impl Default for NodeSection {
             role: "full".into(),
             chain_id: 31337,
             datadir: default_datadir(),
+            dev_mode: false,
         }
     }
 }
