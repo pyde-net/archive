@@ -13,6 +13,8 @@ Rust SDK for interacting with the Pyde blockchain. Async RPC client, FALCON-512 
   - [Chain Queries](#chain-queries)
   - [Account Queries](#account-queries)
   - [Block Queries](#block-queries)
+  - [Transaction Lookup](#transaction-lookup)
+  - [Fee Data](#fee-data)
   - [Static Calls](#static-calls)
   - [Gas Estimation](#gas-estimation)
 - [Wallet](#wallet)
@@ -42,12 +44,14 @@ Rust SDK for interacting with the Pyde blockchain. Async RPC client, FALCON-512 
   - [Simulating Calls](#simulating-calls)
   - [Gas Estimation (ABI-Aware)](#gas-estimation-abi-aware)
   - [Payable Functions](#payable-functions)
+  - [Decoding Write Return Data](#decoding-write-return-data)
   - [The Value Enum](#the-value-enum)
   - [Decoding Return Values](#decoding-return-values)
 - [Events & Logs](#events--logs)
 - [Error Handling](#error-handling)
   - [Error Variants](#error-variants)
   - [Pattern Matching](#pattern-matching)
+- [Hex Utilities](#hex-utilities)
 - [Security](#security)
   - [Keystore Encryption](#keystore-encryption)
   - [File Permissions](#file-permissions)
@@ -147,6 +151,27 @@ let block = provider.get_block_by_number(42).await?;  // Option<BlockHeader>
 if let Some(b) = block {
     println!("Slot: {}, Proposer: {}", b.slot, b.proposer);
 }
+```
+
+### Transaction Lookup
+
+```rust
+let tx = provider.get_transaction(&tx_hash).await?; // Option<serde_json::Value>
+if let Some(tx) = tx {
+    println!("From: {}", tx["from"]);
+}
+```
+
+Note: `return_data` is ephemeral — only available in the receipt immediately after execution, not in transaction lookups.
+
+### Fee Data
+
+Get current network fee info (Pyde uses EIP-1559 with no tips).
+
+```rust
+let fees = provider.get_fee_data().await?;   // FeeData
+println!("Gas price: {}", fees.gas_price);    // u128 (quanta per gas)
+println!("Base fee: {}", fees.base_fee);      // same as gas_price in Pyde
 ```
 
 ### Static Calls
@@ -631,6 +656,22 @@ contract.write("set_status", Some(&json!({"status": "Unknown"})), gas).await?;
 // Error: set_status().status: unknown variant 'Unknown' for enum Status. Valid: Active, Banned
 ```
 
+### Decoding Write Return Data
+
+`Contract::write()` returns a `ContractReceipt` with `decode_return_data()` that
+auto-decodes using the ABI return type. Derefs to `Receipt` so all fields are accessible.
+
+```rust
+let receipt = contract.write("deposit", Some(&json!({"amount": 500})), gas).await?;
+println!("Success: {}", receipt.success);           // Receipt field via Deref
+
+let val = receipt.decode_return_data();              // Option<Value>
+// Returns None if return_data is absent or function returns ()
+```
+
+Note: `return_data` is ephemeral — only available in the receipt immediately after
+tx execution. It is not persisted on-chain.
+
 ### The Value Enum
 
 Return values are decoded into a `Value` enum supporting all Pyde types.
@@ -786,34 +827,66 @@ pub enum SdkError {
     Reverted { gas_used: u64, data: Vec<u8> },  // Tx executed but reverted
     InsufficientBalance { required: u128, available: u128 },
     InvalidAddress(String),      // Bad hex address format
+    InvalidArgument(String),     // Invalid argument to SDK method
     InvalidResponse(String),     // Malformed RPC response
 }
+
+// Helper methods
+error.code();            // "CALL_EXCEPTION", "CONNECTION_ERROR", etc.
+error.revert_reason();   // Some("require failed") — auto-decoded from return data
+error.is_revert();       // true if Reverted variant
 ```
 
 ### Pattern Matching
 
 ```rust
-match wallet.transfer(&provider, &to, amount).await {
+match contract.write("deposit", Some(&json!({"amount": 500})), gas).await {
     Ok(receipt) => {
         println!("Success! Gas: {}", receipt.gas());
+        if let Some(val) = receipt.decode_return_data() {
+            println!("Return: {:?}", val);
+        }
     }
-    Err(SdkError::Reverted { gas_used, data }) => {
-        println!("Reverted after {} gas", gas_used);
+    Err(ref e) if e.is_revert() => {
+        println!("Reverted! Reason: {:?}", e.revert_reason());
     }
-    Err(SdkError::Connection(msg)) => {
-        println!("Node unreachable: {}", msg);
-    }
-    Err(SdkError::Timeout(msg)) => {
-        println!("Timeout: {}", msg);
-    }
-    Err(SdkError::Signing(msg)) => {
-        println!("Signing error: {}", msg);
-    }
-    Err(SdkError::InsufficientBalance { required, available }) => {
-        println!("Need {} quanta but only have {}", required, available);
-    }
-    Err(e) => println!("Error: {}", e),
+    Err(SdkError::Connection(msg)) => println!("Node unreachable: {}", msg),
+    Err(SdkError::Timeout(msg)) => println!("Timeout: {}", msg),
+    Err(e) => println!("Error [{}]: {}", e.code(), e),
 }
+```
+
+---
+
+## Hex Utilities
+
+```rust
+use pyde_rust_sdk::{
+    is_hex_string, hexlify, get_bytes, to_be_hex,
+    concat_bytes, zero_pad_value, strip_zeros, data_length,
+};
+
+// Check if valid hex
+is_hex_string("0xdeadbeef");                  // true
+is_hex_string("0xgg");                         // false
+
+// Convert to/from hex
+let hex = hexlify(&[0xde, 0xad]);             // "0xdead"
+let bytes = get_bytes("0xdeadbeef")?;          // Vec<u8>
+
+// BigInt to big-endian hex (with optional width)
+to_be_hex(255, None);                          // "0xff"
+to_be_hex(255, Some(4));                       // "0x000000ff"
+
+// Concatenate
+let combined = concat_bytes(&[&[0xde, 0xad], &[0xbe, 0xef]]);
+
+// Pad / strip
+let padded = zero_pad_value(&[0xff], 4)?;     // [0, 0, 0, 0xff]
+let stripped = strip_zeros(&[0, 0, 0, 0xff]); // [0xff]
+
+// Length
+data_length("0xdeadbeef");                     // 4
 ```
 
 ---

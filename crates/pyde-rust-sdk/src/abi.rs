@@ -197,14 +197,15 @@ impl<'a> Contract<'a> {
 
     /// Send a state-changing tx. Validates args, encodes, signs, sends, waits.
     /// Pass `None` for functions that take no arguments.
-    pub async fn write(&self, method: &str, args: Option<&serde_json::Value>, gas_limit: u64) -> Result<Receipt> {
+    /// Returns a `ContractReceipt` with a `decode_return_data()` method.
+    pub async fn write(&self, method: &str, args: Option<&serde_json::Value>, gas_limit: u64) -> Result<ContractReceipt> {
         self.write_with_value(method, args, 0, gas_limit).await
     }
 
     /// Send a state-changing tx with native token value. Validates payable.
     pub async fn write_with_value(
         &self, method: &str, args: Option<&serde_json::Value>, value: u128, gas_limit: u64,
-    ) -> Result<Receipt> {
+    ) -> Result<ContractReceipt> {
         let wallet = self.wallet.ok_or_else(|| SdkError::Signing(
             "No wallet connected. Use contract.connect(&wallet) first.".into()
         ))?;
@@ -220,7 +221,9 @@ impl<'a> Contract<'a> {
         }
         let empty = serde_json::json!({});
         let calldata = self.encode_call(method, args.unwrap_or(&empty))?;
-        wallet.send_call_with_value(self.provider, &self.address, calldata, value, gas_limit).await
+        let receipt = wallet.send_call_with_value(self.provider, &self.address, calldata, value, gas_limit).await?;
+        let ret_type = self.functions.get(method).map(|f| f.returns.clone()).unwrap_or_default();
+        Ok(ContractReceipt::new(receipt, ret_type))
     }
 
     // ========================================================================
@@ -574,6 +577,40 @@ impl<'a> Contract<'a> {
 
 /// Parse comma-separated tuple types, handling nested generics.
 /// e.g. "u64, Vec<String>, (u8, bool)" → ["u64", "Vec<String>", "(u8, bool)"]
+// ============================================================================
+// ContractReceipt — receipt with ABI-aware return data decoding
+// ============================================================================
+
+/// Receipt from a Contract::write() call. Extends Receipt with ABI-aware decoding.
+/// Derefs to Receipt so all receipt fields are directly accessible.
+pub struct ContractReceipt {
+    pub receipt: Receipt,
+    ret_type: String,
+}
+
+impl ContractReceipt {
+    fn new(receipt: Receipt, ret_type: String) -> Self {
+        Self { receipt, ret_type }
+    }
+
+    /// Decode returnData using the ABI return type.
+    /// Returns None if returnData is absent (ephemeral — only available right after execution).
+    pub fn decode_return_data(&self) -> Option<Value> {
+        let bytes = self.receipt.return_bytes();
+        if bytes.is_empty() { return None; }
+        if self.ret_type.is_empty() || self.ret_type == "()" || self.ret_type == "unit" { return None; }
+        // Use a dummy contract for decoding (no ABI needed for primitive types)
+        let provider = crate::client::Provider::new("http://localhost:0");
+        let contract = Contract::new([0u8; 32], &provider);
+        Some(contract.decode_value(&bytes, &self.ret_type, 0).0)
+    }
+}
+
+impl std::ops::Deref for ContractReceipt {
+    type Target = Receipt;
+    fn deref(&self) -> &Receipt { &self.receipt }
+}
+
 fn parse_tuple_types(s: &str) -> Vec<&str> {
     let mut types = Vec::new();
     let mut depth = 0i32;
