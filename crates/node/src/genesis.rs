@@ -196,29 +196,68 @@ pub fn initialize_genesis(
     Ok(block)
 }
 
-/// Create a default devnet genesis config with pre-funded accounts.
-pub fn devnet_genesis() -> GenesisConfig {
-    // 10 pre-funded accounts for development (each gets 10B PYDE)
-    // Must be large enough to cover gas_limit * base_fee for contract deploys.
-    // base_fee = 50 gwei, deploy gas ~500K → cost ~25M PYDE in quanta.
-    let ten_billion_pyde = "10000000000000000000"; // 10B PYDE in quanta (10^19)
+/// A devnet account with full keypair (for printing private keys on startup).
+pub struct DevnetAccount {
+    pub address: Address,
+    pub public_key: pyde_crypto::falcon::FalconPublicKey,
+    pub secret_key: pyde_crypto::falcon::FalconSecretKey,
+    pub balance: u128,
+}
+
+impl DevnetAccount {
+    /// Export combined private key (pk + sk) as 0x-prefixed hex.
+    /// Same format as Wallet.exportPrivateKey() in the SDKs.
+    pub fn private_key_hex(&self) -> String {
+        let mut bytes = Vec::with_capacity(897 + 1281);
+        bytes.extend_from_slice(self.public_key.as_bytes());
+        bytes.extend_from_slice(self.secret_key.as_bytes());
+        format!("0x{}", hex::encode(&bytes))
+    }
+
+    /// Address as 0x-prefixed hex.
+    pub fn address_hex(&self) -> String {
+        format!("0x{}", hex::encode(self.address))
+    }
+}
+
+/// Create a default devnet genesis config with 10 pre-funded accounts.
+/// Returns both the config AND the full keypairs (for printing private keys).
+pub fn devnet_genesis() -> (GenesisConfig, Vec<DevnetAccount>) {
+    use pyde_account::address::derive_eoa_address;
+    use pyde_crypto::falcon::falcon_keygen;
+
+    // 10M PYDE per account in quanta (10,000,000 × 10^9)
+    let ten_million_pyde: u128 = 10_000_000 * 1_000_000_000;
 
     let mut allocations = Vec::new();
-    for i in 0u8..10 {
-        let address = hex::encode([i + 1; 32]);
+    let mut accounts = Vec::new();
+
+    for _ in 0..10 {
+        let (pk, sk) = falcon_keygen().expect("FALCON keygen failed");
+        let address = derive_eoa_address(pk.as_bytes());
+
         allocations.push(GenesisAllocation {
+            address: hex::encode(address),
+            balance: ten_million_pyde.to_string(),
+            public_key: Some(hex::encode(pk.as_bytes())),
+        });
+
+        accounts.push(DevnetAccount {
             address,
-            balance: ten_billion_pyde.to_string(),
-            public_key: None,
+            public_key: pk,
+            secret_key: sk,
+            balance: ten_million_pyde,
         });
     }
 
-    GenesisConfig {
-        chain_id: 31337, // devnet chain ID
+    let config = GenesisConfig {
+        chain_id: 31337,
         timestamp: 0,
         allocations,
         validators: Vec::new(),
-    }
+    };
+
+    (config, accounts)
 }
 
 fn parse_hex_address(hex_str: &str) -> Result<Address, String> {
@@ -239,14 +278,34 @@ mod tests {
 
     #[test]
     fn devnet_genesis_has_10_accounts() {
-        let config = devnet_genesis();
+        let (config, accounts) = devnet_genesis();
         assert_eq!(config.allocations.len(), 10);
+        assert_eq!(accounts.len(), 10);
         assert_eq!(config.chain_id, 31337);
+        // Each account should have a public key
+        for alloc in &config.allocations {
+            assert!(alloc.public_key.is_some());
+        }
+        // Private keys should be restorable
+        for acc in &accounts {
+            let pk_hex = acc.private_key_hex();
+            assert!(pk_hex.starts_with("0x"));
+            assert_eq!(pk_hex.len(), 2 + (897 + 1281) * 2); // 0x + 2178 bytes hex
+        }
+    }
+
+    #[test]
+    fn devnet_genesis_balance_correct() {
+        let (_, accounts) = devnet_genesis();
+        let ten_million_pyde: u128 = 10_000_000 * 1_000_000_000;
+        for acc in &accounts {
+            assert_eq!(acc.balance, ten_million_pyde);
+        }
     }
 
     #[test]
     fn genesis_config_roundtrip() {
-        let config = devnet_genesis();
+        let (config, _) = devnet_genesis();
         let toml_str = config.to_toml();
         let parsed: GenesisConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.allocations.len(), 10);
@@ -256,35 +315,36 @@ mod tests {
     #[test]
     fn initialize_genesis_creates_state() {
         let mut state = StateManager::open(
-            &std::env::temp_dir().join("pyde-test-genesis-init"),
+            &std::env::temp_dir().join("pyde-test-genesis-init-v2"),
             1024,
         ).unwrap();
 
-        let config = devnet_genesis();
+        let (config, _) = devnet_genesis();
         let block = initialize_genesis(&mut state, &config).unwrap();
 
         assert_eq!(block.slot(), 0);
         assert!(!state.is_empty());
 
-        // Verify first account has balance (stored as full Account struct)
+        // Verify first account has balance
         let addr = parse_hex_address(&config.allocations[0].address).unwrap();
         let key = pyde_state::keys::balance_key(&addr);
         let account_bytes = state.get(&key).expect("account should exist");
         let account = pyde_account::types::Account::from_bytes(&account_bytes)
             .expect("should be a valid Account");
-        assert_eq!(account.balance, 10_000_000_000_000_000_000u128); // 10B PYDE
+        let ten_million_pyde: u128 = 10_000_000 * 1_000_000_000;
+        assert_eq!(account.balance, ten_million_pyde);
     }
 
     #[test]
     fn genesis_rejects_non_empty_state() {
         let mut state = StateManager::open(
-            &std::env::temp_dir().join("pyde-test-genesis-reject"),
+            &std::env::temp_dir().join("pyde-test-genesis-reject-v2"),
             1024,
         ).unwrap();
 
-        let config = devnet_genesis();
-        initialize_genesis(&mut state, &config).unwrap(); // first time ok
-        let result = initialize_genesis(&mut state, &config); // second time fails
+        let (config, _) = devnet_genesis();
+        initialize_genesis(&mut state, &config).unwrap();
+        let result = initialize_genesis(&mut state, &config);
         assert!(result.is_err());
     }
 

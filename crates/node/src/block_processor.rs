@@ -218,7 +218,7 @@ mod tests {
         let mut state = StateManager::open(&dir, 1024).unwrap();
 
         // Initialize genesis with funded accounts
-        let config = devnet_genesis();
+        let (config, _accounts) = devnet_genesis();
         let _genesis = initialize_genesis(&mut state, &config).unwrap();
 
         let mut chain = ChainState::genesis(state.root(), 31337);

@@ -31,7 +31,8 @@ fn main() {
             print!("{}", NodeConfig::default().to_toml());
         }
         Command::DefaultGenesis => {
-            print!("{}", genesis::devnet_genesis().to_toml());
+            let (config, _) = genesis::devnet_genesis();
+            print!("{}", config.to_toml());
         }
         Command::Run {
             role,
