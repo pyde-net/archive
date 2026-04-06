@@ -33,7 +33,7 @@ pub mod types;
 pub mod wallet;
 
 // Top-level re-exports for convenience
-pub use abi::{Contract, Value};
+pub use abi::{Contract, ContractReceipt, Value};
 pub use client::Provider;
 pub use contract::{compute_selector, ContractCall, DeployData};
 pub use contract::{
@@ -47,6 +47,7 @@ pub use types::{
     format_address, parse_address, is_valid_address, is_zero_address,
     is_valid_private_key, address_eq, ZERO_ADDRESS,
     parse_units, format_units, parse_quanta, format_quanta, PYDE_DECIMALS,
-    Address, Receipt, Log, LogFilter, BlockHeader,
+    is_hex_string, hexlify, get_bytes, to_be_hex, concat_bytes, zero_pad_value, strip_zeros, data_length,
+    Address, Receipt, Log, LogFilter, BlockHeader, FeeData,
 };
 pub use wallet::{Keystore, SignerProvider, Wallet};

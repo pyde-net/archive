@@ -54,13 +54,32 @@ impl Receipt {
     pub fn decode_u64(&self) -> Option<u64> {
         crate::contract::decode_u64(&self.return_bytes())
     }
-
+    pub fn decode_i64(&self) -> Option<i64> {
+        crate::contract::decode_i64(&self.return_bytes())
+    }
+    pub fn decode_u128(&self) -> Option<u128> {
+        crate::contract::decode_u128(&self.return_bytes())
+    }
+    pub fn decode_i128(&self) -> Option<i128> {
+        crate::contract::decode_i128(&self.return_bytes())
+    }
+    pub fn decode_u256(&self) -> Option<ethnum::U256> {
+        crate::contract::decode_u256(&self.return_bytes())
+    }
+    pub fn decode_i256(&self) -> Option<ethnum::I256> {
+        crate::contract::decode_i256(&self.return_bytes())
+    }
     pub fn decode_bool(&self) -> Option<bool> {
         crate::contract::decode_bool(&self.return_bytes())
     }
-
+    pub fn decode_address(&self) -> Option<Address> {
+        crate::contract::decode_address(&self.return_bytes())
+    }
     pub fn decode_string(&self) -> Option<String> {
         crate::contract::decode_string(&self.return_bytes())
+    }
+    pub fn decode_bytes(&self) -> Option<Vec<u8>> {
+        crate::contract::decode_bytes(&self.return_bytes())
     }
 }
 
@@ -101,6 +120,15 @@ pub struct BlockHeader {
     pub state_root: String,
     #[serde(default)]
     pub tx_count: String,
+}
+
+/// Fee data from the network.
+#[derive(Debug, Clone)]
+pub struct FeeData {
+    /// Current gas price (same as base fee in Pyde's EIP-1559 model, no tips).
+    pub gas_price: u128,
+    /// Current base fee per gas unit.
+    pub base_fee: u128,
 }
 
 /// Parse a hex address string to [u8; 32].
@@ -147,6 +175,68 @@ pub fn address_eq(a: &Address, b: &Address) -> bool {
 pub fn is_valid_private_key(hex: &str) -> bool {
     let clean = hex.trim_start_matches("0x");
     clean.len() == (897 + 1281) * 2 && clean.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+// ============================================================================
+// Hex utilities
+// ============================================================================
+
+/// Check if a string is valid hex (with or without 0x prefix).
+pub fn is_hex_string(value: &str) -> bool {
+    let hex = value.trim_start_matches("0x");
+    !hex.is_empty() && hex.len() % 2 == 0 && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Convert bytes to a 0x-prefixed hex string.
+pub fn hexlify(data: &[u8]) -> String {
+    format!("0x{}", hex::encode(data))
+}
+
+/// Convert a hex string to bytes.
+pub fn get_bytes(value: &str) -> std::result::Result<Vec<u8>, String> {
+    let hex_str = value.trim_start_matches("0x");
+    hex::decode(hex_str).map_err(|e| format!("Invalid hex: {}", e))
+}
+
+/// Convert a u128 to a 0x-prefixed big-endian hex string.
+pub fn to_be_hex(value: u128, width: Option<usize>) -> String {
+    let hex = format!("{:x}", value);
+    let padded = if let Some(w) = width {
+        format!("{:0>width$}", hex, width = w * 2)
+    } else if hex.len() % 2 != 0 {
+        format!("0{}", hex)
+    } else {
+        hex
+    };
+    format!("0x{}", padded)
+}
+
+/// Concatenate multiple byte slices.
+pub fn concat_bytes(values: &[&[u8]]) -> Vec<u8> {
+    let total: usize = values.iter().map(|v| v.len()).sum();
+    let mut result = Vec::with_capacity(total);
+    for v in values { result.extend_from_slice(v); }
+    result
+}
+
+/// Zero-pad bytes to a specific length (left-pad).
+pub fn zero_pad_value(data: &[u8], length: usize) -> std::result::Result<Vec<u8>, String> {
+    if data.len() > length { return Err(format!("Value {} bytes exceeds pad length {}", data.len(), length)); }
+    let mut padded = vec![0u8; length];
+    padded[length - data.len()..].copy_from_slice(data);
+    Ok(padded)
+}
+
+/// Strip leading zero bytes.
+pub fn strip_zeros(data: &[u8]) -> Vec<u8> {
+    let start = data.iter().position(|&b| b != 0).unwrap_or(data.len());
+    data[start..].to_vec()
+}
+
+/// Get byte length of a hex string.
+pub fn data_length(hex: &str) -> usize {
+    let h = hex.trim_start_matches("0x");
+    h.len() / 2
 }
 
 // ============================================================================

@@ -96,6 +96,20 @@ impl Provider {
         parse_hex_u64(&result)
     }
 
+    /// Look up a transaction by its hash. Returns None if not found.
+    pub async fn get_transaction(&self, tx_hash: &[u8; 32]) -> Result<Option<serde_json::Value>> {
+        let result = self.rpc("pyde_getTransactionByHash", &[
+            json_str(&format!("0x{}", hex::encode(tx_hash))),
+        ]).await?;
+        if result.is_null() { Ok(None) } else { Ok(Some(result)) }
+    }
+
+    /// Get current fee data (base fee = gas price in Pyde's EIP-1559 model).
+    pub async fn get_fee_data(&self) -> Result<FeeData> {
+        let gas_price = self.get_gas_price().await?;
+        Ok(FeeData { gas_price, base_fee: gas_price })
+    }
+
     // ========================================================================
     // Transaction submission
     // ========================================================================
