@@ -1,0 +1,93 @@
+// Advanced type patterns — tuples, array literals, array repeat, type aliases, try
+
+contract AdvancedTypes {
+    storage {
+        coordinates: Vec<u64>,
+        labels: Vec<String>,
+        matrix: Vec<Vec<u64>>,
+        last_pair: u64,
+        hash_store: Map<u256, String>,
+    }
+
+    struct Point {
+        x: u64,
+        y: u64,
+        z: u64,
+    }
+
+    event PairStored { first: u64, second: u64 }
+    event ArrayCreated { length: u64 }
+    event PointStored { x: u64, y: u64 }
+
+    error InvalidInput {}
+    error OutOfBounds { index: u64, length: u64 }
+
+    #[constructor]
+    pub fn init() {
+        self.last_pair = 0;
+    }
+
+    // === Tuple destructuring ===
+
+    pub fn store_pair(first: u64, second: u64) {
+        let (a, b) = (first, second);
+        self.coordinates.push(a);
+        self.coordinates.push(b);
+        self.last_pair = a + b;
+        emit PairStored { first: a, second: b };
+    }
+
+    pub fn swap_and_store(x: u64, y: u64) {
+        let (swapped_x, swapped_y) = (y, x);
+        self.coordinates.push(swapped_x);
+        self.coordinates.push(swapped_y);
+    }
+
+    // === Array literals ===
+
+    pub fn store_fixed_array() {
+        let arr = [10, 20, 30, 40, 50];
+        for i in 0..5 {
+            self.coordinates.push(arr[i]);
+        }
+        emit ArrayCreated { length: 5 };
+    }
+
+    // === Array repeat ===
+
+    pub fn store_zeroes(count: u64) {
+        let zeros = [0u64; 8];
+        for i in 0..count {
+            if i < 8 {
+                self.coordinates.push(zeros[i]);
+            }
+        }
+    }
+
+    // === Point struct with tuple-like access ===
+
+    pub fn store_point(x: u64, y: u64, z: u64) {
+        let p = Point { x: x, y: y, z: z };
+        self.coordinates.push(p.x);
+        self.coordinates.push(p.y);
+        self.coordinates.push(p.z);
+        emit PointStored { x: p.x, y: p.y };
+    }
+
+    // === Views ===
+
+    #[view]
+    pub fn get_coordinates() -> Vec<u64> {
+        return self.coordinates;
+    }
+
+    #[view]
+    pub fn get_last_pair() -> u64 {
+        return self.last_pair;
+    }
+
+    #[view]
+    pub fn coordinates_count() -> u64 {
+        return self.coordinates.len();
+    }
+}
