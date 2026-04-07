@@ -90,6 +90,7 @@ contract UpgradeableProxy {
     error NotPendingAdmin {}
     error AlreadyInitialized {}
     error NotInitialized {}
+    error ContractPaused {}
     error IsPaused {}
     error NotPaused {}
     error UpgradeNotScheduled {}
@@ -307,5 +308,12 @@ contract UpgradeableProxy {
     #[view]
     pub fn get_nonce() -> u64 {
         return self.nonce;
+    }
+
+    // Fallback: forward unmatched calls to the implementation contract
+    #[fallback]
+    pub fn fallback() {
+        require!(!self.paused, ContractPaused {});
+        let result = raw_call!(self.implementation, msg.data);
     }
 }

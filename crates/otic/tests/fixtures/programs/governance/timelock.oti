@@ -30,6 +30,7 @@ contract TimelockController {
         predecessor: u256,       // id of operation that must execute first (0 = none)
         salt: u256,
         scheduled_at: u64,
+        scheduled_block: u64,    // block.number when scheduled
         ready_at: u64,
         executed: bool,
         cancelled: bool,
@@ -163,6 +164,7 @@ contract TimelockController {
             predecessor: predecessor,
             salt: salt,
             scheduled_at: block.timestamp,
+            scheduled_block: block.number,
             ready_at: ready_at,
             executed: false,
             cancelled: false,
@@ -201,6 +203,7 @@ contract TimelockController {
             batch_id: batch_id,
             operation_count: targets.len(),
             scheduled_at: block.timestamp,
+            scheduled_block: block.number,
             ready_at: ready_at,
             executed: false,
             cancelled: false,

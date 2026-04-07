@@ -1,0 +1,122 @@
+// Simple factory pattern using deploy! macro
+// Demonstrates: deploy! with args, deploy! with value:, factory tracking
+
+contract SimpleToken {
+    storage {
+        name: String,
+        total_supply: u256,
+        owner: Address,
+        balances: Map<Address, u256>,
+    }
+
+    event Transfer {
+        #[indexed]
+        from: Address,
+        #[indexed]
+        to: Address,
+        amount: u256,
+    }
+
+    error InsufficientBalance { available: u256, required: u256 }
+
+    #[constructor]
+    #[payable]
+    pub fn init(name: String, supply: u256) {
+        self.name = name;
+        self.total_supply = supply;
+        self.owner = msg.sender;
+        self.balances[msg.sender] = supply;
+    }
+
+    pub fn transfer(to: Address, amount: u256) {
+        let bal = self.balances[msg.sender];
+        require!(bal >= amount, InsufficientBalance { available: bal, required: amount });
+        self.balances[msg.sender] = bal - amount;
+        self.balances[to] = self.balances[to] + amount;
+        emit Transfer { from: msg.sender, to: to, amount: amount };
+    }
+
+    #[view]
+    pub fn balance_of(addr: Address) -> u256 {
+        return self.balances[addr];
+    }
+
+    #[view]
+    pub fn get_name() -> String {
+        return self.name;
+    }
+}
+
+contract TokenFactory {
+    storage {
+        owner: Address,
+        tokens_created: u64,
+        deployed_tokens: Vec<Address>,
+        token_names: Map<Address, String>,
+    }
+
+    event TokenCreated {
+        #[indexed]
+        creator: Address,
+        token: Address,
+        name: String,
+        supply: u256,
+    }
+
+    error NotOwner {}
+
+    #[constructor]
+    pub fn init() {
+        self.owner = msg.sender;
+        self.tokens_created = 0;
+    }
+
+    // Deploy a new token using deploy! macro — with constructor args
+    pub fn create_token(name: String, supply: u256) {
+        let token = deploy!(SimpleToken, name, supply);
+        // token is now a typed SimpleToken handle
+
+        self.tokens_created = self.tokens_created + 1;
+        self.deployed_tokens.push(address(token));
+        self.token_names[address(token)] = name;
+
+        emit TokenCreated {
+            creator: msg.sender,
+            token: address(token),
+            name: name,
+            supply: supply,
+        };
+    }
+
+    // Deploy with value — payable constructor gets funded
+    #[payable]
+    pub fn create_funded_token(name: String, supply: u256) {
+        let token = deploy!(SimpleToken, name, supply, value: msg.value);
+
+        self.tokens_created = self.tokens_created + 1;
+        self.deployed_tokens.push(address(token));
+        self.token_names[address(token)] = name;
+
+        emit TokenCreated {
+            creator: msg.sender,
+            token: address(token),
+            name: name,
+            supply: supply,
+        };
+    }
+
+    #[view]
+    pub fn get_tokens_created() -> u64 {
+        return self.tokens_created;
+    }
+
+    #[view]
+    pub fn get_deployed_tokens() -> Vec<Address> {
+        return self.deployed_tokens;
+    }
+
+    #[view]
+    pub fn get_token_name(token: Address) -> String {
+        return self.token_names[token];
+    }
+}
