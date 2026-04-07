@@ -1,0 +1,181 @@
+// Kitchen sink contract — exercises all remaining Otigen features
+// Covers: deploy!, assert!, block.number, i128, i256, tuples,
+// array literals, { value: expr }, msg.data, type patterns
+
+contract KitchenSink {
+    storage {
+        owner: Address,
+        counter: u64,
+        signed_val: i64,
+        wide_signed: i128,
+        huge_signed: i256,
+        last_block: u64,
+        deployed_child: Address,
+        total_received: u256,
+        scores: Vec<u64>,
+    }
+
+    struct Pair {
+        first: u64,
+        second: u64,
+    }
+
+    struct SignedData {
+        offset: i128,
+        delta: i256,
+        label: String,
+    }
+
+    enum Action {
+        Deposit,
+        Withdraw,
+        Query,
+    }
+
+    event ValueSet { key: String, amount: i128 }
+    event ChildDeployed { child: Address, value_sent: u256 }
+    event Received { sender: Address, amount: u256 }
+    event ActionTaken { action: u64 }
+
+    error NotOwner {}
+    error InvalidValue { got: i128, min: i128 }
+    error AssertionFailed {}
+    error AlreadyDeployed {}
+
+    #[constructor]
+    pub fn init(initial_counter: u64) {
+        self.owner = msg.sender;
+        self.counter = initial_counter;
+        self.signed_val = -1;
+        self.wide_signed = -500;
+        self.huge_signed = -1;
+        self.last_block = block.number;
+    }
+
+    // === Signed integer operations ===
+
+    pub fn set_signed(val: i64) {
+        self.signed_val = val;
+    }
+
+    pub fn set_wide_signed(val: i128) {
+        require!(val > -1000000, InvalidValue { got: val, min: -1000000 });
+        self.wide_signed = val;
+        emit ValueSet { key: "wide_signed", amount: val };
+    }
+
+    pub fn set_huge_signed(val: i256) {
+        self.huge_signed = val;
+    }
+
+    #[view]
+    pub fn get_signed() -> i64 {
+        return self.signed_val;
+    }
+
+    #[view]
+    pub fn get_wide_signed() -> i128 {
+        return self.wide_signed;
+    }
+
+    // === Block info ===
+
+    pub fn record_block() {
+        self.last_block = block.number;
+    }
+
+    #[view]
+    pub fn get_last_block() -> u64 {
+        return self.last_block;
+    }
+
+    // === Assert macro ===
+
+    pub fn checked_increment() {
+        assert!(self.counter < 1000000);
+        self.counter = self.counter + 1;
+    }
+
+    pub fn checked_set(val: u64) {
+        assert!(val > 0);
+        assert!(val <= 1000000);
+        self.counter = val;
+    }
+
+    // === Payable with value syntax examples ===
+
+    #[payable]
+    pub fn deposit_native() {
+        let amount = msg.value as u256;
+        self.total_received = self.total_received + amount;
+        emit Received { sender: msg.sender, amount: amount };
+    }
+
+    #[receive]
+    #[payable]
+    pub fn on_receive() {
+        let amount = msg.value as u256;
+        self.total_received = self.total_received + amount;
+        emit Received { sender: msg.sender, amount: amount };
+    }
+
+    #[view]
+    pub fn get_total_received() -> u256 {
+        return self.total_received;
+    }
+
+    // === Vec operations ===
+
+    pub fn push_score(score: u64) {
+        self.scores.push(score);
+    }
+
+    pub fn pop_score() -> u64 {
+        return self.scores.pop();
+    }
+
+    #[view]
+    pub fn scores_len() -> u64 {
+        return self.scores.len();
+    }
+
+    // === Match on enum ===
+
+    pub fn take_action(action: Action) {
+        match action {
+            Action::Deposit => {
+                self.counter = self.counter + 10;
+                emit ActionTaken { action: 0 };
+            }
+            Action::Withdraw => {
+                self.counter = self.counter - 1;
+                emit ActionTaken { action: 1 };
+            }
+            Action::Query => {
+                emit ActionTaken { action: 2 };
+            }
+        }
+    }
+
+    // === Struct with signed fields ===
+
+    pub fn process_signed_data(data: SignedData) {
+        if data.offset > 0 {
+            self.wide_signed = self.wide_signed + data.offset;
+        } else {
+            self.wide_signed = self.wide_signed - (-data.offset);
+        }
+    }
+
+    // === Views ===
+
+    #[view]
+    pub fn get_counter() -> u64 {
+        return self.counter;
+    }
+
+    #[view]
+    pub fn get_owner() -> Address {
+        return self.owner;
+    }
+}

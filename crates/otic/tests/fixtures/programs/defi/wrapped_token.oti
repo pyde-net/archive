@@ -264,4 +264,16 @@ contract WrappedToken {
     pub fn is_paused() -> bool {
         return self.paused;
     }
+
+    // Receive native tokens — auto-wrap (like WETH receive())
+    #[receive]
+    #[payable]
+    pub fn receive_native() {
+        let amount = msg.value as u256;
+        require!(amount > 0, ZeroDeposit {});
+        self.balances[msg.sender] = self.balances[msg.sender] + amount;
+        self.total_supply = self.total_supply + amount;
+        self.total_deposits = self.total_deposits + amount;
+        emit Deposit { account: msg.sender, amount: amount };
+    }
 }
