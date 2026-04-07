@@ -214,7 +214,7 @@ contract FractionalOwnership {
         self.claimed_dividends[property_id][msg.sender] = total_owed;
         self.dividend_pool[property_id] -= claimable;
 
-        raw_call!(msg.sender, claimable, bytes(""));
+        raw_call!(msg.sender, value: claimable);
         emit DividendClaimed { property_id: property_id, shareholder: msg.sender, amount: claimable };
     }
 
@@ -268,7 +268,7 @@ contract FractionalOwnership {
             self.shareholder_count[property_id] -= 1;
         }
 
-        raw_call!(order.seller, total_cost, bytes(""));
+        raw_call!(order.seller, value: total_cost);
 
         emit SellOrderFilled { property_id: property_id, order_id: order_id, buyer: msg.sender };
     }

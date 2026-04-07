@@ -283,7 +283,7 @@ contract RECRegistry {
         self.bundled_sales[sale_id].buyer = msg.sender;
         self.bundled_sales[sale_id].completed = true;
 
-        raw_call!(sale.seller, msg.value, bytes(""));
+        raw_call!(sale.seller, value: msg.value);
     }
 
     #[view]

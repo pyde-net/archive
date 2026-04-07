@@ -151,7 +151,7 @@ contract NameRegistry {
         // Refund excess
         let excess = msg.value - total_cost;
         if excess > 0 {
-            raw_call!(msg.sender, excess, bytes::empty());
+            raw_call!(msg.sender, value: excess);
         }
 
         emit NameRegistered {
@@ -189,7 +189,7 @@ contract NameRegistry {
 
         let excess = msg.value - cost;
         if excess > 0 {
-            raw_call!(msg.sender, excess, bytes::empty());
+            raw_call!(msg.sender, value: excess);
         }
 
         emit NameRenewed { name_hash: name_hash, new_expiry: entry.expires_at };
@@ -292,7 +292,7 @@ contract NameRegistry {
         require!(msg.sender == self.owner, Unauthorized {});
         let amount = self.revenue;
         self.revenue = 0;
-        raw_call!(to, amount, bytes::empty());
+        raw_call!(to, value: amount);
     }
 
     pub fn set_fees(registration_fee: u256, renewal_fee: u256) {

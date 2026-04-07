@@ -204,7 +204,7 @@ contract TimeLockAdmin {
         self.executed_action_ids.push(action_id);
 
         // Execute the action
-        raw_call!(action.target, action.value, action.calldata);
+        raw_call!(action.target, action.calldata, value: action.value);
 
         emit ActionExecuted {
             action_id: action_id,

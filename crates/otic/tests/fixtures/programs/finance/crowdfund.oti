@@ -266,7 +266,7 @@ contract Crowdfund {
         self.status = CampaignStatus::Successful;
         self.withdrawn = true;
 
-        raw_call!(self.creator, self.total_raised, bytes::empty());
+        raw_call!(self.creator, value: self.total_raised);
 
         emit FundsWithdrawn {
             creator: self.creator,
@@ -296,7 +296,7 @@ contract Crowdfund {
 
         self.claimed_refunds[msg.sender] = true;
 
-        raw_call!(msg.sender, amount, bytes::empty());
+        raw_call!(msg.sender, value: amount);
 
         emit RefundClaimed { contributor: msg.sender, amount: amount };
     }

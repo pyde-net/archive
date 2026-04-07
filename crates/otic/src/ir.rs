@@ -273,8 +273,8 @@ pub enum Inst {
     /// `%dst = method_call %obj, "method", [args...]`
     MethodCall(Reg, Reg, String, Vec<Reg>),
 
-    /// `ext_call %interface_addr, "method", [(arg, type)...], return_type`
-    ExtCall(Reg, Reg, String, Vec<(Reg, Ty)>, Ty),
+    /// `ext_call %interface_addr, "method", [(arg, type)...], return_type, optional_value_reg`
+    ExtCall(Reg, Reg, String, Vec<(Reg, Ty)>, Ty, Option<Reg>),
 
     /// `%dst = hash [args...]`
     Hash(Reg, Vec<Reg>),
@@ -322,7 +322,7 @@ pub enum Inst {
 
     /// `%addr = create %deploy_blob, [constructor_args...]` — deploy a new contract.
     /// deploy_blob holds the deploy-format bytes. Returns Address.
-    CreateContract(Reg, Reg, Vec<(Reg, Ty)>),
+    CreateContract(Reg, Reg, Vec<(Reg, Ty)>, Option<Reg>),
 
     /// `br @label` — unconditional jump
     Jump(Label),
@@ -488,9 +488,11 @@ impl fmt::Display for Inst {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
                 write!(f, "{} = {}.{}({})", dst, obj, method, args_str.join(", "))
             }
-            Inst::ExtCall(dst, addr, method, args, ret_ty) => {
+            Inst::ExtCall(dst, addr, method, args, ret_ty, value_reg) => {
                 let args_str: Vec<String> = args.iter().map(|(r, t)| format!("{}:{}", r, t)).collect();
-                write!(f, "{}: {} = ext_call {}, \"{}\"({})", dst, ret_ty, addr, method, args_str.join(", "))
+                let val = value_reg.map(|r| format!("{{ value: {} }}", r)).unwrap_or_default();
+                write!(f, "{}: {} = ext_call {}, \"{}\"{}{}", dst, ret_ty, addr, method, val,
+                    if args_str.is_empty() { "()".to_string() } else { format!("({})", args_str.join(", ")) })
             }
             Inst::Hash(dst, args) => {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
@@ -533,9 +535,10 @@ impl fmt::Display for Inst {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
                 write!(f, "{} = raw_call {}({})", dst, target, args_str.join(", "))
             }
-            Inst::CreateContract(dst, blob, args) => {
+            Inst::CreateContract(dst, blob, args, value_reg) => {
                 let args_str: Vec<String> = args.iter().map(|(r, t)| format!("{}:{}", r, t)).collect();
-                write!(f, "{} = create({}, [{}])", dst, blob, args_str.join(", "))
+                let val = value_reg.map(|r| format!("{{ value: {} }}", r)).unwrap_or_default();
+                write!(f, "{} = create({}{}, [{}])", dst, blob, val, args_str.join(", "))
             }
             Inst::Jump(label) => write!(f, "jump {}", label),
             Inst::Branch(cond, then_l, else_l) => write!(f, "br {}, {}, {}", cond, then_l, else_l),

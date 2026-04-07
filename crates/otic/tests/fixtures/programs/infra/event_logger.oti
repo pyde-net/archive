@@ -356,7 +356,7 @@ contract EventLogger {
         require!(msg.sender == self.owner, Unauthorized {});
         let amount = self.revenue;
         self.revenue = 0;
-        raw_call!(to, amount, bytes::empty());
+        raw_call!(to, value: amount);
     }
 
     #[view]

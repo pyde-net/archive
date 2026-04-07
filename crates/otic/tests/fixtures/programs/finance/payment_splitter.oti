@@ -120,7 +120,7 @@ contract PaymentSplitter {
         self.released[payee] = self.released[payee] + payment;
         self.total_released = self.total_released + payment;
 
-        raw_call!(payee, payment, bytes::empty());
+        raw_call!(payee, value: payment);
 
         emit PaymentReleased { to: payee, amount: payment };
 
@@ -141,7 +141,7 @@ contract PaymentSplitter {
             if payment > 0 {
                 self.released[payee] = self.released[payee] + payment;
                 self.total_released = self.total_released + payment;
-                raw_call!(payee, payment, bytes::empty());
+                raw_call!(payee, value: payment);
                 emit PaymentReleased { to: payee, amount: payment };
             }
         }
@@ -188,7 +188,7 @@ contract PaymentSplitter {
         if final_payment > 0 {
             self.released[payee] = self.released[payee] + final_payment;
             self.total_released = self.total_released + final_payment;
-            raw_call!(payee, final_payment, bytes::empty());
+            raw_call!(payee, value: final_payment);
             emit PaymentReleased { to: payee, amount: final_payment };
         }
 

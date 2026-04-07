@@ -237,7 +237,7 @@ contract PredictionMarket {
         require!(payout > 0, NothingToClaim {});
         pos.claimed = true;
         self.positions[market_id][msg.sender] = pos;
-        raw_call!(msg.sender, payout, bytes::empty());
+        raw_call!(msg.sender, value: payout);
 
         emit WinningsClaimed {
             market_id: market_id,
@@ -251,7 +251,7 @@ contract PredictionMarket {
         let amount = self.protocol_balance;
         require!(amount > 0, NothingToClaim {});
         self.protocol_balance = 0;
-        raw_call!(to, amount, bytes::empty());
+        raw_call!(to, value: amount);
     }
 
     pub fn set_oracle(new_oracle: Address) {

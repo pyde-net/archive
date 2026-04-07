@@ -210,7 +210,7 @@ contract UpgradeableProxy {
             call_data_hash: data_hash,
         };
 
-        let result = raw_call!(self.implementation, 0, call_data);
+        let result = raw_call!(self.implementation, call_data);
         return result;
     }
 
@@ -220,7 +220,7 @@ contract UpgradeableProxy {
         require!(self.initialized, NotInitialized {});
         require!(!self.paused, IsPaused {});
 
-        let result = raw_call!(self.implementation, msg.value, call_data);
+        let result = raw_call!(self.implementation, call_data, value: msg.value);
         return result;
     }
 

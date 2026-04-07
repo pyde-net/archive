@@ -210,7 +210,7 @@ contract RoyaltyNFT {
         require!(amount > 0, NoPendingRoyalties {});
 
         self.pending_royalties[msg.sender] = 0;
-        raw_call!(msg.sender, amount, bytes(""));
+        raw_call!(msg.sender, value: amount);
 
         emit RoyaltyWithdrawn { recipient: msg.sender, amount: amount };
     }

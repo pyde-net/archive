@@ -990,7 +990,7 @@ impl TypeChecker {
                 }
             }
 
-            Expr::Call(callee, args, span) => {
+            Expr::Call(callee, args, call_value, span) => {
                 // Infer all argument types
                 let arg_types: Vec<Ty> = args.iter().map(|arg| self.infer_expr(arg)).collect();
 
@@ -1236,19 +1236,7 @@ impl TypeChecker {
                                 ("bytes", "new" | "empty" | "from_hex") => Ty::Bytes,
                                 ("String", "new") => Ty::StringTy,
                                 // Interface::at(addr) → callable handle
-                                // Interface::at(addr) → callable handle (no value)
-                                // Interface::at_payable(addr, value) → callable handle (with value)
                                 (_, "at") => Ty::Unknown,
-                                (_, "at_payable") => {
-                                    if arg_types.len() != 2 {
-                                        self.error(
-                                            "at_payable() takes 2 arguments (address, value)"
-                                                .into(),
-                                            *span,
-                                        );
-                                    }
-                                    Ty::Unknown
-                                }
                                 // std::signature module
                                 ("signature", "verify") => Ty::Bool,
                                 ("signature", "recover") => Ty::Address,

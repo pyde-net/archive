@@ -1403,10 +1403,32 @@ impl Vm {
                 balances: self.ctx.balances.clone(),
             }
         } else {
+            // r8 holds the call value if bit 13 of immediate is set (convention from codegen)
+            let has_value = (d.rs2_or_imm >> 13) & 1 == 1;
+            let cv = if has_value { U256::from(self.cpu.read_gp(8)) } else { U256::ZERO };
+
+            // Transfer value: debit caller, credit callee
+            let mut balances = self.ctx.balances.clone();
+            if cv > U256::ZERO {
+                let caller_addr = self.ctx.self_address;
+                let caller_bal = balances.get(&caller_addr).copied().unwrap_or(U256::ZERO);
+                if caller_bal < cv {
+                    // Insufficient balance — return failed call result
+                    return Ok(CallResult {
+                        success: false,
+                        return_data: Vec::new(),
+                        gas_used: 0,
+                    });
+                }
+                balances.insert(caller_addr, caller_bal - cv);
+                let target_bal = balances.get(&target_addr).copied().unwrap_or(U256::ZERO);
+                balances.insert(target_addr, target_bal + cv);
+            }
+
             ExecutionContext {
                 caller: self.ctx.self_address,
                 self_address: target_addr,
-                call_value: U256::ZERO,
+                call_value: cv,
                 block_number: self.ctx.block_number,
                 timestamp: self.ctx.timestamp,
                 gas_price: self.ctx.gas_price,
@@ -1415,7 +1437,7 @@ impl Vm {
                 tx_hash: self.ctx.tx_hash,
                 block_proposer: self.ctx.block_proposer,
                 block_hashes: self.ctx.block_hashes.clone(),
-                balances: self.ctx.balances.clone(),
+                balances,
             }
         };
 
@@ -1579,10 +1601,24 @@ impl Vm {
         };
         let max_forward = available_gas - (available_gas / 64);
 
+        // Read deploy value from r8 (same convention as CallExt)
+        let cv = U256::from(self.cpu.read_gp(8));
+        let mut balances = self.ctx.balances.clone();
+        if cv > U256::ZERO {
+            let caller_addr = self.ctx.self_address;
+            let caller_bal = balances.get(&caller_addr).copied().unwrap_or(U256::ZERO);
+            if caller_bal < cv {
+                return Err(Trap::MemoryFault); // insufficient balance for deploy value
+            }
+            balances.insert(caller_addr, caller_bal - cv);
+            let target_bal = balances.get(&new_addr).copied().unwrap_or(U256::ZERO);
+            balances.insert(new_addr, target_bal + cv);
+        }
+
         let child_ctx = ExecutionContext {
             caller: self.ctx.self_address,
             self_address: new_addr,
-            call_value: U256::ZERO,
+            call_value: cv,
             block_number: self.ctx.block_number,
             timestamp: self.ctx.timestamp,
             gas_price: self.ctx.gas_price,
@@ -1591,7 +1627,7 @@ impl Vm {
             tx_hash: self.ctx.tx_hash,
             block_proposer: self.ctx.block_proposer,
             block_hashes: self.ctx.block_hashes.clone(),
-            balances: self.ctx.balances.clone(),
+            balances,
         };
 
         // Run constructor if present

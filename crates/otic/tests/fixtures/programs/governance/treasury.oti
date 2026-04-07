@@ -237,7 +237,7 @@ contract Treasury {
 
         // Execute transfer
         if proposal.token == Address::ZERO {
-            raw_call!(proposal.recipient, proposal.amount, bytes(""));
+            raw_call!(proposal.recipient, value: proposal.amount);
         } else {
             let erc20 = IERC20::at(proposal.token);
             erc20.transfer(proposal.recipient, proposal.amount);
@@ -313,7 +313,7 @@ contract Treasury {
             allowance.total_claimed + claim_amount;
 
         if token == Address::ZERO {
-            raw_call!(msg.sender, claim_amount, bytes(""));
+            raw_call!(msg.sender, value: claim_amount);
         } else {
             let erc20 = IERC20::at(token);
             erc20.transfer(msg.sender, claim_amount);
@@ -340,7 +340,7 @@ contract Treasury {
         require!(self.emergency_mode, NotEmergencyMode {});
 
         if token == Address::ZERO {
-            raw_call!(recipient, amount, bytes(""));
+            raw_call!(recipient, value: amount);
         } else {
             let erc20 = IERC20::at(token);
             erc20.transfer(recipient, amount);

@@ -377,7 +377,7 @@ contract NftBattle {
         let payout = self.entry_fee * 2 - (self.entry_fee / PRIZE_FEE_DIVISOR);
         if self.prize_pool >= payout {
             self.prize_pool = self.prize_pool - payout;
-            raw_call!(winner_owner, payout, bytes::empty());
+            raw_call!(winner_owner, value: payout);
         }
 
         emit BattleResolved {

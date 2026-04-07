@@ -312,7 +312,7 @@ contract SwapRouter {
         require!(amount_in > 0u256, ZeroAmount {});
 
         // Wrap native token — payable external call
-        IWPYDE::at_payable(self.wpyde, amount_in).deposit();
+        IWPYDE::at(self.wpyde).deposit{ value: amount_in }();
 
         let net_amount = self.deduct_router_fee(self.wpyde, amount_in);
 
@@ -367,7 +367,7 @@ contract SwapRouter {
 
         // Unwrap and send native
         raw_call!(self.wpyde, "withdraw(uint256)", wpyde_out);
-        raw_call!(msg.sender, wpyde_out);
+        raw_call!(msg.sender, value: wpyde_out);
 
         self.total_swaps = self.total_swaps + 1u256;
 

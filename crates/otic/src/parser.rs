@@ -988,12 +988,22 @@ impl Parser {
                         self.expect_ident()?
                     };
 
-                    // Check for method call: expr.field(args)
-                    if self.at(&TokenKind::LParen) {
+                    // Check for method call: expr.field(args) or expr.field{ value: v }(args)
+                    // Lookahead: only treat { as value annotation if tokens are { value :
+                    let has_value_annotation = self.at(&TokenKind::LBrace)
+                        && self.lookahead_is_value_annotation();
+                    if has_value_annotation || self.at(&TokenKind::LParen) {
+                        let call_value = if has_value_annotation {
+                            let v = self.parse_call_value_annotation()?;
+                            Some(Box::new(v))
+                        } else {
+                            None
+                        };
                         let args = self.parse_call_args()?;
                         expr = Expr::Call(
                             Box::new(Expr::FieldAccess(Box::new(expr), field, span)),
                             args,
+                            call_value,
                             span,
                         );
                     } else {
@@ -1012,13 +1022,38 @@ impl Parser {
                 TokenKind::LParen => {
                     let span = self.peek_span();
                     let args = self.parse_call_args()?;
-                    expr = Expr::Call(Box::new(expr), args, span);
+                    expr = Expr::Call(Box::new(expr), args, None, span);
                 }
                 _ => break,
             }
         }
 
         Ok(expr)
+    }
+
+    /// Check if the next tokens are `{ value :` (lookahead without consuming).
+    fn lookahead_is_value_annotation(&self) -> bool {
+        // Current token is `{`. Check if next is ident "value" and after that is `:`.
+        if self.pos + 2 >= self.tokens.len() { return false; }
+        let next = &self.tokens[self.pos + 1];
+        let after = &self.tokens[self.pos + 2];
+        matches!(&next.kind, TokenKind::Ident(name) if name == "value")
+            && matches!(after.kind, TokenKind::Colon)
+    }
+
+    /// Parse `{ value: expr }` annotation for payable calls.
+    fn parse_call_value_annotation(&mut self) -> Result<Expr, ()> {
+        self.expect(&TokenKind::LBrace)?;
+        let ident = self.expect_ident()?;
+        if ident.name != "value" {
+            self.error(format!("expected 'value' in call annotation, got '{}'", ident.name));
+            self.expect(&TokenKind::RBrace)?;
+            return Ok(Expr::Literal(Literal::Int(ethnum::U256::ZERO), ident.span));
+        }
+        self.expect(&TokenKind::Colon)?;
+        let value_expr = self.parse_expr()?;
+        self.expect(&TokenKind::RBrace)?;
+        Ok(value_expr)
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, ()> {
@@ -1133,7 +1168,7 @@ impl Parser {
             // Path followed by call: IERC20::at(token)
             if self.at(&TokenKind::LParen) {
                 let args = self.parse_call_args()?;
-                return Ok(Expr::Call(Box::new(Expr::Path(segments, span)), args, span));
+                return Ok(Expr::Call(Box::new(Expr::Path(segments, span)), args, None, span));
             }
 
             // Path followed by struct init: MyStruct { ... }
@@ -1647,7 +1682,7 @@ contract Token {
         if let Item::Contract(c) = &file.items[0] {
             if let ContractItem::Function(f) = &c.items[0] {
                 if let Stmt::Let(l) = &f.body.stmts[0] {
-                    assert!(matches!(l.initializer, Expr::Call(_, _, _)));
+                    assert!(matches!(l.initializer, Expr::Call(_, _, _, _)));
                 }
             }
         }
@@ -1862,7 +1897,7 @@ contract Token {
             if let ContractItem::Function(f) = &c.items[0] {
                 if let Stmt::Let(l) = &f.body.stmts[0] {
                     // Should be Call(FieldAccess(Binary(a, +, b), sqrt), [])
-                    assert!(matches!(l.initializer, Expr::Call(_, _, _)));
+                    assert!(matches!(l.initializer, Expr::Call(_, _, _, _)));
                 }
             }
         }

@@ -253,7 +253,7 @@ contract TimelockController {
         }
 
         self.operations[id].executed = true;
-        raw_call!(op.target, op.value, op.calldata);
+        raw_call!(op.target, op.calldata, value: op.value);
 
         emit OperationExecuted { id: id };
     }
@@ -281,7 +281,7 @@ contract TimelockController {
             }
 
             self.operations[op_id].executed = true;
-            raw_call!(op.target, op.value, op.calldata);
+            raw_call!(op.target, op.calldata, value: op.value);
             emit OperationExecuted { id: op_id };
         }
 

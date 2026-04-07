@@ -207,9 +207,9 @@ contract NFTAuction {
             let fee = (auction.highest_bid * self.fee_percent) / 10000;
             let seller_amount = auction.highest_bid - fee;
 
-            raw_call!(auction.seller, seller_amount, bytes(""));
+            raw_call!(auction.seller, value: seller_amount);
             if fee > 0 {
-                raw_call!(self.fee_recipient, fee, bytes(""));
+                raw_call!(self.fee_recipient, value: fee);
             }
 
             // Transfer NFT to winner
@@ -243,7 +243,7 @@ contract NFTAuction {
         require!(amount > 0, NoPendingReturn {});
 
         self.pending_returns[auction_id][msg.sender] = 0;
-        raw_call!(msg.sender, amount, bytes(""));
+        raw_call!(msg.sender, value: amount);
 
         emit BidRefunded { auction_id: auction_id, bidder: msg.sender, amount: amount };
     }

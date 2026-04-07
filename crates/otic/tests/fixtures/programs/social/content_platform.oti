@@ -228,7 +228,7 @@ contract ContentPlatform {
         let earnings = self.creator_earnings[msg.sender];
         require!(earnings > 0, NoEarnings {});
         self.creator_earnings[msg.sender] = 0;
-        raw_call!(msg.sender, earnings, bytes(""));
+        raw_call!(msg.sender, value: earnings);
         emit EarningsWithdrawn { creator: msg.sender, amount: earnings };
     }
 

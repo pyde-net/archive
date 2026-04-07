@@ -276,7 +276,7 @@ contract ShippingContract {
 
         let amount = self.escrow_balances[order_id];
         self.escrow_balances[order_id] = 0;
-        raw_call!(order.carrier, amount, bytes(""));
+        raw_call!(order.carrier, value: amount);
 
         self.carrier_registry[order.carrier].completed_shipments += 1;
         emit EscrowReleased { order_id: order_id, amount: amount };
@@ -307,7 +307,7 @@ contract ShippingContract {
         self.insurance_policies[order_id].claim_amount = payout;
         self.insurance_pool -= payout;
 
-        raw_call!(self.orders[order_id].shipper, payout, bytes(""));
+        raw_call!(self.orders[order_id].shipper, value: payout);
         emit InsuranceClaimed { order_id: order_id, claim_amount: payout };
     }
 

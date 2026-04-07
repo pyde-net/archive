@@ -326,7 +326,7 @@ contract ScholarshipFund {
         self.grants[scholarship_id][recipient].total_disbursed += d.amount;
         self.total_disbursed += d.amount;
 
-        raw_call!(recipient, d.amount, bytes(""));
+        raw_call!(recipient, value: d.amount);
 
         emit DisbursementPaid {
             scholarship_id: scholarship_id,

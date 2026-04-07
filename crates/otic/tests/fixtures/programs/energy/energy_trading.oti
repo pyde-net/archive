@@ -291,7 +291,7 @@ contract EnergyTrading {
         self.consumer_profiles[buy.maker].total_spent += total_cost;
         self.total_energy_traded_kwh += fill_amount;
 
-        raw_call!(sell.maker, seller_payment, bytes(""));
+        raw_call!(sell.maker, value: seller_payment);
 
         emit TradeExecuted {
             trade_id: trade_id,

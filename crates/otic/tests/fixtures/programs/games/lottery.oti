@@ -126,7 +126,7 @@ contract Lottery {
         // Refund overpayment
         let excess = msg.value - cost;
         if excess > 0 {
-            raw_call!(msg.sender, excess, bytes::empty());
+            raw_call!(msg.sender, value: excess);
         }
 
         emit TicketPurchased {
@@ -160,7 +160,7 @@ contract Lottery {
         self.accumulated_fees = self.accumulated_fees + fee;
 
         // Transfer winnings
-        raw_call!(winner, payout, bytes::empty());
+        raw_call!(winner, value: payout);
 
         // Record results
         self.past_winners[self.round_id] = winner;
@@ -180,7 +180,7 @@ contract Lottery {
         let amount = self.accumulated_fees;
         require!(amount > 0, NoFeesToWithdraw {});
         self.accumulated_fees = 0;
-        raw_call!(to, amount, bytes::empty());
+        raw_call!(to, value: amount);
         emit FeesWithdrawn { to: to, amount: amount };
     }
 

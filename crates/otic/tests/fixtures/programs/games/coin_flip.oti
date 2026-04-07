@@ -173,7 +173,7 @@ contract CoinFlip {
             self.bankroll = self.bankroll - payout;
             self.total_paid_out = self.total_paid_out + payout;
             self.player_total_won[flip.player] = self.player_total_won[flip.player] + payout;
-            raw_call!(flip.player, payout, bytes::empty());
+            raw_call!(flip.player, value: payout);
         }
 
         self.flips[flip_id] = flip;
@@ -220,7 +220,7 @@ contract CoinFlip {
             self.bankroll = self.bankroll - payout;
             self.total_paid_out = self.total_paid_out + payout;
             self.player_total_won[flip.player] = self.player_total_won[flip.player] + payout;
-            raw_call!(flip.player, payout, bytes::empty());
+            raw_call!(flip.player, value: payout);
         }
 
         self.flips[flip_id] = flip;
@@ -255,7 +255,7 @@ contract CoinFlip {
         require!(self.bankroll - amount >= max_liability, WithdrawalExceedsSafety {});
 
         self.bankroll = self.bankroll - amount;
-        raw_call!(msg.sender, amount, bytes::empty());
+        raw_call!(msg.sender, value: amount);
         emit BankrollWithdrawn { amount: amount };
     }
 

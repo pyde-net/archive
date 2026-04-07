@@ -283,7 +283,7 @@ contract NFTMarketplace {
         require!(amount > 0, NothingToWithdraw {});
 
         self.proceeds[msg.sender] = 0;
-        raw_call!(msg.sender, amount, bytes(""));
+        raw_call!(msg.sender, value: amount);
 
         emit ProceedsWithdrawn { user: msg.sender, amount: amount };
     }

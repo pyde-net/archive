@@ -254,7 +254,7 @@ contract DAO {
         self.proposals[proposal_id].executed = true;
 
         // Execute the proposal action
-        raw_call!(proposal.target, proposal.value, proposal.calldata);
+        raw_call!(proposal.target, proposal.calldata, value: proposal.value);
 
         emit ProposalExecuted { id: proposal_id };
     }
