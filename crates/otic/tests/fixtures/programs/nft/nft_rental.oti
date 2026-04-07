@@ -280,7 +280,7 @@ contract NFTRental {
         // Return collateral + any refund to renter
         let renter_return = rental.collateral + refund;
         if renter_return > 0 {
-            raw_call!(rental.renter, renter_return, bytes(""));
+            raw_call!(rental.renter, value: renter_return);
         }
 
         if refund > 0 {
@@ -315,7 +315,7 @@ contract NFTRental {
         require!(amount > 0, NothingToWithdraw {});
 
         self.earnings[msg.sender] = 0;
-        raw_call!(msg.sender, amount, bytes(""));
+        raw_call!(msg.sender, value: amount);
 
         emit EarningsWithdrawn { user: msg.sender, amount: amount };
     }
@@ -326,7 +326,7 @@ contract NFTRental {
         require!(amount > 0, NothingToWithdraw {});
 
         self.accumulated_fees = 0;
-        raw_call!(self.fee_recipient, amount, bytes(""));
+        raw_call!(self.fee_recipient, value: amount);
     }
 
     #[view]

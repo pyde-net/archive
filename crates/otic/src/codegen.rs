@@ -2002,7 +2002,7 @@ impl CodeGen {
                 }
             }
 
-            Inst::ExtCall(dst, addr, method, args, ret_ty) => {
+            Inst::ExtCall(dst, addr, method, args, ret_ty, value_reg) => {
                 let wide_return = is_wide_type(ret_ty);
                 let blob_return = matches!(ret_ty, Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_));
                 let ra = self.get_reg(*addr);
@@ -2011,17 +2011,21 @@ impl CodeGen {
                 self.emit_op(Opcode::Push, 12, 0, 0); // save r12 = calldata start
 
                 // Write calldata to heap: [selector(4 BE bytes)][arg0][arg1]...
-                let selector = compute_selector(method);
-                let sel_be = selector.to_be_bytes();
-                let sel_as_le_u32 = u32::from_le_bytes(sel_be);
-                self.load_u32_to_reg(15, sel_as_le_u32);
-                let sel_imm = encode_mem_immediate(0, MemWidth::W32).unwrap();
-                self.emit(encode(Opcode::Store, 15, 12, sel_imm));
+                // Empty method = value-only transfer (no selector, triggers #[receive])
+                let has_selector = !method.is_empty();
+                if has_selector {
+                    let selector = compute_selector(method);
+                    let sel_be = selector.to_be_bytes();
+                    let sel_as_le_u32 = u32::from_le_bytes(sel_be);
+                    self.load_u32_to_reg(15, sel_as_le_u32);
+                    let sel_imm = encode_mem_immediate(0, MemWidth::W32).unwrap();
+                    self.emit(encode(Opcode::Store, 15, 12, sel_imm));
+                }
 
-                // Write args after selector (offset 4)
+                // Write args after selector (offset 4 if selector, 0 if no selector)
                 // GP args: 8 bytes via Store. Wide args: 32 bytes via Wstore.
                 // Blob args (String, Vec, Struct, Bytes): [byte_len:8][flat data].
-                let mut arg_offset: i32 = 4;
+                let mut arg_offset: i32 = if has_selector { 4 } else { 0 };
                 let mut has_blob_args = false;
                 for (arg, ty) in args.iter() {
                     let is_blob = matches!(ty,
@@ -2120,6 +2124,17 @@ impl CodeGen {
                 let imm = (14 & 0xF)           // len_reg = r14
                     | ((15 & 0xF) << 4)         // gas_reg = r15
                     | ((13 & 0xF) << 8); // result_reg = r13
+                // Load call value into r8 (convention: r8 = msg.value for child)
+                // Only set r8 if value is explicitly provided — otherwise leave it alone
+                let has_value = value_reg.is_some();
+                if let Some(val_vreg) = value_reg {
+                    let val_r = self.get_reg(*val_vreg);
+                    if val_r != 8 {
+                        self.emit_op(Opcode::Add, 8, val_r, 0); // r8 = value
+                    }
+                }
+                // Add value flag to immediate
+                let imm = imm | if has_value { 1 << 13 } else { 0 };
                 // Save r13 (spill base) — CallExt overwrites it with success flag
                 self.emit_op(Opcode::Push, 13, 0, 0);
                 self.emit_op(Opcode::CallExt, ra, 12, imm);
@@ -2217,7 +2232,7 @@ impl CodeGen {
                 }
             }
 
-            Inst::CreateContract(dst, blob_reg, args) => {
+            Inst::CreateContract(dst, blob_reg, args, value_reg) => {
                 // The blob register holds an IrConst::Bytes value.
                 // At codegen time, the Const handler has already written the blob to heap.
                 // blob_reg points to the heap location of the deploy-format bytes.
@@ -2292,6 +2307,13 @@ impl CodeGen {
                 }
 
                 // Create: wd = new address, rs1 = blob pointer (r15), imm[3:0] = length register (r14)
+                // Load value into r8 if provided (same convention as CallExt)
+                if let Some(val_vreg) = value_reg {
+                    let val_r = self.get_reg(*val_vreg);
+                    if val_r != 8 {
+                        self.emit_op(Opcode::Add, 8, val_r, 0);
+                    }
+                }
                 self.emit_op(Opcode::Create, wd, 15, 14 & 0xF);
             }
 

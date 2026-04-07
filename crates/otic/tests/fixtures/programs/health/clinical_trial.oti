@@ -301,7 +301,7 @@ contract ClinicalTrial {
         self.trials[trial_id].spent += amount;
         self.compensation_paid[trial_id][participant] += amount;
 
-        raw_call!(participant, amount, bytes(""));
+        raw_call!(participant, value: amount);
         emit CompensationPaid { trial_id: trial_id, participant: participant, amount: amount };
     }
 

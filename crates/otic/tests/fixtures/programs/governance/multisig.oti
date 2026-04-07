@@ -223,7 +223,7 @@ contract Multisig {
         self.transactions[tx_id].executed = true;
         self.nonce = self.nonce + 1;
 
-        raw_call!(txn.to, txn.value, txn.data);
+        raw_call!(txn.to, txn.data, value: txn.value);
 
         emit TransactionExecuted { tx_id: tx_id };
     }

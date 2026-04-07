@@ -297,7 +297,7 @@ contract DigitalWill {
             let beneficiary = self.beneficiaries[will_id][alloc.beneficiary_index];
 
             if alloc.token == Address::ZERO {
-                raw_call!(beneficiary.addr, alloc.amount, bytes(""));
+                raw_call!(beneficiary.addr, value: alloc.amount);
             } else {
                 IERC20::at(alloc.token).transfer(beneficiary.addr, alloc.amount);
             }

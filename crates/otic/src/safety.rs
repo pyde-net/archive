@@ -401,7 +401,7 @@ impl SafetyChecker {
 
     /// Check if a method call on a storage field is mutating (push, pop, etc.).
     fn is_storage_mutating_call(&self, expr: &Expr) -> bool {
-        if let Expr::Call(callee, _, _) = expr {
+        if let Expr::Call(callee, _, _, _) = expr {
             if let Expr::FieldAccess(obj, method, _) = callee.as_ref() {
                 let is_mutating_method = matches!(
                     method.name.as_str(),
@@ -451,7 +451,7 @@ impl SafetyChecker {
     /// Collect self.method() call targets from an expression.
     fn collect_calls_in_expr(&self, expr: &Expr, targets: &mut Vec<String>) {
         match expr {
-            Expr::Call(callee, args, _) => {
+            Expr::Call(callee, args, _, _) => {
                 // self.method(...) → record method name
                 if let Expr::FieldAccess(obj, method, _) = callee.as_ref() {
                     if matches!(obj.as_ref(), Expr::SelfExpr(_)) {
@@ -681,7 +681,7 @@ impl SafetyChecker {
             Expr::Index(obj, idx, _) => {
                 self.expr_accesses_msg_value(obj) || self.expr_accesses_msg_value(idx)
             }
-            Expr::Call(callee, args, _) => {
+            Expr::Call(callee, args, _, _) => {
                 self.expr_accesses_msg_value(callee)
                     || args.iter().any(|a| self.expr_accesses_msg_value(a))
             }

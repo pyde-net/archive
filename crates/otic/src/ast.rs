@@ -443,8 +443,9 @@ pub enum Expr {
     FieldAccess(Box<Expr>, Ident, Span),
     /// `arr[idx]`
     Index(Box<Expr>, Box<Expr>, Span),
-    /// `func(args)` or `obj.method(args)`
-    Call(Box<Expr>, Vec<Expr>, Span),
+    /// `func(args)` or `obj.method(args)` or `obj.method{ value: expr }(args)`
+    /// The optional 4th field is the value expression for payable calls.
+    Call(Box<Expr>, Vec<Expr>, Option<Box<Expr>>, Span),
     /// `path::to::item` — `IERC20::at`, `Address::ZERO`, `GameState::Pending`
     Path(Vec<Ident>, Span),
     /// `require!(cond, err)`, `revert!(err)`, `cross_call!(...)`, `raw_call!(...)`

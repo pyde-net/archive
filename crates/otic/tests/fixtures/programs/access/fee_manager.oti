@@ -359,7 +359,7 @@ contract FeeManager {
 
         if protocol_amount > 0 {
             if token == Address::ZERO {
-                raw_call!(self.treasury, protocol_amount, bytes::empty());
+                raw_call!(self.treasury, value: protocol_amount);
             } else {
                 let erc20 = IERC20::at(token);
                 let success = erc20.transfer(self.treasury, protocol_amount);
@@ -373,7 +373,7 @@ contract FeeManager {
             let share = (distributable * recipient.share_bps) / BPS_DENOMINATOR;
             if share > 0 {
                 if token == Address::ZERO {
-                    raw_call!(recipient.recipient, share, bytes::empty());
+                    raw_call!(recipient.recipient, value: share);
                 } else {
                     let erc20 = IERC20::at(token);
                     let success = erc20.transfer(recipient.recipient, share);

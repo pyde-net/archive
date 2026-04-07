@@ -847,7 +847,7 @@ impl Resolver {
                 self.resolve_expr(index);
             }
 
-            Expr::Call(callee, args, _) => {
+            Expr::Call(callee, args, _, _) => {
                 self.resolve_expr(callee);
                 for arg in args {
                     self.resolve_expr(arg);

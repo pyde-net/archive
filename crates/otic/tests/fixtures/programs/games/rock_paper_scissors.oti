@@ -240,18 +240,18 @@ contract RockPaperScissors {
 
         if is_draw {
             // Return wagers
-            raw_call!(game.player1, game.wager, bytes::empty());
-            raw_call!(game.player2, game.wager, bytes::empty());
+            raw_call!(game.player1, value: game.wager);
+            raw_call!(game.player2, value: game.wager);
             self.player_draws[game.player1] = self.player_draws[game.player1] + 1;
             self.player_draws[game.player2] = self.player_draws[game.player2] + 1;
             game.winner = Address::ZERO;
         } else if p1_wins {
-            raw_call!(game.player1, total_pot, bytes::empty());
+            raw_call!(game.player1, value: total_pot);
             game.winner = game.player1;
             self.player_wins[game.player1] = self.player_wins[game.player1] + 1;
             self.player_losses[game.player2] = self.player_losses[game.player2] + 1;
         } else {
-            raw_call!(game.player2, total_pot, bytes::empty());
+            raw_call!(game.player2, value: total_pot);
             game.winner = game.player2;
             self.player_wins[game.player2] = self.player_wins[game.player2] + 1;
             self.player_losses[game.player1] = self.player_losses[game.player1] + 1;
@@ -280,27 +280,27 @@ contract RockPaperScissors {
         if game.state == GameState::Committed && block.height > game.commit_deadline {
             // Commit phase expired
             if game.player1_committed && !game.player2_committed {
-                raw_call!(game.player1, total_pot, bytes::empty());
+                raw_call!(game.player1, value: total_pot);
                 game.winner = game.player1;
             } else if !game.player1_committed && game.player2_committed {
-                raw_call!(game.player2, total_pot, bytes::empty());
+                raw_call!(game.player2, value: total_pot);
                 game.winner = game.player2;
             } else {
                 // Neither committed, refund both
-                raw_call!(game.player1, game.wager, bytes::empty());
-                raw_call!(game.player2, game.wager, bytes::empty());
+                raw_call!(game.player1, value: game.wager);
+                raw_call!(game.player2, value: game.wager);
             }
         } else if game.state == GameState::Revealed && block.height > game.reveal_deadline {
             // Reveal phase expired
             if game.player1_revealed && !game.player2_revealed {
-                raw_call!(game.player1, total_pot, bytes::empty());
+                raw_call!(game.player1, value: total_pot);
                 game.winner = game.player1;
             } else if !game.player1_revealed && game.player2_revealed {
-                raw_call!(game.player2, total_pot, bytes::empty());
+                raw_call!(game.player2, value: total_pot);
                 game.winner = game.player2;
             } else {
-                raw_call!(game.player1, game.wager, bytes::empty());
-                raw_call!(game.player2, game.wager, bytes::empty());
+                raw_call!(game.player1, value: game.wager);
+                raw_call!(game.player2, value: game.wager);
             }
         } else {
             revert!(DeadlineNotPassed {});
@@ -317,7 +317,7 @@ contract RockPaperScissors {
         require!(game.state == GameState::Waiting, InvalidState { expected: GameState::Waiting, actual: game.state });
         game.state = GameState::Cancelled;
         self.games[game_id] = game;
-        raw_call!(game.player1, game.wager, bytes::empty());
+        raw_call!(game.player1, value: game.wager);
         emit GameCancelled { game_id: game_id };
     }
 

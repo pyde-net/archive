@@ -1082,7 +1082,7 @@ impl Lowerer {
                 dst
             }
 
-            Expr::Call(callee, args, _) => {
+            Expr::Call(callee, args, call_value, _) => {
                 let arg_regs: Vec<Reg> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let dst = self.alloc_reg();
 
@@ -1135,7 +1135,8 @@ impl Lowerer {
                                     let typed_args: Vec<(Reg, Ty)> = arg_regs.iter().zip(
                                         param_types.iter().chain(std::iter::repeat(&Ty::U64))
                                     ).map(|(r, t)| (*r, t.clone())).collect();
-                                    self.emit(Inst::ExtCall(dst, obj_reg, method.name.clone(), typed_args, ret_ty));
+                                    let value_reg = call_value.as_ref().map(|v| self.lower_expr(v));
+                                    self.emit(Inst::ExtCall(dst, obj_reg, method.name.clone(), typed_args, ret_ty, value_reg));
                                 }
                                 _ => {
                                     self.emit(Inst::MethodCall(dst, obj_reg, method.name.clone(), arg_regs));
@@ -1341,12 +1342,25 @@ impl Lowerer {
                     }
                     "raw_call" => {
                         // raw_call!(target, "method_name", arg1, arg2, ...)
+                        // raw_call!(target, "method_name", arg1, value: expr)
                         // arg[0] = target address (Address expr)
                         // arg[1] = method name (string literal) — optional
-                        // arg[2..] = actual parameters
-                        let positional: Vec<&Expr> = args.iter().filter_map(|a| {
-                            if let MacroArg::Positional(e) = a { Some(e) } else { None }
-                        }).collect();
+                        // remaining = actual parameters
+                        // value: = optional named param for native token transfer
+                        let mut positional: Vec<&Expr> = Vec::new();
+                        let mut value_expr: Option<&Expr> = None;
+
+                        for arg in args {
+                            match arg {
+                                MacroArg::Named(key, val) if key.name == "value" => {
+                                    value_expr = Some(val);
+                                }
+                                MacroArg::Positional(e) => {
+                                    positional.push(e);
+                                }
+                                _ => { positional.push(match arg { MacroArg::Named(_, v) => v, MacroArg::Positional(v) => v }); }
+                            }
+                        }
 
                         let dst = self.alloc_reg();
                         if positional.is_empty() {
@@ -1355,6 +1369,7 @@ impl Lowerer {
                         }
 
                         let target = self.lower_expr(positional[0]);
+                        let value_reg = value_expr.map(|v| self.lower_expr(v));
 
                         // Try to extract method name from arg[1] if it's a string literal
                         let method_name = if positional.len() > 1 {
@@ -1374,26 +1389,38 @@ impl Lowerer {
                             .collect();
 
                         if let Some(method) = method_name {
-                            // Emit as ExtCall with the method name (codegen writes selector)
-                            // No type info available for raw_call — default args to GP
                             let typed_params: Vec<(Reg, Ty)> = param_regs.iter()
                                 .map(|r| (*r, Ty::U64)).collect();
-                            self.emit(Inst::ExtCall(dst, target, method, typed_params, Ty::U64));
+                            self.emit(Inst::ExtCall(dst, target, method, typed_params, Ty::U64, value_reg));
                         } else {
                             // No method name: emit as raw call (no selector)
-                            self.emit(Inst::RawCall(dst, target, param_regs));
+                            // If value provided, emit ExtCall with empty method for value transfer
+                            if let Some(val_r) = value_reg {
+                                self.emit(Inst::ExtCall(dst, target, String::new(), vec![], Ty::U64, Some(val_r)));
+                            } else {
+                                self.emit(Inst::RawCall(dst, target, param_regs));
+                            }
                         }
                         dst
                     }
                     "deploy" | "create" => {
-                        // deploy!(ContractName, arg1, arg2, ...) → Ty::Contract("ContractName")
+                        // deploy!(ContractName, arg1, arg2, ..., value: expr)
                         // create! is an alias for deploy!.
                         // Embeds the named contract's bytecode and deploys it.
                         // Constructor runs automatically with the provided args.
+                        // Optional value: param for payable constructors.
                         // Returns a typed contract handle (enables c.method() dispatch).
-                        let positional: Vec<&Expr> = args.iter().filter_map(|a| {
-                            if let MacroArg::Positional(e) = a { Some(e) } else { None }
-                        }).collect();
+                        let mut positional: Vec<&Expr> = Vec::new();
+                        let mut value_expr: Option<&Expr> = None;
+                        for arg in args {
+                            match arg {
+                                MacroArg::Named(key, val) if key.name == "value" => {
+                                    value_expr = Some(val);
+                                }
+                                MacroArg::Positional(e) => positional.push(e),
+                                _ => { if let MacroArg::Named(_, v) = arg { positional.push(v); } }
+                            }
+                        }
 
                         let dst = self.alloc_reg();
 
@@ -1448,8 +1475,9 @@ impl Lowerer {
                         let blob_reg = self.alloc_reg();
                         self.emit(Inst::Const(blob_reg, IrConst::Bytes(deploy_bytes)));
 
-                        // CreateContract(dst, blob_reg, [(arg, type)...])
-                        self.emit(Inst::CreateContract(dst, blob_reg, typed_args));
+                        // CreateContract(dst, blob_reg, [(arg, type)...], value)
+                        let value_reg = value_expr.map(|v| self.lower_expr(v));
+                        self.emit(Inst::CreateContract(dst, blob_reg, typed_args, value_reg));
 
                         // Tag the result register as Ty::Contract so method calls
                         // on the handle (e.g. c.increment()) resolve to ExtCall.

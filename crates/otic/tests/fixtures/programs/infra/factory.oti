@@ -214,8 +214,8 @@ contract ContractFactory {
         );
         let deployed_address = raw_call!(
             Address::ZERO,
-            msg.value - self.deploy_fee,
-            constructor_args
+            constructor_args,
+            value: msg.value - self.deploy_fee
         );
 
         // In practice the VM would return the new contract's address.
@@ -319,7 +319,7 @@ contract ContractFactory {
         require!(msg.sender == self.owner, Unauthorized {});
         let amount = self.revenue;
         self.revenue = 0;
-        raw_call!(to, amount, bytes::empty());
+        raw_call!(to, value: amount);
     }
 
     #[view]

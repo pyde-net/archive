@@ -192,7 +192,7 @@ contract Invoice {
         // Transfer payment
         if inv.token == Address::ZERO {
             require!(msg.value >= amount, PaymentFailed {});
-            raw_call!(inv.vendor, amount, bytes::empty());
+            raw_call!(inv.vendor, value: amount);
         } else {
             let token = IERC20::at(inv.token);
             let success = token.transfer_from(msg.sender, inv.vendor, amount);

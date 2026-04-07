@@ -240,7 +240,7 @@ contract Raffle {
         // Refund excess
         let excess = msg.value - cost;
         if excess > 0 {
-            raw_call!(msg.sender, excess, bytes::empty());
+            raw_call!(msg.sender, value: excess);
         }
 
         emit TicketsPurchased {
@@ -329,7 +329,7 @@ contract Raffle {
         let total_prizes = self.sum_prizes(raffle_id);
         let creator_share = raffle.total_revenue - fee - total_prizes;
         if creator_share > 0 {
-            raw_call!(raffle.creator, creator_share, bytes::empty());
+            raw_call!(raffle.creator, value: creator_share);
         }
 
         self.raffles[raffle_id] = raffle;
@@ -366,7 +366,7 @@ contract Raffle {
         self.winners[raffle_id] = winner_list;
 
         if total_claimed > 0 {
-            raw_call!(msg.sender, total_claimed, bytes::empty());
+            raw_call!(msg.sender, value: total_claimed);
         }
     }
 
@@ -383,7 +383,7 @@ contract Raffle {
         // Clear buyer's tickets to prevent double claim
         self.buyer_tickets[raffle_id][msg.sender] = Vec::new();
 
-        raw_call!(msg.sender, refund, bytes::empty());
+        raw_call!(msg.sender, value: refund);
 
         emit RefundClaimed {
             raffle_id: raffle_id,
@@ -419,7 +419,7 @@ contract Raffle {
         require!(msg.sender == self.owner, Unauthorized {});
         let amount = self.protocol_balance;
         self.protocol_balance = 0;
-        raw_call!(to, amount, bytes::empty());
+        raw_call!(to, value: amount);
     }
 
     #[view]

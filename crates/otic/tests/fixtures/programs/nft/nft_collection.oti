@@ -196,7 +196,7 @@ contract NFTCollection {
         self.withdrawn = true;
 
         let balance = address(self).balance;
-        raw_call!(self.owner, balance, bytes(""));
+        raw_call!(self.owner, value: balance);
     }
 
     pub fn owner_mint(to: Address, quantity: u256) {

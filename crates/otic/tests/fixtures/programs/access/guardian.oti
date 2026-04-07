@@ -331,13 +331,13 @@ contract Guardian {
             EmergencyActionType::EmergencyWithdraw => {
                 // Emergency withdraw - send all balance to owner
                 if address(self).balance > 0 {
-                    raw_call!(self.owner, address(self).balance, bytes::empty());
+                    raw_call!(self.owner, value: address(self).balance);
                 }
             }
             EmergencyActionType::PauseContract => {
                 // Pause a protected contract via raw_call
                 if proposal.target != Address::ZERO {
-                    raw_call!(proposal.target, 0, bytes::empty());
+                    raw_call!(proposal.target, value: 0);
                 }
             }
         }

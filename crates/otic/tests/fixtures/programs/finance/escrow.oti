@@ -182,9 +182,9 @@ contract Escrow {
         entry.status = EscrowStatus::Released;
         self.escrows[escrow_id] = entry;
 
-        raw_call!(entry.seller, seller_amount, bytes::empty());
+        raw_call!(entry.seller, value: seller_amount);
         if platform_fee > 0 {
-            raw_call!(self.platform_treasury, platform_fee, bytes::empty());
+            raw_call!(self.platform_treasury, value: platform_fee);
         }
 
         emit EscrowReleased {
@@ -205,7 +205,7 @@ contract Escrow {
         entry.status = EscrowStatus::Refunded;
         self.escrows[escrow_id] = entry;
 
-        raw_call!(entry.buyer, entry.amount, bytes::empty());
+        raw_call!(entry.buyer, value: entry.amount);
 
         emit EscrowRefunded {
             escrow_id: escrow_id,
@@ -225,7 +225,7 @@ contract Escrow {
         entry.status = EscrowStatus::Refunded;
         self.escrows[escrow_id] = entry;
 
-        raw_call!(entry.buyer, entry.amount, bytes::empty());
+        raw_call!(entry.buyer, value: entry.amount);
 
         emit EscrowRefunded {
             escrow_id: escrow_id,
@@ -271,10 +271,10 @@ contract Escrow {
 
         let winner = if award_to_buyer { entry.buyer } else { entry.seller };
 
-        raw_call!(winner, remaining, bytes::empty());
-        raw_call!(entry.arbiter, arbiter_fee, bytes::empty());
+        raw_call!(winner, value: remaining);
+        raw_call!(entry.arbiter, value: arbiter_fee);
         if platform_fee > 0 {
-            raw_call!(self.platform_treasury, platform_fee, bytes::empty());
+            raw_call!(self.platform_treasury, value: platform_fee);
         }
 
         emit DisputeResolved {

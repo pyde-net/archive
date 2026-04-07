@@ -267,7 +267,7 @@ contract ChessWager {
         }
 
         self.matches[match_id] = m;
-        raw_call!(msg.sender, payout, bytes::empty());
+        raw_call!(msg.sender, value: payout);
 
         emit WinningsClaimed { match_id: match_id, player: msg.sender, amount: payout };
     }
@@ -283,7 +283,7 @@ contract ChessWager {
         self.remove_open_challenge(match_id);
 
         // Refund wager directly
-        raw_call!(m.white, m.wager, bytes::empty());
+        raw_call!(m.white, value: m.wager);
     }
 
     fn update_elo(white: Address, black: Address, result: MatchState) {
@@ -344,7 +344,7 @@ contract ChessWager {
         let amount = self.accumulated_fees;
         require!(amount > 0, NoFeesToWithdraw {});
         self.accumulated_fees = 0;
-        raw_call!(to, amount, bytes::empty());
+        raw_call!(to, value: amount);
     }
 
     pub fn set_arbiter(new_arbiter: Address) {

@@ -121,7 +121,7 @@ contract WrappedToken {
         self.total_withdrawals = self.total_withdrawals + amount;
 
         // Transfer native token back to sender
-        raw_call!(msg.sender, amount);
+        raw_call!(msg.sender, value: amount);
 
         emit Withdrawal { account: msg.sender, amount: amount };
         emit Transfer { from: msg.sender, to: Address::ZERO, amount: amount };
@@ -155,7 +155,7 @@ contract WrappedToken {
         self.total_supply = self.total_supply - amount;
         self.total_withdrawals = self.total_withdrawals + amount;
 
-        raw_call!(to, amount);
+        raw_call!(to, value: amount);
 
         emit Withdrawal { account: msg.sender, amount: amount };
         emit Transfer { from: msg.sender, to: Address::ZERO, amount: amount };

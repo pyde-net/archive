@@ -192,7 +192,7 @@ contract TippingPlatform {
         self.check_milestones(creator);
 
         // Transfer to creator
-        raw_call!(creator, net_amount, bytes(""));
+        raw_call!(creator, value: net_amount);
 
         emit TipSent { from: msg.sender, to: creator, amount: net_amount, token: Address::ZERO };
     }
@@ -228,7 +228,7 @@ contract TippingPlatform {
         require!(msg.sender == self.owner, NotOwner {});
         let amount = self.accumulated_fees;
         self.accumulated_fees = 0;
-        raw_call!(self.owner, amount, bytes(""));
+        raw_call!(self.owner, value: amount);
         emit FeesWithdrawn { amount: amount };
     }
 

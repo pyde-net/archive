@@ -215,7 +215,7 @@ contract CourseMarketplace {
         self.platform_earnings += platform_cut;
         self.instructor_profiles[course.instructor].total_earnings += instructor_cut;
 
-        raw_call!(course.instructor, instructor_cut, bytes(""));
+        raw_call!(course.instructor, value: instructor_cut);
 
         emit StudentEnrolled { course_id: course_id, student: msg.sender };
     }
@@ -292,7 +292,7 @@ contract CourseMarketplace {
         self.enrollments[course_id][msg.sender].enrolled = false;
         self.courses[course_id].enrolled_count -= 1;
 
-        raw_call!(msg.sender, refund_amount, bytes(""));
+        raw_call!(msg.sender, value: refund_amount);
         emit RefundIssued { course_id: course_id, student: msg.sender, amount: refund_amount };
     }
 

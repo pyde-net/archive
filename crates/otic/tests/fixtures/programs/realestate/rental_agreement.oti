@@ -237,7 +237,7 @@ contract RentalAgreement {
         }
 
         // Forward rent to landlord
-        raw_call!(self.landlord, msg.value, bytes(""));
+        raw_call!(self.landlord, value: msg.value);
 
         emit RentPaid { lease_id: lease_id, amount: msg.value, for_month: next_month, late: is_late };
     }
@@ -301,7 +301,7 @@ contract RentalAgreement {
         self.deposits[lease_id].deduction_reason_hash = reason_hash;
 
         if return_amount > 0 {
-            raw_call!(lease.tenant, return_amount, bytes(""));
+            raw_call!(lease.tenant, value: return_amount);
         }
 
         emit DepositReturned {

@@ -385,7 +385,7 @@ contract Insurance {
         self.claims[claim_id] = claim;
         self.pool_balance = self.pool_balance - claim.amount;
 
-        raw_call!(claim.claimant, claim.amount, bytes::empty());
+        raw_call!(claim.claimant, value: claim.amount);
 
         emit ClaimPaid {
             claim_id: claim_id,
