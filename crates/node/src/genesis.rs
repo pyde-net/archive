@@ -152,22 +152,30 @@ pub fn initialize_genesis(
             .ok_or("genesis total supply overflow")?;
     }
 
-    // 2. Write validator stakes as balances (included in total supply)
+    // 2. Write validator stakes as balances (included in total supply).
+    // Skip validators that already appear in allocations (they're already written with auth_keys).
+    let alloc_addresses: std::collections::HashSet<String> = config.allocations.iter()
+        .map(|a| a.address.strip_prefix("0x").unwrap_or(&a.address).to_lowercase())
+        .collect();
+
     for val in &config.validators {
+        let val_addr_normalized = val.address.strip_prefix("0x").unwrap_or(&val.address).to_lowercase();
+        if alloc_addresses.contains(&val_addr_normalized) {
+            debug!(address = val.address, "validator already in allocations, skipping duplicate");
+            continue;
+        }
+
         let address = parse_hex_address(&val.address)?;
         let stake = val.stake_u128()?;
 
-        let mut account = pyde_account::types::Account {
-            address,
-            nonce: 0,
-            balance: stake,
-            code_hash: sparse_merkle_tree::H256::zero(),
-            storage_root: sparse_merkle_tree::H256::zero(),
-            account_type: pyde_account::types::AccountType::EOA,
-            auth_keys: pyde_account::types::AuthKeys::None,
-            gas_tank: 0,
-            key_nonce: 0,
-        };
+        // Parse public key to set auth_keys (validators must be able to sign)
+        let pk_hex = val.public_key.strip_prefix("0x").unwrap_or(&val.public_key);
+        let pk_bytes = hex::decode(pk_hex)
+            .map_err(|e| format!("invalid validator public key hex: {}", e))?;
+        let mut account = pyde_account::types::Account::new_eoa(&pk_bytes);
+        account.address = address;
+        account.balance = stake;
+
         let balance_key = pyde_state::keys::balance_key(&address);
         entries.push((balance_key, account.to_bytes()));
         total_supply = total_supply.checked_add(stake)
@@ -259,6 +267,254 @@ pub fn devnet_genesis() -> (GenesisConfig, Vec<DevnetAccount>) {
     };
 
     (config, accounts)
+}
+
+/// Generate a multi-validator testnet directory.
+/// Creates: shared genesis.toml, per-node validator.key files, per-node config.toml files.
+pub fn generate_testnet(
+    out_dir: &std::path::Path,
+    num_validators: usize,
+    base_port: u16,
+    base_rpc_port: u16,
+    dev_mode: bool,
+) -> Result<(), String> {
+    use pyde_account::address::derive_eoa_address;
+    use pyde_crypto::falcon::falcon_keygen;
+    use std::fs;
+
+    if num_validators < 2 || num_validators > 128 {
+        return Err("validators must be between 2 and 128".into());
+    }
+
+    fs::create_dir_all(out_dir)
+        .map_err(|e| format!("failed to create {}: {}", out_dir.display(), e))?;
+
+    // 10B PYDE per account
+    let funding: u128 = 10_000_000_000 * 1_000_000_000;
+
+    let mut allocations = Vec::new();
+    let mut validators = Vec::new();
+    let mut accounts = Vec::new();
+
+    // Generate FALCON keypairs for each validator
+    for _ in 0..num_validators {
+        let (pk, sk) = falcon_keygen().map_err(|e| format!("keygen failed: {}", e))?;
+        let address = derive_eoa_address(pk.as_bytes());
+
+        allocations.push(GenesisAllocation {
+            address: hex::encode(address),
+            balance: funding.to_string(),
+            public_key: Some(hex::encode(pk.as_bytes())),
+        });
+
+        validators.push(GenesisValidator {
+            address: hex::encode(address),
+            public_key: hex::encode(pk.as_bytes()),
+            stake: funding.to_string(),
+        });
+
+        accounts.push(DevnetAccount {
+            address,
+            public_key: pk,
+            secret_key: sk,
+            balance: funding,
+        });
+    }
+
+    // Also generate 5 non-validator funded accounts for testing
+    for _ in 0..5 {
+        let (pk, sk) = falcon_keygen().map_err(|e| format!("keygen failed: {}", e))?;
+        let address = derive_eoa_address(pk.as_bytes());
+        allocations.push(GenesisAllocation {
+            address: hex::encode(address),
+            balance: funding.to_string(),
+            public_key: Some(hex::encode(pk.as_bytes())),
+        });
+    }
+
+    let genesis_config = GenesisConfig {
+        chain_id: 31337,
+        timestamp: 0,
+        allocations,
+        validators,
+    };
+
+    // Write shared genesis.toml
+    let genesis_path = out_dir.join("genesis.toml");
+    fs::write(&genesis_path, genesis_config.to_toml())
+        .map_err(|e| format!("failed to write genesis.toml: {}", e))?;
+
+    // Determine first node's listen address for bootstrap
+    // (subsequent nodes bootstrap to node-0)
+    let bootstrap_addr = format!(
+        "/ip4/127.0.0.1/udp/{}/quic-v1",
+        base_port,
+    );
+
+    // Write per-node directories
+    for i in 0..num_validators {
+        let node_dir = out_dir.join(format!("node-{}", i));
+        fs::create_dir_all(&node_dir)
+            .map_err(|e| format!("failed to create {}: {}", node_dir.display(), e))?;
+
+        // Write validator.key (format: pk_len(4 LE) || pk || sk)
+        let pk_bytes = accounts[i].public_key.as_bytes();
+        let sk_bytes = accounts[i].secret_key.as_bytes();
+        let mut key_buf = Vec::with_capacity(4 + pk_bytes.len() + sk_bytes.len());
+        key_buf.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
+        key_buf.extend_from_slice(pk_bytes);
+        key_buf.extend_from_slice(sk_bytes);
+        fs::write(node_dir.join("validator.key"), &key_buf)
+            .map_err(|e| format!("failed to write validator.key: {}", e))?;
+
+        // Copy genesis.toml into each node's directory
+        fs::write(node_dir.join("genesis.toml"), genesis_config.to_toml())
+            .map_err(|e| format!("failed to write genesis.toml: {}", e))?;
+
+        // Write config.toml
+        let p2p_port = base_port + i as u16;
+        let rpc_port = base_rpc_port + i as u16;
+        let metrics_port = 9090 + i as u16;
+        let bootstrap = if i == 0 {
+            "[]".to_string()
+        } else {
+            // Note: peer ID is not known until node starts, so we use a placeholder.
+            // The actual connection uses `--bootstrap` CLI flag at runtime.
+            "[]".to_string()
+        };
+
+        let config_toml = format!(
+            r#"[node]
+role = "validator"
+chain_id = 31337
+datadir = "{datadir}"
+dev_mode = {dev}
+
+[network]
+port = {p2p_port}
+max_peers = 50
+max_inbound = 30
+max_outbound = 20
+rate_limit_per_ip = 5
+bootstrap_peers = {bootstrap}
+
+[consensus]
+block_time_ms = 400
+gas_target = 400000000
+gas_ceiling = 1600000000
+
+[storage]
+db_path = "state"
+cache_size = 65536
+
+[rpc]
+enabled = true
+listen = "127.0.0.1"
+port = {rpc_port}
+
+[metrics]
+enabled = true
+port = {metrics_port}
+
+[logging]
+level = "info"
+json = false
+"#,
+            datadir = node_dir.display(),
+            dev = dev_mode,
+            p2p_port = p2p_port,
+            rpc_port = rpc_port,
+            metrics_port = metrics_port,
+            bootstrap = bootstrap,
+        );
+
+        fs::write(node_dir.join("config.toml"), config_toml)
+            .map_err(|e| format!("failed to write config.toml: {}", e))?;
+    }
+
+    // Write a run.sh convenience script
+    let mut run_script = String::from("#!/bin/bash\n# Auto-generated testnet launch script\n\n");
+    run_script.push_str("set -e\n\n");
+    run_script.push_str(&format!("TESTNET_DIR=\"{}\"\n\n", out_dir.display()));
+
+    for i in 0..num_validators {
+        let p2p_port = base_port + i as u16;
+        let rpc_port = base_rpc_port + i as u16;
+        let node_dir = out_dir.join(format!("node-{}", i));
+
+        if i == 0 {
+            run_script.push_str(&format!(
+                "echo \"Starting node-0 (port {p2p_port}, RPC {rpc_port})...\"\n\
+                 pyde run --role validator --config \"{dir}/config.toml\" --datadir \"{dir}\"{dev} &\n\
+                 NODE0_PID=$!\n\
+                 sleep 2\n\n\
+                 # Get node-0's peer ID from its log output\n\
+                 echo \"Node-0 started (PID $NODE0_PID)\"\n\n",
+                p2p_port = p2p_port,
+                rpc_port = rpc_port,
+                dir = node_dir.display(),
+                dev = if dev_mode { " --dev" } else { "" },
+            ));
+        } else {
+            // Subsequent nodes bootstrap to node-0
+            // The actual multiaddr with peer ID must be provided at runtime
+            run_script.push_str(&format!(
+                "echo \"Starting node-{i} (port {p2p_port}, RPC {rpc_port})...\"\n\
+                 echo \"NOTE: Copy the bootstrap multiaddr from node-0's output and pass it:\"\n\
+                 echo \"  pyde run --role validator --config \\\"{dir}/config.toml\\\" --datadir \\\"{dir}\\\" --bootstrap \\\"<node-0-multiaddr>\\\"{dev}\"\n\n",
+                i = i,
+                p2p_port = p2p_port,
+                rpc_port = rpc_port,
+                dir = node_dir.display(),
+                dev = if dev_mode { " --dev" } else { "" },
+            ));
+        }
+    }
+
+    run_script.push_str("wait\n");
+    let script_path = out_dir.join("run.sh");
+    fs::write(&script_path, run_script)
+        .map_err(|e| format!("failed to write run.sh: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755));
+    }
+
+    // Print summary
+    println!("Testnet generated in {}", out_dir.display());
+    println!();
+    println!("Validators: {}", num_validators);
+    println!("Chain ID:   31337");
+    println!();
+    println!("Validator Addresses:");
+    for (i, acc) in accounts.iter().enumerate() {
+        println!("  ({}) {}", i, acc.address_hex());
+    }
+    println!();
+    println!("Private Keys:");
+    for (i, acc) in accounts.iter().enumerate() {
+        println!("  ({}) {}", i, acc.private_key_hex());
+    }
+    println!();
+    println!("Files:");
+    println!("  genesis.toml        — shared genesis (copy to each node's datadir)");
+    for i in 0..num_validators {
+        println!("  node-{}/config.toml  — node {} config (P2P:{}, RPC:{})",
+            i, i, base_port + i as u16, base_rpc_port + i as u16);
+        println!("  node-{}/validator.key — node {} signing key", i, i);
+    }
+    println!();
+    println!("To start:");
+    println!("  # Terminal 1 (node-0):");
+    println!("  pyde run --role validator --config {}/node-0/config.toml --datadir {}/node-0{}",
+        out_dir.display(), out_dir.display(), if dev_mode { " --dev" } else { "" });
+    println!();
+    println!("  # Terminal 2 (node-1 — copy bootstrap addr from node-0 output):");
+    println!("  pyde run --role validator --config {}/node-1/config.toml --datadir {}/node-1 --bootstrap \"<node-0-multiaddr>\"{}",
+        out_dir.display(), out_dir.display(), if dev_mode { " --dev" } else { "" });
+
+    Ok(())
 }
 
 fn parse_hex_address(hex_str: &str) -> Result<Address, String> {

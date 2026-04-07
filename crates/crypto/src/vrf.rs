@@ -23,6 +23,14 @@ impl VrfOutput {
     pub fn to_hash(&self) -> Hash256 {
         self.0
     }
+
+    /// Reconstruct a VrfOutput from raw 32-byte hash.
+    pub fn from_hash_bytes(bytes: &[u8]) -> Self {
+        let mut arr = [0u8; 32];
+        let len = bytes.len().min(32);
+        arr[..len].copy_from_slice(&bytes[..len]);
+        Self(Hash256::from(arr))
+    }
 }
 
 impl VrfProof {

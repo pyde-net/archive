@@ -36,6 +36,8 @@ pub struct RpcState {
     pub logs_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// Dev mode: allows unsigned pyde_sendTransaction.
     pub dev_mode: bool,
+    /// Channel to gossip submitted transactions to the P2P network.
+    pub tx_gossip_tx: tokio::sync::mpsc::Sender<pyde_tx::types::Transaction>,
 }
 
 /// Define the Pyde JSON-RPC API.
@@ -323,11 +325,14 @@ impl PydeApiServer for RpcServer {
         // Compute tx hash (must match tx.hash() used in receipt generation)
         let tx_hash = tx.hash();
 
-        // Add to pending tx queue
+        // Add to pending tx queue and gossip to network
         let mut pending = self.state.pending_txs.write().await;
-        pending.push(tx);
+        pending.push(tx.clone());
         let queue_size = pending.len();
         drop(pending);
+
+        // Gossip to P2P network so all nodes can include it
+        let _ = self.state.tx_gossip_tx.send(tx).await;
 
         let tx_hash_hex = format!("0x{}", hex::encode(tx_hash));
         info!(
@@ -357,8 +362,11 @@ impl PydeApiServer for RpcServer {
         let tx_hash = tx.hash();
 
         let mut pending = self.state.pending_txs.write().await;
-        pending.push(tx);
+        pending.push(tx.clone());
         drop(pending);
+
+        // Gossip to P2P network
+        let _ = self.state.tx_gossip_tx.send(tx).await;
 
         Ok(format!("0x{}", hex::encode(tx_hash)))
     }

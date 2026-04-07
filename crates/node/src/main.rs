@@ -34,6 +34,18 @@ fn main() {
             let (config, _) = genesis::devnet_genesis();
             print!("{}", config.to_toml());
         }
+        Command::Testnet {
+            validators,
+            out,
+            base_port,
+            base_rpc_port,
+            dev,
+        } => {
+            if let Err(e) = genesis::generate_testnet(&out, validators, base_port, base_rpc_port, dev) {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Command::Run {
             role,
             config: config_path,
@@ -65,10 +77,10 @@ fn main() {
                 datadir.as_deref(),
                 Some(&log_level),
                 log_json,
-                Some(metrics_port),
+                metrics_port,
                 &bootstrap,
             );
-            config.rpc.port = rpc_port;
+            if let Some(rp) = rpc_port { config.rpc.port = rp; }
             if dev { config.node.dev_mode = true; }
 
             // Initialize logging first

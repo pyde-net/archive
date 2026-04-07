@@ -20,6 +20,7 @@ pub mod tag {
     pub const CONSENSUS_VOTE: u8 = 0x11;
     pub const CONSENSUS_TIMEOUT: u8 = 0x12;
     pub const CONSENSUS_NEW_VIEW: u8 = 0x13;
+    pub const CONSENSUS_FINALITY_VOTE: u8 = 0x14;
     pub const DECRYPTION_SHARES: u8 = 0x20;
 }
 
@@ -34,6 +35,40 @@ pub struct DecryptionShareMsg {
     /// One share per encrypted tx in the block.
     /// Each share is the raw bytes of the DecryptionShare.
     pub shares: Vec<Vec<u8>>,
+}
+
+pub fn encode_finality_vote(vote: &pyde_consensus::finality::FinalityVote) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(tag::CONSENSUS_FINALITY_VOTE);
+    enc.u64(vote.slot);
+    enc.bytes32(&vote.block_hash);
+    enc.bytes32(&vote.state_root);
+    enc.u8(vote.voter_index);
+    enc.bytes32(&vote.voter_address);
+    enc.var_bytes(&vote.signature);
+    enc.finish()
+}
+
+pub fn decode_finality_vote(data: &[u8]) -> Result<pyde_consensus::finality::FinalityVote, &'static str> {
+    let mut dec = Decoder::new(data);
+    let tag_byte = dec.u8()?;
+    if tag_byte != tag::CONSENSUS_FINALITY_VOTE {
+        return Err("not a finality vote");
+    }
+    let slot = dec.u64()?;
+    let block_hash = dec.bytes32()?;
+    let state_root = dec.bytes32()?;
+    let voter_index = dec.u8()?;
+    let voter_address = dec.bytes32()?;
+    let signature = dec.var_bytes()?;
+    Ok(pyde_consensus::finality::FinalityVote {
+        slot,
+        block_hash,
+        state_root,
+        voter_index,
+        voter_address,
+        signature,
+    })
 }
 
 pub fn encode_decryption_shares(msg: &DecryptionShareMsg) -> Vec<u8> {
