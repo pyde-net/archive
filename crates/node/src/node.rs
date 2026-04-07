@@ -13,6 +13,7 @@ use crate::validator::{ValidatorEngine, ValidatorIdentity, verify_stake};
 use crate::wire;
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub;
+use libp2p::identify;
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::PeerId;
@@ -410,6 +411,21 @@ impl PydeNode {
                             pending.push(tx);
                             debug!(tx_hash = hex::encode(tx_hash), pending = pending.len(), "tx accepted from gossip");
                         }
+                        PostEventAction::AddPeerToKademlia(peer_id, addrs) => {
+                            for addr in &addrs {
+                                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                            }
+                            // Proactively dial peers we learn about through Identify.
+                            // This builds a mesh so nodes survive bootstrap node failure.
+                            if !swarm.is_connected(&peer_id) {
+                                for addr in addrs {
+                                    if let Err(e) = swarm.dial(addr) {
+                                        debug!(error = %e, "failed to dial discovered peer");
+                                    }
+                                }
+                            }
+                            let _ = swarm.behaviour_mut().kademlia.bootstrap();
+                        }
                         PostEventAction::StoreReceipts(slot, receipts_list) => {
                             let mut receipts_w = receipts.write().await;
                             receipts_w.insert_block_receipts(slot, receipts_list);
@@ -632,6 +648,10 @@ impl PydeNode {
                     crate::metrics::record_mempool(mempool_size);
                     let peer_count = swarm.connected_peers().count();
                     crate::metrics::record_peers(peer_count);
+                    // Periodically trigger Kademlia bootstrap to discover + connect to new peers.
+                    // Critical for mesh resilience: ensures nodes connect to each other,
+                    // not just the bootstrap node.
+                    let _ = swarm.behaviour_mut().kademlia.bootstrap();
                     let head = chain.read().await.head_slot;
                     debug!(
                         peers = peer_count,
@@ -672,6 +692,7 @@ enum PostEventAction {
     BroadcastConsensus(Vec<u8>),
     AcceptTransaction(pyde_tx::types::Transaction),
     StoreReceipts(u64, Vec<pyde_tx::execution::Receipt>),
+    AddPeerToKademlia(PeerId, Vec<libp2p::Multiaddr>),
     BlockProcessed {
         slot: u64,
         receipts: Vec<pyde_tx::execution::Receipt>,
@@ -899,6 +920,31 @@ fn handle_swarm_event(
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%address, "listening on");
             PostEventAction::None
+        }
+
+        // --- Identify: peer shared their listen addresses ---
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Identify(
+            identify::Event::Received { peer_id, info, .. },
+        )) => {
+            debug!(%peer_id, addrs = info.listen_addrs.len(), "identify received");
+            if !info.listen_addrs.is_empty() {
+                PostEventAction::AddPeerToKademlia(peer_id, info.listen_addrs)
+            } else {
+                PostEventAction::None
+            }
+        }
+
+        // --- Kademlia: routing table updated (discovered a new peer) ---
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Kademlia(
+            libp2p::kad::Event::RoutingUpdated { peer, addresses, .. },
+        )) => {
+            let addrs: Vec<libp2p::Multiaddr> = addresses.into_vec();
+            if !addrs.is_empty() {
+                debug!(%peer, addrs = addrs.len(), "kademlia discovered peer");
+                PostEventAction::AddPeerToKademlia(peer, addrs)
+            } else {
+                PostEventAction::None
+            }
         }
 
         // All other events

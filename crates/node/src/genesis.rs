@@ -344,12 +344,14 @@ pub fn generate_testnet(
     fs::write(&genesis_path, genesis_config.to_toml())
         .map_err(|e| format!("failed to write genesis.toml: {}", e))?;
 
-    // Determine first node's listen address for bootstrap
-    // (subsequent nodes bootstrap to node-0)
-    let bootstrap_addr = format!(
-        "/ip4/127.0.0.1/udp/{}/quic-v1",
-        base_port,
-    );
+    // Pre-generate node identity keys (Ed25519 for libp2p) so we know peer IDs
+    // and can write full bootstrap multiaddrs in each config.
+    let mut node_keypairs: Vec<(libp2p::identity::Keypair, libp2p::PeerId)> = Vec::new();
+    for _ in 0..num_validators {
+        let kp = pyde_net::node::generate_keypair();
+        let peer_id = libp2p::PeerId::from(kp.public());
+        node_keypairs.push((kp, peer_id));
+    }
 
     // Write per-node directories
     for i in 0..num_validators {
@@ -367,21 +369,34 @@ pub fn generate_testnet(
         fs::write(node_dir.join("validator.key"), &key_buf)
             .map_err(|e| format!("failed to write validator.key: {}", e))?;
 
+        // Write node.key (pre-generated so we know the peer ID for bootstrap addrs)
+        let node_key_bytes = pyde_net::node::keypair_to_bytes(&node_keypairs[i].0)
+            .map_err(|e| format!("failed to serialize node key: {}", e))?;
+        fs::write(node_dir.join("node.key"), &node_key_bytes)
+            .map_err(|e| format!("failed to write node.key: {}", e))?;
+
         // Copy genesis.toml into each node's directory
         fs::write(node_dir.join("genesis.toml"), genesis_config.to_toml())
             .map_err(|e| format!("failed to write genesis.toml: {}", e))?;
+
+        // Build bootstrap list: ALL other nodes (full mesh)
+        let mut bootstrap_addrs: Vec<String> = Vec::new();
+        for j in 0..num_validators {
+            if j != i {
+                let other_port = base_port + j as u16;
+                let other_peer_id = &node_keypairs[j].1;
+                bootstrap_addrs.push(format!(
+                    "\"/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}\"",
+                    other_port, other_peer_id
+                ));
+            }
+        }
+        let bootstrap = format!("[{}]", bootstrap_addrs.join(", "));
 
         // Write config.toml
         let p2p_port = base_port + i as u16;
         let rpc_port = base_rpc_port + i as u16;
         let metrics_port = 9090 + i as u16;
-        let bootstrap = if i == 0 {
-            "[]".to_string()
-        } else {
-            // Note: peer ID is not known until node starts, so we use a placeholder.
-            // The actual connection uses `--bootstrap` CLI flag at runtime.
-            "[]".to_string()
-        };
 
         let config_toml = format!(
             r#"[node]
