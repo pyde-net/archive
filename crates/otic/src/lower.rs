@@ -103,6 +103,9 @@ struct Lowerer {
     contract_constructors: HashMap<String, Vec<(String, Ty)>>,
     /// Register → type tracking for Contract/Interface typed handles.
     reg_types: HashMap<u32, Ty>,
+    /// Cache for builtin values (msg.sender, msg.value, etc.) within a function.
+    /// Prevents allocating multiple wide registers for the same builtin.
+    builtin_cache: HashMap<String, Reg>,
 }
 
 impl Lowerer {
@@ -136,6 +139,7 @@ impl Lowerer {
             contract_functions: HashMap::new(),
             contract_constructors: HashMap::new(),
             reg_types: HashMap::new(),
+            builtin_cache: HashMap::new(),
         }
     }
 
@@ -618,6 +622,8 @@ impl Lowerer {
     }
 
     fn lower_function(&mut self, func: &FunctionDef) {
+        // Clear builtin cache for new function scope
+        self.builtin_cache.clear();
         let params: Vec<(String, Ty)> = func.params.iter()
             .map(|p| (p.name.name.clone(), self.resolve_ty(&p.ty)))
             .collect();
@@ -997,9 +1003,13 @@ impl Lowerer {
                     }
                 }
 
-                // msg.sender, msg.value, msg.data → builtins
+                // msg.sender, msg.value, msg.data → builtins (cached per function)
                 if let Expr::Ident(ident) = obj.as_ref() {
                     if ident.name == "msg" {
+                        let cache_key = format!("msg.{}", field.name);
+                        if let Some(&cached) = self.builtin_cache.get(&cache_key) {
+                            return cached;
+                        }
                         let dst = self.alloc_reg();
                         match field.name.as_str() {
                             "sender" => self.emit(Inst::Builtin(dst, BuiltinOp::MsgSender)),
@@ -1007,6 +1017,7 @@ impl Lowerer {
                             "data" => self.emit(Inst::Builtin(dst, BuiltinOp::MsgData)),
                             _ => self.emit(Inst::Comment(format!("msg.{}", field.name))),
                         }
+                        self.builtin_cache.insert(cache_key, dst);
                         return dst;
                     }
                     if ident.name == "block" {
@@ -1655,8 +1666,13 @@ impl Lowerer {
 
             Expr::Cast(inner, ty, _) => {
                 let src = self.lower_expr(inner);
-                let dst = self.alloc_reg();
                 let target_ty = self.resolve_ty(ty);
+                // Skip no-op casts (same type → same type) to avoid register corruption
+                let src_ty = self.get_reg_type(src).cloned();
+                if src_ty.as_ref() == Some(&target_ty) {
+                    return src; // no-op cast, return source register directly
+                }
+                let dst = self.alloc_reg();
                 self.emit(Inst::Cast(dst, src, target_ty.clone()));
                 // Propagate Contract/Interface type info for typed dispatch
                 match &target_ty {

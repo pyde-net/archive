@@ -438,6 +438,11 @@ impl PydeNode {
                                     );
 
                                     // Process our own block locally
+                                    // IMPORTANT: receipts MUST be stored while state write lock is held.
+                                    // This ensures atomicity: when a client sees a receipt, the state
+                                    // changes are guaranteed to be committed. Storing receipts after
+                                    // releasing the state lock creates a race where the client sees
+                                    // the receipt but reads stale state.
                                     {
                                         let mut chain_w = chain.write().await;
                                         let mut state_w = state.write().await;
@@ -446,7 +451,7 @@ impl PydeNode {
                                                 let _ = block_store.put_header(&block.header);
                                                 let _ = block_store.put_head(current_slot);
                                                 chain_sync.on_block_processed(current_slot);
-                                                // Store receipts
+                                                // Store receipts INSIDE the state write lock
                                                 let mut receipts_w = receipts.write().await;
                                                 receipts_w.insert_block_receipts(current_slot, receipts_list.clone());
                                                 info!(
