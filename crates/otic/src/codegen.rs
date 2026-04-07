@@ -179,7 +179,8 @@ impl RegAlloc {
         if let Some(&phys) = self.mapping.get(&vreg) {
             return phys;
         }
-        let phys = self.next_wide.min(6);
+        // w0-w5 are user registers, w6=WIDE_SCRATCH2, w7=WIDE_SCRATCH (reserved)
+        let phys = self.next_wide.min(5);
         self.next_wide += 1;
         self.mapping.insert(vreg, phys);
         self.wide.insert(vreg);
@@ -193,11 +194,24 @@ impl RegAlloc {
         if phys >= self.next_gp && phys <= 11 {
             self.next_gp = phys + 1;
         }
+        // Also advance wide counter if this is a wide register
+        // (prevents alloc_wide from reusing parameter registers)
+        if self.wide.contains(&vreg) && phys >= self.next_wide && phys <= 6 {
+            self.next_wide = phys + 1;
+        }
     }
 
     /// Get the physical register (backward compat — panics on spill).
     fn get(&self, vreg: Reg) -> u8 {
         *self.mapping.get(&vreg).unwrap_or(&0)
+    }
+
+    /// Invalidate any virtual register mapped to a physical register.
+    /// Call this after operations that clobber specific physical registers.
+    fn invalidate_physical(&mut self, phys: u8) {
+        if let Some(vreg) = self.reverse.remove(&phys) {
+            self.mapping.remove(&vreg);
+        }
     }
 
     /// Check if a register holds a wide (u256) value.
@@ -877,12 +891,18 @@ impl CodeGen {
         // Pre-map params to convention registers (r2, r3, ...)
         // Wide params (u256, Address) must also be marked in the wide set
         // so that BinOp/Cmp/Return use the wide instruction path.
+        // CRITICAL: advance next_wide past pre-mapped wide registers to prevent
+        // alloc_wide from handing out the same physical wide register to a later
+        // vreg, which would silently clobber the parameter value.
         for (i, (_name, ty)) in func.params.iter().enumerate() {
             let vreg = Reg(i as u32);
             let phys = (i as u8) + 2; // r2, r3, r4, ...
             self.regs.pre_map(vreg, phys);
             if is_wide_type(ty) {
                 self.regs.wide.insert(vreg);
+                if phys >= self.regs.next_wide && phys <= 6 {
+                    self.regs.next_wide = phys + 1;
+                }
             }
         }
 
@@ -1196,11 +1216,22 @@ impl CodeGen {
                     .cloned()
                     .unwrap_or(Ty::U64);
 
-                // Widen slot to wide scratch
+                // Get value register FIRST (may trigger spill/reload that clobbers r15)
+                let rv = self.get_reg(*val);
+                // Save value if it's in r15 (which we need for slot)
+                let val_saved = rv == 15;
+                if val_saved { self.emit_op(Opcode::Push, 15, 0, 0); }
+
+                // NOW set slot in wide scratch (r15 is safe to clobber)
                 self.emit_op(Opcode::Addi, 15, 0, slot);
                 self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
 
-                let rv = self.get_reg(*val);
+                // Restore value if it was in r15
+                let rv = if val_saved {
+                    self.emit_op(Opcode::Pop, 14, 0, 0); // use r14 instead
+                    14u8
+                } else { rv };
+
                 if is_blob_type(&ty) {
                     // Save buffer_start on stack (emit_flatten clobbers r14/r15)
                     self.emit_op(Opcode::Push, 12, 0, 0);
@@ -1231,6 +1262,9 @@ impl CodeGen {
 
                 let rk = self.get_reg(*key);
                 self.emit_map_key_derivation(slot, rk, key_wide);
+                // Invalidate r14/r15 — clobbered by key derivation
+                self.regs.invalidate_physical(14);
+                self.regs.invalidate_physical(15);
 
                 if is_blob_type(&val_ty) {
                     // Borsh-deserialize: Sload blob, then deserialize into typed value
@@ -1270,15 +1304,19 @@ impl CodeGen {
                 let key_wide = is_wide_type(&key_ty);
 
                 // For blob types, save val to stack BEFORE key derivation
-                // (derivation clobbers r14/r15, and val may be in a spilled register)
                 if is_blob_type(&val_ty) {
                     let rv_early = self.get_reg(*val);
-                    self.emit_op(Opcode::Push, rv_early, 0, 0); // save val on stack
+                    self.emit_op(Opcode::Push, rv_early, 0, 0);
                 }
                 let rk = self.get_reg(*key);
                 self.emit_map_key_derivation(slot, rk, key_wide);
+                // CRITICAL: invalidate r14/r15 mappings — map key derivation clobbers them.
+                // Without this, subsequent get_reg() calls return stale physical registers.
+                self.regs.invalidate_physical(14);
+                self.regs.invalidate_physical(15);
+
                 let rv = if is_blob_type(&val_ty) {
-                    self.emit_op(Opcode::Pop, 15, 0, 0); // restore val to r15
+                    self.emit_op(Opcode::Pop, 15, 0, 0);
                     15u8
                 } else {
                     self.get_reg(*val)
@@ -1329,6 +1367,8 @@ impl CodeGen {
                 let total = 8 + k1_size + k2_size;
                 self.emit_op(Opcode::Addi, 14, 0, total);
                 self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
+                self.regs.invalidate_physical(14);
+                self.regs.invalidate_physical(15);
 
                 if wide_value {
                     let wd = self.regs.alloc_wide(*dst);
@@ -1366,6 +1406,8 @@ impl CodeGen {
                 let total = 8 + k1_size + k2_size;
                 self.emit_op(Opcode::Addi, 14, 0, total);
                 self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
+                self.regs.invalidate_physical(14);
+                self.regs.invalidate_physical(15);
 
                 // Get val AFTER derivation — derivation clobbers r14/r15
                 let rv = self.get_reg(*val);

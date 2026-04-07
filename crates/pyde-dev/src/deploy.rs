@@ -56,8 +56,18 @@ pub fn run(network: &str, contract: Option<&str>, signer: &Signer, value: u128, 
         .trim_start_matches("0x");
 
     let constructor_len = constructor_hex.len() / 2;
-    let full_bytecode = hex::decode(format!("{}{}", constructor_hex, runtime_hex))
-        .map_err(|e| format!("invalid bytecode hex: {}", e))?;
+    let runtime_len = runtime_hex.len() / 2;
+
+    // Build deploy data in pipeline format: [clen:4 LE][rlen:4 LE][constructor][runtime]
+    let constructor_bytes = hex::decode(constructor_hex)
+        .map_err(|e| format!("invalid constructor hex: {}", e))?;
+    let runtime_bytes = hex::decode(runtime_hex)
+        .map_err(|e| format!("invalid runtime hex: {}", e))?;
+    let mut full_bytecode = Vec::with_capacity(8 + constructor_bytes.len() + runtime_bytes.len());
+    full_bytecode.extend_from_slice(&(constructor_len as u32).to_le_bytes());
+    full_bytecode.extend_from_slice(&(runtime_len as u32).to_le_bytes());
+    full_bytecode.extend_from_slice(&constructor_bytes);
+    full_bytecode.extend_from_slice(&runtime_bytes);
 
     println!("  Deploying {} to {} ({})", contract_name, network, net.rpc_url);
     println!("  Constructor: {} bytes", constructor_len);
