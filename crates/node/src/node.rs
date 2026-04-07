@@ -71,8 +71,8 @@ impl PydeNode {
         let mut state = StateManager::open(datadir, self.config.storage.cache_size)?;
 
         // 3. Apply genesis if state is empty (first start)
-        if state.is_empty() {
-            let genesis_path = datadir.join("genesis.toml");
+        let genesis_path = datadir.join("genesis.toml");
+        let genesis_config = if state.is_empty() {
             let mut genesis_config = if genesis_path.exists() {
                 crate::genesis::GenesisConfig::load(&genesis_path)?
             } else {
@@ -142,12 +142,19 @@ impl PydeNode {
                 slot = genesis_block.slot(),
                 "genesis block created"
             );
+            genesis_config
         } else {
             info!(
                 state_root = hex::encode(state.root()),
                 "state loaded from disk"
             );
-        }
+            // Reload genesis config for committee formation
+            if genesis_path.exists() {
+                crate::genesis::GenesisConfig::load(&genesis_path)?
+            } else {
+                crate::genesis::GenesisConfig::default()
+            }
+        };
 
         // 3. Block store (persistent headers on disk)
         let block_store = BlockStore::open(datadir)?;
@@ -183,7 +190,7 @@ impl PydeNode {
         // 5. Validator engine + identity (only for validator role)
         let mut validator_identity: Option<ValidatorIdentity> = None;
         let mut validator_engine: Option<ValidatorEngine> = if is_validator {
-            let identity = early_validator_identity.expect("validator identity loaded earlier");
+            let mut identity = early_validator_identity.expect("validator identity loaded earlier");
             info!(
                 address = hex::encode(identity.address),
                 "validator identity loaded"
@@ -220,15 +227,38 @@ impl PydeNode {
 
             let mut engine = ValidatorEngine::new([0xAA; 32]); // devnet epoch randomness
 
-            // For devnet: this validator is the sole committee member (index 0).
-            // In production, committee is formed from on-chain validator set at epoch boundary.
-            let pk_bytes = identity.public_key.as_bytes().to_vec();
-            engine.set_committee(vec![pk_bytes]);
+            // Build committee from genesis validators (if any).
+            // If genesis has validators, use them all as the committee.
+            // Otherwise fall back to single-validator mode (just self).
+            let mut committee_keys: Vec<Vec<u8>> = Vec::new();
+            let mut my_index: u8 = 0;
+            let my_pk_hex = hex::encode(identity.public_key.as_bytes());
 
-            info!(
-                committee_size = 1,
-                "validator consensus engine initialized (devnet single-validator mode)"
-            );
+            if !genesis_config.validators.is_empty() {
+                for (i, val) in genesis_config.validators.iter().enumerate() {
+                    let pk_bytes = hex::decode(val.public_key.strip_prefix("0x").unwrap_or(&val.public_key))
+                        .map_err(|e| format!("invalid validator public key in genesis: {}", e))?;
+                    if val.public_key == my_pk_hex || val.public_key == format!("0x{}", my_pk_hex) {
+                        my_index = i as u8;
+                    }
+                    committee_keys.push(pk_bytes);
+                }
+                info!(
+                    committee_size = committee_keys.len(),
+                    my_index,
+                    "committee formed from genesis validators"
+                );
+            } else {
+                // Fallback: single-validator devnet mode
+                committee_keys.push(identity.public_key.as_bytes().to_vec());
+                info!(
+                    committee_size = 1,
+                    "validator consensus engine initialized (devnet single-validator mode)"
+                );
+            }
+
+            engine.set_committee(committee_keys);
+            identity.committee_index = my_index;
             validator_identity = Some(identity);
             Some(engine)
         } else {
@@ -283,6 +313,7 @@ impl PydeNode {
         }
 
         // 10. Start RPC server if enabled
+        let (tx_gossip_tx, mut tx_gossip_rx) = tokio::sync::mpsc::channel::<pyde_tx::types::Transaction>(1024);
         if self.config.rpc.enabled {
             let (new_heads_tx, _) = tokio::sync::broadcast::channel(256);
             let (pending_tx_tx, _) = tokio::sync::broadcast::channel(4096);
@@ -298,6 +329,7 @@ impl PydeNode {
                 pending_tx_tx,
                 logs_tx,
                 dev_mode: self.config.node.dev_mode,
+                tx_gossip_tx,
             });
             match rpc::start_rpc_server(
                 &self.config.rpc.listen,
@@ -378,6 +410,22 @@ impl PydeNode {
                             pending.push(tx);
                             debug!(tx_hash = hex::encode(tx_hash), pending = pending.len(), "tx accepted from gossip");
                         }
+                        PostEventAction::StoreReceipts(slot, receipts_list) => {
+                            let mut receipts_w = receipts.write().await;
+                            receipts_w.insert_block_receipts(slot, receipts_list);
+                        }
+                        PostEventAction::BlockProcessed { slot, receipts: receipts_list, tx_hashes } => {
+                            // Store receipts
+                            if !receipts_list.is_empty() {
+                                let mut receipts_w = receipts.write().await;
+                                receipts_w.insert_block_receipts(slot, receipts_list);
+                            }
+                            // Remove processed txs from pending queue (dedup)
+                            if !tx_hashes.is_empty() {
+                                let mut pending_w = pending_txs.write().await;
+                                pending_w.retain(|tx| !tx_hashes.contains(&tx.hash()));
+                            }
+                        }
                     }
                 }
                 _ = slot_interval.tick() => {
@@ -427,22 +475,28 @@ impl PydeNode {
                                     // Compute tx root
                                     let tx_root = pyde_consensus::block::compute_tx_root(&txs);
 
+                                    // Encode VRF data as [output:32 || proof:N] so verifiers
+                                    // can check both the score and the proof validity.
+                                    let mut vrf_data = Vec::with_capacity(32 + candidate.vrf_proof.as_bytes().len());
+                                    vrf_data.extend_from_slice(candidate.vrf_output.as_bytes());
+                                    vrf_data.extend_from_slice(candidate.vrf_proof.as_bytes());
+
                                     let block = engine.build_proposal(
                                         identity,
                                         parent_hash,
                                         parent_hash, // pre-state root (post-state computed after execution)
                                         tx_root,
-                                        candidate.vrf_proof.as_bytes().to_vec(),
+                                        vrf_data,
                                         txs,
                                         exec_schedule,
                                     );
 
-                                    // Process our own block locally
-                                    // IMPORTANT: receipts MUST be stored while state write lock is held.
-                                    // This ensures atomicity: when a client sees a receipt, the state
-                                    // changes are guaranteed to be committed. Storing receipts after
-                                    // releasing the state lock creates a race where the client sees
-                                    // the receipt but reads stale state.
+                                    // Process our own block immediately.
+                                    // VRF selection ensures only one proposal wins votes, so
+                                    // speculative execution is safe: our block either wins (QC forms)
+                                    // or nobody's block wins (timeout). In the rare case another
+                                    // proposer's block wins for the same slot, our state diverges
+                                    // but the gossip block handler rejects duplicate slots.
                                     {
                                         let mut chain_w = chain.write().await;
                                         let mut state_w = state.write().await;
@@ -451,14 +505,10 @@ impl PydeNode {
                                                 let _ = block_store.put_header(&block.header);
                                                 let _ = block_store.put_head(current_slot);
                                                 chain_sync.on_block_processed(current_slot);
-                                                // Store receipts INSIDE the state write lock
                                                 let mut receipts_w = receipts.write().await;
                                                 receipts_w.insert_block_receipts(current_slot, receipts_list.clone());
                                                 info!(
-                                                    slot = current_slot,
-                                                    txs = tc,
-                                                    gas,
-                                                    mempool_pending = tx_count,
+                                                    slot = current_slot, txs = tc, gas,
                                                     "proposed and processed block"
                                                 );
                                             }
@@ -476,7 +526,7 @@ impl PydeNode {
                                         debug!(slot = current_slot, error = %e, "no gossipsub subscribers for block");
                                     }
 
-                                    // Also broadcast proposal as consensus message
+                                    // Broadcast proposal as consensus message
                                     let proposal = pyde_consensus::hotstuff::ConsensusMessage::Proposal {
                                         header: block.header.clone(),
                                         proposer_signature: block.proposer_signature.clone(),
@@ -484,31 +534,87 @@ impl PydeNode {
                                     let proposal_bytes = wire::encode_consensus_message(&proposal);
                                     let cons_topic = pyde_net::node::topics::consensus();
                                     let _ = swarm.behaviour_mut().gossipsub.publish(cons_topic, proposal_bytes);
+
+                                    // Buffer our own proposal for VRF selection.
+                                    // Voting happens after the proposal collection window.
+                                    engine.buffer_proposal(&block.header, &block.proposer_signature);
                                 } // end if mempool_size > 0
                                 }
                             }
 
-                            // Check for timeout (no proposal received within 200ms)
-                            if engine.is_timed_out() {
-                                if let Some(identity) = validator_identity.as_ref() {
-                                    if let Some(vc_msg) = engine.on_timeout(identity) {
-                                        let vc_bytes = wire::encode_consensus_message(
-                                            &pyde_consensus::hotstuff::ConsensusMessage::Timeout {
-                                                slot: current_slot,
-                                                voter_index: identity.committee_index,
-                                                voter_address: identity.address,
-                                                highest_qc: engine.consensus.highest_qc.clone(),
-                                                signature: vec![], // signed inside on_timeout
-                                            }
-                                        );
-                                        let topic = pyde_net::node::topics::consensus();
-                                        let _ = swarm.behaviour_mut().gossipsub.publish(topic, vc_bytes);
+                            debug!(slot = current_slot, "slot tick (new)");
+                        }
+                    }
+
+                    // --- Per-tick consensus actions (run every 100ms, not just on new slots) ---
+                    if let Some(engine) = validator_engine.as_mut() {
+                        let current_slot = slot_clock.current_slot();
+                        let ms_in_slot = slot_clock.ms_into_slot();
+
+                        // Proposal selection phase: 100ms into the slot, select the
+                        // best proposal (lowest VRF score) and vote for it.
+                        if ms_in_slot >= 100 {
+                            if let Some(identity) = validator_identity.as_ref() {
+                                if let Some(vote) = engine.select_and_vote(identity) {
+                                    // Add own vote to collection
+                                    let qc_formed = if let Some(qc) = engine.on_vote(vote.clone()) {
+                                        info!(slot = current_slot, votes = qc.vote_count(), "QC formed after VRF selection");
+                                        true
+                                    } else {
+                                        false
+                                    };
+                                    // Broadcast vote
+                                    let vote_bytes = wire::encode_consensus_message(&vote);
+                                    let topic = pyde_net::node::topics::consensus();
+                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic, vote_bytes);
+
+                                    // If QC formed: broadcast hard finality vote
+                                    if qc_formed {
+                                        let state_root = chain.read().await.state_root;
+                                        if let Some(fv) = engine.create_finality_vote(
+                                            current_slot,
+                                            engine.consensus.highest_qc.block_hash,
+                                            state_root,
+                                            identity,
+                                        ) {
+                                            engine.on_finality_vote(fv.clone());
+                                            let fv_bytes = wire::encode_finality_vote(&fv);
+                                            let topic = pyde_net::node::topics::consensus();
+                                            let _ = swarm.behaviour_mut().gossipsub.publish(topic, fv_bytes);
+                                        }
                                     }
                                 }
                             }
-
-                            debug!(slot = current_slot, "slot tick");
                         }
+
+                        // Check for timeout (no proposal received within 200ms)
+                        if engine.is_timed_out() {
+                            if let Some(identity) = validator_identity.as_ref() {
+                                if let Some(vc_msg) = engine.on_timeout(identity) {
+                                    let vc_bytes = wire::encode_consensus_message(
+                                        &pyde_consensus::hotstuff::ConsensusMessage::Timeout {
+                                            slot: current_slot,
+                                            voter_index: identity.committee_index,
+                                            voter_address: identity.address,
+                                            highest_qc: engine.consensus.highest_qc.clone(),
+                                            signature: vec![],
+                                        }
+                                    );
+                                    let topic = pyde_net::node::topics::consensus();
+                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic, vc_bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(tx) = tx_gossip_rx.recv() => {
+                    // Gossip transaction from RPC to P2P network
+                    let tx_bytes = wire::encode_transaction(&tx);
+                    let topic = pyde_net::node::topics::transactions();
+                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, tx_bytes) {
+                        debug!(error = %e, "failed to gossip tx (no subscribers)");
+                    } else {
+                        debug!(tx_hash = hex::encode(tx.hash()), "gossiped tx to network");
                     }
                 }
                 _ = sync_interval.tick() => {
@@ -565,6 +671,12 @@ enum PostEventAction {
     ContinueSync,
     BroadcastConsensus(Vec<u8>),
     AcceptTransaction(pyde_tx::types::Transaction),
+    StoreReceipts(u64, Vec<pyde_tx::execution::Receipt>),
+    BlockProcessed {
+        slot: u64,
+        receipts: Vec<pyde_tx::execution::Receipt>,
+        tx_hashes: Vec<[u8; 32]>,
+    },
 }
 
 /// Handle a libp2p swarm event. Returns an action that may need swarm access.
@@ -607,13 +719,36 @@ fn handle_swarm_event(
                     match wire::decode_block(&message.data) {
                         Ok(block) => {
                             let slot = block.header.slot;
+
+                            // Validate block against committee (signature, VRF, proposer, QC)
+                            if let Some(ref engine) = validator_engine {
+                                if let Err(e) = BlockProcessor::validate_network_block(
+                                    &block.header,
+                                    &block.proposer_signature,
+                                    &engine.committee_keys,
+                                    &engine.epoch_randomness,
+                                ) {
+                                    warn!(slot, error = %e, "block validation failed");
+                                    return PostEventAction::None;
+                                }
+                            }
+
                             match BlockProcessor::process_full_block(chain, state, &block) {
-                                Ok((tx_count, gas_used, _receipts)) => {
+                                Ok((tx_count, gas_used, receipts_list)) => {
                                     chain_sync.on_block_processed(slot);
                                     // Persist full block (header + body) to disk
                                     let _ = block_store.put_block(&block.header, &message.data);
                                     let _ = block_store.put_head(slot);
                                     info!(slot, tx_count, gas_used, "block received and processed");
+                                    // Collect tx hashes to deduplicate from pending queue
+                                    let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
+                                        .map(|tx| tx.hash()).collect();
+                                    // Store receipts + deduplicate txs
+                                    return PostEventAction::BlockProcessed {
+                                        slot,
+                                        receipts: receipts_list,
+                                        tx_hashes,
+                                    };
                                 }
                                 Err(e) => {
                                     debug!(slot, error = %e, "block rejected");
@@ -627,20 +762,30 @@ fn handle_swarm_event(
                 }
                 Some(Channel::Consensus) => {
                     if let Some(engine) = validator_engine.as_mut() {
+                        // Check if it's a finality vote (different wire tag)
+                        if !message.data.is_empty() && message.data[0] == wire::tag::CONSENSUS_FINALITY_VOTE {
+                            match wire::decode_finality_vote(&message.data) {
+                                Ok(fv) => {
+                                    debug!(slot = fv.slot, voter = fv.voter_index, "received finality vote");
+                                    engine.on_finality_vote(fv);
+                                }
+                                Err(e) => {
+                                    debug!(error = e, "failed to decode finality vote");
+                                }
+                            }
+                            return PostEventAction::None;
+                        }
+
                         match wire::decode_consensus_message(&message.data) {
                             Ok(msg) => {
                                 use pyde_consensus::hotstuff::ConsensusMessage;
                                 match msg {
-                                    ConsensusMessage::Proposal { ref header, .. } => {
+                                    ConsensusMessage::Proposal { ref header, ref proposer_signature } => {
                                         info!(slot = header.slot, "received proposal");
-                                        // Vote on the proposal if we have an identity
-                                        if let Some(identity) = validator_identity.as_ref() {
-                                            if let Some(vote) = engine.on_proposal(header, identity) {
-                                                // Broadcast vote via gossipsub
-                                                let vote_bytes = wire::encode_consensus_message(&vote);
-                                                return PostEventAction::BroadcastConsensus(vote_bytes);
-                                            }
-                                        }
+                                        // Buffer the proposal for VRF-based selection.
+                                        // Voting happens after the proposal collection window
+                                        // via select_and_vote (triggered by slot timer).
+                                        engine.buffer_proposal(header, proposer_signature);
                                     }
                                     ConsensusMessage::Vote { slot, voter_index, .. } => {
                                         debug!(slot, voter_index, "received vote");
@@ -648,11 +793,30 @@ fn handle_swarm_event(
                                             info!(slot, votes = qc.vote_count(), "QC formed");
                                         }
                                     }
-                                    ConsensusMessage::Timeout { slot, .. } => {
-                                        debug!(slot, "received timeout");
+                                    ConsensusMessage::Timeout {
+                                        slot, voter_index, voter_address, highest_qc, signature
+                                    } => {
+                                        debug!(slot, voter_index, "received timeout");
+                                        // Convert to ViewChangeMessage and process
+                                        let vc_msg = pyde_consensus::view_change::ViewChangeMessage {
+                                            slot,
+                                            highest_qc,
+                                            voter_index,
+                                            voter_address,
+                                            signature,
+                                        };
+                                        if engine.on_view_change(vc_msg) {
+                                            info!(slot, "view change QC formed — fallback proposer can proceed");
+                                        }
                                     }
-                                    ConsensusMessage::NewView { slot, .. } => {
+                                    ConsensusMessage::NewView { slot, highest_qc, voter_address, signature } => {
                                         debug!(slot, "received new view");
+                                        // NewView carries the highest QC from a validator after view change.
+                                        // Update our highest QC if theirs is higher.
+                                        if highest_qc.slot > engine.consensus.highest_qc.slot {
+                                            engine.consensus.highest_qc = highest_qc;
+                                            debug!(slot, "updated highest QC from NewView");
+                                        }
                                     }
                                 }
                             }

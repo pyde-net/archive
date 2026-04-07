@@ -137,6 +137,80 @@ impl BlockProcessor {
         }
         Ok(())
     }
+
+    /// Extended validation for blocks received from the network.
+    /// Checks: proposer signature, proposer in committee, VRF proof, QC quorum.
+    pub fn validate_network_block(
+        header: &BlockHeader,
+        proposer_signature: &[u8],
+        committee_keys: &[Vec<u8>],
+        epoch_randomness: &[u8; 32],
+    ) -> Result<(), String> {
+        let slot = header.slot;
+
+        // Skip validation for genesis block
+        if slot == 0 {
+            return Ok(());
+        }
+
+        // 1. Proposer must be a committee member
+        let proposer_idx = committee_keys.iter().position(|k| {
+            let addr = pyde_account::address::derive_eoa_address(k);
+            addr == header.proposer
+        });
+        if proposer_idx.is_none() {
+            return Err(format!(
+                "proposer {} is not in the committee",
+                hex::encode(header.proposer)
+            ));
+        }
+        let proposer_idx = proposer_idx.unwrap();
+
+        // 2. Verify proposer signature
+        if proposer_signature.is_empty() {
+            return Err("block missing proposer signature".into());
+        }
+        let pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(&committee_keys[proposer_idx])
+            .ok_or("invalid committee public key")?;
+        let block_hash = header.hash();
+        let sig = pyde_crypto::falcon::FalconSignature::from_bytes(proposer_signature)
+            .ok_or("invalid proposer signature format")?;
+        if !pyde_crypto::falcon::falcon_verify(&pk, &block_hash, &sig) {
+            return Err("proposer signature verification failed".into());
+        }
+
+        // 3. Verify VRF proof (encoded as [output:32 || proof:N])
+        if header.vrf_proof.len() >= 33 {
+            let vrf_output_bytes = &header.vrf_proof[..32];
+            let vrf_proof_bytes = &header.vrf_proof[32..];
+
+            let pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(&committee_keys[proposer_idx])
+                .ok_or("invalid committee public key for VRF verification")?;
+            let vrf_output = pyde_crypto::vrf::VrfOutput::from_hash_bytes(vrf_output_bytes);
+            let vrf_proof = pyde_crypto::vrf::VrfProof::from_bytes(vrf_proof_bytes);
+
+            let mut vrf_input = Vec::with_capacity(40);
+            vrf_input.extend_from_slice(epoch_randomness);
+            vrf_input.extend_from_slice(&slot.to_le_bytes());
+
+            if !pyde_crypto::vrf::vrf_verify(&pk, &vrf_input, &vrf_output, &vrf_proof) {
+                return Err("invalid VRF proof in block header".into());
+            }
+        }
+
+        // 4. Previous QC should have quorum (skip for early blocks with empty QC)
+        let committee_size = committee_keys.len();
+        if header.qc_previous.slot > 0 && !header.qc_previous.has_quorum_for(committee_size) {
+            return Err(format!(
+                "previous QC at slot {} has insufficient votes ({}/{})",
+                header.qc_previous.slot,
+                header.qc_previous.vote_count(),
+                pyde_consensus::block::quorum_for_committee(committee_size),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

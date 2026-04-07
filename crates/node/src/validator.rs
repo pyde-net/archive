@@ -1,13 +1,14 @@
 use pyde_account::address::Address;
 use pyde_consensus::block::{
     Block, BlockBody, BlockHeader, QuorumCert, EPOCH_LENGTH,
-    QUORUM_THRESHOLD,
 };
 use pyde_consensus::finality::{FinalityTracker, FinalityVote, create_finality_vote, try_form_hard_finality};
 use pyde_consensus::hotstuff::{
     ConsensusMessage, ConsensusState, create_vote, try_form_qc, verify_vote,
 };
 use pyde_consensus::proposer::{compute_candidacy, ProposerCandidate};
+use pyde_crypto::vrf::VrfProof;
+use pyde_consensus::block::quorum_for_committee;
 use pyde_consensus::validator::VALIDATOR_STAKE;
 use pyde_consensus::view_change::{
     TimeoutTracker, ViewChangeMessage, create_view_change, try_form_view_change_qc,
@@ -49,6 +50,13 @@ struct SlotVotes {
     votes: Vec<ConsensusMessage>,
 }
 
+/// A buffered proposal with verified VRF score.
+struct BufferedProposal {
+    header: BlockHeader,
+    proposer_signature: Vec<u8>,
+    vrf_score: u64,
+}
+
 /// The validator consensus engine.
 /// Manages the HotStuff protocol state, VRF proposer selection,
 /// voting, QC formation, and finality tracking.
@@ -69,6 +77,10 @@ pub struct ValidatorEngine {
     view_changes: HashMap<u64, Vec<ViewChangeMessage>>,
     /// Finality votes collected per slot.
     finality_votes: HashMap<u64, Vec<FinalityVote>>,
+    /// Buffered proposals per slot (collected during proposal phase, voted after selection).
+    buffered_proposals: HashMap<u64, Vec<BufferedProposal>>,
+    /// Whether we've already voted for a given slot (after proposal selection).
+    voted_slots: std::collections::HashSet<u64>,
 }
 
 impl ValidatorEngine {
@@ -84,6 +96,8 @@ impl ValidatorEngine {
             votes: HashMap::new(),
             view_changes: HashMap::new(),
             finality_votes: HashMap::new(),
+            buffered_proposals: HashMap::new(),
+            voted_slots: std::collections::HashSet::new(),
         }
     }
 
@@ -93,7 +107,9 @@ impl ValidatorEngine {
         self.committee_keys = keys;
     }
 
-    /// Check if this validator is the proposer for the current slot.
+    /// Compute VRF candidacy for the current slot.
+    /// All validators compute their candidacy and propose. The best proposal
+    /// (lowest VRF score) is selected during the proposal phase via `select_and_vote`.
     pub fn check_proposer(&self, identity: &ValidatorIdentity) -> Option<ProposerCandidate> {
         let slot = self.consensus.current_slot;
         match compute_candidacy(
@@ -112,6 +128,144 @@ impl ValidatorEngine {
                 None
             }
         }
+    }
+
+    /// Buffer a received proposal. Verifies the VRF proof against the proposer's
+    /// committee key. Invalid proofs are rejected.
+    ///
+    /// The header.vrf_proof field is encoded as [vrf_output:32 || vrf_proof:N].
+    pub fn buffer_proposal(
+        &mut self,
+        header: &BlockHeader,
+        proposer_signature: &[u8],
+    ) -> bool {
+        let slot = header.slot;
+
+        // Don't buffer if we've already voted for this slot
+        if self.voted_slots.contains(&slot) {
+            debug!(slot, "ignoring late proposal (already voted)");
+            return false;
+        }
+
+        // VRF data must be at least 32 bytes (output) + some proof bytes
+        if header.vrf_proof.len() < 33 {
+            warn!(slot, "proposal has missing or truncated VRF data");
+            return false;
+        }
+
+        // Split [output:32 || proof:N]
+        let vrf_output_bytes = &header.vrf_proof[..32];
+        let vrf_proof_bytes = &header.vrf_proof[32..];
+
+        // Find proposer's committee index by matching address
+        let proposer_idx = self.committee_keys.iter().position(|k| {
+            let addr = pyde_account::address::derive_eoa_address(k);
+            addr == header.proposer
+        });
+        let proposer_idx = match proposer_idx {
+            Some(idx) => idx,
+            None => {
+                warn!(slot, proposer = hex::encode(header.proposer), "proposal from non-committee member");
+                return false;
+            }
+        };
+
+        // Reconstruct proposer's public key
+        let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&self.committee_keys[proposer_idx]) {
+            Some(pk) => pk,
+            None => { warn!(slot, "invalid committee public key"); return false; }
+        };
+
+        // Verify proposer signature on block header
+        if !proposer_signature.is_empty() {
+            let block_hash = header.hash();
+            let sig = match pyde_crypto::falcon::FalconSignature::from_bytes(proposer_signature) {
+                Some(s) => s,
+                None => { warn!(slot, "invalid proposer signature format"); return false; }
+            };
+            if !pyde_crypto::falcon::falcon_verify(&pk, &block_hash, &sig) {
+                warn!(slot, "proposer signature verification failed");
+                return false;
+            }
+        } else {
+            warn!(slot, "proposal missing proposer signature");
+            return false;
+        }
+        let vrf_output = pyde_crypto::vrf::VrfOutput::from_hash_bytes(vrf_output_bytes);
+        let vrf_proof = VrfProof::from_bytes(vrf_proof_bytes);
+
+        // Build VRF input: epoch_randomness || slot
+        let mut vrf_input = Vec::with_capacity(40);
+        vrf_input.extend_from_slice(&self.epoch_randomness);
+        vrf_input.extend_from_slice(&slot.to_le_bytes());
+
+        // Verify VRF proof
+        if !pyde_crypto::vrf::vrf_verify(&pk, &vrf_input, &vrf_output, &vrf_proof) {
+            warn!(slot, "invalid VRF proof from proposer");
+            return false;
+        }
+
+        // Score = first 8 bytes of VRF output (LE u64)
+        let vrf_score = {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&vrf_output_bytes[..8]);
+            u64::from_le_bytes(buf)
+        };
+
+        // Mark proposal received for timeout tracker
+        if slot == self.timeout.slot {
+            self.timeout.receive_proposal();
+        }
+
+        let entry = self.buffered_proposals.entry(slot).or_default();
+        entry.push(BufferedProposal {
+            header: header.clone(),
+            proposer_signature: proposer_signature.to_vec(),
+            vrf_score,
+        });
+
+        debug!(slot, vrf_score, proposals = entry.len(), "proposal buffered");
+        true
+    }
+
+    /// Select the best proposal (lowest VRF score) and vote for it.
+    /// Called after the proposal collection window (100ms into the slot).
+    /// Returns the vote to broadcast, or None if no proposals were buffered.
+    pub fn select_and_vote(
+        &mut self,
+        identity: &ValidatorIdentity,
+    ) -> Option<ConsensusMessage> {
+        let slot = self.consensus.current_slot;
+
+        // Don't double-vote
+        if self.voted_slots.contains(&slot) {
+            return None;
+        }
+
+        let proposals = self.buffered_proposals.get(&slot)?;
+        if proposals.is_empty() {
+            return None;
+        }
+
+        // Pick the proposal with the lowest VRF score (clone to release borrow)
+        let best = proposals.iter().min_by_key(|p| p.vrf_score)?;
+        let best_header = best.header.clone();
+        let best_score = best.vrf_score;
+        let best_proposer = best.header.proposer;
+
+        info!(
+            slot,
+            vrf_score = best_score,
+            proposer = hex::encode(best_proposer),
+            "selected best proposal"
+        );
+
+        // Vote for the best proposal
+        let vote = self.on_proposal(&best_header, identity);
+        if vote.is_some() {
+            self.voted_slots.insert(slot);
+        }
+        vote
     }
 
     /// Build a block proposal for the current slot.
@@ -141,13 +295,26 @@ impl ValidatorEngine {
             timestamp: current_time_ms(),
         };
 
+        // Sign the block header hash with the proposer's FALCON key
+        let block_hash = header.hash();
+        let proposer_signature = match pyde_crypto::falcon::falcon_sign(
+            &identity.secret_key,
+            &block_hash,
+        ) {
+            Ok(sig) => sig.to_vec(),
+            Err(_) => {
+                warn!(slot, "failed to sign block header");
+                vec![]
+            }
+        };
+
         Block {
             header,
             body: BlockBody {
                 transactions,
                 execution_schedule,
             },
-            proposer_signature: vec![], // Signed when broadcasting
+            proposer_signature,
         }
     }
 
@@ -217,8 +384,9 @@ impl ValidatorEngine {
         });
         entry.votes.push(vote);
 
-        // Try to form QC
-        if entry.votes.len() >= QUORUM_THRESHOLD {
+        // Try to form QC (dynamic quorum based on actual committee size)
+        let threshold = quorum_for_committee(self.committee_keys.len());
+        if entry.votes.len() >= threshold {
             let qc = try_form_qc(slot, block_hash, &entry.votes, &self.committee_keys);
             if let Some(ref qc) = qc {
                 info!(slot, votes = qc.vote_count(), "QC formed");
@@ -283,8 +451,9 @@ impl ValidatorEngine {
         let entry = self.finality_votes.entry(slot).or_default();
         entry.push(vote);
 
-        // Try to form hard finality cert
-        if entry.len() >= QUORUM_THRESHOLD {
+        // Try to form hard finality cert (dynamic quorum)
+        let threshold = quorum_for_committee(self.committee_keys.len());
+        if entry.len() >= threshold {
             if let Some(cert) = try_form_hard_finality(
                 slot,
                 block_hash,
@@ -311,6 +480,8 @@ impl ValidatorEngine {
             self.votes.retain(|s, _| *s >= prune_before);
             self.view_changes.retain(|s, _| *s >= prune_before);
             self.finality_votes.retain(|s, _| *s >= prune_before);
+            self.buffered_proposals.retain(|s, _| *s >= prune_before);
+            self.voted_slots.retain(|s| *s >= prune_before);
         }
 
         debug!(slot = new_slot, "advanced to next slot");
@@ -483,12 +654,14 @@ mod tests {
     }
 
     #[test]
-    fn qc_forms_at_quorum() {
-        // Use small committee for test speed (3 validators, threshold logic uses QUORUM_THRESHOLD)
-        // Since QUORUM_THRESHOLD is 86, we can't reach it with 3 validators.
-        // Instead, verify votes accumulate correctly.
-        let (mut engine, identities) = make_engine_with_committee(3);
-        engine.advance_slot();
+    fn qc_forms_with_dynamic_quorum() {
+        // 3-member committee: quorum_for_committee(3) = 2
+        // Simulate multi-node: each validator has its own engine for voting,
+        // but votes are collected in one engine for QC formation.
+        let (_, identities) = make_engine_with_committee(3);
+        let committee_keys: Vec<Vec<u8>> = identities.iter()
+            .map(|id| id.public_key.as_bytes().to_vec())
+            .collect();
 
         let header = BlockHeader {
             slot: 1,
@@ -502,17 +675,78 @@ mod tests {
             timestamp: 0,
         };
 
-        // Each validator votes
+        // Each validator creates their vote using their own engine
+        let mut votes = Vec::new();
         for id in &identities {
-            if let Some(vote) = engine.on_proposal(&header, id) {
-                engine.on_vote(vote);
+            let mut voter_engine = ValidatorEngine::new([0xAA; 32]);
+            voter_engine.set_committee(committee_keys.clone());
+            voter_engine.advance_slot();
+            if let Some(vote) = voter_engine.on_proposal(&header, id) {
+                votes.push(vote);
+            }
+        }
+        assert_eq!(votes.len(), 3);
+
+        // Collect votes in a single engine (simulates the proposer node)
+        let mut collector = ValidatorEngine::new([0xAA; 32]);
+        collector.set_committee(committee_keys);
+        collector.advance_slot();
+
+        let mut qc_formed = false;
+        for vote in votes {
+            if let Some(qc) = collector.on_vote(vote) {
+                qc_formed = true;
+                assert!(qc.vote_count() >= 2);
             }
         }
 
-        // 3 votes collected (not enough for QC with QUORUM_THRESHOLD=86)
-        let slot_votes = engine.votes.get(&1);
-        assert!(slot_votes.is_some());
-        assert!(slot_votes.unwrap().votes.len() <= 3);
+        assert!(qc_formed, "QC should form with 3 votes in 3-member committee (quorum=2)");
+    }
+
+    #[test]
+    fn two_node_qc_requires_both_votes() {
+        // 2-member committee: quorum_for_committee(2) = 2
+        let (_, identities) = make_engine_with_committee(2);
+        let committee_keys: Vec<Vec<u8>> = identities.iter()
+            .map(|id| id.public_key.as_bytes().to_vec())
+            .collect();
+
+        let header = BlockHeader {
+            slot: 1,
+            epoch: 0,
+            parent_hash: [0u8; 32],
+            proposer: identities[0].address,
+            vrf_proof: vec![],
+            qc_previous: QuorumCert::empty(),
+            tx_root: [0u8; 32],
+            state_root: [0u8; 32],
+            timestamp: 0,
+        };
+
+        // Each validator votes using their own engine
+        let mut votes = Vec::new();
+        for id in &identities {
+            let mut voter_engine = ValidatorEngine::new([0xAA; 32]);
+            voter_engine.set_committee(committee_keys.clone());
+            voter_engine.advance_slot();
+            if let Some(vote) = voter_engine.on_proposal(&header, id) {
+                votes.push(vote);
+            }
+        }
+        assert_eq!(votes.len(), 2);
+
+        // Collector engine
+        let mut collector = ValidatorEngine::new([0xAA; 32]);
+        collector.set_committee(committee_keys);
+        collector.advance_slot();
+
+        // First vote — not enough
+        assert!(collector.on_vote(votes[0].clone()).is_none(), "1/2 votes should not form QC");
+
+        // Second vote — QC forms
+        let qc = collector.on_vote(votes[1].clone());
+        assert!(qc.is_some(), "2/2 votes should form QC");
+        assert_eq!(qc.unwrap().vote_count(), 2);
     }
 
     #[test]

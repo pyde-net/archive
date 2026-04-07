@@ -71,6 +71,12 @@ impl SlotClock {
     pub fn slot_duration(&self) -> Duration {
         self.slot_duration
     }
+
+    /// Milliseconds elapsed within the current slot (0..400).
+    pub fn ms_into_slot(&self) -> u64 {
+        let elapsed_ms = self.genesis_instant.elapsed().as_millis() as u64;
+        elapsed_ms % BLOCK_TIME_MS
+    }
 }
 
 fn current_time_ms() -> u64 {

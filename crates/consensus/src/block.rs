@@ -15,8 +15,19 @@ use sparse_merkle_tree::H256;
 /// Committee size (128 validators per epoch).
 pub const COMMITTEE_SIZE: usize = 128;
 
-/// Quorum threshold (2/3 of committee = 86).
+/// Quorum threshold for production (2/3 of 128 = 86).
 pub const QUORUM_THRESHOLD: usize = 86;
+
+/// Compute quorum threshold for a given committee size: ceil(2/3 * size).
+/// For production (128 members) this returns 86.
+/// For devnet (2-4 members) this returns the correct BFT threshold.
+pub fn quorum_for_committee(committee_size: usize) -> usize {
+    if committee_size == 0 {
+        return 0;
+    }
+    // ceil(2/3 * n) = (2*n + 2) / 3
+    (2 * committee_size + 2) / 3
+}
 
 /// Blocks per epoch (~1000 blocks, ~6.6 minutes at 400ms).
 pub const EPOCH_LENGTH: u64 = 1000;
@@ -43,9 +54,14 @@ impl QuorumCert {
         self.voter_bitmap.count_ones()
     }
 
-    /// Whether this QC has enough votes (>= 86/128).
+    /// Whether this QC has enough votes (>= 86/128) for production committee.
     pub fn has_quorum(&self) -> bool {
         self.vote_count() >= QUORUM_THRESHOLD as u32
+    }
+
+    /// Whether this QC has enough votes for a given committee size.
+    pub fn has_quorum_for(&self, committee_size: usize) -> bool {
+        self.vote_count() >= quorum_for_committee(committee_size) as u32
     }
 
     /// Hash this QC: Poseidon2(slot + block_hash + voter_bitmap).
@@ -322,5 +338,33 @@ mod tests {
         assert_eq!(QUORUM_THRESHOLD, 86);
         assert_eq!(EPOCH_LENGTH, 1000);
         assert_eq!(BLOCK_TIME_MS, 400);
+    }
+
+    // ========== Dynamic quorum ==========
+
+    #[test]
+    fn quorum_for_committee_production() {
+        // 128 members → 86 (matches production constant)
+        assert_eq!(quorum_for_committee(128), 86);
+    }
+
+    #[test]
+    fn quorum_for_committee_small() {
+        assert_eq!(quorum_for_committee(0), 0);
+        assert_eq!(quorum_for_committee(1), 1); // single node: needs 1
+        assert_eq!(quorum_for_committee(2), 2); // 2 nodes: needs 2
+        assert_eq!(quorum_for_committee(3), 2); // 3 nodes: needs 2
+        assert_eq!(quorum_for_committee(4), 3); // 4 nodes: needs 3
+        assert_eq!(quorum_for_committee(5), 4); // 5 nodes: needs 4
+        assert_eq!(quorum_for_committee(10), 7);
+    }
+
+    #[test]
+    fn has_quorum_for_dynamic() {
+        let mut qc = QuorumCert::empty();
+        qc.voter_bitmap = 0b11; // 2 votes
+        assert!(qc.has_quorum_for(2));  // 2/2 = quorum
+        assert!(qc.has_quorum_for(3));  // 2/3 = quorum (threshold=2)
+        assert!(!qc.has_quorum_for(4)); // 2/4, threshold=3
     }
 }

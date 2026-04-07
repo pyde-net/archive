@@ -36,13 +36,13 @@ pub enum Command {
         #[arg(long)]
         log_json: bool,
 
-        /// Prometheus metrics port (0 = disabled).
-        #[arg(long, default_value = "9090")]
-        metrics_port: u16,
+        /// Prometheus metrics port (0 = disabled). If omitted, uses config file or 9090.
+        #[arg(long)]
+        metrics_port: Option<u16>,
 
-        /// JSON-RPC port.
-        #[arg(long, default_value = "8545")]
-        rpc_port: u16,
+        /// JSON-RPC port. If omitted, uses config file or 8545.
+        #[arg(long)]
+        rpc_port: Option<u16>,
 
         /// Enable dev mode (allows unsigned pyde_sendTransaction, auto-mine).
         #[arg(long)]
@@ -58,6 +58,29 @@ pub enum Command {
 
     /// Print default devnet genesis configuration.
     DefaultGenesis,
+
+    /// Generate a multi-validator testnet directory.
+    Testnet {
+        /// Number of validators (2-128).
+        #[arg(long, default_value = "2")]
+        validators: usize,
+
+        /// Output directory for testnet files.
+        #[arg(long, short, default_value = "./testnet")]
+        out: std::path::PathBuf,
+
+        /// Base P2P port (nodes use base, base+1, base+2, ...).
+        #[arg(long, default_value = "30303")]
+        base_port: u16,
+
+        /// Base RPC port (nodes use base, base+1, base+2, ...).
+        #[arg(long, default_value = "8545")]
+        base_rpc_port: u16,
+
+        /// Enable dev mode on all nodes.
+        #[arg(long)]
+        dev: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
