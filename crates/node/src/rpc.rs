@@ -263,12 +263,31 @@ impl PydeApiServer for RpcServer {
             .unwrap_or_default();
         let gas_limit: u64 = tx_obj.get("gas").and_then(|v| v.as_u64())
             .unwrap_or(21_000);
-        let nonce: u64 = tx_obj.get("nonce").and_then(|v| v.as_u64())
-            .unwrap_or(0);
-
         let chain_r = self.state.chain.read().await;
         let chain_id = chain_r.chain_id;
         drop(chain_r);
+
+        // Auto-fetch nonce from state if not provided
+        let nonce: u64 = if let Some(n) = tx_obj.get("nonce").and_then(|v| v.as_u64()) {
+            n
+        } else {
+            let state_r = self.state.state.read().await;
+            let nonce_key = pyde_state::keys::nonce_key(&from);
+            let n = state_r.get(&nonce_key)
+                .and_then(|bytes| {
+                    if bytes.len() >= 10 {
+                        let ns = pyde_account::nonce::NonceState::from_bytes(
+                            bytes[..10].try_into().unwrap()
+                        );
+                        Some(ns.base)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            drop(state_r);
+            n
+        };
 
         let tx_type = if to == [0u8; 32] {
             pyde_tx::types::TransactionType::Deploy
@@ -276,36 +295,10 @@ impl PydeApiServer for RpcServer {
             pyde_tx::types::TransactionType::Standard
         };
 
-        // For deploy txs: encode constructor length prefix so pipeline can split.
-        // Format: constructor_len(4 LE) + constructor_bytes + runtime_bytes + constructor_args
-        let deploy_data = if tx_type == pyde_tx::types::TransactionType::Deploy {
-            let constructor_len = tx_obj.get("constructorLen")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let constructor_args_hex = tx_obj.get("constructorArgs")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let constructor_args = hex::decode(
-                constructor_args_hex.strip_prefix("0x").unwrap_or(constructor_args_hex)
-            ).unwrap_or_default();
-
-            // Compute runtime length (data = full bytecode = constructor + runtime)
-            let runtime_len = if constructor_len > 0 && data.len() > constructor_len as usize {
-                (data.len() - constructor_len as usize) as u32
-            } else {
-                data.len() as u32
-            };
-
-            // Format: constructor_len(4 LE) + runtime_len(4 LE) + constructor + runtime + args
-            let mut encoded = Vec::with_capacity(8 + data.len() + constructor_args.len());
-            encoded.extend_from_slice(&constructor_len.to_le_bytes());
-            encoded.extend_from_slice(&runtime_len.to_le_bytes());
-            encoded.extend_from_slice(&data);
-            encoded.extend_from_slice(&constructor_args);
-            encoded
-        } else {
-            data
-        };
+        // For deploy txs: data should already be in pipeline format:
+        // [clen:4 LE][rlen:4 LE][constructor][runtime][args]
+        // Pass through as-is. The SDK/CLI constructs this format.
+        let deploy_data = data;
 
         let tx = pyde_tx::types::Transaction {
             from,
