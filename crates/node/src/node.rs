@@ -184,6 +184,10 @@ impl PydeNode {
         let receipts = Arc::new(RwLock::new(ReceiptStore::new()));
         let pending_txs: Arc<RwLock<Vec<pyde_tx::types::Transaction>>> = Arc::new(RwLock::new(Vec::new()));
 
+        // Mempool tx index for compact block reconstruction: tx_hash → wire-encoded bytes
+        let mempool_index: Arc<RwLock<std::collections::HashMap<[u8; 32], Vec<u8>>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
         // 4. Chain sync
         let mut chain_sync = ChainSync::new();
         chain_sync.manager.local_tip = chain.read().await.head_slot;
@@ -407,6 +411,9 @@ impl PydeNode {
                         }
                         PostEventAction::AcceptTransaction(tx) => {
                             let tx_hash = tx.hash();
+                            // Index for compact block reconstruction
+                            let tx_bytes = wire::encode_transaction(&tx);
+                            mempool_index.write().await.insert(tx_hash, tx_bytes);
                             let mut pending = pending_txs.write().await;
                             pending.push(tx);
                             debug!(tx_hash = hex::encode(tx_hash), pending = pending.len(), "tx accepted from gossip");
@@ -429,6 +436,92 @@ impl PydeNode {
                         PostEventAction::StoreReceipts(slot, receipts_list) => {
                             let mut receipts_w = receipts.write().await;
                             receipts_w.insert_block_receipts(slot, receipts_list);
+                        }
+                        PostEventAction::ReconstructCompactBlock(cb) => {
+                            // Reconstruct full block from compact block + mempool index
+                            let header = match wire::decode_block_header(&cb.header) {
+                                Ok(h) => h,
+                                Err(e) => { warn!(error = e, "invalid compact block header"); continue; }
+                            };
+                            let slot = header.slot;
+
+                            // Build mempool snapshot for reconstruction
+                            let idx = mempool_index.read().await;
+                            let mempool_txs: Vec<([u8; 32], Vec<u8>)> = idx.iter()
+                                .map(|(h, b)| (*h, b.clone()))
+                                .collect();
+                            drop(idx);
+
+                            let (matched, missing) = cb.reconstruct(&mempool_txs);
+
+                            if !missing.is_empty() {
+                                // TODO: request missing txs from peers via GetBlockTxs
+                                warn!(slot, missing = missing.len(), "compact block has missing txs — requesting not yet implemented, skipping");
+                                continue;
+                            }
+
+                            // All txs found — decode them and build the full block
+                            let mut transactions = Vec::with_capacity(matched.len());
+                            for (i, tx_bytes_opt) in matched.iter().enumerate() {
+                                let tx_bytes = tx_bytes_opt.as_ref().unwrap();
+                                match wire::decode_transaction(tx_bytes) {
+                                    Ok(tx) => transactions.push(tx),
+                                    Err(e) => {
+                                        warn!(slot, tx_idx = i, error = e, "failed to decode reconstructed tx");
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            let tx_count = transactions.len();
+                            let exec_schedule = pyde_tx::parallel::ExecutionSchedule {
+                                groups: vec![pyde_tx::parallel::ExecutionGroup {
+                                    tx_indices: (0..tx_count).collect(),
+                                }],
+                                total_txs: tx_count,
+                            };
+                            let block = pyde_consensus::block::Block {
+                                header: header.clone(),
+                                body: pyde_consensus::block::BlockBody {
+                                    transactions,
+                                    execution_schedule: exec_schedule,
+                                },
+                                proposer_signature: vec![], // not in compact block, validated via proposal
+                            };
+
+                            // Validate and process
+                            {
+                                let mut chain_w = chain.write().await;
+                                let mut state_w = state.write().await;
+                                match BlockProcessor::process_full_block(&mut chain_w, &mut state_w, &block) {
+                                    Ok((tc, gas, ref receipts_list)) => {
+                                        // Store full block for future sync
+                                        let full_bytes = wire::encode_block(&block);
+                                        let _ = block_store.put_block(&block.header, &full_bytes);
+                                        let _ = block_store.put_head(slot);
+                                        chain_sync.on_block_processed(slot);
+                                        if !receipts_list.is_empty() {
+                                            let mut receipts_w = receipts.write().await;
+                                            receipts_w.insert_block_receipts(slot, receipts_list.clone());
+                                        }
+                                        // Remove processed txs from mempool index + pending
+                                        let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
+                                            .map(|tx| tx.hash()).collect();
+                                        {
+                                            let mut idx = mempool_index.write().await;
+                                            for h in &tx_hashes { idx.remove(h); }
+                                        }
+                                        {
+                                            let mut pending_w = pending_txs.write().await;
+                                            pending_w.retain(|tx| !tx_hashes.contains(&tx.hash()));
+                                        }
+                                        info!(slot, txs = tc, gas, "compact block reconstructed and processed");
+                                    }
+                                    Err(e) => {
+                                        debug!(slot, error = %e, "compact block rejected");
+                                    }
+                                }
+                            }
                         }
                         PostEventAction::BlockProcessed { slot, receipts: receipts_list, tx_hashes } => {
                             // Store receipts
@@ -463,9 +556,15 @@ impl PydeNode {
                             } else if let Some(identity) = validator_identity.as_ref() {
                                 // Check if we're the proposer
                                 if let Some(candidate) = engine.check_proposer(identity) {
-                                    // Drain pending transactions from the queue
+                                    // Build fair transaction list: nonce-ordered, interleaved, per-sender capped
                                     let mut pending_w = pending_txs.write().await;
-                                    let txs: Vec<pyde_tx::types::Transaction> = pending_w.drain(..).collect();
+                                    let all_pending: Vec<pyde_tx::types::Transaction> = pending_w.drain(..).collect();
+                                    let gas_ceiling = self.config.consensus.gas_ceiling;
+                                    let (txs, remaining) = crate::block_builder::build_tx_list(all_pending, gas_ceiling);
+                                    // Return overflow txs to pending queue
+                                    if !remaining.is_empty() {
+                                        pending_w.extend(remaining);
+                                    }
                                     drop(pending_w);
 
                                     // Only produce a block if there are pending transactions
@@ -534,11 +633,24 @@ impl PydeNode {
                                         }
                                     }
 
-                                    // Broadcast via gossipsub
-                                    let block_bytes = wire::encode_block(&block);
+                                    // Store full block for sync serving + missing tx requests
+                                    let full_block_bytes = wire::encode_block(&block);
+                                    let _ = block_store.put_block(&block.header, &full_block_bytes);
+
+                                    // Broadcast COMPACT block (header + 8-byte short IDs) instead of full block.
+                                    // Receivers reconstruct from their mempool.
+                                    let header_bytes = wire::encode_block_header(&block.header);
+                                    let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
+                                        .map(|tx| tx.hash()).collect();
+                                    let compact = pyde_net::propagation::CompactBlock::from_block(
+                                        header_bytes,
+                                        &tx_hashes,
+                                        &[], // no prefilled txs for now
+                                        &[],
+                                    );
+                                    let compact_bytes = wire::encode_compact_block(&compact);
                                     let topic = pyde_net::node::topics::blocks();
-                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, block_bytes) {
-                                        // Expected when no peers subscribe — single node devnet
+                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, compact_bytes) {
                                         debug!(slot = current_slot, error = %e, "no gossipsub subscribers for block");
                                     }
 
@@ -624,8 +736,10 @@ impl PydeNode {
                     }
                 }
                 Some(tx) = tx_gossip_rx.recv() => {
-                    // Gossip transaction from RPC to P2P network
+                    // Index for compact block reconstruction
                     let tx_bytes = wire::encode_transaction(&tx);
+                    mempool_index.write().await.insert(tx.hash(), tx_bytes.clone());
+                    // Gossip to P2P network
                     let topic = pyde_net::node::topics::transactions();
                     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, tx_bytes) {
                         debug!(error = %e, "failed to gossip tx (no subscribers)");
@@ -698,6 +812,7 @@ enum PostEventAction {
         receipts: Vec<pyde_tx::execution::Receipt>,
         tx_hashes: Vec<[u8; 32]>,
     },
+    ReconstructCompactBlock(pyde_net::propagation::CompactBlock),
 }
 
 /// Handle a libp2p swarm event. Returns an action that may need swarm access.
@@ -736,7 +851,21 @@ fn handle_swarm_event(
                 }
                 Some(Channel::Blocks) => {
                     debug!(bytes = message.data.len(), "received block gossip");
-                    // Decode and process the block
+
+                    // Try compact block first (primary format)
+                    if !message.data.is_empty() && message.data[0] == wire::tag::COMPACT_BLOCK {
+                        match wire::decode_compact_block(&message.data) {
+                            Ok(cb) => {
+                                return PostEventAction::ReconstructCompactBlock(cb);
+                            }
+                            Err(e) => {
+                                debug!(error = e, "failed to decode compact block");
+                            }
+                        }
+                        return PostEventAction::None;
+                    }
+
+                    // Fallback: full block (from sync or older nodes)
                     match wire::decode_block(&message.data) {
                         Ok(block) => {
                             let slot = block.header.slot;
@@ -865,7 +994,7 @@ fn handle_swarm_event(
             },
         )) => {
             debug!(%peer, "inbound sync request");
-            let response = ChainSync::handle_inbound_request(&request, chain, state);
+            let response = ChainSync::handle_inbound_request(&request, chain, state, block_store);
             PostEventAction::SendSyncResponse(channel, response)
         }
 
@@ -876,7 +1005,7 @@ fn handle_swarm_event(
                 ..
             },
         )) => {
-            chain_sync.on_response(request_id, response, chain, state);
+            chain_sync.on_response(request_id, response, chain, state, block_store);
             if chain_sync.is_syncing() {
                 PostEventAction::ContinueSync
             } else {

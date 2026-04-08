@@ -21,6 +21,9 @@ pub mod tag {
     pub const CONSENSUS_TIMEOUT: u8 = 0x12;
     pub const CONSENSUS_NEW_VIEW: u8 = 0x13;
     pub const CONSENSUS_FINALITY_VOTE: u8 = 0x14;
+    pub const COMPACT_BLOCK: u8 = 0x03;
+    pub const GET_BLOCK_TXS: u8 = 0x04;
+    pub const BLOCK_TXS_RESPONSE: u8 = 0x05;
     pub const DECRYPTION_SHARES: u8 = 0x20;
 }
 
@@ -69,6 +72,82 @@ pub fn decode_finality_vote(data: &[u8]) -> Result<pyde_consensus::finality::Fin
         voter_address,
         signature,
     })
+}
+
+// ============================================================
+// Compact Block
+// ============================================================
+
+pub fn encode_compact_block(cb: &pyde_net::propagation::CompactBlock) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(tag::COMPACT_BLOCK);
+    enc.var_bytes(&cb.header);
+    enc.u64(cb.nonce);
+    // Short IDs
+    enc.u32(cb.short_tx_ids.len() as u32);
+    for sid in &cb.short_tx_ids {
+        enc.raw(sid);
+    }
+    // Prefilled txs
+    enc.u16(cb.prefilled_txs.len() as u16);
+    for (idx, bytes) in &cb.prefilled_txs {
+        enc.u16(*idx);
+        enc.var_bytes(bytes);
+    }
+    enc.finish()
+}
+
+pub fn decode_compact_block(data: &[u8]) -> Result<pyde_net::propagation::CompactBlock, &'static str> {
+    let mut dec = Decoder::new(data);
+    let t = dec.u8()?;
+    if t != tag::COMPACT_BLOCK { return Err("not a compact block"); }
+    let header = dec.var_bytes()?;
+    let nonce = dec.u64()?;
+    let sid_count = dec.u32()? as usize;
+    let mut short_tx_ids = Vec::with_capacity(sid_count);
+    for _ in 0..sid_count {
+        let mut sid = [0u8; pyde_net::propagation::SHORT_ID_LEN];
+        let raw = dec.raw(pyde_net::propagation::SHORT_ID_LEN)?;
+        sid.copy_from_slice(raw);
+        short_tx_ids.push(sid);
+    }
+    let prefill_count = dec.u16()? as usize;
+    let mut prefilled_txs = Vec::with_capacity(prefill_count);
+    for _ in 0..prefill_count {
+        let idx = dec.u16()?;
+        let bytes = dec.var_bytes()?;
+        prefilled_txs.push((idx, bytes));
+    }
+    Ok(pyde_net::propagation::CompactBlock {
+        header,
+        short_tx_ids,
+        prefilled_txs,
+        nonce,
+    })
+}
+
+/// Encode a request for missing block transactions.
+pub fn encode_get_block_txs(block_hash: &[u8; 32], missing_sids: &[pyde_net::propagation::ShortId]) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(tag::GET_BLOCK_TXS);
+    enc.bytes32(block_hash);
+    enc.u32(missing_sids.len() as u32);
+    for sid in missing_sids {
+        enc.raw(sid);
+    }
+    enc.finish()
+}
+
+/// Encode a response with the requested full transactions.
+pub fn encode_block_txs_response(block_hash: &[u8; 32], txs: &[Vec<u8>]) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(tag::BLOCK_TXS_RESPONSE);
+    enc.bytes32(block_hash);
+    enc.u32(txs.len() as u32);
+    for tx_bytes in txs {
+        enc.var_bytes(tx_bytes);
+    }
+    enc.finish()
 }
 
 pub fn encode_decryption_shares(msg: &DecryptionShareMsg) -> Vec<u8> {
@@ -120,6 +199,7 @@ impl Encoder {
         self.u32(v.len() as u32);
         self.buf.extend_from_slice(v);
     }
+    fn raw(&mut self, v: &[u8]) { self.buf.extend_from_slice(v); }
     fn finish(self) -> Vec<u8> { self.buf }
 }
 
@@ -186,6 +266,13 @@ impl<'a> Decoder<'a> {
         let len = self.u32()? as usize;
         if self.remaining() < len { return Err("unexpected end of data"); }
         let v = self.data[self.pos..self.pos + len].to_vec();
+        self.pos += len;
+        Ok(v)
+    }
+
+    fn raw(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
+        if self.remaining() < len { return Err("unexpected end of data"); }
+        let v = &self.data[self.pos..self.pos + len];
         self.pos += len;
         Ok(v)
     }
