@@ -1,0 +1,6 @@
+target/
+.git/
+node_modules/
+pyde-book/
+crates/pyde-rust-sdk/LIVE_TEST_PLAN.md
+crates/pyde-dev/CHEATCODES_ROADMAP.md
