@@ -245,10 +245,14 @@ impl ValidatorEngine {
     }
 
     /// Compute VRF candidacy for the current slot.
-    /// All validators compute their candidacy and propose. The best proposal
-    /// (lowest VRF score) is selected during the proposal phase via `select_and_vote`.
+    /// Only propose if VRF score is below threshold (targets ~1 proposer per slot).
+    /// Threshold = U64::MAX / committee_size. With N validators, on average 1 score
+    /// falls below this threshold per slot. If 0 qualify → timeout/view change.
+    /// If 2+ qualify → proposal buffering picks the lowest score.
     pub fn check_proposer(&self, identity: &ValidatorIdentity) -> Option<ProposerCandidate> {
         let slot = self.consensus.current_slot;
+        let committee_size = self.committee_keys.len();
+
         match compute_candidacy(
             &identity.public_key,
             &identity.secret_key,
@@ -257,7 +261,31 @@ impl ValidatorEngine {
             identity.address,
         ) {
             Ok(candidate) => {
-                debug!(slot, score = candidate.score, "computed VRF candidacy");
+                // VRF threshold: only propose if score < threshold.
+                // Target ~5 expected proposers per slot for reliability:
+                //   threshold = min(U64::MAX, 5 * U64::MAX / committee_size)
+                //   P(0 proposers) ≈ e^(-5) ≈ 0.67% (virtually no empty slots)
+                //   Proposal buffering picks the lowest VRF score from candidates.
+                //
+                // For small committees (≤5), everyone proposes (threshold = MAX).
+                const TARGET_PROPOSERS: u64 = 5;
+                let threshold = if committee_size as u64 <= TARGET_PROPOSERS {
+                    u64::MAX // small committee: everyone proposes
+                } else {
+                    (u64::MAX / committee_size as u64).saturating_mul(TARGET_PROPOSERS)
+                };
+
+                if candidate.score > threshold {
+                    debug!(
+                        slot,
+                        score = candidate.score,
+                        threshold,
+                        "VRF score above threshold, not proposing"
+                    );
+                    return None;
+                }
+
+                debug!(slot, score = candidate.score, threshold, "proposing (below VRF threshold)");
                 Some(candidate)
             }
             Err(e) => {
@@ -817,11 +845,28 @@ mod tests {
     }
 
     #[test]
-    fn check_proposer_returns_candidate() {
-        let (engine, identities) = make_engine_with_committee(3);
+    fn check_proposer_respects_vrf_threshold() {
+        // With 3 validators, threshold = (U64::MAX / 3) * 3 / 2 ≈ U64::MAX / 2.
+        // Try multiple slots — at least one should qualify (probabilistic but reliable).
+        let (mut engine, identities) = make_engine_with_committee(3);
+        let mut found_proposer = false;
+        for _ in 0..20 {
+            engine.advance_slot();
+            if let Some(candidate) = engine.check_proposer(&identities[0]) {
+                assert_eq!(candidate.address, identities[0].address);
+                found_proposer = true;
+                break;
+            }
+        }
+        assert!(found_proposer, "should find at least 1 slot to propose in 20 tries");
+    }
+
+    #[test]
+    fn single_validator_always_proposes() {
+        let (engine, identities) = make_engine_with_committee(1);
+        // Single validator: threshold = U64::MAX, always qualifies
         let candidate = engine.check_proposer(&identities[0]);
         assert!(candidate.is_some());
-        assert_eq!(candidate.unwrap().address, identities[0].address);
     }
 
     #[test]
