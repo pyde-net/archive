@@ -17,6 +17,11 @@ pub enum TransactionType {
     Deploy = 1,
     /// Batch transaction (multiple operations).
     Batch = 2,
+    /// Stake deposit: lock 10,000 PYDE and register as validator.
+    /// tx.data = FALCON-512 public key (897 bytes).
+    StakeDeposit = 3,
+    /// Stake withdraw: begin unbonding period (14 days).
+    StakeWithdraw = 4,
 }
 
 impl TransactionType {
@@ -25,6 +30,8 @@ impl TransactionType {
             0 => Some(Self::Standard),
             1 => Some(Self::Deploy),
             2 => Some(Self::Batch),
+            3 => Some(Self::StakeDeposit),
+            4 => Some(Self::StakeWithdraw),
             _ => None,
         }
     }

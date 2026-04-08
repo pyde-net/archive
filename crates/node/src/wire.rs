@@ -429,6 +429,8 @@ pub fn encode_transaction(tx: &Transaction) -> Vec<u8> {
         TransactionType::Standard => 0,
         TransactionType::Deploy => 1,
         TransactionType::Batch => 2,
+        TransactionType::StakeDeposit => 3,
+        TransactionType::StakeWithdraw => 4,
     });
     enc.finish()
 }

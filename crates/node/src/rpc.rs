@@ -289,10 +289,15 @@ impl PydeApiServer for RpcServer {
             n
         };
 
-        let tx_type = if to == [0u8; 32] {
-            pyde_tx::types::TransactionType::Deploy
-        } else {
-            pyde_tx::types::TransactionType::Standard
+        let tx_type = match tx_obj.get("txType").and_then(|v| v.as_str()) {
+            Some("stakeDeposit") => pyde_tx::types::TransactionType::StakeDeposit,
+            Some("stakeWithdraw") => pyde_tx::types::TransactionType::StakeWithdraw,
+            Some("deploy") => pyde_tx::types::TransactionType::Deploy,
+            _ => if to == [0u8; 32] {
+                pyde_tx::types::TransactionType::Deploy
+            } else {
+                pyde_tx::types::TransactionType::Standard
+            },
         };
 
         // For deploy txs: data should already be in pipeline format:

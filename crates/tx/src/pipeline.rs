@@ -260,6 +260,93 @@ pub fn execute_transaction(
 
             (true, gas_used, 0u64, vec![], new_addr.to_vec())
         }
+        TransactionType::StakeDeposit => {
+            // Stake deposit: lock VALIDATOR_STAKE from sender, create validator entry.
+            // tx.data = FALCON-512 public key (897 bytes).
+            // 10,000 PYDE = 10_000_000_000_000 quanta (matches consensus::validator::VALIDATOR_STAKE)
+            const VALIDATOR_STAKE: u128 = 10_000_000_000_000;
+
+            if sender.balance < VALIDATOR_STAKE {
+                (false, 21_000u64, 0u64, vec![], b"insufficient balance for stake deposit".to_vec())
+            } else if tx.data.len() < 897 {
+                (false, 21_000u64, 0u64, vec![], b"tx.data must contain FALCON public key (897 bytes)".to_vec())
+            } else {
+                // Deduct stake from sender balance
+                sender.balance -= VALIDATOR_STAKE;
+
+                // Write validator entry to state: [pk_len:4 LE][pk][stake:16 LE][status:1]
+                let pk_bytes = &tx.data[..897];
+                let mut val_data = Vec::with_capacity(4 + 897 + 16 + 1);
+                val_data.extend_from_slice(&(897u32).to_le_bytes());
+                val_data.extend_from_slice(pk_bytes);
+                val_data.extend_from_slice(&VALIDATOR_STAKE.to_le_bytes());
+                val_data.push(0x00); // Active
+
+                let val_key = pyde_state::keys::validator_key(&tx.from);
+                let _ = smt.insert(val_key, val_data);
+
+                // Update validator address list (append sender address)
+                let count_key = pyde_state::keys::validator_count_key();
+                let count = smt.get(&count_key)
+                    .map(|b| {
+                        if b.len() >= 8 {
+                            u64::from_le_bytes(b[..8].try_into().unwrap_or([0;8]))
+                        } else { 0 }
+                    })
+                    .unwrap_or(0);
+                let new_count = count + 1;
+                let _ = smt.insert(count_key, new_count.to_le_bytes().to_vec());
+
+                // Store address at index for enumeration
+                let idx_key = pyde_state::keys::validator_index_key(count);
+                let _ = smt.insert(idx_key, tx.from.to_vec());
+
+                tracing::info!(
+                    validator = hex::encode(tx.from),
+                    stake = VALIDATOR_STAKE,
+                    "stake deposit: new validator registered"
+                );
+
+                (true, 50_000u64, 0u64, vec![], tx.from.to_vec())
+            }
+        }
+        TransactionType::StakeWithdraw => {
+            // Stake withdraw: set validator status to Unbonding.
+            let val_key = pyde_state::keys::validator_key(&tx.from);
+            match smt.get(&val_key) {
+                Some(mut val_data) => {
+                    if val_data.len() < 5 {
+                        (false, 21_000u64, 0u64, vec![], b"invalid validator entry".to_vec())
+                    } else {
+                        let pk_len = u32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]) as usize;
+                        let status_offset = 4 + pk_len + 16;
+                        if val_data.len() <= status_offset {
+                            (false, 21_000u64, 0u64, vec![], b"invalid validator entry".to_vec())
+                        } else if val_data[status_offset] != 0x00 {
+                            // Not Active
+                            (false, 21_000u64, 0u64, vec![], b"validator is not active".to_vec())
+                        } else {
+                            // Set status to Unbonding (0x01) + store exit block
+                            val_data[status_offset] = 0x01;
+                            // Append exit block (8 bytes LE) for unbonding period tracking
+                            val_data.extend_from_slice(&block_ctx.height.to_le_bytes());
+                            let _ = smt.insert(val_key, val_data);
+
+                            tracing::info!(
+                                validator = hex::encode(tx.from),
+                                exit_block = block_ctx.height,
+                                "stake withdraw: validator unbonding started"
+                            );
+
+                            (true, 50_000u64, 0u64, vec![], vec![])
+                        }
+                    }
+                }
+                None => {
+                    (false, 21_000u64, 0u64, vec![], b"not a registered validator".to_vec())
+                }
+            }
+        }
         _ => {
             // Simple transfer or batch (batch deferred)
             (true, 21_000u64, 0u64, vec![], vec![])

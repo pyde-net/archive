@@ -207,6 +207,10 @@ pub fn initialize_genesis(
 
         let key = pyde_state::keys::validator_key(&address);
         entries.push((key, val_data));
+
+        // Store address at index for enumeration
+        let idx_key = pyde_state::keys::validator_index_key(val_count);
+        entries.push((idx_key, address.to_vec()));
         val_count += 1;
     }
 

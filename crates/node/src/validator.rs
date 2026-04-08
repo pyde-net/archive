@@ -52,26 +52,41 @@ pub fn verify_stake(balance: u128) -> Result<u128, String> {
 }
 
 /// Load the validator set from on-chain state.
-/// Reads validator entries stored at genesis (or updated by staking txs).
+/// Reads ALL validator entries via the index (genesis + dynamically staked).
 /// Returns a ValidatorSet that can be used for committee selection.
 pub fn load_validator_set_from_state(
     state: &crate::state_manager::StateManager,
-    genesis_config: &crate::genesis::GenesisConfig,
+    _genesis_config: &crate::genesis::GenesisConfig,
 ) -> pyde_consensus::validator::ValidatorSet {
     use pyde_consensus::validator::{Validator, ValidatorSet, ValidatorStatus};
 
     let mut set = ValidatorSet::new();
 
-    // Read each genesis validator from state
-    for val in &genesis_config.validators {
-        let address = match crate::genesis::parse_hex_address_pub(&val.address) {
-            Ok(a) => a,
-            Err(_) => continue,
+    // Read validator count from state
+    let count_key = pyde_state::keys::validator_count_key();
+    let count = state.get(&count_key)
+        .map(|b| {
+            if b.len() >= 8 {
+                u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]))
+            } else { 0 }
+        })
+        .unwrap_or(0);
+
+    // Read each validator by index
+    for i in 0..count {
+        let idx_key = pyde_state::keys::validator_index_key(i);
+        let address = match state.get(&idx_key) {
+            Some(addr_bytes) if addr_bytes.len() == 32 => {
+                let mut addr = [0u8; 32];
+                addr.copy_from_slice(&addr_bytes);
+                addr
+            }
+            _ => continue,
         };
 
         let val_key = pyde_state::keys::validator_key(&address);
         if let Some(val_data) = state.get(&val_key) {
-            // Parse: [pk_len:4 LE][pk_bytes][stake:16 LE][status:1]
+            // Parse: [pk_len:4 LE][pk_bytes][stake:16 LE][status:1][exit_block:8 LE optional]
             if val_data.len() < 5 {
                 continue;
             }
@@ -86,6 +101,14 @@ pub fn load_validator_set_from_state(
             let status_byte = val_data[4 + pk_len + 16];
             let status = match status_byte {
                 0x00 => ValidatorStatus::Active,
+                0x01 => {
+                    // Unbonding — read exit block if available
+                    let exit_block = if val_data.len() >= 4 + pk_len + 16 + 1 + 8 {
+                        let off = 4 + pk_len + 16 + 1;
+                        u64::from_le_bytes(val_data[off..off+8].try_into().unwrap_or([0;8]))
+                    } else { 0 };
+                    ValidatorStatus::Unbonding { exit_block }
+                }
                 _ => ValidatorStatus::Exited,
             };
 
