@@ -544,9 +544,50 @@ impl PydeNode {
 
                         // New slot — validator block production
                         if let Some(engine) = validator_engine.as_mut() {
+                            let prev_epoch = engine.consensus.current_slot / pyde_consensus::block::EPOCH_LENGTH;
                             // Sync engine slot to clock (not just +1)
                             while engine.consensus.current_slot < current_slot {
                                 engine.advance_slot();
+                            }
+
+                            // Epoch boundary: rotate committee
+                            let new_epoch = current_slot / pyde_consensus::block::EPOCH_LENGTH;
+                            if new_epoch > prev_epoch && new_epoch > 0 {
+                                let state_r = state.read().await;
+                                let val_set = crate::validator::load_validator_set_from_state(
+                                    &state_r, &genesis_config,
+                                );
+                                drop(state_r);
+
+                                match val_set.select_committee(
+                                    new_epoch,
+                                    &engine.epoch_randomness,
+                                    vec![], // no threshold PK yet
+                                ) {
+                                    Ok(committee) => {
+                                        let new_keys: Vec<Vec<u8>> = committee.members.iter()
+                                            .map(|v| v.public_key.clone()).collect();
+                                        // Find our own index in new committee
+                                        if let Some(identity) = validator_identity.as_mut() {
+                                            let my_pk = hex::encode(identity.public_key.as_bytes());
+                                            for (i, member) in committee.members.iter().enumerate() {
+                                                if hex::encode(&member.public_key) == my_pk {
+                                                    identity.committee_index = i as u8;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        engine.set_committee(new_keys);
+                                        info!(
+                                            epoch = new_epoch,
+                                            committee_size = committee.size(),
+                                            "committee rotated at epoch boundary"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(epoch = new_epoch, error = ?e, "committee selection failed, keeping current");
+                                    }
+                                }
                             }
 
                             // Skip if chain head is already at or past this slot

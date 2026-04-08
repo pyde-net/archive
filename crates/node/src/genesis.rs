@@ -188,7 +188,33 @@ pub fn initialize_genesis(
         );
     }
 
-    // 3. Batch insert all entries
+    // 3. Write validator registry entries (for epoch committee selection).
+    // Each validator stored at validator_key(address) with serialized public key + stake.
+    // Format: [pk_len:4 LE][pk_bytes][stake:16 LE][status:1]
+    let mut val_count: u64 = 0;
+    for val in &config.validators {
+        let address = parse_hex_address(&val.address)?;
+        let pk_hex = val.public_key.strip_prefix("0x").unwrap_or(&val.public_key);
+        let pk_bytes = hex::decode(pk_hex)
+            .map_err(|e| format!("invalid validator pk for registry: {}", e))?;
+        let stake = val.stake_u128()?;
+
+        let mut val_data = Vec::with_capacity(4 + pk_bytes.len() + 16 + 1);
+        val_data.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
+        val_data.extend_from_slice(&pk_bytes);
+        val_data.extend_from_slice(&stake.to_le_bytes());
+        val_data.push(0x00); // 0x00 = Active status
+
+        let key = pyde_state::keys::validator_key(&address);
+        entries.push((key, val_data));
+        val_count += 1;
+    }
+
+    // Store validator count
+    let count_key = pyde_state::keys::validator_count_key();
+    entries.push((count_key, val_count.to_le_bytes().to_vec()));
+
+    // 4. Batch insert all entries
     let state_root = state.update_batch(entries)?;
 
     info!(
@@ -530,6 +556,11 @@ json = false
         out_dir.display(), out_dir.display(), if dev_mode { " --dev" } else { "" });
 
     Ok(())
+}
+
+/// Parse a hex-encoded 32-byte address.
+pub fn parse_hex_address_pub(hex_str: &str) -> Result<Address, String> {
+    parse_hex_address(hex_str)
 }
 
 fn parse_hex_address(hex_str: &str) -> Result<Address, String> {

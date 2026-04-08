@@ -201,10 +201,10 @@ impl ValidatorSet {
             .cloned()
             .collect();
 
-        if eligible.len() < COMMITTEE_SIZE {
+        if eligible.is_empty() {
             return Err(ValidatorError::NotEnoughValidators {
-                needed: COMMITTEE_SIZE,
-                available: eligible.len(),
+                needed: 1,
+                available: 0,
             });
         }
 
@@ -227,10 +227,11 @@ impl ValidatorSet {
         // Sort by score (deterministic ordering from randomness)
         scored.sort_by_key(|(score, _)| *score);
 
-        // Take first 128
+        // Take up to COMMITTEE_SIZE (or all if fewer than 128)
+        let take_count = scored.len().min(COMMITTEE_SIZE);
         let members: Vec<Validator> = scored
             .into_iter()
-            .take(COMMITTEE_SIZE)
+            .take(take_count)
             .map(|(_, v)| v)
             .collect();
 
@@ -354,13 +355,18 @@ mod tests {
     }
 
     #[test]
-    fn not_enough_validators_rejected() {
+    fn small_validator_set_selects_all() {
         let mut set = ValidatorSet::new();
-        register_n(&mut set, 100); // only 100, need 128
+        register_n(&mut set, 4); // only 4, less than 128
 
-        let err = set
-            .select_committee(0, &[0xAA; 32], vec![])
-            .unwrap_err();
+        let committee = set.select_committee(0, &[0xAA; 32], vec![]).unwrap();
+        assert_eq!(committee.size(), 4); // takes all 4
+    }
+
+    #[test]
+    fn empty_validator_set_rejected() {
+        let set = ValidatorSet::new();
+        let err = set.select_committee(0, &[0xAA; 32], vec![]).unwrap_err();
         assert!(matches!(err, ValidatorError::NotEnoughValidators { .. }));
     }
 
