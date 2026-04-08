@@ -143,6 +143,16 @@ pub fn validator_count_key() -> H256 {
     H256::from(poseidon2_hash(&[discriminator::VALIDATOR_COUNT]).to_bytes())
 }
 
+/// Key for validator address at index (for enumeration).
+///
+/// `key = Poseidon2(0x11 || index_le_bytes)`
+pub fn validator_index_key(index: u64) -> H256 {
+    let mut input = Vec::with_capacity(9);
+    input.push(discriminator::VALIDATOR_COUNT);
+    input.extend_from_slice(&index.to_le_bytes());
+    H256::from(poseidon2_hash(&input).to_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
