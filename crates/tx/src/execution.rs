@@ -16,9 +16,10 @@ use pyde_crypto::poseidon2::poseidon2_hash;
 use sparse_merkle_tree::H256;
 
 /// Fee distribution ratios (percentages).
-/// 80% burn (deflationary + MEV prevention), 20% validator.
-pub const FEE_BURN_PCT: u64 = 80;
+/// 70% burn (deflationary), 20% validator (proposer reward), 10% treasury (future prover reward).
+pub const FEE_BURN_PCT: u64 = 70;
 pub const FEE_VALIDATOR_PCT: u64 = 20;
+pub const FEE_TREASURY_PCT: u64 = 10;
 
 /// Transaction receipt: result of executing a transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,9 +36,10 @@ pub struct Receipt {
     pub effective_gas: u64,
     /// Fee paid (effective_gas × base_fee).
     pub fee_paid: u128,
-    /// Fee distribution.
+    /// Fee distribution: 70% burned, 20% validator, 10% treasury.
     pub fee_burned: u128,
     pub fee_validator: u128,
+    pub fee_treasury: u128,
     /// Event logs emitted during execution.
     pub logs: Vec<LogEntry>,
     /// Post-execution state root (if available).
@@ -61,6 +63,7 @@ pub struct LogEntry {
 pub struct FeeDistribution {
     pub burned: u128,
     pub validator: u128,
+    pub treasury: u128,
 }
 
 /// Execution context: mutable state during transaction execution.
@@ -167,14 +170,16 @@ pub fn post_execution_refund(
     (effective_gas, actual_refund)
 }
 
-/// Distribute the fee: 80% burn, 20% validator.
+/// Distribute the fee: 70% burn, 20% validator, 10% treasury.
 pub fn distribute_fee(effective_gas: u64, base_fee: u128) -> FeeDistribution {
     let total_fee = effective_gas as u128 * base_fee;
     let burned = total_fee * FEE_BURN_PCT as u128 / 100;
-    let validator = total_fee - burned; // remainder to validator (handles rounding)
+    let validator = total_fee * FEE_VALIDATOR_PCT as u128 / 100;
+    let treasury = total_fee - burned - validator; // remainder to treasury (handles rounding)
     FeeDistribution {
         burned,
         validator,
+        treasury,
     }
 }
 
@@ -200,6 +205,7 @@ pub fn generate_receipt(
         fee_paid: effective_gas as u128 * base_fee,
         fee_burned: fee.burned,
         fee_validator: fee.validator,
+        fee_treasury: fee.treasury,
         logs,
         state_root,
         return_data,
@@ -348,12 +354,13 @@ mod tests {
     // ========== Task 0408: Fee distribution ==========
 
     #[test]
-    fn fee_distribution_80_20() {
-        let dist = distribute_fee(100_000, 1_000); // 100M total fee
+    fn fee_distribution_70_20_10() {
+        let dist = distribute_fee(100_000, 1_000);
         let total = 100_000u128 * 1_000;
-        assert_eq!(dist.burned, total * 80 / 100);
-        // Validator gets remainder (handles rounding)
-        assert_eq!(dist.burned + dist.validator, total);
+        assert_eq!(dist.burned, total * 70 / 100);
+        assert_eq!(dist.validator, total * 20 / 100);
+        // Treasury gets remainder (handles rounding)
+        assert_eq!(dist.burned + dist.validator + dist.treasury, total);
     }
 
     #[test]
@@ -361,6 +368,7 @@ mod tests {
         let dist = distribute_fee(0, 1_000);
         assert_eq!(dist.burned, 0);
         assert_eq!(dist.validator, 0);
+        assert_eq!(dist.treasury, 0);
     }
 
     // ========== Task 0410: Receipt generation ==========
@@ -395,7 +403,7 @@ mod tests {
         assert_eq!(receipt.logs.len(), 1);
         assert_eq!(receipt.logs[0].data, b"transfer");
         assert_eq!(
-            receipt.fee_burned + receipt.fee_validator,
+            receipt.fee_burned + receipt.fee_validator + receipt.fee_treasury,
             receipt.fee_paid
         );
     }

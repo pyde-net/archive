@@ -112,6 +112,7 @@ mod tests {
             fee_paid: 0,
             fee_burned: 0,
             fee_validator: 0,
+            fee_treasury: 0,
             logs: vec![],
             state_root: H256::zero(),
             return_data: vec![],
@@ -159,6 +160,7 @@ mod tests {
             fee_paid: 0,
             fee_burned: 0,
             fee_validator: 0,
+            fee_treasury: 0,
             logs: vec![
                 LogEntry { address: addr, topics: vec![], data: vec![1, 2, 3] },
                 LogEntry { address: [0xDD; 32], topics: vec![], data: vec![4, 5] },

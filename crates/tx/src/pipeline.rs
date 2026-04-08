@@ -288,13 +288,24 @@ pub fn execute_transaction(
         FeePayer::Paymaster(_) => {}
     }
 
-    // 8. Fee distribution
+    // 8. Fee distribution: 70% burned (implicit — never credited), 20% validator, 10% treasury
     let fee_dist = distribute_fee(effective_gas, block_ctx.base_fee);
 
-    // Credit validator
+    // Credit validator (20%)
     let mut validator_account = load_account(smt, &block_ctx.validator_address);
     validator_account.balance += fee_dist.validator;
     store_account(smt, &validator_account)?;
+
+    // Credit treasury (10%) — well-known address: Poseidon2("pyde-treasury")
+    if fee_dist.treasury > 0 {
+        let treasury_addr = pyde_account::address::treasury_address();
+        let mut treasury_account = load_account(smt, &treasury_addr);
+        treasury_account.balance += fee_dist.treasury;
+        store_account(smt, &treasury_account)?;
+    }
+
+    // Burn (70%): implicit — charged from sender in step 3, never credited to anyone.
+    // Total supply decreases by fee_dist.burned each transaction.
 
     // 9. Save updated accounts
     store_account(smt, &sender)?;

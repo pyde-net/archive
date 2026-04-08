@@ -42,6 +42,12 @@ pub fn derive_create2_address(deployer: &Address, salt: &[u8; 32], code: &[u8]) 
     poseidon2_hash(&input).to_bytes()
 }
 
+/// Well-known treasury address: Poseidon2("pyde-treasury").
+/// Accumulates 10% of all transaction fees for future prover rewards.
+pub fn treasury_address() -> Address {
+    poseidon2_hash(b"pyde-treasury").to_bytes()
+}
+
 /// Format an address as a hex string with "0x" prefix.
 pub fn format_address(addr: &Address) -> String {
     let mut s = String::with_capacity(66);
