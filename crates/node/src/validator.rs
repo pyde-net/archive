@@ -9,6 +9,9 @@ use pyde_consensus::hotstuff::{
 use pyde_consensus::proposer::{compute_candidacy, ProposerCandidate};
 use pyde_crypto::vrf::VrfProof;
 use pyde_consensus::block::quorum_for_committee;
+use pyde_consensus::slashing::{
+    DoubleSignEvidence, SlashResult, slash_double_sign, verify_double_sign,
+};
 use pyde_consensus::validator::VALIDATOR_STAKE;
 use pyde_consensus::view_change::{
     TimeoutTracker, ViewChangeMessage, create_view_change, try_form_view_change_qc,
@@ -81,6 +84,14 @@ pub struct ValidatorEngine {
     buffered_proposals: HashMap<u64, Vec<BufferedProposal>>,
     /// Whether we've already voted for a given slot (after proposal selection).
     voted_slots: std::collections::HashSet<u64>,
+    /// Seen proposals per slot: (slot, proposer_address) → (header, signature).
+    /// Used to detect double-proposing.
+    seen_proposals: HashMap<(u64, Address), (BlockHeader, Vec<u8>)>,
+    /// Seen votes per slot: (slot, voter_index) → (block_hash, signature).
+    /// Used to detect double-voting (equivocation).
+    seen_votes: HashMap<(u64, u8), ([u8; 32], Vec<u8>)>,
+    /// Collected slashing evidence to broadcast.
+    pub pending_slashes: Vec<SlashResult>,
 }
 
 impl ValidatorEngine {
@@ -98,6 +109,9 @@ impl ValidatorEngine {
             finality_votes: HashMap::new(),
             buffered_proposals: HashMap::new(),
             voted_slots: std::collections::HashSet::new(),
+            seen_proposals: HashMap::new(),
+            seen_votes: HashMap::new(),
+            pending_slashes: Vec::new(),
         }
     }
 
@@ -211,6 +225,39 @@ impl ValidatorEngine {
             buf.copy_from_slice(&vrf_output_bytes[..8]);
             u64::from_le_bytes(buf)
         };
+
+        // --- Double-propose detection ---
+        let proposal_key = (slot, header.proposer);
+        if let Some((prev_header, prev_sig)) = self.seen_proposals.get(&proposal_key) {
+            // Same proposer for same slot — check if it's a different block
+            if prev_header.hash() != header.hash() {
+                warn!(
+                    slot,
+                    proposer = hex::encode(header.proposer),
+                    "DOUBLE PROPOSE DETECTED — slashing"
+                );
+                let evidence = DoubleSignEvidence {
+                    slot,
+                    block_1: prev_header.clone(),
+                    signature_1: prev_sig.clone(),
+                    block_2: header.clone(),
+                    signature_2: proposer_signature.to_vec(),
+                    signer: header.proposer,
+                    submitter: [0u8; 32], // self — filled by caller
+                };
+                if let Some(result) = slash_double_sign(&evidence, &self.committee_keys[proposer_idx]) {
+                    info!(
+                        slot,
+                        offender = hex::encode(result.offender),
+                        burned = result.amount_burned,
+                        "slash evidence created for double-propose"
+                    );
+                    self.pending_slashes.push(result);
+                }
+            }
+        } else {
+            self.seen_proposals.insert(proposal_key, (header.clone(), proposer_signature.to_vec()));
+        }
 
         // Mark proposal received for timeout tracker
         if slot == self.timeout.slot {
@@ -377,6 +424,27 @@ impl ValidatorEngine {
             }
         }
 
+        // --- Double-vote (equivocation) detection ---
+        let vote_key = (slot, voter_index as u8);
+        let vote_sig = match &vote {
+            ConsensusMessage::Vote { signature, .. } => signature.clone(),
+            _ => vec![],
+        };
+        if let Some((prev_hash, _prev_sig)) = self.seen_votes.get(&vote_key) {
+            if *prev_hash != block_hash {
+                warn!(
+                    slot,
+                    voter_index,
+                    "DOUBLE VOTE DETECTED — equivocation"
+                );
+                // Note: full evidence creation requires both vote messages.
+                // For now, log and flag. Full evidence submission (with both signatures)
+                // can be implemented when the slashing transaction type is added.
+            }
+        } else {
+            self.seen_votes.insert(vote_key, (block_hash, vote_sig));
+        }
+
         // Collect vote
         let entry = self.votes.entry(slot).or_insert_with(|| SlotVotes {
             block_hash,
@@ -482,6 +550,8 @@ impl ValidatorEngine {
             self.finality_votes.retain(|s, _| *s >= prune_before);
             self.buffered_proposals.retain(|s, _| *s >= prune_before);
             self.voted_slots.retain(|s| *s >= prune_before);
+            self.seen_proposals.retain(|(s, _), _| *s >= prune_before);
+            self.seen_votes.retain(|(s, _), _| *s >= prune_before);
         }
 
         debug!(slot = new_slot, "advanced to next slot");
