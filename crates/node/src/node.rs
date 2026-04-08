@@ -583,6 +583,15 @@ impl PydeNode {
                                             committee_size = committee.size(),
                                             "committee rotated at epoch boundary"
                                         );
+
+                                        // Generate and broadcast our epoch randomness share
+                                        if let Some(identity) = validator_identity.as_ref() {
+                                            if let Some(share) = engine.start_epoch_randomness(new_epoch + 1, identity) {
+                                                let share_bytes = wire::encode_randomness_share(new_epoch + 1, &share);
+                                                let topic = pyde_net::node::topics::consensus();
+                                                let _ = swarm.behaviour_mut().gossipsub.publish(topic, share_bytes);
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         warn!(epoch = new_epoch, error = ?e, "committee selection failed, keeping current");
@@ -962,6 +971,26 @@ fn handle_swarm_event(
                                 }
                                 Err(e) => {
                                     debug!(error = e, "failed to decode finality vote");
+                                }
+                            }
+                            return PostEventAction::None;
+                        }
+
+                        // Check if it's an epoch randomness share
+                        if !message.data.is_empty() && message.data[0] == wire::tag::RANDOMNESS_SHARE {
+                            match wire::decode_randomness_share(&message.data) {
+                                Ok((epoch, share)) => {
+                                    debug!(epoch, validator = share.validator_index, "received randomness share");
+                                    if let Some(new_randomness) = engine.on_randomness_share(share) {
+                                        info!(
+                                            epoch,
+                                            randomness = hex::encode(new_randomness),
+                                            "epoch randomness updated"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(error = e, "failed to decode randomness share");
                                 }
                             }
                             return PostEventAction::None;

@@ -9,6 +9,10 @@ use pyde_consensus::hotstuff::{
 use pyde_consensus::proposer::{compute_candidacy, ProposerCandidate};
 use pyde_crypto::vrf::VrfProof;
 use pyde_consensus::block::quorum_for_committee;
+use pyde_consensus::epoch_randomness::{
+    RandomnessCollector, RandomnessShare, generate_share, verify_share,
+    combine_shares_dynamic,
+};
 use pyde_consensus::slashing::{
     DoubleSignEvidence, SlashResult, slash_double_sign, verify_double_sign,
 };
@@ -143,6 +147,8 @@ pub struct ValidatorEngine {
     seen_votes: HashMap<(u64, u8), ([u8; 32], Vec<u8>)>,
     /// Collected slashing evidence to broadcast.
     pub pending_slashes: Vec<SlashResult>,
+    /// Epoch randomness collector (gathers VRF shares at epoch boundary).
+    randomness_collector: Option<RandomnessCollector>,
 }
 
 impl ValidatorEngine {
@@ -163,6 +169,7 @@ impl ValidatorEngine {
             seen_proposals: HashMap::new(),
             seen_votes: HashMap::new(),
             pending_slashes: Vec::new(),
+            randomness_collector: None,
         }
     }
 
@@ -170,6 +177,71 @@ impl ValidatorEngine {
     pub fn set_committee(&mut self, keys: Vec<Vec<u8>>) {
         info!(members = keys.len(), "committee keys loaded");
         self.committee_keys = keys;
+    }
+
+    /// Start collecting epoch randomness shares for the next epoch.
+    /// Called at epoch boundary. Generates and returns our own share to broadcast.
+    pub fn start_epoch_randomness(
+        &mut self,
+        next_epoch: u64,
+        identity: &ValidatorIdentity,
+    ) -> Option<RandomnessShare> {
+        let share = generate_share(
+            &identity.public_key,
+            &identity.secret_key,
+            next_epoch,
+            identity.committee_index,
+            identity.address,
+        ).ok()?;
+
+        let mut collector = RandomnessCollector::new(next_epoch);
+        collector.add_share(share.clone());
+        self.randomness_collector = Some(collector);
+
+        info!(epoch = next_epoch, "started epoch randomness collection");
+        Some(share)
+    }
+
+    /// Add a received randomness share from another committee member.
+    /// Returns the new epoch randomness if threshold reached.
+    pub fn on_randomness_share(
+        &mut self,
+        share: RandomnessShare,
+    ) -> Option<[u8; 32]> {
+        let collector = self.randomness_collector.as_mut()?;
+
+        // Verify share against committee key
+        let idx = share.validator_index as usize;
+        if idx >= self.committee_keys.len() {
+            return None;
+        }
+        let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&self.committee_keys[idx]) {
+            Some(pk) => pk,
+            None => return None,
+        };
+        if !verify_share(&share, &pk, collector.epoch) {
+            warn!(epoch = collector.epoch, validator = idx, "invalid randomness share");
+            return None;
+        }
+
+        collector.add_share(share);
+
+        // Check with dynamic threshold based on committee size
+        let threshold = quorum_for_committee(self.committee_keys.len());
+        if collector.share_count() >= threshold {
+            if let Some(result) = collector.finalize() {
+                info!(
+                    epoch = result.epoch,
+                    shares = result.share_count,
+                    "epoch randomness combined"
+                );
+                self.epoch_randomness = result.randomness;
+                self.randomness_collector = None;
+                return Some(result.randomness);
+            }
+        }
+
+        None
     }
 
     /// Compute VRF candidacy for the current slot.
