@@ -27,8 +27,14 @@ use crate::block::COMMITTEE_SIZE;
 /// Domain separator for epoch randomness VRF input.
 const DOMAIN: &[u8] = b"pyde-epoch-randomness-v1";
 
-/// Minimum shares required (2/3 + 1 of committee).
+/// Minimum shares required for production (2/3 + 1 of 128).
 pub const RANDOMNESS_THRESHOLD: usize = 85;
+
+/// Compute dynamic randomness threshold for a given committee size.
+/// Uses ceil(2/3 * size), same as consensus quorum.
+pub fn randomness_threshold_for(committee_size: usize) -> usize {
+    crate::block::quorum_for_committee(committee_size)
+}
 
 /// A randomness share from one committee member.
 #[derive(Clone, Debug)]
@@ -101,8 +107,26 @@ pub fn verify_share(
 /// the result is order-independent (prevents last-revealer bias).
 ///
 /// Returns None if fewer than RANDOMNESS_THRESHOLD shares provided.
+/// Combine shares with dynamic threshold based on committee size.
+pub fn combine_shares_dynamic(
+    shares: &[RandomnessShare],
+    epoch: u64,
+    committee_size: usize,
+) -> Option<EpochRandomness> {
+    let threshold = randomness_threshold_for(committee_size);
+    combine_shares_with_threshold(shares, epoch, threshold)
+}
+
 pub fn combine_shares(shares: &[RandomnessShare], epoch: u64) -> Option<EpochRandomness> {
-    if shares.len() < RANDOMNESS_THRESHOLD {
+    combine_shares_with_threshold(shares, epoch, RANDOMNESS_THRESHOLD)
+}
+
+fn combine_shares_with_threshold(
+    shares: &[RandomnessShare],
+    epoch: u64,
+    threshold: usize,
+) -> Option<EpochRandomness> {
+    if shares.len() < threshold {
         return None;
     }
 
@@ -114,7 +138,7 @@ pub fn combine_shares(shares: &[RandomnessShare], epoch: u64) -> Option<EpochRan
             unique_shares.push(share);
         }
     }
-    if unique_shares.len() < RANDOMNESS_THRESHOLD {
+    if unique_shares.len() < threshold {
         return None;
     }
 

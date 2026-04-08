@@ -22,6 +22,7 @@ pub mod tag {
     pub const CONSENSUS_NEW_VIEW: u8 = 0x13;
     pub const CONSENSUS_FINALITY_VOTE: u8 = 0x14;
     pub const COMPACT_BLOCK: u8 = 0x03;
+    pub const RANDOMNESS_SHARE: u8 = 0x15;
     pub const GET_BLOCK_TXS: u8 = 0x04;
     pub const BLOCK_TXS_RESPONSE: u8 = 0x05;
     pub const DECRYPTION_SHARES: u8 = 0x20;
@@ -72,6 +73,43 @@ pub fn decode_finality_vote(data: &[u8]) -> Result<pyde_consensus::finality::Fin
         voter_address,
         signature,
     })
+}
+
+// ============================================================
+// Epoch Randomness Share
+// ============================================================
+
+pub fn encode_randomness_share(
+    epoch: u64,
+    share: &pyde_consensus::epoch_randomness::RandomnessShare,
+) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(tag::RANDOMNESS_SHARE);
+    enc.u64(epoch);
+    enc.u8(share.validator_index);
+    enc.bytes32(&share.address);
+    enc.var_bytes(share.vrf_output.as_bytes());
+    enc.var_bytes(share.vrf_proof.as_bytes());
+    enc.finish()
+}
+
+pub fn decode_randomness_share(
+    data: &[u8],
+) -> Result<(u64, pyde_consensus::epoch_randomness::RandomnessShare), &'static str> {
+    let mut dec = Decoder::new(data);
+    let t = dec.u8()?;
+    if t != tag::RANDOMNESS_SHARE { return Err("not a randomness share"); }
+    let epoch = dec.u64()?;
+    let validator_index = dec.u8()?;
+    let address = dec.bytes32()?;
+    let output_bytes = dec.var_bytes()?;
+    let proof_bytes = dec.var_bytes()?;
+    Ok((epoch, pyde_consensus::epoch_randomness::RandomnessShare {
+        validator_index,
+        address,
+        vrf_output: pyde_crypto::vrf::VrfOutput::from_hash_bytes(&output_bytes),
+        vrf_proof: pyde_crypto::vrf::VrfProof::from_bytes(&proof_bytes),
+    }))
 }
 
 // ============================================================
