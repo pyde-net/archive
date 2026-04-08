@@ -111,6 +111,30 @@ pub struct ThresholdPublicKey {
     pub threshold: usize,
 }
 
+impl ThresholdPublicKey {
+    /// Serialize to bytes: [n:4 LE][threshold:4 LE][pk_len:4 LE][pk_bytes]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let pk_bytes = self.kyber_pk.as_bytes();
+        let mut buf = Vec::with_capacity(12 + pk_bytes.len());
+        buf.extend_from_slice(&(self.n as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.threshold as u32).to_le_bytes());
+        buf.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(pk_bytes);
+        buf
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 12 { return None; }
+        let n = u32::from_le_bytes([data[0],data[1],data[2],data[3]]) as usize;
+        let threshold = u32::from_le_bytes([data[4],data[5],data[6],data[7]]) as usize;
+        let pk_len = u32::from_le_bytes([data[8],data[9],data[10],data[11]]) as usize;
+        if data.len() < 12 + pk_len { return None; }
+        let pk = KyberPublicKey::from_bytes(&data[12..12 + pk_len])?;
+        Some(Self { kyber_pk: pk, n, threshold })
+    }
+}
+
 /// Per-validator key share (their portion of the Kyber secret seed).
 #[derive(Clone)]
 pub struct KeyShare {
@@ -118,6 +142,34 @@ pub struct KeyShare {
     pub index: usize,
     /// Share values for each of the 8 seed elements.
     shares: Vec<Goldilocks>,
+}
+
+impl KeyShare {
+    /// Serialize to bytes: [index:8 LE][count:4 LE][share_0:8 LE]...[share_n:8 LE]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(12 + self.shares.len() * 8);
+        buf.extend_from_slice(&(self.index as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.shares.len() as u32).to_le_bytes());
+        for s in &self.shares {
+            buf.extend_from_slice(&gl_to_u64(*s).to_le_bytes());
+        }
+        buf
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 12 { return None; }
+        let index = u64::from_le_bytes([data[0],data[1],data[2],data[3],data[4],data[5],data[6],data[7]]) as usize;
+        let count = u32::from_le_bytes([data[8],data[9],data[10],data[11]]) as usize;
+        if data.len() < 12 + count * 8 { return None; }
+        let mut shares = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 12 + i * 8;
+            let val = u64::from_le_bytes([data[off],data[off+1],data[off+2],data[off+3],data[off+4],data[off+5],data[off+6],data[off+7]]);
+            shares.push(gl(val));
+        }
+        Some(Self { index, shares })
+    }
 }
 
 /// A partial decryption share from one validator.
@@ -196,6 +248,12 @@ fn xor_bytes(data: &[u8], keystream: &[u8]) -> Vec<u8> {
 
 /// Generate a threshold keypair: committee public key + n key shares.
 /// Returns (ThresholdPublicKey, Vec<KeyShare>) where each KeyShare belongs to one validator.
+///
+/// IMPORTANT: This is a CENTRALIZED keygen — the caller sees all shares.
+/// For devnet/testnet where the operator is trusted, this is fine.
+/// For mainnet, use a multi-party ceremony (K operators contribute randomness
+/// via MPC, security holds if any 1 is honest) followed by PSS epoch refresh
+/// (pss_refresh/apply_refresh) which dissolves the genesis trust after epoch 1.
 pub fn threshold_keygen(n: usize, threshold: usize) -> Result<(ThresholdPublicKey, Vec<KeyShare>), &'static str> {
     if threshold > n { return Err("threshold must be <= n"); }
     if threshold < 1 { return Err("threshold must be >= 1"); }

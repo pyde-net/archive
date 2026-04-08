@@ -524,6 +524,7 @@ pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
         header,
         body: BlockBody {
             transactions,
+            encrypted_txs: vec![],
             execution_schedule: ExecutionSchedule { groups, total_txs },
         },
         proposer_signature,
@@ -709,6 +710,7 @@ mod tests {
             header: dummy_header(10),
             body: BlockBody {
                 transactions: vec![dummy_tx(), dummy_tx()],
+                encrypted_txs: vec![],
                 execution_schedule: ExecutionSchedule {
                     groups: vec![
                         pyde_tx::parallel::ExecutionGroup { tx_indices: vec![0] },

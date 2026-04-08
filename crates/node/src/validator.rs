@@ -482,6 +482,7 @@ impl ValidatorEngine {
             header,
             body: BlockBody {
                 transactions,
+                encrypted_txs: vec![],
                 execution_schedule,
             },
             proposer_signature,
