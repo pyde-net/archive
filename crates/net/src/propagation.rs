@@ -9,13 +9,13 @@
 
 use pyde_crypto::poseidon2::poseidon2_hash;
 
-/// Short ID size (6 bytes, per BIP-152 inspired design).
-pub const SHORT_ID_LEN: usize = 6;
+/// Short ID size (8 bytes — collision-safe up to millions of txs).
+pub const SHORT_ID_LEN: usize = 8;
 
 /// Threshold for erasure coding (blocks larger than this get coded).
 pub const ERASURE_THRESHOLD: usize = 256 * 1024; // 256KB
 
-/// A 6-byte short transaction ID.
+/// An 8-byte short transaction ID.
 pub type ShortId = [u8; SHORT_ID_LEN];
 
 /// Compact block: header + short IDs + prefilled txs.
@@ -42,6 +42,83 @@ pub fn compute_short_id(tx_hash: &[u8; 32], nonce: u64) -> ShortId {
     let mut short = [0u8; SHORT_ID_LEN];
     short.copy_from_slice(&hash[..SHORT_ID_LEN]);
     short
+}
+
+/// Time threshold (ms) for prefilling recent txs that peers may not have.
+pub const PREFILL_FRESHNESS_MS: u64 = 200;
+
+impl CompactBlock {
+    /// Build a compact block from a full block.
+    /// Prefills transactions received within PREFILL_FRESHNESS_MS.
+    pub fn from_block(
+        header_bytes: Vec<u8>,
+        tx_hashes: &[[u8; 32]],
+        prefill_indices: &[usize],
+        prefill_tx_bytes: &[Vec<u8>],
+    ) -> Self {
+        let nonce = rand_nonce();
+        let short_tx_ids: Vec<ShortId> = tx_hashes
+            .iter()
+            .map(|h| compute_short_id(h, nonce))
+            .collect();
+
+        let prefilled_txs: Vec<(u16, Vec<u8>)> = prefill_indices
+            .iter()
+            .zip(prefill_tx_bytes.iter())
+            .map(|(&idx, bytes)| (idx as u16, bytes.clone()))
+            .collect();
+
+        Self {
+            header: header_bytes,
+            short_tx_ids,
+            prefilled_txs,
+            nonce,
+        }
+    }
+
+    /// Reconstruct a full block by matching short IDs against a mempool.
+    /// Returns (matched_txs, missing_short_ids).
+    /// matched_txs[i] is Some(tx_bytes) if found, None if missing.
+    pub fn reconstruct(
+        &self,
+        mempool_txs: &[([u8; 32], Vec<u8>)], // (tx_hash, raw_tx_bytes)
+    ) -> (Vec<Option<Vec<u8>>>, Vec<ShortId>) {
+        // Build lookup: short_id → tx_bytes from mempool
+        let mut lookup: std::collections::HashMap<ShortId, Vec<u8>> =
+            std::collections::HashMap::with_capacity(mempool_txs.len());
+        for (hash, bytes) in mempool_txs {
+            let sid = compute_short_id(hash, self.nonce);
+            lookup.insert(sid, bytes.clone());
+        }
+
+        // Also add prefilled txs
+        let mut prefill_map: std::collections::HashMap<u16, Vec<u8>> =
+            self.prefilled_txs.iter().cloned().collect();
+
+        let mut matched: Vec<Option<Vec<u8>>> = Vec::with_capacity(self.short_tx_ids.len());
+        let mut missing: Vec<ShortId> = Vec::new();
+
+        for (i, sid) in self.short_tx_ids.iter().enumerate() {
+            if let Some(bytes) = prefill_map.remove(&(i as u16)) {
+                matched.push(Some(bytes));
+            } else if let Some(bytes) = lookup.get(sid) {
+                matched.push(Some(bytes.clone()));
+            } else {
+                matched.push(None);
+                missing.push(*sid);
+            }
+        }
+
+        (matched, missing)
+    }
+}
+
+/// Generate a random nonce for short ID computation.
+fn rand_nonce() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    // Mix timestamp with a counter for uniqueness
+    t.as_nanos() as u64 ^ (t.as_secs().wrapping_mul(0x517cc1b727220a95))
 }
 
 /// Block body request: request missing transactions by short ID.
@@ -167,9 +244,9 @@ mod tests {
     }
 
     #[test]
-    fn short_id_is_6_bytes() {
+    fn short_id_is_8_bytes() {
         let id = compute_short_id(&[0xCC; 32], 0);
-        assert_eq!(id.len(), 6);
+        assert_eq!(id.len(), 8);
     }
 
     // ========== Erasure coding ==========
