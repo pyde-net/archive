@@ -47,6 +47,57 @@ pub fn verify_stake(balance: u128) -> Result<u128, String> {
     }
 }
 
+/// Load the validator set from on-chain state.
+/// Reads validator entries stored at genesis (or updated by staking txs).
+/// Returns a ValidatorSet that can be used for committee selection.
+pub fn load_validator_set_from_state(
+    state: &crate::state_manager::StateManager,
+    genesis_config: &crate::genesis::GenesisConfig,
+) -> pyde_consensus::validator::ValidatorSet {
+    use pyde_consensus::validator::{Validator, ValidatorSet, ValidatorStatus};
+
+    let mut set = ValidatorSet::new();
+
+    // Read each genesis validator from state
+    for val in &genesis_config.validators {
+        let address = match crate::genesis::parse_hex_address_pub(&val.address) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+
+        let val_key = pyde_state::keys::validator_key(&address);
+        if let Some(val_data) = state.get(&val_key) {
+            // Parse: [pk_len:4 LE][pk_bytes][stake:16 LE][status:1]
+            if val_data.len() < 5 {
+                continue;
+            }
+            let pk_len = u32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]) as usize;
+            if val_data.len() < 4 + pk_len + 16 + 1 {
+                continue;
+            }
+            let pk_bytes = val_data[4..4 + pk_len].to_vec();
+            let mut stake_buf = [0u8; 16];
+            stake_buf.copy_from_slice(&val_data[4 + pk_len..4 + pk_len + 16]);
+            let stake = u128::from_le_bytes(stake_buf);
+            let status_byte = val_data[4 + pk_len + 16];
+            let status = match status_byte {
+                0x00 => ValidatorStatus::Active,
+                _ => ValidatorStatus::Exited,
+            };
+
+            set.validators.push(Validator {
+                address,
+                public_key: pk_bytes,
+                stake,
+                status,
+                registered_epoch: 0,
+            });
+        }
+    }
+
+    set
+}
+
 /// Collected votes for a slot, used to form QCs.
 struct SlotVotes {
     block_hash: [u8; 32],
