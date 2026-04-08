@@ -72,6 +72,7 @@ impl BlockProcessor {
                         fee_paid: 0,
                         fee_burned: 0,
                         fee_validator: 0,
+                        fee_treasury: 0,
                         return_data: reason.into_bytes(),
                         logs: vec![],
                         state_root: sparse_merkle_tree::H256::zero(),

@@ -850,6 +850,7 @@ fn receipt_to_json(receipt: &Receipt) -> serde_json::Value {
         "feePaid": receipt.fee_paid.to_string(),
         "feeBurned": receipt.fee_burned.to_string(),
         "feeValidator": receipt.fee_validator.to_string(),
+        "feeTreasury": receipt.fee_treasury.to_string(),
         "logs": receipt.logs.iter().map(|l| serde_json::json!({
             "address": format!("0x{}", hex::encode(l.address)),
             "topics": l.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
@@ -947,8 +948,9 @@ mod tests {
             gas_refund: 0,
             effective_gas: 21000,
             fee_paid: 1050000,
-            fee_burned: 840000,
-            fee_validator: 210000,
+            fee_burned: 735000,    // 70%
+            fee_validator: 210000, // 20%
+            fee_treasury: 105000,  // 10%
             logs: vec![],
             state_root: sparse_merkle_tree::H256::zero(),
             return_data: vec![],
