@@ -1,25 +1,14 @@
-//! Chain sync: header-first sync over libp2p request-response.
+//! Chain sync: full block sync over libp2p request-response.
 //!
-//! ## Current Limitations
+//! When a new node connects, it discovers the network tip and downloads
+//! full blocks (header + body) in batches. Each block is executed against
+//! state via BlockProcessor, building up the full chain from genesis.
 //!
-//! This is a header-only sync skeleton. A fully synced node currently has:
-//! - Chain head tracking (slot, epoch, parent hashes)
-//! - Block header history for finality verification
-//!
-//! What's NOT synced yet (requires block wire format + tx execution):
-//! - Block bodies (transactions, execution schedules)
-//! - State trie (account balances, storage, contract code)
-//! - Transaction execution / state replay from genesis
-//!
-//! ## TODO: Full Sync
-//!
-//! 1. Block serialization format (header + body + signatures)
-//! 2. Download full blocks (not just headers) during sync
-//! 3. Execute transactions per block to rebuild state from genesis
-//! 4. State snapshot sync (download trie at checkpoint, replay recent blocks)
-//! 5. Parallel block download with sequential execution
+//! For nodes very far behind (>1000 slots), state snapshot sync is available
+//! as an optimization (download state trie directly, skip replay).
 
 use crate::block_processor::BlockProcessor;
+use crate::block_store::BlockStore;
 use crate::chain::ChainState;
 use crate::state_manager::StateManager;
 use libp2p::request_response::{self, OutboundRequestId, ResponseChannel};
@@ -164,6 +153,7 @@ impl ChainSync {
         response: SyncResp,
         chain: &mut ChainState,
         state: &mut StateManager,
+        block_store: &BlockStore,
     ) -> u64 {
         self.pending.remove(&request_id);
 
@@ -178,20 +168,43 @@ impl ChainSync {
                 let mut processed = 0u64;
 
                 for data in &block_data {
-                    if let Ok(header) = crate::wire::decode_block_header(data) {
-                        match BlockProcessor::process_block(chain, state, header, &[]) {
-                            Ok(_) => {
-                                self.manager.advance_local_tip(chain.head_slot);
-                                processed += 1;
+                    // Decode full block (header + body + signature)
+                    match crate::wire::decode_block(data) {
+                        Ok(block) => {
+                            let slot = block.header.slot;
+                            match BlockProcessor::process_full_block(chain, state, &block) {
+                                Ok((tx_count, gas_used, _receipts)) => {
+                                    // Persist to disk for future sync serving
+                                    let _ = block_store.put_block(&block.header, data);
+                                    let _ = block_store.put_head(slot);
+                                    self.manager.advance_local_tip(slot);
+                                    processed += 1;
+                                    debug!(slot, tx_count, gas_used, "synced block");
+                                }
+                                Err(e) => {
+                                    warn!(slot, error = %e, "failed to process synced block");
+                                    break;
+                                }
                             }
-                            Err(e) => {
-                                warn!(error = %e, "failed to process synced block");
+                        }
+                        Err(_) => {
+                            // Fallback: try header-only decode for backwards compat
+                            if let Ok(header) = crate::wire::decode_block_header(data) {
+                                match BlockProcessor::process_block(chain, state, header, &[]) {
+                                    Ok(_) => {
+                                        self.manager.advance_local_tip(chain.head_slot);
+                                        processed += 1;
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "failed to process synced header");
+                                        break;
+                                    }
+                                }
+                            } else {
+                                warn!(len = data.len(), "failed to decode synced block");
                                 break;
                             }
                         }
-                    } else {
-                        warn!(len = data.len(), "failed to deserialize synced block");
-                        break;
                     }
                 }
 
@@ -255,21 +268,30 @@ impl ChainSync {
         req: &SyncReq,
         chain: &ChainState,
         state: &StateManager,
+        block_store: &BlockStore,
     ) -> SyncResp {
         match req {
             SyncReq::GetChainTip => {
                 SyncResp::ChainTip {
                     slot: chain.head_slot,
-                    block_hash: chain.state_root, // simplified: use state_root as block identifier
+                    block_hash: chain.state_root,
                 }
             }
             SyncReq::GetBlocks { start_slot, count } => {
-                // Serialize full block headers using the wire format.
+                // Serve full wire-encoded blocks (header + body + signature).
+                // Skips empty slots (sparse block history — not every slot has a block).
                 let mut blocks = Vec::new();
-                for slot in *start_slot..(*start_slot + *count as u64) {
-                    if let Some(header) = chain.header(slot) {
+                let end_slot = *start_slot + *count as u64;
+                // Scan up to end_slot or chain head, whichever is higher
+                let scan_end = end_slot.max(chain.head_slot + 1);
+                for slot in *start_slot..scan_end {
+                    if let Some(raw) = block_store.get_block_raw(slot) {
+                        blocks.push(raw);
+                    } else if let Some(header) = chain.header(slot) {
                         blocks.push(crate::wire::encode_block_header(header));
-                    } else {
+                    }
+                    // Don't break on missing slots — blocks are sparse
+                    if blocks.len() >= *count as usize {
                         break;
                     }
                 }
@@ -386,13 +408,20 @@ mod tests {
         StateManager::open(&dir, 1024).unwrap()
     }
 
+    fn make_block_store(name: &str) -> BlockStore {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        BlockStore::open(&dir).unwrap()
+    }
+
     #[test]
     fn handle_chain_tip_request() {
         let mut chain = ChainState::genesis([0u8; 32], 1);
         chain.advance(dummy_header(10));
-        let state = make_state("pyde-sync-tip");
+        let state = make_state("pyde-sync-tip-v2");
+        let bs = make_block_store("pyde-sync-tip-bs-v2");
 
-        let resp = ChainSync::handle_inbound_request(&SyncReq::GetChainTip, &chain, &state);
+        let resp = ChainSync::handle_inbound_request(&SyncReq::GetChainTip, &chain, &state, &bs);
         match resp {
             SyncResp::ChainTip { slot, .. } => assert_eq!(slot, 10),
             _ => panic!("expected ChainTip response"),
@@ -405,16 +434,19 @@ mod tests {
         for slot in 1..=5 {
             chain.advance(dummy_header(slot));
         }
-        let state = make_state("pyde-sync-blocks");
+        let state = make_state("pyde-sync-blocks-v2");
+        let bs = make_block_store("pyde-sync-blocks-bs-v2");
 
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetBlocks { start_slot: 1, count: 3 },
             &chain,
             &state,
+            &bs,
         );
         match resp {
             SyncResp::Blocks(blocks) => {
                 assert_eq!(blocks.len(), 3);
+                // Falls back to header-only since no block bodies stored
                 let h = crate::wire::decode_block_header(&blocks[0]).unwrap();
                 assert_eq!(h.slot, 1);
             }
@@ -425,12 +457,14 @@ mod tests {
     #[test]
     fn handle_get_blocks_not_found() {
         let chain = ChainState::genesis([0u8; 32], 1);
-        let state = make_state("pyde-sync-notfound");
+        let state = make_state("pyde-sync-notfound-v2");
+        let bs = make_block_store("pyde-sync-notfound-bs-v2");
 
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetBlocks { start_slot: 100, count: 10 },
             &chain,
             &state,
+            &bs,
         );
         match resp {
             SyncResp::NotFound => {}
@@ -442,16 +476,18 @@ mod tests {
     fn handle_state_snapshot_request() {
         let mut chain = ChainState::genesis([0u8; 32], 1);
         chain.advance(dummy_header(5));
-        let mut state = make_state("pyde-sync-snapshot");
+        let mut state = make_state("pyde-sync-snapshot-v2");
 
         // Insert some state
         let key = pyde_state::keys::balance_key(&[0x01; 32]);
         state.insert(key, 42u128.to_le_bytes().to_vec()).unwrap();
 
+        let bs = make_block_store("pyde-sync-snapshot-bs-v2");
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetStateSnapshot,
             &chain,
             &state,
+            &bs,
         );
         match resp {
             SyncResp::StateSnapshot { state_root, head_slot, entries } => {
