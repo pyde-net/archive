@@ -323,6 +323,7 @@ mod tests {
             header: dummy_header(1),
             body: BlockBody {
                 transactions: vec![tx],
+                encrypted_txs: vec![],
                 execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 1 },
             },
             proposer_signature: vec![],

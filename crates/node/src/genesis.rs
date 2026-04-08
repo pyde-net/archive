@@ -370,6 +370,29 @@ pub fn generate_testnet(
     fs::write(&genesis_path, genesis_config.to_toml())
         .map_err(|e| format!("failed to write genesis.toml: {}", e))?;
 
+    // Generate threshold encryption keys for MEV protection.
+    //
+    // SECURITY NOTE — CENTRALIZED KEYGEN (devnet only):
+    // This generates ALL key shares in one process. The operator of `pyde testnet`
+    // temporarily sees all shares. This is acceptable for devnet/testnet where the
+    // operator is trusted, but NOT acceptable for mainnet.
+    //
+    // Production path (before mainnet):
+    // 1. Multi-party ceremony: K operators each contribute randomness via MPC.
+    //    Security: if ANY 1 of K operators is honest, the combined key is secure.
+    // 2. Shares distributed to validators, combined secret DELETED.
+    // 3. PSS (Proactive Secret Sharing) refresh at each epoch boundary rotates
+    //    shares so the genesis ceremony trust dissolves after epoch 1.
+    //    (PSS is implemented in crypto/threshold.rs: pss_refresh, apply_refresh)
+    // 4. After first PSS refresh, even the original ceremony operator cannot
+    //    reconstruct the secret key from the refreshed shares.
+    //
+    // TODO: Wire PSS refresh into epoch boundary (same P2P pattern as epoch randomness).
+    // TODO: Implement `pyde ceremony` command for multi-party key generation.
+    let threshold = pyde_consensus::block::quorum_for_committee(num_validators);
+    let (threshold_pk, key_shares) = pyde_crypto::threshold::threshold_keygen(num_validators, threshold)
+        .map_err(|e| format!("threshold keygen failed: {}", e))?;
+
     // Pre-generate node identity keys (Ed25519 for libp2p) so we know peer IDs
     // and can write full bootstrap multiaddrs in each config.
     let mut node_keypairs: Vec<(libp2p::identity::Keypair, libp2p::PeerId)> = Vec::new();
@@ -400,6 +423,14 @@ pub fn generate_testnet(
             .map_err(|e| format!("failed to serialize node key: {}", e))?;
         fs::write(node_dir.join("node.key"), &node_key_bytes)
             .map_err(|e| format!("failed to write node.key: {}", e))?;
+
+        // Write threshold key share (binary) for MEV-protected decryption
+        fs::write(node_dir.join("threshold.share"), key_shares[i].to_bytes())
+            .map_err(|e| format!("failed to write threshold.share: {}", e))?;
+
+        // Write threshold public key (shared — same for all nodes)
+        fs::write(node_dir.join("threshold.pk"), threshold_pk.to_bytes())
+            .map_err(|e| format!("failed to write threshold.pk: {}", e))?;
 
         // Copy genesis.toml into each node's directory
         fs::write(node_dir.join("genesis.toml"), genesis_config.to_toml())

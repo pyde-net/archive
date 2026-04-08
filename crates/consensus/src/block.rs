@@ -134,8 +134,11 @@ impl BlockHeader {
 /// Block body: transactions and execution schedule.
 #[derive(Clone, Debug)]
 pub struct BlockBody {
-    /// Ordered list of transactions in this block.
+    /// Ordered list of plaintext transactions (dev mode or post-decryption).
     pub transactions: Vec<Transaction>,
+    /// Encrypted transaction blobs (threshold-encrypted, decrypted after QC).
+    /// Empty in dev mode. In production, proposer includes these from the encrypted mempool.
+    pub encrypted_txs: Vec<Vec<u8>>,
     /// Conflict-based execution schedule. Each group contains transitively
     /// conflicting txs (sequential within group). Groups are independent
     /// and can be proven in parallel from the same pre_state_root.
@@ -211,6 +214,7 @@ pub fn genesis_block(
         header,
         body: BlockBody {
             transactions: vec![],
+            encrypted_txs: vec![],
             execution_schedule: ExecutionSchedule {
                 groups: vec![],
                 total_txs: 0,
