@@ -1,0 +1,89 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Chain Head (slot)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "max(pyde_chain_head_slot)", "legendFormat": "head" }],
+      "fieldConfig": { "defaults": { "unit": "none" } }
+    },
+    {
+      "title": "Blocks Produced",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [{ "expr": "sum(pyde_blocks_processed_total)", "legendFormat": "total" }],
+      "fieldConfig": { "defaults": { "unit": "none" } }
+    },
+    {
+      "title": "Transactions Processed",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [{ "expr": "sum(pyde_transactions_processed_total)", "legendFormat": "total" }],
+      "fieldConfig": { "defaults": { "unit": "none" } }
+    },
+    {
+      "title": "Connected Peers",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "avg(pyde_peers_connected)", "legendFormat": "avg" }],
+      "fieldConfig": { "defaults": { "unit": "none" } }
+    },
+    {
+      "title": "Block Production Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [{ "expr": "rate(pyde_blocks_processed_total[1m])", "legendFormat": "{{instance}} blocks/min" }],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "TPS (Transactions Per Second)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [{ "expr": "rate(pyde_transactions_processed_total[1m]) * 60", "legendFormat": "{{instance}} TPS" }],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "title": "Gas Used Per Block",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [{ "expr": "pyde_block_gas_used", "legendFormat": "{{instance}}" }],
+      "fieldConfig": { "defaults": { "unit": "none" } }
+    },
+    {
+      "title": "Block Processing Time (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [{ "expr": "pyde_block_processing_ms", "legendFormat": "{{instance}}" }],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "title": "Peers Per Node",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [{ "expr": "pyde_peers_connected", "legendFormat": "{{instance}}" }],
+      "fieldConfig": { "defaults": { "unit": "none" } }
+    },
+    {
+      "title": "Mempool Size",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [{ "expr": "pyde_mempool_size", "legendFormat": "{{instance}}" }],
+      "fieldConfig": { "defaults": { "unit": "none" } }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["pyde", "devnet"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Pyde Devnet",
+  "uid": "pyde-devnet",
+  "version": 1
+}

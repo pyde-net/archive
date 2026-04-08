@@ -1,0 +1,134 @@
+# Pyde Devnet: 4 validators + Prometheus + Grafana
+# Usage:
+#   docker build -t pyde-node:latest .
+#   docker compose up -d
+#
+# RPC endpoints:
+#   Node-0: http://localhost:8545
+#   Node-1: http://localhost:8546
+#   Node-2: http://localhost:8547
+#   Node-3: http://localhost:8548
+#
+# Monitoring:
+#   Prometheus: http://localhost:9999
+#   Grafana:    http://localhost:3000 (admin/admin)
+
+services:
+  node-0:
+    image: pyde-node:latest
+    entrypoint: ["/bin/bash", "/docker/entrypoint.sh"]
+    environment:
+      - NODE_INDEX=0
+      - VALIDATORS=4
+      - DEV_MODE=true
+    volumes:
+      - testnet-data:/testnet
+      - node0-data:/data
+    ports:
+      - "8545:8545"
+      - "9090:9090"
+    networks:
+      pyde-net:
+        ipv4_address: 172.20.0.10
+
+  node-1:
+    image: pyde-node:latest
+    entrypoint: ["/bin/bash", "/docker/entrypoint.sh"]
+    environment:
+      - NODE_INDEX=1
+      - DEV_MODE=true
+    volumes:
+      - testnet-data:/testnet
+      - node1-data:/data
+    ports:
+      - "8546:8546"
+      - "9091:9091"
+    depends_on:
+      - node-0
+    networks:
+      pyde-net:
+        ipv4_address: 172.20.0.11
+
+  node-2:
+    image: pyde-node:latest
+    entrypoint: ["/bin/bash", "/docker/entrypoint.sh"]
+    environment:
+      - NODE_INDEX=2
+      - DEV_MODE=true
+    volumes:
+      - testnet-data:/testnet
+      - node2-data:/data
+    ports:
+      - "8547:8547"
+      - "9092:9092"
+    depends_on:
+      - node-0
+    networks:
+      pyde-net:
+        ipv4_address: 172.20.0.12
+
+  node-3:
+    image: pyde-node:latest
+    entrypoint: ["/bin/bash", "/docker/entrypoint.sh"]
+    environment:
+      - NODE_INDEX=3
+      - DEV_MODE=true
+    volumes:
+      - testnet-data:/testnet
+      - node3-data:/data
+    ports:
+      - "8548:8548"
+      - "9093:9093"
+    depends_on:
+      - node-0
+    networks:
+      pyde-net:
+        ipv4_address: 172.20.0.13
+
+  prometheus:
+    image: prom/prometheus:latest
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat > /tmp/prometheus.yml << 'CONF'
+        global:
+          scrape_interval: 5s
+        scrape_configs:
+          - job_name: pyde-validators
+            static_configs:
+              - targets: ['node-0:9090','node-1:9091','node-2:9092','node-3:9093']
+        CONF
+        /bin/prometheus --config.file=/tmp/prometheus.yml --storage.tsdb.path=/prometheus
+    ports:
+      - "9999:9090"
+    depends_on:
+      - node-0
+    networks:
+      pyde-net:
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      pyde-net:
+
+volumes:
+  testnet-data:
+  node0-data:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  pyde-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
