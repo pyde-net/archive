@@ -271,11 +271,20 @@ pub fn execute_transaction(
             } else if tx.data.len() < 897 {
                 (false, 21_000u64, 0u64, vec![], b"tx.data must contain FALCON public key (897 bytes)".to_vec())
             } else {
+                // Validate: public key must derive to sender's address
+                let pk_bytes = &tx.data[..897];
+                let derived_addr = pyde_account::address::derive_eoa_address(pk_bytes);
+                if derived_addr != tx.from {
+                    (false, 21_000u64, 0u64, vec![], b"public key does not match sender address".to_vec())
+                } else if smt.get(&pyde_state::keys::validator_key(&tx.from)).is_some() {
+                    // Already registered
+                    (false, 21_000u64, 0u64, vec![], b"already registered as validator".to_vec())
+                } else {
+
                 // Deduct stake from sender balance
                 sender.balance -= VALIDATOR_STAKE;
 
                 // Write validator entry to state: [pk_len:4 LE][pk][stake:16 LE][status:1]
-                let pk_bytes = &tx.data[..897];
                 let mut val_data = Vec::with_capacity(4 + 897 + 16 + 1);
                 val_data.extend_from_slice(&(897u32).to_le_bytes());
                 val_data.extend_from_slice(pk_bytes);
@@ -308,6 +317,7 @@ pub fn execute_transaction(
                 );
 
                 (true, 50_000u64, 0u64, vec![], tx.from.to_vec())
+                }
             }
         }
         TransactionType::StakeWithdraw => {
@@ -1399,5 +1409,164 @@ mod tests {
         buf.copy_from_slice(&value.unwrap()[..8]);
         let count = u64::from_le_bytes(buf);
         assert_eq!(count, 3, "count should be 3 after 3 increments");
+    }
+
+    // ========== Staking tests ==========
+
+    #[test]
+    fn stake_deposit_registers_validator() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let sender_addr = derive_eoa_address(pk.as_bytes());
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+
+        // Fund sender with enough for stake + gas
+        let balance: u128 = 20_000_000_000_000; // 20K PYDE
+        fund_account_with_pk(&mut smt, &sender_addr, balance, pk.as_bytes());
+
+        // StakeDeposit tx: data = FALCON public key
+        let mut tx = Transaction {
+            from: sender_addr,
+            to: [0u8; 32],
+            value: 0,
+            data: pk.as_bytes().to_vec(),
+            gas_limit: 100_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::StakeDeposit,
+        };
+        sign_tx(&mut tx, &sk);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(receipt.success, "stake deposit should succeed");
+
+        // Verify validator entry in state
+        let val_key = pyde_state::keys::validator_key(&sender_addr);
+        let val_data = smt.get(&val_key);
+        assert!(val_data.is_some(), "validator entry should exist");
+
+        // Verify sender balance reduced by stake
+        let account = load_account(&smt, &sender_addr);
+        assert!(account.balance < balance, "balance should be reduced");
+    }
+
+    #[test]
+    fn stake_deposit_wrong_key_rejected() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let (pk2, _) = falcon_keygen().unwrap();
+        let sender_addr = derive_eoa_address(pk.as_bytes());
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+
+        fund_account_with_pk(&mut smt, &sender_addr, 20_000_000_000_000, pk.as_bytes());
+
+        // Use WRONG public key (pk2 doesn't derive to sender_addr)
+        let mut tx = Transaction {
+            from: sender_addr,
+            to: [0u8; 32],
+            value: 0,
+            data: pk2.as_bytes().to_vec(),
+            gas_limit: 100_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::StakeDeposit,
+        };
+        sign_tx(&mut tx, &sk);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "wrong key should be rejected");
+    }
+
+    #[test]
+    fn stake_deposit_duplicate_rejected() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let sender_addr = derive_eoa_address(pk.as_bytes());
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+
+        fund_account_with_pk(&mut smt, &sender_addr, 30_000_000_000_000, pk.as_bytes());
+
+        // First deposit succeeds
+        let mut tx1 = Transaction {
+            from: sender_addr, to: [0u8;32], value: 0,
+            data: pk.as_bytes().to_vec(), gas_limit: 100_000, nonce: 0,
+            signature: vec![], fee_payer: FeePayer::Sender,
+            access_list: vec![], deadline: None, chain_id: 1,
+            tx_type: TransactionType::StakeDeposit,
+        };
+        sign_tx(&mut tx1, &sk);
+        let r1 = execute_transaction(&tx1, &mut smt, &ctx).unwrap();
+        assert!(r1.success);
+
+        // Second deposit rejected (duplicate)
+        let mut tx2 = tx1.clone();
+        tx2.nonce = 1;
+        sign_tx(&mut tx2, &sk);
+        let r2 = execute_transaction(&tx2, &mut smt, &ctx).unwrap();
+        assert!(!r2.success, "duplicate stake should be rejected");
+    }
+
+    #[test]
+    fn stake_withdraw_starts_unbonding() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let sender_addr = derive_eoa_address(pk.as_bytes());
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+
+        fund_account_with_pk(&mut smt, &sender_addr, 20_000_000_000_000, pk.as_bytes());
+
+        // Deposit first
+        let mut deposit = Transaction {
+            from: sender_addr, to: [0u8;32], value: 0,
+            data: pk.as_bytes().to_vec(), gas_limit: 100_000, nonce: 0,
+            signature: vec![], fee_payer: FeePayer::Sender,
+            access_list: vec![], deadline: None, chain_id: 1,
+            tx_type: TransactionType::StakeDeposit,
+        };
+        sign_tx(&mut deposit, &sk);
+        execute_transaction(&deposit, &mut smt, &ctx).unwrap();
+
+        // Withdraw
+        let mut withdraw = Transaction {
+            from: sender_addr, to: [0u8;32], value: 0,
+            data: vec![], gas_limit: 100_000, nonce: 1,
+            signature: vec![], fee_payer: FeePayer::Sender,
+            access_list: vec![], deadline: None, chain_id: 1,
+            tx_type: TransactionType::StakeWithdraw,
+        };
+        sign_tx(&mut withdraw, &sk);
+        let receipt = execute_transaction(&withdraw, &mut smt, &ctx).unwrap();
+        assert!(receipt.success, "withdraw should succeed");
+
+        // Verify status is Unbonding (0x01)
+        let val_key = pyde_state::keys::validator_key(&sender_addr);
+        let val_data = smt.get(&val_key).unwrap();
+        let pk_len = u32::from_le_bytes([val_data[0],val_data[1],val_data[2],val_data[3]]) as usize;
+        assert_eq!(val_data[4 + pk_len + 16], 0x01, "status should be Unbonding");
+    }
+
+    fn fund_account_with_pk(smt: &mut PydeSMT, addr: &Address, balance: u128, pk: &[u8]) {
+        let mut account = pyde_account::types::Account::new_eoa(pk);
+        account.address = *addr;
+        account.balance = balance;
+        let key = pyde_state::keys::balance_key(addr);
+        smt.insert(key, account.to_bytes()).unwrap();
+        // Also set nonce
+        let nonce_key = pyde_state::keys::nonce_key(addr);
+        let ns = pyde_account::nonce::NonceState::new();
+        smt.insert(nonce_key, ns.to_bytes().to_vec()).unwrap();
+    }
+
+    fn sign_tx(tx: &mut Transaction, sk: &pyde_crypto::falcon::FalconSecretKey) {
+        let hash = tx.hash();
+        tx.signature = falcon_sign(sk, &hash).unwrap().as_bytes().to_vec();
     }
 }

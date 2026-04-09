@@ -563,6 +563,15 @@ impl PydeNode {
                             // Epoch boundary: rotate committee
                             let new_epoch = current_slot / pyde_consensus::block::EPOCH_LENGTH;
                             if new_epoch > prev_epoch && new_epoch > 0 {
+                                // Process unbonding: return stake for validators whose
+                                // unbonding period has expired (14 days / 3,024,000 blocks)
+                                {
+                                    let mut state_w = state.write().await;
+                                    crate::validator::process_unbonding(
+                                        &mut state_w, current_slot,
+                                    );
+                                }
+
                                 let state_r = state.read().await;
                                 let val_set = crate::validator::load_validator_set_from_state(
                                     &state_r, &genesis_config,
