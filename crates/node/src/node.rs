@@ -404,7 +404,7 @@ impl PydeNode {
                             &mut tx_relay_w,
                             &mut chain_sync,
                             &mut validator_engine,
-                            &validator_identity,
+                            &mut validator_identity,
                             &block_store,
                         )
                     };
@@ -671,12 +671,20 @@ impl PydeNode {
                                             "committee rotated at epoch boundary"
                                         );
 
-                                        // Generate and broadcast our epoch randomness share
                                         if let Some(identity) = validator_identity.as_ref() {
+                                            // Generate and broadcast epoch randomness share
                                             if let Some(share) = engine.start_epoch_randomness(new_epoch + 1, identity) {
                                                 let share_bytes = wire::encode_randomness_share(new_epoch + 1, &share);
                                                 let topic = pyde_net::node::topics::consensus();
                                                 let _ = swarm.behaviour_mut().gossipsub.publish(topic, share_bytes);
+                                            }
+
+                                            // Generate and broadcast PSS refresh contribution
+                                            // (rotates threshold key shares so genesis trust dissolves)
+                                            if let Some(contrib) = engine.start_pss_refresh(new_epoch + 1, identity) {
+                                                let contrib_bytes = wire::encode_pss_refresh(new_epoch + 1, &contrib.to_bytes());
+                                                let topic = pyde_net::node::topics::consensus();
+                                                let _ = swarm.behaviour_mut().gossipsub.publish(topic, contrib_bytes);
                                             }
                                         }
                                     }
@@ -1059,6 +1067,20 @@ impl PydeNode {
                         behind = chain_sync.manager.slots_behind(),
                         "maintenance tick"
                     );
+                    // Persist refreshed key share to disk if dirty
+                    if let Some(engine) = validator_engine.as_mut() {
+                        if engine.key_share_dirty {
+                            if let Some(identity) = validator_identity.as_ref() {
+                                if let Some(ref ks) = identity.key_share {
+                                    let share_path = self.config.node.datadir.join("threshold.share");
+                                    if std::fs::write(&share_path, ks.to_bytes()).is_ok() {
+                                        engine.key_share_dirty = false;
+                                        info!("PSS: refreshed key share saved to disk");
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 _ = shutdown_rx.recv() => {
                     info!("shutdown signal received, stopping node...");
@@ -1108,7 +1130,7 @@ fn handle_swarm_event(
     tx_relay: &mut TxRelay,
     chain_sync: &mut ChainSync,
     validator_engine: &mut Option<ValidatorEngine>,
-    validator_identity: &Option<ValidatorIdentity>,
+    validator_identity: &mut Option<ValidatorIdentity>,
     block_store: &BlockStore,
 ) -> PostEventAction {
     match event {
@@ -1226,6 +1248,24 @@ fn handle_swarm_event(
                                 }
                                 Err(e) => {
                                     debug!(error = e, "failed to decode randomness share");
+                                }
+                            }
+                            return PostEventAction::None;
+                        }
+
+                        // Check if it's a PSS refresh contribution
+                        if !message.data.is_empty() && message.data[0] == wire::tag::PSS_REFRESH {
+                            match wire::decode_pss_refresh(&message.data) {
+                                Ok((epoch, contrib_bytes)) => {
+                                    if let Some(contrib) = pyde_crypto::threshold::RefreshContribution::from_bytes(&contrib_bytes) {
+                                        debug!(epoch, from = contrib.from_index, "received PSS refresh contribution");
+                                        if let Some(identity) = validator_identity.as_mut() {
+                                            engine.on_pss_contribution(contrib, identity);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(error = e, "failed to decode PSS contribution");
                                 }
                             }
                             return PostEventAction::None;

@@ -23,6 +23,7 @@ pub mod tag {
     pub const CONSENSUS_FINALITY_VOTE: u8 = 0x14;
     pub const COMPACT_BLOCK: u8 = 0x03;
     pub const RANDOMNESS_SHARE: u8 = 0x15;
+    pub const PSS_REFRESH: u8 = 0x16;
     pub const GET_BLOCK_TXS: u8 = 0x04;
     pub const BLOCK_TXS_RESPONSE: u8 = 0x05;
     pub const DECRYPTION_SHARES: u8 = 0x20;
@@ -110,6 +111,27 @@ pub fn decode_randomness_share(
         vrf_output: pyde_crypto::vrf::VrfOutput::from_hash_bytes(&output_bytes),
         vrf_proof: pyde_crypto::vrf::VrfProof::from_bytes(&proof_bytes),
     }))
+}
+
+// ============================================================
+// PSS Refresh Contribution
+// ============================================================
+
+pub fn encode_pss_refresh(epoch: u64, contribution_bytes: &[u8]) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(tag::PSS_REFRESH);
+    enc.u64(epoch);
+    enc.var_bytes(contribution_bytes);
+    enc.finish()
+}
+
+pub fn decode_pss_refresh(data: &[u8]) -> Result<(u64, Vec<u8>), &'static str> {
+    let mut dec = Decoder::new(data);
+    let t = dec.u8()?;
+    if t != tag::PSS_REFRESH { return Err("not a PSS refresh"); }
+    let epoch = dec.u64()?;
+    let contribution = dec.var_bytes()?;
+    Ok((epoch, contribution))
 }
 
 // ============================================================
