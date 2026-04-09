@@ -172,6 +172,13 @@ impl ChainSync {
                     match crate::wire::decode_block(data) {
                         Ok(block) => {
                             let slot = block.header.slot;
+                            // Validate synced block body (includes signature verification)
+                            if let Err(e) = BlockProcessor::validate_synced_block_body(
+                                &block, state, chain.chain_id,
+                            ) {
+                                warn!(slot, error = %e, "synced block body validation failed");
+                                break;
+                            }
                             match BlockProcessor::process_full_block(chain, state, &block) {
                                 Ok((tx_count, gas_used, _receipts)) => {
                                     // Persist to disk for future sync serving

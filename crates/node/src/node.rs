@@ -463,12 +463,22 @@ impl PydeNode {
                             };
                             let slot = header.slot;
 
-                            // Build mempool snapshot for reconstruction
+                            // Build mempool snapshot for reconstruction (plaintext + encrypted)
                             let idx = mempool_index.read().await;
-                            let mempool_txs: Vec<([u8; 32], Vec<u8>)> = idx.iter()
+                            let mut mempool_txs: Vec<([u8; 32], Vec<u8>)> = idx.iter()
                                 .map(|(h, b)| (*h, b.clone()))
                                 .collect();
                             drop(idx);
+
+                            // Also include encrypted txs from TxRelay
+                            {
+                                let relay_r = tx_relay.read().await;
+                                for etx in relay_r.mempool().iter_txs() {
+                                    let hash = etx.hash();
+                                    let bytes = etx.to_bytes();
+                                    mempool_txs.push((hash, bytes));
+                                }
+                            }
 
                             let (matched, missing) = cb.reconstruct(&mempool_txs);
 
@@ -478,16 +488,18 @@ impl PydeNode {
                                 continue;
                             }
 
-                            // All txs found — decode them and build the full block
-                            let mut transactions = Vec::with_capacity(matched.len());
+                            // All txs found — separate into plaintext and encrypted
+                            let mut transactions = Vec::new();
+                            let mut encrypted_txs = Vec::new();
                             for (i, tx_bytes_opt) in matched.iter().enumerate() {
                                 let tx_bytes = tx_bytes_opt.as_ref().unwrap();
-                                match wire::decode_transaction(tx_bytes) {
-                                    Ok(tx) => transactions.push(tx),
-                                    Err(e) => {
-                                        warn!(slot, tx_idx = i, error = e, "failed to decode reconstructed tx");
-                                        continue;
-                                    }
+                                // Try plaintext first, then encrypted
+                                if let Ok(tx) = wire::decode_transaction(tx_bytes) {
+                                    transactions.push(tx);
+                                } else if pyde_mempool::encrypted::EncryptedTx::from_bytes(tx_bytes).is_some() {
+                                    encrypted_txs.push(tx_bytes.clone());
+                                } else {
+                                    warn!(slot, tx_idx = i, "failed to decode reconstructed tx");
                                 }
                             }
 
@@ -502,7 +514,7 @@ impl PydeNode {
                                 header: header.clone(),
                                 body: pyde_consensus::block::BlockBody {
                                     transactions,
-                                    encrypted_txs: vec![],
+                                    encrypted_txs,
                                     execution_schedule: exec_schedule,
                                 },
                                 proposer_signature: vec![], // not in compact block, validated via proposal
@@ -805,28 +817,28 @@ impl PydeNode {
                                     // Broadcast block to peers.
                                     // If block has encrypted txs, send FULL block (encrypted blobs
                                     // can't be compacted — they're opaque, not matchable against mempool).
-                                    // Otherwise use compact blocks for bandwidth efficiency.
+                                    // Always use compact blocks for bandwidth efficiency.
+                                    // Both plaintext and encrypted tx hashes are included as short IDs.
+                                    // Receivers reconstruct from their respective mempools.
+                                    let header_bytes = wire::encode_block_header(&block.header);
+                                    let mut all_tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
+                                        .map(|tx| tx.hash()).collect();
+                                    // Include encrypted tx hashes (receivers match against TxRelay mempool)
+                                    for etx_bytes in &block.body.encrypted_txs {
+                                        if let Some(etx) = pyde_mempool::encrypted::EncryptedTx::from_bytes(etx_bytes) {
+                                            all_tx_hashes.push(etx.hash());
+                                        }
+                                    }
+                                    let compact = pyde_net::propagation::CompactBlock::from_block(
+                                        header_bytes,
+                                        &all_tx_hashes,
+                                        &[],
+                                        &[],
+                                    );
+                                    let compact_bytes = wire::encode_compact_block(&compact);
                                     let topic = pyde_net::node::topics::blocks();
-                                    if !block.body.encrypted_txs.is_empty() {
-                                        // Full block broadcast (includes encrypted blobs)
-                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, full_block_bytes.clone()) {
-                                            debug!(slot = current_slot, error = %e, "no gossipsub subscribers for block");
-                                        }
-                                    } else {
-                                        // Compact block broadcast (plaintext only)
-                                        let header_bytes = wire::encode_block_header(&block.header);
-                                        let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
-                                            .map(|tx| tx.hash()).collect();
-                                        let compact = pyde_net::propagation::CompactBlock::from_block(
-                                            header_bytes,
-                                            &tx_hashes,
-                                            &[],
-                                            &[],
-                                        );
-                                        let compact_bytes = wire::encode_compact_block(&compact);
-                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, compact_bytes) {
-                                            debug!(slot = current_slot, error = %e, "no gossipsub subscribers for block");
-                                        }
+                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, compact_bytes) {
+                                        debug!(slot = current_slot, error = %e, "no gossipsub subscribers for block");
                                     }
 
                                     // Broadcast proposal as consensus message
@@ -1144,10 +1156,24 @@ fn handle_swarm_event(
             match channel {
                 Some(Channel::Transactions) => {
                     debug!(bytes = message.data.len(), "received tx gossip");
-                    // Decode wire-encoded transaction and add to pending queue
+                    // Decode wire-encoded transaction, verify signature, add to pending queue
                     match wire::decode_transaction(&message.data) {
                         Ok(tx) => {
                             let tx_hash = tx.hash();
+                            // Verify signature at mempool entry (not devnet)
+                            if chain.chain_id != 31337 && !tx.signature.is_empty() {
+                                let sender_key = pyde_state::keys::balance_key(&tx.from);
+                                if let Some(acct_bytes) = state.get(&sender_key) {
+                                    if let Some(acct) = pyde_account::types::Account::from_bytes(&acct_bytes) {
+                                        if let pyde_account::types::AuthKeys::Single(ref pk) = acct.auth_keys {
+                                            if !tx.verify_signature(pk) {
+                                                debug!(tx_hash = hex::encode(tx_hash), "rejected gossip tx: invalid signature");
+                                                return PostEventAction::None;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             debug!(tx_hash = hex::encode(tx_hash), "decoded tx from gossip");
                             return PostEventAction::AcceptTransaction(tx);
                         }
@@ -1177,7 +1203,7 @@ fn handle_swarm_event(
                         Ok(block) => {
                             let slot = block.header.slot;
 
-                            // Validate block against committee (signature, VRF, proposer, QC)
+                            // Validate block header (signature, VRF, proposer, QC)
                             if let Some(ref engine) = validator_engine {
                                 if let Err(e) = BlockProcessor::validate_network_block(
                                     &block.header,
@@ -1185,9 +1211,17 @@ fn handle_swarm_event(
                                     &engine.committee_keys,
                                     &engine.epoch_randomness,
                                 ) {
-                                    warn!(slot, error = %e, "block validation failed");
+                                    warn!(slot, error = %e, "block header validation failed");
                                     return PostEventAction::None;
                                 }
+                            }
+
+                            // Validate block body (tx signatures, gas, no duplicates)
+                            if let Err(e) = BlockProcessor::validate_block_body(
+                                &block, state, chain.chain_id,
+                            ) {
+                                warn!(slot, error = %e, "block body validation failed");
+                                return PostEventAction::None;
                             }
 
                             match BlockProcessor::process_full_block(chain, state, &block) {
