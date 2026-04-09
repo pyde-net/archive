@@ -13,6 +13,9 @@ use pyde_consensus::epoch_randomness::{
     RandomnessCollector, RandomnessShare, generate_share, verify_share,
     combine_shares_dynamic,
 };
+use pyde_crypto::threshold::{
+    RefreshContribution, generate_refresh_contribution, apply_refresh, verify_refresh_contribution,
+};
 use pyde_consensus::slashing::{
     DoubleSignEvidence, SlashResult, slash_double_sign, verify_double_sign,
 };
@@ -235,6 +238,12 @@ pub struct ValidatorEngine {
     pub pending_slashes: Vec<SlashResult>,
     /// Epoch randomness collector (gathers VRF shares at epoch boundary).
     randomness_collector: Option<RandomnessCollector>,
+    /// PSS refresh contributions collected at epoch boundary.
+    pss_contributions: Vec<RefreshContribution>,
+    /// Target epoch for PSS refresh.
+    pss_target_epoch: u64,
+    /// Set to true when key share was refreshed and needs saving to disk.
+    pub key_share_dirty: bool,
 }
 
 impl ValidatorEngine {
@@ -256,6 +265,9 @@ impl ValidatorEngine {
             seen_votes: HashMap::new(),
             pending_slashes: Vec::new(),
             randomness_collector: None,
+            pss_contributions: Vec::new(),
+            pss_target_epoch: 0,
+            key_share_dirty: false,
         }
     }
 
@@ -267,6 +279,78 @@ impl ValidatorEngine {
 
     /// Start collecting epoch randomness shares for the next epoch.
     /// Called at epoch boundary. Generates and returns our own share to broadcast.
+    /// Generate a PSS refresh contribution and start collecting others'.
+    /// Returns our contribution to broadcast.
+    pub fn start_pss_refresh(
+        &mut self,
+        epoch: u64,
+        identity: &ValidatorIdentity,
+    ) -> Option<RefreshContribution> {
+        let key_share = identity.key_share.as_ref()?;
+        let n = self.committee_keys.len();
+        let threshold = quorum_for_committee(n);
+
+        // Use PRIVATE entropy: hash of secret key + epoch randomness.
+        // This ensures each validator's contribution is unpredictable to others.
+        // Public epoch_randomness alone would let attackers derive all contributions.
+        let mut private_entropy = Vec::with_capacity(64);
+        private_entropy.extend_from_slice(identity.secret_key.as_bytes());
+        private_entropy.extend_from_slice(&self.epoch_randomness);
+        let entropy = pyde_crypto::poseidon2::poseidon2_hash(&private_entropy);
+
+        let contribution = generate_refresh_contribution(
+            key_share.index,
+            n,
+            threshold,
+            epoch,
+            entropy.as_bytes(),
+        );
+
+        self.pss_contributions = vec![contribution.clone()];
+        self.pss_target_epoch = epoch;
+        info!(epoch, "started PSS key share refresh");
+        Some(contribution)
+    }
+
+    /// Add a received PSS refresh contribution. Returns the new KeyShare if threshold reached.
+    pub fn on_pss_contribution(
+        &mut self,
+        contribution: RefreshContribution,
+        identity: &mut ValidatorIdentity,
+    ) -> bool {
+        let threshold = quorum_for_committee(self.committee_keys.len());
+
+        // Verify the contribution (zero-secret reconstruction check)
+        if !verify_refresh_contribution(&contribution, threshold) {
+            warn!(from = contribution.from_index, "invalid PSS refresh contribution");
+            return false;
+        }
+
+        // Check for duplicate
+        if self.pss_contributions.iter().any(|c| c.from_index == contribution.from_index) {
+            return false;
+        }
+
+        self.pss_contributions.push(contribution);
+
+        // If threshold reached, apply all contributions to our key share
+        if self.pss_contributions.len() >= threshold {
+            if let Some(ref old_share) = identity.key_share {
+                let new_share = apply_refresh(old_share, &self.pss_contributions);
+                identity.key_share = Some(new_share);
+                self.pss_contributions.clear();
+                self.key_share_dirty = true;
+                info!(
+                    epoch = self.pss_target_epoch,
+                    contributions = threshold,
+                    "PSS key share refreshed — genesis trust dissolved"
+                );
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn start_epoch_randomness(
         &mut self,
         next_epoch: u64,

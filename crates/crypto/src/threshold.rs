@@ -522,6 +522,46 @@ pub fn generate_refresh_contribution(
     RefreshContribution { from_index, deltas }
 }
 
+impl RefreshContribution {
+    /// Serialize for P2P transmission.
+    /// Format: [from_index:8 LE][n:4 LE][elements_per_val:4 LE][[delta:8 LE]*elements]*n
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let n = self.deltas.len();
+        let elems = if n > 0 { self.deltas[0].len() } else { 0 };
+        let mut buf = Vec::with_capacity(16 + n * elems * 8);
+        buf.extend_from_slice(&(self.from_index as u64).to_le_bytes());
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+        buf.extend_from_slice(&(elems as u32).to_le_bytes());
+        for v_deltas in &self.deltas {
+            for d in v_deltas {
+                buf.extend_from_slice(&gl_to_u64(*d).to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 16 { return None; }
+        let from_index = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
+        let n = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
+        let elems = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
+        if data.len() < 16 + n * elems * 8 { return None; }
+        let mut deltas = Vec::with_capacity(n);
+        let mut off = 16;
+        for _ in 0..n {
+            let mut v = Vec::with_capacity(elems);
+            for _ in 0..elems {
+                let val = u64::from_le_bytes(data[off..off+8].try_into().ok()?);
+                v.push(gl(val));
+                off += 8;
+            }
+            deltas.push(v);
+        }
+        Some(Self { from_index, deltas })
+    }
+}
+
 /// Apply refresh contributions to a validator's key share.
 /// Each validator sums the delta values from all contributions into their share.
 /// The underlying secret remains the same, but all shares change.
