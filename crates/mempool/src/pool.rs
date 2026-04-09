@@ -98,6 +98,11 @@ impl Mempool {
     }
 
     /// Number of transactions in the pool.
+    /// Iterate over all transactions in the mempool.
+    pub fn iter_txs(&self) -> impl Iterator<Item = &EncryptedTx> {
+        self.txs.iter()
+    }
+
     pub fn len(&self) -> usize {
         self.txs.len()
     }

@@ -224,6 +224,90 @@ impl BlockProcessor {
 
         Ok(())
     }
+
+    /// Validate transactions within a block body before execution.
+    /// Checks: no duplicate tx hashes, total gas within ceiling.
+    /// Signature verification only for synced blocks (gossip txs are verified at mempool entry).
+    pub fn validate_block_body(
+        block: &Block,
+        state: &StateManager,
+        chain_id: u64,
+    ) -> Result<(), String> {
+        Self::validate_block_body_inner(block, state, chain_id, false)
+    }
+
+    /// Validate block body for synced blocks (includes signature verification).
+    pub fn validate_synced_block_body(
+        block: &Block,
+        state: &StateManager,
+        chain_id: u64,
+    ) -> Result<(), String> {
+        Self::validate_block_body_inner(block, state, chain_id, true)
+    }
+
+    fn validate_block_body_inner(
+        block: &Block,
+        state: &StateManager,
+        chain_id: u64,
+        verify_signatures: bool,
+    ) -> Result<(), String> {
+        let txs = &block.body.transactions;
+        if txs.is_empty() {
+            return Ok(());
+        }
+
+        // 1. No duplicate tx hashes
+        let mut seen_hashes = std::collections::HashSet::with_capacity(txs.len());
+        for tx in txs {
+            let hash = tx.hash();
+            if !seen_hashes.insert(hash) {
+                return Err(format!(
+                    "duplicate transaction {} in block",
+                    hex::encode(hash)
+                ));
+            }
+        }
+
+        // 2. Total gas within block gas ceiling
+        let total_gas: u64 = txs.iter().map(|tx| tx.gas_limit).sum();
+        if total_gas > pyde_tx::fee::GAS_CEILING {
+            return Err(format!(
+                "block gas {} exceeds ceiling {}",
+                total_gas, pyde_tx::fee::GAS_CEILING
+            ));
+        }
+
+        // 3. Verify tx signatures for synced blocks (gossip txs already verified at mempool entry)
+        if verify_signatures && chain_id != 31337 {
+            for (i, tx) in txs.iter().enumerate() {
+                if tx.signature.is_empty() {
+                    return Err(format!("tx {} has empty signature", i));
+                }
+                // Load sender's public key from state
+                let balance_key = pyde_state::keys::balance_key(&tx.from);
+                if let Some(acct_bytes) = state.get(&balance_key) {
+                    if let Some(acct) = pyde_account::types::Account::from_bytes(&acct_bytes) {
+                        match &acct.auth_keys {
+                            pyde_account::types::AuthKeys::Single(pk) => {
+                                if !tx.verify_signature(pk) {
+                                    return Err(format!(
+                                        "tx {} has invalid signature",
+                                        i
+                                    ));
+                                }
+                            }
+                            pyde_account::types::AuthKeys::None => {
+                                // System account — no sig check
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
