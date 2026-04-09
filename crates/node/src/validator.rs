@@ -125,6 +125,69 @@ pub fn load_validator_set_from_state(
     set
 }
 
+/// Process unbonding validators: return stake for those whose unbonding period expired.
+/// Called at each epoch boundary.
+pub fn process_unbonding(
+    state: &mut crate::state_manager::StateManager,
+    current_slot: u64,
+) {
+    use pyde_consensus::validator::{UNBONDING_PERIOD, VALIDATOR_STAKE};
+
+    let count_key = pyde_state::keys::validator_count_key();
+    let count = state.get(&count_key)
+        .map(|b| {
+            if b.len() >= 8 { u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8])) } else { 0 }
+        })
+        .unwrap_or(0);
+
+    for i in 0..count {
+        let idx_key = pyde_state::keys::validator_index_key(i);
+        let address = match state.get(&idx_key) {
+            Some(addr_bytes) if addr_bytes.len() == 32 => {
+                let mut addr = [0u8; 32];
+                addr.copy_from_slice(&addr_bytes);
+                addr
+            }
+            _ => continue,
+        };
+
+        let val_key = pyde_state::keys::validator_key(&address);
+        if let Some(mut val_data) = state.get(&val_key) {
+            if val_data.len() < 5 { continue; }
+            let pk_len = u32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]) as usize;
+            let status_offset = 4 + pk_len + 16;
+            if val_data.len() <= status_offset { continue; }
+
+            // Check if Unbonding (0x01) with expired period
+            if val_data[status_offset] == 0x01 && val_data.len() >= status_offset + 1 + 8 {
+                let exit_off = status_offset + 1;
+                let exit_block = u64::from_le_bytes(
+                    val_data[exit_off..exit_off + 8].try_into().unwrap_or([0; 8])
+                );
+
+                if current_slot >= exit_block + UNBONDING_PERIOD {
+                    // Unbonding expired: return stake to balance, set status to Exited (0x02)
+                    val_data[status_offset] = 0x02; // Exited
+                    let _ = state.insert(val_key, val_data);
+
+                    // Credit stake back to validator's balance
+                    let balance_key = pyde_state::keys::balance_key(&address);
+                    if let Some(account_bytes) = state.get(&balance_key) {
+                        if let Some(mut account) = pyde_account::types::Account::from_bytes(&account_bytes) {
+                            account.balance += VALIDATOR_STAKE;
+                            let _ = state.insert(balance_key, account.to_bytes());
+                            tracing::info!(
+                                validator = hex::encode(address),
+                                "unbonding complete: stake returned"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Collected votes for a slot, used to form QCs.
 struct SlotVotes {
     block_hash: [u8; 32],

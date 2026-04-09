@@ -77,6 +77,10 @@ pub trait PydeApi {
     #[method(name = "pyde_syncing")]
     async fn syncing(&self) -> Result<serde_json::Value, ErrorObjectOwned>;
 
+    /// Get all registered validators with their status and stake.
+    #[method(name = "pyde_getValidators")]
+    async fn get_validators(&self) -> Result<serde_json::Value, ErrorObjectOwned>;
+
     /// Submit a transaction as JSON object. Returns tx hash.
     /// Fields: from, to, value (decimal string), data (hex), gas (number), nonce (number).
     #[method(name = "pyde_sendTransaction")]
@@ -242,6 +246,58 @@ impl PydeApiServer for RpcServer {
             "headSlot": chain.head_slot,
             "epoch": chain.epoch,
             "stateRoot": format!("0x{}", hex::encode(chain.state_root)),
+        }))
+    }
+
+    async fn get_validators(&self) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let state = self.state.state.read().await;
+
+        // Read validator count
+        let count_key = pyde_state::keys::validator_count_key();
+        let count = state.get(&count_key)
+            .map(|b| if b.len() >= 8 { u64::from_le_bytes(b[..8].try_into().unwrap_or([0;8])) } else { 0 })
+            .unwrap_or(0);
+
+        let mut validators = Vec::new();
+        for i in 0..count {
+            let idx_key = pyde_state::keys::validator_index_key(i);
+            let address = match state.get(&idx_key) {
+                Some(b) if b.len() == 32 => {
+                    let mut addr = [0u8; 32];
+                    addr.copy_from_slice(&b);
+                    addr
+                }
+                _ => continue,
+            };
+
+            let val_key = pyde_state::keys::validator_key(&address);
+            if let Some(val_data) = state.get(&val_key) {
+                if val_data.len() < 5 { continue; }
+                let pk_len = u32::from_le_bytes([val_data[0],val_data[1],val_data[2],val_data[3]]) as usize;
+                if val_data.len() < 4 + pk_len + 16 + 1 { continue; }
+
+                let mut stake_buf = [0u8; 16];
+                stake_buf.copy_from_slice(&val_data[4 + pk_len..4 + pk_len + 16]);
+                let stake = u128::from_le_bytes(stake_buf);
+                let status = match val_data[4 + pk_len + 16] {
+                    0x00 => "active",
+                    0x01 => "unbonding",
+                    0x02 => "exited",
+                    _ => "unknown",
+                };
+
+                validators.push(serde_json::json!({
+                    "address": format!("0x{}", hex::encode(address)),
+                    "stake": stake.to_string(),
+                    "status": status,
+                    "index": i,
+                }));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "count": count,
+            "validators": validators,
         }))
     }
 
