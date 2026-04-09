@@ -73,6 +73,46 @@ pub fn is_within_gas_limit(gas_used: u64, gas_ceiling: u64) -> bool {
     gas_used <= gas_ceiling
 }
 
+// ========== Inflation + Block Rewards ==========
+
+/// Blocks per year at 400ms block time: 365.25 * 24 * 3600 / 0.4 ≈ 78,892,800
+pub const BLOCKS_PER_YEAR: u64 = 78_892_800;
+
+/// Genesis total supply: 1 billion PYDE in quanta.
+pub const GENESIS_TOTAL_SUPPLY: u128 = 1_000_000_000 * 1_000_000_000;
+
+/// Inflation schedule: returns the annual inflation rate in basis points (1/10000)
+/// for the given year (0-indexed from genesis).
+///   Year 0: 5.0% (500 bps)
+///   Year 1: 3.0% (300 bps)
+///   Year 2: 2.0% (200 bps)
+///   Year 3+: 1.0% (100 bps)
+pub fn inflation_rate_bps(year: u64) -> u64 {
+    match year {
+        0 => 500,
+        1 => 300,
+        2 => 200,
+        _ => 100,
+    }
+}
+
+/// Compute the block reward for a given slot.
+///
+/// reward = (total_supply × inflation_rate_bps) / (10000 × blocks_per_year)
+///
+/// Uses genesis total supply as the base. In production, this should use
+/// the actual circulating supply (genesis - burned), but that requires
+/// tracking cumulative burn on-chain. For the initial implementation,
+/// genesis supply provides an upper bound.
+pub fn block_reward(slot: u64) -> u128 {
+    let year = slot / BLOCKS_PER_YEAR;
+    let rate = inflation_rate_bps(year) as u128;
+    // reward = supply * rate / 10000 / blocks_per_year
+    // Use careful ordering to avoid overflow: (supply / blocks_per_year) * rate / 10000
+    let per_block_base = GENESIS_TOTAL_SUPPLY / BLOCKS_PER_YEAR as u128;
+    per_block_base * rate / 10_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +282,33 @@ mod tests {
             fee = adjust_base_fee(fee, GAS_TARGET, GAS_TARGET);
         }
         assert_eq!(fee, high_fee);
+    }
+
+    // ========== Inflation + Block Rewards ==========
+
+    #[test]
+    fn inflation_schedule() {
+        assert_eq!(inflation_rate_bps(0), 500);
+        assert_eq!(inflation_rate_bps(1), 300);
+        assert_eq!(inflation_rate_bps(2), 200);
+        assert_eq!(inflation_rate_bps(3), 100);
+        assert_eq!(inflation_rate_bps(100), 100);
+    }
+
+    #[test]
+    fn block_reward_year_0() {
+        let reward = block_reward(0);
+        // Year 0: 5% of 1B PYDE / 78.9M blocks ≈ 0.634 PYDE/block ≈ 634M quanta
+        assert!(reward > 600_000_000, "reward ~634M quanta, got {}", reward);
+        assert!(reward < 700_000_000, "reward ~634M quanta, got {}", reward);
+    }
+
+    #[test]
+    fn block_reward_decreases_over_years() {
+        let r0 = block_reward(0);
+        let r1 = block_reward(BLOCKS_PER_YEAR);
+        let r3 = block_reward(BLOCKS_PER_YEAR * 3);
+        assert!(r0 > r1, "year 1 reward should be less than year 0");
+        assert!(r1 > r3, "year 3 reward should be less than year 1");
     }
 }
