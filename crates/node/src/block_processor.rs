@@ -82,10 +82,22 @@ impl BlockProcessor {
             }
         }
 
-        // 4. Refresh state root after all tx mutations
+        // 4. Block reward: credit proposer with inflation reward
+        let reward = pyde_tx::fee::block_reward(slot);
+        if reward > 0 && block.header.proposer != [0u8; 32] {
+            let proposer_key = pyde_state::keys::balance_key(&block.header.proposer);
+            if let Some(acct_bytes) = state.get(&proposer_key) {
+                if let Some(mut acct) = pyde_account::types::Account::from_bytes(&acct_bytes) {
+                    acct.balance += reward;
+                    let _ = state.insert(proposer_key, acct.to_bytes());
+                }
+            }
+        }
+
+        // 5. Refresh state root after all tx + reward mutations
         state.refresh_root();
 
-        // 5. Adjust base fee for next block (EIP-1559)
+        // 6. Adjust base fee for next block (EIP-1559)
         let gas_target = pyde_tx::fee::GAS_TARGET as u64;
         chain.base_fee = adjust_base_fee(chain.base_fee, total_gas, gas_target);
 
