@@ -485,6 +485,11 @@ pub fn encode_block(block: &Block) -> Vec<u8> {
         let tx_bytes = encode_transaction(tx);
         enc.var_bytes(&tx_bytes);
     }
+    // Encrypted transactions (threshold-encrypted blobs)
+    enc.u32(block.body.encrypted_txs.len() as u32);
+    for etx in &block.body.encrypted_txs {
+        enc.var_bytes(etx);
+    }
     // Execution schedule: group count + tx indices per group
     enc.u16(block.body.execution_schedule.groups.len() as u16);
     for group in &block.body.execution_schedule.groups {
@@ -512,8 +517,14 @@ pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
         let tx_bytes = dec.var_bytes()?;
         transactions.push(decode_transaction(&tx_bytes)?);
     }
+    // Encrypted transactions
+    let enc_count = if dec.remaining() >= 4 { dec.u32()? as usize } else { 0 };
+    let mut encrypted_txs = Vec::with_capacity(enc_count);
+    for _ in 0..enc_count {
+        encrypted_txs.push(dec.var_bytes()?);
+    }
     // Execution schedule
-    let group_count = dec.u16()? as usize;
+    let group_count = if dec.remaining() >= 2 { dec.u16()? as usize } else { 0 };
     let mut groups = Vec::with_capacity(group_count);
     for _ in 0..group_count {
         let idx_count = dec.u16()? as usize;
@@ -526,7 +537,7 @@ pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
         header,
         body: BlockBody {
             transactions,
-            encrypted_txs: vec![],
+            encrypted_txs,
             execution_schedule: ExecutionSchedule { groups, total_txs },
         },
         proposer_signature,

@@ -188,6 +188,15 @@ impl PydeNode {
         let mempool_index: Arc<RwLock<std::collections::HashMap<[u8; 32], Vec<u8>>>> =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
 
+        // Pending block decryptors: slot → BlockDecryptor (collecting shares for threshold decryption)
+        let pending_decryptors: Arc<RwLock<std::collections::HashMap<u64, pyde_mempool::decryption::BlockDecryptor>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        // Queued decryption shares that arrived before the BlockDecryptor was created.
+        // When a decryptor is created for a slot, queued shares are replayed into it.
+        let queued_shares: Arc<RwLock<std::collections::HashMap<u64, Vec<wire::DecryptionShareMsg>>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
         // 4. Chain sync
         let mut chain_sync = ChainSync::new();
         chain_sync.manager.local_tip = chain.read().await.head_slot;
@@ -534,15 +543,74 @@ impl PydeNode {
                             }
                         }
                         PostEventAction::BlockProcessed { slot, receipts: receipts_list, tx_hashes } => {
-                            // Store receipts
                             if !receipts_list.is_empty() {
                                 let mut receipts_w = receipts.write().await;
                                 receipts_w.insert_block_receipts(slot, receipts_list);
                             }
-                            // Remove processed txs from pending queue (dedup)
                             if !tx_hashes.is_empty() {
                                 let mut pending_w = pending_txs.write().await;
                                 pending_w.retain(|tx| !tx_hashes.contains(&tx.hash()));
+                            }
+                        }
+                        PostEventAction::AddDecryptionShares(msg) => {
+                            let slot = msg.slot;
+                            let mut dec_w = pending_decryptors.write().await;
+                            if let Some(decryptor) = dec_w.get_mut(&slot) {
+                                // Decryptor exists — feed shares directly
+                                // Feed each share to the decryptor
+                                for (i, share_bytes) in msg.shares.iter().enumerate() {
+                                    if let Some(share) = pyde_crypto::threshold::DecryptionShare::from_bytes(share_bytes) {
+                                        decryptor.add_share(i, share);
+                                    }
+                                }
+
+                                // Check if threshold reached → decrypt + execute
+                                if decryptor.all_ready() {
+                                    match decryptor.decrypt_all() {
+                                        Ok(decrypted_txs) => {
+                                            info!(
+                                                slot,
+                                                txs = decrypted_txs.len(),
+                                                "threshold reached — decrypted + executing encrypted txs"
+                                            );
+                                            let mut chain_w = chain.write().await;
+                                            let mut state_w = state.write().await;
+                                            let proposer = block_store.get_header(slot)
+                                                .map(|h| h.proposer).unwrap_or([0u8; 32]);
+                                            let block_ctx = pyde_tx::pipeline::BlockContext {
+                                                height: slot,
+                                                timestamp: 0,
+                                                base_fee: chain_w.base_fee,
+                                                block_gas_limit: self.config.consensus.gas_ceiling,
+                                                chain_id: chain_w.chain_id,
+                                                validator_address: proposer,
+                                            };
+                                            let mut slot_receipts = Vec::new();
+                                            for dtx in &decrypted_txs {
+                                                match pyde_tx::pipeline::execute_transaction(dtx, state_w.smt_mut(), &block_ctx) {
+                                                    Ok(receipt) => {
+                                                        slot_receipts.push(receipt);
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(slot, error = ?e, "decrypted tx execution failed");
+                                                    }
+                                                }
+                                            }
+                                            state_w.refresh_root();
+                                            if !slot_receipts.is_empty() {
+                                                let mut receipts_w = receipts.write().await;
+                                                receipts_w.insert_block_receipts(slot, slot_receipts);
+                                            }
+                                        }
+                                        Err(e) => warn!(slot, error = %e, "decryption failed"),
+                                    }
+                                    dec_w.remove(&slot);
+                                }
+                            } else {
+                                // No decryptor yet — queue shares for later replay
+                                drop(dec_w);
+                                let mut q = queued_shares.write().await;
+                                q.entry(slot).or_default().push(msg);
                             }
                         }
                     }
@@ -630,14 +698,23 @@ impl PydeNode {
                                     let all_pending: Vec<pyde_tx::types::Transaction> = pending_w.drain(..).collect();
                                     let gas_ceiling = self.config.consensus.gas_ceiling;
                                     let (txs, remaining) = crate::block_builder::build_tx_list(all_pending, gas_ceiling);
-                                    // Return overflow txs to pending queue
                                     if !remaining.is_empty() {
                                         pending_w.extend(remaining);
                                     }
                                     drop(pending_w);
 
+                                    // Also collect encrypted txs from the threshold-encrypted mempool
+                                    let encrypted_blobs = {
+                                        let relay_r = tx_relay.read().await;
+                                        let selected = relay_r.mempool().select_for_block(
+                                            gas_ceiling, current_slot,
+                                        );
+                                        // Serialize each EncryptedTx to bytes for block inclusion
+                                        selected.iter().map(|etx| etx.to_bytes()).collect::<Vec<Vec<u8>>>()
+                                    };
+
                                     // Only produce a block if there are pending transactions
-                                    if txs.is_empty() {
+                                    if txs.is_empty() && encrypted_blobs.is_empty() {
                                         debug!(slot = current_slot, "skipping empty slot (no pending txs)");
                                     } else {
                                     let tx_count = txs.len();
@@ -668,10 +745,11 @@ impl PydeNode {
                                     let block = engine.build_proposal(
                                         identity,
                                         parent_hash,
-                                        parent_hash, // pre-state root (post-state computed after execution)
+                                        parent_hash,
                                         tx_root,
                                         vrf_data,
                                         txs,
+                                        encrypted_blobs,
                                         exec_schedule,
                                     );
 
@@ -702,25 +780,45 @@ impl PydeNode {
                                         }
                                     }
 
+                                    // Remove included encrypted txs from mempool
+                                    if !block.body.encrypted_txs.is_empty() {
+                                        let enc_hashes: Vec<[u8; 32]> = block.body.encrypted_txs.iter()
+                                            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+                                            .map(|etx| etx.hash())
+                                            .collect();
+                                        let mut relay_w = tx_relay.write().await;
+                                        relay_w.remove_included(&enc_hashes);
+                                    }
+
                                     // Store full block for sync serving + missing tx requests
                                     let full_block_bytes = wire::encode_block(&block);
                                     let _ = block_store.put_block(&block.header, &full_block_bytes);
 
-                                    // Broadcast COMPACT block (header + 8-byte short IDs) instead of full block.
-                                    // Receivers reconstruct from their mempool.
-                                    let header_bytes = wire::encode_block_header(&block.header);
-                                    let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
-                                        .map(|tx| tx.hash()).collect();
-                                    let compact = pyde_net::propagation::CompactBlock::from_block(
-                                        header_bytes,
-                                        &tx_hashes,
-                                        &[], // no prefilled txs for now
-                                        &[],
-                                    );
-                                    let compact_bytes = wire::encode_compact_block(&compact);
+                                    // Broadcast block to peers.
+                                    // If block has encrypted txs, send FULL block (encrypted blobs
+                                    // can't be compacted — they're opaque, not matchable against mempool).
+                                    // Otherwise use compact blocks for bandwidth efficiency.
                                     let topic = pyde_net::node::topics::blocks();
-                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, compact_bytes) {
-                                        debug!(slot = current_slot, error = %e, "no gossipsub subscribers for block");
+                                    if !block.body.encrypted_txs.is_empty() {
+                                        // Full block broadcast (includes encrypted blobs)
+                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, full_block_bytes.clone()) {
+                                            debug!(slot = current_slot, error = %e, "no gossipsub subscribers for block");
+                                        }
+                                    } else {
+                                        // Compact block broadcast (plaintext only)
+                                        let header_bytes = wire::encode_block_header(&block.header);
+                                        let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
+                                            .map(|tx| tx.hash()).collect();
+                                        let compact = pyde_net::propagation::CompactBlock::from_block(
+                                            header_bytes,
+                                            &tx_hashes,
+                                            &[],
+                                            &[],
+                                        );
+                                        let compact_bytes = wire::encode_compact_block(&compact);
+                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, compact_bytes) {
+                                            debug!(slot = current_slot, error = %e, "no gossipsub subscribers for block");
+                                        }
                                     }
 
                                     // Broadcast proposal as consensus message
@@ -779,6 +877,115 @@ impl PydeNode {
                                             let topic = pyde_net::node::topics::consensus();
                                             let _ = swarm.behaviour_mut().gossipsub.publish(topic, fv_bytes);
                                         }
+
+                                        // After QC: if block has encrypted txs, create a
+                                        // BlockDecryptor, generate + broadcast our shares,
+                                        // and start collecting shares from other validators.
+                                        if identity.key_share.is_some() {
+                                            if let Some(block_raw) = block_store.get_block_raw(current_slot) {
+                                                if let Ok(block) = wire::decode_block(&block_raw) {
+                                                    if !block.body.encrypted_txs.is_empty() {
+                                                        let enc_txs: Vec<pyde_mempool::encrypted::EncryptedTx> =
+                                                            block.body.encrypted_txs.iter()
+                                                                .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+                                                                .collect();
+                                                        if !enc_txs.is_empty() {
+                                                            let threshold = pyde_consensus::block::quorum_for_committee(
+                                                                engine.committee_keys.len()
+                                                            );
+                                                            // Create decryptor and seed with our own shares
+                                                            if let Ok(mut decryptor) = pyde_mempool::decryption::BlockDecryptor::new(
+                                                                enc_txs.clone(), threshold,
+                                                            ) {
+                                                                if let Some(ks) = &identity.key_share {
+                                                                    decryptor.add_member_shares(ks);
+                                                                }
+                                                                // Store decryptor for share collection
+                                                                // Replay any queued shares that arrived before the decryptor
+                                                                {
+                                                                    let mut q = queued_shares.write().await;
+                                                                    if let Some(queued) = q.remove(&current_slot) {
+                                                                        for qmsg in &queued {
+                                                                            for (i, sb) in qmsg.shares.iter().enumerate() {
+                                                                                if let Some(s) = pyde_crypto::threshold::DecryptionShare::from_bytes(sb) {
+                                                                                    decryptor.add_share(i, s);
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        debug!(
+                                                                            slot = current_slot,
+                                                                            replayed = queued.len(),
+                                                                            "replayed queued decryption shares"
+                                                                        );
+                                                                    }
+                                                                }
+                                                                pending_decryptors.write().await.insert(current_slot, decryptor);
+                                                            }
+
+                                                            // Broadcast our shares
+                                                            if let Some(shares) = engine.generate_decryption_shares(identity, &enc_txs) {
+                                                                let msg = wire::DecryptionShareMsg {
+                                                                    slot: current_slot,
+                                                                    member_index: identity.committee_index,
+                                                                    shares: shares.iter().map(|s| s.to_bytes()).collect(),
+                                                                };
+                                                                let share_bytes = wire::encode_decryption_shares(&msg);
+                                                                let topic = pyde_net::node::topics::consensus();
+                                                                let _ = swarm.behaviour_mut().gossipsub.publish(topic, share_bytes);
+                                                                info!(
+                                                                    slot = current_slot,
+                                                                    enc_txs = enc_txs.len(),
+                                                                    "broadcast decryption shares"
+                                                                );
+                                                            }
+
+                                                            // Check if already at threshold (e.g. single node)
+                                                            let mut dec_w = pending_decryptors.write().await;
+                                                            if let Some(decryptor) = dec_w.get_mut(&current_slot) {
+                                                                if decryptor.all_ready() {
+                                                                    match decryptor.decrypt_all() {
+                                                                        Ok(decrypted_txs) => {
+                                                                            info!(
+                                                                                slot = current_slot,
+                                                                                txs = decrypted_txs.len(),
+                                                                                "encrypted txs decrypted — executing"
+                                                                            );
+                                                                            // Execute decrypted txs
+                                                                            let mut chain_w = chain.write().await;
+                                                                            let mut state_w = state.write().await;
+                                                                            let proposer = block_store.get_header(current_slot)
+                                                                                .map(|h| h.proposer).unwrap_or(identity.address);
+                                                                            let block_ctx = pyde_tx::pipeline::BlockContext {
+                                                                                height: current_slot,
+                                                                                timestamp: 0,
+                                                                                base_fee: chain_w.base_fee,
+                                                                                block_gas_limit: self.config.consensus.gas_ceiling,
+                                                                                chain_id: chain_w.chain_id,
+                                                                                validator_address: proposer,
+                                                                            };
+                                                                            for dtx in &decrypted_txs {
+                                                                                match pyde_tx::pipeline::execute_transaction(dtx, state_w.smt_mut(), &block_ctx) {
+                                                                                    Ok(receipt) => {
+                                                                                        let mut receipts_w = receipts.write().await;
+                                                                                        receipts_w.insert_block_receipts(current_slot, vec![receipt]);
+                                                                                    }
+                                                                                    Err(e) => {
+                                                                                        warn!(error = ?e, "failed to execute decrypted tx");
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            state_w.refresh_root();
+                                                                        }
+                                                                        Err(e) => warn!(error = %e, "decryption failed"),
+                                                                    }
+                                                                    dec_w.remove(&current_slot);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -835,6 +1042,14 @@ impl PydeNode {
                     // Critical for mesh resilience: ensures nodes connect to each other,
                     // not just the bootstrap node.
                     let _ = swarm.behaviour_mut().kademlia.bootstrap();
+                    // Clean up stale decryptors and queued shares (older than 100 slots)
+                    {
+                        let head = chain.read().await.head_slot;
+                        let mut dec_w = pending_decryptors.write().await;
+                        dec_w.retain(|slot, _| *slot + 100 > head);
+                        let mut q = queued_shares.write().await;
+                        q.retain(|slot, _| *slot + 100 > head);
+                    }
                     let head = chain.read().await.head_slot;
                     debug!(
                         peers = peer_count,
@@ -882,6 +1097,7 @@ enum PostEventAction {
         tx_hashes: Vec<[u8; 32]>,
     },
     ReconstructCompactBlock(pyde_net::propagation::CompactBlock),
+    AddDecryptionShares(wire::DecryptionShareMsg),
 }
 
 /// Handle a libp2p swarm event. Returns an action that may need swarm access.
@@ -1010,6 +1226,26 @@ fn handle_swarm_event(
                                 }
                                 Err(e) => {
                                     debug!(error = e, "failed to decode randomness share");
+                                }
+                            }
+                            return PostEventAction::None;
+                        }
+
+                        // Check if it's a decryption share
+                        if !message.data.is_empty() && message.data[0] == wire::tag::DECRYPTION_SHARES {
+                            match wire::decode_decryption_shares(&message.data) {
+                                Ok(msg) => {
+                                    debug!(
+                                        slot = msg.slot,
+                                        member = msg.member_index,
+                                        shares = msg.shares.len(),
+                                        "received decryption shares"
+                                    );
+                                    // Feed shares to the BlockDecryptor for this slot
+                                    return PostEventAction::AddDecryptionShares(msg);
+                                }
+                                Err(e) => {
+                                    debug!(error = e, "failed to decode decryption shares");
                                 }
                             }
                             return PostEventAction::None;
