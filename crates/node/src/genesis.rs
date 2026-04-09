@@ -362,6 +362,16 @@ pub fn generate_testnet(
         });
     }
 
+    // Generate dedicated faucet account (1 trillion PYDE for dispensing)
+    let faucet_balance: u128 = 1_000_000_000_000 * 1_000_000_000; // 1T PYDE in quanta
+    let (faucet_pk, faucet_sk) = falcon_keygen().map_err(|e| format!("faucet keygen failed: {}", e))?;
+    let faucet_address = derive_eoa_address(faucet_pk.as_bytes());
+    allocations.push(GenesisAllocation {
+        address: hex::encode(faucet_address),
+        balance: faucet_balance.to_string(),
+        public_key: Some(hex::encode(faucet_pk.as_bytes())),
+    });
+
     let genesis_config = GenesisConfig {
         chain_id: 31337,
         timestamp: 0,
@@ -557,6 +567,16 @@ json = false
         let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755));
     }
 
+    // Write faucet key file
+    let faucet_pk_bytes = faucet_pk.as_bytes();
+    let faucet_sk_bytes = faucet_sk.as_bytes();
+    let mut faucet_key_buf = Vec::with_capacity(4 + faucet_pk_bytes.len() + faucet_sk_bytes.len());
+    faucet_key_buf.extend_from_slice(&(faucet_pk_bytes.len() as u32).to_le_bytes());
+    faucet_key_buf.extend_from_slice(faucet_pk_bytes);
+    faucet_key_buf.extend_from_slice(faucet_sk_bytes);
+    fs::write(out_dir.join("faucet.key"), &faucet_key_buf)
+        .map_err(|e| format!("failed to write faucet.key: {}", e))?;
+
     // Print summary
     println!("Testnet generated in {}", out_dir.display());
     println!();
@@ -573,8 +593,14 @@ json = false
         println!("  ({}) {}", i, acc.private_key_hex());
     }
     println!();
+    println!("Faucet:");
+    println!("  Address: 0x{}", hex::encode(faucet_address));
+    println!("  Balance: 1,000,000,000,000 PYDE (1T)");
+    println!("  Key:     {}/faucet.key", out_dir.display());
+    println!();
     println!("Files:");
-    println!("  genesis.toml        — shared genesis (copy to each node's datadir)");
+    println!("  genesis.toml        — shared genesis");
+    println!("  faucet.key          — faucet signing key");
     for i in 0..num_validators {
         println!("  node-{}/config.toml  — node {} config (P2P:{}, RPC:{})",
             i, i, base_port + i as u16, base_rpc_port + i as u16);
@@ -589,6 +615,10 @@ json = false
     println!("  # Terminal 2 (node-1 — copy bootstrap addr from node-0 output):");
     println!("  pyde run --role validator --config {}/node-1/config.toml --datadir {}/node-1 --bootstrap \"<node-0-multiaddr>\"{}",
         out_dir.display(), out_dir.display(), if dev_mode { " --dev" } else { "" });
+    println!();
+    println!("  # Faucet:");
+    println!("  pyde faucet --rpc http://127.0.0.1:8545 --from 0x{} --private-key {}/faucet.key",
+        hex::encode(faucet_address), out_dir.display());
 
     Ok(())
 }

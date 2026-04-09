@@ -4,6 +4,7 @@ mod block_store;
 mod chain;
 mod cli;
 mod config;
+mod faucet;
 mod logging;
 mod metrics;
 mod node;
@@ -46,6 +47,24 @@ fn main() {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
             }
+        }
+        Command::Faucet { rpc, port, amount, from, cooldown, private_key } => {
+            logging::init("info", false);
+            let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
+            rt.block_on(async {
+                let config = faucet::FaucetConfig {
+                    rpc_url: rpc,
+                    port,
+                    amount_pyde: amount,
+                    from_address: from,
+                    cooldown_secs: cooldown,
+                    private_key_path: private_key,
+                };
+                if let Err(e) = faucet::run_faucet(config).await {
+                    tracing::error!("faucet error: {}", e);
+                    std::process::exit(1);
+                }
+            });
         }
         Command::Run {
             role,

@@ -81,6 +81,35 @@ pub enum Command {
         #[arg(long)]
         dev: bool,
     },
+
+    /// Start a public faucet server.
+    Faucet {
+        /// RPC URL of the node to send transactions through.
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        rpc: String,
+
+        /// Faucet listen port.
+        #[arg(long, default_value = "8080")]
+        port: u16,
+
+        /// Amount to dispense per request (in PYDE).
+        #[arg(long, default_value = "100")]
+        amount: u64,
+
+        /// Faucet sender address (hex, must be pre-funded on the network).
+        #[arg(long)]
+        from: String,
+
+        /// Cooldown between requests per address (seconds).
+        #[arg(long, default_value = "3600")]
+        cooldown: u64,
+
+        /// Path to faucet's private key file (same format as validator.key).
+        /// If provided, signs transactions for production networks.
+        /// If omitted, uses unsigned dev mode transactions.
+        #[arg(long)]
+        private_key: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
