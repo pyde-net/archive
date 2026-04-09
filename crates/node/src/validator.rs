@@ -562,6 +562,7 @@ impl ValidatorEngine {
         tx_root: [u8; 32],
         vrf_proof: Vec<u8>,
         transactions: Vec<pyde_tx::types::Transaction>,
+        encrypted_txs: Vec<Vec<u8>>,
         execution_schedule: ExecutionSchedule,
     ) -> Block {
         let slot = self.consensus.current_slot;
@@ -596,7 +597,7 @@ impl ValidatorEngine {
             header,
             body: BlockBody {
                 transactions,
-                encrypted_txs: vec![],
+                encrypted_txs,
                 execution_schedule,
             },
             proposer_signature,
@@ -1104,6 +1105,7 @@ mod tests {
             [0xBB; 32],
             [0xCC; 32],
             vec![0xDD; 100],
+            vec![],
             vec![],
             ExecutionSchedule { groups: vec![], total_txs: 0 },
         );

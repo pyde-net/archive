@@ -181,6 +181,32 @@ pub struct DecryptionShare {
     shares: Vec<Goldilocks>,
 }
 
+impl DecryptionShare {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(12 + self.shares.len() * 8);
+        buf.extend_from_slice(&(self.index as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.shares.len() as u32).to_le_bytes());
+        for s in &self.shares {
+            buf.extend_from_slice(&gl_to_u64(*s).to_le_bytes());
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 12 { return None; }
+        let index = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
+        let count = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
+        if data.len() < 12 + count * 8 { return None; }
+        let mut shares = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 12 + i * 8;
+            let val = u64::from_le_bytes(data[off..off+8].try_into().ok()?);
+            shares.push(gl(val));
+        }
+        Some(Self { index, shares })
+    }
+}
+
 /// Threshold-encrypted ciphertext.
 #[derive(Clone, Debug)]
 pub struct ThresholdCiphertext {
@@ -198,7 +224,8 @@ impl ThresholdCiphertext {
         self.encrypted_msg.len()
     }
 
-    /// Serialize to bytes for hashing/transmission.
+    /// Serialize to bytes for hashing (original format, no length prefixes).
+    /// Format: [kyber_ct_bytes][encrypted_msg][mac:32]
     pub fn to_bytes(&self) -> Vec<u8> {
         let ct_bytes = self.kyber_ct.as_bytes();
         let mut buf = Vec::with_capacity(ct_bytes.len() + self.encrypted_msg.len() + 32);
@@ -206,6 +233,35 @@ impl ThresholdCiphertext {
         buf.extend_from_slice(&self.encrypted_msg);
         buf.extend_from_slice(&self.mac);
         buf
+    }
+
+    /// Serialize to wire format with length prefixes (for block inclusion).
+    /// Format: [ct_len:4 LE][kyber_ct][msg_len:4 LE][encrypted_msg][mac:32]
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let ct_bytes = self.kyber_ct.as_bytes();
+        let mut buf = Vec::with_capacity(4 + ct_bytes.len() + 4 + self.encrypted_msg.len() + 32);
+        buf.extend_from_slice(&(ct_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(ct_bytes);
+        buf.extend_from_slice(&(self.encrypted_msg.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.encrypted_msg);
+        buf.extend_from_slice(&self.mac);
+        buf
+    }
+
+    /// Deserialize from wire format.
+    pub fn from_wire_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 8 { return None; }
+        let ct_len = u32::from_le_bytes([data[0],data[1],data[2],data[3]]) as usize;
+        if data.len() < 4 + ct_len + 4 { return None; }
+        let kyber_ct = KyberCiphertext::from_bytes(&data[4..4 + ct_len])?;
+        let msg_off = 4 + ct_len;
+        let msg_len = u32::from_le_bytes([data[msg_off],data[msg_off+1],data[msg_off+2],data[msg_off+3]]) as usize;
+        let msg_start = msg_off + 4;
+        if data.len() < msg_start + msg_len + 32 { return None; }
+        let encrypted_msg = data[msg_start..msg_start + msg_len].to_vec();
+        let mut mac = [0u8; 32];
+        mac.copy_from_slice(&data[msg_start + msg_len..msg_start + msg_len + 32]);
+        Some(Self { kyber_ct, encrypted_msg, mac })
     }
 }
 

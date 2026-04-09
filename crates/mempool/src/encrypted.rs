@@ -71,6 +71,71 @@ impl EncryptedTx {
         poseidon2_hash(&buf).to_bytes()
     }
 
+    /// Serialize to bytes for block inclusion (wire format).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let ct_bytes = self.ciphertext.to_wire_bytes();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.sender);                          // 32
+        buf.extend_from_slice(&self.nonce.to_le_bytes());             // 8
+        buf.extend_from_slice(&self.gas_limit.to_le_bytes());         // 8
+        buf.extend_from_slice(&self.chain_id.to_le_bytes());          // 8
+        buf.push(self.deadline.is_some() as u8);                      // 1
+        if let Some(d) = self.deadline { buf.extend_from_slice(&d.to_le_bytes()); }
+        // Access list
+        buf.extend_from_slice(&(self.access_list.len() as u32).to_le_bytes());
+        for entry in &self.access_list {
+            buf.extend_from_slice(&entry.address);
+            buf.extend_from_slice(&(entry.reads.len() as u16).to_le_bytes());
+            for r in &entry.reads { buf.extend_from_slice(r); }
+            buf.extend_from_slice(&(entry.writes.len() as u16).to_le_bytes());
+            for w in &entry.writes { buf.extend_from_slice(w); }
+        }
+        // Signature
+        buf.extend_from_slice(&(self.signature.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.signature);
+        // Ciphertext
+        buf.extend_from_slice(&(ct_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&ct_bytes);
+        buf
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 57 { return None; } // minimum: 32+8+8+8+1
+        let mut off = 0;
+        let mut sender = [0u8; 32];
+        sender.copy_from_slice(&data[off..off+32]); off += 32;
+        let nonce = u64::from_le_bytes(data[off..off+8].try_into().ok()?); off += 8;
+        let gas_limit = u64::from_le_bytes(data[off..off+8].try_into().ok()?); off += 8;
+        let chain_id = u64::from_le_bytes(data[off..off+8].try_into().ok()?); off += 8;
+        let has_deadline = data[off]; off += 1;
+        let deadline = if has_deadline != 0 {
+            let d = u64::from_le_bytes(data[off..off+8].try_into().ok()?); off += 8;
+            Some(d)
+        } else { None };
+        // Access list
+        let al_count = u32::from_le_bytes(data[off..off+4].try_into().ok()?) as usize; off += 4;
+        let mut access_list = Vec::with_capacity(al_count);
+        for _ in 0..al_count {
+            let mut addr = [0u8; 32];
+            addr.copy_from_slice(&data[off..off+32]); off += 32;
+            let rc = u16::from_le_bytes(data[off..off+2].try_into().ok()?) as usize; off += 2;
+            let mut reads = Vec::with_capacity(rc);
+            for _ in 0..rc { let mut k=[0u8;32]; k.copy_from_slice(&data[off..off+32]); off+=32; reads.push(k); }
+            let wc = u16::from_le_bytes(data[off..off+2].try_into().ok()?) as usize; off += 2;
+            let mut writes = Vec::with_capacity(wc);
+            for _ in 0..wc { let mut k=[0u8;32]; k.copy_from_slice(&data[off..off+32]); off+=32; writes.push(k); }
+            access_list.push(pyde_tx::types::AccessEntry { address: addr, reads, writes });
+        }
+        // Signature
+        let sig_len = u32::from_le_bytes(data[off..off+4].try_into().ok()?) as usize; off += 4;
+        let signature = data[off..off+sig_len].to_vec(); off += sig_len;
+        // Ciphertext
+        let ct_len = u32::from_le_bytes(data[off..off+4].try_into().ok()?) as usize; off += 4;
+        let ciphertext = pyde_crypto::threshold::ThresholdCiphertext::from_wire_bytes(&data[off..off+ct_len])?;
+        Some(Self { sender, nonce, gas_limit, access_list, deadline, chain_id, signature, ciphertext })
+    }
+
     /// Check if the transaction has expired.
     pub fn is_expired(&self, current_block: u64) -> bool {
         match self.deadline {
