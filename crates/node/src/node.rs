@@ -483,8 +483,15 @@ impl PydeNode {
                             let (matched, missing) = cb.reconstruct(&mempool_txs);
 
                             if !missing.is_empty() {
-                                // TODO: request missing txs from peers via GetBlockTxs
-                                warn!(slot, missing = missing.len(), "compact block has missing txs — requesting not yet implemented, skipping");
+                                // Can't fully reconstruct — request full block via sync.
+                                // Update network tip so sync manager knows to fetch this slot.
+                                debug!(
+                                    slot,
+                                    missing = missing.len(),
+                                    "compact block missing txs — triggering sync for full block"
+                                );
+                                chain_sync.manager.update_network_tip(slot);
+                                chain_sync.request_next_batch(&mut swarm);
                                 continue;
                             }
 
