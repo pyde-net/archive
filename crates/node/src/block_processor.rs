@@ -102,43 +102,82 @@ impl BlockProcessor {
                 }
             }
         } else {
-            // Multiple groups — execute groups sequentially but respect ordering.
-            // Each group's txs are sequential (they conflict internally).
-            // Groups are independent (disjoint access lists).
-            //
-            // True parallel execution (rayon threads) requires per-group SMT cloning,
-            // which is implemented but expensive for small groups. We execute groups
-            // sequentially here for determinism, but the SCHEDULE ensures optimal
-            // ordering — the proposer has already proven the groups are non-conflicting.
-            //
-            // For production parallelism: uncomment rayon path after SMT snapshot
-            // optimization (Phase 18 performance work).
-            for group in groups {
-                for &tx_idx in &group.tx_indices {
-                    if tx_idx >= txs.len() { continue; }
-                    let tx = &txs[tx_idx];
-                    trigger_aot(tx, state, &aot_cache);
-                    match execute_transaction(tx, state.smt_mut(), &block_ctx) {
-                        Ok(receipt) => {
-                            total_gas += receipt.effective_gas;
-                            debug!(slot, tx_index = tx_idx, gas = receipt.effective_gas, "tx executed");
-                            receipts.push(receipt);
-                        }
-                        Err(e) => {
-                            warn!(slot, tx_index = tx_idx, error = ?e, "tx execution failed");
-                            let failed = pyde_tx::execution::Receipt {
-                                tx_hash: tx.hash(), success: false,
-                                gas_used: 0, gas_refund: 0, effective_gas: 0,
-                                fee_paid: 0, fee_burned: 0, fee_validator: 0, fee_treasury: 0,
-                                return_data: format!("{:?}", e).into_bytes(),
-                                logs: vec![], state_root: sparse_merkle_tree::H256::zero(),
-                            };
-                            receipts.push(failed);
+            // Multiple groups — TRUE PARALLEL EXECUTION via rayon + StateOverlay.
+            // Each group gets a StateOverlay (reads from shared SMT, writes to local HashMap).
+            // Groups run on separate rayon threads. After all groups complete, all writes
+            // are merged into the main SMT via update_batch().
+            use rayon::prelude::*;
+            use pyde_state::smt::StateOverlay;
+
+            // Get immutable reference to SMT for overlays
+            let base_smt = state.smt_ref();
+
+            // Execute each group in parallel
+            let group_results: Vec<Vec<(usize, Receipt, Vec<(sparse_merkle_tree::H256, Vec<u8>)>)>> = groups
+                .par_iter()
+                .map(|group| {
+                    let mut overlay = StateOverlay::new(base_smt);
+                    let mut results = Vec::new();
+
+                    for &tx_idx in &group.tx_indices {
+                        if tx_idx >= txs.len() { continue; }
+                        let tx = &txs[tx_idx];
+                        match execute_transaction(tx, &mut overlay, &block_ctx) {
+                            Ok(receipt) => {
+                                results.push((tx_idx, receipt, vec![]));
+                            }
+                            Err(e) => {
+                                let failed = pyde_tx::execution::Receipt {
+                                    tx_hash: tx.hash(), success: false,
+                                    gas_used: 0, gas_refund: 0, effective_gas: 0,
+                                    fee_paid: 0, fee_burned: 0, fee_validator: 0, fee_treasury: 0,
+                                    return_data: format!("{:?}", e).into_bytes(),
+                                    logs: vec![], state_root: sparse_merkle_tree::H256::zero(),
+                                };
+                                results.push((tx_idx, failed, vec![]));
+                            }
                         }
                     }
+
+                    // Collect overlay writes
+                    let writes = overlay.into_writes();
+                    // Attach writes to last result for merging
+                    if let Some(last) = results.last_mut() {
+                        last.2 = writes;
+                    }
+                    results
+                })
+                .collect();
+
+            // Merge: collect all receipts (sorted by tx index) and all writes
+            let mut all_results: Vec<(usize, Receipt)> = Vec::new();
+            let mut all_writes: Vec<(sparse_merkle_tree::H256, Vec<u8>)> = Vec::new();
+
+            for group_result in group_results {
+                for (tx_idx, receipt, writes) in group_result {
+                    total_gas += receipt.effective_gas;
+                    all_results.push((tx_idx, receipt));
+                    all_writes.extend(writes);
                 }
             }
-            info!(slot, groups = groups.len(), txs = txs.len(), "executed with {} parallel groups", groups.len());
+
+            // Sort receipts by original tx index for deterministic ordering
+            all_results.sort_by_key(|(idx, _)| *idx);
+            receipts = all_results.into_iter().map(|(_, r)| r).collect();
+
+            // Batch-insert all writes from all groups into the main SMT
+            if !all_writes.is_empty() {
+                let write_count = all_writes.len();
+                let _ = state.update_batch(all_writes);
+                info!(
+                    slot,
+                    groups = groups.len(),
+                    txs = txs.len(),
+                    writes = write_count,
+                    "parallel execution: {} groups on rayon threads",
+                    groups.len()
+                );
+            }
         }
 
         // 4. Block reward: credit proposer with inflation reward

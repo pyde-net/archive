@@ -18,6 +18,7 @@ pyde-tx = { path = "../tx" }
 pyde-consensus = { path = "../consensus" }
 pyde-mempool = { path = "../mempool" }
 pyde-net = { path = "../net" }
+rayon = "1.10"
 libp2p = { version = "0.54", features = ["quic", "gossipsub", "kad", "noise", "yamux", "tokio", "macros", "identify", "request-response", "cbor", "serde"] }
 serde_json = "1"
 

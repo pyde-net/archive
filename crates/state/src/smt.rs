@@ -162,6 +162,75 @@ impl PydeSMT {
     }
 }
 
+/// Trait for state access — implemented by both PydeSMT and StateOverlay.
+/// Allows the tx pipeline to work with either direct SMT or per-group overlays.
+pub trait StateAccess {
+    fn get(&self, key: &Key) -> Option<Vec<u8>>;
+    fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<H256, &'static str>;
+    fn root(&self) -> H256;
+}
+
+impl StateAccess for PydeSMT {
+    fn get(&self, key: &Key) -> Option<Vec<u8>> {
+        self.get(key)
+    }
+    fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<H256, &'static str> {
+        self.insert(key, value)
+    }
+    fn root(&self) -> H256 {
+        self.root()
+    }
+}
+
+/// Lightweight state overlay for parallel execution.
+/// Reads from a shared base SMT (immutable), writes to a local HashMap.
+/// After execution, the writes are collected and batch-inserted into the real SMT.
+pub struct StateOverlay<'a> {
+    base: &'a PydeSMT,
+    writes: std::collections::HashMap<Key, Vec<u8>>,
+}
+
+impl<'a> StateOverlay<'a> {
+    pub fn new(base: &'a PydeSMT) -> Self {
+        Self {
+            base,
+            writes: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Collect all writes (for merging into the main SMT after parallel execution).
+    pub fn into_writes(self) -> Vec<(Key, Vec<u8>)> {
+        self.writes.into_iter().collect()
+    }
+
+    /// Number of write operations captured.
+    pub fn write_count(&self) -> usize {
+        self.writes.len()
+    }
+}
+
+impl<'a> StateAccess for StateOverlay<'a> {
+    fn get(&self, key: &Key) -> Option<Vec<u8>> {
+        // Check overlay first (local writes), then base SMT
+        if let Some(v) = self.writes.get(key) {
+            if v.is_empty() { None } else { Some(v.clone()) }
+        } else {
+            self.base.get(key)
+        }
+    }
+
+    fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<H256, &'static str> {
+        self.writes.insert(key, value);
+        // Return a dummy root — real root is computed after merge
+        Ok(H256::zero())
+    }
+
+    fn root(&self) -> H256 {
+        // Overlay doesn't track root — use base root as approximation
+        self.base.root()
+    }
+}
+
 impl Default for PydeSMT {
     fn default() -> Self {
         Self::new()
