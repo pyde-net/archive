@@ -213,6 +213,11 @@ pub fn execute_transaction(
                     let contract = Account::new_contract(new_addr, runtime);
                     store_account(smt, &contract)?;
 
+                    // AOT compilation happens at execution time (JIT-cached in memory).
+                    // The PVM bytecode in state is the source of truth.
+                    // AOT native code can't be serialized to the SMT (it's memory-mapped).
+                    // See execute_in_pvm for the JIT compilation cache.
+
                     // Execute constructor.
                     // Constructor args follow the runtime bytecode in the deploy data.
                     // Format: [4-byte len][constructor][runtime][args]

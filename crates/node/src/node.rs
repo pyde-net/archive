@@ -752,13 +752,9 @@ impl PydeNode {
                                     let head = chain_r.head_slot;
                                     drop(chain_r);
 
-                                    // Build execution schedule (single group for devnet)
-                                    let exec_schedule = pyde_tx::parallel::ExecutionSchedule {
-                                        groups: vec![pyde_tx::parallel::ExecutionGroup {
-                                            tx_indices: (0..tx_count).collect(),
-                                        }],
-                                        total_txs: tx_count,
-                                    };
+                                    // Build execution schedule: group non-conflicting txs
+                                    // for parallel execution (Sealevel-style).
+                                    let exec_schedule = pyde_tx::parallel::schedule(&txs);
 
                                     // Compute tx root
                                     let tx_root = pyde_consensus::block::compute_tx_root(&txs);

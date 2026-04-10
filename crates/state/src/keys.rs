@@ -23,6 +23,7 @@ pub mod discriminator {
     pub const CODE_HASH: u8 = 0x03;
     pub const STORAGE_SLOT: u8 = 0x04;
     pub const MAP_ENTRY: u8 = 0x05;
+    pub const AOT_CODE: u8 = 0x06;
     pub const VALIDATOR: u8 = 0x10;
     /// Special key for the validator count (stored at validator_count_key).
     pub const VALIDATOR_COUNT: u8 = 0x11;
@@ -119,6 +120,16 @@ pub fn nested_map_key(contract: &Address, slot: u64, key1: &[u8], key2: &[u8]) -
     input.extend_from_slice(level1.as_slice());
     input.push(discriminator::MAP_ENTRY);
     input.extend_from_slice(key2);
+    H256::from(poseidon2_hash(&input).to_bytes())
+}
+
+/// Derive the SMT key for a contract's AOT-compiled native code.
+///
+/// `key = Poseidon2(address || 0x06)`
+pub fn aot_code_key(address: &Address) -> H256 {
+    let mut input = Vec::with_capacity(33);
+    input.extend_from_slice(address);
+    input.push(discriminator::AOT_CODE);
     H256::from(poseidon2_hash(&input).to_bytes())
 }
 
