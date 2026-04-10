@@ -100,6 +100,12 @@ impl UnionFind {
 ///
 /// Two txs touching the same contract but different keys are NOT conflicting.
 pub fn conflicts(tx_a: &Transaction, tx_b: &Transaction) -> bool {
+    // Transactions with empty access lists are treated as touching EVERYTHING.
+    // They must be sequential with all other txs (can't parallelize safely).
+    if tx_a.access_list.is_empty() || tx_b.access_list.is_empty() {
+        return true;
+    }
+
     // Collect write keys from each tx: (address, key)
     let writes_a: HashSet<(Address, [u8; 32])> = tx_a
         .access_list
@@ -344,10 +350,12 @@ mod tests {
     }
 
     #[test]
-    fn no_conflict_empty_access_lists() {
+    fn empty_access_lists_always_conflict() {
+        // Txs without access lists are conservatively treated as conflicting
+        // because they could access any key at runtime.
         let tx_a = make_tx_with_access(vec![]);
         let tx_b = make_tx_with_access(vec![]);
-        assert!(!conflicts(&tx_a, &tx_b));
+        assert!(conflicts(&tx_a, &tx_b));
     }
 
     #[test]
@@ -552,14 +560,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_access_lists_each_independent() {
-        // Txs with no access lists don't conflict with anything → each in own group
+    fn empty_access_lists_all_in_one_group() {
+        // Txs without access lists conflict with everything → all in one group
         let txs = vec![
             make_tx_with_access(vec![]),
             make_tx_with_access(vec![]),
             make_tx_with_access(vec![]),
         ];
         let schedule = schedule(&txs);
-        assert_eq!(schedule.group_count(), 3);
+        assert_eq!(schedule.group_count(), 1);
+        assert_eq!(schedule.groups[0].tx_indices.len(), 3);
     }
 }

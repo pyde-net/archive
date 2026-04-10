@@ -1,3 +1,4 @@
+mod aot_cache;
 mod block_builder;
 mod block_processor;
 mod block_store;
