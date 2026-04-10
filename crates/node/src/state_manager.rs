@@ -89,6 +89,11 @@ impl StateManager {
         &mut self.smt
     }
 
+    /// Get immutable reference to the SMT (for parallel execution overlays).
+    pub fn smt_ref(&self) -> &PydeSMT {
+        &self.smt
+    }
+
     /// Refresh the cached root after SMT mutations (e.g., after tx execution).
     pub fn refresh_root(&mut self) {
         self.root = self.smt.root().as_slice().try_into().unwrap_or([0u8; 32]);

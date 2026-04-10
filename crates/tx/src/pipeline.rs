@@ -55,7 +55,7 @@ impl From<ValidationError> for PipelineError {
 }
 
 /// Load an account from the SMT. Returns default (empty) account if not found.
-pub fn load_account(smt: &PydeSMT, address: &Address) -> Account {
+pub fn load_account(smt: &dyn pyde_state::smt::StateAccess, address: &Address) -> Account {
     let key = keys::balance_key(address);
     match smt.get(&key) {
         Some(bytes) => Account::from_bytes(&bytes).unwrap_or_else(|| empty_account(address)),
@@ -64,7 +64,7 @@ pub fn load_account(smt: &PydeSMT, address: &Address) -> Account {
 }
 
 /// Store an account into the SMT.
-pub fn store_account(smt: &mut PydeSMT, account: &Account) -> Result<(), PipelineError> {
+pub fn store_account(smt: &mut dyn pyde_state::smt::StateAccess, account: &Account) -> Result<(), PipelineError> {
     let key = keys::balance_key(&account.address);
     smt.insert(key, account.to_bytes())
         .map_err(|e| PipelineError::StateError(e.to_string()))?;
@@ -72,7 +72,7 @@ pub fn store_account(smt: &mut PydeSMT, account: &Account) -> Result<(), Pipelin
 }
 
 /// Load a nonce state for an account. Returns default if not found.
-pub fn load_nonce(smt: &PydeSMT, address: &Address) -> NonceState {
+pub fn load_nonce(smt: &dyn pyde_state::smt::StateAccess, address: &Address) -> NonceState {
     let key = keys::nonce_key(address);
     match smt.get(&key) {
         Some(bytes) if bytes.len() >= 10 => {
@@ -85,7 +85,7 @@ pub fn load_nonce(smt: &PydeSMT, address: &Address) -> NonceState {
 }
 
 /// Store a nonce state into the SMT.
-pub fn store_nonce(smt: &mut PydeSMT, address: &Address, nonce: &NonceState) -> Result<(), PipelineError> {
+pub fn store_nonce(smt: &mut dyn pyde_state::smt::StateAccess, address: &Address, nonce: &NonceState) -> Result<(), PipelineError> {
     let key = keys::nonce_key(address);
     smt.insert(key, nonce.to_bytes().to_vec())
         .map_err(|e| PipelineError::StateError(e.to_string()))?;
@@ -93,13 +93,13 @@ pub fn store_nonce(smt: &mut PydeSMT, address: &Address, nonce: &NonceState) -> 
 }
 
 /// Load contract code from the SMT.
-pub fn load_code(smt: &PydeSMT, address: &Address) -> Option<Vec<u8>> {
+pub fn load_code(smt: &dyn pyde_state::smt::StateAccess, address: &Address) -> Option<Vec<u8>> {
     let key = keys::code_key(address);
     smt.get(&key)
 }
 
 /// Store contract code into the SMT.
-pub fn store_code(smt: &mut PydeSMT, address: &Address, code: &[u8]) -> Result<(), PipelineError> {
+pub fn store_code(smt: &mut dyn pyde_state::smt::StateAccess, address: &Address, code: &[u8]) -> Result<(), PipelineError> {
     let key = keys::code_key(address);
     smt.insert(key, code.to_vec())
         .map_err(|e| PipelineError::StateError(e.to_string()))?;
@@ -124,7 +124,7 @@ fn empty_account(address: &Address) -> Account {
 /// Returns the receipt and updates the SMT in place.
 pub fn execute_transaction(
     tx: &Transaction,
-    smt: &mut PydeSMT,
+    smt: &mut dyn pyde_state::smt::StateAccess,
     block_ctx: &BlockContext,
 ) -> Result<Receipt, PipelineError> {
     // 1. Load accounts
@@ -437,7 +437,7 @@ fn execute_in_pvm(
     tx: &Transaction,
     sender: &Account,
     code: &[u8],
-    smt: &mut PydeSMT,
+    smt: &mut dyn pyde_state::smt::StateAccess,
     block_ctx: &BlockContext,
 ) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
     let ctx = ExecutionContext {
@@ -470,21 +470,30 @@ fn execute_in_pvm(
         }
     }
 
-    // Lazy storage backend: VM reads from SMT on demand during Sload.
-    // During execution, SMT is only read (writes go to vm.storage overlay).
+    // Lazy storage backend: VM reads from state on demand during Sload.
+    // During execution, state is only read (writes go to vm.storage overlay).
     // SAFETY: smt is not mutated during vm.execute(). The pointer is valid for
     // the duration of execute_in_pvm. The closure is dropped before smt is mutated again.
-    let smt_ptr = smt as *const PydeSMT;
+    let smt_ptr = smt as *const dyn pyde_state::smt::StateAccess as *const () as usize;
+    let smt_vtable = unsafe {
+        std::mem::transmute::<&dyn pyde_state::smt::StateAccess, [usize; 2]>(smt)
+    };
     vm.storage_backend = Some(std::sync::Arc::new(move |key: &U256| {
         let smt_key = H256::from(key.to_le_bytes());
-        unsafe { (*smt_ptr).get(&smt_key) }
+        let smt_ref: &dyn pyde_state::smt::StateAccess = unsafe {
+            std::mem::transmute::<[usize; 2], &dyn pyde_state::smt::StateAccess>(smt_vtable)
+        };
+        smt_ref.get(&smt_key)
     }));
 
     // Code backend: lazy-load target contract bytecode for cross-contract calls.
-    let smt_ptr2 = smt as *const PydeSMT;
+    let smt_vtable2 = smt_vtable;
     vm.code_backend = Some(std::sync::Arc::new(move |addr: &pyde_account::address::Address| {
         let code_key = pyde_state::keys::code_key(addr);
-        unsafe { (*smt_ptr2).get(&code_key) }
+        let smt_ref: &dyn pyde_state::smt::StateAccess = unsafe {
+            std::mem::transmute::<[usize; 2], &dyn pyde_state::smt::StateAccess>(smt_vtable2)
+        };
+        smt_ref.get(&code_key)
     }));
 
     if vm.load(code).is_err() {
@@ -578,7 +587,7 @@ fn execute_in_pvm(
 pub fn execute_block_parallel(
     txs: &[Transaction],
     schedule: &crate::parallel::ExecutionSchedule,
-    smt: &mut PydeSMT,
+    smt: &mut dyn pyde_state::smt::StateAccess,
     block_ctx: &BlockContext,
 ) -> Result<Vec<Receipt>, PipelineError> {
     let mut receipts: Vec<Option<Receipt>> = vec![None; txs.len()];
@@ -684,7 +693,7 @@ mod tests {
         tx
     }
 
-    fn setup_funded_account(smt: &mut PydeSMT, pk_bytes: &[u8], balance: u128) -> Address {
+    fn setup_funded_account(smt: &mut dyn pyde_state::smt::StateAccess, pk_bytes: &[u8], balance: u128) -> Address {
         let addr = derive_eoa_address(pk_bytes);
         let mut account = Account::new_eoa(pk_bytes);
         account.balance = balance;
@@ -943,7 +952,7 @@ mod tests {
 
         // Helper: send a tx through the pipeline
         let mut nonce_counter = 0u64;
-        let mut send = |smt: &mut PydeSMT, calldata: Vec<u8>| {
+        let mut send = |smt: &mut dyn pyde_state::smt::StateAccess, calldata: Vec<u8>| {
             let tx = Transaction {
                 from: sender_addr,
                 to: contract_addr,
@@ -967,7 +976,7 @@ mod tests {
         };
 
         // Helper: pyde_call equivalent (read-only)
-        let call = |smt: &PydeSMT, calldata: Vec<u8>| -> u64 {
+        let call = |smt: &dyn pyde_state::smt::StateAccess, calldata: Vec<u8>| -> u64 {
             let ctx = pyde_vm::vm::ExecutionContext {
                 self_address: contract_addr,
                 caller: sender_addr,
@@ -1558,7 +1567,7 @@ mod tests {
         assert_eq!(val_data[4 + pk_len + 16], 0x01, "status should be Unbonding");
     }
 
-    fn fund_account_with_pk(smt: &mut PydeSMT, addr: &Address, balance: u128, pk: &[u8]) {
+    fn fund_account_with_pk(smt: &mut dyn pyde_state::smt::StateAccess, addr: &Address, balance: u128, pk: &[u8]) {
         let mut account = pyde_account::types::Account::new_eoa(pk);
         account.address = *addr;
         account.balance = balance;
