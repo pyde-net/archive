@@ -22,6 +22,7 @@ services:
       - NODE_INDEX=0
       - VALIDATORS=4
       - DEV_MODE=false
+      - CHAIN_ID=1
     volumes:
       - testnet-data:/testnet
       - node0-data:/data

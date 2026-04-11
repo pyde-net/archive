@@ -307,6 +307,7 @@ pub fn generate_testnet(
     base_port: u16,
     base_rpc_port: u16,
     dev_mode: bool,
+    chain_id: u64,
 ) -> Result<(), String> {
     use pyde_account::address::derive_eoa_address;
     use pyde_crypto::falcon::falcon_keygen;
@@ -373,7 +374,7 @@ pub fn generate_testnet(
     });
 
     let genesis_config = GenesisConfig {
-        chain_id: 31337,
+        chain_id,
         timestamp: 0,
         allocations,
         validators,
@@ -472,7 +473,7 @@ pub fn generate_testnet(
         let config_toml = format!(
             r#"[node]
 role = "validator"
-chain_id = 31337
+chain_id = {chain_id}
 datadir = "{datadir}"
 dev_mode = {dev}
 
@@ -581,7 +582,7 @@ json = false
     println!("Testnet generated in {}", out_dir.display());
     println!();
     println!("Validators: {}", num_validators);
-    println!("Chain ID:   31337");
+    println!("Chain ID:   {}", chain_id);
     println!();
     println!("Validator Addresses:");
     for (i, acc) in accounts.iter().enumerate() {
@@ -592,6 +593,26 @@ json = false
     for (i, acc) in accounts.iter().enumerate() {
         println!("  ({}) {}", i, acc.private_key_hex());
     }
+    // Write accounts.json for E2E test scripts (addresses + private keys)
+    {
+        let mut accts = Vec::new();
+        for acc in &accounts {
+            accts.push(serde_json::json!({
+                "address": acc.address_hex(),
+                "privateKey": acc.private_key_hex(),
+                "balance": acc.balance.to_string(),
+            }));
+        }
+        accts.push(serde_json::json!({
+            "address": format!("0x{}", hex::encode(faucet_address)),
+            "privateKey": format!("0x{}", hex::encode(faucet_pk.as_bytes()) + &hex::encode(faucet_sk.as_bytes())),
+            "balance": faucet_balance.to_string(),
+            "faucet": true,
+        }));
+        let json = serde_json::json!({ "chainId": chain_id, "accounts": accts });
+        let _ = fs::write(out_dir.join("accounts.json"), serde_json::to_string_pretty(&json).unwrap_or_default());
+    }
+
     println!();
     println!("Faucet:");
     println!("  Address: 0x{}", hex::encode(faucet_address));
