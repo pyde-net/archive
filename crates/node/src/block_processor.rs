@@ -458,8 +458,9 @@ mod tests {
     #[test]
     fn process_genesis_block() {
         let mut chain = ChainState::genesis([0u8; 32], 31337);
-        let mut state =
-            StateManager::open(&std::env::temp_dir().join("pyde-test-bp2-genesis"), 1024).unwrap();
+        let dir = std::env::temp_dir().join("pyde-test-bp2-genesis");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = StateManager::open(&dir, 1024).unwrap();
 
         let header = dummy_header(1);
         let (tx_count, gas_used) =
@@ -473,8 +474,9 @@ mod tests {
     #[test]
     fn reject_old_slot() {
         let mut chain = ChainState::genesis([0u8; 32], 31337);
-        let mut state =
-            StateManager::open(&std::env::temp_dir().join("pyde-test-bp2-old"), 1024).unwrap();
+        let dir = std::env::temp_dir().join("pyde-test-bp2-old");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = StateManager::open(&dir, 1024).unwrap();
 
         chain.advance(dummy_header(5));
 
@@ -485,8 +487,9 @@ mod tests {
     #[test]
     fn sequential_blocks() {
         let mut chain = ChainState::genesis([0u8; 32], 31337);
-        let mut state =
-            StateManager::open(&std::env::temp_dir().join("pyde-test-bp2-seq"), 1024).unwrap();
+        let dir = std::env::temp_dir().join("pyde-test-bp2-seq");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = StateManager::open(&dir, 1024).unwrap();
 
         for slot in 1..=5 {
             BlockProcessor::process_block(&mut chain, &mut state, dummy_header(slot), &[]).unwrap();
@@ -498,6 +501,7 @@ mod tests {
     #[test]
     fn process_block_with_transfer() {
         let dir = std::env::temp_dir().join("pyde-test-bp2-transfer");
+        let _ = std::fs::remove_dir_all(&dir);
         let mut state = StateManager::open(&dir, 1024).unwrap();
 
         // Initialize genesis with funded accounts

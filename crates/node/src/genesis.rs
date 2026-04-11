@@ -682,10 +682,9 @@ mod tests {
 
     #[test]
     fn initialize_genesis_creates_state() {
-        let mut state = StateManager::open(
-            &std::env::temp_dir().join("pyde-test-genesis-init-v2"),
-            1024,
-        ).unwrap();
+        let dir = std::env::temp_dir().join("pyde-test-genesis-init-v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = StateManager::open(&dir, 1024).unwrap();
 
         let (config, _) = devnet_genesis();
         let block = initialize_genesis(&mut state, &config).unwrap();
@@ -705,10 +704,9 @@ mod tests {
 
     #[test]
     fn genesis_rejects_non_empty_state() {
-        let mut state = StateManager::open(
-            &std::env::temp_dir().join("pyde-test-genesis-reject-v2"),
-            1024,
-        ).unwrap();
+        let dir = std::env::temp_dir().join("pyde-test-genesis-reject-v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = StateManager::open(&dir, 1024).unwrap();
 
         let (config, _) = devnet_genesis();
         initialize_genesis(&mut state, &config).unwrap();

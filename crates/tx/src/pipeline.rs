@@ -12,8 +12,8 @@
 //! 9. Generate receipt
 
 use crate::execution::{
-    distribute_fee, generate_receipt, post_execution_refund, pre_execution_charge,
-    transfer_value, LogEntry, Receipt,
+    distribute_fee, generate_receipt, post_execution_refund, pre_execution_charge, transfer_value,
+    LogEntry, Receipt,
 };
 use crate::fee::adjust_base_fee;
 use crate::types::{FeePayer, Transaction, TransactionType};
@@ -25,7 +25,7 @@ use pyde_account::types::Account;
 use pyde_crypto::poseidon2::poseidon2_hash;
 use pyde_state::keys;
 use pyde_state::smt::{Key, PydeSMT};
-use pyde_vm::vm::{ExecutionContext, ExecResult, Outcome, Vm};
+use pyde_vm::vm::{ExecResult, ExecutionContext, Outcome, Vm};
 use pyde_vm::wide::U256;
 use sparse_merkle_tree::H256;
 
@@ -64,7 +64,10 @@ pub fn load_account(smt: &dyn pyde_state::smt::StateAccess, address: &Address) -
 }
 
 /// Store an account into the SMT.
-pub fn store_account(smt: &mut dyn pyde_state::smt::StateAccess, account: &Account) -> Result<(), PipelineError> {
+pub fn store_account(
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    account: &Account,
+) -> Result<(), PipelineError> {
     let key = keys::balance_key(&account.address);
     smt.insert(key, account.to_bytes())
         .map_err(|e| PipelineError::StateError(e.to_string()))?;
@@ -85,7 +88,11 @@ pub fn load_nonce(smt: &dyn pyde_state::smt::StateAccess, address: &Address) -> 
 }
 
 /// Store a nonce state into the SMT.
-pub fn store_nonce(smt: &mut dyn pyde_state::smt::StateAccess, address: &Address, nonce: &NonceState) -> Result<(), PipelineError> {
+pub fn store_nonce(
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    address: &Address,
+    nonce: &NonceState,
+) -> Result<(), PipelineError> {
     let key = keys::nonce_key(address);
     smt.insert(key, nonce.to_bytes().to_vec())
         .map_err(|e| PipelineError::StateError(e.to_string()))?;
@@ -99,7 +106,11 @@ pub fn load_code(smt: &dyn pyde_state::smt::StateAccess, address: &Address) -> O
 }
 
 /// Store contract code into the SMT.
-pub fn store_code(smt: &mut dyn pyde_state::smt::StateAccess, address: &Address, code: &[u8]) -> Result<(), PipelineError> {
+pub fn store_code(
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    address: &Address,
+    code: &[u8],
+) -> Result<(), PipelineError> {
     let key = keys::code_key(address);
     smt.insert(key, code.to_vec())
         .map_err(|e| PipelineError::StateError(e.to_string()))?;
@@ -153,8 +164,13 @@ pub fn execute_transaction(
     // not by the pipeline.  The pipeline only pre-charges Sender and GasTank
     // fee payers; paymaster settlement is deferred to the contract layer.
     let mut gas_tank_balance = sender.gas_tank;
-    pre_execution_charge(tx, &mut sender.balance, &mut gas_tank_balance, block_ctx.base_fee)
-        .map_err(|e| PipelineError::ExecutionFailed(e))?;
+    pre_execution_charge(
+        tx,
+        &mut sender.balance,
+        &mut gas_tank_balance,
+        block_ctx.base_fee,
+    )
+    .map_err(|e| PipelineError::ExecutionFailed(e))?;
     sender.gas_tank = gas_tank_balance;
 
     // 5. Value transfer
@@ -167,11 +183,18 @@ pub fn execute_transaction(
             // Contract call
             match load_code(smt, &tx.to) {
                 Some(code) => {
-                    tracing::debug!(to = hex::encode(tx.to), code_len = code.len(), "executing contract call in PVM");
+                    tracing::debug!(
+                        to = hex::encode(tx.to),
+                        code_len = code.len(),
+                        "executing contract call in PVM"
+                    );
                     execute_in_pvm(tx, &sender, &code, smt, block_ctx)
                 }
                 None => {
-                    tracing::debug!(to = hex::encode(tx.to), "simple transfer (no code at recipient)");
+                    tracing::debug!(
+                        to = hex::encode(tx.to),
+                        "simple transfer (no code at recipient)"
+                    );
                     (true, 21_000u64, 0u64, vec![], vec![])
                 }
             }
@@ -180,10 +203,7 @@ pub fn execute_transaction(
             // Contract deployment with constructor execution.
             // tx.data format: constructor_len(4 LE) + constructor_bytes + runtime_bytes + constructor_args
             // If constructor_len == 0: store tx.data[4..] as runtime (no constructor).
-            let new_addr = pyde_account::address::derive_create_address(
-                &tx.from,
-                sender.nonce,
-            );
+            let new_addr = pyde_account::address::derive_create_address(&tx.from, sender.nonce);
             // Increment sender nonce so the next deploy gets a different address
             sender.nonce += 1;
 
@@ -238,9 +258,8 @@ pub fn execute_transaction(
                         contract = hex::encode(new_addr),
                         "executing constructor"
                     );
-                    let (success, gas, _, logs, _) = execute_in_pvm(
-                        &constructor_tx, &sender, constructor, smt, block_ctx,
-                    );
+                    let (success, gas, _, logs, _) =
+                        execute_in_pvm(&constructor_tx, &sender, constructor, smt, block_ctx);
                     if !success {
                         tracing::warn!(gas, "constructor execution failed (reverted or trapped)");
                     } else {
@@ -272,56 +291,85 @@ pub fn execute_transaction(
             const VALIDATOR_STAKE: u128 = 10_000_000_000_000;
 
             if sender.balance < VALIDATOR_STAKE {
-                (false, 21_000u64, 0u64, vec![], b"insufficient balance for stake deposit".to_vec())
+                (
+                    false,
+                    21_000u64,
+                    0u64,
+                    vec![],
+                    b"insufficient balance for stake deposit".to_vec(),
+                )
             } else if tx.data.len() < 897 {
-                (false, 21_000u64, 0u64, vec![], b"tx.data must contain FALCON public key (897 bytes)".to_vec())
+                (
+                    false,
+                    21_000u64,
+                    0u64,
+                    vec![],
+                    b"tx.data must contain FALCON public key (897 bytes)".to_vec(),
+                )
             } else {
                 // Validate: public key must derive to sender's address
                 let pk_bytes = &tx.data[..897];
                 let derived_addr = pyde_account::address::derive_eoa_address(pk_bytes);
                 if derived_addr != tx.from {
-                    (false, 21_000u64, 0u64, vec![], b"public key does not match sender address".to_vec())
-                } else if smt.get(&pyde_state::keys::validator_key(&tx.from)).is_some() {
+                    (
+                        false,
+                        21_000u64,
+                        0u64,
+                        vec![],
+                        b"public key does not match sender address".to_vec(),
+                    )
+                } else if smt
+                    .get(&pyde_state::keys::validator_key(&tx.from))
+                    .is_some()
+                {
                     // Already registered
-                    (false, 21_000u64, 0u64, vec![], b"already registered as validator".to_vec())
+                    (
+                        false,
+                        21_000u64,
+                        0u64,
+                        vec![],
+                        b"already registered as validator".to_vec(),
+                    )
                 } else {
+                    // Deduct stake from sender balance
+                    sender.balance -= VALIDATOR_STAKE;
 
-                // Deduct stake from sender balance
-                sender.balance -= VALIDATOR_STAKE;
+                    // Write validator entry to state: [pk_len:4 LE][pk][stake:16 LE][status:1]
+                    let mut val_data = Vec::with_capacity(4 + 897 + 16 + 1);
+                    val_data.extend_from_slice(&(897u32).to_le_bytes());
+                    val_data.extend_from_slice(pk_bytes);
+                    val_data.extend_from_slice(&VALIDATOR_STAKE.to_le_bytes());
+                    val_data.push(0x00); // Active
 
-                // Write validator entry to state: [pk_len:4 LE][pk][stake:16 LE][status:1]
-                let mut val_data = Vec::with_capacity(4 + 897 + 16 + 1);
-                val_data.extend_from_slice(&(897u32).to_le_bytes());
-                val_data.extend_from_slice(pk_bytes);
-                val_data.extend_from_slice(&VALIDATOR_STAKE.to_le_bytes());
-                val_data.push(0x00); // Active
+                    let val_key = pyde_state::keys::validator_key(&tx.from);
+                    let _ = smt.insert(val_key, val_data);
 
-                let val_key = pyde_state::keys::validator_key(&tx.from);
-                let _ = smt.insert(val_key, val_data);
+                    // Update validator address list (append sender address)
+                    let count_key = pyde_state::keys::validator_count_key();
+                    let count = smt
+                        .get(&count_key)
+                        .map(|b| {
+                            if b.len() >= 8 {
+                                u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]))
+                            } else {
+                                0
+                            }
+                        })
+                        .unwrap_or(0);
+                    let new_count = count + 1;
+                    let _ = smt.insert(count_key, new_count.to_le_bytes().to_vec());
 
-                // Update validator address list (append sender address)
-                let count_key = pyde_state::keys::validator_count_key();
-                let count = smt.get(&count_key)
-                    .map(|b| {
-                        if b.len() >= 8 {
-                            u64::from_le_bytes(b[..8].try_into().unwrap_or([0;8]))
-                        } else { 0 }
-                    })
-                    .unwrap_or(0);
-                let new_count = count + 1;
-                let _ = smt.insert(count_key, new_count.to_le_bytes().to_vec());
+                    // Store address at index for enumeration
+                    let idx_key = pyde_state::keys::validator_index_key(count);
+                    let _ = smt.insert(idx_key, tx.from.to_vec());
 
-                // Store address at index for enumeration
-                let idx_key = pyde_state::keys::validator_index_key(count);
-                let _ = smt.insert(idx_key, tx.from.to_vec());
+                    tracing::info!(
+                        validator = hex::encode(tx.from),
+                        stake = VALIDATOR_STAKE,
+                        "stake deposit: new validator registered"
+                    );
 
-                tracing::info!(
-                    validator = hex::encode(tx.from),
-                    stake = VALIDATOR_STAKE,
-                    "stake deposit: new validator registered"
-                );
-
-                (true, 50_000u64, 0u64, vec![], tx.from.to_vec())
+                    (true, 50_000u64, 0u64, vec![], tx.from.to_vec())
                 }
             }
         }
@@ -331,15 +379,38 @@ pub fn execute_transaction(
             match smt.get(&val_key) {
                 Some(mut val_data) => {
                     if val_data.len() < 5 {
-                        (false, 21_000u64, 0u64, vec![], b"invalid validator entry".to_vec())
+                        (
+                            false,
+                            21_000u64,
+                            0u64,
+                            vec![],
+                            b"invalid validator entry".to_vec(),
+                        )
                     } else {
-                        let pk_len = u32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]) as usize;
+                        let pk_len = u32::from_le_bytes([
+                            val_data[0],
+                            val_data[1],
+                            val_data[2],
+                            val_data[3],
+                        ]) as usize;
                         let status_offset = 4 + pk_len + 16;
                         if val_data.len() <= status_offset {
-                            (false, 21_000u64, 0u64, vec![], b"invalid validator entry".to_vec())
+                            (
+                                false,
+                                21_000u64,
+                                0u64,
+                                vec![],
+                                b"invalid validator entry".to_vec(),
+                            )
                         } else if val_data[status_offset] != 0x00 {
                             // Not Active
-                            (false, 21_000u64, 0u64, vec![], b"validator is not active".to_vec())
+                            (
+                                false,
+                                21_000u64,
+                                0u64,
+                                vec![],
+                                b"validator is not active".to_vec(),
+                            )
                         } else {
                             // Set status to Unbonding (0x01) + store exit block
                             val_data[status_offset] = 0x01;
@@ -357,9 +428,13 @@ pub fn execute_transaction(
                         }
                     }
                 }
-                None => {
-                    (false, 21_000u64, 0u64, vec![], b"not a registered validator".to_vec())
-                }
+                None => (
+                    false,
+                    21_000u64,
+                    0u64,
+                    vec![],
+                    b"not a registered validator".to_vec(),
+                ),
             }
         }
         _ => {
@@ -475,9 +550,8 @@ fn execute_in_pvm(
     // SAFETY: smt is not mutated during vm.execute(). The pointer is valid for
     // the duration of execute_in_pvm. The closure is dropped before smt is mutated again.
     let smt_ptr = smt as *const dyn pyde_state::smt::StateAccess as *const () as usize;
-    let smt_vtable = unsafe {
-        std::mem::transmute::<&dyn pyde_state::smt::StateAccess, [usize; 2]>(smt)
-    };
+    let smt_vtable =
+        unsafe { std::mem::transmute::<&dyn pyde_state::smt::StateAccess, [usize; 2]>(smt) };
     vm.storage_backend = Some(std::sync::Arc::new(move |key: &U256| {
         let smt_key = H256::from(key.to_le_bytes());
         let smt_ref: &dyn pyde_state::smt::StateAccess = unsafe {
@@ -488,13 +562,15 @@ fn execute_in_pvm(
 
     // Code backend: lazy-load target contract bytecode for cross-contract calls.
     let smt_vtable2 = smt_vtable;
-    vm.code_backend = Some(std::sync::Arc::new(move |addr: &pyde_account::address::Address| {
-        let code_key = pyde_state::keys::code_key(addr);
-        let smt_ref: &dyn pyde_state::smt::StateAccess = unsafe {
-            std::mem::transmute::<[usize; 2], &dyn pyde_state::smt::StateAccess>(smt_vtable2)
-        };
-        smt_ref.get(&code_key)
-    }));
+    vm.code_backend = Some(std::sync::Arc::new(
+        move |addr: &pyde_account::address::Address| {
+            let code_key = pyde_state::keys::code_key(addr);
+            let smt_ref: &dyn pyde_state::smt::StateAccess = unsafe {
+                std::mem::transmute::<[usize; 2], &dyn pyde_state::smt::StateAccess>(smt_vtable2)
+            };
+            smt_ref.get(&code_key)
+        },
+    ));
 
     if vm.load(code).is_err() {
         return (false, tx.gas_limit, 0, vec![], vec![]);
@@ -569,7 +645,13 @@ fn execute_in_pvm(
     } else {
         vm.return_data.clone() // revert data
     };
-    (success, output.gas_used as u64, output.gas_refund, logs, return_data)
+    (
+        success,
+        output.gas_used as u64,
+        output.gas_refund,
+        logs,
+        return_data,
+    )
 }
 
 /// Execute a block of transactions using parallel group scheduling.
@@ -693,7 +775,11 @@ mod tests {
         tx
     }
 
-    fn setup_funded_account(smt: &mut dyn pyde_state::smt::StateAccess, pk_bytes: &[u8], balance: u128) -> Address {
+    fn setup_funded_account(
+        smt: &mut dyn pyde_state::smt::StateAccess,
+        pk_bytes: &[u8],
+        balance: u128,
+    ) -> Address {
         let addr = derive_eoa_address(pk_bytes);
         let mut account = Account::new_eoa(pk_bytes);
         account.balance = balance;
@@ -928,7 +1014,12 @@ mod tests {
             key_nonce: 0,
         };
         store_account(&mut smt, &sender).unwrap();
-        store_nonce(&mut smt, &sender_addr, &pyde_account::nonce::NonceState::new()).unwrap();
+        store_nonce(
+            &mut smt,
+            &sender_addr,
+            &pyde_account::nonce::NonceState::new(),
+        )
+        .unwrap();
 
         // Also create validator account
         let validator_addr = [0xFFu8; 32];
@@ -984,10 +1075,15 @@ mod tests {
             };
             let code = load_code(smt, &contract_addr).expect("no code");
             let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(10_000_000, ctx);
-            let smt_ptr = smt as *const PydeSMT;
+            let smt_vtable = unsafe {
+                std::mem::transmute::<&dyn pyde_state::smt::StateAccess, [usize; 2]>(smt)
+            };
             vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
                 let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
-                unsafe { (*smt_ptr).get(&smt_key) }
+                let smt_ref: &dyn pyde_state::smt::StateAccess = unsafe {
+                    std::mem::transmute::<[usize; 2], &dyn pyde_state::smt::StateAccess>(smt_vtable)
+                };
+                smt_ref.get(&smt_key)
             }));
             vm.calldata = calldata;
             vm.load(&code).unwrap();
@@ -999,7 +1095,9 @@ mod tests {
         let enc_u64 = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
         let mut cd = |name: &str, args: &[u64]| -> Vec<u8> {
             let mut data = sel(name).to_be_bytes().to_vec();
-            for a in args { data.extend_from_slice(&a.to_le_bytes()); }
+            for a in args {
+                data.extend_from_slice(&a.to_le_bytes());
+            }
             data
         };
 
@@ -1011,10 +1109,26 @@ mod tests {
         send(&mut smt, cd("set_balance", &[1, 1200]));
 
         // Verify pre-batch balances
-        assert_eq!(call(&smt, cd("get_balance", &[10])), 38000, "pre-batch bal(10)");
-        assert_eq!(call(&smt, cd("get_balance", &[20])), 39000, "pre-batch bal(20)");
-        assert_eq!(call(&smt, cd("get_balance", &[30])), 21800, "pre-batch bal(30)");
-        assert_eq!(call(&smt, cd("get_balance", &[1])), 1200, "pre-batch bal(1)");
+        assert_eq!(
+            call(&smt, cd("get_balance", &[10])),
+            38000,
+            "pre-batch bal(10)"
+        );
+        assert_eq!(
+            call(&smt, cd("get_balance", &[20])),
+            39000,
+            "pre-batch bal(20)"
+        );
+        assert_eq!(
+            call(&smt, cd("get_balance", &[30])),
+            21800,
+            "pre-batch bal(30)"
+        );
+        assert_eq!(
+            call(&smt, cd("get_balance", &[1])),
+            1200,
+            "pre-batch bal(1)"
+        );
 
         // Run batch_reward
         send(&mut smt, cd("batch_reward", &[10, 20, 30, 3000]));
@@ -1145,8 +1259,16 @@ mod tests {
         let runtime_code = load_code(&smt, &contract_addr).expect("runtime code");
         vm.load(&runtime_code).unwrap();
         let output = vm.execute();
-        assert_eq!(output.outcome, pyde_vm::vm::Outcome::Success, "rank() failed");
-        assert_eq!(vm.cpu.read_gp(1), 1, "rank should be 1 (no board entries > 400)");
+        assert_eq!(
+            output.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "rank() failed"
+        );
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            1,
+            "rank should be 1 (no board entries > 400)"
+        );
     }
 
     // ========== Task 1183: Pre-derived keys match runtime-derived keys ==========
@@ -1179,7 +1301,8 @@ mod tests {
 
             assert!(
                 allowed.contains(&runtime_key),
-                "pre-derived key for slot {} doesn't match runtime key", slot_val
+                "pre-derived key for slot {} doesn't match runtime key",
+                slot_val
             );
         }
     }
@@ -1207,7 +1330,10 @@ mod tests {
         let caller_addr = derive_eoa_address(b"caller");
         let (allowed, warm) = pre_derive_access_list_keys(&[access_entry], &caller_addr);
 
-        assert!(allowed.contains(&runtime_key), "cross-contract key should match");
+        assert!(
+            allowed.contains(&runtime_key),
+            "cross-contract key should match"
+        );
         assert_eq!(warm.len(), 1);
     }
 
@@ -1247,14 +1373,24 @@ mod tests {
         // Deploy — must set data BEFORE signing
         let deploy_tx = {
             let mut tx = Transaction {
-                from: sender_addr, to: ZERO_ADDRESS, value: 0,
-                data: deploy_data, gas_limit: 100_000_000, nonce: 0,
-                signature: vec![], fee_payer: FeePayer::Sender,
-                access_list: vec![], deadline: None, chain_id: 1,
+                from: sender_addr,
+                to: ZERO_ADDRESS,
+                value: 0,
+                data: deploy_data,
+                gas_limit: 100_000_000,
+                nonce: 0,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
+                access_list: vec![],
+                deadline: None,
+                chain_id: 1,
                 tx_type: TransactionType::Deploy,
             };
             let hash = tx.hash();
-            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash)
+                .unwrap()
+                .as_bytes()
+                .to_vec();
             tx
         };
         let deploy_receipt = execute_transaction(&deploy_tx, &mut smt, &block_ctx).unwrap();
@@ -1264,21 +1400,34 @@ mod tests {
         let selector = otic::codegen::compute_selector("get_value");
         let call_tx = {
             let mut tx = Transaction {
-                from: sender_addr, to: contract_addr, value: 0,
-                data: selector.to_be_bytes().to_vec(), gas_limit: 100_000_000, nonce: 1,
-                signature: vec![], fee_payer: FeePayer::Sender,
-                access_list: vec![], deadline: None, chain_id: 1,
+                from: sender_addr,
+                to: contract_addr,
+                value: 0,
+                data: selector.to_be_bytes().to_vec(),
+                gas_limit: 100_000_000,
+                nonce: 1,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
+                access_list: vec![],
+                deadline: None,
+                chain_id: 1,
                 tx_type: TransactionType::Standard,
             };
             let hash = tx.hash();
-            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash)
+                .unwrap()
+                .as_bytes()
+                .to_vec();
             tx
         };
         let call_receipt = execute_transaction(&call_tx, &mut smt, &block_ctx).unwrap();
         assert!(call_receipt.success, "call failed");
 
         // return_data should contain 42 as u64 LE
-        assert!(!call_receipt.return_data.is_empty(), "return_data should not be empty");
+        assert!(
+            !call_receipt.return_data.is_empty(),
+            "return_data should not be empty"
+        );
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&call_receipt.return_data[..8]);
         let returned_value = u64::from_le_bytes(buf);
@@ -1317,14 +1466,24 @@ mod tests {
         // Deploy — must set data BEFORE signing
         let deploy_tx = {
             let mut tx = Transaction {
-                from: sender_addr, to: ZERO_ADDRESS, value: 0,
-                data: deploy_data, gas_limit: 100_000_000, nonce: 0,
-                signature: vec![], fee_payer: FeePayer::Sender,
-                access_list: vec![], deadline: None, chain_id: 1,
+                from: sender_addr,
+                to: ZERO_ADDRESS,
+                value: 0,
+                data: deploy_data,
+                gas_limit: 100_000_000,
+                nonce: 0,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
+                access_list: vec![],
+                deadline: None,
+                chain_id: 1,
                 tx_type: TransactionType::Deploy,
             };
             let hash = tx.hash();
-            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash)
+                .unwrap()
+                .as_bytes()
+                .to_vec();
             tx
         };
         let deploy_receipt = execute_transaction(&deploy_tx, &mut smt, &block_ctx).unwrap();
@@ -1336,14 +1495,24 @@ mod tests {
         calldata.extend_from_slice(&99u64.to_le_bytes());
         let call_tx = {
             let mut tx = Transaction {
-                from: sender_addr, to: contract_addr, value: 0,
-                data: calldata, gas_limit: 100_000_000, nonce: 1,
-                signature: vec![], fee_payer: FeePayer::Sender,
-                access_list: vec![], deadline: None, chain_id: 1,
+                from: sender_addr,
+                to: contract_addr,
+                value: 0,
+                data: calldata,
+                gas_limit: 100_000_000,
+                nonce: 1,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
+                access_list: vec![],
+                deadline: None,
+                chain_id: 1,
                 tx_type: TransactionType::Standard,
             };
             let hash = tx.hash();
-            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash)
+                .unwrap()
+                .as_bytes()
+                .to_vec();
             tx
         };
         let call_receipt = execute_transaction(&call_tx, &mut smt, &block_ctx).unwrap();
@@ -1383,14 +1552,24 @@ mod tests {
         // Deploy
         let deploy_tx = {
             let mut tx = Transaction {
-                from: sender_addr, to: ZERO_ADDRESS, value: 0,
-                data: deploy_data, gas_limit: 100_000_000, nonce: 0,
-                signature: vec![], fee_payer: FeePayer::Sender,
-                access_list: vec![], deadline: None, chain_id: 1,
+                from: sender_addr,
+                to: ZERO_ADDRESS,
+                value: 0,
+                data: deploy_data,
+                gas_limit: 100_000_000,
+                nonce: 0,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
+                access_list: vec![],
+                deadline: None,
+                chain_id: 1,
                 tx_type: TransactionType::Deploy,
             };
             let hash = tx.hash();
-            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+            tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash)
+                .unwrap()
+                .as_bytes()
+                .to_vec();
             tx
         };
         let deploy_receipt = execute_transaction(&deploy_tx, &mut smt, &block_ctx).unwrap();
@@ -1401,14 +1580,24 @@ mod tests {
             let selector = otic::codegen::compute_selector("increment");
             let call_tx = {
                 let mut tx = Transaction {
-                    from: sender_addr, to: contract_addr, value: 0,
-                    data: selector.to_be_bytes().to_vec(), gas_limit: 100_000_000, nonce: 1 + i,
-                    signature: vec![], fee_payer: FeePayer::Sender,
-                    access_list: vec![], deadline: None, chain_id: 1,
+                    from: sender_addr,
+                    to: contract_addr,
+                    value: 0,
+                    data: selector.to_be_bytes().to_vec(),
+                    gas_limit: 100_000_000,
+                    nonce: 1 + i,
+                    signature: vec![],
+                    fee_payer: FeePayer::Sender,
+                    access_list: vec![],
+                    deadline: None,
+                    chain_id: 1,
                     tx_type: TransactionType::Standard,
                 };
                 let hash = tx.hash();
-                tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash).unwrap().as_bytes().to_vec();
+                tx.signature = pyde_crypto::falcon::falcon_sign(&sk, &hash)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec();
                 tx
             };
             let receipt = execute_transaction(&call_tx, &mut smt, &block_ctx).unwrap();
@@ -1510,10 +1699,17 @@ mod tests {
 
         // First deposit succeeds
         let mut tx1 = Transaction {
-            from: sender_addr, to: [0u8;32], value: 0,
-            data: pk.as_bytes().to_vec(), gas_limit: 100_000, nonce: 0,
-            signature: vec![], fee_payer: FeePayer::Sender,
-            access_list: vec![], deadline: None, chain_id: 1,
+            from: sender_addr,
+            to: [0u8; 32],
+            value: 0,
+            data: pk.as_bytes().to_vec(),
+            gas_limit: 100_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
             tx_type: TransactionType::StakeDeposit,
         };
         sign_tx(&mut tx1, &sk);
@@ -1539,10 +1735,17 @@ mod tests {
 
         // Deposit first
         let mut deposit = Transaction {
-            from: sender_addr, to: [0u8;32], value: 0,
-            data: pk.as_bytes().to_vec(), gas_limit: 100_000, nonce: 0,
-            signature: vec![], fee_payer: FeePayer::Sender,
-            access_list: vec![], deadline: None, chain_id: 1,
+            from: sender_addr,
+            to: [0u8; 32],
+            value: 0,
+            data: pk.as_bytes().to_vec(),
+            gas_limit: 100_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
             tx_type: TransactionType::StakeDeposit,
         };
         sign_tx(&mut deposit, &sk);
@@ -1550,10 +1753,17 @@ mod tests {
 
         // Withdraw
         let mut withdraw = Transaction {
-            from: sender_addr, to: [0u8;32], value: 0,
-            data: vec![], gas_limit: 100_000, nonce: 1,
-            signature: vec![], fee_payer: FeePayer::Sender,
-            access_list: vec![], deadline: None, chain_id: 1,
+            from: sender_addr,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 100_000,
+            nonce: 1,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
             tx_type: TransactionType::StakeWithdraw,
         };
         sign_tx(&mut withdraw, &sk);
@@ -1563,11 +1773,21 @@ mod tests {
         // Verify status is Unbonding (0x01)
         let val_key = pyde_state::keys::validator_key(&sender_addr);
         let val_data = smt.get(&val_key).unwrap();
-        let pk_len = u32::from_le_bytes([val_data[0],val_data[1],val_data[2],val_data[3]]) as usize;
-        assert_eq!(val_data[4 + pk_len + 16], 0x01, "status should be Unbonding");
+        let pk_len =
+            u32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]) as usize;
+        assert_eq!(
+            val_data[4 + pk_len + 16],
+            0x01,
+            "status should be Unbonding"
+        );
     }
 
-    fn fund_account_with_pk(smt: &mut dyn pyde_state::smt::StateAccess, addr: &Address, balance: u128, pk: &[u8]) {
+    fn fund_account_with_pk(
+        smt: &mut dyn pyde_state::smt::StateAccess,
+        addr: &Address,
+        balance: u128,
+        pk: &[u8],
+    ) {
         let mut account = pyde_account::types::Account::new_eoa(pk);
         account.address = *addr;
         account.balance = balance;

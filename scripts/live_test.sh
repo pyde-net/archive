@@ -42,9 +42,15 @@ send_tx() {
 }
 
 deploy() {
-  local bytecode="$1" clen="$2"
+  local constructor_hex="$1" runtime_hex="$2"
+  local clen=$((${#constructor_hex} / 2))
+  local rlen=$((${#runtime_hex} / 2))
+  # Build pipeline format: [clen:4 LE][rlen:4 LE][constructor][runtime]
+  local header
+  header=$(python3 -c "import struct; print(struct.pack('<I', $clen).hex() + struct.pack('<I', $rlen).hex())")
+  local full_data="${header}${constructor_hex}${runtime_hex}"
   _RESP_FILE=$(mktemp)
-  rpc "pyde_sendTransaction" "{\"from\":\"$FROM\",\"to\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"data\":\"0x$bytecode\",\"constructorLen\":$clen,\"gas\":100000000,\"nonce\":$NONCE,\"value\":\"0\"}" > "$_RESP_FILE"
+  rpc "pyde_sendTransaction" "{\"from\":\"$FROM\",\"to\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"data\":\"0x$full_data\",\"gas\":100000000,\"nonce\":$NONCE,\"value\":\"0\"}" > "$_RESP_FILE"
   NONCE=$((NONCE + 1))
 }
 
@@ -254,16 +260,14 @@ fi
 
 CONSTRUCTOR_HEX=$(python3 -c "import json; d=json.load(open('$ARTIFACT')); print(d['constructorBytecode'].replace('0x',''))")
 RUNTIME_HEX=$(python3 -c "import json; d=json.load(open('$ARTIFACT')); print(d['deployedBytecode'].replace('0x',''))")
-CLEN=$((${#CONSTRUCTOR_HEX} / 2))
 
-echo -e "  Constructor: ${CLEN} bytes"
+echo -e "  Constructor: $((${#CONSTRUCTOR_HEX} / 2)) bytes"
 echo -e "  Runtime:     $((${#RUNTIME_HEX} / 2)) bytes"
 echo ""
 
 # ---- Step 2: Deploy ----
 echo -e "${YELLOW}[3/6] Deploying contract...${NC}"
-FULL_BYTECODE="${CONSTRUCTOR_HEX}${RUNTIME_HEX}"
-deploy "$FULL_BYTECODE" "$CLEN"
+deploy "$CONSTRUCTOR_HEX" "$RUNTIME_HEX"
 echo -e "  Response: $(last_resp)"
 
 # Extract contract address

@@ -1,37 +1,36 @@
-use pyde_state::backend::{CachedBackend, RocksDBBackend};
-use pyde_state::smt::{Key, PydeSMT};
+use pyde_state::smt::{Key, PersistentSMT};
 use sparse_merkle_tree::H256;
 use std::collections::HashSet;
 use std::path::Path;
 use tracing::info;
 
-/// Manages on-disk state: RocksDB-backed SMT with LRU cache.
-/// Tracks all inserted keys for state snapshot export.
+/// Manages on-disk state: RocksDB-backed persistent SMT.
+/// State survives node restarts — no data loss.
 pub struct StateManager {
-    smt: PydeSMT,
+    smt: PersistentSMT,
     root: [u8; 32],
     /// All keys ever inserted (for snapshot export).
-    /// In production, this would be persisted to disk.
     tracked_keys: HashSet<Key>,
 }
 
 impl StateManager {
-    /// Open state from disk (or initialize empty state).
-    pub fn open(datadir: &Path, cache_size: usize) -> Result<Self, String> {
+    /// Open persistent state from disk.
+    /// If the database exists, state is loaded (including all contract storage).
+    /// If the database is new, returns an empty state.
+    pub fn open(datadir: &Path, _cache_size: usize) -> Result<Self, String> {
         let db_path = datadir.join("state");
         let db_path_str = db_path.to_str().ok_or("invalid db path")?;
 
-        let backend = RocksDBBackend::open(db_path_str)
-            .map_err(|e| format!("failed to open state db: {}", e))?;
-
-        let _cached = CachedBackend::new(backend, cache_size);
-
-        // For now, use in-memory SMT (RocksDB backend integration with
-        // sparse-merkle-tree requires the Store trait bridge — wired in next phase).
-        let smt = PydeSMT::new();
+        let smt = PersistentSMT::open(db_path_str)?;
         let root = smt.root().as_slice().try_into().unwrap_or([0u8; 32]);
 
-        info!(db = %db_path.display(), cache_size, "state database opened");
+        let is_empty = smt.is_empty();
+        info!(
+            db = %db_path.display(),
+            is_empty,
+            root = hex::encode(root),
+            "state database opened (persistent RocksDB)"
+        );
 
         Ok(Self { smt, root, tracked_keys: HashSet::new() })
     }
@@ -73,24 +72,18 @@ impl StateManager {
         Ok(self.root)
     }
 
-    /// Generate a Merkle proof for the given keys.
-    pub fn prove(&self, keys: Vec<Key>) -> Result<pyde_state::smt::MerkleProof, String> {
-        self.smt.prove(keys)
-            .map_err(|e| format!("proof generation failed: {}", e))
-    }
-
     /// Whether state is empty (genesis).
     pub fn is_empty(&self) -> bool {
         self.smt.is_empty()
     }
 
     /// Get mutable access to the underlying SMT (for tx execution pipeline).
-    pub fn smt_mut(&mut self) -> &mut PydeSMT {
+    pub fn smt_mut(&mut self) -> &mut PersistentSMT {
         &mut self.smt
     }
 
     /// Get immutable reference to the SMT (for parallel execution overlays).
-    pub fn smt_ref(&self) -> &PydeSMT {
+    pub fn smt_ref(&self) -> &PersistentSMT {
         &self.smt
     }
 

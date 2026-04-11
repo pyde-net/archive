@@ -1,0 +1,166 @@
+# Pyde Production Testnet: 4 validators + Prometheus + Grafana + Faucet
+#
+# This mirrors mainnet:
+#   - NO dev mode (signed transactions only)
+#   - Threshold encryption active
+#   - FALCON signatures required
+#   - Real genesis with 1B PYDE supply
+#
+# Usage:
+#   docker build -t pyde-node:latest .
+#   docker compose -f docker/docker-compose.production.yml up -d
+#
+# RPC:     http://localhost:8545-8548
+# Faucet:  http://localhost:8080
+# Grafana: http://localhost:3000
+
+services:
+  node-0:
+    image: pyde-node:latest
+    entrypoint: ["/bin/bash", "/docker/entrypoint.sh"]
+    environment:
+      - NODE_INDEX=0
+      - VALIDATORS=4
+      - DEV_MODE=false
+    volumes:
+      - testnet-data:/testnet
+      - node0-data:/data
+    ports:
+      - "8545:8545"
+      - "9090:9090"
+    networks:
+      pyde-net:
+        ipv4_address: 172.20.0.10
+
+  node-1:
+    image: pyde-node:latest
+    entrypoint: ["/bin/bash", "/docker/entrypoint.sh"]
+    environment:
+      - NODE_INDEX=1
+      - DEV_MODE=false
+    volumes:
+      - testnet-data:/testnet
+      - node1-data:/data
+    ports:
+      - "8546:8546"
+      - "9091:9091"
+    depends_on:
+      - node-0
+    networks:
+      pyde-net:
+        ipv4_address: 172.20.0.11
+
+  node-2:
+    image: pyde-node:latest
+    entrypoint: ["/bin/bash", "/docker/entrypoint.sh"]
+    environment:
+      - NODE_INDEX=2
+      - DEV_MODE=false
+    volumes:
+      - testnet-data:/testnet
+      - node2-data:/data
+    ports:
+      - "8547:8547"
+      - "9092:9092"
+    depends_on:
+      - node-0
+    networks:
+      pyde-net:
+        ipv4_address: 172.20.0.12
+
+  node-3:
+    image: pyde-node:latest
+    entrypoint: ["/bin/bash", "/docker/entrypoint.sh"]
+    environment:
+      - NODE_INDEX=3
+      - DEV_MODE=false
+    volumes:
+      - testnet-data:/testnet
+      - node3-data:/data
+    ports:
+      - "8548:8548"
+      - "9093:9093"
+    depends_on:
+      - node-0
+    networks:
+      pyde-net:
+        ipv4_address: 172.20.0.13
+
+  faucet:
+    image: pyde-node:latest
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Waiting for testnet to be ready..."
+        sleep 20
+        # Read faucet address from genesis
+        FAUCET_ADDR=$(grep -A1 'faucet' /testnet/genesis.toml 2>/dev/null | grep address | head -1 | awk -F'"' '{print $$2}')
+        if [ -z "$$FAUCET_ADDR" ]; then
+          # Use last allocation as faucet
+          FAUCET_ADDR=$(grep 'address' /testnet/genesis.toml | tail -1 | awk -F'"' '{print $$2}')
+        fi
+        echo "Faucet address: 0x$$FAUCET_ADDR"
+        echo "Starting faucet on port 8080..."
+        pyde faucet \
+          --rpc http://172.20.0.10:8545 \
+          --from "0x$$FAUCET_ADDR" \
+          --private-key /testnet/faucet.key \
+          --port 8080 \
+          --amount 100 \
+          --cooldown 3600
+    volumes:
+      - testnet-data:/testnet
+    ports:
+      - "8080:8080"
+    depends_on:
+      - node-0
+    networks:
+      pyde-net:
+
+  prometheus:
+    image: prom/prometheus:latest
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat > /tmp/prometheus.yml << 'CONF'
+        global:
+          scrape_interval: 5s
+        scrape_configs:
+          - job_name: pyde-validators
+            static_configs:
+              - targets: ['node-0:9090','node-1:9091','node-2:9092','node-3:9093']
+        CONF
+        /bin/prometheus --config.file=/tmp/prometheus.yml --storage.tsdb.path=/prometheus
+    ports:
+      - "9999:9090"
+    depends_on:
+      - node-0
+    networks:
+      pyde-net:
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      pyde-net:
+
+volumes:
+  testnet-data:
+  node0-data:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  pyde-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
