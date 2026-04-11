@@ -80,6 +80,10 @@ pub enum Command {
         /// Enable dev mode on all nodes.
         #[arg(long)]
         dev: bool,
+
+        /// Chain ID (31337 = devnet, skips signature validation).
+        #[arg(long, default_value = "31337")]
+        chain_id: u64,
     },
 
     /// Start a public faucet server.

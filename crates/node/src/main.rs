@@ -43,8 +43,9 @@ fn main() {
             base_port,
             base_rpc_port,
             dev,
+            chain_id,
         } => {
-            if let Err(e) = genesis::generate_testnet(&out, validators, base_port, base_rpc_port, dev) {
+            if let Err(e) = genesis::generate_testnet(&out, validators, base_port, base_rpc_port, dev, chain_id) {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
             }

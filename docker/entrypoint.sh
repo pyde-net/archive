@@ -7,6 +7,7 @@ VALIDATORS="${VALIDATORS:-4}"
 BASE_PORT="${BASE_PORT:-30303}"
 BASE_RPC="${BASE_RPC:-8545}"
 DEV_MODE="${DEV_MODE:-true}"
+CHAIN_ID="${CHAIN_ID:-31337}"
 
 CONFIG="$DATADIR/config.toml"
 
@@ -17,6 +18,7 @@ if [ "$NODE_INDEX" = "0" ] && [ ! -f "$CONFIG" ]; then
         --out /testnet \
         --base-port "$BASE_PORT" \
         --base-rpc-port "$BASE_RPC" \
+        --chain-id "$CHAIN_ID" \
         $([ "$DEV_MODE" = "true" ] && echo "--dev")
 
     # Fix configs for Docker networking:
