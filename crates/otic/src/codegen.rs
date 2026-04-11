@@ -1178,33 +1178,35 @@ impl CodeGen {
                     .cloned()
                     .unwrap_or(Ty::U64);
 
-                // Widen slot to wide scratch
-                self.emit_op(Opcode::Addi, 15, 0, slot);
-                self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
+                // Use w5 as a dedicated storage slot register (not WIDE_SCRATCH which
+                // the reentrancy guard and payable guard clobber before we get here).
+                const WIDE_SLOT: u8 = 5;
 
                 if is_blob_type(&ty) {
-                    // Borsh-deserialize: Sload blob to heap, then deserialize into typed value
                     let rd = self.alloc_gp(*dst);
-                    let imm = 1 | ((12 & 0xF) << 2); // mode=1, ptr_reg=r12
-                    self.emit_op(Opcode::Sload, 15, WIDE_SCRATCH, imm); // r15 = byte_len, data at r12
-                                                                        // Save r11, use as read cursor
+                    self.emit_op(Opcode::Addi, 15, 0, slot);
+                    self.emit_op(Opcode::Widen, WIDE_SLOT, 15, 0);
+                    let imm = 1 | ((12 & 0xF) << 2);
+                    self.emit_op(Opcode::Sload, 15, WIDE_SLOT, imm);
                     self.emit_op(Opcode::Push, 11, 0, 0);
-                    self.emit_op(Opcode::Add, 11, 12, 0); // r11 = read cursor = data start
-                                                          // Advance r12 past loaded data (align to 8)
+                    self.emit_op(Opcode::Add, 11, 12, 0);
                     self.emit_op(Opcode::Addi, 15, 15, 7);
                     self.emit_op(Opcode::Addi, 14, 0, 3);
                     self.emit_op(Opcode::Shr, 15, 15, 14);
                     self.emit_op(Opcode::Shl, 15, 15, 14);
                     self.emit_op(Opcode::Add, 12, 12, 15);
-                    // Unflatten from r11 into rd
                     self.emit_unflatten(&ty, 11, rd);
-                    self.emit_op(Opcode::Pop, 11, 0, 0); // restore r11
+                    self.emit_op(Opcode::Pop, 11, 0, 0);
                 } else if is_wide_type(&ty) {
                     let wd = self.regs.alloc_wide(*dst);
-                    self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0); // mode 0: wide value
+                    self.emit_op(Opcode::Addi, 15, 0, slot);
+                    self.emit_op(Opcode::Widen, WIDE_SLOT, 15, 0);
+                    self.emit_op(Opcode::Sload, wd, WIDE_SLOT, 0);
                 } else {
                     let rd = self.alloc_gp(*dst);
-                    self.emit_op(Opcode::Sload, rd, WIDE_SCRATCH, 2); // mode 2: GP value
+                    self.emit_op(Opcode::Addi, 15, 0, slot);
+                    self.emit_op(Opcode::Widen, WIDE_SLOT, 15, 0);
+                    self.emit_op(Opcode::Sload, rd, WIDE_SLOT, 2);
                 }
             }
 
@@ -1216,15 +1218,17 @@ impl CodeGen {
                     .cloned()
                     .unwrap_or(Ty::U64);
 
+                const WIDE_SLOT: u8 = 5;
+
                 // Get value register FIRST (may trigger spill/reload that clobbers r15)
                 let rv = self.get_reg(*val);
                 // Save value if it's in r15 (which we need for slot)
                 let val_saved = rv == 15;
                 if val_saved { self.emit_op(Opcode::Push, 15, 0, 0); }
 
-                // NOW set slot in wide scratch (r15 is safe to clobber)
+                // NOW set slot in wide register (r15 is safe to clobber)
                 self.emit_op(Opcode::Addi, 15, 0, slot);
-                self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
+                self.emit_op(Opcode::Widen, WIDE_SLOT, 15, 0);
 
                 // Restore value if it was in r15
                 let rv = if val_saved {
@@ -1233,18 +1237,17 @@ impl CodeGen {
                 } else { rv };
 
                 if is_blob_type(&ty) {
-                    // Save buffer_start on stack (emit_flatten clobbers r14/r15)
                     self.emit_op(Opcode::Push, 12, 0, 0);
                     self.emit_flatten(&ty, rv);
-                    self.emit_op(Opcode::Pop, 14, 0, 0); // r14 = buffer_start
-                    self.emit_op(Opcode::Sub, 15, 12, 14); // r15 = byte_count
+                    self.emit_op(Opcode::Pop, 14, 0, 0);
+                    self.emit_op(Opcode::Sub, 15, 12, 14);
                     let imm = 1 | ((14 & 0xF) << 2) | ((15 & 0xF) << 6);
-                    self.emit_op(Opcode::Sstore, 0, WIDE_SCRATCH, imm);
-                    self.emit_op(Opcode::Add, 12, 14, 0); // reclaim buffer
+                    self.emit_op(Opcode::Sstore, 0, WIDE_SLOT, imm);
+                    self.emit_op(Opcode::Add, 12, 14, 0);
                 } else if is_wide_type(&ty) {
-                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0); // mode 0: wide value
+                    self.emit_op(Opcode::Sstore, rv, WIDE_SLOT, 0);
                 } else {
-                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 2); // mode 2: GP value
+                    self.emit_op(Opcode::Sstore, rv, WIDE_SLOT, 2);
                 }
             }
 
@@ -1267,28 +1270,27 @@ impl CodeGen {
                 self.regs.invalidate_physical(15);
 
                 if is_blob_type(&val_ty) {
-                    // Borsh-deserialize: Sload blob, then deserialize into typed value
+                    // Allocate dest BEFORE Sload to prevent spill clobbering WIDE_SCRATCH
                     let rd = self.alloc_gp(*dst);
                     let imm = 1 | ((12 & 0xF) << 2);
-                    self.emit_op(Opcode::Sload, 15, WIDE_SCRATCH, imm); // r15 = byte_len, data at r12
-                                                                        // Save r11, use as read cursor
+                    self.emit_op(Opcode::Sload, 15, 5, imm); // r15 = byte_len, data at r12 (w5=slot)
                     self.emit_op(Opcode::Push, 11, 0, 0);
-                    self.emit_op(Opcode::Add, 11, 12, 0); // r11 = read cursor
-                                                          // Advance r12 past loaded data (align to 8)
+                    self.emit_op(Opcode::Add, 11, 12, 0);
                     self.emit_op(Opcode::Addi, 15, 15, 7);
                     self.emit_op(Opcode::Addi, 14, 0, 3);
                     self.emit_op(Opcode::Shr, 15, 15, 14);
                     self.emit_op(Opcode::Shl, 15, 15, 14);
                     self.emit_op(Opcode::Add, 12, 12, 15);
-                    // Unflatten from r11 into rd
                     self.emit_unflatten(&val_ty, 11, rd);
-                    self.emit_op(Opcode::Pop, 11, 0, 0); // restore r11
+                    self.emit_op(Opcode::Pop, 11, 0, 0);
                 } else if is_wide_type(&val_ty) {
+                    // Allocate dest BEFORE Sload to prevent spill clobbering WIDE_SCRATCH
                     let wd = self.regs.alloc_wide(*dst);
-                    self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0);
+                    self.emit_op(Opcode::Sload, wd, 5, 0); // w5=slot
                 } else {
+                    // Allocate dest BEFORE Sload to prevent spill clobbering WIDE_SCRATCH
                     let rd = self.alloc_gp(*dst);
-                    self.emit_op(Opcode::Sload, rd, WIDE_SCRATCH, 2);
+                    self.emit_op(Opcode::Sload, rd, 5, 2); // w5=slot
                 }
             }
 
@@ -1323,18 +1325,17 @@ impl CodeGen {
                 };
 
                 if is_blob_type(&val_ty) {
-                    // Flatten: save buffer_start on stack
-                    self.emit_op(Opcode::Push, 12, 0, 0); // push buffer_start = current r12
+                    self.emit_op(Opcode::Push, 12, 0, 0);
                     self.emit_flatten(&val_ty, rv);
-                    self.emit_op(Opcode::Pop, 14, 0, 0); // r14 = buffer_start
-                    self.emit_op(Opcode::Sub, 15, 12, 14); // r15 = byte_count
+                    self.emit_op(Opcode::Pop, 14, 0, 0);
+                    self.emit_op(Opcode::Sub, 15, 12, 14);
                     let imm = 1 | ((14 & 0xF) << 2) | ((15 & 0xF) << 6);
-                    self.emit_op(Opcode::Sstore, 0, WIDE_SCRATCH, imm);
-                    self.emit_op(Opcode::Add, 12, 14, 0); // reclaim buffer
+                    self.emit_op(Opcode::Sstore, 0, 5, imm); // w5=slot
+                    self.emit_op(Opcode::Add, 12, 14, 0);
                 } else if is_wide_type(&val_ty) {
-                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0);
+                    self.emit_op(Opcode::Sstore, rv, 5, 0); // w5=slot
                 } else {
-                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 2);
+                    self.emit_op(Opcode::Sstore, rv, 5, 2); // w5=slot
                 }
             }
 
@@ -1372,10 +1373,10 @@ impl CodeGen {
 
                 if wide_value {
                     let wd = self.regs.alloc_wide(*dst);
-                    self.emit_op(Opcode::Sload, wd, WIDE_SCRATCH, 0);
+                    self.emit_op(Opcode::Sload, wd, 5, 0); // w5=slot
                 } else {
                     let rd = self.alloc_gp(*dst);
-                    self.emit_op(Opcode::Sload, rd, WIDE_SCRATCH, 2);
+                    self.emit_op(Opcode::Sload, rd, 5, 2); // w5=slot
                 }
             }
 
@@ -1412,9 +1413,9 @@ impl CodeGen {
                 // Get val AFTER derivation — derivation clobbers r14/r15
                 let rv = self.get_reg(*val);
                 if wide_value {
-                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 0);
+                    self.emit_op(Opcode::Sstore, rv, 5, 0); // w5=slot
                 } else {
-                    self.emit_op(Opcode::Sstore, rv, WIDE_SCRATCH, 2);
+                    self.emit_op(Opcode::Sstore, rv, 5, 2); // w5=slot
                 }
             }
 
@@ -2656,9 +2657,10 @@ impl CodeGen {
         self.emit_op(Opcode::Addi, 15, 0, slot);
         self.emit_store(15, 12, 0);
         // Hash: poseidon(heap[r12..r12+8+key_size])
+        // Use w5 (WIDE_SLOT) instead of WIDE_SCRATCH to avoid clobbering by guards
         let total = 8 + key_size;
         self.emit_op(Opcode::Addi, 14, 0, total);
-        self.emit_op(Opcode::Poseidon, WIDE_SCRATCH, 12, 14);
+        self.emit_op(Opcode::Poseidon, 5, 12, 14); // w5 = hash result
     }
 
     /// DEPRECATED: old Borsh-style serializer. Replaced by emit_flatten.
