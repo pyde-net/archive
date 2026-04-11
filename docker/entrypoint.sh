@@ -17,7 +17,7 @@ if [ "$NODE_INDEX" = "0" ] && [ ! -f "$CONFIG" ]; then
         --out /testnet \
         --base-port "$BASE_PORT" \
         --base-rpc-port "$BASE_RPC" \
-        ${DEV_MODE:+--dev}
+        $([ "$DEV_MODE" = "true" ] && echo "--dev")
 
     # Fix configs for Docker networking:
     # 1. Replace 127.0.0.1 bootstrap IPs with Docker container IPs (172.20.0.1X)
@@ -56,6 +56,13 @@ if [ "$NODE_INDEX" != "0" ]; then
         echo "Node-$NODE_INDEX: ERROR — config not found after 30s"
         exit 1
     fi
+    # Fix RPC listen and bootstrap IPs in our own copy
+    sed -i 's|listen = "127.0.0.1"|listen = "0.0.0.0"|' "$DATADIR/config.toml"
+    for j in $(seq 0 $((${VALIDATORS:-4} - 1))); do
+        DOCKER_IP="172.20.0.1${j}"
+        PORT=$((BASE_PORT + j))
+        sed -i "s|/ip4/127.0.0.1/udp/${PORT}/|/ip4/${DOCKER_IP}/udp/${PORT}/|g" "$DATADIR/config.toml"
+    done
 fi
 
 # Override datadir in config

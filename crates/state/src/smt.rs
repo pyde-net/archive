@@ -9,6 +9,8 @@ use sparse_merkle_tree::default_store::DefaultStore;
 use sparse_merkle_tree::traits::{Hasher, Value};
 use sparse_merkle_tree::{SparseMerkleTree as NervosSMT, H256};
 
+use crate::backend::RocksDBBackend;
+
 // ---------------------------------------------------------------------------
 // Poseidon2 hasher adapter for the Nervos SMT
 // ---------------------------------------------------------------------------
@@ -186,12 +188,12 @@ impl StateAccess for PydeSMT {
 /// Reads from a shared base SMT (immutable), writes to a local HashMap.
 /// After execution, the writes are collected and batch-inserted into the real SMT.
 pub struct StateOverlay<'a> {
-    base: &'a PydeSMT,
+    base: &'a dyn StateAccess,
     writes: std::collections::HashMap<Key, Vec<u8>>,
 }
 
 impl<'a> StateOverlay<'a> {
-    pub fn new(base: &'a PydeSMT) -> Self {
+    pub fn new(base: &'a dyn StateAccess) -> Self {
         Self {
             base,
             writes: std::collections::HashMap::new(),
@@ -228,6 +230,79 @@ impl<'a> StateAccess for StateOverlay<'a> {
     fn root(&self) -> H256 {
         // Overlay doesn't track root — use base root as approximation
         self.base.root()
+    }
+}
+
+/// Persistent PydeSMT backed by RocksDB.
+/// State survives node restarts.
+pub struct PersistentSMT {
+    inner: NervosSMT<Poseidon2Hasher, SmtValue, RocksDBBackend>,
+}
+
+impl PersistentSMT {
+    /// Open a persistent SMT backed by RocksDB at the given path.
+    pub fn open(db_path: &str) -> Result<Self, String> {
+        let backend = RocksDBBackend::open(db_path)
+            .map_err(|e| format!("failed to open RocksDB: {}", e))?;
+        let smt = NervosSMT::new_with_store(backend)
+            .map_err(|e| format!("failed to create SMT: {}", e))?;
+        Ok(Self { inner: smt })
+    }
+
+    pub fn root(&self) -> H256 {
+        *self.inner.root()
+    }
+
+    pub fn get(&self, key: &Key) -> Option<Vec<u8>> {
+        match self.inner.get(key) {
+            Ok(v) if v.0.is_empty() => None,
+            Ok(v) => Some(v.0),
+            Err(_) => None,
+        }
+    }
+
+    pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<H256, &'static str> {
+        self.inner
+            .update(key, SmtValue(value))
+            .map_err(|_| "SMT update failed")?;
+        Ok(self.root())
+    }
+
+    pub fn delete(&mut self, key: &Key) -> Result<bool, &'static str> {
+        let existed = self.get(key).is_some();
+        if existed {
+            self.inner
+                .update(*key, SmtValue::zero())
+                .map_err(|_| "SMT delete failed")?;
+        }
+        Ok(existed)
+    }
+
+    pub fn update_all(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<H256, &'static str> {
+        let leaves: Vec<(Key, SmtValue)> = entries
+            .into_iter()
+            .map(|(k, v)| (k, SmtValue(v)))
+            .collect();
+        self.inner
+            .update_all(leaves)
+            .map_err(|_| "SMT batch update failed")?;
+        Ok(self.root())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+impl StateAccess for PersistentSMT {
+    fn get(&self, key: &Key) -> Option<Vec<u8>> {
+        self.get(key)
+    }
+    fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<H256, &'static str> {
+        self.insert(key, value)
+    }
+    fn root(&self) -> H256 {
+        self.root()
     }
 }
 

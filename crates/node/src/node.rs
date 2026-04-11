@@ -381,7 +381,17 @@ impl PydeNode {
         let mut shutdown_rx = self.shutdown.subscribe();
 
         // Slot clock for block timing
-        let slot_clock = SlotClock::new(0); // genesis timestamp 0 = start now
+        // Slot clock: if resuming from persisted head, backdate genesis
+        // so current_slot() picks up where we left off.
+        let slot_clock = if saved_head > 0 {
+            let backdate_ms = saved_head * pyde_consensus::block::BLOCK_TIME_MS;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+                .as_millis() as u64;
+            SlotClock::new(now_ms.saturating_sub(backdate_ms))
+        } else {
+            SlotClock::new(0)
+        };
         let mut last_slot = slot_clock.current_slot();
 
         // Periodic timers
@@ -740,10 +750,9 @@ impl PydeNode {
                                         selected.iter().map(|etx| etx.to_bytes()).collect::<Vec<Vec<u8>>>()
                                     };
 
-                                    // Only produce a block if there are pending transactions
-                                    if txs.is_empty() && encrypted_blobs.is_empty() {
-                                        debug!(slot = current_slot, "skipping empty slot (no pending txs)");
-                                    } else {
+                                    // Always produce blocks to advance the chain.
+                                    // Empty blocks are needed for QC chain progression.
+                                    {
                                     let tx_count = txs.len();
 
                                     // Build block with transactions
