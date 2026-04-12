@@ -3586,6 +3586,7 @@ dependencies = [
  "hex",
  "otic",
  "pyde-account",
+ "pyde-aot",
  "pyde-crypto",
  "pyde-state",
  "pyde-vm",

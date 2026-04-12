@@ -179,6 +179,9 @@ impl PydeNode {
         let chain = Arc::new(RwLock::new(chain));
         let state = Arc::new(RwLock::new(state));
 
+        // AOT JIT compilation cache (background Cranelift compilation)
+        let aot_cache = Arc::new(crate::aot_cache::AotCache::new());
+
         // 3. Transaction relay / mempool + receipt store + pending tx queue
         let tx_relay = Arc::new(RwLock::new(TxRelay::new()));
         let receipts = Arc::new(RwLock::new(ReceiptStore::new()));
@@ -541,7 +544,7 @@ impl PydeNode {
                             {
                                 let mut chain_w = chain.write().await;
                                 let mut state_w = state.write().await;
-                                match BlockProcessor::process_full_block(&mut chain_w, &mut state_w, &block) {
+                                match BlockProcessor::process_full_block_with_aot(&mut chain_w, &mut state_w, &block, Some(&aot_cache)) {
                                     Ok((tc, gas, ref receipts_list)) => {
                                         // Store full block for future sync
                                         let full_bytes = wire::encode_block(&block);
@@ -794,7 +797,7 @@ impl PydeNode {
                                     {
                                         let mut chain_w = chain.write().await;
                                         let mut state_w = state.write().await;
-                                        match BlockProcessor::process_full_block(&mut chain_w, &mut state_w, &block) {
+                                        match BlockProcessor::process_full_block_with_aot(&mut chain_w, &mut state_w, &block, Some(&aot_cache)) {
                                             Ok((tc, gas, ref receipts_list)) => {
                                                 let _ = block_store.put_header(&block.header);
                                                 let _ = block_store.put_head(current_slot);
@@ -1236,7 +1239,7 @@ fn handle_swarm_event(
                                 return PostEventAction::None;
                             }
 
-                            match BlockProcessor::process_full_block(chain, state, &block) {
+                            match BlockProcessor::process_full_block_with_aot(chain, state, &block, None) {
                                 Ok((tx_count, gas_used, receipts_list)) => {
                                     chain_sync.on_block_processed(slot);
                                     // Persist full block (header + body) to disk

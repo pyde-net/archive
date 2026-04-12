@@ -82,7 +82,11 @@ impl BlockProcessor {
             for (i, tx) in txs.iter().enumerate() {
                 // Trigger AOT compilation in background for contract calls
                 trigger_aot(tx, state, &aot_cache);
-                match execute_transaction(tx, state.smt_mut(), &block_ctx) {
+                // Use AOT compiled code if available
+                let aot_fn = aot_cache.as_ref()
+                    .and_then(|c| c.get(&tx.to))
+                    .map(|compiled| compiled.as_fn());
+                match pyde_tx::pipeline::execute_transaction_aot(tx, state.smt_mut(), &block_ctx, aot_fn) {
                     Ok(receipt) => {
                         total_gas += receipt.effective_gas;
                         debug!(slot, tx_index = i, gas = receipt.effective_gas, success = receipt.success, "tx executed");

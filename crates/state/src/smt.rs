@@ -170,6 +170,15 @@ pub trait StateAccess {
     fn get(&self, key: &Key) -> Option<Vec<u8>>;
     fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<H256, &'static str>;
     fn root(&self) -> H256;
+    /// Batch insert: default falls back to individual inserts.
+    /// PersistentSMT overrides with a single Merkle tree update + RocksDB batch write.
+    fn update_all(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<H256, &'static str> {
+        let mut root = self.root();
+        for (k, v) in entries {
+            root = self.insert(k, v)?;
+        }
+        Ok(root)
+    }
 }
 
 impl StateAccess for PydeSMT {
@@ -181,6 +190,9 @@ impl StateAccess for PydeSMT {
     }
     fn root(&self) -> H256 {
         self.root()
+    }
+    fn update_all(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<H256, &'static str> {
+        self.update_all(entries)
     }
 }
 
@@ -303,6 +315,9 @@ impl StateAccess for PersistentSMT {
     }
     fn root(&self) -> H256 {
         self.root()
+    }
+    fn update_all(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<H256, &'static str> {
+        self.update_all(entries)
     }
 }
 
