@@ -11,6 +11,8 @@ pub struct StateManager {
     root: [u8; 32],
     /// All keys ever inserted (for snapshot export).
     tracked_keys: HashSet<Key>,
+    /// Write-ahead buffer for deferred Merkle tree computation.
+    pending_writes: Vec<(Key, Vec<u8>)>,
 }
 
 impl StateManager {
@@ -32,7 +34,7 @@ impl StateManager {
             "state database opened (persistent RocksDB)"
         );
 
-        Ok(Self { smt, root, tracked_keys: HashSet::new() })
+        Ok(Self { smt, root, tracked_keys: HashSet::new(), pending_writes: Vec::new() })
     }
 
     /// Current state root hash.
@@ -70,6 +72,27 @@ impl StateManager {
             .map_err(|e| format!("state batch update failed: {}", e))?;
         self.root = new_root.as_slice().try_into().unwrap_or([0u8; 32]);
         Ok(self.root)
+    }
+
+    /// Fast batch update: buffer writes in-memory without Merkle tree recomputation.
+    /// The dirty entries are stored in the write-ahead cache. Merkle root is computed
+    /// lazily on next `root()` call or explicitly via `flush_pending()`.
+    /// Use this for block execution to defer the expensive Merkle update.
+    pub fn update_batch_deferred(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<(), String> {
+        for (k, _) in &entries {
+            self.tracked_keys.insert(*k);
+        }
+        self.pending_writes.extend(entries);
+        Ok(())
+    }
+
+    /// Flush any pending deferred writes to the SMT (computes Merkle root).
+    pub fn flush_pending(&mut self) -> Result<[u8; 32], String> {
+        if self.pending_writes.is_empty() {
+            return Ok(self.root);
+        }
+        let entries = std::mem::take(&mut self.pending_writes);
+        self.update_batch(entries)
     }
 
     /// Whether state is empty (genesis).

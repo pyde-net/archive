@@ -166,7 +166,7 @@ impl PydeSMT {
 
 /// Trait for state access — implemented by both PydeSMT and StateOverlay.
 /// Allows the tx pipeline to work with either direct SMT or per-group overlays.
-pub trait StateAccess {
+pub trait StateAccess: Sync {
     fn get(&self, key: &Key) -> Option<Vec<u8>>;
     fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<H256, &'static str>;
     fn root(&self) -> H256;

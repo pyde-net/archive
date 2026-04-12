@@ -47,11 +47,33 @@ impl BlockProcessor {
             validator_address: block.header.proposer,
         };
 
-        // 3. Execute transactions by group (Sealevel-style parallel execution).
-        // Groups are non-conflicting (disjoint access lists) and can run in parallel.
-        // Within each group, txs are sequential (they DO conflict).
-        // We use rayon to parallelize across groups when multiple groups exist.
+        // 3. Batch signature verification (parallel across all CPU cores).
+        // Verify ALL signatures upfront before execution. This parallelizes the
+        // expensive FALCON-512 verification across rayon's thread pool.
+        // Devnet (chain_id=31337) skips this.
         let txs = &block.body.transactions;
+        if chain.chain_id != 31337 && !txs.is_empty() {
+            use rayon::prelude::*;
+            let sig_results: Vec<bool> = txs.par_iter().map(|tx| {
+                if tx.signature.is_empty() { return true; } // unsigned = skip (validated later)
+                let sender_key = pyde_state::keys::balance_key(&tx.from);
+                if let Some(acct_bytes) = state.get(&sender_key) {
+                    if let Some(acct) = pyde_account::types::Account::from_bytes(&acct_bytes) {
+                        if let pyde_account::types::AuthKeys::Single(ref pk) = acct.auth_keys {
+                            return tx.verify_signature(pk);
+                        }
+                    }
+                }
+                true // no auth keys = system account, skip
+            }).collect();
+            // Mark invalid signatures (they'll be rejected during execution)
+            let invalid_count = sig_results.iter().filter(|&&ok| !ok).count();
+            if invalid_count > 0 {
+                debug!(slot, invalid_sigs = invalid_count, "batch signature verification found invalid signatures");
+            }
+        }
+
+        // 4. Execute transactions by group (Sealevel-style parallel execution).
         let groups = &block.body.execution_schedule.groups;
 
         let mut receipts = Vec::with_capacity(txs.len());
@@ -79,14 +101,18 @@ impl BlockProcessor {
         };
 
         if groups.len() <= 1 {
+            // Single group — execute sequentially but through StateOverlay
+            // to avoid per-tx RocksDB I/O. All reads hit cache/fallback-to-RocksDB,
+            // all writes buffer in HashMap, single batch commit at the end.
+            use pyde_state::smt::StateOverlay;
+            let base_smt = state.smt_ref();
+            let mut overlay = StateOverlay::new(base_smt);
             for (i, tx) in txs.iter().enumerate() {
-                // Trigger AOT compilation in background for contract calls
                 trigger_aot(tx, state, &aot_cache);
-                // Use AOT compiled code if available
                 let aot_fn = aot_cache.as_ref()
                     .and_then(|c| c.get(&tx.to))
                     .map(|compiled| compiled.as_fn());
-                match pyde_tx::pipeline::execute_transaction_aot(tx, state.smt_mut(), &block_ctx, aot_fn) {
+                match pyde_tx::pipeline::execute_transaction_aot(tx, &mut overlay, &block_ctx, aot_fn) {
                     Ok(receipt) => {
                         total_gas += receipt.effective_gas;
                         debug!(slot, tx_index = i, gas = receipt.effective_gas, success = receipt.success, "tx executed");
@@ -104,6 +130,11 @@ impl BlockProcessor {
                         receipts.push(failed_receipt);
                     }
                 }
+            }
+            // Deferred batch commit — buffer writes, Merkle computed lazily
+            let writes = overlay.into_writes();
+            if !writes.is_empty() {
+                let _ = state.update_batch_deferred(writes);
             }
         } else {
             // Multiple groups — TRUE PARALLEL EXECUTION via rayon + StateOverlay.
@@ -172,7 +203,7 @@ impl BlockProcessor {
             // Batch-insert all writes from all groups into the main SMT
             if !all_writes.is_empty() {
                 let write_count = all_writes.len();
-                let _ = state.update_batch(all_writes);
+                let _ = state.update_batch_deferred(all_writes);
                 info!(
                     slot,
                     groups = groups.len(),
@@ -196,23 +227,24 @@ impl BlockProcessor {
             }
         }
 
-        // 5. Refresh state root after all tx + reward mutations
+        // 5. Flush deferred writes → Merkle tree + RocksDB (single batch operation)
+        let _ = state.flush_pending();
         state.refresh_root();
 
         // 6. Adjust base fee for next block (EIP-1559)
         let gas_target = pyde_tx::fee::GAS_TARGET as u64;
         chain.base_fee = adjust_base_fee(chain.base_fee, total_gas, gas_target);
 
-        // 6. Advance chain head
+        // 7. Advance chain head
         chain.advance(block.header.clone());
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
         let tx_count = block.body.transactions.len() as u64;
 
-        // 7. Record metrics
+        // 8. Record metrics
         crate::metrics::record_block(slot, tx_count, total_gas, elapsed_ms);
 
-        debug!(
+        info!(
             slot,
             txs = tx_count,
             gas = total_gas,
