@@ -106,10 +106,18 @@ pub extern "C" fn host_sload(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
     let slot = vm.cpu.read_wide(ws_slot as u8);
     let key = vm.derive_storage_key(slot);
+    // Check overlay first, then fall back to storage backend (SMT)
+    let data = vm.storage.get(&key).cloned().or_else(|| {
+        if let Some(ref backend) = vm.storage_backend {
+            let val = backend(&key);
+            if let Some(ref v) = val { vm.storage.insert(key, v.clone()); }
+            val
+        } else { None }
+    });
     let mut buf = [0u8; 32];
-    if let Some(data) = vm.storage.get(&key) {
-        let len = data.len().min(32);
-        buf[..len].copy_from_slice(&data[..len]);
+    if let Some(ref d) = data {
+        let len = d.len().min(32);
+        buf[..len].copy_from_slice(&d[..len]);
     }
     vm.cpu.write_wide(wd as u8, U256::from_le_bytes(buf));
     0
@@ -121,10 +129,18 @@ pub extern "C" fn host_sloadg(ctx: *mut VmCtx, ws_slot: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
     let slot = vm.cpu.read_wide(ws_slot as u8);
     let key = vm.derive_storage_key(slot);
+    // Check overlay first, then fall back to storage backend (SMT)
+    let data = vm.storage.get(&key).cloned().or_else(|| {
+        if let Some(ref backend) = vm.storage_backend {
+            let val = backend(&key);
+            if let Some(ref v) = val { vm.storage.insert(key, v.clone()); }
+            val
+        } else { None }
+    });
     let mut buf = [0u8; 8];
-    if let Some(data) = vm.storage.get(&key) {
-        let len = data.len().min(8);
-        buf[..len].copy_from_slice(&data[..len]);
+    if let Some(ref d) = data {
+        let len = d.len().min(8);
+        buf[..len].copy_from_slice(&d[..len]);
     }
     u64::from_le_bytes(buf)
 }

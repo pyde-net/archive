@@ -45,7 +45,7 @@
       "title": "TPS (Transactions Per Second)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
-      "targets": [{ "expr": "rate(pyde_transactions_processed_total[1m]) * 60", "legendFormat": "{{instance}} TPS" }],
+      "targets": [{ "expr": "rate(pyde_transactions_processed_total[15s])", "legendFormat": "{{instance}} TPS" }],
       "fieldConfig": { "defaults": { "unit": "ops" } }
     },
     {

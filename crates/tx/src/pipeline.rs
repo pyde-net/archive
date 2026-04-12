@@ -133,10 +133,30 @@ fn empty_account(address: &Address) -> Account {
 
 /// Execute a single transaction against the state.
 /// Returns the receipt and updates the SMT in place.
+/// `aot_lookup` optionally provides a native compiled function for the target contract.
 pub fn execute_transaction(
     tx: &Transaction,
     smt: &mut dyn pyde_state::smt::StateAccess,
     block_ctx: &BlockContext,
+) -> Result<Receipt, PipelineError> {
+    execute_transaction_inner(tx, smt, block_ctx, None)
+}
+
+/// Execute with optional AOT-compiled native code for the target contract.
+pub fn execute_transaction_aot(
+    tx: &Transaction,
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    block_ctx: &BlockContext,
+    aot_fn: Option<unsafe fn(*mut u64, u64, *mut pyde_vm::vm::Vm) -> u64>,
+) -> Result<Receipt, PipelineError> {
+    execute_transaction_inner(tx, smt, block_ctx, aot_fn)
+}
+
+fn execute_transaction_inner(
+    tx: &Transaction,
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    block_ctx: &BlockContext,
+    aot_fn: Option<unsafe fn(*mut u64, u64, *mut pyde_vm::vm::Vm) -> u64>,
 ) -> Result<Receipt, PipelineError> {
     // 1. Load accounts
     let mut sender = load_account(smt, &tx.from);
@@ -188,7 +208,7 @@ pub fn execute_transaction(
                         code_len = code.len(),
                         "executing contract call in PVM"
                     );
-                    execute_in_pvm(tx, &sender, &code, smt, block_ctx)
+                    execute_in_pvm(tx, &sender, &code, smt, block_ctx, aot_fn)
                 }
                 None => {
                     tracing::debug!(
@@ -259,7 +279,7 @@ pub fn execute_transaction(
                         "executing constructor"
                     );
                     let (success, gas, _, logs, _) =
-                        execute_in_pvm(&constructor_tx, &sender, constructor, smt, block_ctx);
+                        execute_in_pvm(&constructor_tx, &sender, constructor, smt, block_ctx, None);
                     if !success {
                         tracing::warn!(gas, "constructor execution failed (reverted or trapped)");
                     } else {
@@ -508,12 +528,14 @@ pub fn execute_transaction(
 
 /// Execute contract code in the PVM.
 /// Loads contract storage from SMT before execution and persists changes after.
+/// If `aot_fn` is provided, runs native compiled code instead of the interpreter.
 fn execute_in_pvm(
     tx: &Transaction,
     sender: &Account,
     code: &[u8],
     smt: &mut dyn pyde_state::smt::StateAccess,
     block_ctx: &BlockContext,
+    aot_fn: Option<unsafe fn(*mut u64, u64, *mut pyde_vm::vm::Vm) -> u64>,
 ) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
     let ctx = ExecutionContext {
         caller: tx.from,
@@ -572,19 +594,34 @@ fn execute_in_pvm(
         },
     ));
 
-    if vm.load(code).is_err() {
-        return (false, tx.gas_limit, 0, vec![], vec![]);
-    }
-
-    let output = vm.execute();
-    let success = output.outcome == Outcome::Success;
-
-    tracing::debug!(
-        success,
-        gas = output.gas_used,
-        storage_entries = vm.storage.len(),
-        "execute_in_pvm completed"
-    );
+    // Try AOT compiled native code first, fall back to interpreter.
+    let (success, gas_used_raw) = if let Some(func) = aot_fn {
+        // AOT path: map calldata into VM memory, then call native function
+        if vm.load(code).is_err() {
+            return (false, tx.gas_limit, 0, vec![], vec![]);
+        }
+        let mut regs = [0u64; 16];
+        // Copy initial register state (calldata len/ptr set by load→map_calldata)
+        for i in 0..16 { regs[i] = vm.cpu.read_gp(i as u8); }
+        let raw = unsafe { func(regs.as_mut_ptr(), tx.gas_limit, &mut vm as *mut _) };
+        let (status, gas) = pyde_aot::decode_result(raw);
+        // Copy registers back (return values in r1/r2)
+        for i in 0..16 { vm.cpu.write_gp(i as u8, regs[i]); }
+        vm.gas_used_total = gas;
+        let ok = status == pyde_aot::RESULT_SUCCESS;
+        tracing::debug!(ok, gas, aot = true, "execute_in_pvm completed (AOT)");
+        (ok, gas)
+    } else {
+        // Interpreter path
+        if vm.load(code).is_err() {
+            return (false, tx.gas_limit, 0, vec![], vec![]);
+        }
+        let output = vm.execute();
+        let ok = output.outcome == Outcome::Success;
+        tracing::debug!(ok, gas = output.gas_used, storage_entries = vm.storage.len(), "execute_in_pvm completed");
+        (ok, output.gas_used)
+    };
+    let success = success;
 
     // Persist VM storage changes back to SMT.
     // Use the derived key directly (same as what the VM uses internally).
@@ -592,12 +629,12 @@ fn execute_in_pvm(
     vm.storage_backend = None;
     vm.code_backend = None;
 
-    // Persist VM storage changes to SMT
+    // Batch-persist VM storage changes to SMT (single Merkle tree update + RocksDB write)
     if success && !vm.storage.is_empty() {
-        for (vm_key, value_bytes) in &vm.storage {
-            let smt_key = H256::from(vm_key.to_le_bytes());
-            let _ = smt.insert(smt_key, value_bytes.clone());
-        }
+        let entries: Vec<(H256, Vec<u8>)> = vm.storage.iter()
+            .map(|(vm_key, value_bytes)| (H256::from(vm_key.to_le_bytes()), value_bytes.clone()))
+            .collect();
+        let _ = smt.update_all(entries);
     }
 
     // Persist any contracts created via CREATE opcode (factory pattern)
@@ -613,8 +650,7 @@ fn execute_in_pvm(
         }
     }
 
-    let logs = output
-        .logs
+    let logs = vm.logs
         .iter()
         .map(|log| LogEntry {
             address: log.address,
@@ -647,8 +683,8 @@ fn execute_in_pvm(
     };
     (
         success,
-        output.gas_used as u64,
-        output.gas_refund,
+        vm.gas_used_total,
+        vm.gas_refund,
         logs,
         return_data,
     )

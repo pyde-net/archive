@@ -352,14 +352,17 @@ pub fn generate_testnet(
         });
     }
 
-    // Also generate 5 non-validator funded accounts for testing
-    for _ in 0..5 {
+    // Generate 500 non-validator funded accounts for testing + load generation
+    for _ in 0..500 {
         let (pk, sk) = falcon_keygen().map_err(|e| format!("keygen failed: {}", e))?;
         let address = derive_eoa_address(pk.as_bytes());
         allocations.push(GenesisAllocation {
             address: hex::encode(address),
             balance: funding.to_string(),
             public_key: Some(hex::encode(pk.as_bytes())),
+        });
+        accounts.push(DevnetAccount {
+            address, public_key: pk, secret_key: sk, balance: funding,
         });
     }
 

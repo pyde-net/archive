@@ -821,10 +821,26 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         break;
                     }
 
-                    // Remaining opcodes not yet AOT-compiled (Call, Ret, CallExt,
+                    // Internal Call: jump to target (in AOT, Call is just a jump —
+                    // return address tracking isn't needed since blocks link directly).
+                    Opcode::Call => {
+                        let pc = bb.start_pc + (i as u32) * 4;
+                        let offset = sign_extend_18(d.rs2_or_imm);
+                        let target = pc.wrapping_add(offset as u32);
+                        let bl = pc_to_block.get(&target).copied().unwrap_or(trap_block);
+                        builder.ins().jump(bl, &[]);
+                        terminated = true;
+                        break;
+                    }
+                    // Internal Ret: jump to success block (same as Halt).
+                    Opcode::Ret => {
+                        builder.ins().jump(success_block, &[]);
+                        terminated = true;
+                        break;
+                    }
+
+                    // Remaining opcodes not yet AOT-compiled (CallExt,
                     // Delegate, Create, Log, VerifySig, MerkleVerify) trap.
-                    // These require complex VM state interaction that's better
-                    // handled by falling back to the interpreter for now.
                     _ => {
                         builder.ins().jump(trap_block, &[]);
                         terminated = true;
