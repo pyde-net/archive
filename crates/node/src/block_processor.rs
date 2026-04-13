@@ -105,8 +105,7 @@ impl BlockProcessor {
             // to avoid per-tx RocksDB I/O. All reads hit cache/fallback-to-RocksDB,
             // all writes buffer in HashMap, single batch commit at the end.
             use pyde_state::smt::StateOverlay;
-            let base_smt = state.smt_ref();
-            let mut overlay = StateOverlay::new(base_smt);
+            let mut overlay = StateOverlay::new(state as &dyn pyde_state::smt::StateAccess);
             for (i, tx) in txs.iter().enumerate() {
                 trigger_aot(tx, state, &aot_cache);
                 let aot_fn = aot_cache.as_ref()
@@ -145,14 +144,14 @@ impl BlockProcessor {
             use rayon::prelude::*;
             use pyde_state::smt::StateOverlay;
 
-            // Get immutable reference to SMT for overlays
-            let base_smt = state.smt_ref();
+            // Use StateManager as overlay base (reads from cache → SMT)
+            let base: &dyn pyde_state::smt::StateAccess = state;
 
             // Execute each group in parallel
             let group_results: Vec<Vec<(usize, Receipt, Vec<(sparse_merkle_tree::H256, Vec<u8>)>)>> = groups
                 .par_iter()
                 .map(|group| {
-                    let mut overlay = StateOverlay::new(base_smt);
+                    let mut overlay = StateOverlay::new(base);
                     let mut results = Vec::new();
 
                     for &tx_idx in &group.tx_indices {
@@ -232,17 +231,10 @@ impl BlockProcessor {
             }
         }
 
-        // 5. Flush deferred writes → Merkle tree + RocksDB.
-        // The block execution (steps 1-4) ran entirely in-memory via StateOverlay.
-        // The write_cache already has all new values, so subsequent blocks can
-        // read immediately without waiting for this flush.
-        //
-        // PIPELINE: In the node's async event loop, this flush is spawned as a
-        // background task (tokio::spawn_blocking). The next block starts executing
-        // from the write_cache while the Merkle commit runs concurrently.
-        // The state root is available after the flush completes (for consensus voting).
-        let _ = state.flush_pending();
-        state.refresh_root();
+        // 5. Merkle commit is handled by the CALLER (node event loop).
+        // Block execution wrote to write_cache via update_batch_deferred.
+        // The caller extracts pending writes and spawns the Merkle commit
+        // on a background task, allowing the next block to start immediately.
 
         // 6. Adjust base fee for next block (EIP-1559)
         let gas_target = pyde_tx::fee::GAS_TARGET as u64;
