@@ -60,29 +60,27 @@ async fn handle_connection(
 ) {
     let mut accepted = 0u64;
     let mut errors = 0u64;
+    let mut batch: Vec<pyde_tx::types::Transaction> = Vec::with_capacity(256);
 
     loop {
         // Read 4-byte length prefix (LE)
         let mut len_buf = [0u8; 4];
         if stream.read_exact(&mut len_buf).await.is_err() {
-            break; // connection closed
+            break; // connection closed or EOF
         }
         let len = u32::from_le_bytes(len_buf) as usize;
 
-        // Sanity check: max 128KB per tx
         if len == 0 || len > 131_072 {
             debug!(peer = %peer, len, "invalid tx length");
             errors += 1;
             break;
         }
 
-        // Read tx payload
         let mut buf = vec![0u8; len];
         if stream.read_exact(&mut buf).await.is_err() {
             break;
         }
 
-        // Decode transaction (try wire format first, then from_bytes)
         let tx = crate::wire::decode_transaction(&buf)
             .or_else(|_| {
                 pyde_tx::types::Transaction::from_bytes(&buf)
@@ -91,16 +89,29 @@ async fn handle_connection(
 
         match tx {
             Ok(tx) => {
-                let mut pending = pending_txs.write().await;
-                pending.push(tx.clone());
-                drop(pending);
-                let _ = tx_gossip_tx.send(tx).await;
+                batch.push(tx);
                 accepted += 1;
             }
             Err(_) => {
                 errors += 1;
             }
         }
+
+        // Flush batch every 128 txs or when no more data is immediately available
+        if batch.len() >= 128 {
+            let mut pending = pending_txs.write().await;
+            pending.extend(batch.drain(..));
+            drop(pending);
+        }
+    }
+
+    // Flush remaining
+    if !batch.is_empty() {
+        let mut pending = pending_txs.write().await;
+        for tx in &batch {
+            let _ = tx_gossip_tx.send(tx.clone()).await;
+        }
+        pending.extend(batch);
     }
 
     if accepted > 0 || errors > 0 {
