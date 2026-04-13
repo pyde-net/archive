@@ -559,7 +559,26 @@ impl PydeNode {
                                 let mut state_w = state.write().await;
                                 match BlockProcessor::process_full_block_with_aot(&mut chain_w, &mut state_w, &block, Some(&aot_cache)) {
                                     Ok((tc, gas, ref receipts_list)) => {
-                                        // Store full block for future sync
+                                        // PIPELINED: extract writes + SMT handle, release lock
+                                        let pending = state_w.take_pending_writes();
+                                        let smt_handle = state_w.smt_handle();
+                                        drop(state_w);
+                                        drop(chain_w);
+
+                                        // Spawn background Merkle commit — doesn't hold state lock
+                                        if !pending.is_empty() {
+                                            let state_for_root = state.clone();
+                                            tokio::spawn(async move {
+                                                // SMT mutex is separate from the state RwLock
+                                                if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(&smt_handle, pending) {
+                                                    // Update cached root (brief write lock)
+                                                    if let Ok(mut sw) = state_for_root.try_write() {
+                                                        sw.set_root(root);
+                                                    }
+                                                }
+                                            });
+                                        }
+
                                         let full_bytes = wire::encode_block(&block);
                                         let _ = block_store.put_block(&block.header, &full_bytes);
                                         let _ = block_store.put_head(slot);
@@ -568,7 +587,6 @@ impl PydeNode {
                                             let mut receipts_w = receipts.write().await;
                                             receipts_w.insert_block_receipts(slot, receipts_list.clone());
                                         }
-                                        // Remove processed txs from mempool index + pending
                                         let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
                                             .map(|tx| tx.hash()).collect();
                                         {
@@ -632,7 +650,7 @@ impl PydeNode {
                                             };
                                             let mut slot_receipts = Vec::new();
                                             for dtx in &decrypted_txs {
-                                                match pyde_tx::pipeline::execute_transaction(dtx, state_w.smt_mut(), &block_ctx) {
+                                                match pyde_tx::pipeline::execute_transaction(dtx, &mut *state_w.smt_mut(), &block_ctx) {
                                                     Ok(receipt) => {
                                                         slot_receipts.push(receipt);
                                                     }
@@ -812,6 +830,21 @@ impl PydeNode {
                                         let mut state_w = state.write().await;
                                         match BlockProcessor::process_full_block_with_aot(&mut chain_w, &mut state_w, &block, Some(&aot_cache)) {
                                             Ok((tc, gas, ref receipts_list)) => {
+                                                // PIPELINED: background Merkle commit
+                                                let pending = state_w.take_pending_writes();
+                                                let smt_handle = state_w.smt_handle();
+                                                drop(state_w);
+                                                drop(chain_w);
+                                                if !pending.is_empty() {
+                                                    let state_for_root = state.clone();
+                                                    tokio::spawn(async move {
+                                                        if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(&smt_handle, pending) {
+                                                            if let Ok(mut sw) = state_for_root.try_write() {
+                                                                sw.set_root(root);
+                                                            }
+                                                        }
+                                                    });
+                                                }
                                                 let _ = block_store.put_header(&block.header);
                                                 let _ = block_store.put_head(current_slot);
                                                 chain_sync.on_block_processed(current_slot);
@@ -1012,7 +1045,7 @@ impl PydeNode {
                                                                                 validator_address: proposer,
                                                                             };
                                                                             for dtx in &decrypted_txs {
-                                                                                match pyde_tx::pipeline::execute_transaction(dtx, state_w.smt_mut(), &block_ctx) {
+                                                                                match pyde_tx::pipeline::execute_transaction(dtx, &mut *state_w.smt_mut(), &block_ctx) {
                                                                                     Ok(receipt) => {
                                                                                         let mut receipts_w = receipts.write().await;
                                                                                         receipts_w.insert_block_receipts(current_slot, vec![receipt]);
@@ -1254,6 +1287,9 @@ fn handle_swarm_event(
 
                             match BlockProcessor::process_full_block_with_aot(chain, state, &block, None) {
                                 Ok((tx_count, gas_used, receipts_list)) => {
+                                    // Sync flush for gossip-received blocks (no Arc access here)
+                                    let _ = state.flush_pending();
+                                    state.refresh_root();
                                     chain_sync.on_block_processed(slot);
                                     // Persist full block (header + body) to disk
                                     let _ = block_store.put_block(&block.header, &message.data);
