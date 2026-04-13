@@ -332,16 +332,23 @@ fn load_test_full_pipeline() {
                     use tokio::io::AsyncWriteExt;
                     match tokio::net::TcpStream::connect(&addr).await {
                         Ok(mut stream) => {
-                            for tx_bytes in chunk {
-                                let len = (tx_bytes.len() as u32).to_le_bytes();
-                                if stream.write_all(&len).await.is_ok()
-                                    && stream.write_all(&tx_bytes).await.is_ok()
-                                {
-                                    sub.fetch_add(1, Ordering::Relaxed);
-                                } else {
-                                    err.fetch_add(1, Ordering::Relaxed);
+                            let _ = stream.set_nodelay(true);
+                            // Send in micro-batches of 64 txs with small delays
+                            // to match chain ingestion rate (~2K tx/s per node)
+                            for micro in chunk.chunks(64) {
+                                let total_size: usize = micro.iter().map(|t| 4 + t.len()).sum();
+                                let mut buf = Vec::with_capacity(total_size);
+                                for tx_bytes in micro {
+                                    buf.extend_from_slice(&(tx_bytes.len() as u32).to_le_bytes());
+                                    buf.extend_from_slice(tx_bytes);
+                                }
+                                if stream.write_all(&buf).await.is_err() {
+                                    err.fetch_add(micro.len() as u64, Ordering::Relaxed);
                                     break;
                                 }
+                                sub.fetch_add(micro.len() as u64, Ordering::Relaxed);
+                                // Pace submission: ~2K tx/s per connection = 64 txs every 32ms
+                                tokio::time::sleep(std::time::Duration::from_millis(32)).await;
                             }
                         }
                         Err(_) => {
