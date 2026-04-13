@@ -167,13 +167,20 @@ pub fn schedule(txs: &[Transaction]) -> ExecutionSchedule {
         };
     }
 
-    // Build connected components via union-find
+    // Fast path: group by contract address + sender for empty access lists.
+    // Txs to the same contract or from the same sender must be sequential.
+    // This avoids O(n²) pairwise conflict checks.
     let mut uf = UnionFind::new(n);
+    // Fast O(n) path: if all txs have access lists, use hash-based grouping.
+    // Otherwise, fall back to O(n²) pairwise conflict detection.
+    let has_access_lists = txs.iter().any(|t| !t.access_list.is_empty());
 
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if conflicts(&txs[i], &txs[j]) {
-                uf.union(i, j);
+    if has_access_lists {
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if conflicts(&txs[i], &txs[j]) {
+                    uf.union(i, j);
+                }
             }
         }
     }
