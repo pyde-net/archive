@@ -480,46 +480,122 @@ impl Vm {
                 return Ok(Some(ExecResult::Revert));
             }
 
-            // --- ALU ops: delegate to cpu ---
-            Opcode::Add
-            | Opcode::Sub
-            | Opcode::Mul
-            | Opcode::Div
-            | Opcode::Mod
-            | Opcode::Addi
-            | Opcode::And
-            | Opcode::Or
-            | Opcode::Xor
-            | Opcode::Not
-            | Opcode::Shl
-            | Opcode::Shr
-            | Opcode::Sar
-            | Opcode::Lt
-            | Opcode::Gt
-            | Opcode::Eq
-            | Opcode::Slt
-            | Opcode::Sgt => {
-                let instr = crate::isa::encode(d.opcode, d.rd, d.rs1, d.rs2_or_imm);
-                self.cpu.exec_alu(instr)?;
+            // --- ALU ops: inlined for speed (avoids encode→decode roundtrip) ---
+            Opcode::Add => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, a.checked_add(b).ok_or(Trap::Overflow)?);
+                self.pc += 4;
+            }
+            Opcode::Sub => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, a.checked_sub(b).ok_or(Trap::Underflow)?);
+                self.pc += 4;
+            }
+            Opcode::Mul => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, a.checked_mul(b).ok_or(Trap::Overflow)?);
+                self.pc += 4;
+            }
+            Opcode::Div => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                if b == 0 { return Err(Trap::DivisionByZero); }
+                self.cpu.write_gp(d.rd, a / b);
+                self.pc += 4;
+            }
+            Opcode::Mod => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                if b == 0 { return Err(Trap::DivisionByZero); }
+                self.cpu.write_gp(d.rd, a % b);
+                self.pc += 4;
+            }
+            Opcode::Addi => {
+                let a = self.cpu.read_gp(d.rs1);
+                let imm = sign_extend_18(d.rs2_or_imm) as i64;
+                self.cpu.write_gp(d.rd, ((a as i64).wrapping_add(imm)) as u64);
+                self.pc += 4;
+            }
+            Opcode::And => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, a & b);
+                self.pc += 4;
+            }
+            Opcode::Or => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, a | b);
+                self.pc += 4;
+            }
+            Opcode::Xor => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, a ^ b);
+                self.pc += 4;
+            }
+            Opcode::Not => {
+                let a = self.cpu.read_gp(d.rs1);
+                self.cpu.write_gp(d.rd, !a);
+                self.pc += 4;
+            }
+            Opcode::Shl => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, if b >= 64 { 0 } else { a << b });
+                self.pc += 4;
+            }
+            Opcode::Shr => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, if b >= 64 { 0 } else { a >> b });
+                self.pc += 4;
+            }
+            Opcode::Sar => {
+                let a = self.cpu.read_gp(d.rs1) as i64;
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, if b >= 64 { if a < 0 { u64::MAX } else { 0 } } else { (a >> b) as u64 });
+                self.pc += 4;
+            }
+            Opcode::Lt => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, if a < b { 1 } else { 0 });
+                self.pc += 4;
+            }
+            Opcode::Gt => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, if a > b { 1 } else { 0 });
+                self.pc += 4;
+            }
+            Opcode::Eq => {
+                let a = self.cpu.read_gp(d.rs1);
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
+                self.cpu.write_gp(d.rd, if a == b { 1 } else { 0 });
+                self.pc += 4;
+            }
+            Opcode::Slt => {
+                let a = self.cpu.read_gp(d.rs1) as i64;
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8) as i64;
+                self.cpu.write_gp(d.rd, if a < b { 1 } else { 0 });
+                self.pc += 4;
+            }
+            Opcode::Sgt => {
+                let a = self.cpu.read_gp(d.rs1) as i64;
+                let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8) as i64;
+                self.cpu.write_gp(d.rd, if a > b { 1 } else { 0 });
                 self.pc += 4;
             }
 
-            // --- Wide ops: delegate to cpu ---
-            Opcode::Wadd
-            | Opcode::Wsub
-            | Opcode::Wmul
-            | Opcode::Wdiv
-            | Opcode::Wmod
-            | Opcode::Wand
-            | Opcode::Wor
-            | Opcode::Wxor
-            | Opcode::Wnot
-            | Opcode::Wshift
-            | Opcode::Wmov
-            | Opcode::Narrow
-            | Opcode::Widen
-            | Opcode::Weq
-            | Opcode::Wlt => {
+            // --- Wide ops: delegate to cpu (pre-decoded, no re-encode) ---
+            Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv
+            | Opcode::Wmod | Opcode::Wand | Opcode::Wor | Opcode::Wxor
+            | Opcode::Wnot | Opcode::Wshift | Opcode::Wmov | Opcode::Narrow
+            | Opcode::Widen | Opcode::Weq | Opcode::Wlt => {
                 let instr = crate::isa::encode(d.opcode, d.rd, d.rs1, d.rs2_or_imm);
                 self.cpu.exec_wide(instr)?;
                 self.pc += 4;
