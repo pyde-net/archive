@@ -78,11 +78,7 @@ pub fn store_account(
 pub fn load_nonce(smt: &dyn pyde_state::smt::StateAccess, address: &Address) -> NonceState {
     let key = keys::nonce_key(address);
     match smt.get(&key) {
-        Some(bytes) if bytes.len() >= 10 => {
-            let mut nonce_bytes = [0u8; 10];
-            nonce_bytes.copy_from_slice(&bytes[..10]);
-            NonceState::from_bytes(&nonce_bytes)
-        }
+        Some(bytes) if bytes.len() >= 10 => NonceState::from_bytes(&bytes),
         _ => NonceState::new(),
     }
 }
@@ -594,31 +590,40 @@ fn execute_in_pvm(
         },
     ));
 
-    // Try AOT compiled native code first, fall back to interpreter.
+    // Try AOT compiled native code first, fall back to interpreter on failure.
     let (success, gas_used_raw) = if let Some(func) = aot_fn {
-        // AOT path: map calldata into VM memory, then call native function
         if vm.load(code).is_err() {
             return (false, tx.gas_limit, 0, vec![], vec![]);
         }
         let mut regs = [0u64; 16];
-        // Copy initial register state (calldata len/ptr set by load→map_calldata)
         for i in 0..16 { regs[i] = vm.cpu.read_gp(i as u8); }
+        // Save VM state for interpreter fallback
+        let saved_storage = vm.storage.clone();
+        let saved_logs = vm.logs.clone();
         let raw = unsafe { func(regs.as_mut_ptr(), tx.gas_limit, &mut vm as *mut _) };
         let (status, gas) = pyde_aot::decode_result(raw);
-        // Copy registers back (return values in r1/r2)
-        for i in 0..16 { vm.cpu.write_gp(i as u8, regs[i]); }
-        vm.gas_used_total = gas;
-        let ok = status == pyde_aot::RESULT_SUCCESS;
-        tracing::debug!(ok, gas, aot = true, "execute_in_pvm completed (AOT)");
-        (ok, gas)
+        if status == pyde_aot::RESULT_SUCCESS {
+            for i in 0..16 { vm.cpu.write_gp(i as u8, regs[i]); }
+            vm.gas_used_total = gas;
+            (true, gas)
+        } else {
+            // AOT failed — restore state and retry with interpreter
+            vm.storage = saved_storage;
+            vm.logs = saved_logs;
+            vm.gas_used_total = 0;
+            vm.pc = 0;
+            // Re-load code (reset instruction cache + calldata mapping)
+            let _ = vm.load(code);
+            let output = vm.execute();
+            let ok = output.outcome == Outcome::Success;
+            (ok, output.gas_used)
+        }
     } else {
-        // Interpreter path
         if vm.load(code).is_err() {
             return (false, tx.gas_limit, 0, vec![], vec![]);
         }
         let output = vm.execute();
         let ok = output.outcome == Outcome::Success;
-        tracing::debug!(ok, gas = output.gas_used, storage_entries = vm.storage.len(), "execute_in_pvm completed");
         (ok, output.gas_used)
     };
     let success = success;

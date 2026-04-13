@@ -5,17 +5,17 @@
 //! A 16-bit bitmap tracks which slots in `[base, base+15]` are used.
 //! This allows up to 16 concurrent in-flight transactions per account.
 
-/// Window size: 16 nonce slots.
-pub const WINDOW_SIZE: u64 = 16;
+/// Window size: 64 nonce slots (for high-throughput load testing).
+pub const WINDOW_SIZE: u64 = 64;
 
-/// Nonce state: base nonce + 16-bit usage bitmap.
-/// Total: 10 bytes (u64 + u16).
+/// Nonce state: base nonce + 64-bit usage bitmap.
+/// Total: 16 bytes (u64 + u64).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NonceState {
     /// The base nonce (lowest in the window).
     pub base: u64,
-    /// Bitmap of used nonces within the window (bit 0 = base, bit 15 = base+15).
-    pub used: u16,
+    /// Bitmap of used nonces within the window (bit 0 = base, bit 63 = base+63).
+    pub used: u64,
 }
 
 /// Nonce validation error.
@@ -88,23 +88,37 @@ impl NonceState {
         WINDOW_SIZE as u32 - self.used.count_ones()
     }
 
-    /// Serialize to 10 bytes.
-    pub fn to_bytes(&self) -> [u8; 10] {
-        let mut buf = [0u8; 10];
+    /// Serialize to 16 bytes.
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut buf = [0u8; 16];
         buf[0..8].copy_from_slice(&self.base.to_le_bytes());
-        buf[8..10].copy_from_slice(&self.used.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.used.to_le_bytes());
         buf
     }
 
-    /// Deserialize from 10 bytes.
-    pub fn from_bytes(data: &[u8; 10]) -> Self {
-        let mut base_bytes = [0u8; 8];
-        base_bytes.copy_from_slice(&data[0..8]);
-        let mut used_bytes = [0u8; 2];
-        used_bytes.copy_from_slice(&data[8..10]);
-        Self {
-            base: u64::from_le_bytes(base_bytes),
-            used: u16::from_le_bytes(used_bytes),
+    /// Deserialize from bytes (supports both 10-byte legacy and 16-byte new format).
+    pub fn from_bytes(data: &[u8]) -> Self {
+        if data.len() >= 16 {
+            let mut base_bytes = [0u8; 8];
+            base_bytes.copy_from_slice(&data[0..8]);
+            let mut used_bytes = [0u8; 8];
+            used_bytes.copy_from_slice(&data[8..16]);
+            Self {
+                base: u64::from_le_bytes(base_bytes),
+                used: u64::from_le_bytes(used_bytes),
+            }
+        } else if data.len() >= 10 {
+            // Legacy 10-byte format (u16 bitmap)
+            let mut base_bytes = [0u8; 8];
+            base_bytes.copy_from_slice(&data[0..8]);
+            let mut used_bytes = [0u8; 2];
+            used_bytes.copy_from_slice(&data[8..10]);
+            Self {
+                base: u64::from_le_bytes(base_bytes),
+                used: u16::from_le_bytes(used_bytes) as u64,
+            }
+        } else {
+            Self::new()
         }
     }
 }

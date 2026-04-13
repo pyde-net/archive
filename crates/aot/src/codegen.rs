@@ -226,6 +226,14 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_wide_alu = module.declare_function("host_wide_alu", Linkage::Import, &sig_wide)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
+    // host_read_gp(ctx, reg_idx) -> u64 (reads GP register from VM)
+    let mut sig_read_gp = module.make_signature();
+    sig_read_gp.params.push(AbiParam::new(ptr_type));
+    sig_read_gp.params.push(AbiParam::new(I64));
+    sig_read_gp.returns.push(AbiParam::new(I64));
+    let fn_read_gp = module.declare_function("host_read_gp", Linkage::Import, &sig_read_gp)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+
     // host_narrow(ctx, ws1, trap_out) -> u64 (returns narrowed value)
     let mut sig_narrow = module.make_signature();
     sig_narrow.params.push(AbiParam::new(ptr_type));
@@ -270,6 +278,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_wload_ref = module.declare_func_in_func(fn_wload, &mut ctx.func);
     let fn_wstore_ref = module.declare_func_in_func(fn_wstore, &mut ctx.func);
     let fn_wide_alu_ref = module.declare_func_in_func(fn_wide_alu, &mut ctx.func);
+    let fn_read_gp_ref = module.declare_func_in_func(fn_read_gp, &mut ctx.func);
     let fn_narrow_ref = module.declare_func_in_func(fn_narrow, &mut ctx.func);
     let fn_widen_ref = module.declare_func_in_func(fn_widen, &mut ctx.func);
     let fn_checked_add_ref = module.declare_func_in_func(fn_checked_add, &mut ctx.func);
@@ -545,6 +554,15 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.ins().brif(trapped, trap_block, &[], cont, &[]);
                         builder.seal_block(cont);
                         builder.switch_to_block(cont);
+                        // Weq/Wlt write result to GP register rd inside the VM.
+                        // Read it back into the AOT variable so subsequent code sees it.
+                        if matches!(d.opcode, Opcode::Weq | Opcode::Wlt) && d.rd != 0 {
+                            let vm_ctx2 = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                            let rd_idx = builder.ins().iconst(I64, d.rd as i64);
+                            let call2 = builder.ins().call(fn_read_gp_ref, &[vm_ctx2, rd_idx]);
+                            let gp_val = builder.inst_results(call2)[0];
+                            builder.def_var(Variable::from_u32(d.rd as u32), gp_val);
+                        }
                     }
                     Opcode::Wload => {
                         let addr = builder.use_var(Variable::from_u32(d.rs1 as u32));
