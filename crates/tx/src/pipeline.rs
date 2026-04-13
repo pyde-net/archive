@@ -595,21 +595,19 @@ fn execute_in_pvm(
         if vm.load(code).is_err() {
             return (false, tx.gas_limit, 0, vec![], vec![]);
         }
-        let mut regs = [0u64; 16];
-        for i in 0..16 { regs[i] = vm.cpu.read_gp(i as u8); }
-        // Save VM state for interpreter fallback
+        // Pass pointer to vm.cpu.gp DIRECTLY — AOT reads/writes the SAME memory
+        // as host functions. Zero desync between AOT variables and VM state.
+        let regs_ptr = vm.cpu.gp.as_mut_ptr();
         let saved_storage = vm.storage.clone();
         let saved_logs = vm.logs.clone();
-        let raw = unsafe { func(regs.as_mut_ptr(), tx.gas_limit, &mut vm as *mut _) };
+        let raw = unsafe { func(regs_ptr, tx.gas_limit, &mut vm as *mut _) };
         let (status, gas) = pyde_aot::decode_result(raw);
         if status == pyde_aot::RESULT_SUCCESS {
-            for i in 0..16 { vm.cpu.write_gp(i as u8, regs[i]); }
+            // No register copy needed — AOT wrote directly to vm.cpu.gp
             vm.gas_used_total = gas;
             (true, gas)
         } else {
-            // AOT failed — restore state and retry with interpreter.
-            // Log once so the block processor can blacklist this contract.
-            tracing::debug!(contract = hex::encode(tx.to), "AOT runtime failure, falling back to interpreter");
+            // AOT failed — restore and retry with interpreter
             vm.storage = saved_storage;
             vm.logs = saved_logs;
             vm.gas_used_total = 0;
