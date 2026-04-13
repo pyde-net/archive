@@ -204,7 +204,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_assert = module.declare_function("host_assert", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     // (ctx, a, b) -> u64
-    let fn_memcpy = module.declare_function("host_memcpy", Linkage::Import, &sig_sload)
+    let fn_memcpy = module.declare_function("host_memcpy", Linkage::Import, &sig_store)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_wload(ctx, addr, wd) -> u64
@@ -301,9 +301,8 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
         let mut fn_builder_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
 
-        for i in 0..16u32 {
-            builder.declare_var(Variable::from_u32(i), I64);
-        }
+        // GP registers r0-r15 accessed via regs_ptr memory (no Cranelift variables).
+        // Only declare non-GP variables.
         builder.declare_var(Variable::from_u32(VAR_GAS_USED), I64);
         builder.declare_var(Variable::from_u32(VAR_GAS_LIMIT), I64);
         builder.declare_var(Variable::from_u32(VAR_REGS_PTR), ptr_type);
@@ -346,15 +345,12 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
 
         let zero = builder.ins().iconst(I64, 0);
         builder.def_var(Variable::from_u32(VAR_GAS_USED), zero);
-        builder.def_var(Variable::from_u32(0), zero); // r0 always zero
 
-        // Load GP registers from regs_ptr (which points directly to vm.cpu.gp).
-        // AOT uses these as fast Cranelift local variables. Before host calls,
-        // we flush them back to regs_ptr so host functions see up-to-date values.
-        for i in 1..16u32 {
-            let val = builder.ins().load(I64, MemFlags::trusted(), param_regs_ptr, (i as i32) * 8);
-            builder.def_var(Variable::from_u32(i), val);
-        }
+        // GP registers r0-r15 are accessed DIRECTLY through regs_ptr (vm.cpu.gp).
+        // No Cranelift local variables for GP — all reads/writes go through memory.
+        // This eliminates ALL desync between AOT and host functions.
+        // The 128-byte register array stays in L1 cache (1-2 cycle access).
+        // We still declare variables 0-15 but only use them as temporaries.
 
         if let Some(&first) = cl_blocks.first() {
             builder.ins().jump(first, &[]);
@@ -390,16 +386,14 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
             // Helper macro: emit checked arith via host call, trap on overflow
             macro_rules! emit_checked_op {
                 ($builder:expr, $fn_ref:expr, $d:expr, $trap_flag_ss:expr, $trap_block:expr) => {{
-                    let a = $builder.use_var(Variable::from_u32($d.rs1 as u32));
-                    let b = $builder.use_var(Variable::from_u32(($d.rs2_or_imm & 0xF) as u32));
-                    // Zero the trap flag
+                    let a = gp_read!($builder, $d.rs1);
+                    let b = gp_read!($builder, ($d.rs2_or_imm & 0xF) as u8);
                     let z = $builder.ins().iconst(I64, 0);
                     $builder.ins().stack_store(z, $trap_flag_ss, 0);
                     let trap_ptr = $builder.ins().stack_addr(ptr_type, $trap_flag_ss, 0);
                     let call = $builder.ins().call($fn_ref, &[a, b, trap_ptr]);
                     let result = $builder.inst_results(call)[0];
-                    if $d.rd != 0 { $builder.def_var(Variable::from_u32($d.rd as u32), result); }
-                    // Check trap flag
+                    gp_write!($builder, $d.rd, result);
                     let flag = $builder.ins().stack_load(I64, $trap_flag_ss, 0);
                     let trapped = $builder.ins().icmp_imm(IntCC::NotEqual, flag, 0);
                     let cont = $builder.create_block();
@@ -409,48 +403,28 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                 }};
             }
 
-            // Helper: flush all GP Cranelift variables → regs_ptr (vm.cpu.gp) before host calls.
-            // This ensures host functions reading vm.cpu.gp see the latest AOT-computed values.
-            macro_rules! flush_gp {
-                ($builder:expr) => {{
-                    let rp = $builder.use_var(Variable::from_u32(VAR_REGS_PTR));
-                    for r in 1..16u32 {
-                        let val = $builder.use_var(Variable::from_u32(r));
-                        $builder.ins().store(MemFlags::trusted(), val, rp, (r as i32) * 8);
+            // GP register access: always through regs_ptr (vm.cpu.gp memory).
+            // No Cranelift variables for GP — eliminates ALL desync with host functions.
+            macro_rules! gp_read {
+                ($builder:expr, $reg:expr) => {{
+                    if $reg == 0 {
+                        $builder.ins().iconst(I64, 0) // r0 always zero
+                    } else {
+                        let rp = $builder.use_var(Variable::from_u32(VAR_REGS_PTR));
+                        $builder.ins().load(I64, MemFlags::trusted(), rp, ($reg as i32) * 8)
                     }
                 }};
             }
-            // Helper: reload GP variables from regs_ptr after host calls that may modify vm.cpu.gp.
-            macro_rules! reload_gp {
-                ($builder:expr) => {{
-                    let rp = $builder.use_var(Variable::from_u32(VAR_REGS_PTR));
-                    for r in 1..16u32 {
-                        let val = $builder.ins().load(I64, MemFlags::trusted(), rp, (r as i32) * 8);
-                        $builder.def_var(Variable::from_u32(r), val);
+            macro_rules! gp_write {
+                ($builder:expr, $reg:expr, $val:expr) => {{
+                    if $reg != 0 {
+                        let rp = $builder.use_var(Variable::from_u32(VAR_REGS_PTR));
+                        $builder.ins().store(MemFlags::trusted(), $val, rp, ($reg as i32) * 8);
                     }
                 }};
             }
 
             for (i, d) in bb.instructions.iter().enumerate() {
-                // Flush GP registers to vm.cpu.gp before every instruction that
-                // calls a host function. This ensures the VM always has up-to-date
-                // register values when host functions access vm.cpu.gp[].
-                // Flush GP before host calls that access vm.cpu.gp[].
-                // Skip checked arith (Add/Sub/Mul/Div/Mod) — they pass values
-                // directly as parameters and return results, never touching vm.cpu.gp.
-                let needs_flush = matches!(d.opcode,
-                    Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv |
-                    Opcode::Wmod | Opcode::Wand | Opcode::Wor | Opcode::Wxor |
-                    Opcode::Wnot | Opcode::Wmov | Opcode::Weq | Opcode::Wlt |
-                    Opcode::Wload | Opcode::Wstore | Opcode::Narrow | Opcode::Widen |
-                    Opcode::Load | Opcode::Store | Opcode::Push | Opcode::Pop |
-                    Opcode::Sload | Opcode::Sstore | Opcode::Sdelete |
-                    Opcode::Poseidon | Opcode::Caller | Opcode::Callvalue
-                );
-                if needs_flush {
-                    flush_gp!(builder);
-                }
-
                 match d.opcode {
                     // --- Checked arithmetic (host calls for overflow detection) ---
                     Opcode::Add => {
@@ -469,97 +443,97 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         emit_checked_op!(builder, fn_checked_mod_ref, d, trap_flag_ss, trap_block);
                     }
                     Opcode::Addi => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let a = gp_read!(builder, d.rs1);
                         let imm = sign_extend_18(d.rs2_or_imm) as i64;
                         let b = builder.ins().iconst(I64, imm);
                         // ADDI doesn't overflow check in interpreter (immediate is small)
                         let r = builder.ins().iadd(a, b);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
 
                     // --- Bitwise & shifts (no overflow possible) ---
                     Opcode::And => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let b = builder.use_var(Variable::from_u32((d.rs2_or_imm & 0xF) as u32));
+                        let a = gp_read!(builder, d.rs1);
+                        let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let r = builder.ins().band(a, b);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
                     Opcode::Or => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let b = builder.use_var(Variable::from_u32((d.rs2_or_imm & 0xF) as u32));
+                        let a = gp_read!(builder, d.rs1);
+                        let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let r = builder.ins().bor(a, b);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
                     Opcode::Xor => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let b = builder.use_var(Variable::from_u32((d.rs2_or_imm & 0xF) as u32));
+                        let a = gp_read!(builder, d.rs1);
+                        let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let r = builder.ins().bxor(a, b);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
                     Opcode::Not => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let a = gp_read!(builder, d.rs1);
                         let r = builder.ins().bnot(a);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
                     Opcode::Shl => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let b = builder.use_var(Variable::from_u32((d.rs2_or_imm & 0xF) as u32));
+                        let a = gp_read!(builder, d.rs1);
+                        let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let r = builder.ins().ishl(a, b);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
                     Opcode::Shr => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let b = builder.use_var(Variable::from_u32((d.rs2_or_imm & 0xF) as u32));
+                        let a = gp_read!(builder, d.rs1);
+                        let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let r = builder.ins().ushr(a, b);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
                     Opcode::Sar => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let b = builder.use_var(Variable::from_u32((d.rs2_or_imm & 0xF) as u32));
+                        let a = gp_read!(builder, d.rs1);
+                        let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let r = builder.ins().sshr(a, b);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
 
                     // --- Comparisons ---
                     Opcode::Lt => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let b = builder.use_var(Variable::from_u32((d.rs2_or_imm & 0xF) as u32));
+                        let a = gp_read!(builder, d.rs1);
+                        let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let cmp = builder.ins().icmp(IntCC::UnsignedLessThan, a, b);
                         let r = builder.ins().uextend(I64, cmp);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
                     Opcode::Gt => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let b = builder.use_var(Variable::from_u32((d.rs2_or_imm & 0xF) as u32));
+                        let a = gp_read!(builder, d.rs1);
+                        let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let cmp = builder.ins().icmp(IntCC::UnsignedGreaterThan, a, b);
                         let r = builder.ins().uextend(I64, cmp);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
                     Opcode::Eq => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let b = builder.use_var(Variable::from_u32((d.rs2_or_imm & 0xF) as u32));
+                        let a = gp_read!(builder, d.rs1);
+                        let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let cmp = builder.ins().icmp(IntCC::Equal, a, b);
                         let r = builder.ins().uextend(I64, cmp);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
                     Opcode::Slt => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let b = builder.use_var(Variable::from_u32((d.rs2_or_imm & 0xF) as u32));
+                        let a = gp_read!(builder, d.rs1);
+                        let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let cmp = builder.ins().icmp(IntCC::SignedLessThan, a, b);
                         let r = builder.ins().uextend(I64, cmp);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
                     Opcode::Sgt => {
-                        let a = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let b = builder.use_var(Variable::from_u32((d.rs2_or_imm & 0xF) as u32));
+                        let a = gp_read!(builder, d.rs1);
+                        let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let cmp = builder.ins().icmp(IntCC::SignedGreaterThan, a, b);
                         let r = builder.ins().uextend(I64, cmp);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), r); }
+                        gp_write!(builder, d.rd, r);
                     }
 
                     // --- Push/Pop (host calls) ---
                     Opcode::Push => {
-                        let val = builder.use_var(Variable::from_u32(d.rd as u32));
+                        let val = gp_read!(builder, d.rd);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_push_ref, &[vm_ctx, val]);
                         let result = builder.inst_results(call)[0];
@@ -579,7 +553,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.ins().brif(is_err, trap_block, &[], cont, &[]);
                         builder.seal_block(cont);
                         builder.switch_to_block(cont);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), result); }
+                        gp_write!(builder, d.rd, result);
                     }
 
                     // --- Wide register ops (host calls) ---
@@ -600,7 +574,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.switch_to_block(cont);
                     }
                     Opcode::Wload => {
-                        let addr = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let addr = gp_read!(builder, d.rs1);
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_wload_ref, &[vm_ctx, addr, wd]);
@@ -612,7 +586,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.switch_to_block(cont);
                     }
                     Opcode::Wstore => {
-                        let addr = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let addr = gp_read!(builder, d.rs1);
                         let ws = builder.ins().iconst(I64, d.rd as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_wstore_ref, &[vm_ctx, addr, ws]);
@@ -634,7 +608,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let call = builder.ins().call(fn_narrow_ref, &[vm_ctx, ws1, trap_ptr]);
                         let narrowed_val = builder.inst_results(call)[0];
                         // Update the AOT GP variable with the result
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), narrowed_val); }
+                        gp_write!(builder, d.rd, narrowed_val);
                         // Check trap flag
                         let flag = builder.ins().stack_load(I64, trap_flag_ss, 0);
                         let trapped = builder.ins().icmp_imm(IntCC::NotEqual, flag, 0);
@@ -648,13 +622,13 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         // Pass the current AOT variable value directly
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let wd = builder.ins().iconst(I64, d.rd as i64);
-                        let gp_val = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let gp_val = gp_read!(builder, d.rs1);
                         builder.ins().call(fn_widen_ref, &[vm_ctx, wd, gp_val]);
                     }
 
                     // --- Memory operations (host calls) ---
                     Opcode::Load => {
-                        let base = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let base = gp_read!(builder, d.rs1);
                         let offset = pyde_vm::isa::decode_mem_offset(d.rs2_or_imm) as i64;
                         let width = pyde_vm::isa::decode_mem_width(d.rs2_or_imm) as u64;
                         let off_val = builder.ins().iconst(I64, offset);
@@ -663,13 +637,13 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_load_ref, &[vm_ctx, addr, w]);
                         let result = builder.inst_results(call)[0];
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), result); }
+                        gp_write!(builder, d.rd, result);
                     }
                     Opcode::Store => {
-                        let base = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let base = gp_read!(builder, d.rs1);
                         let offset = pyde_vm::isa::decode_mem_offset(d.rs2_or_imm) as i64;
                         let width = pyde_vm::isa::decode_mem_width(d.rs2_or_imm) as u64;
-                        let val = builder.use_var(Variable::from_u32(d.rd as u32));
+                        let val = gp_read!(builder, d.rd);
                         let off_val = builder.ins().iconst(I64, offset);
                         let addr = builder.ins().iadd(base, off_val);
                         let w = builder.ins().iconst(I64, width as i64);
@@ -692,7 +666,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                                 // GP register mode: sloadg rd, ws1 → returns u64
                                 let call = builder.ins().call(fn_sloadg_ref, &[vm_ctx, ws_slot]);
                                 let result = builder.inst_results(call)[0];
-                                if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), result); }
+                                gp_write!(builder, d.rd, result);
                             }
                             _ => {
                                 // Mode 1 (memory) and others: delegate to wide mode for now
@@ -713,7 +687,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                             }
                             2 => {
                                 // GP register mode: sstoreg ws_slot, rd
-                                let rd_val = builder.use_var(Variable::from_u32(d.rd as u32));
+                                let rd_val = gp_read!(builder, d.rd);
                                 builder.ins().call(fn_sstoreg_ref, &[vm_ctx, ws_slot, rd_val])
                             }
                             _ => {
@@ -745,9 +719,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
 
                     // --- Crypto (host calls) ---
                     Opcode::Poseidon => {
-                        let addr = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let len_reg = (d.rs2_or_imm & 0xF) as u32;
-                        let len = builder.use_var(Variable::from_u32(len_reg));
+                        let addr = gp_read!(builder, d.rs1);
+                        let len_reg = (d.rs2_or_imm & 0xF) as u8;
+                        let len = gp_read!(builder, len_reg);
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_poseidon_ref, &[vm_ctx, addr, len, wd]);
@@ -780,8 +754,8 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         break;
                     }
                     Opcode::Beq | Opcode::Bne | Opcode::Blt | Opcode::Bge => {
-                        let a = builder.use_var(Variable::from_u32(d.rd as u32));
-                        let b = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let a = gp_read!(builder, d.rd);
+                        let b = gp_read!(builder, d.rs1);
                         let pc = bb.start_pc + (i as u32) * 4;
                         let offset = sign_extend_18(d.rs2_or_imm);
                         let target = pc.wrapping_add(offset as u32);
@@ -818,7 +792,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                             }
                         };
                         let result = builder.inst_results(call)[0];
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), result); }
+                        gp_write!(builder, d.rd, result);
                     }
                     Opcode::Callvalue => {
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
@@ -828,7 +802,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                             0 => { builder.ins().call(fn_callvalue_ref, &[vm_ctx, wd]); }
                             1 => { builder.ins().call(fn_gasprice_ref, &[vm_ctx, wd]); }
                             2 => {
-                                let addr = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                                let addr = gp_read!(builder, d.rs1);
                                 builder.ins().call(fn_balance_ref, &[vm_ctx, addr, wd]);
                             }
                             3 => { builder.ins().call(fn_caller_ref, &[vm_ctx, wd]); }  // CALLER
@@ -843,12 +817,12 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                     Opcode::Blockhash => {
                         // Blockhash not yet fully supported in AOT — write zero
                         let z = builder.ins().iconst(I64, 0);
-                        if d.rd != 0 { builder.def_var(Variable::from_u32(d.rd as u32), z); }
+                        gp_write!(builder, d.rd, z);
                     }
 
                     // --- Assertions + Memory (host calls) ---
                     Opcode::Assert => {
-                        let val = builder.use_var(Variable::from_u32(d.rs1 as u32));
+                        let val = gp_read!(builder, d.rs1);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_assert_ref, &[vm_ctx, val]);
                         let result = builder.inst_results(call)[0];
@@ -861,10 +835,10 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                     Opcode::Memcpy => {
                         // Memcpy handled by VM runtime call (AOT fallback)
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        let dst = builder.use_var(Variable::from_u32(d.rd as u32));
-                        let src = builder.use_var(Variable::from_u32(d.rs1 as u32));
-                        let len_reg = (d.rs2_or_imm & 0xF) as u32;
-                        let len = builder.use_var(Variable::from_u32(len_reg));
+                        let dst = gp_read!(builder, d.rd);
+                        let src = gp_read!(builder, d.rs1);
+                        let len_reg = (d.rs2_or_imm & 0xF) as u8;
+                        let len = gp_read!(builder, len_reg);
                         builder.ins().call(fn_memcpy_ref, &[vm_ctx, dst, src, len]);
                     }
                     Opcode::Selfdestruct => {
@@ -903,9 +877,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
 
                 // Reload GP registers from vm.cpu.gp after host calls
                 // that may have modified GP state (Weq, Wlt, Narrow, etc.)
-                if needs_flush && !terminated {
-                    reload_gp!(builder);
-                }
+                // No flush/reload needed — GP registers go through regs_ptr memory directly
             }
 
             if !terminated {
@@ -920,12 +892,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
 
         // === Success: store registers back ===
         builder.switch_to_block(success_block);
-        let regs_ptr = builder.use_var(Variable::from_u32(VAR_REGS_PTR));
-        // Write r1-r15 back (r0 is always zero, skip it)
-        for i in 1..16u32 {
-            let val = builder.use_var(Variable::from_u32(i));
-            builder.ins().store(MemFlags::trusted(), val, regs_ptr, (i as i32) * 8);
-        }
+        // GP registers are already in regs_ptr memory — no write-back needed.
         let gas = builder.use_var(Variable::from_u32(VAR_GAS_USED));
         let shifted = builder.ins().ishl_imm(gas, 2);
         let result = builder.ins().bor_imm(shifted, RESULT_SUCCESS as i64);

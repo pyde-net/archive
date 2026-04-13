@@ -135,7 +135,22 @@ fn bench_preloaded_mempool() {
         ca.copy_from_slice(&receipt.return_data);
         contract_addrs.push(ca);
     }
-    println!("  {} contracts deployed ({} instrs each)", num_contracts, cc.constructor_bytecode.len() / 4 + cc.runtime_bytecode.len() / 4);
+    // AOT compile all deployed contracts
+    let mut aot_fns: std::collections::HashMap<[u8; 32], pyde_aot::CompiledCode> = std::collections::HashMap::new();
+    for addr in &contract_addrs {
+        let code_key = pyde_state::keys::code_key(addr);
+        if let Some(bytecode) = smt.get(&code_key) {
+            match pyde_aot::compile_bytecode(&bytecode) {
+                Ok(compiled) => { aot_fns.insert(*addr, compiled); }
+                Err(e) => { println!("    AOT compile failed: {} ({} bytes)", e, bytecode.len()); }
+            }
+        }
+    }
+    let aot_map: std::collections::HashMap<[u8; 32], unsafe fn(*mut u64, u64, *mut pyde_vm::vm::Vm) -> u64> =
+        aot_fns.iter().map(|(addr, code)| (*addr, code.as_fn())).collect();
+
+    println!("  {} contracts deployed ({} instrs, {} AOT compiled)", num_contracts,
+        cc.constructor_bytecode.len() / 4 + cc.runtime_bytecode.len() / 4, aot_fns.len());
 
     // --- Phase 3: Pre-sign 100K mixed txs in parallel ---
     // 500 accounts × 60 nonces (within 64 window) = 30K txs

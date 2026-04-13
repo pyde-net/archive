@@ -298,10 +298,20 @@ fn load_test_full_pipeline() {
 
         // Submit via fast binary TCP endpoint (port 9545) if available,
         // otherwise fall back to HTTP RPC
-        let fast_tx_addrs: Vec<String> = vec![
-            "127.0.0.1:9545".into(), "127.0.0.1:9546".into(),
-            "127.0.0.1:9547".into(), "127.0.0.1:9548".into(),
-        ];
+        // Auto-detect which fast TX ports are available
+        let mut fast_tx_addrs: Vec<String> = Vec::new();
+        for port in [9545, 9546, 9547, 9548] {
+            let addr = format!("127.0.0.1:{}", port);
+            if std::net::TcpStream::connect_timeout(
+                &addr.parse().unwrap(), std::time::Duration::from_millis(100)
+            ).is_ok() {
+                fast_tx_addrs.push(addr);
+            }
+        }
+        if fast_tx_addrs.is_empty() {
+            fast_tx_addrs.push("127.0.0.1:9545".into()); // fallback
+        }
+        println!("  Fast TX ports: {} available", fast_tx_addrs.len());
 
         // signed_txs is already raw bytes, signed_txs_hex is for HTTP fallback
         let raw_txs = &signed_txs;
