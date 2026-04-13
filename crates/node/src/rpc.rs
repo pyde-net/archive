@@ -159,9 +159,7 @@ impl PydeApiServer for RpcServer {
         let nonce = state.get(&key)
             .map(|b| {
                 if b.len() >= 10 {
-                    let ns = pyde_account::nonce::NonceState::from_bytes(
-                        &<[u8; 10]>::try_from(&b[..10]).unwrap_or([0u8; 10])
-                    );
+                    let ns = pyde_account::nonce::NonceState::from_bytes(&b);
                     ns.base
                 } else {
                     0
@@ -332,9 +330,7 @@ impl PydeApiServer for RpcServer {
             let n = state_r.get(&nonce_key)
                 .and_then(|bytes| {
                     if bytes.len() >= 10 {
-                        let ns = pyde_account::nonce::NonceState::from_bytes(
-                            bytes[..10].try_into().unwrap()
-                        );
+                        let ns = pyde_account::nonce::NonceState::from_bytes(&bytes);
                         Some(ns.base)
                     } else {
                         None

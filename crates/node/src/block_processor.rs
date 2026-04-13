@@ -157,7 +157,10 @@ impl BlockProcessor {
                     for &tx_idx in &group.tx_indices {
                         if tx_idx >= txs.len() { continue; }
                         let tx = &txs[tx_idx];
-                        match execute_transaction(tx, &mut overlay, &block_ctx) {
+                        let aot_fn = aot_cache.as_ref()
+                            .and_then(|c| c.get(&tx.to))
+                            .map(|compiled| compiled.as_fn());
+                        match pyde_tx::pipeline::execute_transaction_aot(tx, &mut overlay, &block_ctx, aot_fn) {
                             Ok(receipt) => {
                                 results.push((tx_idx, receipt, vec![]));
                             }
@@ -227,7 +230,12 @@ impl BlockProcessor {
             }
         }
 
-        // 5. Flush deferred writes → Merkle tree + RocksDB (single batch operation)
+        // 5. Flush deferred writes → Merkle tree + RocksDB
+        // The pending writes are committed synchronously here. In future, this
+        // can be pipelined: spawn Merkle computation on a background thread
+        // while the next block starts executing from the in-memory overlay.
+        // For now, the flush is sync to ensure state root is available for
+        // consensus voting on this block.
         let _ = state.flush_pending();
         state.refresh_root();
 

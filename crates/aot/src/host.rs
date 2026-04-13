@@ -257,6 +257,13 @@ pub extern "C" fn host_widen(ctx: *mut VmCtx, wd: u64, gp_value: u64) -> u64 {
     0
 }
 
+/// Host: read a GP register value from the VM. Used by AOT to sync
+/// GP register state after wide ops that write to GP (Weq, Wlt).
+pub extern "C" fn host_read_gp(ctx: *mut VmCtx, reg: u64) -> u64 {
+    let vm = unsafe { &mut *ctx };
+    vm.cpu.read_gp(reg as u8)
+}
+
 // ── Checked arithmetic (overflow detection) ────────────────────────────
 
 /// Host: checked add. Returns result, sets *trap_out to 1 on overflow.
@@ -474,6 +481,7 @@ pub fn host_functions() -> Vec<(&'static str, *const u8)> {
         ("host_poseidon", host_poseidon as *const u8),
         ("host_log", host_log as *const u8),
         ("host_wide_alu", host_wide_alu as *const u8),
+        ("host_read_gp", host_read_gp as *const u8),
         ("host_narrow", host_narrow as *const u8),
         ("host_widen", host_widen as *const u8),
         ("host_caller", host_caller as *const u8),
