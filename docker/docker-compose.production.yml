@@ -28,6 +28,7 @@ services:
       - node0-data:/data
     ports:
       - "8545:8545"
+      - "9545:9545"
       - "9090:9090"
     networks:
       pyde-net:
@@ -44,6 +45,7 @@ services:
       - node1-data:/data
     ports:
       - "8546:8546"
+      - "9546:9546"
       - "9091:9091"
     depends_on:
       - node-0
@@ -62,6 +64,7 @@ services:
       - node2-data:/data
     ports:
       - "8547:8547"
+      - "9547:9547"
       - "9092:9092"
     depends_on:
       - node-0
@@ -80,6 +83,7 @@ services:
       - node3-data:/data
     ports:
       - "8548:8548"
+      - "9548:9548"
       - "9093:9093"
     depends_on:
       - node-0

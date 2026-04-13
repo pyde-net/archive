@@ -6,6 +6,7 @@ mod chain;
 mod cli;
 mod config;
 mod faucet;
+mod fast_tx;
 mod logging;
 mod metrics;
 mod node;

@@ -179,53 +179,74 @@ fn load_test_full_pipeline() {
     let mut call_data = call_selector.to_be_bytes().to_vec();
     call_data.extend_from_slice(&100u64.to_le_bytes()); // n=100 iterations
 
-    println!("  Signing {} mixed transactions (60% transfers, 40% contract calls)...", total_txs);
-    let sign_start = Instant::now();
-    let mut signed_txs: Vec<String> = Vec::with_capacity(total_txs as usize);
-    // Track per-wallet nonce (starts at 1 for deployers, 0 for others)
+    // Pre-compute nonces and tx params, then parallel sign with rayon
+    println!("  Building {} mixed transactions (60% transfers, 40% contract calls)...", total_txs);
     let mut nonce_tracker: Vec<u64> = vec![0; wallets.len()];
-    for i in 0..num_contracts { nonce_tracker[i] = 1; } // deployers used nonce 0
+    for i in 0..num_contracts { nonce_tracker[i] = 1; }
 
+    // Build unsigned tx descriptors (fast, single-threaded)
+    struct TxDesc {
+        w_idx: usize,
+        nonce: u64,
+        is_call: bool,
+        contract_idx: usize,
+    }
+    let mut descs: Vec<TxDesc> = Vec::with_capacity(total_txs as usize);
     for i in 0..total_txs {
         let w_idx = (i as usize) % wallets.len();
-        let w = &wallets[w_idx];
         let nonce = nonce_tracker[w_idx];
         nonce_tracker[w_idx] += 1;
+        descs.push(TxDesc {
+            w_idx,
+            nonce,
+            is_call: (i % 5) >= 3,
+            contract_idx: (i as usize) % num_contracts,
+        });
+    }
 
-        let is_contract_call = (i % 5) >= 3; // 40% contract calls (3,4 out of 0-4)
+    // Parallel signing with rayon (14 cores)
+    use rayon::prelude::*;
+    println!("  Signing {} txs in parallel ({} cores)...", total_txs, rayon::current_num_threads());
+    let sign_start = Instant::now();
 
-        let mut tx = if is_contract_call {
-            // Contract call to a random deployed contract
-            let contract_idx = (i as usize) % num_contracts;
-            // Contract address = derive_create_address(deployer, nonce=0)
-            let deployer = wallets[contract_idx].address;
-            let contract_addr = pyde_account::address::derive_create_address(&deployer, 0);
+    // Pre-compute contract addresses
+    let contract_addrs: Vec<[u8; 32]> = (0..num_contracts)
+        .map(|i| pyde_account::address::derive_create_address(&wallets[i].address, 0))
+        .collect();
+
+    let signed_txs: Vec<Vec<u8>> = descs.par_iter().map(|desc| {
+        let w = &wallets[desc.w_idx];
+        let mut tx = if desc.is_call {
             Transaction {
-                from: w.address, to: contract_addr, value: 0, data: call_data.clone(),
-                gas_limit: 10_000_000, nonce, signature: vec![],
-                fee_payer: FeePayer::Sender, access_list: vec![],
+                from: w.address, to: contract_addrs[desc.contract_idx], value: 0,
+                data: call_data.clone(), gas_limit: 10_000_000, nonce: desc.nonce,
+                signature: vec![], fee_payer: FeePayer::Sender, access_list: vec![],
                 deadline: None, chain_id, tx_type: TransactionType::Standard,
             }
         } else {
-            // Simple transfer
             Transaction {
                 from: w.address, to: recipient, value: 1, data: vec![],
-                gas_limit: 50_000, nonce, signature: vec![],
+                gas_limit: 50_000, nonce: desc.nonce, signature: vec![],
                 fee_payer: FeePayer::Sender, access_list: vec![],
                 deadline: None, chain_id, tx_type: TransactionType::Standard,
             }
         };
-
         let hash = tx.hash();
         tx.signature = falcon_sign(&w.sk, &hash).unwrap().as_bytes().to_vec();
-        signed_txs.push(format!("0x{}", hex::encode(tx.to_bytes())));
-    }
+        tx.to_bytes()
+    }).collect();
+
     let sign_elapsed = sign_start.elapsed();
-    let transfer_count = (0..total_txs).filter(|i| (i % 5) < 3).count();
-    let call_count = total_txs as usize - transfer_count;
+    let transfer_count = descs.iter().filter(|d| !d.is_call).count();
+    let call_count = descs.iter().filter(|d| d.is_call).count();
     println!("  Signed in {:.2}s ({:.0} signs/s) — {} transfers + {} contract calls\n",
         sign_elapsed.as_secs_f64(), total_txs as f64 / sign_elapsed.as_secs_f64(),
         transfer_count, call_count);
+
+    // Also keep hex versions for HTTP fallback
+    let signed_txs_hex: Vec<String> = signed_txs.iter()
+        .map(|b| format!("0x{}", hex::encode(b)))
+        .collect();
 
     // Run async submission
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -275,40 +296,91 @@ fn load_test_full_pipeline() {
         let start_block = u64::from_str_radix(start_block_hex.trim_start_matches("0x"), 16).unwrap_or(0);
         println!("  Start block: {} (0x{:x})", start_block, start_block);
 
-        // Submit mixed workload across all 4 nodes in parallel
+        // Submit via fast binary TCP endpoint (port 9545) if available,
+        // otherwise fall back to HTTP RPC
+        let fast_tx_addrs: Vec<String> = vec![
+            "127.0.0.1:9545".into(), "127.0.0.1:9546".into(),
+            "127.0.0.1:9547".into(), "127.0.0.1:9548".into(),
+        ];
+
+        // signed_txs is already raw bytes, signed_txs_hex is for HTTP fallback
+        let raw_txs = &signed_txs;
+
+        // Try binary endpoint first
+        let use_binary = tokio::net::TcpStream::connect(&fast_tx_addrs[0]).await.is_ok();
+
         let submitted = Arc::new(AtomicU64::new(0));
         let errors = Arc::new(AtomicU64::new(0));
         let send_start = Instant::now();
 
-        // Split txs into chunks, one per async task, round-robin across RPC nodes
-        let concurrency = 32usize;
-        let chunk_size = (signed_txs.len() + concurrency - 1) / concurrency;
-        let mut tasks = Vec::new();
+        if use_binary {
+            println!("  Using fast binary TX endpoint (port 9545-9548)");
+            let concurrency = 32usize;
+            let chunk_size = (raw_txs.len() + concurrency - 1) / concurrency;
+            let mut tasks = Vec::new();
 
-        for c in 0..concurrency {
-            let start = c * chunk_size;
-            let end = (start + chunk_size).min(signed_txs.len());
-            if start >= signed_txs.len() { break; }
-            let chunk: Vec<String> = signed_txs[start..end].to_vec();
-            let url = rpc_urls[c % rpc_urls.len()].clone();
-            let cl = client.clone();
-            let sub = submitted.clone();
-            let err = errors.clone();
+            for c in 0..concurrency {
+                let start_idx = c * chunk_size;
+                let end_idx = (start_idx + chunk_size).min(raw_txs.len());
+                if start_idx >= raw_txs.len() { break; }
+                let chunk: Vec<Vec<u8>> = raw_txs[start_idx..end_idx].to_vec();
+                let addr = fast_tx_addrs[c % fast_tx_addrs.len()].clone();
+                let sub = submitted.clone();
+                let err = errors.clone();
 
-            tasks.push(tokio::spawn(async move {
-                for tx_hex in chunk {
-                    let params = format!("\"{}\"", tx_hex);
-                    let resp = rpc_async(&cl, &url, "pyde_sendRawTransaction", &params).await;
-                    if resp.get("error").is_some() || resp.is_null() {
-                        err.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        sub.fetch_add(1, Ordering::Relaxed);
+                tasks.push(tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    match tokio::net::TcpStream::connect(&addr).await {
+                        Ok(mut stream) => {
+                            for tx_bytes in chunk {
+                                let len = (tx_bytes.len() as u32).to_le_bytes();
+                                if stream.write_all(&len).await.is_ok()
+                                    && stream.write_all(&tx_bytes).await.is_ok()
+                                {
+                                    sub.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    err.fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            err.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        }
                     }
-                }
-            }));
-        }
+                }));
+            }
+            for t in tasks { let _ = t.await; }
+        } else {
+            println!("  Using HTTP RPC (fast TX endpoint not available)");
+            let concurrency = 32usize;
+            let chunk_size = (signed_txs_hex.len() + concurrency - 1) / concurrency;
+            let mut tasks = Vec::new();
 
-        for t in tasks { let _ = t.await; }
+            for c in 0..concurrency {
+                let start_idx = c * chunk_size;
+                let end_idx = (start_idx + chunk_size).min(signed_txs_hex.len());
+                if start_idx >= signed_txs_hex.len() { break; }
+                let chunk: Vec<String> = signed_txs_hex[start_idx..end_idx].to_vec();
+                let url = rpc_urls[c % rpc_urls.len()].clone();
+                let cl = client.clone();
+                let sub = submitted.clone();
+                let err = errors.clone();
+
+                tasks.push(tokio::spawn(async move {
+                    for tx_hex in chunk {
+                        let params = format!("\"{}\"", tx_hex);
+                        let resp = rpc_async(&cl, &url, "pyde_sendRawTransaction", &params).await;
+                        if resp.get("error").is_some() || resp.is_null() {
+                            err.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            sub.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }));
+            }
+            for t in tasks { let _ = t.await; }
+        }
         let send_elapsed = send_start.elapsed();
         let sub_count = submitted.load(Ordering::Relaxed);
         let err_count = errors.load(Ordering::Relaxed);
@@ -348,7 +420,7 @@ fn load_test_full_pipeline() {
         println!("  Block time:   {:.2}s", total_time / blocks as f64);
         println!("  Submitted:    {}", sub_count);
         println!("  Executed:     {} ({:.1}% success)", executed, (executed as f64 / sub_count as f64) * 100.0);
-        println!("  Submit rate:  {:.0} tx/s (async, {} concurrent, 4 nodes)", submit_tps, concurrency);
+        println!("  Submit rate:  {:.0} tx/s ({}, 32 concurrent, 4 nodes)", submit_tps, if use_binary { "binary TCP" } else { "HTTP RPC" });
         println!("  Sign rate:    {:.0} tx/s (FALCON-512)", total_txs as f64 / sign_elapsed.as_secs_f64());
         println!("  Active TPS:   {:.0} (executed / submit time)", active_tps);
         println!("  Overall TPS:  {:.0} (executed / total time incl. wait)", inclusion_tps);
