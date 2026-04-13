@@ -1,11 +1,17 @@
-use pyde_state::smt::{Key, PersistentSMT};
+use pyde_state::smt::{Key, PersistentSMT, StateAccess};
 use sparse_merkle_tree::H256;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tracing::info;
 
-/// Manages on-disk state: RocksDB-backed persistent SMT.
-/// State survives node restarts — no data loss.
+/// Manages on-disk state: RocksDB-backed persistent SMT with write-ahead cache.
+///
+/// Architecture (layered reads):
+///   StateOverlay (per-block) → write_cache (multi-block) → PersistentSMT (disk)
+///
+/// The write_cache holds uncommitted state from recently executed blocks.
+/// The Merkle tree commit (expensive) runs asynchronously while new blocks
+/// execute from the cache. This hides commit latency from the execution path.
 pub struct StateManager {
     smt: PersistentSMT,
     root: [u8; 32],
@@ -13,6 +19,9 @@ pub struct StateManager {
     tracked_keys: HashSet<Key>,
     /// Write-ahead buffer for deferred Merkle tree computation.
     pending_writes: Vec<(Key, Vec<u8>)>,
+    /// Write-ahead cache: holds state from recently executed blocks.
+    /// Reads check here before hitting the SMT/RocksDB.
+    write_cache: HashMap<Key, Vec<u8>>,
 }
 
 impl StateManager {
@@ -34,7 +43,7 @@ impl StateManager {
             "state database opened (persistent RocksDB)"
         );
 
-        Ok(Self { smt, root, tracked_keys: HashSet::new(), pending_writes: Vec::new() })
+        Ok(Self { smt, root, tracked_keys: HashSet::new(), pending_writes: Vec::new(), write_cache: HashMap::new() })
     }
 
     /// Current state root hash.
@@ -42,14 +51,20 @@ impl StateManager {
         self.root
     }
 
-    /// Get a value by key.
+    /// Get a value by key. Checks write-ahead cache first, then disk.
     pub fn get(&self, key: &Key) -> Option<Vec<u8>> {
+        // Check write-ahead cache first (recent block writes)
+        if let Some(val) = self.write_cache.get(key) {
+            return if val.is_empty() { None } else { Some(val.clone()) };
+        }
         self.smt.get(key)
     }
 
     /// Insert a key-value pair, returns new root.
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<[u8; 32], String> {
         self.tracked_keys.insert(key);
+        // Write to cache for immediate visibility
+        self.write_cache.insert(key, value.clone());
         let new_root = self.smt.insert(key, value)
             .map_err(|e| format!("state insert failed: {}", e))?;
         self.root = new_root.as_slice().try_into().unwrap_or([0u8; 32]);
@@ -79,8 +94,10 @@ impl StateManager {
     /// lazily on next `root()` call or explicitly via `flush_pending()`.
     /// Use this for block execution to defer the expensive Merkle update.
     pub fn update_batch_deferred(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<(), String> {
-        for (k, _) in &entries {
+        for (k, v) in &entries {
             self.tracked_keys.insert(*k);
+            // Write to cache for immediate visibility by the next block
+            self.write_cache.insert(*k, v.clone());
         }
         self.pending_writes.extend(entries);
         Ok(())

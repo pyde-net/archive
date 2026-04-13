@@ -348,6 +348,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
         builder.def_var(Variable::from_u32(VAR_GAS_USED), zero);
         builder.def_var(Variable::from_u32(0), zero); // r0 always zero
 
+        // Load GP registers from regs_ptr (which points directly to vm.cpu.gp).
+        // AOT uses these as fast Cranelift local variables. Before host calls,
+        // we flush them back to regs_ptr so host functions see up-to-date values.
         for i in 1..16u32 {
             let val = builder.ins().load(I64, MemFlags::trusted(), param_regs_ptr, (i as i32) * 8);
             builder.def_var(Variable::from_u32(i), val);
@@ -406,7 +409,48 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                 }};
             }
 
+            // Helper: flush all GP Cranelift variables → regs_ptr (vm.cpu.gp) before host calls.
+            // This ensures host functions reading vm.cpu.gp see the latest AOT-computed values.
+            macro_rules! flush_gp {
+                ($builder:expr) => {{
+                    let rp = $builder.use_var(Variable::from_u32(VAR_REGS_PTR));
+                    for r in 1..16u32 {
+                        let val = $builder.use_var(Variable::from_u32(r));
+                        $builder.ins().store(MemFlags::trusted(), val, rp, (r as i32) * 8);
+                    }
+                }};
+            }
+            // Helper: reload GP variables from regs_ptr after host calls that may modify vm.cpu.gp.
+            macro_rules! reload_gp {
+                ($builder:expr) => {{
+                    let rp = $builder.use_var(Variable::from_u32(VAR_REGS_PTR));
+                    for r in 1..16u32 {
+                        let val = $builder.ins().load(I64, MemFlags::trusted(), rp, (r as i32) * 8);
+                        $builder.def_var(Variable::from_u32(r), val);
+                    }
+                }};
+            }
+
             for (i, d) in bb.instructions.iter().enumerate() {
+                // Flush GP registers to vm.cpu.gp before every instruction that
+                // calls a host function. This ensures the VM always has up-to-date
+                // register values when host functions access vm.cpu.gp[].
+                // Flush GP before host calls that access vm.cpu.gp[].
+                // Skip checked arith (Add/Sub/Mul/Div/Mod) — they pass values
+                // directly as parameters and return results, never touching vm.cpu.gp.
+                let needs_flush = matches!(d.opcode,
+                    Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv |
+                    Opcode::Wmod | Opcode::Wand | Opcode::Wor | Opcode::Wxor |
+                    Opcode::Wnot | Opcode::Wmov | Opcode::Weq | Opcode::Wlt |
+                    Opcode::Wload | Opcode::Wstore | Opcode::Narrow | Opcode::Widen |
+                    Opcode::Load | Opcode::Store | Opcode::Push | Opcode::Pop |
+                    Opcode::Sload | Opcode::Sstore | Opcode::Sdelete |
+                    Opcode::Poseidon | Opcode::Caller | Opcode::Callvalue
+                );
+                if needs_flush {
+                    flush_gp!(builder);
+                }
+
                 match d.opcode {
                     // --- Checked arithmetic (host calls for overflow detection) ---
                     Opcode::Add => {
@@ -554,15 +598,6 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.ins().brif(trapped, trap_block, &[], cont, &[]);
                         builder.seal_block(cont);
                         builder.switch_to_block(cont);
-                        // Weq/Wlt write result to GP register rd inside the VM.
-                        // Read it back into the AOT variable so subsequent code sees it.
-                        if matches!(d.opcode, Opcode::Weq | Opcode::Wlt) && d.rd != 0 {
-                            let vm_ctx2 = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                            let rd_idx = builder.ins().iconst(I64, d.rd as i64);
-                            let call2 = builder.ins().call(fn_read_gp_ref, &[vm_ctx2, rd_idx]);
-                            let gp_val = builder.inst_results(call2)[0];
-                            builder.def_var(Variable::from_u32(d.rd as u32), gp_val);
-                        }
                     }
                     Opcode::Wload => {
                         let addr = builder.use_var(Variable::from_u32(d.rs1 as u32));
@@ -864,6 +899,12 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         terminated = true;
                         break;
                     }
+                }
+
+                // Reload GP registers from vm.cpu.gp after host calls
+                // that may have modified GP state (Weq, Wlt, Narrow, etc.)
+                if needs_flush && !terminated {
+                    reload_gp!(builder);
                 }
             }
 
