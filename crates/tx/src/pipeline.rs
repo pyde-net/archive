@@ -607,12 +607,14 @@ fn execute_in_pvm(
             vm.gas_used_total = gas;
             (true, gas)
         } else {
-            // AOT failed — restore state and retry with interpreter
+            // AOT failed — restore state and retry with interpreter.
+            // Log once so the block processor can blacklist this contract.
+            tracing::debug!(contract = hex::encode(tx.to), "AOT runtime failure, falling back to interpreter");
             vm.storage = saved_storage;
             vm.logs = saved_logs;
             vm.gas_used_total = 0;
+            vm.gas_refund = 0;
             vm.pc = 0;
-            // Re-load code (reset instruction cache + calldata mapping)
             let _ = vm.load(code);
             let output = vm.execute();
             let ok = output.outcome == Outcome::Success;

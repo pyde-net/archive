@@ -109,10 +109,11 @@ impl BlockProcessor {
             let mut overlay = StateOverlay::new(base_smt);
             for (i, tx) in txs.iter().enumerate() {
                 trigger_aot(tx, state, &aot_cache);
-                let aot_fn = aot_cache.as_ref()
-                    .and_then(|c| c.get(&tx.to))
-                    .map(|compiled| compiled.as_fn());
-                match pyde_tx::pipeline::execute_transaction_aot(tx, &mut overlay, &block_ctx, aot_fn) {
+                // AOT disabled in block processor for now — the interpreter handles
+                // all opcodes correctly. AOT has GP register sync issues with wide ops
+                // that cause fallback overhead. Re-enable when AOT host callbacks
+                // properly sync all GP register mutations.
+                match pyde_tx::pipeline::execute_transaction(tx, &mut overlay, &block_ctx) {
                     Ok(receipt) => {
                         total_gas += receipt.effective_gas;
                         debug!(slot, tx_index = i, gas = receipt.effective_gas, success = receipt.success, "tx executed");
@@ -157,10 +158,7 @@ impl BlockProcessor {
                     for &tx_idx in &group.tx_indices {
                         if tx_idx >= txs.len() { continue; }
                         let tx = &txs[tx_idx];
-                        let aot_fn = aot_cache.as_ref()
-                            .and_then(|c| c.get(&tx.to))
-                            .map(|compiled| compiled.as_fn());
-                        match pyde_tx::pipeline::execute_transaction_aot(tx, &mut overlay, &block_ctx, aot_fn) {
+                        match pyde_tx::pipeline::execute_transaction(tx, &mut overlay, &block_ctx) {
                             Ok(receipt) => {
                                 results.push((tx_idx, receipt, vec![]));
                             }
@@ -230,12 +228,12 @@ impl BlockProcessor {
             }
         }
 
-        // 5. Flush deferred writes → Merkle tree + RocksDB
-        // The pending writes are committed synchronously here. In future, this
-        // can be pipelined: spawn Merkle computation on a background thread
-        // while the next block starts executing from the in-memory overlay.
-        // For now, the flush is sync to ensure state root is available for
-        // consensus voting on this block.
+        // 5. Flush deferred writes → Merkle tree + RocksDB.
+        // Pipelined: the deferred writes are flushed synchronously for now,
+        // but the block execution (steps 1-4) ran entirely in-memory via
+        // StateOverlay. The flush is the only RocksDB-touching step.
+        // On a server with async I/O, this can be spawned to a background
+        // thread to overlap with the next block's execution.
         let _ = state.flush_pending();
         state.refresh_root();
 

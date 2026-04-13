@@ -15,6 +15,8 @@ pub struct NodeConfig {
     #[serde(default)]
     pub rpc: RpcSection,
     #[serde(default)]
+    pub fast_tx: FastTxSection,
+    #[serde(default)]
     pub metrics: MetricsSection,
     #[serde(default)]
     pub logging: LoggingSection,
@@ -131,6 +133,25 @@ impl Default for RpcSection {
     }
 }
 
+/// Fast binary transaction submission endpoint (no HTTP/JSON overhead).
+/// Clients send raw signed tx bytes with length-prefix framing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FastTxSection {
+    pub enabled: bool,
+    pub listen: String,
+    pub port: u16,
+}
+
+impl Default for FastTxSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen: "0.0.0.0".into(),
+            port: 9545,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MetricsSection {
     /// Enable Prometheus metrics endpoint.
@@ -173,6 +194,7 @@ impl Default for NodeConfig {
             consensus: ConsensusSection::default(),
             storage: StorageSection::default(),
             rpc: RpcSection::default(),
+            fast_tx: FastTxSection::default(),
             metrics: MetricsSection::default(),
             logging: LoggingSection::default(),
         }

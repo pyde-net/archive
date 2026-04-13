@@ -19,6 +19,8 @@ pub struct AotCache {
     cache: RwLock<HashMap<[u8; 32], Arc<CompiledCode>>>,
     /// Contracts currently being compiled (to avoid duplicate compilations).
     compiling: RwLock<std::collections::HashSet<[u8; 32]>>,
+    /// Contracts where AOT execution failed at runtime (skip AOT, use interpreter).
+    blacklisted: RwLock<std::collections::HashSet<[u8; 32]>>,
 }
 
 impl AotCache {
@@ -26,7 +28,20 @@ impl AotCache {
         Self {
             cache: RwLock::new(HashMap::new()),
             compiling: RwLock::new(std::collections::HashSet::new()),
+            blacklisted: RwLock::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Mark a contract as AOT-incompatible (skip native code, use interpreter).
+    pub fn blacklist(&self, address: [u8; 32]) {
+        if let Ok(mut set) = self.blacklisted.write() {
+            set.insert(address);
+        }
+    }
+
+    /// Check if a contract is blacklisted from AOT execution.
+    pub fn is_blacklisted(&self, address: &[u8; 32]) -> bool {
+        self.blacklisted.read().map(|s| s.contains(address)).unwrap_or(false)
     }
 
     /// Get compiled code for a contract, if available.

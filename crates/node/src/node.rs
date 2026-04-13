@@ -355,7 +355,7 @@ impl PydeNode {
                 pending_tx_tx,
                 logs_tx,
                 dev_mode: self.config.node.dev_mode,
-                tx_gossip_tx,
+                tx_gossip_tx: tx_gossip_tx.clone(),
             });
             match rpc::start_rpc_server(
                 &self.config.rpc.listen,
@@ -365,6 +365,19 @@ impl PydeNode {
             ).await {
                 Ok(addr) => info!(%addr, "JSON-RPC server started"),
                 Err(e) => warn!("RPC server disabled: {}", e),
+            }
+        }
+
+        // 11. Start fast binary TX endpoint (high-throughput alternative to HTTP RPC)
+        if self.config.fast_tx.enabled {
+            match crate::fast_tx::start_fast_tx_listener(
+                &self.config.fast_tx.listen,
+                self.config.fast_tx.port,
+                pending_txs.clone(),
+                tx_gossip_tx.clone(),
+            ).await {
+                Ok(addr) => info!(%addr, "fast binary TX endpoint started"),
+                Err(e) => warn!("fast TX endpoint disabled: {}", e),
             }
         }
 

@@ -352,8 +352,8 @@ pub fn generate_testnet(
         });
     }
 
-    // Generate 500 non-validator funded accounts for testing + load generation
-    for _ in 0..500 {
+    // Generate 2000 non-validator funded accounts for load testing
+    for _ in 0..2000 {
         let (pk, sk) = falcon_keygen().map_err(|e| format!("keygen failed: {}", e))?;
         let address = derive_eoa_address(pk.as_bytes());
         allocations.push(GenesisAllocation {
