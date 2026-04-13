@@ -768,7 +768,7 @@ impl PydeNode {
                                     let mut pending_w = pending_txs.write().await;
                                     let all_pending: Vec<pyde_tx::types::Transaction> = pending_w.drain(..).collect();
                                     let gas_ceiling = self.config.consensus.gas_ceiling;
-                                    let (txs, remaining) = crate::block_builder::build_tx_list(all_pending, gas_ceiling);
+                                    let (mut txs, remaining) = crate::block_builder::build_tx_list(all_pending, gas_ceiling);
                                     if !remaining.is_empty() {
                                         pending_w.extend(remaining);
                                     }
@@ -794,6 +794,26 @@ impl PydeNode {
                                     let parent_hash = chain_r.state_root;
                                     let head = chain_r.head_slot;
                                     drop(chain_r);
+
+                                    // Auto-infer access lists for parallel scheduling.
+                                    // Only run when there are enough txs to benefit from parallelism
+                                    // AND enough CPU headroom (infer cost = ~1 simulation per contract call).
+                                    // On small blocks or resource-constrained nodes, the sequential path
+                                    // is faster than infer + parallel.
+                                    if txs.len() >= 100 {
+                                        let state_r = state.read().await;
+                                        let infer_ctx = pyde_tx::pipeline::BlockContext {
+                                            height: current_slot,
+                                            timestamp: slot_clock.slot_timestamp(current_slot),
+                                            base_fee: chain.read().await.base_fee,
+                                            block_gas_limit: gas_ceiling,
+                                            chain_id: self.config.node.chain_id,
+                                            validator_address: identity.address,
+                                        };
+                                        pyde_tx::access_infer::infer_access_lists_batch(
+                                            &mut txs, &*state_r, &infer_ctx,
+                                        );
+                                    }
 
                                     // Build execution schedule: group non-conflicting txs
                                     // for parallel execution (Sealevel-style).
