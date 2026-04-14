@@ -178,7 +178,9 @@ fn serialize_tx(v: &serde_json::Value, signature: &[u8]) -> Result<Vec<u8>, JsVa
     buf.extend_from_slice(signature);                          // ~666
     buf.push(1); // fee_payer bytes len
     buf.push(0); // FeePayer::Sender tag
-    buf.extend_from_slice(&0u32.to_le_bytes());               // access_list len = 0
+    // access_list: byte length of serialized data (4 bytes for the empty count prefix)
+    buf.extend_from_slice(&4u32.to_le_bytes());               // access_list byte len = 4
+    buf.extend_from_slice(&0u32.to_le_bytes());               // entry count = 0
     buf.push(0); // no deadline
     buf.extend_from_slice(&chain_id.to_le_bytes());           // 8
     buf.push(tx_type);                                         // 1

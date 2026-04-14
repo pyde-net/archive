@@ -56,22 +56,25 @@ impl ReceiptStore {
         address_filter: Option<&[u8; 32]>,
     ) -> Vec<(u64, &LogEntry)> {
         let mut results = Vec::new();
-        for slot in from_slot..=to_slot {
-            if let Some(tx_hashes) = self.slot_txs.get(&slot) {
-                for hash in tx_hashes {
-                    if let Some(receipt) = self.receipts.get(hash) {
-                        for log in &receipt.logs {
-                            if let Some(addr) = address_filter {
-                                if &log.address != addr {
-                                    continue;
-                                }
+        // Iterate over stored slots only (not the full range which could be u64::MAX)
+        for (&slot, tx_hashes) in &self.slot_txs {
+            if slot < from_slot || slot > to_slot {
+                continue;
+            }
+            for hash in tx_hashes {
+                if let Some(receipt) = self.receipts.get(hash) {
+                    for log in &receipt.logs {
+                        if let Some(addr) = address_filter {
+                            if &log.address != addr {
+                                continue;
                             }
-                            results.push((slot, log));
                         }
+                        results.push((slot, log));
                     }
                 }
             }
         }
+        results.sort_by_key(|(slot, _)| *slot);
         results
     }
 
