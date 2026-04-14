@@ -167,20 +167,31 @@ pub fn schedule(txs: &[Transaction]) -> ExecutionSchedule {
         };
     }
 
-    // Fast path: group by contract address + sender for empty access lists.
-    // Txs to the same contract or from the same sender must be sequential.
-    // This avoids O(n²) pairwise conflict checks.
-    let mut uf = UnionFind::new(n);
-    // Fast O(n) path: if all txs have access lists, use hash-based grouping.
-    // Otherwise, fall back to O(n²) pairwise conflict detection.
-    let has_access_lists = txs.iter().any(|t| !t.access_list.is_empty());
+    // If NO txs have access lists, they're all potentially conflicting
+    // → put everything in one sequential group (safe default).
+    let has_any_access_list = txs.iter().any(|t| !t.access_list.is_empty());
+    if !has_any_access_list {
+        return ExecutionSchedule {
+            groups: vec![ExecutionGroup {
+                tx_indices: (0..n).collect(),
+            }],
+            total_txs: n,
+        };
+    }
 
-    if has_access_lists {
-        for i in 0..n {
-            for j in (i + 1)..n {
-                if conflicts(&txs[i], &txs[j]) {
-                    uf.union(i, j);
-                }
+    // Pairwise conflict detection using access lists.
+    let mut uf = UnionFind::new(n);
+    for i in 0..n {
+        // Txs with empty access lists conflict with everything (unknown keys).
+        if txs[i].access_list.is_empty() {
+            for j in 0..n {
+                if i != j { uf.union(i, j); }
+            }
+            continue;
+        }
+        for j in (i + 1)..n {
+            if conflicts(&txs[i], &txs[j]) {
+                uf.union(i, j);
             }
         }
     }
