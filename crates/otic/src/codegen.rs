@@ -429,9 +429,8 @@ impl CodeGen {
                 self.emit_calldata_decode(func);
                 self.emit_function_guards(func);
                 self.emit_jump_placeholder(Opcode::Call, 0, 0, *func_label);
-                if func.is_pub && !func.is_view && !func.is_constructor && !func.is_reentrant {
-                    self.emit_reentrancy_cleanup();
-                }
+                // Reentrancy cleanup moved to function body (before Ret) for reliability.
+                // The dispatch wrapper no longer handles cleanup.
                 self.emit_op(Opcode::Halt, 0, 0, 0);
             }
         }
@@ -820,6 +819,7 @@ impl CodeGen {
 
         // Reentrancy guard: check lock, set lock
         if func.is_pub && !func.is_view && !func.is_constructor && !func.is_reentrant {
+            self.needs_guard_cleanup = true;
             // Widen reentrancy slot to wide scratch
             self.emit_op(Opcode::Addi, 15, 0, REENTRANCY_SLOT);
             self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0); // w7 = slot key
@@ -861,7 +861,10 @@ impl CodeGen {
     /// `is_entry`: if true, emit Halt at end (constructor/standalone); if false, emit Ret.
     fn gen_function(&mut self, func: &IrFunction, is_entry: bool) {
         self.regs.reset();
-        self.needs_guard_cleanup = false;
+        // Set guard cleanup flag based on function properties (same condition as guard emission).
+        // This ensures cleanup is emitted before Ret in the function body.
+        self.needs_guard_cleanup = self.emit_guards
+            && func.is_pub && !func.is_view && !func.is_constructor && !func.is_reentrant;
         self.current_return_ty = func.return_ty.clone();
 
         // Remap IR labels to unique codegen labels to prevent cross-function collisions.
@@ -1523,6 +1526,12 @@ impl CodeGen {
                 } else {
                     // Void return: clear r2 to prevent false blob detection
                     self.emit_op(Opcode::Addi, 2, 0, 0);
+                }
+                // Reentrancy guard cleanup: clear lock before returning.
+                // Emitted inside the function body (before Ret) rather than in the
+                // dispatch wrapper (after Call returns) for reliable state persistence.
+                if self.needs_guard_cleanup && !is_entry {
+                    self.emit_reentrancy_cleanup();
                 }
                 if is_entry {
                     self.emit_op(Opcode::Halt, 0, 0, 0);

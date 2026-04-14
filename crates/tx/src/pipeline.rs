@@ -1180,11 +1180,6 @@ mod tests {
         let b30 = call(&smt, cd("get_balance", &[30]));
         let b1 = call(&smt, cd("get_balance", &[1]));
 
-        eprintln!("bal(10)={b10} (want 40700)");
-        eprintln!("bal(20)={b20} (want 41700)");
-        eprintln!("bal(30)={b30} (want 24500)");
-        eprintln!("bal(1)={b1} (want 2100)");
-
         assert_eq!(b10, 40700, "bal(10) = 38000 + 2700");
         assert_eq!(b20, 41700, "bal(20) = 39000 + 2700");
         assert_eq!(b30, 24500, "bal(30) = 21800 + 2700");

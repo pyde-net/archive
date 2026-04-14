@@ -503,8 +503,8 @@ impl PydeApiServer for RpcServer {
                 let blob = vm.memory.load_bytes(r1 as usize, r2 as usize);
                 Ok(format!("0x{}", hex::encode(blob)))
             } else {
-                // GP return: r1 as integer
-                Ok(format!("0x{:x}", r1))
+                // GP return: r1 as u64 — encode as 8 bytes LE hex (consistent with ABI)
+                Ok(format!("0x{}", hex::encode(r1.to_le_bytes())))
             }
         } else {
             Err(rpc_err(-32000, format!("execution failed: {:?}", output.outcome)))
@@ -560,28 +560,10 @@ impl PydeApiServer for RpcServer {
         }));
         let output = vm.execute();
 
-        // Return actual function output (not gas_used).
-        // Uses same r1/r2 convention as do_ext_call and pipeline return_data capture.
-        let return_data = if output.outcome == pyde_vm::vm::Outcome::Success {
-            let r2 = vm.cpu.read_gp(2);
-            if r2 > 0 {
-                // Blob/wide return: r1 = pointer, r2 = length
-                let ptr = vm.cpu.read_gp(1) as usize;
-                let len = (r2 as usize).min(pyde_vm::memory::MEMORY_SIZE);
-                if ptr + len <= pyde_vm::memory::MEMORY_SIZE {
-                    vm.memory.load_bytes(ptr, len)
-                } else {
-                    vm.cpu.read_gp(1).to_le_bytes().to_vec()
-                }
-            } else {
-                // GP return: r1 = value (8 bytes LE)
-                vm.cpu.read_gp(1).to_le_bytes().to_vec()
-            }
-        } else {
-            vec![]
-        };
-
-        Ok(format!("0x{}", hex::encode(&return_data)))
+        // Return gas used (with 20% safety margin for real execution overhead)
+        let gas_used = vm.gas_used_total;
+        let estimate = if gas_used == 0 { 21_000 } else { gas_used + gas_used / 5 };
+        Ok(format!("0x{:x}", estimate))
     }
 
     async fn get_transaction_receipt(&self, tx_hash: String) -> Result<serde_json::Value, ErrorObjectOwned> {
@@ -590,7 +572,7 @@ impl PydeApiServer for RpcServer {
 
         match store.get(&hash) {
             Some(receipt) => Ok(receipt_to_json(receipt)),
-            None => Err(rpc_err(-32602, "receipt not found".to_string())),
+            None => Ok(serde_json::Value::Null),
         }
     }
 

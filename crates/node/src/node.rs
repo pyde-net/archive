@@ -331,10 +331,13 @@ impl PydeNode {
 
         // 10. Start RPC server if enabled
         let (tx_gossip_tx, mut tx_gossip_rx) = tokio::sync::mpsc::channel::<pyde_tx::types::Transaction>(1024);
+        // WebSocket subscription broadcast channels (created even if RPC disabled — cheap no-op)
+        let (new_heads_tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+        let (pending_tx_tx, _) = tokio::sync::broadcast::channel::<String>(4096);
+        let (logs_tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(1024);
+        let ws_heads = new_heads_tx.clone();
+        let ws_logs = logs_tx.clone();
         if self.config.rpc.enabled {
-            let (new_heads_tx, _) = tokio::sync::broadcast::channel(256);
-            let (pending_tx_tx, _) = tokio::sync::broadcast::channel(4096);
-            let (logs_tx, _) = tokio::sync::broadcast::channel(1024);
             let rpc_state = Arc::new(RpcState {
                 chain: chain.clone(),
                 state: state.clone(),
@@ -870,6 +873,22 @@ impl PydeNode {
                                                 chain_sync.on_block_processed(current_slot);
                                                 let mut receipts_w = receipts.write().await;
                                                 receipts_w.insert_block_receipts(current_slot, receipts_list.clone());
+                                                // Broadcast to WS subscribers
+                                                let _ = ws_heads.send(serde_json::json!({
+                                                    "slot": format!("0x{:x}", current_slot),
+                                                    "timestamp": format!("0x{:x}", block.header.timestamp),
+                                                    "proposer": format!("0x{}", hex::encode(block.header.proposer)),
+                                                    "txCount": format!("0x{:x}", tc),
+                                                }));
+                                                for r in receipts_list.iter() {
+                                                    for log in &r.logs {
+                                                        let _ = ws_logs.send(serde_json::json!({
+                                                            "address": format!("0x{}", hex::encode(log.address)),
+                                                            "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+                                                            "data": format!("0x{}", hex::encode(&log.data)),
+                                                        }));
+                                                    }
+                                                }
                                                 info!(
                                                     slot = current_slot, txs = tc, gas,
                                                     "proposed and processed block"
