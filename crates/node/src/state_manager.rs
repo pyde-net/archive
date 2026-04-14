@@ -71,6 +71,27 @@ impl StateManager {
         }
     }
 
+    /// Take a read-consistent snapshot of the cache + SMT for static calls.
+    /// Returns a closure that reads from the frozen snapshot, immune to
+    /// concurrent cache writes from the block processor or Merkle commit.
+    pub fn snapshot_reader(&self) -> impl Fn(&Key) -> Option<Vec<u8>> + Send + Sync {
+        // Clone the entire cache — this is O(n) but pyde_call is infrequent.
+        let cache_snap: HashMap<Key, Vec<u8>> = self.cache.read()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+        let smt = Arc::clone(&self.smt);
+        move |key: &Key| -> Option<Vec<u8>> {
+            if let Some(val) = cache_snap.get(key) {
+                return if val.is_empty() { None } else { Some(val.clone()) };
+            }
+            if let Ok(smt) = smt.lock() {
+                smt.get(key)
+            } else {
+                None
+            }
+        }
+    }
+
     /// Insert directly (used during genesis, bypasses deferred path).
     pub fn insert(&mut self, key: Key, value: Vec<u8>) -> Result<[u8; 32], String> {
         self.tracked_keys.insert(key);
