@@ -142,7 +142,10 @@ impl Transaction {
     /// )
     /// ```
     pub fn hash(&self) -> [u8; 32] {
-        let mut buf = Vec::with_capacity(256);
+        // chain_id(8) + from(32) + to(32) + value(16) + data_hash(32) +
+        // gas_limit(8) + nonce(8) + fee_payer(1) + access_hash(32) +
+        // deadline(1-9) + tx_type(1) = 171-179 bytes
+        let mut buf = Vec::with_capacity(180);
         buf.extend_from_slice(&self.chain_id.to_le_bytes());
         buf.extend_from_slice(&self.from);
         buf.extend_from_slice(&self.to);

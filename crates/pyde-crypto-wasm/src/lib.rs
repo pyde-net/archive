@@ -131,7 +131,10 @@ fn compute_tx_hash(v: &serde_json::Value) -> Result<[u8; 32], JsValue> {
     let tx_type = v.get("txType").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
 
     // Same hash algorithm as Transaction::hash() in pyde-tx
-    let mut buf = Vec::with_capacity(256);
+    // Fields: chain_id(8) + from(32) + to(32) + value(16) + data_hash(32) +
+    //         gas_limit(8) + nonce(8) + fee_payer(1) + access_hash(32) +
+    //         deadline(1-9) + tx_type(1) = 171-179 bytes
+    let mut buf = Vec::with_capacity(180);
     buf.extend_from_slice(&chain_id.to_le_bytes());
     buf.extend_from_slice(&from);
     buf.extend_from_slice(&to);
