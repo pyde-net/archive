@@ -709,9 +709,15 @@ impl PydeApiServer for RpcServer {
         let sink = subscription_sink.accept().await?;
         let mut rx = self.state.new_heads_tx.subscribe();
         tokio::spawn(async move {
-            while let Ok(header) = rx.recv().await {
-                if sink.send(jsonrpsee::SubscriptionMessage::from_json(&header).unwrap()).await.is_err() {
-                    break; // client disconnected
+            loop {
+                match rx.recv().await {
+                    Ok(header) => {
+                        if sink.send(jsonrpsee::SubscriptionMessage::from_json(&header).unwrap()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
                 }
             }
         });
@@ -746,18 +752,26 @@ impl PydeApiServer for RpcServer {
             .and_then(|v| v.as_str())
             .map(|s| s.to_lowercase());
         tokio::spawn(async move {
-            while let Ok(log) = rx.recv().await {
-                // Apply filter: if address specified, only send matching logs
-                if let Some(ref addr) = filter_addr {
-                    let log_addr = log.get("address")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_lowercase());
-                    if log_addr.as_deref() != Some(addr.as_str()) {
-                        continue;
+            loop {
+                match rx.recv().await {
+                    Ok(log) => {
+                        // Apply filter: if address specified, only send matching logs
+                        if let Some(ref addr) = filter_addr {
+                            let log_addr = log.get("address")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_lowercase());
+                            if log_addr.as_deref() != Some(addr.as_str()) {
+                                continue;
+                            }
+                        }
+                        if sink.send(jsonrpsee::SubscriptionMessage::from_json(&log).unwrap()).await.is_err() {
+                            break;
+                        }
                     }
-                }
-                if sink.send(jsonrpsee::SubscriptionMessage::from_json(&log).unwrap()).await.is_err() {
-                    break;
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        continue; // skip missed messages, keep listening
+                    }
+                    Err(_) => break, // channel closed
                 }
             }
         });
