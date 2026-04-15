@@ -303,8 +303,8 @@ pub enum Inst {
     /// `%dst = array_repeat %val, count`
     ArrayRepeat(Reg, Reg, u64),
 
-    /// `emit "event_name", [field_regs...]`
-    Emit(String, Vec<Reg>),
+    /// `emit "event_name", [(reg, type_name)...]`
+    Emit(String, Vec<(Reg, String)>),
 
     /// `revert "error_name", [field_regs...]`
     Revert(String, Vec<Reg>),
@@ -519,7 +519,7 @@ impl fmt::Display for Inst {
             }
             Inst::ArrayRepeat(dst, val, count) => write!(f, "{} = [{}; {}]", dst, val, count),
             Inst::Emit(name, fields) => {
-                let args_str: Vec<String> = fields.iter().map(|r| r.to_string()).collect();
+                let args_str: Vec<String> = fields.iter().map(|(r, ty)| format!("{}: {}", r, ty)).collect();
                 write!(f, "emit \"{}\"({})", name, args_str.join(", "))
             }
             Inst::Revert(name, fields) => {
