@@ -211,7 +211,7 @@ impl PydeApiServer for RpcServer {
                 "timestamp": format!("0x{:x}", header.timestamp),
                 "proposer": format!("0x{}", hex::encode(header.proposer)),
             })),
-            None => Err(rpc_err(-32602, format!("block not found at slot {}", slot))),
+            None => Ok(serde_json::Value::Null),
         }
     }
 
@@ -558,9 +558,11 @@ impl PydeApiServer for RpcServer {
         }));
         let output = vm.execute();
 
-        // Return gas used (with 20% safety margin for real execution overhead)
+        // Return gas used + 10% margin for real execution overhead (nonce check, balance deduct, etc.)
+        // The VM simulation already includes all cold storage surcharges.
         let gas_used = vm.gas_used_total;
-        let estimate = if gas_used == 0 { 21_000 } else { gas_used + gas_used / 5 };
+        let base_tx_cost = 21_000u64;
+        let estimate = if gas_used == 0 { base_tx_cost } else { base_tx_cost + gas_used + gas_used / 10 };
         Ok(format!("0x{:x}", estimate))
     }
 
@@ -706,15 +708,16 @@ impl PydeApiServer for RpcServer {
         &self,
         subscription_sink: jsonrpsee::PendingSubscriptionSink,
     ) -> jsonrpsee::core::SubscriptionResult {
-        let sink = subscription_sink.accept().await?;
+        let mut sink = subscription_sink.accept().await?;
         let mut rx = self.state.new_heads_tx.subscribe();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(header) => {
-                        if sink.send(jsonrpsee::SubscriptionMessage::from_json(&header).unwrap()).await.is_err() {
-                            break;
-                        }
+                        // Use try_send to avoid blocking — if the WS buffer is full, skip this header.
+                        // Block headers arrive every 400ms; missing one is acceptable.
+                        let msg = jsonrpsee::SubscriptionMessage::from_json(&header).unwrap();
+                        let _ = sink.try_send(msg);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,

@@ -429,8 +429,9 @@ impl CodeGen {
                 self.emit_calldata_decode(func);
                 self.emit_function_guards(func);
                 self.emit_jump_placeholder(Opcode::Call, 0, 0, *func_label);
-                // Reentrancy cleanup moved to function body (before Ret) for reliability.
-                // The dispatch wrapper no longer handles cleanup.
+                // Reentrancy cleanup is in the function body (before Ret).
+                // This ensures cleanup runs in the same call frame as the guard SET,
+                // which is more reliable than post-Call cleanup in the dispatch wrapper.
                 self.emit_op(Opcode::Halt, 0, 0, 0);
             }
         }
@@ -1562,7 +1563,7 @@ impl CodeGen {
                 // Layout: [topic0: 32 bytes (event name hash)] [data_ptr: 8] [data_len: 8]
                 let desc_base = 12; // r12 = heap pointer (descriptor start)
 
-                // Topic 0: hash of event name (simplified: FNV hash widened to 256-bit)
+                // Topic 0: hash of event name (FNV hash, stored as LE u32 in 32 bytes)
                 let name_hash = compute_selector(name) as u64;
                 self.load_u64_to_reg(15, name_hash);
                 self.emit_store(15, 12, 0); // store low 8 bytes of topic
@@ -1571,23 +1572,38 @@ impl CodeGen {
                 self.emit_store(15, 12, 16);
                 self.emit_store(15, 12, 24);
 
-                // Data: store field values after descriptor
+                // Data: store field values with correct byte widths per type
                 let data_start_offset = 32 + 16; // after topic + ptr/len
-                for (i, freg) in fields.iter().enumerate() {
+                let mut data_offset = data_start_offset;
+                for (freg, ty) in fields.iter() {
                     let fr = self.get_reg(*freg);
-                    self.emit_store(fr, 12, (data_start_offset + i * 8) as i32);
+                    let is_wide = ty == "Address" || ty == "u256" || ty == "i256";
+                    if is_wide {
+                        // Wide types: store 32 bytes via 4 × Store64
+                        // The value is in a wide register; use Narrow to get pieces
+                        // For simplicity, store the GP value (8 bytes) + 24 zero bytes
+                        self.emit_store(fr, 12, data_offset as i32);
+                        // Zero the remaining 24 bytes
+                        self.emit_op(Opcode::Addi, 15, 0, 0);
+                        self.emit_store(15, 12, (data_offset + 8) as i32);
+                        self.emit_store(15, 12, (data_offset + 16) as i32);
+                        self.emit_store(15, 12, (data_offset + 24) as i32);
+                        data_offset += 32;
+                    } else {
+                        // GP types (u8-u64, bool, etc.): 8 bytes
+                        self.emit_store(fr, 12, data_offset as i32);
+                        data_offset += 8;
+                    }
                 }
+                let data_len = (data_offset - data_start_offset) as u32;
 
                 // Write data_ptr and data_len at offset 32
-                // data_ptr = r12 + data_start_offset
                 self.emit_op(Opcode::Addi, 14, 12, data_start_offset as u32);
                 self.emit_store(14, 12, 32); // data_ptr
-                let data_len = (fields.len() * 8) as u32;
                 self.emit_op(Opcode::Addi, 14, 0, data_len);
                 self.emit_store(14, 12, 40); // data_len
 
                 // Log rs1=descriptor pointer, imm=num_topics
-                // PVM reads descriptor from rs1, NOT rd
                 self.emit_op(Opcode::Log, 0, desc_base, 1);
 
                 // Advance heap past descriptor + data

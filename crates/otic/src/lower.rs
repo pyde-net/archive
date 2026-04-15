@@ -821,11 +821,19 @@ impl Lowerer {
     }
 
     fn lower_emit(&mut self, e: &EmitStmt) {
-        let field_regs: Vec<Reg> = e.fields.iter()
-            .map(|f| self.lower_expr(&f.value))
-            .collect();
-        // Flatten qualified path: event::Deposit → "Deposit"
         let event_name = e.event_name.last().map(|i| i.name.clone()).unwrap_or_default();
+        // Look up event definition to get field types
+        let event_field_types: Vec<String> = self.program.event_defs.iter()
+            .find(|ev| ev.name == event_name)
+            .map(|ev| ev.fields.iter().map(|f| format!("{}", f.ty)).collect())
+            .unwrap_or_default();
+        let field_regs: Vec<(Reg, String)> = e.fields.iter().enumerate()
+            .map(|(i, f)| {
+                let reg = self.lower_expr(&f.value);
+                let ty = event_field_types.get(i).cloned().unwrap_or_else(|| "u64".to_string());
+                (reg, ty)
+            })
+            .collect();
         self.emit(Inst::Emit(event_name, field_regs));
     }
 
