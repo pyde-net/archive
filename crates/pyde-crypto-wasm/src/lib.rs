@@ -141,8 +141,8 @@ fn compute_tx_hash(v: &serde_json::Value) -> Result<[u8; 32], JsValue> {
     buf.extend_from_slice(&nonce.to_le_bytes());
     buf.push(0); // fee_payer tag: Sender
     buf.extend_from_slice(&hash_empty_access_list());
-    // deadline: None → 0u64
-    buf.extend_from_slice(&0u64.to_le_bytes());
+    // deadline: None → single 0 byte (matches Transaction::hash)
+    buf.push(0);
     buf.push(tx_type);
 
     Ok(poseidon2_hash(&buf).to_bytes())
