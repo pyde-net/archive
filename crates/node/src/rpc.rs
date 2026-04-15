@@ -750,15 +750,16 @@ impl PydeApiServer for RpcServer {
     ) -> jsonrpsee::core::SubscriptionResult {
         let sink = subscription_sink.accept().await?;
         let mut rx = self.state.logs_tx.subscribe();
-        // Parse filter for address and topic matching
         let filter_addr = filter.get("address")
             .and_then(|v| v.as_str())
             .map(|s| s.to_lowercase());
+        let receiver_count = self.state.logs_tx.receiver_count();
+        info!(receiver_count, "logs subscription created");
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(log) => {
-                        // Apply filter: if address specified, only send matching logs
+                        info!("logs subscription: received log, forwarding to sink");
                         if let Some(ref addr) = filter_addr {
                             let log_addr = log.get("address")
                                 .and_then(|v| v.as_str())
@@ -771,10 +772,8 @@ impl PydeApiServer for RpcServer {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        continue; // skip missed messages, keep listening
-                    }
-                    Err(_) => break, // channel closed
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
                 }
             }
         });
