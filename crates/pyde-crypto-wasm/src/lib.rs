@@ -143,7 +143,7 @@ fn compute_tx_hash(v: &serde_json::Value) -> Result<[u8; 32], JsValue> {
     buf.extend_from_slice(&gas_limit.to_le_bytes());
     buf.extend_from_slice(&nonce.to_le_bytes());
     buf.push(0); // fee_payer tag: Sender
-    buf.extend_from_slice(&hash_empty_access_list());
+    buf.extend_from_slice(&hash_access_list(v));
     // deadline: None → single 0 byte (matches Transaction::hash)
     buf.push(0);
     buf.push(tx_type);
@@ -151,8 +151,60 @@ fn compute_tx_hash(v: &serde_json::Value) -> Result<[u8; 32], JsValue> {
     Ok(poseidon2_hash(&buf).to_bytes())
 }
 
-fn hash_empty_access_list() -> [u8; 32] {
-    poseidon2_hash(&[]).to_bytes()
+fn hash_access_list(v: &serde_json::Value) -> [u8; 32] {
+    let entries = match v.get("accessList").and_then(|a| a.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return poseidon2_hash(&[]).to_bytes(), // empty = hash of empty bytes
+    };
+    // Must match Rust's hash_access_list format: NO count prefix, just entries
+    let serialized = hash_serialize_access_list(entries);
+    poseidon2_hash(&serialized).to_bytes()
+}
+
+/// Serialize for wire encoding (WITH count prefix — matches Rust serialize_access_list)
+fn serialize_access_list_entries(entries: &[serde_json::Value]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        serialize_one_access_entry(entry, &mut buf);
+    }
+    buf
+}
+
+/// Serialize for HASHING (NO count prefix — matches Rust hash_access_list)
+fn hash_serialize_access_list(entries: &[serde_json::Value]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for entry in entries {
+        serialize_one_access_entry(entry, &mut buf);
+    }
+    buf
+}
+
+fn serialize_one_access_entry(entry: &serde_json::Value, buf: &mut Vec<u8>) {
+    let addr = entry.get("address").and_then(|v| v.as_str())
+        .map(|s| decode_hex(s).unwrap_or_default())
+        .unwrap_or_default();
+    let mut addr32 = [0u8; 32];
+    if addr.len() == 32 { addr32.copy_from_slice(&addr); }
+    buf.extend_from_slice(&addr32);
+
+    let parse_keys = |field: &str| -> Vec<[u8; 32]> {
+        entry.get(field).and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|k| {
+                let b = decode_hex(k.as_str().unwrap_or("")).unwrap_or_default();
+                if b.len() == 32 { let mut k32 = [0u8; 32]; k32.copy_from_slice(&b); Some(k32) }
+                else { None }
+            }).collect())
+            .unwrap_or_default()
+    };
+
+    let reads = parse_keys("reads");
+    buf.extend_from_slice(&(reads.len() as u32).to_le_bytes());
+    for k in &reads { buf.extend_from_slice(k); }
+
+    let writes = parse_keys("writes");
+    buf.extend_from_slice(&(writes.len() as u32).to_le_bytes());
+    for k in &writes { buf.extend_from_slice(k); }
 }
 
 // ============================================================================
@@ -181,9 +233,14 @@ fn serialize_tx(v: &serde_json::Value, signature: &[u8]) -> Result<Vec<u8>, JsVa
     buf.extend_from_slice(signature);                          // ~666
     buf.push(1); // fee_payer bytes len
     buf.push(0); // FeePayer::Sender tag
-    // access_list: byte length of serialized data (4 bytes for the empty count prefix)
-    buf.extend_from_slice(&4u32.to_le_bytes());               // access_list byte len = 4
-    buf.extend_from_slice(&0u32.to_le_bytes());               // entry count = 0
+    // access_list serialization
+    let al_entries = v.get("accessList").and_then(|a| a.as_array());
+    let al_bytes = match al_entries {
+        Some(entries) if !entries.is_empty() => serialize_access_list_entries(entries),
+        _ => { let mut b = Vec::new(); b.extend_from_slice(&0u32.to_le_bytes()); b }
+    };
+    buf.extend_from_slice(&(al_bytes.len() as u32).to_le_bytes()); // byte len prefix
+    buf.extend_from_slice(&al_bytes);
     buf.push(0); // no deadline
     buf.extend_from_slice(&chain_id.to_le_bytes());           // 8
     buf.push(tx_type);                                         // 1

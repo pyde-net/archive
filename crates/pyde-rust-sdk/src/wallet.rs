@@ -202,15 +202,21 @@ impl Wallet {
     }
 
     /// Build, sign, send a contract call with native token value.
+    /// Automatically fetches access list via simulation for parallel scheduling.
     pub async fn send_call_with_value(
         &self, provider: &Provider, to: &Address, data: Vec<u8>, value: u128, gas_limit: u64,
     ) -> Result<Receipt> {
         let (nonce, chain_id) = provider.get_nonce_and_chain_id(&self.address).await?;
 
+        // Fetch access list via simulation (enables parallel scheduling)
+        let val = if value > 0 { Some(value) } else { None };
+        let access_list = provider.create_access_list(to, &data, Some(&self.address), val)
+            .await.unwrap_or_default();
+
         let mut tx = Transaction {
             from: self.address, to: *to, value, data,
             gas_limit, nonce, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list: vec![],
+            fee_payer: FeePayer::Sender, access_list,
             deadline: None, chain_id, tx_type: TransactionType::Standard,
         };
         self.sign_transaction(&mut tx)?;

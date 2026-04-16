@@ -12,6 +12,7 @@ use pyde_consensus::proposer::compute_candidacy;
 use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
 use pyde_crypto::poseidon2::poseidon2_hash;
 use pyde_state::smt::{PersistentSMT, StateAccess, StateOverlay};
+use pyde_tx::parallel::schedule;
 use pyde_tx::pipeline::execute_transaction;
 use pyde_tx::types::*;
 use rayon::prelude::*;
@@ -281,17 +282,11 @@ fn validator_block_lifecycle() {
     let _ = compute_candidacy(&validators[0].pk, &validators[0].sk, &epoch_rand, 1, validators[0].address).unwrap();
     let vrf_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    // ── Phase 2: Scheduling (hash-based, O(n)) ──────────────
+    // ── Phase 2: Scheduling (inverted index, O(n*k)) ──────
     let t = Instant::now();
-    let mut groups_map: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
-    for (i, tx) in selected.iter().enumerate() {
-        // Group by target contract (transfers by sender)
-        let key = if tx.data.is_empty() { tx.from } else { tx.to };
-        groups_map.entry(key).or_default().push(i);
-    }
-    let manual_groups: Vec<Vec<usize>> = groups_map.into_values().collect();
+    let sched = schedule(&selected);
     let sched_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let n_groups = manual_groups.len();
+    let n_groups = sched.group_count();
 
     // ── Phase 3: Batch sig verify ────────────────────────────
     let t = Instant::now();
@@ -311,10 +306,10 @@ fn validator_block_lifecycle() {
     // ── Phase 4: Parallel execution ──────────────────────────
     let t = Instant::now();
     let results: Vec<(Vec<(sparse_merkle_tree::H256, Vec<u8>)>, usize, usize, u64, usize)> =
-        manual_groups.par_iter().map(|indices| {
+        sched.groups.par_iter().map(|group| {
             let mut ov = StateOverlay::new(&smt as &dyn StateAccess);
             let (mut ok, mut fail, mut g, mut ev) = (0, 0, 0u64, 0);
-            for &idx in indices {
+            for &idx in &group.tx_indices {
                 match execute_transaction(&selected[idx], &mut ov, &ctx) {
                     Ok(r) if r.success => { ok += 1; g += r.gas_used; ev += r.logs.len(); }
                     _ => { fail += 1; }

@@ -151,6 +151,54 @@ impl Provider {
         parse_hex_u64(&result)
     }
 
+    /// Simulate a call and return the access list (storage keys touched).
+    /// Used to enable parallel transaction scheduling.
+    pub async fn create_access_list(
+        &self,
+        to: &Address,
+        data: &[u8],
+        from: Option<&Address>,
+        value: Option<u128>,
+    ) -> Result<Vec<pyde_tx::types::AccessEntry>> {
+        let mut params = serde_json::json!({
+            "to": format_address(to),
+            "data": format!("0x{}", hex::encode(data)),
+        });
+        if let Some(f) = from { params["from"] = serde_json::json!(format_address(f)); }
+        if let Some(v) = value { params["value"] = serde_json::json!(format!("0x{:x}", v)); }
+
+        let result = self.rpc("pyde_createAccessList", &[params]).await?;
+        let entries = result.get("accessList").and_then(|a| a.as_array())
+            .ok_or_else(|| SdkError::InvalidResponse("missing accessList".into()))?;
+
+        let mut access_list = Vec::new();
+        for entry in entries {
+            let addr_hex = entry.get("address").and_then(|v| v.as_str()).unwrap_or("");
+            let addr_bytes = hex::decode(addr_hex.strip_prefix("0x").unwrap_or(addr_hex))
+                .unwrap_or_default();
+            let mut address = [0u8; 32];
+            if addr_bytes.len() == 32 { address.copy_from_slice(&addr_bytes); }
+
+            let parse_keys = |field: &str| -> Vec<[u8; 32]> {
+                entry.get(field).and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|k| {
+                        let h = k.as_str().unwrap_or("").strip_prefix("0x").unwrap_or("");
+                        let b = hex::decode(h).ok()?;
+                        if b.len() == 32 { let mut k = [0u8; 32]; k.copy_from_slice(&b); Some(k) }
+                        else { None }
+                    }).collect())
+                    .unwrap_or_default()
+            };
+
+            access_list.push(pyde_tx::types::AccessEntry {
+                address,
+                reads: parse_keys("reads"),
+                writes: parse_keys("writes"),
+            });
+        }
+        Ok(access_list)
+    }
+
     /// Look up a transaction by its hash. Returns None if not found.
     pub async fn get_transaction(&self, tx_hash: &[u8; 32]) -> Result<Option<serde_json::Value>> {
         let result = self.rpc("pyde_getTransactionByHash", &[

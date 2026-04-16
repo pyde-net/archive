@@ -227,7 +227,8 @@ pub struct Vm {
     /// Storage write journal for rollback.
     storage_journal: Vec<(U256, Option<Vec<u8>>)>,
     /// Keys already journaled (O(1) dedup instead of O(n) scan).
-    storage_journal_keys: std::collections::HashSet<U256>,
+    /// Public for access list extraction after simulation.
+    pub storage_journal_keys: std::collections::HashSet<U256>,
     /// Contract registry: address → deployed bytecode.
     pub contracts: HashMap<Address, Vec<u8>>,
     /// Optional code backend for lazy loading contract bytecode (e.g., from SMT).
@@ -250,6 +251,11 @@ pub struct Vm {
     /// First access (cold) costs more gas. Subsequent accesses (warm) cost less.
     /// Public for pre-warming from access lists.
     pub warm_storage_keys: std::collections::HashSet<U256>,
+    /// Raw slot values (pre-derivation) for each storage access.
+    /// Used by pyde_createAccessList to return the raw slots the pipeline expects.
+    pub accessed_raw_slots: std::collections::HashSet<U256>,
+    /// Raw slot values that were WRITTEN (subset of accessed_raw_slots).
+    pub written_raw_slots: std::collections::HashSet<U256>,
 }
 
 /// Safe address calculation: base (u64) + offset (i64) → u32, or MemoryFault.
@@ -289,6 +295,8 @@ impl Vm {
             ext_call_depth: 0,
             allowed_storage_keys: None,
             warm_storage_keys: std::collections::HashSet::new(),
+            accessed_raw_slots: std::collections::HashSet::new(),
+            written_raw_slots: std::collections::HashSet::new(),
         }
     }
 
@@ -760,6 +768,7 @@ impl Vm {
             // imm & 0x3: 0 = wide register (32 bytes), 1 = memory (variable), 2 = GP register (8 bytes)
             Opcode::Sload => {
                 let slot = self.cpu.read_wide(d.rs1);
+                self.accessed_raw_slots.insert(slot);
                 let key = self.derive_storage_key(slot);
                 // Strict access list enforcement: revert if key not in allowed set
                 if let Some(ref allowed) = self.allowed_storage_keys {
@@ -843,6 +852,8 @@ impl Vm {
                     return Err(Trap::StaticModeViolation);
                 }
                 let slot = self.cpu.read_wide(d.rs1);
+                self.accessed_raw_slots.insert(slot);
+                self.written_raw_slots.insert(slot);
                 let key = self.derive_storage_key(slot);
                 // Strict access list enforcement: revert if key not in allowed set
                 if let Some(ref allowed) = self.allowed_storage_keys {
@@ -901,6 +912,8 @@ impl Vm {
                 }
                 // sdelete ws1 — clear storage slot, grant gas refund if non-empty
                 let slot = self.cpu.read_wide(d.rs1);
+                self.accessed_raw_slots.insert(slot);
+                self.written_raw_slots.insert(slot);
                 let key = self.derive_storage_key(slot);
                 // EIP-2929: cold access surcharge
                 if !self.warm_storage_keys.contains(&key) {
@@ -1581,6 +1594,9 @@ impl Vm {
 
         // EIP-2929: merge child's warm keys back (persists regardless of success/failure)
         self.warm_storage_keys.extend(child.warm_storage_keys);
+        // Merge child's raw slot tracking for access list extraction
+        self.accessed_raw_slots.extend(child.accessed_raw_slots);
+        self.written_raw_slots.extend(child.written_raw_slots);
 
         // Return data: check multiple sources in priority order.
         // 1. Explicit return_data (set by Revert or future explicit-return instructions)
@@ -1743,6 +1759,8 @@ impl Vm {
                 self.storage.insert(*k, v.clone());
             }
             self.warm_storage_keys.extend(child.warm_storage_keys);
+            self.accessed_raw_slots.extend(child.accessed_raw_slots);
+            self.written_raw_slots.extend(child.written_raw_slots);
         }
 
         let runtime_code = runtime;

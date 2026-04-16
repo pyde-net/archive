@@ -98,6 +98,11 @@ pub trait PydeApi {
     #[method(name = "pyde_estimateGas")]
     async fn estimate_gas(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned>;
 
+    /// Simulate a call and return the access list (storage keys touched).
+    /// Used by SDKs to attach access lists for parallel scheduling.
+    #[method(name = "pyde_createAccessList")]
+    async fn create_access_list(&self, call_obj: serde_json::Value) -> Result<serde_json::Value, ErrorObjectOwned>;
+
     /// Get a transaction receipt by tx hash.
     #[method(name = "pyde_getTransactionReceipt")]
     async fn get_transaction_receipt(&self, tx_hash: String) -> Result<serde_json::Value, ErrorObjectOwned>;
@@ -559,6 +564,105 @@ impl PydeApiServer for RpcServer {
         let base_tx_cost = 21_000u64;
         let estimate = if gas_used == 0 { base_tx_cost } else { base_tx_cost + gas_used + gas_used / 10 };
         Ok(format!("0x{:x}", estimate))
+    }
+
+    async fn create_access_list(&self, call_obj: serde_json::Value) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let from = call_obj.get("from").and_then(|v| v.as_str())
+            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
+        let to = call_obj.get("to").and_then(|v| v.as_str())
+            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
+        let data_hex = call_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        let calldata = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex))
+            .unwrap_or_default();
+        let value: u128 = call_obj.get("value").and_then(|v| v.as_str())
+            .and_then(|s| u128::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok())
+            .unwrap_or(0);
+        let gas_limit: u64 = call_obj.get("gas").and_then(|v| v.as_u64())
+            .unwrap_or(50_000_000);
+
+        if to == [0u8; 32] {
+            // Deploy — no meaningful access list
+            return Ok(serde_json::json!({
+                "accessList": [],
+                "gasUsed": format!("0x{:x}", 32_000 + calldata.len() as u64 * 16)
+            }));
+        }
+
+        let state_r = self.state.state.read().await;
+        let code_key = pyde_state::keys::code_key(&to);
+        let code = match state_r.get(&code_key) {
+            Some(c) => c,
+            None => {
+                // Simple transfer — access list is just the sender and receiver balance keys
+                let from_slot = pyde_crypto::poseidon2::poseidon2_hash(&{
+                    let mut buf = Vec::with_capacity(33);
+                    buf.extend_from_slice(&from);
+                    buf.push(0x04);
+                    buf
+                }).to_bytes();
+                let to_slot = pyde_crypto::poseidon2::poseidon2_hash(&{
+                    let mut buf = Vec::with_capacity(33);
+                    buf.extend_from_slice(&to);
+                    buf.push(0x04);
+                    buf
+                }).to_bytes();
+                return Ok(serde_json::json!({
+                    "accessList": [
+                        { "address": format!("0x{}", hex::encode(from)), "reads": [], "writes": [format!("0x{}", hex::encode(from_slot))] },
+                        { "address": format!("0x{}", hex::encode(to)), "reads": [], "writes": [format!("0x{}", hex::encode(to_slot))] }
+                    ],
+                    "gasUsed": "0x5208"
+                }));
+            }
+        };
+        let storage_snapshot = state_r.snapshot_reader();
+        drop(state_r);
+
+        let ctx = pyde_vm::vm::ExecutionContext {
+            caller: from,
+            self_address: to,
+            call_value: ethnum::U256::from(value),
+            block_number: 0,
+            timestamp: 0,
+            gas_price: ethnum::U256::ZERO,
+            tx_nonce: 0,
+            tx_gas_limit: gas_limit,
+            tx_hash: ethnum::U256::ZERO,
+            block_proposer: [0u8; 32],
+            block_hashes: vec![],
+            balances: std::collections::HashMap::new(),
+        };
+
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(gas_limit, ctx);
+        vm.calldata = calldata;
+        let _ = vm.load(&code);
+        vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
+            let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+            storage_snapshot(&smt_key)
+        }));
+        let output = vm.execute();
+
+        // Build access list from VM's tracked RAW slots (pre-derivation).
+        // The pipeline's pre_derive_access_list_keys will derive them,
+        // so we must return raw slots, not already-derived keys.
+        let write_keys: Vec<String> = vm.written_raw_slots.iter()
+            .map(|k| format!("0x{}", hex::encode(k.to_le_bytes())))
+            .collect();
+        let read_keys: Vec<String> = vm.accessed_raw_slots.iter()
+            .filter(|k| !vm.written_raw_slots.contains(k))
+            .map(|k| format!("0x{}", hex::encode(k.to_le_bytes())))
+            .collect();
+
+        let gas_used = vm.gas_used_total;
+
+        Ok(serde_json::json!({
+            "accessList": [{
+                "address": format!("0x{}", hex::encode(to)),
+                "reads": read_keys,
+                "writes": write_keys,
+            }],
+            "gasUsed": format!("0x{:x}", gas_used)
+        }))
     }
 
     async fn get_transaction_receipt(&self, tx_hash: String) -> Result<serde_json::Value, ErrorObjectOwned> {
