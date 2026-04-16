@@ -749,8 +749,8 @@ impl Vm {
                 let addr = self.cpu.read_gp(d.rs1) as u32;
                 let len = (d.rs2_or_imm & 0xF) as u8;
                 let byte_len = self.cpu.read_gp(len) as usize;
-                // Dynamic gas: 6 per 32 bytes of input (Poseidon2 absorbs 4 elements per permutation)
-                let dynamic_gas = ((byte_len as u64 + 31) / 32) * 6;
+                // Dynamic gas: 250 per 32 bytes (Poseidon2 permutation ≈ 250ns each)
+                let dynamic_gas = ((byte_len as u64 + 31) / 32) * 250;
                 self.gas_used_total += dynamic_gas;
                 if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                     return Err(Trap::OutOfGas);
@@ -1248,7 +1248,7 @@ impl Vm {
                 }
 
                 // Dynamic gas: 50 per proof level (each level = Poseidon hash + memory read)
-                let dynamic_gas = (proof_len as u64) * 50;
+                let dynamic_gas = (proof_len as u64) * 1_000; // each proof element ≈ 1 Poseidon hash (1µs)
                 self.gas_used_total += dynamic_gas;
                 if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                     return Err(Trap::OutOfGas);
@@ -2430,7 +2430,7 @@ mod tests {
 
     #[test]
     fn gas_tracked() {
-        // ADDI costs 1, HALT costs 1
+        // ADDI costs 3, HALT costs 3
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 42),
             instr_bytes(Opcode::Halt, 0, 0, 0),
@@ -2438,7 +2438,7 @@ mod tests {
         let mut vm = Vm::new();
         vm.load(&code).unwrap();
         vm.run().unwrap();
-        assert_eq!(vm.gas_used_total, 2); // ADDI(1) + HALT(1)
+        assert_eq!(vm.gas_used_total, 6); // ADDI(3) + HALT(3)
     }
 
     #[test]
@@ -2456,12 +2456,12 @@ mod tests {
 
     #[test]
     fn gas_limit_exact_succeeds() {
-        // ADDI(1) + HALT(1) = 2
+        // ADDI(3) + HALT(3) = 6
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 42),
             instr_bytes(Opcode::Halt, 0, 0, 0),
         ]);
-        let mut vm = Vm::with_gas_limit(2);
+        let mut vm = Vm::with_gas_limit(6);
         vm.load(&code).unwrap();
         assert_eq!(vm.run().unwrap(), ExecResult::Halt);
         assert_eq!(vm.gas_remaining(), 0);
@@ -2486,7 +2486,7 @@ mod tests {
 
     #[test]
     fn gas_remaining_decreases() {
-        // ADDI(1) + HALT(1) = 2
+        // ADDI(3) + HALT(3) = 6
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 42),
             instr_bytes(Opcode::Halt, 0, 0, 0),
@@ -2494,7 +2494,7 @@ mod tests {
         let mut vm = Vm::with_gas_limit(100);
         vm.load(&code).unwrap();
         vm.run().unwrap();
-        assert_eq!(vm.gas_remaining(), 98); // 100 - 2
+        assert_eq!(vm.gas_remaining(), 94); // 100 - 6
     }
 
     #[test]
@@ -2649,9 +2649,9 @@ mod tests {
         ]);
         let mut vm = Vm::with_gas_limit(1000);
         vm.load(&code).unwrap();
-        // After executing Caller (gas cost 2), remaining should be 1000 - 2 = 998
+        // After executing Caller (gas cost 5), remaining should be 1000 - 5 = 995
         vm.step().unwrap();
-        assert_eq!(vm.cpu.read_gp(1), 998);
+        assert_eq!(vm.cpu.read_gp(1), 995);
     }
 
     #[test]
@@ -3136,15 +3136,15 @@ mod tests {
         vm.cpu.write_wide(0, U256::from(1u64));
         vm.cpu.write_wide(1, U256::from(42u64));
         let code = bytecode(&[
-            instr_bytes(Opcode::Sstore, 1, 0, 0),  // 2000 gas
-            instr_bytes(Opcode::Sload, 2, 0, 0),   // 200 gas
-            instr_bytes(Opcode::Sdelete, 0, 0, 0), // 500 gas
-            instr_bytes(Opcode::Halt, 0, 0, 0),    // 1 gas
+            instr_bytes(Opcode::Sstore, 1, 0, 0),  // 200 gas
+            instr_bytes(Opcode::Sload, 2, 0, 0),   // 100 gas
+            instr_bytes(Opcode::Sdelete, 0, 0, 0), // 200 gas
+            instr_bytes(Opcode::Halt, 0, 0, 0),    // 3 gas
         ]);
         vm.load(&code).unwrap();
         vm.run().unwrap();
-        // SSTORE=2000+1800(cold), SLOAD=200(warm, same key), SDELETE=500(warm), HALT=1
-        assert_eq!(vm.gas_used_total, (2000 + 1800) + 200 + 500 + 1);
+        // SSTORE=200+1800(cold), SLOAD=100(warm, same key), SDELETE=200(warm), HALT=3
+        assert_eq!(vm.gas_used_total, (200 + 1800) + 100 + 200 + 3);
     }
 
     #[test]
@@ -3424,10 +3424,10 @@ mod tests {
         vm.load(&code).unwrap();
         vm.run().unwrap();
 
-        // Base ISA gas (50) + dynamic (100 + 10*8 + 3*50 = 330)
-        // + HALT (1) + page allocation (200 for heap page touched by descriptor)
-        let log_gas = 50 + 100 + 80 + 150; // 380
-        let halt_gas = 1;
+        // Base ISA gas (375) + dynamic (100 + 10*8 + 3*50 = 330)
+        // + HALT (3) + page allocation (200 for heap page touched by descriptor)
+        let log_gas = 375 + 100 + 80 + 150; // 705
+        let halt_gas = 3;
         let page_gas = 200; // one heap page allocated for descriptor data
         assert_eq!(vm.gas_used_total, log_gas + halt_gas + page_gas);
     }
