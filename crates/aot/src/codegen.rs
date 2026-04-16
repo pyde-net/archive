@@ -151,6 +151,10 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_sloadg = module.declare_function("host_sloadg", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
+    // host_log(ctx, desc_ptr, num_topics) -> u64
+    let fn_log = module.declare_function("host_log", Linkage::Import, &sig_sload)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+
     // host_poseidon(ctx, addr, len, wd) -> u64
     let mut sig_pos = module.make_signature();
     sig_pos.params.push(AbiParam::new(ptr_type));
@@ -272,6 +276,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_sstoreg_ref = module.declare_func_in_func(fn_sstoreg, &mut ctx.func);
     let fn_sdelete_ref = module.declare_func_in_func(fn_sdelete, &mut ctx.func);
     let fn_sloadg_ref = module.declare_func_in_func(fn_sloadg, &mut ctx.func);
+    let fn_log_ref = module.declare_func_in_func(fn_log, &mut ctx.func);
     let fn_poseidon_ref = module.declare_func_in_func(fn_poseidon, &mut ctx.func);
     let fn_push_ref = module.declare_func_in_func(fn_push, &mut ctx.func);
     let fn_pop_ref = module.declare_func_in_func(fn_pop, &mut ctx.func);
@@ -866,8 +871,22 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         break;
                     }
 
+                    // Log: emit event via host_log(ctx, desc_ptr, num_topics)
+                    Opcode::Log => {
+                        let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                        let desc_ptr = gp_read!(builder, d.rs1);
+                        let num_topics = builder.ins().iconst(I64, (d.rs2_or_imm & 0x7) as i64);
+                        let call = builder.ins().call(fn_log_ref, &[vm_ctx, desc_ptr, num_topics]);
+                        let result = builder.inst_results(call)[0];
+                        let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(is_err, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
+                    }
+
                     // Remaining opcodes not yet AOT-compiled (CallExt,
-                    // Delegate, Create, Log, VerifySig, MerkleVerify) trap.
+                    // Delegate, Create, VerifySig, MerkleVerify) trap.
                     _ => {
                         builder.ins().jump(trap_block, &[]);
                         terminated = true;
