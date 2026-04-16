@@ -234,6 +234,16 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_exec_opcode = module.declare_function("host_exec_opcode", Linkage::Import, &sig_wide)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
+    // host_sync_gp_to_vm(ctx, regs_ptr) — copy external regs to vm.cpu.gp
+    // host_sync_gp_from_vm(ctx, regs_ptr) — copy vm.cpu.gp to external regs
+    let mut sig_sync_gp = module.make_signature();
+    sig_sync_gp.params.push(AbiParam::new(ptr_type));
+    sig_sync_gp.params.push(AbiParam::new(ptr_type));
+    let fn_sync_gp_to_vm = module.declare_function("host_sync_gp_to_vm", Linkage::Import, &sig_sync_gp)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    let fn_sync_gp_from_vm = module.declare_function("host_sync_gp_from_vm", Linkage::Import, &sig_sync_gp)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+
     // host_read_gp(ctx, reg_idx) -> u64 (reads GP register from VM)
     let mut sig_read_gp = module.make_signature();
     sig_read_gp.params.push(AbiParam::new(ptr_type));
@@ -306,6 +316,8 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_balance_ref = module.declare_func_in_func(fn_balance, &mut ctx.func);
     let fn_assert_ref = module.declare_func_in_func(fn_assert, &mut ctx.func);
     let fn_memcpy_ref = module.declare_func_in_func(fn_memcpy, &mut ctx.func);
+    let fn_sync_gp_to_vm_ref = module.declare_func_in_func(fn_sync_gp_to_vm, &mut ctx.func);
+    let fn_sync_gp_from_vm_ref = module.declare_func_in_func(fn_sync_gp_from_vm, &mut ctx.func);
 
     {
         let mut fn_builder_ctx = FunctionBuilderContext::new();
@@ -567,9 +579,10 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                     }
 
                     // --- Wide register ops (host calls) ---
+                    // Pure wide-to-wide: no GP interaction
                     Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv
                     | Opcode::Wmod | Opcode::Wand | Opcode::Wor | Opcode::Wxor
-                    | Opcode::Wnot | Opcode::Wmov | Opcode::Weq | Opcode::Wlt => {
+                    | Opcode::Wnot | Opcode::Wmov => {
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let op = builder.ins().iconst(I64, d.opcode.to_u8() as i64);
                         let wd = builder.ins().iconst(I64, d.rd as i64);
@@ -583,8 +596,51 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.seal_block(cont);
                         builder.switch_to_block(cont);
                     }
+                    // Wide comparisons: result written to GP register rd
+                    Opcode::Weq | Opcode::Wlt => {
+                        let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                        let regs_ptr_val = builder.use_var(Variable::from_u32(VAR_REGS_PTR));
+                        let op = builder.ins().iconst(I64, d.opcode.to_u8() as i64);
+                        let wd = builder.ins().iconst(I64, d.rd as i64);
+                        let ws1 = builder.ins().iconst(I64, d.rs1 as i64);
+                        let ws2 = builder.ins().iconst(I64, (d.rs2_or_imm & 0xF) as i64);
+                        let call = builder.ins().call(fn_wide_alu_ref, &[vm_ctx, op, wd, ws1, ws2]);
+                        let result = builder.inst_results(call)[0];
+                        let trapped = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(trapped, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
+                        // Read back GP result: Weq/Wlt write comparison to vm.cpu.gp[rd]
+                        let rd_idx = builder.ins().iconst(I64, d.rd as i64);
+                        let gp_call = builder.ins().call(fn_read_gp_ref, &[vm_ctx, rd_idx]);
+                        let gp_val = builder.inst_results(gp_call)[0];
+                        gp_write!(builder, d.rd, gp_val);
+                    }
+                    // Wide shift: reads shift amount from GP register
+                    Opcode::Wshift => {
+                        let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                        let regs_ptr_val = builder.use_var(Variable::from_u32(VAR_REGS_PTR));
+                        // Sync GP to VM (Wshift reads shift amount from a GP register)
+                        builder.ins().call(fn_sync_gp_to_vm_ref, &[vm_ctx, regs_ptr_val]);
+                        let op = builder.ins().iconst(I64, d.opcode.to_u8() as i64);
+                        let wd = builder.ins().iconst(I64, d.rd as i64);
+                        let ws1 = builder.ins().iconst(I64, d.rs1 as i64);
+                        // Pass full imm (direction bit + shift reg index), not truncated
+                        let imm = builder.ins().iconst(I64, d.rs2_or_imm as i64);
+                        let call = builder.ins().call(fn_wide_alu_ref, &[vm_ctx, op, wd, ws1, imm]);
+                        let result = builder.inst_results(call)[0];
+                        let trapped = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(trapped, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
+                    }
                     Opcode::Wload => {
-                        let addr = gp_read!(builder, d.rs1);
+                        let base = gp_read!(builder, d.rs1);
+                        let offset = sign_extend_18(d.rs2_or_imm) as i64;
+                        let off_val = builder.ins().iconst(I64, offset);
+                        let addr = builder.ins().iadd(base, off_val);
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_wload_ref, &[vm_ctx, addr, wd]);
@@ -596,7 +652,10 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.switch_to_block(cont);
                     }
                     Opcode::Wstore => {
-                        let addr = gp_read!(builder, d.rs1);
+                        let base = gp_read!(builder, d.rs1);
+                        let offset = sign_extend_18(d.rs2_or_imm) as i64;
+                        let off_val = builder.ins().iconst(I64, offset);
+                        let addr = builder.ins().iadd(base, off_val);
                         let ws = builder.ins().iconst(I64, d.rd as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_wstore_ref, &[vm_ctx, addr, ws]);
@@ -890,33 +949,26 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.switch_to_block(cont);
                     }
 
-                    // Complex opcodes: delegate to PVM interpreter for a single step.
-                    // This supports CallExt, Delegate, Create, VerifySig, MerkleVerify
-                    // without reimplementing their complex logic in Cranelift.
-                    Opcode::CallExt | Opcode::Delegate | Opcode::Create
-                    | Opcode::VerifySig | Opcode::MerkleVerify => {
-                        // Flush GP registers to vm.cpu.gp before PVM step
+                    // Complex opcodes delegated to the interpreter via host_exec_opcode.
+                    // GP registers are synced to vm.cpu.gp before the call and reloaded after.
+                    // Wide registers are already in the VM (managed by host_wide_alu/host_widen).
+                    Opcode::CallExt | Opcode::Delegate
+                    | Opcode::Create | Opcode::VerifySig | Opcode::MerkleVerify => {
+                        // Sync GP registers: external regs[] → vm.cpu.gp[]
                         let regs_ptr_val = builder.use_var(Variable::from_u32(VAR_REGS_PTR));
-                        for r in 0..16u8 {
-                            let val = gp_read!(builder, r);
-                            let off = builder.ins().iconst(I64, (r as i64) * 8);
-                            let addr = builder.ins().iadd(regs_ptr_val, off);
-                            builder.ins().store(MemFlags::trusted(), val, addr, 0);
-                        }
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                        builder.ins().call(fn_sync_gp_to_vm_ref, &[vm_ctx, regs_ptr_val]);
+
                         let op = builder.ins().iconst(I64, d.opcode.to_u8() as i64);
                         let rd_val = builder.ins().iconst(I64, d.rd as i64);
                         let rs1_val = builder.ins().iconst(I64, d.rs1 as i64);
                         let imm_val = builder.ins().iconst(I64, d.rs2_or_imm as i64);
                         let call = builder.ins().call(fn_exec_opcode_ref, &[vm_ctx, op, rd_val, rs1_val, imm_val]);
                         let result = builder.inst_results(call)[0];
-                        // Reload GP registers after PVM step (it may have modified them)
-                        for r in 0..16u8 {
-                            let off = builder.ins().iconst(I64, (r as i64) * 8);
-                            let addr = builder.ins().iadd(regs_ptr_val, off);
-                            let val = builder.ins().load(I64, MemFlags::trusted(), addr, 0);
-                            gp_write!(builder, r, val);
-                        }
+
+                        // Sync GP registers back: vm.cpu.gp[] → external regs[]
+                        builder.ins().call(fn_sync_gp_from_vm_ref, &[vm_ctx, regs_ptr_val]);
+
                         // Check result: 0=ok, 1=trap, 2=halt/revert
                         let is_trap = builder.ins().icmp_imm(IntCC::Equal, result, 1);
                         let cont = builder.create_block();

@@ -112,6 +112,7 @@ lower_fixture!(lower_bitmap, "fixtures/programs/library/bitmap.oti");
 
 // Patterns
 lower_fixture!(lower_token_with_resource, "fixtures/programs/patterns/token_with_resource.oti");
+lower_fixture!(lower_simple_factory, "fixtures/programs/patterns/simple_factory.oti");
 lower_fixture!(lower_multi_contract, "fixtures/programs/patterns/multi_contract.oti");
 lower_fixture!(lower_state_machine, "fixtures/programs/patterns/state_machine.oti");
 lower_fixture!(lower_batch_operations, "fixtures/programs/patterns/batch_operations.oti");

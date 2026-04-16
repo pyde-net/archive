@@ -468,6 +468,26 @@ pub extern "C" fn host_memcpy(ctx: *mut VmCtx, dst: u64, src: u64, len: u64) -> 
 // These delegate to the PVM's existing methods via step().
 // ============================================================================
 
+/// Copy GP registers from the AOT's external regs[] array into vm.cpu.gp[].
+/// Must be called before host_exec_opcode for opcodes that read GP state (CallExt, Create, etc.).
+pub extern "C" fn host_sync_gp_to_vm(ctx: *mut VmCtx, regs_ptr: *const u64) {
+    let vm = unsafe { &mut *ctx };
+    let regs = unsafe { std::slice::from_raw_parts(regs_ptr, 16) };
+    for i in 0..16 {
+        vm.cpu.write_gp(i as u8, regs[i]);
+    }
+}
+
+/// Copy GP registers from vm.cpu.gp[] back into the AOT's external regs[] array.
+/// Must be called after host_exec_opcode for opcodes that modify GP state.
+pub extern "C" fn host_sync_gp_from_vm(ctx: *mut VmCtx, regs_ptr: *mut u64) {
+    let vm = unsafe { &mut *ctx };
+    let regs = unsafe { std::slice::from_raw_parts_mut(regs_ptr, 16) };
+    for i in 0..16 {
+        regs[i] = vm.cpu.read_gp(i as u8);
+    }
+}
+
 /// Execute a single PVM instruction by calling vm.step() with the given decoded instruction.
 /// This is the cleanest way to support complex opcodes in AOT: just run one PVM step.
 /// Returns 0 on success, 1 on trap/error.
@@ -523,5 +543,7 @@ pub fn host_functions() -> Vec<(&'static str, *const u8)> {
         ("host_checked_div", host_checked_div as *const u8),
         ("host_checked_mod", host_checked_mod as *const u8),
         ("host_exec_opcode", host_exec_opcode as *const u8),
+        ("host_sync_gp_to_vm", host_sync_gp_to_vm as *const u8),
+        ("host_sync_gp_from_vm", host_sync_gp_from_vm as *const u8),
     ]
 }

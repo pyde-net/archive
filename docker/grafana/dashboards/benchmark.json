@@ -1,0 +1,168 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "pyde-benchmark",
+    "title": "Pyde Benchmark Dashboard",
+    "tags": ["pyde", "benchmark"],
+    "timezone": "browser",
+    "refresh": "5s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "TPS by Workload",
+        "type": "barchart",
+        "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+        "targets": [
+          {
+            "expr": "pyde_bench_tps",
+            "legendFormat": "{{workload}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ops",
+            "color": { "mode": "palette-classic" }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "Execution Time (ms)",
+        "type": "barchart",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+        "targets": [
+          {
+            "expr": "pyde_bench_exec_ms",
+            "legendFormat": "{{workload}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "ms" }
+        }
+      },
+      {
+        "id": 3,
+        "title": "Success / Failure Count",
+        "type": "barchart",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+        "targets": [
+          {
+            "expr": "pyde_bench_ok",
+            "legendFormat": "OK: {{workload}}"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Events Emitted",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 0, "y": 18 },
+        "targets": [
+          {
+            "expr": "sum(pyde_bench_events)",
+            "legendFormat": "Total Events"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Gas Consumed",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 6, "y": 18 },
+        "targets": [
+          {
+            "expr": "sum(pyde_bench_gas)",
+            "legendFormat": "Total Gas"
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Total Transactions",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 12, "y": 18 },
+        "targets": [
+          {
+            "expr": "pyde_bench_total_txs",
+            "legendFormat": "Total TXs"
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Contracts Deployed",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 6, "x": 18, "y": 18 },
+        "targets": [
+          {
+            "expr": "pyde_bench_contracts_deployed",
+            "legendFormat": "Contracts"
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Parallel Groups",
+        "type": "barchart",
+        "gridPos": { "h": 6, "w": 12, "x": 0, "y": 22 },
+        "targets": [
+          {
+            "expr": "pyde_bench_groups",
+            "legendFormat": "{{workload}}"
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Live Node Metrics",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 24, "x": 0, "y": 28 },
+        "targets": [
+          {
+            "expr": "rate(pyde_transactions_processed_total[1m])",
+            "legendFormat": "TX/s (1m rate)"
+          },
+          {
+            "expr": "pyde_block_gas_used",
+            "legendFormat": "Block Gas"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "ops" }
+        }
+      },
+      {
+        "id": 10,
+        "title": "Block Processing Time",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+        "targets": [
+          {
+            "expr": "pyde_block_processing_ms",
+            "legendFormat": "Block time (ms)"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": { "unit": "ms" }
+        }
+      },
+      {
+        "id": 11,
+        "title": "Chain Head + Peers",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+        "targets": [
+          {
+            "expr": "pyde_chain_head_slot",
+            "legendFormat": "Head Slot"
+          },
+          {
+            "expr": "pyde_peers_connected",
+            "legendFormat": "Peers"
+          }
+        ]
+      }
+    ],
+    "time": { "from": "now-5m", "to": "now" }
+  }
+}
