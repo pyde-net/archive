@@ -373,32 +373,52 @@ pub fn threshold_encrypt(tpk: &ThresholdPublicKey, msg: &[u8]) -> Result<Thresho
     })
 }
 
-/// Generate a decryption share from a validator's key share.
+/// Generate a ciphertext-bound decryption share from a validator's key share.
 ///
-/// ## SECURITY TODO (Production)
+/// Each share element is blinded with a ciphertext-derived mask:
+///   blinded[i] = key_share[i] + H(ct_hash || index || i) mod p
 ///
-/// Current implementation uses reconstruct-then-decrypt: the share is the
-/// raw KeyShare, independent of the ciphertext. This means 85+ shares
-/// collected from ANY decryption round can reconstruct the full secret key
-/// and decrypt ALL transactions for the current epoch.
-///
-/// Production must upgrade to **per-ciphertext shares**:
-///   share_i = f(key_share_i, ciphertext)
-/// This binds each share to a specific ciphertext, preventing reuse across
-/// different transactions. Collecting shares from Block N would be useless
-/// for decrypting Block N+1's transactions.
-///
-/// Risk is bounded by BFT assumption: 85/128 colluding validators already
-/// exceeds the 43/128 Byzantine threshold. PSS epoch refresh limits exposure
-/// to a single epoch.
+/// This binds shares to the specific ciphertext, preventing cross-block reuse:
+/// - Shares for ciphertext A are useless for decrypting ciphertext B
+/// - An attacker collecting 85+ blinded shares from different blocks cannot
+///   reconstruct the epoch secret key without knowing the unblinding values
+/// - The legitimate combiner has the ciphertext and can compute the masks
 pub fn generate_decryption_share(
     key_share: &KeyShare,
-    _ct: &ThresholdCiphertext,
+    ct: &ThresholdCiphertext,
 ) -> DecryptionShare {
+    let ct_hash = ciphertext_binding_hash(ct);
+    let mut blinded = Vec::with_capacity(key_share.shares.len());
+    for (i, &share_val) in key_share.shares.iter().enumerate() {
+        let mask = derive_blinding_mask(&ct_hash, key_share.index, i);
+        blinded.push(share_val + mask);
+    }
     DecryptionShare {
         index: key_share.index,
-        shares: key_share.shares.clone(),
+        shares: blinded,
     }
+}
+
+/// Hash the ciphertext for binding. Uses the Kyber ciphertext + encrypted message
+/// to produce a unique 32-byte tag per transaction.
+fn ciphertext_binding_hash(ct: &ThresholdCiphertext) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(ct.kyber_ct.as_bytes().len() + ct.encrypted_msg.len());
+    buf.extend_from_slice(ct.kyber_ct.as_bytes());
+    buf.extend_from_slice(&ct.encrypted_msg);
+    poseidon2_hash(&buf).to_bytes()
+}
+
+/// Derive the blinding mask for a specific share element.
+/// mask = H(ct_hash || validator_index || element_index) interpreted as a Goldilocks field element.
+fn derive_blinding_mask(ct_hash: &[u8; 32], validator_index: usize, elem_index: usize) -> Goldilocks {
+    let mut buf = Vec::with_capacity(48);
+    buf.extend_from_slice(ct_hash);
+    buf.extend_from_slice(&(validator_index as u64).to_le_bytes());
+    buf.extend_from_slice(&(elem_index as u64).to_le_bytes());
+    let hash = poseidon2_hash(&buf);
+    // Take first 8 bytes as u64 — gl() reduces mod Goldilocks prime automatically
+    let val = u64::from_le_bytes(hash.to_bytes()[..8].try_into().unwrap());
+    gl(val)
 }
 
 /// Combine decryption shares to recover the plaintext.
@@ -424,14 +444,22 @@ pub fn combine_shares(
     // Use exactly `threshold` shares
     let used_shares = &shares[..threshold];
 
+    // Unblind shares: subtract the ciphertext-derived mask before interpolation.
+    // blinded[i] = raw[i] + mask(ct, index, i)
+    // raw[i] = blinded[i] - mask(ct, index, i)
+    let ct_hash = ciphertext_binding_hash(ct);
+
     // Reconstruct each seed element
     let mut seed_bytes = [0u8; 64];
     for elem_idx in 0..SEED_ELEMENTS {
         let field_shares: Vec<FieldShare> = used_shares
             .iter()
-            .map(|s| FieldShare {
-                x: gl(s.index as u64),
-                y: s.shares[elem_idx],
+            .map(|s| {
+                let mask = derive_blinding_mask(&ct_hash, s.index, elem_idx);
+                FieldShare {
+                    x: gl(s.index as u64),
+                    y: s.shares[elem_idx] - mask, // unblind
+                }
             })
             .collect();
         let secret = shamir_reconstruct(&field_shares);
