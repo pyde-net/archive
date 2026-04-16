@@ -1365,6 +1365,19 @@ impl Vm {
         &self.decoded_cache
     }
 
+    /// Execute a single decoded instruction (for AOT host delegation).
+    /// Temporarily injects the instruction at pc=0 and runs one step.
+    pub fn exec_single(&mut self, d: crate::isa::DecodedInstruction) -> Result<Option<ExecResult>, Trap> {
+        let saved_pc = self.pc;
+        let saved_cache = std::mem::take(&mut self.decoded_cache);
+        self.decoded_cache = vec![d];
+        self.pc = 0;
+        let result = self.step();
+        self.decoded_cache = saved_cache;
+        self.pc = saved_pc;
+        result
+    }
+
     /// Rollback storage to pre-execution state (public for trace recorder).
     pub fn rollback_storage_pub(&mut self) {
         self.rollback_storage();

@@ -463,6 +463,29 @@ pub extern "C" fn host_memcpy(ctx: *mut VmCtx, dst: u64, src: u64, len: u64) -> 
     }
 }
 
+// ============================================================================
+// Cross-contract calls, Create, VerifySig, MerkleVerify
+// These delegate to the PVM's existing methods via step().
+// ============================================================================
+
+/// Execute a single PVM instruction by calling vm.step() with the given decoded instruction.
+/// This is the cleanest way to support complex opcodes in AOT: just run one PVM step.
+/// Returns 0 on success, 1 on trap/error.
+pub extern "C" fn host_exec_opcode(ctx: *mut VmCtx, opcode: u64, rd: u64, rs1: u64, imm: u64) -> u64 {
+    let vm = unsafe { &mut *ctx };
+    let d = pyde_vm::isa::DecodedInstruction {
+        opcode: pyde_vm::isa::Opcode::from_u8(opcode as u8),
+        rd: rd as u8,
+        rs1: rs1 as u8,
+        rs2_or_imm: imm as u32,
+    };
+    match vm.exec_single(d) {
+        Ok(None) => 0,           // success, continue
+        Ok(Some(_)) => 2,        // halt/revert
+        Err(_) => 1,             // trap
+    }
+}
+
 /// List of all host function names and their function pointers, for
 /// registration with the JIT module.
 pub fn host_functions() -> Vec<(&'static str, *const u8)> {
@@ -499,5 +522,6 @@ pub fn host_functions() -> Vec<(&'static str, *const u8)> {
         ("host_checked_mul", host_checked_mul as *const u8),
         ("host_checked_div", host_checked_div as *const u8),
         ("host_checked_mod", host_checked_mod as *const u8),
+        ("host_exec_opcode", host_exec_opcode as *const u8),
     ]
 }

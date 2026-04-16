@@ -998,7 +998,7 @@ impl CodeGen {
                         // Write raw bytes to heap, set dst = heap pointer
                         let rd = self.alloc_gp(*dst);
                         self.emit_op(Opcode::Add, rd, 12, 0); // rd = current heap ptr
-                                                              // Write bytes in 8-byte chunks
+                        // Write bytes in 8-byte chunks
                         for (i, chunk) in data.chunks(8).enumerate() {
                             let mut buf = [0u8; 8];
                             buf[..chunk.len()].copy_from_slice(chunk);
@@ -1006,9 +1006,11 @@ impl CodeGen {
                             self.load_u64_to_reg(15, val);
                             self.emit_store(15, 12, (i as i32) * 8);
                         }
-                        // Advance heap past the data (aligned to 8)
-                        let aligned = ((data.len() + 7) / 8) * 8;
-                        self.load_u32_to_reg(15, aligned as u32);
+                        // Advance heap by EXACT data length (not aligned).
+                        // deploy! appends constructor args right after the blob,
+                        // and the PVM Create opcode reads args at [8+clen+rlen..].
+                        // Aligning here would create a gap between blob end and args.
+                        self.load_u32_to_reg(15, data.len() as u32);
                         self.emit_op(Opcode::Add, 12, 12, 15);
                     }
                     IrConst::String(s) => {

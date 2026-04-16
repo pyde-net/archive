@@ -490,12 +490,7 @@ impl PydeApiServer for RpcServer {
             // Format: numeric values as BE hex (matches Ethereum convention).
             let r2 = vm.cpu.read_gp(2);
             let r1 = vm.cpu.read_gp(1);
-            if r2 == 32 {
-                // Wide return (u256/Address): 32 bytes on heap, return as BE hex
-                let blob = vm.memory.load_bytes(r1 as usize, 32);
-                let val = ethnum::U256::from_le_bytes(blob.try_into().unwrap_or([0u8; 32]));
-                Ok(format!("0x{:x}", val))
-            } else if r2 > 0 {
+            if r2 > 0 {
                 // Blob return (String, Vec, Struct): raw serialized bytes
                 let blob = vm.memory.load_bytes(r1 as usize, r2 as usize);
                 Ok(format!("0x{}", hex::encode(blob)))

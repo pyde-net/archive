@@ -230,6 +230,10 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_wide_alu = module.declare_function("host_wide_alu", Linkage::Import, &sig_wide)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
+    // host_exec_opcode(ctx, opcode, rd, rs1, imm) -> u64 (same signature as wide_alu)
+    let fn_exec_opcode = module.declare_function("host_exec_opcode", Linkage::Import, &sig_wide)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+
     // host_read_gp(ctx, reg_idx) -> u64 (reads GP register from VM)
     let mut sig_read_gp = module.make_signature();
     sig_read_gp.params.push(AbiParam::new(ptr_type));
@@ -277,6 +281,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_sdelete_ref = module.declare_func_in_func(fn_sdelete, &mut ctx.func);
     let fn_sloadg_ref = module.declare_func_in_func(fn_sloadg, &mut ctx.func);
     let fn_log_ref = module.declare_func_in_func(fn_log, &mut ctx.func);
+    let fn_exec_opcode_ref = module.declare_func_in_func(fn_exec_opcode, &mut ctx.func);
     let fn_poseidon_ref = module.declare_func_in_func(fn_poseidon, &mut ctx.func);
     let fn_push_ref = module.declare_func_in_func(fn_push, &mut ctx.func);
     let fn_pop_ref = module.declare_func_in_func(fn_pop, &mut ctx.func);
@@ -885,8 +890,47 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.switch_to_block(cont);
                     }
 
-                    // Remaining opcodes not yet AOT-compiled (CallExt,
-                    // Delegate, Create, VerifySig, MerkleVerify) trap.
+                    // Complex opcodes: delegate to PVM interpreter for a single step.
+                    // This supports CallExt, Delegate, Create, VerifySig, MerkleVerify
+                    // without reimplementing their complex logic in Cranelift.
+                    Opcode::CallExt | Opcode::Delegate | Opcode::Create
+                    | Opcode::VerifySig | Opcode::MerkleVerify => {
+                        // Flush GP registers to vm.cpu.gp before PVM step
+                        let regs_ptr_val = builder.use_var(Variable::from_u32(VAR_REGS_PTR));
+                        for r in 0..16u8 {
+                            let val = gp_read!(builder, r);
+                            let off = builder.ins().iconst(I64, (r as i64) * 8);
+                            let addr = builder.ins().iadd(regs_ptr_val, off);
+                            builder.ins().store(MemFlags::trusted(), val, addr, 0);
+                        }
+                        let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                        let op = builder.ins().iconst(I64, d.opcode.to_u8() as i64);
+                        let rd_val = builder.ins().iconst(I64, d.rd as i64);
+                        let rs1_val = builder.ins().iconst(I64, d.rs1 as i64);
+                        let imm_val = builder.ins().iconst(I64, d.rs2_or_imm as i64);
+                        let call = builder.ins().call(fn_exec_opcode_ref, &[vm_ctx, op, rd_val, rs1_val, imm_val]);
+                        let result = builder.inst_results(call)[0];
+                        // Reload GP registers after PVM step (it may have modified them)
+                        for r in 0..16u8 {
+                            let off = builder.ins().iconst(I64, (r as i64) * 8);
+                            let addr = builder.ins().iadd(regs_ptr_val, off);
+                            let val = builder.ins().load(I64, MemFlags::trusted(), addr, 0);
+                            gp_write!(builder, r, val);
+                        }
+                        // Check result: 0=ok, 1=trap, 2=halt/revert
+                        let is_trap = builder.ins().icmp_imm(IntCC::Equal, result, 1);
+                        let cont = builder.create_block();
+                        builder.ins().brif(is_trap, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
+                        let is_halt = builder.ins().icmp_imm(IntCC::Equal, result, 2);
+                        let cont2 = builder.create_block();
+                        builder.ins().brif(is_halt, success_block, &[], cont2, &[]);
+                        builder.seal_block(cont2);
+                        builder.switch_to_block(cont2);
+                    }
+
+                    // Truly unknown opcodes trap
                     _ => {
                         builder.ins().jump(trap_block, &[]);
                         terminated = true;
