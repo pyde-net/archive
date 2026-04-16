@@ -1559,54 +1559,104 @@ impl CodeGen {
             }
 
             Inst::Emit(name, fields) => {
-                // Write event descriptor to heap memory, then Log
-                // Layout: [topic0: 32 bytes (event name hash)] [data_ptr: 8] [data_len: 8]
-                let desc_base = 12; // r12 = heap pointer (descriptor start)
+                // PVM Log descriptor: [topics...] [data_ptr:8] [data_len:8]
+                // Each topic is 32 bytes. topic[0] = event name hash.
+                // Indexed fields go to topics[1..3]. Non-indexed go to data blob.
+                let desc_base = 12; // r12 = heap pointer
 
-                // Topic 0: hash of event name (FNV hash, stored as LE u32 in 32 bytes)
+                // Count topics: topic0 (name hash) + indexed fields (max 3)
+                let indexed_fields: Vec<_> = fields.iter().filter(|(_, _, idx)| *idx).collect();
+                let non_indexed: Vec<_> = fields.iter().filter(|(_, _, idx)| !*idx).collect();
+                let num_topics = 1 + indexed_fields.len().min(3);
+
+                // Topic 0: event name hash (FNV-1a, LE u32 in 32 bytes)
                 let name_hash = compute_selector(name) as u64;
                 self.load_u64_to_reg(15, name_hash);
-                self.emit_store(15, 12, 0); // store low 8 bytes of topic
+                self.emit_store(15, 12, 0);
                 self.emit_op(Opcode::Addi, 15, 0, 0);
-                self.emit_store(15, 12, 8); // zero upper bytes
+                self.emit_store(15, 12, 8);
                 self.emit_store(15, 12, 16);
                 self.emit_store(15, 12, 24);
 
-                // Data: store field values with correct byte widths per type
-                let data_start_offset = 32 + 16; // after topic + ptr/len
-                let mut data_offset = data_start_offset;
-                for (freg, ty) in fields.iter() {
-                    let fr = self.get_reg(*freg);
-                    let is_wide = ty == "Address" || ty == "u256" || ty == "i256";
-                    if is_wide {
-                        // Wide types: store 32 bytes via 4 × Store64
-                        // The value is in a wide register; use Narrow to get pieces
-                        // For simplicity, store the GP value (8 bytes) + 24 zero bytes
-                        self.emit_store(fr, 12, data_offset as i32);
-                        // Zero the remaining 24 bytes
+                // Topics 1-3: indexed fields (stored as 32-byte LE values)
+                for (i, (freg, ty, _)) in indexed_fields.iter().enumerate() {
+                    if i >= 3 { break; }
+                    let topic_offset = (1 + i) * 32;
+                    if self.regs.is_wide(*freg) {
+                        // Wide register: extract 32 bytes via Wand+Narrow+Wshift
+                        // Narrow traps if value > u64::MAX, so mask first
+                        let wr = self.regs.alloc_wide(*freg);
+                        // Setup: mask = u64::MAX, shift amount = 64
+                        self.emit_op(Opcode::Addi, 14, 0, (-1i32 as u32) & 0x3FFFF); // r14 = sign-extended to u64::MAX
+                        self.emit_op(Opcode::Widen, WIDE_SCRATCH, 14, 0); // w7 = U256(u64::MAX)
+                        self.emit_op(Opcode::Wmov, WIDE_SCRATCH2, wr, 0); // w6 = source copy
+                        self.emit_op(Opcode::Addi, 14, 0, 64); // r14 = 64 for shift
+                        for j in 0..4u32 {
+                            // Mask low 64 bits: w7_temp = w6 & w7(mask)
+                            self.emit_op(Opcode::Wand, WIDE_SCRATCH, WIDE_SCRATCH2, WIDE_SCRATCH as u32);
+                            // Narrow is safe now (masked to <= u64::MAX)
+                            self.emit_op(Opcode::Narrow, 15, WIDE_SCRATCH, 0);
+                            self.emit_store(15, 12, (topic_offset + j as usize * 8) as i32);
+                            if j < 3 {
+                                // Shift source right by 64 for next chunk
+                                self.emit_op(Opcode::Wshift, WIDE_SCRATCH2, WIDE_SCRATCH2, (14 << 1) | 1);
+                                // Restore mask (Wand clobbered WIDE_SCRATCH)
+                                self.emit_op(Opcode::Addi, 15, 0, (-1i32 as u32) & 0x3FFFF);
+                                self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
+                            }
+                        }
+                    } else {
+                        let fr = self.get_reg(*freg);
+                        self.emit_store(fr, 12, topic_offset as i32);
                         self.emit_op(Opcode::Addi, 15, 0, 0);
-                        self.emit_store(15, 12, (data_offset + 8) as i32);
-                        self.emit_store(15, 12, (data_offset + 16) as i32);
-                        self.emit_store(15, 12, (data_offset + 24) as i32);
+                        self.emit_store(15, 12, (topic_offset + 8) as i32);
+                        self.emit_store(15, 12, (topic_offset + 16) as i32);
+                        self.emit_store(15, 12, (topic_offset + 24) as i32);
+                    }
+                }
+
+                // Data: non-indexed fields after topics + ptr/len header
+                let data_start_offset = num_topics * 32 + 16; // after topics + data_ptr + data_len
+                let mut data_offset = data_start_offset;
+                for (freg, ty, _) in non_indexed.iter() {
+                    let is_wide = ty == "Address" || ty == "u256" || ty == "i256";
+                    if is_wide && self.regs.is_wide(*freg) {
+                        // Wide field: extract 32 bytes via Wand+Narrow+Wshift
+                        let wr = self.regs.alloc_wide(*freg);
+                        self.emit_op(Opcode::Addi, 14, 0, (-1i32 as u32) & 0x3FFFF);
+                        self.emit_op(Opcode::Widen, WIDE_SCRATCH, 14, 0);
+                        self.emit_op(Opcode::Wmov, WIDE_SCRATCH2, wr, 0);
+                        self.emit_op(Opcode::Addi, 14, 0, 64);
+                        for j in 0..4u32 {
+                            self.emit_op(Opcode::Wand, WIDE_SCRATCH, WIDE_SCRATCH2, WIDE_SCRATCH as u32);
+                            self.emit_op(Opcode::Narrow, 15, WIDE_SCRATCH, 0);
+                            self.emit_store(15, 12, (data_offset + j as usize * 8) as i32);
+                            if j < 3 {
+                                self.emit_op(Opcode::Wshift, WIDE_SCRATCH2, WIDE_SCRATCH2, (14 << 1) | 1);
+                                self.emit_op(Opcode::Addi, 15, 0, (-1i32 as u32) & 0x3FFFF);
+                                self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
+                            }
+                        }
                         data_offset += 32;
                     } else {
-                        // GP types (u8-u64, bool, etc.): 8 bytes
+                        let fr = self.get_reg(*freg);
                         self.emit_store(fr, 12, data_offset as i32);
                         data_offset += 8;
                     }
                 }
                 let data_len = (data_offset - data_start_offset) as u32;
 
-                // Write data_ptr and data_len at offset 32
+                // Write data_ptr and data_len
+                let ptr_offset = num_topics * 32;
                 self.emit_op(Opcode::Addi, 14, 12, data_start_offset as u32);
-                self.emit_store(14, 12, 32); // data_ptr
+                self.emit_store(14, 12, ptr_offset as i32);
                 self.emit_op(Opcode::Addi, 14, 0, data_len);
-                self.emit_store(14, 12, 40); // data_len
+                self.emit_store(14, 12, (ptr_offset + 8) as i32);
 
-                // Log rs1=descriptor pointer, imm=num_topics
-                self.emit_op(Opcode::Log, 0, desc_base, 1);
+                // Log rs1=descriptor, imm=num_topics
+                self.emit_op(Opcode::Log, 0, desc_base, num_topics as u32);
 
-                // Advance heap past descriptor + data
+                // Advance heap
                 let total = data_start_offset as u32 + data_len;
                 self.emit_op(Opcode::Addi, 12, 12, total);
             }

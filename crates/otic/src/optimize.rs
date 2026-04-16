@@ -310,7 +310,7 @@ fn collect_used_regs(inst: &Inst, used: &mut HashSet<Reg>) {
         Inst::MakeArray(_, regs) => { for r in regs { used.insert(*r); } }
         Inst::ArrayRepeat(_, val, _) => { used.insert(*val); }
         Inst::MakeVec(_, _) => {}
-        Inst::Emit(_, fields) => { for (r, _) in fields { used.insert(*r); } }
+        Inst::Emit(_, fields) => { for (r, _, _) in fields { used.insert(*r); } }
         Inst::Revert(_, fields) => { for r in fields { used.insert(*r); } }
         Inst::CrossCall { target, method, args, .. } => {
             used.insert(*target); used.insert(*method);

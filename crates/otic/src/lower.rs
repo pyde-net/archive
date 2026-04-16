@@ -827,11 +827,17 @@ impl Lowerer {
             .find(|ev| ev.name == event_name)
             .map(|ev| ev.fields.iter().map(|f| format!("{}", f.ty)).collect())
             .unwrap_or_default();
-        let field_regs: Vec<(Reg, String)> = e.fields.iter().enumerate()
+        // Get indexed flags from event definition
+        let event_indexed: Vec<bool> = self.program.event_defs.iter()
+            .find(|ev| ev.name == event_name)
+            .map(|ev| ev.fields.iter().map(|f| f.indexed).collect())
+            .unwrap_or_default();
+        let field_regs: Vec<(Reg, String, bool)> = e.fields.iter().enumerate()
             .map(|(i, f)| {
                 let reg = self.lower_expr(&f.value);
                 let ty = event_field_types.get(i).cloned().unwrap_or_else(|| "u64".to_string());
-                (reg, ty)
+                let indexed = event_indexed.get(i).copied().unwrap_or(false);
+                (reg, ty, indexed)
             })
             .collect();
         self.emit(Inst::Emit(event_name, field_regs));
