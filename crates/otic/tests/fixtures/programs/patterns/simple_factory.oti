@@ -105,6 +105,11 @@ contract TokenFactory {
         };
     }
 
+    // Cross-contract call: transfer tokens on a deployed child contract
+    pub fn transfer_on_token(token: Address, to: Address, amount: u256) {
+        SimpleToken::at(token).transfer(to, amount);
+    }
+
     #[view]
     pub fn get_tokens_created() -> u64 {
         return self.tokens_created;

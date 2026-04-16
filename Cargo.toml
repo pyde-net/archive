@@ -16,3 +16,16 @@ members = [
     "crates/pyde-rust-sdk",
     "crates/pyde-crypto-wasm",
 ]
+
+# ── Release profile: maximum performance ──────────────────────────────
+[profile.release]
+opt-level = 3
+lto = "fat"            # full cross-crate link-time optimization
+codegen-units = 1      # single codegen unit → better inlining
+panic = "abort"        # no unwind tables → smaller + faster
+strip = "symbols"      # strip debug symbols from binary
+
+# ── Bench profile: inherits release, keeps debug for profiling ────────
+[profile.bench]
+inherits = "release"
+debug = false

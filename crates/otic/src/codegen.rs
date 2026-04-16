@@ -176,10 +176,13 @@ impl RegAlloc {
 
     /// Allocate a wide (256-bit) register.
     fn alloc_wide(&mut self, vreg: Reg) -> u8 {
-        if let Some(&phys) = self.mapping.get(&vreg) {
-            return phys;
+        // If already allocated as wide, return cached
+        if self.wide.contains(&vreg) {
+            if let Some(&phys) = self.mapping.get(&vreg) {
+                return phys;
+            }
         }
-        // w0-w5 are user registers, w6=WIDE_SCRATCH2, w7=WIDE_SCRATCH (reserved)
+        // Allocate fresh wide register (even if vreg was previously mapped as GP)
         let phys = self.next_wide.min(5);
         self.next_wide += 1;
         self.mapping.insert(vreg, phys);
@@ -2125,7 +2128,27 @@ impl CodeGen {
             Inst::ExtCall(dst, addr, method, args, ret_ty, value_reg) => {
                 let wide_return = is_wide_type(ret_ty);
                 let blob_return = matches!(ret_ty, Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_));
-                let ra = self.get_reg(*addr);
+                // The target address is a WIDE register (32-byte Address).
+                // Use alloc_wide to ensure we get the wide register index, not a GP index.
+                // get_reg() can return a GP index if the vreg was spilled, which would
+                // cause CallExt to read the wrong wide register.
+                // The target address MUST be in a wide register (32-byte Address).
+                // Due to register allocation aliasing (let-binding creates GP mapping
+                // for a vreg that was originally wide from StorageGet), always ensure
+                // the address is in a wide register by checking is_wide first.
+                // If not wide, the value is a GP pointer/truncation — use Widen as fallback.
+                let ra = if self.regs.is_wide(*addr) {
+                    self.regs.alloc_wide(*addr)
+                } else {
+                    // The address vreg was allocated as GP (likely from a let-binding
+                    // that aliased a different vreg). Load from the GP register and widen.
+                    // NOTE: This only works if the GP register holds a valid u64 address.
+                    // For 32-byte addresses from storage, the original wide register
+                    // should be used. Check if the mapping has a wide register.
+                    let gp = self.get_reg(*addr);
+                    self.emit_op(Opcode::Widen, WIDE_SCRATCH2, gp, 0);
+                    WIDE_SCRATCH2
+                };
 
                 // Save calldata start for dynamic length calculation
                 self.emit_op(Opcode::Push, 12, 0, 0); // save r12 = calldata start
@@ -2307,7 +2330,13 @@ impl CodeGen {
             Inst::RawCall(dst, target, args) => {
                 let rd = self.alloc_gp(*dst);
                 // Target is an Address (wide register)
-                let rt = self.get_reg(*target);
+                let rt = if self.regs.is_wide(*target) {
+                    self.regs.alloc_wide(*target)
+                } else {
+                    let gp = self.get_reg(*target);
+                    self.emit_op(Opcode::Widen, WIDE_SCRATCH2, gp, 0);
+                    WIDE_SCRATCH2
+                };
 
                 // Write calldata (args) to heap memory at r12
                 // Wide args (Address, u256) get 32 bytes, GP args get 8 bytes.
@@ -8268,6 +8297,51 @@ mod tests {
             vm2.cpu.read_wide(0),
             ethnum::U256::from(1_000_000u64),
             "supply should be 1000000"
+        );
+    }
+
+    /// Verify that compile_all enables cross-contract typed dispatch.
+    /// When Factory calls Token::at(addr).mint(amount), it must emit CallExt,
+    /// not an internal MethodCall.
+    #[test]
+    fn compile_all_cross_contract_ext_call() {
+        let src = r#"
+            contract Token {
+                storage { supply: u64, }
+                #[constructor]
+                pub fn init() { self.supply = 0; }
+                pub fn mint(amount: u64) {
+                    self.supply = self.supply + amount;
+                }
+                #[view]
+                pub fn get_supply() -> u64 { return self.supply; }
+            }
+
+            contract Factory {
+                storage { last_token: Address, }
+                #[constructor]
+                pub fn init() {}
+                pub fn mint_on_last(amount: u64) {
+                    Token::at(self.last_token).mint(amount);
+                }
+            }
+        "#;
+
+        let results = crate::compile_all(src);
+        assert_eq!(results.len(), 2);
+
+        let (name, factory) = &results[1];
+        assert_eq!(name, "Factory");
+
+        // The runtime bytecode for Factory.mint_on_last MUST contain CallExt (0x26)
+        // Instruction encoding: opcode is in bits 26-31, stored as LE bytes.
+        // So byte[3] >> 2 == opcode.
+        let has_callext = factory.runtime_bytecode
+            .chunks(4)
+            .any(|chunk| chunk.len() == 4 && (chunk[3] >> 2) == 0x26);
+        assert!(
+            has_callext,
+            "Factory.mint_on_last must emit CallExt for Token::at(addr).mint() cross-contract call"
         );
     }
 }

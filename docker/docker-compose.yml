@@ -108,6 +108,9 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_DATASOURCES_DEFAULT_NAME=Prometheus
+      - GF_DATASOURCES_DEFAULT_TYPE=prometheus
+      - GF_DATASOURCES_DEFAULT_URL=http://prometheus:9090
     ports:
       - "3000:3000"
     depends_on:
