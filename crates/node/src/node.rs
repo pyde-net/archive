@@ -203,6 +203,7 @@ impl PydeNode {
         // 4. Chain sync
         let mut chain_sync = ChainSync::new();
         chain_sync.manager.local_tip = chain.read().await.head_slot;
+        let mut pinned_snapshot: Option<crate::sync::PinnedSnapshot> = None;
 
         // 5. Validator engine + identity (only for validator role)
         let mut validator_identity: Option<ValidatorIdentity> = None;
@@ -452,6 +453,7 @@ impl PydeNode {
                             &mut validator_engine,
                             &mut validator_identity,
                             &block_store,
+                            &mut pinned_snapshot,
                         )
                     };
 
@@ -465,7 +467,15 @@ impl PydeNode {
                             let _ = swarm.behaviour_mut().sync.send_response(channel, response);
                         }
                         PostEventAction::ContinueSync => {
-                            chain_sync.request_next_batch(&mut swarm);
+                            // If chunked snapshot in progress, request next chunk
+                            if let Some(next_idx) = chain_sync.needs_next_chunk() {
+                                let peer = swarm.connected_peers().next().copied();
+                                if let Some(p) = peer {
+                                    chain_sync.request_next_chunk(&mut swarm, p, next_idx);
+                                }
+                            } else {
+                                chain_sync.request_next_batch(&mut swarm);
+                            }
                         }
                         PostEventAction::BroadcastConsensus(data) => {
                             let topic = pyde_net::node::topics::consensus();
@@ -1261,6 +1271,7 @@ fn handle_swarm_event(
     validator_engine: &mut Option<ValidatorEngine>,
     validator_identity: &mut Option<ValidatorIdentity>,
     block_store: &BlockStore,
+    pinned_snapshot: &mut Option<crate::sync::PinnedSnapshot>,
 ) -> PostEventAction {
     match event {
         // --- Gossipsub message received ---
@@ -1513,7 +1524,7 @@ fn handle_swarm_event(
             },
         )) => {
             debug!(%peer, "inbound sync request");
-            let response = ChainSync::handle_inbound_request(&request, chain, state, block_store);
+            let response = ChainSync::handle_inbound_request(&request, chain, state, block_store, pinned_snapshot);
             PostEventAction::SendSyncResponse(channel, response)
         }
 
@@ -1525,7 +1536,10 @@ fn handle_swarm_event(
             },
         )) => {
             chain_sync.on_response(request_id, response, chain, state, block_store);
-            if chain_sync.is_syncing() {
+            // If chunked snapshot needs more chunks, signal the event loop
+            if chain_sync.needs_next_chunk().is_some() {
+                PostEventAction::ContinueSync // caller will request next chunk
+            } else if chain_sync.is_syncing() {
                 PostEventAction::ContinueSync
             } else {
                 PostEventAction::None

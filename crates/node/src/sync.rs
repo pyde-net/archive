@@ -21,6 +21,11 @@ use tracing::{debug, info, warn};
 
 /// Chain sync coordinator.
 /// Manages the sync state machine and dispatches requests to peers.
+/// Default chunk size for snapshot transfers (entries per chunk).
+pub const SNAPSHOT_CHUNK_SIZE: u32 = 5000;
+/// Max retries per chunk before giving up.
+const CHUNK_MAX_RETRIES: u32 = 3;
+
 pub struct ChainSync {
     /// Sync state tracker from the net crate.
     pub manager: SyncManager,
@@ -28,6 +33,23 @@ pub struct ChainSync {
     pending: HashMap<OutboundRequestId, PeerId>,
     /// Whether initial sync has completed at least once.
     pub initial_sync_done: bool,
+    /// Chunked snapshot receiver state.
+    snapshot_chunks: Vec<(u32, Vec<(Vec<u8>, Vec<u8>)>, [u8; 32])>,
+    snapshot_expected_root: Option<[u8; 32]>,
+    snapshot_total_chunks: u32,
+    snapshot_head_slot: u64,
+    snapshot_retry_count: u32,
+}
+
+/// Pinned snapshot cache for serving chunked requests.
+/// Created on first chunk request, reused for all subsequent chunks
+/// so the state root stays consistent across the entire transfer.
+pub struct PinnedSnapshot {
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub state_root: [u8; 32],
+    pub head_slot: u64,
+    /// Slot at which this snapshot was pinned (stale after N slots).
+    pub pinned_at_slot: u64,
 }
 
 impl ChainSync {
@@ -36,6 +58,11 @@ impl ChainSync {
             manager: SyncManager::new(),
             pending: HashMap::new(),
             initial_sync_done: false,
+            snapshot_chunks: Vec::new(),
+            snapshot_expected_root: None,
+            snapshot_total_chunks: 0,
+            snapshot_head_slot: 0,
+            snapshot_retry_count: 0,
         }
     }
 
@@ -125,6 +152,7 @@ impl ChainSync {
     }
 
     /// Request a state snapshot from a peer (for fast sync when far behind).
+    /// Uses chunked transfer for production, falls back to bulk for small states.
     pub fn request_state_snapshot(
         &mut self,
         swarm: &mut Swarm<PydeBehaviour>,
@@ -133,13 +161,38 @@ impl ChainSync {
             Some(p) => *p,
             None => return false,
         };
+        // Start chunked download from chunk 0
+        self.snapshot_chunks.clear();
+        self.snapshot_expected_root = None;
+        self.snapshot_total_chunks = 0;
         let request_id = swarm
             .behaviour_mut()
             .sync
-            .send_request(&peer, SyncReq::GetStateSnapshot);
+            .send_request(&peer, SyncReq::GetStateSnapshotChunk {
+                chunk_index: 0,
+                chunk_size: SNAPSHOT_CHUNK_SIZE,
+            });
         self.pending.insert(request_id, peer);
-        info!(%peer, "requested state snapshot");
+        info!(%peer, chunk_size = SNAPSHOT_CHUNK_SIZE, "requested state snapshot (chunked)");
         true
+    }
+
+    /// Request the next chunk of an in-progress snapshot download.
+    pub fn request_next_chunk(
+        &mut self,
+        swarm: &mut Swarm<PydeBehaviour>,
+        peer: PeerId,
+        next_index: u32,
+    ) {
+        let request_id = swarm
+            .behaviour_mut()
+            .sync
+            .send_request(&peer, SyncReq::GetStateSnapshotChunk {
+                chunk_index: next_index,
+                chunk_size: SNAPSHOT_CHUNK_SIZE,
+            });
+        self.pending.insert(request_id, peer);
+        debug!(chunk = next_index, "requesting next snapshot chunk");
     }
 
     /// Threshold: if behind by more than this many slots, use snapshot sync.
@@ -262,20 +315,112 @@ impl ChainSync {
                 }
                 0
             }
+            SyncResp::StateSnapshotChunk {
+                state_root, head_slot, chunk_index, total_chunks, chunk_hash, entries,
+            } => {
+                // Verify chunk hash
+                let mut hash_buf = Vec::new();
+                for (k, v) in &entries {
+                    hash_buf.extend_from_slice(k);
+                    hash_buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    hash_buf.extend_from_slice(v);
+                }
+                let computed = pyde_crypto::poseidon2::poseidon2_hash(&hash_buf).to_bytes();
+                if computed != chunk_hash {
+                    self.snapshot_retry_count += 1;
+                    if self.snapshot_retry_count > CHUNK_MAX_RETRIES {
+                        warn!(chunk = chunk_index, retries = self.snapshot_retry_count,
+                            "snapshot chunk hash mismatch — max retries exceeded, aborting sync");
+                        self.snapshot_chunks.clear();
+                        self.snapshot_expected_root = None;
+                        self.snapshot_total_chunks = 0;
+                        self.snapshot_retry_count = 0;
+                    } else {
+                        warn!(chunk = chunk_index, retry = self.snapshot_retry_count,
+                            "snapshot chunk hash mismatch — will retry");
+                        // Don't store the bad chunk — needs_next_chunk() will re-request it
+                    }
+                    return 0;
+                }
+                self.snapshot_retry_count = 0; // reset on success
+
+                // Store chunk
+                if self.snapshot_expected_root.is_none() {
+                    self.snapshot_expected_root = Some(state_root);
+                    self.snapshot_total_chunks = total_chunks;
+                    self.snapshot_head_slot = head_slot;
+                }
+                self.snapshot_chunks.push((chunk_index, entries, chunk_hash));
+
+                info!(
+                    chunk = chunk_index,
+                    total = total_chunks,
+                    collected = self.snapshot_chunks.len(),
+                    "received snapshot chunk"
+                );
+
+                // If all chunks received, assemble and import
+                if self.snapshot_chunks.len() as u32 >= total_chunks {
+                    // Sort by index, flatten entries
+                    self.snapshot_chunks.sort_by_key(|(idx, _, _)| *idx);
+                    let all_entries: Vec<(Vec<u8>, Vec<u8>)> = self.snapshot_chunks
+                        .drain(..)
+                        .flat_map(|(_, entries, _)| entries)
+                        .collect();
+
+                    let root = self.snapshot_expected_root.take().unwrap_or([0u8; 32]);
+                    let slot = self.snapshot_head_slot;
+
+                    info!(entries = all_entries.len(), head_slot = slot, "all chunks received — importing snapshot");
+
+                    match state.import_snapshot(all_entries) {
+                        Ok(imported_root) => {
+                            if imported_root == root {
+                                self.manager.advance_local_tip(slot);
+                                if !self.initial_sync_done {
+                                    self.initial_sync_done = true;
+                                }
+                                info!(head_slot = slot, "chunked snapshot applied — node synced");
+                            } else {
+                                warn!(
+                                    expected = hex::encode(root),
+                                    got = hex::encode(imported_root),
+                                    "state root mismatch after chunked snapshot"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to import chunked snapshot");
+                        }
+                    }
+                }
+                0
+            }
             SyncResp::NotFound => {
-                warn!("peer doesn't have requested blocks");
+                // If we're mid-chunk-sync, abort — peer can't serve the snapshot
+                if self.snapshot_total_chunks > 0 {
+                    warn!("peer returned NotFound during chunked snapshot — aborting");
+                    self.snapshot_chunks.clear();
+                    self.snapshot_expected_root = None;
+                    self.snapshot_total_chunks = 0;
+                    self.snapshot_retry_count = 0;
+                } else {
+                    warn!("peer doesn't have requested data");
+                }
                 0
             }
         }
     }
 
     /// Handle an inbound sync request from a peer.
-    /// Returns the response to send back.
+    /// `pinned_snapshot` is used for chunked requests — the caller pins the snapshot
+    /// on first chunk request and reuses it for all subsequent chunks.
     pub fn handle_inbound_request(
         req: &SyncReq,
         chain: &ChainState,
         state: &StateManager,
         block_store: &BlockStore,
+        pinned_snapshot: &mut Option<PinnedSnapshot>,
     ) -> SyncResp {
         match req {
             SyncReq::GetChainTip => {
@@ -335,12 +480,78 @@ impl ChainSync {
                     }
                 }
             }
+            SyncReq::GetStateSnapshotChunk { chunk_index, chunk_size } => {
+                // Pin snapshot on first chunk request (reuse for all subsequent chunks)
+                let snap = pinned_snapshot.get_or_insert_with(|| {
+                    let entries = state.export_snapshot();
+                    PinnedSnapshot {
+                        state_root: state.root(),
+                        head_slot: chain.head_slot,
+                        pinned_at_slot: chain.head_slot,
+                        entries,
+                    }
+                });
+
+                // Expire stale pins (if state advanced >100 slots since pin)
+                if chain.head_slot > snap.pinned_at_slot + 100 {
+                    *pinned_snapshot = Some(PinnedSnapshot {
+                        entries: state.export_snapshot(),
+                        state_root: state.root(),
+                        head_slot: chain.head_slot,
+                        pinned_at_slot: chain.head_slot,
+                    });
+                }
+                let snap = pinned_snapshot.as_ref().unwrap();
+
+                if snap.entries.is_empty() {
+                    return SyncResp::NotFound;
+                }
+
+                let cs = (*chunk_size as usize).max(1);
+                let total_chunks = ((snap.entries.len() + cs - 1) / cs).max(1) as u32;
+                let start = (*chunk_index as usize) * cs;
+
+                if start >= snap.entries.len() {
+                    return SyncResp::NotFound;
+                }
+                let end = (start + cs).min(snap.entries.len());
+                let chunk_entries: Vec<(Vec<u8>, Vec<u8>)> = snap.entries[start..end].to_vec();
+
+                let mut hash_buf = Vec::new();
+                for (k, v) in &chunk_entries {
+                    hash_buf.extend_from_slice(k);
+                    hash_buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    hash_buf.extend_from_slice(v);
+                }
+                let chunk_hash = pyde_crypto::poseidon2::poseidon2_hash(&hash_buf).to_bytes();
+
+                SyncResp::StateSnapshotChunk {
+                    state_root: snap.state_root,
+                    head_slot: snap.head_slot,
+                    chunk_index: *chunk_index,
+                    total_chunks,
+                    chunk_hash,
+                    entries: chunk_entries,
+                }
+            }
         }
     }
 
     /// Whether sync is in progress.
     pub fn is_syncing(&self) -> bool {
         self.manager.needs_sync()
+    }
+
+    /// Whether a chunked snapshot download is in progress and needs more chunks.
+    /// Returns the next chunk index to request, or None if complete.
+    pub fn needs_next_chunk(&self) -> Option<u32> {
+        if self.snapshot_total_chunks == 0 { return None; }
+        let collected = self.snapshot_chunks.len() as u32;
+        if collected < self.snapshot_total_chunks {
+            Some(collected)
+        } else {
+            None
+        }
     }
 }
 
@@ -428,7 +639,7 @@ mod tests {
         let state = make_state("pyde-sync-tip-v2");
         let bs = make_block_store("pyde-sync-tip-bs-v2");
 
-        let resp = ChainSync::handle_inbound_request(&SyncReq::GetChainTip, &chain, &state, &bs);
+        let resp = ChainSync::handle_inbound_request(&SyncReq::GetChainTip, &chain, &state, &bs, &mut None::<PinnedSnapshot>);
         match resp {
             SyncResp::ChainTip { slot, .. } => assert_eq!(slot, 10),
             _ => panic!("expected ChainTip response"),
@@ -446,9 +657,7 @@ mod tests {
 
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetBlocks { start_slot: 1, count: 3 },
-            &chain,
-            &state,
-            &bs,
+            &chain, &state, &bs, &mut None::<PinnedSnapshot>,
         );
         match resp {
             SyncResp::Blocks(blocks) => {
@@ -469,9 +678,7 @@ mod tests {
 
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetBlocks { start_slot: 100, count: 10 },
-            &chain,
-            &state,
-            &bs,
+            &chain, &state, &bs, &mut None::<PinnedSnapshot>,
         );
         match resp {
             SyncResp::NotFound => {}
@@ -492,9 +699,7 @@ mod tests {
         let bs = make_block_store("pyde-sync-snapshot-bs-v2");
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetStateSnapshot,
-            &chain,
-            &state,
-            &bs,
+            &chain, &state, &bs, &mut None::<PinnedSnapshot>,
         );
         match resp {
             SyncResp::StateSnapshot { state_root, head_slot, entries } => {

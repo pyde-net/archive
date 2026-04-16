@@ -27,6 +27,11 @@ pub enum SyncReq {
     },
     /// Request a full state snapshot at the peer's current state root.
     GetStateSnapshot,
+    /// Request a single chunk of a state snapshot (for large states).
+    GetStateSnapshotChunk {
+        chunk_index: u32,
+        chunk_size: u32,
+    },
 }
 
 /// Sync response from peer.
@@ -45,6 +50,15 @@ pub enum SyncResp {
     StateSnapshot {
         state_root: [u8; 32],
         head_slot: u64,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// A single chunk of a state snapshot.
+    StateSnapshotChunk {
+        state_root: [u8; 32],
+        head_slot: u64,
+        chunk_index: u32,
+        total_chunks: u32,
+        chunk_hash: [u8; 32],
         entries: Vec<(Vec<u8>, Vec<u8>)>,
     },
     /// Peer doesn't have the requested data.
