@@ -43,6 +43,10 @@ metrics-exporter-prometheus = "0.16"
 # RPC
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
 
+# WebSocket subscriptions (bypasses jsonrpsee sink delivery bug)
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
 # Storage
 rocksdb = "0.24"
 

@@ -20,6 +20,7 @@ mod sync;
 mod tx_relay;
 mod validator;
 pub mod wire;
+mod ws_sub;
 
 use clap::Parser;
 use cli::{Cli, Command};

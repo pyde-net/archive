@@ -337,6 +337,8 @@ impl PydeNode {
         let (logs_tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(1024);
         let ws_heads = new_heads_tx.clone();
         let ws_logs = logs_tx.clone();
+        let ws_sub_heads = new_heads_tx.clone();
+        let ws_sub_logs = logs_tx.clone();
         if self.config.rpc.enabled {
             let rpc_state = Arc::new(RpcState {
                 chain: chain.clone(),
@@ -371,7 +373,22 @@ impl PydeNode {
             }
         }
 
-        // 11. Start fast binary TX endpoint (high-throughput alternative to HTTP RPC)
+        // 11. Start dedicated WebSocket subscription server (port 8546)
+        // Uses tokio-tungstenite directly for reliable subscription delivery.
+        if self.config.rpc.enabled {
+            let ws_port = self.config.rpc.port + 1; // 8546
+            match crate::ws_sub::start_ws_server(
+                &self.config.rpc.listen,
+                ws_port,
+                ws_sub_heads,
+                ws_sub_logs,
+            ).await {
+                Ok(addr) => info!(%addr, "WebSocket subscription server started"),
+                Err(e) => warn!("WS subscription server disabled: {}", e),
+            }
+        }
+
+        // 12. Start fast binary TX endpoint (high-throughput alternative to HTTP RPC)
         if self.config.fast_tx.enabled {
             match crate::fast_tx::start_fast_tx_listener(
                 &self.config.fast_tx.listen,
