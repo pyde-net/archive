@@ -816,6 +816,37 @@ impl PydeNode {
                                     }
                                     drop(pending_w);
 
+                                    // Drain any queued double-sign evidence into Slash txs and
+                                    // prepend them to the block. This is the detection → punishment
+                                    // link: without it, `pending_evidence` would accumulate forever
+                                    // with no on-chain effect.
+                                    if !engine.pending_evidence.is_empty() {
+                                        let state_r = state.read().await;
+                                        let base_nonce = pyde_tx::pipeline::load_nonce(
+                                            &*state_r,
+                                            &identity.address,
+                                        ).base;
+                                        drop(state_r);
+                                        let mut slash_txs: Vec<pyde_tx::types::Transaction> = Vec::new();
+                                        let _ = engine.drain_evidence_into_slash_txs(
+                                            identity,
+                                            base_nonce,
+                                            self.config.node.chain_id,
+                                            &mut slash_txs,
+                                        );
+                                        if !slash_txs.is_empty() {
+                                            tracing::info!(
+                                                count = slash_txs.len(),
+                                                "prepending slash txs to block proposal"
+                                            );
+                                            // Slash txs go first so they execute before any
+                                            // tx that might depend on the offender's stake
+                                            // (e.g. a self-Withdraw racing the slash).
+                                            slash_txs.extend(txs);
+                                            txs = slash_txs;
+                                        }
+                                    }
+
                                     // Also collect encrypted txs from the threshold-encrypted mempool
                                     let encrypted_blobs = {
                                         let relay_r = tx_relay.read().await;

@@ -986,6 +986,70 @@ impl ValidatorEngine {
         self.pending_evidence.extend(evidence);
     }
 
+    /// Drain `pending_evidence` and turn each entry into a signed
+    /// `TransactionType::Slash` transaction, authored by `identity`.
+    ///
+    /// Slash txs are added to `out` in the order they were queued, each
+    /// with a sequential nonce starting at `start_nonce`. The
+    /// submitter's address (`identity.address`) is also stamped into
+    /// the evidence's `submitter` field so `execute_slash` can pay the
+    /// finder's fee to the correct account — this is the point where
+    /// the "filled by caller" stub at the detection site is resolved.
+    ///
+    /// Returns the next nonce the caller should use for any additional
+    /// txs from this address within the same block.
+    pub fn drain_evidence_into_slash_txs(
+        &mut self,
+        identity: &ValidatorIdentity,
+        start_nonce: u64,
+        chain_id: u64,
+        out: &mut Vec<pyde_tx::types::Transaction>,
+    ) -> u64 {
+        use pyde_tx::types::{FeePayer, Transaction, TransactionType};
+
+        let mut next_nonce = start_nonce;
+        for mut evidence in self.drain_pending_evidence() {
+            evidence.submitter = identity.address;
+            let data = crate::wire::encode_double_sign_evidence(&evidence);
+
+            let mut tx = Transaction {
+                from: identity.address,
+                to: [0u8; 32],
+                value: 0,
+                data,
+                // Handler charges 100_000 on success; give ~3× headroom for
+                // safety against any future gas-model adjustment.
+                gas_limit: 300_000,
+                nonce: next_nonce,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
+                access_list: vec![],
+                deadline: None,
+                chain_id,
+                tx_type: TransactionType::Slash,
+            };
+
+            let tx_hash = tx.hash();
+            match pyde_crypto::falcon::falcon_sign(&identity.secret_key, &tx_hash) {
+                Ok(sig) => tx.signature = sig.as_bytes().to_vec(),
+                Err(e) => {
+                    error!(error = ?e, "failed to sign slash tx; dropping evidence");
+                    continue;
+                }
+            }
+
+            info!(
+                offender = hex::encode(evidence.signer),
+                slot = evidence.slot,
+                nonce = next_nonce,
+                "slash tx built for block inclusion"
+            );
+            out.push(tx);
+            next_nonce = next_nonce.saturating_add(1);
+        }
+        next_nonce
+    }
+
     /// Advance to the next slot. Returns the new slot number.
     pub fn advance_slot(&mut self) -> u64 {
         self.consensus.advance_slot();
@@ -1514,6 +1578,187 @@ mod tests {
 
         let slots: Vec<u64> = engine.pending_evidence.iter().map(|e| e.slot).collect();
         assert_eq!(slots, vec![1, 2, 3]);
+    }
+
+    // ========== End-to-end: drain evidence → Slash tx → state mutation ==========
+
+    #[test]
+    fn drain_evidence_builds_signed_slash_tx() {
+        use pyde_crypto::falcon::falcon_keygen;
+
+        // Set up a validator (the submitter) with a real FALCON key. This
+        // is the validator that will build the block and submit evidence.
+        let (pk, sk) = falcon_keygen().unwrap();
+        let submitter_addr = pyde_account::address::derive_eoa_address(pk.as_bytes());
+        let identity = ValidatorIdentity {
+            address: submitter_addr,
+            public_key: pk.clone(),
+            secret_key: sk,
+            committee_index: 0,
+            key_share: None,
+        };
+
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        engine.pending_evidence.push(evidence_fixture(42, [0xFF; 32]));
+
+        let mut out = Vec::new();
+        let next = engine.drain_evidence_into_slash_txs(&identity, 7, 1, &mut out);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(next, 8);
+        let tx = &out[0];
+        assert_eq!(tx.from, submitter_addr);
+        assert_eq!(tx.nonce, 7);
+        assert_eq!(tx.chain_id, 1);
+        assert!(matches!(tx.tx_type, pyde_tx::types::TransactionType::Slash));
+        assert!(!tx.signature.is_empty(), "tx must be signed");
+        // submitter field was rewritten from [0; 32] → submitter_addr during drain
+        assert!(engine.pending_evidence.is_empty());
+    }
+
+    #[test]
+    fn end_to_end_detection_to_on_chain_slash() {
+        // This exercises the full slice B pipeline without driving VRF/
+        // proposal verification: craft real evidence, push it, drain into
+        // a signed Slash tx, execute against an SMT, assert state
+        // mutations. It's what a validator would do on every block
+        // proposal when its pending_evidence queue is non-empty.
+        use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
+        use pyde_state::smt::PydeSMT;
+        use pyde_tx::pipeline::{execute_transaction, BlockContext};
+
+        const VALIDATOR_STAKE: u128 = 10_000_000_000_000;
+
+        // Offender: produces the two conflicting signatures.
+        let (offender_pk, offender_sk) = falcon_keygen().unwrap();
+        let offender_addr =
+            pyde_account::address::derive_eoa_address(offender_pk.as_bytes());
+
+        // Submitter: the validator building the block (and receiving the fee).
+        let (submitter_pk, submitter_sk) = falcon_keygen().unwrap();
+        let submitter_addr =
+            pyde_account::address::derive_eoa_address(submitter_pk.as_bytes());
+
+        // Stand up an SMT with the offender registered as an Active
+        // validator (status 0x00) and the submitter funded.
+        let mut smt = PydeSMT::new();
+        let pk_len = offender_pk.as_bytes().len() as u32;
+        let mut val_data = Vec::new();
+        val_data.extend_from_slice(&pk_len.to_le_bytes());
+        val_data.extend_from_slice(offender_pk.as_bytes());
+        val_data.extend_from_slice(&VALIDATOR_STAKE.to_le_bytes());
+        val_data.push(0x00); // Active
+        smt.insert(pyde_state::keys::validator_key(&offender_addr), val_data)
+            .unwrap();
+
+        let mut submitter_account =
+            pyde_account::types::Account::new_eoa(submitter_pk.as_bytes());
+        submitter_account.address = submitter_addr;
+        submitter_account.balance = 1_000_000_000_000; // 1K PYDE, plenty for gas
+        smt.insert(
+            pyde_state::keys::balance_key(&submitter_addr),
+            submitter_account.to_bytes(),
+        )
+        .unwrap();
+        smt.insert(
+            pyde_state::keys::nonce_key(&submitter_addr),
+            pyde_account::nonce::NonceState::new().to_bytes().to_vec(),
+        )
+        .unwrap();
+
+        // Craft two real FALCON-signed attestations for the same slot —
+        // exactly what an equivocating proposer would produce.
+        let slot = 100u64;
+        let hash_1 = [0xA1u8; 32];
+        let hash_2 = [0xA2u8; 32];
+        let sign_msg_1 = {
+            let mut m = Vec::with_capacity(40);
+            m.extend_from_slice(&slot.to_le_bytes());
+            m.extend_from_slice(&hash_1);
+            m
+        };
+        let sign_msg_2 = {
+            let mut m = Vec::with_capacity(40);
+            m.extend_from_slice(&slot.to_le_bytes());
+            m.extend_from_slice(&hash_2);
+            m
+        };
+        let sig_1 = falcon_sign(&offender_sk, &sign_msg_1)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let sig_2 = falcon_sign(&offender_sk, &sign_msg_2)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+
+        // Push into the engine's queue, exactly as the detection site does.
+        let identity = ValidatorIdentity {
+            address: submitter_addr,
+            public_key: submitter_pk,
+            secret_key: submitter_sk,
+            committee_index: 0,
+            key_share: None,
+        };
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        engine.pending_evidence.push(DoubleSignEvidence {
+            slot,
+            block_hash_1: hash_1,
+            signature_1: sig_1,
+            block_hash_2: hash_2,
+            signature_2: sig_2,
+            signer: offender_addr,
+            submitter: [0u8; 32], // filled by drain
+        });
+
+        // Drain into Slash txs.
+        let mut slash_txs = Vec::new();
+        engine.drain_evidence_into_slash_txs(&identity, 0, 1, &mut slash_txs);
+        assert_eq!(slash_txs.len(), 1);
+
+        // Execute on the SMT.
+        let ctx = BlockContext {
+            height: 101,
+            timestamp: 1_000_000,
+            base_fee: 1_000,
+            block_gas_limit: 400_000_000,
+            chain_id: 1,
+            validator_address: [0xEE; 32],
+        };
+        let receipt = execute_transaction(&slash_txs[0], &mut smt, &ctx).unwrap();
+        assert!(
+            receipt.success,
+            "on-chain slash must succeed with real evidence"
+        );
+
+        // Offender: stake 0, status Ejected.
+        let val_data = smt
+            .get(&pyde_state::keys::validator_key(&offender_addr))
+            .expect("validator entry still present");
+        // Layout: [pk_len:4 LE][pk][stake:16 LE][status:1].
+        let pk_len =
+            u32::from_le_bytes(val_data[0..4].try_into().unwrap()) as usize;
+        let stake_offset = 4 + pk_len;
+        let stake = u128::from_le_bytes(
+            val_data[stake_offset..stake_offset + 16].try_into().unwrap(),
+        );
+        let status = val_data[stake_offset + 16];
+        assert_eq!(stake, 0, "offender stake must be fully slashed");
+        assert_eq!(status, 0x02, "offender must be marked Ejected");
+
+        // Submitter: balance increased by finder's fee (10% of stake) minus gas.
+        let raw = smt.get(&pyde_state::keys::balance_key(&submitter_addr)).unwrap();
+        let acc = pyde_account::types::Account::from_bytes(&raw).unwrap();
+        let expected_fee = VALIDATOR_STAKE / 10;
+        let gas_cost = receipt.gas_used as u128 * ctx.base_fee;
+        assert_eq!(
+            acc.balance,
+            1_000_000_000_000 + expected_fee - gas_cost,
+            "submitter must net finder's fee minus gas"
+        );
+
+        // Queue is drained.
+        assert!(engine.pending_evidence.is_empty());
     }
 
     #[test]
