@@ -508,6 +508,18 @@ impl PydeNode {
                                 warn!(error = %e, "failed to broadcast consensus message");
                             }
                         }
+                        PostEventAction::BroadcastConsensusMany(messages) => {
+                            let topic = pyde_net::node::topics::consensus();
+                            for data in messages {
+                                if let Err(e) = swarm
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .publish(topic.clone(), data)
+                                {
+                                    warn!(error = %e, "failed to broadcast consensus message");
+                                }
+                            }
+                        }
                         PostEventAction::AcceptTransaction(tx) => {
                             let tx_hash = tx.hash();
                             // Index for compact block reconstruction
@@ -1038,6 +1050,18 @@ impl PydeNode {
                                     // Buffer our own proposal for VRF selection.
                                     // Voting happens after the proposal collection window.
                                     engine.buffer_proposal(&block.header, &block.proposer_signature);
+
+                                    // If buffering triggered local detection of an
+                                    // equivocation, relay the evidence on the consensus
+                                    // channel so peers can slash even if they never
+                                    // directly witnessed the double-propose.
+                                    for ev in engine.drain_broadcast_evidence() {
+                                        let bytes = wire::encode_slash_evidence_msg(&ev);
+                                        let topic = pyde_net::node::topics::consensus();
+                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, bytes) {
+                                            warn!(error = ?e, "failed to publish slash evidence");
+                                        }
+                                    }
                                 } // end if mempool_size > 0
                                 }
                             }
@@ -1308,6 +1332,11 @@ enum PostEventAction {
     SendSyncResponse(request_response::ResponseChannel<SyncResp>, SyncResp),
     ContinueSync,
     BroadcastConsensus(Vec<u8>),
+    /// Batch-publish multiple consensus messages in one post-event
+    /// action. Used for slashing evidence: a single received proposal
+    /// can cause the engine to queue several messages at once (e.g. if
+    /// gossip and local detection arrive in the same tick).
+    BroadcastConsensusMany(Vec<Vec<u8>>),
     AcceptTransaction(pyde_tx::types::Transaction),
     StoreReceipts(u64, Vec<pyde_tx::execution::Receipt>),
     AddPeerToKademlia(PeerId, Vec<libp2p::Multiaddr>),
@@ -1477,6 +1506,34 @@ fn handle_swarm_event(
                             return PostEventAction::None;
                         }
 
+                        // Check if it's a slashing-evidence gossip message.
+                        // Validators relay these so that even a validator
+                        // that never directly witnessed the equivocation
+                        // can include a Slash tx in its next proposal.
+                        if !message.data.is_empty() && message.data[0] == wire::tag::CONSENSUS_SLASH_EVIDENCE {
+                            match wire::decode_slash_evidence_msg(&message.data) {
+                                Ok(evidence) => {
+                                    let slot = evidence.slot;
+                                    let signer = evidence.signer;
+                                    if engine.ingest_evidence(evidence) {
+                                        info!(
+                                            slot,
+                                            signer = hex::encode(signer),
+                                            "ingested slash evidence from gossip"
+                                        );
+                                    }
+                                    // Note: no immediate re-publish here.
+                                    // gossipsub already propagates the
+                                    // message across the mesh; re-emitting
+                                    // would cause an amplification storm.
+                                }
+                                Err(e) => {
+                                    debug!(error = e, "failed to decode slash evidence gossip");
+                                }
+                            }
+                            return PostEventAction::None;
+                        }
+
                         // Check if it's a PSS refresh contribution
                         if !message.data.is_empty() && message.data[0] == wire::tag::PSS_REFRESH {
                             match wire::decode_pss_refresh(&message.data) {
@@ -1525,6 +1582,20 @@ fn handle_swarm_event(
                                         // Voting happens after the proposal collection window
                                         // via select_and_vote (triggered by slot timer).
                                         engine.buffer_proposal(header, proposer_signature);
+                                        // Same detection-then-relay pattern as when we
+                                        // produce our own proposal: buffering a received
+                                        // proposal can reveal it conflicts with one we
+                                        // already saw from the same proposer. Hand the
+                                        // encoded envelopes back to the outer loop to
+                                        // publish — swarm isn't accessible from here.
+                                        let new_evidence: Vec<Vec<u8>> = engine
+                                            .drain_broadcast_evidence()
+                                            .iter()
+                                            .map(wire::encode_slash_evidence_msg)
+                                            .collect();
+                                        if !new_evidence.is_empty() {
+                                            return PostEventAction::BroadcastConsensusMany(new_evidence);
+                                        }
                                     }
                                     ConsensusMessage::Vote { slot, voter_index, .. } => {
                                         debug!(slot, voter_index, "received vote");

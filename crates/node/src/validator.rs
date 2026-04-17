@@ -256,6 +256,17 @@ pub struct ValidatorEngine {
     /// writes to disk on every safety-critical mutation and reloads on startup.
     /// Crash-safe property: never regress last_voted_slot or highest_qc.
     consensus_store: Option<Arc<ConsensusStateStore>>,
+    /// Evidence staged for P2P broadcast. Populated by local detection
+    /// (and by ingest_evidence on first-seen gossip items); drained by
+    /// the node loop after each proposal it processes, so new
+    /// equivocations reach every validator even if only one directly
+    /// witnessed them.
+    broadcast_evidence: Vec<DoubleSignEvidence>,
+    /// (slot, signer) pairs we've already ingested. Dedups both local
+    /// re-detection (same validator conflicting across >2 blocks at the
+    /// same slot) and gossip arrivals — each pair is broadcast at most
+    /// once and stored in pending_evidence at most once.
+    seen_evidence: std::collections::HashSet<(u64, Address)>,
 }
 
 impl ValidatorEngine {
@@ -276,6 +287,8 @@ impl ValidatorEngine {
             seen_proposals: HashMap::new(),
             seen_votes: HashMap::new(),
             pending_evidence: Vec::new(),
+            broadcast_evidence: Vec::new(),
+            seen_evidence: std::collections::HashSet::new(),
             randomness_collector: None,
             pss_contributions: Vec::new(),
             pss_target_epoch: 0,
@@ -660,17 +673,16 @@ impl ValidatorEngine {
                     // the Slash tx — typically the next block proposer.
                     submitter: [0u8; 32],
                 };
-                // Cross-check both signatures verify against the accused
-                // proposer's committee key. slash_double_sign returns None
-                // if either sig is invalid; in that case we drop the
-                // evidence rather than queue garbage.
-                if slash_double_sign(&evidence, &self.committee_keys[proposer_idx]).is_some() {
+                // Route through ingest_evidence: validates both sigs,
+                // dedupes on (slot, signer), and also stages the entry
+                // for P2P broadcast so other validators can slash even
+                // if they never directly observed the equivocation.
+                if self.ingest_evidence(evidence) {
                     info!(
                         slot,
-                        offender = hex::encode(evidence.signer),
+                        offender = hex::encode(header.proposer),
                         "double-propose evidence queued for slashing"
                     );
-                    self.pending_evidence.push(evidence);
                 }
             }
         } else {
@@ -1013,6 +1025,73 @@ impl ValidatorEngine {
     /// appending at the tail.
     pub fn push_evidence(&mut self, evidence: Vec<DoubleSignEvidence>) {
         self.pending_evidence.extend(evidence);
+    }
+
+    /// Ingest a piece of equivocation evidence — shared entry point for
+    /// both local detection and gossip reception. The flow is:
+    ///
+    /// 1. Deduplicate on `(slot, signer)`. A validator that has already
+    ///    queued evidence against the same offender at the same slot
+    ///    ignores repeats.
+    /// 2. Verify that `signer` is a current committee member. Evidence
+    ///    naming a non-validator is meaningless and wastes block space.
+    /// 3. Verify both FALCON signatures against the signer's committee
+    ///    key (delegated to `slash_double_sign`, which re-runs the
+    ///    canonical verification used by the on-chain handler).
+    /// 4. If all three pass, push to `pending_evidence` (for block
+    ///    inclusion) and `broadcast_evidence` (for P2P relay).
+    ///
+    /// Returns `true` if the evidence was newly accepted; `false` means
+    /// it was a duplicate or failed verification. Callers relying on
+    /// the return value: gossip path should only relay on `true` to
+    /// avoid amplification storms.
+    pub fn ingest_evidence(&mut self, evidence: DoubleSignEvidence) -> bool {
+        let key = (evidence.slot, evidence.signer);
+        if self.seen_evidence.contains(&key) {
+            return false;
+        }
+
+        // Resolve the accused signer to their committee index. A signer
+        // not in the active committee cannot be slashed — drop.
+        let signer_pk = self.committee_keys.iter().find(|pk| {
+            pyde_account::address::derive_eoa_address(pk) == evidence.signer
+        });
+        let pk_bytes = match signer_pk {
+            Some(pk) => pk.clone(),
+            None => {
+                debug!(
+                    slot = evidence.slot,
+                    signer = hex::encode(evidence.signer),
+                    "rejecting evidence: signer not in committee"
+                );
+                return false;
+            }
+        };
+
+        // slash_double_sign returns None if the sig/format verification
+        // fails. We discard the SlashResult — only verification matters;
+        // the on-chain handler re-computes it from state.
+        if slash_double_sign(&evidence, &pk_bytes).is_none() {
+            debug!(
+                slot = evidence.slot,
+                signer = hex::encode(evidence.signer),
+                "rejecting evidence: signature verification failed"
+            );
+            return false;
+        }
+
+        self.seen_evidence.insert(key);
+        self.pending_evidence.push(evidence.clone());
+        self.broadcast_evidence.push(evidence);
+        true
+    }
+
+    /// Drain the broadcast staging queue. Returns every piece of
+    /// evidence that has been newly ingested (either locally detected
+    /// or received via gossip) since the last call. The caller is
+    /// responsible for publishing each entry on the consensus channel.
+    pub fn drain_broadcast_evidence(&mut self) -> Vec<DoubleSignEvidence> {
+        std::mem::take(&mut self.broadcast_evidence)
     }
 
     /// Drain `pending_evidence` and turn each entry into a signed
@@ -1607,6 +1686,124 @@ mod tests {
 
         let slots: Vec<u64> = engine.pending_evidence.iter().map(|e| e.slot).collect();
         assert_eq!(slots, vec![1, 2, 3]);
+    }
+
+    // ========== Evidence gossip ingest + dedup ==========
+
+    /// Build valid evidence signed by a real FALCON key. Registers
+    /// `pk` as committee index 0 so ingest_evidence passes the
+    /// signer-in-committee check.
+    fn valid_evidence_and_engine()
+        -> (ValidatorEngine, pyde_crypto::falcon::FalconSecretKey, DoubleSignEvidence, Address)
+    {
+        use pyde_crypto::falcon::falcon_keygen;
+
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let signer = pyde_account::address::derive_eoa_address(&pk_bytes);
+
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        engine.set_committee(vec![pk_bytes]);
+
+        let slot = 42u64;
+        let hash_1 = [0x01u8; 32];
+        let hash_2 = [0x02u8; 32];
+        let sign_1 = {
+            let mut m = Vec::with_capacity(40);
+            m.extend_from_slice(&slot.to_le_bytes());
+            m.extend_from_slice(&hash_1);
+            m
+        };
+        let sign_2 = {
+            let mut m = Vec::with_capacity(40);
+            m.extend_from_slice(&slot.to_le_bytes());
+            m.extend_from_slice(&hash_2);
+            m
+        };
+        let sig_1 = pyde_crypto::falcon::falcon_sign(&sk, &sign_1).unwrap().as_bytes().to_vec();
+        let sig_2 = pyde_crypto::falcon::falcon_sign(&sk, &sign_2).unwrap().as_bytes().to_vec();
+
+        let evidence = DoubleSignEvidence {
+            slot,
+            block_hash_1: hash_1,
+            signature_1: sig_1,
+            block_hash_2: hash_2,
+            signature_2: sig_2,
+            signer,
+            submitter: [0u8; 32],
+        };
+        (engine, sk, evidence, signer)
+    }
+
+    #[test]
+    fn ingest_evidence_accepts_valid_and_stages_for_broadcast() {
+        let (mut engine, _sk, evidence, signer) = valid_evidence_and_engine();
+        assert!(engine.ingest_evidence(evidence.clone()));
+
+        // Pending queue populated (block builder will drain it).
+        assert_eq!(engine.pending_evidence.len(), 1);
+        assert_eq!(engine.pending_evidence[0].signer, signer);
+
+        // Broadcast queue populated (node loop will drain it).
+        let broadcast = engine.drain_broadcast_evidence();
+        assert_eq!(broadcast.len(), 1);
+        assert_eq!(broadcast[0].signer, signer);
+
+        // Second drain is empty — ownership transferred.
+        assert!(engine.drain_broadcast_evidence().is_empty());
+    }
+
+    #[test]
+    fn ingest_evidence_dedups_on_slot_signer_pair() {
+        let (mut engine, _sk, evidence, _signer) = valid_evidence_and_engine();
+        assert!(engine.ingest_evidence(evidence.clone()));
+        // Second call with the same (slot, signer) is dropped — returns
+        // false, doesn't re-push to either queue.
+        assert!(!engine.ingest_evidence(evidence.clone()));
+        assert_eq!(engine.pending_evidence.len(), 1);
+
+        let broadcast = engine.drain_broadcast_evidence();
+        assert_eq!(broadcast.len(), 1, "duplicates must not double-broadcast");
+    }
+
+    #[test]
+    fn ingest_evidence_rejects_non_committee_signer() {
+        let (mut engine, _sk, mut evidence, _signer) = valid_evidence_and_engine();
+        // Replace the signer with an address that isn't in committee_keys.
+        evidence.signer = [0xEE; 32];
+        assert!(!engine.ingest_evidence(evidence));
+        assert!(engine.pending_evidence.is_empty());
+        assert!(engine.drain_broadcast_evidence().is_empty());
+    }
+
+    #[test]
+    fn ingest_evidence_rejects_forged_signatures() {
+        let (mut engine, _sk, mut evidence, _signer) = valid_evidence_and_engine();
+        // Replace sig_2 with random bytes — FALCON verify will fail.
+        evidence.signature_2 = vec![0xFFu8; evidence.signature_2.len()];
+        assert!(!engine.ingest_evidence(evidence));
+        assert!(engine.pending_evidence.is_empty());
+    }
+
+    #[test]
+    fn ingest_evidence_rejects_same_hash() {
+        // `block_hash_1 == block_hash_2` isn't equivocation; verify_double_sign
+        // returns false, so ingest_evidence should drop it.
+        let (mut engine, sk, mut evidence, _signer) = valid_evidence_and_engine();
+        // Sign the SAME hash twice so both signatures are individually valid.
+        let h = [0x77u8; 32];
+        let sign_msg = {
+            let mut m = Vec::with_capacity(40);
+            m.extend_from_slice(&evidence.slot.to_le_bytes());
+            m.extend_from_slice(&h);
+            m
+        };
+        let sig = pyde_crypto::falcon::falcon_sign(&sk, &sign_msg).unwrap().as_bytes().to_vec();
+        evidence.block_hash_1 = h;
+        evidence.block_hash_2 = h;
+        evidence.signature_1 = sig.clone();
+        evidence.signature_2 = sig;
+        assert!(!engine.ingest_evidence(evidence));
     }
 
     // ========== End-to-end: drain evidence → Slash tx → state mutation ==========
