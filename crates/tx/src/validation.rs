@@ -27,6 +27,13 @@ pub struct ValidationContext {
     pub block_gas_limit: u64,
     /// Expected chain ID.
     pub chain_id: u64,
+    /// When true, FALCON signature verification is skipped. Intended
+    /// only for in-process devnet tests that construct transactions
+    /// without real FALCON keys. Production must keep this `false`
+    /// regardless of `chain_id` — the previous check was "skip sigs
+    /// if chain_id == 31337" which let a misconfigured mainnet node
+    /// with a devnet chain_id accept forged transactions.
+    pub dev_skip_signature: bool,
 }
 
 /// Validation error with specific reason.
@@ -65,8 +72,11 @@ pub fn validate_transaction(
     // 1. Chain ID
     validate_chain_id(tx, ctx)?;
 
-    // 2. Signature (skipped in devnet mode for testing without real FALCON keys)
-    if ctx.chain_id != 31337 {
+    // 2. Signature. Skipping is only allowed when the caller explicitly
+    // sets `dev_skip_signature` — chain_id is NOT consulted here, so a
+    // misconfigured production validator with chain_id = 31337 cannot
+    // accidentally accept forged transactions.
+    if !ctx.dev_skip_signature {
         validate_signature(tx, sender)?;
     }
 
@@ -267,6 +277,11 @@ mod tests {
             base_fee: 1_000,
             block_gas_limit: BLOCK_GAS_TARGET,
             chain_id: 1,
+            // validation.rs unit tests exercise each rule in isolation;
+            // individual tests pass signed txs when they want to exercise
+            // signature validation, and the module's signature test
+            // overrides this field.
+            dev_skip_signature: true,
         }
     }
 
@@ -292,7 +307,12 @@ mod tests {
     fn invalid_signature_rejected() {
         let (mut tx, account, nonce) = make_valid_tx_and_account();
         tx.signature = vec![0xFF; 666]; // garbage sig
-        let ctx = default_ctx();
+        // Override default_ctx()'s dev_skip_signature so the sig check
+        // actually runs — the whole point of this test.
+        let ctx = ValidationContext {
+            dev_skip_signature: false,
+            ..default_ctx()
+        };
         let err = validate_transaction(&tx, &account, &nonce, &ctx).unwrap_err();
         assert!(matches!(err, ValidationError::InvalidSignature));
     }

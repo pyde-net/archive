@@ -67,14 +67,44 @@ impl Cpu {
         }
     }
 
-    /// Read a wide register (0-7).
+    /// Read a wide register without bounds checking. Indices 8..16 are
+    /// masked down to 0..8 via `& 0x07` — convenient for test/bench
+    /// scaffolding that constructs known-good indices, but unsafe to
+    /// use for user-controlled inputs. Production paths must call
+    /// `read_wide_checked` so a malicious decoded instruction with
+    /// `rd >= 8` traps instead of silently aliasing w0..w7.
     pub fn read_wide(&self, reg: u8) -> U256 {
         self.wide[(reg & 0x07) as usize]
     }
 
-    /// Write a wide register (0-7).
+    /// Write a wide register without bounds checking. See `read_wide`
+    /// for why production paths should prefer `write_wide_checked`.
     pub fn write_wide(&mut self, reg: u8, val: U256) {
         self.wide[(reg & 0x07) as usize] = val;
+    }
+
+    /// Read a wide register, trapping on out-of-range indices.
+    ///
+    /// The decoded register field is 4 bits (0..16) but only indices
+    /// 0..8 are valid. A hand-crafted malicious instruction encoding
+    /// `rd >= 8` would previously silently alias into w0..w7; this
+    /// variant returns `Trap::InvalidOpcode` instead, which the VM
+    /// propagates as a normal tx-level fault.
+    pub fn read_wide_checked(&self, reg: u8) -> Result<U256, Trap> {
+        if (reg as usize) >= WIDE_REG_COUNT {
+            return Err(Trap::InvalidOpcode);
+        }
+        Ok(self.wide[reg as usize])
+    }
+
+    /// Write a wide register, trapping on out-of-range indices.
+    /// See `read_wide_checked` for rationale.
+    pub fn write_wide_checked(&mut self, reg: u8, val: U256) -> Result<(), Trap> {
+        if (reg as usize) >= WIDE_REG_COUNT {
+            return Err(Trap::InvalidOpcode);
+        }
+        self.wide[reg as usize] = val;
+        Ok(())
     }
 
     /// Execute a single arithmetic/logic instruction.
@@ -204,56 +234,56 @@ impl Cpu {
 
         match d.opcode {
             Opcode::Wadd => {
-                let ws1 = self.read_wide(d.rs1);
-                let ws2 = self.read_wide(d.rs2_or_imm as u8);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                let ws2 = self.read_wide_checked(d.rs2_or_imm as u8)?;
                 let result = wide::wide_add(ws1, ws2)?;
-                self.write_wide(d.rd, result);
+                self.write_wide_checked(d.rd, result)?;
             }
             Opcode::Wsub => {
-                let ws1 = self.read_wide(d.rs1);
-                let ws2 = self.read_wide(d.rs2_or_imm as u8);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                let ws2 = self.read_wide_checked(d.rs2_or_imm as u8)?;
                 let result = wide::wide_sub(ws1, ws2)?;
-                self.write_wide(d.rd, result);
+                self.write_wide_checked(d.rd, result)?;
             }
             Opcode::Wmul => {
-                let ws1 = self.read_wide(d.rs1);
-                let ws2 = self.read_wide(d.rs2_or_imm as u8);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                let ws2 = self.read_wide_checked(d.rs2_or_imm as u8)?;
                 let result = wide::wide_mul(ws1, ws2)?;
-                self.write_wide(d.rd, result);
+                self.write_wide_checked(d.rd, result)?;
             }
             Opcode::Wdiv => {
-                let ws1 = self.read_wide(d.rs1);
-                let ws2 = self.read_wide(d.rs2_or_imm as u8);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                let ws2 = self.read_wide_checked(d.rs2_or_imm as u8)?;
                 let result = wide::wide_div(ws1, ws2)?;
-                self.write_wide(d.rd, result);
+                self.write_wide_checked(d.rd, result)?;
             }
             Opcode::Wmod => {
-                let ws1 = self.read_wide(d.rs1);
-                let ws2 = self.read_wide(d.rs2_or_imm as u8);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                let ws2 = self.read_wide_checked(d.rs2_or_imm as u8)?;
                 let result = wide::wide_mod(ws1, ws2)?;
-                self.write_wide(d.rd, result);
+                self.write_wide_checked(d.rd, result)?;
             }
             Opcode::Wand => {
-                let ws1 = self.read_wide(d.rs1);
-                let ws2 = self.read_wide(d.rs2_or_imm as u8);
-                self.write_wide(d.rd, ws1 & ws2);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                let ws2 = self.read_wide_checked(d.rs2_or_imm as u8)?;
+                self.write_wide_checked(d.rd, ws1 & ws2)?;
             }
             Opcode::Wor => {
-                let ws1 = self.read_wide(d.rs1);
-                let ws2 = self.read_wide(d.rs2_or_imm as u8);
-                self.write_wide(d.rd, ws1 | ws2);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                let ws2 = self.read_wide_checked(d.rs2_or_imm as u8)?;
+                self.write_wide_checked(d.rd, ws1 | ws2)?;
             }
             Opcode::Wxor => {
-                let ws1 = self.read_wide(d.rs1);
-                let ws2 = self.read_wide(d.rs2_or_imm as u8);
-                self.write_wide(d.rd, ws1 ^ ws2);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                let ws2 = self.read_wide_checked(d.rs2_or_imm as u8)?;
+                self.write_wide_checked(d.rd, ws1 ^ ws2)?;
             }
             Opcode::Wnot => {
-                let ws1 = self.read_wide(d.rs1);
-                self.write_wide(d.rd, !ws1);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                self.write_wide_checked(d.rd, !ws1)?;
             }
             Opcode::Wshift => {
-                let ws1 = self.read_wide(d.rs1);
+                let ws1 = self.read_wide_checked(d.rs1)?;
                 let dir = d.rs2_or_imm & 1; // 0=left, 1=right
                 let shift_reg = ((d.rs2_or_imm >> 1) & 0xF) as u8;
                 let shift = self.read_gp(shift_reg) as u32;
@@ -264,29 +294,29 @@ impl Cpu {
                 } else {
                     ws1 >> shift
                 };
-                self.write_wide(d.rd, result);
+                self.write_wide_checked(d.rd, result)?;
             }
             Opcode::Wmov => {
-                let ws1 = self.read_wide(d.rs1);
-                self.write_wide(d.rd, ws1);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                self.write_wide_checked(d.rd, ws1)?;
             }
             Opcode::Narrow => {
-                let ws1 = self.read_wide(d.rs1);
+                let ws1 = self.read_wide_checked(d.rs1)?;
                 let val = wide::narrow(ws1).ok_or(Trap::NarrowOverflow)?;
                 self.write_gp(d.rd, val);
             }
             Opcode::Widen => {
                 let val = self.read_gp(d.rs1);
-                self.write_wide(d.rd, U256::from(val));
+                self.write_wide_checked(d.rd, U256::from(val))?;
             }
             Opcode::Weq => {
-                let ws1 = self.read_wide(d.rs1);
-                let ws2 = self.read_wide(d.rs2_or_imm as u8);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                let ws2 = self.read_wide_checked(d.rs2_or_imm as u8)?;
                 self.write_gp(d.rd, if ws1 == ws2 { 1 } else { 0 });
             }
             Opcode::Wlt => {
-                let ws1 = self.read_wide(d.rs1);
-                let ws2 = self.read_wide(d.rs2_or_imm as u8);
+                let ws1 = self.read_wide_checked(d.rs1)?;
+                let ws2 = self.read_wide_checked(d.rs2_or_imm as u8)?;
                 self.write_gp(d.rd, if ws1 < ws2 { 1 } else { 0 });
             }
             _ => return Err(Trap::InvalidOpcode),

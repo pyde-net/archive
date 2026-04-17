@@ -8,7 +8,7 @@ High-performance, post-quantum Layer 1 blockchain with native MEV protection.
 - **Post-quantum cryptography** — FALCON-512 signatures, Kyber-768 KEM, Poseidon2 hashing, lattice-based VRF
 - **PVM (Pyde Virtual Machine)** — custom register-based VM with 32-bit fixed-width ISA
 - **Encrypted mempool** — threshold decryption prevents MEV extraction
-- **EIP-1559 gas model** — no tips, elastic 4x blocks, 80% burn / 20% validator
+- **EIP-1559 gas model** — no tips, elastic 4x blocks, 70% burn / 20% validator / 10% treasury
 - **Otigen language** (.oti) — purpose-built smart contract language with Rust-like syntax
 - **HotStuff BFT consensus** — committee-based with VRF proposer selection
 

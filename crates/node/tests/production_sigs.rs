@@ -56,6 +56,7 @@ fn production_chain_id_1_full_lifecycle() {
         block_gas_limit: 4_000_000_000,
         chain_id: 1,
         validator_address: validator,
+        dev_skip_signature: false,
     };
 
     // Generate 10 accounts with FALCON keys

@@ -979,6 +979,7 @@ async fn parse_call_object(
         block_gas_limit: pyde_tx::fee::GAS_CEILING as u64,
         chain_id: chain.chain_id,
         validator_address: [0u8; 32],
+        dev_skip_signature: false,
     };
     Ok((tx, block_ctx))
 }

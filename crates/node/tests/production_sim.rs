@@ -397,8 +397,9 @@ fn production_simulation() {
         timestamp: 1_700_000_000,
         base_fee: 1,
         block_gas_limit: 4_000_000_000,
-        chain_id: 31337, // devnet — sig verification at tx build time, pipeline skips recheck
+        chain_id: 31337,
         validator_address: validators[0].address,
+        dev_skip_signature: true,
     };
 
     // ═══ BLOCK 1: Deploy 20 complex contracts ════════════════════════

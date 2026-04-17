@@ -687,14 +687,14 @@ impl Vm {
                 let offset = sign_extend_18(d.rs2_or_imm) as i64;
                 let addr = safe_addr(base, offset)?;
                 let bytes = self.memory.load256(addr).map_err(|_| Trap::MemoryFault)?;
-                self.cpu.write_wide(d.rd, U256::from_le_bytes(bytes));
+                self.cpu.write_wide_checked(d.rd, U256::from_le_bytes(bytes))?;
                 self.pc += 4;
             }
             Opcode::Wstore => {
                 let base = self.cpu.read_gp(d.rs1);
                 let offset = sign_extend_18(d.rs2_or_imm) as i64;
                 let addr = safe_addr(base, offset)?;
-                let val = self.cpu.read_wide(d.rd);
+                let val = self.cpu.read_wide_checked(d.rd)?;
                 self.memory
                     .store256(addr, &val.to_le_bytes())
                     .map_err(|_| Trap::MemoryFault)?;
@@ -740,7 +740,7 @@ impl Vm {
                     env_wide::GAS_PRICE => self.ctx.gas_price,
                     env_wide::BALANCE => {
                         // Address in wide register ws1
-                        let addr_u256 = self.cpu.read_wide(d.rs1);
+                        let addr_u256 = self.cpu.read_wide_checked(d.rs1)?;
                         let addr: Address = addr_u256.to_le_bytes();
                         *self.ctx.balances.get(&addr).unwrap_or(&U256::ZERO)
                     }
@@ -750,7 +750,7 @@ impl Vm {
                     env_wide::BLOCK_PROPOSER => U256::from_le_bytes(self.ctx.block_proposer),
                     _ => return Err(Trap::InvalidOpcode),
                 };
-                self.cpu.write_wide(d.rd, val);
+                self.cpu.write_wide_checked(d.rd, val)?;
                 self.pc += 4;
             }
             Opcode::Blockhash => {
@@ -767,7 +767,7 @@ impl Vm {
                 } else {
                     U256::ZERO
                 };
-                self.cpu.write_wide(d.rd, hash);
+                self.cpu.write_wide_checked(d.rd, hash)?;
                 self.pc += 4;
             }
 
@@ -789,13 +789,13 @@ impl Vm {
                     .map_err(|_| Trap::MemoryFault)?;
                 let hash = pyde_crypto::poseidon2::poseidon2_hash(&data);
                 let hash_bytes: [u8; 32] = hash.to_bytes();
-                self.cpu.write_wide(d.rd, U256::from_le_bytes(hash_bytes));
+                self.cpu.write_wide_checked(d.rd, U256::from_le_bytes(hash_bytes))?;
                 self.pc += 4;
             }
             // --- Storage instructions ---
             // imm & 0x3: 0 = wide register (32 bytes), 1 = memory (variable), 2 = GP register (8 bytes)
             Opcode::Sload => {
-                let slot = self.cpu.read_wide(d.rs1);
+                let slot = self.cpu.read_wide_checked(d.rs1)?;
                 self.accessed_raw_slots.insert(slot);
                 let key = self.derive_storage_key(slot);
                 // Strict access list enforcement: revert if key not in allowed set
@@ -879,7 +879,7 @@ impl Vm {
                 if self.static_mode {
                     return Err(Trap::StaticModeViolation);
                 }
-                let slot = self.cpu.read_wide(d.rs1);
+                let slot = self.cpu.read_wide_checked(d.rs1)?;
                 self.accessed_raw_slots.insert(slot);
                 self.written_raw_slots.insert(slot);
                 let key = self.derive_storage_key(slot);
@@ -903,7 +903,7 @@ impl Vm {
                 match mode {
                     0 => {
                         // Wide register mode: sstore ws1, wd
-                        let value = self.cpu.read_wide(d.rd);
+                        let value = self.cpu.read_wide_checked(d.rd)?;
                         self.storage.insert(key, value.to_le_bytes().to_vec());
                     }
                     2 => {
@@ -939,7 +939,7 @@ impl Vm {
                     return Err(Trap::StaticModeViolation);
                 }
                 // sdelete ws1 — clear storage slot, grant gas refund if non-empty
-                let slot = self.cpu.read_wide(d.rs1);
+                let slot = self.cpu.read_wide_checked(d.rs1)?;
                 self.accessed_raw_slots.insert(slot);
                 self.written_raw_slots.insert(slot);
                 let key = self.derive_storage_key(slot);
@@ -1452,7 +1452,7 @@ impl Vm {
             return Err(Trap::StackOverflow);
         }
 
-        let target_addr: Address = self.cpu.read_wide(d.rd).to_le_bytes();
+        let target_addr: Address = self.cpu.read_wide_checked(d.rd)?.to_le_bytes();
         let calldata_ptr = self.cpu.read_gp(d.rs1) as u32;
         let len_reg = (d.rs2_or_imm & 0xF) as u8;
         let gas_reg = ((d.rs2_or_imm >> 4) & 0xF) as u8;
@@ -1680,7 +1680,7 @@ impl Vm {
 
         // Derive 32-byte contract address
         let new_addr: Address = if is_create2 {
-            let salt = self.cpu.read_wide(0);
+            let salt = self.cpu.read_wide_checked(0)?;
             let code_hash = pyde_crypto::poseidon2::poseidon2_hash(&init_code);
             let mut addr_input = Vec::with_capacity(1 + 32 + 32 + 32);
             addr_input.push(0xFF);

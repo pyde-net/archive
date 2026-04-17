@@ -24,6 +24,7 @@ fn block_ctx() -> BlockContext {
         block_gas_limit: 400_000_000,
         chain_id: 1,
         validator_address: derive_eoa_address(b"validator"),
+        dev_skip_signature: false,
     }
 }
 
@@ -880,6 +881,7 @@ fn elastic_block_gas_ceiling() {
         block_gas_limit: 1_600_000_000, // 4x elastic max
         chain_id: 1,
         validator_address: derive_eoa_address(b"validator"),
+        dev_skip_signature: false,
     };
     let sender = fund_account(&mut smt, pk.as_bytes(), BALANCE * 1000);
 

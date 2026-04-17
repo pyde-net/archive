@@ -298,6 +298,7 @@ fn full_production_benchmark() {
         height: 1, timestamp: 1_700_000_000, base_fee: 1,
         block_gas_limit: 4_000_000_000, chain_id: 31337,
         validator_address: validators[0].address,
+        dev_skip_signature: true,
     };
 
     // ── Compile all contracts ────────────────────────────────────

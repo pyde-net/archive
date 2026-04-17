@@ -6,7 +6,7 @@
 //! 2. Value transfer: sender → recipient
 //! 3. PVM execution (contract call or deployment)
 //! 4. Post-execution: refund unused gas, apply SDELETE refunds
-//! 5. Fee distribution: 80% burn, 20% validator
+//! 5. Fee distribution: 70% burn, 20% validator, 10% treasury
 //! 6. Generate receipt
 
 use crate::types::{FeePayer, Transaction, TransactionType};
