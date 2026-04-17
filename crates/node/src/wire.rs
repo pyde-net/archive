@@ -786,6 +786,74 @@ pub fn decode_double_sign_evidence(data: &[u8]) -> Result<DoubleSignEvidence, &'
     })
 }
 
+// ============================================================
+// EvidenceState — ingest queues persisted as a single blob
+// ============================================================
+
+/// Full evidence state of a running `ValidatorEngine`:
+/// what's queued for block inclusion, what's queued for broadcast,
+/// and what we've already ingested. Persisted together as one
+/// atomic blob so a crash mid-ingest cannot leave the three in
+/// mutually inconsistent states.
+#[derive(Clone, Debug, Default)]
+pub struct EvidenceState {
+    pub pending: Vec<DoubleSignEvidence>,
+    pub broadcast: Vec<DoubleSignEvidence>,
+    /// (slot, signer) pairs already seen, for dedup.
+    pub seen: Vec<(u64, Address)>,
+}
+
+const EVIDENCE_STATE_VERSION: u8 = 1;
+
+pub fn encode_evidence_state(state: &EvidenceState) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(EVIDENCE_STATE_VERSION);
+    enc.u16(state.pending.len() as u16);
+    for ev in &state.pending {
+        enc.var_bytes(&encode_double_sign_evidence(ev));
+    }
+    enc.u16(state.broadcast.len() as u16);
+    for ev in &state.broadcast {
+        enc.var_bytes(&encode_double_sign_evidence(ev));
+    }
+    enc.u32(state.seen.len() as u32);
+    for (slot, addr) in &state.seen {
+        enc.u64(*slot);
+        enc.bytes32(addr);
+    }
+    enc.finish()
+}
+
+pub fn decode_evidence_state(data: &[u8]) -> Result<EvidenceState, &'static str> {
+    let mut dec = Decoder::new(data);
+    let version = dec.u8()?;
+    if version != EVIDENCE_STATE_VERSION {
+        return Err("unsupported evidence state version");
+    }
+    let pending_count = dec.u16()? as usize;
+    let mut pending = Vec::with_capacity(pending_count);
+    for _ in 0..pending_count {
+        pending.push(decode_double_sign_evidence(&dec.var_bytes()?)?);
+    }
+    let broadcast_count = dec.u16()? as usize;
+    let mut broadcast = Vec::with_capacity(broadcast_count);
+    for _ in 0..broadcast_count {
+        broadcast.push(decode_double_sign_evidence(&dec.var_bytes()?)?);
+    }
+    let seen_count = dec.u32()? as usize;
+    let mut seen = Vec::with_capacity(seen_count);
+    for _ in 0..seen_count {
+        let slot = dec.u64()?;
+        let addr = dec.bytes32()?;
+        seen.push((slot, addr));
+    }
+    Ok(EvidenceState {
+        pending,
+        broadcast,
+        seen,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,5 +1231,42 @@ mod tests {
     #[test]
     fn slash_evidence_empty_fails() {
         assert!(decode_slash_evidence_msg(&[]).is_err());
+    }
+
+    // ========== EvidenceState roundtrip ==========
+
+    #[test]
+    fn evidence_state_empty_roundtrip() {
+        let state = EvidenceState::default();
+        let bytes = encode_evidence_state(&state);
+        let restored = decode_evidence_state(&bytes).unwrap();
+        assert!(restored.pending.is_empty());
+        assert!(restored.broadcast.is_empty());
+        assert!(restored.seen.is_empty());
+    }
+
+    #[test]
+    fn evidence_state_populated_roundtrip() {
+        let state = EvidenceState {
+            pending: vec![dummy_evidence(10), dummy_evidence(11)],
+            broadcast: vec![dummy_evidence(12)],
+            seen: vec![(10, [0x11; 32]), (11, [0x22; 32]), (12, [0x33; 32])],
+        };
+        let bytes = encode_evidence_state(&state);
+        let restored = decode_evidence_state(&bytes).unwrap();
+        assert_eq!(restored.pending.len(), 2);
+        assert_eq!(restored.pending[0].slot, 10);
+        assert_eq!(restored.pending[1].slot, 11);
+        assert_eq!(restored.broadcast.len(), 1);
+        assert_eq!(restored.broadcast[0].slot, 12);
+        assert_eq!(restored.seen.len(), 3);
+        assert_eq!(restored.seen[1], (11, [0x22; 32]));
+    }
+
+    #[test]
+    fn evidence_state_wrong_version_fails() {
+        let mut bytes = encode_evidence_state(&EvidenceState::default());
+        bytes[0] = 0xFF;
+        assert!(decode_evidence_state(&bytes).is_err());
     }
 }

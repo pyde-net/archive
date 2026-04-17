@@ -11,6 +11,8 @@
 //!
 //! Key layout:
 //!   b"consensus:state"              → serialized ConsensusState
+//!   b"evidence:state"               → serialized EvidenceState (pending +
+//!                                     broadcast queues + seen dedup set)
 //!   b"p:" || slot_be8 || addr[32]   → (encoded BlockHeader, signature)
 //!   b"v:" || slot_be8 || voter_idx  → (block_hash[32], signature)
 
@@ -23,6 +25,7 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 
 const STATE_KEY: &[u8] = b"consensus:state";
+const EVIDENCE_STATE_KEY: &[u8] = b"evidence:state";
 const PROPOSAL_PREFIX: &[u8] = b"p:";
 const VOTE_PREFIX: &[u8] = b"v:";
 
@@ -97,6 +100,44 @@ impl ConsensusStateStore {
             }
             Ok(None) => Ok(None),
             Err(e) => Err(format!("failed to read consensus state: {}", e)),
+        }
+    }
+
+    /// Persist the ingest queues (pending, broadcast, seen) as one
+    /// atomic blob. Rewrites the whole blob on each call — fine
+    /// because equivocations are rare and the blob is small
+    /// (~1 KB per evidence × 10 entries max, pruned per slot).
+    pub fn save_evidence_state(&self, state: &wire::EvidenceState) -> Result<(), String> {
+        let bytes = wire::encode_evidence_state(state);
+        self.db
+            .put_opt(EVIDENCE_STATE_KEY, &bytes, &self.sync_opts)
+            .map_err(|e| format!("failed to save evidence state: {}", e))?;
+        debug!(
+            pending = state.pending.len(),
+            broadcast = state.broadcast.len(),
+            seen = state.seen.len(),
+            bytes = bytes.len(),
+            "evidence state persisted"
+        );
+        Ok(())
+    }
+
+    /// Load the previously-persisted evidence state, if any.
+    pub fn load_evidence_state(&self) -> Result<Option<wire::EvidenceState>, String> {
+        match self.db.get(EVIDENCE_STATE_KEY) {
+            Ok(Some(bytes)) => {
+                let state = wire::decode_evidence_state(&bytes)
+                    .map_err(|e| format!("failed to decode evidence state: {}", e))?;
+                info!(
+                    pending = state.pending.len(),
+                    broadcast = state.broadcast.len(),
+                    seen = state.seen.len(),
+                    "evidence state restored from disk"
+                );
+                Ok(Some(state))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("failed to read evidence state: {}", e)),
         }
     }
 
@@ -557,5 +598,84 @@ mod tests {
         assert!(store.load().unwrap().is_some());
         assert_eq!(store.load_all_seen_proposals().len(), 1);
         assert_eq!(store.load_all_seen_votes().len(), 1);
+    }
+
+    /// Hardening task 014f: measure fsync overhead on consensus-state
+    /// writes so we know whether per-vote `set_sync(true)` caps us
+    /// below the 12,500 TPS target at 400 ms slots.
+    ///
+    /// Gated as `#[ignore]` — it's informational + sensitive to the
+    /// host filesystem (SSD vs HDD, ext4 vs APFS vs NTFS). Run with:
+    ///
+    /// ```text
+    /// cargo test -p pyde-node --bin pyde --release -- --ignored \
+    ///     consensus_store::tests::fsync_cost_bench --nocapture
+    /// ```
+    ///
+    /// Reports per-write latency and derived max TPS. If sync mode
+    /// shows > 10× latency and drops TPS below 1000, switch to batched
+    /// writes or slot-end sync before mainnet.
+    #[test]
+    #[ignore = "benchmark — run with --ignored"]
+    fn fsync_cost_bench() {
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 500;
+
+        // Baseline: sync=false (WAL to OS page cache, no fsync).
+        let dir_async = tempdir().unwrap();
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let db_async = DB::open(&opts, dir_async.path().join("async")).unwrap();
+        let async_opts = WriteOptions::default();
+        let state = populated_state();
+        let bytes = wire::encode_consensus_state(&state);
+
+        let t0 = Instant::now();
+        for i in 0..ITERATIONS {
+            let mut key = b"x:".to_vec();
+            key.extend_from_slice(&i.to_le_bytes());
+            db_async.put_opt(&key, &bytes, &async_opts).unwrap();
+        }
+        let async_total = t0.elapsed();
+        let async_per = async_total.as_secs_f64() / ITERATIONS as f64 * 1_000_000.0;
+        let async_tps = 1.0 / (async_total.as_secs_f64() / ITERATIONS as f64);
+
+        // Production: sync=true (fsync on every write).
+        let dir_sync = tempdir().unwrap();
+        let db_sync = DB::open(&opts, dir_sync.path().join("sync")).unwrap();
+        let mut sync_opts = WriteOptions::default();
+        sync_opts.set_sync(true);
+
+        let t0 = Instant::now();
+        for i in 0..ITERATIONS {
+            let mut key = b"x:".to_vec();
+            key.extend_from_slice(&i.to_le_bytes());
+            db_sync.put_opt(&key, &bytes, &sync_opts).unwrap();
+        }
+        let sync_total = t0.elapsed();
+        let sync_per = sync_total.as_secs_f64() / ITERATIONS as f64 * 1_000_000.0;
+        let sync_tps = 1.0 / (sync_total.as_secs_f64() / ITERATIONS as f64);
+
+        eprintln!();
+        eprintln!("=== ConsensusStateStore fsync cost ({} writes, {}-byte payload) ===",
+            ITERATIONS, bytes.len());
+        eprintln!(
+            "async (page cache): {:>8.1} µs/write  →  {:>9.0} writes/sec",
+            async_per, async_tps
+        );
+        eprintln!(
+            "sync  (fsync)    : {:>8.1} µs/write  →  {:>9.0} writes/sec",
+            sync_per, sync_tps
+        );
+        eprintln!(
+            "overhead: {:.1}× slower",
+            sync_total.as_secs_f64() / async_total.as_secs_f64()
+        );
+        eprintln!();
+
+        // Sanity: both paths produced durable writes. We don't assert a
+        // hard TPS threshold — the number is environment-dependent. The
+        // operator reads the output and decides whether to re-tune.
     }
 }
