@@ -453,6 +453,7 @@ fn execute_transaction_inner(
                 ),
             }
         }
+        TransactionType::Slash => execute_slash(tx, smt, &mut sender.balance),
         _ => {
             // Simple transfer or batch (batch deferred)
             (true, 21_000u64, 0u64, vec![], vec![])
@@ -702,6 +703,204 @@ fn execute_in_pvm(
 /// Between groups, execution is order-independent because the scheduler
 /// guarantees disjoint state access — groups never touch the same storage keys.
 ///
+// ============================================================
+// Slash transaction handler
+// ============================================================
+//
+// Canonical constants — kept in lockstep with consensus::slashing.
+// pyde-tx cannot depend on pyde-consensus (consensus already depends
+// on tx), so the values are duplicated here. Any change must land on
+// both sides simultaneously.
+const SLASH_VALIDATOR_STAKE: u128 = 10_000_000_000_000;
+const SLASH_FINDER_FEE_PERCENT: u128 = 10;
+const SLASH_EVIDENCE_VERSION: u8 = 1;
+
+/// Parsed contents of a `TransactionType::Slash` payload.
+struct SlashEvidence {
+    slot: u64,
+    block_hash_1: [u8; 32],
+    signature_1: Vec<u8>,
+    block_hash_2: [u8; 32],
+    signature_2: Vec<u8>,
+    signer: Address,
+    _submitter: Address, // carried for wire compatibility; the on-chain
+                         // submitter is authoritatively tx.from.
+}
+
+/// Decode the Slash-tx payload. Mirrors the wire layout in
+/// `pyde_node::wire::encode_double_sign_evidence`; see that file for
+/// the canonical format description.
+fn decode_slash_evidence(data: &[u8]) -> Result<SlashEvidence, String> {
+    fn need(data: &[u8], pos: usize, n: usize) -> Result<(), String> {
+        if data.len() < pos + n {
+            Err(format!("evidence truncated at offset {}", pos))
+        } else {
+            Ok(())
+        }
+    }
+    let mut pos = 0usize;
+    need(data, pos, 1)?;
+    let version = data[pos];
+    pos += 1;
+    if version != SLASH_EVIDENCE_VERSION {
+        return Err(format!("unsupported evidence version: {}", version));
+    }
+    need(data, pos, 8)?;
+    let slot = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+    need(data, pos, 32)?;
+    let mut block_hash_1 = [0u8; 32];
+    block_hash_1.copy_from_slice(&data[pos..pos + 32]);
+    pos += 32;
+    need(data, pos, 4)?;
+    let sig1_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    need(data, pos, sig1_len)?;
+    let signature_1 = data[pos..pos + sig1_len].to_vec();
+    pos += sig1_len;
+    need(data, pos, 32)?;
+    let mut block_hash_2 = [0u8; 32];
+    block_hash_2.copy_from_slice(&data[pos..pos + 32]);
+    pos += 32;
+    need(data, pos, 4)?;
+    let sig2_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    need(data, pos, sig2_len)?;
+    let signature_2 = data[pos..pos + sig2_len].to_vec();
+    pos += sig2_len;
+    need(data, pos, 32)?;
+    let mut signer = [0u8; 32];
+    signer.copy_from_slice(&data[pos..pos + 32]);
+    pos += 32;
+    need(data, pos, 32)?;
+    let mut submitter = [0u8; 32];
+    submitter.copy_from_slice(&data[pos..pos + 32]);
+    Ok(SlashEvidence {
+        slot,
+        block_hash_1,
+        signature_1,
+        block_hash_2,
+        signature_2,
+        signer,
+        _submitter: submitter,
+    })
+}
+
+/// Parse a serialized validator entry:
+/// `[pk_len:4 LE][pk][stake:16 LE][status:1]`.
+/// Returns `(pk_bytes, stake, status, status_offset)`.
+fn parse_validator_entry(data: &[u8]) -> Option<(Vec<u8>, u128, u8, usize)> {
+    if data.len() < 4 {
+        return None;
+    }
+    let pk_len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    let stake_offset = 4 + pk_len;
+    let status_offset = stake_offset + 16;
+    if data.len() <= status_offset {
+        return None;
+    }
+    let pk_bytes = data[4..stake_offset].to_vec();
+    let stake = u128::from_le_bytes(data[stake_offset..stake_offset + 16].try_into().ok()?);
+    let status = data[status_offset];
+    Some((pk_bytes, stake, status, status_offset))
+}
+
+/// Canonical `(slot_le || block_hash)` bytes that proposers and voters
+/// sign. Mirrors `pyde_consensus::hotstuff::proposer_sign_message`.
+fn proposer_sign_message_bytes(slot: u64, block_hash: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(40);
+    msg.extend_from_slice(&slot.to_le_bytes());
+    msg.extend_from_slice(block_hash);
+    msg
+}
+
+/// Execute a Slash tx. Returns the standard
+/// `(success, gas_used, gas_refund, logs, return_data)` tuple expected
+/// by the outer pipeline match. On success, `submitter_balance` is
+/// credited the finder's fee and the offender's validator entry is
+/// updated in the SMT (stake zeroed, status = Ejected).
+fn execute_slash(
+    tx: &Transaction,
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    submitter_balance: &mut u128,
+) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
+    let failed = |gas: u64, msg: &[u8]| -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
+        (false, gas, 0, vec![], msg.to_vec())
+    };
+
+    let ev = match decode_slash_evidence(&tx.data) {
+        Ok(ev) => ev,
+        Err(e) => return failed(21_000, e.as_bytes()),
+    };
+
+    if ev.block_hash_1 == ev.block_hash_2 {
+        return failed(21_000, b"evidence blocks must differ");
+    }
+
+    let val_key = pyde_state::keys::validator_key(&ev.signer);
+    let val_data = match smt.get(&val_key) {
+        Some(d) => d,
+        None => return failed(21_000, b"accused signer is not a registered validator"),
+    };
+
+    let (pk_bytes, stake, status, status_offset) = match parse_validator_entry(&val_data) {
+        Some(v) => v,
+        None => return failed(21_000, b"corrupt validator entry"),
+    };
+
+    // Status: 0x00 = Active, 0x01 = Unbonding, 0x02 = Ejected.
+    // An already-ejected validator has already been slashed — skip.
+    if status == 0x02 {
+        return failed(21_000, b"signer already ejected");
+    }
+
+    // Re-verify both signatures using the pubkey from state (not from
+    // the evidence payload — the submitter could lie about signer).
+    let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&pk_bytes) {
+        Some(pk) => pk,
+        None => return failed(21_000, b"validator public key is malformed"),
+    };
+    let sig_1 = match pyde_crypto::falcon::FalconSignature::from_bytes(&ev.signature_1) {
+        Some(s) => s,
+        None => return failed(21_000, b"signature_1 malformed"),
+    };
+    let sig_2 = match pyde_crypto::falcon::FalconSignature::from_bytes(&ev.signature_2) {
+        Some(s) => s,
+        None => return failed(21_000, b"signature_2 malformed"),
+    };
+    let msg_1 = proposer_sign_message_bytes(ev.slot, &ev.block_hash_1);
+    let msg_2 = proposer_sign_message_bytes(ev.slot, &ev.block_hash_2);
+    if !pyde_crypto::falcon::falcon_verify(&pk, &msg_1, &sig_1)
+        || !pyde_crypto::falcon::falcon_verify(&pk, &msg_2, &sig_2)
+    {
+        return failed(21_000, b"evidence signatures failed FALCON verification");
+    }
+
+    // Evidence valid. Apply the slash: zero the stake, pay the finder,
+    // mark the offender Ejected. The portion of stake not paid to the
+    // finder is burned (implicit — never credited to any account).
+    let slash_amount = stake.min(SLASH_VALIDATOR_STAKE);
+    let finder_fee = slash_amount * SLASH_FINDER_FEE_PERCENT / 100;
+    let new_stake = stake.saturating_sub(slash_amount);
+    *submitter_balance = submitter_balance.saturating_add(finder_fee);
+
+    let mut new_val_data = val_data.clone();
+    let stake_offset = status_offset - 16;
+    new_val_data[stake_offset..stake_offset + 16].copy_from_slice(&new_stake.to_le_bytes());
+    new_val_data[status_offset] = 0x02; // Ejected
+    let _ = smt.insert(val_key, new_val_data);
+
+    tracing::info!(
+        offender = hex::encode(ev.signer),
+        finder = hex::encode(tx.from),
+        finder_fee,
+        burned = slash_amount - finder_fee,
+        "slash applied: offender ejected, finder paid"
+    );
+
+    (true, 100_000, 0, vec![], ev.signer.to_vec())
+}
+
 /// Currently executes groups sequentially on the shared SMT. True thread-level
 /// parallelism (per-group SMT clones or overlays) is a future optimization —
 /// the correctness guarantee is already provided by the conflict scheduler.
@@ -1838,5 +2037,300 @@ mod tests {
     fn sign_tx(tx: &mut Transaction, sk: &pyde_crypto::falcon::FalconSecretKey) {
         let hash = tx.hash();
         tx.signature = falcon_sign(sk, &hash).unwrap().as_bytes().to_vec();
+    }
+
+    // ========== Slash transaction handler ==========
+
+    /// Directly install a validator entry under `validator_key(addr)`,
+    /// bypassing the StakeDeposit flow. Matches the layout the
+    /// StakeDeposit handler writes: [pk_len:4 LE][pk][stake:16 LE][status:1].
+    fn register_validator_directly(
+        smt: &mut dyn pyde_state::smt::StateAccess,
+        addr: &Address,
+        pk_bytes: &[u8],
+        stake: u128,
+        status_byte: u8,
+    ) {
+        let pk_len = pk_bytes.len() as u32;
+        let mut val_data = Vec::with_capacity(4 + pk_bytes.len() + 16 + 1);
+        val_data.extend_from_slice(&pk_len.to_le_bytes());
+        val_data.extend_from_slice(pk_bytes);
+        val_data.extend_from_slice(&stake.to_le_bytes());
+        val_data.push(status_byte);
+        let key = pyde_state::keys::validator_key(addr);
+        smt.insert(key, val_data).unwrap();
+    }
+
+    /// Assemble a Slash-tx payload matching the wire format in
+    /// `pyde_node::wire::encode_double_sign_evidence`.
+    fn encode_evidence_for_test(
+        slot: u64,
+        block_hash_1: &[u8; 32],
+        signature_1: &[u8],
+        block_hash_2: &[u8; 32],
+        signature_2: &[u8],
+        signer: &Address,
+        submitter: &Address,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(SLASH_EVIDENCE_VERSION);
+        out.extend_from_slice(&slot.to_le_bytes());
+        out.extend_from_slice(block_hash_1);
+        out.extend_from_slice(&(signature_1.len() as u32).to_le_bytes());
+        out.extend_from_slice(signature_1);
+        out.extend_from_slice(block_hash_2);
+        out.extend_from_slice(&(signature_2.len() as u32).to_le_bytes());
+        out.extend_from_slice(signature_2);
+        out.extend_from_slice(signer);
+        out.extend_from_slice(submitter);
+        out
+    }
+
+    fn sign_proposer_for_test(
+        sk: &pyde_crypto::falcon::FalconSecretKey,
+        slot: u64,
+        block_hash: &[u8; 32],
+    ) -> Vec<u8> {
+        let msg = proposer_sign_message_bytes(slot, block_hash);
+        falcon_sign(sk, &msg).unwrap().as_bytes().to_vec()
+    }
+
+    /// Build a signed Slash tx for tests. The submitter signs the outer
+    /// tx; the offender's two FALCON sigs live inside the payload.
+    fn build_slash_tx(
+        submitter_addr: Address,
+        submitter_sk: &pyde_crypto::falcon::FalconSecretKey,
+        evidence_bytes: Vec<u8>,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            from: submitter_addr,
+            to: [0u8; 32],
+            value: 0,
+            data: evidence_bytes,
+            gas_limit: 300_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Slash,
+        };
+        sign_tx(&mut tx, submitter_sk);
+        tx
+    }
+
+    /// Setup: register an offender validator with `initial_stake` and a
+    /// submitter funded with `submitter_balance`. Returns keys + addrs.
+    fn slash_fixture(
+        smt: &mut dyn pyde_state::smt::StateAccess,
+        initial_stake: u128,
+        submitter_balance: u128,
+    ) -> (
+        pyde_crypto::falcon::FalconPublicKey,
+        pyde_crypto::falcon::FalconSecretKey,
+        Address,
+        pyde_crypto::falcon::FalconPublicKey,
+        pyde_crypto::falcon::FalconSecretKey,
+        Address,
+    ) {
+        let (offender_pk, offender_sk) = falcon_keygen().unwrap();
+        let offender_addr = derive_eoa_address(offender_pk.as_bytes());
+        register_validator_directly(
+            smt,
+            &offender_addr,
+            offender_pk.as_bytes(),
+            initial_stake,
+            0x00,
+        );
+
+        let (submitter_pk, submitter_sk) = falcon_keygen().unwrap();
+        let submitter_addr = derive_eoa_address(submitter_pk.as_bytes());
+        fund_account_with_pk(smt, &submitter_addr, submitter_balance, submitter_pk.as_bytes());
+
+        (
+            offender_pk,
+            offender_sk,
+            offender_addr,
+            submitter_pk,
+            submitter_sk,
+            submitter_addr,
+        )
+    }
+
+    #[test]
+    fn slash_tx_valid_evidence_debits_stake_and_pays_finder() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let submitter_start: u128 = 1_000_000_000_000; // 1K PYDE + gas headroom
+        let (_opk, osk, offender, _spk, ssk, submitter) =
+            slash_fixture(&mut smt, SLASH_VALIDATOR_STAKE, submitter_start);
+
+        let slot = 100u64;
+        let hash_1 = [0x01u8; 32];
+        let hash_2 = [0x02u8; 32];
+        let sig_1 = sign_proposer_for_test(&osk, slot, &hash_1);
+        let sig_2 = sign_proposer_for_test(&osk, slot, &hash_2);
+
+        let evidence = encode_evidence_for_test(
+            slot, &hash_1, &sig_1, &hash_2, &sig_2, &offender, &submitter,
+        );
+        let tx = build_slash_tx(submitter, &ssk, evidence);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(receipt.success, "valid slash should succeed");
+
+        // Offender's validator entry: stake zeroed, status = Ejected (0x02).
+        let val_data = smt
+            .get(&pyde_state::keys::validator_key(&offender))
+            .expect("validator entry must still exist");
+        let (_pk, stake, status, _off) = parse_validator_entry(&val_data).unwrap();
+        assert_eq!(stake, 0, "stake should be fully slashed");
+        assert_eq!(status, 0x02, "status should be Ejected");
+
+        // Submitter got finder's fee = 10% of VALIDATOR_STAKE = 1K PYDE.
+        // Also lost gas for the tx. Net: start + 1K PYDE - gas_fee.
+        let submitter_acc = load_account(&smt, &submitter);
+        let expected_fee = SLASH_VALIDATOR_STAKE * SLASH_FINDER_FEE_PERCENT / 100;
+        // Fee is credited pre-gas-refund; gas is charged separately.
+        // So final balance = start + fee - effective_gas * base_fee.
+        let gas_cost = receipt.gas_used as u128 * ctx.base_fee;
+        assert_eq!(
+            submitter_acc.balance,
+            submitter_start + expected_fee - gas_cost,
+            "submitter should net finder's fee minus gas"
+        );
+    }
+
+    #[test]
+    fn slash_tx_same_hash_rejected() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let (_opk, osk, offender, _spk, ssk, submitter) =
+            slash_fixture(&mut smt, SLASH_VALIDATOR_STAKE, 1_000_000_000_000);
+
+        let slot = 100;
+        let hash = [0x01u8; 32];
+        let sig = sign_proposer_for_test(&osk, slot, &hash);
+        let evidence = encode_evidence_for_test(
+            slot, &hash, &sig, &hash, &sig, &offender, &submitter,
+        );
+        let tx = build_slash_tx(submitter, &ssk, evidence);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "same-hash evidence is not equivocation");
+
+        // State untouched.
+        let val_data = smt.get(&pyde_state::keys::validator_key(&offender)).unwrap();
+        let (_, stake, status, _) = parse_validator_entry(&val_data).unwrap();
+        assert_eq!(stake, SLASH_VALIDATOR_STAKE);
+        assert_eq!(status, 0x00);
+    }
+
+    #[test]
+    fn slash_tx_nonexistent_validator_rejected() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+
+        // Submitter only — no validator registered.
+        let (spk, ssk) = falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(spk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 1_000_000_000_000, spk.as_bytes());
+
+        let (_opk, osk) = falcon_keygen().unwrap();
+        let ghost_signer = [0xAB; 32]; // never registered
+        let slot = 100;
+        let sig_1 = sign_proposer_for_test(&osk, slot, &[0x01; 32]);
+        let sig_2 = sign_proposer_for_test(&osk, slot, &[0x02; 32]);
+        let evidence = encode_evidence_for_test(
+            slot, &[0x01; 32], &sig_1, &[0x02; 32], &sig_2, &ghost_signer, &submitter,
+        );
+        let tx = build_slash_tx(submitter, &ssk, evidence);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn slash_tx_already_ejected_rejected() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let (opk, osk) = falcon_keygen().unwrap();
+        let offender = derive_eoa_address(opk.as_bytes());
+        // Pre-ejected: status byte = 0x02
+        register_validator_directly(&mut smt, &offender, opk.as_bytes(), 0, 0x02);
+
+        let (spk, ssk) = falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(spk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 1_000_000_000_000, spk.as_bytes());
+
+        let slot = 100;
+        let hash_1 = [0x01u8; 32];
+        let hash_2 = [0x02u8; 32];
+        let sig_1 = sign_proposer_for_test(&osk, slot, &hash_1);
+        let sig_2 = sign_proposer_for_test(&osk, slot, &hash_2);
+        let evidence = encode_evidence_for_test(
+            slot, &hash_1, &sig_1, &hash_2, &sig_2, &offender, &submitter,
+        );
+        let tx = build_slash_tx(submitter, &ssk, evidence);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "can't slash an already-ejected validator");
+    }
+
+    #[test]
+    fn slash_tx_wrong_slot_signature_rejected() {
+        // Signer produced sigs for slot 101, but evidence claims slot 100.
+        // FALCON verify at slot 100 must reject.
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let (_opk, osk, offender, _spk, ssk, submitter) =
+            slash_fixture(&mut smt, SLASH_VALIDATOR_STAKE, 1_000_000_000_000);
+
+        let evidence_slot = 100u64;
+        let signed_slot = 101u64; // wrong!
+        let hash_1 = [0x01u8; 32];
+        let hash_2 = [0x02u8; 32];
+        let sig_1 = sign_proposer_for_test(&osk, signed_slot, &hash_1);
+        let sig_2 = sign_proposer_for_test(&osk, signed_slot, &hash_2);
+
+        let evidence = encode_evidence_for_test(
+            evidence_slot, &hash_1, &sig_1, &hash_2, &sig_2, &offender, &submitter,
+        );
+        let tx = build_slash_tx(submitter, &ssk, evidence);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "sigs from wrong slot cannot be replayed");
+    }
+
+    #[test]
+    fn slash_tx_garbage_signature_rejected() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let (_opk, _osk, offender, _spk, ssk, submitter) =
+            slash_fixture(&mut smt, SLASH_VALIDATOR_STAKE, 1_000_000_000_000);
+
+        let slot = 100;
+        // Garbage bytes instead of valid FALCON sigs.
+        let bad_sig = vec![0xDE; 666];
+        let evidence = encode_evidence_for_test(
+            slot, &[0x01; 32], &bad_sig, &[0x02; 32], &bad_sig, &offender, &submitter,
+        );
+        let tx = build_slash_tx(submitter, &ssk, evidence);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn slash_tx_truncated_evidence_rejected() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let (_opk, _osk, _offender, _spk, ssk, submitter) =
+            slash_fixture(&mut smt, SLASH_VALIDATOR_STAKE, 1_000_000_000_000);
+
+        let tx = build_slash_tx(submitter, &ssk, vec![SLASH_EVIDENCE_VERSION, 0x00]);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
     }
 }
