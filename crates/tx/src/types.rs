@@ -22,6 +22,12 @@ pub enum TransactionType {
     StakeDeposit = 3,
     /// Stake withdraw: begin unbonding period (14 days).
     StakeWithdraw = 4,
+    /// Slashing evidence submission. `tx.data` = serialized
+    /// `pyde_consensus::slashing::DoubleSignEvidence`. When executed,
+    /// the pipeline verifies the evidence, debits the offender's stake,
+    /// burns the slashed amount, and pays the finder's fee to
+    /// `tx.from`. Gate is permissionless so any node can submit.
+    Slash = 5,
 }
 
 impl TransactionType {
@@ -32,6 +38,7 @@ impl TransactionType {
             2 => Some(Self::Batch),
             3 => Some(Self::StakeDeposit),
             4 => Some(Self::StakeWithdraw),
+            5 => Some(Self::Slash),
             _ => None,
         }
     }
@@ -440,6 +447,40 @@ mod tests {
         let bytes = tx.to_bytes();
         let restored = Transaction::from_bytes(&bytes).unwrap();
         assert_eq!(tx, restored);
+    }
+
+    #[test]
+    fn tx_type_u8_roundtrip_covers_all_variants() {
+        // Every declared variant must roundtrip. If a new variant is added
+        // without updating from_u8, this test catches it.
+        let all = [
+            TransactionType::Standard,
+            TransactionType::Deploy,
+            TransactionType::Batch,
+            TransactionType::StakeDeposit,
+            TransactionType::StakeWithdraw,
+            TransactionType::Slash,
+        ];
+        for ty in all {
+            let tag = ty as u8;
+            assert_eq!(TransactionType::from_u8(tag), Some(ty), "roundtrip failed for {:?}", ty);
+        }
+        // Unknown tags are rejected.
+        assert_eq!(TransactionType::from_u8(255), None);
+    }
+
+    #[test]
+    fn serialize_slash_tx() {
+        // Evidence payload shape is defined in task 005; task 004 just
+        // ensures the type tag survives wire encoding with arbitrary
+        // opaque bytes in tx.data.
+        let mut tx = make_test_tx();
+        tx.tx_type = TransactionType::Slash;
+        tx.data = vec![0xAB; 1200]; // placeholder evidence blob
+        let bytes = tx.to_bytes();
+        let restored = Transaction::from_bytes(&bytes).unwrap();
+        assert_eq!(tx, restored);
+        assert_eq!(restored.tx_type, TransactionType::Slash);
     }
 
     // ========== Task 0383: Hash is deterministic ==========
