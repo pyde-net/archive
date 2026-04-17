@@ -50,33 +50,56 @@ fn production_chain_id_1_full_lifecycle() {
     // Production context: chain_id=1, sig verification ON
     let validator = derive_eoa_address(b"validator");
     let ctx = BlockContext {
-        height: 1, timestamp: 1_700_000_000, base_fee: 100,
-        block_gas_limit: 4_000_000_000, chain_id: 1,
+        height: 1,
+        timestamp: 1_700_000_000,
+        base_fee: 100,
+        block_gas_limit: 4_000_000_000,
+        chain_id: 1,
         validator_address: validator,
     };
 
     // Generate 10 accounts with FALCON keys
     let t0 = Instant::now();
-    let mut accounts: Vec<Acct> = (0..10).map(|_| {
-        let (pk, sk) = falcon_keygen().unwrap();
-        let address = derive_eoa_address(pk.as_bytes());
-        Acct { pk, sk, address, nonce: 0 }
-    }).collect();
-    println!("  Keygen (10 accounts): {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    let mut accounts: Vec<Acct> = (0..10)
+        .map(|_| {
+            let (pk, sk) = falcon_keygen().unwrap();
+            let address = derive_eoa_address(pk.as_bytes());
+            Acct {
+                pk,
+                sk,
+                address,
+                nonce: 0,
+            }
+        })
+        .collect();
+    println!(
+        "  Keygen (10 accounts): {:.0}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Fund accounts with AuthKeys::Single (enables sig verification)
     for acc in &accounts {
         let account = pyde_account::types::Account {
-            address: acc.address, nonce: 0, balance: 10_000_000_000_000,
+            address: acc.address,
+            nonce: 0,
+            balance: 10_000_000_000_000,
             code_hash: sparse_merkle_tree::H256::zero(),
             storage_root: sparse_merkle_tree::H256::zero(),
             account_type: pyde_account::types::AccountType::EOA,
             auth_keys: pyde_account::types::AuthKeys::Single(acc.pk.as_bytes().to_vec()),
-            gas_tank: 0, key_nonce: 0,
+            gas_tank: 0,
+            key_nonce: 0,
         };
-        smt.insert(pyde_state::keys::balance_key(&acc.address), account.to_bytes()).unwrap();
-        smt.insert(pyde_state::keys::nonce_key(&acc.address),
-            pyde_account::nonce::NonceState::new().to_bytes().to_vec()).unwrap();
+        smt.insert(
+            pyde_state::keys::balance_key(&acc.address),
+            account.to_bytes(),
+        )
+        .unwrap();
+        smt.insert(
+            pyde_state::keys::nonce_key(&acc.address),
+            pyde_account::nonce::NonceState::new().to_bytes().to_vec(),
+        )
+        .unwrap();
     }
 
     let mut ok = 0;
@@ -88,26 +111,52 @@ fn production_chain_id_1_full_lifecycle() {
         let to = accounts[1].address;
         let acc = &mut accounts[0];
         let from_slot = poseidon2_hash(&{
-            let mut b = Vec::with_capacity(33); b.extend_from_slice(&acc.address); b.push(0x04); b
-        }).to_bytes();
+            let mut b = Vec::with_capacity(33);
+            b.extend_from_slice(&acc.address);
+            b.push(0x04);
+            b
+        })
+        .to_bytes();
         let to_slot = poseidon2_hash(&{
-            let mut b = Vec::with_capacity(33); b.extend_from_slice(&to); b.push(0x04); b
-        }).to_bytes();
+            let mut b = Vec::with_capacity(33);
+            b.extend_from_slice(&to);
+            b.push(0x04);
+            b
+        })
+        .to_bytes();
         let mut tx = Transaction {
-            from: acc.address, to, value: 1_000_000, data: vec![],
-            gas_limit: 21_000, nonce: acc.nonce, signature: vec![],
+            from: acc.address,
+            to,
+            value: 1_000_000,
+            data: vec![],
+            gas_limit: 21_000,
+            nonce: acc.nonce,
+            signature: vec![],
             fee_payer: FeePayer::Sender,
             access_list: vec![
-                AccessEntry { address: acc.address, reads: vec![], writes: vec![from_slot] },
-                AccessEntry { address: to, reads: vec![], writes: vec![to_slot] },
+                AccessEntry {
+                    address: acc.address,
+                    reads: vec![],
+                    writes: vec![from_slot],
+                },
+                AccessEntry {
+                    address: to,
+                    reads: vec![],
+                    writes: vec![to_slot],
+                },
             ],
-            deadline: None, chain_id: 1, tx_type: TransactionType::Standard,
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Standard,
         };
         sign(&mut tx, &acc.sk);
         acc.nonce += 1;
 
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
-        assert!(receipt.success, "transfer should succeed with valid FALCON sig");
+        assert!(
+            receipt.success,
+            "transfer should succeed with valid FALCON sig"
+        );
         println!("    OK — gas={}", receipt.gas_used);
         ok += 1;
     }
@@ -118,7 +167,8 @@ fn production_chain_id_1_full_lifecycle() {
     {
         sync_nonces(&mut accounts, &smt);
         let acc = &mut accounts[2];
-        let bin = compile(r#"
+        let bin = compile(
+            r#"
             contract Counter {
                 storage { count: u64, }
                 #[constructor] pub fn init() { self.count = 0; }
@@ -126,19 +176,32 @@ fn production_chain_id_1_full_lifecycle() {
                 pub fn set_count(n: u64) { self.count = n; }
                 #[view] pub fn get_count() -> u64 { return self.count; }
             }
-        "#);
+        "#,
+        );
         let mut tx = Transaction {
-            from: acc.address, to: [0u8; 32], value: 0, data: bin,
-            gas_limit: 200_000_000, nonce: acc.nonce, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list: vec![],
-            deadline: None, chain_id: 1, tx_type: TransactionType::Deploy,
+            from: acc.address,
+            to: [0u8; 32],
+            value: 0,
+            data: bin,
+            gas_limit: 200_000_000,
+            nonce: acc.nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Deploy,
         };
         sign(&mut tx, &acc.sk);
         acc.nonce += 1;
 
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(receipt.success, "deploy should succeed");
-        assert_eq!(receipt.return_data.len(), 32, "should return contract address");
+        assert_eq!(
+            receipt.return_data.len(),
+            32,
+            "should return contract address"
+        );
         counter_addr = {
             let mut a = [0u8; 32];
             a.copy_from_slice(&receipt.return_data);
@@ -155,12 +218,18 @@ fn production_chain_id_1_full_lifecycle() {
         let acc = &mut accounts[3];
         let sel = otic::codegen::compute_selector("increment");
         let mut tx = Transaction {
-            from: acc.address, to: counter_addr, value: 0,
+            from: acc.address,
+            to: counter_addr,
+            value: 0,
             data: sel.to_be_bytes().to_vec(),
-            gas_limit: 50_000_000, nonce: acc.nonce, signature: vec![],
+            gas_limit: 50_000_000,
+            nonce: acc.nonce,
+            signature: vec![],
             fee_payer: FeePayer::Sender,
             access_list: vec![], // empty = no strict mode
-            deadline: None, chain_id: 1, tx_type: TransactionType::Standard,
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Standard,
         };
         sign(&mut tx, &acc.sk);
         acc.nonce += 1;
@@ -180,10 +249,18 @@ fn production_chain_id_1_full_lifecycle() {
         let mut data = sel.to_be_bytes().to_vec();
         data.extend_from_slice(&42u64.to_le_bytes());
         let mut tx = Transaction {
-            from: acc.address, to: counter_addr, value: 0, data,
-            gas_limit: 50_000_000, nonce: acc.nonce, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list: vec![],
-            deadline: None, chain_id: 1, tx_type: TransactionType::Standard,
+            from: acc.address,
+            to: counter_addr,
+            value: 0,
+            data,
+            gas_limit: 50_000_000,
+            nonce: acc.nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Standard,
         };
         sign(&mut tx, &acc.sk);
         acc.nonce += 1;
@@ -200,7 +277,8 @@ fn production_chain_id_1_full_lifecycle() {
     {
         sync_nonces(&mut accounts, &smt);
         let acc = &mut accounts[5];
-        let bin = compile(r#"
+        let bin = compile(
+            r#"
             contract Vault {
                 storage { total: u256, balances: Map<Address, u256>, }
                 event Deposit { #[indexed] sender: Address, amount: u256, }
@@ -212,12 +290,21 @@ fn production_chain_id_1_full_lifecycle() {
                 }
                 #[view] pub fn get_total() -> u256 { return self.total; }
             }
-        "#);
+        "#,
+        );
         let mut tx = Transaction {
-            from: acc.address, to: [0u8; 32], value: 0, data: bin,
-            gas_limit: 200_000_000, nonce: acc.nonce, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list: vec![],
-            deadline: None, chain_id: 1, tx_type: TransactionType::Deploy,
+            from: acc.address,
+            to: [0u8; 32],
+            value: 0,
+            data: bin,
+            gas_limit: 200_000_000,
+            nonce: acc.nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Deploy,
         };
         sign(&mut tx, &acc.sk);
         acc.nonce += 1;
@@ -240,11 +327,18 @@ fn production_chain_id_1_full_lifecycle() {
         let acc = &mut accounts[6];
         let sel = otic::codegen::compute_selector("deposit");
         let mut tx = Transaction {
-            from: acc.address, to: vault_addr, value: 500_000,
+            from: acc.address,
+            to: vault_addr,
+            value: 500_000,
             data: sel.to_be_bytes().to_vec(),
-            gas_limit: 50_000_000, nonce: acc.nonce, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list: vec![],
-            deadline: None, chain_id: 1, tx_type: TransactionType::Standard,
+            gas_limit: 50_000_000,
+            nonce: acc.nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Standard,
         };
         sign(&mut tx, &acc.sk);
         acc.nonce += 1;
@@ -252,7 +346,11 @@ fn production_chain_id_1_full_lifecycle() {
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(receipt.success, "vault deposit should succeed");
         assert!(!receipt.logs.is_empty(), "should emit Deposit event");
-        println!("    OK — gas={}, events={}", receipt.gas_used, receipt.logs.len());
+        println!(
+            "    OK — gas={}, events={}",
+            receipt.gas_used,
+            receipt.logs.len()
+        );
         ok += 1;
     }
 
@@ -263,10 +361,18 @@ fn production_chain_id_1_full_lifecycle() {
         let to = accounts[8].address;
         let acc = &mut accounts[7];
         let mut tx = Transaction {
-            from: acc.address, to, value: 1_000, data: vec![],
-            gas_limit: 21_000, nonce: acc.nonce, signature: vec![0xDE; 666], // garbage sig
-            fee_payer: FeePayer::Sender, access_list: vec![],
-            deadline: None, chain_id: 1, tx_type: TransactionType::Standard,
+            from: acc.address,
+            to,
+            value: 1_000,
+            data: vec![],
+            gas_limit: 21_000,
+            nonce: acc.nonce,
+            signature: vec![0xDE; 666], // garbage sig
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Standard,
         };
         // DON'T sign properly — use garbage sig
 
@@ -283,10 +389,17 @@ fn production_chain_id_1_full_lifecycle() {
         let to = accounts[9].address;
         let acc = &mut accounts[8];
         let mut tx = Transaction {
-            from: acc.address, to, value: 1_000, data: vec![],
-            gas_limit: 21_000, nonce: acc.nonce, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list: vec![],
-            deadline: None, chain_id: 999, // WRONG chain_id
+            from: acc.address,
+            to,
+            value: 1_000,
+            data: vec![],
+            gas_limit: 21_000,
+            nonce: acc.nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 999, // WRONG chain_id
             tx_type: TransactionType::Standard,
         };
         sign(&mut tx, &acc.sk);
@@ -305,10 +418,18 @@ fn production_chain_id_1_full_lifecycle() {
         for i in 0..3 {
             let acc = &mut accounts[0];
             let mut tx = Transaction {
-                from: acc.address, to, value: 100, data: vec![],
-                gas_limit: 21_000, nonce: acc.nonce, signature: vec![],
-                fee_payer: FeePayer::Sender, access_list: vec![],
-                deadline: None, chain_id: 1, tx_type: TransactionType::Standard,
+                from: acc.address,
+                to,
+                value: 100,
+                data: vec![],
+                gas_limit: 21_000,
+                nonce: acc.nonce,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
+                access_list: vec![],
+                deadline: None,
+                chain_id: 1,
+                tx_type: TransactionType::Standard,
             };
             sign(&mut tx, &acc.sk);
             acc.nonce += 1;
