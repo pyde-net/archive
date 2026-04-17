@@ -41,6 +41,8 @@ fn block_ctx(chain_id: u64) -> BlockContext {
         height: 100, timestamp: 1_000_000, base_fee: 1,
         block_gas_limit: 4_000_000_000, chain_id,
         validator_address: [0u8; 32],
+        // Bench fixture: skip sig verification when caller opts into devnet.
+        dev_skip_signature: chain_id == 31337,
     }
 }
 

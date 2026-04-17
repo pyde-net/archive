@@ -48,6 +48,45 @@ impl BlockWitness {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Stamp the post-execution state root onto the witness. Callers
+    /// MUST do this after applying state diffs; without it
+    /// `post_state_root` remains `H256::zero()` (the placeholder from
+    /// `generate_witnesses`) and stateless verifiers have no way to
+    /// check the transition.
+    pub fn set_post_state_root(&mut self, root: H256) {
+        self.post_state_root = root;
+    }
+
+    /// Whether this witness has been finalized (its `post_state_root`
+    /// is non-zero). Useful as a sanity check at the block-producer
+    /// boundary: a not-yet-finalized witness should never leave the node.
+    pub fn is_finalized(&self) -> bool {
+        self.post_state_root != H256::zero()
+    }
+}
+
+/// Apply `diffs` to `smt`, compute the new root, and stamp it onto
+/// `witness.post_state_root` in one step. Intended for the block-
+/// producer flow:
+///
+/// ```text
+/// 1. generate_witnesses(smt, access_keys) → pre-execution witness
+/// 2. execute transactions against `smt`, collecting diffs
+/// 3. finalize_witness(&mut witness, &mut smt, diffs)
+/// 4. broadcast witness (now has pre + post roots)
+/// ```
+///
+/// Returns the post-root for convenience; it is also written into
+/// `witness.post_state_root`.
+pub fn finalize_witness(
+    witness: &mut BlockWitness,
+    smt: &mut PydeSMT,
+    diffs: Vec<(Key, Vec<u8>)>,
+) -> Result<H256, &'static str> {
+    let post_root = compute_post_state_root(smt, diffs)?;
+    witness.set_post_state_root(post_root);
+    Ok(post_root)
 }
 
 /// Generate a block witness from an access list using a single batch proof.
@@ -219,6 +258,54 @@ mod tests {
             assert_eq!(state_map.get(k), Some(&format!("val_{i}").into_bytes()));
             assert_eq!(smt.get(k), Some(format!("val_{i}").into_bytes()));
         }
+    }
+
+    #[test]
+    fn new_witness_is_not_finalized() {
+        let smt = PydeSMT::new();
+        let witness = generate_witnesses(&smt, &[]).unwrap();
+        assert!(
+            !witness.is_finalized(),
+            "freshly-generated witness must NOT report as finalized — \
+             post_state_root starts as H256::zero() and is only set \
+             by finalize_witness after execution diffs are applied"
+        );
+    }
+
+    #[test]
+    fn set_post_state_root_marks_witness_finalized() {
+        let mut smt = PydeSMT::new();
+        smt.insert(key_from_seed(1), b"x".to_vec()).unwrap();
+        let mut witness = generate_witnesses(&smt, &[key_from_seed(1)]).unwrap();
+        assert!(!witness.is_finalized());
+
+        witness.set_post_state_root(H256::from([0x42u8; 32]));
+        assert!(witness.is_finalized());
+        assert_eq!(witness.post_state_root, H256::from([0x42u8; 32]));
+    }
+
+    #[test]
+    fn finalize_witness_stamps_actual_post_root() {
+        let mut smt = PydeSMT::new();
+        let key = key_from_seed(1);
+        smt.insert(key, b"old".to_vec()).unwrap();
+
+        let mut witness = generate_witnesses(&smt, &[key]).unwrap();
+        assert!(!witness.is_finalized());
+
+        // Independently compute what the post-root should be.
+        let mut expected = PydeSMT::new();
+        expected.insert(key, b"old".to_vec()).unwrap();
+        expected.insert(key, b"new".to_vec()).unwrap();
+        let expected_root = expected.root();
+
+        let stamped = finalize_witness(&mut witness, &mut smt, vec![(key, b"new".to_vec())])
+            .unwrap();
+
+        assert!(witness.is_finalized());
+        assert_eq!(witness.post_state_root, stamped);
+        assert_eq!(witness.post_state_root, expected_root);
+        assert_eq!(smt.root(), expected_root);
     }
 
     #[test]

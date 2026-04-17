@@ -386,7 +386,7 @@ fn execute_with_rpc_bridge(
                 let contract_addr = poll_receipt_for_address(&client, rpc_url, &tx_hash)?;
                 println!("         → 0x{}", hex::encode(&contract_addr[..4]));
 
-                // Write contract address back to PVM wide register
+                // Write contract address back to PVM wide register.
                 vm.cpu.write_wide(d.rd, U256::from_le_bytes(contract_addr));
                 // Register the deployed bytecode locally so subsequent CallExts
                 // to this address during simulation can be identified

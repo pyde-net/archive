@@ -71,7 +71,10 @@ pub fn execute_with_cheatcodes(vm: &mut Vm, cheat_state: &mut CheatcodeState) ->
 
         if let Some(d) = maybe_instr {
             if d.opcode == Opcode::CallExt {
-                // Check if target is the cheatcode address
+                // Check if target is the cheatcode address. The infallible
+                // read_wide masks `d.rd & 0x07`; if d.rd >= 8 the target
+                // won't match CHEATCODE_ADDRESS, and the subsequent step()
+                // takes the _checked path and traps on the bad index.
                 let target: [u8; 32] = vm.cpu.read_wide(d.rd).to_le_bytes();
                 if target == CHEATCODE_ADDRESS {
                     // Intercept: read calldata, apply cheatcode, skip instruction

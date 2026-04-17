@@ -46,6 +46,7 @@ impl BlockProcessor {
             block_gas_limit: pyde_tx::fee::GAS_CEILING as u64,
             chain_id: chain.chain_id,
             validator_address: block.header.proposer,
+            dev_skip_signature: false,
         };
 
         // 3. Batch signature verification (parallel across all CPU cores).

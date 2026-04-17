@@ -48,12 +48,14 @@ pub extern "C" fn host_store(ctx: *mut VmCtx, addr: u64, value: u64, width: u64)
 }
 
 /// Host: load 256-bit value from memory into wide register.
-/// Returns 0 on success, 1 on fault.
+/// Returns 0 on success, 1 on fault (memory fault or invalid wide reg).
 pub extern "C" fn host_wload(ctx: *mut VmCtx, addr: u64, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
     match vm.memory.load256(addr as u32) {
         Ok(bytes) => {
-            vm.cpu.write_wide(wd as u8, U256::from_le_bytes(bytes));
+            if vm.cpu.write_wide_checked(wd as u8, U256::from_le_bytes(bytes)).is_err() {
+                return 1;
+            }
             0
         }
         Err(_) => 1,
@@ -64,7 +66,10 @@ pub extern "C" fn host_wload(ctx: *mut VmCtx, addr: u64, wd: u64) -> u64 {
 /// Returns 0 on success, 1 on fault.
 pub extern "C" fn host_wstore(ctx: *mut VmCtx, addr: u64, ws: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    let val = vm.cpu.read_wide(ws as u8);
+    let val = match vm.cpu.read_wide_checked(ws as u8) {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
     match vm.memory.store256(addr as u32, &val.to_le_bytes()) {
         Ok(()) => 0,
         Err(_) => 1,
@@ -77,10 +82,14 @@ pub extern "C" fn host_wstore(ctx: *mut VmCtx, addr: u64, ws: u64) -> u64 {
 pub extern "C" fn host_push(ctx: *mut VmCtx, value: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
     match vm.memory.stack_alloc(8) {
-        Ok(sp) => {
-            vm.memory.store64(sp, value).unwrap_or(());
-            0
-        }
+        Ok(sp) => match vm.memory.store64(sp, value) {
+            Ok(()) => 0,
+            // stack_alloc succeeded but the store failed (e.g. page
+            // fault underneath the just-allocated region). Return fault
+            // so the AOT-compiled caller traps — previously this was
+            // silently swallowed with .unwrap_or(()).
+            Err(_) => 1,
+        },
         Err(_) => 1,
     }
 }
@@ -104,7 +113,10 @@ pub extern "C" fn host_pop(ctx: *mut VmCtx) -> u64 {
 /// Returns 0 on success.
 pub extern "C" fn host_sload(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    let slot = vm.cpu.read_wide(ws_slot as u8);
+    let slot = match vm.cpu.read_wide_checked(ws_slot as u8) {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
     let key = vm.derive_storage_key(slot);
     // Check overlay first, then fall back to storage backend (SMT)
     let data = vm.storage.get(&key).cloned().or_else(|| {
@@ -119,7 +131,9 @@ pub extern "C" fn host_sload(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
         let len = d.len().min(32);
         buf[..len].copy_from_slice(&d[..len]);
     }
-    vm.cpu.write_wide(wd as u8, U256::from_le_bytes(buf));
+    if vm.cpu.write_wide_checked(wd as u8, U256::from_le_bytes(buf)).is_err() {
+        return 1;
+    }
     0
 }
 
@@ -127,7 +141,12 @@ pub extern "C" fn host_sload(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
 /// Returns the loaded value.
 pub extern "C" fn host_sloadg(ctx: *mut VmCtx, ws_slot: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    let slot = vm.cpu.read_wide(ws_slot as u8);
+    // Invalid wide reg → return 0. host_sloadg signals "no data" via 0,
+    // matching the behavior when the slot is empty.
+    let slot = match vm.cpu.read_wide_checked(ws_slot as u8) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
     let key = vm.derive_storage_key(slot);
     // Check overlay first, then fall back to storage backend (SMT)
     let data = vm.storage.get(&key).cloned().or_else(|| {
@@ -152,10 +171,16 @@ pub extern "C" fn host_sstore(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
     if vm.static_mode {
         return 1;
     }
-    let slot = vm.cpu.read_wide(ws_slot as u8);
+    let slot = match vm.cpu.read_wide_checked(ws_slot as u8) {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
     let key = vm.derive_storage_key(slot);
     vm.journal_storage_write(&key);
-    let value = vm.cpu.read_wide(wd as u8);
+    let value = match vm.cpu.read_wide_checked(wd as u8) {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
     vm.storage.insert(key, value.to_le_bytes().to_vec());
     0
 }
@@ -167,7 +192,10 @@ pub extern "C" fn host_sstoreg(ctx: *mut VmCtx, ws_slot: u64, value: u64) -> u64
     if vm.static_mode {
         return 1;
     }
-    let slot = vm.cpu.read_wide(ws_slot as u8);
+    let slot = match vm.cpu.read_wide_checked(ws_slot as u8) {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
     let key = vm.derive_storage_key(slot);
     vm.journal_storage_write(&key);
     vm.storage.insert(key, value.to_le_bytes().to_vec());
@@ -181,7 +209,10 @@ pub extern "C" fn host_sdelete(ctx: *mut VmCtx, ws_slot: u64) -> u64 {
     if vm.static_mode {
         return 1;
     }
-    let slot = vm.cpu.read_wide(ws_slot as u8);
+    let slot = match vm.cpu.read_wide_checked(ws_slot as u8) {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
     let key = vm.derive_storage_key(slot);
     vm.journal_storage_write(&key);
     if let Some(v) = vm.storage.get(&key) {
@@ -207,7 +238,9 @@ pub extern "C" fn host_poseidon(ctx: *mut VmCtx, addr: u64, len: u64, wd: u64) -
     };
     let hash = pyde_crypto::poseidon2::poseidon2_hash(&data);
     let hash_bytes: [u8; 32] = hash.to_bytes();
-    vm.cpu.write_wide(wd as u8, U256::from_le_bytes(hash_bytes));
+    if vm.cpu.write_wide_checked(wd as u8, U256::from_le_bytes(hash_bytes)).is_err() {
+        return 1;
+    }
     0
 }
 
@@ -235,7 +268,15 @@ pub extern "C" fn host_wide_alu(ctx: *mut VmCtx, op_code: u64, wd: u64, ws1: u64
 /// Sets *trap_out to 1 if value exceeds u64::MAX.
 pub extern "C" fn host_narrow(ctx: *mut VmCtx, ws1: u64, trap_out: *mut u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    let wide_val = vm.cpu.read_wide(ws1 as u8);
+    let wide_val = match vm.cpu.read_wide_checked(ws1 as u8) {
+        Ok(v) => v,
+        Err(_) => {
+            unsafe {
+                *trap_out = 1;
+            }
+            return 0;
+        }
+    };
     let bytes = wide_val.to_le_bytes();
     // Check if any bytes above the first 8 are non-zero
     if bytes[8..].iter().any(|&b| b != 0) {
@@ -252,8 +293,13 @@ pub extern "C" fn host_narrow(ctx: *mut VmCtx, ws1: u64, trap_out: *mut u64) -> 
 /// Host: widen (GP → wide). Takes the GP value directly from AOT, writes to wide register.
 pub extern "C" fn host_widen(ctx: *mut VmCtx, wd: u64, gp_value: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    vm.cpu
-        .write_wide(wd as u8, pyde_vm::wide::U256::from(gp_value));
+    if vm
+        .cpu
+        .write_wide_checked(wd as u8, pyde_vm::wide::U256::from(gp_value))
+        .is_err()
+    {
+        return 1;
+    }
     0
 }
 
@@ -381,18 +427,29 @@ pub extern "C" fn host_log(ctx: *mut VmCtx, desc_ptr: u64, num_topics: u64) -> u
 /// Host: get caller (msg.sender) into wide register wd.
 pub extern "C" fn host_caller(ctx: *mut VmCtx, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    vm.cpu
-        .write_wide(wd as u8, pyde_vm::wide::U256::from_le_bytes(vm.ctx.caller));
+    if vm
+        .cpu
+        .write_wide_checked(wd as u8, pyde_vm::wide::U256::from_le_bytes(vm.ctx.caller))
+        .is_err()
+    {
+        return 1;
+    }
     0
 }
 
 /// Host: get self address into wide register wd.
 pub extern "C" fn host_address(ctx: *mut VmCtx, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    vm.cpu.write_wide(
-        wd as u8,
-        pyde_vm::wide::U256::from_le_bytes(vm.ctx.self_address),
-    );
+    if vm
+        .cpu
+        .write_wide_checked(
+            wd as u8,
+            pyde_vm::wide::U256::from_le_bytes(vm.ctx.self_address),
+        )
+        .is_err()
+    {
+        return 1;
+    }
     0
 }
 
@@ -417,24 +474,33 @@ pub extern "C" fn host_gas_remaining(ctx: *mut VmCtx) -> u64 {
 /// Host: get call value (256-bit) into wide register.
 pub extern "C" fn host_callvalue(ctx: *mut VmCtx, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    vm.cpu.write_wide(wd as u8, vm.ctx.call_value);
+    if vm.cpu.write_wide_checked(wd as u8, vm.ctx.call_value).is_err() {
+        return 1;
+    }
     0
 }
 
 /// Host: get gas price into wide register.
 pub extern "C" fn host_gasprice(ctx: *mut VmCtx, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    vm.cpu.write_wide(wd as u8, vm.ctx.gas_price);
+    if vm.cpu.write_wide_checked(wd as u8, vm.ctx.gas_price).is_err() {
+        return 1;
+    }
     0
 }
 
 /// Host: get balance of address (in wide register ws) into wide register wd.
 pub extern "C" fn host_balance(ctx: *mut VmCtx, ws_addr: u64, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    let addr_u256 = vm.cpu.read_wide(ws_addr as u8);
+    let addr_u256 = match vm.cpu.read_wide_checked(ws_addr as u8) {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
     let addr: [u8; 32] = addr_u256.to_le_bytes();
     let bal = vm.ctx.balances.get(&addr).copied().unwrap_or(U256::ZERO);
-    vm.cpu.write_wide(wd as u8, bal);
+    if vm.cpu.write_wide_checked(wd as u8, bal).is_err() {
+        return 1;
+    }
     0
 }
 

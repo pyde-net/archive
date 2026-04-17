@@ -12,8 +12,10 @@ fn block_ctx() -> BlockContext {
         height: 100, timestamp: 1_000_000,
         base_fee: 1, // minimal for benchmark
         block_gas_limit: 4_000_000_000,
-        chain_id: 31337, // devnet — skips sig verification
+        chain_id: 31337,
         validator_address: derive_eoa_address(b"validator"),
+        // Synthetic bench transactions have no real FALCON sigs.
+        dev_skip_signature: true,
     }
 }
 

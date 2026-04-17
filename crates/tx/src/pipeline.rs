@@ -7,7 +7,7 @@
 //! 4. Value transfer: sender → recipient
 //! 5. PVM execution (contract call or deployment)
 //! 6. Post-execution: refund unused gas, apply SDELETE refunds
-//! 7. Fee distribution: 80% burn, 20% validator
+//! 7. Fee distribution: 70% burn, 20% validator, 10% treasury
 //! 8. Update accounts in State SMT
 //! 9. Generate receipt
 
@@ -37,6 +37,29 @@ pub struct BlockContext {
     pub block_gas_limit: u64,
     pub chain_id: u64,
     pub validator_address: Address,
+    /// When true, FALCON signature verification is skipped for every
+    /// transaction in this block. Intended only for in-process test
+    /// harnesses that construct unsigned transactions against
+    /// synthetic state. Production paths must leave this `false`. See
+    /// `ValidationContext::dev_skip_signature`.
+    pub dev_skip_signature: bool,
+}
+
+impl Default for BlockContext {
+    /// Safe defaults for every field — notably `dev_skip_signature: false`
+    /// so a caller that forgets to set it never accidentally skips
+    /// signature verification in production.
+    fn default() -> Self {
+        Self {
+            height: 0,
+            timestamp: 0,
+            base_fee: 0,
+            block_gas_limit: 0,
+            chain_id: 0,
+            validator_address: [0u8; 32],
+            dev_skip_signature: false,
+        }
+    }
 }
 
 /// Pipeline execution error.
@@ -165,6 +188,7 @@ fn execute_transaction_inner(
         base_fee: block_ctx.base_fee,
         block_gas_limit: block_ctx.block_gas_limit,
         chain_id: block_ctx.chain_id,
+        dev_skip_signature: block_ctx.dev_skip_signature,
     };
     validate_transaction(tx, &sender, &nonce_state, &val_ctx)?;
 
@@ -985,6 +1009,12 @@ mod tests {
             block_gas_limit: 400_000_000,
             chain_id: 1,
             validator_address: derive_eoa_address(b"validator"),
+            // Pipeline tests construct unsigned tx fixtures — existing
+            // tests relied on the old chain_id=31337 bypass; now we set
+            // the flag explicitly to preserve that behavior without the
+            // chain_id coupling. Individual tests override tx.signature
+            // when they want to exercise signature validation.
+            dev_skip_signature: true,
         }
     }
 
@@ -1277,6 +1307,7 @@ mod tests {
             block_gas_limit: 400_000_000,
             chain_id: 31337,
             validator_address: validator_addr,
+            dev_skip_signature: true,
         };
 
         let sel = |name: &str| -> u32 { otic::codegen::compute_selector(name) };

@@ -1753,6 +1753,7 @@ mod tests {
             block_gas_limit: 400_000_000,
             chain_id: 1,
             validator_address: [0xEE; 32],
+            dev_skip_signature: false,
         };
         let receipt = execute_transaction(&slash_txs[0], &mut smt, &ctx).unwrap();
         assert!(

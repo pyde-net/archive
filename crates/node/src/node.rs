@@ -320,8 +320,21 @@ impl PydeNode {
         subscribe_topics(&mut swarm, is_validator)?;
         info!("gossipsub topics subscribed");
 
-        // 8. Dial bootstrap peers
-        if !self.config.network.bootstrap_peers.is_empty() {
+        // 8. Dial bootstrap peers. Empty on anything other than a single
+        // isolated devnet node is almost certainly misconfiguration —
+        // without peers the node produces a fork of one and can never
+        // sync. Warn loudly so operators catch this before genesis
+        // rather than after.
+        if self.config.network.bootstrap_peers.is_empty() {
+            if self.config.node.chain_id != 31337 {
+                warn!(
+                    chain_id = self.config.node.chain_id,
+                    "no bootstrap_peers configured for a non-devnet chain — this node will not \
+                     discover peers and cannot sync. Set network.bootstrap_peers in config.toml \
+                     before launch."
+                );
+            }
+        } else {
             pyde_net::node::dial_bootstrap_peers(&mut swarm, &self.config.network.bootstrap_peers);
         }
 
@@ -689,6 +702,7 @@ impl PydeNode {
                                                 block_gas_limit: self.config.consensus.gas_ceiling,
                                                 chain_id: chain_w.chain_id,
                                                 validator_address: proposer,
+                                                dev_skip_signature: false,
                                             };
                                             let mut slot_receipts = Vec::new();
                                             for dtx in &decrypted_txs {
@@ -882,6 +896,7 @@ impl PydeNode {
                                             block_gas_limit: gas_ceiling,
                                             chain_id: self.config.node.chain_id,
                                             validator_address: identity.address,
+                                            dev_skip_signature: false,
                                         };
                                         pyde_tx::access_infer::infer_access_lists_batch(
                                             &mut txs, &*state_r, &infer_ctx,
@@ -1152,6 +1167,7 @@ impl PydeNode {
                                                                                 block_gas_limit: self.config.consensus.gas_ceiling,
                                                                                 chain_id: chain_w.chain_id,
                                                                                 validator_address: proposer,
+                                                                                dev_skip_signature: false,
                                                                             };
                                                                             for dtx in &decrypted_txs {
                                                                                 match pyde_tx::pipeline::execute_transaction(dtx, &mut *state_w.smt_mut(), &block_ctx) {
