@@ -1,4 +1,5 @@
 use crate::project;
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
 /// Interactive REPL for interacting with contracts on a live network.
@@ -14,8 +15,8 @@ use std::io::{self, BufRead, Write};
 ///   exit / quit                             — exit console
 ///
 /// Supported arg types: u64, hex (0x...), bool (true/false), strings ("...").
-/// Complex types (structs, arrays, Vec) are not yet supported — use `pyde script`
-/// for those. TODO: load contract ABI from artifacts for type-aware encoding.
+/// Use `abi <path.json>` to load a contract artifact for type-aware encoding
+/// of u256, Address, and other complex types.
 pub fn run(network: &str, signer: &crate::signer::Signer) -> Result<(), String> {
     let from = &signer.address_hex();
     let (config, _) = project::load_config()?;
@@ -45,6 +46,8 @@ pub fn run(network: &str, signer: &crate::signer::Signer) -> Result<(), String> 
 
     let stdin = io::stdin();
     let mut nonce = get_nonce(&client, &net.rpc_url, from);
+    // ABI state: method_name → Vec<param_type_string> (loaded via `abi` command)
+    let mut loaded_abi: HashMap<String, Vec<String>> = HashMap::new();
 
     loop {
         print!("pyde> ");
@@ -59,7 +62,7 @@ pub fn run(network: &str, signer: &crate::signer::Signer) -> Result<(), String> 
             continue;
         }
 
-        match handle_command(&client, &net.rpc_url, from, signer, &net, &mut nonce, line) {
+        match handle_command(&client, &net.rpc_url, from, signer, &net, &mut nonce, line, &mut loaded_abi) {
             Ok(true) => break, // exit
             Ok(false) => {}
             Err(e) => eprintln!("  error: {}", e),
@@ -78,6 +81,7 @@ fn handle_command(
     net: &crate::project::NetworkConfig,
     nonce: &mut u64,
     line: &str,
+    abi: &mut HashMap<String, Vec<String>>,
 ) -> Result<bool, String> {
     let parts: Vec<&str> = line.splitn(2, ' ').collect();
     let cmd = parts[0];
@@ -87,6 +91,7 @@ fn handle_command(
         "exit" | "quit" | "q" => return Ok(true),
 
         "help" => {
+            println!("  abi <path.json>                    — load contract ABI for type-aware encoding");
             println!("  call <address> <method>(<args>)   — read-only call");
             println!("  send <address> <method>(<args>)   — state-changing tx");
             println!("  balance <address>                  — query balance");
@@ -95,6 +100,20 @@ fn handle_command(
             println!("  receipt <tx_hash>                  — get tx receipt");
             println!("  block                              — current block number");
             println!("  exit                               — quit console");
+        }
+
+        "abi" => {
+            if args.is_empty() {
+                return Err("usage: abi <path.json>".into());
+            }
+            match load_abi(args) {
+                Ok(loaded) => {
+                    let count = loaded.len();
+                    abi.extend(loaded);
+                    println!("  loaded {} functions from {}", count, args);
+                }
+                Err(e) => return Err(format!("failed to load ABI: {}", e)),
+            }
         }
 
         "block" => {
@@ -143,8 +162,10 @@ fn handle_command(
             let (addr, method, method_args) = parse_call_args(args)?;
             let selector = compute_selector(&method);
             let mut calldata = selector.to_be_bytes().to_vec();
-            for arg in &method_args {
-                calldata.extend_from_slice(&encode_arg(arg));
+            let param_types = abi.get(&method);
+            for (i, arg) in method_args.iter().enumerate() {
+                let ty = param_types.and_then(|pts| pts.get(i)).map(|s| s.as_str());
+                calldata.extend_from_slice(&encode_arg_typed(arg, ty));
             }
             let calldata_hex = format!("0x{}", hex::encode(&calldata));
 
@@ -169,8 +190,10 @@ fn handle_command(
             let to = parse_hex_address(&addr)?;
             let selector = compute_selector(&method);
             let mut calldata = selector.to_be_bytes().to_vec();
-            for arg in &method_args {
-                calldata.extend_from_slice(&encode_arg(arg));
+            let param_types = abi.get(&method);
+            for (i, arg) in method_args.iter().enumerate() {
+                let ty = param_types.and_then(|pts| pts.get(i)).map(|s| s.as_str());
+                calldata.extend_from_slice(&encode_arg_typed(arg, ty));
             }
 
             // Build, sign, and send transaction
@@ -238,7 +261,78 @@ fn parse_call_args(input: &str) -> Result<(String, String, Vec<String>), String>
     }
 }
 
-/// Encode a CLI argument as 8 bytes LE (u64).
+/// Load a contract ABI from a compiled .json artifact.
+/// Returns method_name → Vec<param_type_string>.
+fn load_abi(path: &str) -> Result<HashMap<String, Vec<String>>, String> {
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let json: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| format!("invalid JSON: {}", e))?;
+
+    let mut methods = HashMap::new();
+    // Support both top-level "functions" and nested "abi.functions"
+    let functions = json.get("functions").and_then(|v| v.as_array())
+        .or_else(|| json.get("abi").and_then(|a| a.get("functions")).and_then(|v| v.as_array()));
+    if let Some(functions) = functions {
+        for f in functions {
+            let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let params: Vec<String> = f.get("params")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|p| {
+                    p.get("type").and_then(|t| t.as_str()).map(|s| s.to_string())
+                }).collect())
+                .unwrap_or_default();
+            if !name.is_empty() {
+                methods.insert(name, params);
+            }
+        }
+    }
+    Ok(methods)
+}
+
+/// Encode a CLI argument with optional type hint from ABI.
+fn encode_arg_typed(arg: &str, ty: Option<&str>) -> Vec<u8> {
+    let arg = arg.trim();
+    match ty {
+        Some("u256" | "i256") => {
+            // 32-byte LE integer
+            let val = if let Some(hex) = arg.strip_prefix("0x") {
+                u128::from_str_radix(hex, 16).unwrap_or(0)
+            } else {
+                arg.parse::<u128>().unwrap_or(0)
+            };
+            let mut bytes = [0u8; 32];
+            bytes[..16].copy_from_slice(&val.to_le_bytes());
+            bytes.to_vec()
+        }
+        Some("Address") => {
+            // 32-byte address
+            let hex = arg.strip_prefix("0x").unwrap_or(arg);
+            let mut addr = [0u8; 32];
+            if let Ok(bytes) = hex::decode(hex) {
+                let len = bytes.len().min(32);
+                addr[..len].copy_from_slice(&bytes[..len]);
+            }
+            addr.to_vec()
+        }
+        Some("bool") => {
+            match arg {
+                "true" | "1" => 1u64.to_le_bytes().to_vec(),
+                _ => 0u64.to_le_bytes().to_vec(),
+            }
+        }
+        Some("String") => {
+            let s = arg.trim_matches('"');
+            let mut encoded = (s.len() as u64).to_le_bytes().to_vec();
+            encoded.extend_from_slice(s.as_bytes());
+            while encoded.len() % 8 != 0 { encoded.push(0); }
+            encoded
+        }
+        _ => encode_arg(arg), // fallback to auto-detect
+    }
+}
+
+/// Encode a CLI argument as 8 bytes LE (u64). Fallback when no ABI type available.
 fn encode_arg(arg: &str) -> Vec<u8> {
     let arg = arg.trim();
     // Try as integer
@@ -507,5 +601,50 @@ mod tests {
         // Same FNV-1a as otic::codegen::compute_selector
         assert_eq!(compute_selector("get_count"), 0xd9e32bf7);
         assert_eq!(compute_selector("increment"), 0x3812e73e);
+    }
+
+    #[test]
+    fn load_abi_from_artifact() {
+        // Write a minimal artifact matching real format
+        let artifact = r#"{
+            "abi": {
+                "functions": [
+                    {"name": "deposit", "params": [{"name": "amount", "type": "u256"}], "returns": "()"},
+                    {"name": "get_balance", "params": [{"name": "addr", "type": "Address"}], "returns": "u256"},
+                    {"name": "increment", "params": [], "returns": "()"}
+                ]
+            }
+        }"#;
+        let tmp = std::env::temp_dir().join("pyde-test-abi.json");
+        std::fs::write(&tmp, artifact).unwrap();
+        let methods = load_abi(tmp.to_str().unwrap()).unwrap();
+        assert_eq!(methods.len(), 3);
+        assert_eq!(methods["deposit"], vec!["u256"]);
+        assert_eq!(methods["get_balance"], vec!["Address"]);
+        assert!(methods["increment"].is_empty());
+    }
+
+    #[test]
+    fn encode_arg_typed_u256() {
+        let bytes = encode_arg_typed("1000000", Some("u256"));
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(u128::from_le_bytes(bytes[..16].try_into().unwrap()), 1000000);
+        assert_eq!(&bytes[16..], &[0u8; 16]);
+    }
+
+    #[test]
+    fn encode_arg_typed_address() {
+        let hex = format!("0x{}", "aa".repeat(32));
+        let bytes = encode_arg_typed(&hex, Some("Address"));
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[0], 0xaa);
+    }
+
+    #[test]
+    fn encode_arg_typed_fallback() {
+        // No type hint → auto-detect as u64
+        let bytes = encode_arg_typed("42", None);
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 42);
     }
 }

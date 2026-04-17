@@ -25,9 +25,8 @@ struct FnInfo {
     return_ty: Ty,
 }
 
-/// TODO(M11.4): Replace `--from` address with `--wallet`/`--keystore` once the
-/// wallet system is implemented (tasks 0914-0921). Currently uses bare address
-/// without transaction signing (devnet mode only).
+/// Executes a Pyde script file against a network.
+/// Uses the provided signer for FALCON-512 transaction signing.
 pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<(), String> {
     let from = &signer.address_hex();
     let (config, root) = project::load_config()?;
