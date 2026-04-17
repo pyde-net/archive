@@ -380,18 +380,46 @@ impl Vm {
         Ok(())
     }
 
-    /// Fetch the instruction at the current PC.
-    fn fetch(&self) -> Result<Instruction, Trap> {
-        let addr = crate::memory::CODE_START + self.pc;
-        if self.pc + 4 > self.memory.code_end - crate::memory::CODE_START {
+    /// Validate the current PC is word-aligned and inside the decoded
+    /// instruction cache. Jumps, branches, calls, and returns all mutate
+    /// `self.pc` with unchecked arithmetic; this is the single choke point
+    /// that converts an out-of-range PC into a deterministic trap rather
+    /// than silently dispatching on a wrapped cache index or executing
+    /// bytes from the heap / stack / null page.
+    ///
+    /// Bounds are expressed against `decoded_cache.len()` rather than
+    /// `memory.code_end` so the same check works for both full-program
+    /// execution (cache populated from loaded bytecode) and the
+    /// single-instruction `exec_single` path used by the AOT host.
+    #[inline]
+    fn check_pc_bounds(&self) -> Result<(), Trap> {
+        if (self.pc & 3) != 0 {
             return Err(Trap::InvalidOpcode);
         }
+        let idx = (self.pc / 4) as usize;
+        if idx >= self.decoded_cache.len() {
+            return Err(Trap::InvalidOpcode);
+        }
+        Ok(())
+    }
+
+    /// Fetch the instruction at the current PC.
+    fn fetch(&self) -> Result<Instruction, Trap> {
+        self.check_pc_bounds()?;
+        let addr = crate::memory::CODE_START + self.pc;
         let word = self.memory.fetch_code_u32(addr);
         Ok(Instruction(word))
     }
 
     /// Execute a single step. Returns Some(ExecResult) if execution finished.
     pub fn step(&mut self) -> Result<Option<ExecResult>, Trap> {
+        // Reject malformed PC before we do anything else. This catches:
+        //   - wrap-around from signed jump offsets
+        //   - targets that land in heap / stack / null page
+        //   - non-word-aligned jumps that would otherwise silently re-execute
+        //     the preceding instruction via the pc/4 rounding
+        //   - running off the end of the code section without HALT
+        self.check_pc_bounds()?;
         let idx = (self.pc / 4) as usize;
         let d = match self.decoded_cache.get(idx) {
             Some(&d) => d,
@@ -4082,5 +4110,103 @@ mod tests {
         assert_eq!(output.outcome, Outcome::Success);
         // r1 = child's return value (callee loaded calldata[0]=99 into r1)
         assert_eq!(vm.cpu.read_gp(1), 99);
+    }
+
+    // ========== PC bounds enforcement ==========
+
+    #[test]
+    fn jmp_misaligned_target_traps() {
+        // Jmp with imm=1 lands pc at offset 1, which is not 4-aligned.
+        // Previously this would silently re-execute the current instruction
+        // via pc/4 rounding; the bounds check turns it into InvalidOpcode.
+        let code = bytecode(&[
+            instr_ri(Opcode::Jmp, 0, 0, 1),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap_err(), Trap::InvalidOpcode);
+    }
+
+    #[test]
+    fn jmp_past_code_end_traps() {
+        // Code length = 8 bytes. Jmp forward by 100 lands far past code_end.
+        let code = bytecode(&[
+            instr_ri(Opcode::Jmp, 0, 0, 100),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap_err(), Trap::InvalidOpcode);
+    }
+
+    #[test]
+    fn jmp_backward_wraps_traps() {
+        // pc starts at 0. Jmp -8 wraps pc to u32::MAX-7, which is far outside
+        // the code section. Previously pc/4 with the huge index was caught
+        // only by decoded_cache.get() returning None — now the explicit
+        // bounds check catches it at the VM boundary.
+        let code = bytecode(&[
+            instr_ri(Opcode::Jmp, 0, 0, -8),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap_err(), Trap::InvalidOpcode);
+    }
+
+    #[test]
+    fn branch_taken_to_misaligned_traps() {
+        // BEQ r0, r0 is always taken (both 0). Offset 2 is not word-aligned.
+        let code = bytecode(&[
+            instr_ri(Opcode::Beq, 0, 0, 2),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap_err(), Trap::InvalidOpcode);
+    }
+
+    #[test]
+    fn call_misaligned_target_traps() {
+        let code = bytecode(&[
+            instr_ri(Opcode::Call, 0, 0, 3),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap_err(), Trap::InvalidOpcode);
+    }
+
+    #[test]
+    fn run_off_end_without_halt_traps() {
+        // 2 instructions, neither is Halt. Execution runs both, then pc
+        // advances to the end of code and the next step() must trap.
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 1),
+            instr_ri(Opcode::Addi, 2, 0, 2),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap_err(), Trap::InvalidOpcode);
+        // Sanity: both ADDIs ran before the fall-off trap.
+        assert_eq!(vm.cpu.read_gp(1), 1);
+        assert_eq!(vm.cpu.read_gp(2), 2);
+    }
+
+    #[test]
+    fn valid_jmp_still_works() {
+        // Regression coverage: the check must not reject legitimate jumps.
+        // This mirrors the existing jmp_forward test, but explicit here
+        // alongside the negative cases so the intent is obvious.
+        let code = bytecode(&[
+            instr_ri(Opcode::Jmp, 0, 0, 8),
+            instr_ri(Opcode::Addi, 1, 0, 99),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = Vm::new();
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+        assert_eq!(vm.cpu.read_gp(1), 0);
     }
 }
