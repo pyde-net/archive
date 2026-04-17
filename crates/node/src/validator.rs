@@ -344,7 +344,63 @@ impl ValidatorEngine {
             self.seen_votes.insert(key, value);
         }
 
+        // Restore the ingest queues. Without this, a validator that
+        // detected equivocation and crashed before draining would lose
+        // the evidence — the seen_proposals/seen_votes indexes would
+        // still know about the conflict but the ready-to-slash queue
+        // would be empty, and if the offender never equivocated again
+        // they'd escape punishment.
+        match store.load_evidence_state() {
+            Ok(Some(ev_state)) => {
+                info!(
+                    pending = ev_state.pending.len(),
+                    broadcast = ev_state.broadcast.len(),
+                    seen = ev_state.seen.len(),
+                    "restoring evidence ingest queues from disk"
+                );
+                self.pending_evidence = ev_state.pending;
+                self.broadcast_evidence = ev_state.broadcast;
+                self.seen_evidence = ev_state.seen.into_iter().collect();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Non-fatal: we can continue with empty queues. The
+                // dedup HashSet being empty means we might re-ingest
+                // duplicate gossip, but duplicates are caught by the
+                // on-chain slash handler (already-ejected rejection).
+                warn!(error = %e, "failed to load evidence state; starting empty");
+            }
+        }
+
         self.consensus_store = Some(store);
+    }
+
+    /// Snapshot the current evidence ingest queues into an
+    /// `EvidenceState` for persistence. Called after any mutation
+    /// that changes pending_evidence, broadcast_evidence, or
+    /// seen_evidence.
+    fn evidence_snapshot(&self) -> crate::wire::EvidenceState {
+        crate::wire::EvidenceState {
+            pending: self.pending_evidence.clone(),
+            broadcast: self.broadcast_evidence.clone(),
+            seen: self.seen_evidence.iter().copied().collect(),
+        }
+    }
+
+    /// Persist the current evidence state. No-op without a store.
+    /// Panics on failure for the same reason as `persist_consensus`:
+    /// a silent revert to in-memory-only mode loses safety
+    /// guarantees on the next crash.
+    fn persist_evidence_state(&self) {
+        if let Some(store) = &self.consensus_store {
+            if let Err(e) = store.save_evidence_state(&self.evidence_snapshot()) {
+                error!(
+                    error = %e,
+                    "FATAL: failed to persist evidence state — halting validator"
+                );
+                panic!("evidence state persist failed: {}", e);
+            }
+        }
     }
 
     /// Persist consensus state to disk. No-op when no store is attached.
@@ -1017,14 +1073,22 @@ impl ValidatorEngine {
     /// are responsible for re-queueing the evidence via `push_evidence`
     /// — otherwise it is lost along with the unbuilt proposal.
     pub fn drain_pending_evidence(&mut self) -> Vec<DoubleSignEvidence> {
-        std::mem::take(&mut self.pending_evidence)
+        let out = std::mem::take(&mut self.pending_evidence);
+        if !out.is_empty() {
+            self.persist_evidence_state();
+        }
+        out
     }
 
     /// Re-queue previously drained evidence, e.g. after a failed block
     /// build. No-op if `evidence` is empty. Preserves insertion order by
     /// appending at the tail.
     pub fn push_evidence(&mut self, evidence: Vec<DoubleSignEvidence>) {
+        if evidence.is_empty() {
+            return;
+        }
         self.pending_evidence.extend(evidence);
+        self.persist_evidence_state();
     }
 
     /// Ingest a piece of equivocation evidence — shared entry point for
@@ -1083,6 +1147,9 @@ impl ValidatorEngine {
         self.seen_evidence.insert(key);
         self.pending_evidence.push(evidence.clone());
         self.broadcast_evidence.push(evidence);
+        // Persist BEFORE returning so a crash between ingest and the
+        // next drain_* call cannot lose the evidence.
+        self.persist_evidence_state();
         true
     }
 
@@ -1091,7 +1158,11 @@ impl ValidatorEngine {
     /// or received via gossip) since the last call. The caller is
     /// responsible for publishing each entry on the consensus channel.
     pub fn drain_broadcast_evidence(&mut self) -> Vec<DoubleSignEvidence> {
-        std::mem::take(&mut self.broadcast_evidence)
+        let out = std::mem::take(&mut self.broadcast_evidence);
+        if !out.is_empty() {
+            self.persist_evidence_state();
+        }
+        out
     }
 
     /// Drain `pending_evidence` and turn each entry into a signed
@@ -1804,6 +1875,87 @@ mod tests {
         evidence.signature_1 = sig.clone();
         evidence.signature_2 = sig;
         assert!(!engine.ingest_evidence(evidence));
+    }
+
+    #[test]
+    fn evidence_queues_survive_restart() {
+        // Hardening task 014c: a validator that ingests evidence and
+        // then crashes must still have the evidence available on
+        // restart. Without this, detected-but-un-drained equivocations
+        // are silently lost if the observing validator crashes before
+        // producing its next block.
+        use pyde_crypto::falcon::falcon_keygen;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let committee_pk: Vec<u8>;
+        let signer_addr: Address;
+
+        // --- Run 1: ingest evidence, then "crash" (drop engine) ---
+        {
+            let (pk, sk) = falcon_keygen().unwrap();
+            committee_pk = pk.as_bytes().to_vec();
+            signer_addr = pyde_account::address::derive_eoa_address(&committee_pk);
+
+            let mut engine = ValidatorEngine::new([0xAA; 32]);
+            engine.set_committee(vec![committee_pk.clone()]);
+            let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+            engine.attach_consensus_store(store);
+
+            let slot = 50u64;
+            let hash_1 = [0x01u8; 32];
+            let hash_2 = [0x02u8; 32];
+            let sign_1 = {
+                let mut m = Vec::with_capacity(40);
+                m.extend_from_slice(&slot.to_le_bytes());
+                m.extend_from_slice(&hash_1);
+                m
+            };
+            let sign_2 = {
+                let mut m = Vec::with_capacity(40);
+                m.extend_from_slice(&slot.to_le_bytes());
+                m.extend_from_slice(&hash_2);
+                m
+            };
+            let sig_1 = pyde_crypto::falcon::falcon_sign(&sk, &sign_1).unwrap().as_bytes().to_vec();
+            let sig_2 = pyde_crypto::falcon::falcon_sign(&sk, &sign_2).unwrap().as_bytes().to_vec();
+
+            let evidence = DoubleSignEvidence {
+                slot,
+                block_hash_1: hash_1,
+                signature_1: sig_1,
+                block_hash_2: hash_2,
+                signature_2: sig_2,
+                signer: signer_addr,
+                submitter: [0u8; 32],
+            };
+            assert!(engine.ingest_evidence(evidence));
+            assert_eq!(engine.pending_evidence.len(), 1);
+            assert_eq!(engine.broadcast_evidence.len(), 1);
+            // engine drops here — disk is the only source of truth now.
+        }
+
+        // --- Run 2: reopen, attach, evidence must still be there ---
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        engine.set_committee(vec![committee_pk.clone()]);
+        let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+        engine.attach_consensus_store(store);
+
+        assert_eq!(
+            engine.pending_evidence.len(),
+            1,
+            "pending queue must survive restart"
+        );
+        assert_eq!(
+            engine.broadcast_evidence.len(),
+            1,
+            "broadcast queue must survive restart"
+        );
+        assert_eq!(engine.pending_evidence[0].slot, 50);
+        assert_eq!(engine.pending_evidence[0].signer, signer_addr);
+
+        // Dedup set is also restored — a repeat gossip would be dropped.
+        assert!(engine.seen_evidence.contains(&(50, signer_addr)));
     }
 
     // ========== End-to-end: drain evidence → Slash tx → state mutation ==========
