@@ -25,6 +25,10 @@ pub mod tag {
     pub const COMPACT_BLOCK: u8 = 0x03;
     pub const RANDOMNESS_SHARE: u8 = 0x15;
     pub const PSS_REFRESH: u8 = 0x16;
+    /// Equivocation evidence broadcast on the consensus channel so any
+    /// validator — not just the one that directly observed the double
+    /// proposal — can include the offender in a `Slash` tx.
+    pub const CONSENSUS_SLASH_EVIDENCE: u8 = 0x17;
     pub const GET_BLOCK_TXS: u8 = 0x04;
     pub const BLOCK_TXS_RESPONSE: u8 = 0x05;
     pub const DECRYPTION_SHARES: u8 = 0x20;
@@ -734,6 +738,30 @@ pub fn encode_double_sign_evidence(evidence: &DoubleSignEvidence) -> Vec<u8> {
     enc.finish()
 }
 
+/// Wrap encoded evidence in a gossip envelope: `tag || evidence_bytes`.
+/// The tag lets the consensus channel handler dispatch this message
+/// alongside proposals, votes, timeouts, etc. without collision.
+pub fn encode_slash_evidence_msg(evidence: &DoubleSignEvidence) -> Vec<u8> {
+    let payload = encode_double_sign_evidence(evidence);
+    let mut out = Vec::with_capacity(1 + payload.len());
+    out.push(tag::CONSENSUS_SLASH_EVIDENCE);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// Unwrap a gossip envelope produced by `encode_slash_evidence_msg`.
+/// Returns the decoded `DoubleSignEvidence`, or an error if the tag is
+/// wrong or the payload is malformed.
+pub fn decode_slash_evidence_msg(data: &[u8]) -> Result<DoubleSignEvidence, &'static str> {
+    if data.is_empty() {
+        return Err("empty slash-evidence gossip message");
+    }
+    if data[0] != tag::CONSENSUS_SLASH_EVIDENCE {
+        return Err("not a slash-evidence gossip message");
+    }
+    decode_double_sign_evidence(&data[1..])
+}
+
 pub fn decode_double_sign_evidence(data: &[u8]) -> Result<DoubleSignEvidence, &'static str> {
     let mut dec = Decoder::new(data);
     let version = dec.u8()?;
@@ -1113,5 +1141,27 @@ mod tests {
         // Truncate mid-encoding
         let bytes = encode_double_sign_evidence(&dummy_evidence(5));
         assert!(decode_double_sign_evidence(&bytes[..bytes.len() - 10]).is_err());
+    }
+
+    #[test]
+    fn slash_evidence_gossip_envelope_roundtrip() {
+        let evidence = dummy_evidence(99);
+        let bytes = encode_slash_evidence_msg(&evidence);
+        assert_eq!(bytes[0], tag::CONSENSUS_SLASH_EVIDENCE);
+        let restored = decode_slash_evidence_msg(&bytes).unwrap();
+        assert_eq!(restored.slot, 99);
+        assert_eq!(restored.block_hash_1, evidence.block_hash_1);
+    }
+
+    #[test]
+    fn slash_evidence_wrong_tag_fails() {
+        let mut bytes = encode_slash_evidence_msg(&dummy_evidence(1));
+        bytes[0] = tag::CONSENSUS_VOTE; // wrong tag
+        assert!(decode_slash_evidence_msg(&bytes).is_err());
+    }
+
+    #[test]
+    fn slash_evidence_empty_fails() {
+        assert!(decode_slash_evidence_msg(&[]).is_err());
     }
 }
