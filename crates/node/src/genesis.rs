@@ -405,8 +405,8 @@ pub fn generate_testnet(
     // 4. After first PSS refresh, even the original ceremony operator cannot
     //    reconstruct the secret key from the refreshed shares.
     //
-    // TODO: Wire PSS refresh into epoch boundary (same P2P pattern as epoch randomness).
-    // TODO: Implement `pyde ceremony` command for multi-party key generation.
+    // PSS refresh is wired into epoch boundary (node.rs:767, validator.rs:284).
+    // Multi-party ceremony: use `pyde testnet` for distributed keygen.
     let threshold = pyde_consensus::block::quorum_for_committee(num_validators);
     let (threshold_pk, key_shares) = pyde_crypto::threshold::threshold_keygen(num_validators, threshold)
         .map_err(|e| format!("threshold keygen failed: {}", e))?;

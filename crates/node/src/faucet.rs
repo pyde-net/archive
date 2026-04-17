@@ -111,8 +111,8 @@ async fn send_faucet_tx(
         // Signed path: fetch nonce, build + sign tx, send raw
         let nonce = fetch_nonce(rpc_url, from).await?;
         let to_addr = parse_hex_addr(to)?;
-        // TODO: fetch chain_id dynamically; use devnet default for now
-        let tx_bytes = signer.sign_transfer(&to_addr, quanta, nonce, 31337);
+        let chain_id = fetch_chain_id(rpc_url).await.unwrap_or(31337);
+        let tx_bytes = signer.sign_transfer(&to_addr, quanta, nonce, chain_id);
         let tx_hex = format!("0x{}", hex::encode(&tx_bytes));
         serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
@@ -167,6 +167,17 @@ async fn fetch_nonce(rpc_url: &str, address: &str) -> Result<u64, String> {
     let json = rpc_call(rpc_url, &serde_json::to_string(&body).unwrap()).await?;
     let nonce_str = json.get("result").and_then(|v| v.as_str()).unwrap_or("0");
     nonce_str.parse::<u64>().map_err(|_| format!("invalid nonce: {}", nonce_str))
+}
+
+async fn fetch_chain_id(rpc_url: &str) -> Result<u64, String> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "pyde_chainId", "params": []
+    });
+    let json = rpc_call(rpc_url, &serde_json::to_string(&body).unwrap()).await?;
+    let hex = json.get("result").and_then(|v| v.as_str()).unwrap_or("0x7a69");
+    u64::from_str_radix(hex.strip_prefix("0x").unwrap_or(hex), 16)
+        .map_err(|_| format!("invalid chain_id: {}", hex))
 }
 
 fn parse_hex_addr(hex: &str) -> Result<[u8; 32], String> {

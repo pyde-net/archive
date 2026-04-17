@@ -8,19 +8,15 @@
 //! The proposer reveals their VRF proof in the block header.
 //! Other validators verify the proof and check it's the lowest score.
 //!
-//! ## Epoch Randomness (TODO: Phase 7)
+//! ## Epoch Randomness
 //!
-//! `epoch_randomness` is currently passed in by the caller. In production,
-//! it must be generated via **threshold randomness** to prevent the last
-//! block proposer from biasing the next epoch's committee selection.
-//!
-//! The planned approach: at each epoch boundary, committee members produce
-//! randomness shares via threshold signatures (85-of-128). The combined
-//! output is unpredictable to any coalition of <86 validators. This reuses
-//! the existing threshold Kyber infrastructure from the crypto crate.
-//!
-//! Implementation requires the networking layer (Phase 7) for validators
-//! to exchange randomness shares over P2P.
+//! At each epoch boundary, committee members produce randomness shares
+//! via threshold signatures (85-of-128). The combined output is unpredictable
+//! to any coalition of <86 validators. Wired in:
+//! - `validator.rs:start_epoch_randomness()` — generate + broadcast share
+//! - `validator.rs:on_randomness_share()` — collect + combine at threshold
+//! - `node.rs:769` — triggered at epoch boundary
+//! - `node.rs:1406` — share collection via gossipsub
 
 use crate::validator::Committee;
 use pyde_account::address::Address;

@@ -1615,9 +1615,8 @@ fn handle_swarm_event(
 }
 
 /// Load validator FALCON signing key from disk.
-/// Requires `validator.key` to exist in the data directory.
-/// Use `pyde keygen` to generate one (TODO: add keygen subcommand).
-/// For now, generates on first run if missing.
+/// If `validator.key` doesn't exist, generates a new keypair and saves it.
+/// The key file format: `[pk_len:4 LE][pk_bytes][sk_bytes]`.
 fn load_validator_identity(datadir: &Path) -> Result<ValidatorIdentity, String> {
     let key_path = datadir.join("validator.key");
 

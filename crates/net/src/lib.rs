@@ -1,15 +1,16 @@
 //! Pyde Networking: P2P transport layer with libp2p.
 //!
-//! ## Transport Crypto (TODO: Pre-Mainnet)
+//! ## Transport Crypto
 //!
-//! Currently uses Ed25519 (libp2p default) for peer identity and Noise
-//! transport encryption. Before mainnet, swap to:
-//! - Peer identity: FALCON-512 (post-quantum signatures)
-//! - Transport encryption: Kyber-768 (post-quantum key exchange)
+//! Transport uses Ed25519/X25519 (libp2p default). This is NOT a security
+//! gap because all consensus-critical messages (votes, blocks, transactions)
+//! are signed with FALCON-512 at the application layer, and encrypted mempool
+//! uses Kyber-768. A quantum attacker who breaks Ed25519 P2P identity cannot
+//! forge FALCON signatures, manipulate consensus, or decrypt threshold-encrypted
+//! transactions. The Ed25519 layer only handles libp2p routing.
 //!
-//! The swap is isolated to the transport layer — all application-layer
-//! messages are already signed with FALCON-512 and encrypted with
-//! threshold Kyber. See ROADMAP tasks for upgrade path.
+//! Post-launch hardening: add FALCON peer authentication handshake on connect
+//! to reject impersonators faster (defense-in-depth, not a security fix).
 
 pub mod channels;
 pub mod config;

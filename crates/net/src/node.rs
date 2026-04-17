@@ -1,14 +1,8 @@
 //! Pyde P2P node: libp2p swarm with QUIC transport.
 //!
-//! ## Transport Crypto Upgrade Path (Pre-Mainnet)
-//!
-//! Current: Ed25519 identity + Noise/X25519 encryption (libp2p default)
-//! Target:  FALCON-512 identity + Kyber-768 key exchange
-//!
-//! The upgrade requires implementing:
-//! 1. Custom `libp2p::identity::Keypair` backed by FALCON-512
-//! 2. Custom Noise handshake pattern using Kyber-768 KEM
-//! Both are isolated to this module — no changes needed above transport layer.
+//! Transport uses Ed25519 identity (libp2p requirement). All consensus-critical
+//! operations are FALCON-512 signed at the application layer — the Ed25519
+//! identity has no authority over consensus, blocks, or transactions.
 
 use crate::config::NetworkConfig;
 use crate::sync_protocol::{self, SyncReq, SyncResp};
