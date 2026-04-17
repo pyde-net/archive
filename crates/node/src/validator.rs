@@ -307,6 +307,25 @@ impl ValidatorEngine {
                 return;
             }
         }
+
+        // Restore equivocation evidence index. Missing or corrupt entries are
+        // skipped by the store loader; we take whatever comes back.
+        let proposals = store.load_all_seen_proposals();
+        let votes = store.load_all_seen_votes();
+        if !proposals.is_empty() || !votes.is_empty() {
+            info!(
+                proposals = proposals.len(),
+                votes = votes.len(),
+                "restoring equivocation evidence from disk"
+            );
+        }
+        for (key, value) in proposals {
+            self.seen_proposals.insert(key, value);
+        }
+        for (key, value) in votes {
+            self.seen_votes.insert(key, value);
+        }
+
         self.consensus_store = Some(store);
     }
 
@@ -631,6 +650,13 @@ impl ValidatorEngine {
                 }
             }
         } else {
+            // Persist BEFORE the in-memory insert so a crash between the two
+            // leaves the in-memory state recoverable from disk.
+            if let Some(store) = &self.consensus_store {
+                if let Err(e) = store.save_seen_proposal(slot, &header.proposer, header, proposer_signature) {
+                    error!(error = %e, "failed to persist seen proposal");
+                }
+            }
             self.seen_proposals.insert(proposal_key, (header.clone(), proposer_signature.to_vec()));
         }
 
@@ -823,6 +849,11 @@ impl ValidatorEngine {
                 // can be implemented when the slashing transaction type is added.
             }
         } else {
+            if let Some(store) = &self.consensus_store {
+                if let Err(e) = store.save_seen_vote(slot, voter_index as u8, &block_hash, &vote_sig) {
+                    error!(error = %e, "failed to persist seen vote");
+                }
+            }
             self.seen_votes.insert(vote_key, (block_hash, vote_sig));
         }
 
@@ -940,6 +971,13 @@ impl ValidatorEngine {
             self.voted_slots.retain(|s| *s >= prune_before);
             self.seen_proposals.retain(|(s, _), _| *s >= prune_before);
             self.seen_votes.retain(|(s, _), _| *s >= prune_before);
+            // Mirror the same pruning on disk so the evidence index does not
+            // grow unbounded. Best-effort: a failure here just delays cleanup.
+            if let Some(store) = &self.consensus_store {
+                if let Err(e) = store.prune_evidence_before(prune_before) {
+                    warn!(error = %e, "failed to prune evidence on disk");
+                }
+            }
         }
 
         debug!(slot = new_slot, "advanced to next slot");
@@ -1272,6 +1310,116 @@ mod tests {
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
         engine.attach_consensus_store(store);
         assert_eq!(engine.consensus.current_slot, 7);
+    }
+
+    // ========== Equivocation evidence crash-restart tests ==========
+
+    fn evidence_header(slot: u64, state_root: [u8; 32]) -> BlockHeader {
+        BlockHeader {
+            slot,
+            epoch: slot / 1000,
+            parent_hash: [0x11; 32],
+            proposer: [0xAA; 32],
+            vrf_proof: vec![0xCC; 100],
+            qc_previous: QuorumCert::empty(),
+            tx_root: [0x22; 32],
+            state_root,
+            timestamp: slot * 400,
+        }
+    }
+
+    #[test]
+    fn seen_proposals_restored_on_attach() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let proposer: Address = [0xAB; 32];
+        let header = evidence_header(5, [0x33; 32]);
+        let sig = vec![0xEE; 600];
+
+        // Write evidence via an isolated store (simulating pre-crash state).
+        {
+            let store = ConsensusStateStore::open(dir.path()).unwrap();
+            store.save_seen_proposal(5, &proposer, &header, &sig).unwrap();
+        }
+
+        // Fresh engine attaches the same store and must restore the index.
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+        engine.attach_consensus_store(store);
+
+        let entry = engine
+            .seen_proposals
+            .get(&(5u64, proposer))
+            .expect("proposal must be reloaded");
+        assert_eq!(entry.0.slot, 5);
+        assert_eq!(entry.0.state_root, [0x33; 32]);
+        assert_eq!(entry.1, sig);
+    }
+
+    #[test]
+    fn seen_votes_restored_on_attach() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let block_hash = [0x99; 32];
+        let sig = vec![0xFF; 600];
+
+        {
+            let store = ConsensusStateStore::open(dir.path()).unwrap();
+            store.save_seen_vote(12, 4, &block_hash, &sig).unwrap();
+        }
+
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+        engine.attach_consensus_store(store);
+
+        let entry = engine
+            .seen_votes
+            .get(&(12u64, 4u8))
+            .expect("vote must be reloaded");
+        assert_eq!(entry.0, block_hash);
+        assert_eq!(entry.1, sig);
+    }
+
+    #[test]
+    fn advance_slot_prunes_evidence_on_disk() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+
+        // Seed 15 slots of evidence via the store directly.
+        {
+            let store = ConsensusStateStore::open(dir.path()).unwrap();
+            for slot in 1..=15u64 {
+                store
+                    .save_seen_proposal(slot, &[0xAA; 32], &evidence_header(slot, [0x33; 32]), &vec![0x11; 10])
+                    .unwrap();
+                store.save_seen_vote(slot, 0, &[0x99; 32], &vec![0x22; 10]).unwrap();
+            }
+        }
+
+        // Attach, jump forward to slot 15, advancing triggers prune.
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+        engine.attach_consensus_store(Arc::clone(&store));
+        // Sanity: reload pulled them all in.
+        assert_eq!(engine.seen_proposals.len(), 15);
+        assert_eq!(engine.seen_votes.len(), 15);
+
+        // Jump to slot 15 (prune removes slot < new_slot - 10 = 5).
+        engine.consensus.current_slot = 14;
+        engine.advance_slot(); // new_slot = 15, prune_before = 5
+
+        // Memory pruned in lockstep.
+        assert!(engine.seen_proposals.iter().all(|((s, _), _)| *s >= 5));
+        assert!(engine.seen_votes.iter().all(|((s, _), _)| *s >= 5));
+
+        // Disk pruned too.
+        let on_disk_props = store.load_all_seen_proposals();
+        let on_disk_votes = store.load_all_seen_votes();
+        assert!(on_disk_props.iter().all(|((s, _), _)| *s >= 5));
+        assert!(on_disk_votes.iter().all(|((s, _), _)| *s >= 5));
     }
 
     #[test]
