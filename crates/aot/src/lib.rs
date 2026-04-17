@@ -174,21 +174,21 @@ mod tests {
     #[test]
     fn aot_gas_metering_basic() {
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 42),        // 1 gas
-            instr_bytes(Opcode::Halt, 0, 0, 0),      // 1 gas
+            instr_ri(Opcode::Addi, 1, 0, 42),        // 3 gas
+            instr_bytes(Opcode::Halt, 0, 0, 0),      // 3 gas
         ]);
         let (status, gas_used, _) = run_aot(&code, 1_000_000);
         assert_eq!(status, RESULT_SUCCESS);
-        assert_eq!(gas_used, 2);
+        assert_eq!(gas_used, 6);
     }
 
     #[test]
     fn aot_out_of_gas() {
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 42),        // 1 gas
-            instr_bytes(Opcode::Halt, 0, 0, 0),      // 1 gas — total 2
+            instr_ri(Opcode::Addi, 1, 0, 42),        // 3 gas
+            instr_bytes(Opcode::Halt, 0, 0, 0),      // 3 gas — total 6
         ]);
-        let (status, _, _) = run_aot(&code, 1); // only 1 gas available
+        let (status, _, _) = run_aot(&code, 1); // only 1 gas available (needs 6)
         assert_eq!(status, RESULT_OUT_OF_GAS);
     }
 

@@ -242,7 +242,7 @@ mod tests {
 
         let program = analyze(&code).unwrap();
         let total: u64 = program.blocks.iter().map(|b| b.gas_cost).sum();
-        assert_eq!(total, 1 + 1 + 1);
+        assert_eq!(total, 3 + 3 + 3); // Addi(3) + Addi(3) + Halt(3)
     }
 
     #[test]

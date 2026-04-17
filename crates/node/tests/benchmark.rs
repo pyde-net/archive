@@ -242,7 +242,7 @@ fn benchmark_realistic_block() {
     use rayon::prelude::*;
     use pyde_state::smt::{StateAccess, StateOverlay};
 
-    let dir = std::env::temp_dir().join("pyde-bench-realistic");
+    let dir = std::env::temp_dir().join(format!("pyde-bench-realistic-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut persistent = PersistentSMT::open(
         dir.join("state").to_str().unwrap()
@@ -359,9 +359,18 @@ fn benchmark_realistic_block() {
             }
         "#);
 
-        // Deploy one contract
+        // Deploy one contract — read current nonce from state
         let (deployer, _) = accounts[0];
-        let dtx = make_deploy(deployer, counter_deploy.clone(), 10);
+        let deploy_nonce = {
+            let nk = pyde_state::keys::nonce_key(&deployer);
+            persistent.get(&nk)
+                .map(|d| {
+                    let ns = pyde_account::nonce::NonceState::from_bytes(&d);
+                    ns.base + ns.used.trailing_ones() as u64
+                })
+                .unwrap_or(0)
+        };
+        let dtx = make_deploy(deployer, counter_deploy.clone(), deploy_nonce);
         let receipt = execute_transaction(&dtx, &mut persistent, &ctx).unwrap();
         let contract = {
             let mut a = [0u8; 32];

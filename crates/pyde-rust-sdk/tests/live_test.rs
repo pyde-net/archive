@@ -3,10 +3,21 @@
 //! Covers all 17 groups from LIVE_TEST_PLAN.md.
 //! Requires: pyde node running at localhost:8545 with --dev
 //! Run: cargo test -p pyde-rust-sdk --test live_test -- --nocapture --test-threads=1
+//!
+//! Skipped during `cargo test --workspace` unless PYDE_LIVE_TEST=1 is set.
 
 use pyde_rust_sdk::*;
 use pyde_tx::types::{FeePayer, TransactionType};
 use std::path::Path;
+
+/// Skip live tests unless PYDE_LIVE_TEST=1.
+/// These require a running node, fresh state, and --test-threads=1.
+fn require_live() {
+    if std::env::var("PYDE_LIVE_TEST").unwrap_or_default() != "1" {
+        eprintln!("  [SKIP] Set PYDE_LIVE_TEST=1 to run live tests");
+        std::process::exit(0);
+    }
+}
 
 const COUNTER: &str = "/tmp/pyde-ts-sdk-test/counter.json";
 const COUNTER_ARGS: &str = "/tmp/pyde-ts-sdk-test/counter_args.json";
@@ -27,6 +38,7 @@ fn provider() -> Provider { Provider::new("http://127.0.0.1:8545") }
 // ============================================================================
 #[tokio::test]
 async fn g01_provider_basics() {
+    require_live();
     let p = provider();
     assert_eq!(p.get_chain_id().await.unwrap(), 31337);
     assert!(p.get_block_number().await.unwrap() > 0);
