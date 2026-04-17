@@ -5,6 +5,7 @@ mod block_store;
 mod chain;
 mod cli;
 mod config;
+mod consensus_store;
 mod faucet;
 mod fast_tx;
 mod logging;

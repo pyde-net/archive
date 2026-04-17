@@ -3544,6 +3544,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sparse-merkle-tree",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "toml",
