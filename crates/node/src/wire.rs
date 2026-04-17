@@ -9,6 +9,7 @@
 use pyde_account::address::Address;
 use pyde_consensus::block::{Block, BlockBody, BlockHeader, QuorumCert};
 use pyde_consensus::hotstuff::ConsensusMessage;
+use pyde_consensus::slashing::DoubleSignEvidence;
 use pyde_tx::parallel::ExecutionSchedule;
 use pyde_tx::types::{AccessEntry, FeePayer, Transaction, TransactionType};
 
@@ -698,6 +699,51 @@ pub fn decode_consensus_state(data: &[u8]) -> Result<pyde_consensus::hotstuff::C
     })
 }
 
+// ============================================================
+// DoubleSignEvidence (payload for TransactionType::Slash)
+// ============================================================
+
+/// Schema version tag for the Slash-tx payload. Bumping this is a
+/// protocol change: old nodes would reject new evidence and vice versa.
+const EVIDENCE_VERSION: u8 = 1;
+
+pub fn encode_double_sign_evidence(evidence: &DoubleSignEvidence) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(EVIDENCE_VERSION);
+    enc.u64(evidence.slot);
+    enc.var_bytes(&encode_block_header(&evidence.block_1));
+    enc.var_bytes(&evidence.signature_1);
+    enc.var_bytes(&encode_block_header(&evidence.block_2));
+    enc.var_bytes(&evidence.signature_2);
+    enc.bytes32(&evidence.signer);
+    enc.bytes32(&evidence.submitter);
+    enc.finish()
+}
+
+pub fn decode_double_sign_evidence(data: &[u8]) -> Result<DoubleSignEvidence, &'static str> {
+    let mut dec = Decoder::new(data);
+    let version = dec.u8()?;
+    if version != EVIDENCE_VERSION {
+        return Err("unsupported double-sign evidence version");
+    }
+    let slot = dec.u64()?;
+    let block_1 = decode_block_header(&dec.var_bytes()?)?;
+    let signature_1 = dec.var_bytes()?;
+    let block_2 = decode_block_header(&dec.var_bytes()?)?;
+    let signature_2 = dec.var_bytes()?;
+    let signer = dec.bytes32()?;
+    let submitter = dec.bytes32()?;
+    Ok(DoubleSignEvidence {
+        slot,
+        block_1,
+        signature_1,
+        block_2,
+        signature_2,
+        signer,
+        submitter,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,5 +1052,59 @@ mod tests {
     fn consensus_state_truncated_fails() {
         assert!(decode_consensus_state(&[]).is_err());
         assert!(decode_consensus_state(&[1]).is_err());
+    }
+
+    // ========== DoubleSignEvidence roundtrip ==========
+
+    fn dummy_evidence(slot: u64) -> DoubleSignEvidence {
+        // tx_root is part of BlockHeader::hash; state_root is deliberately
+        // not. So distinct tx_roots make these two blocks hash-distinct,
+        // which is the minimum requirement for valid equivocation evidence.
+        DoubleSignEvidence {
+            slot,
+            block_1: dummy_header(slot),
+            signature_1: vec![0xAA; 600],
+            block_2: BlockHeader {
+                tx_root: [0xEE; 32],
+                ..dummy_header(slot)
+            },
+            signature_2: vec![0xBB; 600],
+            signer: [0x11; 32],
+            submitter: [0x22; 32],
+        }
+    }
+
+    #[test]
+    fn double_sign_evidence_roundtrip() {
+        let evidence = dummy_evidence(42);
+        let bytes = encode_double_sign_evidence(&evidence);
+        let restored = decode_double_sign_evidence(&bytes).unwrap();
+
+        assert_eq!(restored.slot, 42);
+        assert_eq!(restored.block_1.slot, 42);
+        assert_eq!(restored.block_1.tx_root, [0x22; 32]);
+        assert_eq!(restored.block_2.tx_root, [0xEE; 32]);
+        assert_eq!(restored.signature_1, vec![0xAA; 600]);
+        assert_eq!(restored.signature_2, vec![0xBB; 600]);
+        assert_eq!(restored.signer, [0x11; 32]);
+        assert_eq!(restored.submitter, [0x22; 32]);
+        // Sanity: the two blocks must have distinct hashes or this isn't evidence.
+        assert_ne!(restored.block_1.hash(), restored.block_2.hash());
+    }
+
+    #[test]
+    fn double_sign_evidence_wrong_version_fails() {
+        let mut bytes = encode_double_sign_evidence(&dummy_evidence(1));
+        bytes[0] = 0xFF;
+        assert!(decode_double_sign_evidence(&bytes).is_err());
+    }
+
+    #[test]
+    fn double_sign_evidence_truncated_fails() {
+        assert!(decode_double_sign_evidence(&[]).is_err());
+        assert!(decode_double_sign_evidence(&[EVIDENCE_VERSION]).is_err());
+        // Truncate mid-encoding
+        let bytes = encode_double_sign_evidence(&dummy_evidence(5));
+        assert!(decode_double_sign_evidence(&bytes[..bytes.len() - 10]).is_err());
     }
 }

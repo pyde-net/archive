@@ -17,7 +17,7 @@ use pyde_crypto::threshold::{
     RefreshContribution, generate_refresh_contribution, apply_refresh, verify_refresh_contribution,
 };
 use pyde_consensus::slashing::{
-    DoubleSignEvidence, SlashResult, slash_double_sign, verify_double_sign,
+    DoubleSignEvidence, slash_double_sign, verify_double_sign,
 };
 use pyde_consensus::validator::VALIDATOR_STAKE;
 use pyde_consensus::view_change::{
@@ -237,8 +237,13 @@ pub struct ValidatorEngine {
     /// Seen votes per slot: (slot, voter_index) → (block_hash, signature).
     /// Used to detect double-voting (equivocation).
     seen_votes: HashMap<(u64, u8), ([u8; 32], Vec<u8>)>,
-    /// Collected slashing evidence to broadcast.
-    pub pending_slashes: Vec<SlashResult>,
+    /// Collected double-sign evidence awaiting inclusion in a Slash tx.
+    /// Drained by `drain_pending_evidence` when the block builder wants
+    /// to construct slashing transactions. We hold the raw evidence here
+    /// rather than the computed SlashResult because the slashing handler
+    /// on the receiving node will re-verify signatures from state —
+    /// SlashResult is just a local convenience.
+    pub pending_evidence: Vec<DoubleSignEvidence>,
     /// Epoch randomness collector (gathers VRF shares at epoch boundary).
     randomness_collector: Option<RandomnessCollector>,
     /// PSS refresh contributions collected at epoch boundary.
@@ -270,7 +275,7 @@ impl ValidatorEngine {
             voted_slots: std::collections::HashSet::new(),
             seen_proposals: HashMap::new(),
             seen_votes: HashMap::new(),
-            pending_slashes: Vec::new(),
+            pending_evidence: Vec::new(),
             randomness_collector: None,
             pss_contributions: Vec::new(),
             pss_target_epoch: 0,
@@ -637,16 +642,21 @@ impl ValidatorEngine {
                     block_2: header.clone(),
                     signature_2: proposer_signature.to_vec(),
                     signer: header.proposer,
-                    submitter: [0u8; 32], // self — filled by caller
+                    // submitter is filled in by whoever actually broadcasts
+                    // the Slash tx — typically the next block proposer.
+                    submitter: [0u8; 32],
                 };
-                if let Some(result) = slash_double_sign(&evidence, &self.committee_keys[proposer_idx]) {
+                // Cross-check both signatures verify against the accused
+                // proposer's committee key. slash_double_sign returns None
+                // if either sig is invalid; in that case we drop the
+                // evidence rather than queue garbage.
+                if slash_double_sign(&evidence, &self.committee_keys[proposer_idx]).is_some() {
                     info!(
                         slot,
-                        offender = hex::encode(result.offender),
-                        burned = result.amount_burned,
-                        "slash evidence created for double-propose"
+                        offender = hex::encode(evidence.signer),
+                        "double-propose evidence queued for slashing"
                     );
-                    self.pending_slashes.push(result);
+                    self.pending_evidence.push(evidence);
                 }
             }
         } else {
@@ -950,6 +960,25 @@ impl ValidatorEngine {
                 self.finality.record_hard_finality(cert);
             }
         }
+    }
+
+    /// Take ownership of all queued double-sign evidence, clearing the
+    /// internal queue. Called by the block builder when constructing a
+    /// proposal so each piece of evidence can be wrapped into a
+    /// `TransactionType::Slash` and submitted on-chain.
+    ///
+    /// If the caller fails to produce the block (e.g. view change), they
+    /// are responsible for re-queueing the evidence via `push_evidence`
+    /// — otherwise it is lost along with the unbuilt proposal.
+    pub fn drain_pending_evidence(&mut self) -> Vec<DoubleSignEvidence> {
+        std::mem::take(&mut self.pending_evidence)
+    }
+
+    /// Re-queue previously drained evidence, e.g. after a failed block
+    /// build. No-op if `evidence` is empty. Preserves insertion order by
+    /// appending at the tail.
+    pub fn push_evidence(&mut self, evidence: Vec<DoubleSignEvidence>) {
+        self.pending_evidence.extend(evidence);
     }
 
     /// Advance to the next slot. Returns the new slot number.
@@ -1420,6 +1449,69 @@ mod tests {
         let on_disk_votes = store.load_all_seen_votes();
         assert!(on_disk_props.iter().all(|((s, _), _)| *s >= 5));
         assert!(on_disk_votes.iter().all(|((s, _), _)| *s >= 5));
+    }
+
+    // ========== Pending evidence drain/push ==========
+
+    fn evidence_fixture(slot: u64, signer: Address) -> DoubleSignEvidence {
+        DoubleSignEvidence {
+            slot,
+            block_1: evidence_header(slot, [0x01; 32]),
+            signature_1: vec![0xAA; 600],
+            block_2: BlockHeader {
+                tx_root: [0x02; 32],
+                ..evidence_header(slot, [0x01; 32])
+            },
+            signature_2: vec![0xBB; 600],
+            signer,
+            submitter: [0u8; 32],
+        }
+    }
+
+    #[test]
+    fn drain_pending_evidence_empties_queue() {
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        engine.pending_evidence.push(evidence_fixture(1, [0xAB; 32]));
+        engine.pending_evidence.push(evidence_fixture(2, [0xCD; 32]));
+
+        let drained = engine.drain_pending_evidence();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].slot, 1);
+        assert_eq!(drained[1].slot, 2);
+        assert!(engine.pending_evidence.is_empty());
+
+        // Second drain returns empty — ownership was already transferred.
+        assert!(engine.drain_pending_evidence().is_empty());
+    }
+
+    #[test]
+    fn push_evidence_restores_queue() {
+        // Simulates the failed-block-build recovery path: drain, fail to
+        // build, push back, drain again.
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        engine.pending_evidence.push(evidence_fixture(7, [0x99; 32]));
+
+        let drained = engine.drain_pending_evidence();
+        assert_eq!(drained.len(), 1);
+        assert!(engine.pending_evidence.is_empty());
+
+        engine.push_evidence(drained);
+        assert_eq!(engine.pending_evidence.len(), 1);
+        assert_eq!(engine.pending_evidence[0].slot, 7);
+    }
+
+    #[test]
+    fn push_evidence_appends_preserving_order() {
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        engine.pending_evidence.push(evidence_fixture(1, [0x01; 32]));
+
+        engine.push_evidence(vec![
+            evidence_fixture(2, [0x02; 32]),
+            evidence_fixture(3, [0x03; 32]),
+        ]);
+
+        let slots: Vec<u64> = engine.pending_evidence.iter().map(|e| e.slot).collect();
+        assert_eq!(slots, vec![1, 2, 3]);
     }
 
     #[test]
