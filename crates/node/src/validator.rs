@@ -335,16 +335,27 @@ impl ValidatorEngine {
     }
 
     /// Persist consensus state to disk. No-op when no store is attached.
+    ///
     /// Safety-critical: must be called after any mutation of
     /// `last_voted_slot`, `highest_qc`, or `current_slot`.
+    ///
+    /// **Panics on persist failure.** Continuing after a failed write would
+    /// silently degrade the validator to in-memory-only mode: the next
+    /// crash or restart would reload stale state from disk, potentially
+    /// regressing `last_voted_slot` and allowing a double-vote — a BFT
+    /// safety violation. We'd rather abort the process loudly and let
+    /// the operator restart from a clean (last known-good) disk state
+    /// after resolving the underlying I/O issue. In release builds the
+    /// workspace uses `panic = "abort"`, so this unwinds to an immediate
+    /// SIGABRT; in tests it surfaces as a test failure.
     fn persist_consensus(&self) {
         if let Some(store) = &self.consensus_store {
             if let Err(e) = store.save(&self.consensus) {
-                // A failed write is serious — next crash could regress safety.
-                // We log and continue; a follow-up write will likely succeed.
-                // Hardening: promote to fatal once we have a shutdown path that
-                // drains inflight messages before exit.
-                error!(error = %e, "failed to persist consensus state");
+                error!(
+                    error = %e,
+                    "FATAL: failed to persist consensus state — halting validator to preserve BFT safety"
+                );
+                panic!("consensus state persist failed: {}", e);
             }
         }
     }
@@ -665,9 +676,19 @@ impl ValidatorEngine {
         } else {
             // Persist BEFORE the in-memory insert so a crash between the two
             // leaves the in-memory state recoverable from disk.
+            //
+            // Panics on persist failure: losing the seen-proposal index
+            // silently disables equivocation detection for this slot,
+            // and a validator that cannot detect its own double-proposes
+            // is worse than one that halts visibly.
             if let Some(store) = &self.consensus_store {
                 if let Err(e) = store.save_seen_proposal(slot, &header.proposer, header, proposer_signature) {
-                    error!(error = %e, "failed to persist seen proposal");
+                    error!(
+                        error = %e,
+                        slot,
+                        "FATAL: failed to persist seen proposal — halting validator"
+                    );
+                    panic!("seen-proposal persist failed: {}", e);
                 }
             }
             self.seen_proposals.insert(proposal_key, (header.clone(), proposer_signature.to_vec()));
@@ -864,9 +885,17 @@ impl ValidatorEngine {
                 // can be implemented when the slashing transaction type is added.
             }
         } else {
+            // Persist BEFORE the in-memory insert. Panics on failure for
+            // the same reason as the seen-proposal site above.
             if let Some(store) = &self.consensus_store {
                 if let Err(e) = store.save_seen_vote(slot, voter_index as u8, &block_hash, &vote_sig) {
-                    error!(error = %e, "failed to persist seen vote");
+                    error!(
+                        error = %e,
+                        slot,
+                        voter_index,
+                        "FATAL: failed to persist seen vote — halting validator"
+                    );
+                    panic!("seen-vote persist failed: {}", e);
                 }
             }
             self.seen_votes.insert(vote_key, (block_hash, vote_sig));

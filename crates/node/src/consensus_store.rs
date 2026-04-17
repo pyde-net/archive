@@ -18,7 +18,7 @@ use crate::wire;
 use pyde_account::address::Address;
 use pyde_consensus::block::BlockHeader;
 use pyde_consensus::hotstuff::ConsensusState;
-use rocksdb::{DB, IteratorMode, Options, WriteBatch};
+use rocksdb::{DB, IteratorMode, Options, WriteBatch, WriteOptions};
 use std::path::Path;
 use tracing::{debug, info, warn};
 
@@ -37,8 +37,15 @@ pub type SeenVote = ((u64, u8), ([u8; 32], Vec<u8>));
 /// There is exactly one persisted state per node, so the store is
 /// effectively a single-key KV. RocksDB gives us atomic writes,
 /// crash recovery, and fsync guarantees at the filesystem layer.
+///
+/// All mutating writes go through `sync_opts` (`set_sync(true)`), which
+/// forces an fsync before the `put` returns. Without this, a vote
+/// "committed" to the WAL page cache could be lost in a power-loss
+/// window — the entire crash-safety guarantee of the store depends on
+/// the data actually being on disk when we return Ok.
 pub struct ConsensusStateStore {
     db: DB,
+    sync_opts: WriteOptions,
 }
 
 impl ConsensusStateStore {
@@ -49,15 +56,18 @@ impl ConsensusStateStore {
         opts.create_if_missing(true);
         let db = DB::open(&opts, &db_path)
             .map_err(|e| format!("failed to open consensus state store: {}", e))?;
-        info!(path = %db_path.display(), "consensus state store opened");
-        Ok(Self { db })
+        let mut sync_opts = WriteOptions::default();
+        sync_opts.set_sync(true);
+        info!(path = %db_path.display(), "consensus state store opened (fsync on every write)");
+        Ok(Self { db, sync_opts })
     }
 
     /// Persist the current consensus state. Overwrites any prior value.
+    /// Blocks until the write is fsync'd to disk.
     pub fn save(&self, state: &ConsensusState) -> Result<(), String> {
         let bytes = wire::encode_consensus_state(state);
         self.db
-            .put(STATE_KEY, &bytes)
+            .put_opt(STATE_KEY, &bytes, &self.sync_opts)
             .map_err(|e| format!("failed to save consensus state: {}", e))?;
         debug!(
             slot = state.current_slot,
@@ -95,6 +105,7 @@ impl ConsensusStateStore {
     // ============================================================
 
     /// Persist a seen proposal entry. Idempotent on repeat writes.
+    /// fsync'd before return (see struct docstring).
     pub fn save_seen_proposal(
         &self,
         slot: u64,
@@ -105,11 +116,12 @@ impl ConsensusStateStore {
         let key = encode_proposal_key(slot, proposer);
         let value = encode_seen_proposal(header, signature);
         self.db
-            .put(&key, &value)
+            .put_opt(&key, &value, &self.sync_opts)
             .map_err(|e| format!("failed to save seen proposal: {}", e))
     }
 
     /// Persist a seen vote entry. Idempotent on repeat writes.
+    /// fsync'd before return (see struct docstring).
     pub fn save_seen_vote(
         &self,
         slot: u64,
@@ -120,7 +132,7 @@ impl ConsensusStateStore {
         let key = encode_vote_key(slot, voter_index);
         let value = encode_seen_vote(block_hash, signature);
         self.db
-            .put(&key, &value)
+            .put_opt(&key, &value, &self.sync_opts)
             .map_err(|e| format!("failed to save seen vote: {}", e))
     }
 
@@ -212,8 +224,13 @@ impl ConsensusStateStore {
         }
 
         if count > 0 {
+            // Prune writes also fsync. Loss of a prune doesn't violate
+            // safety (stale disk entries are benign — in-memory state is
+            // source of truth for active slots), but fsync-consistent
+            // pruning keeps the disk size predictable and simplifies
+            // reasoning about what the next cold-start will reload.
             self.db
-                .write(batch)
+                .write_opt(batch, &self.sync_opts)
                 .map_err(|e| format!("failed to prune evidence: {}", e))?;
             debug!(pruned = count, prune_before, "evidence pruned");
         }
