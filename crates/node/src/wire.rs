@@ -447,13 +447,7 @@ pub fn encode_transaction(tx: &Transaction) -> Vec<u8> {
     if let Some(d) = tx.deadline { enc.u64(d); }
     enc.u64(tx.chain_id);
     // tx_type
-    enc.u8(match tx.tx_type {
-        TransactionType::Standard => 0,
-        TransactionType::Deploy => 1,
-        TransactionType::Batch => 2,
-        TransactionType::StakeDeposit => 3,
-        TransactionType::StakeWithdraw => 4,
-    });
+    enc.u8(tx.tx_type as u8);
     enc.finish()
 }
 
@@ -477,12 +471,7 @@ pub fn decode_transaction(data: &[u8]) -> Result<Transaction, &'static str> {
     for _ in 0..access_count { access_list.push(decode_access_entry(&mut dec)?); }
     let deadline = if dec.u8()? == 1 { Some(dec.u64()?) } else { None };
     let chain_id = dec.u64()?;
-    let tx_type = match dec.u8()? {
-        0 => TransactionType::Standard,
-        1 => TransactionType::Deploy,
-        2 => TransactionType::Batch,
-        _ => return Err("invalid tx_type tag"),
-    };
+    let tx_type = TransactionType::from_u8(dec.u8()?).ok_or("invalid tx_type tag")?;
     Ok(Transaction {
         from, to, value, data: data_field, gas_limit, nonce, signature,
         fee_payer, access_list, deadline, chain_id, tx_type,
@@ -800,6 +789,27 @@ mod tests {
         assert_eq!(restored.deadline, Some(1000));
         assert_eq!(restored.chain_id, 1);
         assert!(matches!(restored.tx_type, TransactionType::Batch));
+    }
+
+    #[test]
+    fn tx_type_roundtrip_all_variants() {
+        // The prior decode hand-coded only Standard/Deploy/Batch and rejected
+        // StakeDeposit/StakeWithdraw; this guards against that class of regression.
+        let variants = [
+            TransactionType::Standard,
+            TransactionType::Deploy,
+            TransactionType::Batch,
+            TransactionType::StakeDeposit,
+            TransactionType::StakeWithdraw,
+            TransactionType::Slash,
+        ];
+        for ty in variants {
+            let mut tx = dummy_tx();
+            tx.tx_type = ty;
+            let bytes = encode_transaction(&tx);
+            let restored = decode_transaction(&bytes).unwrap();
+            assert_eq!(restored.tx_type, ty, "tx_type roundtrip failed for {:?}", ty);
+        }
     }
 
     // ========== Block roundtrip ==========
