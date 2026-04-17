@@ -4,7 +4,7 @@ use pyde_consensus::block::{
 };
 use pyde_consensus::finality::{FinalityTracker, FinalityVote, create_finality_vote, try_form_hard_finality};
 use pyde_consensus::hotstuff::{
-    ConsensusMessage, ConsensusState, create_vote, try_form_qc, verify_vote,
+    ConsensusMessage, ConsensusState, create_vote, proposer_sign_message, try_form_qc, verify_vote,
 };
 use pyde_consensus::proposer::{compute_candidacy, ProposerCandidate};
 use pyde_crypto::vrf::VrfProof;
@@ -589,14 +589,17 @@ impl ValidatorEngine {
             None => { warn!(slot, "invalid committee public key"); return false; }
         };
 
-        // Verify proposer signature on block header
+        // Verify proposer signature on block header.
+        // Proposers sign `slot || block_hash` (same canonical layout as
+        // votes) so a sig at slot N cannot be replayed for a block at slot M.
         if !proposer_signature.is_empty() {
             let block_hash = header.hash();
             let sig = match pyde_crypto::falcon::FalconSignature::from_bytes(proposer_signature) {
                 Some(s) => s,
                 None => { warn!(slot, "invalid proposer signature format"); return false; }
             };
-            if !pyde_crypto::falcon::falcon_verify(&pk, &block_hash, &sig) {
+            let sign_msg = proposer_sign_message(slot, &block_hash);
+            if !pyde_crypto::falcon::falcon_verify(&pk, &sign_msg, &sig) {
                 warn!(slot, "proposer signature verification failed");
                 return false;
             }
@@ -637,9 +640,9 @@ impl ValidatorEngine {
                 );
                 let evidence = DoubleSignEvidence {
                     slot,
-                    block_1: prev_header.clone(),
+                    block_hash_1: prev_header.hash(),
                     signature_1: prev_sig.clone(),
-                    block_2: header.clone(),
+                    block_hash_2: header.hash(),
                     signature_2: proposer_signature.to_vec(),
                     signer: header.proposer,
                     // submitter is filled in by whoever actually broadcasts
@@ -754,11 +757,13 @@ impl ValidatorEngine {
             timestamp: current_time_ms(),
         };
 
-        // Sign the block header hash with the proposer's FALCON key
+        // Sign the canonical (slot || block_hash) message with the
+        // proposer's FALCON key. See proposer_sign_message for the format.
         let block_hash = header.hash();
+        let sign_msg = proposer_sign_message(header.slot, &block_hash);
         let proposer_signature = match pyde_crypto::falcon::falcon_sign(
             &identity.secret_key,
-            &block_hash,
+            &sign_msg,
         ) {
             Ok(sig) => sig.to_vec(),
             Err(_) => {
@@ -1456,12 +1461,9 @@ mod tests {
     fn evidence_fixture(slot: u64, signer: Address) -> DoubleSignEvidence {
         DoubleSignEvidence {
             slot,
-            block_1: evidence_header(slot, [0x01; 32]),
+            block_hash_1: [0x01; 32],
             signature_1: vec![0xAA; 600],
-            block_2: BlockHeader {
-                tx_root: [0x02; 32],
-                ..evidence_header(slot, [0x01; 32])
-            },
+            block_hash_2: [0x02; 32],
             signature_2: vec![0xBB; 600],
             signer,
             submitter: [0u8; 32],

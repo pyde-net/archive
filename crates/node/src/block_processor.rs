@@ -1,6 +1,7 @@
 use crate::chain::ChainState;
 use crate::state_manager::StateManager;
 use pyde_consensus::block::{Block, BlockHeader};
+use pyde_consensus::hotstuff::proposer_sign_message;
 use pyde_tx::execution::Receipt;
 use pyde_tx::fee::adjust_base_fee;
 use pyde_tx::pipeline::{execute_transaction, BlockContext};
@@ -327,7 +328,10 @@ impl BlockProcessor {
         let block_hash = header.hash();
         let sig = pyde_crypto::falcon::FalconSignature::from_bytes(proposer_signature)
             .ok_or("invalid proposer signature format")?;
-        if !pyde_crypto::falcon::falcon_verify(&pk, &block_hash, &sig) {
+        // Proposers sign `slot || block_hash` (canonical layout shared
+        // with votes) to prevent cross-slot signature replay.
+        let sign_msg = proposer_sign_message(slot, &block_hash);
+        if !pyde_crypto::falcon::falcon_verify(&pk, &sign_msg, &sig) {
             return Err("proposer signature verification failed".into());
         }
 

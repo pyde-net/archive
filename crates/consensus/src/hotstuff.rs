@@ -13,6 +13,22 @@ use pyde_account::address::Address;
 use pyde_crypto::falcon::{falcon_verify, FalconPublicKey, FalconSignature};
 use pyde_crypto::poseidon2::poseidon2_hash;
 
+/// Canonical message bytes that both proposers and voters sign for a
+/// block at a given slot: `slot_le || block_hash`.
+///
+/// The slot prefix binds the signature to a specific slot, preventing
+/// cross-slot replay of the same block hash. Both proposer signatures
+/// (on block headers) and vote signatures (on `Vote` messages) use this
+/// exact layout so slashing evidence can be verified with a single
+/// routine regardless of signature origin.
+#[inline]
+pub fn proposer_sign_message(slot: u64, block_hash: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(8 + 32);
+    msg.extend_from_slice(&slot.to_le_bytes());
+    msg.extend_from_slice(block_hash);
+    msg
+}
+
 /// Consensus message types exchanged between validators.
 #[derive(Clone, Debug)]
 pub enum ConsensusMessage {
@@ -122,12 +138,10 @@ pub fn create_vote(
         state.highest_qc = header.qc_previous.clone();
     }
 
-    // Sign (slot || block_hash) to bind the vote to a specific slot,
-    // preventing replay of a vote from one slot to another.
+    // Sign (slot || block_hash) via the canonical proposer/vote message
+    // layout, binding the vote to a specific slot.
     let block_hash = header.hash();
-    let mut vote_msg = Vec::with_capacity(40);
-    vote_msg.extend_from_slice(&header.slot.to_le_bytes());
-    vote_msg.extend_from_slice(&block_hash);
+    let vote_msg = proposer_sign_message(header.slot, &block_hash);
     let sig = pyde_crypto::falcon::falcon_sign(voter_sk, &vote_msg)
         .map_err(|_| "vote signing failed")?;
 
@@ -156,9 +170,7 @@ pub fn verify_vote(vote: &ConsensusMessage, public_key: &[u8]) -> bool {
                 Some(pk) => pk,
                 None => return false,
             };
-            let mut vote_msg = Vec::with_capacity(40);
-            vote_msg.extend_from_slice(&slot.to_le_bytes());
-            vote_msg.extend_from_slice(block_hash);
+            let vote_msg = proposer_sign_message(*slot, block_hash);
             let sig = match FalconSignature::from_bytes(signature) {
                 Some(s) => s,
                 None => return false,

@@ -62,21 +62,29 @@ pub struct SlashResult {
 }
 
 /// Double-signing evidence: two different blocks signed for the same slot.
+///
+/// Carries block *hashes* rather than full `BlockHeader`s because both
+/// the proposer signature and vote signature formats bind (slot || hash)
+/// directly — verifying the evidence requires nothing more than the
+/// hashes, the two FALCON signatures, and the signer's public key. This
+/// keeps the on-chain payload (`TransactionType::Slash` data field)
+/// small and lets the tx pipeline verify the evidence without depending
+/// on `BlockHeader` internals.
 #[derive(Clone, Debug)]
 pub struct DoubleSignEvidence {
     /// The slot where double-signing occurred.
     pub slot: u64,
-    /// First block header.
-    pub block_1: BlockHeader,
-    /// FALCON signature over block_1.hash().
+    /// Hash of the first block the signer signed for this slot.
+    pub block_hash_1: [u8; 32],
+    /// FALCON signature over `proposer_sign_message(slot, block_hash_1)`.
     pub signature_1: Vec<u8>,
-    /// Second block header (must have different hash from block_1).
-    pub block_2: BlockHeader,
-    /// FALCON signature over block_2.hash().
+    /// Hash of the second block — must differ from `block_hash_1`.
+    pub block_hash_2: [u8; 32],
+    /// FALCON signature over `proposer_sign_message(slot, block_hash_2)`.
     pub signature_2: Vec<u8>,
-    /// Address of the signer.
+    /// Address of the signer being accused.
     pub signer: Address,
-    /// Address of the evidence submitter (receives finder's fee).
+    /// Address of the evidence submitter (receives the finder's fee).
     pub submitter: Address,
 }
 
@@ -105,29 +113,22 @@ impl LivenessReport {
 /// Verify double-sign evidence.
 ///
 /// Checks:
-/// 1. Both blocks are for the same slot
-/// 2. Block hashes are different
-/// 3. Both signatures are valid for the signer's public key
+/// 1. The two block hashes are different (otherwise it's not equivocation).
+/// 2. Both signatures verify over `(slot || block_hash)` against the
+///    accused signer's public key.
+///
+/// The slot binding lives inside the signed message, so a sig for slot
+/// N cannot be replayed as evidence of equivocation at slot M.
 pub fn verify_double_sign(evidence: &DoubleSignEvidence, public_key: &[u8]) -> bool {
-    // Same slot
-    if evidence.block_1.slot != evidence.slot || evidence.block_2.slot != evidence.slot {
+    // Two distinct blocks (empty-or-equal hashes = not evidence).
+    if evidence.block_hash_1 == evidence.block_hash_2 {
         return false;
     }
 
-    let hash_1 = evidence.block_1.hash();
-    let hash_2 = evidence.block_2.hash();
-
-    // Different blocks
-    if hash_1 == hash_2 {
-        return false;
-    }
-
-    // Verify both signatures
     let pk = match FalconPublicKey::from_bytes(public_key) {
         Some(pk) => pk,
         None => return false,
     };
-
     let sig_1 = match FalconSignature::from_bytes(&evidence.signature_1) {
         Some(s) => s,
         None => return false,
@@ -137,7 +138,9 @@ pub fn verify_double_sign(evidence: &DoubleSignEvidence, public_key: &[u8]) -> b
         None => return false,
     };
 
-    falcon_verify(&pk, &hash_1, &sig_1) && falcon_verify(&pk, &hash_2, &sig_2)
+    let msg_1 = crate::hotstuff::proposer_sign_message(evidence.slot, &evidence.block_hash_1);
+    let msg_2 = crate::hotstuff::proposer_sign_message(evidence.slot, &evidence.block_hash_2);
+    falcon_verify(&pk, &msg_1, &sig_1) && falcon_verify(&pk, &msg_2, &sig_2)
 }
 
 // ========== Slash Computation ==========
@@ -279,6 +282,17 @@ mod tests {
         }
     }
 
+    /// Helper: produce a proposer signature over the canonical
+    /// `(slot || block_hash)` message layout the production code uses.
+    fn sign_proposer(
+        sk: &pyde_crypto::falcon::FalconSecretKey,
+        slot: u64,
+        block_hash: &[u8; 32],
+    ) -> Vec<u8> {
+        let msg = crate::hotstuff::proposer_sign_message(slot, block_hash);
+        falcon_sign(sk, &msg).unwrap().as_bytes().to_vec()
+    }
+
     // ========== Task 0512: Double-sign slashes validator ==========
 
     #[test]
@@ -287,18 +301,15 @@ mod tests {
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
-        let header_1 = make_header(100, 1_000_000);
-        let header_2 = make_header(100, 2_000_000); // same slot, different timestamp → different hash
-
-        let sig_1 = falcon_sign(&sk, &header_1.hash()).unwrap();
-        let sig_2 = falcon_sign(&sk, &header_2.hash()).unwrap();
+        let hash_1 = make_header(100, 1_000_000).hash();
+        let hash_2 = make_header(100, 2_000_000).hash(); // different timestamp → different hash
 
         let evidence = DoubleSignEvidence {
             slot: 100,
-            block_1: header_1,
-            signature_1: sig_1.as_bytes().to_vec(),
-            block_2: header_2,
-            signature_2: sig_2.as_bytes().to_vec(),
+            block_hash_1: hash_1,
+            signature_1: sign_proposer(&sk, 100, &hash_1),
+            block_hash_2: hash_2,
+            signature_2: sign_proposer(&sk, 100, &hash_2),
             signer: addr,
             submitter: derive_eoa_address(b"submitter"),
         };
@@ -323,15 +334,15 @@ mod tests {
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
-        let header = make_header(100, 1_000_000);
-        let sig = falcon_sign(&sk, &header.hash()).unwrap();
+        let hash = make_header(100, 1_000_000).hash();
+        let sig = sign_proposer(&sk, 100, &hash);
 
         let evidence = DoubleSignEvidence {
             slot: 100,
-            block_1: header.clone(),
-            signature_1: sig.as_bytes().to_vec(),
-            block_2: header, // same block!
-            signature_2: sig.as_bytes().to_vec(),
+            block_hash_1: hash,
+            signature_1: sig.clone(),
+            block_hash_2: hash, // same hash!
+            signature_2: sig,
             signer: addr,
             submitter: derive_eoa_address(b"submitter"),
         };
@@ -346,18 +357,15 @@ mod tests {
         let (pk2, _sk2) = falcon_keygen().unwrap();
         let addr = derive_eoa_address(pk1.as_bytes());
 
-        let header_1 = make_header(100, 1_000_000);
-        let header_2 = make_header(100, 2_000_000);
-
-        let sig_1 = falcon_sign(&sk1, &header_1.hash()).unwrap();
-        let sig_2 = falcon_sign(&sk1, &header_2.hash()).unwrap();
+        let hash_1 = make_header(100, 1_000_000).hash();
+        let hash_2 = make_header(100, 2_000_000).hash();
 
         let evidence = DoubleSignEvidence {
             slot: 100,
-            block_1: header_1,
-            signature_1: sig_1.as_bytes().to_vec(),
-            block_2: header_2,
-            signature_2: sig_2.as_bytes().to_vec(),
+            block_hash_1: hash_1,
+            signature_1: sign_proposer(&sk1, 100, &hash_1),
+            block_hash_2: hash_2,
+            signature_2: sign_proposer(&sk1, 100, &hash_2),
             signer: addr,
             submitter: derive_eoa_address(b"submitter"),
         };
@@ -368,22 +376,23 @@ mod tests {
 
     #[test]
     fn wrong_slot_rejected() {
+        // Signatures are bound to (slot || hash). If the signer attested
+        // to slot 101 but the evidence claims slot 100, the FALCON
+        // verify at slot 100 fails — no cross-slot replay possible.
         let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
-        let header_1 = make_header(100, 1_000_000);
-        let header_2 = make_header(101, 2_000_000); // different slot!
-
-        let sig_1 = falcon_sign(&sk, &header_1.hash()).unwrap();
-        let sig_2 = falcon_sign(&sk, &header_2.hash()).unwrap();
+        let hash_1 = make_header(100, 1_000_000).hash();
+        let hash_2 = make_header(100, 2_000_000).hash();
 
         let evidence = DoubleSignEvidence {
             slot: 100,
-            block_1: header_1,
-            signature_1: sig_1.as_bytes().to_vec(),
-            block_2: header_2,
-            signature_2: sig_2.as_bytes().to_vec(),
+            block_hash_1: hash_1,
+            // Signed at the wrong slot (101) — verify at slot 100 rejects.
+            signature_1: sign_proposer(&sk, 101, &hash_1),
+            block_hash_2: hash_2,
+            signature_2: sign_proposer(&sk, 100, &hash_2),
             signer: addr,
             submitter: derive_eoa_address(b"submitter"),
         };
@@ -458,18 +467,15 @@ mod tests {
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
-        let header_1 = make_header(100, 1_000_000);
-        let header_2 = make_header(100, 2_000_000);
-
-        let sig_1 = falcon_sign(&sk, &header_1.hash()).unwrap();
-        let sig_2 = falcon_sign(&sk, &header_2.hash()).unwrap();
+        let hash_1 = make_header(100, 1_000_000).hash();
+        let hash_2 = make_header(100, 2_000_000).hash();
 
         let evidence = DoubleSignEvidence {
             slot: 100,
-            block_1: header_1,
-            signature_1: sig_1.as_bytes().to_vec(),
-            block_2: header_2,
-            signature_2: sig_2.as_bytes().to_vec(),
+            block_hash_1: hash_1,
+            signature_1: sign_proposer(&sk, 100, &hash_1),
+            block_hash_2: hash_2,
+            signature_2: sign_proposer(&sk, 100, &hash_2),
             signer: addr,
             submitter: derive_eoa_address(b"finder"),
         };
@@ -491,17 +497,15 @@ mod tests {
         set.register(addr, pk_bytes.clone(), VALIDATOR_STAKE, 0).unwrap();
         assert_eq!(set.validators[0].stake, VALIDATOR_STAKE);
 
-        let header_1 = make_header(100, 1_000_000);
-        let header_2 = make_header(100, 2_000_000);
-        let sig_1 = falcon_sign(&sk, &header_1.hash()).unwrap();
-        let sig_2 = falcon_sign(&sk, &header_2.hash()).unwrap();
+        let hash_1 = make_header(100, 1_000_000).hash();
+        let hash_2 = make_header(100, 2_000_000).hash();
 
         let evidence = DoubleSignEvidence {
             slot: 100,
-            block_1: header_1,
-            signature_1: sig_1.as_bytes().to_vec(),
-            block_2: header_2,
-            signature_2: sig_2.as_bytes().to_vec(),
+            block_hash_1: hash_1,
+            signature_1: sign_proposer(&sk, 100, &hash_1),
+            block_hash_2: hash_2,
+            signature_2: sign_proposer(&sk, 100, &hash_2),
             signer: addr,
             submitter: derive_eoa_address(b"finder"),
         };

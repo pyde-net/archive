@@ -705,15 +705,29 @@ pub fn decode_consensus_state(data: &[u8]) -> Result<pyde_consensus::hotstuff::C
 
 /// Schema version tag for the Slash-tx payload. Bumping this is a
 /// protocol change: old nodes would reject new evidence and vice versa.
-const EVIDENCE_VERSION: u8 = 1;
+pub(crate) const EVIDENCE_VERSION: u8 = 1;
 
+/// Layout:
+///   u8 version = 1
+///   u64 slot
+///   [u8; 32] block_hash_1
+///   var_bytes signature_1
+///   [u8; 32] block_hash_2
+///   var_bytes signature_2
+///   [u8; 32] signer
+///   [u8; 32] submitter
+///
+/// Carrying just the hashes (not full `BlockHeader`s) is enough because
+/// each signature is verified over `proposer_sign_message(slot, hash)`
+/// — the slot binding lives inside the signed message, not the wire
+/// format, so a third-party verifier needs nothing besides the hashes.
 pub fn encode_double_sign_evidence(evidence: &DoubleSignEvidence) -> Vec<u8> {
     let mut enc = Encoder::new();
     enc.u8(EVIDENCE_VERSION);
     enc.u64(evidence.slot);
-    enc.var_bytes(&encode_block_header(&evidence.block_1));
+    enc.bytes32(&evidence.block_hash_1);
     enc.var_bytes(&evidence.signature_1);
-    enc.var_bytes(&encode_block_header(&evidence.block_2));
+    enc.bytes32(&evidence.block_hash_2);
     enc.var_bytes(&evidence.signature_2);
     enc.bytes32(&evidence.signer);
     enc.bytes32(&evidence.submitter);
@@ -727,17 +741,17 @@ pub fn decode_double_sign_evidence(data: &[u8]) -> Result<DoubleSignEvidence, &'
         return Err("unsupported double-sign evidence version");
     }
     let slot = dec.u64()?;
-    let block_1 = decode_block_header(&dec.var_bytes()?)?;
+    let block_hash_1 = dec.bytes32()?;
     let signature_1 = dec.var_bytes()?;
-    let block_2 = decode_block_header(&dec.var_bytes()?)?;
+    let block_hash_2 = dec.bytes32()?;
     let signature_2 = dec.var_bytes()?;
     let signer = dec.bytes32()?;
     let submitter = dec.bytes32()?;
     Ok(DoubleSignEvidence {
         slot,
-        block_1,
+        block_hash_1,
         signature_1,
-        block_2,
+        block_hash_2,
         signature_2,
         signer,
         submitter,
@@ -1057,17 +1071,11 @@ mod tests {
     // ========== DoubleSignEvidence roundtrip ==========
 
     fn dummy_evidence(slot: u64) -> DoubleSignEvidence {
-        // tx_root is part of BlockHeader::hash; state_root is deliberately
-        // not. So distinct tx_roots make these two blocks hash-distinct,
-        // which is the minimum requirement for valid equivocation evidence.
         DoubleSignEvidence {
             slot,
-            block_1: dummy_header(slot),
+            block_hash_1: [0x01; 32],
             signature_1: vec![0xAA; 600],
-            block_2: BlockHeader {
-                tx_root: [0xEE; 32],
-                ..dummy_header(slot)
-            },
+            block_hash_2: [0x02; 32],
             signature_2: vec![0xBB; 600],
             signer: [0x11; 32],
             submitter: [0x22; 32],
@@ -1081,15 +1089,14 @@ mod tests {
         let restored = decode_double_sign_evidence(&bytes).unwrap();
 
         assert_eq!(restored.slot, 42);
-        assert_eq!(restored.block_1.slot, 42);
-        assert_eq!(restored.block_1.tx_root, [0x22; 32]);
-        assert_eq!(restored.block_2.tx_root, [0xEE; 32]);
+        assert_eq!(restored.block_hash_1, [0x01; 32]);
+        assert_eq!(restored.block_hash_2, [0x02; 32]);
         assert_eq!(restored.signature_1, vec![0xAA; 600]);
         assert_eq!(restored.signature_2, vec![0xBB; 600]);
         assert_eq!(restored.signer, [0x11; 32]);
         assert_eq!(restored.submitter, [0x22; 32]);
-        // Sanity: the two blocks must have distinct hashes or this isn't evidence.
-        assert_ne!(restored.block_1.hash(), restored.block_2.hash());
+        // Sanity: distinct hashes or it isn't evidence of equivocation.
+        assert_ne!(restored.block_hash_1, restored.block_hash_2);
     }
 
     #[test]
