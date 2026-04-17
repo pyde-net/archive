@@ -34,6 +34,7 @@ fn get_result_string(resp: &serde_json::Value) -> String {
 }
 
 #[test]
+#[ignore = "requires live node — run with --ignored and PYDE_PRODUCTION_RPC set"]
 fn production_signed_transfer() {
     let rpc = match std::env::var("PYDE_PRODUCTION_RPC") {
         Ok(url) => url,
@@ -171,6 +172,7 @@ fn production_signed_transfer() {
 }
 
 #[test]
+#[ignore = "requires live node — run with --ignored and PYDE_PRODUCTION_RPC set"]
 fn production_signed_deploy_and_call() {
     let rpc = match std::env::var("PYDE_PRODUCTION_RPC") {
         Ok(url) => url,

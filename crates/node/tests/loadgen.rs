@@ -39,6 +39,7 @@ fn get_str(resp: &serde_json::Value) -> String {
 }
 
 #[test]
+#[ignore = "load generator — requires running node, run with --ignored"]
 fn load_test_full_pipeline() {
     let accounts_path = match std::env::var("PYDE_ACCOUNTS_JSON") {
         Ok(p) => p,

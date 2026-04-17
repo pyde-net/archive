@@ -45,6 +45,7 @@ fn block_ctx(chain_id: u64) -> BlockContext {
 }
 
 #[test]
+#[ignore = "benchmark — run with --ignored"]
 fn bench_preloaded_mempool() {
     let dir = std::env::temp_dir().join("pyde-bench-mempool");
     let _ = std::fs::remove_dir_all(&dir);

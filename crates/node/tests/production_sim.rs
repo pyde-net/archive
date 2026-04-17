@@ -327,6 +327,7 @@ const TIMELOCK: &str = r#"
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "heavy multi-slot simulation — run with --ignored"]
 fn production_simulation() {
     let total_start = Instant::now();
 
