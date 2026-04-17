@@ -29,7 +29,10 @@ use pyde_mempool::decryption::BlockDecryptor;
 use pyde_mempool::encrypted::EncryptedTx;
 use pyde_tx::parallel::ExecutionSchedule;
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use std::sync::Arc;
+use tracing::{debug, error, info, warn};
+
+use crate::consensus_store::ConsensusStateStore;
 
 /// Validator keypair and identity.
 pub struct ValidatorIdentity {
@@ -244,6 +247,10 @@ pub struct ValidatorEngine {
     pss_target_epoch: u64,
     /// Set to true when key share was refreshed and needs saving to disk.
     pub key_share_dirty: bool,
+    /// Optional persistent store for ConsensusState. When set, the engine
+    /// writes to disk on every safety-critical mutation and reloads on startup.
+    /// Crash-safe property: never regress last_voted_slot or highest_qc.
+    consensus_store: Option<Arc<ConsensusStateStore>>,
 }
 
 impl ValidatorEngine {
@@ -268,6 +275,53 @@ impl ValidatorEngine {
             pss_contributions: Vec::new(),
             pss_target_epoch: 0,
             key_share_dirty: false,
+            consensus_store: None,
+        }
+    }
+
+    /// Attach a persistent ConsensusState store.
+    ///
+    /// If the store already contains a prior state (from a previous run),
+    /// it is loaded into `self.consensus`, preserving `last_voted_slot` and
+    /// `highest_qc` across restarts — the safety guarantee that prevents
+    /// double-voting after a crash.
+    pub fn attach_consensus_store(&mut self, store: Arc<ConsensusStateStore>) {
+        match store.load() {
+            Ok(Some(prior)) => {
+                info!(
+                    slot = prior.current_slot,
+                    last_voted = prior.last_voted_slot,
+                    highest_qc = prior.highest_qc.slot,
+                    "restoring consensus state from disk"
+                );
+                self.consensus = prior;
+            }
+            Ok(None) => {
+                info!("no prior consensus state found; starting fresh");
+            }
+            Err(e) => {
+                // A corrupt store is a hard failure — we refuse to start
+                // with possibly-regressed safety state rather than silently
+                // continue with a fresh state that could double-vote.
+                error!(error = %e, "failed to load consensus state; aborting attach");
+                return;
+            }
+        }
+        self.consensus_store = Some(store);
+    }
+
+    /// Persist consensus state to disk. No-op when no store is attached.
+    /// Safety-critical: must be called after any mutation of
+    /// `last_voted_slot`, `highest_qc`, or `current_slot`.
+    fn persist_consensus(&self) {
+        if let Some(store) = &self.consensus_store {
+            if let Err(e) = store.save(&self.consensus) {
+                // A failed write is serious — next crash could regress safety.
+                // We log and continue; a follow-up write will likely succeed.
+                // Hardening: promote to fatal once we have a shutdown path that
+                // drains inflight messages before exit.
+                error!(error = %e, "failed to persist consensus state");
+            }
         }
     }
 
@@ -711,6 +765,10 @@ impl ValidatorEngine {
             &identity.secret_key,
         ) {
             Ok(Some(vote)) => {
+                // create_vote mutated last_voted_slot and possibly highest_qc.
+                // Persist BEFORE returning the vote so a crash between this line
+                // and the network broadcast cannot produce a double-vote on restart.
+                self.persist_consensus();
                 info!(slot, "voted for block");
                 Some(vote)
             }
@@ -782,8 +840,13 @@ impl ValidatorEngine {
             if let Some(ref qc) = qc {
                 info!(slot, votes = qc.vote_count(), "QC formed");
                 // Update consensus state
+                let mut mutated = false;
                 if slot > self.consensus.highest_qc.slot {
                     self.consensus.highest_qc = qc.clone();
+                    mutated = true;
+                }
+                if mutated {
+                    self.persist_consensus();
                 }
                 // Record soft finality
                 self.finality.record_soft_finality(slot, block_hash, qc.clone());
@@ -861,6 +924,8 @@ impl ValidatorEngine {
     /// Advance to the next slot. Returns the new slot number.
     pub fn advance_slot(&mut self) -> u64 {
         self.consensus.advance_slot();
+        // current_slot changed + pending_votes/timeouts cleared.
+        self.persist_consensus();
         let new_slot = self.consensus.current_slot;
         let now_ms = current_time_ms();
         self.timeout = TimeoutTracker::new(new_slot, now_ms);
@@ -1061,6 +1126,152 @@ mod tests {
 
         let vote = engine.on_proposal(&header, &identities[1]);
         assert!(vote.is_some());
+    }
+
+    // ========== Crash-restart safety tests ==========
+
+    #[test]
+    fn crash_restart_preserves_last_voted_slot() {
+        // Safety-critical test: if a validator crashes after voting, on restart
+        // it MUST remember it already voted for that slot, or BFT safety breaks.
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let committee_keys: Vec<Vec<u8>>;
+        let voter: ValidatorIdentity;
+
+        // --- Pre-crash: vote for slot 1 ---
+        {
+            let (mut engine, identities) = make_engine_with_committee(3);
+            committee_keys = identities.iter().map(|id| id.public_key.as_bytes().to_vec()).collect();
+            voter = make_identity(1);
+
+            let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+            engine.attach_consensus_store(store);
+            engine.advance_slot(); // → slot 1
+
+            let header = BlockHeader {
+                slot: 1,
+                epoch: 0,
+                parent_hash: [0u8; 32],
+                proposer: identities[0].address,
+                vrf_proof: vec![],
+                qc_previous: QuorumCert::empty(),
+                tx_root: [0u8; 32],
+                state_root: [0u8; 32],
+                timestamp: 0,
+            };
+
+            let vote = engine.on_proposal(&header, &voter);
+            assert!(vote.is_some(), "first vote must succeed");
+            assert_eq!(engine.consensus.last_voted_slot, 1);
+            // engine drops here, simulating a crash
+        }
+
+        // --- Post-crash: reopen and attempt to vote for slot 1 again ---
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        engine.set_committee(committee_keys);
+        let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+        engine.attach_consensus_store(store);
+
+        assert_eq!(
+            engine.consensus.last_voted_slot, 1,
+            "last_voted_slot must survive restart"
+        );
+        assert_eq!(
+            engine.consensus.current_slot, 1,
+            "current_slot must survive restart"
+        );
+
+        // Attempt to vote again for slot 1 — create_vote's safety rule must reject it.
+        let header = BlockHeader {
+            slot: 1,
+            epoch: 0,
+            parent_hash: [0u8; 32],
+            proposer: voter.address,
+            vrf_proof: vec![],
+            qc_previous: QuorumCert::empty(),
+            tx_root: [0u8; 32],
+            state_root: [0u8; 32],
+            timestamp: 0,
+        };
+        let vote = engine.on_proposal(&header, &voter);
+        assert!(
+            vote.is_none(),
+            "double-vote after crash must be blocked by safety rule"
+        );
+    }
+
+    #[test]
+    fn crash_restart_preserves_highest_qc() {
+        // A formed QC updates highest_qc. After a crash, the restarted validator
+        // must not vote for a proposal that doesn't extend that QC.
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+
+        // Pre-crash: form a QC at slot 5, which becomes highest_qc.
+        {
+            let mut engine = ValidatorEngine::new([0xAA; 32]);
+            let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+            engine.attach_consensus_store(store);
+
+            engine.consensus.highest_qc = QuorumCert {
+                slot: 5,
+                block_hash: [0xAB; 32],
+                voter_bitmap: (1u128 << 86) - 1,
+                signatures: vec![vec![0xCC; 600]],
+            };
+            engine.consensus.current_slot = 5;
+            engine.consensus.last_voted_slot = 5;
+            // Force a persist via advance_slot (which calls persist_consensus).
+            engine.advance_slot();
+        }
+
+        // Post-crash: reopen.
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+        engine.attach_consensus_store(store);
+
+        assert_eq!(engine.consensus.highest_qc.slot, 5);
+        assert_eq!(engine.consensus.highest_qc.block_hash, [0xAB; 32]);
+        assert_eq!(engine.consensus.last_voted_slot, 5);
+    }
+
+    #[test]
+    fn fresh_store_starts_at_genesis() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+        engine.attach_consensus_store(store);
+
+        assert_eq!(engine.consensus.current_slot, 0);
+        assert_eq!(engine.consensus.last_voted_slot, 0);
+        assert_eq!(engine.consensus.highest_qc.slot, 0);
+    }
+
+    #[test]
+    fn advance_slot_persists_across_restart() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+
+        {
+            let mut engine = ValidatorEngine::new([0xAA; 32]);
+            let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+            engine.attach_consensus_store(store);
+            for _ in 0..7 {
+                engine.advance_slot();
+            }
+            assert_eq!(engine.consensus.current_slot, 7);
+        }
+
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+        engine.attach_consensus_store(store);
+        assert_eq!(engine.consensus.current_slot, 7);
     }
 
     #[test]

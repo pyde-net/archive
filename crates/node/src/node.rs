@@ -1,5 +1,6 @@
 use crate::block_processor::BlockProcessor;
 use crate::block_store::BlockStore;
+use crate::consensus_store::ConsensusStateStore;
 use crate::chain::ChainState;
 use crate::config::NodeConfig;
 use crate::receipt_store::ReceiptStore;
@@ -244,6 +245,17 @@ impl PydeNode {
             }
 
             let mut engine = ValidatorEngine::new([0xAA; 32]); // devnet epoch randomness
+
+            // Attach persistent ConsensusState store. If a prior state exists,
+            // it is loaded here — this is what prevents last_voted_slot or
+            // highest_qc from regressing after a validator crash/restart.
+            match ConsensusStateStore::open(datadir) {
+                Ok(store) => engine.attach_consensus_store(Arc::new(store)),
+                Err(e) => warn!(
+                    error = %e,
+                    "failed to open consensus state store; running without crash-safe vote persistence"
+                ),
+            }
 
             // Build committee from genesis validators (if any).
             // If genesis has validators, use them all as the committee.

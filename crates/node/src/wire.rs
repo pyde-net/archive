@@ -644,6 +644,71 @@ pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, &'stati
     }
 }
 
+// ============================================================
+// ConsensusState (for crash-safe persistence)
+// ============================================================
+
+const CONSENSUS_STATE_VERSION: u8 = 1;
+
+pub fn encode_consensus_state(state: &pyde_consensus::hotstuff::ConsensusState) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(CONSENSUS_STATE_VERSION);
+    enc.u64(state.current_slot);
+    enc.u64(state.current_epoch);
+    encode_qc(&mut enc, &state.highest_qc);
+    enc.u64(state.last_voted_slot);
+    enc.bytes32(&state.last_committed_hash);
+    enc.u64(state.last_committed_slot);
+    enc.u16(state.pending_votes.len() as u16);
+    for msg in &state.pending_votes {
+        enc.var_bytes(&encode_consensus_message(msg));
+    }
+    enc.u16(state.pending_timeouts.len() as u16);
+    for msg in &state.pending_timeouts {
+        enc.var_bytes(&encode_consensus_message(msg));
+    }
+    enc.finish()
+}
+
+pub fn decode_consensus_state(data: &[u8]) -> Result<pyde_consensus::hotstuff::ConsensusState, &'static str> {
+    let mut dec = Decoder::new(data);
+    let version = dec.u8()?;
+    if version != CONSENSUS_STATE_VERSION {
+        return Err("unsupported consensus state version");
+    }
+    let current_slot = dec.u64()?;
+    let current_epoch = dec.u64()?;
+    let highest_qc = decode_qc(&mut dec)?;
+    let last_voted_slot = dec.u64()?;
+    let last_committed_hash = dec.bytes32()?;
+    let last_committed_slot = dec.u64()?;
+
+    let votes_count = dec.u16()? as usize;
+    let mut pending_votes = Vec::with_capacity(votes_count);
+    for _ in 0..votes_count {
+        let msg_bytes = dec.var_bytes()?;
+        pending_votes.push(decode_consensus_message(&msg_bytes)?);
+    }
+
+    let timeouts_count = dec.u16()? as usize;
+    let mut pending_timeouts = Vec::with_capacity(timeouts_count);
+    for _ in 0..timeouts_count {
+        let msg_bytes = dec.var_bytes()?;
+        pending_timeouts.push(decode_consensus_message(&msg_bytes)?);
+    }
+
+    Ok(pyde_consensus::hotstuff::ConsensusState {
+        current_slot,
+        current_epoch,
+        highest_qc,
+        last_voted_slot,
+        last_committed_hash,
+        last_committed_slot,
+        pending_votes,
+        pending_timeouts,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -847,5 +912,89 @@ mod tests {
     fn decode_invalid_tag_fails() {
         assert!(decode_consensus_message(&[0xFF]).is_err());
         assert!(decode_block(&[0xFF, 0, 0, 0, 0]).is_err());
+    }
+
+    // ========== ConsensusState roundtrip ==========
+
+    #[test]
+    fn consensus_state_empty_roundtrip() {
+        let state = pyde_consensus::hotstuff::ConsensusState::new();
+        let bytes = encode_consensus_state(&state);
+        let restored = decode_consensus_state(&bytes).unwrap();
+
+        assert_eq!(restored.current_slot, 0);
+        assert_eq!(restored.current_epoch, 0);
+        assert_eq!(restored.last_voted_slot, 0);
+        assert_eq!(restored.last_committed_slot, 0);
+        assert_eq!(restored.last_committed_hash, [0u8; 32]);
+        assert_eq!(restored.highest_qc.slot, 0);
+        assert!(restored.pending_votes.is_empty());
+        assert!(restored.pending_timeouts.is_empty());
+    }
+
+    #[test]
+    fn consensus_state_populated_roundtrip() {
+        let state = pyde_consensus::hotstuff::ConsensusState {
+            current_slot: 42,
+            current_epoch: 3,
+            highest_qc: dummy_qc(41),
+            last_voted_slot: 42,
+            last_committed_hash: [0x77; 32],
+            last_committed_slot: 40,
+            pending_votes: vec![
+                ConsensusMessage::Vote {
+                    slot: 42,
+                    block_hash: [0xAA; 32],
+                    voter_index: 7,
+                    voter_address: ZERO_ADDRESS,
+                    signature: vec![0xBB; 600],
+                },
+                ConsensusMessage::Vote {
+                    slot: 42,
+                    block_hash: [0xAA; 32],
+                    voter_index: 9,
+                    voter_address: ZERO_ADDRESS,
+                    signature: vec![0xCC; 600],
+                },
+            ],
+            pending_timeouts: vec![ConsensusMessage::Timeout {
+                slot: 42,
+                voter_index: 3,
+                voter_address: ZERO_ADDRESS,
+                highest_qc: dummy_qc(40),
+                signature: vec![0xDD; 600],
+            }],
+        };
+
+        let bytes = encode_consensus_state(&state);
+        let restored = decode_consensus_state(&bytes).unwrap();
+
+        assert_eq!(restored.current_slot, 42);
+        assert_eq!(restored.current_epoch, 3);
+        assert_eq!(restored.highest_qc.slot, 41);
+        assert_eq!(restored.last_voted_slot, 42);
+        assert_eq!(restored.last_committed_hash, [0x77; 32]);
+        assert_eq!(restored.last_committed_slot, 40);
+        assert_eq!(restored.pending_votes.len(), 2);
+        assert_eq!(restored.pending_timeouts.len(), 1);
+
+        match &restored.pending_votes[1] {
+            ConsensusMessage::Vote { voter_index, .. } => assert_eq!(*voter_index, 9),
+            _ => panic!("expected Vote"),
+        }
+    }
+
+    #[test]
+    fn consensus_state_wrong_version_fails() {
+        // Build bytes with version 0xFF
+        let mut bytes = encode_consensus_state(&pyde_consensus::hotstuff::ConsensusState::new());
+        bytes[0] = 0xFF;
+        assert!(decode_consensus_state(&bytes).is_err());
+    }
+
+    #[test]
+    fn consensus_state_truncated_fails() {
+        assert!(decode_consensus_state(&[]).is_err());
+        assert!(decode_consensus_state(&[1]).is_err());
     }
 }

@@ -61,6 +61,7 @@ sparse-merkle-tree = "0.6"
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
 otic = { path = "../otic" }
+tempfile = "3"
 
 [[bench]]
 name = "rpc_bench"
