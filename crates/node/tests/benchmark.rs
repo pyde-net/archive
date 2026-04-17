@@ -110,6 +110,7 @@ fn run_benchmark(label: &str, txs: &[Transaction], smt: &mut pyde_state::smt::Py
 }
 
 #[test]
+#[ignore = "benchmark — run with --ignored"]
 fn benchmark_throughput() {
     let mut smt = pyde_state::smt::PydeSMT::new();
     let ctx = block_ctx();
@@ -237,6 +238,7 @@ fn benchmark_throughput() {
 }
 
 #[test]
+#[ignore = "benchmark — run with --ignored"]
 fn benchmark_realistic_block() {
     use pyde_state::smt::PersistentSMT;
     use rayon::prelude::*;
@@ -443,6 +445,7 @@ fn benchmark_realistic_block() {
 /// Production benchmark: AOT compiled parallel execution on PersistentSMT.
 /// Tests the actual hot path: schedule → parallel execute → batch commit.
 #[test]
+#[ignore = "benchmark — run with --ignored"]
 fn benchmark_production_block() {
     use pyde_state::smt::PersistentSMT;
     use pyde_state::smt::StateAccess;

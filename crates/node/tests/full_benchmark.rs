@@ -247,6 +247,7 @@ fn run_consensus(
 // ═══════════════════════════════════════════════════════════════════
 
 #[test]
+#[ignore = "benchmark — run with --ignored"]
 fn full_production_benchmark() {
     let bench_start = Instant::now();
 

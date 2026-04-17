@@ -54,6 +54,7 @@ fn sync_nonces(accounts: &mut [Acct], smt: &dyn StateAccess) {
 }
 
 #[test]
+#[ignore = "benchmark — run with --ignored"]
 fn validator_block_lifecycle() {
     let dir = std::env::temp_dir().join("pyde-lifecycle-real");
     let _ = std::fs::remove_dir_all(&dir);
