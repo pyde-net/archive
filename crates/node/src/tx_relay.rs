@@ -25,8 +25,10 @@ impl TxRelay {
         self.mempool.set_current_block(block);
     }
 
-    /// Attempt to add a transaction received from the network.
-    /// Returns true if accepted (new), false if rejected (duplicate, invalid, etc.).
+    /// Attempt to add a transaction received from the network using only
+    /// structural + rate-limit checks. Intended for devnet/tests.
+    /// Returns true if accepted (new), false if rejected (duplicate, invalid,
+    /// rate-limited, etc.).
     pub fn receive_tx(&mut self, tx: EncryptedTx) -> bool {
         match self.mempool.add(tx) {
             Ok(()) => {
@@ -35,6 +37,24 @@ impl TxRelay {
             }
             Err(e) => {
                 debug!(?e, "tx rejected");
+                false
+            }
+        }
+    }
+
+    /// Attempt to add a transaction using full FALCON signature verification
+    /// against the sender's known public key (task 028). Mainnet path:
+    /// callers must look up `sender_pubkey` from on-chain state before
+    /// invoking. If the sender isn't registered or the sig fails, rejected
+    /// with `UnknownOrUnverifiedSender`.
+    pub fn receive_tx_verified(&mut self, tx: EncryptedTx, sender_pubkey: &[u8]) -> bool {
+        match self.mempool.add_with_pubkey(tx, sender_pubkey) {
+            Ok(()) => {
+                debug!("tx accepted into mempool (verified)");
+                true
+            }
+            Err(e) => {
+                debug!(?e, "tx rejected (verified path)");
                 false
             }
         }
