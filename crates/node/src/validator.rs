@@ -2980,16 +2980,26 @@ mod tests {
             pyde_account::address::derive_eoa_address(submitter_pk.as_bytes());
 
         // Stand up an SMT with the offender registered as an Active
-        // validator (status 0x00) and the submitter funded.
+        // validator (status 0x00) and the submitter funded. Uses the
+        // unified ValidatorEntry encoder so the fixture tracks the
+        // live wire format.
         let mut smt = PydeSMT::new();
-        let pk_len = offender_pk.as_bytes().len() as u32;
-        let mut val_data = Vec::new();
-        val_data.extend_from_slice(&pk_len.to_le_bytes());
-        val_data.extend_from_slice(offender_pk.as_bytes());
-        val_data.extend_from_slice(&VALIDATOR_STAKE.to_le_bytes());
-        val_data.push(0x00); // Active
-        smt.insert(pyde_state::keys::validator_key(&offender_addr), val_data)
-            .unwrap();
+        let entry = pyde_tx::pipeline::ValidatorEntry {
+            pk: offender_pk.as_bytes().to_vec(),
+            stake: VALIDATOR_STAKE,
+            status: 0x00,
+            last_claimed_at: 0,
+            exit_block: None,
+        };
+        smt.insert(
+            pyde_state::keys::validator_key(&offender_addr),
+            entry.encode(),
+        )
+        .unwrap();
+        // Mirror the active-count bookkeeping the real StakeDeposit path
+        // would have done, so the slash decrement leaves the counter
+        // non-negative.
+        pyde_tx::pipeline::increment_active_validator_count(&mut smt);
 
         let mut submitter_account =
             pyde_account::types::Account::new_eoa(submitter_pk.as_bytes());
@@ -3076,16 +3086,9 @@ mod tests {
         let val_data = smt
             .get(&pyde_state::keys::validator_key(&offender_addr))
             .expect("validator entry still present");
-        // Layout: [pk_len:4 LE][pk][stake:16 LE][status:1].
-        let pk_len =
-            u32::from_le_bytes(val_data[0..4].try_into().unwrap()) as usize;
-        let stake_offset = 4 + pk_len;
-        let stake = u128::from_le_bytes(
-            val_data[stake_offset..stake_offset + 16].try_into().unwrap(),
-        );
-        let status = val_data[stake_offset + 16];
-        assert_eq!(stake, 0, "offender stake must be fully slashed");
-        assert_eq!(status, 0x02, "offender must be marked Ejected");
+        let entry = pyde_tx::pipeline::ValidatorEntry::decode(&val_data).unwrap();
+        assert_eq!(entry.stake, 0, "offender stake must be fully slashed");
+        assert_eq!(entry.status, 0x02, "offender must be marked Ejected");
 
         // Submitter: balance increased by finder's fee (10% of stake) minus gas.
         let raw = smt.get(&pyde_state::keys::balance_key(&submitter_addr)).unwrap();

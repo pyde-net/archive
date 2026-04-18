@@ -38,6 +38,11 @@ pub mod discriminator {
     /// identical `VALIDATOR_STAKE`, we can collapse the classic
     /// `rewards_per_stake_unit × stake` form into a per-validator counter.
     pub const REWARDS_PER_VALIDATOR: u8 = 0x14;
+    /// Active-only validator count for the pool-share divisor (slice 4.2).
+    /// Diverges from `VALIDATOR_COUNT` once any validator exits or is
+    /// slashed — `VALIDATOR_COUNT` is monotonic (enumerable history),
+    /// `ACTIVE_VALIDATOR_COUNT` is the number currently in status `Active`.
+    pub const ACTIVE_VALIDATOR_COUNT: u8 = 0x15;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +201,14 @@ pub fn total_burned_key() -> H256 {
 /// `last_claimed_at` in the validator entry. u128 LE.
 pub fn rewards_per_validator_key() -> H256 {
     H256::from(poseidon2_hash(&[discriminator::REWARDS_PER_VALIDATOR]).to_bytes())
+}
+
+/// Active-only validator count. Incremented on each StakeDeposit,
+/// decremented on exit transitions (Active→Unbonding, Active→Ejected).
+/// Used as the pool-share divisor so exited validators don't dilute
+/// the yield of still-active members. u64 LE.
+pub fn active_validator_count_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::ACTIVE_VALIDATOR_COUNT]).to_bytes())
 }
 
 #[cfg(test)]
