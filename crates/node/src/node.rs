@@ -229,6 +229,13 @@ impl PydeNode {
         let mut pending_auth_nonces: std::collections::HashMap<libp2p::PeerId, [u8; 32]> =
             std::collections::HashMap::new();
 
+        // Size of the committee that was in power at the last epoch boundary.
+        // Feeds the `old_threshold` passed to `on_reshare_contribution` after
+        // `engine.set_committee` has already advanced `engine.committee_keys`
+        // to the incoming set. Initialized to 0 (no prior committee); the
+        // first epoch boundary sets it.
+        let mut last_outgoing_committee_size: usize = 0;
+
         // 5. Validator engine + identity (only for validator role)
         let mut validator_identity: Option<ValidatorIdentity> = None;
         let mut validator_engine: Option<ValidatorEngine> = if is_validator {
@@ -504,6 +511,7 @@ impl PydeNode {
                             &mut pinned_snapshot,
                             &mut peer_manager,
                             &mut pending_auth_nonces,
+                            last_outgoing_committee_size,
                         )
                     };
 
@@ -823,6 +831,36 @@ impl PydeNode {
                                 engine.advance_slot();
                             }
 
+                            // Task 034: re-broadcast our resharing contribution
+                            // while we're inside the `RESHARE_REBROADCAST_SLOTS`
+                            // window. Gossipsub's own message cache covers only
+                            // a few heartbeats; this helps validators that come
+                            // online a few slots into the target epoch catch up
+                            // without needing a dedicated sync protocol.
+                            if let Some((target_epoch, bytes)) = engine.maybe_rebroadcast_reshare() {
+                                let msg = wire::encode_resharing(target_epoch, &bytes);
+                                let topic = pyde_net::node::topics::consensus();
+                                let _ = swarm.behaviour_mut().gossipsub.publish(topic, msg);
+                                debug!(target_epoch, "re-broadcast resharing contribution");
+                            }
+
+                            // Task 034: deterministic aggregation trigger. We
+                            // deliberately DON'T aggregate on first-threshold
+                            // arrival because async gossip can deliver a
+                            // different pool subset to different new members,
+                            // causing them to derive shares on divergent
+                            // polynomials. Instead, every new member waits
+                            // `RESHARE_AGGREGATION_DELAY_SLOTS` past the
+                            // epoch boundary and aggregates from whatever is
+                            // in the pool — by then gossipsub has converged.
+                            if let Some(identity) = validator_identity.as_mut() {
+                                engine.try_aggregate_reshare_on_slot(
+                                    current_slot,
+                                    last_outgoing_committee_size,
+                                    identity,
+                                );
+                            }
+
                             // Epoch boundary: rotate committee
                             let new_epoch = current_slot / pyde_consensus::block::EPOCH_LENGTH;
                             if new_epoch > prev_epoch && new_epoch > 0 {
@@ -849,21 +887,46 @@ impl PydeNode {
                                     Ok(committee) => {
                                         let new_keys: Vec<Vec<u8>> = committee.members.iter()
                                             .map(|v| v.public_key.clone()).collect();
-                                        // Find our own index in new committee
+
+                                        // Snapshot the OLD committee BEFORE any rotation — task
+                                        // 034 resharing needs to know who's outgoing to compute
+                                        // the old_threshold we accept contributions against.
+                                        let old_committee_keys = engine.committee_keys.clone();
+                                        let was_in_old_committee =
+                                            if let Some(identity) = validator_identity.as_ref() {
+                                                old_committee_keys
+                                                    .iter()
+                                                    .any(|k| k.as_slice() == identity.public_key.as_bytes())
+                                            } else { false };
+
+                                        // Find our own index in the new committee. Zero means
+                                        // we're leaving; non-zero means we'll aggregate
+                                        // incoming resharing contributions.
+                                        let mut our_new_index: usize = 0;
                                         if let Some(identity) = validator_identity.as_mut() {
                                             let my_pk = hex::encode(identity.public_key.as_bytes());
                                             for (i, member) in committee.members.iter().enumerate() {
                                                 if hex::encode(&member.public_key) == my_pk {
                                                     identity.committee_index = i as u8;
+                                                    our_new_index = i + 1; // 1-based for KeyShare
                                                     break;
                                                 }
                                             }
                                         }
-                                        engine.set_committee(new_keys);
+                                        engine.set_committee(new_keys.clone());
                                         info!(
                                             epoch = new_epoch,
                                             committee_size = committee.size(),
                                             "committee rotated at epoch boundary"
+                                        );
+
+                                        // Prepare to aggregate resharing contributions when we're
+                                        // on the incoming committee. Safe to call even with
+                                        // our_new_index = 0 — the engine will drop contributions.
+                                        engine.prepare_for_reshare_reception(
+                                            new_epoch,
+                                            new_keys.clone(),
+                                            our_new_index,
                                         );
 
                                         if let Some(identity) = validator_identity.as_ref() {
@@ -881,7 +944,30 @@ impl PydeNode {
                                                 let topic = pyde_net::node::topics::consensus();
                                                 let _ = swarm.behaviour_mut().gossipsub.publish(topic, contrib_bytes);
                                             }
+
+                                            // Task 034: if we were in the outgoing committee and
+                                            // actually hold a key share, broadcast a resharing
+                                            // contribution so the incoming committee can derive
+                                            // its shares of the invariant threshold secret.
+                                            // Same-committee-continuation also runs through this
+                                            // path so the bookkeeping stays uniform.
+                                            if was_in_old_committee && identity.key_share.is_some() {
+                                                if let Some(contrib) = engine.start_committee_reshare(
+                                                    new_epoch, &new_keys, identity,
+                                                ) {
+                                                    let contrib_bytes = wire::encode_resharing(
+                                                        new_epoch, &contrib.to_bytes(),
+                                                    );
+                                                    let topic = pyde_net::node::topics::consensus();
+                                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic, contrib_bytes);
+                                                }
+                                            }
                                         }
+
+                                        // Stash old committee size for inbound resharing
+                                        // handlers — ingestion needs old_threshold to decide
+                                        // when the canonical subset is reachable.
+                                        last_outgoing_committee_size = old_committee_keys.len();
                                     }
                                     Err(e) => {
                                         warn!(epoch = new_epoch, error = ?e, "committee selection failed, keeping current");
@@ -1463,6 +1549,7 @@ fn handle_swarm_event(
     pinned_snapshot: &mut Option<crate::sync::PinnedSnapshot>,
     peer_manager: &mut pyde_net::peer::PeerManager,
     pending_auth_nonces: &mut std::collections::HashMap<PeerId, [u8; 32]>,
+    last_outgoing_committee_size: usize,
 ) -> PostEventAction {
     match event {
         // --- Gossipsub message received ---
@@ -1700,6 +1787,47 @@ fn handle_swarm_event(
                                 }
                                 Err(e) => {
                                     debug!(error = e, "failed to decode PSS contribution");
+                                }
+                            }
+                            return PostEventAction::None;
+                        }
+
+                        // Check if it's a committee resharing contribution (task 034)
+                        if !message.data.is_empty() && message.data[0] == wire::tag::COMMITTEE_RESHARING {
+                            match wire::decode_resharing(&message.data) {
+                                Ok((target_epoch, contrib_bytes)) => {
+                                    // Drop stale contributions targeted at epochs other
+                                    // than the one we're currently receiving for.
+                                    if target_epoch != engine.reshare_target() {
+                                        debug!(
+                                            target_epoch,
+                                            active = engine.reshare_target(),
+                                            "ignoring stale resharing contribution"
+                                        );
+                                        return PostEventAction::None;
+                                    }
+                                    match pyde_crypto::threshold::ResharingContribution::from_bytes(&contrib_bytes) {
+                                        Some(contrib) => {
+                                            debug!(
+                                                target_epoch,
+                                                from_old_index = contrib.from_old_index,
+                                                "received resharing contribution"
+                                            );
+                                            if let Some(identity) = validator_identity.as_mut() {
+                                                engine.on_reshare_contribution(
+                                                    contrib,
+                                                    last_outgoing_committee_size,
+                                                    identity,
+                                                );
+                                            }
+                                        }
+                                        None => {
+                                            debug!("malformed resharing contribution bytes");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(error = e, "failed to decode resharing message");
                                 }
                             }
                             return PostEventAction::None;

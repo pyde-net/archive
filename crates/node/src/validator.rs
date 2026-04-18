@@ -14,7 +14,9 @@ use pyde_consensus::epoch_randomness::{
     combine_shares_dynamic,
 };
 use pyde_crypto::threshold::{
-    RefreshContribution, generate_refresh_contribution, apply_refresh, verify_refresh_contribution,
+    RefreshContribution, ResharingContribution, aggregate_new_share, apply_refresh,
+    canonical_resharing_subset, generate_refresh_contribution, generate_resharing_contribution,
+    verify_refresh_contribution, verify_resharing_contribution,
 };
 use pyde_consensus::slashing::{
     DoubleSignEvidence, slash_double_sign, verify_double_sign,
@@ -250,6 +252,45 @@ pub struct ValidatorEngine {
     pss_contributions: Vec<RefreshContribution>,
     /// Target epoch for PSS refresh.
     pss_target_epoch: u64,
+    /// Cross-committee resharing contributions collected at epoch boundary
+    /// (task 034). Keyed by target epoch so late contributions from
+    /// previous epochs are ignored.
+    reshare_contributions: Vec<ResharingContribution>,
+    /// Target epoch for active resharing (the epoch whose incoming committee
+    /// the contributions are addressed to).
+    reshare_target_epoch: u64,
+    /// Committee key pubkeys of the NEW committee for the active reshare.
+    /// Used to compute new_n, new_threshold, and our own 1-based index in
+    /// the incoming committee (0 if we're not a member).
+    reshare_new_committee: Vec<Vec<u8>>,
+    /// Our 1-based index in the incoming committee for the active reshare.
+    /// Zero when we're not on the new committee (no aggregation to perform).
+    reshare_new_index: usize,
+    /// Our own resharing contribution (if we're outgoing) stashed for
+    /// periodic re-broadcast. Gossipsub's message cache only retains a few
+    /// heartbeats, so a validator that comes online a few slots after the
+    /// epoch-boundary broadcast could miss contributions. Re-broadcasting
+    /// for the first `RESHARE_REBROADCAST_SLOTS` slots of the target epoch
+    /// lets stragglers catch up without a dedicated sync protocol.
+    /// Layout: `(target_epoch, contribution_bytes)`.
+    pending_reshare_rebroadcast: Option<(u64, Vec<u8>)>,
+    /// Slot at which `start_committee_reshare` published our contribution.
+    /// `maybe_rebroadcast_reshare` uses this + `current_slot` to decide
+    /// whether we're still inside the re-broadcast window.
+    reshare_broadcast_start_slot: u64,
+    /// Slot at which the next aggregation attempt should fire. Set by
+    /// `prepare_for_reshare_reception` to
+    /// `current_slot + RESHARE_AGGREGATION_DELAY_SLOTS`. The delay gives
+    /// gossipsub enough time to deliver every old member's contribution
+    /// to every new member, so all new members see the same pool and
+    /// derive identical canonical subsets. Aggregating eagerly on first
+    /// threshold — as we did before — is unsafe under async gossip,
+    /// because different new members can hit threshold with different
+    /// pool subsets and end up on different polynomials.
+    reshare_aggregation_trigger_slot: u64,
+    /// `true` once aggregation has fired for the current target epoch.
+    /// Prevents re-aggregating when additional late contributions arrive.
+    reshare_aggregated: bool,
     /// Set to true when key share was refreshed and needs saving to disk.
     pub key_share_dirty: bool,
     /// Optional persistent store for ConsensusState. When set, the engine
@@ -300,6 +341,14 @@ impl ValidatorEngine {
             randomness_collector: None,
             pss_contributions: Vec::new(),
             pss_target_epoch: 0,
+            reshare_contributions: Vec::new(),
+            reshare_target_epoch: 0,
+            reshare_new_committee: Vec::new(),
+            reshare_new_index: 0,
+            pending_reshare_rebroadcast: None,
+            reshare_broadcast_start_slot: 0,
+            reshare_aggregation_trigger_slot: 0,
+            reshare_aggregated: false,
             key_share_dirty: false,
             consensus_store: None,
         }
@@ -377,6 +426,28 @@ impl ValidatorEngine {
                 // duplicate gossip, but duplicates are caught by the
                 // on-chain slash handler (already-ejected rejection).
                 warn!(error = %e, "failed to load evidence state; starting empty");
+            }
+        }
+
+        // Reshare state restore (task 034 crash safety). Contribution pool
+        // is intentionally NOT persisted — it rebuilds from rebroadcasts
+        // during the window. All other fields ARE persisted so an in-
+        // progress rotation resumes cleanly: the same target epoch, the
+        // same new-committee index, the same aggregation trigger slot, and
+        // the same `aggregated` flag that prevents double-aggregation.
+        match store.load_reshare_state() {
+            Ok(Some(rs)) => {
+                info!(
+                    target_epoch = rs.target_epoch,
+                    new_index = rs.new_index,
+                    aggregated = rs.aggregated,
+                    "restoring reshare state from disk"
+                );
+                self.restore_reshare_state(rs);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to load reshare state; starting empty");
             }
         }
 
@@ -515,6 +586,310 @@ impl ValidatorEngine {
             }
         }
         false
+    }
+
+    // ==================================================================
+    // Task 034 — cross-committee resharing at epoch boundary
+    // ==================================================================
+    //
+    // Flow (see `pyde_crypto::threshold` for the math):
+    //
+    // * `start_committee_reshare` is called by any OLD committee member
+    //   (those leaving or staying) when the epoch boundary announces the
+    //   new committee. Returns a contribution addressed to every new
+    //   member. The node layer broadcasts it on the consensus channel.
+    //
+    // * `prepare_for_reshare_reception` is called by any NEW committee
+    //   member when they learn the incoming committee roster. Sets
+    //   `reshare_new_index` and clears the prior bucket so stale epochs
+    //   don't leak.
+    //
+    // * `on_reshare_contribution` accepts contributions from the old
+    //   committee and, once the OLD threshold is reached, Lagrange-
+    //   interpolates the new member's share using the canonical subset
+    //   rule. Returns `true` the first time a new share is derived.
+
+    /// How long (in slots) an outgoing member keeps re-broadcasting their
+    /// resharing contribution after the initial epoch-boundary publish.
+    /// Wide enough that late-joining validators within the first few slots
+    /// of the target epoch can still catch up, narrow enough to not spam
+    /// the consensus channel. Re-broadcasts fire every
+    /// `RESHARE_REBROADCAST_INTERVAL_SLOTS` slots.
+    pub const RESHARE_REBROADCAST_SLOTS: u64 = 10;
+    pub const RESHARE_REBROADCAST_INTERVAL_SLOTS: u64 = 2;
+
+    /// Slots each new committee member waits past the epoch boundary
+    /// before aggregating received contributions. During this window
+    /// gossipsub delivers contributions to everyone, so all new members
+    /// observe the same pool and derive identical canonical subsets.
+    /// MUST be ≤ `RESHARE_REBROADCAST_SLOTS` so late joiners still get
+    /// contributions during the window.
+    pub const RESHARE_AGGREGATION_DELAY_SLOTS: u64 = 5;
+
+    /// Snapshot the resharing state for disk persistence (task 034 crash
+    /// safety). Returns `None` when nothing needs to be saved (engine is
+    /// idle between rotations). Excludes the contribution pool — on
+    /// restart within the rebroadcast window the pool rebuilds from
+    /// gossip; after the window, the node stays locked out of this
+    /// epoch's decryption and resumes normally on the next rotation.
+    pub fn reshare_state_snapshot(&self) -> Option<crate::wire::ReshareState> {
+        if self.reshare_target_epoch == 0
+            && self.pending_reshare_rebroadcast.is_none()
+        {
+            return None;
+        }
+        Some(crate::wire::ReshareState {
+            target_epoch: self.reshare_target_epoch,
+            new_index: self.reshare_new_index as u64,
+            aggregation_trigger_slot: self.reshare_aggregation_trigger_slot,
+            aggregated: self.reshare_aggregated,
+            broadcast_start_slot: self.reshare_broadcast_start_slot,
+            pending_rebroadcast: self.pending_reshare_rebroadcast.clone(),
+            new_committee_keys: self.reshare_new_committee.clone(),
+        })
+    }
+
+    /// Restore the persistent resharing fields from a disk snapshot. The
+    /// contribution pool starts empty and refills from gossip rebroadcasts.
+    pub fn restore_reshare_state(&mut self, s: crate::wire::ReshareState) {
+        self.reshare_target_epoch = s.target_epoch;
+        self.reshare_new_index = s.new_index as usize;
+        self.reshare_aggregation_trigger_slot = s.aggregation_trigger_slot;
+        self.reshare_aggregated = s.aggregated;
+        self.reshare_broadcast_start_slot = s.broadcast_start_slot;
+        self.pending_reshare_rebroadcast = s.pending_rebroadcast;
+        self.reshare_new_committee = s.new_committee_keys;
+        self.reshare_contributions.clear();
+    }
+
+    /// Generate a share-transfer contribution for the incoming committee.
+    /// Caller is an OLD committee member. Returns `None` if we don't have
+    /// a key share (e.g. not a previous committee member) or if the new
+    /// committee is empty.
+    pub fn start_committee_reshare(
+        &mut self,
+        target_epoch: u64,
+        new_committee_keys: &[Vec<u8>],
+        identity: &ValidatorIdentity,
+    ) -> Option<ResharingContribution> {
+        let key_share = identity.key_share.as_ref()?;
+        let new_n = new_committee_keys.len();
+        if new_n == 0 {
+            return None;
+        }
+        let new_threshold = quorum_for_committee(new_n);
+
+        // Private entropy: combines validator secret key with the target
+        // epoch so each old member picks an independent polynomial, even
+        // if two old members briefly share the same `from_old_index`
+        // (shouldn't happen, but defense-in-depth).
+        let mut private = Vec::with_capacity(64 + 8);
+        private.extend_from_slice(identity.secret_key.as_bytes());
+        private.extend_from_slice(&self.epoch_randomness);
+        private.extend_from_slice(&target_epoch.to_le_bytes());
+        let entropy = pyde_crypto::poseidon2::poseidon2_hash(&private);
+
+        let contribution = generate_resharing_contribution(
+            key_share,
+            new_n,
+            new_threshold,
+            target_epoch,
+            entropy.as_bytes(),
+        );
+        // Stash bytes + target epoch so `maybe_rebroadcast_reshare` can
+        // re-publish during the early target-epoch slot window.
+        self.pending_reshare_rebroadcast = Some((target_epoch, contribution.to_bytes()));
+        self.reshare_broadcast_start_slot = self.consensus.current_slot;
+        self.persist_reshare_state();
+        info!(
+            target_epoch,
+            new_n,
+            new_threshold,
+            from_old_index = contribution.from_old_index,
+            "broadcasting cross-committee resharing contribution"
+        );
+        Some(contribution)
+    }
+
+    /// Fsync the reshare snapshot to the ConsensusStateStore when one is
+    /// attached. No-op when there's no store (devnet/tests) or when
+    /// snapshot is empty. Panics on write failure — same safety-critical
+    /// contract as other consensus-state persistence.
+    fn persist_reshare_state(&self) {
+        let (Some(store), Some(snap)) = (self.consensus_store.as_ref(), self.reshare_state_snapshot()) else {
+            return;
+        };
+        if let Err(e) = store.save_reshare_state(&snap) {
+            panic!("CRITICAL: reshare state persistence failed — {}", e);
+        }
+    }
+
+    /// Called by the node-layer slot tick. Returns the stashed resharing
+    /// contribution to re-broadcast, or `None` if we're not in the window.
+    /// Re-publishes every `RESHARE_REBROADCAST_INTERVAL_SLOTS` slots for up
+    /// to `RESHARE_REBROADCAST_SLOTS` slots after the initial broadcast.
+    /// Self-clears after the window expires.
+    pub fn maybe_rebroadcast_reshare(&mut self) -> Option<(u64, Vec<u8>)> {
+        let (target_epoch, bytes) = self.pending_reshare_rebroadcast.as_ref()?;
+        let now = self.consensus.current_slot;
+        let elapsed = now.saturating_sub(self.reshare_broadcast_start_slot);
+        if elapsed > Self::RESHARE_REBROADCAST_SLOTS {
+            // Window closed — purge so we don't re-broadcast a stale epoch.
+            self.pending_reshare_rebroadcast = None;
+            return None;
+        }
+        if elapsed == 0 {
+            // Initial publish already happened this slot; don't re-broadcast
+            // immediately (gossipsub dedupes but we avoid the extra traffic).
+            return None;
+        }
+        if elapsed % Self::RESHARE_REBROADCAST_INTERVAL_SLOTS != 0 {
+            return None;
+        }
+        Some((*target_epoch, bytes.clone()))
+    }
+
+    /// Install the incoming committee roster + our 1-based index in it so
+    /// future resharing contributions can be collected. Safe to call even
+    /// if we're not in the new committee (`our_new_index` = 0) — we'll
+    /// ignore received contributions in that case.
+    ///
+    /// Sets the aggregation trigger to fire `RESHARE_AGGREGATION_DELAY_SLOTS`
+    /// slots after the current slot. Aggregation itself happens in
+    /// `try_aggregate_reshare_on_slot`, which the node slot tick drives.
+    pub fn prepare_for_reshare_reception(
+        &mut self,
+        target_epoch: u64,
+        new_committee_keys: Vec<Vec<u8>>,
+        our_new_index: usize,
+    ) {
+        self.reshare_target_epoch = target_epoch;
+        self.reshare_new_committee = new_committee_keys;
+        self.reshare_new_index = our_new_index;
+        self.reshare_contributions.clear();
+        self.reshare_aggregation_trigger_slot =
+            self.consensus.current_slot + Self::RESHARE_AGGREGATION_DELAY_SLOTS;
+        self.reshare_aggregated = false;
+        self.persist_reshare_state();
+        debug!(
+            target_epoch,
+            our_new_index,
+            trigger_slot = self.reshare_aggregation_trigger_slot,
+            "prepared resharing reception bucket"
+        );
+    }
+
+    /// Store an incoming resharing contribution in the pool. Does NOT
+    /// aggregate — that's `try_aggregate_reshare_on_slot`'s job, fired at
+    /// a deterministic trigger slot so all new members see the same
+    /// contribution pool before combining.
+    ///
+    /// Returns `true` if the contribution was newly accepted (not a
+    /// duplicate, not stale, not malformed). Return value is for
+    /// telemetry; the caller can ignore it.
+    pub fn on_reshare_contribution(
+        &mut self,
+        contribution: ResharingContribution,
+        _old_committee_size: usize,
+        _identity: &mut ValidatorIdentity,
+    ) -> bool {
+        // Silently drop: not a new committee member.
+        if self.reshare_new_index == 0 || self.reshare_new_committee.is_empty() {
+            return false;
+        }
+        if self.reshare_aggregated {
+            // Already aggregated this epoch; late arrivals are ignored.
+            return false;
+        }
+        let new_n = self.reshare_new_committee.len();
+        let new_threshold = quorum_for_committee(new_n);
+
+        // Verify structural consistency of the contribution.
+        if !verify_resharing_contribution(&contribution, new_threshold, new_n) {
+            warn!(
+                from_old_index = contribution.from_old_index,
+                "invalid resharing contribution (failed polynomial check)"
+            );
+            return false;
+        }
+
+        // Dedupe by old-index so a re-broadcast doesn't inflate our pool.
+        if self.reshare_contributions.iter().any(|c| c.from_old_index == contribution.from_old_index) {
+            return false;
+        }
+        self.reshare_contributions.push(contribution);
+        true
+    }
+
+    /// Called from the node slot tick. If the current slot is at or past
+    /// the aggregation trigger and we haven't aggregated yet, attempt to
+    /// derive our new share from the canonical subset of the contribution
+    /// pool. Returns `true` when a new `KeyShare` is derived and installed.
+    ///
+    /// Failure modes:
+    /// - Not a new committee member → returns false silently.
+    /// - Not enough contributions (< `old_threshold`) by the trigger →
+    ///   logs a warning and returns false. The engine stays "unaggregated"
+    ///   so subsequent slots will retry, which accommodates genuinely
+    ///   delayed contributions; but if too many old members went dark,
+    ///   this node is effectively locked out of threshold decryption for
+    ///   this epoch until they can resync.
+    pub fn try_aggregate_reshare_on_slot(
+        &mut self,
+        current_slot: u64,
+        old_committee_size: usize,
+        identity: &mut ValidatorIdentity,
+    ) -> bool {
+        if self.reshare_aggregated
+            || self.reshare_new_index == 0
+            || self.reshare_new_committee.is_empty()
+            || self.reshare_aggregation_trigger_slot == 0
+        {
+            return false;
+        }
+        if current_slot < self.reshare_aggregation_trigger_slot {
+            return false;
+        }
+        let old_threshold = quorum_for_committee(old_committee_size);
+        if old_threshold == 0 {
+            return false;
+        }
+        if self.reshare_contributions.len() < old_threshold {
+            warn!(
+                target_epoch = self.reshare_target_epoch,
+                received = self.reshare_contributions.len(),
+                old_threshold,
+                "resharing aggregation trigger fired but below threshold — waiting"
+            );
+            return false;
+        }
+        let canonical = match canonical_resharing_subset(&self.reshare_contributions, old_threshold) {
+            Some(c) => c,
+            None => return false,
+        };
+        let new_share = match aggregate_new_share(self.reshare_new_index, &canonical) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        identity.key_share = Some(new_share);
+        self.key_share_dirty = true;
+        self.reshare_aggregated = true;
+        self.reshare_contributions.clear();
+        self.persist_reshare_state();
+        info!(
+            target_epoch = self.reshare_target_epoch,
+            new_index = self.reshare_new_index,
+            old_threshold,
+            "committee handoff complete — new key share derived from resharing"
+        );
+        true
+    }
+
+    /// Expose the target epoch of any pending resharing (for node-layer
+    /// stale-message filtering).
+    pub fn reshare_target(&self) -> u64 {
+        self.reshare_target_epoch
     }
 
     pub fn start_epoch_randomness(
@@ -1561,6 +1936,478 @@ mod tests {
         assert!(!engine.is_inclusion_violated(slot));
         let vote = engine.select_and_vote(&identities[1]);
         assert!(vote.is_some(), "un-flagged slot should produce a vote");
+    }
+
+    // ========== Task 034: cross-committee resharing ==========
+
+    use pyde_crypto::threshold::{
+        combine_shares, generate_decryption_share, threshold_encrypt, threshold_keygen,
+    };
+
+    /// Outfit a validator identity with a specific key share — lets tests
+    /// simulate membership in a particular committee without running full
+    /// DKG through ValidatorEngine.
+    fn identity_with_share(
+        index: u8,
+        key_share: pyde_crypto::threshold::KeyShare,
+    ) -> ValidatorIdentity {
+        let mut id = make_identity(index);
+        id.key_share = Some(key_share);
+        id
+    }
+
+    #[test]
+    fn reshare_full_rotation_preserves_decryption() {
+        // End-to-end: encrypt under the committee's public key, rotate to a
+        // completely fresh committee via ValidatorEngine resharing, and
+        // verify the new committee decrypts the pre-rotation ciphertext.
+        // Every new member ingests all contributions, waits past the
+        // aggregation trigger, fires aggregation from the slot tick.
+        let (tpk, old_shares) = threshold_keygen(5, 3).unwrap();
+        let msg = b"rotation survives";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+
+        let (mut outgoing, old_ids) = make_engine_with_committee(5);
+        let mut outgoing_ids: Vec<ValidatorIdentity> = old_ids
+            .into_iter()
+            .zip(old_shares.iter())
+            .enumerate()
+            .map(|(i, (id, ks))| {
+                let mut with_share = id;
+                with_share.key_share = Some(ks.clone());
+                with_share.committee_index = i as u8;
+                with_share
+            })
+            .collect();
+
+        let (mut incoming, new_ids) = make_engine_with_committee(6);
+        let new_committee_keys: Vec<Vec<u8>> = new_ids
+            .iter()
+            .map(|id| id.public_key.as_bytes().to_vec())
+            .collect();
+        let mut new_identities: Vec<ValidatorIdentity> = new_ids;
+
+        let contribs: Vec<ResharingContribution> = outgoing_ids
+            .iter_mut()
+            .filter_map(|id| outgoing.start_committee_reshare(1, &new_committee_keys, id))
+            .collect();
+        assert_eq!(contribs.len(), 5);
+
+        for (new_idx, identity) in new_identities.iter_mut().enumerate() {
+            incoming.prepare_for_reshare_reception(
+                /* target */ 1,
+                new_committee_keys.clone(),
+                /* our 1-based new index */ new_idx + 1,
+            );
+            // Ingest all contributions — storage only, no aggregation.
+            for c in &contribs {
+                incoming.on_reshare_contribution(c.clone(), 5, identity);
+            }
+            // Before the trigger fires, no share should be derived.
+            let trigger = incoming.reshare_aggregation_trigger_slot;
+            assert!(incoming.consensus.current_slot < trigger);
+            assert!(!incoming.try_aggregate_reshare_on_slot(
+                incoming.consensus.current_slot, 5, identity
+            ));
+            // Advance past the trigger; aggregation fires.
+            let fire_at = trigger + 1;
+            assert!(incoming.try_aggregate_reshare_on_slot(fire_at, 5, identity));
+            // Second call after aggregation: no-op.
+            assert!(!incoming.try_aggregate_reshare_on_slot(fire_at + 1, 5, identity));
+        }
+
+        let dec_shares: Vec<_> = new_identities
+            .iter()
+            .take(4)
+            .map(|id| generate_decryption_share(id.key_share.as_ref().unwrap(), &ct))
+            .collect();
+        let plaintext = combine_shares(&dec_shares, 4, &ct).unwrap();
+        assert_eq!(plaintext, msg);
+    }
+
+    #[test]
+    fn reshare_async_arrival_converges_on_same_polynomial() {
+        // CORRECTNESS REGRESSION TEST.
+        // Simulates the asymmetric-gossip scenario that motivated the
+        // deterministic-trigger design: two new members receive
+        // contributions in different orders, and one hits the old-
+        // threshold with a different subset than the other. Under the
+        // old "aggregate on first threshold reached" rule, they'd derive
+        // shares on different polynomials and threshold decryption in
+        // the new committee would silently fail. With the trigger-
+        // based rule, they wait until the pool has converged and then
+        // both pick the canonical lowest-indexed subset.
+        let (tpk, old_shares) = threshold_keygen(5, 3).unwrap();
+        let msg = b"async arrival convergence";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+
+        let new_committee_keys = vec![vec![0xAA; 897]; 6];
+
+        // Two new members, independent engines — model separate nodes.
+        let mut engine_a = ValidatorEngine::new([0u8; 32]);
+        engine_a.set_committee(new_committee_keys.clone());
+        let mut engine_b = ValidatorEngine::new([0u8; 32]);
+        engine_b.set_committee(new_committee_keys.clone());
+
+        engine_a.prepare_for_reshare_reception(1, new_committee_keys.clone(), 1);
+        engine_b.prepare_for_reshare_reception(1, new_committee_keys.clone(), 2);
+
+        let contribs: Vec<ResharingContribution> = old_shares
+            .iter()
+            .map(|s| generate_resharing_contribution(s, 6, 4, 1, b"conv"))
+            .collect();
+
+        let mut id_a = make_identity(0);
+        let mut id_b = make_identity(1);
+
+        // Asymmetric arrival:
+        // A receives {2, 3, 4} first (contributions 1 and 5 delayed).
+        for c in [&contribs[1], &contribs[2], &contribs[3]] {
+            engine_a.on_reshare_contribution(c.clone(), 5, &mut id_a);
+        }
+        // B receives {1, 2, 3} first.
+        for c in [&contribs[0], &contribs[1], &contribs[2]] {
+            engine_b.on_reshare_contribution(c.clone(), 5, &mut id_b);
+        }
+
+        // Under the OLD first-threshold rule this is where they'd
+        // diverge. Under the new rule, they haven't aggregated yet —
+        // the trigger hasn't fired.
+        let trigger = engine_a.reshare_aggregation_trigger_slot;
+        assert!(!engine_a.try_aggregate_reshare_on_slot(trigger - 1, 5, &mut id_a));
+        assert!(!engine_b.try_aggregate_reshare_on_slot(trigger - 1, 5, &mut id_b));
+
+        // Gossip converges: both engines now have the full set.
+        engine_a.on_reshare_contribution(contribs[0].clone(), 5, &mut id_a);
+        engine_a.on_reshare_contribution(contribs[4].clone(), 5, &mut id_a);
+        engine_b.on_reshare_contribution(contribs[3].clone(), 5, &mut id_b);
+        engine_b.on_reshare_contribution(contribs[4].clone(), 5, &mut id_b);
+
+        // Trigger fires on both.
+        assert!(engine_a.try_aggregate_reshare_on_slot(trigger, 5, &mut id_a));
+        assert!(engine_b.try_aggregate_reshare_on_slot(trigger, 5, &mut id_b));
+
+        // THE KEY CHECK: A's and B's shares must combine to decrypt.
+        // If they were on different polynomials, `combine_shares` would
+        // produce garbage.
+        let shares = vec![
+            generate_decryption_share(id_a.key_share.as_ref().unwrap(), &ct),
+            generate_decryption_share(id_b.key_share.as_ref().unwrap(), &ct),
+        ];
+        // Can't combine with only 2 of 4 required — add more honest shares.
+        let mut helpers: Vec<ValidatorEngine> = (3..=6)
+            .map(|_| {
+                let mut e = ValidatorEngine::new([0u8; 32]);
+                e.set_committee(new_committee_keys.clone());
+                e
+            })
+            .collect();
+        let mut helper_ids: Vec<ValidatorIdentity> =
+            (3..=6).map(|i| make_identity(i)).collect();
+        for (i, (engine, id)) in helpers.iter_mut().zip(helper_ids.iter_mut()).enumerate() {
+            engine.prepare_for_reshare_reception(1, new_committee_keys.clone(), i + 3);
+            for c in &contribs {
+                engine.on_reshare_contribution(c.clone(), 5, id);
+            }
+            assert!(engine.try_aggregate_reshare_on_slot(trigger, 5, id));
+        }
+        let mut all_shares = shares;
+        for id in &helper_ids[..2] {
+            all_shares.push(generate_decryption_share(id.key_share.as_ref().unwrap(), &ct));
+        }
+        let plaintext = combine_shares(&all_shares, 4, &ct).unwrap();
+        assert_eq!(
+            plaintext, msg,
+            "shares must be on same polynomial — canonical subset divergence would break this"
+        );
+    }
+
+    #[test]
+    fn reshare_aggregation_waits_for_trigger() {
+        let (_, old_shares) = threshold_keygen(4, 3).unwrap();
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let new_committee = vec![vec![0xAA; 897]; 4];
+        engine.prepare_for_reshare_reception(1, new_committee.clone(), 1);
+        let mut id = make_identity(0);
+
+        // Submit ALL 4 contributions.
+        for s in &old_shares {
+            let c = generate_resharing_contribution(s, 4, 3, 1, b"e");
+            engine.on_reshare_contribution(c, 4, &mut id);
+        }
+        // Pool is full, but trigger hasn't fired.
+        let trigger = engine.reshare_aggregation_trigger_slot;
+        assert!(trigger > 0);
+        assert!(!engine.try_aggregate_reshare_on_slot(trigger - 1, 4, &mut id));
+        assert!(id.key_share.is_none());
+
+        // At trigger: fires.
+        assert!(engine.try_aggregate_reshare_on_slot(trigger, 4, &mut id));
+        assert!(id.key_share.is_some());
+    }
+
+    #[test]
+    fn reshare_aggregation_below_threshold_retries() {
+        // If only 2 of 4 contributions arrive by trigger time, aggregation
+        // doesn't fire — and `reshare_aggregated` stays false so a
+        // subsequent slot tick with a fuller pool can succeed.
+        let (_, old_shares) = threshold_keygen(4, 3).unwrap();
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        engine.prepare_for_reshare_reception(1, vec![vec![0xAA; 897]; 4], 1);
+        let mut id = make_identity(0);
+
+        // Only 2 contributions (below old_threshold of 3).
+        for s in old_shares.iter().take(2) {
+            let c = generate_resharing_contribution(s, 4, 3, 1, b"e");
+            engine.on_reshare_contribution(c, 4, &mut id);
+        }
+        let trigger = engine.reshare_aggregation_trigger_slot;
+        assert!(!engine.try_aggregate_reshare_on_slot(trigger, 4, &mut id));
+        // Third contribution arrives late.
+        let late = generate_resharing_contribution(&old_shares[2], 4, 3, 1, b"e");
+        engine.on_reshare_contribution(late, 4, &mut id);
+        // Later slot: now we have enough → fires.
+        assert!(engine.try_aggregate_reshare_on_slot(trigger + 3, 4, &mut id));
+        assert!(id.key_share.is_some());
+    }
+
+    // ========== Task 034: reshare crash-safety ==========
+
+    #[test]
+    fn reshare_state_wire_roundtrip() {
+        let s = crate::wire::ReshareState {
+            target_epoch: 42,
+            new_index: 7,
+            aggregation_trigger_slot: 123,
+            aggregated: false,
+            broadcast_start_slot: 100,
+            pending_rebroadcast: Some((42, vec![0xAA; 16])),
+            new_committee_keys: vec![vec![0x11; 50], vec![0x22; 50], vec![0x33; 50]],
+        };
+        let bytes = crate::wire::encode_reshare_state(&s);
+        let decoded = crate::wire::decode_reshare_state(&bytes).unwrap();
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn reshare_state_wire_none_rebroadcast() {
+        let s = crate::wire::ReshareState {
+            target_epoch: 0,
+            new_index: 0,
+            aggregation_trigger_slot: 0,
+            aggregated: true,
+            broadcast_start_slot: 0,
+            pending_rebroadcast: None,
+            new_committee_keys: vec![],
+        };
+        let bytes = crate::wire::encode_reshare_state(&s);
+        let decoded = crate::wire::decode_reshare_state(&bytes).unwrap();
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn reshare_state_restores_across_engine_restart() {
+        // Full crash-restart roundtrip: attach a store, advance through a
+        // rotation preparation, "crash" (drop engine), reattach the store
+        // to a fresh engine, and verify the reshare state came back.
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let new_committee = vec![vec![0x11; 897], vec![0x22; 897], vec![0x33; 897], vec![0x44; 897]];
+
+        let trigger_slot;
+        {
+            let mut engine = ValidatorEngine::new([0xAA; 32]);
+            engine.set_committee(vec![vec![0x01; 897]; 4]);
+            let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+            engine.attach_consensus_store(store);
+            engine.prepare_for_reshare_reception(7, new_committee.clone(), 2);
+            trigger_slot = engine.reshare_aggregation_trigger_slot;
+            assert!(trigger_slot > 0);
+            // engine dropped here — simulates crash.
+        }
+
+        // Reopen store, reattach.
+        let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        engine.attach_consensus_store(store);
+
+        // Post-restore invariants.
+        assert_eq!(engine.reshare_target_epoch, 7);
+        assert_eq!(engine.reshare_new_index, 2);
+        assert_eq!(engine.reshare_aggregation_trigger_slot, trigger_slot);
+        assert_eq!(engine.reshare_new_committee, new_committee);
+        assert!(!engine.reshare_aggregated);
+        // Contribution pool is NOT persisted (rebuilds from rebroadcasts).
+        assert_eq!(engine.reshare_contributions.len(), 0);
+    }
+
+    #[test]
+    fn reshare_state_restores_aggregated_flag() {
+        // If aggregation fired before the crash, the aggregated flag must
+        // persist — otherwise the restarted node could double-aggregate
+        // when late contributions arrive and overwrite its now-correct
+        // key share with garbage derived from a different canonical set.
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+
+        {
+            let (_, old_shares) = threshold_keygen(4, 3).unwrap();
+            let mut engine = ValidatorEngine::new([0u8; 32]);
+            let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+            engine.attach_consensus_store(store);
+            engine.prepare_for_reshare_reception(1, vec![vec![0xAA; 897]; 4], 1);
+            let mut id = make_identity(0);
+            for s in &old_shares {
+                let c = generate_resharing_contribution(s, 4, 3, 1, b"e");
+                engine.on_reshare_contribution(c, 4, &mut id);
+            }
+            let trigger = engine.reshare_aggregation_trigger_slot;
+            assert!(engine.try_aggregate_reshare_on_slot(trigger, 4, &mut id));
+            assert!(engine.reshare_aggregated);
+        }
+
+        let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        engine.attach_consensus_store(store);
+        assert!(engine.reshare_aggregated, "aggregated flag must survive restart");
+    }
+
+    #[test]
+    fn reshare_state_pending_rebroadcast_survives_restart() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let (_, old_shares) = threshold_keygen(3, 2).unwrap();
+
+        {
+            let mut engine = ValidatorEngine::new([0u8; 32]);
+            engine.set_committee(vec![vec![0x01; 897]; 3]);
+            let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+            engine.attach_consensus_store(store);
+            let id = identity_with_share(0, old_shares[0].clone());
+            engine
+                .start_committee_reshare(5, &vec![vec![0xBB; 897]; 3], &id)
+                .unwrap();
+            assert!(engine.pending_reshare_rebroadcast.is_some());
+        }
+
+        let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        engine.attach_consensus_store(store);
+        assert!(
+            engine.pending_reshare_rebroadcast.is_some(),
+            "outgoing member must continue rebroadcasting after restart"
+        );
+    }
+
+    #[test]
+    fn reshare_ignores_when_not_on_new_committee() {
+        // Departing member (not on new committee): prepare_for_reshare_reception
+        // with index 0 → contributions get silently dropped, no share derived.
+        let (_, old_shares) = threshold_keygen(4, 3).unwrap();
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        engine.prepare_for_reshare_reception(1, vec![vec![0xAA; 897]], /* our_new_index */ 0);
+        let mut leaving = identity_with_share(0, old_shares[0].clone());
+
+        let sample_contrib = generate_resharing_contribution(&old_shares[0], 4, 3, 1, b"e");
+        let derived = engine.on_reshare_contribution(sample_contrib, 4, &mut leaving);
+        assert!(!derived);
+    }
+
+    #[test]
+    fn reshare_rejects_invalid_contribution() {
+        // Tampered contribution: must fail internal consistency check and
+        // NOT be counted toward threshold.
+        let (_, old_shares) = threshold_keygen(4, 3).unwrap();
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let new_committee = vec![vec![0xAA; 897]; 4];
+        engine.prepare_for_reshare_reception(1, new_committee, 1);
+        let mut new_id = make_identity(0);
+
+        let mut bad = generate_resharing_contribution(&old_shares[0], 4, 3, 1, b"e");
+        // Flip one sub-share to break the polynomial.
+        bad.to_bytes(); // sanity
+        // Expose a mutation path: rebuild via from_bytes after a byte flip.
+        let mut bytes = bad.to_bytes();
+        // Corrupt a payload byte well past the 16-byte header.
+        let corrupt_at = bytes.len() - 4;
+        bytes[corrupt_at] ^= 0xFF;
+        let corrupted = ResharingContribution::from_bytes(&bytes).unwrap();
+        assert!(!engine.on_reshare_contribution(corrupted, 4, &mut new_id));
+    }
+
+    #[test]
+    fn reshare_deduplicates_same_old_index() {
+        // Same old member re-broadcasts (gossip retry). The pool must not
+        // double-count duplicates; subsequent calls with the same
+        // `from_old_index` return false.
+        let (_, old_shares) = threshold_keygen(4, 3).unwrap();
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let new_committee = vec![vec![0xAA; 897]; 4];
+        engine.prepare_for_reshare_reception(1, new_committee, 1);
+        let mut new_id = make_identity(0);
+
+        let c = generate_resharing_contribution(&old_shares[0], 4, 3, 1, b"e");
+        // First call: newly stored → returns true.
+        assert!(engine.on_reshare_contribution(c.clone(), 4, &mut new_id));
+        // Duplicate: rejected → returns false. Pool still at size 1.
+        assert!(!engine.on_reshare_contribution(c, 4, &mut new_id));
+        assert_eq!(engine.reshare_contributions.len(), 1);
+    }
+
+    #[test]
+    fn reshare_rebroadcast_fires_within_window() {
+        // Outgoing member stashes a contribution and re-broadcasts every
+        // RESHARE_REBROADCAST_INTERVAL_SLOTS slots for RESHARE_REBROADCAST_SLOTS.
+        let (_, old_shares) = threshold_keygen(3, 2).unwrap();
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        engine.set_committee(vec![vec![0xAA; 897]; 3]);
+        let mut id = identity_with_share(0, old_shares[0].clone());
+
+        // Initial broadcast at slot 0.
+        engine.start_committee_reshare(7, &vec![vec![0xBB; 897]; 3], &id).unwrap();
+
+        // Same slot: should NOT re-broadcast (already-publishing slot).
+        assert!(engine.maybe_rebroadcast_reshare().is_none());
+
+        // Slot 2 (interval hit) → re-broadcast.
+        engine.advance_slot();
+        engine.advance_slot();
+        let r = engine.maybe_rebroadcast_reshare();
+        assert!(r.is_some(), "expected rebroadcast at slot 2");
+        assert_eq!(r.unwrap().0, 7);
+
+        // Slot 3 (off-interval) → skip.
+        engine.advance_slot();
+        assert!(engine.maybe_rebroadcast_reshare().is_none());
+
+        // Slot 4 (interval hit) → re-broadcast.
+        engine.advance_slot();
+        assert!(engine.maybe_rebroadcast_reshare().is_some());
+
+        // Push past the window (RESHARE_REBROADCAST_SLOTS = 10). Clears
+        // the pending bytes so no stale epoch leaks out later.
+        for _ in 0..20 {
+            engine.advance_slot();
+        }
+        assert!(engine.maybe_rebroadcast_reshare().is_none());
+        // Second call after window: still None — the purge is sticky.
+        assert!(engine.maybe_rebroadcast_reshare().is_none());
+
+        // Suppress unused-variable warning on id in branches that don't touch it.
+        let _ = &mut id;
+    }
+
+    #[test]
+    fn reshare_rebroadcast_none_without_prior_start() {
+        // maybe_rebroadcast with no stashed contribution → always None.
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        assert!(engine.maybe_rebroadcast_reshare().is_none());
+        for _ in 0..20 {
+            engine.advance_slot();
+            assert!(engine.maybe_rebroadcast_reshare().is_none());
+        }
     }
 
     // ========== Crash-restart safety tests ==========

@@ -676,6 +676,270 @@ pub fn pss_refresh(
     (new_material, new_shares)
 }
 
+// ==========================================================================
+// Cross-committee resharing (task 034)
+// ==========================================================================
+//
+// PSS (`RefreshContribution` / `apply_refresh`) refreshes shares among the
+// *same* committee. Real committee rotation requires transferring trust from
+// an OLD committee to a DIFFERENT NEW committee. The construction below is
+// classical share-transfer resharing (Desmedt/Jajodia):
+//
+// 1. Each old member `i` with share `s_i` of the secret polynomial `f` (of
+//    degree `old_t - 1`, with `f(0) = secret`) picks a fresh polynomial
+//    `g_i` of degree `new_t - 1` with `g_i(0) = s_i` and evaluates at each
+//    new member index: `sub_shares[j] = g_i(j)` for j in 1..=new_n.
+// 2. New member `j` collects `{g_i(j) : i ∈ canonical old-subset S}` from
+//    gossip. They compute `H(j) = Σ_{i ∈ S} λ_i(0) · g_i(j)`, where
+//    `λ_i(0)` is the Lagrange coefficient reconstructing `f(0)` from shares
+//    at `S`. The new share of member j is `H(j)`.
+// 3. Because `λ_i(0) · g_i(0) = λ_i(0) · s_i = λ_i(0) · f(i)`, summing over
+//    `S` gives `H(0) = Σ_{i ∈ S} λ_i(0) · f(i) = f(0) = secret`. So `H` is
+//    a valid new polynomial with the SAME secret.
+// 4. The public key is invariant across resharing — so in-flight mempool
+//    ciphertexts (encrypted under the committee's aggregate public key)
+//    stay decryptable by the new committee. No re-encryption required.
+//
+// **Determinism is load-bearing**: every new member must use the identical
+// old-subset `S`. Otherwise, new members end up on different polynomials `H`
+// and threshold decryption across the new committee breaks. The canonical
+// rule is `threshold` lowest-indexed old members whose contributions have
+// been gossiped; `canonical_resharing_subset` enforces this.
+
+/// Sub-share package from one old committee member to all new committee
+/// members. `sub_shares[j-1][e]` is `g_i(j)` — old member i's new-polynomial
+/// evaluated at new index j, for the e-th seed element.
+#[derive(Clone, Debug)]
+pub struct ResharingContribution {
+    /// 1-based index of the old committee member that produced this.
+    pub from_old_index: usize,
+    /// Length = new_n. Each inner vec has length SEED_ELEMENTS.
+    sub_shares: Vec<Vec<Goldilocks>>,
+}
+
+impl ResharingContribution {
+    /// Wire format:
+    /// [from_old_index:8 LE][new_n:4 LE][elems:4 LE][[g:8 LE]*elems]*new_n
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let n = self.sub_shares.len();
+        let elems = if n > 0 { self.sub_shares[0].len() } else { 0 };
+        let mut buf = Vec::with_capacity(16 + n * elems * 8);
+        buf.extend_from_slice(&(self.from_old_index as u64).to_le_bytes());
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+        buf.extend_from_slice(&(elems as u32).to_le_bytes());
+        for row in &self.sub_shares {
+            for g in row {
+                buf.extend_from_slice(&gl_to_u64(*g).to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 16 { return None; }
+        let from_old_index = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
+        let n = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
+        let elems = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
+        if data.len() < 16 + n * elems * 8 { return None; }
+        let mut sub_shares = Vec::with_capacity(n);
+        let mut off = 16;
+        for _ in 0..n {
+            let mut row = Vec::with_capacity(elems);
+            for _ in 0..elems {
+                let v = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
+                row.push(gl(v));
+                off += 8;
+            }
+            sub_shares.push(row);
+        }
+        Some(Self { from_old_index, sub_shares })
+    }
+
+    /// Expose `new_n` (number of new committee members this contribution targets).
+    pub fn new_n(&self) -> usize {
+        self.sub_shares.len()
+    }
+}
+
+/// Generate one old member's share-transfer contribution for the new
+/// committee. Each seed element of the old share becomes the constant term
+/// of a fresh degree-(new_threshold-1) polynomial, evaluated at new indices
+/// 1..=new_n.
+pub fn generate_resharing_contribution(
+    old_share: &KeyShare,
+    new_n: usize,
+    new_threshold: usize,
+    epoch: u64,
+    entropy: &[u8],
+) -> ResharingContribution {
+    // Domain-separate by epoch + old-index so different old members
+    // generate independent polynomials from the same public entropy.
+    let mut dom_in = Vec::with_capacity(entropy.len() + 24);
+    dom_in.extend_from_slice(entropy);
+    dom_in.extend_from_slice(b"pyde-reshare");
+    dom_in.extend_from_slice(&epoch.to_le_bytes());
+    dom_in.extend_from_slice(&(old_share.index as u64).to_le_bytes());
+    let dom_entropy = poseidon2_hash(&dom_in);
+
+    // For each seed element: polynomial with g(0) = old_share.shares[elem],
+    // evaluated at new indices 1..=new_n via shamir_split (secret = g(0)).
+    let mut per_elem: Vec<Vec<Goldilocks>> = Vec::with_capacity(SEED_ELEMENTS);
+    for elem_idx in 0..SEED_ELEMENTS {
+        let shares = shamir_split(
+            old_share.shares[elem_idx],
+            new_n,
+            new_threshold,
+            dom_entropy.as_bytes(),
+            elem_idx,
+        );
+        per_elem.push(shares.iter().map(|s| s.y).collect());
+    }
+
+    // Transpose to sub_shares[new_idx][elem_idx].
+    let sub_shares: Vec<Vec<Goldilocks>> = (0..new_n)
+        .map(|v| (0..SEED_ELEMENTS).map(|e| per_elem[e][v]).collect())
+        .collect();
+
+    ResharingContribution {
+        from_old_index: old_share.index,
+        sub_shares,
+    }
+}
+
+/// Verify a resharing contribution is internally consistent — i.e. its
+/// sub-shares truly lie on a single polynomial of degree `new_threshold - 1`
+/// per seed element. Interpolates a threshold subset, then re-evaluates at
+/// remaining new indices and compares against the provided values. A
+/// malicious old member could fabricate inconsistent points; this catches it.
+pub fn verify_resharing_contribution(
+    contribution: &ResharingContribution,
+    new_threshold: usize,
+    new_n: usize,
+) -> bool {
+    if contribution.sub_shares.len() != new_n {
+        return false;
+    }
+    if new_threshold == 0 || new_threshold > new_n {
+        return false;
+    }
+    for row in &contribution.sub_shares {
+        if row.len() != SEED_ELEMENTS {
+            return false;
+        }
+    }
+    // For each seed element, interpolate first `new_threshold` sub-shares
+    // and verify the remaining ones match via Lagrange evaluation.
+    for elem_idx in 0..SEED_ELEMENTS {
+        let interp_shares: Vec<FieldShare> = (0..new_threshold)
+            .map(|v| FieldShare {
+                x: gl((v + 1) as u64),
+                y: contribution.sub_shares[v][elem_idx],
+            })
+            .collect();
+        for check_idx in new_threshold..new_n {
+            let check_x = gl((check_idx + 1) as u64);
+            let mut y = Goldilocks::ZERO;
+            for i in 0..new_threshold {
+                let x_i = interp_shares[i].x;
+                let mut basis = Goldilocks::ONE;
+                for j in 0..new_threshold {
+                    if i != j {
+                        let x_j = interp_shares[j].x;
+                        let num = check_x - x_j;
+                        let den = x_i - x_j;
+                        basis *= num * gl_inv(den);
+                    }
+                }
+                y += interp_shares[i].y * basis;
+            }
+            if y != contribution.sub_shares[check_idx][elem_idx] {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Pick the deterministic canonical subset of old contributions every new
+/// member must use: the `old_threshold` contributions with the LOWEST
+/// `from_old_index` values. Returns `None` if fewer than `old_threshold`
+/// contributions are available. All new members converge on the same
+/// polynomial when they apply this rule.
+pub fn canonical_resharing_subset<'a>(
+    pool: &'a [ResharingContribution],
+    old_threshold: usize,
+) -> Option<Vec<&'a ResharingContribution>> {
+    if pool.len() < old_threshold {
+        return None;
+    }
+    let mut refs: Vec<&ResharingContribution> = pool.iter().collect();
+    refs.sort_by_key(|c| c.from_old_index);
+    refs.truncate(old_threshold);
+    Some(refs)
+}
+
+/// Aggregate a canonical subset of resharing contributions into a single
+/// new `KeyShare` for the given new-committee index. Lagrange coefficients
+/// are computed over the OLD indices in `canonical`, so all new members
+/// that apply this function to the same canonical subset converge on the
+/// same underlying polynomial.
+pub fn aggregate_new_share(
+    new_index: usize,
+    canonical: &[&ResharingContribution],
+) -> Option<KeyShare> {
+    if canonical.is_empty() || new_index == 0 {
+        return None;
+    }
+    let new_idx0 = new_index - 1;
+    // All contributions must target the same new_n and expose our new_idx.
+    let new_n = canonical[0].sub_shares.len();
+    if new_idx0 >= new_n {
+        return None;
+    }
+    for c in canonical.iter() {
+        if c.sub_shares.len() != new_n {
+            return None;
+        }
+        if c.sub_shares[new_idx0].len() != SEED_ELEMENTS {
+            return None;
+        }
+    }
+
+    // Lagrange coefficients at x=0 for the OLD indices.
+    let old_indices: Vec<Goldilocks> = canonical
+        .iter()
+        .map(|c| gl(c.from_old_index as u64))
+        .collect();
+    let lambdas: Vec<Goldilocks> = (0..canonical.len())
+        .map(|i| {
+            let x_i = old_indices[i];
+            let mut basis = Goldilocks::ONE;
+            for j in 0..canonical.len() {
+                if i != j {
+                    let x_j = old_indices[j];
+                    let num = Goldilocks::ZERO - x_j;
+                    let den = x_i - x_j;
+                    basis *= num * gl_inv(den);
+                }
+            }
+            basis
+        })
+        .collect();
+
+    // Combine: new_share[e] = Σ_i λ_i · g_i(new_index) for each element e.
+    let mut new_shares = vec![Goldilocks::ZERO; SEED_ELEMENTS];
+    for (i, contrib) in canonical.iter().enumerate() {
+        for elem_idx in 0..SEED_ELEMENTS {
+            new_shares[elem_idx] += lambdas[i] * contrib.sub_shares[new_idx0][elem_idx];
+        }
+    }
+
+    Some(KeyShare {
+        index: new_index,
+        shares: new_shares,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -985,5 +1249,184 @@ mod tests {
             .collect();
         let plaintext = combine_shares(&dec_shares, 7, &ct).unwrap();
         assert_eq!(plaintext, msg);
+    }
+
+    // ======================================================================
+    // Resharing (task 034): cross-committee share transfer
+    // ======================================================================
+
+    /// Drive a full resharing from old shares at indices `old_indices` (with
+    /// threshold `old_t`) to a new committee of size `new_n` with threshold
+    /// `new_t`. Returns new KeyShares. Pure-function harness used by the
+    /// tests below.
+    fn do_resharing(
+        old_shares: &[KeyShare],
+        old_t: usize,
+        new_n: usize,
+        new_t: usize,
+        epoch: u64,
+    ) -> Vec<KeyShare> {
+        // Each old member produces one contribution. Public entropy is the
+        // epoch; domain separation by old-index happens inside the fn.
+        let entropy = epoch.to_le_bytes();
+        let pool: Vec<ResharingContribution> = old_shares
+            .iter()
+            .map(|s| generate_resharing_contribution(s, new_n, new_t, epoch, &entropy))
+            .collect();
+        let canonical = canonical_resharing_subset(&pool, old_t).unwrap();
+        (1..=new_n)
+            .map(|j| aggregate_new_share(j, &canonical).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn reshare_preserves_secret_and_decrypts_old_ciphertext() {
+        // Encrypt under the epoch-0 public key, rotate to an entirely new
+        // committee via resharing, and verify the new shares still decrypt
+        // the original ciphertext — proves the public key is invariant.
+        let (epoch_mat, old_shares) = setup_epoch(10, 7);
+        let msg = b"committee rotation preserves decryptability";
+        let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
+
+        // New committee: 8 members, threshold 5 — different size AND
+        // different members than the original.
+        let new_shares = do_resharing(&old_shares, 7, 8, 5, 1);
+
+        // Five new members (their new threshold) suffice to decrypt.
+        let dec_shares: Vec<DecryptionShare> = new_shares[..5]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        let plaintext = combine_shares(&dec_shares, 5, &ct).unwrap();
+        assert_eq!(plaintext, msg);
+    }
+
+    #[test]
+    fn reshare_any_subset_of_new_committee_suffices() {
+        // Verify that any subset of size >= new_threshold from the new
+        // committee can combine — ensures all new members sit on the same
+        // polynomial (the whole point of the canonical-subset rule).
+        let (epoch_mat, old_shares) = setup_epoch(8, 5);
+        let msg = b"interchangeable new shares";
+        let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
+
+        let new_shares = do_resharing(&old_shares, 5, 10, 7, 2);
+
+        // Two different subsets of size 7 — both should decrypt.
+        let subset_a: Vec<DecryptionShare> = new_shares[..7]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        let subset_b: Vec<DecryptionShare> = new_shares[3..10]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+
+        assert_eq!(combine_shares(&subset_a, 7, &ct).unwrap(), msg);
+        assert_eq!(combine_shares(&subset_b, 7, &ct).unwrap(), msg);
+    }
+
+    #[test]
+    fn reshare_below_old_threshold_contributions_fails() {
+        // Fewer than `old_threshold` contributions available → canonical
+        // subset selection returns None. Enforcement lives with the caller.
+        let (_, old_shares) = setup_epoch(6, 4);
+        let pool: Vec<ResharingContribution> = old_shares[..3]
+            .iter()
+            .map(|s| generate_resharing_contribution(s, 8, 5, 1, b"e"))
+            .collect();
+        assert!(canonical_resharing_subset(&pool, /* old_threshold */ 4).is_none());
+    }
+
+    #[test]
+    fn reshare_canonical_subset_is_lowest_indexed() {
+        // Determinism: regardless of iteration order, canonical subset is
+        // the threshold lowest old-indices. This guarantees convergence
+        // across new members.
+        let (_, old_shares) = setup_epoch(6, 3);
+        let pool: Vec<ResharingContribution> = old_shares
+            .iter()
+            .rev() // reversed to test sorting
+            .map(|s| generate_resharing_contribution(s, 4, 3, 1, b"e"))
+            .collect();
+        let canonical = canonical_resharing_subset(&pool, 3).unwrap();
+        let picked: Vec<usize> = canonical.iter().map(|c| c.from_old_index).collect();
+        assert_eq!(picked, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn reshare_two_new_members_converge_on_same_polynomial() {
+        // If two new members apply aggregation to the canonical subset,
+        // their resulting shares must be combinable (sit on one polynomial).
+        let (epoch_mat, old_shares) = setup_epoch(6, 4);
+        let msg = b"two members same poly";
+        let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
+
+        let new_shares = do_resharing(&old_shares, 4, 7, 4, 1);
+
+        // Pick 4 disjoint-ish subsets, all must decrypt.
+        for start in 0..4 {
+            let subset: Vec<DecryptionShare> = new_shares[start..start + 4]
+                .iter()
+                .map(|s| generate_decryption_share(s, &ct))
+                .collect();
+            assert_eq!(
+                combine_shares(&subset, 4, &ct).unwrap(),
+                msg,
+                "subset starting at {start} failed to decrypt"
+            );
+        }
+    }
+
+    #[test]
+    fn reshare_verify_detects_inconsistent_contribution() {
+        let (_, old_shares) = setup_epoch(6, 4);
+        let mut contrib = generate_resharing_contribution(&old_shares[0], 8, 5, 1, b"e");
+        assert!(verify_resharing_contribution(&contrib, 5, 8));
+
+        // Tamper: flip a value in one of the non-interpolation rows.
+        contrib.sub_shares[6][2] = contrib.sub_shares[6][2] + gl(1);
+        assert!(!verify_resharing_contribution(&contrib, 5, 8));
+    }
+
+    #[test]
+    fn reshare_verify_rejects_wrong_dimensions() {
+        let (_, old_shares) = setup_epoch(6, 4);
+        let contrib = generate_resharing_contribution(&old_shares[0], 8, 5, 1, b"e");
+        // Pretend new_n is different from what the contribution was built for.
+        assert!(!verify_resharing_contribution(&contrib, 5, 9));
+        // Threshold > new_n should also be rejected.
+        assert!(!verify_resharing_contribution(&contrib, 9, 8));
+    }
+
+    #[test]
+    fn reshare_contribution_roundtrips_through_wire_format() {
+        let (_, old_shares) = setup_epoch(5, 3);
+        let original = generate_resharing_contribution(&old_shares[1], 6, 4, 42, b"wire");
+        let bytes = original.to_bytes();
+        let decoded = ResharingContribution::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.from_old_index, original.from_old_index);
+        assert_eq!(decoded.sub_shares.len(), original.sub_shares.len());
+        for (a, b) in decoded.sub_shares.iter().zip(original.sub_shares.iter()) {
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn reshare_chain_of_two_rotations_decrypts() {
+        // Rotate twice: old -> mid -> new. Ciphertext encrypted at epoch 0
+        // must still decrypt under epoch-2 shares.
+        let (epoch_mat, old_shares) = setup_epoch(6, 4);
+        let msg = b"two rotations";
+        let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
+
+        let mid_shares = do_resharing(&old_shares, 4, 7, 5, 1);
+        let new_shares = do_resharing(&mid_shares, 5, 8, 6, 2);
+
+        let dec_shares: Vec<DecryptionShare> = new_shares[..6]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        assert_eq!(combine_shares(&dec_shares, 6, &ct).unwrap(), msg);
     }
 }

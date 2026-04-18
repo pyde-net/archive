@@ -620,24 +620,29 @@ mod tests {
         assert!(sync.initial_sync_done);
     }
 
-    fn make_state(name: &str) -> StateManager {
-        let dir = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        StateManager::open(&dir, 1024).unwrap()
+    /// Return a `(StateManager, TempDir)` pair. Callers must hold the
+    /// `TempDir` in scope for the life of the manager; dropping it
+    /// removes the underlying directory. Using `tempfile::tempdir()`
+    /// gives unique-per-invocation paths, which sidesteps the parallel
+    /// RocksDB races that plague fixed `/tmp/pyde-*` tests.
+    fn make_state() -> (StateManager, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sm = StateManager::open(tmp.path(), 1024).unwrap();
+        (sm, tmp)
     }
 
-    fn make_block_store(name: &str) -> BlockStore {
-        let dir = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        BlockStore::open(&dir).unwrap()
+    fn make_block_store() -> (BlockStore, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let bs = BlockStore::open(tmp.path()).unwrap();
+        (bs, tmp)
     }
 
     #[test]
     fn handle_chain_tip_request() {
         let mut chain = ChainState::genesis([0u8; 32], 1);
         chain.advance(dummy_header(10));
-        let state = make_state("pyde-sync-tip-v2");
-        let bs = make_block_store("pyde-sync-tip-bs-v2");
+        let (state, _sd) = make_state();
+        let (bs, _bd) = make_block_store();
 
         let resp = ChainSync::handle_inbound_request(&SyncReq::GetChainTip, &chain, &state, &bs, &mut None::<PinnedSnapshot>);
         match resp {
@@ -652,8 +657,8 @@ mod tests {
         for slot in 1..=5 {
             chain.advance(dummy_header(slot));
         }
-        let state = make_state("pyde-sync-blocks-v2");
-        let bs = make_block_store("pyde-sync-blocks-bs-v2");
+        let (state, _sd) = make_state();
+        let (bs, _bd) = make_block_store();
 
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetBlocks { start_slot: 1, count: 3 },
@@ -673,8 +678,8 @@ mod tests {
     #[test]
     fn handle_get_blocks_not_found() {
         let chain = ChainState::genesis([0u8; 32], 1);
-        let state = make_state("pyde-sync-notfound-v2");
-        let bs = make_block_store("pyde-sync-notfound-bs-v2");
+        let (state, _sd) = make_state();
+        let (bs, _bd) = make_block_store();
 
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetBlocks { start_slot: 100, count: 10 },
@@ -690,13 +695,13 @@ mod tests {
     fn handle_state_snapshot_request() {
         let mut chain = ChainState::genesis([0u8; 32], 1);
         chain.advance(dummy_header(5));
-        let mut state = make_state("pyde-sync-snapshot-v2");
+        let (mut state, _sd) = make_state();
 
         // Insert some state
         let key = pyde_state::keys::balance_key(&[0x01; 32]);
         state.insert(key, 42u128.to_le_bytes().to_vec()).unwrap();
 
-        let bs = make_block_store("pyde-sync-snapshot-bs-v2");
+        let (bs, _bd) = make_block_store();
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetStateSnapshot,
             &chain, &state, &bs, &mut None::<PinnedSnapshot>,
