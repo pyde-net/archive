@@ -56,6 +56,12 @@ pub struct Mempool {
     seen_hashes: HashSet<[u8; 32]>,
     /// Per-sender nonce tracking (sender → highest nonce seen).
     sender_nonces: HashMap<Address, u64>,
+    /// Slot at which each tx first entered this pool. Used by the
+    /// inclusion-audit path (task 026) to distinguish txs that have
+    /// been in the mempool long enough that the proposer *should*
+    /// have seen them, versus txs so new that missing them is not
+    /// evidence of censorship.
+    first_seen_slot: HashMap<[u8; 32], u64>,
     /// Maximum pool size.
     max_size: usize,
     /// Current block height (for expiry checks).
@@ -70,6 +76,7 @@ impl Mempool {
             txs: Vec::new(),
             seen_hashes: HashSet::new(),
             sender_nonces: HashMap::new(),
+            first_seen_slot: HashMap::new(),
             max_size: DEFAULT_MAX_POOL_SIZE,
             current_block: 0,
             block_gas_limit: pyde_tx::fee::GAS_CEILING as u64,
@@ -81,6 +88,7 @@ impl Mempool {
             txs: Vec::with_capacity(max_size),
             seen_hashes: HashSet::with_capacity(max_size),
             sender_nonces: HashMap::new(),
+            first_seen_slot: HashMap::with_capacity(max_size),
             max_size,
             current_block: 0,
             block_gas_limit: pyde_tx::fee::GAS_CEILING as u64,
@@ -171,6 +179,7 @@ impl Mempool {
         }
 
         self.seen_hashes.insert(hash);
+        self.first_seen_slot.insert(hash, self.current_block);
         self.txs.push(tx);
 
         Ok(())
@@ -182,7 +191,9 @@ impl Mempool {
             return;
         }
         let evicted = self.txs.remove(0);
-        self.seen_hashes.remove(&evicted.hash());
+        let h = evicted.hash();
+        self.seen_hashes.remove(&h);
+        self.first_seen_slot.remove(&h);
     }
 
     /// Verify the FALCON-512 signature on an encrypted transaction.
@@ -222,12 +233,12 @@ impl Mempool {
         let before = self.txs.len();
         self.txs.retain(|tx| !tx.is_expired(current));
 
-        // Rebuild hash set if we pruned anything
+        // Rebuild hash set + first-seen tracking if we pruned anything
         if self.txs.len() != before {
             self.seen_hashes.clear();
-            for tx in &self.txs {
-                self.seen_hashes.insert(tx.hash());
-            }
+            let kept: HashSet<[u8; 32]> = self.txs.iter().map(|tx| tx.hash()).collect();
+            self.first_seen_slot.retain(|h, _| kept.contains(h));
+            self.seen_hashes = kept;
         }
     }
 
@@ -268,7 +279,17 @@ impl Mempool {
 
         for hash in hashes {
             self.seen_hashes.remove(hash);
+            self.first_seen_slot.remove(hash);
         }
+    }
+
+    /// View of mempool entries paired with the slot they first arrived.
+    /// Used by the inclusion-audit path (task 026).
+    pub fn view_with_slots(&self) -> impl Iterator<Item = (&EncryptedTx, u64)> {
+        self.txs.iter().filter_map(move |tx| {
+            let h = tx.hash();
+            self.first_seen_slot.get(&h).map(|s| (tx, *s))
+        })
     }
 
     /// Check if a transaction hash is already in the pool.
