@@ -4,6 +4,7 @@
 //! operations are FALCON-512 signed at the application layer — the Ed25519
 //! identity has no authority over consensus, blocks, or transactions.
 
+use crate::auth::{self, PydeAuthReq, PydeAuthResp};
 use crate::config::NetworkConfig;
 use crate::sync_protocol::{self, SyncReq, SyncResp};
 use libp2p::{
@@ -26,6 +27,8 @@ pub struct PydeBehaviour {
     pub identify: identify::Behaviour,
     /// Request-response for sync protocol (block download, chain tip queries).
     pub sync: request_response::cbor::Behaviour<SyncReq, SyncResp>,
+    /// Request-response for FALCON peer attestation (tasks 029/030).
+    pub auth: request_response::cbor::Behaviour<PydeAuthReq, PydeAuthResp>,
 }
 
 /// Generate a new node keypair. Call once on first run, then persist.
@@ -88,11 +91,15 @@ pub fn create_node(config: &NetworkConfig, local_key: identity::Keypair) -> Resu
             // Sync request-response protocol
             let sync = sync_protocol::sync_behaviour();
 
+            // FALCON peer-attestation protocol (tasks 029/030).
+            let auth = auth::auth_behaviour();
+
             Ok(PydeBehaviour {
                 gossipsub,
                 kademlia,
                 identify,
                 sync,
+                auth,
             })
         })
         .map_err(|e| format!("behaviour error: {e}"))?
