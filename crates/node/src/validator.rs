@@ -94,36 +94,22 @@ pub fn load_validator_set_from_state(
 
         let val_key = pyde_state::keys::validator_key(&address);
         if let Some(val_data) = state.get(&val_key) {
-            // Parse: [pk_len:4 LE][pk_bytes][stake:16 LE][status:1][exit_block:8 LE optional]
-            if val_data.len() < 5 {
-                continue;
-            }
-            let pk_len = u32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]) as usize;
-            if val_data.len() < 4 + pk_len + 16 + 1 {
-                continue;
-            }
-            let pk_bytes = val_data[4..4 + pk_len].to_vec();
-            let mut stake_buf = [0u8; 16];
-            stake_buf.copy_from_slice(&val_data[4 + pk_len..4 + pk_len + 16]);
-            let stake = u128::from_le_bytes(stake_buf);
-            let status_byte = val_data[4 + pk_len + 16];
-            let status = match status_byte {
+            let entry = match pyde_tx::pipeline::ValidatorEntry::decode(&val_data) {
+                Some(e) => e,
+                None => continue,
+            };
+            let status = match entry.status {
                 0x00 => ValidatorStatus::Active,
-                0x01 => {
-                    // Unbonding — read exit block if available
-                    let exit_block = if val_data.len() >= 4 + pk_len + 16 + 1 + 8 {
-                        let off = 4 + pk_len + 16 + 1;
-                        u64::from_le_bytes(val_data[off..off+8].try_into().unwrap_or([0;8]))
-                    } else { 0 };
-                    ValidatorStatus::Unbonding { exit_block }
-                }
+                0x01 => ValidatorStatus::Unbonding {
+                    exit_block: entry.exit_block.unwrap_or(0),
+                },
                 _ => ValidatorStatus::Exited,
             };
 
             set.validators.push(Validator {
                 address,
-                public_key: pk_bytes,
-                stake,
+                public_key: entry.pk,
+                stake: entry.stake,
                 status,
                 registered_epoch: 0,
             });
@@ -160,34 +146,44 @@ pub fn process_unbonding(
         };
 
         let val_key = pyde_state::keys::validator_key(&address);
-        if let Some(mut val_data) = state.get(&val_key) {
-            if val_data.len() < 5 { continue; }
-            let pk_len = u32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]) as usize;
-            let status_offset = 4 + pk_len + 16;
-            if val_data.len() <= status_offset { continue; }
+        if let Some(val_data) = state.get(&val_key) {
+            let mut entry = match pyde_tx::pipeline::ValidatorEntry::decode(&val_data) {
+                Some(e) => e,
+                None => continue,
+            };
 
-            // Check if Unbonding (0x01) with expired period
-            if val_data[status_offset] == 0x01 && val_data.len() >= status_offset + 1 + 8 {
-                let exit_off = status_offset + 1;
-                let exit_block = u64::from_le_bytes(
-                    val_data[exit_off..exit_off + 8].try_into().unwrap_or([0; 8])
-                );
+            // Unbonding period elapsed? Transition to Exited + return stake.
+            // Auto-claim any pending pool yield BEFORE transitioning to
+            // Exited — the ClaimReward handler rejects Exited entries, so
+            // without this step the validator's legitimate pre-exit
+            // accrual would be stranded in the accumulator forever.
+            if entry.status == 0x01 {
+                if let Some(exit_block) = entry.exit_block {
+                    if current_slot >= exit_block + UNBONDING_PERIOD {
+                        let current_acc = pyde_tx::pipeline::read_rewards_per_validator(state);
+                        let owed = current_acc.saturating_sub(entry.last_claimed_at);
 
-                if current_slot >= exit_block + UNBONDING_PERIOD {
-                    // Unbonding expired: return stake to balance, set status to Exited (0x02)
-                    val_data[status_offset] = 0x02; // Exited
-                    let _ = state.insert(val_key, val_data);
+                        entry.status = 0x02;
+                        entry.exit_block = None;
+                        entry.last_claimed_at = current_acc;
+                        let _ = state.insert(val_key, entry.encode());
 
-                    // Credit stake back to validator's balance
-                    let balance_key = pyde_state::keys::balance_key(&address);
-                    if let Some(account_bytes) = state.get(&balance_key) {
-                        if let Some(mut account) = pyde_account::types::Account::from_bytes(&account_bytes) {
-                            account.balance += VALIDATOR_STAKE;
-                            let _ = state.insert(balance_key, account.to_bytes());
-                            tracing::info!(
-                                validator = hex::encode(address),
-                                "unbonding complete: stake returned"
-                            );
+                        let balance_key = pyde_state::keys::balance_key(&address);
+                        if let Some(account_bytes) = state.get(&balance_key) {
+                            if let Some(mut account) =
+                                pyde_account::types::Account::from_bytes(&account_bytes)
+                            {
+                                account.balance =
+                                    account.balance.saturating_add(VALIDATOR_STAKE);
+                                account.balance = account.balance.saturating_add(owed);
+                                let _ = state.insert(balance_key, account.to_bytes());
+                                tracing::info!(
+                                    validator = hex::encode(address),
+                                    stake_returned = VALIDATOR_STAKE,
+                                    reward_claimed = owed,
+                                    "unbonding complete: stake + pending reward returned"
+                                );
+                            }
                         }
                     }
                 }

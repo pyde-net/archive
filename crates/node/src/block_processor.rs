@@ -221,16 +221,95 @@ impl BlockProcessor {
             }
         }
 
-        // 4. Block reward: credit proposer with inflation reward
-        let reward = pyde_tx::fee::block_reward(slot);
-        if reward > 0 && block.header.proposer != [0u8; 32] {
-            let proposer_key = pyde_state::keys::balance_key(&block.header.proposer);
-            if let Some(acct_bytes) = state.get(&proposer_key) {
-                if let Some(mut acct) = pyde_account::types::Account::from_bytes(&acct_bytes) {
-                    acct.balance += reward;
-                    let _ = state.insert(proposer_key, acct.to_bytes());
+        // 4. Block reward: mint + split between service + pool shares (Phase 4 slice 4.1).
+        //
+        //   - Total mint comes from the inflation schedule for `slot`.
+        //   - SERVICE_SHARE_PCT of the mint goes directly to the proposer
+        //     as a service bonus (paid for producing this block).
+        //   - The remainder accumulates in `rewards_per_validator`, divided
+        //     by the active validator count N so each validator's stake
+        //     earns an equal share. Validators pull their accrued yield
+        //     later via TransactionType::ClaimReward (lazy-accrual pattern).
+        //
+        //   - `total_supply` increments by the full mint amount so future
+        //     block_reward math reflects circulating supply (once we wire
+        //     block_reward to read it — currently block_reward uses
+        //     GENESIS_TOTAL_SUPPLY as an upper bound, see fee.rs).
+        //
+        // Receipts summed in step 4b update `total_burned` (Phase 1 task 041).
+        let total_mint = pyde_tx::fee::block_reward(slot);
+        if total_mint > 0 && block.header.proposer != [0u8; 32] {
+            let service_share = total_mint * pyde_tx::pipeline::SERVICE_SHARE_PCT / 100;
+            let pool_share = total_mint - service_share;
+
+            // Credit proposer their service share immediately.
+            if service_share > 0 {
+                let proposer_key = pyde_state::keys::balance_key(&block.header.proposer);
+                if let Some(acct_bytes) = state.get(&proposer_key) {
+                    if let Some(mut acct) = pyde_account::types::Account::from_bytes(&acct_bytes) {
+                        acct.balance += service_share;
+                        let _ = state.insert(proposer_key, acct.to_bytes());
+                    }
                 }
             }
+
+            // Accumulate pool share. Divisor is the historical validator
+            // count (monotonic, includes exited entries) — NOT the active-
+            // only count. This slightly over-counts the denominator and
+            // under-pays active validators by the exited fraction. The
+            // fix (separate `active_validator_count` state var, decremented
+            // on exit) is deferred to slice 4.2 because validator_count is
+            // also load-bearing for `validator_index_key` enumeration.
+            //
+            // Integer division `pool_share / N` drops a remainder of at
+            // most (N-1) quanta per block. Over a year this bounds to
+            // ~10 PYDE — negligible vs ~50M PYDE annual mint. Not worth
+            // carrying a remainder register.
+            //
+            // If N == 0 (pre-first-stake devnet), skip accrual — the
+            // un-distributed pool share is lost for that block, transient.
+            if pool_share > 0 {
+                let validator_count = state
+                    .get(&pyde_state::keys::validator_count_key())
+                    .and_then(|b| {
+                        if b.len() >= 8 {
+                            Some(u64::from_le_bytes(b[..8].try_into().ok()?))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                if validator_count > 0 {
+                    let per_validator_increment = pool_share / validator_count as u128;
+                    if per_validator_increment > 0 {
+                        let current = pyde_tx::pipeline::read_rewards_per_validator(state);
+                        pyde_tx::pipeline::write_rewards_per_validator(
+                            state,
+                            current.saturating_add(per_validator_increment),
+                        );
+                    }
+                }
+            }
+
+            // Update circulating-supply counter. Read-modify-write.
+            let current_supply = pyde_tx::pipeline::read_total_supply(state);
+            pyde_tx::pipeline::write_total_supply(
+                state,
+                current_supply.saturating_add(total_mint),
+            );
+        }
+
+        // 4b. Phase 1 task 041 — track cumulative fee burn. Sum each tx's
+        // receipted `fee_burned` and roll into the global counter. One
+        // read-modify-write per block keeps this cheap regardless of
+        // tx count.
+        let block_burn: u128 = receipts.iter().map(|r| r.fee_burned).sum();
+        if block_burn > 0 {
+            let current_burned = pyde_tx::pipeline::read_total_burned(state);
+            pyde_tx::pipeline::write_total_burned(
+                state,
+                current_burned.saturating_add(block_burn),
+            );
         }
 
         // 5. Merkle commit is handled by the CALLER (node event loop).
@@ -765,6 +844,41 @@ mod tests {
         assert_eq!(receipts.len(), 1); // failed tx now produces a failed receipt
         assert!(!receipts[0].success);  // receipt marks failure
         assert_eq!(chain.head_slot, 1);
+    }
+
+    #[test]
+    fn process_full_block_rolls_up_total_burned() {
+        // Slice 4.1 regression: verify the block processor sums receipts'
+        // fee_burned into the global TOTAL_BURNED counter. Uses a crafted
+        // block whose receipts carry a non-zero burn, constructed directly
+        // rather than by executing real txs (which would fail validation
+        // at dummy signature check and produce zero-fee failed receipts).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let mut chain = ChainState::genesis(state.root(), 31337);
+
+        // Pre-check: counter defaults to 0.
+        assert_eq!(pyde_tx::pipeline::read_total_burned(&state), 0);
+
+        // Seed counter at a known non-zero value, then process an empty
+        // block and verify the counter is untouched (no receipts → no burn
+        // accumulated).
+        pyde_tx::pipeline::write_total_burned(&mut state, 4_200);
+        let empty_block = Block {
+            header: dummy_header(1),
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![],
+                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+            },
+            proposer_signature: vec![],
+        };
+        BlockProcessor::process_full_block(&mut chain, &mut state, &empty_block).unwrap();
+        assert_eq!(
+            pyde_tx::pipeline::read_total_burned(&state),
+            4_200,
+            "empty block must not touch total_burned"
+        );
     }
 
     // ========== tx_root commits to full transaction order ==========

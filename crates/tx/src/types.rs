@@ -28,6 +28,12 @@ pub enum TransactionType {
     /// burns the slashed amount, and pays the finder's fee to
     /// `tx.from`. Gate is permissionless so any node can submit.
     Slash = 5,
+    /// Claim accrued staking yield from the pool-reward accumulator
+    /// (Phase 4 slice 4.1). Pulls `rewards_per_validator - last_claimed_at`
+    /// quanta into `tx.from`'s balance and updates the validator entry's
+    /// `last_claimed_at` to the current accumulator. Gas is paid normally
+    /// — a zero-reward claim still costs gas but is otherwise a no-op.
+    ClaimReward = 6,
 }
 
 impl TransactionType {
@@ -39,6 +45,7 @@ impl TransactionType {
             3 => Some(Self::StakeDeposit),
             4 => Some(Self::StakeWithdraw),
             5 => Some(Self::Slash),
+            6 => Some(Self::ClaimReward),
             _ => None,
         }
     }
