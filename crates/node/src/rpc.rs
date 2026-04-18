@@ -791,9 +791,36 @@ impl PydeApiServer for RpcServer {
 
         let tx_hash = enc_tx.hash();
 
-        // Add to encrypted mempool
+        // Task 028: bind ciphertext to sender's on-chain FALCON pubkey.
+        // Look up the sender's account; if a Single auth_key is registered,
+        // enforce full FALCON verification (receive_tx_verified). Accounts
+        // with no registered key (fresh / faucet / system) fall back to
+        // the structural-only path so devnet bootstrap still works. Mainnet
+        // users are expected to have an auth_key set, putting them on the
+        // verified path by default.
+        let sender_pk_opt = {
+            let state_r = self.state.state.read().await;
+            let sender_key = pyde_state::keys::balance_key(&from);
+            state_r.get(&sender_key)
+                .and_then(|bytes| pyde_account::types::Account::from_bytes(&bytes))
+                .and_then(|acct| match acct.auth_keys {
+                    pyde_account::types::AuthKeys::Single(pk) => Some(pk),
+                    _ => None,
+                })
+        };
+
         let mut relay = self.state.tx_relay.write().await;
-        relay.receive_tx(enc_tx);
+        let accepted = if let Some(sender_pk) = sender_pk_opt {
+            relay.receive_tx_verified(enc_tx, &sender_pk)
+        } else {
+            relay.receive_tx(enc_tx)
+        };
+        if !accepted {
+            return Err(rpc_err(
+                -32000,
+                "tx rejected (duplicate, rate-limited, or signature failed verification)".to_string(),
+            ));
+        }
 
         info!(tx_hash = hex::encode(tx_hash), "encrypted tx accepted into mempool");
         Ok(format!("0x{}", hex::encode(tx_hash)))
