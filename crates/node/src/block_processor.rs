@@ -554,11 +554,65 @@ pub fn try_decrypt_and_execute(
         return DecryptOutcome::TxRootMismatch;
     }
 
+    // Re-verify each EncryptedTx's FALCON signature against the sender's
+    // on-chain public key BEFORE decrypting. The sig lives in the
+    // `EncryptedTx::hash()` domain (binds sender + ciphertext_hash +
+    // nonce + gas + chain). Verifying here closes the malicious-proposer
+    // attack: a byzantine proposer could otherwise include an EncryptedTx
+    // with forged sender (bypassing mempool admission entirely), have it
+    // decrypted by the honest committee, and executed. Without this check
+    // a single byzantine proposer steals funds from any EOA.
+    //
+    // Txs whose sender has no `AuthKeys::Single` registration are rejected
+    // here: for mainnet, the only legitimate way an encrypted tx reaches
+    // a block is submit via RPC, which requires the sender to have a
+    // registered auth key (task 028). Accounts without auth_keys (system
+    // accounts, pre-auth EOAs) can't originate encrypted txs.
+    //
+    // A tx that fails verification is dropped from the execution list
+    // rather than aborting the whole block — matches the receipt-per-tx
+    // failure model used elsewhere.
+    let mut verified_enc_indices: Vec<usize> = Vec::with_capacity(decryptor.encrypted_txs.len());
+    for (i, etx) in decryptor.encrypted_txs.iter().enumerate() {
+        let sender_key = pyde_state::keys::balance_key(&etx.sender);
+        let sender_pk: Option<Vec<u8>> = state.get(&sender_key)
+            .and_then(|bytes| pyde_account::types::Account::from_bytes(&bytes))
+            .and_then(|acct| match acct.auth_keys {
+                pyde_account::types::AuthKeys::Single(pk) => Some(pk),
+                _ => None,
+            });
+        match sender_pk {
+            Some(pk) => {
+                if pyde_mempool::pool::Mempool::verify_signature_with_key(etx, &pk) {
+                    verified_enc_indices.push(i);
+                } else {
+                    warn!(
+                        slot,
+                        sender = hex::encode(etx.sender),
+                        "dropping encrypted tx with invalid FALCON signature — block may have been built by a byzantine proposer"
+                    );
+                }
+            }
+            None => {
+                warn!(
+                    slot,
+                    sender = hex::encode(etx.sender),
+                    "dropping encrypted tx from sender with no registered auth key"
+                );
+            }
+        }
+    }
+
     let decrypted_txs = match decryptor.decrypt_all() {
         Ok(t) => t,
         Err(e) => return DecryptOutcome::DecryptFailed(e),
     };
 
+    // After explicit verification above, the Transaction's signature
+    // field (which is over `EncryptedTx::hash()`, not `Transaction::hash()`)
+    // would fail a naive re-check. `dev_skip_signature: true` is safe
+    // here because each tx we execute below was already FALCON-verified
+    // in the correct hash domain.
     let block_ctx = BlockContext {
         height: slot,
         timestamp: header.timestamp,
@@ -566,10 +620,13 @@ pub fn try_decrypt_and_execute(
         block_gas_limit,
         chain_id,
         validator_address: proposer_addr,
-        dev_skip_signature: false,
+        dev_skip_signature: true,
     };
     let mut receipts = Vec::with_capacity(decrypted_txs.len());
-    for dtx in &decrypted_txs {
+    for (i, dtx) in decrypted_txs.iter().enumerate() {
+        if !verified_enc_indices.contains(&i) {
+            continue;
+        }
         match execute_transaction(dtx, &mut *state.smt_mut(), &block_ctx) {
             Ok(r) => receipts.push(r),
             Err(e) => warn!(slot, error = ?e, "decrypted tx execution failed"),
@@ -578,7 +635,7 @@ pub fn try_decrypt_and_execute(
     state.refresh_root();
 
     DecryptOutcome::Executed {
-        tx_count: decrypted_txs.len(),
+        tx_count: verified_enc_indices.len(),
         receipts,
     }
 }
@@ -914,9 +971,14 @@ mod tests {
 
     #[test]
     fn try_decrypt_and_execute_runs_on_honest_decryptor() {
-        // Positive case: honest decryptor + honest block → Executed outcome,
-        // regardless of tx-level success/failure (dummy sigs will fail at
-        // execution time, producing failed receipts, but the flow runs).
+        // Positive case: honest decryptor + honest block → Executed outcome.
+        // Note `tx_count` reports VERIFIED txs (passed FALCON check against
+        // on-chain auth key). The test's helper builds ciphertexts with
+        // dummy-byte signatures and unregistered senders, so verified
+        // count is 0 — but the Executed variant confirms the end-to-end
+        // pipeline ran without tx_root / header / decrypt failures.
+        // End-to-end with real keys is covered by the e2e suite in
+        // validator.rs tests.
         let tmp = tempfile::tempdir().unwrap();
         let mut state = StateManager::open(tmp.path(), 1024).unwrap();
         let bs = crate::block_store::BlockStore::open(tmp.path()).unwrap();
@@ -939,8 +1001,8 @@ mod tests {
         );
 
         assert!(
-            matches!(outcome, DecryptOutcome::Executed { tx_count: 2, .. }),
-            "honest decryptor must execute; got {:?}",
+            matches!(outcome, DecryptOutcome::Executed { .. }),
+            "honest decryptor must reach the Executed outcome; got {:?}",
             outcome
         );
     }
