@@ -375,12 +375,23 @@ fn execute_transaction_inner(
                     // Deduct stake from sender balance
                     sender.balance -= VALIDATOR_STAKE;
 
-                    // Write validator entry to state: [pk_len:4 LE][pk][stake:16 LE][status:1]
-                    let mut val_data = Vec::with_capacity(4 + 897 + 16 + 1);
+                    // Snapshot the current global rewards accumulator. Seeding
+                    // `last_claimed_at` at the CURRENT value means the new
+                    // validator starts with zero owed — they only earn from
+                    // future blocks. Without this, a late-joiner would be
+                    // retroactively credited with every historical pool
+                    // payout and claim an outsized amount on their first
+                    // ClaimReward tx.
+                    let current_rewards_per_validator = read_rewards_per_validator(smt);
+
+                    // Write validator entry to state:
+                    //   [pk_len:4 LE][pk][stake:16 LE][status:1][last_claimed_at:16 LE]
+                    let mut val_data = Vec::with_capacity(4 + 897 + 16 + 1 + 16);
                     val_data.extend_from_slice(&(897u32).to_le_bytes());
                     val_data.extend_from_slice(pk_bytes);
                     val_data.extend_from_slice(&VALIDATOR_STAKE.to_le_bytes());
                     val_data.push(0x00); // Active
+                    val_data.extend_from_slice(&current_rewards_per_validator.to_le_bytes());
 
                     let val_key = pyde_state::keys::validator_key(&tx.from);
                     let _ = smt.insert(val_key, val_data);
@@ -418,57 +429,33 @@ fn execute_transaction_inner(
             // Stake withdraw: set validator status to Unbonding.
             let val_key = pyde_state::keys::validator_key(&tx.from);
             match smt.get(&val_key) {
-                Some(mut val_data) => {
-                    if val_data.len() < 5 {
-                        (
-                            false,
-                            21_000u64,
-                            0u64,
-                            vec![],
-                            b"invalid validator entry".to_vec(),
-                        )
-                    } else {
-                        let pk_len = u32::from_le_bytes([
-                            val_data[0],
-                            val_data[1],
-                            val_data[2],
-                            val_data[3],
-                        ]) as usize;
-                        let status_offset = 4 + pk_len + 16;
-                        if val_data.len() <= status_offset {
-                            (
-                                false,
-                                21_000u64,
-                                0u64,
-                                vec![],
-                                b"invalid validator entry".to_vec(),
-                            )
-                        } else if val_data[status_offset] != 0x00 {
-                            // Not Active
-                            (
-                                false,
-                                21_000u64,
-                                0u64,
-                                vec![],
-                                b"validator is not active".to_vec(),
-                            )
-                        } else {
-                            // Set status to Unbonding (0x01) + store exit block
-                            val_data[status_offset] = 0x01;
-                            // Append exit block (8 bytes LE) for unbonding period tracking
-                            val_data.extend_from_slice(&block_ctx.height.to_le_bytes());
-                            let _ = smt.insert(val_key, val_data);
-
-                            tracing::info!(
-                                validator = hex::encode(tx.from),
-                                exit_block = block_ctx.height,
-                                "stake withdraw: validator unbonding started"
-                            );
-
-                            (true, 50_000u64, 0u64, vec![], vec![])
-                        }
+                Some(val_data) => match ValidatorEntry::decode(&val_data) {
+                    Some(mut entry) if entry.status == 0x00 => {
+                        entry.status = 0x01;
+                        entry.exit_block = Some(block_ctx.height);
+                        let _ = smt.insert(val_key, entry.encode());
+                        tracing::info!(
+                            validator = hex::encode(tx.from),
+                            exit_block = block_ctx.height,
+                            "stake withdraw: validator unbonding started"
+                        );
+                        (true, 50_000u64, 0u64, vec![], vec![])
                     }
-                }
+                    Some(_) => (
+                        false,
+                        21_000u64,
+                        0u64,
+                        vec![],
+                        b"validator is not active".to_vec(),
+                    ),
+                    None => (
+                        false,
+                        21_000u64,
+                        0u64,
+                        vec![],
+                        b"invalid validator entry".to_vec(),
+                    ),
+                },
                 None => (
                     false,
                     21_000u64,
@@ -479,6 +466,56 @@ fn execute_transaction_inner(
             }
         }
         TransactionType::Slash => execute_slash(tx, smt, &mut sender.balance),
+        TransactionType::ClaimReward => {
+            // Pull the sender's accrued pool share. Valid only for
+            // Active (0x00) and Unbonding (0x01) entries — Exited
+            // (0x02) validators are rejected. Without this gate, an
+            // exited validator whose entry sits in state could still
+            // claim whatever the accumulator has gained since their
+            // last_claimed_at — free yield after they've already
+            // withdrawn their stake. Real fund leakage.
+            //
+            // Unbonding validators CAN claim: they may have earned
+            // yield while still Active and haven't pulled it yet.
+            // Denying their claim punishes honest validators who
+            // submitted StakeWithdraw.
+            let val_key = pyde_state::keys::validator_key(&tx.from);
+            match smt.get(&val_key) {
+                Some(val_data) => match ValidatorEntry::decode(&val_data) {
+                    Some(mut entry) if entry.status == 0x02 => (
+                        false,
+                        21_000u64,
+                        0u64,
+                        vec![],
+                        b"validator has exited; no further claims".to_vec(),
+                    ),
+                    Some(mut entry) => {
+                        let current = read_rewards_per_validator(smt);
+                        let owed = current.saturating_sub(entry.last_claimed_at);
+                        if owed > 0 {
+                            sender.balance = sender.balance.saturating_add(owed);
+                            entry.last_claimed_at = current;
+                            let _ = smt.insert(val_key, entry.encode());
+                        }
+                        (true, 21_000u64, 0u64, vec![], owed.to_le_bytes().to_vec())
+                    }
+                    None => (
+                        false,
+                        21_000u64,
+                        0u64,
+                        vec![],
+                        b"validator entry corrupt".to_vec(),
+                    ),
+                },
+                None => (
+                    false,
+                    21_000u64,
+                    0u64,
+                    vec![],
+                    b"not a registered validator".to_vec(),
+                ),
+            }
+        }
         _ => {
             // Simple transfer or batch (batch deferred)
             (true, 21_000u64, 0u64, vec![], vec![])
@@ -728,6 +765,148 @@ fn execute_in_pvm(
 /// Between groups, execution is order-independent because the scheduler
 /// guarantees disjoint state access — groups never touch the same storage keys.
 ///
+// ============================================================
+// Staking yield accounting (Phase 4 slice 4.1)
+// ============================================================
+
+/// Percentage of per-block inflation minted to the block proposer as a
+/// "service reward." The remainder (100 - `SERVICE_SHARE_PCT`) flows into
+/// the pool-yield accumulator and is claimable by every registered
+/// validator proportional to their (identical) stake.
+///
+/// Chosen at 25% to roughly mirror Ethereum's proposer-vs-attester split
+/// (proposer takes a meaningful bonus but most mint accrues to stakers).
+pub const SERVICE_SHARE_PCT: u128 = 25;
+
+/// Read the global rewards-per-validator accumulator. Returns 0 when the
+/// key has not yet been initialized (pre-first-mint state).
+pub fn read_rewards_per_validator(smt: &dyn pyde_state::smt::StateAccess) -> u128 {
+    read_u128_state(smt, pyde_state::keys::rewards_per_validator_key()).unwrap_or(0)
+}
+
+/// Write the global rewards-per-validator accumulator.
+pub fn write_rewards_per_validator(
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    value: u128,
+) {
+    let _ = smt.insert(
+        pyde_state::keys::rewards_per_validator_key(),
+        value.to_le_bytes().to_vec(),
+    );
+}
+
+/// Read the global `total_supply` state variable. Returns
+/// `GENESIS_TOTAL_SUPPLY` (1B PYDE in quanta) as the default for
+/// pre-initialization state, so block_reward math is correct at block 1
+/// even before the first `total_supply` write.
+pub fn read_total_supply(smt: &dyn pyde_state::smt::StateAccess) -> u128 {
+    read_u128_state(smt, pyde_state::keys::supply_key())
+        .unwrap_or(crate::fee::GENESIS_TOTAL_SUPPLY)
+}
+
+/// Write the global `total_supply` state variable.
+pub fn write_total_supply(smt: &mut dyn pyde_state::smt::StateAccess, value: u128) {
+    let _ = smt.insert(
+        pyde_state::keys::supply_key(),
+        value.to_le_bytes().to_vec(),
+    );
+}
+
+/// Read cumulative fee burn counter (u128 LE, defaults to 0).
+pub fn read_total_burned(smt: &dyn pyde_state::smt::StateAccess) -> u128 {
+    read_u128_state(smt, pyde_state::keys::total_burned_key()).unwrap_or(0)
+}
+
+/// Write cumulative fee burn counter.
+pub fn write_total_burned(smt: &mut dyn pyde_state::smt::StateAccess, value: u128) {
+    let _ = smt.insert(
+        pyde_state::keys::total_burned_key(),
+        value.to_le_bytes().to_vec(),
+    );
+}
+
+fn read_u128_state(
+    smt: &dyn pyde_state::smt::StateAccess,
+    key: sparse_merkle_tree::H256,
+) -> Option<u128> {
+    smt.get(&key).and_then(|b| {
+        if b.len() >= 16 {
+            Some(u128::from_le_bytes(b[..16].try_into().ok()?))
+        } else {
+            None
+        }
+    })
+}
+
+/// Layout of a validator entry:
+///   [pk_len:4 LE][pk:897][stake:16 LE][status:1][last_claimed_at:16 LE][exit_block:8 LE, optional]
+/// `exit_block` is present iff `status == 0x01` (Unbonding). Total is
+/// either 4 + 897 + 16 + 1 + 16 = 934 bytes (Active/Exited), or
+/// 934 + 8 = 942 bytes (Unbonding).
+pub const VALIDATOR_ENTRY_BASE_LEN: usize = 4 + 897 + 16 + 1 + 16;
+
+/// Parsed view of a validator entry. Single source of truth for the wire
+/// format — both the StakeDeposit / StakeWithdraw / ClaimReward handlers
+/// and the consensus-side loader in pyde-node::validator go through this
+/// struct to avoid offset drift.
+pub struct ValidatorEntry {
+    pub pk: Vec<u8>,
+    pub stake: u128,
+    pub status: u8,
+    pub last_claimed_at: u128,
+    /// Block at which unbonding was initiated. Only populated when
+    /// `status == 0x01` (Unbonding).
+    pub exit_block: Option<u64>,
+}
+
+impl ValidatorEntry {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < VALIDATOR_ENTRY_BASE_LEN {
+            return None;
+        }
+        let pk_len = u32::from_le_bytes(bytes[..4].try_into().ok()?) as usize;
+        if pk_len != 897 || bytes.len() < 4 + pk_len + 16 + 1 + 16 {
+            return None;
+        }
+        let pk = bytes[4..4 + pk_len].to_vec();
+        let stake_start = 4 + pk_len;
+        let stake = u128::from_le_bytes(bytes[stake_start..stake_start + 16].try_into().ok()?);
+        let status_pos = stake_start + 16;
+        let status = bytes[status_pos];
+        let claim_start = status_pos + 1;
+        let last_claimed_at =
+            u128::from_le_bytes(bytes[claim_start..claim_start + 16].try_into().ok()?);
+        let exit_start = claim_start + 16;
+        let exit_block = if status == 0x01 && bytes.len() >= exit_start + 8 {
+            Some(u64::from_le_bytes(
+                bytes[exit_start..exit_start + 8].try_into().ok()?,
+            ))
+        } else {
+            None
+        };
+        Some(Self {
+            pk,
+            stake,
+            status,
+            last_claimed_at,
+            exit_block,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(VALIDATOR_ENTRY_BASE_LEN + 8);
+        buf.extend_from_slice(&(self.pk.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.pk);
+        buf.extend_from_slice(&self.stake.to_le_bytes());
+        buf.push(self.status);
+        buf.extend_from_slice(&self.last_claimed_at.to_le_bytes());
+        if let Some(eb) = self.exit_block {
+            buf.extend_from_slice(&eb.to_le_bytes());
+        }
+        buf
+    }
+}
+
 // ============================================================
 // Slash transaction handler
 // ============================================================
@@ -2041,13 +2220,274 @@ mod tests {
         // Verify status is Unbonding (0x01)
         let val_key = pyde_state::keys::validator_key(&sender_addr);
         let val_data = smt.get(&val_key).unwrap();
-        let pk_len =
-            u32::from_le_bytes([val_data[0], val_data[1], val_data[2], val_data[3]]) as usize;
-        assert_eq!(
-            val_data[4 + pk_len + 16],
-            0x01,
-            "status should be Unbonding"
+        let entry = ValidatorEntry::decode(&val_data).expect("entry should decode");
+        assert_eq!(entry.status, 0x01, "status should be Unbonding");
+        assert!(entry.exit_block.is_some(), "exit_block must be set when unbonding");
+    }
+
+    // ========== Phase 4 slice 4.1: ClaimReward + pool accrual ==========
+
+    fn deposit_validator(
+        smt: &mut PydeSMT,
+        ctx: &BlockContext,
+    ) -> (Address, pyde_crypto::falcon::FalconSecretKey) {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let addr = derive_eoa_address(pk.as_bytes());
+        // Generous balance so gas + stake + later-claim fits.
+        fund_account_with_pk(
+            smt,
+            &addr,
+            pyde_slashing::VALIDATOR_STAKE + 1_000_000_000_000,
+            pk.as_bytes(),
         );
+        let mut tx = Transaction {
+            from: addr,
+            to: [0u8; 32],
+            value: 0,
+            data: pk.as_bytes().to_vec(),
+            gas_limit: 100_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::StakeDeposit,
+        };
+        sign_tx(&mut tx, &sk);
+        let r = execute_transaction(&tx, smt, ctx).unwrap();
+        assert!(r.success, "deposit should succeed");
+        (addr, sk)
+    }
+
+    #[test]
+    fn claim_reward_late_joiner_gets_zero() {
+        // Validator joins AFTER some blocks have accrued pool rewards.
+        // Their `last_claimed_at` is seeded to the current accumulator, so
+        // the first ClaimReward pulls exactly zero — no retroactive crediting.
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+
+        // Seed the accumulator as if earlier blocks accrued 500 quanta/validator.
+        write_rewards_per_validator(&mut smt, 500);
+
+        let (addr, sk) = deposit_validator(&mut smt, &ctx);
+
+        // Read entry — last_claimed_at should equal current accumulator (500).
+        let entry = ValidatorEntry::decode(
+            &smt.get(&pyde_state::keys::validator_key(&addr)).unwrap(),
+        ).unwrap();
+        assert_eq!(entry.last_claimed_at, 500);
+
+        // Claim now with no further accrual → owed = 0.
+        let mut claim = Transaction {
+            from: addr,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 50_000,
+            nonce: 1,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::ClaimReward,
+        };
+        sign_tx(&mut claim, &sk);
+        let r = execute_transaction(&claim, &mut smt, &ctx).unwrap();
+        assert!(r.success);
+        // return_data encodes the owed amount as u128 LE.
+        let owed = u128::from_le_bytes(r.return_data[..16].try_into().unwrap());
+        assert_eq!(owed, 0);
+    }
+
+    #[test]
+    fn claim_reward_pulls_accrued_amount() {
+        // Validator joins first, THEN pool accrues, then claim → pulls the
+        // full accrued amount. Verifies lazy-accrual math end-to-end.
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+
+        let (addr, sk) = deposit_validator(&mut smt, &ctx);
+        let balance_before = load_account(&smt, &addr).balance;
+
+        // Simulate pool accrual. Set ACCRUED large enough that the gas
+        // charge on the claim tx is negligible — the test asserts that
+        // the accrued amount landed in the validator's balance, not gas
+        // math. 10 PYDE is ~500× the gas cost at the devnet base_fee.
+        const ACCRUED: u128 = 10_000_000_000;
+        write_rewards_per_validator(&mut smt, ACCRUED);
+
+        let mut claim = Transaction {
+            from: addr,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 50_000,
+            nonce: 1,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::ClaimReward,
+        };
+        sign_tx(&mut claim, &sk);
+        let r = execute_transaction(&claim, &mut smt, &ctx).unwrap();
+        assert!(r.success);
+
+        let owed = u128::from_le_bytes(r.return_data[..16].try_into().unwrap());
+        assert_eq!(owed, ACCRUED, "claim must pull exactly the accrued amount");
+
+        let balance_after = load_account(&smt, &addr).balance;
+        // The claim adds ACCRUED; gas consumes some of it. Net delta must
+        // be positive (claim > gas) and bounded above by ACCRUED.
+        let delta = balance_after - balance_before;
+        assert!(
+            delta > 0 && delta <= ACCRUED,
+            "balance delta (0, ACCRUED]: got {}, accrued {}",
+            delta,
+            ACCRUED,
+        );
+
+        // last_claimed_at must advance to current accumulator.
+        let entry = ValidatorEntry::decode(
+            &smt.get(&pyde_state::keys::validator_key(&addr)).unwrap(),
+        ).unwrap();
+        assert_eq!(entry.last_claimed_at, ACCRUED);
+    }
+
+    #[test]
+    fn claim_reward_twice_only_pulls_once() {
+        // Second claim immediately after the first must pull zero — the
+        // accumulator hasn't moved between calls.
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let (addr, sk) = deposit_validator(&mut smt, &ctx);
+        write_rewards_per_validator(&mut smt, 10_000);
+
+        let mut c1 = Transaction {
+            from: addr, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
+            nonce: 1, signature: vec![], fee_payer: FeePayer::Sender,
+            access_list: vec![], deadline: None, chain_id: 1,
+            tx_type: TransactionType::ClaimReward,
+        };
+        sign_tx(&mut c1, &sk);
+        let r1 = execute_transaction(&c1, &mut smt, &ctx).unwrap();
+        assert_eq!(
+            u128::from_le_bytes(r1.return_data[..16].try_into().unwrap()),
+            10_000,
+        );
+
+        let mut c2 = c1.clone();
+        c2.nonce = 2;
+        sign_tx(&mut c2, &sk);
+        let r2 = execute_transaction(&c2, &mut smt, &ctx).unwrap();
+        assert_eq!(
+            u128::from_le_bytes(r2.return_data[..16].try_into().unwrap()),
+            0,
+            "second claim at same accumulator must be empty"
+        );
+    }
+
+    #[test]
+    fn claim_reward_exited_validator_rejected() {
+        // REGRESSION TEST for the fund-leakage bug surfaced during slice 4.1
+        // review. Without the status gate, an exited validator could continue
+        // pulling from the accumulator after already receiving their stake back.
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+
+        let (addr, sk) = deposit_validator(&mut smt, &ctx);
+
+        // Flip the entry to Exited directly (simulates post-unbonding state).
+        let val_key = pyde_state::keys::validator_key(&addr);
+        let mut entry = ValidatorEntry::decode(&smt.get(&val_key).unwrap()).unwrap();
+        entry.status = 0x02;
+        smt.insert(val_key, entry.encode()).unwrap();
+
+        // Accumulator has moved up since their last_claimed_at; under the
+        // old code this would be claimable. After the fix it must reject.
+        write_rewards_per_validator(&mut smt, 1_000_000);
+
+        let mut claim = Transaction {
+            from: addr, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
+            nonce: 1, signature: vec![], fee_payer: FeePayer::Sender,
+            access_list: vec![], deadline: None, chain_id: 1,
+            tx_type: TransactionType::ClaimReward,
+        };
+        sign_tx(&mut claim, &sk);
+        let r = execute_transaction(&claim, &mut smt, &ctx).unwrap();
+        assert!(!r.success, "exited validator must not be able to claim");
+        assert_eq!(r.return_data, b"validator has exited; no further claims");
+    }
+
+    #[test]
+    fn claim_reward_unbonding_validator_still_allowed() {
+        // Unbonding validators can still claim what they earned while
+        // Active. Only Exited is gated. Without this, honest validators
+        // who submitted StakeWithdraw would lose their legitimate yield.
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+
+        let (addr, sk) = deposit_validator(&mut smt, &ctx);
+        write_rewards_per_validator(&mut smt, 10_000_000_000);
+
+        // Flip to Unbonding (0x01) — analogous to a StakeWithdraw having run.
+        let val_key = pyde_state::keys::validator_key(&addr);
+        let mut entry = ValidatorEntry::decode(&smt.get(&val_key).unwrap()).unwrap();
+        entry.status = 0x01;
+        entry.exit_block = Some(100);
+        smt.insert(val_key, entry.encode()).unwrap();
+
+        let mut claim = Transaction {
+            from: addr, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
+            nonce: 1, signature: vec![], fee_payer: FeePayer::Sender,
+            access_list: vec![], deadline: None, chain_id: 1,
+            tx_type: TransactionType::ClaimReward,
+        };
+        sign_tx(&mut claim, &sk);
+        let r = execute_transaction(&claim, &mut smt, &ctx).unwrap();
+        assert!(r.success, "unbonding validator must be able to claim earned yield");
+        let owed = u128::from_le_bytes(r.return_data[..16].try_into().unwrap());
+        assert_eq!(owed, 10_000_000_000);
+    }
+
+    #[test]
+    fn claim_reward_non_validator_rejected() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let (pk, sk) = falcon_keygen().unwrap();
+        let addr = derive_eoa_address(pk.as_bytes());
+        fund_account_with_pk(&mut smt, &addr, 1_000_000_000_000, pk.as_bytes());
+
+        let mut claim = Transaction {
+            from: addr, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
+            nonce: 0, signature: vec![], fee_payer: FeePayer::Sender,
+            access_list: vec![], deadline: None, chain_id: 1,
+            tx_type: TransactionType::ClaimReward,
+        };
+        sign_tx(&mut claim, &sk);
+        let r = execute_transaction(&claim, &mut smt, &ctx).unwrap();
+        assert!(!r.success, "non-validator must be rejected");
+        assert_eq!(r.return_data, b"not a registered validator");
+    }
+
+    #[test]
+    fn supply_and_burn_counters_default_correctly() {
+        let smt = PydeSMT::new();
+        assert_eq!(read_total_supply(&smt), crate::fee::GENESIS_TOTAL_SUPPLY);
+        assert_eq!(read_total_burned(&smt), 0);
+        assert_eq!(read_rewards_per_validator(&smt), 0);
+    }
+
+    #[test]
+    fn supply_counter_round_trips() {
+        let mut smt = PydeSMT::new();
+        let val = crate::fee::GENESIS_TOTAL_SUPPLY + 12_345_678;
+        write_total_supply(&mut smt, val);
+        assert_eq!(read_total_supply(&smt), val);
     }
 
     fn fund_account_with_pk(

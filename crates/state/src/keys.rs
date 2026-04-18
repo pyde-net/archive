@@ -27,6 +27,17 @@ pub mod discriminator {
     pub const VALIDATOR: u8 = 0x10;
     /// Special key for the validator count (stored at validator_count_key).
     pub const VALIDATOR_COUNT: u8 = 0x11;
+    /// Global total supply counter (Phase 4 slice 4.1, task 041-supply).
+    pub const SUPPLY: u8 = 0x12;
+    /// Cumulative fee burn counter (Phase 4 task 041).
+    pub const TOTAL_BURNED: u8 = 0x13;
+    /// Global "rewards per validator" accumulator for the lazy-accrual pool
+    /// yield. Every block adds `pool_share / N` to this counter; each
+    /// validator computes owed = current - their `last_claimed_at` when
+    /// they submit a `ClaimReward` tx. Because every validator stakes an
+    /// identical `VALIDATOR_STAKE`, we can collapse the classic
+    /// `rewards_per_stake_unit × stake` form into a per-validator counter.
+    pub const REWARDS_PER_VALIDATOR: u8 = 0x14;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +173,29 @@ pub fn validator_index_key(index: u64) -> H256 {
     input.push(discriminator::VALIDATOR_COUNT);
     input.extend_from_slice(&index.to_le_bytes());
     H256::from(poseidon2_hash(&input).to_bytes())
+}
+
+/// Global current total supply.
+///
+/// Starts at `GENESIS_TOTAL_SUPPLY`, increments on every per-block mint.
+/// We do NOT decrement on burn because burn and supply are tracked
+/// separately (see `total_burned_key`); circulating supply at any slot
+/// is `supply - total_burned`. Stored as `u128` little-endian.
+pub fn supply_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::SUPPLY]).to_bytes())
+}
+
+/// Cumulative fee burn. Monotonic counter, u128 LE.
+pub fn total_burned_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::TOTAL_BURNED]).to_bytes())
+}
+
+/// Global rewards-per-validator accumulator for lazy-accrual staking yield.
+/// Each block increments by `pool_reward / N` where N is the active
+/// validator count. Validators claim by diffing against their stored
+/// `last_claimed_at` in the validator entry. u128 LE.
+pub fn rewards_per_validator_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::REWARDS_PER_VALIDATOR]).to_bytes())
 }
 
 #[cfg(test)]

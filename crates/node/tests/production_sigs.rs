@@ -43,9 +43,8 @@ fn sync_nonces(accounts: &mut [Acct], smt: &dyn pyde_state::smt::StateAccess) {
 
 #[test]
 fn production_chain_id_1_full_lifecycle() {
-    let dir = std::env::temp_dir().join("pyde-prod-sigs");
-    let _ = std::fs::remove_dir_all(&dir);
-    let mut smt = PersistentSMT::open(dir.join("state").to_str().unwrap()).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut smt = PersistentSMT::open(tmp.path().join("state").to_str().unwrap()).unwrap();
 
     // Production context: chain_id=1, sig verification ON
     let validator = derive_eoa_address(b"validator");
