@@ -395,8 +395,31 @@ impl BlockProcessor {
         chain_id: u64,
         verify_signatures: bool,
     ) -> Result<(), String> {
+        // 0. Verify tx_root commits to the full transaction ordering —
+        // plaintext AND encrypted. Without this, a proposer could reorder
+        // encrypted_txs after the QC without changing the signed block
+        // hash, defeating MEV protection.
+        let encrypted_tx_hashes: Vec<[u8; 32]> = block
+            .body
+            .encrypted_txs
+            .iter()
+            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+            .map(|etx| etx.hash())
+            .collect();
+        if !pyde_consensus::block::verify_tx_root(
+            &block.header.tx_root,
+            &block.body.transactions,
+            &encrypted_tx_hashes,
+        ) {
+            return Err(format!(
+                "tx_root mismatch: header {} — block body has been \
+                 tampered with or the proposer reordered encrypted txs after QC",
+                hex::encode(block.header.tx_root)
+            ));
+        }
+
         let txs = &block.body.transactions;
-        if txs.is_empty() {
+        if txs.is_empty() && block.body.encrypted_txs.is_empty() {
             return Ok(());
         }
 
@@ -451,6 +474,112 @@ impl BlockProcessor {
         }
 
         Ok(())
+    }
+}
+
+/// Outcome of `try_decrypt_and_execute`.
+///
+/// `TxRootMismatch` is the MEV-protection path: the decryptor's encrypted_txs
+/// ordering does not match what the block's tx_root committed to, so applying
+/// its decrypted output would violate the commitment validators voted on.
+#[derive(Debug)]
+pub enum DecryptOutcome {
+    Executed {
+        tx_count: usize,
+        receipts: Vec<Receipt>,
+    },
+    HeaderMissing,
+    TxRootMismatch,
+    DecryptFailed(String),
+}
+
+/// Verify a decryptor's encrypted_txs ordering matches a block's committed tx_root.
+///
+/// This is the decryption-time MEV invariant. The block's tx_root (signed by the
+/// proposer, voted on by 2/3+, cemented in the QC) binds a specific ordering of
+/// encrypted_txs. Anything that feeds a decryptor MUST produce the same order,
+/// or the committee would collectively decrypt state that no one voted for.
+pub fn verify_decryptor_against_committed_root(
+    committed_tx_root: &[u8; 32],
+    block_plaintext_txs: &[Transaction],
+    decryptor_encrypted_txs: &[pyde_mempool::encrypted::EncryptedTx],
+) -> bool {
+    let enc_hashes: Vec<[u8; 32]> = decryptor_encrypted_txs
+        .iter()
+        .map(|e| e.hash())
+        .collect();
+    pyde_consensus::block::verify_tx_root(
+        committed_tx_root,
+        block_plaintext_txs,
+        &enc_hashes,
+    )
+}
+
+/// Full decrypt + execute flow with MEV tx_root check.
+///
+/// 1. Load block header + plaintext body from `block_store`.
+/// 2. Verify the decryptor's encrypted_txs match the committed tx_root.
+///    If not → `TxRootMismatch`, no state change.
+/// 3. `decrypt_all` on the decryptor.
+/// 4. Execute each decrypted tx against state. Failures don't abort the block
+///    (they produce failed receipts like any other tx execution path).
+/// 5. Refresh state root.
+///
+/// Returns outcome for caller observability (logging + receipt storage).
+pub fn try_decrypt_and_execute(
+    block_store: &crate::block_store::BlockStore,
+    slot: u64,
+    decryptor: &mut pyde_mempool::decryption::BlockDecryptor,
+    state: &mut StateManager,
+    block_gas_limit: u64,
+    base_fee: u128,
+    chain_id: u64,
+    proposer_addr: [u8; 32],
+) -> DecryptOutcome {
+    let header = match block_store.get_header(slot) {
+        Some(h) => h,
+        None => return DecryptOutcome::HeaderMissing,
+    };
+    let plaintext_txs = block_store
+        .get_block_raw(slot)
+        .and_then(|raw| crate::wire::decode_block(&raw).ok())
+        .map(|b| b.body.transactions)
+        .unwrap_or_default();
+
+    if !verify_decryptor_against_committed_root(
+        &header.tx_root,
+        &plaintext_txs,
+        &decryptor.encrypted_txs,
+    ) {
+        return DecryptOutcome::TxRootMismatch;
+    }
+
+    let decrypted_txs = match decryptor.decrypt_all() {
+        Ok(t) => t,
+        Err(e) => return DecryptOutcome::DecryptFailed(e),
+    };
+
+    let block_ctx = BlockContext {
+        height: slot,
+        timestamp: header.timestamp,
+        base_fee,
+        block_gas_limit,
+        chain_id,
+        validator_address: proposer_addr,
+        dev_skip_signature: false,
+    };
+    let mut receipts = Vec::with_capacity(decrypted_txs.len());
+    for dtx in &decrypted_txs {
+        match execute_transaction(dtx, &mut *state.smt_mut(), &block_ctx) {
+            Ok(r) => receipts.push(r),
+            Err(e) => warn!(slot, error = ?e, "decrypted tx execution failed"),
+        }
+    }
+    state.refresh_root();
+
+    DecryptOutcome::Executed {
+        tx_count: decrypted_txs.len(),
+        receipts,
     }
 }
 
@@ -583,5 +712,266 @@ mod tests {
         assert_eq!(receipts.len(), 1); // failed tx now produces a failed receipt
         assert!(!receipts[0].success);  // receipt marks failure
         assert_eq!(chain.head_slot, 1);
+    }
+
+    // ========== tx_root commits to full transaction order ==========
+
+    fn build_dummy_encrypted_tx(seed: u8) -> Vec<u8> {
+        // Real EncryptedTx via the public API. Private threshold-
+        // ciphertext fields can't be synthesized directly. We use a
+        // throwaway 2-of-3 committee key — hash stability + wire
+        // roundtrip is what the tests need, not decryption.
+        let (committee_pk, _shares) = pyde_crypto::threshold::threshold_keygen(3, 2).unwrap();
+        let etx = pyde_mempool::encrypted::encrypt_transaction(
+            [seed; 32], // sender
+            seed as u64,
+            21_000,
+            vec![],
+            None,
+            1,
+            vec![0xAA; 666],
+            &[seed; 32],        // to
+            (seed as u128) * 100,
+            &[seed, seed, seed], // calldata
+            &committee_pk,
+        )
+        .unwrap();
+        etx.to_bytes()
+    }
+
+    #[test]
+    fn validate_body_rejects_reordered_encrypted_txs() {
+        // The MEV-protection invariant: a proposer who has committed to
+        // ordering via the QC cannot swap encrypted_tx positions afterwards.
+        // Here we simulate a tampered block — header tx_root was computed
+        // over [enc_a, enc_b], but the body ships [enc_b, enc_a].
+        let dir = std::env::temp_dir().join("pyde-test-bp2-reorder");
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = StateManager::open(&dir, 1024).unwrap();
+
+        let enc_a = build_dummy_encrypted_tx(0xAA);
+        let enc_b = build_dummy_encrypted_tx(0xBB);
+        let hash_a = pyde_mempool::encrypted::EncryptedTx::from_bytes(&enc_a).unwrap().hash();
+        let hash_b = pyde_mempool::encrypted::EncryptedTx::from_bytes(&enc_b).unwrap().hash();
+
+        // Honest tx_root covers [A, B].
+        let honest_root = pyde_consensus::block::compute_tx_root(&[], &[hash_a, hash_b]);
+
+        let mut header = dummy_header(1);
+        header.tx_root = honest_root;
+
+        // Tampered body ships [B, A] while claiming the [A, B] root.
+        let tampered = Block {
+            header,
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![enc_b, enc_a],
+                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+            },
+            proposer_signature: vec![],
+        };
+
+        let err = BlockProcessor::validate_block_body(&tampered, &state, 1).unwrap_err();
+        assert!(
+            err.contains("tx_root mismatch"),
+            "expected tx_root mismatch, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_body_rejects_added_encrypted_tx() {
+        // Proposer tries to slip an extra encrypted tx into the body
+        // without updating tx_root — rejected.
+        let dir = std::env::temp_dir().join("pyde-test-bp2-add-enc");
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = StateManager::open(&dir, 1024).unwrap();
+
+        let honest_root = pyde_consensus::block::compute_tx_root(&[], &[]);
+
+        let mut header = dummy_header(1);
+        header.tx_root = honest_root; // empty — no txs promised
+
+        let tampered = Block {
+            header,
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![build_dummy_encrypted_tx(0xCC)], // surprise!
+                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+            },
+            proposer_signature: vec![],
+        };
+
+        assert!(BlockProcessor::validate_block_body(&tampered, &state, 1).is_err());
+    }
+
+    #[test]
+    fn validate_body_accepts_honest_block() {
+        // Sanity: a well-formed block with matching tx_root passes.
+        let dir = std::env::temp_dir().join("pyde-test-bp2-honest");
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = StateManager::open(&dir, 1024).unwrap();
+
+        let enc = build_dummy_encrypted_tx(0xAA);
+        let hash = pyde_mempool::encrypted::EncryptedTx::from_bytes(&enc).unwrap().hash();
+        let tx_root = pyde_consensus::block::compute_tx_root(&[], &[hash]);
+
+        let mut header = dummy_header(1);
+        header.tx_root = tx_root;
+
+        let block = Block {
+            header,
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![enc],
+                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+            },
+            proposer_signature: vec![],
+        };
+
+        BlockProcessor::validate_block_body(&block, &state, 1).unwrap();
+    }
+
+    // ========== Decrypt-time tx_root check (task 025 integration) ==========
+
+    fn build_two_encrypted_txs_with_keys() -> (
+        pyde_crypto::threshold::ThresholdPublicKey,
+        Vec<pyde_crypto::threshold::KeyShare>,
+        pyde_mempool::encrypted::EncryptedTx,
+        pyde_mempool::encrypted::EncryptedTx,
+    ) {
+        let (pk, shares) = pyde_crypto::threshold::threshold_keygen(3, 2).unwrap();
+        let enc_a = pyde_mempool::encrypted::encrypt_transaction(
+            [0xAA; 32], 0, 21_000, vec![], None, 1,
+            vec![0xAA; 666],
+            &[0x11; 32], 100,
+            &[0xAA, 0xAA],
+            &pk,
+        ).unwrap();
+        let enc_b = pyde_mempool::encrypted::encrypt_transaction(
+            [0xBB; 32], 1, 21_000, vec![], None, 1,
+            vec![0xBB; 666],
+            &[0x22; 32], 200,
+            &[0xBB, 0xBB],
+            &pk,
+        ).unwrap();
+        (pk, shares, enc_a, enc_b)
+    }
+
+    fn store_block_with_encrypted_order(
+        bs: &crate::block_store::BlockStore,
+        slot: u64,
+        enc_order: &[&pyde_mempool::encrypted::EncryptedTx],
+    ) -> [u8; 32] {
+        let hashes: Vec<[u8; 32]> = enc_order.iter().map(|e| e.hash()).collect();
+        let committed_root = pyde_consensus::block::compute_tx_root(&[], &hashes);
+        let mut header = dummy_header(slot);
+        header.tx_root = committed_root;
+        let body = BlockBody {
+            transactions: vec![],
+            encrypted_txs: enc_order.iter().map(|e| e.to_bytes()).collect(),
+            execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+        };
+        let block = Block {
+            header: header.clone(),
+            body,
+            proposer_signature: vec![],
+        };
+        let raw = crate::wire::encode_block(&block);
+        bs.put_block(&header, &raw).unwrap();
+        committed_root
+    }
+
+    #[test]
+    fn try_decrypt_and_execute_aborts_on_tampered_decryptor() {
+        // This is the REGRESSION TEST for the decrypt-time MEV check.
+        // If someone deletes the verify_decryptor_against_committed_root call
+        // inside try_decrypt_and_execute, this test must fail.
+        //
+        // Setup: an honest block commits to encrypted_txs [A, B]. A tampered
+        // decryptor holds them as [B, A] — as would happen if an attacker
+        // swapped ciphertexts between block acceptance and decrypt time.
+        let dir = std::env::temp_dir().join("pyde-test-bp2-decrypt-tamper");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = StateManager::open(&dir, 1024).unwrap();
+        let bs = crate::block_store::BlockStore::open(&dir).unwrap();
+
+        let (_pk, _shares, enc_a, enc_b) = build_two_encrypted_txs_with_keys();
+        store_block_with_encrypted_order(&bs, 1, &[&enc_a, &enc_b]);
+
+        // Tampered decryptor: [B, A] — opposite of what tx_root committed to.
+        let mut tampered = pyde_mempool::decryption::BlockDecryptor::new(
+            vec![enc_b, enc_a],
+            2,
+        ).unwrap();
+
+        let outcome = try_decrypt_and_execute(
+            &bs, 1, &mut tampered, &mut state,
+            /* gas_limit */ 400_000_000,
+            /* base_fee  */ 1_000_000_000,
+            /* chain_id  */ 1,
+            /* proposer  */ [0u8; 32],
+        );
+
+        assert!(
+            matches!(outcome, DecryptOutcome::TxRootMismatch),
+            "tampered decryptor must be rejected; got {:?}",
+            outcome
+        );
+    }
+
+    #[test]
+    fn try_decrypt_and_execute_runs_on_honest_decryptor() {
+        // Positive case: honest decryptor + honest block → Executed outcome,
+        // regardless of tx-level success/failure (dummy sigs will fail at
+        // execution time, producing failed receipts, but the flow runs).
+        let dir = std::env::temp_dir().join("pyde-test-bp2-decrypt-honest");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = StateManager::open(&dir, 1024).unwrap();
+        let bs = crate::block_store::BlockStore::open(&dir).unwrap();
+
+        let (_pk, shares, enc_a, enc_b) = build_two_encrypted_txs_with_keys();
+        store_block_with_encrypted_order(&bs, 1, &[&enc_a, &enc_b]);
+
+        let mut honest = pyde_mempool::decryption::BlockDecryptor::new(
+            vec![enc_a, enc_b],
+            2,
+        ).unwrap();
+        for ks in &shares[..2] {
+            honest.add_member_shares(ks);
+        }
+        assert!(honest.all_ready(), "should have threshold shares");
+
+        let outcome = try_decrypt_and_execute(
+            &bs, 1, &mut honest, &mut state,
+            400_000_000, 1_000_000_000, 1, [0u8; 32],
+        );
+
+        assert!(
+            matches!(outcome, DecryptOutcome::Executed { tx_count: 2, .. }),
+            "honest decryptor must execute; got {:?}",
+            outcome
+        );
+    }
+
+    #[test]
+    fn try_decrypt_and_execute_returns_header_missing_when_unknown() {
+        let dir = std::env::temp_dir().join("pyde-test-bp2-decrypt-nohdr");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut state = StateManager::open(&dir, 1024).unwrap();
+        let bs = crate::block_store::BlockStore::open(&dir).unwrap();
+
+        let (_pk, _shares, enc_a, enc_b) = build_two_encrypted_txs_with_keys();
+        let mut decryptor = pyde_mempool::decryption::BlockDecryptor::new(
+            vec![enc_a, enc_b],
+            2,
+        ).unwrap();
+
+        let outcome = try_decrypt_and_execute(
+            &bs, 42, &mut decryptor, &mut state,
+            400_000_000, 1_000_000_000, 1, [0u8; 32],
+        );
+
+        assert!(matches!(outcome, DecryptOutcome::HeaderMissing));
     }
 }
