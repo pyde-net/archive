@@ -6,6 +6,7 @@ members = [
     "crates/aot",
     "crates/state",
     "crates/account",
+    "crates/slashing",
     "crates/tx",
     "crates/consensus",
     "crates/mempool",

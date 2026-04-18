@@ -1751,6 +1751,27 @@ fn handle_swarm_event(
                         // that never directly witnessed the equivocation
                         // can include a Slash tx in its next proposal.
                         if !message.data.is_empty() && message.data[0] == wire::tag::CONSENSUS_SLASH_EVIDENCE {
+                            // Task 014d: rate-limit evidence ingest by peer score.
+                            // Evidence verification costs ~60µs of FALCON verify.
+                            // A spammer that has already produced
+                            // `EVIDENCE_SPAM_THRESHOLD` rejected messages gets
+                            // dropped without decode+verify. Honest validators
+                            // producing legitimate evidence stay well under
+                            // the threshold because `ingest_evidence` dedupes
+                            // by (slot, signer) and silently ignores repeats.
+                            const EVIDENCE_SPAM_THRESHOLD: u64 = 5;
+                            let propagator_invalid = peer_manager
+                                .get_peer(&propagation_source)
+                                .map(|p| p.invalid_messages)
+                                .unwrap_or(0);
+                            if propagator_invalid >= EVIDENCE_SPAM_THRESHOLD {
+                                debug!(
+                                    forwarder = %propagation_source,
+                                    invalid = propagator_invalid,
+                                    "dropping evidence from peer over spam threshold"
+                                );
+                                return PostEventAction::None;
+                            }
                             match wire::decode_slash_evidence_msg(&message.data) {
                                 Ok(evidence) => {
                                     let slot = evidence.slot;
@@ -1761,6 +1782,14 @@ fn handle_swarm_event(
                                             signer = hex::encode(signer),
                                             "ingested slash evidence from gossip"
                                         );
+                                    } else {
+                                        // Failed verification or dedupe — bump
+                                        // the peer's invalid counter so repeat
+                                        // offenders cross the spam threshold
+                                        // and get dropped without further verify.
+                                        if let Some(info) = peer_manager.get_peer_mut(&propagation_source) {
+                                            info.invalid_messages = info.invalid_messages.saturating_add(1);
+                                        }
                                     }
                                     // Note: no immediate re-publish here.
                                     // gossipsub already propagates the
@@ -1769,6 +1798,9 @@ fn handle_swarm_event(
                                 }
                                 Err(e) => {
                                     debug!(error = e, "failed to decode slash evidence gossip");
+                                    if let Some(info) = peer_manager.get_peer_mut(&propagation_source) {
+                                        info.invalid_messages = info.invalid_messages.saturating_add(1);
+                                    }
                                 }
                             }
                             return PostEventAction::None;

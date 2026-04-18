@@ -2969,10 +2969,9 @@ mod tests {
         // mutations. It's what a validator would do on every block
         // proposal when its pending_evidence queue is non-empty.
         use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
+        use pyde_slashing::VALIDATOR_STAKE;
         use pyde_state::smt::PydeSMT;
         use pyde_tx::pipeline::{execute_transaction, BlockContext};
-
-        const VALIDATOR_STAKE: u128 = 10_000_000_000_000;
 
         // Offender: produces the two conflicting signatures.
         let (offender_pk, offender_sk) = falcon_keygen().unwrap();

@@ -3439,6 +3439,7 @@ version = "0.1.0"
 dependencies = [
  "pyde-account",
  "pyde-crypto",
+ "pyde-slashing",
  "pyde-tx",
  "sparse-merkle-tree",
 ]
@@ -3537,6 +3538,7 @@ dependencies = [
  "pyde-crypto",
  "pyde-mempool",
  "pyde-net",
+ "pyde-slashing",
  "pyde-state",
  "pyde-tx",
  "pyde-vm",
@@ -3575,6 +3577,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyde-slashing"
+version = "0.1.0"
+
+[[package]]
 name = "pyde-state"
 version = "0.1.0"
 dependencies = [
@@ -3595,6 +3601,7 @@ dependencies = [
  "pyde-account",
  "pyde-aot",
  "pyde-crypto",
+ "pyde-slashing",
  "pyde-state",
  "pyde-vm",
  "sparse-merkle-tree",

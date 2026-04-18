@@ -7,4 +7,5 @@ edition = "2021"
 pyde-crypto = { path = "../crypto" }
 pyde-account = { path = "../account" }
 pyde-tx = { path = "../tx" }
+pyde-slashing = { path = "../slashing" }
 sparse-merkle-tree = "0.6"

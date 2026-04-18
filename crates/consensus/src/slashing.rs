@@ -18,8 +18,10 @@ use crate::validator::{Validator, ValidatorSet, ValidatorStatus, VALIDATOR_STAKE
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{falcon_verify, FalconPublicKey, FalconSignature};
 
-/// Finder's fee percentage (10% of slashed amount).
-pub const FINDER_FEE_PERCENT: u128 = 10;
+/// Finder's fee percentage (10% of slashed amount). Canonical definition
+/// in `pyde-slashing`; re-exported here so existing consumers continue
+/// to work via `pyde_consensus::slashing::FINDER_FEE_PERCENT`.
+pub use pyde_slashing::FINDER_FEE_PERCENT;
 
 /// Slash percentages for liveness tiers.
 pub const LIVENESS_SLASH_MINOR: u128 = 1;   // 1% — participation < 90%

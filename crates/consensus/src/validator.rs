@@ -9,8 +9,11 @@ use crate::block::{COMMITTEE_SIZE, EPOCH_LENGTH};
 use pyde_account::address::Address;
 use pyde_crypto::poseidon2::poseidon2_hash;
 
-/// Required stake to register as a validator (in quanta, 10^9 quanta = 1 PYDE).
-pub const VALIDATOR_STAKE: u128 = 10_000_000_000_000; // 10,000 PYDE
+/// Required stake to register as a validator. Canonical definition lives
+/// in the `pyde-slashing` leaf crate so the slash-tx handler in `pyde-tx`
+/// (which can't depend on `pyde-consensus` due to a dep cycle) reads the
+/// same value. Re-exported here for backward-compat with existing consumers.
+pub use pyde_slashing::VALIDATOR_STAKE;
 
 /// Unbonding period in blocks (~14 days at 400ms blocks).
 /// 14 days × 24 hours × 60 min × 60 sec / 0.4 sec = 3,024,000 blocks.
