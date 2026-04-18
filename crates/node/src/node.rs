@@ -27,7 +27,7 @@ use pyde_net::node::{
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// The main Pyde node. Owns all subsystems.
 pub struct PydeNode {
@@ -696,44 +696,41 @@ impl PydeNode {
 
                                 // Check if threshold reached → decrypt + execute
                                 if decryptor.all_ready() {
-                                    match decryptor.decrypt_all() {
-                                        Ok(decrypted_txs) => {
-                                            info!(
-                                                slot,
-                                                txs = decrypted_txs.len(),
-                                                "threshold reached — decrypted + executing encrypted txs"
-                                            );
-                                            let mut chain_w = chain.write().await;
-                                            let mut state_w = state.write().await;
-                                            let proposer = block_store.get_header(slot)
-                                                .map(|h| h.proposer).unwrap_or([0u8; 32]);
-                                            let block_ctx = pyde_tx::pipeline::BlockContext {
-                                                height: slot,
-                                                timestamp: 0,
-                                                base_fee: chain_w.base_fee,
-                                                block_gas_limit: self.config.consensus.gas_ceiling,
-                                                chain_id: chain_w.chain_id,
-                                                validator_address: proposer,
-                                                dev_skip_signature: false,
-                                            };
-                                            let mut slot_receipts = Vec::new();
-                                            for dtx in &decrypted_txs {
-                                                match pyde_tx::pipeline::execute_transaction(dtx, &mut *state_w.smt_mut(), &block_ctx) {
-                                                    Ok(receipt) => {
-                                                        slot_receipts.push(receipt);
-                                                    }
-                                                    Err(e) => {
-                                                        warn!(slot, error = ?e, "decrypted tx execution failed");
-                                                    }
-                                                }
-                                            }
-                                            state_w.refresh_root();
+                                    let chain_w = chain.read().await;
+                                    let base_fee = chain_w.base_fee;
+                                    let chain_id = chain_w.chain_id;
+                                    drop(chain_w);
+                                    let proposer = block_store.get_header(slot)
+                                        .map(|h| h.proposer).unwrap_or([0u8; 32]);
+                                    let mut state_w = state.write().await;
+                                    let outcome = crate::block_processor::try_decrypt_and_execute(
+                                        &block_store,
+                                        slot,
+                                        decryptor,
+                                        &mut state_w,
+                                        self.config.consensus.gas_ceiling,
+                                        base_fee,
+                                        chain_id,
+                                        proposer,
+                                    );
+                                    drop(state_w);
+                                    match outcome {
+                                        crate::block_processor::DecryptOutcome::Executed { tx_count, receipts: slot_receipts } => {
+                                            info!(slot, txs = tx_count, "threshold reached — decrypted + executed");
                                             if !slot_receipts.is_empty() {
                                                 let mut receipts_w = receipts.write().await;
                                                 receipts_w.insert_block_receipts(slot, slot_receipts);
                                             }
                                         }
-                                        Err(e) => warn!(slot, error = %e, "decryption failed"),
+                                        crate::block_processor::DecryptOutcome::TxRootMismatch => {
+                                            error!(slot, "decrypt-time tx_root mismatch — dropped decryptor without executing");
+                                        }
+                                        crate::block_processor::DecryptOutcome::HeaderMissing => {
+                                            warn!(slot, "block header missing at decrypt time");
+                                        }
+                                        crate::block_processor::DecryptOutcome::DecryptFailed(e) => {
+                                            warn!(slot, error = %e, "decryption failed");
+                                        }
                                     }
                                     dec_w.remove(&slot);
                                 }
@@ -919,8 +916,20 @@ impl PydeNode {
                                     // for parallel execution (Sealevel-style).
                                     let exec_schedule = pyde_tx::parallel::schedule(&txs);
 
-                                    // Compute tx root
-                                    let tx_root = pyde_consensus::block::compute_tx_root(&txs);
+                                    // Compute tx root over BOTH plaintext and encrypted txs.
+                                    // Including encrypted tx hashes is what closes proposer
+                                    // front-running: without it, a proposer could reorder
+                                    // encrypted_txs after decryption without changing the
+                                    // block hash. See `compute_tx_root` for the rationale.
+                                    let encrypted_tx_hashes: Vec<[u8; 32]> = encrypted_blobs
+                                        .iter()
+                                        .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+                                        .map(|etx| etx.hash())
+                                        .collect();
+                                    let tx_root = pyde_consensus::block::compute_tx_root(
+                                        &txs,
+                                        &encrypted_tx_hashes,
+                                    );
 
                                     // Encode VRF data as [output:32 || proof:N] so verifiers
                                     // can check both the score and the proof validity.
@@ -1118,7 +1127,21 @@ impl PydeNode {
                                                             block.body.encrypted_txs.iter()
                                                                 .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
                                                                 .collect();
-                                                        if !enc_txs.is_empty() {
+
+                                                        let tx_root_ok = crate::block_processor::verify_decryptor_against_committed_root(
+                                                            &block.header.tx_root,
+                                                            &block.body.transactions,
+                                                            &enc_txs,
+                                                        );
+                                                        if !tx_root_ok {
+                                                            error!(
+                                                                slot = current_slot,
+                                                                "decrypt-time tx_root mismatch — \
+                                                                 refusing to decrypt tampered block"
+                                                            );
+                                                        }
+
+                                                        if tx_root_ok && !enc_txs.is_empty() {
                                                             let threshold = pyde_consensus::block::quorum_for_committee(
                                                                 engine.committee_keys.len()
                                                             );
