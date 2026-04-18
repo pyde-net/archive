@@ -42,6 +42,12 @@ pub struct PeerInfo {
     pub messages_received: u64,
     /// Number of invalid messages from this peer (for reputation).
     pub invalid_messages: u64,
+    /// FALCON-512 pubkey the peer attested on connect (task 029). `None`
+    /// until the auth handshake completes; populated via
+    /// `PeerManager::set_falcon_pubkey` after `pyde_net::auth::verify_auth_resp`
+    /// succeeds. Used by the consensus-channel filter (task 030) to drop
+    /// gossip from peers not in the current committee.
+    pub falcon_pubkey: Option<Vec<u8>>,
 }
 
 impl PeerInfo {
@@ -54,6 +60,7 @@ impl PeerInfo {
             ip: None,
             messages_received: 0,
             invalid_messages: 0,
+            falcon_pubkey: None,
         }
     }
 
@@ -204,6 +211,56 @@ impl PeerManager {
         self.peers.values().filter(|p| p.role == PeerRole::Validator)
     }
 
+    /// Record the FALCON pubkey attested by a peer during the auth
+    /// handshake (task 029). Idempotent: re-binding the same pubkey is a
+    /// no-op; rebinding to a different pubkey returns `false` — the caller
+    /// should treat this as a protocol violation (peers cannot change
+    /// their FALCON identity mid-connection without reconnecting).
+    pub fn set_falcon_pubkey(&mut self, peer_id: &PeerId, pubkey: Vec<u8>) -> bool {
+        match self.peers.get_mut(peer_id) {
+            Some(info) => match &info.falcon_pubkey {
+                Some(existing) if existing == &pubkey => true,
+                Some(_) => false,
+                None => {
+                    info.falcon_pubkey = Some(pubkey);
+                    true
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// Promote a peer to `PeerRole::Validator` once its attested FALCON
+    /// pubkey is confirmed to match a current committee key. The node
+    /// layer calls this after each auth handshake completes and after
+    /// every committee rotation.
+    pub fn mark_validator(&mut self, peer_id: &PeerId) -> bool {
+        match self.peers.get_mut(peer_id) {
+            Some(info) => {
+                info.role = PeerRole::Validator;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Look up a peer's attested FALCON pubkey, if any.
+    pub fn peer_falcon_pubkey(&self, peer_id: &PeerId) -> Option<&[u8]> {
+        self.peers.get(peer_id)?.falcon_pubkey.as_deref()
+    }
+
+    /// Evaluate whether a peer is authorized to publish on the
+    /// consensus-topic. A peer is authorized iff their attested FALCON
+    /// pubkey is present in `committee_keys` — missing attestations or
+    /// out-of-committee pubkeys return `false`. Callers drop consensus
+    /// gossip from unauthorized peers (task 030).
+    pub fn is_consensus_authorized(&self, peer_id: &PeerId, committee_keys: &[Vec<u8>]) -> bool {
+        match self.peer_falcon_pubkey(peer_id) {
+            Some(pk) => committee_keys.iter().any(|ck| ck.as_slice() == pk),
+            None => false,
+        }
+    }
+
     /// Evict the peer with lowest reputation. Returns the evicted peer ID.
     pub fn evict_lowest_reputation(&mut self) -> Option<PeerId> {
         let worst = self
@@ -338,5 +395,113 @@ mod tests {
         mgr.add_peer(full);
 
         assert_eq!(mgr.validators().count(), 1);
+    }
+
+    // ========== Task 029/030: FALCON attestation + consensus filter ==========
+
+    #[test]
+    fn set_falcon_pubkey_stores_attestation() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = dummy_peer(Direction::Inbound);
+        let id = peer.peer_id;
+        mgr.add_peer(peer);
+
+        let pk = vec![0xAA; 897];
+        assert!(mgr.set_falcon_pubkey(&id, pk.clone()));
+        assert_eq!(mgr.peer_falcon_pubkey(&id), Some(pk.as_slice()));
+    }
+
+    #[test]
+    fn set_falcon_pubkey_idempotent_on_rebind_same_key() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = dummy_peer(Direction::Inbound);
+        let id = peer.peer_id;
+        mgr.add_peer(peer);
+
+        let pk = vec![0xAA; 897];
+        assert!(mgr.set_falcon_pubkey(&id, pk.clone()));
+        // Re-setting to the same key is harmless; common if handshake retries.
+        assert!(mgr.set_falcon_pubkey(&id, pk));
+    }
+
+    #[test]
+    fn set_falcon_pubkey_rejects_rebind_to_different_key() {
+        // A peer switching FALCON identity mid-connection is a protocol
+        // violation — callers treat this as evidence to disconnect.
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = dummy_peer(Direction::Inbound);
+        let id = peer.peer_id;
+        mgr.add_peer(peer);
+
+        assert!(mgr.set_falcon_pubkey(&id, vec![0xAA; 897]));
+        assert!(!mgr.set_falcon_pubkey(&id, vec![0xBB; 897]));
+        // First key sticks; the rebind attempt is ignored.
+        assert_eq!(mgr.peer_falcon_pubkey(&id), Some(vec![0xAA; 897].as_slice()));
+    }
+
+    #[test]
+    fn set_falcon_pubkey_returns_false_for_unknown_peer() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let id = PeerId::random();
+        assert!(!mgr.set_falcon_pubkey(&id, vec![0xAA; 897]));
+    }
+
+    #[test]
+    fn is_consensus_authorized_accepts_committee_member() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = dummy_peer(Direction::Inbound);
+        let id = peer.peer_id;
+        mgr.add_peer(peer);
+
+        let committee_pk = vec![0xCC; 897];
+        mgr.set_falcon_pubkey(&id, committee_pk.clone());
+
+        let committee = vec![committee_pk, vec![0xDD; 897]];
+        assert!(mgr.is_consensus_authorized(&id, &committee));
+    }
+
+    #[test]
+    fn is_consensus_authorized_rejects_non_committee_member() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = dummy_peer(Direction::Inbound);
+        let id = peer.peer_id;
+        mgr.add_peer(peer);
+
+        // Peer has a valid FALCON pubkey, but it's not in the committee.
+        mgr.set_falcon_pubkey(&id, vec![0xEE; 897]);
+        let committee = vec![vec![0xAA; 897], vec![0xBB; 897]];
+        assert!(!mgr.is_consensus_authorized(&id, &committee));
+    }
+
+    #[test]
+    fn is_consensus_authorized_rejects_unattested_peer() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = dummy_peer(Direction::Inbound);
+        let id = peer.peer_id;
+        mgr.add_peer(peer);
+
+        // No pubkey set → unauthorized, even if committee non-empty.
+        let committee = vec![vec![0xAA; 897]];
+        assert!(!mgr.is_consensus_authorized(&id, &committee));
+    }
+
+    #[test]
+    fn is_consensus_authorized_rejects_unknown_peer() {
+        let mgr = PeerManager::new(10, 10, 10, 100);
+        let id = PeerId::random();
+        let committee = vec![vec![0xAA; 897]];
+        assert!(!mgr.is_consensus_authorized(&id, &committee));
+    }
+
+    #[test]
+    fn mark_validator_updates_role() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = dummy_peer(Direction::Inbound);
+        let id = peer.peer_id;
+        mgr.add_peer(peer);
+
+        assert_eq!(mgr.get_peer(&id).unwrap().role, PeerRole::Unknown);
+        assert!(mgr.mark_validator(&id));
+        assert_eq!(mgr.get_peer(&id).unwrap().role, PeerRole::Validator);
     }
 }

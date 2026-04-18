@@ -12,6 +12,7 @@
 //! Post-launch hardening: add FALCON peer authentication handshake on connect
 //! to reject impersonators faster (defense-in-depth, not a security fix).
 
+pub mod auth;
 pub mod channels;
 pub mod config;
 pub mod ddos;

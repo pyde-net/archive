@@ -214,6 +214,21 @@ impl PydeNode {
         chain_sync.manager.local_tip = chain.read().await.head_slot;
         let mut pinned_snapshot: Option<crate::sync::PinnedSnapshot> = None;
 
+        // Peer tracking for task 029/030 FALCON attestation + consensus filter.
+        // Sized generously — the mempool pool is 500K, validator mesh is 128
+        // with gossipsub fan-out reaching ~30 peers in practice.
+        let mut peer_manager = pyde_net::peer::PeerManager::new(
+            /* max_peers */ 200,
+            /* max_inbound */ 150,
+            /* max_outbound */ 150,
+            /* rate_limit_per_ip */ 10,
+        );
+        // Nonces we've sent out in outbound auth requests, keyed by peer.
+        // Populated in `SendAuthRequest`, consumed when the matching
+        // `PydeAuthResp` arrives.
+        let mut pending_auth_nonces: std::collections::HashMap<libp2p::PeerId, [u8; 32]> =
+            std::collections::HashMap::new();
+
         // 5. Validator engine + identity (only for validator role)
         let mut validator_identity: Option<ValidatorIdentity> = None;
         let mut validator_engine: Option<ValidatorEngine> = if is_validator {
@@ -487,6 +502,8 @@ impl PydeNode {
                             &mut validator_identity,
                             &block_store,
                             &mut pinned_snapshot,
+                            &mut peer_manager,
+                            &mut pending_auth_nonces,
                         )
                     };
 
@@ -498,6 +515,20 @@ impl PydeNode {
                         }
                         PostEventAction::SendSyncResponse(channel, response) => {
                             let _ = swarm.behaviour_mut().sync.send_response(channel, response);
+                        }
+                        PostEventAction::SendAuthRequest(peer) => {
+                            // Generate a fresh nonce, record it, send the request.
+                            // We only authenticate to peers once; if a response is
+                            // already pending we skip to avoid stacking nonces.
+                            if !pending_auth_nonces.contains_key(&peer) {
+                                let nonce = pyde_net::auth::generate_nonce();
+                                pending_auth_nonces.insert(peer, nonce);
+                                let req = pyde_net::auth::PydeAuthReq { nonce };
+                                let _ = swarm.behaviour_mut().auth.send_request(&peer, req);
+                            }
+                        }
+                        PostEventAction::SendAuthResponse(channel, resp) => {
+                            let _ = swarm.behaviour_mut().auth.send_response(channel, resp);
                         }
                         PostEventAction::ContinueSync => {
                             // If chunked snapshot in progress, request next chunk
@@ -1406,6 +1437,17 @@ enum PostEventAction {
     },
     ReconstructCompactBlock(pyde_net::propagation::CompactBlock),
     AddDecryptionShares(wire::DecryptionShareMsg),
+    /// Send a `PydeAuthReq` to a newly connected peer. The main loop
+    /// generates a fresh nonce, records it in `pending_auth_nonces`, and
+    /// dispatches via the swarm.
+    SendAuthRequest(PeerId),
+    /// Reply to an inbound `PydeAuthReq` with a signed attestation over
+    /// `(nonce, our_peer_id)`. The response channel holds the pending
+    /// outbound stream to the requester.
+    SendAuthResponse(
+        request_response::ResponseChannel<pyde_net::auth::PydeAuthResp>,
+        pyde_net::auth::PydeAuthResp,
+    ),
 }
 
 /// Handle a libp2p swarm event. Returns an action that may need swarm access.
@@ -1419,11 +1461,13 @@ fn handle_swarm_event(
     validator_identity: &mut Option<ValidatorIdentity>,
     block_store: &BlockStore,
     pinned_snapshot: &mut Option<crate::sync::PinnedSnapshot>,
+    peer_manager: &mut pyde_net::peer::PeerManager,
+    pending_auth_nonces: &mut std::collections::HashMap<PeerId, [u8; 32]>,
 ) -> PostEventAction {
     match event {
         // --- Gossipsub message received ---
         SwarmEvent::Behaviour(PydeBehaviourEvent::Gossipsub(
-            gossipsub::Event::Message { message, .. },
+            gossipsub::Event::Message { message, propagation_source, .. },
         )) => {
             let topic = message.topic.to_string();
             let channel = Channel::from_topic(&topic);
@@ -1530,6 +1574,56 @@ fn handle_swarm_event(
                     }
                 }
                 Some(Channel::Consensus) => {
+                    // Task 030: block non-validator relays of consensus
+                    // gossip. Two layered checks:
+                    //
+                    // 1. `propagation_source` — the DIRECT peer that
+                    //    forwarded this message to us. Every in-mesh peer
+                    //    has attempted our FALCON handshake, so an
+                    //    attested-non-committee propagator is a solid
+                    //    signal of a non-validator spamming the mesh.
+                    //    Drop hard.
+                    // 2. `message.source` — the ORIGINATOR. We may or may
+                    //    not have shaken hands with them (they might not
+                    //    be in our mesh at all). When we have, applying
+                    //    the same committee check blocks originator-level
+                    //    impersonation too.
+                    //
+                    // Unattested peers in either slot fall through to
+                    // app-layer FALCON sig verification — which catches
+                    // forgeries but pays the decode + verify cost.
+                    if let Some(engine) = validator_engine.as_ref() {
+                        // Primary: immediate forwarder.
+                        let prop_attested = peer_manager.peer_falcon_pubkey(&propagation_source).is_some();
+                        let prop_authorized = peer_manager
+                            .is_consensus_authorized(&propagation_source, &engine.committee_keys);
+                        if prop_attested && !prop_authorized {
+                            debug!(
+                                forwarder = %propagation_source,
+                                "dropping consensus gossip relayed by non-committee attested peer"
+                            );
+                            if let Some(info) = peer_manager.get_peer_mut(&propagation_source) {
+                                info.invalid_messages = info.invalid_messages.saturating_add(1);
+                            }
+                            return PostEventAction::None;
+                        }
+                        // Secondary: originator, when known.
+                        if let Some(source) = message.source.as_ref() {
+                            let src_attested = peer_manager.peer_falcon_pubkey(source).is_some();
+                            let src_authorized = peer_manager
+                                .is_consensus_authorized(source, &engine.committee_keys);
+                            if src_attested && !src_authorized {
+                                debug!(
+                                    %source,
+                                    "dropping consensus gossip originated by non-committee attested peer"
+                                );
+                                if let Some(info) = peer_manager.get_peer_mut(source) {
+                                    info.invalid_messages = info.invalid_messages.saturating_add(1);
+                                }
+                                return PostEventAction::None;
+                            }
+                        }
+                    }
                     if let Some(engine) = validator_engine.as_mut() {
                         // Check if it's a finality vote (different wire tag)
                         if !message.data.is_empty() && message.data[0] == wire::tag::CONSENSUS_FINALITY_VOTE {
@@ -1743,7 +1837,105 @@ fn handle_swarm_event(
             PostEventAction::None
         }
 
-        // --- Peer connected: ask for their chain tip ---
+        // --- Auth: inbound PydeAuthReq from a peer ---
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Auth(
+            request_response::Event::Message {
+                message: request_response::Message::Request { request, channel, .. },
+                peer,
+            },
+        )) => {
+            // Only validators can answer auth challenges — they're the only
+            // ones with a FALCON keypair. Full nodes stay silent; the
+            // requester will simply have no attestation to record for
+            // this peer, which is fine (they'll be treated as a
+            // non-validator by the consensus filter).
+            match validator_identity.as_ref() {
+                Some(id) => {
+                    let our_peer_bytes = id.address; // 32-byte EOA derived from FALCON pk
+                    match pyde_net::auth::build_auth_resp(
+                        &request,
+                        &our_peer_bytes,
+                        &id.secret_key,
+                        &id.public_key,
+                    ) {
+                        Ok(resp) => {
+                            debug!(%peer, "sending auth attestation");
+                            PostEventAction::SendAuthResponse(channel, resp)
+                        }
+                        Err(e) => {
+                            warn!(%peer, error = %e, "failed to build auth response");
+                            PostEventAction::None
+                        }
+                    }
+                }
+                None => {
+                    debug!(%peer, "ignoring auth request — no validator identity");
+                    PostEventAction::None
+                }
+            }
+        }
+
+        // --- Auth: response to our outbound PydeAuthReq ---
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Auth(
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                peer,
+            },
+        )) => {
+            // All handshake logic lives in `apply_auth_response` so this
+            // arm stays purely the swarm-event adapter. Keeps the state
+            // transitions testable without a live libp2p swarm.
+            let committee_keys = validator_engine
+                .as_ref()
+                .map(|e| e.committee_keys.clone())
+                .unwrap_or_default();
+            let outcome = pyde_net::auth::apply_auth_response(
+                peer,
+                &response,
+                pending_auth_nonces,
+                peer_manager,
+                &committee_keys,
+            );
+            use pyde_net::auth::AuthOutcome;
+            match outcome {
+                AuthOutcome::StoredAsValidator => {
+                    info!(%peer, "peer attested as committee validator");
+                }
+                AuthOutcome::StoredAsNonValidator => {
+                    debug!(%peer, "peer attested as non-validator");
+                }
+                AuthOutcome::NoPendingNonce => {
+                    debug!(%peer, "unexpected auth response (no pending nonce)");
+                }
+                AuthOutcome::VerifyFailed => {
+                    warn!(%peer, "FALCON attestation failed verification");
+                }
+                AuthOutcome::RebindRejected => {
+                    warn!(%peer, "peer attempted to rebind FALCON pubkey — ignoring");
+                }
+            }
+            PostEventAction::None
+        }
+
+        // --- Auth failures ---
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Auth(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            debug!(%peer, ?error, "auth request failed");
+            pending_auth_nonces.remove(&peer);
+            PostEventAction::None
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Auth(
+            request_response::Event::InboundFailure { peer, error, .. },
+        )) => {
+            debug!(%peer, ?error, "auth inbound failed");
+            PostEventAction::None
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Auth(
+            request_response::Event::ResponseSent { .. },
+        )) => PostEventAction::None,
+
+        // --- Peer connected: register + ask for chain tip + trigger auth handshake ---
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
         } => {
@@ -1752,7 +1944,19 @@ fn handle_swarm_event(
                 addr = %endpoint.get_remote_address(),
                 "peer connected"
             );
-            PostEventAction::RequestChainTip(peer_id)
+            // Track the peer so attested pubkeys can later be stored.
+            // Direction + IP are best-effort; we don't enforce inbound
+            // limits here because libp2p already handled transport.
+            let direction = match &endpoint {
+                libp2p::core::ConnectedPoint::Dialer { .. } => pyde_net::peer::Direction::Outbound,
+                libp2p::core::ConnectedPoint::Listener { .. } => pyde_net::peer::Direction::Inbound,
+            };
+            let info = pyde_net::peer::PeerInfo::new(peer_id, direction);
+            peer_manager.add_peer(info);
+
+            // Task 029: kick off the FALCON attestation handshake so the
+            // consensus filter (task 030) has a pubkey to check.
+            PostEventAction::SendAuthRequest(peer_id)
         }
 
         // --- Peer disconnected ---
@@ -1764,6 +1968,8 @@ fn handle_swarm_event(
                 cause = ?cause,
                 "peer disconnected"
             );
+            peer_manager.remove_peer(&peer_id);
+            pending_auth_nonces.remove(&peer_id);
             PostEventAction::None
         }
 

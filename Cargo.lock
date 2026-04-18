@@ -3506,6 +3506,8 @@ dependencies = [
 name = "pyde-net"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "getrandom 0.2.17",
  "libp2p",
  "pyde-account",
  "pyde-crypto",
