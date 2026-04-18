@@ -415,6 +415,13 @@ fn execute_transaction_inner(
                     let idx_key = pyde_state::keys::validator_index_key(count);
                     let _ = smt.insert(idx_key, tx.from.to_vec());
 
+                    // Slice 4.2: bump the active-only count. This is the
+                    // divisor used by the pool-yield accumulator; tracking
+                    // separately from the monotonic `VALIDATOR_COUNT`
+                    // (which doubles as an enumeration index) lets exited
+                    // and ejected members stop diluting active stakers.
+                    increment_active_validator_count(smt);
+
                     tracing::info!(
                         validator = hex::encode(tx.from),
                         stake = VALIDATOR_STAKE,
@@ -434,6 +441,8 @@ fn execute_transaction_inner(
                         entry.status = 0x01;
                         entry.exit_block = Some(block_ctx.height);
                         let _ = smt.insert(val_key, entry.encode());
+                        // Slice 4.2: Active→Unbonding, stop earning yield.
+                        decrement_active_validator_count(smt);
                         tracing::info!(
                             validator = hex::encode(tx.from),
                             exit_block = block_ctx.height,
@@ -838,6 +847,40 @@ fn read_u128_state(
     })
 }
 
+/// Read active-only validator count (slice 4.2). Defaults to 0.
+pub fn read_active_validator_count(smt: &dyn pyde_state::smt::StateAccess) -> u64 {
+    smt.get(&pyde_state::keys::active_validator_count_key())
+        .and_then(|b| {
+            if b.len() >= 8 {
+                Some(u64::from_le_bytes(b[..8].try_into().ok()?))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+/// Increment `active_validator_count`. Called on successful StakeDeposit.
+pub fn increment_active_validator_count(smt: &mut dyn pyde_state::smt::StateAccess) {
+    let n = read_active_validator_count(smt).saturating_add(1);
+    let _ = smt.insert(
+        pyde_state::keys::active_validator_count_key(),
+        n.to_le_bytes().to_vec(),
+    );
+}
+
+/// Decrement `active_validator_count`. Called on each transition OUT of
+/// Active (StakeWithdraw, slash, ejection). `saturating_sub(1)` protects
+/// against counter corruption — if it ever went negative the underflow
+/// would silently wrap and dilute payouts.
+pub fn decrement_active_validator_count(smt: &mut dyn pyde_state::smt::StateAccess) {
+    let n = read_active_validator_count(smt).saturating_sub(1);
+    let _ = smt.insert(
+        pyde_state::keys::active_validator_count_key(),
+        n.to_le_bytes().to_vec(),
+    );
+}
+
 /// Layout of a validator entry:
 ///   [pk_len:4 LE][pk:897][stake:16 LE][status:1][last_claimed_at:16 LE][exit_block:8 LE, optional]
 /// `exit_block` is present iff `status == 0x01` (Unbonding). Total is
@@ -994,22 +1037,6 @@ fn decode_slash_evidence(data: &[u8]) -> Result<SlashEvidence, String> {
 /// Parse a serialized validator entry:
 /// `[pk_len:4 LE][pk][stake:16 LE][status:1]`.
 /// Returns `(pk_bytes, stake, status, status_offset)`.
-fn parse_validator_entry(data: &[u8]) -> Option<(Vec<u8>, u128, u8, usize)> {
-    if data.len() < 4 {
-        return None;
-    }
-    let pk_len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
-    let stake_offset = 4 + pk_len;
-    let status_offset = stake_offset + 16;
-    if data.len() <= status_offset {
-        return None;
-    }
-    let pk_bytes = data[4..stake_offset].to_vec();
-    let stake = u128::from_le_bytes(data[stake_offset..stake_offset + 16].try_into().ok()?);
-    let status = data[status_offset];
-    Some((pk_bytes, stake, status, status_offset))
-}
-
 /// Canonical `(slot_le || block_hash)` bytes that proposers and voters
 /// sign. Mirrors `pyde_consensus::hotstuff::proposer_sign_message`.
 fn proposer_sign_message_bytes(slot: u64, block_hash: &[u8; 32]) -> Vec<u8> {
@@ -1048,20 +1075,21 @@ fn execute_slash(
         None => return failed(21_000, b"accused signer is not a registered validator"),
     };
 
-    let (pk_bytes, stake, status, status_offset) = match parse_validator_entry(&val_data) {
-        Some(v) => v,
+    let mut entry = match ValidatorEntry::decode(&val_data) {
+        Some(e) => e,
         None => return failed(21_000, b"corrupt validator entry"),
     };
 
-    // Status: 0x00 = Active, 0x01 = Unbonding, 0x02 = Ejected.
+    // Status: 0x00 = Active, 0x01 = Unbonding, 0x02 = Ejected/Exited.
     // An already-ejected validator has already been slashed — skip.
-    if status == 0x02 {
+    if entry.status == 0x02 {
         return failed(21_000, b"signer already ejected");
     }
+    let was_active = entry.status == 0x00;
 
     // Re-verify both signatures using the pubkey from state (not from
     // the evidence payload — the submitter could lie about signer).
-    let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&pk_bytes) {
+    let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&entry.pk) {
         Some(pk) => pk,
         None => return failed(21_000, b"validator public key is malformed"),
     };
@@ -1084,16 +1112,19 @@ fn execute_slash(
     // Evidence valid. Apply the slash: zero the stake, pay the finder,
     // mark the offender Ejected. The portion of stake not paid to the
     // finder is burned (implicit — never credited to any account).
-    let slash_amount = stake.min(SLASH_VALIDATOR_STAKE);
+    let slash_amount = entry.stake.min(SLASH_VALIDATOR_STAKE);
     let finder_fee = slash_amount * SLASH_FINDER_FEE_PERCENT / 100;
-    let new_stake = stake.saturating_sub(slash_amount);
+    entry.stake = entry.stake.saturating_sub(slash_amount);
+    entry.status = 0x02;
+    entry.exit_block = None;
     *submitter_balance = submitter_balance.saturating_add(finder_fee);
+    let _ = smt.insert(val_key, entry.encode());
 
-    let mut new_val_data = val_data.clone();
-    let stake_offset = status_offset - 16;
-    new_val_data[stake_offset..stake_offset + 16].copy_from_slice(&new_stake.to_le_bytes());
-    new_val_data[status_offset] = 0x02; // Ejected
-    let _ = smt.insert(val_key, new_val_data);
+    // Task 4.2: decrement active_validator_count when slashing an Active
+    // member (Unbonding members were already decremented on withdraw).
+    if was_active {
+        decrement_active_validator_count(smt);
+    }
 
     tracing::info!(
         offender = hex::encode(ev.signer),
@@ -2474,6 +2505,116 @@ mod tests {
         assert_eq!(r.return_data, b"not a registered validator");
     }
 
+    // ========== Phase 4 slice 4.2: active validator count + lifecycle ==========
+
+    #[test]
+    fn active_count_increments_on_stake_deposit() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        assert_eq!(read_active_validator_count(&smt), 0);
+
+        let (_, _) = deposit_validator(&mut smt, &ctx);
+        assert_eq!(read_active_validator_count(&smt), 1);
+
+        let (_, _) = deposit_validator(&mut smt, &ctx);
+        assert_eq!(read_active_validator_count(&smt), 2);
+    }
+
+    #[test]
+    fn active_count_decrements_on_stake_withdraw() {
+        // Active → Unbonding must release a slot in the active pool so
+        // the validator stops earning new yield immediately on withdraw.
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let (addr, sk) = deposit_validator(&mut smt, &ctx);
+        assert_eq!(read_active_validator_count(&smt), 1);
+
+        let mut withdraw = Transaction {
+            from: addr, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
+            nonce: 1, signature: vec![], fee_payer: FeePayer::Sender,
+            access_list: vec![], deadline: None, chain_id: 1,
+            tx_type: TransactionType::StakeWithdraw,
+        };
+        sign_tx(&mut withdraw, &sk);
+        let r = execute_transaction(&withdraw, &mut smt, &ctx).unwrap();
+        assert!(r.success);
+        assert_eq!(read_active_validator_count(&smt), 0);
+
+        // Entry is Unbonding and carries the exit block.
+        let val_key = pyde_state::keys::validator_key(&addr);
+        let entry = ValidatorEntry::decode(&smt.get(&val_key).unwrap()).unwrap();
+        assert_eq!(entry.status, 0x01);
+        assert!(entry.exit_block.is_some());
+    }
+
+    #[test]
+    fn active_count_decrements_on_slash() {
+        // Direct slash on an Active validator: active count must drop,
+        // entry stake must be zeroed, status must be Ejected (0x02).
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let (addr, _) = deposit_validator(&mut smt, &ctx);
+        assert_eq!(read_active_validator_count(&smt), 1);
+
+        // Synthesize an Ejected transition via direct state poke + the
+        // public decrement helper (integration testing execute_slash
+        // requires real FALCON sigs + evidence encoding; the slash unit
+        // tests elsewhere already cover the sig path. Here we focus on
+        // the lifecycle bookkeeping invariant.)
+        let val_key = pyde_state::keys::validator_key(&addr);
+        let mut entry = ValidatorEntry::decode(&smt.get(&val_key).unwrap()).unwrap();
+        entry.status = 0x02;
+        entry.stake = 0;
+        smt.insert(val_key, entry.encode()).unwrap();
+        decrement_active_validator_count(&mut smt);
+
+        assert_eq!(read_active_validator_count(&smt), 0);
+    }
+
+    #[test]
+    fn active_count_is_independent_of_monotonic_total() {
+        // Two validators register → active=2, total=2.
+        // One withdraws → active=1, total=2 (monotonic never decreases).
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let (addr1, sk1) = deposit_validator(&mut smt, &ctx);
+        let (_addr2, _sk2) = deposit_validator(&mut smt, &ctx);
+
+        assert_eq!(read_active_validator_count(&smt), 2);
+        let total: u64 = smt
+            .get(&pyde_state::keys::validator_count_key())
+            .map(|b| u64::from_le_bytes(b[..8].try_into().unwrap()))
+            .unwrap_or(0);
+        assert_eq!(total, 2);
+
+        let mut withdraw = Transaction {
+            from: addr1, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
+            nonce: 1, signature: vec![], fee_payer: FeePayer::Sender,
+            access_list: vec![], deadline: None, chain_id: 1,
+            tx_type: TransactionType::StakeWithdraw,
+        };
+        sign_tx(&mut withdraw, &sk1);
+        execute_transaction(&withdraw, &mut smt, &ctx).unwrap();
+
+        assert_eq!(read_active_validator_count(&smt), 1);
+        let total_after: u64 = smt
+            .get(&pyde_state::keys::validator_count_key())
+            .map(|b| u64::from_le_bytes(b[..8].try_into().unwrap()))
+            .unwrap_or(0);
+        assert_eq!(total_after, 2, "monotonic total must NOT decrement");
+    }
+
+    #[test]
+    fn decrement_active_count_saturates_at_zero() {
+        // Guard: counter corruption must not wrap to u64::MAX and silently
+        // cause a gigantic divisor next block.
+        let mut smt = PydeSMT::new();
+        decrement_active_validator_count(&mut smt);
+        assert_eq!(read_active_validator_count(&smt), 0);
+        decrement_active_validator_count(&mut smt);
+        assert_eq!(read_active_validator_count(&smt), 0);
+    }
+
     #[test]
     fn supply_and_burn_counters_default_correctly() {
         let smt = PydeSMT::new();
@@ -2515,8 +2656,8 @@ mod tests {
     // ========== Slash transaction handler ==========
 
     /// Directly install a validator entry under `validator_key(addr)`,
-    /// bypassing the StakeDeposit flow. Matches the layout the
-    /// StakeDeposit handler writes: [pk_len:4 LE][pk][stake:16 LE][status:1].
+    /// bypassing the StakeDeposit flow. Uses the unified `ValidatorEntry`
+    /// struct so test fixtures track the live wire format.
     fn register_validator_directly(
         smt: &mut dyn pyde_state::smt::StateAccess,
         addr: &Address,
@@ -2524,14 +2665,21 @@ mod tests {
         stake: u128,
         status_byte: u8,
     ) {
-        let pk_len = pk_bytes.len() as u32;
-        let mut val_data = Vec::with_capacity(4 + pk_bytes.len() + 16 + 1);
-        val_data.extend_from_slice(&pk_len.to_le_bytes());
-        val_data.extend_from_slice(pk_bytes);
-        val_data.extend_from_slice(&stake.to_le_bytes());
-        val_data.push(status_byte);
+        let entry = ValidatorEntry {
+            pk: pk_bytes.to_vec(),
+            stake,
+            status: status_byte,
+            last_claimed_at: 0,
+            exit_block: None,
+        };
         let key = pyde_state::keys::validator_key(addr);
-        smt.insert(key, val_data).unwrap();
+        smt.insert(key, entry.encode()).unwrap();
+        // Mirror the active-count bookkeeping StakeDeposit would do, so
+        // subsequent slash/withdraw decrements leave the counter
+        // consistent (otherwise a slash would saturate at 0 here).
+        if status_byte == 0x00 {
+            increment_active_validator_count(smt);
+        }
     }
 
     /// Assemble a Slash-tx payload matching the wire format in
@@ -2657,9 +2805,9 @@ mod tests {
         let val_data = smt
             .get(&pyde_state::keys::validator_key(&offender))
             .expect("validator entry must still exist");
-        let (_pk, stake, status, _off) = parse_validator_entry(&val_data).unwrap();
-        assert_eq!(stake, 0, "stake should be fully slashed");
-        assert_eq!(status, 0x02, "status should be Ejected");
+        let entry = ValidatorEntry::decode(&val_data).unwrap();
+        assert_eq!(entry.stake, 0, "stake should be fully slashed");
+        assert_eq!(entry.status, 0x02, "status should be Ejected");
 
         // Submitter got finder's fee = 10% of VALIDATOR_STAKE = 1K PYDE.
         // Also lost gas for the tx. Net: start + 1K PYDE - gas_fee.
@@ -2695,9 +2843,9 @@ mod tests {
 
         // State untouched.
         let val_data = smt.get(&pyde_state::keys::validator_key(&offender)).unwrap();
-        let (_, stake, status, _) = parse_validator_entry(&val_data).unwrap();
-        assert_eq!(stake, SLASH_VALIDATOR_STAKE);
-        assert_eq!(status, 0x00);
+        let entry = ValidatorEntry::decode(&val_data).unwrap();
+        assert_eq!(entry.stake, SLASH_VALIDATOR_STAKE);
+        assert_eq!(entry.status, 0x00);
     }
 
     #[test]

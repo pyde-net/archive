@@ -253,13 +253,9 @@ impl BlockProcessor {
                 }
             }
 
-            // Accumulate pool share. Divisor is the historical validator
-            // count (monotonic, includes exited entries) — NOT the active-
-            // only count. This slightly over-counts the denominator and
-            // under-pays active validators by the exited fraction. The
-            // fix (separate `active_validator_count` state var, decremented
-            // on exit) is deferred to slice 4.2 because validator_count is
-            // also load-bearing for `validator_index_key` enumeration.
+            // Accumulate pool share. Divisor is the ACTIVE-ONLY validator
+            // count (slice 4.2) — exited/unbonding/ejected members don't
+            // dilute payouts to active stakers.
             //
             // Integer division `pool_share / N` drops a remainder of at
             // most (N-1) quanta per block. Over a year this bounds to
@@ -269,18 +265,9 @@ impl BlockProcessor {
             // If N == 0 (pre-first-stake devnet), skip accrual — the
             // un-distributed pool share is lost for that block, transient.
             if pool_share > 0 {
-                let validator_count = state
-                    .get(&pyde_state::keys::validator_count_key())
-                    .and_then(|b| {
-                        if b.len() >= 8 {
-                            Some(u64::from_le_bytes(b[..8].try_into().ok()?))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                if validator_count > 0 {
-                    let per_validator_increment = pool_share / validator_count as u128;
+                let active_count = pyde_tx::pipeline::read_active_validator_count(state);
+                if active_count > 0 {
+                    let per_validator_increment = pool_share / active_count as u128;
                     if per_validator_increment > 0 {
                         let current = pyde_tx::pipeline::read_rewards_per_validator(state);
                         pyde_tx::pipeline::write_rewards_per_validator(
