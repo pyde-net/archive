@@ -3335,4 +3335,510 @@ mod tests {
         assert_eq!(decryptor.tx_count(), 1);
         assert_eq!(decryptor.share_count(0), 1); // our own share added
     }
+
+    // ==========================================================================
+    // Task 031 + 032: multi-node MEV lifecycle + frontrun rejection
+    // ==========================================================================
+    //
+    // These tests orchestrate three simulated validators through the full MEV
+    // pipeline: submit encrypted tx → block build → body validation → plaintext
+    // execution → threshold decryption → decrypted execution → state root
+    // convergence. Networking is stubbed (direct function calls between
+    // engines) so the tests are deterministic and fast — real libp2p transport
+    // is exercised separately by `auth_handshake.rs` + `reshare_handshake.rs`.
+
+    use crate::block_processor::{try_decrypt_and_execute, BlockProcessor, DecryptOutcome};
+    use crate::block_store::BlockStore;
+    use crate::chain::ChainState;
+    use crate::state_manager::StateManager;
+    use crate::wire;
+    use pyde_consensus::block::{Block, BlockBody};
+    use pyde_mempool::decryption::BlockDecryptor;
+    use pyde_mempool::encrypted::{encrypt_transaction, EncryptedTx};
+    use pyde_tx::parallel::ExecutionSchedule;
+    use pyde_tx::types::AccessEntry;
+    use tempfile::TempDir;
+
+    /// Per-node test rig for the MEV e2e scenarios.
+    struct E2ENode {
+        state: StateManager,
+        chain: ChainState,
+        block_store: BlockStore,
+        key_share: pyde_crypto::threshold::KeyShare,
+        _tmp: TempDir,
+    }
+
+    impl E2ENode {
+        fn new(key_share: pyde_crypto::threshold::KeyShare, chain_id: u64) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = StateManager::open(tmp.path(), 1024).unwrap();
+            let block_store = BlockStore::open(tmp.path()).unwrap();
+            let chain = ChainState::genesis(state.root(), chain_id);
+            Self { state, chain, block_store, key_share, _tmp: tmp }
+        }
+    }
+
+    fn e2e_header(
+        slot: u64,
+        parent_hash: [u8; 32],
+        state_root: [u8; 32],
+        tx_root: [u8; 32],
+    ) -> BlockHeader {
+        BlockHeader {
+            slot,
+            epoch: 0,
+            parent_hash,
+            proposer: [0u8; 32],
+            vrf_proof: vec![],
+            qc_previous: QuorumCert::empty(),
+            tx_root,
+            state_root,
+            timestamp: slot * 400,
+        }
+    }
+
+    fn e2e_access_list() -> Vec<AccessEntry> {
+        vec![AccessEntry {
+            address: [0x01; 32],
+            reads: vec![[0x01; 32]],
+            writes: vec![],
+        }]
+    }
+
+    fn e2e_signed_encrypted(
+        tpk: &pyde_crypto::threshold::ThresholdPublicKey,
+        sender_keys: &(pyde_crypto::falcon::FalconPublicKey, pyde_crypto::falcon::FalconSecretKey),
+        recipient: Address,
+        value: u128,
+        nonce: u64,
+    ) -> EncryptedTx {
+        let (pk, sk) = sender_keys;
+        let sender = pyde_account::address::derive_eoa_address(pk.as_bytes());
+        let template = encrypt_transaction(
+            sender, nonce, 100_000,
+            e2e_access_list(), None, 31337,
+            vec![0u8; 666], &recipient, value, b"",
+            tpk,
+        ).unwrap();
+        let hash = template.hash();
+        let sig = pyde_crypto::falcon::falcon_sign(sk, &hash).unwrap().to_vec();
+        EncryptedTx {
+            sender,
+            nonce,
+            gas_limit: 100_000,
+            access_list: template.access_list.clone(),
+            deadline: None,
+            chain_id: 31337,
+            signature: sig,
+            ciphertext: template.ciphertext.clone(),
+        }
+    }
+
+    #[test]
+    fn e2e_encrypted_tx_lifecycle_three_validators() {
+        // TASK 031: submit encrypted tx → commit → decrypt → seal.
+        //
+        // Three validators with a 2-of-3 threshold. A transfer from Alice
+        // (funded at genesis) to Bob gets encrypted, committed to a block,
+        // threshold-decrypted, and applied. Final state root matches across
+        // all three validators — the strongest property we can assert
+        // about MEV-protected txs in one test.
+        use pyde_crypto::falcon::falcon_keygen;
+        use pyde_crypto::threshold::threshold_keygen;
+
+        let (tpk, key_shares) = threshold_keygen(3, 2).unwrap();
+        let alice_keys = falcon_keygen().unwrap();
+        let alice = pyde_account::address::derive_eoa_address(alice_keys.0.as_bytes());
+        let bob = pyde_account::address::derive_eoa_address(b"bob-recipient");
+
+        let mut nodes: Vec<E2ENode> = key_shares
+            .iter()
+            .take(3)
+            .map(|ks| E2ENode::new(ks.clone(), 31337))
+            .collect();
+
+        // Fund Alice with an on-chain account (balance + FALCON pubkey
+        // for signature verification during decrypted-tx execution).
+        // Bypasses real genesis config to keep the test narrow.
+        let starting_balance: u128 = 10_000_000_000_000_000_000_u128; // plenty for gas + transfer
+        let mut alice_account = pyde_account::types::Account::new_eoa(alice_keys.0.as_bytes());
+        alice_account.balance = starting_balance;
+        let account_bytes = alice_account.to_bytes();
+        for node in &mut nodes {
+            let key = pyde_state::keys::balance_key(&alice);
+            node.state.insert(key, account_bytes.clone()).unwrap();
+            node.state.refresh_root();
+            node.chain = ChainState::genesis(node.state.root(), 31337);
+        }
+        assert_eq!(nodes[0].state.root(), nodes[1].state.root());
+        assert_eq!(nodes[1].state.root(), nodes[2].state.root());
+
+        // Alice encrypts a 100-quanta transfer to Bob.
+        let enc_tx = e2e_signed_encrypted(&tpk, &alice_keys, bob, 100, 0);
+        let encrypted_body: Vec<Vec<u8>> = vec![enc_tx.to_bytes()];
+        let tx_root = pyde_consensus::block::compute_tx_root(&[], &[enc_tx.hash()]);
+
+        let starting_root = nodes[0].state.root();
+        let header = e2e_header(1, [0u8; 32], starting_root, tx_root);
+        let block = Block {
+            header: header.clone(),
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: encrypted_body.clone(),
+                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+            },
+            proposer_signature: vec![],
+        };
+
+        // Every validator processes the block. Body validation runs the
+        // tx_root check from slice 3.1; execution advances chain state.
+        // Storing the raw block lets the decrypt path fetch it later.
+        let raw = wire::encode_block(&block);
+        for node in &mut nodes {
+            BlockProcessor::validate_block_body(&block, &node.state, 31337)
+                .expect("honest block must pass body validation");
+            node.block_store.put_block(&header, &raw).unwrap();
+            BlockProcessor::process_full_block(&mut node.chain, &mut node.state, &block)
+                .expect("honest block must process");
+        }
+        for n in &nodes {
+            assert_eq!(n.chain.head_slot, 1);
+        }
+
+        // Each validator produces a decryption share. In production these
+        // ride the consensus gossip topic post-QC; we collect them directly.
+        let shares: Vec<_> = nodes
+            .iter()
+            .map(|n| pyde_crypto::threshold::generate_decryption_share(&n.key_share, &enc_tx.ciphertext))
+            .collect();
+
+        // Every validator then runs the decrypt+execute path. Uses the
+        // same `try_decrypt_and_execute` helper the production node loop
+        // calls — so the MEV invariant check (slice 3.1's second-chance
+        // tx_root verify) fires on every node.
+        for node in &mut nodes {
+            let mut decryptor = BlockDecryptor::new(vec![enc_tx.clone()], 2).unwrap();
+            decryptor.add_share(0, shares[0].clone());
+            decryptor.add_share(0, shares[1].clone());
+            assert!(decryptor.all_ready());
+            let outcome = try_decrypt_and_execute(
+                &node.block_store,
+                1,
+                &mut decryptor,
+                &mut node.state,
+                400_000_000,
+                1_000_000_000,
+                31337,
+                [0u8; 32],
+            );
+            assert!(
+                matches!(outcome, DecryptOutcome::Executed { tx_count: 1, .. }),
+                "decrypt+execute must succeed on every validator; got {:?}",
+                outcome
+            );
+        }
+
+        // All three validators converged on the same post-decryption
+        // state root, AND the root actually changed — the decrypted
+        // transfer produced a real write. Both properties together are
+        // the end-to-end MEV guarantee: every validator applied the
+        // committed ordering and ended up with the same correct state.
+        let final_root = nodes[0].state.root();
+        assert_eq!(nodes[1].state.root(), final_root);
+        assert_eq!(nodes[2].state.root(), final_root);
+        assert_ne!(final_root, starting_root);
+
+        // Bob got his transfer, Alice's balance dropped (ignoring gas).
+        let bob_key = pyde_state::keys::balance_key(&bob);
+        let bob_raw = nodes[0].state.get(&bob_key).expect("bob should exist");
+        // Account format: parse as Account if it decodes, else u128 LE.
+        let bob_balance = pyde_account::types::Account::from_bytes(&bob_raw)
+            .map(|a| a.balance)
+            .unwrap_or_else(|| {
+                let mut buf = [0u8; 16];
+                buf.copy_from_slice(&bob_raw[..16]);
+                u128::from_le_bytes(buf)
+            });
+        assert_eq!(bob_balance, 100, "bob received the 100-quanta transfer");
+    }
+
+    #[test]
+    fn e2e_frontrun_by_reorder_is_rejected() {
+        // TASK 032: any attempt to reorder encrypted_txs after QC breaks
+        // the tx_root → header hash → proposer-signature chain. Body
+        // validation rejects the tampered block before decryption.
+        use pyde_crypto::threshold::threshold_keygen;
+        let (tpk, _) = threshold_keygen(3, 2).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateManager::open(tmp.path(), 1024).unwrap();
+
+        let tx_a = encrypt_transaction(
+            [0xAA; 32], 0, 100_000,
+            e2e_access_list(), None, 31337,
+            vec![0xAA; 666], &[0x11; 32], 100, b"swap-a",
+            &tpk,
+        ).unwrap();
+        let tx_b = encrypt_transaction(
+            [0xBB; 32], 1, 100_000,
+            e2e_access_list(), None, 31337,
+            vec![0xBB; 666], &[0x22; 32], 200, b"swap-b",
+            &tpk,
+        ).unwrap();
+
+        // Honest tx_root commits to [A, B]; tampered body ships [B, A].
+        let honest_tx_root = pyde_consensus::block::compute_tx_root(
+            &[], &[tx_a.hash(), tx_b.hash()],
+        );
+        let header = e2e_header(1, [0u8; 32], state.root(), honest_tx_root);
+        let tampered = Block {
+            header,
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![tx_b.to_bytes(), tx_a.to_bytes()],
+                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+            },
+            proposer_signature: vec![],
+        };
+
+        let err = BlockProcessor::validate_block_body(&tampered, &state, 31337)
+            .expect_err("tampered block must be rejected");
+        assert!(
+            err.contains("tx_root mismatch"),
+            "expected tx_root mismatch, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn e2e_frontrun_by_injection_is_rejected() {
+        // Injection variant of 032: attacker prepends a sandwich-front tx
+        // hoping to execute before the victim. tx_root committed to just
+        // the victim, so the injected tx breaks validation.
+        use pyde_crypto::threshold::threshold_keygen;
+        let (tpk, _) = threshold_keygen(3, 2).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateManager::open(tmp.path(), 1024).unwrap();
+
+        let victim = encrypt_transaction(
+            [0xAA; 32], 0, 100_000,
+            e2e_access_list(), None, 31337,
+            vec![0xAA; 666], &[0x11; 32], 100, b"victim-swap",
+            &tpk,
+        ).unwrap();
+        let sandwich_front = encrypt_transaction(
+            [0xEE; 32], 0, 100_000,
+            e2e_access_list(), None, 31337,
+            vec![0xEE; 666], &[0x22; 32], 50_000, b"front",
+            &tpk,
+        ).unwrap();
+
+        let honest_tx_root = pyde_consensus::block::compute_tx_root(&[], &[victim.hash()]);
+        let header = e2e_header(1, [0u8; 32], state.root(), honest_tx_root);
+        let tampered = Block {
+            header,
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![sandwich_front.to_bytes(), victim.to_bytes()],
+                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+            },
+            proposer_signature: vec![],
+        };
+
+        let err = BlockProcessor::validate_block_body(&tampered, &state, 31337)
+            .expect_err("injection must be rejected");
+        assert!(err.contains("tx_root mismatch"), "got: {}", err);
+    }
+
+    #[test]
+    fn e2e_byzantine_proposer_forged_encrypted_tx_rejected_at_execute() {
+        // REGRESSION TEST for the malicious-proposer hole surfaced during
+        // slice 3.6. A byzantine proposer includes an EncryptedTx with a
+        // forged sender (bypasses mempool admission entirely). The
+        // committee decrypts it (crypto works), but execution must reject
+        // because the FALCON signature doesn't verify against Alice's
+        // on-chain auth key.
+        use pyde_crypto::falcon::falcon_keygen;
+        use pyde_crypto::threshold::threshold_keygen;
+
+        let (tpk, key_shares) = threshold_keygen(3, 2).unwrap();
+        let alice_keys = falcon_keygen().unwrap();
+        let alice = pyde_account::address::derive_eoa_address(alice_keys.0.as_bytes());
+        let attacker = pyde_account::address::derive_eoa_address(b"attacker");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let bs = BlockStore::open(tmp.path()).unwrap();
+
+        // Alice funded with proper on-chain auth key.
+        let mut alice_account = pyde_account::types::Account::new_eoa(alice_keys.0.as_bytes());
+        alice_account.balance = 10_000_000_000_000_000_000_u128;
+        state.insert(
+            pyde_state::keys::balance_key(&alice),
+            alice_account.to_bytes(),
+        ).unwrap();
+        state.refresh_root();
+
+        // Byzantine proposer forges: sender=alice, garbage sig, but the
+        // transfer ciphertext actually moves Alice's funds to attacker.
+        // (In a real attack the sig would be something plausible-looking,
+        // but a 666-byte garbage blob is indistinguishable at mempool
+        // structural check.)
+        let template = encrypt_transaction(
+            alice, 0, 100_000,
+            e2e_access_list(), None, 31337,
+            vec![0xFF; 666], &attacker, 1_000, b"",
+            &tpk,
+        ).unwrap();
+        let forged = EncryptedTx {
+            sender: alice, // plaintext — attacker claims to be alice
+            nonce: 0,
+            gas_limit: 100_000,
+            access_list: template.access_list,
+            deadline: None,
+            chain_id: 31337,
+            signature: vec![0xFF; 666], // garbage — NOT signed by alice
+            ciphertext: template.ciphertext,
+        };
+        let forged_hash = forged.hash();
+
+        // Proposer puts it in a block with the correct tx_root (they're
+        // building the block, so they can commit to whatever they're
+        // shipping — slice 3.1's ordering commitment doesn't help here,
+        // this is a different attack).
+        let tx_root = pyde_consensus::block::compute_tx_root(&[], &[forged_hash]);
+        let header = e2e_header(1, [0u8; 32], state.root(), tx_root);
+        let block = Block {
+            header: header.clone(),
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![forged.to_bytes()],
+                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+            },
+            proposer_signature: vec![],
+        };
+        bs.put_block(&header, &wire::encode_block(&block)).unwrap();
+
+        // Body validation passes (tx_root matches) — this is NOT what
+        // catches the attack.
+        BlockProcessor::validate_block_body(&block, &state, 31337).unwrap();
+
+        let before_root = state.root();
+        let before_balance = 10_000_000_000_000_000_000_u128;
+
+        // Run decryption + execution. The FALCON sig won't verify against
+        // Alice's on-chain pubkey over EncryptedTx::hash(), so the tx is
+        // dropped BEFORE it can move her funds.
+        let shares: Vec<_> = key_shares
+            .iter()
+            .take(2)
+            .map(|ks| pyde_crypto::threshold::generate_decryption_share(ks, &forged.ciphertext))
+            .collect();
+        let mut decryptor = BlockDecryptor::new(vec![forged], 2).unwrap();
+        decryptor.add_share(0, shares[0].clone());
+        decryptor.add_share(0, shares[1].clone());
+        let outcome = try_decrypt_and_execute(
+            &bs, 1, &mut decryptor, &mut state,
+            400_000_000, 1_000_000_000, 31337, [0u8; 32],
+        );
+
+        // Outcome reports zero verified txs executed (the forged one
+        // was dropped).
+        match outcome {
+            DecryptOutcome::Executed { tx_count, .. } => {
+                assert_eq!(tx_count, 0, "forged tx must NOT be counted as executed");
+            }
+            other => panic!("unexpected outcome: {:?}", other),
+        }
+
+        // Alice's balance is untouched. Root may change due to SMT
+        // bookkeeping, but the balance key must still hold her original
+        // funds.
+        let alice_raw = state.get(&pyde_state::keys::balance_key(&alice)).unwrap();
+        let alice_acct = pyde_account::types::Account::from_bytes(&alice_raw).unwrap();
+        assert_eq!(
+            alice_acct.balance, before_balance,
+            "alice's funds must be untouched by the forged tx"
+        );
+        let _ = before_root;
+    }
+
+    #[test]
+    fn e2e_decrypted_ordering_matches_committed_ordering() {
+        // Completes the "committed → executed" chain: if a block commits
+        // to encrypted order [A, B], the decrypted txs must execute in
+        // THAT order, not whatever a malicious validator might prefer.
+        // A tampered decryptor (one that reorders encrypted_txs) is
+        // rejected by try_decrypt_and_execute's secondary tx_root check.
+        use pyde_crypto::falcon::falcon_keygen;
+        use pyde_crypto::threshold::threshold_keygen;
+        let (tpk, shares) = threshold_keygen(3, 2).unwrap();
+
+        // Both senders get FALCON-backed accounts so execute-time auth
+        // verification accepts the honest txs. (Proves the ordering
+        // invariant independently of the byzantine-proposer auth hole.)
+        let sender_a_keys = falcon_keygen().unwrap();
+        let sender_b_keys = falcon_keygen().unwrap();
+        let tx_a = e2e_signed_encrypted(&tpk, &sender_a_keys, [0x11; 32], 100, 0);
+        let tx_b = e2e_signed_encrypted(&tpk, &sender_b_keys, [0x22; 32], 200, 0);
+
+        let committed_root = pyde_consensus::block::compute_tx_root(
+            &[], &[tx_a.hash(), tx_b.hash()],
+        );
+        let header = e2e_header(1, [0u8; 32], [0u8; 32], committed_root);
+        let block = Block {
+            header: header.clone(),
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![tx_a.to_bytes(), tx_b.to_bytes()],
+                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+            },
+            proposer_signature: vec![],
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let bs = BlockStore::open(tmp.path()).unwrap();
+        bs.put_block(&header, &wire::encode_block(&block)).unwrap();
+
+        // Fund each sender account so the honest-path auth check passes.
+        // Balances are ample for the transfer + gas.
+        for keys in [&sender_a_keys, &sender_b_keys] {
+            let addr = pyde_account::address::derive_eoa_address(keys.0.as_bytes());
+            let mut acct = pyde_account::types::Account::new_eoa(keys.0.as_bytes());
+            acct.balance = 10_000_000_000_000_000_000_u128;
+            state.insert(
+                pyde_state::keys::balance_key(&addr),
+                acct.to_bytes(),
+            ).unwrap();
+        }
+        state.refresh_root();
+
+        // Honest decryptor, committed order [A, B].
+        let mut honest = BlockDecryptor::new(vec![tx_a.clone(), tx_b.clone()], 2).unwrap();
+        honest.add_share(0, pyde_crypto::threshold::generate_decryption_share(&shares[0], &tx_a.ciphertext));
+        honest.add_share(0, pyde_crypto::threshold::generate_decryption_share(&shares[1], &tx_a.ciphertext));
+        honest.add_share(1, pyde_crypto::threshold::generate_decryption_share(&shares[0], &tx_b.ciphertext));
+        honest.add_share(1, pyde_crypto::threshold::generate_decryption_share(&shares[1], &tx_b.ciphertext));
+        let honest_outcome = try_decrypt_and_execute(
+            &bs, 1, &mut honest, &mut state,
+            400_000_000, 1_000_000_000, 31337, [0u8; 32],
+        );
+        assert!(
+            matches!(honest_outcome, DecryptOutcome::Executed { tx_count: 2, .. }),
+            "honest-order decrypt must run; got {:?}",
+            honest_outcome
+        );
+
+        // Tampered decryptor flipping to [B, A] is rejected by the
+        // second-chance tx_root check in try_decrypt_and_execute.
+        let mut tampered = BlockDecryptor::new(vec![tx_b, tx_a], 2).unwrap();
+        let tampered_outcome = try_decrypt_and_execute(
+            &bs, 1, &mut tampered, &mut state,
+            400_000_000, 1_000_000_000, 31337, [0u8; 32],
+        );
+        assert!(
+            matches!(tampered_outcome, DecryptOutcome::TxRootMismatch),
+            "reordered decryptor must be rejected; got {:?}",
+            tampered_outcome
+        );
+    }
 }
