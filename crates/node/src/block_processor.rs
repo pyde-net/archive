@@ -633,9 +633,8 @@ mod tests {
     #[test]
     fn process_genesis_block() {
         let mut chain = ChainState::genesis([0u8; 32], 31337);
-        let dir = std::env::temp_dir().join("pyde-test-bp2-genesis");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut state = StateManager::open(&dir, 1024).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
 
         let header = dummy_header(1);
         let (tx_count, gas_used) =
@@ -649,9 +648,8 @@ mod tests {
     #[test]
     fn reject_old_slot() {
         let mut chain = ChainState::genesis([0u8; 32], 31337);
-        let dir = std::env::temp_dir().join("pyde-test-bp2-old");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut state = StateManager::open(&dir, 1024).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
 
         chain.advance(dummy_header(5));
 
@@ -662,9 +660,8 @@ mod tests {
     #[test]
     fn sequential_blocks() {
         let mut chain = ChainState::genesis([0u8; 32], 31337);
-        let dir = std::env::temp_dir().join("pyde-test-bp2-seq");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut state = StateManager::open(&dir, 1024).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
 
         for slot in 1..=5 {
             BlockProcessor::process_block(&mut chain, &mut state, dummy_header(slot), &[]).unwrap();
@@ -675,9 +672,8 @@ mod tests {
 
     #[test]
     fn process_block_with_transfer() {
-        let dir = std::env::temp_dir().join("pyde-test-bp2-transfer");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut state = StateManager::open(&dir, 1024).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
 
         // Initialize genesis with funded accounts
         let (config, _accounts) = devnet_genesis();
@@ -745,9 +741,8 @@ mod tests {
         // ordering via the QC cannot swap encrypted_tx positions afterwards.
         // Here we simulate a tampered block — header tx_root was computed
         // over [enc_a, enc_b], but the body ships [enc_b, enc_a].
-        let dir = std::env::temp_dir().join("pyde-test-bp2-reorder");
-        let _ = std::fs::remove_dir_all(&dir);
-        let state = StateManager::open(&dir, 1024).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateManager::open(tmp.path(), 1024).unwrap();
 
         let enc_a = build_dummy_encrypted_tx(0xAA);
         let enc_b = build_dummy_encrypted_tx(0xBB);
@@ -783,9 +778,8 @@ mod tests {
     fn validate_body_rejects_added_encrypted_tx() {
         // Proposer tries to slip an extra encrypted tx into the body
         // without updating tx_root — rejected.
-        let dir = std::env::temp_dir().join("pyde-test-bp2-add-enc");
-        let _ = std::fs::remove_dir_all(&dir);
-        let state = StateManager::open(&dir, 1024).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateManager::open(tmp.path(), 1024).unwrap();
 
         let honest_root = pyde_consensus::block::compute_tx_root(&[], &[]);
 
@@ -808,9 +802,8 @@ mod tests {
     #[test]
     fn validate_body_accepts_honest_block() {
         // Sanity: a well-formed block with matching tx_root passes.
-        let dir = std::env::temp_dir().join("pyde-test-bp2-honest");
-        let _ = std::fs::remove_dir_all(&dir);
-        let state = StateManager::open(&dir, 1024).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateManager::open(tmp.path(), 1024).unwrap();
 
         let enc = build_dummy_encrypted_tx(0xAA);
         let hash = pyde_mempool::encrypted::EncryptedTx::from_bytes(&enc).unwrap().hash();
@@ -891,10 +884,9 @@ mod tests {
         // Setup: an honest block commits to encrypted_txs [A, B]. A tampered
         // decryptor holds them as [B, A] — as would happen if an attacker
         // swapped ciphertexts between block acceptance and decrypt time.
-        let dir = std::env::temp_dir().join("pyde-test-bp2-decrypt-tamper");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut state = StateManager::open(&dir, 1024).unwrap();
-        let bs = crate::block_store::BlockStore::open(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let bs = crate::block_store::BlockStore::open(tmp.path()).unwrap();
 
         let (_pk, _shares, enc_a, enc_b) = build_two_encrypted_txs_with_keys();
         store_block_with_encrypted_order(&bs, 1, &[&enc_a, &enc_b]);
@@ -925,10 +917,9 @@ mod tests {
         // Positive case: honest decryptor + honest block → Executed outcome,
         // regardless of tx-level success/failure (dummy sigs will fail at
         // execution time, producing failed receipts, but the flow runs).
-        let dir = std::env::temp_dir().join("pyde-test-bp2-decrypt-honest");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut state = StateManager::open(&dir, 1024).unwrap();
-        let bs = crate::block_store::BlockStore::open(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let bs = crate::block_store::BlockStore::open(tmp.path()).unwrap();
 
         let (_pk, shares, enc_a, enc_b) = build_two_encrypted_txs_with_keys();
         store_block_with_encrypted_order(&bs, 1, &[&enc_a, &enc_b]);
@@ -956,10 +947,9 @@ mod tests {
 
     #[test]
     fn try_decrypt_and_execute_returns_header_missing_when_unknown() {
-        let dir = std::env::temp_dir().join("pyde-test-bp2-decrypt-nohdr");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut state = StateManager::open(&dir, 1024).unwrap();
-        let bs = crate::block_store::BlockStore::open(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let bs = crate::block_store::BlockStore::open(tmp.path()).unwrap();
 
         let (_pk, _shares, enc_a, enc_b) = build_two_encrypted_txs_with_keys();
         let mut decryptor = pyde_mempool::decryption::BlockDecryptor::new(

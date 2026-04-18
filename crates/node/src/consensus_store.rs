@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 
 const STATE_KEY: &[u8] = b"consensus:state";
 const EVIDENCE_STATE_KEY: &[u8] = b"evidence:state";
+const RESHARE_STATE_KEY: &[u8] = b"reshare:state";
 const PROPOSAL_PREFIX: &[u8] = b"p:";
 const VOTE_PREFIX: &[u8] = b"v:";
 
@@ -139,6 +140,56 @@ impl ConsensusStateStore {
             Ok(None) => Ok(None),
             Err(e) => Err(format!("failed to read evidence state: {}", e)),
         }
+    }
+
+    /// Persist resharing runtime state (task 034 crash safety). Written
+    /// on each state transition: `prepare_for_reshare_reception`,
+    /// `start_committee_reshare`, `try_aggregate_reshare_on_slot` when it
+    /// fires. Small blob (committee keys + scalars, tens of KB), so
+    /// fsync cost per transition is bounded.
+    pub fn save_reshare_state(&self, state: &wire::ReshareState) -> Result<(), String> {
+        let bytes = wire::encode_reshare_state(state);
+        self.db
+            .put_opt(RESHARE_STATE_KEY, &bytes, &self.sync_opts)
+            .map_err(|e| format!("failed to save reshare state: {}", e))?;
+        debug!(
+            target_epoch = state.target_epoch,
+            new_index = state.new_index,
+            aggregated = state.aggregated,
+            bytes = bytes.len(),
+            "reshare state persisted"
+        );
+        Ok(())
+    }
+
+    /// Load the previously-persisted reshare state, if any.
+    pub fn load_reshare_state(&self) -> Result<Option<wire::ReshareState>, String> {
+        match self.db.get(RESHARE_STATE_KEY) {
+            Ok(Some(bytes)) => {
+                let state = wire::decode_reshare_state(&bytes)
+                    .map_err(|e| format!("failed to decode reshare state: {}", e))?;
+                info!(
+                    target_epoch = state.target_epoch,
+                    new_index = state.new_index,
+                    aggregated = state.aggregated,
+                    "reshare state restored from disk"
+                );
+                Ok(Some(state))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("failed to read reshare state: {}", e)),
+        }
+    }
+
+    /// Remove any persisted reshare state. Used when an epoch's rotation
+    /// completes successfully; keeping stale state around causes confused
+    /// behavior on a subsequent restart.
+    pub fn clear_reshare_state(&self) -> Result<(), String> {
+        self.db
+            .delete_opt(RESHARE_STATE_KEY, &self.sync_opts)
+            .map_err(|e| format!("failed to clear reshare state: {}", e))?;
+        debug!("reshare state cleared");
+        Ok(())
     }
 
     // ============================================================

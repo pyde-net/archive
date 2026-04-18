@@ -29,6 +29,10 @@ pub mod tag {
     /// validator — not just the one that directly observed the double
     /// proposal — can include the offender in a `Slash` tx.
     pub const CONSENSUS_SLASH_EVIDENCE: u8 = 0x17;
+    /// Cross-committee resharing contribution (task 034). Broadcast by
+    /// outgoing committee members to the incoming committee at epoch
+    /// boundary.
+    pub const COMMITTEE_RESHARING: u8 = 0x18;
     pub const GET_BLOCK_TXS: u8 = 0x04;
     pub const BLOCK_TXS_RESPONSE: u8 = 0x05;
     pub const DECRYPTION_SHARES: u8 = 0x20;
@@ -137,6 +141,114 @@ pub fn decode_pss_refresh(data: &[u8]) -> Result<(u64, Vec<u8>), &'static str> {
     let epoch = dec.u64()?;
     let contribution = dec.var_bytes()?;
     Ok((epoch, contribution))
+}
+
+// ============================================================
+// Committee resharing contribution (task 034)
+// ============================================================
+
+/// Wire payload:
+/// [tag:1][target_epoch:8][contribution_bytes: var_bytes]
+/// The `contribution_bytes` blob is `ResharingContribution::to_bytes()`;
+/// `target_epoch` is the epoch the new committee takes over.
+pub fn encode_resharing(target_epoch: u64, contribution_bytes: &[u8]) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(tag::COMMITTEE_RESHARING);
+    enc.u64(target_epoch);
+    enc.var_bytes(contribution_bytes);
+    enc.finish()
+}
+
+pub fn decode_resharing(data: &[u8]) -> Result<(u64, Vec<u8>), &'static str> {
+    let mut dec = Decoder::new(data);
+    let t = dec.u8()?;
+    if t != tag::COMMITTEE_RESHARING { return Err("not a resharing"); }
+    let target_epoch = dec.u64()?;
+    let contribution = dec.var_bytes()?;
+    Ok((target_epoch, contribution))
+}
+
+// ============================================================
+// ReshareState — persistent resharing runtime (task 034 crash safety)
+// ============================================================
+
+/// Persistable resharing state for `ValidatorEngine`.
+///
+/// Excludes the in-flight contribution pool; on restart we rely on
+/// gossip rebroadcasts to refill it. That's a deliberate trade-off: the
+/// persisted blob stays small (new_committee keys + scalars only,
+/// tens of KB) so fsync latency on each state transition is bounded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReshareState {
+    pub target_epoch: u64,
+    pub new_index: u64,
+    pub aggregation_trigger_slot: u64,
+    pub aggregated: bool,
+    pub broadcast_start_slot: u64,
+    /// Stashed contribution bytes + target epoch if we're still in the
+    /// outgoing-member rebroadcast window.
+    pub pending_rebroadcast: Option<(u64, Vec<u8>)>,
+    /// FALCON pubkeys of the incoming committee members, in index order.
+    pub new_committee_keys: Vec<Vec<u8>>,
+}
+
+/// Wire format (no tag — this is stored in RocksDB under a fixed key,
+/// not gossipsub'd):
+/// `[target_epoch:8 LE][new_index:8 LE][trigger_slot:8 LE][aggregated:1]`
+/// `[broadcast_start:8 LE][has_pending:1]`
+/// `  if has_pending: [rebroadcast_target:8 LE][bytes: var_bytes]`
+/// `[committee_len:4 LE][[key: var_bytes]*]`
+pub fn encode_reshare_state(s: &ReshareState) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u64(s.target_epoch);
+    enc.u64(s.new_index);
+    enc.u64(s.aggregation_trigger_slot);
+    enc.u8(s.aggregated as u8);
+    enc.u64(s.broadcast_start_slot);
+    match &s.pending_rebroadcast {
+        Some((epoch, bytes)) => {
+            enc.u8(1);
+            enc.u64(*epoch);
+            enc.var_bytes(bytes);
+        }
+        None => enc.u8(0),
+    }
+    enc.u32(s.new_committee_keys.len() as u32);
+    for key in &s.new_committee_keys {
+        enc.var_bytes(key);
+    }
+    enc.finish()
+}
+
+pub fn decode_reshare_state(data: &[u8]) -> Result<ReshareState, &'static str> {
+    let mut dec = Decoder::new(data);
+    let target_epoch = dec.u64()?;
+    let new_index = dec.u64()?;
+    let aggregation_trigger_slot = dec.u64()?;
+    let aggregated = dec.u8()? != 0;
+    let broadcast_start_slot = dec.u64()?;
+    let pending_flag = dec.u8()?;
+    let pending_rebroadcast = if pending_flag != 0 {
+        let epoch = dec.u64()?;
+        let bytes = dec.var_bytes()?;
+        Some((epoch, bytes))
+    } else {
+        None
+    };
+    let count = dec.u32()? as usize;
+    let mut new_committee_keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        new_committee_keys.push(dec.var_bytes()?);
+    }
+    Ok(ReshareState {
+        target_epoch,
+        new_index,
+        aggregation_trigger_slot,
+        aggregated,
+        broadcast_start_slot,
+        pending_rebroadcast,
+        new_committee_keys,
+    })
 }
 
 // ============================================================
