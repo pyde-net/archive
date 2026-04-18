@@ -327,8 +327,9 @@ fn execute_transaction_inner(
         TransactionType::StakeDeposit => {
             // Stake deposit: lock VALIDATOR_STAKE from sender, create validator entry.
             // tx.data = FALCON-512 public key (897 bytes).
-            // 10,000 PYDE = 10_000_000_000_000 quanta (matches consensus::validator::VALIDATOR_STAKE)
-            const VALIDATOR_STAKE: u128 = 10_000_000_000_000;
+            // Shared constant — see `pyde-slashing` crate for the authoritative
+            // value and why it's in a leaf crate.
+            use pyde_slashing::VALIDATOR_STAKE;
 
             if sender.balance < VALIDATOR_STAKE {
                 (
@@ -731,13 +732,14 @@ fn execute_in_pvm(
 // Slash transaction handler
 // ============================================================
 //
-// Canonical constants — kept in lockstep with consensus::slashing.
-// pyde-tx cannot depend on pyde-consensus (consensus already depends
-// on tx), so the values are duplicated here. Any change must land on
-// both sides simultaneously.
-const SLASH_VALIDATOR_STAKE: u128 = 10_000_000_000_000;
-const SLASH_FINDER_FEE_PERCENT: u128 = 10;
-const SLASH_EVIDENCE_VERSION: u8 = 1;
+// Canonical constants live in `pyde-slashing`. Both `pyde-tx` and
+// `pyde-consensus` depend on it directly — this eliminates the earlier
+// drift risk where the shadow copies could fork.
+use pyde_slashing::{
+    EVIDENCE_VERSION as SLASH_EVIDENCE_VERSION,
+    FINDER_FEE_PERCENT as SLASH_FINDER_FEE_PERCENT,
+    VALIDATOR_STAKE as SLASH_VALIDATOR_STAKE,
+};
 
 /// Parsed contents of a `TransactionType::Slash` payload.
 struct SlashEvidence {
