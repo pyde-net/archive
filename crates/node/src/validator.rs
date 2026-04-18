@@ -267,6 +267,13 @@ pub struct ValidatorEngine {
     /// same slot) and gossip arrivals — each pair is broadcast at most
     /// once and stored in pending_evidence at most once.
     seen_evidence: std::collections::HashSet<(u64, Address)>,
+    /// Slots flagged by the inclusion audit (task 026). When a compact
+    /// block is received, validators compare its encrypted_txs against
+    /// their local mempool view; if a tx older than the grace window is
+    /// absent while gas budget remains, the slot is flagged and this
+    /// validator will not vote on the selected proposal for that slot.
+    /// Soft enforcement — a 1/128 false positive just costs one vote.
+    inclusion_violated_slots: std::collections::HashSet<u64>,
 }
 
 impl ValidatorEngine {
@@ -289,6 +296,7 @@ impl ValidatorEngine {
             pending_evidence: Vec::new(),
             broadcast_evidence: Vec::new(),
             seen_evidence: std::collections::HashSet::new(),
+            inclusion_violated_slots: std::collections::HashSet::new(),
             randomness_collector: None,
             pss_contributions: Vec::new(),
             pss_target_epoch: 0,
@@ -778,6 +786,20 @@ impl ValidatorEngine {
         true
     }
 
+    /// Flag a slot as having failed the mandatory-inclusion audit (task 026).
+    /// Caller is the compact-block reception path in node.rs. A flagged slot
+    /// causes `select_and_vote` to skip its vote for this proposal, whatever
+    /// the VRF selection picks.
+    pub fn flag_inclusion_violation(&mut self, slot: u64) {
+        self.inclusion_violated_slots.insert(slot);
+    }
+
+    /// True when a slot was flagged via `flag_inclusion_violation`.
+    /// Exposed for tests.
+    pub fn is_inclusion_violated(&self, slot: u64) -> bool {
+        self.inclusion_violated_slots.contains(&slot)
+    }
+
     /// Select the best proposal (lowest VRF score) and vote for it.
     /// Called after the proposal collection window (100ms into the slot).
     /// Returns the vote to broadcast, or None if no proposals were buffered.
@@ -789,6 +811,19 @@ impl ValidatorEngine {
 
         // Don't double-vote
         if self.voted_slots.contains(&slot) {
+            return None;
+        }
+
+        // Task 026 — skip vote if the local inclusion audit flagged this slot.
+        // The flag is set by the compact-block reception path when encrypted
+        // txs the validator has held past the grace window are missing from
+        // the proposal while gas budget remained.
+        if self.inclusion_violated_slots.contains(&slot) {
+            warn!(slot, "skipping vote: mandatory-inclusion audit failed");
+            // Mark voted so a later arriving compact block that clears the
+            // flag doesn't cause us to belatedly cast a vote. The decision
+            // is final for this slot.
+            self.voted_slots.insert(slot);
             return None;
         }
 
@@ -1441,6 +1476,91 @@ mod tests {
 
         let vote = engine.on_proposal(&header, &identities[1]);
         assert!(vote.is_some());
+    }
+
+    // ========== Task 026: mandatory-inclusion vote-skip ==========
+
+    #[test]
+    fn select_and_vote_skips_when_inclusion_flag_set() {
+        // End-to-end enforcement test for the mandatory-inclusion path.
+        // Directly exercises the vote-skip mechanism that node.rs's compact-
+        // block handler triggers via flag_inclusion_violation.
+        let (mut engine, identities) = make_engine_with_committee(3);
+        engine.advance_slot();
+        let slot = engine.consensus.current_slot;
+
+        // Seed a buffered proposal so select_and_vote has something to act on.
+        // Without this the function returns None for an unrelated reason
+        // (nothing to vote for), which would mask whether the inclusion
+        // check actually fires.
+        let header = BlockHeader {
+            slot,
+            epoch: 0,
+            parent_hash: [0u8; 32],
+            proposer: identities[0].address,
+            vrf_proof: vec![],
+            qc_previous: QuorumCert::empty(),
+            tx_root: [0u8; 32],
+            state_root: [0u8; 32],
+            timestamp: 0,
+        };
+        engine.buffered_proposals.entry(slot).or_default().push(BufferedProposal {
+            header,
+            proposer_signature: vec![],
+            vrf_score: 0,
+        });
+
+        // Baseline: without the flag, select_and_vote produces a vote.
+        let baseline_engine_clone_check = {
+            // Clone-the-flag by using a fresh engine snapshot — we instead
+            // assert by the positive path in vote_on_proposal (already
+            // covered). Here, flag then assert None.
+            engine.flag_inclusion_violation(slot);
+            assert!(engine.is_inclusion_violated(slot));
+            engine.select_and_vote(&identities[1])
+        };
+        assert!(
+            baseline_engine_clone_check.is_none(),
+            "inclusion-flagged slot must not produce a vote"
+        );
+
+        // Post-skip invariant: subsequent calls still return None. The
+        // engine should treat the slot as "voted" for this round, so that
+        // a compact block that clears the flag late cannot cause a
+        // belated vote.
+        assert!(engine.voted_slots.contains(&slot));
+        assert!(engine.select_and_vote(&identities[1]).is_none());
+    }
+
+    #[test]
+    fn select_and_vote_produces_vote_without_inclusion_flag() {
+        // Positive case: no inclusion flag → normal vote path runs.
+        // Pairs with the skip test above so we know the flag is what
+        // caused the skip, not some unrelated issue.
+        let (mut engine, identities) = make_engine_with_committee(3);
+        engine.advance_slot();
+        let slot = engine.consensus.current_slot;
+
+        let header = BlockHeader {
+            slot,
+            epoch: 0,
+            parent_hash: [0u8; 32],
+            proposer: identities[0].address,
+            vrf_proof: vec![],
+            qc_previous: QuorumCert::empty(),
+            tx_root: [0u8; 32],
+            state_root: [0u8; 32],
+            timestamp: 0,
+        };
+        engine.buffered_proposals.entry(slot).or_default().push(BufferedProposal {
+            header,
+            proposer_signature: vec![],
+            vrf_score: 0,
+        });
+
+        assert!(!engine.is_inclusion_violated(slot));
+        let vote = engine.select_and_vote(&identities[1]);
+        assert!(vote.is_some(), "un-flagged slot should produce a vote");
     }
 
     // ========== Crash-restart safety tests ==========

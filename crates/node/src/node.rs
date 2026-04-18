@@ -29,6 +29,14 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+/// Grace window (in slots) for the task-026 mandatory-inclusion audit.
+/// An encrypted_tx must sit in local mempool for at least this many slots
+/// before its absence from a proposal counts as censorship. Mainnet ships
+/// with 2 slots (~800ms at 400ms block time) — long enough for libp2p
+/// gossip to reach the whole 128-validator committee, short enough that
+/// a censoring proposer can't hide behind latency.
+const MEV_INCLUSION_GRACE_SLOTS: u64 = 2;
+
 /// The main Pyde node. Owns all subsystems.
 pub struct PydeNode {
     config: NodeConfig,
@@ -619,6 +627,34 @@ impl PydeNode {
                                 },
                                 proposer_signature: vec![], // not in compact block, validated via proposal
                             };
+
+                            // Task 026: mandatory-inclusion audit. Compare the block's
+                            // encrypted_tx set against our local mempool view. If the
+                            // proposer skipped a tx we've held past the grace window
+                            // while gas budget remained, flag the slot so the later
+                            // select_and_vote call abstains. Enforcement is soft —
+                            // HotStuff tolerates 1/128 dissent; false positives under
+                            // network jitter only cost liveness on the affected slot.
+                            if let Some(engine) = validator_engine.as_mut() {
+                                let relay_r = tx_relay.read().await;
+                                let audit = pyde_mempool::inclusion::audit_block_inclusion(
+                                    &block.body.encrypted_txs,
+                                    relay_r.mempool().view_with_slots(),
+                                    slot,
+                                    MEV_INCLUSION_GRACE_SLOTS,
+                                    self.config.consensus.gas_ceiling,
+                                );
+                                drop(relay_r);
+                                if !audit.is_clean() {
+                                    warn!(
+                                        slot,
+                                        missing = audit.missing_older_than_grace.len(),
+                                        gas_remaining = audit.gas_remaining,
+                                        "mandatory-inclusion audit failed — skipping vote for this slot"
+                                    );
+                                    engine.flag_inclusion_violation(slot);
+                                }
+                            }
 
                             // Validate and process
                             {
