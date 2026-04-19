@@ -53,6 +53,20 @@ pub mod discriminator {
     /// mints per-block subsidy to the `rewards_per_validator`
     /// accumulator while `current_slot < end_slot`.
     pub const VALIDATOR_SUBSIDY: u8 = 0x17;
+    /// Airdrop Merkle root (slice 4.4b). 32-byte commitment to
+    /// `{(address, amount)}` tuples. `ClaimAirdrop` transactions verify
+    /// a proof against this root before debiting the pool.
+    pub const AIRDROP_ROOT: u8 = 0x18;
+    /// Airdrop claim deadline (slice 4.4b). Slot after which
+    /// `ClaimAirdrop` is rejected. u64 LE.
+    pub const AIRDROP_DEADLINE: u8 = 0x19;
+    /// Per-leaf-index claimed marker (slice 4.4b). 1-byte presence
+    /// flag keyed by the leaf's u64 index — prevents double-claim.
+    pub const AIRDROP_CLAIMED: u8 = 0x1A;
+    /// Declared sum of all claimable leaf amounts (slice 4.4b).
+    /// Enforced at genesis: `airdrop_pool.balance >= AIRDROP_EXPECTED_SUM`.
+    /// u128 LE.
+    pub const AIRDROP_EXPECTED_SUM: u8 = 0x1B;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +255,38 @@ pub fn vesting_key(address: &Address) -> H256 {
 /// by the active validator count).
 pub fn validator_subsidy_key() -> H256 {
     H256::from(poseidon2_hash(&[discriminator::VALIDATOR_SUBSIDY]).to_bytes())
+}
+
+/// Airdrop Merkle root key (slice 4.4b). Value is the 32-byte root.
+/// Written at genesis, immutable thereafter.
+pub fn airdrop_root_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::AIRDROP_ROOT]).to_bytes())
+}
+
+/// Airdrop claim deadline key (slice 4.4b). Value is u64 LE (slot).
+pub fn airdrop_deadline_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::AIRDROP_DEADLINE]).to_bytes())
+}
+
+/// Airdrop declared-sum key (slice 4.4b). Value is u128 LE — the
+/// operator-declared total of all claimable leaves. Checked against
+/// pool balance at genesis so underfunding is caught at boot, not
+/// at claim time.
+pub fn airdrop_expected_sum_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::AIRDROP_EXPECTED_SUM]).to_bytes())
+}
+
+/// Per-leaf claimed-marker key (slice 4.4b). Presence of the key
+/// (any value) means the leaf has been claimed. Keyed by leaf index
+/// so a single address can appear in the tree multiple times under
+/// distinct indices if the operator wants to tranche out claims.
+///
+/// `key = Poseidon2(0x1A || leaf_index_le_8)`
+pub fn airdrop_claimed_key(leaf_index: u64) -> H256 {
+    let mut input = Vec::with_capacity(9);
+    input.push(discriminator::AIRDROP_CLAIMED);
+    input.extend_from_slice(&leaf_index.to_le_bytes());
+    H256::from(poseidon2_hash(&input).to_bytes())
 }
 
 #[cfg(test)]

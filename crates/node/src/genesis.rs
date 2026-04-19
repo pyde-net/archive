@@ -52,6 +52,74 @@ pub struct GenesisConfig {
     /// percentages of declared supply).
     #[serde(default)]
     pub bucket_caps: std::collections::HashMap<String, u32>,
+    /// Optional airdrop commitment (slice 4.4b). When present, genesis
+    /// pre-mints the airdrop pool to `airdrop_pool_address()` and stores
+    /// the Merkle root + deadline + expected-sum so `ClaimAirdrop` txs
+    /// can verify proofs against the commitment.
+    #[serde(default)]
+    pub airdrop: Option<AirdropConfig>,
+}
+
+/// Genesis airdrop commitment (slice 4.4b).
+///
+/// The operator ships the Merkle root of the `(address, amount)` set
+/// they're airdropping. At genesis:
+///
+/// 1. `pool_total_amount` quanta are minted to `airdrop_pool_address()`
+///    (counts toward `initial_supply` like any other allocation).
+/// 2. `root` and `deadline_slot` are stored so `ClaimAirdrop` handlers
+///    can verify proofs and reject late claims.
+/// 3. `expected_claim_sum` is enforced to be ≤ `pool_total_amount` so
+///    underfunding is caught at boot, not at claim time.
+///
+/// Unclaimed residue after `deadline_slot` can be moved to the treasury
+/// via a permissionless `SweepAirdrop` tx.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AirdropConfig {
+    /// Hex-encoded 32-byte Merkle root.
+    pub root: String,
+    /// Slot after which `ClaimAirdrop` is rejected.
+    pub deadline_slot: u64,
+    /// Total quanta pre-minted to the airdrop pool as a string.
+    pub pool_total_amount: String,
+    /// Operator-declared sum of all claimable leaves as a string.
+    /// Enforced: `expected_claim_sum <= pool_total_amount`. Must be set
+    /// so that underfunding the pool fails genesis, not later claims.
+    pub expected_claim_sum: String,
+}
+
+impl AirdropConfig {
+    pub fn root_bytes(&self) -> Result<[u8; 32], String> {
+        let hex = self.root.strip_prefix("0x").unwrap_or(&self.root);
+        let bytes = hex::decode(hex).map_err(|e| format!("invalid airdrop root hex: {}", e))?;
+        if bytes.len() != 32 {
+            return Err(format!(
+                "airdrop root must be 32 bytes, got {}",
+                bytes.len()
+            ));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    pub fn pool_total_u128(&self) -> Result<u128, String> {
+        self.pool_total_amount.parse::<u128>().map_err(|e| {
+            format!(
+                "invalid airdrop.pool_total_amount '{}': {}",
+                self.pool_total_amount, e
+            )
+        })
+    }
+
+    pub fn expected_sum_u128(&self) -> Result<u128, String> {
+        self.expected_claim_sum.parse::<u128>().map_err(|e| {
+            format!(
+                "invalid airdrop.expected_claim_sum '{}': {}",
+                self.expected_claim_sum, e
+            )
+        })
+    }
 }
 
 /// Configuration for the validator bootstrap subsidy stream.
@@ -164,6 +232,7 @@ impl Default for GenesisConfig {
             initial_supply: String::new(),
             validator_subsidy: None,
             bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
         }
     }
 }
@@ -328,6 +397,62 @@ pub fn initialize_genesis(
     let count_key = pyde_state::keys::validator_count_key();
     entries.push((count_key, val_count.to_le_bytes().to_vec()));
 
+    // Slice 4.4b: pre-mint airdrop pool + install commitment.
+    //
+    // Pool is credited to the well-known `airdrop_pool_address()` so
+    // `ClaimAirdrop` handlers debit it by exact leaf amount. The pool
+    // amount is added to `total_supply` the same way any other
+    // allocation is — so the 4.4a supply sanity check still holds.
+    if let Some(air) = &config.airdrop {
+        let root = air.root_bytes()?;
+        let pool_total = air.pool_total_u128()?;
+        let expected_sum = air.expected_sum_u128()?;
+
+        if expected_sum > pool_total {
+            return Err(format!(
+                "airdrop underfunded: expected_claim_sum={} quanta but pool_total_amount={}",
+                expected_sum, pool_total
+            ));
+        }
+
+        let pool_addr = pyde_account::address::airdrop_pool_address();
+        let pool_account = pyde_account::types::Account {
+            address: pool_addr,
+            nonce: 0,
+            balance: pool_total,
+            code_hash: sparse_merkle_tree::H256::zero(),
+            storage_root: sparse_merkle_tree::H256::zero(),
+            account_type: pyde_account::types::AccountType::EOA,
+            auth_keys: pyde_account::types::AuthKeys::None,
+            gas_tank: 0,
+            key_nonce: 0,
+        };
+        entries.push((
+            pyde_state::keys::balance_key(&pool_addr),
+            pool_account.to_bytes(),
+        ));
+
+        entries.push((pyde_state::keys::airdrop_root_key(), root.to_vec()));
+        entries.push((
+            pyde_state::keys::airdrop_deadline_key(),
+            air.deadline_slot.to_le_bytes().to_vec(),
+        ));
+        entries.push((
+            pyde_state::keys::airdrop_expected_sum_key(),
+            expected_sum.to_le_bytes().to_vec(),
+        ));
+
+        total_supply = total_supply
+            .checked_add(pool_total)
+            .ok_or("genesis total supply overflow")?;
+
+        // Count the airdrop pool as its own bucket for per-bucket cap
+        // enforcement. Operators who want to cap airdrop size pass
+        // `bucket_caps["airdrop"] = N`.
+        let e = bucket_totals.entry("airdrop".to_string()).or_insert(0u128);
+        *e = e.checked_add(pool_total).ok_or("airdrop bucket overflow")?;
+    }
+
     // Slice 4.4a: install validator bootstrap subsidy schedule.
     // `total_amount` was already included in `total_supply` if the
     // operator allocated it to the subsidy pool via a genesis
@@ -486,6 +611,7 @@ pub fn devnet_genesis() -> (GenesisConfig, Vec<DevnetAccount>) {
         initial_supply: String::new(),
         validator_subsidy: None,
         bucket_caps: std::collections::HashMap::new(),
+        airdrop: None,
     };
 
     (config, accounts)
@@ -582,6 +708,7 @@ pub fn generate_testnet(
         initial_supply: String::new(),
         validator_subsidy: None,
         bucket_caps: std::collections::HashMap::new(),
+        airdrop: None,
     };
 
     // Write shared genesis.toml
@@ -967,6 +1094,7 @@ mod tests {
             initial_supply: "1000".to_string(),
             validator_subsidy: None,
             bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
         };
         initialize_genesis(&mut state, &config).expect("matching sum should accept");
     }
@@ -983,6 +1111,7 @@ mod tests {
             initial_supply: "500".to_string(), // allocations sum to 300 — mismatch
             validator_subsidy: None,
             bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("genesis supply mismatch"), "got: {}", err);
@@ -1002,6 +1131,7 @@ mod tests {
             initial_supply: String::new(),
             validator_subsidy: None,
             bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
         };
         initialize_genesis(&mut state, &config).unwrap();
     }
@@ -1021,6 +1151,7 @@ mod tests {
                 duration_slots: 1_000,
             }),
             bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
         };
         initialize_genesis(&mut state, &config).unwrap();
 
@@ -1045,6 +1176,7 @@ mod tests {
                 duration_slots: 0,
             }),
             bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("duration_slots must be > 0"));
@@ -1079,6 +1211,7 @@ mod tests {
             initial_supply: "1000".to_string(),
             validator_subsidy: None,
             bucket_caps: caps,
+            airdrop: None,
         };
         initialize_genesis(&mut state, &config).unwrap();
     }
@@ -1101,6 +1234,7 @@ mod tests {
             initial_supply: "1000".to_string(),
             validator_subsidy: None,
             bucket_caps: caps,
+            airdrop: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("bucket 'team' exceeds cap"), "got: {}", err);
@@ -1122,6 +1256,7 @@ mod tests {
             initial_supply: String::new(),
             validator_subsidy: None,
             bucket_caps: caps,
+            airdrop: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("requires initial_supply"), "got: {}", err);
@@ -1141,6 +1276,7 @@ mod tests {
             initial_supply: "100".to_string(),
             validator_subsidy: None,
             bucket_caps: caps,
+            airdrop: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("not a valid percentage"), "got: {}", err);
@@ -1163,5 +1299,146 @@ mod tests {
     #[test]
     fn parse_hex_address_wrong_length() {
         assert!(parse_hex_address("deadbeef").is_err());
+    }
+
+    // ========== Slice 4.4b: airdrop commitment ==========
+
+    fn airdrop_cfg(root: [u8; 32], pool: u128, expected: u128, deadline: u64) -> AirdropConfig {
+        AirdropConfig {
+            root: hex::encode(root),
+            deadline_slot: deadline,
+            pool_total_amount: pool.to_string(),
+            expected_claim_sum: expected.to_string(),
+        }
+    }
+
+    #[test]
+    fn genesis_writes_airdrop_root_and_funds_pool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let (root, _) = pyde_tx::airdrop::build_tree(&[([0x11; 32], 500u128), ([0x22; 32], 500u128)]);
+
+        let config = GenesisConfig {
+            chain_id: 1,
+            timestamp: 0,
+            allocations: vec![tiny_alloc([0xAA; 32], 200)],
+            validators: Vec::new(),
+            initial_supply: "1200".to_string(), // 200 alloc + 1000 pool
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+            airdrop: Some(airdrop_cfg(root, 1000, 1000, 10_000)),
+        };
+        initialize_genesis(&mut state, &config).expect("airdrop genesis should accept");
+
+        // Root stored
+        let root_bytes = state.get(&pyde_state::keys::airdrop_root_key()).unwrap();
+        assert_eq!(root_bytes.len(), 32);
+        assert_eq!(&root_bytes[..], &root[..]);
+        // Deadline stored
+        let deadline_bytes = state.get(&pyde_state::keys::airdrop_deadline_key()).unwrap();
+        let deadline = u64::from_le_bytes(deadline_bytes[..8].try_into().unwrap());
+        assert_eq!(deadline, 10_000);
+        // Pool funded to exactly pool_total_amount
+        let pool_addr = pyde_account::address::airdrop_pool_address();
+        let bytes = state.get(&pyde_state::keys::balance_key(&pool_addr)).unwrap();
+        let account = pyde_account::types::Account::from_bytes(&bytes).unwrap();
+        assert_eq!(account.balance, 1000);
+    }
+
+    #[test]
+    fn genesis_rejects_underfunded_airdrop_pool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let (root, _) = pyde_tx::airdrop::build_tree(&[([0x11; 32], 2000u128)]);
+
+        let config = GenesisConfig {
+            chain_id: 1,
+            timestamp: 0,
+            allocations: vec![],
+            validators: Vec::new(),
+            initial_supply: "1000".to_string(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+            // expected_claim_sum (2000) > pool_total (1000) → underfunded
+            airdrop: Some(airdrop_cfg(root, 1000, 2000, 10_000)),
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("airdrop underfunded"), "got: {}", err);
+    }
+
+    #[test]
+    fn genesis_airdrop_pool_counts_toward_supply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let (root, _) = pyde_tx::airdrop::build_tree(&[([0x11; 32], 500u128)]);
+
+        let config = GenesisConfig {
+            chain_id: 1,
+            timestamp: 0,
+            allocations: vec![tiny_alloc([0xAA; 32], 300)],
+            validators: Vec::new(),
+            // Declared supply 700 = 300 alloc + 400 pool. If the pool
+            // weren't counted toward total_supply, the sanity check
+            // would see 300 ≠ 700 and reject. Successful acceptance
+            // proves pool balance flows into the total.
+            initial_supply: "700".to_string(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+            airdrop: Some(airdrop_cfg(root, 400, 400, 10_000)),
+        };
+        // 300 + 400 = 700, matches declared → accepts.
+        initialize_genesis(&mut state, &config).expect("declared supply includes pool");
+    }
+
+    #[test]
+    fn genesis_rejects_invalid_airdrop_root_hex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let mut config = GenesisConfig {
+            chain_id: 1,
+            timestamp: 0,
+            allocations: vec![],
+            validators: Vec::new(),
+            initial_supply: "100".to_string(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+            airdrop: Some(AirdropConfig {
+                root: "not-hex".to_string(),
+                deadline_slot: 100,
+                pool_total_amount: "100".to_string(),
+                expected_claim_sum: "100".to_string(),
+            }),
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("invalid airdrop root hex"), "got: {}", err);
+
+        // Wrong length (16 bytes instead of 32)
+        config.airdrop.as_mut().unwrap().root = hex::encode([0xAB; 16]);
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("airdrop root must be 32 bytes"), "got: {}", err);
+    }
+
+    #[test]
+    fn genesis_airdrop_honors_bucket_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let (root, _) = pyde_tx::airdrop::build_tree(&[([0x11; 32], 300u128)]);
+
+        let mut caps = std::collections::HashMap::new();
+        caps.insert("airdrop".to_string(), 20u32); // cap 20% of 1000 = 200
+
+        let config = GenesisConfig {
+            chain_id: 1,
+            timestamp: 0,
+            allocations: vec![tiny_alloc([0xAA; 32], 700)],
+            validators: Vec::new(),
+            initial_supply: "1000".to_string(),
+            validator_subsidy: None,
+            bucket_caps: caps,
+            // Pool is 300 quanta = 30% of 1000 → exceeds 20% cap.
+            airdrop: Some(airdrop_cfg(root, 300, 300, 10_000)),
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("bucket 'airdrop' exceeds cap"), "got: {}", err);
     }
 }

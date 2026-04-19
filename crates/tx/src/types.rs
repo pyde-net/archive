@@ -34,6 +34,16 @@ pub enum TransactionType {
     /// `last_claimed_at` to the current accumulator. Gas is paid normally
     /// — a zero-reward claim still costs gas but is otherwise a no-op.
     ClaimReward = 6,
+    /// Claim a genesis airdrop allocation (Phase 4 slice 4.4b). `tx.data`
+    /// carries `[leaf_index:8 LE][amount:16 LE][proof_len:1][siblings: 32×N]`.
+    /// Handler verifies the Merkle proof against the on-chain `airdrop_root`,
+    /// checks the deadline + not-already-claimed, debits the airdrop pool,
+    /// credits `tx.from`, and sets the claimed flag.
+    ClaimAirdrop = 7,
+    /// Sweep leftover airdrop funds to the treasury (Phase 4 slice 4.4b).
+    /// Permissionless; only callable once the airdrop deadline has passed.
+    /// Transfers the full remaining pool balance to `treasury_address()`.
+    SweepAirdrop = 8,
 }
 
 impl TransactionType {
@@ -46,6 +56,8 @@ impl TransactionType {
             4 => Some(Self::StakeWithdraw),
             5 => Some(Self::Slash),
             6 => Some(Self::ClaimReward),
+            7 => Some(Self::ClaimAirdrop),
+            8 => Some(Self::SweepAirdrop),
             _ => None,
         }
     }
@@ -467,6 +479,9 @@ mod tests {
             TransactionType::StakeDeposit,
             TransactionType::StakeWithdraw,
             TransactionType::Slash,
+            TransactionType::ClaimReward,
+            TransactionType::ClaimAirdrop,
+            TransactionType::SweepAirdrop,
         ];
         for ty in all {
             let tag = ty as u8;
