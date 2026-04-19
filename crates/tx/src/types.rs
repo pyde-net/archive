@@ -57,6 +57,15 @@ pub enum TransactionType {
     /// the current set. Enables signer-set turnover (incl. annual
     /// validator-rep rotation) without a hard fork.
     RotateMultisig = 10,
+    /// Freeze block production except `EmergencyResume` (Phase 4 slice
+    /// 4.6). `tx.data` carries a simple multisig-signed action blob.
+    /// While paused, every other tx type is rejected before any state
+    /// write so an emergency patch can be coordinated without user
+    /// traffic interfering.
+    EmergencyPause = 11,
+    /// Resume normal block processing (Phase 4 slice 4.6). Clears the
+    /// pause flag. Same multisig-signed blob format as `EmergencyPause`.
+    EmergencyResume = 12,
 }
 
 impl TransactionType {
@@ -73,6 +82,8 @@ impl TransactionType {
             8 => Some(Self::SweepAirdrop),
             9 => Some(Self::MultisigTx),
             10 => Some(Self::RotateMultisig),
+            11 => Some(Self::EmergencyPause),
+            12 => Some(Self::EmergencyResume),
             _ => None,
         }
     }
@@ -499,6 +510,8 @@ mod tests {
             TransactionType::SweepAirdrop,
             TransactionType::MultisigTx,
             TransactionType::RotateMultisig,
+            TransactionType::EmergencyPause,
+            TransactionType::EmergencyResume,
         ];
         for ty in all {
             let tag = ty as u8;

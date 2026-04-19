@@ -177,6 +177,22 @@ fn execute_transaction_inner(
     block_ctx: &BlockContext,
     aot_fn: Option<unsafe fn(*mut u64, u64, *mut pyde_vm::vm::Vm) -> u64>,
 ) -> Result<Receipt, PipelineError> {
+    // 0. Emergency pause gate (slice 4.6).
+    //
+    // The pause state stores an `end_slot`; the chain is paused while
+    // `current_slot < end_slot`. While paused, only `EmergencyResume`
+    // may execute. Rejection happens BEFORE validation + gas charging
+    // so spam-to-fail during pause doesn't burn user gas.
+    //
+    // Past-deadline end_slots auto-expire without any explicit clear
+    // — if signers lose their keys during pause, the chain recovers
+    // once the declared pause window lapses instead of being bricked.
+    if is_paused(smt, block_ctx.height) && tx.tx_type != TransactionType::EmergencyResume {
+        return Err(PipelineError::ExecutionFailed(
+            "chain paused: only EmergencyResume accepted".into(),
+        ));
+    }
+
     // 1. Load accounts
     let mut sender = load_account(smt, &tx.from);
     let mut recipient = load_account(smt, &tx.to);
@@ -490,6 +506,8 @@ fn execute_transaction_inner(
         }
         TransactionType::MultisigTx => execute_multisig_spend(tx, smt),
         TransactionType::RotateMultisig => execute_rotate_multisig(tx, smt),
+        TransactionType::EmergencyPause => execute_emergency_pause(tx, smt, block_ctx),
+        TransactionType::EmergencyResume => execute_emergency_resume(tx, smt, block_ctx),
         TransactionType::ClaimReward => {
             // Pull the sender's accrued pool share. Valid only for
             // Active (0x00) and Unbonding (0x01) entries — Exited
@@ -988,6 +1006,38 @@ pub fn write_multisig_nonce(smt: &mut dyn pyde_state::smt::StateAccess, n: u64) 
         pyde_state::keys::multisig_nonce_key(),
         n.to_le_bytes().to_vec(),
     );
+}
+
+/// Read the emergency pause end-slot (slice 4.6). `0` or absent means
+/// the chain is not paused. A non-zero value means "paused until
+/// `current_slot >= end_slot`" — callers typically want `is_paused`
+/// below, which compares against the current slot.
+pub fn read_emergency_pause_end_slot(smt: &dyn pyde_state::smt::StateAccess) -> u64 {
+    smt.get(&pyde_state::keys::emergency_pause_end_slot_key())
+        .and_then(|b| {
+            if b.len() >= 8 {
+                Some(u64::from_le_bytes(b[..8].try_into().ok()?))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+pub fn write_emergency_pause_end_slot(
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    end_slot: u64,
+) {
+    let _ = smt.insert(
+        pyde_state::keys::emergency_pause_end_slot_key(),
+        end_slot.to_le_bytes().to_vec(),
+    );
+}
+
+/// True when `current_slot < pause_end_slot`. Past-deadline pauses are
+/// treated as unpaused without any explicit clear — lazy expiry.
+pub fn is_paused(smt: &dyn pyde_state::smt::StateAccess, current_slot: u64) -> bool {
+    current_slot < read_emergency_pause_end_slot(smt)
 }
 
 /// Read the airdrop Merkle root, if configured.
@@ -1881,6 +1931,192 @@ fn execute_rotate_multisig(
         vec![],
         vec![signer_count, rotate.new_threshold],
     )
+}
+
+// ---------------------------------------------------------------------------
+// Emergency pause / resume (slice 4.6)
+// ---------------------------------------------------------------------------
+
+/// Base gas for EmergencyPause / EmergencyResume. State work is
+/// minimal (one slot write + nonce bump); sig verification is the
+/// dominant cost, charged per-sig below.
+const EMERGENCY_BASE_GAS: u64 = 40_000;
+
+/// Maximum pause window in slots. 6_500_000 × 400ms ≈ 30 days. Caps
+/// the lost-keys blast radius: even a worst-case "all signers lose
+/// their keys during pause" scenario auto-recovers after 30 days.
+pub const MAX_PAUSE_DURATION_SLOTS: u64 = 6_500_000;
+
+fn multisig_ok(
+    smt: &dyn pyde_state::smt::StateAccess,
+    sigs: &[crate::multisig::SigEntry],
+    signing_bytes: &[u8],
+    gas: u64,
+) -> Result<(), (bool, u64, u64, Vec<LogEntry>, Vec<u8>)> {
+    let signer_pks = match read_multisig_signers(smt) {
+        Some(p) => p,
+        None => {
+            return Err((
+                false,
+                gas,
+                0,
+                vec![],
+                b"multisig not configured".to_vec(),
+            ));
+        }
+    };
+    let threshold = read_multisig_threshold(smt);
+    if threshold == 0 {
+        return Err((false, gas, 0, vec![], b"multisig threshold = 0".to_vec()));
+    }
+    let valid = match crate::multisig::count_valid_sigs(sigs, &signer_pks, signing_bytes) {
+        Ok(v) => v,
+        Err(e) => return Err((false, gas, 0, vec![], e.as_bytes().to_vec())),
+    };
+    if valid < threshold as usize {
+        return Err((
+            false,
+            gas,
+            0,
+            vec![],
+            format!(
+                "emergency below threshold: {} valid of {} required",
+                valid, threshold
+            )
+            .into_bytes(),
+        ));
+    }
+    Ok(())
+}
+
+fn execute_emergency_pause(
+    tx: &Transaction,
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    block_ctx: &BlockContext,
+) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
+    let payload = match crate::multisig::EmergencyPausePayload::decode(&tx.data) {
+        Some(p) => p,
+        None => {
+            return (
+                false,
+                EMERGENCY_BASE_GAS,
+                0,
+                vec![],
+                b"pause payload malformed".to_vec(),
+            );
+        }
+    };
+
+    let gas = EMERGENCY_BASE_GAS
+        .saturating_add(MULTISIG_PER_SIG_GAS.saturating_mul(payload.sigs.len() as u64));
+
+    if tx.gas_limit < gas {
+        return (
+            false,
+            tx.gas_limit,
+            0,
+            vec![],
+            b"pause gas_limit below required cost".to_vec(),
+        );
+    }
+
+    // Duration bounds. Zero = no pause (weird), above cap = too long.
+    if payload.duration_slots == 0 || payload.duration_slots > MAX_PAUSE_DURATION_SLOTS {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            format!(
+                "pause duration_slots {} outside 1..={}",
+                payload.duration_slots, MAX_PAUSE_DURATION_SLOTS
+            )
+            .into_bytes(),
+        );
+    }
+
+    // Reject re-pause while already paused — unreachable via public
+    // entry (gate blocks non-Resume while paused) but kept as
+    // defense-in-depth against future refactors.
+    if is_paused(smt, block_ctx.height) {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"chain already paused".to_vec(),
+        );
+    }
+
+    let nonce = read_multisig_nonce(smt);
+    let msg = payload.signing_bytes(nonce);
+    if let Err(e) = multisig_ok(smt, &payload.sigs, &msg, gas) {
+        return e;
+    }
+
+    let end_slot = block_ctx.height.saturating_add(payload.duration_slots);
+    write_emergency_pause_end_slot(smt, end_slot);
+    write_multisig_nonce(smt, nonce.saturating_add(1));
+
+    (true, gas, 0, vec![], end_slot.to_le_bytes().to_vec())
+}
+
+fn execute_emergency_resume(
+    tx: &Transaction,
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    block_ctx: &BlockContext,
+) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
+    let payload = match crate::multisig::EmergencyResumePayload::decode(&tx.data) {
+        Some(p) => p,
+        None => {
+            return (
+                false,
+                EMERGENCY_BASE_GAS,
+                0,
+                vec![],
+                b"resume payload malformed".to_vec(),
+            );
+        }
+    };
+
+    let gas = EMERGENCY_BASE_GAS
+        .saturating_add(MULTISIG_PER_SIG_GAS.saturating_mul(payload.sigs.len() as u64));
+
+    if tx.gas_limit < gas {
+        return (
+            false,
+            tx.gas_limit,
+            0,
+            vec![],
+            b"resume gas_limit below required cost".to_vec(),
+        );
+    }
+
+    // Resume only makes sense if currently paused. An auto-expired
+    // pause (end_slot in the past) still counts as "not paused" and
+    // should reject resume submissions as a no-op waste of signer
+    // coordination.
+    if !is_paused(smt, block_ctx.height) {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"chain already unpaused".to_vec(),
+        );
+    }
+
+    let nonce = read_multisig_nonce(smt);
+    let msg = crate::multisig::EmergencyResumePayload::signing_bytes(nonce);
+    if let Err(e) = multisig_ok(smt, &payload.sigs, &msg, gas) {
+        return e;
+    }
+
+    // Explicit unpause: zero out the end slot.
+    write_emergency_pause_end_slot(smt, 0);
+    write_multisig_nonce(smt, nonce.saturating_add(1));
+
+    (true, gas, 0, vec![], vec![])
 }
 
 /// Currently executes groups sequentially on the shared SMT. True thread-level
@@ -4823,6 +5059,446 @@ mod tests {
             treasury_after >= treasury_before,
             "treasury must not have been debited"
         );
+        assert_eq!(read_multisig_nonce(&smt), 0);
+    }
+
+    // ========== Slice 4.6: emergency pause / resume ==========
+
+    fn sign_pause_sigs(
+        sks: &[&pyde_crypto::falcon::FalconSecretKey],
+        indices: &[u8],
+        duration_slots: u64,
+        nonce: u64,
+    ) -> Vec<crate::multisig::SigEntry> {
+        let stub = crate::multisig::EmergencyPausePayload {
+            duration_slots,
+            sigs: vec![],
+        };
+        let msg = stub.signing_bytes(nonce);
+        sks.iter()
+            .zip(indices.iter())
+            .map(|(sk, idx)| crate::multisig::SigEntry {
+                signer_index: *idx,
+                signature: pyde_crypto::falcon::falcon_sign(sk, &msg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            })
+            .collect()
+    }
+
+    fn sign_resume_sigs(
+        sks: &[&pyde_crypto::falcon::FalconSecretKey],
+        indices: &[u8],
+        nonce: u64,
+    ) -> Vec<crate::multisig::SigEntry> {
+        let msg = crate::multisig::EmergencyResumePayload::signing_bytes(nonce);
+        sks.iter()
+            .zip(indices.iter())
+            .map(|(sk, idx)| crate::multisig::SigEntry {
+                signer_index: *idx,
+                signature: pyde_crypto::falcon::falcon_sign(sk, &msg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            })
+            .collect()
+    }
+
+    fn build_pause_tx(
+        submitter: Address,
+        submitter_sk: &pyde_crypto::falcon::FalconSecretKey,
+        duration_slots: u64,
+        sigs: Vec<crate::multisig::SigEntry>,
+        outer_nonce: u64,
+    ) -> Transaction {
+        let payload = crate::multisig::EmergencyPausePayload {
+            duration_slots,
+            sigs,
+        };
+        let mut tx = Transaction {
+            from: submitter,
+            to: [0u8; 32],
+            value: 0,
+            data: payload.encode(),
+            gas_limit: 1_000_000,
+            nonce: outer_nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::EmergencyPause,
+        };
+        sign_tx(&mut tx, submitter_sk);
+        tx
+    }
+
+    fn build_resume_tx(
+        submitter: Address,
+        submitter_sk: &pyde_crypto::falcon::FalconSecretKey,
+        sigs: Vec<crate::multisig::SigEntry>,
+        outer_nonce: u64,
+    ) -> Transaction {
+        let payload = crate::multisig::EmergencyResumePayload { sigs };
+        let mut tx = Transaction {
+            from: submitter,
+            to: [0u8; 32],
+            value: 0,
+            data: payload.encode(),
+            gas_limit: 1_000_000,
+            nonce: outer_nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::EmergencyResume,
+        };
+        sign_tx(&mut tx, submitter_sk);
+        tx
+    }
+
+    #[test]
+    fn emergency_pause_sets_end_slot_and_bumps_nonce() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        assert!(!is_paused(&smt, ctx.height));
+
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let tx = build_pause_tx(submitter, &sub_sk, 500, sigs, 0);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(receipt.success);
+        assert!(is_paused(&smt, ctx.height), "chain must be paused");
+        assert_eq!(
+            read_emergency_pause_end_slot(&smt),
+            ctx.height + 500,
+            "end slot = current + duration"
+        );
+        assert_eq!(read_multisig_nonce(&smt), 1);
+    }
+
+    #[test]
+    fn emergency_resume_clears_end_slot_and_bumps_nonce() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
+        execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
+
+        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1);
+        let resume_tx = build_resume_tx(submitter, &sub_sk, resume_sigs, 1);
+        let r = execute_transaction(&resume_tx, &mut smt, &ctx).unwrap();
+        assert!(r.success);
+        assert!(!is_paused(&smt, ctx.height));
+        assert_eq!(read_emergency_pause_end_slot(&smt), 0);
+        assert_eq!(read_multisig_nonce(&smt), 2);
+    }
+
+    #[test]
+    fn emergency_pause_auto_expires_past_end_slot() {
+        let mut smt = PydeSMT::new();
+        let mut ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 10, 0);
+        let tx = build_pause_tx(submitter, &sub_sk, 10, sigs, 0);
+        execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(is_paused(&smt, ctx.height));
+
+        // Advance well past the declared window. End slot is
+        // ctx.height(100) + 10 = 110. At slot 1000 the chain is no
+        // longer paused — lost-keys scenario recovers here without
+        // any explicit resume tx.
+        ctx.height = 1000;
+        assert!(!is_paused(&smt, ctx.height));
+
+        // A standard transfer should execute at slot 1000 even though
+        // the state still holds a stale end_slot.
+        let (recv_pk, _) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let recipient = derive_eoa_address(recv_pk.as_bytes());
+        let transfer = make_signed_tx(submitter, recipient, 100, 100_000, 1, &sub_sk);
+        let r = execute_transaction(&transfer, &mut smt, &ctx).unwrap();
+        assert!(r.success);
+    }
+
+    #[test]
+    fn emergency_pause_rejects_zero_duration() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 0, 0);
+        let tx = build_pause_tx(submitter, &sub_sk, 0, sigs, 0);
+        let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!r.success);
+        assert!(!is_paused(&smt, ctx.height));
+        assert_eq!(read_multisig_nonce(&smt), 0);
+    }
+
+    #[test]
+    fn emergency_pause_rejects_over_max_duration() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let over = MAX_PAUSE_DURATION_SLOTS + 1;
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], over, 0);
+        let tx = build_pause_tx(submitter, &sub_sk, over, sigs, 0);
+        let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!r.success);
+        assert!(!is_paused(&smt, ctx.height));
+    }
+
+    #[test]
+    fn emergency_pause_rejects_below_threshold() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let sigs = sign_pause_sigs(&[&sks[0]], &[0], 500, 0);
+        let tx = build_pause_tx(submitter, &sub_sk, 500, sigs, 0);
+        let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!r.success);
+        assert!(!is_paused(&smt, ctx.height));
+        assert_eq!(read_multisig_nonce(&smt), 0);
+    }
+
+    #[test]
+    fn emergency_pause_rejects_replay_after_success() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_tx = build_pause_tx(submitter, &sub_sk, 500, sigs.clone(), 0);
+        execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
+
+        // Resume so we can attempt re-pause.
+        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1);
+        let resume_tx = build_resume_tx(submitter, &sub_sk, resume_sigs, 1);
+        execute_transaction(&resume_tx, &mut smt, &ctx).unwrap();
+
+        // Replay original pause sigs — signed against nonce 0, multisig
+        // nonce is now 2.
+        let replay_tx = build_pause_tx(submitter, &sub_sk, 500, sigs, 2);
+        let r = execute_transaction(&replay_tx, &mut smt, &ctx).unwrap();
+        assert!(!r.success, "pause sigs bound to nonce 0 must not replay");
+    }
+
+    #[test]
+    fn emergency_pause_rejects_duration_mismatch() {
+        // Signers sign over duration=500 but submitter tampers with
+        // duration in the wire payload. Sigs verify against signed
+        // bytes (nonce || "PAUSE" || 500), but handler uses the wire
+        // duration (100). The decoder preserves the duration from
+        // wire, so the signing_bytes recomputed at verify time use
+        // 100, which doesn't match the signed preimage.
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let sigs_over_500 = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let tx = build_pause_tx(submitter, &sub_sk, 100, sigs_over_500, 0);
+        let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!r.success, "duration tamper must fail sig verification");
+    }
+
+    #[test]
+    fn emergency_rejects_re_resume_when_not_paused() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 0);
+        let tx = build_resume_tx(submitter, &sub_sk, sigs, 0);
+        let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!r.success);
+        assert_eq!(read_multisig_nonce(&smt), 0);
+    }
+
+    #[test]
+    fn while_paused_standard_tx_rejected() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
+        execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
+
+        let (recv_pk, _) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let recipient = derive_eoa_address(recv_pk.as_bytes());
+        let transfer = make_signed_tx(submitter, recipient, 100, 100_000, 1, &sub_sk);
+        let err = execute_transaction(&transfer, &mut smt, &ctx);
+        assert!(err.is_err(), "standard tx must fail during pause");
+    }
+
+    #[test]
+    fn while_paused_multisig_spend_rejected() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
+        execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
+
+        let spend = make_spend([0xEE; 32], 1_000);
+        let spend_sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 1);
+        let payload = crate::multisig::MultisigPayload::Spend {
+            spend,
+            sigs: spend_sigs,
+        };
+        let mut spend_tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+        spend_tx.nonce = 1;
+        sign_tx(&mut spend_tx, &sub_sk);
+        let err = execute_transaction(&spend_tx, &mut smt, &ctx);
+        assert!(err.is_err(), "MultisigTx must fail during pause");
+    }
+
+    #[test]
+    fn while_paused_rotate_rejected() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
+        execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
+
+        let (new_pk, _) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let rotate = crate::multisig::MultisigRotate {
+            new_signer_pks: vec![new_pk.as_bytes().to_vec()],
+            new_threshold: 1,
+        };
+        let rmsg = rotate.signing_bytes(1);
+        let rsigs = vec![
+            crate::multisig::SigEntry {
+                signer_index: 0,
+                signature: pyde_crypto::falcon::falcon_sign(&sks[0], &rmsg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            },
+            crate::multisig::SigEntry {
+                signer_index: 1,
+                signature: pyde_crypto::falcon::falcon_sign(&sks[1], &rmsg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            },
+        ];
+        let rpayload = crate::multisig::MultisigPayload::Rotate { rotate, sigs: rsigs };
+        let mut rtx = build_multisig_rotate_tx(submitter, &sub_sk, rpayload);
+        rtx.nonce = 1;
+        sign_tx(&mut rtx, &sub_sk);
+        let err = execute_transaction(&rtx, &mut smt, &ctx);
+        assert!(err.is_err(), "RotateMultisig must fail during pause");
+    }
+
+    #[test]
+    fn while_paused_emergency_resume_accepted() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
+        execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
+        assert!(is_paused(&smt, ctx.height));
+
+        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1);
+        let resume_tx = build_resume_tx(submitter, &sub_sk, resume_sigs, 1);
+        let r = execute_transaction(&resume_tx, &mut smt, &ctx).unwrap();
+        assert!(r.success);
+        assert!(!is_paused(&smt, ctx.height));
+    }
+
+    #[test]
+    fn pause_resume_cycle_restores_normal_operation() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
+        execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
+
+        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1);
+        let resume_tx = build_resume_tx(submitter, &sub_sk, resume_sigs, 1);
+        execute_transaction(&resume_tx, &mut smt, &ctx).unwrap();
+
+        let (recv_pk, _) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let recipient = derive_eoa_address(recv_pk.as_bytes());
+        let transfer = make_signed_tx(submitter, recipient, 100, 100_000, 2, &sub_sk);
+        let r = execute_transaction(&transfer, &mut smt, &ctx).unwrap();
+        assert!(r.success);
+    }
+
+    #[test]
+    fn emergency_rejects_insufficient_gas_limit() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let mut tx = build_pause_tx(submitter, &sub_sk, 500, sigs, 0);
+        tx.gas_limit = 50_000;
+        sign_tx(&mut tx, &sub_sk);
+
+        let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!r.success);
+        assert!(!is_paused(&smt, ctx.height));
         assert_eq!(read_multisig_nonce(&smt), 0);
     }
 }

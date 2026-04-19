@@ -78,6 +78,13 @@ pub mod discriminator {
     /// successful multisig operation to bind signatures to a specific
     /// operation and prevent replay.
     pub const MULTISIG_NONCE: u8 = 0x1E;
+    /// Emergency pause end slot (slice 4.6). u64 LE. Block processing
+    /// rejects all tx types except `EmergencyResume` while
+    /// `current_slot < END_SLOT`. `0` (or absent) = not paused. Past
+    /// values = automatically unpaused (lazy clear — no sweep tx
+    /// needed). Enforced cap at `EmergencyPause` time so the chain
+    /// can't be bricked by lost signer keys during pause.
+    pub const EMERGENCY_PAUSE_END_SLOT: u8 = 0x1F;
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +322,14 @@ pub fn multisig_threshold_key() -> H256 {
 /// successful MultisigTx or RotateMultisig execution.
 pub fn multisig_nonce_key() -> H256 {
     H256::from(poseidon2_hash(&[discriminator::MULTISIG_NONCE]).to_bytes())
+}
+
+/// Emergency pause end-slot key (slice 4.6). Value is u64 LE —
+/// block processing rejects non-Resume txs while `current_slot <
+/// end_slot`. `0` / absent = not paused. Past values = effectively
+/// unpaused (lazy clear).
+pub fn emergency_pause_end_slot_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::EMERGENCY_PAUSE_END_SLOT]).to_bytes())
 }
 
 #[cfg(test)]
