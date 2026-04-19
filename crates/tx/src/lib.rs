@@ -1,6 +1,7 @@
 //! Pyde Transaction Processing: transaction types, serialization, and hashing.
 
 pub mod access_infer;
+pub mod airdrop;
 pub mod execution;
 pub mod fee;
 pub mod gas_tank;

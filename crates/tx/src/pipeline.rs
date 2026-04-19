@@ -482,6 +482,12 @@ fn execute_transaction_inner(
             }
         }
         TransactionType::Slash => execute_slash(tx, smt, &mut sender.balance),
+        TransactionType::ClaimAirdrop => {
+            execute_claim_airdrop(tx, smt, block_ctx, &mut sender.balance)
+        }
+        TransactionType::SweepAirdrop => {
+            execute_sweep_airdrop(smt, block_ctx)
+        }
         TransactionType::ClaimReward => {
             // Pull the sender's accrued pool share. Valid only for
             // Active (0x00) and Unbonding (0x01) entries — Exited
@@ -925,6 +931,72 @@ pub fn write_validator_subsidy(
     );
 }
 
+/// Read the airdrop Merkle root, if configured.
+pub fn read_airdrop_root(
+    smt: &dyn pyde_state::smt::StateAccess,
+) -> Option<[u8; 32]> {
+    let bytes = smt.get(&pyde_state::keys::airdrop_root_key())?;
+    if bytes.len() == 32 {
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&bytes);
+        Some(root)
+    } else {
+        None
+    }
+}
+
+pub fn write_airdrop_root(smt: &mut dyn pyde_state::smt::StateAccess, root: &[u8; 32]) {
+    let _ = smt.insert(pyde_state::keys::airdrop_root_key(), root.to_vec());
+}
+
+/// Read the airdrop claim deadline (slot). Absent = no deadline configured.
+pub fn read_airdrop_deadline(smt: &dyn pyde_state::smt::StateAccess) -> Option<u64> {
+    let bytes = smt.get(&pyde_state::keys::airdrop_deadline_key())?;
+    if bytes.len() >= 8 {
+        Some(u64::from_le_bytes(bytes[..8].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
+pub fn write_airdrop_deadline(smt: &mut dyn pyde_state::smt::StateAccess, slot: u64) {
+    let _ = smt.insert(
+        pyde_state::keys::airdrop_deadline_key(),
+        slot.to_le_bytes().to_vec(),
+    );
+}
+
+/// Read the operator-declared expected airdrop claim sum.
+pub fn read_airdrop_expected_sum(smt: &dyn pyde_state::smt::StateAccess) -> Option<u128> {
+    let bytes = smt.get(&pyde_state::keys::airdrop_expected_sum_key())?;
+    if bytes.len() >= 16 {
+        Some(u128::from_le_bytes(bytes[..16].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
+pub fn write_airdrop_expected_sum(smt: &mut dyn pyde_state::smt::StateAccess, amount: u128) {
+    let _ = smt.insert(
+        pyde_state::keys::airdrop_expected_sum_key(),
+        amount.to_le_bytes().to_vec(),
+    );
+}
+
+/// Check whether a leaf index has already been claimed.
+pub fn is_airdrop_claimed(smt: &dyn pyde_state::smt::StateAccess, leaf_index: u64) -> bool {
+    smt.get(&pyde_state::keys::airdrop_claimed_key(leaf_index))
+        .is_some()
+}
+
+/// Mark a leaf index as claimed. Idempotent — value is a single marker byte.
+pub fn mark_airdrop_claimed(smt: &mut dyn pyde_state::smt::StateAccess, leaf_index: u64) {
+    let _ = smt.insert(
+        pyde_state::keys::airdrop_claimed_key(leaf_index),
+        vec![0x01],
+    );
+}
+
 /// Read active-only validator count (slice 4.2). Defaults to 0.
 pub fn read_active_validator_count(smt: &dyn pyde_state::smt::StateAccess) -> u64 {
     smt.get(&pyde_state::keys::active_validator_count_key())
@@ -1213,6 +1285,183 @@ fn execute_slash(
     );
 
     (true, 100_000, 0, vec![], ev.signer.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Airdrop claim + sweep (slice 4.4b)
+// ---------------------------------------------------------------------------
+
+/// Base gas for a `ClaimAirdrop` tx (covers state lookups + balance writes).
+const AIRDROP_CLAIM_BASE_GAS: u64 = 30_000;
+
+/// Per-proof-level gas for the Poseidon2 pair hash that reconstructs the
+/// root. Calibrated to be strictly above the measured cost of one
+/// `poseidon2_pair` call in `crypto/benches/poseidon2_bench.rs` (≈ 3.5µs
+/// on M-series hardware at a 1 gas ≈ 1ns target ratio). Rounded up to
+/// give headroom for slower hardware + CI variance.
+const AIRDROP_CLAIM_PER_LEVEL_GAS: u64 = 5_000;
+
+/// Flat gas for `SweepAirdrop`: three reads (deadline, pool account,
+/// treasury account) + two balance writes.
+const AIRDROP_SWEEP_GAS: u64 = 40_000;
+
+fn execute_claim_airdrop(
+    tx: &Transaction,
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    block_ctx: &BlockContext,
+    sender_balance: &mut u128,
+) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
+    let payload = match crate::airdrop::ClaimPayload::decode(&tx.data) {
+        Some(p) => p,
+        None => {
+            return (
+                false,
+                AIRDROP_CLAIM_BASE_GAS,
+                0,
+                vec![],
+                b"airdrop payload malformed".to_vec(),
+            );
+        }
+    };
+
+    let gas = AIRDROP_CLAIM_BASE_GAS
+        .saturating_add(AIRDROP_CLAIM_PER_LEVEL_GAS.saturating_mul(payload.proof.len() as u64));
+
+    // Deadline — if no deadline is configured the airdrop isn't active.
+    let deadline = match read_airdrop_deadline(smt) {
+        Some(d) => d,
+        None => {
+            return (
+                false,
+                gas,
+                0,
+                vec![],
+                b"airdrop not configured".to_vec(),
+            );
+        }
+    };
+    if block_ctx.height > deadline {
+        return (false, gas, 0, vec![], b"airdrop deadline passed".to_vec());
+    }
+
+    // Root — required alongside deadline, but check defensively in case
+    // of partially-written genesis state.
+    let root = match read_airdrop_root(smt) {
+        Some(r) => r,
+        None => {
+            return (
+                false,
+                gas,
+                0,
+                vec![],
+                b"airdrop root missing".to_vec(),
+            );
+        }
+    };
+
+    // Anti-replay check BEFORE proof verification so repeated failed
+    // claims don't waste Poseidon2 cycles on the validator.
+    if is_airdrop_claimed(smt, payload.leaf_index) {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"airdrop leaf already claimed".to_vec(),
+        );
+    }
+
+    if !crate::airdrop::verify_proof(
+        payload.leaf_index,
+        &tx.from,
+        payload.amount,
+        &payload.proof,
+        &root,
+    ) {
+        return (false, gas, 0, vec![], b"airdrop proof invalid".to_vec());
+    }
+
+    // Debit pool, credit claimer. Pool underfund should be caught at
+    // genesis by the `expected_sum >= pool_balance` check, but we
+    // defend in depth in case the expected sum was wrong and late
+    // claimers hit a drained pool.
+    let pool_addr = pyde_account::address::airdrop_pool_address();
+    let mut pool = load_account(smt, &pool_addr);
+    if pool.balance < payload.amount {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"airdrop pool insufficient".to_vec(),
+        );
+    }
+    pool.balance -= payload.amount;
+    if store_account(smt, &pool).is_err() {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"airdrop pool write failed".to_vec(),
+        );
+    }
+
+    *sender_balance = sender_balance.saturating_add(payload.amount);
+    mark_airdrop_claimed(smt, payload.leaf_index);
+
+    (true, gas, 0, vec![], payload.amount.to_le_bytes().to_vec())
+}
+
+fn execute_sweep_airdrop(
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    block_ctx: &BlockContext,
+) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
+    let deadline = match read_airdrop_deadline(smt) {
+        Some(d) => d,
+        None => {
+            return (
+                false,
+                AIRDROP_SWEEP_GAS,
+                0,
+                vec![],
+                b"airdrop not configured".to_vec(),
+            );
+        }
+    };
+    if block_ctx.height <= deadline {
+        return (
+            false,
+            AIRDROP_SWEEP_GAS,
+            0,
+            vec![],
+            b"airdrop still active".to_vec(),
+        );
+    }
+
+    let pool_addr = pyde_account::address::airdrop_pool_address();
+    let mut pool = load_account(smt, &pool_addr);
+    let residue = pool.balance;
+    if residue == 0 {
+        return (true, AIRDROP_SWEEP_GAS, 0, vec![], vec![]);
+    }
+
+    let treasury_addr = pyde_account::address::treasury_address();
+    let mut treasury = load_account(smt, &treasury_addr);
+    pool.balance = 0;
+    treasury.balance = treasury.balance.saturating_add(residue);
+
+    if store_account(smt, &pool).is_err() || store_account(smt, &treasury).is_err() {
+        return (
+            false,
+            AIRDROP_SWEEP_GAS,
+            0,
+            vec![],
+            b"sweep state write failed".to_vec(),
+        );
+    }
+
+    (true, AIRDROP_SWEEP_GAS, 0, vec![], residue.to_le_bytes().to_vec())
 }
 
 /// Currently executes groups sequentially on the shared SMT. True thread-level
@@ -3186,5 +3435,304 @@ mod tests {
         let tx = build_slash_tx(submitter, &ssk, vec![SLASH_EVIDENCE_VERSION, 0x00]);
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(!receipt.success);
+    }
+
+    // ========== Slice 4.4b: airdrop claim + sweep ==========
+
+    /// Seed airdrop state: root, deadline, pool balance, and optional
+    /// expected-sum. Returns the claimer address + secret key + the
+    /// computed proof for `leaf_index`.
+    fn airdrop_fixture(
+        smt: &mut dyn pyde_state::smt::StateAccess,
+        leaves: Vec<(Address, u128)>,
+        leaf_index: usize,
+        deadline: u64,
+        pool_balance: u128,
+    ) -> (
+        pyde_crypto::falcon::FalconPublicKey,
+        pyde_crypto::falcon::FalconSecretKey,
+        Address,
+        Vec<[u8; 32]>,
+    ) {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let claimer = derive_eoa_address(pk.as_bytes());
+
+        // Replace the placeholder at leaf_index with the real claimer
+        // address so the proof binds to a signable account.
+        let mut leaves = leaves;
+        let amount = leaves[leaf_index].1;
+        leaves[leaf_index] = (claimer, amount);
+
+        let (root, proofs) = crate::airdrop::build_tree(&leaves);
+        let proof = proofs[leaf_index].clone();
+
+        write_airdrop_root(smt, &root);
+        write_airdrop_deadline(smt, deadline);
+
+        // Fund the pool.
+        let pool_addr = pyde_account::address::airdrop_pool_address();
+        let mut pool_account = pyde_account::types::Account {
+            address: pool_addr,
+            nonce: 0,
+            balance: pool_balance,
+            code_hash: sparse_merkle_tree::H256::zero(),
+            storage_root: sparse_merkle_tree::H256::zero(),
+            account_type: pyde_account::types::AccountType::EOA,
+            auth_keys: pyde_account::types::AuthKeys::None,
+            gas_tank: 0,
+            key_nonce: 0,
+        };
+        pool_account.balance = pool_balance;
+        store_account(smt, &pool_account).unwrap();
+
+        fund_account_with_pk(smt, &claimer, 1_000_000_000_000, pk.as_bytes());
+
+        (pk, sk, claimer, proof)
+    }
+
+    fn build_claim_tx(
+        from: Address,
+        sk: &pyde_crypto::falcon::FalconSecretKey,
+        leaf_index: u64,
+        amount: u128,
+        proof: Vec<[u8; 32]>,
+        nonce: u64,
+    ) -> Transaction {
+        let payload = crate::airdrop::ClaimPayload {
+            leaf_index,
+            amount,
+            proof,
+        };
+        let mut tx = Transaction {
+            from,
+            to: [0u8; 32],
+            value: 0,
+            data: payload.encode(),
+            gas_limit: 200_000,
+            nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::ClaimAirdrop,
+        };
+        sign_tx(&mut tx, sk);
+        tx
+    }
+
+    #[test]
+    fn airdrop_claim_debits_pool_and_credits_claimer() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let leaves = vec![([0xAA; 32], 1_000u128), ([0xBB; 32], 2_000u128)];
+        let (_pk, sk, claimer, proof) = airdrop_fixture(&mut smt, leaves, 0, 10_000, 5_000);
+
+        let starting_balance = load_account(&smt, &claimer).balance;
+
+        let tx = build_claim_tx(claimer, &sk, 0, 1_000, proof, 0);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(receipt.success, "valid claim should succeed");
+
+        // Pool debited
+        let pool = load_account(&smt, &pyde_account::address::airdrop_pool_address());
+        assert_eq!(pool.balance, 4_000);
+
+        // Claimer credited — minus gas cost
+        let after = load_account(&smt, &claimer);
+        let gas_cost = receipt.gas_used as u128 * ctx.base_fee;
+        assert_eq!(after.balance, starting_balance + 1_000 - gas_cost);
+
+        // Claimed flag set
+        assert!(is_airdrop_claimed(&smt, 0));
+    }
+
+    #[test]
+    fn airdrop_claim_rejects_double_claim() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let leaves = vec![([0xAA; 32], 1_000u128), ([0xBB; 32], 2_000u128)];
+        let (_pk, sk, claimer, proof) = airdrop_fixture(&mut smt, leaves, 0, 10_000, 5_000);
+
+        let tx1 = build_claim_tx(claimer, &sk, 0, 1_000, proof.clone(), 0);
+        let r1 = execute_transaction(&tx1, &mut smt, &ctx).unwrap();
+        assert!(r1.success);
+
+        let tx2 = build_claim_tx(claimer, &sk, 0, 1_000, proof, 1);
+        let r2 = execute_transaction(&tx2, &mut smt, &ctx).unwrap();
+        assert!(!r2.success, "second claim for same leaf must fail");
+    }
+
+    #[test]
+    fn airdrop_claim_rejects_wrong_amount() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let leaves = vec![([0xAA; 32], 1_000u128), ([0xBB; 32], 2_000u128)];
+        let (_pk, sk, claimer, proof) = airdrop_fixture(&mut smt, leaves, 0, 10_000, 5_000);
+
+        // Claim more than the leaf allocates.
+        let tx = build_claim_tx(claimer, &sk, 0, 9_999, proof, 0);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "wrong-amount claim must fail proof check");
+    }
+
+    #[test]
+    fn airdrop_claim_rejects_wrong_claimer() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let leaves = vec![([0xAA; 32], 1_000u128), ([0xBB; 32], 2_000u128)];
+        // Install fixture for leaf 0, but have a different funded account
+        // try to submit. Proof commits to leaf 0's address, so an impostor
+        // fails verification.
+        let (_pk, _sk, _legit_claimer, proof) =
+            airdrop_fixture(&mut smt, leaves, 0, 10_000, 5_000);
+
+        let (imp_pk, imp_sk) = falcon_keygen().unwrap();
+        let impostor = derive_eoa_address(imp_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &impostor, 1_000_000_000_000, imp_pk.as_bytes());
+
+        let tx = build_claim_tx(impostor, &imp_sk, 0, 1_000, proof, 0);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "impostor must fail proof verify");
+    }
+
+    #[test]
+    fn airdrop_claim_rejects_past_deadline() {
+        let mut smt = PydeSMT::new();
+        // Block height 100 — set deadline below that to simulate expiry.
+        let ctx = make_block_ctx();
+        let leaves = vec![([0xAA; 32], 1_000u128), ([0xBB; 32], 2_000u128)];
+        let (_pk, sk, claimer, proof) = airdrop_fixture(&mut smt, leaves, 0, 50, 5_000);
+
+        let tx = build_claim_tx(claimer, &sk, 0, 1_000, proof, 0);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "post-deadline claim must fail");
+    }
+
+    #[test]
+    fn airdrop_claim_rejects_when_not_configured() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let (pk, sk) = falcon_keygen().unwrap();
+        let claimer = derive_eoa_address(pk.as_bytes());
+        fund_account_with_pk(&mut smt, &claimer, 1_000_000_000_000, pk.as_bytes());
+
+        let tx = build_claim_tx(claimer, &sk, 0, 1_000, vec![], 0);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "must reject with no airdrop configured");
+    }
+
+    #[test]
+    fn airdrop_claim_rejects_pool_underfunded() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let leaves = vec![([0xAA; 32], 10_000u128)];
+        // Pool balance 500 < leaf amount 10_000. Expected-sum check
+        // should have caught this at genesis, but we defend in depth.
+        let (_pk, sk, claimer, proof) = airdrop_fixture(&mut smt, leaves, 0, 10_000, 500);
+
+        let tx = build_claim_tx(claimer, &sk, 0, 10_000, proof, 0);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "underfunded pool must reject claim");
+    }
+
+    #[test]
+    fn airdrop_claim_rejects_malformed_payload() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let leaves = vec![([0xAA; 32], 1_000u128)];
+        let (pk, sk, claimer, _proof) = airdrop_fixture(&mut smt, leaves, 0, 10_000, 5_000);
+
+        let mut tx = Transaction {
+            from: claimer,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![0x01, 0x02], // truncated
+            gas_limit: 200_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::ClaimAirdrop,
+        };
+        sign_tx(&mut tx, &sk);
+        let _ = pk;
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "malformed payload must fail");
+    }
+
+    #[test]
+    fn airdrop_sweep_moves_residue_to_treasury() {
+        let mut smt = PydeSMT::new();
+        let mut ctx = make_block_ctx();
+        let leaves = vec![([0xAA; 32], 1_000u128)];
+        let (_pk, sk, claimer, _proof) = airdrop_fixture(&mut smt, leaves, 0, 50, 5_000);
+
+        // Advance block height past deadline.
+        ctx.height = 100; // already > 50
+
+        let mut sweep_tx = Transaction {
+            from: claimer,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 200_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::SweepAirdrop,
+        };
+        sign_tx(&mut sweep_tx, &sk);
+
+        let treasury_before =
+            load_account(&smt, &pyde_account::address::treasury_address()).balance;
+
+        let receipt = execute_transaction(&sweep_tx, &mut smt, &ctx).unwrap();
+        assert!(receipt.success, "sweep after deadline should succeed");
+
+        let pool = load_account(&smt, &pyde_account::address::airdrop_pool_address());
+        let treasury = load_account(&smt, &pyde_account::address::treasury_address());
+        assert_eq!(pool.balance, 0, "pool drained");
+        // Treasury gets both the swept residue (5000) AND the 10% of this
+        // tx's gas fee. Assert the residue landed; fee share is orthogonal.
+        assert!(
+            treasury.balance >= treasury_before + 5_000,
+            "treasury should gain at least 5000 from sweep; got {} - {}",
+            treasury.balance,
+            treasury_before
+        );
+    }
+
+    #[test]
+    fn airdrop_sweep_rejected_before_deadline() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx(); // height = 100
+        let leaves = vec![([0xAA; 32], 1_000u128)];
+        // Deadline 1000 > current 100 → still active.
+        let (_pk, sk, claimer, _proof) = airdrop_fixture(&mut smt, leaves, 0, 1_000, 5_000);
+
+        let mut sweep_tx = Transaction {
+            from: claimer,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 200_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::SweepAirdrop,
+        };
+        sign_tx(&mut sweep_tx, &sk);
+
+        let receipt = execute_transaction(&sweep_tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "pre-deadline sweep must be rejected");
     }
 }

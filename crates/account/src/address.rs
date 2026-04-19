@@ -48,6 +48,14 @@ pub fn treasury_address() -> Address {
     poseidon2_hash(b"pyde-treasury").to_bytes()
 }
 
+/// Well-known airdrop pool address: Poseidon2("pyde-airdrop-pool").
+/// Genesis pre-mints the total claimable amount to this address;
+/// `ClaimAirdrop` debits the pool and credits the claimer.
+/// `SweepAirdrop` transfers any post-deadline residue to the treasury.
+pub fn airdrop_pool_address() -> Address {
+    poseidon2_hash(b"pyde-airdrop-pool").to_bytes()
+}
+
 /// Format an address as a hex string with "0x" prefix.
 pub fn format_address(addr: &Address) -> String {
     let mut s = String::with_capacity(66);
