@@ -486,7 +486,7 @@ fn execute_transaction_inner(
             execute_claim_airdrop(tx, smt, block_ctx, &mut sender.balance)
         }
         TransactionType::SweepAirdrop => {
-            execute_sweep_airdrop(smt, block_ctx)
+            execute_sweep_airdrop(tx, smt, block_ctx)
         }
         TransactionType::ClaimReward => {
             // Pull the sender's accrued pool share. Valid only for
@@ -1295,10 +1295,12 @@ fn execute_slash(
 const AIRDROP_CLAIM_BASE_GAS: u64 = 30_000;
 
 /// Per-proof-level gas for the Poseidon2 pair hash that reconstructs the
-/// root. Calibrated to be strictly above the measured cost of one
-/// `poseidon2_pair` call in `crypto/benches/poseidon2_bench.rs` (≈ 3.5µs
-/// on M-series hardware at a 1 gas ≈ 1ns target ratio). Rounded up to
-/// give headroom for slower hardware + CI variance.
+/// root. Measured via `crypto/benches/poseidon2_bench.rs` at ≈ 1.0 µs per
+/// `poseidon2_pair` on M-series (≈ 1_000 gas at the 1 ns/gas target).
+/// Charged at 5× the measured cost to absorb slower hardware, state I/O
+/// that accompanies each level, and CI variance. A 20-level proof pays
+/// ~100_000 gas vs ~20_000 gas of pure hashing — the margin is real
+/// state-write overhead, not arbitrary inflation.
 const AIRDROP_CLAIM_PER_LEVEL_GAS: u64 = 5_000;
 
 /// Flat gas for `SweepAirdrop`: three reads (deadline, pool account,
@@ -1326,6 +1328,23 @@ fn execute_claim_airdrop(
 
     let gas = AIRDROP_CLAIM_BASE_GAS
         .saturating_add(AIRDROP_CLAIM_PER_LEVEL_GAS.saturating_mul(payload.proof.len() as u64));
+
+    // If the tx.gas_limit can't cover the measured cost of this claim,
+    // reject BEFORE we touch any state. Without this, `post_execution_refund`
+    // would cap the charge at `gas_limit × base_fee`, effectively letting
+    // the claimer underpay for the Poseidon2 work — cheap exploit because
+    // state writes (pool debit, claimed flag, balance credit) would still
+    // commit. Returning `gas_limit` here caps the fee at exactly what the
+    // sender budgeted; no state mutations have happened yet.
+    if tx.gas_limit < gas {
+        return (
+            false,
+            tx.gas_limit,
+            0,
+            vec![],
+            b"airdrop claim gas_limit below required cost".to_vec(),
+        );
+    }
 
     // Deadline — if no deadline is configured the airdrop isn't active.
     let deadline = match read_airdrop_deadline(smt) {
@@ -1414,9 +1433,24 @@ fn execute_claim_airdrop(
 }
 
 fn execute_sweep_airdrop(
+    tx: &Transaction,
     smt: &mut dyn pyde_state::smt::StateAccess,
     block_ctx: &BlockContext,
 ) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
+    // Symmetric to the claim handler: reject before touching state if
+    // the sweeper budgeted less gas than we actually charge. Without
+    // this, the balance-transfer writes would commit while the fee is
+    // capped at the sweeper's limit.
+    if tx.gas_limit < AIRDROP_SWEEP_GAS {
+        return (
+            false,
+            tx.gas_limit,
+            0,
+            vec![],
+            b"sweep gas_limit below required cost".to_vec(),
+        );
+    }
+
     let deadline = match read_airdrop_deadline(smt) {
         Some(d) => d,
         None => {
@@ -3706,6 +3740,87 @@ mod tests {
             treasury.balance,
             treasury_before
         );
+    }
+
+    #[test]
+    fn airdrop_claim_rejects_insufficient_gas_limit() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let leaves = vec![([0xAA; 32], 1_000u128), ([0xBB; 32], 2_000u128)];
+        let (_pk, sk, claimer, proof) =
+            airdrop_fixture(&mut smt, leaves, 0, 10_000, 5_000);
+
+        // Needed gas = 30_000 + proof.len() * 5_000. Set gas_limit to
+        // exactly the intrinsic minimum (21_000) to trigger the early
+        // gas-check guard. Without the guard, pool would be debited
+        // despite underpayment.
+        let payload = crate::airdrop::ClaimPayload {
+            leaf_index: 0,
+            amount: 1_000,
+            proof,
+        };
+        let mut tx = Transaction {
+            from: claimer,
+            to: [0u8; 32],
+            value: 0,
+            data: payload.encode(),
+            gas_limit: 22_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::ClaimAirdrop,
+        };
+        sign_tx(&mut tx, &sk);
+
+        let pool_before =
+            load_account(&smt, &pyde_account::address::airdrop_pool_address()).balance;
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "under-gassed claim must fail");
+
+        // Pool untouched — the gas guard prevents state writes.
+        let pool_after =
+            load_account(&smt, &pyde_account::address::airdrop_pool_address()).balance;
+        assert_eq!(pool_before, pool_after, "pool must not be debited");
+        assert!(!is_airdrop_claimed(&smt, 0), "claimed flag must not be set");
+    }
+
+    #[test]
+    fn airdrop_sweep_rejects_insufficient_gas_limit() {
+        let mut smt = PydeSMT::new();
+        let mut ctx = make_block_ctx();
+        let leaves = vec![([0xAA; 32], 1_000u128)];
+        let (_pk, sk, claimer, _proof) = airdrop_fixture(&mut smt, leaves, 0, 50, 5_000);
+        ctx.height = 100; // past deadline
+
+        let mut sweep_tx = Transaction {
+            from: claimer,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 22_000, // below AIRDROP_SWEEP_GAS = 40_000
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::SweepAirdrop,
+        };
+        sign_tx(&mut sweep_tx, &sk);
+
+        let pool_before =
+            load_account(&smt, &pyde_account::address::airdrop_pool_address()).balance;
+
+        let receipt = execute_transaction(&sweep_tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "under-gassed sweep must fail");
+
+        let pool_after =
+            load_account(&smt, &pyde_account::address::airdrop_pool_address()).balance;
+        assert_eq!(pool_before, pool_after, "pool must not move");
     }
 
     #[test]
