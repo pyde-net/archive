@@ -8,3 +8,4 @@ pub mod parallel;
 pub mod pipeline;
 pub mod types;
 pub mod validation;
+pub mod vesting;

@@ -182,6 +182,12 @@ fn execute_transaction_inner(
     let mut recipient = load_account(smt, &tx.to);
     let mut nonce_state = load_nonce(smt, &tx.from);
 
+    // Compute vested-locked amount for the sender (slice 4.4). Senders
+    // with no vesting schedule get 0 — their full balance is spendable.
+    let sender_locked = read_vesting_schedule(smt, &tx.from)
+        .map(|s| s.locked_at(block_ctx.height))
+        .unwrap_or(0);
+
     // 2. Validate
     let val_ctx = ValidationContext {
         block_height: block_ctx.height,
@@ -189,6 +195,7 @@ fn execute_transaction_inner(
         block_gas_limit: block_ctx.block_gas_limit,
         chain_id: block_ctx.chain_id,
         dev_skip_signature: block_ctx.dev_skip_signature,
+        sender_locked,
     };
     validate_transaction(tx, &sender, &nonce_state, &val_ctx)?;
 
@@ -845,6 +852,28 @@ fn read_u128_state(
             None
         }
     })
+}
+
+/// Read a vesting schedule from state (slice 4.4). Returns `None` when
+/// the account has no vesting — tx validation treats this as "fully
+/// unlocked." Writers: genesis init installs one per allocation; post-
+/// genesis there is no mechanism to create or modify vesting, so an
+/// installed schedule is effectively write-once.
+pub fn read_vesting_schedule(
+    smt: &dyn pyde_state::smt::StateAccess,
+    address: &Address,
+) -> Option<crate::vesting::VestingSchedule> {
+    let bytes = smt.get(&pyde_state::keys::vesting_key(address))?;
+    crate::vesting::VestingSchedule::decode(&bytes)
+}
+
+/// Install a vesting schedule for an account. Called by genesis init.
+pub fn write_vesting_schedule(
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    address: &Address,
+    schedule: &crate::vesting::VestingSchedule,
+) {
+    let _ = smt.insert(pyde_state::keys::vesting_key(address), schedule.encode());
 }
 
 /// Read active-only validator count (slice 4.2). Defaults to 0.
@@ -2629,6 +2658,161 @@ mod tests {
         let val = crate::fee::GENESIS_TOTAL_SUPPLY + 12_345_678;
         write_total_supply(&mut smt, val);
         assert_eq!(read_total_supply(&smt), val);
+    }
+
+    // ========== Phase 4 slice 4.4: vesting enforcement ==========
+
+    fn make_vesting_fixture(
+        balance: u128,
+        vesting: crate::vesting::VestingSchedule,
+    ) -> (PydeSMT, Address, pyde_crypto::falcon::FalconSecretKey) {
+        let mut smt = PydeSMT::new();
+        let (pk, sk) = falcon_keygen().unwrap();
+        let addr = derive_eoa_address(pk.as_bytes());
+        fund_account_with_pk(&mut smt, &addr, balance, pk.as_bytes());
+        write_vesting_schedule(&mut smt, &addr, &vesting);
+        (smt, addr, sk)
+    }
+
+    fn transfer_tx(
+        from: Address,
+        to: Address,
+        value: u128,
+        nonce: u64,
+    ) -> Transaction {
+        Transaction {
+            from, to, value,
+            data: vec![],
+            gas_limit: 50_000,
+            nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Standard,
+        }
+    }
+
+    #[test]
+    fn tx_rejected_when_value_exceeds_unlocked() {
+        // Pre-cliff: 100% of balance locked. Any non-zero value must fail
+        // the balance check.
+        let total: u128 = 1_000_000_000_000;
+        let vest = crate::vesting::VestingSchedule {
+            start_slot: 0,
+            cliff_slots: 1_000,
+            duration_slots: 10_000,
+            total_amount: total,
+        };
+        let (mut smt, addr, sk) = make_vesting_fixture(total, vest);
+        let recipient = derive_eoa_address(b"recipient");
+
+        let mut ctx = make_block_ctx();
+        ctx.height = 100; // before cliff
+        ctx.base_fee = 1;
+
+        let mut tx = transfer_tx(addr, recipient, 100, 0);
+        sign_tx(&mut tx, &sk);
+        let err = execute_transaction(&tx, &mut smt, &ctx).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::Validation(crate::validation::ValidationError::InsufficientBalance { .. })),
+            "pre-cliff transfer must be rejected with InsufficientBalance; got {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn tx_accepted_when_value_within_unlocked() {
+        // At 50% duration, 50% is unlocked. Transfer below that succeeds.
+        let total: u128 = 1_000_000_000_000;
+        let vest = crate::vesting::VestingSchedule {
+            start_slot: 0,
+            cliff_slots: 100,
+            duration_slots: 1_000,
+            total_amount: total,
+        };
+        let (mut smt, addr, sk) = make_vesting_fixture(total, vest);
+        let recipient = derive_eoa_address(b"recipient-ok");
+
+        let mut ctx = make_block_ctx();
+        ctx.height = 500; // 50% through duration
+        ctx.base_fee = 1;
+
+        // Unlocked at slot 500 = 500/1000 × total = 500 PYDE.
+        // Transfer 100 PYDE — well within.
+        let mut tx = transfer_tx(addr, recipient, 100_000_000_000, 0);
+        sign_tx(&mut tx, &sk);
+        let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(r.success, "transfer within unlocked must succeed");
+    }
+
+    #[test]
+    fn tx_rejected_at_boundary_exceeds_unlocked() {
+        // Exact boundary: unlocked = 50_000_000_000, value = 50_000_000_001.
+        // Gas adds more required. Must fail.
+        let total: u128 = 100_000_000_000;
+        let vest = crate::vesting::VestingSchedule {
+            start_slot: 0,
+            cliff_slots: 100,
+            duration_slots: 1_000,
+            total_amount: total,
+        };
+        let (mut smt, addr, sk) = make_vesting_fixture(total, vest);
+        let recipient = derive_eoa_address(b"recipient-boundary");
+
+        let mut ctx = make_block_ctx();
+        ctx.height = 500;
+        ctx.base_fee = 1;
+
+        let mut tx = transfer_tx(addr, recipient, 50_000_000_001, 0);
+        sign_tx(&mut tx, &sk);
+        let err = execute_transaction(&tx, &mut smt, &ctx).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::Validation(crate::validation::ValidationError::InsufficientBalance { .. })),
+            "transfer > unlocked must fail with InsufficientBalance; got {:?}",
+            err,
+        );
+    }
+
+    #[test]
+    fn tx_fully_unlocked_after_duration() {
+        let total: u128 = 1_000_000_000_000;
+        let vest = crate::vesting::VestingSchedule {
+            start_slot: 0,
+            cliff_slots: 100,
+            duration_slots: 1_000,
+            total_amount: total,
+        };
+        let (mut smt, addr, sk) = make_vesting_fixture(total, vest);
+        let recipient = derive_eoa_address(b"recipient-post");
+
+        let mut ctx = make_block_ctx();
+        ctx.height = 10_000; // well past end
+        ctx.base_fee = 1;
+
+        let mut tx = transfer_tx(addr, recipient, total - 50_000, 0);
+        sign_tx(&mut tx, &sk);
+        let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(r.success, "post-vesting transfer must succeed");
+    }
+
+    #[test]
+    fn account_without_vesting_is_fully_spendable() {
+        let mut smt = PydeSMT::new();
+        let (pk, sk) = falcon_keygen().unwrap();
+        let addr = derive_eoa_address(pk.as_bytes());
+        fund_account_with_pk(&mut smt, &addr, 1_000_000_000_000, pk.as_bytes());
+        assert!(read_vesting_schedule(&smt, &addr).is_none());
+
+        let recipient = derive_eoa_address(b"recipient-free");
+        let mut ctx = make_block_ctx();
+        ctx.base_fee = 1;
+
+        let mut tx = transfer_tx(addr, recipient, 500_000_000_000, 0);
+        sign_tx(&mut tx, &sk);
+        let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(r.success);
     }
 
     fn fund_account_with_pk(

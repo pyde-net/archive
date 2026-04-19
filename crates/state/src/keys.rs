@@ -43,6 +43,11 @@ pub mod discriminator {
     /// slashed — `VALIDATOR_COUNT` is monotonic (enumerable history),
     /// `ACTIVE_VALIDATOR_COUNT` is the number currently in status `Active`.
     pub const ACTIVE_VALIDATOR_COUNT: u8 = 0x15;
+    /// Per-account vesting schedule (Phase 4 slice 4.4). Genesis
+    /// allocations with a vesting config write one entry per recipient;
+    /// tx validation subtracts the locked portion from the sender's
+    /// spendable balance so time-locked tokens can't be moved early.
+    pub const VESTING: u8 = 0x16;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +214,17 @@ pub fn rewards_per_validator_key() -> H256 {
 /// the yield of still-active members. u64 LE.
 pub fn active_validator_count_key() -> H256 {
     H256::from(poseidon2_hash(&[discriminator::ACTIVE_VALIDATOR_COUNT]).to_bytes())
+}
+
+/// Per-account vesting schedule key (slice 4.4).
+///
+/// Value is the encoded `VestingSchedule` struct. Absent when the account
+/// has no vesting; tx validation treats "absent" as "fully unlocked."
+pub fn vesting_key(address: &Address) -> H256 {
+    let mut input = Vec::with_capacity(33);
+    input.extend_from_slice(address);
+    input.push(discriminator::VESTING);
+    H256::from(poseidon2_hash(&input).to_bytes())
 }
 
 #[cfg(test)]

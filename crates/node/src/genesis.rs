@@ -39,6 +39,37 @@ pub struct GenesisAllocation {
     /// Optional hex-encoded FALCON-512 public key (sets auth_keys for tx signing).
     #[serde(default)]
     pub public_key: Option<String>,
+    /// Optional allocation bucket label (Phase 4 slice 4.4). Pure
+    /// metadata — not interpreted by the protocol, only useful for
+    /// offline accounting ("did we actually put 30% in community?").
+    /// Typical values: "team", "investors", "treasury", "community",
+    /// "validator_subsidy", "liquidity".
+    #[serde(default)]
+    pub bucket: Option<String>,
+    /// Optional vesting schedule. When present, the full `balance` is
+    /// deposited but only the unlocked portion is spendable until the
+    /// cliff is reached and linear vesting completes. See
+    /// `pyde_tx::vesting::VestingSchedule` for the unlock curve.
+    #[serde(default)]
+    pub vesting: Option<GenesisVesting>,
+}
+
+/// Serialization-friendly vesting spec loaded from TOML.
+///
+/// Units are in SLOTS, not seconds. At 400ms slots the relationships:
+///   1 day   = 216_000 slots
+///   30 days = 6_480_000 slots
+///   1 year  = 78_892_800 slots
+/// Operators encode durations in slots to match the runtime.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenesisVesting {
+    /// Slot at which vesting begins. Usually 0 (genesis).
+    #[serde(default)]
+    pub start_slot: u64,
+    /// Slots from `start` during which nothing unlocks.
+    pub cliff_slots: u64,
+    /// Total vesting duration in slots (counted from `start`, not cliff).
+    pub duration_slots: u64,
 }
 
 impl GenesisAllocation {
@@ -141,10 +172,27 @@ pub fn initialize_genesis(
 
         let key = pyde_state::keys::balance_key(&address);
         entries.push((key, account.to_bytes()));
+
+        // Slice 4.4: install vesting schedule if the allocation specifies
+        // one. The full `balance` is credited to the account immediately;
+        // the protocol subtracts the locked portion from the spendable
+        // balance during tx validation. Empty schedule is a no-op.
+        if let Some(v) = &alloc.vesting {
+            let schedule = pyde_tx::vesting::VestingSchedule {
+                start_slot: v.start_slot,
+                cliff_slots: v.cliff_slots,
+                duration_slots: v.duration_slots,
+                total_amount: balance,
+            };
+            entries.push((pyde_state::keys::vesting_key(&address), schedule.encode()));
+        }
+
         debug!(
             address = alloc.address,
             balance,
             has_auth_keys = alloc.public_key.is_some(),
+            bucket = alloc.bucket.as_deref().unwrap_or(""),
+            vesting = alloc.vesting.is_some(),
             "genesis allocation"
         );
 
@@ -279,6 +327,8 @@ pub fn devnet_genesis() -> (GenesisConfig, Vec<DevnetAccount>) {
             address: hex::encode(address),
             balance: funding_per_account.to_string(),
             public_key: Some(hex::encode(pk.as_bytes())),
+            bucket: None,
+            vesting: None,
         });
 
         accounts.push(DevnetAccount {
@@ -336,6 +386,8 @@ pub fn generate_testnet(
             address: hex::encode(address),
             balance: funding.to_string(),
             public_key: Some(hex::encode(pk.as_bytes())),
+            bucket: None,
+            vesting: None,
         });
 
         validators.push(GenesisValidator {
@@ -360,6 +412,8 @@ pub fn generate_testnet(
             address: hex::encode(address),
             balance: funding.to_string(),
             public_key: Some(hex::encode(pk.as_bytes())),
+            bucket: None,
+            vesting: None,
         });
         accounts.push(DevnetAccount {
             address, public_key: pk, secret_key: sk, balance: funding,
@@ -374,6 +428,8 @@ pub fn generate_testnet(
         address: hex::encode(faucet_address),
         balance: faucet_balance.to_string(),
         public_key: Some(hex::encode(faucet_pk.as_bytes())),
+        bucket: None,
+        vesting: None,
     });
 
     let genesis_config = GenesisConfig {
