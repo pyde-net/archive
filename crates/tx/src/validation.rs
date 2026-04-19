@@ -34,6 +34,11 @@ pub struct ValidationContext {
     /// if chain_id == 31337" which let a misconfigured mainnet node
     /// with a devnet chain_id accept forged transactions.
     pub dev_skip_signature: bool,
+    /// Sender's currently-locked vesting balance (Phase 4 slice 4.4).
+    /// Computed by the caller from the sender's `VestingSchedule`
+    /// before validation. Deducted from `sender.balance` when checking
+    /// that `gas_cost + value` fits. Zero for accounts with no vesting.
+    pub sender_locked: u128,
 }
 
 /// Validation error with specific reason.
@@ -144,16 +149,23 @@ fn validate_balance(
     let gas_cost = tx.gas_limit as u128 * ctx.base_fee;
     let total_required = gas_cost + tx.value;
 
+    // Vested / locked balance (slice 4.4) is subtracted from the raw
+    // account balance before any solvency check. `saturating_sub`
+    // handles the edge case where a slash reduces balance below the
+    // lock amount — the account is effectively frozen until vesting
+    // progresses further (or the lock ends).
+    let spendable = sender.balance.saturating_sub(ctx.sender_locked);
+
     // Check the fee payer's balance
     let available = match &tx.fee_payer {
-        crate::types::FeePayer::Sender => sender.balance,
+        crate::types::FeePayer::Sender => spendable,
         crate::types::FeePayer::GasTank(_) => {
-            // Gas tank pays gas, sender pays value only
-            // Gas tank balance check happens at execution time
-            if sender.balance < tx.value {
+            // Gas tank pays gas, sender pays value only.
+            // Gas tank balance check happens at execution time.
+            if spendable < tx.value {
                 return Err(ValidationError::InsufficientBalance {
                     required: tx.value,
-                    available: sender.balance,
+                    available: spendable,
                 });
             }
             return Ok(());
@@ -282,6 +294,7 @@ mod tests {
             // signature validation, and the module's signature test
             // overrides this field.
             dev_skip_signature: true,
+            sender_locked: 0,
         }
     }
 

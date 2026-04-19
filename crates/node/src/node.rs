@@ -133,6 +133,8 @@ impl PydeNode {
                         address: val_addr.clone(),
                         balance: pyde_consensus::validator::VALIDATOR_STAKE.to_string(),
                         public_key: Some(hex::encode(identity.public_key.as_bytes())),
+                        bucket: None,
+                        vesting: None,
                     });
                     info!(address = val_addr, "auto-funded validator in genesis with 10,000 PYDE");
                 }
