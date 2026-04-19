@@ -287,6 +287,20 @@ impl PydeNode {
                 ),
             }
 
+            // Slice 4.3 gap 2: install config-provided WS bootstrap anchor
+            // if no on-disk checkpoint is present yet. Operators use this
+            // to close the long-range-attack window for validators joining
+            // an established network (genesis validators self-observe).
+            if engine.finality.latest_checkpoint.is_none() {
+                if let Some(bootstrap_slot) = self.config.consensus.initial_ws_checkpoint_slot {
+                    engine.install_bootstrap_ws_anchor(bootstrap_slot);
+                    info!(
+                        bootstrap_slot,
+                        "installed config-provided weak-subjectivity bootstrap anchor"
+                    );
+                }
+            }
+
             // Build committee from genesis validators (if any).
             // If genesis has validators, use them all as the committee.
             // Otherwise fall back to single-validator mode (just self).
@@ -695,11 +709,14 @@ impl PydeNode {
                                 }
                             }
 
-                            // Validate and process
+                            // Validate and process with WS checkpoint (slice 4.3).
                             {
                                 let mut chain_w = chain.write().await;
                                 let mut state_w = state.write().await;
-                                match BlockProcessor::process_full_block_with_aot(&mut chain_w, &mut state_w, &block, Some(&aot_cache)) {
+                                let ws_slot = validator_engine
+                                    .as_ref()
+                                    .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot));
+                                match BlockProcessor::process_full_block_with_aot_and_checkpoint(&mut chain_w, &mut state_w, &block, Some(&aot_cache), ws_slot) {
                                     Ok((tc, gas, ref receipts_list)) => {
                                         // PIPELINED: extract writes + SMT handle, release lock
                                         let pending = state_w.take_pending_writes();
@@ -1110,7 +1127,12 @@ impl PydeNode {
                                     {
                                         let mut chain_w = chain.write().await;
                                         let mut state_w = state.write().await;
-                                        match BlockProcessor::process_full_block_with_aot(&mut chain_w, &mut state_w, &block, Some(&aot_cache)) {
+                                        let ws_slot = engine
+                                            .finality
+                                            .latest_checkpoint
+                                            .as_ref()
+                                            .map(|cp| cp.slot);
+                                        match BlockProcessor::process_full_block_with_aot_and_checkpoint(&mut chain_w, &mut state_w, &block, Some(&aot_cache), ws_slot) {
                                             Ok((tc, gas, ref receipts_list)) => {
                                                 // PIPELINED: background Merkle commit
                                                 let pending = state_w.take_pending_writes();
@@ -1263,10 +1285,17 @@ impl PydeNode {
                                             state_root,
                                             identity,
                                         ) {
-                                            engine.on_finality_vote(fv.clone());
+                                            let cert_formed = engine.on_finality_vote(fv.clone());
                                             let fv_bytes = wire::encode_finality_vote(&fv);
                                             let topic = pyde_net::node::topics::consensus();
-                                            let _ = swarm.behaviour_mut().gossipsub.publish(topic, fv_bytes);
+                                            let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), fv_bytes);
+                                            if cert_formed {
+                                                if let Some(cp) = engine.latest_finality_checkpoint() {
+                                                    let cp_bytes =
+                                                        wire::encode_finality_checkpoint_msg(cp);
+                                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic, cp_bytes);
+                                                }
+                                            }
                                         }
 
                                         // After QC: if block has encrypted txs, create a
@@ -1630,7 +1659,10 @@ fn handle_swarm_event(
                                 return PostEventAction::None;
                             }
 
-                            match BlockProcessor::process_full_block_with_aot(chain, state, &block, None) {
+                            let ws_slot = validator_engine
+                                .as_ref()
+                                .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot));
+                            match BlockProcessor::process_full_block_with_aot_and_checkpoint(chain, state, &block, None, ws_slot) {
                                 Ok((tx_count, gas_used, receipts_list)) => {
                                     // Sync flush for gossip-received blocks (no Arc access here)
                                     let _ = state.flush_pending();
@@ -1717,10 +1749,34 @@ fn handle_swarm_event(
                             match wire::decode_finality_vote(&message.data) {
                                 Ok(fv) => {
                                     debug!(slot = fv.slot, voter = fv.voter_index, "received finality vote");
-                                    engine.on_finality_vote(fv);
+                                    if engine.on_finality_vote(fv) {
+                                        // Slice 4.3 gap 1: freshly formed cert →
+                                        // broadcast so non-validator peers can
+                                        // advance their WS anchor.
+                                        if let Some(cp) = engine.latest_finality_checkpoint() {
+                                            let msg = wire::encode_finality_checkpoint_msg(cp);
+                                            return PostEventAction::BroadcastConsensus(msg);
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     debug!(error = e, "failed to decode finality vote");
+                                }
+                            }
+                            return PostEventAction::None;
+                        }
+
+                        // Slice 4.3 gap 1: received a finality checkpoint from another peer.
+                        if !message.data.is_empty() && message.data[0] == wire::tag::CONSENSUS_FINALITY_CHECKPOINT {
+                            match wire::decode_finality_checkpoint_msg(&message.data) {
+                                Ok(cp) => {
+                                    let slot = cp.slot;
+                                    if engine.ingest_finality_checkpoint(cp) {
+                                        info!(slot, "WS anchor advanced from peer checkpoint");
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(error = e, "failed to decode finality checkpoint");
                                 }
                             }
                             return PostEventAction::None;
@@ -1978,7 +2034,10 @@ fn handle_swarm_event(
                 ..
             },
         )) => {
-            chain_sync.on_response(request_id, response, chain, state, block_store);
+            let ws_slot = validator_engine
+                .as_ref()
+                .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot));
+            chain_sync.on_response(request_id, response, chain, state, block_store, ws_slot);
             // If chunked snapshot needs more chunks, signal the event loop
             if chain_sync.needs_next_chunk().is_some() {
                 PostEventAction::ContinueSync // caller will request next chunk

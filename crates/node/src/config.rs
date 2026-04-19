@@ -84,6 +84,22 @@ pub struct ConsensusSection {
     pub gas_target: u64,
     /// Block gas ceiling (max, 4x target).
     pub gas_ceiling: u64,
+    /// Weak-subjectivity bootstrap anchor (Phase 4 slice 4.3, gap 2).
+    ///
+    /// Initial slot that acts as a hard-finality lower bound when a node
+    /// first starts and has no checkpoint persisted. Operators bootstrap
+    /// a new node with a recent, trusted checkpoint slot — any incoming
+    /// block at or before this slot is rejected regardless of
+    /// cryptographic validity, closing the long-range-attack window
+    /// that otherwise exists until the node has observed its first
+    /// hard finality.
+    ///
+    /// `None` on networks where this is not configured (devnet) or on
+    /// genesis validators who self-observe finality from epoch 1.
+    /// Once the node records its own hard finality, the observed
+    /// checkpoint overrides this value.
+    #[serde(default)]
+    pub initial_ws_checkpoint_slot: Option<u64>,
 }
 
 impl Default for ConsensusSection {
@@ -92,6 +108,7 @@ impl Default for ConsensusSection {
             block_time_ms: 400,
             gas_target: 400_000_000,
             gas_ceiling: 1_600_000_000,
+            initial_ws_checkpoint_slot: None,
         }
     }
 }
