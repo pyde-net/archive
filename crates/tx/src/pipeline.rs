@@ -876,6 +876,55 @@ pub fn write_vesting_schedule(
     let _ = smt.insert(pyde_state::keys::vesting_key(address), schedule.encode());
 }
 
+/// Validator bootstrap subsidy schedule (slice 4.4a).
+///
+/// `per_block` is precomputed as `total_amount / duration_slots` to avoid
+/// doing the division in the hot path every block. The block processor
+/// still gates on `end_slot` so the subsidy stream ends precisely.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatorSubsidySchedule {
+    pub per_block: u128,
+    pub end_slot: u64,
+}
+
+impl ValidatorSubsidySchedule {
+    pub const ENCODED_LEN: usize = 16 + 8;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::ENCODED_LEN);
+        buf.extend_from_slice(&self.per_block.to_le_bytes());
+        buf.extend_from_slice(&self.end_slot.to_le_bytes());
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::ENCODED_LEN {
+            return None;
+        }
+        let per_block = u128::from_le_bytes(bytes[0..16].try_into().ok()?);
+        let end_slot = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+        Some(Self { per_block, end_slot })
+    }
+}
+
+/// Read the bootstrap subsidy schedule, if configured. Absent = no subsidy.
+pub fn read_validator_subsidy(
+    smt: &dyn pyde_state::smt::StateAccess,
+) -> Option<ValidatorSubsidySchedule> {
+    let bytes = smt.get(&pyde_state::keys::validator_subsidy_key())?;
+    ValidatorSubsidySchedule::decode(&bytes)
+}
+
+pub fn write_validator_subsidy(
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    schedule: &ValidatorSubsidySchedule,
+) {
+    let _ = smt.insert(
+        pyde_state::keys::validator_subsidy_key(),
+        schedule.encode(),
+    );
+}
+
 /// Read active-only validator count (slice 4.2). Defaults to 0.
 pub fn read_active_validator_count(smt: &dyn pyde_state::smt::StateAccess) -> u64 {
     smt.get(&pyde_state::keys::active_validator_count_key())

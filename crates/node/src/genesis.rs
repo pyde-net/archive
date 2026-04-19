@@ -28,6 +28,57 @@ pub struct GenesisConfig {
     pub allocations: Vec<GenesisAllocation>,
     /// Initial validators: hex address → public key hex.
     pub validators: Vec<GenesisValidator>,
+    /// Expected total supply in quanta (slice 4.4a sanity check).
+    /// Declared as a string to avoid TOML u128 limitation. When non-empty,
+    /// `initialize_genesis` verifies that the sum of all allocations
+    /// matches this value and rejects the config otherwise. Catches
+    /// typos in large allocation tables before mainnet ceremony.
+    /// Empty (default) → no check, matches pre-4.4a behaviour.
+    #[serde(default)]
+    pub initial_supply: String,
+    /// Optional per-validator streaming subsidy (slice 4.4a).
+    /// The 15% bootstrap allocation flows to active validators via the
+    /// same lazy-accrual `rewards_per_validator` accumulator that
+    /// handles inflation pool yield — one mechanism, uniform math.
+    /// `None` means no subsidy configured (devnet).
+    #[serde(default)]
+    pub validator_subsidy: Option<ValidatorSubsidyConfig>,
+    /// Per-bucket allocation ceilings (slice 4.4a).
+    /// Map of bucket name → max percentage (integer 0..=100) of
+    /// `initial_supply`. Enforced at startup: if the sum of
+    /// allocations tagged with a given bucket exceeds its cap,
+    /// `initialize_genesis` returns an error. Unset caps = no limit.
+    /// Requires `initial_supply` to be non-empty (caps are
+    /// percentages of declared supply).
+    #[serde(default)]
+    pub bucket_caps: std::collections::HashMap<String, u32>,
+}
+
+/// Configuration for the validator bootstrap subsidy stream.
+///
+/// `total_amount` quanta are minted over `duration_slots` blocks
+/// starting at genesis, distributed per-block to the ACTIVE validator
+/// pool (identical share per validator). Operates as an add-on to
+/// inflation — validators during the subsidy window earn
+/// `inflation_share + subsidy_share` per block.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ValidatorSubsidyConfig {
+    /// Total subsidy pool in quanta as string (to avoid TOML u128 limitation).
+    pub total_amount: String,
+    /// How many slots the subsidy streams for. After `genesis.timestamp +
+    /// duration_slots × block_time`, the subsidy pool ends.
+    pub duration_slots: u64,
+}
+
+impl ValidatorSubsidyConfig {
+    pub fn total_u128(&self) -> Result<u128, String> {
+        self.total_amount.parse::<u128>().map_err(|e| {
+            format!(
+                "invalid validator_subsidy.total_amount '{}': {}",
+                self.total_amount, e
+            )
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,6 +161,9 @@ impl Default for GenesisConfig {
             timestamp: 0,
             allocations: Vec::new(),
             validators: Vec::new(),
+            initial_supply: String::new(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
         }
     }
 }
@@ -141,6 +195,8 @@ pub fn initialize_genesis(
 
     let mut entries = Vec::new();
     let mut total_supply: u128 = 0;
+    let mut bucket_totals: std::collections::HashMap<String, u128> =
+        std::collections::HashMap::new();
 
     // 1. Write initial allocations (balances)
     for alloc in &config.allocations {
@@ -198,6 +254,12 @@ pub fn initialize_genesis(
 
         total_supply = total_supply.checked_add(balance)
             .ok_or("genesis total supply overflow")?;
+
+        // Slice 4.4a: accumulate per-bucket totals for cap enforcement.
+        if let Some(name) = &alloc.bucket {
+            let e = bucket_totals.entry(name.clone()).or_insert(0u128);
+            *e = e.checked_add(balance).ok_or("bucket total overflow")?;
+        }
     }
 
     // 2. Write validator stakes as balances (included in total supply).
@@ -265,6 +327,83 @@ pub fn initialize_genesis(
     // Store validator count
     let count_key = pyde_state::keys::validator_count_key();
     entries.push((count_key, val_count.to_le_bytes().to_vec()));
+
+    // Slice 4.4a: install validator bootstrap subsidy schedule.
+    // `total_amount` was already included in `total_supply` if the
+    // operator allocated it to the subsidy pool via a genesis
+    // allocation; this record just instructs the block processor to
+    // stream it to active validators.
+    if let Some(vs) = &config.validator_subsidy {
+        let total = vs.total_u128()?;
+        if vs.duration_slots == 0 {
+            return Err("validator_subsidy.duration_slots must be > 0".into());
+        }
+        let per_block = total / vs.duration_slots as u128;
+        let schedule = pyde_tx::pipeline::ValidatorSubsidySchedule {
+            per_block,
+            end_slot: vs.duration_slots, // relative to slot 0 (genesis)
+        };
+        entries.push((
+            pyde_state::keys::validator_subsidy_key(),
+            schedule.encode(),
+        ));
+    }
+
+    // Slice 4.4a: declared-vs-actual supply sanity check. When the
+    // operator declares `initial_supply` in the config, verify the
+    // sum of allocation balances matches. Catches fat-finger typos in
+    // large allocation tables before the mainnet ceremony burns them
+    // in. Empty string (default) preserves pre-4.4a behaviour.
+    if !config.initial_supply.is_empty() {
+        let declared = config.initial_supply.parse::<u128>().map_err(|e| {
+            format!("invalid initial_supply '{}': {}", config.initial_supply, e)
+        })?;
+        if declared != total_supply {
+            return Err(format!(
+                "genesis supply mismatch: config declares {} quanta but allocations sum to {}",
+                declared, total_supply
+            ));
+        }
+    }
+
+    // Slice 4.4a: per-bucket cap enforcement. Each cap is integer
+    // percent of `total_supply`. We use u128 arithmetic with explicit
+    // multiplication to avoid float rounding and catch operators who
+    // silently exceed their declared distribution targets. Caps only
+    // apply when `initial_supply` was declared (otherwise percentages
+    // have no reference point — we'd be dividing by the actual sum,
+    // which is what the operator is trying to constrain in the first
+    // place).
+    if !config.bucket_caps.is_empty() {
+        if config.initial_supply.is_empty() {
+            return Err(
+                "bucket_caps requires initial_supply to be declared (caps are percentages of supply)".into()
+            );
+        }
+        for (bucket_name, cap_pct) in &config.bucket_caps {
+            if *cap_pct > 100 {
+                return Err(format!(
+                    "bucket_caps['{}'] = {} is not a valid percentage",
+                    bucket_name, cap_pct
+                ));
+            }
+            let actual = bucket_totals.get(bucket_name).copied().unwrap_or(0);
+            // actual * 100 > total * cap_pct  →  actual exceeds cap%
+            let lhs = actual.checked_mul(100).ok_or("bucket cap math overflow")?;
+            let rhs = total_supply
+                .checked_mul(*cap_pct as u128)
+                .ok_or("bucket cap math overflow")?;
+            if lhs > rhs {
+                return Err(format!(
+                    "bucket '{}' exceeds cap: allocated {} quanta = {:.2}% of supply, cap is {}%",
+                    bucket_name,
+                    actual,
+                    (actual as f64) * 100.0 / (total_supply as f64),
+                    cap_pct,
+                ));
+            }
+        }
+    }
 
     // 4. Batch insert all entries
     let state_root = state.update_batch(entries)?;
@@ -344,6 +483,9 @@ pub fn devnet_genesis() -> (GenesisConfig, Vec<DevnetAccount>) {
         timestamp: 0,
         allocations,
         validators: Vec::new(),
+        initial_supply: String::new(),
+        validator_subsidy: None,
+        bucket_caps: std::collections::HashMap::new(),
     };
 
     (config, accounts)
@@ -437,6 +579,9 @@ pub fn generate_testnet(
         timestamp: 0,
         allocations,
         validators,
+        initial_supply: String::new(),
+        validator_subsidy: None,
+        bucket_caps: std::collections::HashMap::new(),
     };
 
     // Write shared genesis.toml
@@ -792,6 +937,213 @@ mod tests {
         initialize_genesis(&mut state, &config).unwrap();
         let result = initialize_genesis(&mut state, &config);
         assert!(result.is_err());
+    }
+
+    // ========== Slice 4.4a: sanity check + validator subsidy ==========
+
+    fn tiny_alloc(addr: [u8; 32], balance: u128) -> GenesisAllocation {
+        GenesisAllocation {
+            address: hex::encode(addr),
+            balance: balance.to_string(),
+            public_key: None,
+            bucket: None,
+            vesting: None,
+        }
+    }
+
+    #[test]
+    fn genesis_supply_sanity_check_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let config = GenesisConfig {
+            chain_id: 31337,
+            timestamp: 0,
+            allocations: vec![
+                tiny_alloc([0x01; 32], 100),
+                tiny_alloc([0x02; 32], 200),
+                tiny_alloc([0x03; 32], 700),
+            ],
+            validators: Vec::new(),
+            initial_supply: "1000".to_string(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+        };
+        initialize_genesis(&mut state, &config).expect("matching sum should accept");
+    }
+
+    #[test]
+    fn genesis_supply_sanity_check_rejects_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let config = GenesisConfig {
+            chain_id: 31337,
+            timestamp: 0,
+            allocations: vec![tiny_alloc([0x01; 32], 100), tiny_alloc([0x02; 32], 200)],
+            validators: Vec::new(),
+            initial_supply: "500".to_string(), // allocations sum to 300 — mismatch
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("genesis supply mismatch"), "got: {}", err);
+    }
+
+    #[test]
+    fn genesis_supply_sanity_check_empty_means_no_check() {
+        // Default behaviour: no declared supply → no check, anything
+        // allocations add up to is accepted. Preserves pre-4.4a devnet flows.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let config = GenesisConfig {
+            chain_id: 31337,
+            timestamp: 0,
+            allocations: vec![tiny_alloc([0x01; 32], 999)],
+            validators: Vec::new(),
+            initial_supply: String::new(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+        };
+        initialize_genesis(&mut state, &config).unwrap();
+    }
+
+    #[test]
+    fn genesis_writes_validator_subsidy_schedule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let config = GenesisConfig {
+            chain_id: 31337,
+            timestamp: 0,
+            allocations: vec![tiny_alloc([0x01; 32], 100_000_000)],
+            validators: Vec::new(),
+            initial_supply: String::new(),
+            validator_subsidy: Some(ValidatorSubsidyConfig {
+                total_amount: "100_000_000".replace("_", ""),
+                duration_slots: 1_000,
+            }),
+            bucket_caps: std::collections::HashMap::new(),
+        };
+        initialize_genesis(&mut state, &config).unwrap();
+
+        let sched = pyde_tx::pipeline::read_validator_subsidy(&state)
+            .expect("subsidy schedule must be installed");
+        assert_eq!(sched.per_block, 100_000_000 / 1_000);
+        assert_eq!(sched.end_slot, 1_000);
+    }
+
+    #[test]
+    fn genesis_rejects_zero_duration_subsidy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let config = GenesisConfig {
+            chain_id: 31337,
+            timestamp: 0,
+            allocations: vec![tiny_alloc([0x01; 32], 100)],
+            validators: Vec::new(),
+            initial_supply: String::new(),
+            validator_subsidy: Some(ValidatorSubsidyConfig {
+                total_amount: "100".to_string(),
+                duration_slots: 0,
+            }),
+            bucket_caps: std::collections::HashMap::new(),
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("duration_slots must be > 0"));
+    }
+
+    fn alloc_with_bucket(addr: [u8; 32], balance: u128, bucket: &str) -> GenesisAllocation {
+        GenesisAllocation {
+            address: hex::encode(addr),
+            balance: balance.to_string(),
+            public_key: None,
+            bucket: Some(bucket.to_string()),
+            vesting: None,
+        }
+    }
+
+    #[test]
+    fn bucket_caps_accept_under_limit() {
+        // 15% of 1000 = 150; team bucket at 100 → within cap.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let mut caps = std::collections::HashMap::new();
+        caps.insert("team".to_string(), 15);
+        caps.insert("treasury".to_string(), 90);
+        let config = GenesisConfig {
+            chain_id: 31337,
+            timestamp: 0,
+            allocations: vec![
+                alloc_with_bucket([0x01; 32], 100, "team"),
+                alloc_with_bucket([0x02; 32], 900, "treasury"),
+            ],
+            validators: Vec::new(),
+            initial_supply: "1000".to_string(),
+            validator_subsidy: None,
+            bucket_caps: caps,
+        };
+        initialize_genesis(&mut state, &config).unwrap();
+    }
+
+    #[test]
+    fn bucket_caps_reject_over_limit() {
+        // team cap 15% of 1000 = 150, allocation gives 200 → rejected.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let mut caps = std::collections::HashMap::new();
+        caps.insert("team".to_string(), 15);
+        let config = GenesisConfig {
+            chain_id: 31337,
+            timestamp: 0,
+            allocations: vec![
+                alloc_with_bucket([0x01; 32], 200, "team"),
+                alloc_with_bucket([0x02; 32], 800, "treasury"),
+            ],
+            validators: Vec::new(),
+            initial_supply: "1000".to_string(),
+            validator_subsidy: None,
+            bucket_caps: caps,
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("bucket 'team' exceeds cap"), "got: {}", err);
+    }
+
+    #[test]
+    fn bucket_caps_require_declared_supply() {
+        // Caps are percentages; without `initial_supply` there's no
+        // reference denominator → reject the config.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let mut caps = std::collections::HashMap::new();
+        caps.insert("team".to_string(), 15);
+        let config = GenesisConfig {
+            chain_id: 31337,
+            timestamp: 0,
+            allocations: vec![alloc_with_bucket([0x01; 32], 100, "team")],
+            validators: Vec::new(),
+            initial_supply: String::new(),
+            validator_subsidy: None,
+            bucket_caps: caps,
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("requires initial_supply"), "got: {}", err);
+    }
+
+    #[test]
+    fn bucket_caps_reject_invalid_percentage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let mut caps = std::collections::HashMap::new();
+        caps.insert("team".to_string(), 101); // > 100
+        let config = GenesisConfig {
+            chain_id: 31337,
+            timestamp: 0,
+            allocations: vec![alloc_with_bucket([0x01; 32], 100, "team")],
+            validators: Vec::new(),
+            initial_supply: "100".to_string(),
+            validator_subsidy: None,
+            bucket_caps: caps,
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("not a valid percentage"), "got: {}", err);
     }
 
     #[test]
