@@ -58,6 +58,62 @@ pub struct GenesisConfig {
     /// can verify proofs against the commitment.
     #[serde(default)]
     pub airdrop: Option<AirdropConfig>,
+    /// Governance multisig (slice 4.5). Declares the initial signer
+    /// set + threshold used by `MultisigTx` / `RotateMultisig`. When
+    /// absent, the chain has no on-chain governance — treasury
+    /// balance accumulates with no way to spend until a hard fork
+    /// installs a multisig.
+    #[serde(default)]
+    pub multisig: Option<MultisigConfig>,
+}
+
+/// Genesis multisig configuration (slice 4.5).
+///
+/// `signer_public_keys` are hex-encoded FALCON-512 public keys (897
+/// bytes each). The on-chain signer set is derived from these; the
+/// EOA addresses `derive_eoa_address(pk)` are not stored separately
+/// because they're derivable.
+///
+/// Note: these signers are the INITIAL set. After launch, `threshold`
+/// sigs from the current set can install a new set via
+/// `RotateMultisig`, enabling signer rotation (annual validator-rep
+/// turnover, compromised-key replacement) without a hard fork.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultisigConfig {
+    /// Hex-encoded FALCON-512 public keys (897 bytes each).
+    pub signer_public_keys: Vec<String>,
+    /// Required number of valid signatures. Must be 1..=signer count.
+    pub threshold: u8,
+}
+
+impl MultisigConfig {
+    pub fn decode_pks(&self) -> Result<Vec<Vec<u8>>, String> {
+        let mut out = Vec::with_capacity(self.signer_public_keys.len());
+        for (i, hex_pk) in self.signer_public_keys.iter().enumerate() {
+            let s = hex_pk.strip_prefix("0x").unwrap_or(hex_pk);
+            let bytes = hex::decode(s).map_err(|e| {
+                format!(
+                    "invalid multisig.signer_public_keys[{}] hex: {}",
+                    i, e
+                )
+            })?;
+            if bytes.len() != 897 {
+                return Err(format!(
+                    "multisig.signer_public_keys[{}] must be 897 bytes, got {}",
+                    i,
+                    bytes.len()
+                ));
+            }
+            if pyde_crypto::falcon::FalconPublicKey::from_bytes(&bytes).is_none() {
+                return Err(format!(
+                    "multisig.signer_public_keys[{}] is not a valid FALCON pk",
+                    i
+                ));
+            }
+            out.push(bytes);
+        }
+        Ok(out)
+    }
 }
 
 /// Genesis airdrop commitment (slice 4.4b).
@@ -233,6 +289,7 @@ impl Default for GenesisConfig {
             validator_subsidy: None,
             bucket_caps: std::collections::HashMap::new(),
             airdrop: None,
+            multisig: None,
         }
     }
 }
@@ -396,6 +453,53 @@ pub fn initialize_genesis(
     // Store validator count
     let count_key = pyde_state::keys::validator_count_key();
     entries.push((count_key, val_count.to_le_bytes().to_vec()));
+
+    // Slice 4.5: install governance multisig signer set + threshold.
+    //
+    // The signer set is used by MultisigTx (treasury spend) and
+    // RotateMultisig (signer-set rotation). Nonce starts at 0 — each
+    // successful multisig operation increments it so signatures bind
+    // to a single execution.
+    if let Some(ms) = &config.multisig {
+        let pks = ms.decode_pks()?;
+        if pks.is_empty() || pks.len() > pyde_tx::multisig::MAX_SIGNERS as usize {
+            return Err(format!(
+                "multisig.signer_public_keys count {} outside 1..={}",
+                pks.len(),
+                pyde_tx::multisig::MAX_SIGNERS
+            ));
+        }
+        if ms.threshold == 0 || ms.threshold as usize > pks.len() {
+            return Err(format!(
+                "multisig.threshold {} must be in 1..={}",
+                ms.threshold,
+                pks.len()
+            ));
+        }
+        // Duplicate-pk check.
+        for i in 0..pks.len() {
+            for j in (i + 1)..pks.len() {
+                if pks[i] == pks[j] {
+                    return Err(format!(
+                        "multisig.signer_public_keys contains duplicate pk at indices {} and {}",
+                        i, j
+                    ));
+                }
+            }
+        }
+        entries.push((
+            pyde_state::keys::multisig_signers_key(),
+            pyde_tx::multisig::encode_signer_set(&pks),
+        ));
+        entries.push((
+            pyde_state::keys::multisig_threshold_key(),
+            vec![ms.threshold],
+        ));
+        entries.push((
+            pyde_state::keys::multisig_nonce_key(),
+            0u64.to_le_bytes().to_vec(),
+        ));
+    }
 
     // Slice 4.4b: pre-mint airdrop pool + install commitment.
     //
@@ -612,6 +716,7 @@ pub fn devnet_genesis() -> (GenesisConfig, Vec<DevnetAccount>) {
         validator_subsidy: None,
         bucket_caps: std::collections::HashMap::new(),
         airdrop: None,
+        multisig: None,
     };
 
     (config, accounts)
@@ -709,6 +814,7 @@ pub fn generate_testnet(
         validator_subsidy: None,
         bucket_caps: std::collections::HashMap::new(),
         airdrop: None,
+        multisig: None,
     };
 
     // Write shared genesis.toml
@@ -1095,6 +1201,7 @@ mod tests {
             validator_subsidy: None,
             bucket_caps: std::collections::HashMap::new(),
             airdrop: None,
+            multisig: None,
         };
         initialize_genesis(&mut state, &config).expect("matching sum should accept");
     }
@@ -1112,6 +1219,7 @@ mod tests {
             validator_subsidy: None,
             bucket_caps: std::collections::HashMap::new(),
             airdrop: None,
+            multisig: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("genesis supply mismatch"), "got: {}", err);
@@ -1132,6 +1240,7 @@ mod tests {
             validator_subsidy: None,
             bucket_caps: std::collections::HashMap::new(),
             airdrop: None,
+            multisig: None,
         };
         initialize_genesis(&mut state, &config).unwrap();
     }
@@ -1152,6 +1261,7 @@ mod tests {
             }),
             bucket_caps: std::collections::HashMap::new(),
             airdrop: None,
+            multisig: None,
         };
         initialize_genesis(&mut state, &config).unwrap();
 
@@ -1177,6 +1287,7 @@ mod tests {
             }),
             bucket_caps: std::collections::HashMap::new(),
             airdrop: None,
+            multisig: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("duration_slots must be > 0"));
@@ -1212,6 +1323,7 @@ mod tests {
             validator_subsidy: None,
             bucket_caps: caps,
             airdrop: None,
+            multisig: None,
         };
         initialize_genesis(&mut state, &config).unwrap();
     }
@@ -1235,6 +1347,7 @@ mod tests {
             validator_subsidy: None,
             bucket_caps: caps,
             airdrop: None,
+            multisig: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("bucket 'team' exceeds cap"), "got: {}", err);
@@ -1257,6 +1370,7 @@ mod tests {
             validator_subsidy: None,
             bucket_caps: caps,
             airdrop: None,
+            multisig: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("requires initial_supply"), "got: {}", err);
@@ -1277,6 +1391,7 @@ mod tests {
             validator_subsidy: None,
             bucket_caps: caps,
             airdrop: None,
+            multisig: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("not a valid percentage"), "got: {}", err);
@@ -1327,6 +1442,7 @@ mod tests {
             validator_subsidy: None,
             bucket_caps: std::collections::HashMap::new(),
             airdrop: Some(airdrop_cfg(root, 1000, 1000, 10_000)),
+            multisig: None,
         };
         initialize_genesis(&mut state, &config).expect("airdrop genesis should accept");
 
@@ -1361,6 +1477,7 @@ mod tests {
             bucket_caps: std::collections::HashMap::new(),
             // expected_claim_sum (2000) > pool_total (1000) → underfunded
             airdrop: Some(airdrop_cfg(root, 1000, 2000, 10_000)),
+            multisig: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("airdrop underfunded"), "got: {}", err);
@@ -1385,6 +1502,7 @@ mod tests {
             validator_subsidy: None,
             bucket_caps: std::collections::HashMap::new(),
             airdrop: Some(airdrop_cfg(root, 400, 400, 10_000)),
+            multisig: None,
         };
         // 300 + 400 = 700, matches declared → accepts.
         initialize_genesis(&mut state, &config).expect("declared supply includes pool");
@@ -1408,6 +1526,7 @@ mod tests {
                 pool_total_amount: "100".to_string(),
                 expected_claim_sum: "100".to_string(),
             }),
+            multisig: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("invalid airdrop root hex"), "got: {}", err);
@@ -1437,8 +1556,155 @@ mod tests {
             bucket_caps: caps,
             // Pool is 300 quanta = 30% of 1000 → exceeds 20% cap.
             airdrop: Some(airdrop_cfg(root, 300, 300, 10_000)),
+            multisig: None,
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("bucket 'airdrop' exceeds cap"), "got: {}", err);
+    }
+
+    // ========== Slice 4.5: multisig governance ==========
+
+    fn multisig_cfg(n: usize, threshold: u8) -> (MultisigConfig, Vec<pyde_crypto::falcon::FalconSecretKey>) {
+        use pyde_crypto::falcon::falcon_keygen;
+        let mut pk_hexes = Vec::with_capacity(n);
+        let mut sks = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (pk, sk) = falcon_keygen().unwrap();
+            pk_hexes.push(hex::encode(pk.as_bytes()));
+            sks.push(sk);
+        }
+        (
+            MultisigConfig {
+                signer_public_keys: pk_hexes,
+                threshold,
+            },
+            sks,
+        )
+    }
+
+    #[test]
+    fn genesis_installs_multisig() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let (ms_cfg, _) = multisig_cfg(5, 3);
+
+        let config = GenesisConfig {
+            chain_id: 1,
+            timestamp: 0,
+            allocations: vec![],
+            validators: Vec::new(),
+            initial_supply: String::new(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
+            multisig: Some(ms_cfg),
+        };
+        initialize_genesis(&mut state, &config).expect("multisig genesis should accept");
+
+        // Threshold stored.
+        let threshold_bytes = state
+            .get(&pyde_state::keys::multisig_threshold_key())
+            .unwrap();
+        assert_eq!(threshold_bytes, vec![3u8]);
+
+        // Nonce initialized to 0.
+        let nonce_bytes = state
+            .get(&pyde_state::keys::multisig_nonce_key())
+            .unwrap();
+        assert_eq!(nonce_bytes, 0u64.to_le_bytes().to_vec());
+
+        // Signer set parseable.
+        let set_bytes = state
+            .get(&pyde_state::keys::multisig_signers_key())
+            .unwrap();
+        let decoded = pyde_tx::multisig::decode_signer_set(&set_bytes).unwrap();
+        assert_eq!(decoded.len(), 5);
+    }
+
+    #[test]
+    fn genesis_rejects_multisig_threshold_over_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let (mut ms_cfg, _) = multisig_cfg(3, 2);
+        ms_cfg.threshold = 10; // > count
+
+        let config = GenesisConfig {
+            chain_id: 1,
+            timestamp: 0,
+            allocations: vec![],
+            validators: Vec::new(),
+            initial_supply: String::new(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
+            multisig: Some(ms_cfg),
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("multisig.threshold"), "got: {}", err);
+    }
+
+    #[test]
+    fn genesis_rejects_multisig_zero_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let (mut ms_cfg, _) = multisig_cfg(3, 2);
+        ms_cfg.threshold = 0;
+
+        let config = GenesisConfig {
+            chain_id: 1,
+            timestamp: 0,
+            allocations: vec![],
+            validators: Vec::new(),
+            initial_supply: String::new(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
+            multisig: Some(ms_cfg),
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("multisig.threshold"), "got: {}", err);
+    }
+
+    #[test]
+    fn genesis_rejects_duplicate_multisig_pk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let (mut ms_cfg, _) = multisig_cfg(3, 2);
+        ms_cfg.signer_public_keys[1] = ms_cfg.signer_public_keys[0].clone();
+
+        let config = GenesisConfig {
+            chain_id: 1,
+            timestamp: 0,
+            allocations: vec![],
+            validators: Vec::new(),
+            initial_supply: String::new(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
+            multisig: Some(ms_cfg),
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("duplicate pk"), "got: {}", err);
+    }
+
+    #[test]
+    fn genesis_rejects_multisig_over_max_signers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let (ms_cfg, _) = multisig_cfg(pyde_tx::multisig::MAX_SIGNERS as usize + 1, 2);
+
+        let config = GenesisConfig {
+            chain_id: 1,
+            timestamp: 0,
+            allocations: vec![],
+            validators: Vec::new(),
+            initial_supply: String::new(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
+            multisig: Some(ms_cfg),
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(err.contains("signer_public_keys count"), "got: {}", err);
     }
 }

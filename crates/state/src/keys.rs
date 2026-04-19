@@ -67,6 +67,17 @@ pub mod discriminator {
     /// Enforced at genesis: `airdrop_pool.balance >= AIRDROP_EXPECTED_SUM`.
     /// u128 LE.
     pub const AIRDROP_EXPECTED_SUM: u8 = 0x1B;
+    /// Multisig signer set (slice 4.5). Length-prefixed array of
+    /// FALCON-512 public keys (897 bytes each). Addresses are derived
+    /// via `derive_eoa_address(pk)` at verification time.
+    pub const MULTISIG_SIGNERS: u8 = 0x1C;
+    /// Multisig threshold (slice 4.5). u8 — required number of valid
+    /// signatures for MultisigTx / RotateMultisig acceptance.
+    pub const MULTISIG_THRESHOLD: u8 = 0x1D;
+    /// Multisig nonce (slice 4.5). u64 LE — increments on every
+    /// successful multisig operation to bind signatures to a specific
+    /// operation and prevent replay.
+    pub const MULTISIG_NONCE: u8 = 0x1E;
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +298,23 @@ pub fn airdrop_claimed_key(leaf_index: u64) -> H256 {
     input.push(discriminator::AIRDROP_CLAIMED);
     input.extend_from_slice(&leaf_index.to_le_bytes());
     H256::from(poseidon2_hash(&input).to_bytes())
+}
+
+/// Multisig signer set key (slice 4.5). Value is a length-prefixed
+/// array of FALCON-512 public keys: `[count:1][pk:897]...[pk:897]`.
+pub fn multisig_signers_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::MULTISIG_SIGNERS]).to_bytes())
+}
+
+/// Multisig threshold key (slice 4.5). Value is a single u8.
+pub fn multisig_threshold_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::MULTISIG_THRESHOLD]).to_bytes())
+}
+
+/// Multisig nonce key (slice 4.5). Value is u64 LE — increments each
+/// successful MultisigTx or RotateMultisig execution.
+pub fn multisig_nonce_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::MULTISIG_NONCE]).to_bytes())
 }
 
 #[cfg(test)]
