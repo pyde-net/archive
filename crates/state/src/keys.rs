@@ -48,6 +48,11 @@ pub mod discriminator {
     /// tx validation subtracts the locked portion from the sender's
     /// spendable balance so time-locked tokens can't be moved early.
     pub const VESTING: u8 = 0x16;
+    /// Validator bootstrap subsidy schedule (slice 4.4a).
+    /// Stores `total_amount:16 LE || end_slot:8 LE`. Block processor
+    /// mints per-block subsidy to the `rewards_per_validator`
+    /// accumulator while `current_slot < end_slot`.
+    pub const VALIDATOR_SUBSIDY: u8 = 0x17;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +230,17 @@ pub fn vesting_key(address: &Address) -> H256 {
     input.extend_from_slice(address);
     input.push(discriminator::VESTING);
     H256::from(poseidon2_hash(&input).to_bytes())
+}
+
+/// Validator bootstrap subsidy config key (slice 4.4a).
+///
+/// Stored value: `[total_amount:16 LE][end_slot:8 LE]`. Block processor
+/// reads this every block during reward calculation; while
+/// `current_slot < end_slot`, `total_amount / duration_slots` additional
+/// quanta are added to the `rewards_per_validator` accumulator (divided
+/// by the active validator count).
+pub fn validator_subsidy_key() -> H256 {
+    H256::from(poseidon2_hash(&[discriminator::VALIDATOR_SUBSIDY]).to_bytes())
 }
 
 #[cfg(test)]
