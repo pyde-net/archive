@@ -76,6 +76,97 @@ pub enum MultisigPayload {
     },
 }
 
+/// Tag byte for `EmergencyPause` payloads in wire format.
+const EMERGENCY_PAUSE_TAG: u8 = 0x03;
+/// Tag byte for `EmergencyResume` payloads in wire format.
+const EMERGENCY_RESUME_TAG: u8 = 0x04;
+
+/// `EmergencyPause` payload (slice 4.6). Carries the pause duration so
+/// the chain auto-unpauses after the declared window — lost-key
+/// scenarios can't brick the chain. Signers commit to the duration in
+/// the signed preimage so an attacker can't coerce a longer pause
+/// than signers intended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmergencyPausePayload {
+    /// Number of slots the pause should hold. Multiplied to an
+    /// `end_slot = current_slot + duration_slots` at execution time.
+    /// Signers pick this; handler rejects outside
+    /// `1..=MAX_PAUSE_DURATION_SLOTS`.
+    pub duration_slots: u64,
+    pub sigs: Vec<SigEntry>,
+}
+
+/// `EmergencyResume` payload (slice 4.6). Just a signature slate —
+/// the action is "set pause_end_slot to 0 immediately."
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmergencyResumePayload {
+    pub sigs: Vec<SigEntry>,
+}
+
+impl EmergencyPausePayload {
+    /// Wire layout: `[op_version:1][0x03 PAUSE_TAG][duration:8 LE][sig_count:1][sig_entry...]`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(11 + self.sigs.len() * 700);
+        out.push(MULTISIG_VERSION);
+        out.push(EMERGENCY_PAUSE_TAG);
+        out.extend_from_slice(&self.duration_slots.to_le_bytes());
+        encode_sigs(&mut out, &self.sigs);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 2 + 8 || bytes[0] != MULTISIG_VERSION || bytes[1] != EMERGENCY_PAUSE_TAG {
+            return None;
+        }
+        let duration_slots = u64::from_le_bytes(bytes[2..10].try_into().ok()?);
+        let sigs = decode_sigs(&bytes[10..])?;
+        Some(Self {
+            duration_slots,
+            sigs,
+        })
+    }
+
+    /// Bytes over which signers compute their FALCON signature. The
+    /// signed preimage binds the action label, the multisig nonce,
+    /// AND the duration — so a signature authorizing a 100-slot pause
+    /// can't be replayed to authorize a 10M-slot pause.
+    pub fn signing_bytes(&self, nonce: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + 5 + 8);
+        buf.extend_from_slice(&nonce.to_le_bytes());
+        buf.extend_from_slice(b"PAUSE");
+        buf.extend_from_slice(&self.duration_slots.to_le_bytes());
+        poseidon2_hash(&buf).to_bytes().to_vec()
+    }
+}
+
+impl EmergencyResumePayload {
+    /// Wire layout: `[op_version:1][0x04 RESUME_TAG][sig_count:1][sig_entry...]`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(3 + self.sigs.len() * 700);
+        out.push(MULTISIG_VERSION);
+        out.push(EMERGENCY_RESUME_TAG);
+        encode_sigs(&mut out, &self.sigs);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 2 || bytes[0] != MULTISIG_VERSION || bytes[1] != EMERGENCY_RESUME_TAG {
+            return None;
+        }
+        let sigs = decode_sigs(&bytes[2..])?;
+        Some(Self { sigs })
+    }
+
+    /// Signed preimage for a resume: just the nonce + action label.
+    /// Resume doesn't carry a duration — it's always a single action.
+    pub fn signing_bytes(nonce: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + 6);
+        buf.extend_from_slice(&nonce.to_le_bytes());
+        buf.extend_from_slice(b"RESUME");
+        poseidon2_hash(&buf).to_bytes().to_vec()
+    }
+}
+
 impl MultisigSpend {
     /// Bytes over which signers compute their FALCON signature. Includes
     /// the on-chain nonce so each signature is bound to a specific
@@ -542,6 +633,74 @@ mod tests {
         let sigs = vec![sign_at(&sks[0], &msg, 99)];
         let err = count_valid_sigs(&sigs, &pks, &msg).unwrap_err();
         assert!(err.contains("out of bounds"));
+    }
+
+    #[test]
+    fn emergency_pause_payload_roundtrip() {
+        let payload = EmergencyPausePayload {
+            duration_slots: 1_000_000,
+            sigs: vec![SigEntry {
+                signer_index: 2,
+                signature: vec![0xAB; 666],
+            }],
+        };
+        let bytes = payload.encode();
+        let decoded = EmergencyPausePayload::decode(&bytes).unwrap();
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn emergency_resume_payload_roundtrip() {
+        let payload = EmergencyResumePayload {
+            sigs: vec![SigEntry {
+                signer_index: 0,
+                signature: vec![0xCD; 666],
+            }],
+        };
+        let bytes = payload.encode();
+        let decoded = EmergencyResumePayload::decode(&bytes).unwrap();
+        assert_eq!(payload, decoded);
+    }
+
+    #[test]
+    fn emergency_cross_decode_rejected() {
+        // Pause bytes must not decode as Resume, and vice versa.
+        let pause = EmergencyPausePayload {
+            duration_slots: 100,
+            sigs: vec![SigEntry {
+                signer_index: 0,
+                signature: vec![0xAB; 666],
+            }],
+        };
+        let resume = EmergencyResumePayload {
+            sigs: vec![SigEntry {
+                signer_index: 0,
+                signature: vec![0xCD; 666],
+            }],
+        };
+        assert!(EmergencyResumePayload::decode(&pause.encode()).is_none());
+        assert!(EmergencyPausePayload::decode(&resume.encode()).is_none());
+    }
+
+    #[test]
+    fn emergency_signing_bytes_bind_action_nonce_and_duration() {
+        let p1 = EmergencyPausePayload { duration_slots: 100, sigs: vec![] };
+        let p2 = EmergencyPausePayload { duration_slots: 101, sigs: vec![] };
+        assert_ne!(
+            p1.signing_bytes(0),
+            p2.signing_bytes(0),
+            "duration must affect signing bytes"
+        );
+        assert_ne!(
+            p1.signing_bytes(0),
+            p1.signing_bytes(1),
+            "nonce must affect signing bytes"
+        );
+        assert_ne!(
+            p1.signing_bytes(0),
+            EmergencyResumePayload::signing_bytes(0),
+            "action label must differentiate pause from resume"
+        );
     }
 
     #[test]
