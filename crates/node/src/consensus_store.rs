@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 const STATE_KEY: &[u8] = b"consensus:state";
 const EVIDENCE_STATE_KEY: &[u8] = b"evidence:state";
 const RESHARE_STATE_KEY: &[u8] = b"reshare:state";
+const FINALITY_CHECKPOINT_KEY: &[u8] = b"finality:checkpoint";
 const PROPOSAL_PREFIX: &[u8] = b"p:";
 const VOTE_PREFIX: &[u8] = b"v:";
 
@@ -190,6 +191,44 @@ impl ConsensusStateStore {
             .map_err(|e| format!("failed to clear reshare state: {}", e))?;
         debug!("reshare state cleared");
         Ok(())
+    }
+
+    /// Persist the current weak-subjectivity finality checkpoint (slice 4.3).
+    /// Called every time `FinalityTracker::record_hard_finality` produces a
+    /// new checkpoint. fsync'd per the store's safety contract so a crash
+    /// between finality and the next restart doesn't silently reset the
+    /// WS anchor and let a long-range-attack chain through.
+    pub fn save_finality_checkpoint(
+        &self,
+        cp: &pyde_consensus::finality::FinalityCheckpoint,
+    ) -> Result<(), String> {
+        let bytes = wire::encode_finality_checkpoint(cp);
+        self.db
+            .put_opt(FINALITY_CHECKPOINT_KEY, &bytes, &self.sync_opts)
+            .map_err(|e| format!("failed to save finality checkpoint: {}", e))?;
+        debug!(
+            slot = cp.slot,
+            bytes = bytes.len(),
+            "finality checkpoint persisted"
+        );
+        Ok(())
+    }
+
+    /// Load the persisted WS checkpoint, if any. Returns `Ok(None)` on a
+    /// fresh store or one that has never seen hard finality yet.
+    pub fn load_finality_checkpoint(
+        &self,
+    ) -> Result<Option<pyde_consensus::finality::FinalityCheckpoint>, String> {
+        match self.db.get(FINALITY_CHECKPOINT_KEY) {
+            Ok(Some(bytes)) => {
+                let cp = wire::decode_finality_checkpoint(&bytes)
+                    .map_err(|e| format!("failed to decode finality checkpoint: {}", e))?;
+                info!(slot = cp.slot, "weak-subjectivity checkpoint restored from disk");
+                Ok(Some(cp))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("failed to read finality checkpoint: {}", e)),
+        }
     }
 
     // ============================================================
@@ -633,6 +672,101 @@ mod tests {
         let store = ConsensusStateStore::open(dir.path()).unwrap();
         assert_eq!(store.load_all_seen_proposals().len(), 1);
         assert_eq!(store.load_all_seen_votes().len(), 1);
+    }
+
+    #[test]
+    fn finality_checkpoint_empty_load_returns_none() {
+        let dir = tempdir().unwrap();
+        let store = ConsensusStateStore::open(dir.path()).unwrap();
+        assert!(store.load_finality_checkpoint().unwrap().is_none());
+    }
+
+    #[test]
+    fn finality_checkpoint_roundtrips() {
+        use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
+        let dir = tempdir().unwrap();
+        let store = ConsensusStateStore::open(dir.path()).unwrap();
+        let cp = FinalityCheckpoint {
+            slot: 1_234,
+            block_hash: [0xAB; 32],
+            state_root: [0xCD; 32],
+            cert: HardFinalityCert {
+                slot: 1_234,
+                block_hash: [0xAB; 32],
+                state_root: [0xCD; 32],
+                voter_bitmap: (1u128 << 86) - 1,
+                signatures: vec![vec![0x11; 600], vec![0x22; 600], vec![0x33; 600]],
+            },
+        };
+        store.save_finality_checkpoint(&cp).unwrap();
+        let loaded = store.load_finality_checkpoint().unwrap().unwrap();
+        assert_eq!(loaded.slot, cp.slot);
+        assert_eq!(loaded.block_hash, cp.block_hash);
+        assert_eq!(loaded.state_root, cp.state_root);
+        assert_eq!(loaded.cert.slot, cp.cert.slot);
+        assert_eq!(loaded.cert.voter_bitmap, cp.cert.voter_bitmap);
+        assert_eq!(loaded.cert.signatures.len(), cp.cert.signatures.len());
+        for (a, b) in loaded.cert.signatures.iter().zip(cp.cert.signatures.iter()) {
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn finality_checkpoint_msg_wire_roundtrip() {
+        use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
+        let cp = FinalityCheckpoint {
+            slot: 42,
+            block_hash: [0xAA; 32],
+            state_root: [0xBB; 32],
+            cert: HardFinalityCert {
+                slot: 42,
+                block_hash: [0xAA; 32],
+                state_root: [0xBB; 32],
+                voter_bitmap: 0x00FF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF,
+                signatures: vec![vec![0x11; 600]; 86],
+            },
+        };
+        let bytes = wire::encode_finality_checkpoint_msg(&cp);
+        assert_eq!(bytes[0], wire::tag::CONSENSUS_FINALITY_CHECKPOINT);
+        let decoded = wire::decode_finality_checkpoint_msg(&bytes).unwrap();
+        assert_eq!(decoded.slot, cp.slot);
+        assert_eq!(decoded.cert.signatures.len(), cp.cert.signatures.len());
+    }
+
+    #[test]
+    fn finality_checkpoint_msg_rejects_wrong_tag() {
+        // Payload missing the envelope tag — must not be silently treated
+        // as a checkpoint (that would let a blocked peer smuggle WS
+        // updates through via a mis-tagged topic).
+        let bytes = vec![0xFF; 100];
+        assert!(wire::decode_finality_checkpoint_msg(&bytes).is_err());
+    }
+
+    #[test]
+    fn finality_checkpoint_survives_reopen() {
+        use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
+        let dir = tempdir().unwrap();
+        let cp = FinalityCheckpoint {
+            slot: 7,
+            block_hash: [0xFF; 32],
+            state_root: [0x01; 32],
+            cert: HardFinalityCert {
+                slot: 7,
+                block_hash: [0xFF; 32],
+                state_root: [0x01; 32],
+                voter_bitmap: 0,
+                signatures: vec![],
+            },
+        };
+        {
+            let store = ConsensusStateStore::open(dir.path()).unwrap();
+            store.save_finality_checkpoint(&cp).unwrap();
+        }
+        // Simulated restart.
+        let store = ConsensusStateStore::open(dir.path()).unwrap();
+        let loaded = store.load_finality_checkpoint().unwrap().unwrap();
+        assert_eq!(loaded.slot, 7);
+        assert_eq!(loaded.block_hash, cp.block_hash);
     }
 
     #[test]

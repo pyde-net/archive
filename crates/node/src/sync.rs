@@ -200,6 +200,12 @@ impl ChainSync {
 
     /// Handle a sync response from a peer.
     /// Returns the number of blocks processed.
+    ///
+    /// `ws_checkpoint_slot` (slice 4.3) is the caller's live
+    /// weak-subjectivity anchor — `Some(cp_slot)` during normal
+    /// operation, `None` during first-time bootstrap. Blocks at or
+    /// before `cp_slot` are rejected even via sync to defend against
+    /// long-range attacks delivered through a compromised peer.
     pub fn on_response(
         &mut self,
         request_id: OutboundRequestId,
@@ -207,6 +213,7 @@ impl ChainSync {
         chain: &mut ChainState,
         state: &mut StateManager,
         block_store: &BlockStore,
+        ws_checkpoint_slot: Option<u64>,
     ) -> u64 {
         self.pending.remove(&request_id);
 
@@ -232,7 +239,9 @@ impl ChainSync {
                                 warn!(slot, error = %e, "synced block body validation failed");
                                 break;
                             }
-                            match BlockProcessor::process_full_block(chain, state, &block) {
+                            match BlockProcessor::process_full_block_with_aot_and_checkpoint(
+                                chain, state, &block, None, ws_checkpoint_slot,
+                            ) {
                                 Ok((tx_count, gas_used, _receipts)) => {
                                     // Persist to disk for future sync serving
                                     let _ = block_store.put_block(&block.header, data);
@@ -250,7 +259,9 @@ impl ChainSync {
                         Err(_) => {
                             // Fallback: try header-only decode for backwards compat
                             if let Ok(header) = crate::wire::decode_block_header(data) {
-                                match BlockProcessor::process_block(chain, state, header, &[]) {
+                                match BlockProcessor::process_block_with_checkpoint(
+                                    chain, state, header, &[], ws_checkpoint_slot,
+                                ) {
                                     Ok(_) => {
                                         self.manager.advance_local_tip(chain.head_slot);
                                         processed += 1;

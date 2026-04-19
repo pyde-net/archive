@@ -33,6 +33,14 @@ pub mod tag {
     /// outgoing committee members to the incoming committee at epoch
     /// boundary.
     pub const COMMITTEE_RESHARING: u8 = 0x18;
+    /// Hard-finality checkpoint broadcast on the consensus topic (slice 4.3
+    /// gap 1). Validators publish after `record_hard_finality`; receivers
+    /// update their local WS anchor. Carries the full cert so validator
+    /// receivers can cross-verify signatures against their own
+    /// committee_keys. Non-validator receivers, absent access to the
+    /// historical committee keys, trust the slice-3.4 consensus-channel
+    /// filter (validator-only publisher).
+    pub const CONSENSUS_FINALITY_CHECKPOINT: u8 = 0x19;
     pub const GET_BLOCK_TXS: u8 = 0x04;
     pub const BLOCK_TXS_RESPONSE: u8 = 0x05;
     pub const DECRYPTION_SHARES: u8 = 0x20;
@@ -166,6 +174,91 @@ pub fn decode_resharing(data: &[u8]) -> Result<(u64, Vec<u8>), &'static str> {
     let target_epoch = dec.u64()?;
     let contribution = dec.var_bytes()?;
     Ok((target_epoch, contribution))
+}
+
+// ============================================================
+// FinalityCheckpoint (Phase 4 slice 4.3 — WS checkpoint persistence)
+// ============================================================
+
+/// Wire payload for a `FinalityCheckpoint`. Stored at a fixed key in
+/// ConsensusStateStore; no tag byte since it's not gossipsubbed.
+/// Layout:
+/// `[slot:8][block_hash:32][state_root:32][cert_slot:8][cert_block_hash:32]
+///  [cert_state_root:32][voter_bitmap:16][sig_count:4][[sig: var_bytes]*]`
+pub fn encode_finality_checkpoint(cp: &pyde_consensus::finality::FinalityCheckpoint) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u64(cp.slot);
+    enc.raw(&cp.block_hash);
+    enc.raw(&cp.state_root);
+    enc.u64(cp.cert.slot);
+    enc.raw(&cp.cert.block_hash);
+    enc.raw(&cp.cert.state_root);
+    enc.raw(&cp.cert.voter_bitmap.to_le_bytes());
+    enc.u32(cp.cert.signatures.len() as u32);
+    for sig in &cp.cert.signatures {
+        enc.var_bytes(sig);
+    }
+    enc.finish()
+}
+
+/// Wrap a checkpoint in a tagged gossip envelope.
+/// Format: `[tag:CONSENSUS_FINALITY_CHECKPOINT:1][checkpoint_bytes]`
+/// where `checkpoint_bytes` is the storage-format from
+/// `encode_finality_checkpoint`.
+pub fn encode_finality_checkpoint_msg(
+    cp: &pyde_consensus::finality::FinalityCheckpoint,
+) -> Vec<u8> {
+    let body = encode_finality_checkpoint(cp);
+    let mut out = Vec::with_capacity(1 + body.len());
+    out.push(tag::CONSENSUS_FINALITY_CHECKPOINT);
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Decode the tagged gossip envelope. Rejects payloads with the wrong tag.
+pub fn decode_finality_checkpoint_msg(
+    data: &[u8],
+) -> Result<pyde_consensus::finality::FinalityCheckpoint, &'static str> {
+    if data.is_empty() || data[0] != tag::CONSENSUS_FINALITY_CHECKPOINT {
+        return Err("not a finality checkpoint message");
+    }
+    decode_finality_checkpoint(&data[1..])
+}
+
+pub fn decode_finality_checkpoint(
+    data: &[u8],
+) -> Result<pyde_consensus::finality::FinalityCheckpoint, &'static str> {
+    let mut dec = Decoder::new(data);
+    let slot = dec.u64()?;
+    let mut block_hash = [0u8; 32];
+    block_hash.copy_from_slice(dec.raw(32)?);
+    let mut state_root = [0u8; 32];
+    state_root.copy_from_slice(dec.raw(32)?);
+    let cert_slot = dec.u64()?;
+    let mut cert_block_hash = [0u8; 32];
+    cert_block_hash.copy_from_slice(dec.raw(32)?);
+    let mut cert_state_root = [0u8; 32];
+    cert_state_root.copy_from_slice(dec.raw(32)?);
+    let mut bitmap_bytes = [0u8; 16];
+    bitmap_bytes.copy_from_slice(dec.raw(16)?);
+    let voter_bitmap = u128::from_le_bytes(bitmap_bytes);
+    let sig_count = dec.u32()? as usize;
+    let mut signatures = Vec::with_capacity(sig_count);
+    for _ in 0..sig_count {
+        signatures.push(dec.var_bytes()?);
+    }
+    Ok(pyde_consensus::finality::FinalityCheckpoint {
+        slot,
+        block_hash,
+        state_root,
+        cert: pyde_consensus::finality::HardFinalityCert {
+            slot: cert_slot,
+            block_hash: cert_block_hash,
+            state_root: cert_state_root,
+            voter_bitmap,
+            signatures,
+        },
+    })
 }
 
 // ============================================================

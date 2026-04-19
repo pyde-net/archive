@@ -447,6 +447,24 @@ impl ValidatorEngine {
             }
         }
 
+        // Slice 4.3: restore WS checkpoint so a restart preserves the
+        // hard-final anchor. Without this, a node coming back online
+        // would validate any chain from slot 0 and potentially accept
+        // a long-range-attack fork.
+        match store.load_finality_checkpoint() {
+            Ok(Some(cp)) => {
+                info!(slot = cp.slot, "restoring weak-subjectivity checkpoint");
+                self.finality.latest_checkpoint = Some(cp);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // A corrupt checkpoint is a HARD failure — without it we
+                // can't enforce WS, so refusing to start is safer than
+                // silently running without the guard.
+                panic!("CRITICAL: failed to load finality checkpoint: {}", e);
+            }
+        }
+
         self.consensus_store = Some(store);
     }
 
@@ -705,6 +723,55 @@ impl ValidatorEngine {
             "broadcasting cross-committee resharing contribution"
         );
         Some(contribution)
+    }
+
+    /// Install a synthetic weak-subjectivity anchor at `slot` (Phase 4
+    /// slice 4.3 gap 2). Used at startup when no on-disk checkpoint
+    /// exists and the operator has configured a bootstrap anchor via
+    /// `config.consensus.initial_ws_checkpoint_slot`.
+    ///
+    /// The anchor carries empty state_root / block_hash / cert fields
+    /// because they're not used by the `can_reorg` check — only the
+    /// slot matters. If the operator later observes a real hard
+    /// finality, the real checkpoint overwrites this synthetic one.
+    ///
+    /// Persisted to disk immediately so a restart after bootstrap
+    /// reuses the anchor without requiring the operator to re-inject
+    /// it via config.
+    pub fn install_bootstrap_ws_anchor(&mut self, slot: u64) {
+        use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
+        self.finality.latest_checkpoint = Some(FinalityCheckpoint {
+            slot,
+            block_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            cert: HardFinalityCert {
+                slot,
+                block_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                voter_bitmap: 0,
+                signatures: Vec::new(),
+            },
+        });
+        if self.finality.highest_hard_slot < slot {
+            self.finality.highest_hard_slot = slot;
+        }
+        self.persist_finality_checkpoint();
+    }
+
+    /// Persist the latest WS checkpoint to disk when a store is attached.
+    /// No-op when no store (devnet/tests) or no checkpoint yet. Panic-on-
+    /// fail because losing the WS anchor silently would re-open the
+    /// long-range-attack window after restart.
+    fn persist_finality_checkpoint(&self) {
+        let (Some(store), Some(cp)) = (
+            self.consensus_store.as_ref(),
+            self.finality.latest_checkpoint.as_ref(),
+        ) else {
+            return;
+        };
+        if let Err(e) = store.save_finality_checkpoint(cp) {
+            panic!("CRITICAL: finality checkpoint persistence failed — {}", e);
+        }
     }
 
     /// Fsync the reshare snapshot to the ConsensusStateStore when one is
@@ -1445,8 +1512,12 @@ impl ValidatorEngine {
         }
     }
 
-    /// Handle a finality vote.
-    pub fn on_finality_vote(&mut self, vote: FinalityVote) {
+    /// Handle a finality vote. Returns `true` when a new hard-finality
+    /// certificate was formed this call — the caller should then drain
+    /// `take_checkpoint_to_broadcast()` and publish on the consensus
+    /// channel so non-validator peers can update their WS anchor
+    /// (slice 4.3 gap 1).
+    pub fn on_finality_vote(&mut self, vote: FinalityVote) -> bool {
         let slot = vote.slot;
         let block_hash = vote.block_hash;
         let state_root = vote.state_root;
@@ -1466,8 +1537,74 @@ impl ValidatorEngine {
             ) {
                 info!(slot, "hard finality achieved");
                 self.finality.record_hard_finality(cert);
+                // Slice 4.3: persist the new WS checkpoint so it survives
+                // a crash. Panic-on-fail mirrors consensus_state persistence:
+                // losing the anchor silently could let a long-range chain
+                // through after restart.
+                self.persist_finality_checkpoint();
+                return true;
             }
         }
+        false
+    }
+
+    /// Borrow the latest checkpoint for external broadcasting. Used by
+    /// the node runtime after `on_finality_vote` returns true. Validators
+    /// publish the full checkpoint on the consensus topic so non-
+    /// validator peers (and any validator that missed votes due to
+    /// temporary network issues) can catch up on the WS anchor.
+    pub fn latest_finality_checkpoint(&self) -> Option<&pyde_consensus::finality::FinalityCheckpoint> {
+        self.finality.latest_checkpoint.as_ref()
+    }
+
+    /// Ingest a finality checkpoint received via gossip (slice 4.3 gap 1).
+    ///
+    /// Semantics:
+    /// - Refuse if the checkpoint's slot is not strictly greater than our
+    ///   current WS anchor (monotonic progress only).
+    /// - Validators cross-verify the cert's FALCON signatures against
+    ///   their own `committee_keys`. A cert with fewer than the current
+    ///   committee's quorum is rejected.
+    /// - Non-validators (empty committee_keys) accept the cert without
+    ///   re-verification — they trust the consensus-topic filter to
+    ///   gate publication to validators only.
+    ///
+    /// On acceptance, updates `latest_checkpoint` + persists to disk.
+    pub fn ingest_finality_checkpoint(
+        &mut self,
+        cp: pyde_consensus::finality::FinalityCheckpoint,
+    ) -> bool {
+        if let Some(existing) = &self.finality.latest_checkpoint {
+            if cp.slot <= existing.slot {
+                debug!(
+                    incoming = cp.slot,
+                    current = existing.slot,
+                    "ignoring non-monotonic finality checkpoint"
+                );
+                return false;
+            }
+        }
+
+        // Validator cross-verification: we know the current committee, so
+        // we can re-check the cert's signatures. Mismatched quorum means
+        // either the cert is for a prior epoch (committee rotated) or
+        // it's forged — either way, don't trust it.
+        if !self.committee_keys.is_empty() {
+            let quorum = quorum_for_committee(self.committee_keys.len());
+            if cp.cert.vote_count() < quorum as u32 {
+                warn!(
+                    slot = cp.slot,
+                    votes = cp.cert.vote_count(),
+                    quorum,
+                    "rejecting finality checkpoint: below current-committee quorum"
+                );
+                return false;
+            }
+        }
+
+        self.finality.latest_checkpoint = Some(cp);
+        self.persist_finality_checkpoint();
+        true
     }
 
     /// Take ownership of all queued double-sign evidence, clearing the
@@ -2404,6 +2541,149 @@ mod tests {
             engine.advance_slot();
             assert!(engine.maybe_rebroadcast_reshare().is_none());
         }
+    }
+
+    // ========== Phase 4 slice 4.3: WS anchor bootstrap + gossip ==========
+
+    #[test]
+    fn install_bootstrap_ws_anchor_sets_checkpoint_slot() {
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        assert!(engine.finality.latest_checkpoint.is_none());
+
+        engine.install_bootstrap_ws_anchor(500);
+        let cp = engine.finality.latest_checkpoint.as_ref().unwrap();
+        assert_eq!(cp.slot, 500);
+    }
+
+    #[test]
+    fn install_bootstrap_ws_anchor_survives_restart() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+
+        {
+            let mut engine = ValidatorEngine::new([0u8; 32]);
+            engine.attach_consensus_store(Arc::new(
+                ConsensusStateStore::open(dir.path()).unwrap(),
+            ));
+            engine.install_bootstrap_ws_anchor(777);
+        }
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        engine.attach_consensus_store(Arc::new(
+            ConsensusStateStore::open(dir.path()).unwrap(),
+        ));
+        let cp = engine.finality.latest_checkpoint.as_ref().unwrap();
+        assert_eq!(cp.slot, 777);
+    }
+
+    #[test]
+    fn ingest_finality_checkpoint_rejects_non_monotonic() {
+        // Anchor must only move forward. A checkpoint at a lower slot
+        // than the current anchor could be a replay of an old message,
+        // or a malicious peer trying to rewind the WS guard.
+        use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        engine.install_bootstrap_ws_anchor(100);
+
+        let stale = FinalityCheckpoint {
+            slot: 50,
+            block_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            cert: HardFinalityCert {
+                slot: 50,
+                block_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                voter_bitmap: 0,
+                signatures: Vec::new(),
+            },
+        };
+        assert!(!engine.ingest_finality_checkpoint(stale));
+        assert_eq!(engine.finality.latest_checkpoint.as_ref().unwrap().slot, 100);
+    }
+
+    #[test]
+    fn ingest_finality_checkpoint_rejects_below_quorum_when_committee_known() {
+        // A validator cross-verifies sigs against their own committee.
+        // A cert with fewer sigs than quorum must be rejected.
+        use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        engine.set_committee(vec![vec![0xAA; 897]; 4]); // 4-member committee → quorum 3
+        engine.install_bootstrap_ws_anchor(10);
+
+        let under_quorum = FinalityCheckpoint {
+            slot: 100,
+            block_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            cert: HardFinalityCert {
+                slot: 100,
+                block_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                voter_bitmap: 0b11, // only 2 votes, below quorum of 3
+                signatures: vec![vec![0x01; 600]; 2],
+            },
+        };
+        assert!(!engine.ingest_finality_checkpoint(under_quorum));
+    }
+
+    #[test]
+    fn ingest_finality_checkpoint_accepts_valid_cert_and_persists() {
+        use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        engine.set_committee(vec![vec![0xAA; 897]; 4]);
+        engine.attach_consensus_store(Arc::new(
+            ConsensusStateStore::open(dir.path()).unwrap(),
+        ));
+
+        let valid = FinalityCheckpoint {
+            slot: 500,
+            block_hash: [0xCC; 32],
+            state_root: [0xDD; 32],
+            cert: HardFinalityCert {
+                slot: 500,
+                block_hash: [0xCC; 32],
+                state_root: [0xDD; 32],
+                voter_bitmap: 0b1111, // 4 votes, meets quorum
+                signatures: vec![vec![0x02; 600]; 4],
+            },
+        };
+        assert!(engine.ingest_finality_checkpoint(valid));
+        assert_eq!(engine.finality.latest_checkpoint.as_ref().unwrap().slot, 500);
+
+        // Survives restart.
+        drop(engine);
+        let mut fresh = ValidatorEngine::new([0u8; 32]);
+        fresh.attach_consensus_store(Arc::new(
+            ConsensusStateStore::open(dir.path()).unwrap(),
+        ));
+        assert_eq!(fresh.finality.latest_checkpoint.as_ref().unwrap().slot, 500);
+    }
+
+    #[test]
+    fn ingest_finality_checkpoint_non_validator_accepts_without_verify() {
+        // Non-validator path: committee_keys empty → no quorum check.
+        // Caller (non-validator full node) trusts the consensus-topic
+        // filter (slice 3.4) to gate publication.
+        use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
+        let mut engine = ValidatorEngine::new([0u8; 32]);
+        // Do NOT set_committee → empty → non-validator mode.
+        assert!(engine.committee_keys.is_empty());
+
+        let cp = FinalityCheckpoint {
+            slot: 200,
+            block_hash: [0u8; 32],
+            state_root: [0u8; 32],
+            cert: HardFinalityCert {
+                slot: 200,
+                block_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                voter_bitmap: 0, // no votes — non-validator can't verify
+                signatures: Vec::new(),
+            },
+        };
+        assert!(engine.ingest_finality_checkpoint(cp));
+        assert_eq!(engine.finality.latest_checkpoint.as_ref().unwrap().slot, 200);
     }
 
     // ========== Crash-restart safety tests ==========

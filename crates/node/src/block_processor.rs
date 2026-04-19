@@ -26,17 +26,32 @@ impl BlockProcessor {
     }
 
     /// Process a full block with optional AOT cache for background compilation.
+    /// Delegates to the checkpoint-aware variant with `None` (no WS check).
     pub fn process_full_block_with_aot(
         chain: &mut ChainState,
         state: &mut StateManager,
         block: &Block,
         aot_cache: Option<&std::sync::Arc<crate::aot_cache::AotCache>>,
     ) -> Result<(u64, u64, Vec<Receipt>), String> {
+        Self::process_full_block_with_aot_and_checkpoint(chain, state, block, aot_cache, None)
+    }
+
+    /// Full-block processing with an explicit weak-subjectivity checkpoint
+    /// slot (Phase 4 slice 4.3). Callers that have a live `FinalityTracker`
+    /// should pass `tracker.latest_checkpoint.as_ref().map(|c| c.slot)` —
+    /// any block at or before the checkpoint slot is rejected.
+    pub fn process_full_block_with_aot_and_checkpoint(
+        chain: &mut ChainState,
+        state: &mut StateManager,
+        block: &Block,
+        aot_cache: Option<&std::sync::Arc<crate::aot_cache::AotCache>>,
+        ws_checkpoint_slot: Option<u64>,
+    ) -> Result<(u64, u64, Vec<Receipt>), String> {
         let start = Instant::now();
         let slot = block.header.slot;
 
         // 1. Validate header
-        Self::validate_header(&block.header, chain)?;
+        Self::validate_header_with_checkpoint(&block.header, chain, ws_checkpoint_slot)?;
 
         // 2. Build block context for tx execution
         let block_ctx = BlockContext {
@@ -337,7 +352,18 @@ impl BlockProcessor {
         header: BlockHeader,
         _tx_data: &[Vec<u8>],
     ) -> Result<(u64, u64), String> {
-        Self::validate_header(&header, chain)?;
+        Self::process_block_with_checkpoint(chain, state, header, _tx_data, None)
+    }
+
+    /// Header-only processing with explicit WS checkpoint (slice 4.3).
+    pub fn process_block_with_checkpoint(
+        chain: &mut ChainState,
+        _state: &mut StateManager,
+        header: BlockHeader,
+        _tx_data: &[Vec<u8>],
+        ws_checkpoint_slot: Option<u64>,
+    ) -> Result<(u64, u64), String> {
+        Self::validate_header_with_checkpoint(&header, chain, ws_checkpoint_slot)?;
 
         let gas_target = pyde_tx::fee::GAS_TARGET as u64;
         chain.base_fee = adjust_base_fee(chain.base_fee, 0, gas_target);
@@ -347,6 +373,36 @@ impl BlockProcessor {
     }
 
     fn validate_header(header: &BlockHeader, chain: &ChainState) -> Result<(), String> {
+        Self::validate_header_with_checkpoint(header, chain, None)
+    }
+
+    /// Weak-subjectivity-aware header validation (Phase 4 slice 4.3, task 042).
+    ///
+    /// When `ws_checkpoint_slot` is `Some(cp)`, any header with
+    /// `slot <= cp` is rejected regardless of cryptographic validity.
+    /// This defends against long-range attacks where an attacker
+    /// acquires retired-validator keys and constructs a crypto-valid
+    /// alternate chain starting from an old state. Without this check,
+    /// a node with a cleared `ConsensusState` (e.g. after disk
+    /// corruption or a fresh install without a configured checkpoint)
+    /// would accept such a chain.
+    ///
+    /// `None` means no checkpoint available yet (pre-first-hard-finality
+    /// or bootstrap of a devnet) — falls back to the head-advancement
+    /// check only.
+    pub fn validate_header_with_checkpoint(
+        header: &BlockHeader,
+        chain: &ChainState,
+        ws_checkpoint_slot: Option<u64>,
+    ) -> Result<(), String> {
+        if let Some(cp_slot) = ws_checkpoint_slot {
+            if header.slot <= cp_slot {
+                return Err(format!(
+                    "block slot {} is at or before hard-final checkpoint {}",
+                    header.slot, cp_slot
+                ));
+            }
+        }
         if !chain.is_genesis() {
             if header.slot <= chain.head_slot {
                 return Err(format!(
@@ -866,6 +922,80 @@ mod tests {
             4_200,
             "empty block must not touch total_burned"
         );
+    }
+
+    // ========== Phase 4 slice 4.3: weak-subjectivity checkpoint ==========
+
+    #[test]
+    fn validate_header_accepts_block_above_checkpoint() {
+        let chain = ChainState::genesis([0u8; 32], 31337);
+        let header = dummy_header(100);
+        BlockProcessor::validate_header_with_checkpoint(&header, &chain, Some(50)).unwrap();
+    }
+
+    #[test]
+    fn validate_header_rejects_block_at_checkpoint() {
+        // Block slot EQUAL to checkpoint is rejected (the checkpoint
+        // itself is already canonical; re-submitting at the same slot
+        // is always an attempted fork).
+        let chain = ChainState::genesis([0u8; 32], 31337);
+        let header = dummy_header(50);
+        let err = BlockProcessor::validate_header_with_checkpoint(&header, &chain, Some(50))
+            .unwrap_err();
+        assert!(err.contains("hard-final checkpoint"), "got: {}", err);
+    }
+
+    #[test]
+    fn validate_header_rejects_block_below_checkpoint() {
+        let chain = ChainState::genesis([0u8; 32], 31337);
+        let header = dummy_header(49);
+        let err = BlockProcessor::validate_header_with_checkpoint(&header, &chain, Some(50))
+            .unwrap_err();
+        assert!(err.contains("hard-final checkpoint"), "got: {}", err);
+    }
+
+    #[test]
+    fn validate_header_without_checkpoint_uses_head_check_only() {
+        // No checkpoint → falls back to head check. Behaves as before.
+        let mut chain = ChainState::genesis([0u8; 32], 31337);
+        chain.advance(dummy_header(5));
+        let old_header = dummy_header(3);
+        BlockProcessor::validate_header_with_checkpoint(&old_header, &chain, None)
+            .expect_err("head-behind block must still be rejected");
+        let new_header = dummy_header(6);
+        BlockProcessor::validate_header_with_checkpoint(&new_header, &chain, None).unwrap();
+    }
+
+    #[test]
+    fn process_full_block_rejects_pre_checkpoint_block() {
+        // End-to-end integration: process_full_block_with_aot_and_checkpoint
+        // wraps the checkpoint-aware validation. A pre-checkpoint block
+        // must be refused without mutating state.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let mut chain = ChainState::genesis(state.root(), 31337);
+        let root_before = chain.state_root;
+
+        let header = dummy_header(10);
+        let block = Block {
+            header,
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![],
+                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+            },
+            proposer_signature: vec![],
+        };
+
+        let err = BlockProcessor::process_full_block_with_aot_and_checkpoint(
+            &mut chain, &mut state, &block, None, Some(100),
+        )
+        .expect_err("pre-checkpoint block must be rejected");
+        assert!(err.contains("hard-final checkpoint"), "got: {}", err);
+
+        // Chain head did not advance, state root unchanged.
+        assert_eq!(chain.head_slot, 0);
+        assert_eq!(chain.state_root, root_before);
     }
 
     // ========== tx_root commits to full transaction order ==========
