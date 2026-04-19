@@ -44,6 +44,19 @@ pub enum TransactionType {
     /// Permissionless; only callable once the airdrop deadline has passed.
     /// Transfers the full remaining pool balance to `treasury_address()`.
     SweepAirdrop = 8,
+    /// Governance treasury spend (Phase 4 slice 4.5). `tx.data` carries
+    /// an encoded `MultisigPayload` with target / value / data_digest
+    /// and ≥ threshold FALCON signatures from the declared signer set.
+    /// Debits `treasury_address()`, credits the target. The data_digest
+    /// should be `hash(pip_file_contents)` so the spend is auditably
+    /// linked to its rationale on-chain.
+    MultisigTx = 9,
+    /// Rotate multisig signer set + threshold (Phase 4 slice 4.5).
+    /// `tx.data` carries an encoded `RotatePayload` with the new
+    /// signer list + new threshold + ≥ current-threshold sigs from
+    /// the current set. Enables signer-set turnover (incl. annual
+    /// validator-rep rotation) without a hard fork.
+    RotateMultisig = 10,
 }
 
 impl TransactionType {
@@ -58,6 +71,8 @@ impl TransactionType {
             6 => Some(Self::ClaimReward),
             7 => Some(Self::ClaimAirdrop),
             8 => Some(Self::SweepAirdrop),
+            9 => Some(Self::MultisigTx),
+            10 => Some(Self::RotateMultisig),
             _ => None,
         }
     }
@@ -482,6 +497,8 @@ mod tests {
             TransactionType::ClaimReward,
             TransactionType::ClaimAirdrop,
             TransactionType::SweepAirdrop,
+            TransactionType::MultisigTx,
+            TransactionType::RotateMultisig,
         ];
         for ty in all {
             let tag = ty as u8;

@@ -488,6 +488,8 @@ fn execute_transaction_inner(
         TransactionType::SweepAirdrop => {
             execute_sweep_airdrop(tx, smt, block_ctx)
         }
+        TransactionType::MultisigTx => execute_multisig_spend(tx, smt),
+        TransactionType::RotateMultisig => execute_rotate_multisig(tx, smt),
         TransactionType::ClaimReward => {
             // Pull the sender's accrued pool share. Valid only for
             // Active (0x00) and Unbonding (0x01) entries — Exited
@@ -928,6 +930,63 @@ pub fn write_validator_subsidy(
     let _ = smt.insert(
         pyde_state::keys::validator_subsidy_key(),
         schedule.encode(),
+    );
+}
+
+/// Read the multisig signer public keys (slice 4.5). Returns the raw
+/// byte list; caller decodes via `crate::multisig::decode_signer_set`.
+pub fn read_multisig_signers_raw(
+    smt: &dyn pyde_state::smt::StateAccess,
+) -> Option<Vec<u8>> {
+    smt.get(&pyde_state::keys::multisig_signers_key())
+}
+
+pub fn read_multisig_signers(
+    smt: &dyn pyde_state::smt::StateAccess,
+) -> Option<Vec<Vec<u8>>> {
+    let bytes = read_multisig_signers_raw(smt)?;
+    crate::multisig::decode_signer_set(&bytes)
+}
+
+pub fn write_multisig_signers(
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    pks: &[Vec<u8>],
+) {
+    let _ = smt.insert(
+        pyde_state::keys::multisig_signers_key(),
+        crate::multisig::encode_signer_set(pks),
+    );
+}
+
+/// Read the multisig threshold (slice 4.5). Returns 0 when absent —
+/// handlers should treat 0 as "no multisig configured" and reject.
+pub fn read_multisig_threshold(smt: &dyn pyde_state::smt::StateAccess) -> u8 {
+    smt.get(&pyde_state::keys::multisig_threshold_key())
+        .and_then(|b| b.first().copied())
+        .unwrap_or(0)
+}
+
+pub fn write_multisig_threshold(smt: &mut dyn pyde_state::smt::StateAccess, t: u8) {
+    let _ = smt.insert(pyde_state::keys::multisig_threshold_key(), vec![t]);
+}
+
+/// Read the multisig nonce (slice 4.5). Defaults to 0.
+pub fn read_multisig_nonce(smt: &dyn pyde_state::smt::StateAccess) -> u64 {
+    smt.get(&pyde_state::keys::multisig_nonce_key())
+        .and_then(|b| {
+            if b.len() >= 8 {
+                Some(u64::from_le_bytes(b[..8].try_into().ok()?))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+pub fn write_multisig_nonce(smt: &mut dyn pyde_state::smt::StateAccess, n: u64) {
+    let _ = smt.insert(
+        pyde_state::keys::multisig_nonce_key(),
+        n.to_le_bytes().to_vec(),
     );
 }
 
@@ -1496,6 +1555,332 @@ fn execute_sweep_airdrop(
     }
 
     (true, AIRDROP_SWEEP_GAS, 0, vec![], residue.to_le_bytes().to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Multisig governance (slice 4.5)
+// ---------------------------------------------------------------------------
+
+/// Base gas for a MultisigTx (state reads + one treasury debit + one
+/// target credit + nonce bump). Verification cost of each FALCON sig is
+/// charged per-sig below.
+const MULTISIG_SPEND_BASE_GAS: u64 = 50_000;
+
+/// Per-sig verification cost. FALCON-512 verify measured at ~21 µs via
+/// `crypto/benches/falcon_bench.rs`, so at the 1 ns/gas target a single
+/// verify is ~21_000 gas of pure crypto. Charged at 50_000 gas per sig
+/// (≈ 2.4× measured) to absorb slower hardware, per-sig bookkeeping,
+/// and the overhead of building the signing-bytes preimage.
+const MULTISIG_PER_SIG_GAS: u64 = 50_000;
+
+/// Base gas for a RotateMultisig (same reads + signer set write).
+const MULTISIG_ROTATE_BASE_GAS: u64 = 60_000;
+
+/// Per-new-signer gas for the signer-set write. 16 signers = 14.4KB of
+/// pk bytes, charged at 10_000 per pk.
+const MULTISIG_ROTATE_PER_NEW_SIGNER_GAS: u64 = 10_000;
+
+fn execute_multisig_spend(
+    tx: &Transaction,
+    smt: &mut dyn pyde_state::smt::StateAccess,
+) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
+    let payload = match crate::multisig::MultisigPayload::decode(&tx.data) {
+        Some(p) => p,
+        None => {
+            return (
+                false,
+                MULTISIG_SPEND_BASE_GAS,
+                0,
+                vec![],
+                b"multisig payload malformed".to_vec(),
+            );
+        }
+    };
+    let (spend, sigs) = match payload {
+        crate::multisig::MultisigPayload::Spend { spend, sigs } => (spend, sigs),
+        crate::multisig::MultisigPayload::Rotate { .. } => {
+            return (
+                false,
+                MULTISIG_SPEND_BASE_GAS,
+                0,
+                vec![],
+                b"wrong payload tag for MultisigTx".to_vec(),
+            );
+        }
+    };
+
+    let gas = MULTISIG_SPEND_BASE_GAS
+        .saturating_add(MULTISIG_PER_SIG_GAS.saturating_mul(sigs.len() as u64));
+
+    // Early gas guard — same pattern as ClaimAirdrop. Reject before
+    // state writes if the sender under-budgeted.
+    if tx.gas_limit < gas {
+        return (
+            false,
+            tx.gas_limit,
+            0,
+            vec![],
+            b"multisig gas_limit below required cost".to_vec(),
+        );
+    }
+
+    // Structural checks on the spend itself before any crypto work.
+    if spend.value == 0 {
+        return (false, gas, 0, vec![], b"multisig value must be > 0".to_vec());
+    }
+    if spend.target == [0u8; 32] {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"multisig target must not be zero".to_vec(),
+        );
+    }
+    let treasury = pyde_account::address::treasury_address();
+    if spend.target == treasury {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"multisig cannot spend to treasury itself".to_vec(),
+        );
+    }
+    // The pipeline's post-execution stage unconditionally writes back
+    // `sender` (the submitter account) and `recipient` (tx.to). Both
+    // writebacks happen AFTER the handler. If our handler credits
+    // `spend.target` and then the pipeline writes `sender` or
+    // `recipient` back to the same balance key, our credit is
+    // clobbered — treasury gets debited but the target never sees the
+    // funds. Block the two collision paths.
+    if spend.target == tx.from {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"multisig target must not be the submitter".to_vec(),
+        );
+    }
+    if tx.to != [0u8; 32] {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"MultisigTx must set tx.to = ZERO_ADDRESS".to_vec(),
+        );
+    }
+
+    let signer_pks = match read_multisig_signers(smt) {
+        Some(p) => p,
+        None => {
+            return (
+                false,
+                gas,
+                0,
+                vec![],
+                b"multisig not configured".to_vec(),
+            );
+        }
+    };
+    let threshold = read_multisig_threshold(smt);
+    if threshold == 0 {
+        return (false, gas, 0, vec![], b"multisig threshold = 0".to_vec());
+    }
+
+    let nonce = read_multisig_nonce(smt);
+    let msg = spend.signing_bytes(nonce);
+    let valid = match crate::multisig::count_valid_sigs(&sigs, &signer_pks, &msg) {
+        Ok(v) => v,
+        Err(e) => return (false, gas, 0, vec![], e.as_bytes().to_vec()),
+    };
+
+    if valid < threshold as usize {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            format!(
+                "multisig below threshold: {} valid of {} required",
+                valid, threshold
+            )
+            .into_bytes(),
+        );
+    }
+
+    // Check treasury balance.
+    let mut treasury_account = load_account(smt, &treasury);
+    if treasury_account.balance < spend.value {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"treasury balance insufficient".to_vec(),
+        );
+    }
+
+    let mut target_account = load_account(smt, &spend.target);
+    treasury_account.balance -= spend.value;
+    target_account.balance = target_account.balance.saturating_add(spend.value);
+
+    if store_account(smt, &treasury_account).is_err()
+        || store_account(smt, &target_account).is_err()
+    {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"multisig state write failed".to_vec(),
+        );
+    }
+
+    // Bump nonce — binds THIS payload to THIS nonce, preventing replay.
+    write_multisig_nonce(smt, nonce.saturating_add(1));
+
+    (true, gas, 0, vec![], spend.value.to_le_bytes().to_vec())
+}
+
+fn execute_rotate_multisig(
+    tx: &Transaction,
+    smt: &mut dyn pyde_state::smt::StateAccess,
+) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
+    let payload = match crate::multisig::MultisigPayload::decode(&tx.data) {
+        Some(p) => p,
+        None => {
+            return (
+                false,
+                MULTISIG_ROTATE_BASE_GAS,
+                0,
+                vec![],
+                b"multisig payload malformed".to_vec(),
+            );
+        }
+    };
+    let (rotate, sigs) = match payload {
+        crate::multisig::MultisigPayload::Rotate { rotate, sigs } => (rotate, sigs),
+        crate::multisig::MultisigPayload::Spend { .. } => {
+            return (
+                false,
+                MULTISIG_ROTATE_BASE_GAS,
+                0,
+                vec![],
+                b"wrong payload tag for RotateMultisig".to_vec(),
+            );
+        }
+    };
+
+    let gas = MULTISIG_ROTATE_BASE_GAS
+        .saturating_add(MULTISIG_PER_SIG_GAS.saturating_mul(sigs.len() as u64))
+        .saturating_add(
+            MULTISIG_ROTATE_PER_NEW_SIGNER_GAS.saturating_mul(rotate.new_signer_pks.len() as u64),
+        );
+
+    if tx.gas_limit < gas {
+        return (
+            false,
+            tx.gas_limit,
+            0,
+            vec![],
+            b"multisig rotate gas_limit below required cost".to_vec(),
+        );
+    }
+
+    // New-set structural checks.
+    if rotate.new_signer_pks.is_empty()
+        || rotate.new_signer_pks.len() > crate::multisig::MAX_SIGNERS as usize
+    {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"rotate signer count out of range".to_vec(),
+        );
+    }
+    if rotate.new_threshold == 0 || rotate.new_threshold as usize > rotate.new_signer_pks.len() {
+        return (false, gas, 0, vec![], b"rotate threshold invalid".to_vec());
+    }
+    // Every pk must be 897 bytes AND parseable — decoder already
+    // enforced length; verify pk parses cleanly, and detect duplicates.
+    let mut seen: Vec<&[u8]> = Vec::with_capacity(rotate.new_signer_pks.len());
+    for pk in &rotate.new_signer_pks {
+        if pyde_crypto::falcon::FalconPublicKey::from_bytes(pk).is_none() {
+            return (
+                false,
+                gas,
+                0,
+                vec![],
+                b"rotate contains malformed pk".to_vec(),
+            );
+        }
+        if seen.iter().any(|p| *p == pk.as_slice()) {
+            return (
+                false,
+                gas,
+                0,
+                vec![],
+                b"rotate contains duplicate pk".to_vec(),
+            );
+        }
+        seen.push(pk.as_slice());
+    }
+
+    // Load current config for authorization check.
+    let current_signers = match read_multisig_signers(smt) {
+        Some(p) => p,
+        None => {
+            return (
+                false,
+                gas,
+                0,
+                vec![],
+                b"multisig not configured".to_vec(),
+            );
+        }
+    };
+    let current_threshold = read_multisig_threshold(smt);
+    if current_threshold == 0 {
+        return (false, gas, 0, vec![], b"multisig threshold = 0".to_vec());
+    }
+
+    let nonce = read_multisig_nonce(smt);
+    let msg = rotate.signing_bytes(nonce);
+    let valid = match crate::multisig::count_valid_sigs(&sigs, &current_signers, &msg) {
+        Ok(v) => v,
+        Err(e) => return (false, gas, 0, vec![], e.as_bytes().to_vec()),
+    };
+    if valid < current_threshold as usize {
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            format!(
+                "rotate below threshold: {} valid of {} required",
+                valid, current_threshold
+            )
+            .into_bytes(),
+        );
+    }
+
+    // Install new set + threshold + bump nonce.
+    write_multisig_signers(smt, &rotate.new_signer_pks);
+    write_multisig_threshold(smt, rotate.new_threshold);
+    write_multisig_nonce(smt, nonce.saturating_add(1));
+
+    let signer_count = rotate.new_signer_pks.len() as u8;
+    (
+        true,
+        gas,
+        0,
+        vec![],
+        vec![signer_count, rotate.new_threshold],
+    )
 }
 
 /// Currently executes groups sequentially on the shared SMT. True thread-level
@@ -3849,5 +4234,595 @@ mod tests {
 
         let receipt = execute_transaction(&sweep_tx, &mut smt, &ctx).unwrap();
         assert!(!receipt.success, "pre-deadline sweep must be rejected");
+    }
+
+    // ========== Slice 4.5: multisig governance ==========
+
+    /// Set up a multisig configuration on the SMT and return the signer
+    /// secret keys so the test can sign. Also funds the treasury so
+    /// MultisigTx spends have something to pull from.
+    fn multisig_fixture(
+        smt: &mut dyn pyde_state::smt::StateAccess,
+        n: usize,
+        threshold: u8,
+        treasury_balance: u128,
+    ) -> Vec<pyde_crypto::falcon::FalconSecretKey> {
+        let mut pks = Vec::with_capacity(n);
+        let mut sks = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (pk, sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+            pks.push(pk.as_bytes().to_vec());
+            sks.push(sk);
+        }
+        write_multisig_signers(smt, &pks);
+        write_multisig_threshold(smt, threshold);
+        write_multisig_nonce(smt, 0);
+
+        // Fund treasury
+        let treasury = pyde_account::address::treasury_address();
+        let account = pyde_account::types::Account {
+            address: treasury,
+            nonce: 0,
+            balance: treasury_balance,
+            code_hash: sparse_merkle_tree::H256::zero(),
+            storage_root: sparse_merkle_tree::H256::zero(),
+            account_type: pyde_account::types::AccountType::EOA,
+            auth_keys: pyde_account::types::AuthKeys::None,
+            gas_tank: 0,
+            key_nonce: 0,
+        };
+        store_account(smt, &account).unwrap();
+
+        sks
+    }
+
+    /// Build a signed outer tx (the submitter is any funded account —
+    /// their role is to pay gas and submit; authority comes from the
+    /// multisig signatures inside tx.data).
+    fn build_multisig_spend_tx(
+        submitter: Address,
+        submitter_sk: &pyde_crypto::falcon::FalconSecretKey,
+        payload: crate::multisig::MultisigPayload,
+    ) -> Transaction {
+        let mut tx = Transaction {
+            from: submitter,
+            to: [0u8; 32],
+            value: 0,
+            data: payload.encode(),
+            gas_limit: 2_000_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::MultisigTx,
+        };
+        sign_tx(&mut tx, submitter_sk);
+        tx
+    }
+
+    fn build_multisig_rotate_tx(
+        submitter: Address,
+        submitter_sk: &pyde_crypto::falcon::FalconSecretKey,
+        payload: crate::multisig::MultisigPayload,
+    ) -> Transaction {
+        let mut tx = build_multisig_spend_tx(submitter, submitter_sk, payload);
+        tx.tx_type = TransactionType::RotateMultisig;
+        sign_tx(&mut tx, submitter_sk);
+        tx
+    }
+
+    fn make_spend(target: Address, value: u128) -> crate::multisig::MultisigSpend {
+        crate::multisig::MultisigSpend {
+            target,
+            value,
+            data_digest: [0xAA; 32],
+        }
+    }
+
+    fn sign_spend(
+        spend: &crate::multisig::MultisigSpend,
+        sks: &[&pyde_crypto::falcon::FalconSecretKey],
+        indices: &[u8],
+        nonce: u64,
+    ) -> Vec<crate::multisig::SigEntry> {
+        let msg = spend.signing_bytes(nonce);
+        sks.iter()
+            .zip(indices.iter())
+            .map(|(sk, idx)| {
+                let sig = pyde_crypto::falcon::falcon_sign(sk, &msg).unwrap();
+                crate::multisig::SigEntry {
+                    signer_index: *idx,
+                    signature: sig.as_bytes().to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn multisig_spend_debits_treasury_and_credits_target() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 5, 3, 10_000_000);
+
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let target = [0xEE; 32];
+        let spend = make_spend(target, 1_000_000);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1], &sks[2]], &[0, 1, 2], 0);
+        let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
+        let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(receipt.success, "valid multisig spend should succeed");
+
+        let target_acc = load_account(&smt, &target);
+        // Target got exactly the spend amount. Treasury dynamics are
+        // complicated by 10% fee share flowing in from the submitter's
+        // gas — net treasury change = fee_share - spend_value, which can
+        // be negative or positive depending on gas usage. Asserting the
+        // target credit is the clean invariant.
+        assert_eq!(target_acc.balance, 1_000_000, "target received spend");
+
+        // Nonce should have incremented.
+        assert_eq!(read_multisig_nonce(&smt), 1);
+    }
+
+    #[test]
+    fn multisig_spend_rejects_below_threshold() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 5, 3, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let spend = make_spend([0xEE; 32], 1_000_000);
+        // Only 2 sigs but threshold = 3.
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
+        let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "below-threshold must fail");
+        // Nonce untouched.
+        assert_eq!(read_multisig_nonce(&smt), 0);
+    }
+
+    #[test]
+    fn multisig_spend_rejects_replay_after_success() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let spend = make_spend([0xEE; 32], 500_000);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let payload = crate::multisig::MultisigPayload::Spend { spend: spend.clone(), sigs: sigs.clone() };
+        let tx1 = build_multisig_spend_tx(submitter, &sub_sk, payload.clone());
+        let r1 = execute_transaction(&tx1, &mut smt, &ctx).unwrap();
+        assert!(r1.success);
+
+        // Resubmit the SAME signed payload. Nonce has advanced so sigs
+        // now verify against a stale message → 0 valid sigs → reject.
+        let mut tx2 = build_multisig_spend_tx(submitter, &sub_sk, payload);
+        tx2.nonce = 1; // advance outer nonce (tx-level); inner multisig nonce is what matters
+        sign_tx(&mut tx2, &sub_sk);
+        let r2 = execute_transaction(&tx2, &mut smt, &ctx).unwrap();
+        assert!(!r2.success, "replay of exact payload must fail after nonce advance");
+    }
+
+    #[test]
+    fn multisig_spend_rejects_zero_value() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let spend = make_spend([0xEE; 32], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
+        let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn multisig_spend_rejects_zero_target() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let spend = make_spend([0u8; 32], 1_000);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
+        let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn multisig_spend_rejects_treasury_self_target() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let spend = make_spend(pyde_account::address::treasury_address(), 1_000);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
+        let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn multisig_spend_rejects_insufficient_treasury() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 500); // only 500 in treasury
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let spend = make_spend([0xEE; 32], 1_000_000);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
+        let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn multisig_spend_rejects_duplicate_signer_index() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let spend = make_spend([0xEE; 32], 1_000);
+        // Same signer_index twice — hard reject at sig-count stage.
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[0]], &[0, 0], 0);
+        let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
+        let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn multisig_spend_rejects_target_equal_submitter() {
+        // Regression guard: if submitter == target, the pipeline's
+        // post-exec sender writeback clobbers the handler's target
+        // credit. Treasury would be debited while the target sees
+        // nothing — ledger integrity violation. Must reject early.
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let spend = make_spend(submitter, 500_000);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
+        let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+
+        let treasury_before =
+            load_account(&smt, &pyde_account::address::treasury_address()).balance;
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "submitter-as-target must reject");
+
+        // Treasury must not have been debited by the spend — nonce
+        // also must be unchanged.
+        let treasury_after =
+            load_account(&smt, &pyde_account::address::treasury_address()).balance;
+        assert!(treasury_after >= treasury_before, "treasury must not lose value");
+        assert_eq!(read_multisig_nonce(&smt), 0);
+    }
+
+    #[test]
+    fn multisig_spend_rejects_nonzero_tx_to() {
+        // Regression guard: tx.to is unconditionally loaded + written
+        // back by the pipeline. If tx.to matches spend.target, the
+        // recipient writeback clobbers the handler's target credit.
+        // Enforce tx.to = ZERO_ADDRESS for MultisigTx.
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let target = [0xEE; 32];
+        let spend = make_spend(target, 500_000);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
+        let mut tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+        tx.to = target; // non-zero tx.to — would clobber target credit
+        sign_tx(&mut tx, &sub_sk);
+
+        let treasury_before =
+            load_account(&smt, &pyde_account::address::treasury_address()).balance;
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success, "non-zero tx.to must reject");
+
+        let treasury_after =
+            load_account(&smt, &pyde_account::address::treasury_address()).balance;
+        assert!(treasury_after >= treasury_before);
+        assert_eq!(read_multisig_nonce(&smt), 0);
+    }
+
+    #[test]
+    fn rotate_installs_new_signer_set() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let old_sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let mut new_pks = Vec::new();
+        for _ in 0..5 {
+            let (pk, _) = pyde_crypto::falcon::falcon_keygen().unwrap();
+            new_pks.push(pk.as_bytes().to_vec());
+        }
+        let rotate = crate::multisig::MultisigRotate {
+            new_signer_pks: new_pks.clone(),
+            new_threshold: 3,
+        };
+        let msg = rotate.signing_bytes(0);
+        let sigs = vec![
+            crate::multisig::SigEntry {
+                signer_index: 0,
+                signature: pyde_crypto::falcon::falcon_sign(&old_sks[0], &msg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            },
+            crate::multisig::SigEntry {
+                signer_index: 1,
+                signature: pyde_crypto::falcon::falcon_sign(&old_sks[1], &msg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            },
+        ];
+        let payload = crate::multisig::MultisigPayload::Rotate { rotate, sigs };
+        let tx = build_multisig_rotate_tx(submitter, &sub_sk, payload);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(receipt.success);
+
+        // New signer set installed.
+        let stored = read_multisig_signers(&smt).unwrap();
+        assert_eq!(stored, new_pks);
+        assert_eq!(read_multisig_threshold(&smt), 3);
+        assert_eq!(read_multisig_nonce(&smt), 1);
+    }
+
+    #[test]
+    fn rotate_rejects_invalid_new_threshold() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let old_sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let (new_pk, _) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let rotate = crate::multisig::MultisigRotate {
+            new_signer_pks: vec![new_pk.as_bytes().to_vec()],
+            new_threshold: 5, // > signer count
+        };
+        let msg = rotate.signing_bytes(0);
+        let sigs = vec![
+            crate::multisig::SigEntry {
+                signer_index: 0,
+                signature: pyde_crypto::falcon::falcon_sign(&old_sks[0], &msg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            },
+            crate::multisig::SigEntry {
+                signer_index: 1,
+                signature: pyde_crypto::falcon::falcon_sign(&old_sks[1], &msg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            },
+        ];
+        let payload = crate::multisig::MultisigPayload::Rotate { rotate, sigs };
+        let tx = build_multisig_rotate_tx(submitter, &sub_sk, payload);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn rotate_rejects_duplicate_new_pk() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let old_sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let (dup_pk, _) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let dup = dup_pk.as_bytes().to_vec();
+        let rotate = crate::multisig::MultisigRotate {
+            new_signer_pks: vec![dup.clone(), dup.clone()],
+            new_threshold: 1,
+        };
+        let msg = rotate.signing_bytes(0);
+        let sigs = vec![
+            crate::multisig::SigEntry {
+                signer_index: 0,
+                signature: pyde_crypto::falcon::falcon_sign(&old_sks[0], &msg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            },
+            crate::multisig::SigEntry {
+                signer_index: 1,
+                signature: pyde_crypto::falcon::falcon_sign(&old_sks[1], &msg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            },
+        ];
+        let payload = crate::multisig::MultisigPayload::Rotate { rotate, sigs };
+        let tx = build_multisig_rotate_tx(submitter, &sub_sk, payload);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn spend_after_rotate_requires_new_signers() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let old_sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        // Rotate to a fresh set with threshold 2.
+        let (new_pk_a, new_sk_a) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let (new_pk_b, new_sk_b) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let (new_pk_c, _new_sk_c) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let new_pks = vec![
+            new_pk_a.as_bytes().to_vec(),
+            new_pk_b.as_bytes().to_vec(),
+            new_pk_c.as_bytes().to_vec(),
+        ];
+        let rotate = crate::multisig::MultisigRotate {
+            new_signer_pks: new_pks,
+            new_threshold: 2,
+        };
+        let rmsg = rotate.signing_bytes(0);
+        let rsigs = vec![
+            crate::multisig::SigEntry {
+                signer_index: 0,
+                signature: pyde_crypto::falcon::falcon_sign(&old_sks[0], &rmsg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            },
+            crate::multisig::SigEntry {
+                signer_index: 1,
+                signature: pyde_crypto::falcon::falcon_sign(&old_sks[1], &rmsg)
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            },
+        ];
+        let rpayload = crate::multisig::MultisigPayload::Rotate { rotate, sigs: rsigs };
+        let rtx = build_multisig_rotate_tx(submitter, &sub_sk, rpayload);
+        let rr = execute_transaction(&rtx, &mut smt, &ctx).unwrap();
+        assert!(rr.success);
+
+        // Spend signed by OLD signers should now fail.
+        let spend = make_spend([0xEE; 32], 1_000);
+        let old_sigs = sign_spend(&spend, &[&old_sks[0], &old_sks[1]], &[0, 1], 1);
+        let old_payload = crate::multisig::MultisigPayload::Spend {
+            spend: spend.clone(),
+            sigs: old_sigs,
+        };
+        let mut old_tx = build_multisig_spend_tx(submitter, &sub_sk, old_payload);
+        old_tx.nonce = 1;
+        sign_tx(&mut old_tx, &sub_sk);
+        let orr = execute_transaction(&old_tx, &mut smt, &ctx).unwrap();
+        assert!(!orr.success, "old signers must no longer authorize");
+
+        // Spend signed by NEW signers should succeed.
+        let new_sigs = sign_spend(&spend, &[&new_sk_a, &new_sk_b], &[0, 1], 1);
+        let new_payload = crate::multisig::MultisigPayload::Spend { spend, sigs: new_sigs };
+        let mut new_tx = build_multisig_spend_tx(submitter, &sub_sk, new_payload);
+        new_tx.nonce = 2;
+        sign_tx(&mut new_tx, &sub_sk);
+        let nrr = execute_transaction(&new_tx, &mut smt, &ctx).unwrap();
+        assert!(nrr.success, "new signers should authorize");
+    }
+
+    #[test]
+    fn multisig_spend_rejects_when_not_configured() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        // Fund treasury but do NOT configure multisig.
+        let treasury = pyde_account::address::treasury_address();
+        let acc = pyde_account::types::Account {
+            address: treasury,
+            nonce: 0,
+            balance: 1_000_000,
+            code_hash: sparse_merkle_tree::H256::zero(),
+            storage_root: sparse_merkle_tree::H256::zero(),
+            account_type: pyde_account::types::AccountType::EOA,
+            auth_keys: pyde_account::types::AuthKeys::None,
+            gas_tank: 0,
+            key_nonce: 0,
+        };
+        store_account(&mut smt, &acc).unwrap();
+
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let spend = make_spend([0xEE; 32], 1_000);
+        let payload = crate::multisig::MultisigPayload::Spend {
+            spend,
+            sigs: vec![crate::multisig::SigEntry {
+                signer_index: 0,
+                signature: vec![0xAB; 666],
+            }],
+        };
+        let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
+    }
+
+    #[test]
+    fn multisig_spend_rejects_insufficient_gas_limit() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx();
+        let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
+        let (sub_pk, sub_sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        let submitter = derive_eoa_address(sub_pk.as_bytes());
+        fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
+
+        let spend = make_spend([0xEE; 32], 1_000);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
+        let mut tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
+        // Needed: 50k base + 2*50k = 150k. Set below.
+        tx.gas_limit = 100_000;
+        sign_tx(&mut tx, &sub_sk);
+
+        let treasury_before =
+            load_account(&smt, &pyde_account::address::treasury_address()).balance;
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(!receipt.success);
+        // Treasury balance unchanged by multisig handler (may gain fee
+        // share from gas distribution, but not spend).
+        let treasury_after =
+            load_account(&smt, &pyde_account::address::treasury_address()).balance;
+        assert!(
+            treasury_after >= treasury_before,
+            "treasury must not have been debited"
+        );
+        assert_eq!(read_multisig_nonce(&smt), 0);
     }
 }

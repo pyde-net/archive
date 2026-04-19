@@ -5,6 +5,7 @@ pub mod airdrop;
 pub mod execution;
 pub mod fee;
 pub mod gas_tank;
+pub mod multisig;
 pub mod parallel;
 pub mod pipeline;
 pub mod types;
