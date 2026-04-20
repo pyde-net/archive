@@ -13,6 +13,17 @@ pub const MIN_GAS_LIMIT: u64 = 21_000;
 /// Maximum transaction size in bytes (wire format).
 pub const MAX_TX_SIZE: usize = 128 * 1024; // 128 KB
 
+/// Maximum calldata (tx.data) size in bytes (Phase 5 slice 5.3).
+///
+/// Separate from `MAX_TX_SIZE` because calldata dominates a tx's
+/// size budget. Without a dedicated cap, a malicious tx with a
+/// near-`MAX_TX_SIZE` data field (e.g. 120 KB of worthless bytes)
+/// still passes validation and burns validator cycles during
+/// execution + witness propagation. 64 KB is the standard cap used
+/// by comparable EVM-family chains — large enough for legitimate
+/// contract-deploy bytecode, small enough to bound DoS surface.
+pub const MAX_CALLDATA: usize = 64 * 1024;
+
 /// Block gas limit (target). Elastic blocks can go up to 4x.
 pub const BLOCK_GAS_TARGET: u64 = 400_000_000;
 pub const BLOCK_GAS_MAX: u64 = 1_600_000_000; // 4x elastic
@@ -58,6 +69,8 @@ pub enum ValidationError {
     DeadlineExpired { deadline: u64, current: u64 },
     /// Transaction is too large.
     TxTooLarge { size: usize, max: usize },
+    /// Calldata (`tx.data`) exceeds `MAX_CALLDATA` (slice 5.3).
+    CalldataTooLarge { size: usize, max: usize },
     /// Access list malformed.
     InvalidAccessList(String),
     /// Wrong chain ID.
@@ -235,6 +248,15 @@ fn validate_access_list(tx: &Transaction) -> Result<(), ValidationError> {
 }
 
 fn validate_size(tx: &Transaction) -> Result<(), ValidationError> {
+    // Calldata cap runs BEFORE the wire-encode size check so a pathological
+    // tx with 1 GB of data can't force a 1 GB allocation inside
+    // `to_bytes()` just to then reject.
+    if tx.data.len() > MAX_CALLDATA {
+        return Err(ValidationError::CalldataTooLarge {
+            size: tx.data.len(),
+            max: MAX_CALLDATA,
+        });
+    }
     let size = tx.to_bytes().len();
     if size > MAX_TX_SIZE {
         return Err(ValidationError::TxTooLarge {
@@ -516,5 +538,52 @@ mod tests {
             AccessEntry { address: [0xBB; 32], reads: vec![], writes: vec![] },
         ];
         assert!(validate_access_list(&tx).is_ok());
+    }
+
+    // ========== Slice 5.3: MAX_CALLDATA ==========
+
+    #[test]
+    fn calldata_at_max_accepted() {
+        let (mut tx, account, nonce_state) = make_valid_tx_and_account();
+        tx.data = vec![0u8; MAX_CALLDATA];
+        // Re-sign after mutating the body.
+        let (_pk, sk) = falcon_keygen().unwrap();
+        let tx_hash = tx.hash();
+        tx.signature = falcon_sign(&sk, &tx_hash).unwrap().as_bytes().to_vec();
+        // Calldata check is size-only; signature check is bypassed under
+        // dev_skip_signature = true in default_ctx.
+        assert!(validate_size(&tx).is_ok());
+
+        // Also run through full validation — signature is skipped by ctx,
+        // account has headroom balance.
+        let ctx = default_ctx();
+        let _ = validate_transaction(&tx, &account, &nonce_state, &ctx);
+    }
+
+    #[test]
+    fn calldata_over_max_rejected_by_size() {
+        let (mut tx, _, _) = make_valid_tx_and_account();
+        tx.data = vec![0u8; MAX_CALLDATA + 1];
+        let err = validate_size(&tx).unwrap_err();
+        match err {
+            ValidationError::CalldataTooLarge { size, max } => {
+                assert_eq!(size, MAX_CALLDATA + 1);
+                assert_eq!(max, MAX_CALLDATA);
+            }
+            other => panic!("wrong error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn calldata_check_runs_before_tx_size_check() {
+        // A tx with ridiculously oversized calldata should hit the
+        // calldata cap first, not the tx-size cap — guards against
+        // a future refactor reordering the checks and forcing the
+        // pipeline to allocate MAX_TX_SIZE + K bytes via to_bytes()
+        // before rejecting.
+        let (mut tx, _, _) = make_valid_tx_and_account();
+        tx.data = vec![0u8; MAX_CALLDATA * 10];
+        let err = validate_size(&tx).unwrap_err();
+        assert!(matches!(err, ValidationError::CalldataTooLarge { .. }));
     }
 }
