@@ -1,5 +1,12 @@
 //! Test contract sources for the production benchmark.
 //! 30+ contracts covering every Otigen feature.
+//!
+//! `#![allow(dead_code)]` — each `tests/*.rs` file is its own binary
+//! crate. Only a subset of these `pub const`s is referenced by any
+//! given test binary; Rust reports the rest as unused. `-D warnings`
+//! in CI would fail without this allow.
+
+#![allow(dead_code)]
 
 // ═══════════════════════════════════════════════════════════════════
 // SIMPLE CONTRACTS (10) — basic patterns, light storage

@@ -9,8 +9,7 @@ use crate::config::NetworkConfig;
 use crate::sync_protocol::{self, SyncReq, SyncResp};
 use libp2p::{
     gossipsub, identify, identity,
-    kad::{self, store::MemoryStore},
-    noise, request_response,
+    kad::{self, store::MemoryStore}, request_response,
     swarm::NetworkBehaviour,
     Multiaddr, PeerId, Swarm, SwarmBuilder,
 };

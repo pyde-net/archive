@@ -10,7 +10,6 @@ use pyde_account::address::Address;
 use pyde_crypto::poseidon2::poseidon2_hash;
 use pyde_tx::parallel::ExecutionSchedule;
 use pyde_tx::types::Transaction;
-use sparse_merkle_tree::H256;
 
 /// Committee size (128 validators per epoch).
 pub const COMMITTEE_SIZE: usize = 128;

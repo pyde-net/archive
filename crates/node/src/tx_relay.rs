@@ -1,6 +1,6 @@
 use pyde_mempool::encrypted::EncryptedTx;
 use pyde_mempool::pool::Mempool;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Transaction relay: receives encrypted txs from gossipsub, validates, stores in mempool.
 pub struct TxRelay {
@@ -14,6 +14,7 @@ impl TxRelay {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_capacity(max_size: usize) -> Self {
         Self {
             mempool: Mempool::with_capacity(max_size),
@@ -21,6 +22,7 @@ impl TxRelay {
     }
 
     /// Update the current block height (for expiry checks).
+    #[allow(dead_code)]
     pub fn set_current_block(&mut self, block: u64) {
         self.mempool.set_current_block(block);
     }
@@ -71,6 +73,7 @@ impl TxRelay {
     }
 
     /// Get a mutable reference to the mempool.
+    #[allow(dead_code)]
     pub fn mempool_mut(&mut self) -> &mut Mempool {
         &mut self.mempool
     }

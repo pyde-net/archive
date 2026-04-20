@@ -60,6 +60,7 @@ impl BlockStore {
     }
 
     /// Look up a slot by block hash.
+    #[allow(dead_code)]
     pub fn get_slot_by_hash(&self, hash: &[u8; 32]) -> Option<u64> {
         let mut key = Vec::with_capacity(34);
         key.extend_from_slice(b"i:");
@@ -72,6 +73,7 @@ impl BlockStore {
     }
 
     /// Get a header by block hash.
+    #[allow(dead_code)]
     pub fn get_header_by_hash(&self, hash: &[u8; 32]) -> Option<BlockHeader> {
         let slot = self.get_slot_by_hash(hash)?;
         self.get_header(slot)
@@ -121,6 +123,7 @@ impl BlockStore {
     }
 
     /// Check if full block data exists for this slot.
+    #[allow(dead_code)]
     pub fn has_block_data(&self, slot: u64) -> bool {
         self.get_block_raw(slot).is_some()
     }

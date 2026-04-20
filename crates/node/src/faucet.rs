@@ -54,6 +54,7 @@ impl RateLimiter {
 /// Faucet signing key (loaded once at startup).
 pub struct FaucetSigner {
     pub address: [u8; 32],
+    #[allow(dead_code)]
     pub public_key: pyde_crypto::falcon::FalconPublicKey,
     pub secret_key: pyde_crypto::falcon::FalconSecretKey,
 }
@@ -230,7 +231,7 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
     tracing::info!("  rate limit: {} seconds per address", config.cooldown_secs);
 
     loop {
-        let (mut stream, _) = listener.accept().await
+        let (stream, _) = listener.accept().await
             .map_err(|e| format!("accept: {}", e))?;
 
         let limiter = limiter.clone();

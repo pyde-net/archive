@@ -8,7 +8,7 @@
 //!
 //! Liveness: guaranteed if 86+ of 128 validators are honest and online.
 
-use crate::block::{BlockHeader, QuorumCert, COMMITTEE_SIZE, QUORUM_THRESHOLD};
+use crate::block::{BlockHeader, QuorumCert, QUORUM_THRESHOLD};
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature};
 

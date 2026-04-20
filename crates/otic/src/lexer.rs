@@ -65,6 +65,7 @@ impl<'a> Lexer<'a> {
         self.src.get(self.pos).copied()
     }
 
+    #[allow(dead_code)]
     fn peek2(&self) -> Option<u8> {
         self.src.get(self.pos + 1).copied()
     }
@@ -420,7 +421,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn lex_attribute(&mut self, start: usize, start_line: u32, start_col: u32) -> TokenKind {
+    fn lex_attribute(&mut self, _start: usize, start_line: u32, start_col: u32) -> TokenKind {
         // Already consumed #[, now read until ]
         let content_start = self.pos;
         let mut depth = 1u32;
@@ -567,7 +568,7 @@ impl<'a> Lexer<'a> {
         TokenKind::IntLiteral(val)
     }
 
-    fn lex_ident_or_keyword(&mut self, first: u8, start: usize) -> TokenKind {
+    fn lex_ident_or_keyword(&mut self, _first: u8, start: usize) -> TokenKind {
         let ident_start = start;
         while let Some(ch) = self.peek() {
             if ch.is_ascii_alphanumeric() || ch == b'_' {

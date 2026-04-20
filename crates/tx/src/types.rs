@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn wrong_key_fails_verification() {
-        let (pk1, sk1) = falcon_keygen().unwrap();
+        let (_pk1, sk1) = falcon_keygen().unwrap();
         let (pk2, _sk2) = falcon_keygen().unwrap();
         let mut tx = make_test_tx();
 

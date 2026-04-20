@@ -5,11 +5,10 @@
 //! but the WS frame isn't written to the client.
 
 use futures_util::{SinkExt, StreamExt};
-use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 pub async fn start_ws_server(
     listen: &str,

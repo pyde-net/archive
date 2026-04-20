@@ -13,6 +13,7 @@ pub struct SlotClock {
     /// Genesis Unix timestamp in ms (for absolute time reference).
     genesis_timestamp_ms: u64,
     /// Slot duration.
+    #[allow(dead_code)]
     slot_duration: Duration,
 }
 
@@ -43,6 +44,7 @@ impl SlotClock {
     }
 
     /// Time remaining in the current slot.
+    #[allow(dead_code)]
     pub fn time_remaining(&self) -> Duration {
         let elapsed = self.genesis_instant.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
@@ -52,6 +54,7 @@ impl SlotClock {
     }
 
     /// Duration until a specific slot starts.
+    #[allow(dead_code)]
     pub fn duration_until_slot(&self, slot: u64) -> Duration {
         let slot_start_ms = slot * BLOCK_TIME_MS;
         let elapsed_ms = self.genesis_instant.elapsed().as_millis() as u64;
@@ -68,6 +71,7 @@ impl SlotClock {
     }
 
     /// Slot duration.
+    #[allow(dead_code)]
     pub fn slot_duration(&self) -> Duration {
         self.slot_duration
     }

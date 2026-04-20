@@ -11,7 +11,6 @@
 use crate::state_manager::StateManager;
 use pyde_account::address::Address;
 use pyde_consensus::block::{genesis_block, Block};
-use pyde_tx::fee::GENESIS_BASE_FEE;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::{debug, info};
@@ -1092,6 +1091,7 @@ json = false
 }
 
 /// Parse a hex-encoded 32-byte address.
+#[allow(dead_code)]
 pub fn parse_hex_address_pub(hex_str: &str) -> Result<Address, String> {
     parse_hex_address(hex_str)
 }

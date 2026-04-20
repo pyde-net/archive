@@ -44,6 +44,7 @@ struct BlockMetrics {
     ok_count: usize,
     fail_count: usize,
     exec_ms: f64,
+    #[allow(dead_code)]
     commit_ms: f64,
     sign_ms: f64,
     events: usize,

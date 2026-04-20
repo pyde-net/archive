@@ -185,6 +185,7 @@ impl ConsensusStateStore {
     /// Remove any persisted reshare state. Used when an epoch's rotation
     /// completes successfully; keeping stale state around causes confused
     /// behavior on a subsequent restart.
+    #[allow(dead_code)]
     pub fn clear_reshare_state(&self) -> Result<(), String> {
         self.db
             .delete_opt(RESHARE_STATE_KEY, &self.sync_opts)

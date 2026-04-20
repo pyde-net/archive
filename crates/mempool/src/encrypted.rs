@@ -12,7 +12,7 @@
 use pyde_account::address::Address;
 use pyde_crypto::poseidon2::poseidon2_hash;
 use pyde_crypto::threshold::{
-    self, DecryptionShare, KeyShare, ThresholdCiphertext, ThresholdPublicKey,
+    self, DecryptionShare, ThresholdCiphertext, ThresholdPublicKey,
 };
 use pyde_tx::types::AccessEntry;
 
@@ -217,6 +217,7 @@ pub fn decrypt_payload(
 mod tests {
     use super::*;
     use pyde_account::address::derive_eoa_address;
+    use pyde_crypto::threshold::KeyShare;
 
     fn make_threshold_keys() -> (ThresholdPublicKey, Vec<KeyShare>) {
         threshold::threshold_keygen(3, 2).unwrap() // 2-of-3

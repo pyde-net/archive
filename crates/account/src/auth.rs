@@ -138,7 +138,7 @@ pub fn build_rotation_message(account: &Account, new_keys: &AuthKeys) -> Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::AccountType;
+    
     use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
 
     fn make_eoa_with_real_key() -> (Account, pyde_crypto::falcon::FalconSecretKey) {

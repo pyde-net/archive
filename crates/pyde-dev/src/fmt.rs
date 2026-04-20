@@ -13,7 +13,6 @@
 
 use crate::project;
 use std::fs;
-use std::path::Path;
 
 pub fn run() -> Result<(), String> {
     let (config, root) = project::load_config()?;

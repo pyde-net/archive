@@ -281,7 +281,7 @@ fn execute_with_rpc_bridge(
 ) -> Result<Outcome, String> {
     vm.clear_journal();
     let client = reqwest::blocking::Client::new();
-    let zero_addr = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    let _zero_addr = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
     loop {
         let idx = (vm.pc / 4) as usize;

@@ -7,7 +7,7 @@
 //! 4. Maintains a set of known peers for reconnection
 
 use libp2p::{Multiaddr, PeerId};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 /// Default bootstrap peers for mainnet (empty until launch).

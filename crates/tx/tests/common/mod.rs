@@ -5,6 +5,13 @@
 //! once per test binary via `OnceLock` and let strategies pick from
 //! the pool by index. This keeps a 256-case proptest suite under a
 //! second instead of minutes.
+//!
+//! `#![allow(dead_code)]` because each `tests/*.rs` file is its own
+//! binary crate and only uses a subset of the helpers; Rust reports
+//! everything else as dead per-binary, which makes `-D warnings` in
+//! CI impossible without this allow.
+
+#![allow(dead_code)]
 
 use pyde_account::address::{derive_eoa_address, Address};
 use pyde_crypto::falcon::{falcon_keygen, falcon_sign, FalconPublicKey, FalconSecretKey};

@@ -92,6 +92,7 @@ impl AotCache {
     }
 
     /// Mark a contract as AOT-incompatible (use interpreter permanently).
+    #[allow(dead_code)]
     pub fn blacklist(&self, address: [u8; 32]) {
         if let Ok(mut set) = self.blacklisted.write() {
             set.insert(address);

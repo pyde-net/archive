@@ -17,6 +17,7 @@ impl BlockProcessor {
     /// Executes each tx against the state, collects receipts, updates chain head.
     /// Optionally triggers AOT background compilation for new contracts.
     /// Returns (tx_count, total_gas_used, receipts).
+    #[allow(dead_code)]
     pub fn process_full_block(
         chain: &mut ChainState,
         state: &mut StateManager,
@@ -27,6 +28,7 @@ impl BlockProcessor {
 
     /// Process a full block with optional AOT cache for background compilation.
     /// Delegates to the checkpoint-aware variant with `None` (no WS check).
+    #[allow(dead_code)]
     pub fn process_full_block_with_aot(
         chain: &mut ChainState,
         state: &mut StateManager,
@@ -108,7 +110,7 @@ impl BlockProcessor {
                     let code_key = pyde_state::keys::code_key(&tx.to);
                     if let Some(bytecode) = state.get(&code_key) {
                         crate::aot_cache::compile_in_background(
-                            cache.clone().clone(),
+                            std::sync::Arc::clone(cache),
                             tx.to,
                             bytecode,
                         );
@@ -375,6 +377,7 @@ impl BlockProcessor {
 
     /// Process a header-only block (no transactions — used during header sync).
     /// Returns (0, 0) since no txs are executed.
+    #[allow(dead_code)]
     pub fn process_block(
         chain: &mut ChainState,
         state: &mut StateManager,
@@ -401,6 +404,7 @@ impl BlockProcessor {
         Ok((0, 0))
     }
 
+    #[allow(dead_code)]
     fn validate_header(header: &BlockHeader, chain: &ChainState) -> Result<(), String> {
         Self::validate_header_with_checkpoint(header, chain, None)
     }
@@ -797,10 +801,10 @@ mod tests {
     use crate::chain::ChainState;
     use crate::genesis::{initialize_genesis, devnet_genesis};
     use crate::state_manager::StateManager;
-    use pyde_account::address::{derive_eoa_address, ZERO_ADDRESS};
+    use pyde_account::address::ZERO_ADDRESS;
     use pyde_consensus::block::{BlockBody, QuorumCert};
     use pyde_tx::parallel::ExecutionSchedule;
-    use pyde_tx::types::{AccessEntry, FeePayer, TransactionType};
+    use pyde_tx::types::{FeePayer, TransactionType};
 
     fn dummy_header(slot: u64) -> BlockHeader {
         BlockHeader {
@@ -906,7 +910,7 @@ mod tests {
             proposer_signature: vec![],
         };
 
-        let (tx_count, gas_used, receipts) =
+        let (tx_count, _gas_used, receipts) =
             BlockProcessor::process_full_block(&mut chain, &mut state, &block).unwrap();
 
         assert_eq!(tx_count, 1);

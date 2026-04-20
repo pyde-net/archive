@@ -774,9 +774,10 @@ mod tests {
         ).unwrap()
     }
 
-    /// Test clock backed by a thread-local counter. `set_test_clock_ms`
-    /// moves the needle; `test_clock_ms` is the function pointer fed to
-    /// `Mempool::set_clock`.
+    // Test clock backed by a thread-local counter. `set_test_clock_ms`
+    // moves the needle; `test_clock_ms` is the function pointer fed to
+    // `Mempool::set_clock`. (Regular comment, not a doc comment — `///`
+    // doesn't attach to `thread_local!` macro items.)
     thread_local! {
         static TEST_CLOCK: std::cell::Cell<u64> = std::cell::Cell::new(0);
     }

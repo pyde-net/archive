@@ -20,7 +20,7 @@ mod common;
 
 use common::*;
 use proptest::prelude::*;
-use pyde_account::address::{derive_eoa_address, Address};
+use pyde_account::address::Address;
 use pyde_state::smt::PydeSMT;
 use pyde_tx::pipeline::{execute_transaction, load_account};
 use pyde_tx::types::{FeePayer, Transaction, TransactionType};

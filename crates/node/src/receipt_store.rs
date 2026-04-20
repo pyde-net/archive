@@ -79,6 +79,7 @@ impl ReceiptStore {
     }
 
     /// Number of stored receipts.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.receipts.len()
     }

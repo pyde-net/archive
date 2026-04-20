@@ -11,7 +11,7 @@ use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::server::Server;
 use jsonrpsee::types::ErrorObjectOwned;
 use pyde_tx::execution::Receipt;
-use pyde_tx::pipeline::{execute_transaction, BlockContext};
+use pyde_tx::pipeline::BlockContext;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -553,7 +553,7 @@ impl PydeApiServer for RpcServer {
             let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
             storage_snapshot(&smt_key)
         }));
-        let output = vm.execute();
+        let _output = vm.execute();
 
         // Return gas used + 10% margin for real execution overhead (nonce check, balance deduct, etc.)
         // The VM simulation already includes all cold storage surcharges.
@@ -637,7 +637,7 @@ impl PydeApiServer for RpcServer {
             let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
             storage_snapshot(&smt_key)
         }));
-        let output = vm.execute();
+        let _output = vm.execute();
 
         // Build access list from VM's tracked RAW slots (pre-derivation).
         // The pipeline's pre_derive_access_list_keys will derive them,
@@ -961,6 +961,7 @@ fn parse_hash(input: &str) -> Result<[u8; 32], ErrorObjectOwned> {
 }
 
 /// Parse a JSON call object into a Transaction + BlockContext for simulation.
+#[allow(dead_code)]
 async fn parse_call_object(
     obj: &serde_json::Value,
     rpc_state: &RpcState,
@@ -1052,6 +1053,7 @@ fn decode_u128(data: &[u8]) -> u128 {
     } else { 0 }
 }
 
+#[allow(dead_code)]
 fn decode_u64(data: &[u8]) -> u64 {
     if data.len() >= 8 {
         let mut buf = [0u8; 8];

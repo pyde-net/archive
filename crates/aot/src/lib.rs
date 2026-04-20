@@ -56,7 +56,7 @@ mod tests {
         let interp_output = vm.execute();
 
         // AOT
-        let (aot_status, aot_gas, aot_regs) = run_aot(code, gas_limit);
+        let (aot_status, _aot_gas, aot_regs) = run_aot(code, gas_limit);
 
         // Compare outcome
         match interp_output.outcome {

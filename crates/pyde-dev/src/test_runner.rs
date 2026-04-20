@@ -42,6 +42,7 @@ pub fn run(filter: Option<&str>, verbosity: u8) -> Result<(), String> {
 
     // Gas profiling: collect per-test gas usage for summary
     struct GasEntry {
+        #[allow(dead_code)]
         file: String,
         test_name: String,
         gas_used: u64,

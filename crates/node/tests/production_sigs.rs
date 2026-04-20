@@ -103,7 +103,7 @@ fn production_chain_id_1_full_lifecycle() {
     }
 
     let mut ok = 0;
-    let mut fail = 0;
+    let fail = 0;
 
     // ── 1. Native transfer (chain_id=1, FALCON sig verified) ─────
     println!("\n  1. Native transfer (chain_id=1, FALCON verified)");
@@ -360,7 +360,7 @@ fn production_chain_id_1_full_lifecycle() {
         sync_nonces(&mut accounts, &smt);
         let to = accounts[8].address;
         let acc = &mut accounts[7];
-        let mut tx = Transaction {
+        let tx = Transaction {
             from: acc.address,
             to,
             value: 1_000,

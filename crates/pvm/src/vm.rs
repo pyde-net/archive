@@ -404,6 +404,7 @@ impl Vm {
     }
 
     /// Fetch the instruction at the current PC.
+    #[allow(dead_code)]
     fn fetch(&self) -> Result<Instruction, Trap> {
         self.check_pc_bounds()?;
         let addr = crate::memory::CODE_START + self.pc;
@@ -818,7 +819,7 @@ impl Vm {
                     if let Some(ref backend) = self.storage_backend {
                         let val = backend(&key);
                         // Cache in overlay for future reads
-                        if let Some(ref v) = val {
+                        if let Some(ref _v) = val {
                             // Can't borrow self.storage mutably here, cache after match
                         }
                         val
@@ -3710,6 +3711,7 @@ mod tests {
     // --- M1.13: Contract Call Instruction tests ---
 
     /// Helper: create a VM with a contract registry containing the given contracts.
+    #[allow(dead_code)]
     fn vm_with_contracts(contracts: Vec<(Address, Vec<u8>)>) -> Vm {
         let mut vm = Vm::new();
         for (a, code) in contracts {
@@ -4022,7 +4024,7 @@ mod tests {
 
     #[test]
     fn calldata_readable_via_load_instruction() {
-        let heap = crate::memory::HEAP_START;
+        let _heap = crate::memory::HEAP_START;
         let mut vm = Vm::new();
         // Calldata: 8 bytes representing u64 value 42
         vm.calldata = 42u64.to_le_bytes().to_vec();

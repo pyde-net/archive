@@ -18,7 +18,6 @@
 //! - `node.rs:769` — triggered at epoch boundary
 //! - `node.rs:1406` — share collection via gossipsub
 
-use crate::validator::Committee;
 use pyde_account::address::Address;
 use pyde_crypto::falcon::FalconPublicKey;
 use pyde_crypto::vrf::{vrf_prove, vrf_verify, VrfOutput, VrfProof};

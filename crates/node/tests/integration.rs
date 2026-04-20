@@ -8,7 +8,6 @@
 use pyde_account::address::derive_eoa_address;
 use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
 use pyde_state::smt::PydeSMT;
-use pyde_tx::execution::Receipt;
 use pyde_tx::pipeline::{execute_transaction, BlockContext};
 use pyde_tx::types::*;
 
@@ -812,7 +811,7 @@ fn reentrancy_attack_blocked() {
     // on_hook() tries to re-enter Vault.withdraw() — should be BLOCKED by guard
     // The entire tx should revert because the re-entry fails
     let tx = call_tx(sender, attacker_addr, "attack", 100u64.to_le_bytes().to_vec(), 3, &sk);
-    let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+    let _r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
 
     // The re-entry is blocked by the guard. The first withdraw (100) is legit
     // and succeeds. The re-entry attempt from on_hook() fails silently.
