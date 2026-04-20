@@ -360,6 +360,16 @@ pub fn initialize_genesis(
         // the protocol subtracts the locked portion from the spendable
         // balance during tx validation. Empty schedule is a no-op.
         if let Some(v) = &alloc.vesting {
+            // `cliff > duration` is semantically nonsense (the cliff
+            // would fall past the already-complete vesting window).
+            // Reject at genesis so the config is sane by the time it
+            // ships — a bug surfaced by slice 5.1 property tests.
+            if v.cliff_slots > v.duration_slots {
+                return Err(format!(
+                    "vesting for {}: cliff_slots {} exceeds duration_slots {}",
+                    alloc.address, v.cliff_slots, v.duration_slots
+                ));
+            }
             let schedule = pyde_tx::vesting::VestingSchedule {
                 start_slot: v.start_slot,
                 cliff_slots: v.cliff_slots,
@@ -1706,5 +1716,41 @@ mod tests {
         };
         let err = initialize_genesis(&mut state, &config).unwrap_err();
         assert!(err.contains("signer_public_keys count"), "got: {}", err);
+    }
+
+    // ========== Slice 5.1: surfaced vesting misconfig ==========
+
+    #[test]
+    fn genesis_rejects_vesting_cliff_exceeds_duration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let alloc = GenesisAllocation {
+            address: hex::encode([0xAB; 32]),
+            balance: "1000".to_string(),
+            public_key: None,
+            bucket: None,
+            vesting: Some(GenesisVesting {
+                start_slot: 0,
+                cliff_slots: 1000,
+                duration_slots: 100, // cliff > duration: nonsense
+            }),
+        };
+        let config = GenesisConfig {
+            chain_id: 1,
+            timestamp: 0,
+            allocations: vec![alloc],
+            validators: Vec::new(),
+            initial_supply: String::new(),
+            validator_subsidy: None,
+            bucket_caps: std::collections::HashMap::new(),
+            airdrop: None,
+            multisig: None,
+        };
+        let err = initialize_genesis(&mut state, &config).unwrap_err();
+        assert!(
+            err.contains("cliff_slots") && err.contains("exceeds duration_slots"),
+            "got: {}",
+            err
+        );
     }
 }

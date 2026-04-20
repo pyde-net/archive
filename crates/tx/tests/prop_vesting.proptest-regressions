@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 78102b977c0ead9a524f775b6b793fb9d868797dc91461fd274ce14a9dc0b44b # shrinks to sched = VestingSchedule { start_slot: 0, cliff_slots: 351411539, duration_slots: 1, total_amount: 1 }

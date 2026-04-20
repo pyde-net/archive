@@ -17,3 +17,4 @@ ethnum = "1.5.2"
 
 [dev-dependencies]
 otic = { path = "../otic" }
+proptest = "1"
