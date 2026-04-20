@@ -75,12 +75,18 @@ impl VestingSchedule {
         if self.duration_slots == 0 {
             return self.total_amount;
         }
-        if current_slot < self.start_slot.saturating_add(self.cliff_slots) {
-            return 0;
-        }
+        // End-of-vesting takes priority over the cliff check. An
+        // ill-configured schedule with `cliff_slots > duration_slots`
+        // is rejected at genesis, but defend in depth at runtime: once
+        // `current_slot >= start + duration`, the full amount MUST be
+        // unlocked even if the (invalid) cliff is still in the future.
+        // Without this, a malformed config would lock funds forever.
         let end = self.start_slot.saturating_add(self.duration_slots);
         if current_slot >= end {
             return self.total_amount;
+        }
+        if current_slot < self.start_slot.saturating_add(self.cliff_slots) {
+            return 0;
         }
         let elapsed = current_slot.saturating_sub(self.start_slot) as u128;
         let duration = self.duration_slots as u128;
@@ -174,5 +180,17 @@ mod tests {
     #[test]
     fn decode_rejects_truncated() {
         assert!(VestingSchedule::decode(&[0u8; 39]).is_none());
+    }
+
+    #[test]
+    fn cliff_exceeding_duration_still_fully_unlocks_past_end() {
+        // Regression guard for the property test surfaced in slice 5.1:
+        // if an ill-configured schedule has cliff > duration, the
+        // runtime must still return `total_amount` once current_slot
+        // passes end_slot. End-of-vesting takes priority over cliff.
+        let s = sched(0, 100, 10, 1_000);
+        assert_eq!(s.unlocked_at(10), 1_000, "end_slot reached");
+        assert_eq!(s.unlocked_at(9), 0, "pre-end + pre-cliff = locked");
+        assert_eq!(s.locked_at(10), 0);
     }
 }
