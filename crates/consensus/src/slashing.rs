@@ -13,8 +13,7 @@
 //! Evidence submitter receives 10% finder's fee from slashed stake.
 //! No time limit on evidence — previous epoch evidence is still valid.
 
-use crate::block::BlockHeader;
-use crate::validator::{Validator, ValidatorSet, ValidatorStatus, VALIDATOR_STAKE};
+use crate::validator::{ValidatorSet, ValidatorStatus, VALIDATOR_STAKE};
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{falcon_verify, FalconPublicKey, FalconSignature};
 
@@ -260,7 +259,7 @@ pub fn apply_slash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::QuorumCert;
+    use crate::block::{BlockHeader, QuorumCert};
     use pyde_account::address::derive_eoa_address;
     use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
 

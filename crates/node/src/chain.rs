@@ -1,4 +1,4 @@
-use pyde_consensus::block::{BlockHeader, QuorumCert, EPOCH_LENGTH};
+use pyde_consensus::block::{BlockHeader, EPOCH_LENGTH};
 use std::collections::HashMap;
 use tracing::debug;
 
@@ -15,6 +15,7 @@ pub struct ChainState {
     /// Block hash → slot index (for getBlockByHash lookups).
     pub hash_to_slot: HashMap<[u8; 32], u64>,
     /// Genesis block hash.
+    #[allow(dead_code)]
     pub genesis_hash: [u8; 32],
     /// Base fee for EIP-1559 gas pricing.
     pub base_fee: u128,
@@ -80,6 +81,7 @@ impl ChainState {
 mod tests {
     use super::*;
     use pyde_account::address::ZERO_ADDRESS;
+    use pyde_consensus::block::QuorumCert;
 
     fn dummy_header(slot: u64, parent_hash: [u8; 32]) -> BlockHeader {
         BlockHeader {

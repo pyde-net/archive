@@ -97,7 +97,7 @@ fn install_package(
         .unwrap_or_else(|| rev.unwrap_or("main").to_string());
 
     // Conflict detection
-    if let Some((existing_git, existing_rev)) = versions.get(pkg_name) {
+    if let Some((_existing_git, existing_rev)) = versions.get(pkg_name) {
         if existing_rev != &pinned_rev {
             let _ = fs::remove_dir_all(&pkg_dir);
             return Err(format!(

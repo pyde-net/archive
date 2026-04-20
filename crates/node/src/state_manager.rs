@@ -105,6 +105,7 @@ impl StateManager {
         Ok(self.root)
     }
 
+    #[allow(dead_code)]
     pub fn delete(&mut self, key: &Key) -> Result<bool, String> {
         self.tracked_keys.remove(key);
         let mut smt = self.smt.lock().map_err(|e| format!("smt lock: {}", e))?;
@@ -184,6 +185,7 @@ impl StateManager {
     }
 
     /// Get immutable SMT access. Returns MutexGuard.
+    #[allow(dead_code)]
     pub fn smt_ref(&self) -> std::sync::MutexGuard<'_, PersistentSMT> {
         self.smt.lock().expect("smt lock poisoned")
     }
@@ -224,6 +226,7 @@ impl StateManager {
         Ok(self.root)
     }
 
+    #[allow(dead_code)]
     pub fn entry_count(&self) -> usize {
         self.tracked_keys.len()
     }

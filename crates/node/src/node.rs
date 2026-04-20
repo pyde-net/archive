@@ -21,8 +21,7 @@ use libp2p::PeerId;
 use pyde_net::channels::Channel;
 use pyde_net::config::NetworkConfig;
 use pyde_net::node::{
-    create_node, generate_keypair, keypair_from_bytes, keypair_to_bytes, subscribe_topics,
-    PydeBehaviour, PydeBehaviourEvent,
+    create_node, generate_keypair, keypair_from_bytes, keypair_to_bytes, subscribe_topics, PydeBehaviourEvent,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -1055,12 +1054,12 @@ impl PydeNode {
                                     // Always produce blocks to advance the chain.
                                     // Empty blocks are needed for QC chain progression.
                                     {
-                                    let tx_count = txs.len();
+                                    let _tx_count = txs.len();
 
                                     // Build block with transactions
                                     let chain_r = chain.read().await;
                                     let parent_hash = chain_r.state_root;
-                                    let head = chain_r.head_slot;
+                                    let _head = chain_r.head_slot;
                                     drop(chain_r);
 
                                     // Auto-infer access lists for parallel scheduling.
@@ -1387,7 +1386,7 @@ impl PydeNode {
                                                                                 "encrypted txs decrypted — executing"
                                                                             );
                                                                             // Execute decrypted txs
-                                                                            let mut chain_w = chain.write().await;
+                                                                            let chain_w = chain.write().await;
                                                                             let mut state_w = state.write().await;
                                                                             let proposer = block_store.get_header(current_slot)
                                                                                 .map(|h| h.proposer).unwrap_or(identity.address);
@@ -1431,7 +1430,7 @@ impl PydeNode {
                         // Check for timeout (no proposal received within 200ms)
                         if engine.is_timed_out() {
                             if let Some(identity) = validator_identity.as_ref() {
-                                if let Some(vc_msg) = engine.on_timeout(identity) {
+                                if let Some(_vc_msg) = engine.on_timeout(identity) {
                                     let vc_bytes = wire::encode_consensus_message(
                                         &pyde_consensus::hotstuff::ConsensusMessage::Timeout {
                                             slot: current_slot,
@@ -1530,11 +1529,12 @@ impl PydeNode {
     }
 }
 
-use pyde_net::sync_protocol::{SyncReq, SyncResp};
+use pyde_net::sync_protocol::SyncResp;
 
 /// Action to take after processing a swarm event (avoids borrow conflicts with swarm).
 enum PostEventAction {
     None,
+    #[allow(dead_code)]
     RequestChainTip(PeerId),
     SendSyncResponse(request_response::ResponseChannel<SyncResp>, SyncResp),
     ContinueSync,
@@ -1545,6 +1545,7 @@ enum PostEventAction {
     /// gossip and local detection arrive in the same tick).
     BroadcastConsensusMany(Vec<Vec<u8>>),
     AcceptTransaction(pyde_tx::types::Transaction),
+    #[allow(dead_code)]
     StoreReceipts(u64, Vec<pyde_tx::execution::Receipt>),
     AddPeerToKademlia(PeerId, Vec<libp2p::Multiaddr>),
     BlockProcessed {
@@ -1572,7 +1573,7 @@ fn handle_swarm_event(
     event: SwarmEvent<PydeBehaviourEvent>,
     chain: &mut ChainState,
     state: &mut StateManager,
-    tx_relay: &mut TxRelay,
+    _tx_relay: &mut TxRelay,
     chain_sync: &mut ChainSync,
     validator_engine: &mut Option<ValidatorEngine>,
     validator_identity: &mut Option<ValidatorIdentity>,
@@ -1990,7 +1991,7 @@ fn handle_swarm_event(
                                             info!(slot, "view change QC formed — fallback proposer can proceed");
                                         }
                                     }
-                                    ConsensusMessage::NewView { slot, highest_qc, voter_address, signature } => {
+                                    ConsensusMessage::NewView { slot, highest_qc, voter_address: _, signature: _ } => {
                                         debug!(slot, "received new view");
                                         // NewView carries the highest QC from a validator after view change.
                                         // Update our highest QC if theirs is higher.

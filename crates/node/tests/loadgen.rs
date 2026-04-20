@@ -265,7 +265,7 @@ fn load_test_full_pipeline() {
 
         // Deploy contracts — submit to ALL nodes for fastest inclusion
         println!("  Deploying {} contracts (to all 4 nodes)...", deploy_txs.len());
-        for (i, dtx) in deploy_txs.iter().enumerate() {
+        for (_i, dtx) in deploy_txs.iter().enumerate() {
             let params = format!("\"{}\"", dtx);
             // Submit to all 4 nodes simultaneously
             for url in &rpc_urls {

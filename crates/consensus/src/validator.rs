@@ -5,7 +5,7 @@
 //! - Epoch rotation every 1,000 blocks
 //! - 14-day unbonding period on deregistration
 
-use crate::block::{COMMITTEE_SIZE, EPOCH_LENGTH};
+use crate::block::COMMITTEE_SIZE;
 use pyde_account::address::Address;
 use pyde_crypto::poseidon2::poseidon2_hash;
 

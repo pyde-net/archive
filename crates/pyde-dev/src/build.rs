@@ -42,6 +42,7 @@ pub struct ModuleExports {
 
 impl ModuleExports {
     /// Check if a name is exported by this module.
+    #[allow(dead_code)]
     pub fn has(&self, name: &str) -> bool {
         self.contracts.iter().any(|n| n == name)
             || self.interfaces.iter().any(|n| n == name)
@@ -257,7 +258,7 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
     let mut compiled_registry: HashMap<String, Vec<u8>> = HashMap::new();
     let mut contract_functions: HashMap<String, Vec<FnSig>> = HashMap::new();
     let mut contract_constructors: HashMap<String, Vec<(String, otic::types::Ty)>> = HashMap::new();
-    let mut module_exports: HashMap<String, ModuleExports> = HashMap::new();
+    let module_exports: HashMap<String, ModuleExports> = HashMap::new();
     let mut result = BuildResult {
         contracts: Vec::new(),
         total_bytecode: 0,

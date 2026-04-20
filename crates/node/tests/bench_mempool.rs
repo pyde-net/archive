@@ -3,7 +3,7 @@
 //! block processor — exactly how mainnet processes blocks.
 
 use pyde_account::address::derive_eoa_address;
-use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
+use pyde_crypto::falcon::falcon_keygen;
 use pyde_state::smt::{PersistentSMT, StateAccess, StateOverlay};
 use pyde_tx::pipeline::{execute_transaction, BlockContext};
 use pyde_tx::types::*;
@@ -65,7 +65,7 @@ fn bench_preloaded_mempool() {
         (addr, pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
     }).collect();
 
-    for (addr, pk_bytes, _) in &accounts {
+    for (addr, _pk_bytes, _) in &accounts {
         let account = pyde_account::types::Account {
             address: *addr, nonce: 0, balance: 1_000_000_000_000_000,
             code_hash: sparse_merkle_tree::H256::zero(),
@@ -149,7 +149,7 @@ fn bench_preloaded_mempool() {
             }
         }
     }
-    let aot_map: std::collections::HashMap<[u8; 32], unsafe fn(*mut u64, u64, *mut pyde_vm::vm::Vm) -> u64> =
+    let _aot_map: std::collections::HashMap<[u8; 32], unsafe fn(*mut u64, u64, *mut pyde_vm::vm::Vm) -> u64> =
         aot_fns.iter().map(|(addr, code)| (*addr, code.as_fn())).collect();
 
     println!("  {} contracts deployed ({} instrs, {} AOT compiled)", num_contracts,

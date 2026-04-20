@@ -18,7 +18,7 @@
 
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{FalconPublicKey, FalconSecretKey};
-use pyde_crypto::poseidon2::{poseidon2_hash, poseidon2_many};
+use pyde_crypto::poseidon2::poseidon2_many;
 use pyde_crypto::hash::Hash256;
 use pyde_crypto::vrf::{vrf_prove, vrf_verify, VrfOutput, VrfProof};
 

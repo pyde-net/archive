@@ -16,7 +16,6 @@ use pyde_tx::parallel::schedule;
 use pyde_tx::pipeline::execute_transaction;
 use pyde_tx::types::*;
 use rayon::prelude::*;
-use std::collections::HashMap;
 use std::time::Instant;
 
 struct Acct {

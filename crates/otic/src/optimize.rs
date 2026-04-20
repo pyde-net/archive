@@ -13,7 +13,6 @@ use std::collections::{HashMap, HashSet};
 use ethnum::U256;
 
 use crate::ir::*;
-use crate::types::Ty;
 
 /// Run all optimization passes on an IR program.
 pub fn optimize(program: &mut IrProgram) {

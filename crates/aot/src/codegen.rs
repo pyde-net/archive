@@ -599,7 +599,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                     // Wide comparisons: result written to GP register rd
                     Opcode::Weq | Opcode::Wlt => {
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        let regs_ptr_val = builder.use_var(Variable::from_u32(VAR_REGS_PTR));
+                        let _regs_ptr_val = builder.use_var(Variable::from_u32(VAR_REGS_PTR));
                         let op = builder.ins().iconst(I64, d.opcode.to_u8() as i64);
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let ws1 = builder.ins().iconst(I64, d.rs1 as i64);

@@ -16,6 +16,7 @@ use pyde_tx::types::Transaction;
 
 pub struct Signer {
     pub address: [u8; 32],
+    #[allow(dead_code)]
     pub public_key: FalconPublicKey,
     pub secret_key: FalconSecretKey,
 }

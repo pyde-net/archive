@@ -9,10 +9,8 @@
 //! 5. Fee distribution: 70% burn, 20% validator, 10% treasury
 //! 6. Generate receipt
 
-use crate::types::{FeePayer, Transaction, TransactionType};
-use pyde_account::address::{Address, ZERO_ADDRESS};
-use pyde_account::types::Account;
-use pyde_crypto::poseidon2::poseidon2_hash;
+use crate::types::{FeePayer, Transaction};
+use pyde_account::address::Address;
 use sparse_merkle_tree::H256;
 
 /// Fee distribution ratios (percentages).
@@ -215,7 +213,7 @@ pub fn generate_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AccessEntry, TransactionType};
+    use crate::types::TransactionType;
     use pyde_account::address::derive_eoa_address;
 
     fn make_tx(value: u128, gas_limit: u64) -> Transaction {

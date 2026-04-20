@@ -50,6 +50,7 @@ pub enum TraceEvent {
         /// Target contract address (32 bytes).
         target: [u8; 32],
         /// Function selector (4 bytes).
+        #[allow(dead_code)]
         selector: u32,
         /// Function name (resolved from selector, or "unknown").
         function_name: String,
@@ -110,6 +111,7 @@ pub enum TraceEvent {
     /// Revert with error data.
     Revert {
         /// Error selector (first 4 bytes of revert data).
+        #[allow(dead_code)]
         error_selector: Option<u32>,
         /// Error name (resolved).
         error_name: Option<String>,
@@ -122,6 +124,7 @@ pub enum TraceEvent {
 #[derive(Clone, Debug)]
 pub struct ExecutionTrace {
     pub events: Vec<TraceEvent>,
+    #[allow(dead_code)]
     pub depth: u32,
 }
 
@@ -137,14 +140,17 @@ impl ExecutionTrace {
         self.events.push(event);
     }
 
+    #[allow(dead_code)]
     pub fn enter_call(&mut self) {
         self.depth += 1;
     }
 
+    #[allow(dead_code)]
     pub fn exit_call(&mut self) {
         self.depth = self.depth.saturating_sub(1);
     }
 
+    #[allow(dead_code)]
     pub fn current_depth(&self) -> u32 {
         self.depth
     }

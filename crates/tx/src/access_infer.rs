@@ -3,7 +3,7 @@
 //! without requiring users to manually declare access lists.
 
 use crate::types::{AccessEntry, Transaction};
-use pyde_state::smt::{Key, StateAccess};
+use pyde_state::smt::StateAccess;
 
 /// Simulate a transaction to discover which storage keys it reads/writes.
 /// Returns a list of AccessEntry with the discovered keys.
@@ -31,7 +31,7 @@ pub fn infer_access_list(
     };
 
     // Load sender account for simulation
-    let sender = match state.get(&pyde_state::keys::balance_key(&tx.from)) {
+    let _sender = match state.get(&pyde_state::keys::balance_key(&tx.from)) {
         Some(bytes) => match pyde_account::types::Account::from_bytes(&bytes) {
             Some(a) => a,
             None => return vec![],

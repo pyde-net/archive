@@ -734,7 +734,9 @@ impl<'a> Contract<'a> {
 /// Standalone ABI encoder/decoder (no contract address or provider needed).
 pub struct Interface {
     functions: HashMap<String, AbiFunction>,
+    #[allow(dead_code)]
     events: HashMap<String, AbiEvent>,
+    #[allow(dead_code)]
     events_by_topic: HashMap<String, AbiEvent>,
     structs: HashMap<String, AbiStructDef>,
     enums: HashMap<String, AbiEnumDef>,

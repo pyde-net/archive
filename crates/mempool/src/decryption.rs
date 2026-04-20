@@ -9,11 +9,10 @@
 //! The decryption happens AFTER ordering is committed (QC formed).
 
 use crate::encrypted::{decrypt_payload, EncryptedTx};
-use pyde_account::address::Address;
 use pyde_crypto::threshold::{
-    combine_shares, generate_decryption_share, DecryptionShare, KeyShare, ThresholdCiphertext,
+    generate_decryption_share, DecryptionShare, KeyShare,
 };
-use pyde_tx::types::{AccessEntry, FeePayer, Transaction, TransactionType};
+use pyde_tx::types::{FeePayer, Transaction, TransactionType};
 
 /// Decryption state for a single block's worth of encrypted transactions.
 #[derive(Debug)]
@@ -161,8 +160,9 @@ impl BlockDecryptor {
 mod tests {
     use super::*;
     use crate::encrypted::encrypt_transaction;
-    use pyde_account::address::derive_eoa_address;
+    use pyde_account::address::{derive_eoa_address, Address};
     use pyde_crypto::threshold;
+    use pyde_crypto::threshold::KeyShare;
     use pyde_tx::types::AccessEntry;
 
     fn make_keys(n: usize, t: usize) -> (threshold::ThresholdPublicKey, Vec<KeyShare>) {

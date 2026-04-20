@@ -540,7 +540,7 @@ mod tests {
         assert_eq!(decode_bool(&1u64.to_le_bytes()), Some(true));
         assert_eq!(decode_bool(&0u64.to_le_bytes()), Some(false));
 
-        let mut addr = [0xAA; 32];
+        let addr = [0xAA; 32];
         assert_eq!(decode_address(&addr), Some(addr));
     }
 

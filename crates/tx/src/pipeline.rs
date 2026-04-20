@@ -15,7 +15,6 @@ use crate::execution::{
     distribute_fee, generate_receipt, post_execution_refund, pre_execution_charge, transfer_value,
     LogEntry, Receipt,
 };
-use crate::fee::adjust_base_fee;
 use crate::types::{FeePayer, Transaction, TransactionType};
 use crate::validation::{validate_transaction, ValidationContext, ValidationError};
 
@@ -24,8 +23,7 @@ use pyde_account::nonce::NonceState;
 use pyde_account::types::Account;
 use pyde_crypto::poseidon2::poseidon2_hash;
 use pyde_state::keys;
-use pyde_state::smt::{Key, PydeSMT};
-use pyde_vm::vm::{ExecResult, ExecutionContext, Outcome, Vm};
+use pyde_vm::vm::{ExecutionContext, Outcome, Vm};
 use pyde_vm::wide::U256;
 use sparse_merkle_tree::H256;
 
@@ -270,7 +268,7 @@ fn execute_transaction_inner(
             // Increment sender nonce so the next deploy gets a different address
             sender.nonce += 1;
 
-            let (runtime_code, gas_used) = if tx.data.len() >= 8 {
+            let (_runtime_code, gas_used) = if tx.data.len() >= 8 {
                 let mut clen_bytes = [0u8; 4];
                 clen_bytes.copy_from_slice(&tx.data[..4]);
                 let constructor_len = u32::from_le_bytes(clen_bytes) as usize;
@@ -321,7 +319,7 @@ fn execute_transaction_inner(
                         contract = hex::encode(new_addr),
                         "executing constructor"
                     );
-                    let (success, gas, _, logs, _) =
+                    let (success, gas, _, _logs, _) =
                         execute_in_pvm(&constructor_tx, &sender, constructor, smt, block_ctx, None);
                     if !success {
                         tracing::warn!(gas, "constructor execution failed (reverted or trapped)");
@@ -524,7 +522,7 @@ fn execute_transaction_inner(
             let val_key = pyde_state::keys::validator_key(&tx.from);
             match smt.get(&val_key) {
                 Some(val_data) => match ValidatorEntry::decode(&val_data) {
-                    Some(mut entry) if entry.status == 0x02 => (
+                    Some(entry) if entry.status == 0x02 => (
                         false,
                         21_000u64,
                         0u64,
@@ -632,7 +630,7 @@ fn execute_transaction_inner(
 /// If `aot_fn` is provided, runs native compiled code instead of the interpreter.
 fn execute_in_pvm(
     tx: &Transaction,
-    sender: &Account,
+    _sender: &Account,
     code: &[u8],
     smt: &mut dyn pyde_state::smt::StateAccess,
     block_ctx: &BlockContext,
@@ -672,7 +670,7 @@ fn execute_in_pvm(
     // During execution, state is only read (writes go to vm.storage overlay).
     // SAFETY: smt is not mutated during vm.execute(). The pointer is valid for
     // the duration of execute_in_pvm. The closure is dropped before smt is mutated again.
-    let smt_ptr = smt as *const dyn pyde_state::smt::StateAccess as *const () as usize;
+    let _smt_ptr = smt as *const dyn pyde_state::smt::StateAccess as *const () as usize;
     let smt_vtable =
         unsafe { std::mem::transmute::<&dyn pyde_state::smt::StateAccess, [usize; 2]>(smt) };
     vm.storage_backend = Some(std::sync::Arc::new(move |key: &U256| {
@@ -696,7 +694,7 @@ fn execute_in_pvm(
     ));
 
     // Try AOT compiled native code first, fall back to interpreter on failure.
-    let (success, gas_used_raw) = if let Some(func) = aot_fn {
+    let (success, _gas_used_raw) = if let Some(func) = aot_fn {
         if vm.load(code).is_err() {
             return (false, tx.gas_limit, 0, vec![], vec![]);
         }
@@ -2194,6 +2192,7 @@ mod tests {
     use super::*;
     use pyde_account::address::derive_eoa_address;
     use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
+    use pyde_state::smt::PydeSMT;
 
     fn make_block_ctx() -> BlockContext {
         BlockContext {
@@ -2466,7 +2465,7 @@ mod tests {
 
         // Create sender account with huge balance
         let sender_addr = [0x01u8; 32];
-        let mut sender = Account {
+        let sender = Account {
             address: sender_addr,
             nonce: 0,
             balance: 10_000_000_000_000_000_000u128,
@@ -2557,8 +2556,8 @@ mod tests {
             vm.cpu.read_gp(1)
         };
 
-        let enc_u64 = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
-        let mut cd = |name: &str, args: &[u64]| -> Vec<u8> {
+        let _enc_u64 = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        let cd = |name: &str, args: &[u64]| -> Vec<u8> {
             let mut data = sel(name).to_be_bytes().to_vec();
             for a in args {
                 data.extend_from_slice(&a.to_le_bytes());

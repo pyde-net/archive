@@ -11,7 +11,6 @@ use pyde_crypto::vrf::VrfProof;
 use pyde_consensus::block::quorum_for_committee;
 use pyde_consensus::epoch_randomness::{
     RandomnessCollector, RandomnessShare, generate_share, verify_share,
-    combine_shares_dynamic,
 };
 use pyde_crypto::threshold::{
     RefreshContribution, ResharingContribution, aggregate_new_share, apply_refresh,
@@ -19,7 +18,7 @@ use pyde_crypto::threshold::{
     verify_refresh_contribution, verify_resharing_contribution,
 };
 use pyde_consensus::slashing::{
-    DoubleSignEvidence, slash_double_sign, verify_double_sign,
+    DoubleSignEvidence, slash_double_sign,
 };
 use pyde_consensus::validator::VALIDATOR_STAKE;
 use pyde_consensus::view_change::{
@@ -194,6 +193,7 @@ pub fn process_unbonding(
 
 /// Collected votes for a slot, used to form QCs.
 struct SlotVotes {
+    #[allow(dead_code)]
     block_hash: [u8; 32],
     votes: Vec<ConsensusMessage>,
 }
@@ -201,6 +201,7 @@ struct SlotVotes {
 /// A buffered proposal with verified VRF score.
 struct BufferedProposal {
     header: BlockHeader,
+    #[allow(dead_code)]
     proposer_signature: Vec<u8>,
     vrf_score: u64,
 }
@@ -1234,6 +1235,7 @@ impl ValidatorEngine {
 
     /// True when a slot was flagged via `flag_inclusion_violation`.
     /// Exposed for tests.
+    #[allow(dead_code)]
     pub fn is_inclusion_violated(&self, slot: u64) -> bool {
         self.inclusion_violated_slots.contains(&slot)
     }
@@ -1626,6 +1628,7 @@ impl ValidatorEngine {
     /// Re-queue previously drained evidence, e.g. after a failed block
     /// build. No-op if `evidence` is empty. Preserves insertion order by
     /// appending at the tail.
+    #[allow(dead_code)]
     pub fn push_evidence(&mut self, evidence: Vec<DoubleSignEvidence>) {
         if evidence.is_empty() {
             return;
@@ -1837,6 +1840,7 @@ impl ValidatorEngine {
 
     /// Create a BlockDecryptor and seed it with our own shares.
     /// Other committee members' shares are added as they arrive via gossipsub.
+    #[allow(dead_code)]
     pub fn start_decryption(
         &self,
         identity: &ValidatorIdentity,
@@ -2458,7 +2462,7 @@ mod tests {
         engine.prepare_for_reshare_reception(1, new_committee, 1);
         let mut new_id = make_identity(0);
 
-        let mut bad = generate_resharing_contribution(&old_shares[0], 4, 3, 1, b"e");
+        let bad = generate_resharing_contribution(&old_shares[0], 4, 3, 1, b"e");
         // Flip one sub-share to break the polynomial.
         bad.to_bytes(); // sanity
         // Expose a mutation path: rebuild via from_bytes after a byte flip.

@@ -7,11 +7,11 @@
 //! Keys are promoted on access (cold → warm → hot) and demoted when
 //! not accessed for a configurable number of blocks.
 
-use crate::smt::{Key, SmtValue};
+use crate::smt::SmtValue;
 use sparse_merkle_tree::traits::{StoreReadOps, StoreWriteOps};
 use sparse_merkle_tree::{BranchKey, BranchNode, H256};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Configuration for tier demotion.
 const DEFAULT_HOT_EVICT_BLOCKS: u64 = 128;
@@ -318,11 +318,11 @@ mod tests {
 
     #[test]
     fn reads_promote_to_hot() {
-        let mut warm = InMemoryBackend::new();
+        let _warm = InMemoryBackend::new();
         // Pre-populate warm tier
         let key = key_from_seed(1);
         let val = SmtValue(b"warm_data".to_vec());
-        let leaf_key = val.to_h256();
+        let _leaf_key = val.to_h256();
 
         // We need to write through a real SMT to populate correctly
         let mut warm_smt = SMT::new(H256::zero(), InMemoryBackend::new());

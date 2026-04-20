@@ -177,8 +177,9 @@ impl TypeChecker {
             // Unknown/Error declared type accepts anything
             (_, Ty::Unknown) | (_, Ty::Error) => true,
             (Ty::Unknown, _) | (Ty::Error, _) => true,
-            // Struct inferred matches unknown declared
-            (Ty::Struct(_), Ty::Unknown) => true,
+            // NB: `(Ty::Struct(_), Ty::Unknown)` used to live here but
+            // is already subsumed by `(_, Ty::Unknown)` above — leaving
+            // it caused a `#[warn(unreachable_patterns)]`.
             _ => false,
         }
     }
@@ -990,7 +991,7 @@ impl TypeChecker {
                 }
             }
 
-            Expr::Call(callee, args, call_value, span) => {
+            Expr::Call(callee, args, _call_value, span) => {
                 // Infer all argument types
                 let arg_types: Vec<Ty> = args.iter().map(|arg| self.infer_expr(arg)).collect();
 
@@ -1381,7 +1382,7 @@ impl TypeChecker {
                 }
             }
 
-            Expr::StructInit(name_segments, fields, span) => {
+            Expr::StructInit(name_segments, fields, _span) => {
                 let struct_name = name_segments.first().map(|s| s.name.as_str()).unwrap_or("");
 
                 // Check if it's a struct init or error init

@@ -206,7 +206,7 @@ impl SafetyChecker {
     fn check_function_attrs(&mut self, func: &FunctionDef) {
         let mut has_constructor = false;
         let mut has_view = false;
-        let mut has_sponsored = false;
+        let mut _has_sponsored = false; // TODO see note at "sponsored" arm below
         let mut has_reentrant = false;
         let mut has_payable = false;
         let mut has_test = false;
@@ -236,7 +236,15 @@ impl SafetyChecker {
                     has_view = true;
                 }
                 "sponsored" => {
-                    has_sponsored = true;
+                    // TODO(post-slice-5.4): #[sponsored] has no conflict-
+                    // detection below (unlike every other attribute here).
+                    // Determining which attributes conflict with #[sponsored]
+                    // requires a design decision, not a style fix — leaving
+                    // the assignment live so `cargo fix` doesn't silently
+                    // drop it. Likely candidates to forbid: #[view] (view
+                    // functions read state and don't consume gas),
+                    // #[constructor] (constructors run once at deploy).
+                    _has_sponsored = true;
                 }
                 "reentrant" => {
                     has_reentrant = true;
@@ -851,7 +859,7 @@ impl SafetyChecker {
         }
     }
 
-    fn scan_expr_cross_calls(&mut self, expr: &Expr, span: Span) {
+    fn scan_expr_cross_calls(&mut self, expr: &Expr, _span: Span) {
         match expr {
             Expr::MacroCall(name, args, macro_span) => {
                 if name.name == "cross_call" {

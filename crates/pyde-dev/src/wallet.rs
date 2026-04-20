@@ -5,7 +5,7 @@ use aes_gcm::{
 use pyde_crypto::falcon::{falcon_keygen, falcon_sign, FalconSecretKey, FalconPublicKey};
 use pyde_crypto::poseidon2::poseidon2_hash;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const WALLET_DIR: &str = ".pyde/wallets";
 const KEYSTORE_VERSION: u32 = 1;
@@ -23,6 +23,7 @@ pub struct Keystore {
 
 /// Decrypted wallet ready for signing.
 pub struct Wallet {
+    #[allow(dead_code)]
     pub name: String,
     pub address: [u8; 32],
     pub public_key: FalconPublicKey,
@@ -62,11 +63,12 @@ pub fn create(name: &str, password: &str) -> Result<Wallet, String> {
 }
 
 /// Import an existing secret key.
-pub fn import(name: &str, sk_hex: &str, password: &str) -> Result<Wallet, String> {
+#[allow(dead_code)]
+pub fn import(_name: &str, sk_hex: &str, _password: &str) -> Result<Wallet, String> {
     let sk_bytes = hex::decode(sk_hex.trim_start_matches("0x"))
         .map_err(|e| format!("invalid secret key hex: {}", e))?;
 
-    let sk = FalconSecretKey::from_bytes(&sk_bytes)
+    let _sk = FalconSecretKey::from_bytes(&sk_bytes)
         .ok_or("invalid FALCON-512 secret key (expected 1281 bytes)")?;
 
     // Derive public key by signing a test message and... we can't derive pk from sk directly.
@@ -295,6 +297,7 @@ pub fn prompt_password(prompt: &str) -> Result<String, String> {
 
 /// Load a wallet by name, prompt for password, return the address hex.
 /// Used by deploy/script/console when --wallet is specified.
+#[allow(dead_code)]
 pub fn resolve_wallet_address(name: &str) -> Result<String, String> {
     let password = prompt_password("  Enter wallet password: ")?;
     let w = load(name, &password)?;

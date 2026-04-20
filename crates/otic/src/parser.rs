@@ -289,7 +289,7 @@ impl Parser {
         Ok(ModuleDef { name, span: start })
     }
 
-    fn parse_contract(&mut self, attrs: Vec<Attribute>) -> Result<ContractDef, ()> {
+    fn parse_contract(&mut self, _attrs: Vec<Attribute>) -> Result<ContractDef, ()> {
         let start = self.peek_span();
         self.expect(&TokenKind::Contract)?;
         let name = self.expect_ident()?;
@@ -1193,7 +1193,7 @@ impl Parser {
     /// vs a block (`{ stmt; ... }`)? Look ahead for `ident :`.
     fn looks_like_struct_init(&self) -> bool {
         // Look at tokens after `{`: if we see `ident :` it's struct init
-        let mut i = self.pos + 1; // skip the `{`
+        let i = self.pos + 1; // skip the `{`
         if let Some(tok) = self.tokens.get(i) {
             if matches!(tok.kind, TokenKind::Ident(_)) {
                 if let Some(next) = self.tokens.get(i + 1) {
@@ -1335,7 +1335,7 @@ impl Parser {
                 // Check for range pattern: `100..200`
                 if self.at(&TokenKind::DotDot) {
                     self.advance(); // eat ..
-                    let end_span = self.peek_span();
+                    let _end_span = self.peek_span();
                     match self.peek().clone() {
                         TokenKind::IntLiteral(end_v) => {
                             self.advance();

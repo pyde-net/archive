@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(vs.height, 3);
 
         // Undo 2 blocks
-        let root = vs.undo_blocks(2).unwrap().unwrap();
+        let _root = vs.undo_blocks(2).unwrap().unwrap();
         assert_eq!(vs.height, 1);
         assert_eq!(vs.get(&k1), Some(b"a".to_vec()));
         assert_eq!(vs.get(&k2), None);

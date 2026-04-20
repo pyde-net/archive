@@ -272,7 +272,7 @@ mod tests {
     use super::*;
     use crate::types::{AccessEntry, FeePayer, TransactionType};
     use pyde_account::address::{derive_eoa_address, ZERO_ADDRESS};
-    use pyde_account::types::{Account, AuthKeys};
+    use pyde_account::types::Account;
     use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
 
     fn make_valid_tx_and_account() -> (Transaction, Account, NonceState) {
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn nonce_outside_window_rejected() {
-        let (mut tx, account, nonce) = make_valid_tx_and_account();
+        let (mut tx, _account, nonce) = make_valid_tx_and_account();
         tx.nonce = 100; // way outside [0, 15]
         // Re-sign with correct hash
         let (pk, sk) = falcon_keygen().unwrap();
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn future_deadline_passes() {
-        let (tx, account, nonce) = make_valid_tx_and_account();
+        let (tx, _account, _nonce) = make_valid_tx_and_account();
         let mut tx = tx;
         // Need to re-sign with deadline
         let (pk, sk) = falcon_keygen().unwrap();
@@ -497,7 +497,7 @@ mod tests {
 
     #[test]
     fn gas_limit_too_low_rejected() {
-        let (mut tx, account, nonce) = make_valid_tx_and_account();
+        let (mut tx, _account, _nonce) = make_valid_tx_and_account();
         tx.gas_limit = 1_000; // below 21,000 minimum
         let ctx = default_ctx();
         // Skip sig check — gas limit is checked before execution

@@ -9,7 +9,7 @@ use ethnum::U256;
 
 use crate::ast;
 use crate::ast::*;
-use crate::ir::{self, IrProgram, IrFunction, BasicBlock, Label, Reg, Inst, IrConst, BinOp, UnOp, CmpOp, BuiltinOp, StorageFieldDef};
+use crate::ir::{self, IrProgram, IrFunction, Label, Reg, Inst, IrConst, BinOp, UnOp, CmpOp, BuiltinOp, StorageFieldDef};
 use crate::types::Ty;
 
 /// Lower a source file into an IR program.

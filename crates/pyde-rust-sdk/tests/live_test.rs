@@ -52,17 +52,19 @@ async fn g01_provider_basics() {
     assert!(fee.gas_price > 0);
     assert!(fee.base_fee > 0);
 
-    // getBlockByNumber — try recent blocks (RPC may error on missing slots)
+    // getBlockByNumber — try recent blocks (RPC may error on missing slots).
+    // Result is not asserted: in-memory nodes may only retain a recent window,
+    // so a "no block found" result is valid. We're just exercising the RPC
+    // path. The meaningful assertion is that `get_block_number` itself
+    // returned a positive slot (checked below).
     let current = p.get_block_number().await.unwrap();
-    let mut found_block = false;
     for slot in (1..=current).rev().take(10) {
         match p.get_block_by_number(slot).await {
-            Ok(Some(_)) => { found_block = true; break; }
+            Ok(Some(_)) => break,
             Ok(None) => continue,
             Err(_) => continue, // block not stored in memory
         }
     }
-    // Block store may be empty for in-memory nodes that only store recent blocks
     assert!(current > 0, "node should have produced blocks (block_number={})", current);
 
     println!("[PASS] Group 1: Provider Basics (7/7)");

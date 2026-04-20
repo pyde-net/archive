@@ -3,9 +3,9 @@
 //! and diverse workloads. Measures real TPS across the entire pipeline.
 
 use pyde_account::address::derive_eoa_address;
-use pyde_consensus::block::{BlockHeader, QuorumCert, quorum_for_committee};
-use pyde_consensus::hotstuff::{ConsensusState, ConsensusMessage, create_vote, verify_vote, try_form_qc};
-use pyde_crypto::falcon::{falcon_keygen, falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey};
+use pyde_consensus::block::{BlockHeader, QuorumCert};
+use pyde_consensus::hotstuff::{ConsensusState, create_vote, verify_vote, try_form_qc};
+use pyde_crypto::falcon::{falcon_keygen, falcon_sign, FalconPublicKey, FalconSecretKey};
 use pyde_crypto::poseidon2::poseidon2_hash;
 use pyde_state::smt::{PersistentSMT, StateAccess, StateOverlay};
 use pyde_tx::parallel::schedule;
@@ -45,6 +45,7 @@ fn compile_single(source: &str) -> Vec<u8> {
 
 /// Compile multi-contract file, return deploy data for the LAST contract
 /// (the one that references earlier contracts via deploy!/at()).
+#[allow(dead_code)]
 fn compile_last(source: &str) -> Vec<u8> {
     let compiled = otic::compile_all(source);
     let (_, c) = compiled.last().unwrap();
@@ -118,6 +119,7 @@ fn sign_tx(tx: &mut Transaction, sk: &FalconSecretKey) {
     tx.signature = falcon_sign(sk, &hash).unwrap().as_bytes().to_vec();
 }
 
+#[allow(dead_code)]
 fn deploy_and_get_addr(
     tx: &Transaction,
     smt: &mut dyn StateAccess,

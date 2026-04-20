@@ -1,7 +1,6 @@
 //! Comprehensive throughput benchmark — measures REAL TPS with diverse workloads.
 
 use pyde_account::address::derive_eoa_address;
-use pyde_crypto::falcon::falcon_keygen;
 use pyde_tx::parallel::schedule;
 use pyde_tx::pipeline::{execute_transaction, BlockContext};
 use pyde_tx::types::*;
@@ -24,7 +23,7 @@ fn fund_account(smt: &mut pyde_state::smt::PydeSMT, idx: u64) -> ([u8; 32], u64)
     let mut pk_bytes = vec![0u8; 897];
     pk_bytes[..8].copy_from_slice(&seed);
     let address = derive_eoa_address(&pk_bytes);
-    let mut account = pyde_account::types::Account {
+    let account = pyde_account::types::Account {
         address, nonce: 0, balance: 1_000_000_000_000_000,
         code_hash: sparse_merkle_tree::H256::zero(),
         storage_root: sparse_merkle_tree::H256::zero(),
@@ -243,8 +242,6 @@ fn benchmark_throughput() {
 #[ignore = "benchmark — run with --ignored"]
 fn benchmark_realistic_block() {
     use pyde_state::smt::PersistentSMT;
-    use rayon::prelude::*;
-    use pyde_state::smt::{StateAccess, StateOverlay};
 
     let dir = std::env::temp_dir().join(format!("pyde-bench-realistic-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -454,7 +451,7 @@ fn benchmark_production_block() {
     use pyde_state::smt::StateOverlay;
     use pyde_tx::pipeline::execute_transaction_aot;
     use rayon::prelude::*;
-    use std::sync::Arc;
+    
 
     let dir = std::env::temp_dir().join("pyde-bench-production");
     let _ = std::fs::remove_dir_all(&dir);
@@ -482,9 +479,14 @@ fn benchmark_production_block() {
             gas_tank: 0, key_nonce: 0,
         };
         let key = pyde_state::keys::balance_key(&address);
-        &mut persistent.insert(key, account.to_bytes()).unwrap();
+        persistent.insert(key, account.to_bytes()).unwrap();
         let nonce_key = pyde_state::keys::nonce_key(&address);
-        &mut persistent.insert(nonce_key, pyde_account::nonce::NonceState::new().to_bytes().to_vec()).unwrap();
+        persistent
+            .insert(
+                nonce_key,
+                pyde_account::nonce::NonceState::new().to_bytes().to_vec(),
+            )
+            .unwrap();
         accounts.push((address, 0));
     }
 

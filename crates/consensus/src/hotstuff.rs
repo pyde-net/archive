@@ -8,10 +8,9 @@
 //! Pipelined: certify for slot N overlaps with propose for slot N+1.
 //! Finality: block finalized when referenced by 2 consecutive QCs.
 
-use crate::block::{BlockHeader, QuorumCert, COMMITTEE_SIZE, QUORUM_THRESHOLD, quorum_for_committee};
+use crate::block::{BlockHeader, QuorumCert, quorum_for_committee};
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{falcon_verify, FalconPublicKey, FalconSignature};
-use pyde_crypto::poseidon2::poseidon2_hash;
 
 /// Canonical message bytes that both proposers and voters sign for a
 /// block at a given slot: `slot_le || block_hash`.

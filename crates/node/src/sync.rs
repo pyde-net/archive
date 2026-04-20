@@ -11,7 +11,7 @@ use crate::block_processor::BlockProcessor;
 use crate::block_store::BlockStore;
 use crate::chain::ChainState;
 use crate::state_manager::StateManager;
-use libp2p::request_response::{self, OutboundRequestId, ResponseChannel};
+use libp2p::request_response::OutboundRequestId;
 use libp2p::{PeerId, Swarm};
 use pyde_net::node::PydeBehaviour;
 use pyde_net::sync::SyncManager;
@@ -67,6 +67,7 @@ impl ChainSync {
     }
 
     /// Called when we learn a peer's chain tip (from ChainTip response or identify).
+    #[allow(dead_code)]
     pub fn on_peer_tip(&mut self, peer: PeerId, tip_slot: u64) {
         let old_tip = self.manager.network_tip;
         self.manager.update_network_tip(tip_slot);
@@ -153,6 +154,7 @@ impl ChainSync {
 
     /// Request a state snapshot from a peer (for fast sync when far behind).
     /// Uses chunked transfer for production, falls back to bulk for small states.
+    #[allow(dead_code)]
     pub fn request_state_snapshot(
         &mut self,
         swarm: &mut Swarm<PydeBehaviour>,
@@ -196,6 +198,7 @@ impl ChainSync {
     }
 
     /// Threshold: if behind by more than this many slots, use snapshot sync.
+    #[allow(dead_code)]
     pub const SNAPSHOT_THRESHOLD: u64 = 1000;
 
     /// Handle a sync response from a peer.

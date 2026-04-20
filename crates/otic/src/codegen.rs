@@ -81,12 +81,14 @@ pub struct CompiledContract {
 /// Spill event: the CodeGen must emit Store/Load for register pressure.
 enum SpillAction {
     /// Store this physical register to spill slot before reusing it.
+    #[allow(dead_code)]
     Save(u8, u32), // (physical_reg, spill_slot_offset)
 }
 
 /// Restore event: the CodeGen must emit Load to bring a spilled value back.
 enum RestoreAction {
     /// Load from spill slot into this physical register.
+    #[allow(dead_code)]
     Restore(u8, u32), // (physical_reg, spill_slot_offset)
 }
 
@@ -205,6 +207,7 @@ impl RegAlloc {
     }
 
     /// Get the physical register (backward compat — panics on spill).
+    #[allow(dead_code)]
     fn get(&self, vreg: Reg) -> u8 {
         *self.mapping.get(&vreg).unwrap_or(&0)
     }
@@ -1043,10 +1046,6 @@ impl CodeGen {
                         self.emit_op(Opcode::Add, 12, 12, 15);
                     }
                     IrConst::Unit => {}
-                    _ => {
-                        let rd = self.alloc_gp(*dst);
-                        self.emit_op(Opcode::Addi, rd, 0, 0);
-                    }
                 }
             }
 
@@ -1270,7 +1269,7 @@ impl CodeGen {
                 let key_ty = map_key_type(&map_ty);
                 let val_ty = map_value_type(&map_ty);
                 let key_wide = is_wide_type(&key_ty);
-                let wide_value = is_wide_type(&val_ty);
+                let _wide_value = is_wide_type(&val_ty);
 
                 let rk = self.get_reg(*key);
                 self.emit_map_key_derivation(slot, rk, key_wide);
@@ -1584,7 +1583,7 @@ impl CodeGen {
                 self.emit_store(15, 12, 24);
 
                 // Topics 1-3: indexed fields (stored as 32-byte LE values)
-                for (i, (freg, ty, _)) in indexed_fields.iter().enumerate() {
+                for (i, (freg, _ty, _)) in indexed_fields.iter().enumerate() {
                     if i >= 3 { break; }
                     let topic_offset = (1 + i) * 32;
                     if self.regs.is_wide(*freg) {
@@ -3506,6 +3505,7 @@ fn map_key_type(ty: &Ty) -> Ty {
 }
 
 /// Compute byte size of a struct field.
+#[allow(dead_code)]
 fn field_byte_size(ty: &Ty) -> u32 {
     if is_wide_type(ty) {
         memory::WIDE_SIZE
@@ -3544,7 +3544,7 @@ fn serialized_elem_size(ty: &Ty) -> Option<u32> {
 /// Used by emit_flatten/emit_unflatten to decide between bulk Memcpy (fixed) and
 /// per-element loop (variable). Unlike `serialized_elem_size`, this correctly
 /// returns `Some(N*8)` for all-fixed-field structs (enabling bulk copy for Vec<Struct>).
-fn flat_elem_size(ty: &Ty, struct_defs: &HashMap<String, Vec<(String, Ty)>>) -> Option<u32> {
+fn flat_elem_size(ty: &Ty, _struct_defs: &HashMap<String, Vec<(String, Ty)>>) -> Option<u32> {
     match ty {
         Ty::U8
         | Ty::U16
@@ -4876,7 +4876,7 @@ mod tests {
     #[test]
     fn pvm_dispatch_with_calldata() {
         // Test the full dispatch path: selector matching + calldata decode
-        let compiled = compile(
+        let _compiled = compile(
             r#"
             contract T {
                 pub fn add(a: u64, b: u64) -> u64 {
@@ -5895,7 +5895,7 @@ mod tests {
         };
 
         // Helper: create a lazy backend from SMT
-        let load_from_smt = |smt: &pyde_state::smt::PydeSMT,
+        let _load_from_smt = |smt: &pyde_state::smt::PydeSMT,
                              storage: &mut std::collections::HashMap<ethnum::U256, Vec<u8>>,
                              keys: &[ethnum::U256]| {
             for key in keys {

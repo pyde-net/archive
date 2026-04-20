@@ -92,6 +92,7 @@ pub struct Symbol {
 #[derive(Clone, Debug)]
 struct Scope {
     symbols: HashMap<String, Symbol>,
+    #[allow(dead_code)]
     kind: ScopeKind,
 }
 
@@ -854,7 +855,7 @@ impl Resolver {
                 }
             }
 
-            Expr::Path(segments, span) => {
+            Expr::Path(segments, _span) => {
                 // First segment should be a known name
                 if let Some(first) = segments.first() {
                     if self.lookup(&first.name).is_none()
@@ -877,7 +878,7 @@ impl Resolver {
                 }
             }
 
-            Expr::MacroCall(name, args, span) => {
+            Expr::MacroCall(name, args, _span) => {
                 // Built-in macros: require!, revert!, cross_call!, raw_call!
                 let known_macros = ["require", "revert", "assert", "cross_call", "raw_call", "create", "deploy"];
                 if !known_macros.contains(&name.name.as_str()) {
@@ -894,7 +895,7 @@ impl Resolver {
                 }
             }
 
-            Expr::StructInit(name_segments, fields, span) => {
+            Expr::StructInit(name_segments, fields, _span) => {
                 // Verify the struct/error name exists
                 if let Some(first) = name_segments.first() {
                     if !self.is_type_defined(&first.name)
@@ -964,7 +965,7 @@ impl Resolver {
 
     fn resolve_pattern(&mut self, pattern: &Pattern) {
         match pattern {
-            Pattern::Path(segments, span) => {
+            Pattern::Path(segments, _span) => {
                 // Verify enum variant path exists (e.g., Status::Active)
                 if segments.len() >= 2 {
                     let qualified = segments.iter()
