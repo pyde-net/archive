@@ -146,11 +146,17 @@ mod tests {
         }
     }
 
+    // Each test uses a `tempfile::tempdir()` instead of a shared path
+    // under `std::env::temp_dir()`. The prior `pyde-bstore-N` paths
+    // collided between concurrent `cargo test --workspace` invocations
+    // (e.g. two CI jobs, or one job plus a developer's local run),
+    // producing flaky assertion failures as tests observed each other's
+    // state through the shared RocksDB directory.
+
     #[test]
     fn store_and_load_header() {
-        let dir = std::env::temp_dir().join("pyde-bstore-1");
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = BlockStore::open(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
 
         let header = dummy_header(5);
         store.put_header(&header).unwrap();
@@ -162,9 +168,8 @@ mod tests {
 
     #[test]
     fn lookup_by_hash() {
-        let dir = std::env::temp_dir().join("pyde-bstore-2");
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = BlockStore::open(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
 
         let header = dummy_header(10);
         let hash = header.hash();
@@ -176,9 +181,8 @@ mod tests {
 
     #[test]
     fn missing_returns_none() {
-        let dir = std::env::temp_dir().join("pyde-bstore-3");
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = BlockStore::open(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
 
         assert!(store.get_header(999).is_none());
         assert!(store.get_header_by_hash(&[0xFF; 32]).is_none());
@@ -186,9 +190,8 @@ mod tests {
 
     #[test]
     fn head_persistence() {
-        let dir = std::env::temp_dir().join("pyde-bstore-4");
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = BlockStore::open(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
 
         assert_eq!(store.get_head(), 0);
         store.put_head(42).unwrap();

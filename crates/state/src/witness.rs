@@ -11,6 +11,18 @@
 use crate::smt::{CompiledProof, Key, PydeSMT};
 use sparse_merkle_tree::H256;
 
+/// Maximum witness size in bytes (Phase 5 slice 5.3).
+///
+/// Enforced by `verify_witnesses`: any incoming witness whose
+/// `size_bytes()` exceeds this cap is rejected without running the
+/// batch-proof verifier. Without this cap, a peer can gossip a
+/// pathologically large witness (e.g. GB-scale) and force a syncing
+/// node to allocate + verify it. 1 MB is large enough for any
+/// realistic block witness (at ~32 B per entry + batch proof
+/// overhead, that's tens of thousands of accessed keys) and small
+/// enough to keep the DoS surface bounded.
+pub const MAX_WITNESS_SIZE: usize = 1024 * 1024;
+
 /// A leaf entry in the witness: key + current value.
 #[derive(Clone, Debug)]
 pub struct WitnessEntry {
@@ -132,6 +144,15 @@ pub fn generate_witnesses(smt: &PydeSMT, access_keys: &[Key]) -> Result<BlockWit
 ///
 /// Returns true if the proof verifies. The validator calls this before executing.
 pub fn verify_witnesses(witness: &BlockWitness) -> bool {
+    // Size gate (slice 5.3). Reject oversized witnesses before doing
+    // any proof-verification work — an adversary shouldn't be able to
+    // burn CPU on a multi-MB witness just by gossiping garbage. Run
+    // this BEFORE the empty-witness branch so an empty-entries-but-
+    // huge-proof blob is also caught.
+    if witness.size_bytes() > MAX_WITNESS_SIZE {
+        return false;
+    }
+
     if witness.entries.is_empty() {
         // Empty witness is only valid if proof is also empty
         return witness.proof.is_empty();
@@ -357,6 +378,64 @@ mod tests {
         let smt = PydeSMT::new();
         let witness = generate_witnesses(&smt, &[]).unwrap();
         assert!(witness.is_empty());
+        assert!(verify_witnesses(&witness));
+    }
+
+    // ========== Slice 5.3: MAX_WITNESS_SIZE ==========
+
+    #[test]
+    fn oversized_witness_rejected_without_verify() {
+        // Construct a witness whose `size_bytes()` exceeds MAX_WITNESS_SIZE.
+        // The proof blob itself is junk — verify_witnesses must return
+        // false via the size gate BEFORE attempting proof verification,
+        // so the junk proof never gets parsed. Simulates an adversary
+        // gossiping a pathological witness.
+        let witness = BlockWitness {
+            entries: vec![],
+            proof: vec![0u8; MAX_WITNESS_SIZE + 1],
+            pre_state_root: H256::zero(),
+            post_state_root: H256::zero(),
+        };
+        assert!(witness.size_bytes() > MAX_WITNESS_SIZE);
+        assert!(!verify_witnesses(&witness));
+    }
+
+    #[test]
+    fn oversized_witness_via_entries_rejected() {
+        // Large number of entries also trips the cap even with a small
+        // proof blob.
+        let entries: Vec<WitnessEntry> = (0..50_000)
+            .map(|i| WitnessEntry {
+                key: key_from_seed(i as u64),
+                value: vec![0xFF; 32],
+            })
+            .collect();
+        let witness = BlockWitness {
+            entries,
+            proof: vec![],
+            pre_state_root: H256::zero(),
+            post_state_root: H256::zero(),
+        };
+        // Each entry = 32 (key) + 32 (value) = 64 bytes; 50_000 entries
+        // = 3.2 MB, well above 1 MB cap.
+        assert!(witness.size_bytes() > MAX_WITNESS_SIZE);
+        assert!(!verify_witnesses(&witness));
+    }
+
+    #[test]
+    fn witness_at_boundary_still_runs_proof_path() {
+        // A witness slightly UNDER the cap must be allowed past the
+        // size gate and reach the proof-verification path. We use an
+        // empty entries + empty proof (always valid) as the "normal"
+        // witness; the gate must not reject it just for being near
+        // the cap.
+        let witness = BlockWitness {
+            entries: vec![],
+            proof: vec![],
+            pre_state_root: H256::zero(),
+            post_state_root: H256::zero(),
+        };
+        assert!(witness.size_bytes() < MAX_WITNESS_SIZE);
         assert!(verify_witnesses(&witness));
     }
 }

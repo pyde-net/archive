@@ -736,9 +736,14 @@ mod tests {
 
         assert_eq!(sched.total_txs, 10_000);
         assert_eq!(sched.group_count(), 100); // 100 hot keys → 100 groups
+        // Sanity floor for scheduler complexity — 200 ms is deliberately
+        // loose because this runs in a debug build under contention with
+        // the rest of `cargo test --workspace`. A regression to O(n²)
+        // would take seconds, which this catches; tighter timings belong
+        // in `cargo bench`, not in the regression suite.
         assert!(
-            elapsed.as_millis() < 50,
-            "10K scheduling took {}ms, must be <50ms",
+            elapsed.as_millis() < 200,
+            "10K scheduling took {}ms, must be <200ms (expected ~few ms under release)",
             elapsed.as_millis()
         );
     }
