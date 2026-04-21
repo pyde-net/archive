@@ -11,7 +11,10 @@ pub struct ProviderOptions {
 
 impl Default for ProviderOptions {
     fn default() -> Self {
-        Self { timeout: std::time::Duration::from_secs(30), retries: 0 }
+        Self {
+            timeout: std::time::Duration::from_secs(30),
+            retries: 0,
+        }
     }
 }
 
@@ -33,7 +36,12 @@ impl Provider {
             .timeout(options.timeout)
             .build()
             .unwrap_or_default();
-        Self { rpc_url: rpc_url.to_string(), client, retries: options.retries, cached_chain_id: std::sync::Mutex::new(None) }
+        Self {
+            rpc_url: rpc_url.to_string(),
+            client,
+            retries: options.retries,
+            cached_chain_id: std::sync::Mutex::new(None),
+        }
     }
 
     // ========================================================================
@@ -41,17 +49,26 @@ impl Provider {
     // ========================================================================
 
     pub async fn get_balance(&self, addr: &Address) -> Result<u128> {
-        let result = self.rpc("pyde_getBalance", &[json_str(&format_address(addr))]).await?;
+        let result = self
+            .rpc("pyde_getBalance", &[json_str(&format_address(addr))])
+            .await?;
         parse_u128_str(&result)
     }
 
     pub async fn get_nonce(&self, addr: &Address) -> Result<u64> {
-        let result = self.rpc("pyde_getTransactionCount", &[json_str(&format_address(addr))]).await?;
+        let result = self
+            .rpc(
+                "pyde_getTransactionCount",
+                &[json_str(&format_address(addr))],
+            )
+            .await?;
         parse_u64_str(&result)
     }
 
     pub async fn get_code(&self, addr: &Address) -> Result<Vec<u8>> {
-        let result = self.rpc("pyde_getCode", &[json_str(&format_address(addr))]).await?;
+        let result = self
+            .rpc("pyde_getCode", &[json_str(&format_address(addr))])
+            .await?;
         let hex = result.as_str().unwrap_or("0x").trim_start_matches("0x");
         hex::decode(hex).map_err(|e| SdkError::InvalidResponse(format!("bad code hex: {}", e)))
     }
@@ -68,10 +85,7 @@ impl Provider {
 
     /// Fetch nonce and chainId in parallel (saves one round trip).
     pub async fn get_nonce_and_chain_id(&self, address: &Address) -> Result<(u64, u64)> {
-        let (nonce, chain_id) = tokio::join!(
-            self.get_nonce(address),
-            self.get_chain_id()
-        );
+        let (nonce, chain_id) = tokio::join!(self.get_nonce(address), self.get_chain_id());
         Ok((nonce?, chain_id?))
     }
 
@@ -86,18 +100,26 @@ impl Provider {
     }
 
     pub async fn get_storage_at(&self, addr: &Address, slot: u64) -> Result<Vec<u8>> {
-        let result = self.rpc("pyde_getStorageAt", &[
-            json_str(&format_address(addr)),
-            serde_json::Value::Number(slot.into()),
-        ]).await?;
+        let result = self
+            .rpc(
+                "pyde_getStorageAt",
+                &[
+                    json_str(&format_address(addr)),
+                    serde_json::Value::Number(slot.into()),
+                ],
+            )
+            .await?;
         let hex = result.as_str().unwrap_or("0x").trim_start_matches("0x");
         hex::decode(hex).map_err(|e| SdkError::InvalidResponse(format!("bad storage hex: {}", e)))
     }
 
     pub async fn get_block_by_number(&self, slot: u64) -> Result<Option<BlockHeader>> {
-        let result = self.rpc("pyde_getBlockByNumber", &[
-            serde_json::Value::Number(slot.into()),
-        ]).await?;
+        let result = self
+            .rpc(
+                "pyde_getBlockByNumber",
+                &[serde_json::Value::Number(slot.into())],
+            )
+            .await?;
         if result.is_null() {
             return Ok(None);
         }
@@ -115,7 +137,12 @@ impl Provider {
     }
 
     /// Static call with overrides (from, value, gas).
-    pub async fn call_with(&self, to: &Address, data: &[u8], overrides: Option<&CallOverrides>) -> Result<Vec<u8>> {
+    pub async fn call_with(
+        &self,
+        to: &Address,
+        data: &[u8],
+        overrides: Option<&CallOverrides>,
+    ) -> Result<Vec<u8>> {
         let mut params = serde_json::json!({
             "from": overrides.and_then(|o| o.from.as_ref()).map(format_address)
                 .unwrap_or_else(|| "0x".to_string() + &"00".repeat(32)),
@@ -123,8 +150,12 @@ impl Provider {
             "data": format!("0x{}", hex::encode(data)),
         });
         if let Some(o) = overrides {
-            if let Some(v) = o.value { params["value"] = serde_json::json!(format!("0x{:x}", v)); }
-            if let Some(g) = o.gas_limit { params["gas"] = serde_json::json!(format!("0x{:x}", g)); }
+            if let Some(v) = o.value {
+                params["value"] = serde_json::json!(format!("0x{:x}", v));
+            }
+            if let Some(g) = o.gas_limit {
+                params["gas"] = serde_json::json!(format!("0x{:x}", g));
+            }
         }
         let result = self.rpc("pyde_call", &[params]).await?;
         let hex = result.as_str().unwrap_or("0x").trim_start_matches("0x");
@@ -136,7 +167,12 @@ impl Provider {
     }
 
     /// Estimate gas with overrides (from, value, gas).
-    pub async fn estimate_gas_with(&self, to: &Address, data: &[u8], overrides: Option<&CallOverrides>) -> Result<u64> {
+    pub async fn estimate_gas_with(
+        &self,
+        to: &Address,
+        data: &[u8],
+        overrides: Option<&CallOverrides>,
+    ) -> Result<u64> {
         let mut params = serde_json::json!({
             "from": overrides.and_then(|o| o.from.as_ref()).map(format_address)
                 .unwrap_or_else(|| "0x".to_string() + &"00".repeat(32)),
@@ -144,8 +180,12 @@ impl Provider {
             "data": format!("0x{}", hex::encode(data)),
         });
         if let Some(o) = overrides {
-            if let Some(v) = o.value { params["value"] = serde_json::json!(format!("0x{:x}", v)); }
-            if let Some(g) = o.gas_limit { params["gas"] = serde_json::json!(format!("0x{:x}", g)); }
+            if let Some(v) = o.value {
+                params["value"] = serde_json::json!(format!("0x{:x}", v));
+            }
+            if let Some(g) = o.gas_limit {
+                params["gas"] = serde_json::json!(format!("0x{:x}", g));
+            }
         }
         let result = self.rpc("pyde_estimateGas", &[params]).await?;
         parse_hex_u64(&result)
@@ -164,29 +204,48 @@ impl Provider {
             "to": format_address(to),
             "data": format!("0x{}", hex::encode(data)),
         });
-        if let Some(f) = from { params["from"] = serde_json::json!(format_address(f)); }
-        if let Some(v) = value { params["value"] = serde_json::json!(format!("0x{:x}", v)); }
+        if let Some(f) = from {
+            params["from"] = serde_json::json!(format_address(f));
+        }
+        if let Some(v) = value {
+            params["value"] = serde_json::json!(format!("0x{:x}", v));
+        }
 
         let result = self.rpc("pyde_createAccessList", &[params]).await?;
-        let entries = result.get("accessList").and_then(|a| a.as_array())
+        let entries = result
+            .get("accessList")
+            .and_then(|a| a.as_array())
             .ok_or_else(|| SdkError::InvalidResponse("missing accessList".into()))?;
 
         let mut access_list = Vec::new();
         for entry in entries {
             let addr_hex = entry.get("address").and_then(|v| v.as_str()).unwrap_or("");
-            let addr_bytes = hex::decode(addr_hex.strip_prefix("0x").unwrap_or(addr_hex))
-                .unwrap_or_default();
+            let addr_bytes =
+                hex::decode(addr_hex.strip_prefix("0x").unwrap_or(addr_hex)).unwrap_or_default();
             let mut address = [0u8; 32];
-            if addr_bytes.len() == 32 { address.copy_from_slice(&addr_bytes); }
+            if addr_bytes.len() == 32 {
+                address.copy_from_slice(&addr_bytes);
+            }
 
             let parse_keys = |field: &str| -> Vec<[u8; 32]> {
-                entry.get(field).and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|k| {
-                        let h = k.as_str().unwrap_or("").strip_prefix("0x").unwrap_or("");
-                        let b = hex::decode(h).ok()?;
-                        if b.len() == 32 { let mut k = [0u8; 32]; k.copy_from_slice(&b); Some(k) }
-                        else { None }
-                    }).collect())
+                entry
+                    .get(field)
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|k| {
+                                let h = k.as_str().unwrap_or("").strip_prefix("0x").unwrap_or("");
+                                let b = hex::decode(h).ok()?;
+                                if b.len() == 32 {
+                                    let mut k = [0u8; 32];
+                                    k.copy_from_slice(&b);
+                                    Some(k)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default()
             };
 
@@ -201,16 +260,26 @@ impl Provider {
 
     /// Look up a transaction by its hash. Returns None if not found.
     pub async fn get_transaction(&self, tx_hash: &[u8; 32]) -> Result<Option<serde_json::Value>> {
-        let result = self.rpc("pyde_getTransactionByHash", &[
-            json_str(&format!("0x{}", hex::encode(tx_hash))),
-        ]).await?;
-        if result.is_null() { Ok(None) } else { Ok(Some(result)) }
+        let result = self
+            .rpc(
+                "pyde_getTransactionByHash",
+                &[json_str(&format!("0x{}", hex::encode(tx_hash)))],
+            )
+            .await?;
+        if result.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
     }
 
     /// Get current fee data (base fee = gas price in Pyde's EIP-1559 model).
     pub async fn get_fee_data(&self) -> Result<FeeData> {
         let gas_price = self.get_gas_price().await?;
-        Ok(FeeData { gas_price, base_fee: gas_price })
+        Ok(FeeData {
+            gas_price,
+            base_fee: gas_price,
+        })
     }
 
     // ========================================================================
@@ -220,11 +289,17 @@ impl Provider {
     /// Send a signed transaction. Returns a TransactionResponse with hash and wait().
     pub async fn send_transaction(&self, tx: &Transaction) -> Result<TransactionResponse<'_>> {
         let tx_bytes = tx.to_bytes();
-        let result = self.rpc("pyde_sendRawTransaction", &[
-            json_str(&format!("0x{}", hex::encode(&tx_bytes))),
-        ]).await?;
+        let result = self
+            .rpc(
+                "pyde_sendRawTransaction",
+                &[json_str(&format!("0x{}", hex::encode(&tx_bytes)))],
+            )
+            .await?;
         let hash = parse_tx_hash(&result)?;
-        Ok(TransactionResponse { hash, provider: self })
+        Ok(TransactionResponse {
+            hash,
+            provider: self,
+        })
     }
 
     /// Send a signed transaction and wait for the receipt.
@@ -238,9 +313,12 @@ impl Provider {
     // ========================================================================
 
     pub async fn get_receipt(&self, tx_hash: &[u8; 32]) -> Result<Option<Receipt>> {
-        let result = self.rpc("pyde_getTransactionReceipt", &[
-            json_str(&format!("0x{}", hex::encode(tx_hash))),
-        ]).await?;
+        let result = self
+            .rpc(
+                "pyde_getTransactionReceipt",
+                &[json_str(&format!("0x{}", hex::encode(tx_hash)))],
+            )
+            .await?;
         if result.is_null() {
             return Ok(None);
         }
@@ -288,17 +366,25 @@ impl Provider {
     // ========================================================================
 
     /// Send multiple RPC calls in a single HTTP request.
-    pub async fn batch(&self, calls: &[(&str, &[serde_json::Value])]) -> Result<Vec<serde_json::Value>> {
-        let bodies: Vec<_> = calls.iter().enumerate().map(|(i, (method, params))| {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": i + 1,
-                "method": method,
-                "params": params,
+    pub async fn batch(
+        &self,
+        calls: &[(&str, &[serde_json::Value])],
+    ) -> Result<Vec<serde_json::Value>> {
+        let bodies: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (method, params))| {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": i + 1,
+                    "method": method,
+                    "params": params,
+                })
             })
-        }).collect();
+            .collect();
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&self.rpc_url)
             .json(&bodies)
             .send()
@@ -313,13 +399,16 @@ impl Provider {
         // Sort by id to match request order (JSON-RPC allows arbitrary response order)
         results.sort_by_key(|r| r.get("id").and_then(|v| v.as_u64()).unwrap_or(0));
 
-        results.into_iter().map(|r| {
-            if let Some(err) = r.get("error") {
-                Err(SdkError::Rpc(err.to_string()))
-            } else {
-                Ok(r.get("result").cloned().unwrap_or(serde_json::Value::Null))
-            }
-        }).collect()
+        results
+            .into_iter()
+            .map(|r| {
+                if let Some(err) = r.get("error") {
+                    Err(SdkError::Rpc(err.to_string()))
+                } else {
+                    Ok(r.get("result").cloned().unwrap_or(serde_json::Value::Null))
+                }
+            })
+            .collect()
     }
 
     // ========================================================================
@@ -341,7 +430,10 @@ impl Provider {
                 Err(e) => {
                     last_err = e;
                     if attempt < self.retries {
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1))).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            100 * (attempt as u64 + 1),
+                        ))
+                        .await;
                     }
                 }
             }
@@ -350,7 +442,8 @@ impl Provider {
     }
 
     async fn do_rpc(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
-        let resp = self.client
+        let resp = self
+            .client
             .post(&self.rpc_url)
             .json(body)
             .send()
@@ -366,7 +459,10 @@ impl Provider {
             return Err(SdkError::Rpc(err.to_string()));
         }
 
-        Ok(json.get("result").cloned().unwrap_or(serde_json::Value::Null))
+        Ok(json
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 }
 
@@ -431,14 +527,20 @@ fn parse_tx_hash(val: &serde_json::Value) -> Result<[u8; 32]> {
     // Response may be a JSON string containing a nested JSON object
     let s = val.as_str().unwrap_or("");
     let hash_hex = if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
-        inner.get("txHash").and_then(|v| v.as_str())
-            .unwrap_or(s).to_string()
+        inner
+            .get("txHash")
+            .and_then(|v| v.as_str())
+            .unwrap_or(s)
+            .to_string()
     } else {
         s.to_string()
     };
     let hex = hash_hex.trim_start_matches("0x");
     if hex.len() != 64 {
-        return Err(SdkError::InvalidResponse(format!("bad tx hash: {}", hash_hex)));
+        return Err(SdkError::InvalidResponse(format!(
+            "bad tx hash: {}",
+            hash_hex
+        )));
     }
     let bytes = hex::decode(hex)
         .map_err(|e| SdkError::InvalidResponse(format!("bad tx hash hex: {}", e)))?;

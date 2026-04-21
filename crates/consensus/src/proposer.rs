@@ -20,8 +20,8 @@
 
 use pyde_account::address::Address;
 use pyde_crypto::falcon::FalconPublicKey;
-use pyde_crypto::vrf::{vrf_prove, vrf_verify, VrfOutput, VrfProof};
 use pyde_crypto::falcon::FalconSecretKey;
+use pyde_crypto::vrf::{vrf_prove, vrf_verify, VrfOutput, VrfProof};
 
 /// Build the VRF input for a given slot: epoch_randomness || slot_bytes.
 fn vrf_input(epoch_randomness: &[u8; 32], slot: u64) -> Vec<u8> {
@@ -196,7 +196,12 @@ mod tests {
         let (candidate, _pk_bytes) = make_candidate(100, &[0xAA; 32]);
         let (pk2, _sk2) = falcon_keygen().unwrap();
         // Verify with wrong public key
-        assert!(!verify_candidacy(&candidate, pk2.as_bytes(), &[0xAA; 32], 100));
+        assert!(!verify_candidacy(
+            &candidate,
+            pk2.as_bytes(),
+            &[0xAA; 32],
+            100
+        ));
     }
 
     #[test]

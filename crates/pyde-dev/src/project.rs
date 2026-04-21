@@ -31,7 +31,6 @@ pub struct TestSection {
     pub verbosity: u8,
 }
 
-
 #[derive(Deserialize, Serialize, Debug)]
 pub struct ProjectSection {
     pub name: String,
@@ -145,19 +144,23 @@ pub fn resolve_artifact(
         if p.exists() {
             return Ok((p, name));
         }
-        return Err(format!("artifact not found: {} (run `pyde-dev build` first)", p.display()));
+        return Err(format!(
+            "artifact not found: {} (run `pyde-dev build` first)",
+            p.display()
+        ));
     }
 
     // Auto-detect: find .json artifacts in out/ (skip cache)
-    let mut artifacts: Vec<std::path::PathBuf> = glob::glob(&format!("{}/*.json", out_dir.display()))
-        .map_err(|e| format!("glob error: {}", e))?
-        .filter_map(|r| r.ok())
-        .filter(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy() != ".build-cache.json")
-                .unwrap_or(false)
-        })
-        .collect();
+    let mut artifacts: Vec<std::path::PathBuf> =
+        glob::glob(&format!("{}/*.json", out_dir.display()))
+            .map_err(|e| format!("glob error: {}", e))?
+            .filter_map(|r| r.ok())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy() != ".build-cache.json")
+                    .unwrap_or(false)
+            })
+            .collect();
 
     if artifacts.is_empty() {
         return Err("no compiled artifacts found — run `pyde-dev build` first".into());
@@ -173,7 +176,8 @@ pub fn resolve_artifact(
         ));
     }
     let path = artifacts.remove(0);
-    let name = path.file_stem()
+    let name = path
+        .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     Ok((path, name))
@@ -208,7 +212,9 @@ chain_id = 31337
 /// Falls back to default localhost if config can't be loaded.
 pub fn get_rpc_url(network: &str) -> Result<String, String> {
     let (config, _) = load_config()?;
-    let net = config.networks.get(network)
+    let net = config
+        .networks
+        .get(network)
         .ok_or_else(|| format!("network '{}' not found in pyde.toml", network))?;
     Ok(net.rpc_url.clone())
 }

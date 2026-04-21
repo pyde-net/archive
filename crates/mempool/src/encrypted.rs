@@ -11,9 +11,7 @@
 
 use pyde_account::address::Address;
 use pyde_crypto::poseidon2::poseidon2_hash;
-use pyde_crypto::threshold::{
-    self, DecryptionShare, ThresholdCiphertext, ThresholdPublicKey,
-};
+use pyde_crypto::threshold::{self, DecryptionShare, ThresholdCiphertext, ThresholdPublicKey};
 use pyde_tx::types::AccessEntry;
 
 /// Maximum transaction size (128 KB).
@@ -43,7 +41,6 @@ pub struct EncryptedTx {
     // === Encrypted fields (hidden) ===
     /// Threshold-encrypted payload: contains to, value, calldata.
     pub ciphertext: ThresholdCiphertext,
-
 }
 
 impl EncryptedTx {
@@ -75,20 +72,26 @@ impl EncryptedTx {
     pub fn to_bytes(&self) -> Vec<u8> {
         let ct_bytes = self.ciphertext.to_wire_bytes();
         let mut buf = Vec::new();
-        buf.extend_from_slice(&self.sender);                          // 32
-        buf.extend_from_slice(&self.nonce.to_le_bytes());             // 8
-        buf.extend_from_slice(&self.gas_limit.to_le_bytes());         // 8
-        buf.extend_from_slice(&self.chain_id.to_le_bytes());          // 8
-        buf.push(self.deadline.is_some() as u8);                      // 1
-        if let Some(d) = self.deadline { buf.extend_from_slice(&d.to_le_bytes()); }
+        buf.extend_from_slice(&self.sender); // 32
+        buf.extend_from_slice(&self.nonce.to_le_bytes()); // 8
+        buf.extend_from_slice(&self.gas_limit.to_le_bytes()); // 8
+        buf.extend_from_slice(&self.chain_id.to_le_bytes()); // 8
+        buf.push(self.deadline.is_some() as u8); // 1
+        if let Some(d) = self.deadline {
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
         // Access list
         buf.extend_from_slice(&(self.access_list.len() as u32).to_le_bytes());
         for entry in &self.access_list {
             buf.extend_from_slice(&entry.address);
             buf.extend_from_slice(&(entry.reads.len() as u16).to_le_bytes());
-            for r in &entry.reads { buf.extend_from_slice(r); }
+            for r in &entry.reads {
+                buf.extend_from_slice(r);
+            }
             buf.extend_from_slice(&(entry.writes.len() as u16).to_le_bytes());
-            for w in &entry.writes { buf.extend_from_slice(w); }
+            for w in &entry.writes {
+                buf.extend_from_slice(w);
+            }
         }
         // Signature
         buf.extend_from_slice(&(self.signature.len() as u32).to_le_bytes());
@@ -101,39 +104,80 @@ impl EncryptedTx {
 
     /// Deserialize from bytes.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 57 { return None; } // minimum: 32+8+8+8+1
+        if data.len() < 57 {
+            return None;
+        } // minimum: 32+8+8+8+1
         let mut off = 0;
         let mut sender = [0u8; 32];
-        sender.copy_from_slice(&data[off..off+32]); off += 32;
-        let nonce = u64::from_le_bytes(data[off..off+8].try_into().ok()?); off += 8;
-        let gas_limit = u64::from_le_bytes(data[off..off+8].try_into().ok()?); off += 8;
-        let chain_id = u64::from_le_bytes(data[off..off+8].try_into().ok()?); off += 8;
-        let has_deadline = data[off]; off += 1;
+        sender.copy_from_slice(&data[off..off + 32]);
+        off += 32;
+        let nonce = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
+        off += 8;
+        let gas_limit = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
+        off += 8;
+        let chain_id = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
+        off += 8;
+        let has_deadline = data[off];
+        off += 1;
         let deadline = if has_deadline != 0 {
-            let d = u64::from_le_bytes(data[off..off+8].try_into().ok()?); off += 8;
+            let d = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
+            off += 8;
             Some(d)
-        } else { None };
+        } else {
+            None
+        };
         // Access list
-        let al_count = u32::from_le_bytes(data[off..off+4].try_into().ok()?) as usize; off += 4;
+        let al_count = u32::from_le_bytes(data[off..off + 4].try_into().ok()?) as usize;
+        off += 4;
         let mut access_list = Vec::with_capacity(al_count);
         for _ in 0..al_count {
             let mut addr = [0u8; 32];
-            addr.copy_from_slice(&data[off..off+32]); off += 32;
-            let rc = u16::from_le_bytes(data[off..off+2].try_into().ok()?) as usize; off += 2;
+            addr.copy_from_slice(&data[off..off + 32]);
+            off += 32;
+            let rc = u16::from_le_bytes(data[off..off + 2].try_into().ok()?) as usize;
+            off += 2;
             let mut reads = Vec::with_capacity(rc);
-            for _ in 0..rc { let mut k=[0u8;32]; k.copy_from_slice(&data[off..off+32]); off+=32; reads.push(k); }
-            let wc = u16::from_le_bytes(data[off..off+2].try_into().ok()?) as usize; off += 2;
+            for _ in 0..rc {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&data[off..off + 32]);
+                off += 32;
+                reads.push(k);
+            }
+            let wc = u16::from_le_bytes(data[off..off + 2].try_into().ok()?) as usize;
+            off += 2;
             let mut writes = Vec::with_capacity(wc);
-            for _ in 0..wc { let mut k=[0u8;32]; k.copy_from_slice(&data[off..off+32]); off+=32; writes.push(k); }
-            access_list.push(pyde_tx::types::AccessEntry { address: addr, reads, writes });
+            for _ in 0..wc {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&data[off..off + 32]);
+                off += 32;
+                writes.push(k);
+            }
+            access_list.push(pyde_tx::types::AccessEntry {
+                address: addr,
+                reads,
+                writes,
+            });
         }
         // Signature
-        let sig_len = u32::from_le_bytes(data[off..off+4].try_into().ok()?) as usize; off += 4;
-        let signature = data[off..off+sig_len].to_vec(); off += sig_len;
+        let sig_len = u32::from_le_bytes(data[off..off + 4].try_into().ok()?) as usize;
+        off += 4;
+        let signature = data[off..off + sig_len].to_vec();
+        off += sig_len;
         // Ciphertext
-        let ct_len = u32::from_le_bytes(data[off..off+4].try_into().ok()?) as usize; off += 4;
-        let ciphertext = pyde_crypto::threshold::ThresholdCiphertext::from_wire_bytes(&data[off..off+ct_len])?;
-        Some(Self { sender, nonce, gas_limit, access_list, deadline, chain_id, signature, ciphertext })
+        let ct_len = u32::from_le_bytes(data[off..off + 4].try_into().ok()?) as usize;
+        off += 4;
+        let ciphertext =
+            pyde_crypto::threshold::ThresholdCiphertext::from_wire_bytes(&data[off..off + ct_len])?;
+        Some(Self {
+            sender,
+            nonce,
+            gas_limit,
+            access_list,
+            deadline,
+            chain_id,
+            signature,
+            ciphertext,
+        })
     }
 
     /// Check if the transaction has expired.
@@ -271,14 +315,25 @@ mod tests {
         let to = derive_eoa_address(b"recipient");
 
         let enc_tx = encrypt_transaction(
-            sender, 0, 21_000, vec![], None, 1, vec![], &to, 100, b"", &pk,
+            sender,
+            0,
+            21_000,
+            vec![],
+            None,
+            1,
+            vec![],
+            &to,
+            100,
+            b"",
+            &pk,
         )
         .unwrap();
 
         // Only 1 share (need 2)
-        let dec_shares = vec![
-            threshold::generate_decryption_share(&key_shares[0], &enc_tx.ciphertext),
-        ];
+        let dec_shares = vec![threshold::generate_decryption_share(
+            &key_shares[0],
+            &enc_tx.ciphertext,
+        )];
 
         assert!(decrypt_payload(&enc_tx.ciphertext, &dec_shares, 2).is_err());
     }
@@ -290,7 +345,17 @@ mod tests {
         let to = derive_eoa_address(b"recipient");
 
         let enc_tx = encrypt_transaction(
-            sender, 0, 21_000, vec![], None, 1, vec![], &to, 100, b"", &pk,
+            sender,
+            0,
+            21_000,
+            vec![],
+            None,
+            1,
+            vec![],
+            &to,
+            100,
+            b"",
+            &pk,
         )
         .unwrap();
 
@@ -304,7 +369,17 @@ mod tests {
         let to = derive_eoa_address(b"recipient");
 
         let enc_tx = encrypt_transaction(
-            sender, 0, 21_000, vec![], Some(100), 1, vec![], &to, 0, b"", &pk,
+            sender,
+            0,
+            21_000,
+            vec![],
+            Some(100),
+            1,
+            vec![],
+            &to,
+            0,
+            b"",
+            &pk,
         )
         .unwrap();
 
@@ -319,10 +394,9 @@ mod tests {
         let sender = derive_eoa_address(b"sender");
         let to = derive_eoa_address(b"recipient");
 
-        let enc_tx = encrypt_transaction(
-            sender, 0, 21_000, vec![], None, 1, vec![], &to, 0, b"", &pk,
-        )
-        .unwrap();
+        let enc_tx =
+            encrypt_transaction(sender, 0, 21_000, vec![], None, 1, vec![], &to, 0, b"", &pk)
+                .unwrap();
 
         assert!(!enc_tx.is_expired(u64::MAX));
     }
@@ -333,14 +407,23 @@ mod tests {
         let sender = derive_eoa_address(b"sender");
         let to = derive_eoa_address(b"recipient");
 
-        let small_tx = encrypt_transaction(
-            sender, 0, 21_000, vec![], None, 1, vec![], &to, 0, b"", &pk,
-        )
-        .unwrap();
+        let small_tx =
+            encrypt_transaction(sender, 0, 21_000, vec![], None, 1, vec![], &to, 0, b"", &pk)
+                .unwrap();
         assert!(!small_tx.is_oversized());
 
         let big_tx = encrypt_transaction(
-            sender, 0, 21_000, vec![], None, 1, vec![], &to, 0, &vec![0xFF; 200_000], &pk,
+            sender,
+            0,
+            21_000,
+            vec![],
+            None,
+            1,
+            vec![],
+            &to,
+            0,
+            &vec![0xFF; 200_000],
+            &pk,
         )
         .unwrap();
         assert!(big_tx.is_oversized());

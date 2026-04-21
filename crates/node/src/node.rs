@@ -1,8 +1,8 @@
 use crate::block_processor::BlockProcessor;
 use crate::block_store::BlockStore;
-use crate::consensus_store::ConsensusStateStore;
 use crate::chain::ChainState;
 use crate::config::NodeConfig;
+use crate::consensus_store::ConsensusStateStore;
 use crate::receipt_store::ReceiptStore;
 use crate::rpc::{self, RpcState};
 use crate::shutdown::ShutdownSignal;
@@ -10,7 +10,7 @@ use crate::slot_clock::SlotClock;
 use crate::state_manager::StateManager;
 use crate::sync::ChainSync;
 use crate::tx_relay::TxRelay;
-use crate::validator::{ValidatorEngine, ValidatorIdentity, verify_stake};
+use crate::validator::{verify_stake, ValidatorEngine, ValidatorIdentity};
 use crate::wire;
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub;
@@ -21,7 +21,8 @@ use libp2p::PeerId;
 use pyde_net::channels::Channel;
 use pyde_net::config::NetworkConfig;
 use pyde_net::node::{
-    create_node, generate_keypair, keypair_from_bytes, keypair_to_bytes, subscribe_topics, PydeBehaviourEvent,
+    create_node, generate_keypair, keypair_from_bytes, keypair_to_bytes, subscribe_topics,
+    PydeBehaviourEvent,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -110,14 +111,20 @@ impl PydeNode {
 
                 // Save devnet keys for SDK usage
                 let keys_path = datadir.join("devnet-keys.json");
-                let keys_json: Vec<serde_json::Value> = devnet_accounts.iter().map(|acc| {
-                    serde_json::json!({
-                        "address": acc.address_hex(),
-                        "privateKey": acc.private_key_hex(),
-                        "balance": acc.balance.to_string(),
+                let keys_json: Vec<serde_json::Value> = devnet_accounts
+                    .iter()
+                    .map(|acc| {
+                        serde_json::json!({
+                            "address": acc.address_hex(),
+                            "privateKey": acc.private_key_hex(),
+                            "balance": acc.balance.to_string(),
+                        })
                     })
-                }).collect();
-                let _ = std::fs::write(&keys_path, serde_json::to_string_pretty(&keys_json).unwrap_or_default());
+                    .collect();
+                let _ = std::fs::write(
+                    &keys_path,
+                    serde_json::to_string_pretty(&keys_json).unwrap_or_default(),
+                );
 
                 config
             };
@@ -125,17 +132,24 @@ impl PydeNode {
             // Auto-fund validator address with required stake for devnet
             if let Some(ref identity) = early_validator_identity {
                 let val_addr = hex::encode(identity.address);
-                let already_funded = genesis_config.allocations.iter()
+                let already_funded = genesis_config
+                    .allocations
+                    .iter()
                     .any(|a| a.address == val_addr);
                 if !already_funded {
-                    genesis_config.allocations.push(crate::genesis::GenesisAllocation {
-                        address: val_addr.clone(),
-                        balance: pyde_consensus::validator::VALIDATOR_STAKE.to_string(),
-                        public_key: Some(hex::encode(identity.public_key.as_bytes())),
-                        bucket: None,
-                        vesting: None,
-                    });
-                    info!(address = val_addr, "auto-funded validator in genesis with 10,000 PYDE");
+                    genesis_config
+                        .allocations
+                        .push(crate::genesis::GenesisAllocation {
+                            address: val_addr.clone(),
+                            balance: pyde_consensus::validator::VALIDATOR_STAKE.to_string(),
+                            public_key: Some(hex::encode(identity.public_key.as_bytes())),
+                            bucket: None,
+                            vesting: None,
+                        });
+                    info!(
+                        address = val_addr,
+                        "auto-funded validator in genesis with 10,000 PYDE"
+                    );
                 }
             }
 
@@ -195,20 +209,23 @@ impl PydeNode {
         // 3. Transaction relay / mempool + receipt store + pending tx queue
         let tx_relay = Arc::new(RwLock::new(TxRelay::new()));
         let receipts = Arc::new(RwLock::new(ReceiptStore::new()));
-        let pending_txs: Arc<RwLock<Vec<pyde_tx::types::Transaction>>> = Arc::new(RwLock::new(Vec::new()));
+        let pending_txs: Arc<RwLock<Vec<pyde_tx::types::Transaction>>> =
+            Arc::new(RwLock::new(Vec::new()));
 
         // Mempool tx index for compact block reconstruction: tx_hash → wire-encoded bytes
         let mempool_index: Arc<RwLock<std::collections::HashMap<[u8; 32], Vec<u8>>>> =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
 
         // Pending block decryptors: slot → BlockDecryptor (collecting shares for threshold decryption)
-        let pending_decryptors: Arc<RwLock<std::collections::HashMap<u64, pyde_mempool::decryption::BlockDecryptor>>> =
-            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let pending_decryptors: Arc<
+            RwLock<std::collections::HashMap<u64, pyde_mempool::decryption::BlockDecryptor>>,
+        > = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
         // Queued decryption shares that arrived before the BlockDecryptor was created.
         // When a decryptor is created for a slot, queued shares are replayed into it.
-        let queued_shares: Arc<RwLock<std::collections::HashMap<u64, Vec<wire::DecryptionShareMsg>>>> =
-            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let queued_shares: Arc<
+            RwLock<std::collections::HashMap<u64, Vec<wire::DecryptionShareMsg>>>,
+        > = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
         // 4. Chain sync
         let mut chain_sync = ChainSync::new();
@@ -219,9 +236,7 @@ impl PydeNode {
         // Sized generously — the mempool pool is 500K, validator mesh is 128
         // with gossipsub fan-out reaching ~30 peers in practice.
         let mut peer_manager = pyde_net::peer::PeerManager::new(
-            /* max_peers */ 200,
-            /* max_inbound */ 150,
-            /* max_outbound */ 150,
+            /* max_peers */ 200, /* max_inbound */ 150, /* max_outbound */ 150,
             /* rate_limit_per_ip */ 10,
         );
         // Nonces we've sent out in outbound auth requests, keyed by peer.
@@ -251,7 +266,8 @@ impl PydeNode {
                 let state_guard = state.read().await;
                 if !state_guard.is_empty() {
                     let balance_key = pyde_state::keys::balance_key(&identity.address);
-                    let balance = state_guard.get(&balance_key)
+                    let balance = state_guard
+                        .get(&balance_key)
                         .and_then(|b| {
                             // Try to parse as full Account first, fall back to raw u128
                             if let Some(account) = pyde_account::types::Account::from_bytes(&b) {
@@ -271,7 +287,9 @@ impl PydeNode {
                         Err(e) => warn!("{} — proceeding in devnet mode", e),
                     }
                 } else {
-                    warn!("state is empty (genesis) — stake verification deferred until chain syncs");
+                    warn!(
+                        "state is empty (genesis) — stake verification deferred until chain syncs"
+                    );
                 }
             }
 
@@ -311,8 +329,10 @@ impl PydeNode {
 
             if !genesis_config.validators.is_empty() {
                 for (i, val) in genesis_config.validators.iter().enumerate() {
-                    let pk_bytes = hex::decode(val.public_key.strip_prefix("0x").unwrap_or(&val.public_key))
-                        .map_err(|e| format!("invalid validator public key in genesis: {}", e))?;
+                    let pk_bytes = hex::decode(
+                        val.public_key.strip_prefix("0x").unwrap_or(&val.public_key),
+                    )
+                    .map_err(|e| format!("invalid validator public key in genesis: {}", e))?;
                     if val.public_key == my_pk_hex || val.public_key == format!("0x{}", my_pk_hex) {
                         my_index = i as u8;
                     }
@@ -320,8 +340,7 @@ impl PydeNode {
                 }
                 info!(
                     committee_size = committee_keys.len(),
-                    my_index,
-                    "committee formed from genesis validators"
+                    my_index, "committee formed from genesis validators"
                 );
             } else {
                 // Fallback: single-validator devnet mode
@@ -401,7 +420,8 @@ impl PydeNode {
         }
 
         // 10. Start RPC server if enabled
-        let (tx_gossip_tx, mut tx_gossip_rx) = tokio::sync::mpsc::channel::<pyde_tx::types::Transaction>(1024);
+        let (tx_gossip_tx, mut tx_gossip_rx) =
+            tokio::sync::mpsc::channel::<pyde_tx::types::Transaction>(1024);
         // WebSocket subscription broadcast channels (created even if RPC disabled — cheap no-op)
         let (new_heads_tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
         let (pending_tx_tx, _) = tokio::sync::broadcast::channel::<String>(4096);
@@ -422,7 +442,9 @@ impl PydeNode {
                     let tpk_path = self.config.node.datadir.join("threshold.pk");
                     if tpk_path.exists() {
                         let tpk_bytes = std::fs::read(&tpk_path).ok();
-                        tpk_bytes.and_then(|b| pyde_crypto::threshold::ThresholdPublicKey::from_bytes(&b))
+                        tpk_bytes.and_then(|b| {
+                            pyde_crypto::threshold::ThresholdPublicKey::from_bytes(&b)
+                        })
                     } else {
                         None
                     }
@@ -438,7 +460,9 @@ impl PydeNode {
                 self.config.rpc.port,
                 rpc_state,
                 self.config.node.chain_id,
-            ).await {
+            )
+            .await
+            {
                 Ok(addr) => info!(%addr, "JSON-RPC server started"),
                 Err(e) => warn!("RPC server disabled: {}", e),
             }
@@ -453,7 +477,9 @@ impl PydeNode {
                 ws_port,
                 ws_sub_heads,
                 ws_sub_logs,
-            ).await {
+            )
+            .await
+            {
                 Ok(addr) => info!(%addr, "WebSocket subscription server started"),
                 Err(e) => warn!("WS subscription server disabled: {}", e),
             }
@@ -466,7 +492,9 @@ impl PydeNode {
                 self.config.fast_tx.port,
                 pending_txs.clone(),
                 tx_gossip_tx.clone(),
-            ).await {
+            )
+            .await
+            {
                 Ok(addr) => info!(%addr, "fast binary TX endpoint started"),
                 Err(e) => warn!("fast TX endpoint disabled: {}", e),
             }
@@ -493,7 +521,8 @@ impl PydeNode {
         let slot_clock = if saved_head > 0 {
             let backdate_ms = saved_head * pyde_consensus::block::BLOCK_TIME_MS;
             let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
                 .as_millis() as u64;
             SlotClock::new(now_ms.saturating_sub(backdate_ms))
         } else {
@@ -1599,9 +1628,11 @@ fn handle_swarm_event(
 ) -> PostEventAction {
     match event {
         // --- Gossipsub message received ---
-        SwarmEvent::Behaviour(PydeBehaviourEvent::Gossipsub(
-            gossipsub::Event::Message { message, propagation_source, .. },
-        )) => {
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            message,
+            propagation_source,
+            ..
+        })) => {
             let topic = message.topic.to_string();
             let channel = Channel::from_topic(&topic);
 
@@ -1616,10 +1647,17 @@ fn handle_swarm_event(
                             if chain.chain_id != 31337 && !tx.signature.is_empty() {
                                 let sender_key = pyde_state::keys::balance_key(&tx.from);
                                 if let Some(acct_bytes) = state.get(&sender_key) {
-                                    if let Some(acct) = pyde_account::types::Account::from_bytes(&acct_bytes) {
-                                        if let pyde_account::types::AuthKeys::Single(ref pk) = acct.auth_keys {
+                                    if let Some(acct) =
+                                        pyde_account::types::Account::from_bytes(&acct_bytes)
+                                    {
+                                        if let pyde_account::types::AuthKeys::Single(ref pk) =
+                                            acct.auth_keys
+                                        {
                                             if !tx.verify_signature(pk) {
-                                                debug!(tx_hash = hex::encode(tx_hash), "rejected gossip tx: invalid signature");
+                                                debug!(
+                                                    tx_hash = hex::encode(tx_hash),
+                                                    "rejected gossip tx: invalid signature"
+                                                );
                                                 return PostEventAction::None;
                                             }
                                         }
@@ -1669,17 +1707,19 @@ fn handle_swarm_event(
                             }
 
                             // Validate block body (tx signatures, gas, no duplicates)
-                            if let Err(e) = BlockProcessor::validate_block_body(
-                                &block, state, chain.chain_id,
-                            ) {
+                            if let Err(e) =
+                                BlockProcessor::validate_block_body(&block, state, chain.chain_id)
+                            {
                                 warn!(slot, error = %e, "block body validation failed");
                                 return PostEventAction::None;
                             }
 
-                            let ws_slot = validator_engine
-                                .as_ref()
-                                .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot));
-                            match BlockProcessor::process_full_block_with_aot_and_checkpoint(chain, state, &block, None, ws_slot) {
+                            let ws_slot = validator_engine.as_ref().and_then(|e| {
+                                e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot)
+                            });
+                            match BlockProcessor::process_full_block_with_aot_and_checkpoint(
+                                chain, state, &block, None, ws_slot,
+                            ) {
                                 Ok((tx_count, gas_used, receipts_list)) => {
                                     // Sync flush for gossip-received blocks (no Arc access here)
                                     let _ = state.flush_pending();
@@ -1690,8 +1730,12 @@ fn handle_swarm_event(
                                     let _ = block_store.put_head(slot);
                                     info!(slot, tx_count, gas_used, "block received and processed");
                                     // Collect tx hashes to deduplicate from pending queue
-                                    let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
-                                        .map(|tx| tx.hash()).collect();
+                                    let tx_hashes: Vec<[u8; 32]> = block
+                                        .body
+                                        .transactions
+                                        .iter()
+                                        .map(|tx| tx.hash())
+                                        .collect();
                                     // Store receipts + deduplicate txs
                                     return PostEventAction::BlockProcessed {
                                         slot,
@@ -1730,7 +1774,9 @@ fn handle_swarm_event(
                     // forgeries but pays the decode + verify cost.
                     if let Some(engine) = validator_engine.as_ref() {
                         // Primary: immediate forwarder.
-                        let prop_attested = peer_manager.peer_falcon_pubkey(&propagation_source).is_some();
+                        let prop_attested = peer_manager
+                            .peer_falcon_pubkey(&propagation_source)
+                            .is_some();
                         let prop_authorized = peer_manager
                             .is_consensus_authorized(&propagation_source, &engine.committee_keys);
                         if prop_attested && !prop_authorized {
@@ -1762,10 +1808,16 @@ fn handle_swarm_event(
                     }
                     if let Some(engine) = validator_engine.as_mut() {
                         // Check if it's a finality vote (different wire tag)
-                        if !message.data.is_empty() && message.data[0] == wire::tag::CONSENSUS_FINALITY_VOTE {
+                        if !message.data.is_empty()
+                            && message.data[0] == wire::tag::CONSENSUS_FINALITY_VOTE
+                        {
                             match wire::decode_finality_vote(&message.data) {
                                 Ok(fv) => {
-                                    debug!(slot = fv.slot, voter = fv.voter_index, "received finality vote");
+                                    debug!(
+                                        slot = fv.slot,
+                                        voter = fv.voter_index,
+                                        "received finality vote"
+                                    );
                                     if engine.on_finality_vote(fv) {
                                         // Slice 4.3 gap 1: freshly formed cert →
                                         // broadcast so non-validator peers can
@@ -1784,7 +1836,9 @@ fn handle_swarm_event(
                         }
 
                         // Slice 4.3 gap 1: received a finality checkpoint from another peer.
-                        if !message.data.is_empty() && message.data[0] == wire::tag::CONSENSUS_FINALITY_CHECKPOINT {
+                        if !message.data.is_empty()
+                            && message.data[0] == wire::tag::CONSENSUS_FINALITY_CHECKPOINT
+                        {
                             match wire::decode_finality_checkpoint_msg(&message.data) {
                                 Ok(cp) => {
                                     let slot = cp.slot;
@@ -1800,11 +1854,18 @@ fn handle_swarm_event(
                         }
 
                         // Check if it's an epoch randomness share
-                        if !message.data.is_empty() && message.data[0] == wire::tag::RANDOMNESS_SHARE {
+                        if !message.data.is_empty()
+                            && message.data[0] == wire::tag::RANDOMNESS_SHARE
+                        {
                             match wire::decode_randomness_share(&message.data) {
                                 Ok((epoch, share)) => {
-                                    debug!(epoch, validator = share.validator_index, "received randomness share");
-                                    if let Some(new_randomness) = engine.on_randomness_share(share) {
+                                    debug!(
+                                        epoch,
+                                        validator = share.validator_index,
+                                        "received randomness share"
+                                    );
+                                    if let Some(new_randomness) = engine.on_randomness_share(share)
+                                    {
                                         info!(
                                             epoch,
                                             randomness = hex::encode(new_randomness),
@@ -1823,7 +1884,9 @@ fn handle_swarm_event(
                         // Validators relay these so that even a validator
                         // that never directly witnessed the equivocation
                         // can include a Slash tx in its next proposal.
-                        if !message.data.is_empty() && message.data[0] == wire::tag::CONSENSUS_SLASH_EVIDENCE {
+                        if !message.data.is_empty()
+                            && message.data[0] == wire::tag::CONSENSUS_SLASH_EVIDENCE
+                        {
                             // Task 014d: rate-limit evidence ingest by peer score.
                             // Evidence verification costs ~60µs of FALCON verify.
                             // A spammer that has already produced
@@ -1860,8 +1923,11 @@ fn handle_swarm_event(
                                         // the peer's invalid counter so repeat
                                         // offenders cross the spam threshold
                                         // and get dropped without further verify.
-                                        if let Some(info) = peer_manager.get_peer_mut(&propagation_source) {
-                                            info.invalid_messages = info.invalid_messages.saturating_add(1);
+                                        if let Some(info) =
+                                            peer_manager.get_peer_mut(&propagation_source)
+                                        {
+                                            info.invalid_messages =
+                                                info.invalid_messages.saturating_add(1);
                                         }
                                     }
                                     // Note: no immediate re-publish here.
@@ -1871,8 +1937,11 @@ fn handle_swarm_event(
                                 }
                                 Err(e) => {
                                     debug!(error = e, "failed to decode slash evidence gossip");
-                                    if let Some(info) = peer_manager.get_peer_mut(&propagation_source) {
-                                        info.invalid_messages = info.invalid_messages.saturating_add(1);
+                                    if let Some(info) =
+                                        peer_manager.get_peer_mut(&propagation_source)
+                                    {
+                                        info.invalid_messages =
+                                            info.invalid_messages.saturating_add(1);
                                     }
                                 }
                             }
@@ -1883,8 +1952,16 @@ fn handle_swarm_event(
                         if !message.data.is_empty() && message.data[0] == wire::tag::PSS_REFRESH {
                             match wire::decode_pss_refresh(&message.data) {
                                 Ok((epoch, contrib_bytes)) => {
-                                    if let Some(contrib) = pyde_crypto::threshold::RefreshContribution::from_bytes(&contrib_bytes) {
-                                        debug!(epoch, from = contrib.from_index, "received PSS refresh contribution");
+                                    if let Some(contrib) =
+                                        pyde_crypto::threshold::RefreshContribution::from_bytes(
+                                            &contrib_bytes,
+                                        )
+                                    {
+                                        debug!(
+                                            epoch,
+                                            from = contrib.from_index,
+                                            "received PSS refresh contribution"
+                                        );
                                         if let Some(identity) = validator_identity.as_mut() {
                                             engine.on_pss_contribution(contrib, identity);
                                         }
@@ -1898,7 +1975,9 @@ fn handle_swarm_event(
                         }
 
                         // Check if it's a committee resharing contribution (task 034)
-                        if !message.data.is_empty() && message.data[0] == wire::tag::COMMITTEE_RESHARING {
+                        if !message.data.is_empty()
+                            && message.data[0] == wire::tag::COMMITTEE_RESHARING
+                        {
                             match wire::decode_resharing(&message.data) {
                                 Ok((target_epoch, contrib_bytes)) => {
                                     // Drop stale contributions targeted at epochs other
@@ -1911,7 +1990,9 @@ fn handle_swarm_event(
                                         );
                                         return PostEventAction::None;
                                     }
-                                    match pyde_crypto::threshold::ResharingContribution::from_bytes(&contrib_bytes) {
+                                    match pyde_crypto::threshold::ResharingContribution::from_bytes(
+                                        &contrib_bytes,
+                                    ) {
                                         Some(contrib) => {
                                             debug!(
                                                 target_epoch,
@@ -1939,7 +2020,9 @@ fn handle_swarm_event(
                         }
 
                         // Check if it's a decryption share
-                        if !message.data.is_empty() && message.data[0] == wire::tag::DECRYPTION_SHARES {
+                        if !message.data.is_empty()
+                            && message.data[0] == wire::tag::DECRYPTION_SHARES
+                        {
                             match wire::decode_decryption_shares(&message.data) {
                                 Ok(msg) => {
                                     debug!(
@@ -1962,7 +2045,10 @@ fn handle_swarm_event(
                             Ok(msg) => {
                                 use pyde_consensus::hotstuff::ConsensusMessage;
                                 match msg {
-                                    ConsensusMessage::Proposal { ref header, ref proposer_signature } => {
+                                    ConsensusMessage::Proposal {
+                                        ref header,
+                                        ref proposer_signature,
+                                    } => {
                                         info!(slot = header.slot, "received proposal");
                                         // Buffer the proposal for VRF-based selection.
                                         // Voting happens after the proposal collection window
@@ -1980,32 +2066,46 @@ fn handle_swarm_event(
                                             .map(wire::encode_slash_evidence_msg)
                                             .collect();
                                         if !new_evidence.is_empty() {
-                                            return PostEventAction::BroadcastConsensusMany(new_evidence);
+                                            return PostEventAction::BroadcastConsensusMany(
+                                                new_evidence,
+                                            );
                                         }
                                     }
-                                    ConsensusMessage::Vote { slot, voter_index, .. } => {
+                                    ConsensusMessage::Vote {
+                                        slot, voter_index, ..
+                                    } => {
                                         debug!(slot, voter_index, "received vote");
                                         if let Some(qc) = engine.on_vote(msg) {
                                             info!(slot, votes = qc.vote_count(), "QC formed");
                                         }
                                     }
                                     ConsensusMessage::Timeout {
-                                        slot, voter_index, voter_address, highest_qc, signature
+                                        slot,
+                                        voter_index,
+                                        voter_address,
+                                        highest_qc,
+                                        signature,
                                     } => {
                                         debug!(slot, voter_index, "received timeout");
                                         // Convert to ViewChangeMessage and process
-                                        let vc_msg = pyde_consensus::view_change::ViewChangeMessage {
-                                            slot,
-                                            highest_qc,
-                                            voter_index,
-                                            voter_address,
-                                            signature,
-                                        };
+                                        let vc_msg =
+                                            pyde_consensus::view_change::ViewChangeMessage {
+                                                slot,
+                                                highest_qc,
+                                                voter_index,
+                                                voter_address,
+                                                signature,
+                                            };
                                         if engine.on_view_change(vc_msg) {
                                             info!(slot, "view change QC formed — fallback proposer can proceed");
                                         }
                                     }
-                                    ConsensusMessage::NewView { slot, highest_qc, voter_address: _, signature: _ } => {
+                                    ConsensusMessage::NewView {
+                                        slot,
+                                        highest_qc,
+                                        voter_address: _,
+                                        signature: _,
+                                    } => {
                                         debug!(slot, "received new view");
                                         // NewView carries the highest QC from a validator after view change.
                                         // Update our highest QC if theirs is higher.
@@ -2033,24 +2133,33 @@ fn handle_swarm_event(
         }
 
         // --- Sync: inbound request from peer ---
-        SwarmEvent::Behaviour(PydeBehaviourEvent::Sync(
-            request_response::Event::Message {
-                message: request_response::Message::Request { request, channel, .. },
-                peer,
-            },
-        )) => {
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Sync(request_response::Event::Message {
+            message:
+                request_response::Message::Request {
+                    request, channel, ..
+                },
+            peer,
+        })) => {
             debug!(%peer, "inbound sync request");
-            let response = ChainSync::handle_inbound_request(&request, chain, state, block_store, pinned_snapshot);
+            let response = ChainSync::handle_inbound_request(
+                &request,
+                chain,
+                state,
+                block_store,
+                pinned_snapshot,
+            );
             PostEventAction::SendSyncResponse(channel, response)
         }
 
         // --- Sync: response to our outbound request ---
-        SwarmEvent::Behaviour(PydeBehaviourEvent::Sync(
-            request_response::Event::Message {
-                message: request_response::Message::Response { request_id, response },
-                ..
-            },
-        )) => {
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Sync(request_response::Event::Message {
+            message:
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                },
+            ..
+        })) => {
             let ws_slot = validator_engine
                 .as_ref()
                 .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot));
@@ -2075,12 +2184,13 @@ fn handle_swarm_event(
         }
 
         // --- Auth: inbound PydeAuthReq from a peer ---
-        SwarmEvent::Behaviour(PydeBehaviourEvent::Auth(
-            request_response::Event::Message {
-                message: request_response::Message::Request { request, channel, .. },
-                peer,
-            },
-        )) => {
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Auth(request_response::Event::Message {
+            message:
+                request_response::Message::Request {
+                    request, channel, ..
+                },
+            peer,
+        })) => {
             // Only validators can answer auth challenges — they're the only
             // ones with a FALCON keypair. Full nodes stay silent; the
             // requester will simply have no attestation to record for
@@ -2113,12 +2223,10 @@ fn handle_swarm_event(
         }
 
         // --- Auth: response to our outbound PydeAuthReq ---
-        SwarmEvent::Behaviour(PydeBehaviourEvent::Auth(
-            request_response::Event::Message {
-                message: request_response::Message::Response { response, .. },
-                peer,
-            },
-        )) => {
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Auth(request_response::Event::Message {
+            message: request_response::Message::Response { response, .. },
+            peer,
+        })) => {
             // All handshake logic lives in `apply_auth_response` so this
             // arm stays purely the swarm-event adapter. Keeps the state
             // transitions testable without a live libp2p swarm.
@@ -2197,9 +2305,7 @@ fn handle_swarm_event(
         }
 
         // --- Peer disconnected ---
-        SwarmEvent::ConnectionClosed {
-            peer_id, cause, ..
-        } => {
+        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
             info!(
                 %peer_id,
                 cause = ?cause,
@@ -2217,9 +2323,11 @@ fn handle_swarm_event(
         }
 
         // --- Identify: peer shared their listen addresses ---
-        SwarmEvent::Behaviour(PydeBehaviourEvent::Identify(
-            identify::Event::Received { peer_id, info, .. },
-        )) => {
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Identify(identify::Event::Received {
+            peer_id,
+            info,
+            ..
+        })) => {
             debug!(%peer_id, addrs = info.listen_addrs.len(), "identify received");
             if !info.listen_addrs.is_empty() {
                 PostEventAction::AddPeerToKademlia(peer_id, info.listen_addrs)
@@ -2230,7 +2338,9 @@ fn handle_swarm_event(
 
         // --- Kademlia: routing table updated (discovered a new peer) ---
         SwarmEvent::Behaviour(PydeBehaviourEvent::Kademlia(
-            libp2p::kad::Event::RoutingUpdated { peer, addresses, .. },
+            libp2p::kad::Event::RoutingUpdated {
+                peer, addresses, ..
+            },
         )) => {
             let addrs: Vec<libp2p::Multiaddr> = addresses.into_vec();
             if !addrs.is_empty() {

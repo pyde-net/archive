@@ -95,7 +95,8 @@ pub fn pre_execution_charge(
             let total = max_gas_cost + tx.value;
             if *sender_balance < total {
                 return Err(format!(
-                    "insufficient balance: need {total}, have {}", *sender_balance
+                    "insufficient balance: need {total}, have {}",
+                    *sender_balance
                 ));
             }
             *sender_balance -= max_gas_cost;
@@ -104,7 +105,8 @@ pub fn pre_execution_charge(
         FeePayer::GasTank(_) => {
             if *gas_tank_balance < max_gas_cost {
                 return Err(format!(
-                    "insufficient gas tank: need {max_gas_cost}, have {}", *gas_tank_balance
+                    "insufficient gas tank: need {max_gas_cost}, have {}",
+                    *gas_tank_balance
                 ));
             }
             if *sender_balance < tx.value {
@@ -134,7 +136,8 @@ pub fn transfer_value(
     }
     if *sender_balance < value {
         return Err(format!(
-            "insufficient balance for transfer: need {value}, have {}", *sender_balance
+            "insufficient balance for transfer: need {value}, have {}",
+            *sender_balance
         ));
     }
     *sender_balance -= value;
@@ -269,7 +272,8 @@ mod tests {
         let mut sender_balance = 100_000_000u128;
         let mut gas_tank = 0u128;
 
-        let deducted = pre_execution_charge(&tx, &mut sender_balance, &mut gas_tank, base_fee).unwrap();
+        let deducted =
+            pre_execution_charge(&tx, &mut sender_balance, &mut gas_tank, base_fee).unwrap();
         assert_eq!(deducted, 50_000 * 1_000); // 50M
         assert_eq!(sender_balance, 100_000_000 - 50_000_000);
     }
@@ -318,9 +322,9 @@ mod tests {
         let base_fee = 1_000u128;
 
         let (effective, refund) = post_execution_refund(
-            30_000,  // gas_used
-            50_000,  // gas_limit
-            0,       // no sdelete refund
+            30_000, // gas_used
+            50_000, // gas_limit
+            0,      // no sdelete refund
             &mut fee_payer,
             base_fee,
         );
@@ -336,9 +340,9 @@ mod tests {
         let base_fee = 100u128;
 
         let (effective, refund) = post_execution_refund(
-            10_000,  // gas_used
-            10_000,  // gas_limit (no unused)
-            8_000,   // 8K sdelete refund requested
+            10_000, // gas_used
+            10_000, // gas_limit (no unused)
+            8_000,  // 8K sdelete refund requested
             &mut fee_payer,
             base_fee,
         );
@@ -384,9 +388,9 @@ mod tests {
         let receipt = generate_receipt(
             &tx,
             true,
-            30_000,  // gas_used
-            5_000,   // gas_refund
-            25_000,  // effective_gas
+            30_000, // gas_used
+            5_000,  // gas_refund
+            25_000, // effective_gas
             base_fee,
             logs.clone(),
             H256::zero(),
@@ -410,7 +414,15 @@ mod tests {
     fn failed_tx_receipt() {
         let tx = make_tx(0, 21_000);
         let receipt = generate_receipt(
-            &tx, false, 21_000, 0, 21_000, 100, vec![], H256::zero(), vec![],
+            &tx,
+            false,
+            21_000,
+            0,
+            21_000,
+            100,
+            vec![],
+            H256::zero(),
+            vec![],
         );
         assert!(!receipt.success);
         assert_eq!(receipt.gas_used, 21_000);

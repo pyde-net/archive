@@ -61,7 +61,11 @@ impl StateManager {
     pub fn get(&self, key: &Key) -> Option<Vec<u8>> {
         if let Ok(cache) = self.cache.read() {
             if let Some(val) = cache.get(key) {
-                return if val.is_empty() { None } else { Some(val.clone()) };
+                return if val.is_empty() {
+                    None
+                } else {
+                    Some(val.clone())
+                };
             }
         }
         if let Ok(smt) = self.smt.lock() {
@@ -76,13 +80,16 @@ impl StateManager {
     /// concurrent cache writes from the block processor or Merkle commit.
     pub fn snapshot_reader(&self) -> impl Fn(&Key) -> Option<Vec<u8>> + Send + Sync {
         // Clone the entire cache — this is O(n) but pyde_call is infrequent.
-        let cache_snap: HashMap<Key, Vec<u8>> = self.cache.read()
-            .map(|c| c.clone())
-            .unwrap_or_default();
+        let cache_snap: HashMap<Key, Vec<u8>> =
+            self.cache.read().map(|c| c.clone()).unwrap_or_default();
         let smt = Arc::clone(&self.smt);
         move |key: &Key| -> Option<Vec<u8>> {
             if let Some(val) = cache_snap.get(key) {
-                return if val.is_empty() { None } else { Some(val.clone()) };
+                return if val.is_empty() {
+                    None
+                } else {
+                    Some(val.clone())
+                };
             }
             if let Ok(smt) = smt.lock() {
                 smt.get(key)
@@ -99,7 +106,8 @@ impl StateManager {
             cache.insert(key, value.clone());
         }
         let mut smt = self.smt.lock().map_err(|e| format!("smt lock: {}", e))?;
-        let new_root = smt.insert(key, value)
+        let new_root = smt
+            .insert(key, value)
             .map_err(|e| format!("state insert failed: {}", e))?;
         self.root = new_root.as_slice().try_into().unwrap_or([0u8; 32]);
         Ok(self.root)
@@ -109,7 +117,8 @@ impl StateManager {
     pub fn delete(&mut self, key: &Key) -> Result<bool, String> {
         self.tracked_keys.remove(key);
         let mut smt = self.smt.lock().map_err(|e| format!("smt lock: {}", e))?;
-        smt.delete(key).map_err(|e| format!("state delete failed: {}", e))
+        smt.delete(key)
+            .map_err(|e| format!("state delete failed: {}", e))
     }
 
     pub fn update_batch(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<[u8; 32], String> {
@@ -117,7 +126,8 @@ impl StateManager {
             self.tracked_keys.insert(*k);
         }
         let mut smt = self.smt.lock().map_err(|e| format!("smt lock: {}", e))?;
-        let new_root = smt.update_all(entries)
+        let new_root = smt
+            .update_all(entries)
             .map_err(|e| format!("state batch update failed: {}", e))?;
         self.root = new_root.as_slice().try_into().unwrap_or([0u8; 32]);
         Ok(self.root)
@@ -160,7 +170,8 @@ impl StateManager {
         entries: Vec<(Key, Vec<u8>)>,
     ) -> Result<[u8; 32], String> {
         let mut smt = smt.lock().map_err(|e| format!("smt lock: {}", e))?;
-        let root = smt.update_all(entries)
+        let root = smt
+            .update_all(entries)
             .map_err(|e| format!("commit failed: {}", e))?;
         Ok(root.as_slice().try_into().unwrap_or([0u8; 32]))
     }
@@ -207,7 +218,10 @@ impl StateManager {
         entries
     }
 
-    pub fn import_snapshot(&mut self, entries: Vec<(Vec<u8>, Vec<u8>)>) -> Result<[u8; 32], String> {
+    pub fn import_snapshot(
+        &mut self,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<[u8; 32], String> {
         let smt_entries: Vec<(Key, Vec<u8>)> = entries
             .into_iter()
             .map(|(k, v)| {
@@ -219,10 +233,15 @@ impl StateManager {
             self.tracked_keys.insert(*k);
         }
         let mut smt = self.smt.lock().map_err(|e| format!("smt lock: {}", e))?;
-        let new_root = smt.update_all(smt_entries)
+        let new_root = smt
+            .update_all(smt_entries)
             .map_err(|e| format!("snapshot import failed: {}", e))?;
         self.root = new_root.as_slice().try_into().unwrap_or([0u8; 32]);
-        info!(entries = self.tracked_keys.len(), state_root = hex::encode(self.root), "state snapshot imported");
+        info!(
+            entries = self.tracked_keys.len(),
+            state_root = hex::encode(self.root),
+            "state snapshot imported"
+        );
         Ok(self.root)
     }
 
@@ -263,8 +282,12 @@ mod tests {
         let mut state1 = StateManager::open(&dir1, 1024).unwrap();
         let key_a = pyde_state::keys::balance_key(&[0x01; 32]);
         let key_b = pyde_state::keys::balance_key(&[0x02; 32]);
-        state1.insert(key_a, 1000u128.to_le_bytes().to_vec()).unwrap();
-        state1.insert(key_b, 2000u128.to_le_bytes().to_vec()).unwrap();
+        state1
+            .insert(key_a, 1000u128.to_le_bytes().to_vec())
+            .unwrap();
+        state1
+            .insert(key_b, 2000u128.to_le_bytes().to_vec())
+            .unwrap();
         let root1 = state1.root();
         let snapshot = state1.export_snapshot();
         assert_eq!(snapshot.len(), 2);

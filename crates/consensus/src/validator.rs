@@ -111,7 +111,11 @@ impl ValidatorSet {
             });
         }
 
-        if self.validators.iter().any(|v| v.address == address && v.status == ValidatorStatus::Active) {
+        if self
+            .validators
+            .iter()
+            .any(|v| v.address == address && v.status == ValidatorStatus::Active)
+        {
             return Err(ValidatorError::AlreadyRegistered(address));
         }
 
@@ -399,9 +403,7 @@ mod tests {
         let target = set.validators[0].address;
         set.deregister(&target, 100).unwrap();
 
-        let committee = set
-            .select_committee(1, &[0xAA; 32], vec![])
-            .unwrap();
+        let committee = set.select_committee(1, &[0xAA; 32], vec![]).unwrap();
         assert!(!committee.contains(&target));
     }
 
@@ -489,7 +491,8 @@ mod tests {
         assert_eq!(set.underfunded_validators().len(), 1);
 
         // Top up
-        set.top_up_stake(&set.validators[0].address.clone(), 100).unwrap();
+        set.top_up_stake(&set.validators[0].address.clone(), 100)
+            .unwrap();
         assert_eq!(set.underfunded_validators().len(), 0);
         assert_eq!(set.validators[0].stake, VALIDATOR_STAKE);
     }

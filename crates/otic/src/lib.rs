@@ -9,22 +9,22 @@
 // module level; narrow to specific items if this grows.
 #![allow(clippy::type_complexity)]
 
-pub mod token;
-pub mod lexer;
-pub mod ast;
-pub mod parser;
-pub mod resolve;
-pub mod types;
-pub mod typecheck;
-pub mod safety;
-pub mod ir;
-pub mod lower;
-pub mod optimize;
-pub mod memory;
-pub mod codegen;
 pub mod abi;
-pub mod pyc;
+pub mod ast;
+pub mod codegen;
 pub mod diagnostic;
+pub mod ir;
+pub mod lexer;
+pub mod lower;
+pub mod memory;
+pub mod optimize;
+pub mod parser;
+pub mod pyc;
+pub mod resolve;
+pub mod safety;
+pub mod token;
+pub mod typecheck;
+pub mod types;
 
 use std::collections::HashMap;
 use types::Ty;
@@ -53,15 +53,28 @@ fn resolve_ast_type(ty: &ast::Type) -> Ty {
         ast::Type::Bytes(_) => Ty::Bytes,
         ast::Type::Array(elem, size, _) => Ty::Array(Box::new(resolve_ast_type(elem)), *size),
         ast::Type::Vec(elem, _) => Ty::Vec(Box::new(resolve_ast_type(elem))),
-        ast::Type::Map(key, val, _) => Ty::Map(Box::new(resolve_ast_type(key)), Box::new(resolve_ast_type(val))),
+        ast::Type::Map(key, val, _) => Ty::Map(
+            Box::new(resolve_ast_type(key)),
+            Box::new(resolve_ast_type(val)),
+        ),
         ast::Type::Named(path) => {
             let name = path.last().map(|i| i.name.as_str()).unwrap_or("");
             match name {
-                "u8" => Ty::U8, "u16" => Ty::U16, "u32" => Ty::U32, "u64" => Ty::U64,
-                "u128" => Ty::U128, "u256" => Ty::U256,
-                "i8" => Ty::I8, "i16" => Ty::I16, "i32" => Ty::I32, "i64" => Ty::I64,
-                "i128" => Ty::I128, "i256" => Ty::I256,
-                "bool" => Ty::Bool, "Address" => Ty::Address, "String" => Ty::StringTy,
+                "u8" => Ty::U8,
+                "u16" => Ty::U16,
+                "u32" => Ty::U32,
+                "u64" => Ty::U64,
+                "u128" => Ty::U128,
+                "u256" => Ty::U256,
+                "i8" => Ty::I8,
+                "i16" => Ty::I16,
+                "i32" => Ty::I32,
+                "i64" => Ty::I64,
+                "i128" => Ty::I128,
+                "i256" => Ty::I256,
+                "bool" => Ty::Bool,
+                "Address" => Ty::Address,
+                "String" => Ty::StringTy,
                 _ => Ty::Struct(name.to_string()),
             }
         }
@@ -74,8 +87,8 @@ fn resolve_ast_type(ty: &ast::Type) -> Ty {
 fn extract_all_contract_signatures(
     file: &ast::SourceFile,
 ) -> (
-    HashMap<String, Vec<(String, Vec<(String, Ty)>, Ty)>>,  // contract_functions
-    HashMap<String, Vec<(String, Ty)>>,                       // contract_constructors
+    HashMap<String, Vec<(String, Vec<(String, Ty)>, Ty)>>, // contract_functions
+    HashMap<String, Vec<(String, Ty)>>,                    // contract_constructors
 ) {
     let mut contract_functions = HashMap::new();
     let mut contract_constructors = HashMap::new();
@@ -86,16 +99,22 @@ fn extract_all_contract_signatures(
             for ci in &c.items {
                 if let ast::ContractItem::Function(f) = ci {
                     if f.is_pub && !f.is_constructor() && !f.is_test() {
-                        let params: Vec<(String, Ty)> = f.params.iter()
+                        let params: Vec<(String, Ty)> = f
+                            .params
+                            .iter()
                             .map(|p| (p.name.name.clone(), resolve_ast_type(&p.ty)))
                             .collect();
-                        let ret = f.return_type.as_ref()
+                        let ret = f
+                            .return_type
+                            .as_ref()
                             .map(resolve_ast_type)
                             .unwrap_or(Ty::Unit);
                         pub_fns.push((f.name.name.clone(), params, ret));
                     }
                     if f.is_constructor() {
-                        let params: Vec<(String, Ty)> = f.params.iter()
+                        let params: Vec<(String, Ty)> = f
+                            .params
+                            .iter()
                             .map(|p| (p.name.name.clone(), resolve_ast_type(&p.ty)))
                             .collect();
                         contract_constructors.insert(c.name.name.clone(), params);
@@ -125,9 +144,17 @@ pub fn compile_all(src: &str) -> Vec<(String, codegen::CompiledContract)> {
     let (all_contract_fns, all_contract_ctors) = extract_all_contract_signatures(&file);
 
     // Collect contract names
-    let contract_items: Vec<&ast::ContractDef> = file.items.iter().filter_map(|item| {
-        if let ast::Item::Contract(c) = item { Some(c) } else { None }
-    }).collect();
+    let contract_items: Vec<&ast::ContractDef> = file
+        .items
+        .iter()
+        .filter_map(|item| {
+            if let ast::Item::Contract(c) = item {
+                Some(c)
+            } else {
+                None
+            }
+        })
+        .collect();
 
     let mut results = Vec::new();
     let mut compiled_registry: HashMap<String, Vec<u8>> = HashMap::new();

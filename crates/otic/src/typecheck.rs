@@ -402,12 +402,14 @@ impl TypeChecker {
                 ContractItem::Function(f) => {
                     self.collect_func_sig(f);
                     if f.is_constructor() {
-                        let params: Vec<(String, Ty)> = f.params.iter()
+                        let params: Vec<(String, Ty)> = f
+                            .params
+                            .iter()
                             .map(|p| (p.name.name.clone(), self.resolve_type(&p.ty)))
                             .collect();
-                        self.env.contract_constructors.insert(
-                            contract.name.name.clone(), params,
-                        );
+                        self.env
+                            .contract_constructors
+                            .insert(contract.name.name.clone(), params);
                     }
                 }
             }
@@ -548,16 +550,15 @@ impl TypeChecker {
         self.check_block(&func.body);
 
         // Check that non-void functions have a return path
-        if ret_ty != Ty::Unit && ret_ty != Ty::Unknown
-            && !self.block_has_return(&func.body) {
-                self.error(
-                    format!(
-                        "function '{}' must return {} but body may not return a value",
-                        func.name.name, ret_ty
-                    ),
-                    func.span,
-                );
-            }
+        if ret_ty != Ty::Unit && ret_ty != Ty::Unknown && !self.block_has_return(&func.body) {
+            self.error(
+                format!(
+                    "function '{}' must return {} but body may not return a value",
+                    func.name.name, ret_ty
+                ),
+                func.span,
+            );
+        }
 
         self.current_return_type = None;
         self.env.pop_scope();
@@ -977,8 +978,9 @@ impl TypeChecker {
                     }
                 }
                 // Address.balance → u256
-                if obj_ty == Ty::Address
-                    && field.name.as_str() == "balance" { return Ty::U256 }
+                if obj_ty == Ty::Address && field.name.as_str() == "balance" {
+                    return Ty::U256;
+                }
                 // struct.field → field type
                 if let Ty::Struct(name) = &obj_ty {
                     if let Some(fields) = self.env.struct_defs.get(name) {
@@ -1320,23 +1322,31 @@ impl TypeChecker {
                         // First arg is the contract name (path expression).
                         if let Some(MacroArg::Positional(first)) = args.first() {
                             let contract_name_opt = if let Expr::Path(segments, _) = first {
-                                Some(segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::"))
+                                Some(
+                                    segments
+                                        .iter()
+                                        .map(|s| s.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("::"),
+                                )
                             } else if let Expr::Ident(ident) = first {
                                 Some(ident.name.clone())
                             } else {
                                 None
                             };
                             if let Some(contract_name) = contract_name_opt {
-
                                 // Validate constructor args (count + types)
                                 let user_arg_types = &arg_types[1..]; // skip contract name
-                                let ctor_params = self.env.contract_constructors.get(&contract_name).cloned();
+                                let ctor_params =
+                                    self.env.contract_constructors.get(&contract_name).cloned();
                                 if let Some(ref params) = ctor_params {
                                     if user_arg_types.len() != params.len() {
                                         self.error(
                                             format!(
                                                 "deploy!: {}() constructor expects {} args, got {}",
-                                                contract_name, params.len(), user_arg_types.len()
+                                                contract_name,
+                                                params.len(),
+                                                user_arg_types.len()
                                             ),
                                             *span,
                                         );
@@ -1355,7 +1365,10 @@ impl TypeChecker {
                                                 self.error(
                                                     format!(
                                                         "deploy!: {}() arg '{}' expects {}, got {}",
-                                                        contract_name, _param_name, param_ty, arg_ty
+                                                        contract_name,
+                                                        _param_name,
+                                                        param_ty,
+                                                        arg_ty
                                                     ),
                                                     *span,
                                                 );
@@ -1369,7 +1382,8 @@ impl TypeChecker {
                                     self.error(
                                         format!(
                                             "deploy!: {} has no constructor, but {} args provided",
-                                            contract_name, user_arg_types.len()
+                                            contract_name,
+                                            user_arg_types.len()
                                         ),
                                         *span,
                                     );

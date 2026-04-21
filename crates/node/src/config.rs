@@ -2,8 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Top-level node configuration (loaded from TOML).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct NodeConfig {
     #[serde(default)]
     pub node: NodeSection,
@@ -203,7 +202,6 @@ impl Default for LoggingSection {
         }
     }
 }
-
 
 impl NodeConfig {
     /// Load config from a TOML file, falling back to defaults for missing fields.

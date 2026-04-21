@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 /// Start the fast binary TX submission listener.
 /// Returns the bound address on success.
@@ -27,9 +27,11 @@ pub async fn start_fast_tx_listener(
     tx_gossip_tx: tokio::sync::mpsc::Sender<pyde_tx::types::Transaction>,
 ) -> Result<std::net::SocketAddr, String> {
     let addr = format!("{}:{}", listen, port);
-    let listener = TcpListener::bind(&addr).await
+    let listener = TcpListener::bind(&addr)
+        .await
         .map_err(|e| format!("fast_tx bind failed on {}: {}", addr, e))?;
-    let bound = listener.local_addr()
+    let bound = listener
+        .local_addr()
         .map_err(|e| format!("fast_tx local_addr: {}", e))?;
 
     info!(%bound, "fast binary TX endpoint started");
@@ -81,11 +83,9 @@ async fn handle_connection(
             break;
         }
 
-        let tx = crate::wire::decode_transaction(&buf)
-            .or_else(|_| {
-                pyde_tx::types::Transaction::from_bytes(&buf)
-                    .ok_or("invalid tx encoding")
-            });
+        let tx = crate::wire::decode_transaction(&buf).or_else(|_| {
+            pyde_tx::types::Transaction::from_bytes(&buf).ok_or("invalid tx encoding")
+        });
 
         match tx {
             Ok(tx) => {

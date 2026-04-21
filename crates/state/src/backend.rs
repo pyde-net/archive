@@ -332,8 +332,8 @@ impl<S> CachedBackend<S> {
     /// Create a new cached wrapper with the given capacity.
     pub fn new(inner: S, capacity: usize) -> Self {
         let effective_capacity = capacity.max(1);
-        let cap = std::num::NonZeroUsize::new(effective_capacity)
-            .expect("max(1) is always nonzero");
+        let cap =
+            std::num::NonZeroUsize::new(effective_capacity).expect("max(1) is always nonzero");
         Self {
             inner,
             branch_cache: RefCell::new(lru::LruCache::new(cap)),

@@ -12,7 +12,9 @@ fn bench_keygen() {
         let iterations = if n <= 10 { 100 } else { 10 };
         let start = Instant::now();
         for _ in 0..iterations {
-            std::hint::black_box(threshold_keygen(n, t));
+            // Bench measures keygen latency; unwrap to consume the
+            // `#[must_use]` Result and fail loudly on unexpected error.
+            let _ = std::hint::black_box(threshold_keygen(n, t).unwrap());
         }
         let elapsed = start.elapsed();
         println!(
@@ -32,7 +34,7 @@ fn bench_encrypt() {
 
     let start = Instant::now();
     for _ in 0..iterations {
-        std::hint::black_box(threshold_encrypt(&tpk, std::hint::black_box(msg)));
+        let _ = std::hint::black_box(threshold_encrypt(&tpk, std::hint::black_box(msg)));
     }
     let elapsed = start.elapsed();
     println!(

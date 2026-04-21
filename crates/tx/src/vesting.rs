@@ -97,7 +97,8 @@ impl VestingSchedule {
     /// Currently-locked amount = total - unlocked. Used by tx validation
     /// to derive the sender's spendable balance.
     pub fn locked_at(&self, current_slot: u64) -> u128 {
-        self.total_amount.saturating_sub(self.unlocked_at(current_slot))
+        self.total_amount
+            .saturating_sub(self.unlocked_at(current_slot))
     }
 }
 

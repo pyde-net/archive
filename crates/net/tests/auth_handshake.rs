@@ -11,14 +11,14 @@
 use futures::StreamExt;
 use libp2p::{
     request_response,
-    swarm::{SwarmEvent, NetworkBehaviour},
+    swarm::{NetworkBehaviour, SwarmEvent},
     Swarm, SwarmBuilder,
 };
 use pyde_account::address::derive_eoa_address;
 use pyde_crypto::falcon::falcon_keygen;
 use pyde_net::auth::{
-    apply_auth_response, auth_behaviour, build_auth_resp, generate_nonce, AuthOutcome,
-    PydeAuthReq, PydeAuthResp,
+    apply_auth_response, auth_behaviour, build_auth_resp, generate_nonce, AuthOutcome, PydeAuthReq,
+    PydeAuthResp,
 };
 use pyde_net::peer::{Direction, PeerInfo, PeerManager, PeerRole};
 use std::collections::HashMap;
@@ -34,7 +34,9 @@ fn build_swarm() -> Swarm<AuthOnly> {
     SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_quic()
-        .with_behaviour(|_| AuthOnly { auth: auth_behaviour() })
+        .with_behaviour(|_| AuthOnly {
+            auth: auth_behaviour(),
+        })
         .expect("behaviour ok")
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(30)))
         .build()
@@ -71,8 +73,7 @@ async fn run_handshake(
         }
     };
     let responder_peer_id = *responder.local_peer_id();
-    let full_addr = responder_addr
-        .with(libp2p::multiaddr::Protocol::P2p(responder_peer_id));
+    let full_addr = responder_addr.with(libp2p::multiaddr::Protocol::P2p(responder_peer_id));
     initiator.dial(full_addr).unwrap();
 
     // Track initiator state.
@@ -159,15 +160,16 @@ async fn end_to_end_handshake_with_committee_member() {
 
     let initiator = build_swarm();
     let responder = build_swarm();
-    let (outcome, mgr, expected_pk) = run_handshake(
-        initiator, responder, pk_bytes, sk, pk, committee,
-    )
-    .await;
+    let (outcome, mgr, expected_pk) =
+        run_handshake(initiator, responder, pk_bytes, sk, pk, committee).await;
 
     assert_eq!(outcome, AuthOutcome::StoredAsValidator);
     // Exactly one peer tracked by the initiator — the responder.
     let peer_id = mgr.all_peers().next().map(|p| p.peer_id).unwrap();
-    assert_eq!(mgr.peer_falcon_pubkey(&peer_id), Some(expected_pk.as_slice()));
+    assert_eq!(
+        mgr.peer_falcon_pubkey(&peer_id),
+        Some(expected_pk.as_slice())
+    );
     assert_eq!(mgr.get_peer(&peer_id).unwrap().role, PeerRole::Validator);
 }
 
@@ -182,13 +184,14 @@ async fn end_to_end_handshake_with_non_committee_peer() {
 
     let initiator = build_swarm();
     let responder = build_swarm();
-    let (outcome, mgr, expected_pk) = run_handshake(
-        initiator, responder, pk_bytes, sk, pk, committee,
-    )
-    .await;
+    let (outcome, mgr, expected_pk) =
+        run_handshake(initiator, responder, pk_bytes, sk, pk, committee).await;
 
     assert_eq!(outcome, AuthOutcome::StoredAsNonValidator);
     let peer_id = mgr.all_peers().next().map(|p| p.peer_id).unwrap();
-    assert_eq!(mgr.peer_falcon_pubkey(&peer_id), Some(expected_pk.as_slice()));
+    assert_eq!(
+        mgr.peer_falcon_pubkey(&peer_id),
+        Some(expected_pk.as_slice())
+    );
     assert_eq!(mgr.get_peer(&peer_id).unwrap().role, PeerRole::Unknown);
 }

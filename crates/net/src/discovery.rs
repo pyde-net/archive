@@ -105,12 +105,15 @@ impl Discovery {
             return; // don't track banned peers
         }
 
-        let entry = self.known_peers.entry(peer_id).or_insert_with(|| KnownPeer {
-            peer_id,
-            addresses: Vec::new(),
-            last_seen: Instant::now(),
-            connection_failures: 0,
-        });
+        let entry = self
+            .known_peers
+            .entry(peer_id)
+            .or_insert_with(|| KnownPeer {
+                peer_id,
+                addresses: Vec::new(),
+                last_seen: Instant::now(),
+                connection_failures: 0,
+            });
 
         entry.last_seen = Instant::now();
         if !entry.addresses.contains(&addr) {

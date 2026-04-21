@@ -84,7 +84,8 @@ pub trait PydeApi {
     /// Submit a transaction as JSON object. Returns tx hash.
     /// Fields: from, to, value (decimal string), data (hex), gas (number), nonce (number).
     #[method(name = "pyde_sendTransaction")]
-    async fn send_transaction(&self, tx_obj: serde_json::Value) -> Result<String, ErrorObjectOwned>;
+    async fn send_transaction(&self, tx_obj: serde_json::Value)
+        -> Result<String, ErrorObjectOwned>;
 
     /// Submit a raw wire-encoded transaction (hex string). Returns tx hash.
     #[method(name = "pyde_sendRawTransaction")]
@@ -101,15 +102,24 @@ pub trait PydeApi {
     /// Simulate a call and return the access list (storage keys touched).
     /// Used by SDKs to attach access lists for parallel scheduling.
     #[method(name = "pyde_createAccessList")]
-    async fn create_access_list(&self, call_obj: serde_json::Value) -> Result<serde_json::Value, ErrorObjectOwned>;
+    async fn create_access_list(
+        &self,
+        call_obj: serde_json::Value,
+    ) -> Result<serde_json::Value, ErrorObjectOwned>;
 
     /// Get a transaction receipt by tx hash.
     #[method(name = "pyde_getTransactionReceipt")]
-    async fn get_transaction_receipt(&self, tx_hash: String) -> Result<serde_json::Value, ErrorObjectOwned>;
+    async fn get_transaction_receipt(
+        &self,
+        tx_hash: String,
+    ) -> Result<serde_json::Value, ErrorObjectOwned>;
 
     /// Get logs matching a filter.
     #[method(name = "pyde_getLogs")]
-    async fn get_logs(&self, filter: serde_json::Value) -> Result<serde_json::Value, ErrorObjectOwned>;
+    async fn get_logs(
+        &self,
+        filter: serde_json::Value,
+    ) -> Result<serde_json::Value, ErrorObjectOwned>;
 
     /// Get the mempool size.
     #[method(name = "pyde_mempoolSize")]
@@ -119,7 +129,10 @@ pub trait PydeApi {
     /// Accepts a JSON object with: from, to, value, data, gas, nonce, signature.
     /// The node encrypts it with the committee's threshold public key before adding to mempool.
     #[method(name = "pyde_sendEncryptedTransaction")]
-    async fn send_encrypted_transaction(&self, tx_obj: serde_json::Value) -> Result<String, ErrorObjectOwned>;
+    async fn send_encrypted_transaction(
+        &self,
+        tx_obj: serde_json::Value,
+    ) -> Result<String, ErrorObjectOwned>;
 
     // ========================================================================
     // WebSocket Subscriptions
@@ -135,7 +148,10 @@ pub trait PydeApi {
 
     /// Subscribe to contract event logs matching a filter.
     #[subscription(name = "pyde_subscribeLogs" => "pyde_logSubscription", item = serde_json::Value, unsubscribe = "pyde_unsubscribeLogs")]
-    async fn subscribe_logs(&self, filter: serde_json::Value) -> jsonrpsee::core::SubscriptionResult;
+    async fn subscribe_logs(
+        &self,
+        filter: serde_json::Value,
+    ) -> jsonrpsee::core::SubscriptionResult;
 }
 
 /// RPC server implementation.
@@ -150,7 +166,8 @@ impl PydeApiServer for RpcServer {
         let addr = parse_address(&address)?;
         let key = pyde_state::keys::balance_key(&addr);
         let state = self.state.state.read().await;
-        let balance = state.get(&key)
+        let balance = state
+            .get(&key)
             .and_then(|b| read_account_balance(&b))
             .unwrap_or(0);
         Ok(balance.to_string())
@@ -161,7 +178,8 @@ impl PydeApiServer for RpcServer {
         // Nonce is stored separately at nonce_key (NonceState: base u64 + bitmap u16)
         let key = pyde_state::keys::nonce_key(&addr);
         let state = self.state.state.read().await;
-        let nonce = state.get(&key)
+        let nonce = state
+            .get(&key)
             .map(|b| {
                 if b.len() >= 10 {
                     let ns = pyde_account::nonce::NonceState::from_bytes(&b);
@@ -257,8 +275,15 @@ impl PydeApiServer for RpcServer {
 
         // Read validator count
         let count_key = pyde_state::keys::validator_count_key();
-        let count = state.get(&count_key)
-            .map(|b| if b.len() >= 8 { u64::from_le_bytes(b[..8].try_into().unwrap_or([0;8])) } else { 0 })
+        let count = state
+            .get(&count_key)
+            .map(|b| {
+                if b.len() >= 8 {
+                    u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]))
+                } else {
+                    0
+                }
+            })
             .unwrap_or(0);
 
         let mut validators = Vec::new();
@@ -301,24 +326,33 @@ impl PydeApiServer for RpcServer {
         }))
     }
 
-    async fn send_transaction(&self, tx_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
+    async fn send_transaction(
+        &self,
+        tx_obj: serde_json::Value,
+    ) -> Result<String, ErrorObjectOwned> {
         if !self.state.dev_mode {
             return Err(rpc_err(-32601, "pyde_sendTransaction is only available in dev mode (--dev). Use pyde_sendRawTransaction with a signed transaction.".into()));
         }
-        let from = tx_obj.get("from").and_then(|v| v.as_str())
-            .map(parse_address).transpose()?
+        let from = tx_obj
+            .get("from")
+            .and_then(|v| v.as_str())
+            .map(parse_address)
+            .transpose()?
             .ok_or_else(|| rpc_err(-32602, "missing 'from' field".into()))?;
-        let to = tx_obj.get("to").and_then(|v| v.as_str())
-            .map(parse_address).transpose()?
+        let to = tx_obj
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(parse_address)
+            .transpose()?
             .unwrap_or([0u8; 32]);
-        let value: u128 = tx_obj.get("value").and_then(|v| v.as_str())
+        let value: u128 = tx_obj
+            .get("value")
+            .and_then(|v| v.as_str())
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         let data_hex = tx_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
-        let data = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex))
-            .unwrap_or_default();
-        let gas_limit: u64 = tx_obj.get("gas").and_then(|v| v.as_u64())
-            .unwrap_or(21_000);
+        let data = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex)).unwrap_or_default();
+        let gas_limit: u64 = tx_obj.get("gas").and_then(|v| v.as_u64()).unwrap_or(21_000);
         let chain_r = self.state.chain.read().await;
         let chain_id = chain_r.chain_id;
         drop(chain_r);
@@ -329,7 +363,8 @@ impl PydeApiServer for RpcServer {
         } else {
             let state_r = self.state.state.read().await;
             let nonce_key = pyde_state::keys::nonce_key(&from);
-            let n = state_r.get(&nonce_key)
+            let n = state_r
+                .get(&nonce_key)
                 .and_then(|bytes| {
                     if bytes.len() >= 10 {
                         let ns = pyde_account::nonce::NonceState::from_bytes(&bytes);
@@ -347,11 +382,13 @@ impl PydeApiServer for RpcServer {
             Some("stakeDeposit") => pyde_tx::types::TransactionType::StakeDeposit,
             Some("stakeWithdraw") => pyde_tx::types::TransactionType::StakeWithdraw,
             Some("deploy") => pyde_tx::types::TransactionType::Deploy,
-            _ => if to == [0u8; 32] {
-                pyde_tx::types::TransactionType::Deploy
-            } else {
-                pyde_tx::types::TransactionType::Standard
-            },
+            _ => {
+                if to == [0u8; 32] {
+                    pyde_tx::types::TransactionType::Deploy
+                } else {
+                    pyde_tx::types::TransactionType::Standard
+                }
+            }
         };
 
         // For deploy txs: data should already be in pipeline format:
@@ -397,18 +434,18 @@ impl PydeApiServer for RpcServer {
         // receipt's returnData (authoritative, computed at execution time).
         Ok(serde_json::json!({
             "txHash": tx_hash_hex,
-        }).to_string())
+        })
+        .to_string())
     }
 
     async fn send_raw_transaction(&self, tx_hex: String) -> Result<String, ErrorObjectOwned> {
         let hex_str = tx_hex.strip_prefix("0x").unwrap_or(&tx_hex);
-        let tx_bytes = hex::decode(hex_str)
-            .map_err(|e| rpc_err(-32602, format!("invalid tx hex: {}", e)))?;
+        let tx_bytes =
+            hex::decode(hex_str).map_err(|e| rpc_err(-32602, format!("invalid tx hex: {}", e)))?;
         // Try wire format first, then Transaction::from_bytes (used by wallet CLI)
         let tx = crate::wire::decode_transaction(&tx_bytes)
             .or_else(|_| {
-                pyde_tx::types::Transaction::from_bytes(&tx_bytes)
-                    .ok_or("invalid tx encoding")
+                pyde_tx::types::Transaction::from_bytes(&tx_bytes).ok_or("invalid tx encoding")
             })
             .map_err(|e| rpc_err(-32602, format!("invalid tx encoding: {}", e)))?;
         let tx_hash = tx.hash();
@@ -424,15 +461,24 @@ impl PydeApiServer for RpcServer {
     }
 
     async fn call(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
-        let from = call_obj.get("from").and_then(|v| v.as_str())
-            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
-        let to = call_obj.get("to").and_then(|v| v.as_str())
-            .map(parse_address).transpose()?
+        let from = call_obj
+            .get("from")
+            .and_then(|v| v.as_str())
+            .map(parse_address)
+            .transpose()?
+            .unwrap_or([0u8; 32]);
+        let to = call_obj
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(parse_address)
+            .transpose()?
             .ok_or_else(|| rpc_err(-32602, "missing 'to' for call".into()))?;
         let data_hex = call_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
-        let calldata = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex))
-            .unwrap_or_default();
-        let gas_limit: u64 = call_obj.get("gas").and_then(|v| v.as_u64())
+        let calldata =
+            hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex)).unwrap_or_default();
+        let gas_limit: u64 = call_obj
+            .get("gas")
+            .and_then(|v| v.as_u64())
             .unwrap_or(100_000_000); // 100M default — Vec deserialization + loops need headroom
 
         // Take a read-consistent snapshot of state for the entire call.
@@ -441,7 +487,8 @@ impl PydeApiServer for RpcServer {
         // the same key returned different values within one pyde_call).
         let state_r = self.state.state.read().await;
         let code_key = pyde_state::keys::code_key(&to);
-        let code = state_r.get(&code_key)
+        let code = state_r
+            .get(&code_key)
             .ok_or_else(|| rpc_err(-32000, "no code at address".into()))?;
         let storage_snapshot = state_r.snapshot_reader();
         let code_snapshot = state_r.snapshot_reader();
@@ -501,20 +548,33 @@ impl PydeApiServer for RpcServer {
                 Ok(format!("0x{}", hex::encode(r1.to_le_bytes())))
             }
         } else {
-            Err(rpc_err(-32000, format!("execution failed: {:?}", output.outcome)))
+            Err(rpc_err(
+                -32000,
+                format!("execution failed: {:?}", output.outcome),
+            ))
         }
     }
 
     async fn estimate_gas(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
         // Run the same as call but return gas used
-        let from = call_obj.get("from").and_then(|v| v.as_str())
-            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
-        let to = call_obj.get("to").and_then(|v| v.as_str())
-            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
+        let from = call_obj
+            .get("from")
+            .and_then(|v| v.as_str())
+            .map(parse_address)
+            .transpose()?
+            .unwrap_or([0u8; 32]);
+        let to = call_obj
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(parse_address)
+            .transpose()?
+            .unwrap_or([0u8; 32]);
         let data_hex = call_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
-        let calldata = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex))
-            .unwrap_or_default();
-        let gas_limit: u64 = call_obj.get("gas").and_then(|v| v.as_u64())
+        let calldata =
+            hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex)).unwrap_or_default();
+        let gas_limit: u64 = call_obj
+            .get("gas")
+            .and_then(|v| v.as_u64())
             .unwrap_or(1_000_000);
 
         if to == [0u8; 32] {
@@ -559,22 +619,41 @@ impl PydeApiServer for RpcServer {
         // The VM simulation already includes all cold storage surcharges.
         let gas_used = vm.gas_used_total;
         let base_tx_cost = 21_000u64;
-        let estimate = if gas_used == 0 { base_tx_cost } else { base_tx_cost + gas_used + gas_used / 10 };
+        let estimate = if gas_used == 0 {
+            base_tx_cost
+        } else {
+            base_tx_cost + gas_used + gas_used / 10
+        };
         Ok(format!("0x{:x}", estimate))
     }
 
-    async fn create_access_list(&self, call_obj: serde_json::Value) -> Result<serde_json::Value, ErrorObjectOwned> {
-        let from = call_obj.get("from").and_then(|v| v.as_str())
-            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
-        let to = call_obj.get("to").and_then(|v| v.as_str())
-            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
+    async fn create_access_list(
+        &self,
+        call_obj: serde_json::Value,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let from = call_obj
+            .get("from")
+            .and_then(|v| v.as_str())
+            .map(parse_address)
+            .transpose()?
+            .unwrap_or([0u8; 32]);
+        let to = call_obj
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(parse_address)
+            .transpose()?
+            .unwrap_or([0u8; 32]);
         let data_hex = call_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
-        let calldata = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex))
-            .unwrap_or_default();
-        let value: u128 = call_obj.get("value").and_then(|v| v.as_str())
+        let calldata =
+            hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex)).unwrap_or_default();
+        let value: u128 = call_obj
+            .get("value")
+            .and_then(|v| v.as_str())
             .and_then(|s| u128::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok())
             .unwrap_or(0);
-        let gas_limit: u64 = call_obj.get("gas").and_then(|v| v.as_u64())
+        let gas_limit: u64 = call_obj
+            .get("gas")
+            .and_then(|v| v.as_u64())
             .unwrap_or(50_000_000);
 
         if to == [0u8; 32] {
@@ -596,13 +675,15 @@ impl PydeApiServer for RpcServer {
                     buf.extend_from_slice(&from);
                     buf.push(0x04);
                     buf
-                }).to_bytes();
+                })
+                .to_bytes();
                 let to_slot = pyde_crypto::poseidon2::poseidon2_hash(&{
                     let mut buf = Vec::with_capacity(33);
                     buf.extend_from_slice(&to);
                     buf.push(0x04);
                     buf
-                }).to_bytes();
+                })
+                .to_bytes();
                 return Ok(serde_json::json!({
                     "accessList": [
                         { "address": format!("0x{}", hex::encode(from)), "reads": [], "writes": [format!("0x{}", hex::encode(from_slot))] },
@@ -642,10 +723,14 @@ impl PydeApiServer for RpcServer {
         // Build access list from VM's tracked RAW slots (pre-derivation).
         // The pipeline's pre_derive_access_list_keys will derive them,
         // so we must return raw slots, not already-derived keys.
-        let write_keys: Vec<String> = vm.written_raw_slots.iter()
+        let write_keys: Vec<String> = vm
+            .written_raw_slots
+            .iter()
             .map(|k| format!("0x{}", hex::encode(k.to_le_bytes())))
             .collect();
-        let read_keys: Vec<String> = vm.accessed_raw_slots.iter()
+        let read_keys: Vec<String> = vm
+            .accessed_raw_slots
+            .iter()
             .filter(|k| !vm.written_raw_slots.contains(k))
             .map(|k| format!("0x{}", hex::encode(k.to_le_bytes())))
             .collect();
@@ -662,7 +747,10 @@ impl PydeApiServer for RpcServer {
         }))
     }
 
-    async fn get_transaction_receipt(&self, tx_hash: String) -> Result<serde_json::Value, ErrorObjectOwned> {
+    async fn get_transaction_receipt(
+        &self,
+        tx_hash: String,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
         let hash = parse_hash(&tx_hash)?;
         let store = self.state.receipts.read().await;
 
@@ -672,42 +760,59 @@ impl PydeApiServer for RpcServer {
         }
     }
 
-    async fn get_logs(&self, filter: serde_json::Value) -> Result<serde_json::Value, ErrorObjectOwned> {
-        let from_slot = filter.get("fromBlock")
+    async fn get_logs(
+        &self,
+        filter: serde_json::Value,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let from_slot = filter
+            .get("fromBlock")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let to_slot = filter.get("toBlock")
+        let to_slot = filter
+            .get("toBlock")
             .and_then(|v| v.as_u64())
             .unwrap_or(u64::MAX);
-        let address_filter = filter.get("address")
+        let address_filter = filter
+            .get("address")
             .and_then(|v| v.as_str())
             .map(|s| parse_address(s))
             .transpose()?;
 
         // Topic filters: array of arrays. topics[i] matches log.topics[i].
         // null/empty at position i means "any". Multiple values at position i means "OR".
-        let topic_filters: Vec<Vec<Vec<u8>>> = filter.get("topics")
+        let topic_filters: Vec<Vec<Vec<u8>>> = filter
+            .get("topics")
             .and_then(|v| v.as_array())
             .map(|arr| {
-                arr.iter().map(|entry| {
-                    if entry.is_null() {
-                        vec![] // match any
-                    } else if let Some(s) = entry.as_str() {
-                        // Single topic
-                        hex::decode(s.trim_start_matches("0x")).unwrap_or_default()
-                            .chunks(32).map(|c| c.to_vec()).collect::<Vec<_>>()
-                            .into_iter().take(1)
-                            .flat_map(|v| vec![v])
-                            .collect()
-                    } else if let Some(arr) = entry.as_array() {
-                        // OR list of topics
-                        arr.iter().filter_map(|t| {
-                            t.as_str().map(|s| hex::decode(s.trim_start_matches("0x")).unwrap_or_default())
-                        }).collect()
-                    } else {
-                        vec![]
-                    }
-                }).collect()
+                arr.iter()
+                    .map(|entry| {
+                        if entry.is_null() {
+                            vec![] // match any
+                        } else if let Some(s) = entry.as_str() {
+                            // Single topic
+                            hex::decode(s.trim_start_matches("0x"))
+                                .unwrap_or_default()
+                                .chunks(32)
+                                .map(|c| c.to_vec())
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .take(1)
+                                .flat_map(|v| vec![v])
+                                .collect()
+                        } else if let Some(arr) = entry.as_array() {
+                            // OR list of topics
+                            arr.iter()
+                                .filter_map(|t| {
+                                    t.as_str().map(|s| {
+                                        hex::decode(s.trim_start_matches("0x")).unwrap_or_default()
+                                    })
+                                })
+                                .collect()
+                        } else {
+                            vec![]
+                        }
+                    })
+                    .collect()
             })
             .unwrap_or_default();
 
@@ -744,23 +849,44 @@ impl PydeApiServer for RpcServer {
         Ok(relay.mempool_size().to_string())
     }
 
-    async fn send_encrypted_transaction(&self, tx_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
-        let tpk = self.state.threshold_pk.as_ref()
-            .ok_or_else(|| rpc_err(-32000, "threshold encryption not configured".to_string()))?;
+    async fn send_encrypted_transaction(
+        &self,
+        tx_obj: serde_json::Value,
+    ) -> Result<String, ErrorObjectOwned> {
+        let tpk =
+            self.state.threshold_pk.as_ref().ok_or_else(|| {
+                rpc_err(-32000, "threshold encryption not configured".to_string())
+            })?;
 
         // Parse tx fields
-        let from = tx_obj.get("from").and_then(|v| v.as_str())
-            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
-        let to = tx_obj.get("to").and_then(|v| v.as_str())
-            .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
-        let value: u128 = tx_obj.get("value").and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok()).unwrap_or(0);
+        let from = tx_obj
+            .get("from")
+            .and_then(|v| v.as_str())
+            .map(parse_address)
+            .transpose()?
+            .unwrap_or([0u8; 32]);
+        let to = tx_obj
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(parse_address)
+            .transpose()?
+            .unwrap_or([0u8; 32]);
+        let value: u128 = tx_obj
+            .get("value")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let data_hex = tx_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
-        let data = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex))
-            .unwrap_or_default();
-        let gas_limit: u64 = tx_obj.get("gas").and_then(|v| v.as_u64()).unwrap_or(100_000);
+        let data = hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex)).unwrap_or_default();
+        let gas_limit: u64 = tx_obj
+            .get("gas")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(100_000);
         let nonce: u64 = tx_obj.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0);
-        let signature_hex = tx_obj.get("signature").and_then(|v| v.as_str()).unwrap_or("");
+        let signature_hex = tx_obj
+            .get("signature")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let signature = hex::decode(signature_hex.strip_prefix("0x").unwrap_or(signature_hex))
             .unwrap_or_default();
         let chain_id: u64 = tx_obj.get("chainId").and_then(|v| v.as_u64()).unwrap_or(1);
@@ -782,9 +908,19 @@ impl PydeApiServer for RpcServer {
 
         // Threshold-encrypt the transaction
         let enc_tx = pyde_mempool::encrypted::encrypt_transaction(
-            from, nonce, gas_limit, access_list, None, chain_id,
-            signature, &to, value, &data, tpk,
-        ).map_err(|e| rpc_err(-32000, format!("encryption failed: {}", e)))?;
+            from,
+            nonce,
+            gas_limit,
+            access_list,
+            None,
+            chain_id,
+            signature,
+            &to,
+            value,
+            &data,
+            tpk,
+        )
+        .map_err(|e| rpc_err(-32000, format!("encryption failed: {}", e)))?;
 
         let tx_hash = enc_tx.hash();
 
@@ -798,7 +934,8 @@ impl PydeApiServer for RpcServer {
         let sender_pk_opt = {
             let state_r = self.state.state.read().await;
             let sender_key = pyde_state::keys::balance_key(&from);
-            state_r.get(&sender_key)
+            state_r
+                .get(&sender_key)
                 .and_then(|bytes| pyde_account::types::Account::from_bytes(&bytes))
                 .and_then(|acct| match acct.auth_keys {
                     pyde_account::types::AuthKeys::Single(pk) => Some(pk),
@@ -815,11 +952,15 @@ impl PydeApiServer for RpcServer {
         if !accepted {
             return Err(rpc_err(
                 -32000,
-                "tx rejected (duplicate, rate-limited, or signature failed verification)".to_string(),
+                "tx rejected (duplicate, rate-limited, or signature failed verification)"
+                    .to_string(),
             ));
         }
 
-        info!(tx_hash = hex::encode(tx_hash), "encrypted tx accepted into mempool");
+        info!(
+            tx_hash = hex::encode(tx_hash),
+            "encrypted tx accepted into mempool"
+        );
         Ok(format!("0x{}", hex::encode(tx_hash)))
     }
 
@@ -858,7 +999,11 @@ impl PydeApiServer for RpcServer {
         let mut rx = self.state.pending_tx_tx.subscribe();
         tokio::spawn(async move {
             while let Ok(tx_hash) = rx.recv().await {
-                if sink.send(jsonrpsee::SubscriptionMessage::from_json(&tx_hash).unwrap()).await.is_err() {
+                if sink
+                    .send(jsonrpsee::SubscriptionMessage::from_json(&tx_hash).unwrap())
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -873,7 +1018,8 @@ impl PydeApiServer for RpcServer {
     ) -> jsonrpsee::core::SubscriptionResult {
         let sink = subscription_sink.accept().await?;
         let mut rx = self.state.logs_tx.subscribe();
-        let filter_addr = filter.get("address")
+        let filter_addr = filter
+            .get("address")
             .and_then(|v| v.as_str())
             .map(|s| s.to_lowercase());
         tokio::spawn(async move {
@@ -881,14 +1027,19 @@ impl PydeApiServer for RpcServer {
                 match rx.recv().await {
                     Ok(log) => {
                         if let Some(ref addr) = filter_addr {
-                            let log_addr = log.get("address")
+                            let log_addr = log
+                                .get("address")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_lowercase());
                             if log_addr.as_deref() != Some(addr.as_str()) {
                                 continue;
                             }
                         }
-                        if sink.send(jsonrpsee::SubscriptionMessage::from_json(&log).unwrap()).await.is_err() {
+                        if sink
+                            .send(jsonrpsee::SubscriptionMessage::from_json(&log).unwrap())
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -917,10 +1068,14 @@ pub async fn start_rpc_server(
         .await
         .map_err(|e| format!("failed to start RPC server: {}", e))?;
 
-    let bound_addr = server.local_addr()
+    let bound_addr = server
+        .local_addr()
         .map_err(|e| format!("failed to get RPC server address: {}", e))?;
 
-    let rpc = RpcServer { state: rpc_state, chain_id };
+    let rpc = RpcServer {
+        state: rpc_state,
+        chain_id,
+    };
     let handle = server.start(rpc.into_rpc());
     tokio::spawn(handle.stopped());
 
@@ -938,10 +1093,13 @@ fn rpc_err(code: i32, msg: String) -> ErrorObjectOwned {
 
 fn parse_address(input: &str) -> Result<[u8; 32], ErrorObjectOwned> {
     let hex_str = input.strip_prefix("0x").unwrap_or(input);
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| rpc_err(-32602, format!("invalid address: {}", e)))?;
+    let bytes =
+        hex::decode(hex_str).map_err(|e| rpc_err(-32602, format!("invalid address: {}", e)))?;
     if bytes.len() != 32 {
-        return Err(rpc_err(-32602, format!("address must be 32 bytes, got {}", bytes.len())));
+        return Err(rpc_err(
+            -32602,
+            format!("address must be 32 bytes, got {}", bytes.len()),
+        ));
     }
     let mut addr = [0u8; 32];
     addr.copy_from_slice(&bytes);
@@ -950,10 +1108,13 @@ fn parse_address(input: &str) -> Result<[u8; 32], ErrorObjectOwned> {
 
 fn parse_hash(input: &str) -> Result<[u8; 32], ErrorObjectOwned> {
     let hex_str = input.strip_prefix("0x").unwrap_or(input);
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| rpc_err(-32602, format!("invalid hash: {}", e)))?;
+    let bytes =
+        hex::decode(hex_str).map_err(|e| rpc_err(-32602, format!("invalid hash: {}", e)))?;
     if bytes.len() != 32 {
-        return Err(rpc_err(-32602, format!("hash must be 32 bytes, got {}", bytes.len())));
+        return Err(rpc_err(
+            -32602,
+            format!("hash must be 32 bytes, got {}", bytes.len()),
+        ));
     }
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&bytes);
@@ -966,21 +1127,32 @@ async fn parse_call_object(
     obj: &serde_json::Value,
     rpc_state: &RpcState,
 ) -> Result<(pyde_tx::types::Transaction, BlockContext), ErrorObjectOwned> {
-    let from = obj.get("from").and_then(|v| v.as_str())
-        .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
-    let to = obj.get("to").and_then(|v| v.as_str())
-        .map(parse_address).transpose()?.unwrap_or([0u8; 32]);
-    let data = obj.get("data").and_then(|v| v.as_str())
+    let from = obj
+        .get("from")
+        .and_then(|v| v.as_str())
+        .map(parse_address)
+        .transpose()?
+        .unwrap_or([0u8; 32]);
+    let to = obj
+        .get("to")
+        .and_then(|v| v.as_str())
+        .map(parse_address)
+        .transpose()?
+        .unwrap_or([0u8; 32]);
+    let data = obj
+        .get("data")
+        .and_then(|v| v.as_str())
         .map(|s| {
             let s = s.strip_prefix("0x").unwrap_or(s);
             hex::decode(s).unwrap_or_default()
         })
         .unwrap_or_default();
-    let value: u128 = obj.get("value").and_then(|v| v.as_str())
+    let value: u128 = obj
+        .get("value")
+        .and_then(|v| v.as_str())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let gas_limit: u64 = obj.get("gas").and_then(|v| v.as_u64())
-        .unwrap_or(1_000_000);
+    let gas_limit: u64 = obj.get("gas").and_then(|v| v.as_u64()).unwrap_or(1_000_000);
 
     let chain = rpc_state.chain.read().await;
     let tx = pyde_tx::types::Transaction {
@@ -1027,9 +1199,8 @@ fn receipt_to_json(receipt: &Receipt) -> serde_json::Value {
     });
     // Include return_data if non-empty (ephemeral — not persisted to disk)
     if !receipt.return_data.is_empty() {
-        json["returnData"] = serde_json::Value::String(
-            format!("0x{}", hex::encode(&receipt.return_data))
-        );
+        json["returnData"] =
+            serde_json::Value::String(format!("0x{}", hex::encode(&receipt.return_data)));
     }
     json
 }
@@ -1050,7 +1221,9 @@ fn decode_u128(data: &[u8]) -> u128 {
         let mut buf = [0u8; 16];
         buf.copy_from_slice(&data[..16]);
         u128::from_le_bytes(buf)
-    } else { 0 }
+    } else {
+        0
+    }
 }
 
 #[allow(dead_code)]
@@ -1059,7 +1232,9 @@ fn decode_u64(data: &[u8]) -> u64 {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&data[..8]);
         u64::from_le_bytes(buf)
-    } else { 0 }
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]

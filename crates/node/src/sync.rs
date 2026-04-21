@@ -93,10 +93,7 @@ impl ChainSync {
 
     /// Try to request the next batch of blocks from a peer.
     /// Returns true if a request was sent.
-    pub fn request_next_batch(
-        &mut self,
-        swarm: &mut Swarm<PydeBehaviour>,
-    ) -> bool {
+    pub fn request_next_batch(&mut self, swarm: &mut Swarm<PydeBehaviour>) -> bool {
         if !self.manager.needs_sync() {
             return false;
         }
@@ -117,14 +114,19 @@ impl ChainSync {
 
         if let Some(req) = self.manager.next_request() {
             let (start, count) = match &req {
-                pyde_net::sync::SyncRequest::GetBlocks { start_slot, count } => (*start_slot, *count),
+                pyde_net::sync::SyncRequest::GetBlocks { start_slot, count } => {
+                    (*start_slot, *count)
+                }
                 _ => return false,
             };
 
-            let request_id = swarm
-                .behaviour_mut()
-                .sync
-                .send_request(&peer, SyncReq::GetBlocks { start_slot: start, count });
+            let request_id = swarm.behaviour_mut().sync.send_request(
+                &peer,
+                SyncReq::GetBlocks {
+                    start_slot: start,
+                    count,
+                },
+            );
 
             self.pending.insert(request_id, peer);
             info!(
@@ -140,11 +142,7 @@ impl ChainSync {
     }
 
     /// Ask a newly connected peer for their chain tip.
-    pub fn request_chain_tip(
-        &mut self,
-        swarm: &mut Swarm<PydeBehaviour>,
-        peer: PeerId,
-    ) {
+    pub fn request_chain_tip(&mut self, swarm: &mut Swarm<PydeBehaviour>, peer: PeerId) {
         let _id = swarm
             .behaviour_mut()
             .sync
@@ -155,10 +153,7 @@ impl ChainSync {
     /// Request a state snapshot from a peer (for fast sync when far behind).
     /// Uses chunked transfer for production, falls back to bulk for small states.
     #[allow(dead_code)]
-    pub fn request_state_snapshot(
-        &mut self,
-        swarm: &mut Swarm<PydeBehaviour>,
-    ) -> bool {
+    pub fn request_state_snapshot(&mut self, swarm: &mut Swarm<PydeBehaviour>) -> bool {
         let peer = match swarm.connected_peers().next() {
             Some(p) => *p,
             None => return false,
@@ -167,13 +162,13 @@ impl ChainSync {
         self.snapshot_chunks.clear();
         self.snapshot_expected_root = None;
         self.snapshot_total_chunks = 0;
-        let request_id = swarm
-            .behaviour_mut()
-            .sync
-            .send_request(&peer, SyncReq::GetStateSnapshotChunk {
+        let request_id = swarm.behaviour_mut().sync.send_request(
+            &peer,
+            SyncReq::GetStateSnapshotChunk {
                 chunk_index: 0,
                 chunk_size: SNAPSHOT_CHUNK_SIZE,
-            });
+            },
+        );
         self.pending.insert(request_id, peer);
         info!(%peer, chunk_size = SNAPSHOT_CHUNK_SIZE, "requested state snapshot (chunked)");
         true
@@ -186,13 +181,13 @@ impl ChainSync {
         peer: PeerId,
         next_index: u32,
     ) {
-        let request_id = swarm
-            .behaviour_mut()
-            .sync
-            .send_request(&peer, SyncReq::GetStateSnapshotChunk {
+        let request_id = swarm.behaviour_mut().sync.send_request(
+            &peer,
+            SyncReq::GetStateSnapshotChunk {
                 chunk_index: next_index,
                 chunk_size: SNAPSHOT_CHUNK_SIZE,
-            });
+            },
+        );
         self.pending.insert(request_id, peer);
         debug!(chunk = next_index, "requesting next snapshot chunk");
     }
@@ -237,13 +232,19 @@ impl ChainSync {
                             let slot = block.header.slot;
                             // Validate synced block body (includes signature verification)
                             if let Err(e) = BlockProcessor::validate_synced_block_body(
-                                &block, state, chain.chain_id,
+                                &block,
+                                state,
+                                chain.chain_id,
                             ) {
                                 warn!(slot, error = %e, "synced block body validation failed");
                                 break;
                             }
                             match BlockProcessor::process_full_block_with_aot_and_checkpoint(
-                                chain, state, &block, None, ws_checkpoint_slot,
+                                chain,
+                                state,
+                                &block,
+                                None,
+                                ws_checkpoint_slot,
                             ) {
                                 Ok((tx_count, gas_used, _receipts)) => {
                                     // Persist to disk for future sync serving
@@ -263,7 +264,11 @@ impl ChainSync {
                             // Fallback: try header-only decode for backwards compat
                             if let Ok(header) = crate::wire::decode_block_header(data) {
                                 match BlockProcessor::process_block_with_checkpoint(
-                                    chain, state, header, &[], ws_checkpoint_slot,
+                                    chain,
+                                    state,
+                                    header,
+                                    &[],
+                                    ws_checkpoint_slot,
                                 ) {
                                     Ok(_) => {
                                         self.manager.advance_local_tip(chain.head_slot);
@@ -294,7 +299,11 @@ impl ChainSync {
                 debug!("received headers (not used in block sync)");
                 0
             }
-            SyncResp::StateSnapshot { state_root, head_slot, entries } => {
+            SyncResp::StateSnapshot {
+                state_root,
+                head_slot,
+                entries,
+            } => {
                 let count = entries.len();
                 info!(
                     entries = count,
@@ -330,7 +339,12 @@ impl ChainSync {
                 0
             }
             SyncResp::StateSnapshotChunk {
-                state_root, head_slot, chunk_index, total_chunks, chunk_hash, entries,
+                state_root,
+                head_slot,
+                chunk_index,
+                total_chunks,
+                chunk_hash,
+                entries,
             } => {
                 // Verify chunk hash
                 let mut hash_buf = Vec::new();
@@ -343,15 +357,21 @@ impl ChainSync {
                 if computed != chunk_hash {
                     self.snapshot_retry_count += 1;
                     if self.snapshot_retry_count > CHUNK_MAX_RETRIES {
-                        warn!(chunk = chunk_index, retries = self.snapshot_retry_count,
-                            "snapshot chunk hash mismatch — max retries exceeded, aborting sync");
+                        warn!(
+                            chunk = chunk_index,
+                            retries = self.snapshot_retry_count,
+                            "snapshot chunk hash mismatch — max retries exceeded, aborting sync"
+                        );
                         self.snapshot_chunks.clear();
                         self.snapshot_expected_root = None;
                         self.snapshot_total_chunks = 0;
                         self.snapshot_retry_count = 0;
                     } else {
-                        warn!(chunk = chunk_index, retry = self.snapshot_retry_count,
-                            "snapshot chunk hash mismatch — will retry");
+                        warn!(
+                            chunk = chunk_index,
+                            retry = self.snapshot_retry_count,
+                            "snapshot chunk hash mismatch — will retry"
+                        );
                         // Don't store the bad chunk — needs_next_chunk() will re-request it
                     }
                     return 0;
@@ -364,7 +384,8 @@ impl ChainSync {
                     self.snapshot_total_chunks = total_chunks;
                     self.snapshot_head_slot = head_slot;
                 }
-                self.snapshot_chunks.push((chunk_index, entries, chunk_hash));
+                self.snapshot_chunks
+                    .push((chunk_index, entries, chunk_hash));
 
                 info!(
                     chunk = chunk_index,
@@ -377,7 +398,8 @@ impl ChainSync {
                 if self.snapshot_chunks.len() as u32 >= total_chunks {
                     // Sort by index, flatten entries
                     self.snapshot_chunks.sort_by_key(|(idx, _, _)| *idx);
-                    let all_entries: Vec<(Vec<u8>, Vec<u8>)> = self.snapshot_chunks
+                    let all_entries: Vec<(Vec<u8>, Vec<u8>)> = self
+                        .snapshot_chunks
                         .drain(..)
                         .flat_map(|(_, entries, _)| entries)
                         .collect();
@@ -385,7 +407,11 @@ impl ChainSync {
                     let root = self.snapshot_expected_root.take().unwrap_or([0u8; 32]);
                     let slot = self.snapshot_head_slot;
 
-                    info!(entries = all_entries.len(), head_slot = slot, "all chunks received — importing snapshot");
+                    info!(
+                        entries = all_entries.len(),
+                        head_slot = slot,
+                        "all chunks received — importing snapshot"
+                    );
 
                     match state.import_snapshot(all_entries) {
                         Ok(imported_root) => {
@@ -437,12 +463,10 @@ impl ChainSync {
         pinned_snapshot: &mut Option<PinnedSnapshot>,
     ) -> SyncResp {
         match req {
-            SyncReq::GetChainTip => {
-                SyncResp::ChainTip {
-                    slot: chain.head_slot,
-                    block_hash: chain.state_root,
-                }
-            }
+            SyncReq::GetChainTip => SyncResp::ChainTip {
+                slot: chain.head_slot,
+                block_hash: chain.state_root,
+            },
             SyncReq::GetBlocks { start_slot, count } => {
                 // Serve full wire-encoded blocks (header + body + signature).
                 // Skips empty slots (sparse block history — not every slot has a block).
@@ -494,7 +518,10 @@ impl ChainSync {
                     }
                 }
             }
-            SyncReq::GetStateSnapshotChunk { chunk_index, chunk_size } => {
+            SyncReq::GetStateSnapshotChunk {
+                chunk_index,
+                chunk_size,
+            } => {
                 // Pin snapshot on first chunk request (reuse for all subsequent chunks)
                 let snap = pinned_snapshot.get_or_insert_with(|| {
                     let entries = state.export_snapshot();
@@ -559,7 +586,9 @@ impl ChainSync {
     /// Whether a chunked snapshot download is in progress and needs more chunks.
     /// Returns the next chunk index to request, or None if complete.
     pub fn needs_next_chunk(&self) -> Option<u32> {
-        if self.snapshot_total_chunks == 0 { return None; }
+        if self.snapshot_total_chunks == 0 {
+            return None;
+        }
         let collected = self.snapshot_chunks.len() as u32;
         if collected < self.snapshot_total_chunks {
             Some(collected)
@@ -658,7 +687,13 @@ mod tests {
         let (state, _sd) = make_state();
         let (bs, _bd) = make_block_store();
 
-        let resp = ChainSync::handle_inbound_request(&SyncReq::GetChainTip, &chain, &state, &bs, &mut None::<PinnedSnapshot>);
+        let resp = ChainSync::handle_inbound_request(
+            &SyncReq::GetChainTip,
+            &chain,
+            &state,
+            &bs,
+            &mut None::<PinnedSnapshot>,
+        );
         match resp {
             SyncResp::ChainTip { slot, .. } => assert_eq!(slot, 10),
             _ => panic!("expected ChainTip response"),
@@ -675,8 +710,14 @@ mod tests {
         let (bs, _bd) = make_block_store();
 
         let resp = ChainSync::handle_inbound_request(
-            &SyncReq::GetBlocks { start_slot: 1, count: 3 },
-            &chain, &state, &bs, &mut None::<PinnedSnapshot>,
+            &SyncReq::GetBlocks {
+                start_slot: 1,
+                count: 3,
+            },
+            &chain,
+            &state,
+            &bs,
+            &mut None::<PinnedSnapshot>,
         );
         match resp {
             SyncResp::Blocks(blocks) => {
@@ -696,8 +737,14 @@ mod tests {
         let (bs, _bd) = make_block_store();
 
         let resp = ChainSync::handle_inbound_request(
-            &SyncReq::GetBlocks { start_slot: 100, count: 10 },
-            &chain, &state, &bs, &mut None::<PinnedSnapshot>,
+            &SyncReq::GetBlocks {
+                start_slot: 100,
+                count: 10,
+            },
+            &chain,
+            &state,
+            &bs,
+            &mut None::<PinnedSnapshot>,
         );
         match resp {
             SyncResp::NotFound => {}
@@ -718,10 +765,17 @@ mod tests {
         let (bs, _bd) = make_block_store();
         let resp = ChainSync::handle_inbound_request(
             &SyncReq::GetStateSnapshot,
-            &chain, &state, &bs, &mut None::<PinnedSnapshot>,
+            &chain,
+            &state,
+            &bs,
+            &mut None::<PinnedSnapshot>,
         );
         match resp {
-            SyncResp::StateSnapshot { state_root, head_slot, entries } => {
+            SyncResp::StateSnapshot {
+                state_root,
+                head_slot,
+                entries,
+            } => {
                 assert_eq!(head_slot, 5);
                 assert_eq!(entries.len(), 1);
                 assert_eq!(state_root, state.root());

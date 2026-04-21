@@ -23,9 +23,9 @@ use pyde_crypto::falcon::{falcon_verify, FalconPublicKey, FalconSignature};
 pub use pyde_slashing::FINDER_FEE_PERCENT;
 
 /// Slash percentages for liveness tiers.
-pub const LIVENESS_SLASH_MINOR: u128 = 1;   // 1% — participation < 90%
-pub const LIVENESS_SLASH_MAJOR: u128 = 5;   // 5% — participation < 50%
-pub const LIVENESS_SLASH_ABSENT: u128 = 10;  // 10% — participation == 0%
+pub const LIVENESS_SLASH_MINOR: u128 = 1; // 1% — participation < 90%
+pub const LIVENESS_SLASH_MAJOR: u128 = 5; // 5% — participation < 50%
+pub const LIVENESS_SLASH_ABSENT: u128 = 10; // 10% — participation == 0%
 
 /// Slash percentage for invalid block proposal.
 pub const INVALID_PROPOSAL_SLASH: u128 = 50; // 50%
@@ -38,9 +38,9 @@ pub const DECRYPTION_WITHHOLD_SLASH: u128 = 2; // 2% per offense
 pub enum SlashingOffense {
     DoubleSigning,
     Equivocation,
-    LivenessMinor,    // < 90% participation
-    LivenessMajor,    // < 50% participation
-    LivenessAbsent,   // 0% participation
+    LivenessMinor,  // < 90% participation
+    LivenessMajor,  // < 50% participation
+    LivenessAbsent, // 0% participation
     InvalidProposal,
     DecryptionWithholding,
 }
@@ -198,7 +198,10 @@ pub fn slash_liveness(report: &LivenessReport) -> Option<SlashResult> {
     };
 
     let (burned, finder_fee) = compute_slash(VALIDATOR_STAKE, &offense);
-    let ejected = matches!(offense, SlashingOffense::LivenessMajor | SlashingOffense::LivenessAbsent);
+    let ejected = matches!(
+        offense,
+        SlashingOffense::LivenessMajor | SlashingOffense::LivenessAbsent
+    );
     let forced_unbonding = matches!(offense, SlashingOffense::LivenessAbsent);
 
     Some(SlashResult {
@@ -495,7 +498,8 @@ mod tests {
         let addr = derive_eoa_address(&pk_bytes);
 
         let mut set = ValidatorSet::new();
-        set.register(addr, pk_bytes.clone(), VALIDATOR_STAKE, 0).unwrap();
+        set.register(addr, pk_bytes.clone(), VALIDATOR_STAKE, 0)
+            .unwrap();
         assert_eq!(set.validators[0].stake, VALIDATOR_STAKE);
 
         let hash_1 = make_header(100, 1_000_000).hash();

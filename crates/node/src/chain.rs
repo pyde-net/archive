@@ -68,7 +68,9 @@ impl ChainState {
 
     /// Get the header by block hash.
     pub fn header_by_hash(&self, hash: &[u8; 32]) -> Option<&BlockHeader> {
-        self.hash_to_slot.get(hash).and_then(|s| self.headers.get(s))
+        self.hash_to_slot
+            .get(hash)
+            .and_then(|s| self.headers.get(s))
     }
 
     /// Whether we're at genesis (no blocks processed yet).
@@ -132,8 +134,8 @@ mod tests {
         }
 
         // Epoch 2 (slot 2500): keep epochs 1+2 (slots >= 1000), prune epoch 0
-        assert!(chain.header(1).is_none());    // epoch 0, pruned
-        assert!(chain.header(999).is_none());  // epoch 0, pruned
+        assert!(chain.header(1).is_none()); // epoch 0, pruned
+        assert!(chain.header(999).is_none()); // epoch 0, pruned
         assert!(chain.header(1000).is_some()); // epoch 1, kept
         assert!(chain.header(2500).is_some()); // epoch 2, kept
     }

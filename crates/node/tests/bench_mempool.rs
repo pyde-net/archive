@@ -21,11 +21,19 @@ struct CachedSmt<'a> {
 impl<'a> StateAccess for CachedSmt<'a> {
     fn get(&self, key: &pyde_state::smt::Key) -> Option<Vec<u8>> {
         if let Some(val) = self.cache.get(key) {
-            return if val.is_empty() { None } else { Some(val.clone()) };
+            return if val.is_empty() {
+                None
+            } else {
+                Some(val.clone())
+            };
         }
         self.base.get(key)
     }
-    fn insert(&mut self, _key: pyde_state::smt::Key, _value: Vec<u8>) -> Result<sparse_merkle_tree::H256, &'static str> {
+    fn insert(
+        &mut self,
+        _key: pyde_state::smt::Key,
+        _value: Vec<u8>,
+    ) -> Result<sparse_merkle_tree::H256, &'static str> {
         Err("CachedSmt is read-only")
     }
     fn root(&self) -> sparse_merkle_tree::H256 {
@@ -38,8 +46,11 @@ unsafe impl<'a> Sync for CachedSmt<'a> {}
 
 fn block_ctx(chain_id: u64) -> BlockContext {
     BlockContext {
-        height: 100, timestamp: 1_000_000, base_fee: 1,
-        block_gas_limit: 4_000_000_000, chain_id,
+        height: 100,
+        timestamp: 1_000_000,
+        base_fee: 1,
+        block_gas_limit: 4_000_000_000,
+        chain_id,
         validator_address: [0u8; 32],
         // Bench fixture: skip sig verification when caller opts into devnet.
         dev_skip_signature: chain_id == 31337,
@@ -59,31 +70,42 @@ fn bench_preloaded_mempool() {
     let num_accounts = 2000usize;
     println!("  Generating {} accounts...", num_accounts);
 
-    let accounts: Vec<([u8; 32], Vec<u8>, Vec<u8>)> = (0..num_accounts).into_par_iter().map(|_| {
-        let (pk, sk) = falcon_keygen().unwrap();
-        let addr = derive_eoa_address(pk.as_bytes());
-        (addr, pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
-    }).collect();
+    let accounts: Vec<([u8; 32], Vec<u8>, Vec<u8>)> = (0..num_accounts)
+        .into_par_iter()
+        .map(|_| {
+            let (pk, sk) = falcon_keygen().unwrap();
+            let addr = derive_eoa_address(pk.as_bytes());
+            (addr, pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
+        })
+        .collect();
 
     for (addr, _pk_bytes, _) in &accounts {
         let account = pyde_account::types::Account {
-            address: *addr, nonce: 0, balance: 1_000_000_000_000_000,
+            address: *addr,
+            nonce: 0,
+            balance: 1_000_000_000_000_000,
             code_hash: sparse_merkle_tree::H256::zero(),
             storage_root: sparse_merkle_tree::H256::zero(),
             account_type: pyde_account::types::AccountType::EOA,
             auth_keys: pyde_account::types::AuthKeys::None,
-            gas_tank: 0, key_nonce: 0,
+            gas_tank: 0,
+            key_nonce: 0,
         };
-        smt.insert(pyde_state::keys::balance_key(addr), account.to_bytes()).unwrap();
-        smt.insert(pyde_state::keys::nonce_key(addr),
-            pyde_account::nonce::NonceState::new().to_bytes().to_vec()).unwrap();
+        smt.insert(pyde_state::keys::balance_key(addr), account.to_bytes())
+            .unwrap();
+        smt.insert(
+            pyde_state::keys::nonce_key(addr),
+            pyde_account::nonce::NonceState::new().to_bytes().to_vec(),
+        )
+        .unwrap();
     }
 
     // --- Phase 2: Deploy 20 complex contracts ---
     let num_contracts = 20usize;
     println!("  Deploying {} complex contracts...", num_contracts);
 
-    let compiled = otic::compile_all(r#"
+    let compiled = otic::compile_all(
+        r#"
         struct Stats { sum: u256, count: u64, min: u64, max: u64 }
         contract HeavyWork {
             storage { result: u64, }
@@ -115,7 +137,8 @@ fn bench_preloaded_mempool() {
                 self.result = fib_sum ^ xor_acc ^ stats.count;
             }
         }
-    "#);
+    "#,
+    );
     let (_, cc) = &compiled[0];
     let mut deploy_data = Vec::new();
     deploy_data.extend_from_slice(&(cc.constructor_bytecode.len() as u32).to_le_bytes());
@@ -127,10 +150,18 @@ fn bench_preloaded_mempool() {
     for i in 0..num_contracts {
         let (addr, _, _) = &accounts[i];
         let dtx = Transaction {
-            from: *addr, to: [0u8; 32], value: 0, data: deploy_data.clone(),
-            gas_limit: 100_000_000, nonce: 0, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list: vec![],
-            deadline: None, chain_id: 31337, tx_type: TransactionType::Deploy,
+            from: *addr,
+            to: [0u8; 32],
+            value: 0,
+            data: deploy_data.clone(),
+            gas_limit: 100_000_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 31337,
+            tx_type: TransactionType::Deploy,
         };
         let receipt = execute_transaction(&dtx, &mut smt, &ctx).unwrap();
         assert!(receipt.success, "deploy {} failed", i);
@@ -139,21 +170,35 @@ fn bench_preloaded_mempool() {
         contract_addrs.push(ca);
     }
     // AOT compile all deployed contracts
-    let mut aot_fns: std::collections::HashMap<[u8; 32], pyde_aot::CompiledCode> = std::collections::HashMap::new();
+    let mut aot_fns: std::collections::HashMap<[u8; 32], pyde_aot::CompiledCode> =
+        std::collections::HashMap::new();
     for addr in &contract_addrs {
         let code_key = pyde_state::keys::code_key(addr);
         if let Some(bytecode) = smt.get(&code_key) {
             match pyde_aot::compile_bytecode(&bytecode) {
-                Ok(compiled) => { aot_fns.insert(*addr, compiled); }
-                Err(e) => { println!("    AOT compile failed: {} ({} bytes)", e, bytecode.len()); }
+                Ok(compiled) => {
+                    aot_fns.insert(*addr, compiled);
+                }
+                Err(e) => {
+                    println!("    AOT compile failed: {} ({} bytes)", e, bytecode.len());
+                }
             }
         }
     }
-    let _aot_map: std::collections::HashMap<[u8; 32], unsafe fn(*mut u64, u64, *mut pyde_vm::vm::Vm) -> u64> =
-        aot_fns.iter().map(|(addr, code)| (*addr, code.as_fn())).collect();
+    let _aot_map: std::collections::HashMap<
+        [u8; 32],
+        unsafe fn(*mut u64, u64, *mut pyde_vm::vm::Vm) -> u64,
+    > = aot_fns
+        .iter()
+        .map(|(addr, code)| (*addr, code.as_fn()))
+        .collect();
 
-    println!("  {} contracts deployed ({} instrs, {} AOT compiled)", num_contracts,
-        cc.constructor_bytecode.len() / 4 + cc.runtime_bytecode.len() / 4, aot_fns.len());
+    println!(
+        "  {} contracts deployed ({} instrs, {} AOT compiled)",
+        num_contracts,
+        cc.constructor_bytecode.len() / 4 + cc.runtime_bytecode.len() / 4,
+        aot_fns.len()
+    );
 
     // --- Phase 3: Pre-sign 100K mixed txs in parallel ---
     // 500 accounts × 60 nonces (within 64 window) = 30K txs
@@ -164,41 +209,72 @@ fn bench_preloaded_mempool() {
     let mut call_data = selector.to_be_bytes().to_vec();
     call_data.extend_from_slice(&50u64.to_le_bytes()); // n=50 iterations
 
-    println!("  Pre-signing {} mixed txs ({} cores)...", total_txs, rayon::current_num_threads());
+    println!(
+        "  Pre-signing {} mixed txs ({} cores)...",
+        total_txs,
+        rayon::current_num_threads()
+    );
     let sign_start = Instant::now();
 
-    let txs: Vec<Transaction> = (0..total_txs).into_par_iter().map(|i| {
-        let acc_idx = i % num_accounts;
-        let (addr, _, _) = &accounts[acc_idx];
-        let nonce = (i / num_accounts) as u64 + 1; // +1 because deploy used nonce 0
-        let is_call = (i % 5) >= 3; // 40% contract calls
+    let txs: Vec<Transaction> = (0..total_txs)
+        .into_par_iter()
+        .map(|i| {
+            let acc_idx = i % num_accounts;
+            let (addr, _, _) = &accounts[acc_idx];
+            let nonce = (i / num_accounts) as u64 + 1; // +1 because deploy used nonce 0
+            let is_call = (i % 5) >= 3; // 40% contract calls
 
-        if is_call {
-            let contract = contract_addrs[i % num_contracts];
-            Transaction {
-                from: *addr, to: contract, value: 0, data: call_data.clone(),
-                gas_limit: 10_000_000, nonce, signature: vec![],
-                fee_payer: FeePayer::Sender, access_list: vec![],
-                deadline: None, chain_id: 31337, tx_type: TransactionType::Standard,
+            if is_call {
+                let contract = contract_addrs[i % num_contracts];
+                Transaction {
+                    from: *addr,
+                    to: contract,
+                    value: 0,
+                    data: call_data.clone(),
+                    gas_limit: 10_000_000,
+                    nonce,
+                    signature: vec![],
+                    fee_payer: FeePayer::Sender,
+                    access_list: vec![],
+                    deadline: None,
+                    chain_id: 31337,
+                    tx_type: TransactionType::Standard,
+                }
+            } else {
+                Transaction {
+                    from: *addr,
+                    to: recipient,
+                    value: 1,
+                    data: vec![],
+                    gas_limit: 50_000,
+                    nonce,
+                    signature: vec![],
+                    fee_payer: FeePayer::Sender,
+                    access_list: vec![],
+                    deadline: None,
+                    chain_id: 31337,
+                    tx_type: TransactionType::Standard,
+                }
             }
-        } else {
-            Transaction {
-                from: *addr, to: recipient, value: 1, data: vec![],
-                gas_limit: 50_000, nonce, signature: vec![],
-                fee_payer: FeePayer::Sender, access_list: vec![],
-                deadline: None, chain_id: 31337, tx_type: TransactionType::Standard,
-            }
-        }
-    }).collect();
+        })
+        .collect();
 
     let sign_elapsed = sign_start.elapsed();
     let transfers = txs.iter().filter(|t| t.data.is_empty()).count();
     let calls = total_txs - transfers;
-    println!("  Built in {:.2}s — {} transfers + {} contract calls", sign_elapsed.as_secs_f64(), transfers, calls);
+    println!(
+        "  Built in {:.2}s — {} transfers + {} contract calls",
+        sign_elapsed.as_secs_f64(),
+        transfers,
+        calls
+    );
 
     // --- Phase 4: Process ALL txs through block processor simulation ---
     // This is the EXACT path mainnet uses: StateOverlay → parallel groups → batch commit
-    println!("\n  Processing {} txs through block processor...", total_txs);
+    println!(
+        "\n  Processing {} txs through block processor...",
+        total_txs
+    );
     let process_start = Instant::now();
 
     let mut ok_count = 0u64;
@@ -210,12 +286,16 @@ fn bench_preloaded_mempool() {
 
     // Write-ahead cache: holds state from previous blocks so the next block
     // reads from memory, not RocksDB. Merkle commit is deferred.
-    let mut write_cache: std::collections::HashMap<sparse_merkle_tree::H256, Vec<u8>> = std::collections::HashMap::new();
+    let mut write_cache: std::collections::HashMap<sparse_merkle_tree::H256, Vec<u8>> =
+        std::collections::HashMap::new();
 
     for batch in txs.chunks(batch_size) {
         let exec_start = Instant::now();
         // Create a cached reader that checks write_cache → PersistentSMT
-        let cached_base = CachedSmt { cache: &write_cache, base: &smt };
+        let cached_base = CachedSmt {
+            cache: &write_cache,
+            base: &smt,
+        };
         let mut overlay = StateOverlay::new(&cached_base);
         for tx in batch {
             match execute_transaction(tx, &mut overlay, &ctx) {
@@ -247,10 +327,14 @@ fn bench_preloaded_mempool() {
 
         block_num += 1;
         if block_num <= 3 || block_num % 10 == 0 {
-            println!("    block {}: exec={:.0}ms, commit={:.0}ms ({} writes), {:.0} exec TPS",
-                block_num, exec_elapsed.as_secs_f64() * 1000.0,
-                commit_elapsed.as_secs_f64() * 1000.0, write_count,
-                batch.len() as f64 / exec_elapsed.as_secs_f64());
+            println!(
+                "    block {}: exec={:.0}ms, commit={:.0}ms ({} writes), {:.0} exec TPS",
+                block_num,
+                exec_elapsed.as_secs_f64() * 1000.0,
+                commit_elapsed.as_secs_f64() * 1000.0,
+                write_count,
+                batch.len() as f64 / exec_elapsed.as_secs_f64()
+            );
         }
     }
 
@@ -262,10 +346,18 @@ fn bench_preloaded_mempool() {
 
     println!("\n  ========== RESULTS ==========");
     println!("  Total txs:    {}", total_txs);
-    println!("  Succeeded:    {} ({:.1}%)", ok_count, (ok_count as f64 / total_txs as f64) * 100.0);
+    println!(
+        "  Succeeded:    {} ({:.1}%)",
+        ok_count,
+        (ok_count as f64 / total_txs as f64) * 100.0
+    );
     println!("  Failed:       {}", fail_count);
     println!("  Blocks:       {} ({} txs/block)", blocks, batch_size);
-    println!("  Exec time:    {:.2}s ({:.0} TPS execution only)", total_exec_ms / 1000.0, exec_tps);
+    println!(
+        "  Exec time:    {:.2}s ({:.0} TPS execution only)",
+        total_exec_ms / 1000.0,
+        exec_tps
+    );
     println!("  Commit time:  {:.2}s", total_commit_ms / 1000.0);
     println!("  Total time:   {:.2}s", process_elapsed.as_secs_f64());
     println!("  **Exec TPS:   {:.0}** (no commit overhead)", exec_tps);

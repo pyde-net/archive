@@ -556,9 +556,9 @@ impl CodeGen {
                 // Load msg.value into w7, check if > 0
                 self.emit_op(Opcode::Callvalue, WIDE_SCRATCH, 0, 0); // w7 = msg.value
                 self.emit_op(Opcode::Addi, 15, 0, 0);
-                self.emit_op(Opcode::Widen, WIDE_SCRATCH2, 15, 0);  // w6 = 0
+                self.emit_op(Opcode::Widen, WIDE_SCRATCH2, 15, 0); // w6 = 0
                 self.emit_op(Opcode::Weq, 15, WIDE_SCRATCH, WIDE_SCRATCH2 as u32); // r15 = (value == 0)
-                // If value != 0 (r15 == 0) → receive
+                                                                                   // If value != 0 (r15 == 0) → receive
                 self.emit_jump_placeholder(Opcode::Beq, 15, 0, recv_label);
             }
 
@@ -883,7 +883,10 @@ impl CodeGen {
         // Set guard cleanup flag based on function properties (same condition as guard emission).
         // This ensures cleanup is emitted before Ret in the function body.
         self.needs_guard_cleanup = self.emit_guards
-            && func.is_pub && !func.is_view && !func.is_constructor && !func.is_reentrant;
+            && func.is_pub
+            && !func.is_view
+            && !func.is_constructor
+            && !func.is_reentrant;
         self.current_return_ty = func.return_ty.clone();
 
         // Remap IR labels to unique codegen labels to prevent cross-function collisions.
@@ -1016,7 +1019,7 @@ impl CodeGen {
                         // Write raw bytes to heap, set dst = heap pointer
                         let rd = self.alloc_gp(*dst);
                         self.emit_op(Opcode::Add, rd, 12, 0); // rd = current heap ptr
-                        // Write bytes in 8-byte chunks
+                                                              // Write bytes in 8-byte chunks
                         for (i, chunk) in data.chunks(8).enumerate() {
                             let mut buf = [0u8; 8];
                             buf[..chunk.len()].copy_from_slice(chunk);
@@ -1244,7 +1247,9 @@ impl CodeGen {
                 let rv = self.get_reg(*val);
                 // Save value if it's in r15 (which we need for slot)
                 let val_saved = rv == 15;
-                if val_saved { self.emit_op(Opcode::Push, 15, 0, 0); }
+                if val_saved {
+                    self.emit_op(Opcode::Push, 15, 0, 0);
+                }
 
                 // NOW set slot in wide register (r15 is safe to clobber)
                 self.emit_op(Opcode::Addi, 15, 0, slot);
@@ -1254,7 +1259,9 @@ impl CodeGen {
                 let rv = if val_saved {
                     self.emit_op(Opcode::Pop, 14, 0, 0); // use r14 instead
                     14u8
-                } else { rv };
+                } else {
+                    rv
+                };
 
                 if is_blob_type(&ty) {
                     self.emit_op(Opcode::Push, 12, 0, 0);
@@ -1528,9 +1535,9 @@ impl CodeGen {
                             if rv != 0 {
                                 self.emit_op(Opcode::Wmov, 0, rv, 0);
                             }
-                            self.emit_op(Opcode::Wstore, 0, 12, 0);  // mem[heap] = w0
-                            self.emit_op(Opcode::Add, 1, 12, 0);     // r1 = heap ptr
-                            self.emit_op(Opcode::Addi, 2, 0, 32);    // r2 = 32 bytes
+                            self.emit_op(Opcode::Wstore, 0, 12, 0); // mem[heap] = w0
+                            self.emit_op(Opcode::Add, 1, 12, 0); // r1 = heap ptr
+                            self.emit_op(Opcode::Addi, 2, 0, 32); // r2 = 32 bytes
                         } else if rv != 1 {
                             self.emit_op(Opcode::Add, 1, rv, 0);
                             // Clear r2 AFTER rv→r1 copy so blob return check doesn't false-trigger
@@ -1596,7 +1603,9 @@ impl CodeGen {
 
                 // Topics 1-3: indexed fields (stored as 32-byte LE values)
                 for (i, (freg, _ty, _)) in indexed_fields.iter().enumerate() {
-                    if i >= 3 { break; }
+                    if i >= 3 {
+                        break;
+                    }
                     let topic_offset = (1 + i) * 32;
                     if self.regs.is_wide(*freg) {
                         // Wide register: extract 32 bytes via Wand+Narrow+Wshift
@@ -1609,13 +1618,23 @@ impl CodeGen {
                         self.emit_op(Opcode::Addi, 14, 0, 64); // r14 = 64 for shift
                         for j in 0..4u32 {
                             // Mask low 64 bits: w7_temp = w6 & w7(mask)
-                            self.emit_op(Opcode::Wand, WIDE_SCRATCH, WIDE_SCRATCH2, WIDE_SCRATCH as u32);
+                            self.emit_op(
+                                Opcode::Wand,
+                                WIDE_SCRATCH,
+                                WIDE_SCRATCH2,
+                                WIDE_SCRATCH as u32,
+                            );
                             // Narrow is safe now (masked to <= u64::MAX)
                             self.emit_op(Opcode::Narrow, 15, WIDE_SCRATCH, 0);
                             self.emit_store(15, 12, (topic_offset + j as usize * 8) as i32);
                             if j < 3 {
                                 // Shift source right by 64 for next chunk
-                                self.emit_op(Opcode::Wshift, WIDE_SCRATCH2, WIDE_SCRATCH2, (14 << 1) | 1);
+                                self.emit_op(
+                                    Opcode::Wshift,
+                                    WIDE_SCRATCH2,
+                                    WIDE_SCRATCH2,
+                                    (14 << 1) | 1,
+                                );
                                 // Restore mask (Wand clobbered WIDE_SCRATCH)
                                 self.emit_op(Opcode::Addi, 15, 0, (-1i32 as u32) & 0x3FFFF);
                                 self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
@@ -1644,11 +1663,21 @@ impl CodeGen {
                         self.emit_op(Opcode::Wmov, WIDE_SCRATCH2, wr, 0);
                         self.emit_op(Opcode::Addi, 14, 0, 64);
                         for j in 0..4u32 {
-                            self.emit_op(Opcode::Wand, WIDE_SCRATCH, WIDE_SCRATCH2, WIDE_SCRATCH as u32);
+                            self.emit_op(
+                                Opcode::Wand,
+                                WIDE_SCRATCH,
+                                WIDE_SCRATCH2,
+                                WIDE_SCRATCH as u32,
+                            );
                             self.emit_op(Opcode::Narrow, 15, WIDE_SCRATCH, 0);
                             self.emit_store(15, 12, (data_offset + j as usize * 8) as i32);
                             if j < 3 {
-                                self.emit_op(Opcode::Wshift, WIDE_SCRATCH2, WIDE_SCRATCH2, (14 << 1) | 1);
+                                self.emit_op(
+                                    Opcode::Wshift,
+                                    WIDE_SCRATCH2,
+                                    WIDE_SCRATCH2,
+                                    (14 << 1) | 1,
+                                );
                                 self.emit_op(Opcode::Addi, 15, 0, (-1i32 as u32) & 0x3FFFF);
                                 self.emit_op(Opcode::Widen, WIDE_SCRATCH, 15, 0);
                             }
@@ -2138,7 +2167,10 @@ impl CodeGen {
 
             Inst::ExtCall(dst, addr, method, args, ret_ty, value_reg) => {
                 let wide_return = is_wide_type(ret_ty);
-                let blob_return = matches!(ret_ty, Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_));
+                let blob_return = matches!(
+                    ret_ty,
+                    Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_)
+                );
                 // The target address is a WIDE register (32-byte Address).
                 // Use alloc_wide to ensure we get the wide register index, not a GP index.
                 // get_reg() can return a GP index if the vreg was spilled, which would
@@ -2182,8 +2214,8 @@ impl CodeGen {
                 let mut arg_offset: i32 = if has_selector { 4 } else { 0 };
                 let mut has_blob_args = false;
                 for (arg, ty) in args.iter() {
-                    let is_blob = matches!(ty,
-                        Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_));
+                    let is_blob =
+                        matches!(ty, Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_));
                     if is_blob {
                         has_blob_args = true;
                     }
@@ -2231,8 +2263,11 @@ impl CodeGen {
                         // Move arg to safe register — emit_flatten clobbers r14/r15
                         let r = self.get_reg(*arg);
                         let safe_r = if r == 14 || r == 15 {
-                            self.emit_op(Opcode::Add, 11, r, 0); 11
-                        } else { r };
+                            self.emit_op(Opcode::Add, 11, r, 0);
+                            11
+                        } else {
+                            r
+                        };
                         self.emit_op(Opcode::Push, 12, 0, 0); // save start for byte_len patch
                         self.emit_op(Opcode::Addi, 12, 12, 8); // skip byte_len placeholder
                         self.emit_flatten(ty, safe_r);
@@ -2268,7 +2303,7 @@ impl CodeGen {
                 if has_blob_args {
                     // Dynamic length: r14 = r12 - calldata_start
                     self.emit_op(Opcode::Sub, 14, 12, 14); // r14 = total calldata len
-                    // Restore r12 to calldata start for the CallExt rs1 operand
+                                                           // Restore r12 to calldata start for the CallExt rs1 operand
                     self.emit_op(Opcode::Sub, 12, 12, 14); // r12 = calldata start
                 } else {
                     // Static length — r14 is the calldata_start (not needed), overwrite with len
@@ -2278,8 +2313,8 @@ impl CodeGen {
                 let imm = (14 & 0xF)           // len_reg = r14
                     | ((15 & 0xF) << 4)         // gas_reg = r15
                     | ((13 & 0xF) << 8); // result_reg = r13
-                // Load call value into r8 (convention: r8 = msg.value for child)
-                // Only set r8 if value is explicitly provided — otherwise leave it alone
+                                         // Load call value into r8 (convention: r8 = msg.value for child)
+                                         // Only set r8 if value is explicitly provided — otherwise leave it alone
                 let has_value = value_reg.is_some();
                 if let Some(val_vreg) = value_reg {
                     let val_r = self.get_reg(*val_vreg);
@@ -2378,7 +2413,7 @@ impl CodeGen {
                 let imm = (14 & 0xF)           // len_reg = r14
                     | ((15 & 0xF) << 4)         // gas_reg = r15
                     | ((13 & 0xF) << 8); // result_reg = r13
-                // Save r13 (spill base) — CallExt overwrites it with success flag
+                                         // Save r13 (spill base) — CallExt overwrites it with success flag
                 self.emit_op(Opcode::Push, 13, 0, 0);
                 self.emit_op(Opcode::CallExt, rt, 12, imm);
                 self.emit_op(Opcode::Pop, 13, 0, 0); // restore spill base
@@ -2408,8 +2443,9 @@ impl CodeGen {
 
                 // Write constructor args after the blob.
                 // r12 points to right after the blob — append args here.
-                let has_blob_args = args.iter().any(|(_, ty)| matches!(ty,
-                    Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_)));
+                let has_blob_args = args.iter().any(|(_, ty)| {
+                    matches!(ty, Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_))
+                });
 
                 if !has_blob_args {
                     // All fixed-size: use static offsets (original path)
@@ -2434,8 +2470,8 @@ impl CodeGen {
                         // Push args in reverse so first arg pops first
                         let r = self.get_reg(*arg);
                         self.emit_op(Opcode::Push, r, 0, 0);
-                        let is_blob = matches!(ty,
-                            Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_));
+                        let is_blob =
+                            matches!(ty, Ty::StringTy | Ty::Bytes | Ty::Vec(_) | Ty::Struct(_));
                         arg_info.push((ty.clone(), is_blob));
                     }
                     arg_info.reverse(); // back to original order
@@ -3440,9 +3476,9 @@ impl CodeGen {
                         // Deserialize field from src into temp register, then store to struct
                         if is_wide_type(fty) {
                             self.emit_deserialize(fty, src_reg, 14); // wide → but we use 14 as GP temp
-                                                                      // For wide fields in struct, store the wide value at struct+offset
-                                                                      // Actually wide fields need 32 bytes but struct layout uses 8 per field (pointer)
-                                                                      // This is a limitation — skip for now
+                                                                     // For wide fields in struct, store the wide value at struct+offset
+                                                                     // Actually wide fields need 32 bytes but struct layout uses 8 per field (pointer)
+                                                                     // This is a limitation — skip for now
                             self.emit_op(Opcode::Pop, 15, 0, 0); // peek struct base
                             self.emit_op(Opcode::Push, 15, 0, 0);
                             self.emit_store(14, 15, offset as i32);
@@ -3480,7 +3516,10 @@ impl CodeGen {
 
 /// Check if a type uses wide (256-bit) register.
 fn is_wide_type(ty: &Ty) -> bool {
-    matches!(ty, Ty::U256 | Ty::I256 | Ty::Address | Ty::Contract(_) | Ty::Interface(_))
+    matches!(
+        ty,
+        Ty::U256 | Ty::I256 | Ty::Address | Ty::Contract(_) | Ty::Interface(_)
+    )
 }
 
 /// Return the PVM MemWidth for a GP type (used by emit_load_typed / emit_store_typed).
@@ -5917,8 +5956,8 @@ mod tests {
 
         // Helper: create a lazy backend from SMT
         let _load_from_smt = |smt: &pyde_state::smt::PydeSMT,
-                             storage: &mut std::collections::HashMap<ethnum::U256, Vec<u8>>,
-                             keys: &[ethnum::U256]| {
+                              storage: &mut std::collections::HashMap<ethnum::U256, Vec<u8>>,
+                              keys: &[ethnum::U256]| {
             for key in keys {
                 let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
                 if let Some(val) = smt.get(&smt_key) {
@@ -8357,7 +8396,8 @@ mod tests {
         // The runtime bytecode for Factory.mint_on_last MUST contain CallExt (0x26)
         // Instruction encoding: opcode is in bits 26-31, stored as LE bytes.
         // So byte[3] >> 2 == opcode.
-        let has_callext = factory.runtime_bytecode
+        let has_callext = factory
+            .runtime_bytecode
             .chunks(4)
             .any(|chunk| chunk.len() == 4 && (chunk[3] >> 2) == 0x26);
         assert!(

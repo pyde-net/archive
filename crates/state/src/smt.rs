@@ -139,10 +139,8 @@ impl PydeSMT {
 
     /// Batch insert/update multiple key-value pairs. Returns the new root.
     pub fn update_all(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<H256, &'static str> {
-        let leaves: Vec<(Key, SmtValue)> = entries
-            .into_iter()
-            .map(|(k, v)| (k, SmtValue(v)))
-            .collect();
+        let leaves: Vec<(Key, SmtValue)> =
+            entries.into_iter().map(|(k, v)| (k, SmtValue(v))).collect();
         self.inner
             .update_all(leaves)
             .map_err(|_| "SMT batch update failed")?;
@@ -227,7 +225,11 @@ impl<'a> StateAccess for StateOverlay<'a> {
     fn get(&self, key: &Key) -> Option<Vec<u8>> {
         // Check overlay first (local writes), then base SMT
         if let Some(v) = self.writes.get(key) {
-            if v.is_empty() { None } else { Some(v.clone()) }
+            if v.is_empty() {
+                None
+            } else {
+                Some(v.clone())
+            }
         } else {
             self.base.get(key)
         }
@@ -254,8 +256,8 @@ pub struct PersistentSMT {
 impl PersistentSMT {
     /// Open a persistent SMT backed by RocksDB at the given path.
     pub fn open(db_path: &str) -> Result<Self, String> {
-        let backend = RocksDBBackend::open(db_path)
-            .map_err(|e| format!("failed to open RocksDB: {}", e))?;
+        let backend =
+            RocksDBBackend::open(db_path).map_err(|e| format!("failed to open RocksDB: {}", e))?;
         let smt = NervosSMT::new_with_store(backend)
             .map_err(|e| format!("failed to create SMT: {}", e))?;
         Ok(Self { inner: smt })
@@ -291,10 +293,8 @@ impl PersistentSMT {
     }
 
     pub fn update_all(&mut self, entries: Vec<(Key, Vec<u8>)>) -> Result<H256, &'static str> {
-        let leaves: Vec<(Key, SmtValue)> = entries
-            .into_iter()
-            .map(|(k, v)| (k, SmtValue(v)))
-            .collect();
+        let leaves: Vec<(Key, SmtValue)> =
+            entries.into_iter().map(|(k, v)| (k, SmtValue(v))).collect();
         self.inner
             .update_all(leaves)
             .map_err(|_| "SMT batch update failed")?;
@@ -344,11 +344,7 @@ impl MerkleProof {
 
     /// Verify this proof against a root hash and expected leaves.
     /// `leaves` is a list of (key, value) pairs. Use empty vec for non-existence.
-    pub fn verify(
-        &self,
-        root: H256,
-        leaves: Vec<(Key, Vec<u8>)>,
-    ) -> bool {
+    pub fn verify(&self, root: H256, leaves: Vec<(Key, Vec<u8>)>) -> bool {
         let smt_leaves: Vec<(Key, H256)> = leaves
             .iter()
             .map(|(k, v)| {
@@ -364,10 +360,7 @@ impl MerkleProof {
 
     /// Verify non-existence of keys against a root hash.
     pub fn verify_absence(&self, root: H256, keys: Vec<Key>) -> bool {
-        let smt_leaves: Vec<(Key, H256)> = keys
-            .iter()
-            .map(|k| (*k, H256::zero()))
-            .collect();
+        let smt_leaves: Vec<(Key, H256)> = keys.iter().map(|k| (*k, H256::zero())).collect();
         self.inner
             .clone()
             .verify::<Poseidon2Hasher>(&root, smt_leaves)
@@ -685,5 +678,4 @@ mod tests {
         assert!(compiled.verify(root, vec![(key, value.clone())]));
         assert!(!compiled.verify(root, vec![(key, b"wrong".to_vec())]));
     }
-
 }

@@ -8,7 +8,7 @@
 //! Pipelined: certify for slot N overlaps with propose for slot N+1.
 //! Finality: block finalized when referenced by 2 consecutive QCs.
 
-use crate::block::{BlockHeader, QuorumCert, quorum_for_committee};
+use crate::block::{quorum_for_committee, BlockHeader, QuorumCert};
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{falcon_verify, FalconPublicKey, FalconSignature};
 
@@ -141,8 +141,8 @@ pub fn create_vote(
     // layout, binding the vote to a specific slot.
     let block_hash = header.hash();
     let vote_msg = proposer_sign_message(header.slot, &block_hash);
-    let sig = pyde_crypto::falcon::falcon_sign(voter_sk, &vote_msg)
-        .map_err(|_| "vote signing failed")?;
+    let sig =
+        pyde_crypto::falcon::falcon_sign(voter_sk, &vote_msg).map_err(|_| "vote signing failed")?;
 
     state.last_voted_slot = header.slot;
 
@@ -255,7 +255,10 @@ pub fn is_finalized(
     headers: &std::collections::HashMap<u64, crate::block::BlockHeader>,
 ) -> bool {
     // Find a valid QC for block_slot
-    let qc_for_block = match qc_chain.iter().find(|qc| qc.slot == block_slot && qc.has_quorum()) {
+    let qc_for_block = match qc_chain
+        .iter()
+        .find(|qc| qc.slot == block_slot && qc.has_quorum())
+    {
         Some(qc) => qc,
         None => return false,
     };
@@ -266,7 +269,10 @@ pub fn is_finalized(
     }
 
     // Find a valid QC for block_slot+1
-    let qc_for_next = match qc_chain.iter().find(|qc| qc.slot == block_slot + 1 && qc.has_quorum()) {
+    let qc_for_next = match qc_chain
+        .iter()
+        .find(|qc| qc.slot == block_slot + 1 && qc.has_quorum())
+    {
         Some(qc) => qc,
         None => return false,
     };
@@ -290,8 +296,8 @@ pub fn create_timeout(
     let mut msg = Vec::new();
     msg.extend_from_slice(b"timeout");
     msg.extend_from_slice(&slot.to_le_bytes());
-    let sig = pyde_crypto::falcon::falcon_sign(voter_sk, &msg)
-        .map_err(|_| "timeout signing failed")?;
+    let sig =
+        pyde_crypto::falcon::falcon_sign(voter_sk, &msg).map_err(|_| "timeout signing failed")?;
 
     Ok(ConsensusMessage::Timeout {
         slot,
@@ -343,7 +349,9 @@ mod tests {
         let header = make_header(1, 0);
 
         // Create vote
-        let vote = create_vote(&mut state, &header, 0, addr, &sk).unwrap().unwrap();
+        let vote = create_vote(&mut state, &header, 0, addr, &sk)
+            .unwrap()
+            .unwrap();
         assert!(matches!(vote, ConsensusMessage::Vote { .. }));
 
         // Verify vote
@@ -434,9 +442,9 @@ mod tests {
 
     #[test]
     fn pipelined_finality() {
-        use std::collections::HashMap;
         use crate::block::BlockHeader;
         use pyde_account::address::ZERO_ADDRESS;
+        use std::collections::HashMap;
 
         // Block at slot 5 is finalized when QCs exist for slot 5 and slot 6,
         // AND the block at slot 6 chains to the block at slot 5.
@@ -487,7 +495,11 @@ mod tests {
         };
         let mut bad_headers = HashMap::new();
         bad_headers.insert(6, header_6_bad);
-        assert!(!is_finalized(5, &[qc_5.clone(), qc_6.clone()], &bad_headers));
+        assert!(!is_finalized(
+            5,
+            &[qc_5.clone(), qc_6.clone()],
+            &bad_headers
+        ));
     }
 
     // ========== Task 0487: QC requires 86/128 ==========
@@ -530,7 +542,9 @@ mod tests {
 
         // Vote for slot 5
         let header5 = make_header(5, 4);
-        create_vote(&mut state, &header5, 0, addr, &sk).unwrap().unwrap();
+        create_vote(&mut state, &header5, 0, addr, &sk)
+            .unwrap()
+            .unwrap();
 
         // Try to vote for slot 3 (old)
         let header3 = make_header(3, 2);
@@ -549,7 +563,9 @@ mod tests {
         assert_eq!(state.highest_qc.slot, 0);
 
         let header = make_header(5, 4); // QC for slot 4
-        create_vote(&mut state, &header, 0, addr, &sk).unwrap().unwrap();
+        create_vote(&mut state, &header, 0, addr, &sk)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(state.highest_qc.slot, 4);
     }

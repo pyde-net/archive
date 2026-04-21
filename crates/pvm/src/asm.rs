@@ -42,7 +42,10 @@ pub enum AsmError {
 /// Wrap encode_immediate with assembler error context.
 fn asm_encode_imm(val: i32, line: usize) -> Result<u32, AsmError> {
     encode_immediate(val).ok_or_else(|| {
-        AsmError::ImmediateRange(format!("line {}: immediate {} out of 18-bit range", line, val))
+        AsmError::ImmediateRange(format!(
+            "line {}: immediate {} out of 18-bit range",
+            line, val
+        ))
     })
 }
 
@@ -56,9 +59,9 @@ enum Token {
     Register(u8),     // r0-r15
     WideRegister(u8), // w0-w7
     Immediate(i64),
-    Label(String),    // "foo:"
-    LabelRef(String), // "foo" used as operand
-    Directive(String), // ".ascii", ".bytes", ".align"
+    Label(String),          // "foo:"
+    LabelRef(String),       // "foo" used as operand
+    Directive(String),      // ".ascii", ".bytes", ".align"
     StringLiteral(Vec<u8>), // "hello"
     Comma,
     Newline,
@@ -494,16 +497,18 @@ enum ParsedItem {
     /// Raw data bytes (from .ascii, .bytes directives).
     Data(Vec<u8>),
     /// Load address pseudo: `la rd, label` → addi rd, r0, CODE_START + label_offset
-    LoadAddr { line: usize, rd: u8, label: String },
+    LoadAddr {
+        line: usize,
+        rd: u8,
+        label: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
 
-fn parse(
-    tokens: &[(usize, Token)],
-) -> Result<(Vec<ParsedItem>, HashMap<String, u32>), AsmError> {
+fn parse(tokens: &[(usize, Token)]) -> Result<(Vec<ParsedItem>, HashMap<String, u32>), AsmError> {
     let mut items: Vec<ParsedItem> = Vec::new();
     let mut labels: HashMap<String, u32> = HashMap::new();
     let mut offset: u32 = 0;
@@ -741,7 +746,8 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, AsmError> {
                 }
                 let imm_bits = encode_immediate(abs_i32).ok_or_else(|| {
                     AsmError::ImmediateRange(format!(
-                        "line {}: immediate {} out of 18-bit range", line, abs_i32
+                        "line {}: immediate {} out of 18-bit range",
+                        line, abs_i32
                     ))
                 })?;
                 let word = encode(Opcode::Addi, *rd, 0, imm_bits);
@@ -877,7 +883,8 @@ fn encode_instr(
         let offset = expect_imm_or_label(&ops[2], pc, labels, line)?;
         let imm = encode_mem_immediate(offset, width).ok_or_else(|| {
             AsmError::ImmediateRange(format!(
-                "line {}: memory offset {} out of 16-bit range", line, offset
+                "line {}: memory offset {} out of 16-bit range",
+                line, offset
             ))
         })?;
         return Ok(encode(actual_op, rd, rs1, imm));
@@ -1550,29 +1557,25 @@ fn disassemble_one(opcode: Opcode, rd: u8, rs1: u8, rs2_or_imm: u32) -> String {
         Opcode::VerifySig => format!("verifysig r{}, r{}", rd, rs1),
 
         // Storage
-        Opcode::Sload => {
-            match rs2_or_imm & 0x3 {
-                0 => format!("sload w{}, w{}", rd, rs1),
-                1 => {
-                    let ptr_reg = (rs2_or_imm >> 2) & 0xF;
-                    format!("sloadb r{}, w{}, r{}", rd, rs1, ptr_reg)
-                }
-                2 => format!("sloadg r{}, w{}", rd, rs1),
-                _ => format!("sload? {}, {}, {}", rd, rs1, rs2_or_imm),
+        Opcode::Sload => match rs2_or_imm & 0x3 {
+            0 => format!("sload w{}, w{}", rd, rs1),
+            1 => {
+                let ptr_reg = (rs2_or_imm >> 2) & 0xF;
+                format!("sloadb r{}, w{}, r{}", rd, rs1, ptr_reg)
             }
-        }
-        Opcode::Sstore => {
-            match rs2_or_imm & 0x3 {
-                0 => format!("sstore w{}, w{}", rs1, rd),
-                1 => {
-                    let ptr_reg = (rs2_or_imm >> 2) & 0xF;
-                    let len_reg = (rs2_or_imm >> 6) & 0xF;
-                    format!("sstoreb w{}, r{}, r{}", rs1, ptr_reg, len_reg)
-                }
-                2 => format!("sstoreg w{}, r{}", rs1, rd),
-                _ => format!("sstore? {}, {}, {}", rd, rs1, rs2_or_imm),
+            2 => format!("sloadg r{}, w{}", rd, rs1),
+            _ => format!("sload? {}, {}, {}", rd, rs1, rs2_or_imm),
+        },
+        Opcode::Sstore => match rs2_or_imm & 0x3 {
+            0 => format!("sstore w{}, w{}", rs1, rd),
+            1 => {
+                let ptr_reg = (rs2_or_imm >> 2) & 0xF;
+                let len_reg = (rs2_or_imm >> 6) & 0xF;
+                format!("sstoreb w{}, r{}, r{}", rs1, ptr_reg, len_reg)
             }
-        }
+            2 => format!("sstoreg w{}, r{}", rs1, rd),
+            _ => format!("sstore? {}, {}, {}", rd, rs1, rs2_or_imm),
+        },
         Opcode::Sdelete => format!("sdelete w{}", rs1),
 
         // Assert
@@ -2119,7 +2122,9 @@ msg: .ascii "hi\n\0""#;
         let code = assemble(src).unwrap();
         // la is at offset 0, msg is at offset 8 (after la + halt)
         // la should encode: addi r1, r0, CODE_START + 8
-        let d = decode(Instruction(u32::from_le_bytes(code[0..4].try_into().unwrap())));
+        let d = decode(Instruction(u32::from_le_bytes(
+            code[0..4].try_into().unwrap(),
+        )));
         assert_eq!(d.opcode, Opcode::Addi);
         assert_eq!(d.rd, 1);
         assert_eq!(d.rs1, 0);

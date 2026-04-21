@@ -10,7 +10,9 @@
 
 use crate::block::{BlockHeader, QuorumCert, QUORUM_THRESHOLD};
 use pyde_account::address::Address;
-use pyde_crypto::falcon::{falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature};
+use pyde_crypto::falcon::{
+    falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature,
+};
 
 /// Timeout duration before declaring proposer failure (milliseconds).
 pub const PROPOSAL_TIMEOUT_MS: u64 = 200;
@@ -313,11 +315,7 @@ mod tests {
 
     #[test]
     fn fallback_proposer_is_second_lowest() {
-        let scores = vec![
-            ([0x01; 32], 100),
-            ([0x02; 32], 200),
-            ([0x03; 32], 300),
-        ];
+        let scores = vec![([0x01; 32], 100), ([0x02; 32], 200), ([0x03; 32], 300)];
         let fallback = fallback_proposer(&scores).unwrap();
         assert_eq!(fallback, [0x02; 32]); // 2nd lowest
     }
@@ -405,7 +403,7 @@ mod tests {
     fn slot_elapsed_at_400ms() {
         let tracker = TimeoutTracker::new(5, 1000);
         assert!(!tracker.slot_elapsed(1399)); // 399ms
-        assert!(tracker.slot_elapsed(1400));  // 400ms
+        assert!(tracker.slot_elapsed(1400)); // 400ms
     }
 
     #[test]
@@ -413,7 +411,7 @@ mod tests {
         let tracker = TimeoutTracker::new(5, 1000);
         assert_eq!(tracker.ms_until_timeout(1000), 200); // just started
         assert_eq!(tracker.ms_until_timeout(1100), 100); // 100ms in
-        assert_eq!(tracker.ms_until_timeout(1200), 0);   // at timeout
-        assert_eq!(tracker.ms_until_timeout(1500), 0);   // past timeout
+        assert_eq!(tracker.ms_until_timeout(1200), 0); // at timeout
+        assert_eq!(tracker.ms_until_timeout(1500), 0); // past timeout
     }
 }

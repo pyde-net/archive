@@ -238,19 +238,19 @@ impl Transaction {
         let access_bytes = serialize_access_list(&self.access_list);
 
         let mut buf = Vec::new();
-        buf.extend_from_slice(&self.from);                              // 32
-        buf.extend_from_slice(&self.to);                                // 32
-        buf.extend_from_slice(&self.value.to_le_bytes());               // 16
+        buf.extend_from_slice(&self.from); // 32
+        buf.extend_from_slice(&self.to); // 32
+        buf.extend_from_slice(&self.value.to_le_bytes()); // 16
         buf.extend_from_slice(&(self.data.len() as u32).to_le_bytes()); // 4
-        buf.extend_from_slice(&self.data);                              // var
-        buf.extend_from_slice(&self.gas_limit.to_le_bytes());           // 8
-        buf.extend_from_slice(&self.nonce.to_le_bytes());               // 8
+        buf.extend_from_slice(&self.data); // var
+        buf.extend_from_slice(&self.gas_limit.to_le_bytes()); // 8
+        buf.extend_from_slice(&self.nonce.to_le_bytes()); // 8
         buf.extend_from_slice(&(self.signature.len() as u16).to_le_bytes()); // 2
-        buf.extend_from_slice(&self.signature);                         // ~666
+        buf.extend_from_slice(&self.signature); // ~666
         buf.extend_from_slice(&(fee_bytes.len() as u8).to_le_bytes()); // 1
-        buf.extend_from_slice(&fee_bytes);                              // 1-33
+        buf.extend_from_slice(&fee_bytes); // 1-33
         buf.extend_from_slice(&(access_bytes.len() as u32).to_le_bytes()); // 4
-        buf.extend_from_slice(&access_bytes);                           // var
+        buf.extend_from_slice(&access_bytes); // var
         match self.deadline {
             Some(d) => {
                 buf.push(1);
@@ -258,8 +258,8 @@ impl Transaction {
             }
             None => buf.push(0),
         }
-        buf.extend_from_slice(&self.chain_id.to_le_bytes());           // 8
-        buf.push(self.tx_type as u8);                                   // 1
+        buf.extend_from_slice(&self.chain_id.to_le_bytes()); // 8
+        buf.push(self.tx_type as u8); // 1
         buf
     }
 
@@ -407,7 +407,11 @@ fn deserialize_access_list(data: &[u8]) -> Result<Vec<AccessEntry>, &'static str
             writes.push(key);
             offset += 32;
         }
-        entries.push(AccessEntry { address, reads, writes });
+        entries.push(AccessEntry {
+            address,
+            reads,
+            writes,
+        });
     }
     Ok(entries)
 }
@@ -515,7 +519,12 @@ mod tests {
         ];
         for ty in all {
             let tag = ty as u8;
-            assert_eq!(TransactionType::from_u8(tag), Some(ty), "roundtrip failed for {:?}", ty);
+            assert_eq!(
+                TransactionType::from_u8(tag),
+                Some(ty),
+                "roundtrip failed for {:?}",
+                ty
+            );
         }
         // Unknown tags are rejected.
         assert_eq!(TransactionType::from_u8(255), None);

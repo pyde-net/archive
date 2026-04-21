@@ -86,7 +86,9 @@ impl SafetyChecker {
                 _ => {}
             }
         }
-        SafetyCheckResult { errors: self.errors }
+        SafetyCheckResult {
+            errors: self.errors,
+        }
     }
 
     fn error(&mut self, message: String, span: Span) {
@@ -101,10 +103,18 @@ impl SafetyChecker {
         // Contract-only attributes on top-level functions
         let contract_only = ["constructor", "view", "payable", "sponsored", "reentrant"];
         for attr in &func.attributes {
-            let name = attr.content.split('(').next().unwrap_or(&attr.content).trim();
+            let name = attr
+                .content
+                .split('(')
+                .next()
+                .unwrap_or(&attr.content)
+                .trim();
             if contract_only.contains(&name) {
                 self.error(
-                    format!("#[{}] can only be used on functions inside a contract", name),
+                    format!(
+                        "#[{}] can only be used on functions inside a contract",
+                        name
+                    ),
                     attr.span,
                 );
             }
@@ -132,10 +142,14 @@ impl SafetyChecker {
         }
 
         // Check for exactly one constructor
-        let constructors: Vec<&FunctionDef> = contract.items.iter()
+        let constructors: Vec<&FunctionDef> = contract
+            .items
+            .iter()
             .filter_map(|item| {
                 if let ContractItem::Function(f) = item {
-                    if f.is_constructor() { return Some(f); }
+                    if f.is_constructor() {
+                        return Some(f);
+                    }
                 }
                 None
             })
@@ -151,10 +165,14 @@ impl SafetyChecker {
         }
 
         // Check for at most one #[receive]
-        let receives: Vec<&FunctionDef> = contract.items.iter()
+        let receives: Vec<&FunctionDef> = contract
+            .items
+            .iter()
             .filter_map(|item| {
                 if let ContractItem::Function(f) = item {
-                    if f.is_receive() { return Some(f); }
+                    if f.is_receive() {
+                        return Some(f);
+                    }
                 }
                 None
             })
@@ -169,10 +187,14 @@ impl SafetyChecker {
         }
 
         // Check for at most one #[fallback]
-        let fallbacks: Vec<&FunctionDef> = contract.items.iter()
+        let fallbacks: Vec<&FunctionDef> = contract
+            .items
+            .iter()
             .filter_map(|item| {
                 if let ContractItem::Function(f) = item {
-                    if f.is_fallback() { return Some(f); }
+                    if f.is_fallback() {
+                        return Some(f);
+                    }
                 }
                 None
             })
@@ -227,7 +249,12 @@ impl SafetyChecker {
                 continue;
             }
 
-            let name = attr.content.split('(').next().unwrap_or(&attr.content).trim();
+            let name = attr
+                .content
+                .split('(')
+                .next()
+                .unwrap_or(&attr.content)
+                .trim();
             match name {
                 "constructor" => {
                     if has_constructor {
@@ -300,7 +327,8 @@ impl SafetyChecker {
         }
         if has_view && has_payable {
             self.error(
-                "#[view] and #[payable] cannot be combined (view functions cannot receive value)".into(),
+                "#[view] and #[payable] cannot be combined (view functions cannot receive value)"
+                    .into(),
                 func.span,
             );
         }
@@ -308,7 +336,8 @@ impl SafetyChecker {
         // View functions must have a return type (otherwise they're useless)
         if has_view && func.return_type.is_none() {
             self.error(
-                "#[view] function must have a return type (view functions read and return data)".into(),
+                "#[view] function must have a return type (view functions read and return data)"
+                    .into(),
                 func.span,
             );
         }
@@ -355,7 +384,9 @@ impl SafetyChecker {
                     }
                 }
             }
-            if !changed { break; }
+            if !changed {
+                break;
+            }
         }
 
         // Build result map
@@ -496,7 +527,11 @@ impl SafetyChecker {
     }
 
     /// Check #[view] purity using the pre-computed purity map.
-    fn check_view_purity_transitive(&mut self, func: &FunctionDef, purity_map: &HashMap<String, bool>) {
+    fn check_view_purity_transitive(
+        &mut self,
+        func: &FunctionDef,
+        purity_map: &HashMap<String, bool>,
+    ) {
         if !func.is_view() {
             return;
         }
@@ -557,7 +592,10 @@ impl SafetyChecker {
                     }
                     if self.is_storage_mutating_call(&e.expr) {
                         self.error(
-                            format!("#[view] function '{}' cannot mutate storage collections", func_name),
+                            format!(
+                                "#[view] function '{}' cannot mutate storage collections",
+                                func_name
+                            ),
                             e.span,
                         );
                     }
@@ -574,8 +612,12 @@ impl SafetyChecker {
                 self.check_block_purity_direct(then_block, func_name);
                 if let Some(clause) = else_clause {
                     match clause {
-                        ElseClause::ElseBlock(block) => self.check_block_purity_direct(block, func_name),
-                        ElseClause::ElseIf(else_if) => self.check_expr_purity_direct(else_if, func_name),
+                        ElseClause::ElseBlock(block) => {
+                            self.check_block_purity_direct(block, func_name)
+                        }
+                        ElseClause::ElseIf(else_if) => {
+                            self.check_expr_purity_direct(else_if, func_name)
+                        }
                     }
                 }
             }
@@ -597,9 +639,7 @@ impl SafetyChecker {
             Expr::FieldAccess(obj, _, _) => {
                 matches!(obj.as_ref(), Expr::SelfExpr(_))
             }
-            Expr::Index(obj, _, _) => {
-                self.is_storage_access(obj)
-            }
+            Expr::Index(obj, _, _) => self.is_storage_access(obj),
             _ => false,
         }
     }
@@ -610,9 +650,7 @@ impl SafetyChecker {
             Expr::FieldAccess(obj, _, _) => {
                 matches!(obj.as_ref(), Expr::SelfExpr(_)) || self.is_storage_access(obj)
             }
-            Expr::Index(obj, _, _) => {
-                self.is_storage_access(obj)
-            }
+            Expr::Index(obj, _, _) => self.is_storage_access(obj),
             _ => false,
         }
     }
@@ -656,22 +694,21 @@ impl SafetyChecker {
         match stmt {
             Stmt::Let(l) => self.expr_accesses_msg_value(&l.initializer),
             Stmt::Assign(a) => {
-                self.expr_accesses_msg_value(&a.target)
-                    || self.expr_accesses_msg_value(&a.value)
+                self.expr_accesses_msg_value(&a.target) || self.expr_accesses_msg_value(&a.value)
             }
-            Stmt::Return(r) => {
-                r.value.as_ref().is_some_and(|v| self.expr_accesses_msg_value(v))
-            }
-            Stmt::Emit(e) => {
-                e.fields.iter().any(|f| self.expr_accesses_msg_value(&f.value))
-            }
+            Stmt::Return(r) => r
+                .value
+                .as_ref()
+                .is_some_and(|v| self.expr_accesses_msg_value(v)),
+            Stmt::Emit(e) => e
+                .fields
+                .iter()
+                .any(|f| self.expr_accesses_msg_value(&f.value)),
             Stmt::For(f) => {
-                self.expr_accesses_msg_value(&f.iterator)
-                    || self.block_accesses_msg_value(&f.body)
+                self.expr_accesses_msg_value(&f.iterator) || self.block_accesses_msg_value(&f.body)
             }
             Stmt::While(w) => {
-                self.expr_accesses_msg_value(&w.condition)
-                    || self.block_accesses_msg_value(&w.body)
+                self.expr_accesses_msg_value(&w.condition) || self.block_accesses_msg_value(&w.body)
             }
             Stmt::Expr(e) => self.expr_accesses_msg_value(&e.expr),
             _ => false,
@@ -714,18 +751,14 @@ impl SafetyChecker {
                     || arms.iter().any(|a| self.expr_accesses_msg_value(&a.body))
             }
             Expr::Block(block) => self.block_accesses_msg_value(block),
-            Expr::MacroCall(_, args, _) => {
-                args.iter().any(|a| match a {
-                    MacroArg::Positional(e) => self.expr_accesses_msg_value(e),
-                    MacroArg::Named(_, e) => self.expr_accesses_msg_value(e),
-                })
-            }
-            Expr::StructInit(_, fields, _) => {
-                fields.iter().any(|f| self.expr_accesses_msg_value(&f.value))
-            }
-            Expr::Cast(inner, _, _) | Expr::Try(inner, _) => {
-                self.expr_accesses_msg_value(inner)
-            }
+            Expr::MacroCall(_, args, _) => args.iter().any(|a| match a {
+                MacroArg::Positional(e) => self.expr_accesses_msg_value(e),
+                MacroArg::Named(_, e) => self.expr_accesses_msg_value(e),
+            }),
+            Expr::StructInit(_, fields, _) => fields
+                .iter()
+                .any(|f| self.expr_accesses_msg_value(&f.value)),
+            Expr::Cast(inner, _, _) | Expr::Try(inner, _) => self.expr_accesses_msg_value(inner),
             Expr::Tuple(elems, _) | Expr::ArrayLiteral(elems, _) => {
                 elems.iter().any(|e| self.expr_accesses_msg_value(e))
             }
@@ -744,16 +777,28 @@ impl SafetyChecker {
         }
         // Cannot combine with #[constructor], #[view], #[test], or #[fallback]
         if func.is_constructor() {
-            self.error("#[receive] cannot be combined with #[constructor]".into(), func.span);
+            self.error(
+                "#[receive] cannot be combined with #[constructor]".into(),
+                func.span,
+            );
         }
         if func.is_view() {
-            self.error("#[receive] cannot be combined with #[view]".into(), func.span);
+            self.error(
+                "#[receive] cannot be combined with #[view]".into(),
+                func.span,
+            );
         }
         if func.is_fallback() {
-            self.error("#[receive] cannot be combined with #[fallback]".into(), func.span);
+            self.error(
+                "#[receive] cannot be combined with #[fallback]".into(),
+                func.span,
+            );
         }
         if func.is_test() {
-            self.error("#[receive] cannot be combined with #[test]".into(), func.span);
+            self.error(
+                "#[receive] cannot be combined with #[test]".into(),
+                func.span,
+            );
         }
         // #[receive] must also be #[payable]
         if !func.is_payable() {
@@ -764,24 +809,15 @@ impl SafetyChecker {
         }
         // Must be pub (externally callable)
         if !func.is_pub {
-            self.error(
-                "#[receive] must be a pub function".into(),
-                func.span,
-            );
+            self.error("#[receive] must be a pub function".into(), func.span);
         }
         // No parameters
         if !func.params.is_empty() {
-            self.error(
-                "#[receive] cannot have parameters".into(),
-                func.span,
-            );
+            self.error("#[receive] cannot have parameters".into(), func.span);
         }
         // No return type
         if func.return_type.is_some() {
-            self.error(
-                "#[receive] cannot have a return type".into(),
-                func.span,
-            );
+            self.error("#[receive] cannot have a return type".into(), func.span);
         }
     }
 
@@ -791,37 +827,40 @@ impl SafetyChecker {
         }
         // Cannot combine with #[constructor], #[view], #[test], or #[receive]
         if func.is_constructor() {
-            self.error("#[fallback] cannot be combined with #[constructor]".into(), func.span);
+            self.error(
+                "#[fallback] cannot be combined with #[constructor]".into(),
+                func.span,
+            );
         }
         if func.is_view() {
-            self.error("#[fallback] cannot be combined with #[view]".into(), func.span);
+            self.error(
+                "#[fallback] cannot be combined with #[view]".into(),
+                func.span,
+            );
         }
         if func.is_receive() {
-            self.error("#[fallback] cannot be combined with #[receive]".into(), func.span);
+            self.error(
+                "#[fallback] cannot be combined with #[receive]".into(),
+                func.span,
+            );
         }
         if func.is_test() {
-            self.error("#[fallback] cannot be combined with #[test]".into(), func.span);
+            self.error(
+                "#[fallback] cannot be combined with #[test]".into(),
+                func.span,
+            );
         }
         // Must be pub (externally callable)
         if !func.is_pub {
-            self.error(
-                "#[fallback] must be a pub function".into(),
-                func.span,
-            );
+            self.error("#[fallback] must be a pub function".into(), func.span);
         }
         // No parameters
         if !func.params.is_empty() {
-            self.error(
-                "#[fallback] cannot have parameters".into(),
-                func.span,
-            );
+            self.error("#[fallback] cannot have parameters".into(), func.span);
         }
         // No return type
         if func.return_type.is_some() {
-            self.error(
-                "#[fallback] cannot have a return type".into(),
-                func.span,
-            );
+            self.error("#[fallback] cannot have a return type".into(), func.span);
         }
     }
 
@@ -832,18 +871,12 @@ impl SafetyChecker {
 
         // Constructor must be pub
         if !func.is_pub {
-            self.error(
-                "#[constructor] must be a pub function".into(),
-                func.span,
-            );
+            self.error("#[constructor] must be a pub function".into(), func.span);
         }
 
         // Constructor must not have a return type
         if func.return_type.is_some() {
-            self.error(
-                "#[constructor] cannot have a return type".into(),
-                func.span,
-            );
+            self.error("#[constructor] cannot have a return type".into(), func.span);
         }
     }
 
@@ -937,7 +970,8 @@ mod tests {
 
     #[test]
     fn single_constructor_ok() {
-        check_ok(r#"
+        check_ok(
+            r#"
             contract T {
                 storage { owner: Address, }
                 #[constructor]
@@ -945,51 +979,63 @@ mod tests {
                     self.owner = msg.sender;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn error_duplicate_constructor() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 #[constructor]
                 pub fn init() {}
                 #[constructor]
                 pub fn init2() {}
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("only have one #[constructor]"));
     }
 
     #[test]
     fn error_constructor_not_pub() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 #[constructor]
                 fn init() {}
             }
-        "#);
-        assert!(errors[0].message.contains("#[constructor] must be a pub function"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("#[constructor] must be a pub function"));
     }
 
     #[test]
     fn error_constructor_with_return_type() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 #[constructor]
                 pub fn init() -> u256 {
                     return 0;
                 }
             }
-        "#);
-        assert!(errors[0].message.contains("#[constructor] cannot have a return type"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("#[constructor] cannot have a return type"));
     }
 
     // ========== #[view] purity ==========
 
     #[test]
     fn view_read_only_ok() {
-        check_ok(r#"
+        check_ok(
+            r#"
             contract T {
                 storage { balance: u256, }
                 #[view]
@@ -997,12 +1043,14 @@ mod tests {
                     return self.balance;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn error_view_writes_storage() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 storage { balance: u256, }
                 #[view]
@@ -1011,13 +1059,15 @@ mod tests {
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("cannot modify storage"));
     }
 
     #[test]
     fn error_view_emits_event() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 event Transfer { amount: u256, }
                 #[view]
@@ -1026,13 +1076,15 @@ mod tests {
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("cannot emit events"));
     }
 
     #[test]
     fn error_view_cross_call() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 #[view]
                 pub fn bad() -> u64 {
@@ -1040,13 +1092,15 @@ mod tests {
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("cannot make cross_call!"));
     }
 
     #[test]
     fn error_view_writes_map() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 storage { balances: Map<Address, u256>, }
                 #[view]
@@ -1055,13 +1109,15 @@ mod tests {
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("cannot modify storage"));
     }
 
     #[test]
     fn error_view_no_return_type() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 storage { x: u64, }
                 #[view]
@@ -1069,7 +1125,8 @@ mod tests {
                     let a = self.x;
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("must have a return type"));
     }
 
@@ -1077,55 +1134,70 @@ mod tests {
 
     #[test]
     fn error_constructor_and_view() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 #[constructor]
                 #[view]
                 pub fn init() {}
             }
-        "#);
-        assert!(errors[0].message.contains("#[constructor] and #[view] cannot be combined"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("#[constructor] and #[view] cannot be combined"));
     }
 
     #[test]
     fn error_view_and_reentrant() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 #[view]
                 #[reentrant]
                 pub fn f() {}
             }
-        "#);
-        assert!(errors[0].message.contains("#[view] and #[reentrant] cannot be combined"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("#[view] and #[reentrant] cannot be combined"));
     }
 
     #[test]
     fn error_should_panic_without_test() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 #[should_panic]
                 pub fn f() {}
             }
-        "#);
-        assert!(errors[0].message.contains("#[should_panic] can only be used with #[test]"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("#[should_panic] can only be used with #[test]"));
     }
 
     // ========== Unknown attributes ==========
 
     #[test]
     fn error_unknown_attribute() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 #[banana]
                 pub fn f() {}
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("unknown attribute '#[banana]'"));
     }
 
     #[test]
     fn known_attributes_ok() {
-        check_ok(r#"
+        check_ok(
+            r#"
             contract T {
                 storage { x: u256, }
                 #[constructor]
@@ -1137,52 +1209,62 @@ mod tests {
                 #[reentrant]
                 pub fn withdraw() {}
             }
-        "#);
+        "#,
+        );
     }
 
     // ========== cross_call! callback ==========
 
     #[test]
     fn cross_call_valid_callback() {
-        check_ok(r#"
+        check_ok(
+            r#"
             contract T {
                 pub fn request() {
                     cross_call!(target: "oracle", method: "get_price", args: (1,), callback: "on_price");
                 }
                 pub fn on_price() {}
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn error_cross_call_missing_callback() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 pub fn request() {
                     cross_call!(target: "oracle", method: "get_price", args: (1,), callback: "nonexistent");
                 }
             }
-        "#);
-        assert!(errors[0].message.contains("callback 'nonexistent' not found"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("callback 'nonexistent' not found"));
     }
 
     #[test]
     fn cross_call_no_callback_ok() {
         // Fire-and-forget cross_call without callback is fine
-        check_ok(r#"
+        check_ok(
+            r#"
             contract T {
                 pub fn notify() {
                     cross_call!(target: "logger", method: "log", args: (1,));
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     // ========== #[test] and #[should_panic] ==========
 
     #[test]
     fn test_attribute_ok() {
-        check_ok(r#"
+        check_ok(
+            r#"
             contract T {
                 #[test]
                 fn test_something() {}
@@ -1190,14 +1272,16 @@ mod tests {
                 #[should_panic]
                 fn test_panic() {}
             }
-        "#);
+        "#,
+        );
     }
 
     // ========== Transitive purity ==========
 
     #[test]
     fn error_view_calls_impure_function() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 storage { balance: u256, }
                 fn modify_state() {
@@ -1209,14 +1293,18 @@ mod tests {
                     return self.balance;
                 }
             }
-        "#);
-        assert!(errors[0].message.contains("calls 'modify_state' which modifies state"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("calls 'modify_state' which modifies state"));
     }
 
     #[test]
     fn error_view_calls_chain_impure() {
         // view → helper → impure (transitive chain)
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 storage { x: u256, }
                 fn set_x() { self.x = 1; }
@@ -1227,13 +1315,17 @@ mod tests {
                     return self.x;
                 }
             }
-        "#);
-        assert!(errors[0].message.contains("calls 'helper' which modifies state"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("calls 'helper' which modifies state"));
     }
 
     #[test]
     fn error_view_push_on_storage() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 storage { items: Vec<u256>, }
                 #[view]
@@ -1242,13 +1334,17 @@ mod tests {
                     return 0;
                 }
             }
-        "#);
-        assert!(errors[0].message.contains("cannot mutate storage collections"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("cannot mutate storage collections"));
     }
 
     #[test]
     fn error_view_raw_call() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 #[view]
                 pub fn bad() -> u64 {
@@ -1256,13 +1352,15 @@ mod tests {
                     return 0;
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("cannot make raw_call!"));
     }
 
     #[test]
     fn view_calls_pure_function_ok() {
-        check_ok(r#"
+        check_ok(
+            r#"
             contract T {
                 storage { balance: u256, }
                 fn compute(x: u256) -> u256 {
@@ -1273,14 +1371,16 @@ mod tests {
                     return self.compute(self.balance);
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     // ========== msg.value payable enforcement ==========
 
     #[test]
     fn check_payable_function_accesses_msg_value() {
-        check_ok(r#"
+        check_ok(
+            r#"
             contract T {
                 storage { deposits: Map<Address, u256>, }
                 #[payable]
@@ -1288,25 +1388,29 @@ mod tests {
                     self.deposits[msg.sender] = self.deposits[msg.sender] + msg.value;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn error_non_payable_accesses_msg_value() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 pub fn bad() {
                     let amount = msg.value;
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("not marked #[payable]"));
     }
 
     #[test]
     fn check_constructor_accesses_msg_value() {
         // Constructors can access msg.value (initial funding)
-        check_ok(r#"
+        check_ok(
+            r#"
             contract T {
                 storage { initial_funding: u256, }
                 #[constructor]
@@ -1314,96 +1418,121 @@ mod tests {
                     self.initial_funding = msg.value;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn error_non_payable_nested_msg_value() {
         // msg.value buried in a nested expression
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 storage { x: u256, }
                 pub fn bad() {
                     self.x = msg.value + 100;
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("not marked #[payable]"));
     }
 
     #[test]
     fn error_non_payable_msg_value_in_require() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 error NoValue {}
                 pub fn bad() {
                     require!(msg.value > 0, NoValue {});
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("not marked #[payable]"));
     }
 
     #[test]
     fn check_msg_sender_without_payable() {
         // msg.sender is fine without #[payable] — only msg.value is restricted
-        check_ok(r#"
+        check_ok(
+            r#"
             contract T {
                 storage { owner: Address, }
                 pub fn f() {
                     self.owner = msg.sender;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     // ========== Top-level function attribute restrictions ==========
 
     #[test]
     fn error_constructor_outside_contract() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             #[constructor]
             pub fn init() {}
-        "#);
-        assert!(errors[0].message.contains("can only be used on functions inside a contract"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("can only be used on functions inside a contract"));
     }
 
     #[test]
     fn error_view_outside_contract() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             #[view]
             pub fn get() -> u256 { return 0; }
-        "#);
-        assert!(errors[0].message.contains("can only be used on functions inside a contract"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("can only be used on functions inside a contract"));
     }
 
     #[test]
     fn error_sponsored_outside_contract() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             #[sponsored]
             pub fn transfer() {}
-        "#);
-        assert!(errors[0].message.contains("can only be used on functions inside a contract"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("can only be used on functions inside a contract"));
     }
 
     #[test]
     fn test_attribute_on_top_level_ok() {
         // #[test] is allowed on top-level functions (module test functions)
-        check_ok(r#"
+        check_ok(
+            r#"
             #[test]
             fn test_something() {}
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn error_constructor_and_test() {
-        let errors = check_err(r#"
+        let errors = check_err(
+            r#"
             contract T {
                 #[constructor]
                 #[test]
                 pub fn init() {}
             }
-        "#);
-        assert!(errors[0].message.contains("#[constructor] and #[test] cannot be combined"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("#[constructor] and #[test] cannot be combined"));
     }
 }

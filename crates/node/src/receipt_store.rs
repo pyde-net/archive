@@ -85,7 +85,9 @@ impl ReceiptStore {
     }
 
     fn prune_before(&mut self, slot: u64) {
-        let slots_to_remove: Vec<u64> = self.slot_txs.keys()
+        let slots_to_remove: Vec<u64> = self
+            .slot_txs
+            .keys()
             .filter(|s| **s < slot)
             .copied()
             .collect();
@@ -166,8 +168,16 @@ mod tests {
             fee_validator: 0,
             fee_treasury: 0,
             logs: vec![
-                LogEntry { address: addr, topics: vec![], data: vec![1, 2, 3] },
-                LogEntry { address: [0xDD; 32], topics: vec![], data: vec![4, 5] },
+                LogEntry {
+                    address: addr,
+                    topics: vec![],
+                    data: vec![1, 2, 3],
+                },
+                LogEntry {
+                    address: [0xDD; 32],
+                    topics: vec![],
+                    data: vec![4, 5],
+                },
             ],
             state_root: H256::zero(),
             return_data: vec![],

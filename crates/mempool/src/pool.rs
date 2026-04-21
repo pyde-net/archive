@@ -427,11 +427,7 @@ impl Mempool {
 
     /// Select transactions for a block in arrival order, respecting gas limit.
     /// The proposer VRF-shuffles the selected set after this.
-    pub fn select_for_block(
-        &self,
-        block_gas_limit: u64,
-        current_slot: u64,
-    ) -> Vec<&EncryptedTx> {
+    pub fn select_for_block(&self, block_gas_limit: u64, current_slot: u64) -> Vec<&EncryptedTx> {
         let mut selected = Vec::new();
         let mut gas_used = 0u64;
 
@@ -532,7 +528,20 @@ mod tests {
     fn make_enc_tx(pk: &threshold::ThresholdPublicKey, gas: u64, nonce: u64) -> EncryptedTx {
         let sender = derive_eoa_address(&nonce.to_le_bytes());
         let to = derive_eoa_address(b"to");
-        encrypt_transaction(sender, nonce, gas, dummy_access_list(), None, 1, dummy_signature(), &to, 0, b"", pk).unwrap()
+        encrypt_transaction(
+            sender,
+            nonce,
+            gas,
+            dummy_access_list(),
+            None,
+            1,
+            dummy_signature(),
+            &to,
+            0,
+            b"",
+            pk,
+        )
+        .unwrap()
     }
 
     fn make_enc_tx_with_deadline(
@@ -543,7 +552,20 @@ mod tests {
     ) -> EncryptedTx {
         let sender = derive_eoa_address(&nonce.to_le_bytes());
         let to = derive_eoa_address(b"to");
-        encrypt_transaction(sender, nonce, gas, dummy_access_list(), Some(deadline), 1, dummy_signature(), &to, 0, b"", pk).unwrap()
+        encrypt_transaction(
+            sender,
+            nonce,
+            gas,
+            dummy_access_list(),
+            Some(deadline),
+            1,
+            dummy_signature(),
+            &to,
+            0,
+            b"",
+            pk,
+        )
+        .unwrap()
     }
 
     // ========== Task 0520: Encrypted tx stored in mempool ==========
@@ -604,9 +626,17 @@ mod tests {
         let to = derive_eoa_address(b"to");
 
         let tx = encrypt_transaction(
-            sender, 0, 50_000, dummy_access_list(), None, 1,
+            sender,
+            0,
+            50_000,
+            dummy_access_list(),
+            None,
+            1,
             vec![], // empty sig
-            &to, 0, b"", &pk,
+            &to,
+            0,
+            b"",
+            &pk,
         )
         .unwrap();
         assert_eq!(pool.add(tx), Err(MempoolError::InvalidSignature));
@@ -620,8 +650,17 @@ mod tests {
         let to = derive_eoa_address(b"to");
 
         let tx = encrypt_transaction(
-            sender, 0, 50_000, vec![], None, 1, // empty access list
-            dummy_signature(), &to, 0, b"", &pk,
+            sender,
+            0,
+            50_000,
+            vec![],
+            None,
+            1, // empty access list
+            dummy_signature(),
+            &to,
+            0,
+            b"",
+            &pk,
         )
         .unwrap();
         assert_eq!(pool.add(tx), Err(MempoolError::MissingAccessList));
@@ -689,7 +728,8 @@ mod tests {
         let pk = make_pk();
         let mut pool = Mempool::new();
 
-        pool.add(make_enc_tx_with_deadline(&pk, 50_000, 0, 200)).unwrap();
+        pool.add(make_enc_tx_with_deadline(&pk, 50_000, 0, 200))
+            .unwrap();
         pool.add(make_enc_tx(&pk, 60_000, 1)).unwrap(); // no deadline
 
         // At slot 300, first tx is expired
@@ -705,7 +745,8 @@ mod tests {
         let pk = make_pk();
         let mut pool = Mempool::new();
 
-        pool.add(make_enc_tx_with_deadline(&pk, 50_000, 0, 100)).unwrap();
+        pool.add(make_enc_tx_with_deadline(&pk, 50_000, 0, 100))
+            .unwrap();
         pool.add(make_enc_tx(&pk, 60_000, 1)).unwrap();
         assert_eq!(pool.len(), 2);
 
@@ -739,10 +780,7 @@ mod tests {
     #[test]
     fn no_duplicates_passes() {
         let pk = make_pk();
-        let txs = vec![
-            make_enc_tx(&pk, 50_000, 0),
-            make_enc_tx(&pk, 60_000, 1),
-        ];
+        let txs = vec![make_enc_tx(&pk, 50_000, 0), make_enc_tx(&pk, 60_000, 1)];
         assert!(check_no_duplicate_txs(&txs).is_ok());
     }
 
@@ -767,11 +805,19 @@ mod tests {
     ) -> EncryptedTx {
         let to = derive_eoa_address(b"rate-to");
         encrypt_transaction(
-            sender, nonce, 50_000,
-            dummy_access_list(), None, 1,
-            dummy_signature(), &to, 0, b"",
+            sender,
+            nonce,
+            50_000,
+            dummy_access_list(),
+            None,
+            1,
+            dummy_signature(),
+            &to,
+            0,
+            b"",
             pk,
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     // Test clock backed by a thread-local counter. `set_test_clock_ms`
@@ -859,8 +905,8 @@ mod tests {
         // Include one of the in-pool txs → slot opens up.
         pool.remove_included(&[hashes[0]]);
         set_test_clock_ms(2_100); // roll window so the rate counter doesn't
-                                   // independently block (submits are windowed
-                                   // but in_pool count is not).
+                                  // independently block (submits are windowed
+                                  // but in_pool count is not).
         pool.add(make_enc_tx_from(&pk, sender, 3))
             .expect("slot should have been released");
     }
@@ -906,9 +952,19 @@ mod tests {
         // First build the tx with a placeholder signature so we can compute
         // the hash, then re-sign and rebuild (hash ignores signature field).
         let template = encrypt_transaction(
-            sender, nonce, gas, dummy_access_list(), None, 1,
-            vec![0u8; 666], &to, 0, b"", threshold_pk,
-        ).unwrap();
+            sender,
+            nonce,
+            gas,
+            dummy_access_list(),
+            None,
+            1,
+            vec![0u8; 666],
+            &to,
+            0,
+            b"",
+            threshold_pk,
+        )
+        .unwrap();
         let hash = template.hash();
         let sig = pyde_crypto::falcon::falcon_sign(&falcon_sk, &hash)
             .unwrap()
@@ -948,7 +1004,9 @@ mod tests {
         let (attacker_pk, _) = pyde_crypto::falcon::falcon_keygen().unwrap();
 
         let mut pool = Mempool::new();
-        let err = pool.add_with_pubkey(tx, attacker_pk.as_bytes()).unwrap_err();
+        let err = pool
+            .add_with_pubkey(tx, attacker_pk.as_bytes())
+            .unwrap_err();
         assert_eq!(err, MempoolError::UnknownOrUnverifiedSender);
         assert_eq!(pool.len(), 0);
     }
@@ -993,7 +1051,9 @@ mod tests {
         // Align sender + resign with sk1 so the pubkey matches.
         tx2.sender = derive_eoa_address(&pk1);
         let new_hash = tx2.hash();
-        tx2.signature = pyde_crypto::falcon::falcon_sign(&sk1, &new_hash).unwrap().to_vec();
+        tx2.signature = pyde_crypto::falcon::falcon_sign(&sk1, &new_hash)
+            .unwrap()
+            .to_vec();
 
         assert_eq!(
             pool.add_with_pubkey(tx2, &pk1).unwrap_err(),

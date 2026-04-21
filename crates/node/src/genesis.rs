@@ -90,12 +90,8 @@ impl MultisigConfig {
         let mut out = Vec::with_capacity(self.signer_public_keys.len());
         for (i, hex_pk) in self.signer_public_keys.iter().enumerate() {
             let s = hex_pk.strip_prefix("0x").unwrap_or(hex_pk);
-            let bytes = hex::decode(s).map_err(|e| {
-                format!(
-                    "invalid multisig.signer_public_keys[{}] hex: {}",
-                    i, e
-                )
-            })?;
+            let bytes = hex::decode(s)
+                .map_err(|e| format!("invalid multisig.signer_public_keys[{}] hex: {}", i, e))?;
             if bytes.len() != 897 {
                 return Err(format!(
                     "multisig.signer_public_keys[{}] must be 897 bytes, got {}",
@@ -248,7 +244,9 @@ pub struct GenesisVesting {
 
 impl GenesisAllocation {
     pub fn balance_u128(&self) -> Result<u128, String> {
-        self.balance.parse::<u128>().map_err(|e| format!("invalid balance '{}': {}", self.balance, e))
+        self.balance
+            .parse::<u128>()
+            .map_err(|e| format!("invalid balance '{}': {}", self.balance, e))
     }
 }
 
@@ -264,7 +262,9 @@ pub struct GenesisValidator {
 
 impl GenesisValidator {
     pub fn stake_u128(&self) -> Result<u128, String> {
-        self.stake.parse::<u128>().map_err(|e| format!("invalid stake '{}': {}", self.stake, e))
+        self.stake
+            .parse::<u128>()
+            .map_err(|e| format!("invalid stake '{}': {}", self.stake, e))
     }
 }
 
@@ -298,8 +298,7 @@ impl GenesisConfig {
     pub fn load(path: &Path) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read genesis config {}: {}", path.display(), e))?;
-        toml::from_str(&content)
-            .map_err(|e| format!("failed to parse genesis config: {}", e))
+        toml::from_str(&content).map_err(|e| format!("failed to parse genesis config: {}", e))
     }
 
     /// Serialize to TOML string.
@@ -387,7 +386,8 @@ pub fn initialize_genesis(
             "genesis allocation"
         );
 
-        total_supply = total_supply.checked_add(balance)
+        total_supply = total_supply
+            .checked_add(balance)
             .ok_or("genesis total supply overflow")?;
 
         // Slice 4.4a: accumulate per-bucket totals for cap enforcement.
@@ -399,14 +399,28 @@ pub fn initialize_genesis(
 
     // 2. Write validator stakes as balances (included in total supply).
     // Skip validators that already appear in allocations (they're already written with auth_keys).
-    let alloc_addresses: std::collections::HashSet<String> = config.allocations.iter()
-        .map(|a| a.address.strip_prefix("0x").unwrap_or(&a.address).to_lowercase())
+    let alloc_addresses: std::collections::HashSet<String> = config
+        .allocations
+        .iter()
+        .map(|a| {
+            a.address
+                .strip_prefix("0x")
+                .unwrap_or(&a.address)
+                .to_lowercase()
+        })
         .collect();
 
     for val in &config.validators {
-        let val_addr_normalized = val.address.strip_prefix("0x").unwrap_or(&val.address).to_lowercase();
+        let val_addr_normalized = val
+            .address
+            .strip_prefix("0x")
+            .unwrap_or(&val.address)
+            .to_lowercase();
         if alloc_addresses.contains(&val_addr_normalized) {
-            debug!(address = val.address, "validator already in allocations, skipping duplicate");
+            debug!(
+                address = val.address,
+                "validator already in allocations, skipping duplicate"
+            );
             continue;
         }
 
@@ -415,22 +429,19 @@ pub fn initialize_genesis(
 
         // Parse public key to set auth_keys (validators must be able to sign)
         let pk_hex = val.public_key.strip_prefix("0x").unwrap_or(&val.public_key);
-        let pk_bytes = hex::decode(pk_hex)
-            .map_err(|e| format!("invalid validator public key hex: {}", e))?;
+        let pk_bytes =
+            hex::decode(pk_hex).map_err(|e| format!("invalid validator public key hex: {}", e))?;
         let mut account = pyde_account::types::Account::new_eoa(&pk_bytes);
         account.address = address;
         account.balance = stake;
 
         let balance_key = pyde_state::keys::balance_key(&address);
         entries.push((balance_key, account.to_bytes()));
-        total_supply = total_supply.checked_add(stake)
+        total_supply = total_supply
+            .checked_add(stake)
             .ok_or("genesis total supply overflow")?;
 
-        debug!(
-            address = val.address,
-            stake,
-            "genesis validator"
-        );
+        debug!(address = val.address, stake, "genesis validator");
     }
 
     // 3. Write validator registry entries (for epoch committee selection).
@@ -440,8 +451,8 @@ pub fn initialize_genesis(
     for val in &config.validators {
         let address = parse_hex_address(&val.address)?;
         let pk_hex = val.public_key.strip_prefix("0x").unwrap_or(&val.public_key);
-        let pk_bytes = hex::decode(pk_hex)
-            .map_err(|e| format!("invalid validator pk for registry: {}", e))?;
+        let pk_bytes =
+            hex::decode(pk_hex).map_err(|e| format!("invalid validator pk for registry: {}", e))?;
         let stake = val.stake_u128()?;
 
         let mut val_data = Vec::with_capacity(4 + pk_bytes.len() + 16 + 1);
@@ -581,10 +592,7 @@ pub fn initialize_genesis(
             per_block,
             end_slot: vs.duration_slots, // relative to slot 0 (genesis)
         };
-        entries.push((
-            pyde_state::keys::validator_subsidy_key(),
-            schedule.encode(),
-        ));
+        entries.push((pyde_state::keys::validator_subsidy_key(), schedule.encode()));
     }
 
     // Slice 4.4a: declared-vs-actual supply sanity check. When the
@@ -593,9 +601,10 @@ pub fn initialize_genesis(
     // large allocation tables before the mainnet ceremony burns them
     // in. Empty string (default) preserves pre-4.4a behaviour.
     if !config.initial_supply.is_empty() {
-        let declared = config.initial_supply.parse::<u128>().map_err(|e| {
-            format!("invalid initial_supply '{}': {}", config.initial_supply, e)
-        })?;
+        let declared = config
+            .initial_supply
+            .parse::<u128>()
+            .map_err(|e| format!("invalid initial_supply '{}': {}", config.initial_supply, e))?;
         if declared != total_supply {
             return Err(format!(
                 "genesis supply mismatch: config declares {} quanta but allocations sum to {}",
@@ -798,13 +807,17 @@ pub fn generate_testnet(
             vesting: None,
         });
         accounts.push(DevnetAccount {
-            address, public_key: pk, secret_key: sk, balance: funding,
+            address,
+            public_key: pk,
+            secret_key: sk,
+            balance: funding,
         });
     }
 
     // Generate dedicated faucet account (1 trillion PYDE for dispensing)
     let faucet_balance: u128 = 1_000_000_000_000 * 1_000_000_000; // 1T PYDE in quanta
-    let (faucet_pk, faucet_sk) = falcon_keygen().map_err(|e| format!("faucet keygen failed: {}", e))?;
+    let (faucet_pk, faucet_sk) =
+        falcon_keygen().map_err(|e| format!("faucet keygen failed: {}", e))?;
     let faucet_address = derive_eoa_address(faucet_pk.as_bytes());
     allocations.push(GenesisAllocation {
         address: hex::encode(faucet_address),
@@ -851,8 +864,9 @@ pub fn generate_testnet(
     // PSS refresh is wired into epoch boundary (node.rs:767, validator.rs:284).
     // Multi-party ceremony: use `pyde testnet` for distributed keygen.
     let threshold = pyde_consensus::block::quorum_for_committee(num_validators);
-    let (threshold_pk, key_shares) = pyde_crypto::threshold::threshold_keygen(num_validators, threshold)
-        .map_err(|e| format!("threshold keygen failed: {}", e))?;
+    let (threshold_pk, key_shares) =
+        pyde_crypto::threshold::threshold_keygen(num_validators, threshold)
+            .map_err(|e| format!("threshold keygen failed: {}", e))?;
 
     // Pre-generate node identity keys (Ed25519 for libp2p) so we know peer IDs
     // and can write full bootstrap multiaddrs in each config.
@@ -1006,8 +1020,7 @@ json = false
 
     run_script.push_str("wait\n");
     let script_path = out_dir.join("run.sh");
-    fs::write(&script_path, run_script)
-        .map_err(|e| format!("failed to write run.sh: {}", e))?;
+    fs::write(&script_path, run_script).map_err(|e| format!("failed to write run.sh: {}", e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1056,7 +1069,10 @@ json = false
             "faucet": true,
         }));
         let json = serde_json::json!({ "chainId": chain_id, "accounts": accts });
-        let _ = fs::write(out_dir.join("accounts.json"), serde_json::to_string_pretty(&json).unwrap_or_default());
+        let _ = fs::write(
+            out_dir.join("accounts.json"),
+            serde_json::to_string_pretty(&json).unwrap_or_default(),
+        );
     }
 
     println!();
@@ -1069,23 +1085,35 @@ json = false
     println!("  genesis.toml        — shared genesis");
     println!("  faucet.key          — faucet signing key");
     for i in 0..num_validators {
-        println!("  node-{}/config.toml  — node {} config (P2P:{}, RPC:{})",
-            i, i, base_port + i as u16, base_rpc_port + i as u16);
+        println!(
+            "  node-{}/config.toml  — node {} config (P2P:{}, RPC:{})",
+            i,
+            i,
+            base_port + i as u16,
+            base_rpc_port + i as u16
+        );
         println!("  node-{}/validator.key — node {} signing key", i, i);
     }
     println!();
     println!("To start:");
     println!("  # Terminal 1 (node-0):");
-    println!("  pyde run --role validator --config {}/node-0/config.toml --datadir {}/node-0{}",
-        out_dir.display(), out_dir.display(), if dev_mode { " --dev" } else { "" });
+    println!(
+        "  pyde run --role validator --config {}/node-0/config.toml --datadir {}/node-0{}",
+        out_dir.display(),
+        out_dir.display(),
+        if dev_mode { " --dev" } else { "" }
+    );
     println!();
     println!("  # Terminal 2 (node-1 — copy bootstrap addr from node-0 output):");
     println!("  pyde run --role validator --config {}/node-1/config.toml --datadir {}/node-1 --bootstrap \"<node-0-multiaddr>\"{}",
         out_dir.display(), out_dir.display(), if dev_mode { " --dev" } else { "" });
     println!();
     println!("  # Faucet:");
-    println!("  pyde faucet --rpc http://127.0.0.1:8545 --from 0x{} --private-key {}/faucet.key",
-        hex::encode(faucet_address), out_dir.display());
+    println!(
+        "  pyde faucet --rpc http://127.0.0.1:8545 --from 0x{} --private-key {}/faucet.key",
+        hex::encode(faucet_address),
+        out_dir.display()
+    );
 
     Ok(())
 }
@@ -1098,8 +1126,8 @@ pub fn parse_hex_address_pub(hex_str: &str) -> Result<Address, String> {
 
 fn parse_hex_address(hex_str: &str) -> Result<Address, String> {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| format!("invalid hex address '{}': {}", hex_str, e))?;
+    let bytes =
+        hex::decode(hex_str).map_err(|e| format!("invalid hex address '{}': {}", hex_str, e))?;
     if bytes.len() != 32 {
         return Err(format!("address must be 32 bytes, got {}", bytes.len()));
     }
@@ -1441,7 +1469,8 @@ mod tests {
     fn genesis_writes_airdrop_root_and_funds_pool() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = StateManager::open(tmp.path(), 1024).unwrap();
-        let (root, _) = pyde_tx::airdrop::build_tree(&[([0x11; 32], 500u128), ([0x22; 32], 500u128)]);
+        let (root, _) =
+            pyde_tx::airdrop::build_tree(&[([0x11; 32], 500u128), ([0x22; 32], 500u128)]);
 
         let config = GenesisConfig {
             chain_id: 1,
@@ -1461,12 +1490,16 @@ mod tests {
         assert_eq!(root_bytes.len(), 32);
         assert_eq!(&root_bytes[..], &root[..]);
         // Deadline stored
-        let deadline_bytes = state.get(&pyde_state::keys::airdrop_deadline_key()).unwrap();
+        let deadline_bytes = state
+            .get(&pyde_state::keys::airdrop_deadline_key())
+            .unwrap();
         let deadline = u64::from_le_bytes(deadline_bytes[..8].try_into().unwrap());
         assert_eq!(deadline, 10_000);
         // Pool funded to exactly pool_total_amount
         let pool_addr = pyde_account::address::airdrop_pool_address();
-        let bytes = state.get(&pyde_state::keys::balance_key(&pool_addr)).unwrap();
+        let bytes = state
+            .get(&pyde_state::keys::balance_key(&pool_addr))
+            .unwrap();
         let account = pyde_account::types::Account::from_bytes(&bytes).unwrap();
         assert_eq!(account.balance, 1000);
     }
@@ -1544,7 +1577,11 @@ mod tests {
         // Wrong length (16 bytes instead of 32)
         config.airdrop.as_mut().unwrap().root = hex::encode([0xAB; 16]);
         let err = initialize_genesis(&mut state, &config).unwrap_err();
-        assert!(err.contains("airdrop root must be 32 bytes"), "got: {}", err);
+        assert!(
+            err.contains("airdrop root must be 32 bytes"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -1574,7 +1611,10 @@ mod tests {
 
     // ========== Slice 4.5: multisig governance ==========
 
-    fn multisig_cfg(n: usize, threshold: u8) -> (MultisigConfig, Vec<pyde_crypto::falcon::FalconSecretKey>) {
+    fn multisig_cfg(
+        n: usize,
+        threshold: u8,
+    ) -> (MultisigConfig, Vec<pyde_crypto::falcon::FalconSecretKey>) {
         use pyde_crypto::falcon::falcon_keygen;
         let mut pk_hexes = Vec::with_capacity(n);
         let mut sks = Vec::with_capacity(n);
@@ -1618,9 +1658,7 @@ mod tests {
         assert_eq!(threshold_bytes, vec![3u8]);
 
         // Nonce initialized to 0.
-        let nonce_bytes = state
-            .get(&pyde_state::keys::multisig_nonce_key())
-            .unwrap();
+        let nonce_bytes = state.get(&pyde_state::keys::multisig_nonce_key()).unwrap();
         assert_eq!(nonce_bytes, 0u64.to_le_bytes().to_vec());
 
         // Signer set parseable.

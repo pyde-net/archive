@@ -64,15 +64,23 @@ impl FaucetSigner {
     pub fn load(path: &str) -> Result<Self, String> {
         let bytes = std::fs::read(path)
             .map_err(|e| format!("failed to read faucet key {}: {}", path, e))?;
-        if bytes.len() < 4 { return Err("faucet key too short".into()); }
+        if bytes.len() < 4 {
+            return Err("faucet key too short".into());
+        }
         let pk_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        if bytes.len() < 4 + pk_len { return Err("faucet key truncated".into()); }
+        if bytes.len() < 4 + pk_len {
+            return Err("faucet key truncated".into());
+        }
         let pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(&bytes[4..4 + pk_len])
             .ok_or("invalid faucet public key")?;
         let sk = pyde_crypto::falcon::FalconSecretKey::from_bytes(&bytes[4 + pk_len..])
             .ok_or("invalid faucet secret key")?;
         let address = pyde_account::address::derive_eoa_address(pk.as_bytes());
-        Ok(Self { address, public_key: pk, secret_key: sk })
+        Ok(Self {
+            address,
+            public_key: pk,
+            secret_key: sk,
+        })
     }
 
     /// Build and sign a transfer transaction.
@@ -137,7 +145,11 @@ async fn send_faucet_tx(
 
     let result = json.get("result").and_then(|v| v.as_str()).unwrap_or("");
     if let Ok(inner) = serde_json::from_str::<serde_json::Value>(result) {
-        Ok(inner.get("txHash").and_then(|v| v.as_str()).unwrap_or(result).to_string())
+        Ok(inner
+            .get("txHash")
+            .and_then(|v| v.as_str())
+            .unwrap_or(result)
+            .to_string())
     } else {
         Ok(result.to_string())
     }
@@ -145,16 +157,23 @@ async fn send_faucet_tx(
 
 async fn rpc_call(rpc_url: &str, body_str: &str) -> Result<serde_json::Value, String> {
     let url = rpc_url.strip_prefix("http://").unwrap_or(rpc_url);
-    let mut stream = tokio::net::TcpStream::connect(url).await
+    let mut stream = tokio::net::TcpStream::connect(url)
+        .await
         .map_err(|e| format!("connect failed: {}", e))?;
     let request = format!(
         "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         url, body_str.len(), body_str
     );
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    stream.write_all(request.as_bytes()).await.map_err(|e| format!("write: {}", e))?;
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("write: {}", e))?;
     let mut response = String::new();
-    stream.read_to_string(&mut response).await.map_err(|e| format!("read: {}", e))?;
+    stream
+        .read_to_string(&mut response)
+        .await
+        .map_err(|e| format!("read: {}", e))?;
     let json_body = response.split("\r\n\r\n").nth(1).ok_or("no body")?;
     serde_json::from_str(json_body).map_err(|e| format!("json: {}", e))
 }
@@ -167,7 +186,9 @@ async fn fetch_nonce(rpc_url: &str, address: &str) -> Result<u64, String> {
     });
     let json = rpc_call(rpc_url, &serde_json::to_string(&body).unwrap()).await?;
     let nonce_str = json.get("result").and_then(|v| v.as_str()).unwrap_or("0");
-    nonce_str.parse::<u64>().map_err(|_| format!("invalid nonce: {}", nonce_str))
+    nonce_str
+        .parse::<u64>()
+        .map_err(|_| format!("invalid nonce: {}", nonce_str))
 }
 
 async fn fetch_chain_id(rpc_url: &str) -> Result<u64, String> {
@@ -176,7 +197,10 @@ async fn fetch_chain_id(rpc_url: &str) -> Result<u64, String> {
         "method": "pyde_chainId", "params": []
     });
     let json = rpc_call(rpc_url, &serde_json::to_string(&body).unwrap()).await?;
-    let hex = json.get("result").and_then(|v| v.as_str()).unwrap_or("0x7a69");
+    let hex = json
+        .get("result")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0x7a69");
     u64::from_str_radix(hex.strip_prefix("0x").unwrap_or(hex), 16)
         .map_err(|_| format!("invalid chain_id: {}", hex))
 }
@@ -184,7 +208,9 @@ async fn fetch_chain_id(rpc_url: &str) -> Result<u64, String> {
 fn parse_hex_addr(hex: &str) -> Result<[u8; 32], String> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
     let bytes = hex::decode(hex).map_err(|e| format!("invalid hex: {}", e))?;
-    if bytes.len() != 32 { return Err(format!("address must be 32 bytes, got {}", bytes.len())); }
+    if bytes.len() != 32 {
+        return Err(format!("address must be 32 bytes, got {}", bytes.len()));
+    }
     let mut addr = [0u8; 32];
     addr.copy_from_slice(&bytes);
     Ok(addr)
@@ -223,7 +249,8 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
     });
 
     let addr = format!("0.0.0.0:{}", config.port);
-    let listener = TcpListener::bind(&addr).await
+    let listener = TcpListener::bind(&addr)
+        .await
         .map_err(|e| format!("failed to bind {}: {}", addr, e))?;
 
     tracing::info!("faucet started on http://{}", addr);
@@ -231,7 +258,9 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
     tracing::info!("  rate limit: {} seconds per address", config.cooldown_secs);
 
     loop {
-        let (stream, _) = listener.accept().await
+        let (stream, _) = listener
+            .accept()
+            .await
             .map_err(|e| format!("accept: {}", e))?;
 
         let limiter = limiter.clone();
@@ -250,7 +279,9 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
             // Parse: "GET /path?query HTTP/1.1"
             let parts: Vec<&str> = request_line.split_whitespace().collect();
             if parts.len() < 2 {
-                let _ = writer.write_all(json_response(400, r#"{"error":"bad request"}"#).as_bytes()).await;
+                let _ = writer
+                    .write_all(json_response(400, r#"{"error":"bad request"}"#).as_bytes())
+                    .await;
                 return;
             }
 
@@ -264,38 +295,48 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
             let response = match path {
                 "/health" => json_response(200, r#"{"status":"ok"}"#),
                 "/faucet" => {
-                    let address = query.split('&')
-                        .find_map(|p| {
-                            let (k, v) = p.split_once('=')?;
-                            
-                            
-                            if k == "address" { Some(v.to_string()) } else { None }
-                        });
+                    let address = query.split('&').find_map(|p| {
+                        let (k, v) = p.split_once('=')?;
+
+                        if k == "address" {
+                            Some(v.to_string())
+                        } else {
+                            None
+                        }
+                    });
 
                     match address {
-                        Some(addr) if addr.len() >= 64 => {
-                            match limiter.check(&addr) {
-                                Err(secs) => {
-                                    json_response(429, &format!(
-                                        r#"{{"error":"rate limited","retryAfter":{}}}"#, secs
-                                    ))
-                                }
-                                Ok(()) => {
-                                    match send_faucet_tx(&rpc, &from, &addr, amount, signer.as_ref().as_ref()).await {
-                                        Ok(tx_hash) => {
-                                            tracing::info!(to = %addr, amount, tx_hash = %tx_hash, "faucet dispensed");
-                                            json_response(200, &format!(
+                        Some(addr) if addr.len() >= 64 => match limiter.check(&addr) {
+                            Err(secs) => json_response(
+                                429,
+                                &format!(r#"{{"error":"rate limited","retryAfter":{}}}"#, secs),
+                            ),
+                            Ok(()) => {
+                                match send_faucet_tx(
+                                    &rpc,
+                                    &from,
+                                    &addr,
+                                    amount,
+                                    signer.as_ref().as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(tx_hash) => {
+                                        tracing::info!(to = %addr, amount, tx_hash = %tx_hash, "faucet dispensed");
+                                        json_response(
+                                            200,
+                                            &format!(
                                                 r#"{{"txHash":"{}","amount":"{}","to":"{}"}}"#,
                                                 tx_hash, amount, addr
-                                            ))
-                                        }
-                                        Err(e) => {
-                                            json_response(500, &format!(r#"{{"error":"{}"}}"#, e))
-                                        }
+                                            ),
+                                        )
+                                    }
+                                    Err(e) => {
+                                        json_response(500, &format!(r#"{{"error":"{}"}}"#, e))
                                     }
                                 }
                             }
-                        }
+                        },
                         _ => json_response(400, r#"{"error":"missing or invalid address"}"#),
                     }
                 }

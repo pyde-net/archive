@@ -8,7 +8,8 @@ use std::time::Instant;
 
 fn block_ctx() -> BlockContext {
     BlockContext {
-        height: 100, timestamp: 1_000_000,
+        height: 100,
+        timestamp: 1_000_000,
         base_fee: 1, // minimal for benchmark
         block_gas_limit: 4_000_000_000,
         chain_id: 31337,
@@ -24,17 +25,24 @@ fn fund_account(smt: &mut pyde_state::smt::PydeSMT, idx: u64) -> ([u8; 32], u64)
     pk_bytes[..8].copy_from_slice(&seed);
     let address = derive_eoa_address(&pk_bytes);
     let account = pyde_account::types::Account {
-        address, nonce: 0, balance: 1_000_000_000_000_000,
+        address,
+        nonce: 0,
+        balance: 1_000_000_000_000_000,
         code_hash: sparse_merkle_tree::H256::zero(),
         storage_root: sparse_merkle_tree::H256::zero(),
         account_type: pyde_account::types::AccountType::EOA,
         auth_keys: pyde_account::types::AuthKeys::None,
-        gas_tank: 0, key_nonce: 0,
+        gas_tank: 0,
+        key_nonce: 0,
     };
     let key = pyde_state::keys::balance_key(&address);
     smt.insert(key, account.to_bytes()).unwrap();
     let nonce_key = pyde_state::keys::nonce_key(&address);
-    smt.insert(nonce_key, pyde_account::nonce::NonceState::new().to_bytes().to_vec()).unwrap();
+    smt.insert(
+        nonce_key,
+        pyde_account::nonce::NonceState::new().to_bytes().to_vec(),
+    )
+    .unwrap();
     (address, 0)
 }
 
@@ -45,22 +53,39 @@ fn make_transfer(from: [u8; 32], to: [u8; 32], nonce: u64) -> Transaction {
         buf.extend_from_slice(&from);
         buf.push(0x04); // STORAGE_SLOT discriminator
         buf
-    }).to_bytes();
+    })
+    .to_bytes();
     let to_slot = pyde_crypto::poseidon2::poseidon2_hash(&{
         let mut buf = Vec::with_capacity(33);
         buf.extend_from_slice(&to);
         buf.push(0x04);
         buf
-    }).to_bytes();
+    })
+    .to_bytes();
     Transaction {
-        from, to, value: 1_000, data: vec![],
-        gas_limit: 21_000, nonce, signature: vec![],
+        from,
+        to,
+        value: 1_000,
+        data: vec![],
+        gas_limit: 21_000,
+        nonce,
+        signature: vec![],
         fee_payer: FeePayer::Sender,
         access_list: vec![
-            AccessEntry { address: from, reads: vec![], writes: vec![from_slot] },
-            AccessEntry { address: to, reads: vec![], writes: vec![to_slot] },
+            AccessEntry {
+                address: from,
+                reads: vec![],
+                writes: vec![from_slot],
+            },
+            AccessEntry {
+                address: to,
+                reads: vec![],
+                writes: vec![to_slot],
+            },
         ],
-        deadline: None, chain_id: 31337, tx_type: TransactionType::Standard,
+        deadline: None,
+        chain_id: 31337,
+        tx_type: TransactionType::Standard,
     }
 }
 
@@ -77,10 +102,18 @@ fn compile(source: &str) -> Vec<u8> {
 
 fn make_deploy(from: [u8; 32], deploy_data: Vec<u8>, nonce: u64) -> Transaction {
     Transaction {
-        from, to: [0u8; 32], value: 0, data: deploy_data,
-        gas_limit: 100_000_000, nonce, signature: vec![],
-        fee_payer: FeePayer::Sender, access_list: vec![],
-        deadline: None, chain_id: 31337, tx_type: TransactionType::Deploy,
+        from,
+        to: [0u8; 32],
+        value: 0,
+        data: deploy_data,
+        gas_limit: 100_000_000,
+        nonce,
+        signature: vec![],
+        fee_payer: FeePayer::Sender,
+        access_list: vec![],
+        deadline: None,
+        chain_id: 31337,
+        tx_type: TransactionType::Deploy,
     }
 }
 
@@ -89,16 +122,31 @@ fn make_call(from: [u8; 32], to: [u8; 32], method: &str, args: Vec<u8>, nonce: u
     let mut data = selector.to_be_bytes().to_vec();
     data.extend_from_slice(&args);
     Transaction {
-        from, to, value: 0, data, gas_limit: 10_000_000, nonce,
-        signature: vec![], fee_payer: FeePayer::Sender,
-        access_list: vec![
-            AccessEntry { address: to, reads: vec![[0x01; 32]], writes: vec![[0x01; 32]] },
-        ],
-        deadline: None, chain_id: 31337, tx_type: TransactionType::Standard,
+        from,
+        to,
+        value: 0,
+        data,
+        gas_limit: 10_000_000,
+        nonce,
+        signature: vec![],
+        fee_payer: FeePayer::Sender,
+        access_list: vec![AccessEntry {
+            address: to,
+            reads: vec![[0x01; 32]],
+            writes: vec![[0x01; 32]],
+        }],
+        deadline: None,
+        chain_id: 31337,
+        tx_type: TransactionType::Standard,
     }
 }
 
-fn run_benchmark(label: &str, txs: &[Transaction], smt: &mut pyde_state::smt::PydeSMT, ctx: &BlockContext) {
+fn run_benchmark(
+    label: &str,
+    txs: &[Transaction],
+    smt: &mut pyde_state::smt::PydeSMT,
+    ctx: &BlockContext,
+) {
     let sched = schedule(txs);
     let start = Instant::now();
     for tx in txs {
@@ -106,8 +154,14 @@ fn run_benchmark(label: &str, txs: &[Transaction], smt: &mut pyde_state::smt::Py
     }
     let elapsed = start.elapsed();
     let tps = txs.len() as f64 / elapsed.as_secs_f64();
-    println!("  {}: {} txs, {} groups, {:.1}ms, {:.0} TPS",
-        label, txs.len(), sched.group_count(), elapsed.as_secs_f64() * 1000.0, tps);
+    println!(
+        "  {}: {} txs, {} groups, {:.1}ms, {:.0} TPS",
+        label,
+        txs.len(),
+        sched.group_count(),
+        elapsed.as_secs_f64() * 1000.0,
+        tps
+    );
 }
 
 #[test]
@@ -137,19 +191,25 @@ fn benchmark_throughput() {
     }
 
     // --- 2. Contract deployments ---
-    let counter_deploy = compile(r#"
+    let counter_deploy = compile(
+        r#"
         contract Counter {
             storage { count: u64, }
             #[constructor] pub fn init() { self.count = 0; }
             pub fn increment() { self.count = self.count + 1; }
             pub fn get_count() -> u64 { return self.count; }
         }
-    "#);
+    "#,
+    );
     {
         let mut txs = Vec::new();
         for i in 0..20 {
             let (from, _) = accounts[i % 100];
-            txs.push(make_deploy(from, counter_deploy.clone(), (i / 100 + 5) as u64));
+            txs.push(make_deploy(
+                from,
+                counter_deploy.clone(),
+                (i / 100 + 5) as u64,
+            ));
         }
         run_benchmark("Deploys (20)", &txs, &mut smt, &ctx);
     }
@@ -162,20 +222,29 @@ fn benchmark_throughput() {
         let receipt = execute_transaction(&dtx, &mut smt, &ctx).unwrap();
         let contract = {
             let mut a = [0u8; 32];
-            if receipt.return_data.len() == 32 { a.copy_from_slice(&receipt.return_data); }
+            if receipt.return_data.len() == 32 {
+                a.copy_from_slice(&receipt.return_data);
+            }
             a
         };
 
         let mut txs = Vec::new();
         for i in 0..200 {
             let (from, _) = accounts[i % 100];
-            txs.push(make_call(from, contract, "increment", vec![], (i / 100 + 11) as u64));
+            txs.push(make_call(
+                from,
+                contract,
+                "increment",
+                vec![],
+                (i / 100 + 11) as u64,
+            ));
         }
         run_benchmark("Contract calls (200)", &txs, &mut smt, &ctx);
     }
 
     // --- 4. Math-heavy ---
-    let math_deploy = compile(r#"
+    let math_deploy = compile(
+        r#"
         contract MathHeavy {
             storage { result: u64, }
             #[constructor] pub fn init() { self.result = 0; }
@@ -185,21 +254,30 @@ fn benchmark_throughput() {
                 self.result = sum;
             }
         }
-    "#);
+    "#,
+    );
     {
         let (deployer, _) = accounts[1];
         let dtx = make_deploy(deployer, math_deploy.clone(), 13);
         let receipt = execute_transaction(&dtx, &mut smt, &ctx).unwrap();
         let math_addr = {
             let mut a = [0u8; 32];
-            if receipt.return_data.len() == 32 { a.copy_from_slice(&receipt.return_data); }
+            if receipt.return_data.len() == 32 {
+                a.copy_from_slice(&receipt.return_data);
+            }
             a
         };
 
         let mut txs = Vec::new();
         for i in 0..50 {
             let (from, _) = accounts[i % 100];
-            txs.push(make_call(from, math_addr, "compute", 100u64.to_le_bytes().to_vec(), (i / 100 + 14) as u64));
+            txs.push(make_call(
+                from,
+                math_addr,
+                "compute",
+                100u64.to_le_bytes().to_vec(),
+                (i / 100 + 14) as u64,
+            ));
         }
         run_benchmark("Math-heavy (50, n=100)", &txs, &mut smt, &ctx);
     }
@@ -211,7 +289,9 @@ fn benchmark_throughput() {
         let receipt = execute_transaction(&dtx, &mut smt, &ctx).unwrap();
         let caddr = {
             let mut a = [0u8; 32];
-            if receipt.return_data.len() == 32 { a.copy_from_slice(&receipt.return_data); }
+            if receipt.return_data.len() == 32 {
+                a.copy_from_slice(&receipt.return_data);
+            }
             a
         };
 
@@ -225,14 +305,29 @@ fn benchmark_throughput() {
         // 150 contract calls from different senders
         for i in 0..150 {
             let (from, _) = accounts[i % 100];
-            txs.push(make_call(from, caddr, "increment", vec![], (i / 100 + 19) as u64));
+            txs.push(make_call(
+                from,
+                caddr,
+                "increment",
+                vec![],
+                (i / 100 + 19) as u64,
+            ));
         }
         // 50 deploys
         for i in 0..50 {
             let (from, _) = accounts[i % 100];
-            txs.push(make_deploy(from, counter_deploy.clone(), (i / 100 + 22) as u64));
+            txs.push(make_deploy(
+                from,
+                counter_deploy.clone(),
+                (i / 100 + 22) as u64,
+            ));
         }
-        run_benchmark("Mixed (300 xfer + 150 call + 50 deploy)", &txs, &mut smt, &ctx);
+        run_benchmark(
+            "Mixed (300 xfer + 150 call + 50 deploy)",
+            &txs,
+            &mut smt,
+            &ctx,
+        );
     }
 
     println!("\n========== BENCHMARK COMPLETE ==========\n");
@@ -245,9 +340,7 @@ fn benchmark_realistic_block() {
 
     let dir = std::env::temp_dir().join(format!("pyde-bench-realistic-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut persistent = PersistentSMT::open(
-        dir.join("state").to_str().unwrap()
-    ).unwrap();
+    let mut persistent = PersistentSMT::open(dir.join("state").to_str().unwrap()).unwrap();
 
     let ctx = block_ctx();
 
@@ -259,17 +352,25 @@ fn benchmark_realistic_block() {
         pk_bytes[..8].copy_from_slice(&seed);
         let address = derive_eoa_address(&pk_bytes);
         let account = pyde_account::types::Account {
-            address, nonce: 0, balance: 1_000_000_000_000_000,
+            address,
+            nonce: 0,
+            balance: 1_000_000_000_000_000,
             code_hash: sparse_merkle_tree::H256::zero(),
             storage_root: sparse_merkle_tree::H256::zero(),
             account_type: pyde_account::types::AccountType::EOA,
             auth_keys: pyde_account::types::AuthKeys::None,
-            gas_tank: 0, key_nonce: 0,
+            gas_tank: 0,
+            key_nonce: 0,
         };
         let key = pyde_state::keys::balance_key(&address);
         persistent.insert(key, account.to_bytes()).unwrap();
         let nonce_key = pyde_state::keys::nonce_key(&address);
-        persistent.insert(nonce_key, pyde_account::nonce::NonceState::new().to_bytes().to_vec()).unwrap();
+        persistent
+            .insert(
+                nonce_key,
+                pyde_account::nonce::NonceState::new().to_bytes().to_vec(),
+            )
+            .unwrap();
         accounts.push((address, 0));
     }
 
@@ -294,8 +395,12 @@ fn benchmark_realistic_block() {
         }
         let elapsed = start.elapsed();
         let tps = txs.len() as f64 / elapsed.as_secs_f64();
-        println!("  Transfers (1000, sequential, RocksDB): {} groups, {:.1}ms, {:.0} TPS",
-            sched.group_count(), elapsed.as_secs_f64() * 1000.0, tps);
+        println!(
+            "  Transfers (1000, sequential, RocksDB): {} groups, {:.1}ms, {:.0} TPS",
+            sched.group_count(),
+            elapsed.as_secs_f64() * 1000.0,
+            tps
+        );
     }
 
     // --- 2. Parallel transfers (non-overlapping sender pairs for max parallelism) ---
@@ -314,8 +419,8 @@ fn benchmark_realistic_block() {
         let num_groups = groups.len();
 
         // Parallel execution via rayon + StateOverlay
-        use rayon::prelude::*;
         use pyde_state::smt::StateOverlay;
+        use rayon::prelude::*;
 
         let start = Instant::now();
         if num_groups > 1 {
@@ -330,41 +435,52 @@ fn benchmark_realistic_block() {
                     overlay.into_writes()
                 })
                 .collect();
-            let all_writes: Vec<(sparse_merkle_tree::H256, Vec<u8>)> = group_writes
-                .into_iter().flatten().collect();
+            let all_writes: Vec<(sparse_merkle_tree::H256, Vec<u8>)> =
+                group_writes.into_iter().flatten().collect();
             let write_count = all_writes.len();
             let _ = persistent.update_all(all_writes);
             let elapsed = start.elapsed();
             let tps = txs.len() as f64 / elapsed.as_secs_f64();
-            println!("  Parallel transfers (1000, {} groups, {} writes, RocksDB): {:.1}ms, {:.0} TPS",
-                num_groups, write_count, elapsed.as_secs_f64() * 1000.0, tps);
+            println!(
+                "  Parallel transfers (1000, {} groups, {} writes, RocksDB): {:.1}ms, {:.0} TPS",
+                num_groups,
+                write_count,
+                elapsed.as_secs_f64() * 1000.0,
+                tps
+            );
         } else {
             for tx in &txs {
                 let _ = execute_transaction(tx, &mut persistent, &ctx);
             }
             let elapsed = start.elapsed();
             let tps = txs.len() as f64 / elapsed.as_secs_f64();
-            println!("  Transfers (1000, 1 group, RocksDB): {:.1}ms, {:.0} TPS",
-                elapsed.as_secs_f64() * 1000.0, tps);
+            println!(
+                "  Transfers (1000, 1 group, RocksDB): {:.1}ms, {:.0} TPS",
+                elapsed.as_secs_f64() * 1000.0,
+                tps
+            );
         }
     }
 
     // --- 3. Contract deploy + calls on RocksDB ---
     {
-        let counter_deploy = compile(r#"
+        let counter_deploy = compile(
+            r#"
             contract Counter {
                 storage { count: u64, }
                 #[constructor] pub fn init() { self.count = 0; }
                 pub fn increment() { self.count = self.count + 1; }
                 pub fn get_count() -> u64 { return self.count; }
             }
-        "#);
+        "#,
+        );
 
         // Deploy one contract — read current nonce from state
         let (deployer, _) = accounts[0];
         let deploy_nonce = {
             let nk = pyde_state::keys::nonce_key(&deployer);
-            persistent.get(&nk)
+            persistent
+                .get(&nk)
                 .map(|d| {
                     let ns = pyde_account::nonce::NonceState::from_bytes(&d);
                     ns.base + ns.used.trailing_ones() as u64
@@ -375,14 +491,22 @@ fn benchmark_realistic_block() {
         let receipt = execute_transaction(&dtx, &mut persistent, &ctx).unwrap();
         let contract = {
             let mut a = [0u8; 32];
-            if receipt.return_data.len() == 32 { a.copy_from_slice(&receipt.return_data); }
+            if receipt.return_data.len() == 32 {
+                a.copy_from_slice(&receipt.return_data);
+            }
             a
         };
 
         let mut txs = Vec::new();
         for i in 0..500 {
             let (from, _) = accounts[i % 200];
-            txs.push(make_call(from, contract, "increment", vec![], (i / 200 + 11) as u64));
+            txs.push(make_call(
+                from,
+                contract,
+                "increment",
+                vec![],
+                (i / 200 + 11) as u64,
+            ));
         }
         let start = Instant::now();
         for tx in &txs {
@@ -390,25 +514,32 @@ fn benchmark_realistic_block() {
         }
         let elapsed = start.elapsed();
         let tps = txs.len() as f64 / elapsed.as_secs_f64();
-        println!("  Contract calls (500, sequential, RocksDB): {:.1}ms, {:.0} TPS",
-            elapsed.as_secs_f64() * 1000.0, tps);
+        println!(
+            "  Contract calls (500, sequential, RocksDB): {:.1}ms, {:.0} TPS",
+            elapsed.as_secs_f64() * 1000.0,
+            tps
+        );
     }
 
     // --- 4. Mixed realistic block ---
     {
-        let counter_deploy = compile(r#"
+        let counter_deploy = compile(
+            r#"
             contract Counter {
                 storage { count: u64, }
                 #[constructor] pub fn init() { self.count = 0; }
                 pub fn increment() { self.count = self.count + 1; }
             }
-        "#);
+        "#,
+        );
         let (deployer, _) = accounts[1];
         let dtx = make_deploy(deployer, counter_deploy.clone(), 15);
         let receipt = execute_transaction(&dtx, &mut persistent, &ctx).unwrap();
         let contract = {
             let mut a = [0u8; 32];
-            if receipt.return_data.len() == 32 { a.copy_from_slice(&receipt.return_data); }
+            if receipt.return_data.len() == 32 {
+                a.copy_from_slice(&receipt.return_data);
+            }
             a
         };
 
@@ -420,11 +551,21 @@ fn benchmark_realistic_block() {
         }
         for i in 0..400 {
             let (from, _) = accounts[i % 200];
-            txs.push(make_call(from, contract, "increment", vec![], (i / 200 + 24) as u64));
+            txs.push(make_call(
+                from,
+                contract,
+                "increment",
+                vec![],
+                (i / 200 + 24) as u64,
+            ));
         }
         for i in 0..100 {
             let (from, _) = accounts[i % 200];
-            txs.push(make_deploy(from, counter_deploy.clone(), (i / 200 + 26) as u64));
+            txs.push(make_deploy(
+                from,
+                counter_deploy.clone(),
+                (i / 200 + 26) as u64,
+            ));
         }
 
         let start = Instant::now();
@@ -433,8 +574,11 @@ fn benchmark_realistic_block() {
         }
         let elapsed = start.elapsed();
         let tps = txs.len() as f64 / elapsed.as_secs_f64();
-        println!("  Mixed block (1500 xfer + 400 call + 100 deploy, RocksDB): {:.1}ms, {:.0} TPS",
-            elapsed.as_secs_f64() * 1000.0, tps);
+        println!(
+            "  Mixed block (1500 xfer + 400 call + 100 deploy, RocksDB): {:.1}ms, {:.0} TPS",
+            elapsed.as_secs_f64() * 1000.0,
+            tps
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -451,14 +595,11 @@ fn benchmark_production_block() {
     use pyde_state::smt::StateOverlay;
     use pyde_tx::pipeline::execute_transaction_aot;
     use rayon::prelude::*;
-    
 
     let dir = std::env::temp_dir().join("pyde-bench-production");
     let _ = std::fs::remove_dir_all(&dir);
 
-    let mut persistent = PersistentSMT::open(
-        dir.join("state").to_str().unwrap()
-    ).unwrap();
+    let mut persistent = PersistentSMT::open(dir.join("state").to_str().unwrap()).unwrap();
 
     let ctx = block_ctx();
     let num_accounts = 500;
@@ -471,12 +612,15 @@ fn benchmark_production_block() {
         pk_bytes[..8].copy_from_slice(&seed);
         let address = derive_eoa_address(&pk_bytes);
         let account = pyde_account::types::Account {
-            address, nonce: 0, balance: 1_000_000_000_000_000,
+            address,
+            nonce: 0,
+            balance: 1_000_000_000_000_000,
             code_hash: sparse_merkle_tree::H256::zero(),
             storage_root: sparse_merkle_tree::H256::zero(),
             account_type: pyde_account::types::AccountType::EOA,
             auth_keys: pyde_account::types::AuthKeys::None,
-            gas_tank: 0, key_nonce: 0,
+            gas_tank: 0,
+            key_nonce: 0,
         };
         let key = pyde_state::keys::balance_key(&address);
         persistent.insert(key, account.to_bytes()).unwrap();
@@ -498,7 +642,8 @@ fn benchmark_production_block() {
     // - Multiple storage reads + writes per call
     // Complex contract: 200-iteration loop with math + bitwise ops,
     // writes result to a single storage field (parallelizable with 1 access key)
-    let heavy_code = compile(r#"
+    let heavy_code = compile(
+        r#"
         contract HeavyWork {
             storage {
                 result: u64,
@@ -516,11 +661,13 @@ fn benchmark_production_block() {
                 self.result = sum;
             }
         }
-    "#);
+    "#,
+    );
 
     // Deploy 10 contracts and pre-compile AOT
     let mut contract_addrs = Vec::new();
-    let mut aot_compiled: std::collections::HashMap<[u8; 32], pyde_aot::CompiledCode> = std::collections::HashMap::new();
+    let mut aot_compiled: std::collections::HashMap<[u8; 32], pyde_aot::CompiledCode> =
+        std::collections::HashMap::new();
     let num_contracts = 100usize;
     for i in 0..num_contracts as u64 {
         // Each contract deployed by a different account (nonce 0 for each)
@@ -528,7 +675,9 @@ fn benchmark_production_block() {
         let dtx = make_deploy(deployer, heavy_code.clone(), 0);
         let receipt = execute_transaction(&dtx, &mut persistent, &ctx).unwrap();
         let mut addr = [0u8; 32];
-        if receipt.return_data.len() == 32 { addr.copy_from_slice(&receipt.return_data); }
+        if receipt.return_data.len() == 32 {
+            addr.copy_from_slice(&receipt.return_data);
+        }
         contract_addrs.push(addr);
 
         let code_key = pyde_state::keys::code_key(&addr);
@@ -542,13 +691,22 @@ fn benchmark_production_block() {
     println!("\n========== PRODUCTION BLOCK BENCHMARK ==========\n");
     println!("  Accounts: {}", num_accounts);
     let aot_count = aot_compiled.len();
-    println!("  Contracts: {} (AOT pre-compiled: {})", contract_addrs.len(), aot_count);
+    println!(
+        "  Contracts: {} (AOT pre-compiled: {})",
+        contract_addrs.len(),
+        aot_count
+    );
     println!("  CPU cores: {}", rayon::current_num_threads());
     println!();
 
     // Build AOT lookup: contract address → compiled function pointer
-    let aot_map: std::collections::HashMap<[u8; 32], unsafe fn(*mut u64, u64, *mut pyde_vm::vm::Vm) -> u64> =
-        aot_compiled.iter().map(|(addr, code)| (*addr, code.as_fn())).collect();
+    let aot_map: std::collections::HashMap<
+        [u8; 32],
+        unsafe fn(*mut u64, u64, *mut pyde_vm::vm::Vm) -> u64,
+    > = aot_compiled
+        .iter()
+        .map(|(addr, code)| (*addr, code.as_fn()))
+        .collect();
 
     // Helper: run block sequentially (to verify txs work, get accurate write counts)
     let run_sequential = |label: &str, txs: &[Transaction], smt: &mut PersistentSMT| {
@@ -561,13 +719,27 @@ fn benchmark_production_block() {
         for (i, tx) in txs.iter().enumerate() {
             let aot_fn = aot_map.get(&tx.to).copied();
             match execute_transaction_aot(tx, &mut overlay, &ctx, aot_fn) {
-                Ok(r) => if r.success { ok += 1; } else {
-                    fail += 1;
-                    if i < 3 { eprintln!("    tx {} reverted: gas_used={}, ret_len={}, ret={}", i, r.gas_used, r.return_data.len(), String::from_utf8_lossy(&r.return_data)); }
+                Ok(r) => {
+                    if r.success {
+                        ok += 1;
+                    } else {
+                        fail += 1;
+                        if i < 3 {
+                            eprintln!(
+                                "    tx {} reverted: gas_used={}, ret_len={}, ret={}",
+                                i,
+                                r.gas_used,
+                                r.return_data.len(),
+                                String::from_utf8_lossy(&r.return_data)
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     fail += 1;
-                    if i < 3 { eprintln!("    tx {} error: {:?}", i, e); }
+                    if i < 3 {
+                        eprintln!("    tx {} error: {:?}", i, e);
+                    }
                 }
             }
         }
@@ -576,8 +748,16 @@ fn benchmark_production_block() {
         let _ = smt.update_all(writes);
         let elapsed = start.elapsed();
         let tps = txs.len() as f64 / elapsed.as_secs_f64();
-        println!("  {} ({} txs, {} ok, {} fail, {} groups): {:.1}ms, {:.0} TPS",
-            label, txs.len(), ok, fail, sched.group_count(), elapsed.as_secs_f64() * 1000.0, tps);
+        println!(
+            "  {} ({} txs, {} ok, {} fail, {} groups): {:.1}ms, {:.0} TPS",
+            label,
+            txs.len(),
+            ok,
+            fail,
+            sched.group_count(),
+            elapsed.as_secs_f64() * 1000.0,
+            tps
+        );
     };
 
     // Helper: run block with parallel execution
@@ -615,11 +795,22 @@ fn benchmark_production_block() {
             let total_elapsed = start.elapsed();
             let exec_tps = txs.len() as f64 / exec_elapsed.as_secs_f64();
             let total_tps = txs.len() as f64 / total_elapsed.as_secs_f64();
-            println!("  {} ({} txs, {} ok, {} groups, {} writes)", label, txs.len(), total_ok, num_groups, write_count);
-            println!("    exec: {:.1}ms ({:.0} TPS), commit: {:.1}ms, total: {:.1}ms ({:.0} TPS)",
-                exec_elapsed.as_secs_f64() * 1000.0, exec_tps,
+            println!(
+                "  {} ({} txs, {} ok, {} groups, {} writes)",
+                label,
+                txs.len(),
+                total_ok,
+                num_groups,
+                write_count
+            );
+            println!(
+                "    exec: {:.1}ms ({:.0} TPS), commit: {:.1}ms, total: {:.1}ms ({:.0} TPS)",
+                exec_elapsed.as_secs_f64() * 1000.0,
+                exec_tps,
                 commit_elapsed.as_secs_f64() * 1000.0,
-                total_elapsed.as_secs_f64() * 1000.0, total_tps);
+                total_elapsed.as_secs_f64() * 1000.0,
+                total_tps
+            );
         } else {
             run_sequential(label, txs, smt);
         }
@@ -652,17 +843,34 @@ fn benchmark_production_block() {
             let mut data = selector.to_be_bytes().to_vec();
             data.extend_from_slice(&200u64.to_le_bytes()); // n=200 iterations
             txs.push(Transaction {
-                from, to: contract, value: 0, data,
-                gas_limit: 10_000_000, nonce: (i / (num_accounts as usize)) as u64,
-                signature: vec![], fee_payer: FeePayer::Sender,
-                access_list: vec![
-                    AccessEntry { address: contract, reads: vec![slot_0], writes: vec![slot_0] },
-                ],
-                deadline: None, chain_id: 31337, tx_type: TransactionType::Standard,
+                from,
+                to: contract,
+                value: 0,
+                data,
+                gas_limit: 10_000_000,
+                nonce: (i / (num_accounts as usize)) as u64,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
+                access_list: vec![AccessEntry {
+                    address: contract,
+                    reads: vec![slot_0],
+                    writes: vec![slot_0],
+                }],
+                deadline: None,
+                chain_id: 31337,
+                tx_type: TransactionType::Standard,
             });
         }
-        run_sequential("Contract calls (sequential, n=200)", &txs[..500], &mut persistent);
-        run_parallel("Contract calls (parallel, n=200, 10K txs)", &txs[500..], &mut persistent);
+        run_sequential(
+            "Contract calls (sequential, n=200)",
+            &txs[..500],
+            &mut persistent,
+        );
+        run_parallel(
+            "Contract calls (parallel, n=200, 10K txs)",
+            &txs[500..],
+            &mut persistent,
+        );
     }
 
     // --- 3. Mixed block ---
@@ -681,11 +889,18 @@ fn benchmark_production_block() {
             let mut data = selector.to_be_bytes().to_vec();
             data.extend_from_slice(&200u64.to_le_bytes());
             txs.push(Transaction {
-                from, to: contract, value: 0, data,
-                gas_limit: 10_000_000, nonce: (i / (num_accounts as usize)) as u64,
-                signature: vec![], fee_payer: FeePayer::Sender,
+                from,
+                to: contract,
+                value: 0,
+                data,
+                gas_limit: 10_000_000,
+                nonce: (i / (num_accounts as usize)) as u64,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
                 access_list: vec![],
-                deadline: None, chain_id: 31337, tx_type: TransactionType::Standard,
+                deadline: None,
+                chain_id: 31337,
+                tx_type: TransactionType::Standard,
             });
         }
         run_parallel("Mixed (1500 xfer + 500 call)", &txs, &mut persistent);
@@ -694,4 +909,3 @@ fn benchmark_production_block() {
     let _ = std::fs::remove_dir_all(&dir);
     println!("\n========== PRODUCTION BENCHMARK COMPLETE ==========\n");
 }
-

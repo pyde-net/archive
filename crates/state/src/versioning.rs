@@ -277,7 +277,8 @@ mod tests {
     #[test]
     fn undo_blocks_too_many_returns_none() {
         let mut vs = VersionedState::new();
-        vs.apply_block(vec![(key_from_seed(1), b"x".to_vec())]).unwrap();
+        vs.apply_block(vec![(key_from_seed(1), b"x".to_vec())])
+            .unwrap();
         assert_eq!(vs.undo_blocks(5).unwrap(), None);
     }
 
@@ -310,7 +311,8 @@ mod tests {
     #[test]
     fn get_at_height_future_returns_none() {
         let mut vs = VersionedState::new();
-        vs.apply_block(vec![(key_from_seed(1), b"x".to_vec())]).unwrap();
+        vs.apply_block(vec![(key_from_seed(1), b"x".to_vec())])
+            .unwrap();
         assert_eq!(vs.get_at_height(&key_from_seed(1), 999), None);
     }
 
@@ -322,7 +324,8 @@ mod tests {
         let key = key_from_seed(1);
 
         for i in 0..10u64 {
-            vs.apply_block(vec![(key, format!("v{i}").into_bytes())]).unwrap();
+            vs.apply_block(vec![(key, format!("v{i}").into_bytes())])
+                .unwrap();
         }
 
         assert_eq!(vs.undo_depth(), 5);
@@ -336,7 +339,8 @@ mod tests {
         let key = key_from_seed(1);
 
         for i in 0..10u64 {
-            vs.apply_block(vec![(key, format!("v{i}").into_bytes())]).unwrap();
+            vs.apply_block(vec![(key, format!("v{i}").into_bytes())])
+                .unwrap();
         }
 
         // Can only undo 3 blocks
@@ -359,7 +363,8 @@ mod tests {
             (k1, b"a".to_vec()),
             (k2, b"b".to_vec()),
             (k3, b"c".to_vec()),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(vs.get(&k1), Some(b"a".to_vec()));
         assert_eq!(vs.get(&k2), Some(b"b".to_vec()));
         assert_eq!(vs.get(&k3), Some(b"c".to_vec()));

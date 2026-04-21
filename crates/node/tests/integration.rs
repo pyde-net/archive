@@ -27,11 +27,7 @@ fn block_ctx() -> BlockContext {
     }
 }
 
-fn fund_account(
-    smt: &mut PydeSMT,
-    pk_bytes: &[u8],
-    balance: u128,
-) -> [u8; 32] {
+fn fund_account(smt: &mut PydeSMT, pk_bytes: &[u8], balance: u128) -> [u8; 32] {
     let addr = derive_eoa_address(pk_bytes);
     let mut account = pyde_account::types::Account::new_eoa(pk_bytes);
     account.balance = balance;
@@ -53,7 +49,9 @@ fn transfer_tx(
     sk: &pyde_crypto::falcon::FalconSecretKey,
 ) -> Transaction {
     let mut tx = Transaction {
-        from, to, value,
+        from,
+        to,
+        value,
         data: vec![],
         gas_limit: 21_000,
         nonce,
@@ -104,7 +102,9 @@ fn call_tx(
     let mut data = selector.to_be_bytes().to_vec();
     data.extend_from_slice(&args);
     let mut tx = Transaction {
-        from, to, value: 0,
+        from,
+        to,
+        value: 0,
         data,
         gas_limit: 100_000_000,
         nonce,
@@ -185,7 +185,8 @@ fn deploy_and_call_counter() {
     let sender = fund_account(&mut smt, pk.as_bytes(), BALANCE);
     let contract_addr = pyde_account::address::derive_create_address(&sender, 0);
 
-    let (deploy_data, _) = compile_contract(r#"
+    let (deploy_data, _) = compile_contract(
+        r#"
         contract Counter {
             storage { count: u64, }
             #[constructor]
@@ -193,7 +194,8 @@ fn deploy_and_call_counter() {
             pub fn increment() { self.count = self.count + 1; }
             pub fn get_count() -> u64 { return self.count; }
         }
-    "#);
+    "#,
+    );
 
     // Deploy
     let dtx = deploy_tx(sender, deploy_data, 0, &sk);
@@ -227,7 +229,8 @@ fn erc20_token_flow() {
     let sender = fund_account(&mut smt, pk.as_bytes(), BALANCE);
     let contract_addr = pyde_account::address::derive_create_address(&sender, 0);
 
-    let (deploy_data, _) = compile_contract(r#"
+    let (deploy_data, _) = compile_contract(
+        r#"
         contract Token {
             storage {
                 total_supply: u64,
@@ -244,7 +247,8 @@ fn erc20_token_flow() {
             }
             pub fn total_supply() -> u64 { return self.total_supply; }
         }
-    "#);
+    "#,
+    );
 
     // Deploy
     let dtx = deploy_tx(sender, deploy_data, 0, &sk);
@@ -286,7 +290,8 @@ fn out_of_gas_reverts() {
     let sender = fund_account(&mut smt, pk.as_bytes(), BALANCE);
     let contract_addr = pyde_account::address::derive_create_address(&sender, 0);
 
-    let (deploy_data, _) = compile_contract(r#"
+    let (deploy_data, _) = compile_contract(
+        r#"
         contract Burner {
             storage { val: u64, }
             #[constructor]
@@ -299,7 +304,8 @@ fn out_of_gas_reverts() {
                 }
             }
         }
-    "#);
+    "#,
+    );
 
     let dtx = deploy_tx(sender, deploy_data, 0, &sk);
     let r = execute_transaction(&dtx, &mut smt, &ctx).unwrap();
@@ -307,8 +313,12 @@ fn out_of_gas_reverts() {
 
     // Call burn with very low gas — should fail
     let mut tx = Transaction {
-        from: sender, to: contract_addr, value: 0,
-        data: otic::codegen::compute_selector("burn").to_be_bytes().to_vec(),
+        from: sender,
+        to: contract_addr,
+        value: 0,
+        data: otic::codegen::compute_selector("burn")
+            .to_be_bytes()
+            .to_vec(),
         gas_limit: 25_000, // enough for dispatch but not the loop
         nonce: 1,
         signature: vec![],
@@ -335,7 +345,8 @@ fn revert_rolls_back_state() {
     let sender = fund_account(&mut smt, pk.as_bytes(), BALANCE);
     let contract_addr = pyde_account::address::derive_create_address(&sender, 0);
 
-    let (deploy_data, _) = compile_contract(r#"
+    let (deploy_data, _) = compile_contract(
+        r#"
         contract Reverter {
             storage { count: u64, }
             #[constructor]
@@ -346,14 +357,22 @@ fn revert_rolls_back_state() {
             }
             pub fn get_count() -> u64 { return self.count; }
         }
-    "#);
+    "#,
+    );
 
     let dtx = deploy_tx(sender, deploy_data, 0, &sk);
     let r = execute_transaction(&dtx, &mut smt, &ctx).unwrap();
     assert!(r.success);
 
     // Call increment_and_revert — should fail
-    let itx = call_tx(sender, contract_addr, "increment_and_revert", vec![], 1, &sk);
+    let itx = call_tx(
+        sender,
+        contract_addr,
+        "increment_and_revert",
+        vec![],
+        1,
+        &sk,
+    );
     let r = execute_transaction(&itx, &mut smt, &ctx).unwrap();
     assert!(!r.success, "should revert");
 
@@ -378,14 +397,16 @@ fn overflow_panics() {
     let sender = fund_account(&mut smt, pk.as_bytes(), BALANCE);
     let contract_addr = pyde_account::address::derive_create_address(&sender, 0);
 
-    let (deploy_data, _) = compile_contract(r#"
+    let (deploy_data, _) = compile_contract(
+        r#"
         contract Overflow {
             storage { val: u64, }
             #[constructor]
             pub fn init() { self.val = 18446744073709551615; }
             pub fn add_one() { self.val = self.val + 1; }
         }
-    "#);
+    "#,
+    );
 
     let dtx = deploy_tx(sender, deploy_data, 0, &sk);
     let r = execute_transaction(&dtx, &mut smt, &ctx).unwrap();
@@ -409,20 +430,18 @@ fn base_fee_adjustment() {
     let gas_target: u64 = 400_000_000 / 2; // 50% = target
 
     // Simulate full block
-    let new_fee_full = pyde_tx::fee::adjust_base_fee(
-        initial_base_fee,
-        400_000_000u64,
-        gas_target,
+    let new_fee_full = pyde_tx::fee::adjust_base_fee(initial_base_fee, 400_000_000u64, gas_target);
+    assert!(
+        new_fee_full > initial_base_fee,
+        "full block should increase fee"
     );
-    assert!(new_fee_full > initial_base_fee, "full block should increase fee");
 
     // Simulate empty block
-    let new_fee_empty = pyde_tx::fee::adjust_base_fee(
-        initial_base_fee,
-        0u64,
-        gas_target,
+    let new_fee_empty = pyde_tx::fee::adjust_base_fee(initial_base_fee, 0u64, gas_target);
+    assert!(
+        new_fee_empty < initial_base_fee,
+        "empty block should decrease fee"
     );
-    assert!(new_fee_empty < initial_base_fee, "empty block should decrease fee");
 }
 
 // ============================================================================
@@ -437,7 +456,8 @@ fn auction_contract_flow() {
     let sender = fund_account(&mut smt, pk.as_bytes(), BALANCE);
     let contract_addr = pyde_account::address::derive_create_address(&sender, 0);
 
-    let (deploy_data, _) = compile_contract(r#"
+    let (deploy_data, _) = compile_contract(
+        r#"
         contract Auction {
             storage {
                 highest_bid: u64,
@@ -463,7 +483,8 @@ fn auction_contract_flow() {
             pub fn get_bid_count() -> u64 { return self.bid_count; }
             pub fn is_ended() -> bool { return self.ended; }
         }
-    "#);
+    "#,
+    );
 
     // Deploy
     let dtx = deploy_tx(sender, deploy_data, 0, &sk);
@@ -527,7 +548,8 @@ fn vault_deposit_withdraw() {
     let sender = fund_account(&mut smt, pk.as_bytes(), BALANCE);
     let contract_addr = pyde_account::address::derive_create_address(&sender, 0);
 
-    let (deploy_data, _) = compile_contract(r#"
+    let (deploy_data, _) = compile_contract(
+        r#"
         contract Vault {
             storage {
                 balance: u64,
@@ -552,24 +574,46 @@ fn vault_deposit_withdraw() {
             pub fn get_balance() -> u64 { return self.balance; }
             pub fn get_total_fees() -> u64 { return self.total_fees; }
         }
-    "#);
+    "#,
+    );
 
     let dtx = deploy_tx(sender, deploy_data, 0, &sk);
     let r = execute_transaction(&dtx, &mut smt, &ctx).unwrap();
     assert!(r.success);
 
     // Deposit 1000
-    let tx = call_tx(sender, contract_addr, "deposit", 1000u64.to_le_bytes().to_vec(), 1, &sk);
+    let tx = call_tx(
+        sender,
+        contract_addr,
+        "deposit",
+        1000u64.to_le_bytes().to_vec(),
+        1,
+        &sk,
+    );
     let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
     assert!(r.success);
 
     // Deposit 500
-    let tx = call_tx(sender, contract_addr, "deposit", 500u64.to_le_bytes().to_vec(), 2, &sk);
+    let tx = call_tx(
+        sender,
+        contract_addr,
+        "deposit",
+        500u64.to_le_bytes().to_vec(),
+        2,
+        &sk,
+    );
     let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
     assert!(r.success);
 
     // Withdraw 200 (fee = 200 * 10/100 = 20, total deducted = 220)
-    let tx = call_tx(sender, contract_addr, "withdraw", 200u64.to_le_bytes().to_vec(), 3, &sk);
+    let tx = call_tx(
+        sender,
+        contract_addr,
+        "withdraw",
+        200u64.to_le_bytes().to_vec(),
+        3,
+        &sk,
+    );
     let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
     assert!(r.success);
 
@@ -589,7 +633,14 @@ fn vault_deposit_withdraw() {
     assert_eq!(u64::from_le_bytes(buf), 20);
 
     // Withdraw too much — should fail
-    let tx = call_tx(sender, contract_addr, "withdraw", 5000u64.to_le_bytes().to_vec(), 6, &sk);
+    let tx = call_tx(
+        sender,
+        contract_addr,
+        "withdraw",
+        5000u64.to_le_bytes().to_vec(),
+        6,
+        &sk,
+    );
     let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
     assert!(!r.success, "overdraw should fail");
 }
@@ -609,7 +660,8 @@ fn reentrancy_guard() {
     // Vault with guarded withdraw (default: no #[reentrant]).
     // The reentrancy guard sets a storage lock on entry and clears on exit.
     // Sequential external calls (separate txs) should work — guard resets.
-    let (vault_deploy, _) = compile_contract(r#"
+    let (vault_deploy, _) = compile_contract(
+        r#"
         contract Vault {
             storage { balance: u64, }
             #[constructor]
@@ -620,7 +672,8 @@ fn reentrancy_guard() {
             }
             pub fn get_balance() -> u64 { return self.balance; }
         }
-    "#);
+    "#,
+    );
 
     let dtx = deploy_tx(sender, vault_deploy, 0, &sk);
     let r = execute_transaction(&dtx, &mut smt, &ctx).unwrap();
@@ -628,7 +681,14 @@ fn reentrancy_guard() {
 
     // Three sequential withdrawals — guard resets between txs
     for i in 0..3u64 {
-        let tx = call_tx(sender, vault_addr, "withdraw", 200u64.to_le_bytes().to_vec(), 1 + i, &sk);
+        let tx = call_tx(
+            sender,
+            vault_addr,
+            "withdraw",
+            200u64.to_le_bytes().to_vec(),
+            1 + i,
+            &sk,
+        );
         let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(r.success, "withdraw {} should succeed", i + 1);
     }
@@ -642,7 +702,14 @@ fn reentrancy_guard() {
     assert_eq!(u64::from_le_bytes(buf), 400);
 
     // Overdraw reverts, balance unchanged
-    let tx = call_tx(sender, vault_addr, "withdraw", 999u64.to_le_bytes().to_vec(), 5, &sk);
+    let tx = call_tx(
+        sender,
+        vault_addr,
+        "withdraw",
+        999u64.to_le_bytes().to_vec(),
+        5,
+        &sk,
+    );
     let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
     assert!(!r.success, "overdraw should revert");
 
@@ -650,7 +717,11 @@ fn reentrancy_guard() {
     let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
     assert!(r.success);
     buf.copy_from_slice(&r.return_data[..8]);
-    assert_eq!(u64::from_le_bytes(buf), 400, "balance unchanged after revert");
+    assert_eq!(
+        u64::from_le_bytes(buf),
+        400,
+        "balance unchanged after revert"
+    );
 }
 
 // ============================================================================
@@ -667,7 +738,8 @@ fn cross_contract_storage_visibility() {
     // Driver deploys Vault, calls withdraw twice, reads balance back.
     // Tests that Vault.withdraw()'s storage changes are visible to
     // the next Vault.get_balance() call within the same transaction.
-    let compiled = otic::compile_all(r#"
+    let compiled = otic::compile_all(
+        r#"
         contract Vault {
             storage { balance: u64, }
             #[constructor]
@@ -691,7 +763,8 @@ fn cross_contract_storage_visibility() {
             }
             pub fn get_result() -> u64 { return self.result; }
         }
-    "#);
+    "#,
+    );
 
     let driver_contract = compiled.iter().find(|(n, _)| n == "Driver").unwrap();
     let clen = driver_contract.1.constructor_bytecode.len() as u32;
@@ -719,8 +792,11 @@ fn cross_contract_storage_visibility() {
     assert!(r.success);
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&r.return_data[..8]);
-    assert_eq!(u64::from_le_bytes(buf), 700,
-        "vault balance should be 700 (cross-contract storage visible within tx)");
+    assert_eq!(
+        u64::from_le_bytes(buf),
+        700,
+        "vault balance should be 700 (cross-contract storage visible within tx)"
+    );
 }
 
 // ============================================================================
@@ -737,7 +813,8 @@ fn reentrancy_attack_blocked() {
     // Vault: withdraw calls back to caller via raw_call! (simulates ETH transfer callback).
     // Attacker: on_hook() tries to re-enter Vault.withdraw().
     // Without #[reentrant], the guard should block the re-entry.
-    let compiled = otic::compile_all(r#"
+    let compiled = otic::compile_all(
+        r#"
         contract Vault {
             storage { balance: u64, }
             #[constructor]
@@ -769,7 +846,8 @@ fn reentrancy_attack_blocked() {
             }
             pub fn get_stolen() -> u64 { return self.stolen; }
         }
-    "#);
+    "#,
+    );
 
     // Deploy Vault
     let vault_c = compiled.iter().find(|(n, _)| n == "Vault").unwrap();
@@ -802,7 +880,14 @@ fn reentrancy_attack_blocked() {
     assert!(r.success, "attacker deploy failed");
 
     // Set vault address on attacker
-    let tx = call_tx(sender, attacker_addr, "set_vault", vault_addr.to_vec(), 2, &sk);
+    let tx = call_tx(
+        sender,
+        attacker_addr,
+        "set_vault",
+        vault_addr.to_vec(),
+        2,
+        &sk,
+    );
     let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
     assert!(r.success, "set_vault failed");
 
@@ -810,7 +895,14 @@ fn reentrancy_attack_blocked() {
     // Vault deducts 100, calls attacker.on_hook()
     // on_hook() tries to re-enter Vault.withdraw() — should be BLOCKED by guard
     // The entire tx should revert because the re-entry fails
-    let tx = call_tx(sender, attacker_addr, "attack", 100u64.to_le_bytes().to_vec(), 3, &sk);
+    let tx = call_tx(
+        sender,
+        attacker_addr,
+        "attack",
+        100u64.to_le_bytes().to_vec(),
+        3,
+        &sk,
+    );
     let _r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
 
     // The re-entry is blocked by the guard. The first withdraw (100) is legit
@@ -822,8 +914,11 @@ fn reentrancy_attack_blocked() {
     assert!(r.success);
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&r.return_data[..8]);
-    assert_eq!(u64::from_le_bytes(buf), 900,
-        "vault balance should be 900 — first withdraw ok, re-entry blocked");
+    assert_eq!(
+        u64::from_le_bytes(buf),
+        900,
+        "vault balance should be 900 — first withdraw ok, re-entry blocked"
+    );
 }
 
 // ============================================================================
@@ -850,8 +945,16 @@ fn access_list_validation() {
         signature: vec![],
         fee_payer: FeePayer::Sender,
         access_list: vec![
-            AccessEntry { address: dup_addr, reads: vec![], writes: vec![] },
-            AccessEntry { address: dup_addr, reads: vec![], writes: vec![] }, // duplicate
+            AccessEntry {
+                address: dup_addr,
+                reads: vec![],
+                writes: vec![],
+            },
+            AccessEntry {
+                address: dup_addr,
+                reads: vec![],
+                writes: vec![],
+            }, // duplicate
         ],
         deadline: None,
         chain_id: 1,
@@ -860,7 +963,10 @@ fn access_list_validation() {
     sign_tx(&mut tx, &sk);
 
     let result = execute_transaction(&tx, &mut smt, &ctx);
-    assert!(result.is_err(), "duplicate access list entries should be rejected");
+    assert!(
+        result.is_err(),
+        "duplicate access list entries should be rejected"
+    );
 }
 
 // ============================================================================
@@ -886,10 +992,17 @@ fn elastic_block_gas_ceiling() {
 
     // Transaction within limit should work
     let mut tx = Transaction {
-        from: sender, to: derive_eoa_address(b"bob"), value: 100,
-        data: vec![], gas_limit: 21_000, nonce: 0,
-        signature: vec![], fee_payer: FeePayer::Sender,
-        access_list: vec![], deadline: None, chain_id: 1,
+        from: sender,
+        to: derive_eoa_address(b"bob"),
+        value: 100,
+        data: vec![],
+        gas_limit: 21_000,
+        nonce: 0,
+        signature: vec![],
+        fee_payer: FeePayer::Sender,
+        access_list: vec![],
+        deadline: None,
+        chain_id: 1,
         tx_type: TransactionType::Standard,
     };
     sign_tx(&mut tx, &sk);
@@ -898,13 +1011,23 @@ fn elastic_block_gas_ceiling() {
 
     // Transaction exceeding block gas limit should be rejected
     let mut tx2 = Transaction {
-        from: sender, to: derive_eoa_address(b"bob"), value: 100,
-        data: vec![], gas_limit: 2_000_000_000, // > 1.6B
-        nonce: 1, signature: vec![], fee_payer: FeePayer::Sender,
-        access_list: vec![], deadline: None, chain_id: 1,
+        from: sender,
+        to: derive_eoa_address(b"bob"),
+        value: 100,
+        data: vec![],
+        gas_limit: 2_000_000_000, // > 1.6B
+        nonce: 1,
+        signature: vec![],
+        fee_payer: FeePayer::Sender,
+        access_list: vec![],
+        deadline: None,
+        chain_id: 1,
         tx_type: TransactionType::Standard,
     };
     sign_tx(&mut tx2, &sk);
     let result = execute_transaction(&tx2, &mut smt, &ctx);
-    assert!(result.is_err(), "tx exceeding block gas limit should be rejected");
+    assert!(
+        result.is_err(),
+        "tx exceeding block gas limit should be rejected"
+    );
 }

@@ -66,8 +66,15 @@ pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<
             format!(
                 "network '{}' not found in pyde.toml (available: {})",
                 network,
-                if available.is_empty() { "none".to_string() }
-                else { available.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ") }
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
             )
         })?
         .clone();
@@ -96,7 +103,8 @@ pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<
     let all_compiled = otic::compile_all(&source);
 
     // Find the target contract
-    let target_name = contract_filter.as_deref()
+    let target_name = contract_filter
+        .as_deref()
         .or_else(|| {
             // Auto-detect: find the last contract (usually the script contract)
             all_compiled.last().map(|(name, _)| name.as_str())
@@ -105,7 +113,10 @@ pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<
         .to_string();
 
     if !all_compiled.iter().any(|(name, _)| name == &target_name) {
-        return Err(format!("contract '{}' not found in {}", target_name, script_path));
+        return Err(format!(
+            "contract '{}' not found in {}",
+            target_name, script_path
+        ));
     }
 
     // Re-lower the target contract with external registries for deploy! of imported contracts
@@ -184,7 +195,9 @@ pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<
     };
 
     // Run the script with RPC bridge
-    let entry_name = ir.functions.iter()
+    let entry_name = ir
+        .functions
+        .iter()
         .find(|f| f.is_pub && !f.is_constructor)
         .unwrap()
         .name
@@ -204,15 +217,19 @@ pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<
     vm.storage = constructor_storage;
 
     // Build selector → function info map for view/non-view detection
-    let mut selector_info: std::collections::HashMap<u32, FnInfo> = std::collections::HashMap::new();
+    let mut selector_info: std::collections::HashMap<u32, FnInfo> =
+        std::collections::HashMap::new();
     for fns in build_result.contract_functions.values() {
         for (name, _params, ret_ty) in fns {
             let sel = otic::codegen::compute_selector(name);
-            selector_info.insert(sel, FnInfo {
-                name: name.clone(),
-                is_view: false, // contract_functions doesn't track is_view — conservative default
-                return_ty: ret_ty.clone(),
-            });
+            selector_info.insert(
+                sel,
+                FnInfo {
+                    name: name.clone(),
+                    is_view: false, // contract_functions doesn't track is_view — conservative default
+                    return_ty: ret_ty.clone(),
+                },
+            );
         }
     }
     // Also check IR for view functions
@@ -222,11 +239,14 @@ pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<
             if let Some(info) = selector_info.get_mut(&sel) {
                 info.is_view = true;
             } else {
-                selector_info.insert(sel, FnInfo {
-                    name: func.name.clone(),
-                    is_view: true,
-                    return_ty: func.return_ty.clone(),
-                });
+                selector_info.insert(
+                    sel,
+                    FnInfo {
+                        name: func.name.clone(),
+                        is_view: true,
+                        return_ty: func.return_ty.clone(),
+                    },
+                );
             }
         }
     }
@@ -254,7 +274,10 @@ pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<
             return Err(format!("script reverted after {} transactions", tx_count));
         }
         other => {
-            return Err(format!("script failed: {:?} after {} transactions", other, tx_count));
+            return Err(format!(
+                "script failed: {:?} after {} transactions",
+                other, tx_count
+            ));
         }
     }
 
@@ -296,7 +319,9 @@ fn execute_with_rpc_bridge(
                 let len_reg = (d.rs2_or_imm & 0xF) as u8;
                 let code_len = vm.cpu.read_gp(len_reg) as usize;
 
-                let init_code = vm.memory.checked_read_slice(code_ptr, code_len)
+                let init_code = vm
+                    .memory
+                    .checked_read_slice(code_ptr, code_len)
                     .map_err(|_| "failed to read deploy bytecode from memory")?;
 
                 // Match against build registry for the contract name
@@ -306,10 +331,14 @@ fn execute_with_rpc_bridge(
                 // Split into code (constructor+runtime) and args for the RPC.
                 let constructor_len = if init_code.len() >= 4 {
                     u32::from_le_bytes(init_code[..4].try_into().unwrap_or([0; 4]))
-                } else { 0 };
+                } else {
+                    0
+                };
                 let runtime_len = if init_code.len() >= 8 {
                     u32::from_le_bytes(init_code[4..8].try_into().unwrap_or([0; 4]))
-                } else { 0 };
+                } else {
+                    0
+                };
                 // The blob constant is 8-byte aligned in PVM memory, so
                 // actual blob end may be up to 7 bytes past clen+rlen.
                 let raw_code_len = constructor_len as usize + runtime_len as usize;
@@ -332,7 +361,12 @@ fn execute_with_rpc_bridge(
                     &[]
                 };
 
-                println!("    [{}] deploy {} ({} bytes)", tx_count, contract_name, code_only.len());
+                println!(
+                    "    [{}] deploy {} ({} bytes)",
+                    tx_count,
+                    contract_name,
+                    code_only.len()
+                );
 
                 // Build deploy data: [constructor_bytecode][runtime_bytecode][args]
                 let mut deploy_data = code_only.to_vec();
@@ -364,9 +398,13 @@ fn execute_with_rpc_bridge(
                     "params": [tx_hex]
                 });
 
-                let resp = client.post(rpc_url).json(&body).send()
+                let resp = client
+                    .post(rpc_url)
+                    .json(&body)
+                    .send()
                     .map_err(|e| format!("RPC error: {} — is the node running?", e))?;
-                let resp_json: serde_json::Value = resp.json()
+                let resp_json: serde_json::Value = resp
+                    .json()
                     .map_err(|e| format!("invalid RPC response: {}", e))?;
 
                 if let Some(err) = resp_json.get("error") {
@@ -375,13 +413,20 @@ fn execute_with_rpc_bridge(
 
                 // Extract tx hash from response, then poll receipt for authoritative address.
                 // The receipt's returnData contains the actual deployed contract address (32 bytes).
-                let result_str = resp_json.get("result").and_then(|v| v.as_str()).unwrap_or("");
-                let tx_hash = if let Ok(inner) = serde_json::from_str::<serde_json::Value>(result_str) {
-                    inner.get("txHash").and_then(|v| v.as_str())
-                        .unwrap_or(result_str).to_string()
-                } else {
-                    result_str.to_string()
-                };
+                let result_str = resp_json
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let tx_hash =
+                    if let Ok(inner) = serde_json::from_str::<serde_json::Value>(result_str) {
+                        inner
+                            .get("txHash")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(result_str)
+                            .to_string()
+                    } else {
+                        result_str.to_string()
+                    };
 
                 let contract_addr = poll_receipt_for_address(&client, rpc_url, &tx_hash)?;
                 println!("         → 0x{}", hex::encode(&contract_addr[..4]));
@@ -413,7 +458,9 @@ fn execute_with_rpc_bridge(
                     // Save heap pointer — reclaim after RPC (calldata no longer needed)
                     let heap_before = vm.cpu.read_gp(12);
 
-                    let calldata = vm.memory.checked_read_slice(calldata_ptr, calldata_len)
+                    let calldata = vm
+                        .memory
+                        .checked_read_slice(calldata_ptr, calldata_len)
                         .map_err(|_| "failed to read calldata from memory")?;
                     let target_hex = format!("0x{}", hex::encode(target));
                     let calldata_hex = format!("0x{}", hex::encode(&calldata));
@@ -442,9 +489,13 @@ fn execute_with_rpc_bridge(
                             }]
                         });
 
-                        let resp = client.post(rpc_url).json(&body).send()
+                        let resp = client
+                            .post(rpc_url)
+                            .json(&body)
+                            .send()
                             .map_err(|e| format!("RPC error: {}", e))?;
-                        let resp_json: serde_json::Value = resp.json()
+                        let resp_json: serde_json::Value = resp
+                            .json()
                             .map_err(|e| format!("invalid RPC response: {}", e))?;
 
                         if let Some(err) = resp_json.get("error") {
@@ -452,11 +503,13 @@ fn execute_with_rpc_bridge(
                             vm.cpu.write_gp(result_reg, 0);
                         } else {
                             // pyde_call returns result directly as hex string
-                            let result_hex = resp_json.get("result")
-                                .and_then(|v| v.as_str()).unwrap_or("0x");
-                            let return_data = hex::decode(
-                                result_hex.strip_prefix("0x").unwrap_or(result_hex)
-                            ).unwrap_or_default();
+                            let result_hex = resp_json
+                                .get("result")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0x");
+                            let return_data =
+                                hex::decode(result_hex.strip_prefix("0x").unwrap_or(result_hex))
+                                    .unwrap_or_default();
 
                             inject_return_data(vm, &return_data, fn_info);
                             vm.cpu.write_gp(result_reg, 1);
@@ -467,12 +520,16 @@ fn execute_with_rpc_bridge(
                         // State-changing call: signed pyde_sendRawTransaction
                         println!("    [{}] {}.{}()", tx_count, &target_hex[..10], fn_name);
 
-                        let to_bytes = hex::decode(target_hex.strip_prefix("0x").unwrap_or(&target_hex))
-                            .unwrap_or_default();
+                        let to_bytes =
+                            hex::decode(target_hex.strip_prefix("0x").unwrap_or(&target_hex))
+                                .unwrap_or_default();
                         let mut to_addr = [0u8; 32];
-                        if to_bytes.len() == 32 { to_addr.copy_from_slice(&to_bytes); }
-                        let calldata_bytes = hex::decode(calldata_hex.strip_prefix("0x").unwrap_or(&calldata_hex))
-                            .unwrap_or_default();
+                        if to_bytes.len() == 32 {
+                            to_addr.copy_from_slice(&to_bytes);
+                        }
+                        let calldata_bytes =
+                            hex::decode(calldata_hex.strip_prefix("0x").unwrap_or(&calldata_hex))
+                                .unwrap_or_default();
 
                         let mut tx = pyde_tx::types::Transaction {
                             from: signer.address,
@@ -497,9 +554,13 @@ fn execute_with_rpc_bridge(
                             "params": [tx_hex_raw]
                         });
 
-                        let resp = client.post(rpc_url).json(&body).send()
+                        let resp = client
+                            .post(rpc_url)
+                            .json(&body)
+                            .send()
                             .map_err(|e| format!("RPC error: {}", e))?;
-                        let resp_json: serde_json::Value = resp.json()
+                        let resp_json: serde_json::Value = resp
+                            .json()
                             .map_err(|e| format!("invalid RPC response: {}", e))?;
 
                         if let Some(err) = resp_json.get("error") {
@@ -507,10 +568,13 @@ fn execute_with_rpc_bridge(
                             vm.cpu.write_gp(result_reg, 0);
                         } else {
                             // Poll receipt for authoritative return data
-                            let result_str = resp_json.get("result")
-                                .and_then(|v| v.as_str()).unwrap_or("");
+                            let result_str = resp_json
+                                .get("result")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
                             let tx_hash = extract_tx_hash(result_str);
-                            let (success, return_data) = poll_receipt_for_return_data(&client, rpc_url, &tx_hash);
+                            let (success, return_data) =
+                                poll_receipt_for_return_data(&client, rpc_url, &tx_hash);
                             if success {
                                 inject_return_data(vm, &return_data, fn_info);
                                 vm.cpu.write_gp(result_reg, 1);
@@ -564,8 +628,22 @@ fn inject_return_data(vm: &mut Vm, return_data: &[u8], fn_info: Option<&FnInfo>)
         return;
     }
 
-    let is_wide = fn_info.map(|f| matches!(f.return_ty, Ty::U256 | Ty::I256 | Ty::Address | Ty::Contract(_) | Ty::Interface(_))).unwrap_or(false);
-    let is_blob = fn_info.map(|f| matches!(f.return_ty, Ty::Vec(_) | Ty::StringTy | Ty::Bytes | Ty::Struct(_))).unwrap_or(false);
+    let is_wide = fn_info
+        .map(|f| {
+            matches!(
+                f.return_ty,
+                Ty::U256 | Ty::I256 | Ty::Address | Ty::Contract(_) | Ty::Interface(_)
+            )
+        })
+        .unwrap_or(false);
+    let is_blob = fn_info
+        .map(|f| {
+            matches!(
+                f.return_ty,
+                Ty::Vec(_) | Ty::StringTy | Ty::Bytes | Ty::Struct(_)
+            )
+        })
+        .unwrap_or(false);
 
     if is_wide && return_data.len() >= 32 {
         // Wide return: write 32 bytes to heap, r1 = ptr, r2 = 32
@@ -592,8 +670,11 @@ fn inject_return_data(vm: &mut Vm, return_data: &[u8], fn_info: Option<&FnInfo>)
 /// Extract txHash from a sendTransaction result string.
 fn extract_tx_hash(result_str: &str) -> String {
     if let Ok(inner) = serde_json::from_str::<serde_json::Value>(result_str) {
-        inner.get("txHash").and_then(|v| v.as_str())
-            .unwrap_or(result_str).to_string()
+        inner
+            .get("txHash")
+            .and_then(|v| v.as_str())
+            .unwrap_or(result_str)
+            .to_string()
     } else {
         result_str.to_string()
     }
@@ -607,17 +688,27 @@ fn poll_receipt_for_address(
     tx_hash: &str,
 ) -> Result<[u8; 32], String> {
     let receipt = poll_receipt(client, rpc_url, tx_hash)?;
-    let success = receipt.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = receipt
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !success {
         return Err(format!("deploy transaction reverted (tx {})", tx_hash));
     }
-    let return_data_hex = receipt.get("returnData")
-        .and_then(|v| v.as_str()).unwrap_or("");
-    let hex = return_data_hex.strip_prefix("0x").unwrap_or(return_data_hex);
+    let return_data_hex = receipt
+        .get("returnData")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let hex = return_data_hex
+        .strip_prefix("0x")
+        .unwrap_or(return_data_hex);
     if hex.len() == 64 {
         parse_address(&format!("0x{}", hex))
     } else {
-        Err(format!("deploy receipt missing contract address in returnData (got {} bytes)", hex.len() / 2))
+        Err(format!(
+            "deploy receipt missing contract address in returnData (got {} bytes)",
+            hex.len() / 2
+        ))
     }
 }
 
@@ -632,9 +723,14 @@ fn poll_receipt_for_return_data(
         Ok(r) => r,
         Err(_) => return (false, vec![]),
     };
-    let success = receipt.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-    let hex_str = receipt.get("returnData")
-        .and_then(|v| v.as_str()).unwrap_or("");
+    let success = receipt
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let hex_str = receipt
+        .get("returnData")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let hex = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     (success, hex::decode(hex).unwrap_or_default())
 }
@@ -654,9 +750,13 @@ fn poll_receipt(
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let resp = client.post(rpc_url).json(&body).send()
+        let resp = client
+            .post(rpc_url)
+            .json(&body)
+            .send()
             .map_err(|e| format!("RPC error polling receipt: {}", e))?;
-        let json: serde_json::Value = resp.json()
+        let json: serde_json::Value = resp
+            .json()
             .map_err(|e| format!("invalid receipt response: {}", e))?;
         if json.get("error").is_none() {
             if let Some(result) = json.get("result") {
@@ -679,7 +779,9 @@ fn find_contract_name(
             return name.clone();
         }
         // Also check if init_code starts with deploy_bytes (may have args appended)
-        if init_code.len() >= deploy_bytes.len() && &init_code[..deploy_bytes.len()] == deploy_bytes.as_slice() {
+        if init_code.len() >= deploy_bytes.len()
+            && &init_code[..deploy_bytes.len()] == deploy_bytes.as_slice()
+        {
             return name.clone();
         }
     }
@@ -693,11 +795,16 @@ fn fetch_nonce(rpc_url: &str, address: &str) -> Result<u64, String> {
         "method": "pyde_getTransactionCount",
         "params": [address]
     });
-    let resp = client.post(rpc_url).json(&body).send()
+    let resp = client
+        .post(rpc_url)
+        .json(&body)
+        .send()
         .map_err(|e| format!("cannot fetch nonce: {}", e))?;
-    let json: serde_json::Value = resp.json()
+    let json: serde_json::Value = resp
+        .json()
         .map_err(|e| format!("invalid nonce response: {}", e))?;
-    json.get("result").and_then(|v| v.as_str())
+    json.get("result")
+        .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<u64>().ok())
         .ok_or_else(|| "failed to parse nonce".into())
 }
@@ -705,7 +812,10 @@ fn fetch_nonce(rpc_url: &str, address: &str) -> Result<u64, String> {
 fn parse_address(hex: &str) -> Result<[u8; 32], String> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
     if hex.len() != 64 {
-        return Err(format!("invalid address: expected 64 hex chars, got {}", hex.len()));
+        return Err(format!(
+            "invalid address: expected 64 hex chars, got {}",
+            hex.len()
+        ));
     }
     let bytes = hex::decode(hex).map_err(|e| format!("invalid address hex: {}", e))?;
     let mut addr = [0u8; 32];
@@ -758,7 +868,10 @@ mod tests {
         let mut registry = std::collections::HashMap::new();
         registry.insert("Counter".to_string(), vec![1, 2, 3, 4]);
         // init_code has deploy bytes + constructor args appended
-        assert_eq!(find_contract_name(&[1, 2, 3, 4, 5, 6], &registry), "Counter");
+        assert_eq!(
+            find_contract_name(&[1, 2, 3, 4, 5, 6], &registry),
+            "Counter"
+        );
     }
 
     #[test]
@@ -792,7 +905,11 @@ mod tests {
     fn inject_gp_return() {
         let mut vm = Vm::new();
         vm.memory.heap_alloc(1024).unwrap(); // make heap space
-        let info = FnInfo { name: "get".into(), is_view: true, return_ty: Ty::U64 };
+        let info = FnInfo {
+            name: "get".into(),
+            is_view: true,
+            return_ty: Ty::U64,
+        };
         let data = 42u64.to_le_bytes().to_vec();
         inject_return_data(&mut vm, &data, Some(&info));
         assert_eq!(vm.cpu.read_gp(1), 42);
@@ -804,7 +921,11 @@ mod tests {
         let mut vm = Vm::new();
         // Need heap space — advance past code section
         vm.cpu.write_gp(12, pyde_vm::memory::HEAP_START as u64);
-        let info = FnInfo { name: "get".into(), is_view: true, return_ty: Ty::U256 };
+        let info = FnInfo {
+            name: "get".into(),
+            is_view: true,
+            return_ty: Ty::U256,
+        };
         let mut data = vec![0u8; 32];
         data[0] = 0xAB;
         data[31] = 0xCD;
@@ -817,7 +938,11 @@ mod tests {
     fn inject_blob_return() {
         let mut vm = Vm::new();
         vm.cpu.write_gp(12, pyde_vm::memory::HEAP_START as u64);
-        let info = FnInfo { name: "get".into(), is_view: true, return_ty: Ty::StringTy };
+        let info = FnInfo {
+            name: "get".into(),
+            is_view: true,
+            return_ty: Ty::StringTy,
+        };
         let data = b"hello world".to_vec();
         inject_return_data(&mut vm, &data, Some(&info));
         assert_eq!(vm.cpu.read_gp(1), pyde_vm::memory::HEAP_START as u64);
@@ -864,7 +989,10 @@ mod tests {
                 }
             }
         }
-        assert!(has_create, "deploy!(Counter) should produce a CreateContract instruction");
+        assert!(
+            has_create,
+            "deploy!(Counter) should produce a CreateContract instruction"
+        );
     }
 
     #[test]

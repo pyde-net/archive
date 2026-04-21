@@ -18,9 +18,8 @@ use libp2p::{
     Swarm, SwarmBuilder,
 };
 use pyde_crypto::threshold::{
-    aggregate_new_share, canonical_resharing_subset, combine_shares,
-    generate_decryption_share, generate_resharing_contribution, threshold_encrypt,
-    threshold_keygen, ResharingContribution,
+    aggregate_new_share, canonical_resharing_subset, combine_shares, generate_decryption_share,
+    generate_resharing_contribution, threshold_encrypt, threshold_keygen, ResharingContribution,
 };
 use std::time::Duration;
 use tokio::time::timeout;
@@ -40,11 +39,8 @@ fn build_swarm() -> Swarm<GossipOnly> {
                 .validation_mode(gossipsub::ValidationMode::Strict)
                 .build()
                 .unwrap();
-            let gossip = gossipsub::Behaviour::new(
-                MessageAuthenticity::Signed(key.clone()),
-                cfg,
-            )
-            .unwrap();
+            let gossip =
+                gossipsub::Behaviour::new(MessageAuthenticity::Signed(key.clone()), cfg).unwrap();
             Ok(GossipOnly { gossipsub: gossip })
         })
         .unwrap()
@@ -98,9 +94,7 @@ async fn resharing_end_to_end_over_gossipsub() {
     // Pre-build all resharing contributions from every old member.
     let contribs: Vec<ResharingContribution> = old_shares
         .iter()
-        .map(|s| {
-            generate_resharing_contribution(s, NEW_N, NEW_T, TARGET_EPOCH, b"gossip-test")
-        })
+        .map(|s| generate_resharing_contribution(s, NEW_N, NEW_T, TARGET_EPOCH, b"gossip-test"))
         .collect();
     let mut to_publish: Vec<Vec<u8>> = contribs.iter().map(|c| c.to_bytes()).collect();
 

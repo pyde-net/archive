@@ -97,10 +97,10 @@ pub fn validate_message(msg: &NetworkMessage, is_validator_peer: bool) -> Valida
 
     // Check message size limits per channel
     let max_size = match msg.channel {
-        Channel::Consensus => 64 * 1024,       // 64KB (votes, view changes)
-        Channel::Transactions => 128 * 1024,    // 128KB (encrypted txs)
-        Channel::Blocks => 4 * 1024 * 1024,     // 4MB (full blocks)
-        Channel::Sync => 8 * 1024 * 1024,        // 8MB (state chunks)
+        Channel::Consensus => 64 * 1024,     // 64KB (votes, view changes)
+        Channel::Transactions => 128 * 1024, // 128KB (encrypted txs)
+        Channel::Blocks => 4 * 1024 * 1024,  // 4MB (full blocks)
+        Channel::Sync => 8 * 1024 * 1024,    // 8MB (state chunks)
     };
 
     if msg.data.len() > max_size {
@@ -285,7 +285,7 @@ mod tests {
     fn dedup_duplicate_rejected() {
         let mut dedup = MessageDedup::new(100);
         let id = [0xBB; 32];
-        assert!(dedup.check_and_insert(&id));  // first time: new
+        assert!(dedup.check_and_insert(&id)); // first time: new
         assert!(!dedup.check_and_insert(&id)); // second time: duplicate
         assert_eq!(dedup.len(), 1);
     }

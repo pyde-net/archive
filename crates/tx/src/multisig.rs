@@ -684,8 +684,14 @@ mod tests {
 
     #[test]
     fn emergency_signing_bytes_bind_action_nonce_and_duration() {
-        let p1 = EmergencyPausePayload { duration_slots: 100, sigs: vec![] };
-        let p2 = EmergencyPausePayload { duration_slots: 101, sigs: vec![] };
+        let p1 = EmergencyPausePayload {
+            duration_slots: 100,
+            sigs: vec![],
+        };
+        let p2 = EmergencyPausePayload {
+            duration_slots: 101,
+            sigs: vec![],
+        };
         assert_ne!(
             p1.signing_bytes(0),
             p2.signing_bytes(0),

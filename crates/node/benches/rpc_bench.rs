@@ -20,7 +20,10 @@ fn main() {
         match send_rpc(&client, url, "pyde_chainId", "[]").await {
             Ok(_) => {}
             Err(e) => {
-                eprintln!("Cannot connect to RPC at {}. Start a node first: make run-full", url);
+                eprintln!(
+                    "Cannot connect to RPC at {}. Start a node first: make run-full",
+                    url
+                );
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -35,8 +38,22 @@ fn main() {
         bench(&client, url, "pyde_syncing", "[]", 10_000).await;
 
         let addr = format!("\"{}\"", hex::encode([0x01; 32]));
-        bench(&client, url, "pyde_getBalance", &format!("[{}]", addr), 10_000).await;
-        bench(&client, url, "pyde_getTransactionCount", &format!("[{}]", addr), 10_000).await;
+        bench(
+            &client,
+            url,
+            "pyde_getBalance",
+            &format!("[{}]", addr),
+            10_000,
+        )
+        .await;
+        bench(
+            &client,
+            url,
+            "pyde_getTransactionCount",
+            &format!("[{}]", addr),
+            10_000,
+        )
+        .await;
         bench(&client, url, "pyde_getCode", &format!("[{}]", addr), 10_000).await;
         bench(&client, url, "pyde_mempoolSize", "[]", 10_000).await;
 

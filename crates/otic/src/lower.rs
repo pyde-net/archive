@@ -16,7 +16,10 @@ use ethnum::U256;
 
 use crate::ast;
 use crate::ast::*;
-use crate::ir::{self, IrProgram, IrFunction, Label, Reg, Inst, IrConst, BinOp, UnOp, CmpOp, BuiltinOp, StorageFieldDef};
+use crate::ir::{
+    self, BinOp, BuiltinOp, CmpOp, Inst, IrConst, IrFunction, IrProgram, Label, Reg,
+    StorageFieldDef, UnOp,
+};
 use crate::types::Ty;
 
 /// Lower a source file into an IR program.
@@ -47,10 +50,7 @@ pub fn lower(file: &SourceFile) -> IrProgram {
 /// Lower with a registry of previously compiled contracts.
 /// Used for multi-contract files where `create!(ContractName, args)` references
 /// another contract's bytecode.
-pub fn lower_with_contracts(
-    file: &SourceFile,
-    compiled: &HashMap<String, Vec<u8>>,
-) -> IrProgram {
+pub fn lower_with_contracts(file: &SourceFile, compiled: &HashMap<String, Vec<u8>>) -> IrProgram {
     let mut lowerer = Lowerer::new();
     lowerer.compiled_contracts = compiled.clone();
     lowerer.lower_file(file);
@@ -72,7 +72,9 @@ pub fn lower_with_context(
         lowerer.contract_functions.insert(name.clone(), fns.clone());
     }
     for (name, params) in ext_contract_constructors {
-        lowerer.contract_constructors.insert(name.clone(), params.clone());
+        lowerer
+            .contract_constructors
+            .insert(name.clone(), params.clone());
     }
     lowerer.lower_file(file);
     lowerer.program
@@ -355,17 +357,30 @@ impl Lowerer {
             ast::Type::Bytes(_) => Ty::Bytes,
             ast::Type::Array(elem, size, _) => Ty::Array(Box::new(self.resolve_ty(elem)), *size),
             ast::Type::Vec(elem, _) => Ty::Vec(Box::new(self.resolve_ty(elem))),
-            ast::Type::Map(key, val, _) => Ty::Map(Box::new(self.resolve_ty(key)), Box::new(self.resolve_ty(val))),
+            ast::Type::Map(key, val, _) => Ty::Map(
+                Box::new(self.resolve_ty(key)),
+                Box::new(self.resolve_ty(val)),
+            ),
             ast::Type::Named(path) => {
                 // Flatten qualified path: module::Type → just "Type"
                 let name = path.last().map(|i| i.name.as_str()).unwrap_or("");
                 // Check for primitive type names (parser may emit Named instead of Primitive for casts)
                 match name {
-                    "u8" => Ty::U8, "u16" => Ty::U16, "u32" => Ty::U32, "u64" => Ty::U64,
-                    "u128" => Ty::U128, "u256" => Ty::U256,
-                    "i8" => Ty::I8, "i16" => Ty::I16, "i32" => Ty::I32, "i64" => Ty::I64,
-                    "i128" => Ty::I128, "i256" => Ty::I256,
-                    "bool" => Ty::Bool, "Address" => Ty::Address, "String" => Ty::StringTy,
+                    "u8" => Ty::U8,
+                    "u16" => Ty::U16,
+                    "u32" => Ty::U32,
+                    "u64" => Ty::U64,
+                    "u128" => Ty::U128,
+                    "u256" => Ty::U256,
+                    "i8" => Ty::I8,
+                    "i16" => Ty::I16,
+                    "i32" => Ty::I32,
+                    "i64" => Ty::I64,
+                    "i128" => Ty::I128,
+                    "i256" => Ty::I256,
+                    "bool" => Ty::Bool,
+                    "Address" => Ty::Address,
+                    "String" => Ty::StringTy,
                     _ => {
                         if self.enum_defs.contains_key(name) {
                             Ty::Enum(name.to_string())
@@ -379,7 +394,9 @@ impl Lowerer {
                     }
                 }
             }
-            ast::Type::Tuple(types, _) => Ty::Tuple(types.iter().map(|t| self.resolve_ty(t)).collect()),
+            ast::Type::Tuple(types, _) => {
+                Ty::Tuple(types.iter().map(|t| self.resolve_ty(t)).collect())
+            }
         }
     }
 
@@ -424,28 +441,43 @@ impl Lowerer {
                     }
                 }
                 Item::Struct(s) => {
-                    let fields: Vec<(String, Ty)> = s.fields.iter()
+                    let fields: Vec<(String, Ty)> = s
+                        .fields
+                        .iter()
                         .map(|f| (f.name.name.clone(), self.resolve_ty(&f.ty)))
                         .collect();
-                    self.struct_field_defs.insert(s.name.name.clone(), fields.clone());
+                    self.struct_field_defs
+                        .insert(s.name.name.clone(), fields.clone());
                     self.program.struct_defs.push(ir::StructDef {
                         name: s.name.name.clone(),
                         fields,
                     });
                 }
                 Item::Interface(i) => {
-                    let funcs: Vec<ir::InterfaceFnDef> = i.functions.iter()
+                    let funcs: Vec<ir::InterfaceFnDef> = i
+                        .functions
+                        .iter()
                         .map(|f| ir::InterfaceFnDef {
                             name: f.name.name.clone(),
-                            params: f.params.iter().map(|p| (p.name.name.clone(), self.resolve_ty(&p.ty))).collect(),
-                            return_ty: f.return_type.as_ref().map(|t| self.resolve_ty(t)).unwrap_or(Ty::Unit),
+                            params: f
+                                .params
+                                .iter()
+                                .map(|p| (p.name.name.clone(), self.resolve_ty(&p.ty)))
+                                .collect(),
+                            return_ty: f
+                                .return_type
+                                .as_ref()
+                                .map(|t| self.resolve_ty(t))
+                                .unwrap_or(Ty::Unit),
                         })
                         .collect();
                     // Register interface function signatures for typed method dispatch
-                    let sig_list: Vec<(String, Vec<(String, Ty)>, Ty)> = funcs.iter()
+                    let sig_list: Vec<(String, Vec<(String, Ty)>, Ty)> = funcs
+                        .iter()
                         .map(|f| (f.name.clone(), f.params.clone(), f.return_ty.clone()))
                         .collect();
-                    self.interface_functions.insert(i.name.name.clone(), sig_list);
+                    self.interface_functions
+                        .insert(i.name.name.clone(), sig_list);
                     self.program.interface_defs.push(ir::InterfaceDef {
                         name: i.name.name.clone(),
                         functions: funcs,
@@ -466,14 +498,17 @@ impl Lowerer {
                     } else {
                         // Grouped import: use std::math::{sqrt, pow};
                         for item in &u.items {
-                            let mut full_path: Vec<String> = u.path.iter().map(|s| s.name.clone()).collect();
+                            let mut full_path: Vec<String> =
+                                u.path.iter().map(|s| s.name.clone()).collect();
                             full_path.push(item.name.clone());
                             self.program.imports.push(ir::ImportDef { path: full_path });
                         }
                     }
                 }
                 Item::Error(e) => {
-                    let fields: Vec<(String, Ty)> = e.fields.iter()
+                    let fields: Vec<(String, Ty)> = e
+                        .fields
+                        .iter()
                         .map(|f| (f.name.name.clone(), self.resolve_ty(&f.ty)))
                         .collect();
                     self.program.error_defs.push(ir::ErrorDef {
@@ -494,10 +529,14 @@ impl Lowerer {
                 for ci in &c.items {
                     if let ContractItem::Function(f) = ci {
                         if f.is_pub && !f.is_constructor() && !f.is_test() {
-                            let params: Vec<(String, Ty)> = f.params.iter()
+                            let params: Vec<(String, Ty)> = f
+                                .params
+                                .iter()
                                 .map(|p| (p.name.name.clone(), self.resolve_ty(&p.ty)))
                                 .collect();
-                            let ret = f.return_type.as_ref()
+                            let ret = f
+                                .return_type
+                                .as_ref()
                                 .map(|t| self.resolve_ty(t))
                                 .unwrap_or(Ty::Unit);
                             pub_fns.push((f.name.name.clone(), params, ret));
@@ -511,10 +550,13 @@ impl Lowerer {
                 for ci in &c.items {
                     if let ContractItem::Function(f) = ci {
                         if f.is_constructor() {
-                            let params: Vec<(String, Ty)> = f.params.iter()
+                            let params: Vec<(String, Ty)> = f
+                                .params
+                                .iter()
                                 .map(|p| (p.name.name.clone(), self.resolve_ty(&p.ty)))
                                 .collect();
-                            self.contract_constructors.insert(c.name.name.clone(), params);
+                            self.contract_constructors
+                                .insert(c.name.name.clone(), params);
                             break; // only one constructor per contract
                         }
                     }
@@ -545,10 +587,13 @@ impl Lowerer {
                     }
                 }
                 ContractItem::Struct(s) => {
-                    let fields: Vec<(String, Ty)> = s.fields.iter()
+                    let fields: Vec<(String, Ty)> = s
+                        .fields
+                        .iter()
                         .map(|f| (f.name.name.clone(), self.resolve_ty(&f.ty)))
                         .collect();
-                    self.struct_field_defs.insert(s.name.name.clone(), fields.clone());
+                    self.struct_field_defs
+                        .insert(s.name.name.clone(), fields.clone());
                     self.program.struct_defs.push(ir::StructDef {
                         name: s.name.name.clone(),
                         fields,
@@ -563,7 +608,9 @@ impl Lowerer {
                     self.enum_defs.insert(e.name.name.clone(), variants);
                 }
                 ContractItem::Event(e) => {
-                    let fields: Vec<ir::EventFieldDef> = e.fields.iter()
+                    let fields: Vec<ir::EventFieldDef> = e
+                        .fields
+                        .iter()
                         .map(|f| ir::EventFieldDef {
                             name: f.name.name.clone(),
                             ty: self.resolve_ty(&f.ty),
@@ -577,7 +624,9 @@ impl Lowerer {
                     });
                 }
                 ContractItem::Error(e) => {
-                    let fields: Vec<(String, Ty)> = e.fields.iter()
+                    let fields: Vec<(String, Ty)> = e
+                        .fields
+                        .iter()
                         .map(|f| (f.name.name.clone(), self.resolve_ty(&f.ty)))
                         .collect();
                     self.program.error_defs.push(ir::ErrorDef {
@@ -606,17 +655,22 @@ impl Lowerer {
         for item in &contract.items {
             if let ContractItem::Function(f) = item {
                 if f.is_pub && !f.is_constructor() && !f.is_test() {
-                    let params: Vec<(String, Ty)> = f.params.iter()
+                    let params: Vec<(String, Ty)> = f
+                        .params
+                        .iter()
                         .map(|p| (p.name.name.clone(), self.resolve_ty(&p.ty)))
                         .collect();
-                    let ret = f.return_type.as_ref()
+                    let ret = f
+                        .return_type
+                        .as_ref()
                         .map(|t| self.resolve_ty(t))
                         .unwrap_or(Ty::Unit);
                     pub_fns.push((f.name.name.clone(), params, ret));
                 }
             }
         }
-        self.contract_functions.insert(contract.name.name.clone(), pub_fns);
+        self.contract_functions
+            .insert(contract.name.name.clone(), pub_fns);
 
         // Second pass: lower functions
         for item in &contract.items {
@@ -629,10 +683,14 @@ impl Lowerer {
     fn lower_function(&mut self, func: &FunctionDef) {
         // Clear builtin cache for new function scope
         self.builtin_cache.clear();
-        let params: Vec<(String, Ty)> = func.params.iter()
+        let params: Vec<(String, Ty)> = func
+            .params
+            .iter()
             .map(|p| (p.name.name.clone(), self.resolve_ty(&p.ty)))
             .collect();
-        let return_ty = func.return_type.as_ref()
+        let return_ty = func
+            .return_type
+            .as_ref()
             .map(|t| self.resolve_ty(t))
             .unwrap_or(Ty::Unit);
 
@@ -664,7 +722,11 @@ impl Lowerer {
         self.lower_block(&func.body);
 
         // Ensure function ends with a return
-        let needs_ret = self.func().current_block().instructions.last()
+        let needs_ret = self
+            .func()
+            .current_block()
+            .instructions
+            .last()
             .map(|inst| !matches!(inst, Inst::Return(_) | Inst::Jump(_)))
             .unwrap_or(true);
         if needs_ret {
@@ -672,7 +734,10 @@ impl Lowerer {
         }
 
         self.pop_scope();
-        let ir_func = self.current_fn.take().expect("lower_function called without active function");
+        let ir_func = self
+            .current_fn
+            .take()
+            .expect("lower_function called without active function");
         self.program.functions.push(ir_func);
     }
 
@@ -694,7 +759,9 @@ impl Lowerer {
             Stmt::Emit(e) => self.lower_emit(e),
             Stmt::For(f) => self.lower_for(f),
             Stmt::While(w) => self.lower_while(w),
-            Stmt::Expr(e) => { self.lower_expr(&e.expr); }
+            Stmt::Expr(e) => {
+                self.lower_expr(&e.expr);
+            }
             Stmt::Break(_) => {
                 if let Some((_, exit_label)) = self.loop_stack.last() {
                     self.emit(Inst::Jump(*exit_label));
@@ -782,7 +849,12 @@ impl Lowerer {
                         if matches!(self_expr.as_ref(), Expr::SelfExpr(_)) {
                             let key1 = self.lower_expr(inner_key);
                             let key2 = self.lower_expr(key);
-                            self.emit(Inst::StorageNestedMapSet(field.name.clone(), key1, key2, value));
+                            self.emit(Inst::StorageNestedMapSet(
+                                field.name.clone(),
+                                key1,
+                                key2,
+                                value,
+                            ));
                             return;
                         }
                     }
@@ -824,21 +896,37 @@ impl Lowerer {
     }
 
     fn lower_emit(&mut self, e: &EmitStmt) {
-        let event_name = e.event_name.last().map(|i| i.name.clone()).unwrap_or_default();
+        let event_name = e
+            .event_name
+            .last()
+            .map(|i| i.name.clone())
+            .unwrap_or_default();
         // Look up event definition to get field types
-        let event_field_types: Vec<String> = self.program.event_defs.iter()
+        let event_field_types: Vec<String> = self
+            .program
+            .event_defs
+            .iter()
             .find(|ev| ev.name == event_name)
             .map(|ev| ev.fields.iter().map(|f| format!("{}", f.ty)).collect())
             .unwrap_or_default();
         // Get indexed flags from event definition
-        let event_indexed: Vec<bool> = self.program.event_defs.iter()
+        let event_indexed: Vec<bool> = self
+            .program
+            .event_defs
+            .iter()
             .find(|ev| ev.name == event_name)
             .map(|ev| ev.fields.iter().map(|f| f.indexed).collect())
             .unwrap_or_default();
-        let field_regs: Vec<(Reg, String, bool)> = e.fields.iter().enumerate()
+        let field_regs: Vec<(Reg, String, bool)> = e
+            .fields
+            .iter()
+            .enumerate()
             .map(|(i, f)| {
                 let reg = self.lower_expr(&f.value);
-                let ty = event_field_types.get(i).cloned().unwrap_or_else(|| "u64".to_string());
+                let ty = event_field_types
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| "u64".to_string());
                 let indexed = event_indexed.get(i).copied().unwrap_or(false);
                 (reg, ty, indexed)
             })
@@ -1013,11 +1101,12 @@ impl Lowerer {
             Expr::FieldAccess(obj, field, _) => {
                 // self.field → storage.get
                 if matches!(obj.as_ref(), Expr::SelfExpr(_))
-                    && self.storage_slots.contains_key(&field.name) {
-                        let dst = self.alloc_reg();
-                        self.emit(Inst::StorageGet(dst, field.name.clone()));
-                        return dst;
-                    }
+                    && self.storage_slots.contains_key(&field.name)
+                {
+                    let dst = self.alloc_reg();
+                    self.emit(Inst::StorageGet(dst, field.name.clone()));
+                    return dst;
+                }
 
                 // msg.sender, msg.value, msg.data → builtins (cached per function)
                 if let Expr::Ident(ident) = obj.as_ref() {
@@ -1064,7 +1153,12 @@ impl Lowerer {
                 if field.name == "balance" {
                     let obj_reg = self.lower_expr(obj);
                     let dst = self.alloc_reg();
-                    self.emit(Inst::FieldGet(dst, obj_reg, String::new(), "balance".into()));
+                    self.emit(Inst::FieldGet(
+                        dst,
+                        obj_reg,
+                        String::new(),
+                        "balance".into(),
+                    ));
                     return dst;
                 }
 
@@ -1072,7 +1166,12 @@ impl Lowerer {
                 let struct_name = self.resolve_expr_struct_type(obj);
                 let obj_reg = self.lower_expr(obj);
                 let dst = self.alloc_reg();
-                self.emit(Inst::FieldGet(dst, obj_reg, struct_name, field.name.clone()));
+                self.emit(Inst::FieldGet(
+                    dst,
+                    obj_reg,
+                    struct_name,
+                    field.name.clone(),
+                ));
                 dst
             }
 
@@ -1086,7 +1185,12 @@ impl Lowerer {
                             let key1 = self.lower_expr(inner_idx);
                             let key2 = self.lower_expr(index);
                             let dst = self.alloc_reg();
-                            self.emit(Inst::StorageNestedMapGet(dst, field.name.clone(), key1, key2));
+                            self.emit(Inst::StorageNestedMapGet(
+                                dst,
+                                field.name.clone(),
+                                key1,
+                                key2,
+                            ));
                             return dst;
                         }
                     }
@@ -1145,28 +1249,42 @@ impl Lowerer {
                         } else {
                             let obj_reg = self.lower_expr(obj);
                             // Check if obj is a typed Contract/Interface handle
-                            let obj_type = self.get_reg_type(obj_reg).cloned()
-                                .or_else(|| {
-                                    // Also check local_types by variable name
-                                    if let Expr::Ident(ident) = obj.as_ref() {
-                                        self.lookup_local_type(&ident.name)
-                                    } else {
-                                        None
-                                    }
-                                });
+                            let obj_type = self.get_reg_type(obj_reg).cloned().or_else(|| {
+                                // Also check local_types by variable name
+                                if let Expr::Ident(ident) = obj.as_ref() {
+                                    self.lookup_local_type(&ident.name)
+                                } else {
+                                    None
+                                }
+                            });
                             match obj_type {
                                 Some(Ty::Contract(ref name)) | Some(Ty::Interface(ref name)) => {
                                     // Typed contract/interface call → ExtCall
                                     let ret_ty = self.lookup_method_return_type(name, &method.name);
-                                    let param_types = self.lookup_method_param_types(name, &method.name);
-                                    let typed_args: Vec<(Reg, Ty)> = arg_regs.iter().zip(
-                                        param_types.iter().chain(std::iter::repeat(&Ty::U64))
-                                    ).map(|(r, t)| (*r, t.clone())).collect();
+                                    let param_types =
+                                        self.lookup_method_param_types(name, &method.name);
+                                    let typed_args: Vec<(Reg, Ty)> = arg_regs
+                                        .iter()
+                                        .zip(param_types.iter().chain(std::iter::repeat(&Ty::U64)))
+                                        .map(|(r, t)| (*r, t.clone()))
+                                        .collect();
                                     let value_reg = call_value.as_ref().map(|v| self.lower_expr(v));
-                                    self.emit(Inst::ExtCall(dst, obj_reg, method.name.clone(), typed_args, ret_ty, value_reg));
+                                    self.emit(Inst::ExtCall(
+                                        dst,
+                                        obj_reg,
+                                        method.name.clone(),
+                                        typed_args,
+                                        ret_ty,
+                                        value_reg,
+                                    ));
                                 }
                                 _ => {
-                                    self.emit(Inst::MethodCall(dst, obj_reg, method.name.clone(), arg_regs));
+                                    self.emit(Inst::MethodCall(
+                                        dst,
+                                        obj_reg,
+                                        method.name.clone(),
+                                        arg_regs,
+                                    ));
                                 }
                             }
                         }
@@ -1187,7 +1305,10 @@ impl Lowerer {
                                     // If the arg is a hex literal, convert to address bytes
                                     // so the byte order is correct (hex = BE, PVM = LE bytes).
                                     let reg = self.ensure_address_bytes(*addr_reg, args);
-                                    self.set_local_type_for_reg(reg, Ty::Interface(type_name.to_string()));
+                                    self.set_local_type_for_reg(
+                                        reg,
+                                        Ty::Interface(type_name.to_string()),
+                                    );
                                     return reg;
                                 }
                             }
@@ -1195,12 +1316,19 @@ impl Lowerer {
                             if member == "at" && self.contract_functions.contains_key(type_name) {
                                 if let Some(addr_reg) = arg_regs.first() {
                                     let reg = self.ensure_address_bytes(*addr_reg, args);
-                                    self.set_local_type_for_reg(reg, Ty::Contract(type_name.to_string()));
+                                    self.set_local_type_for_reg(
+                                        reg,
+                                        Ty::Contract(type_name.to_string()),
+                                    );
                                     return reg;
                                 }
                             }
                         }
-                        let path = segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::");
+                        let path = segments
+                            .iter()
+                            .map(|s| s.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("::");
                         self.emit(Inst::Call(dst, path, arg_regs));
                     }
                     _ => {
@@ -1226,7 +1354,10 @@ impl Lowerer {
                     // Enum variant → discriminant integer
                     if let Some(variants) = self.enum_defs.get(type_name.as_str()).cloned() {
                         if let Some(idx) = variants.iter().position(|v| v == member) {
-                            self.emit(Inst::Const(dst, IrConst::Int(U256::from(idx as u64), Ty::U8)));
+                            self.emit(Inst::Const(
+                                dst,
+                                IrConst::Int(U256::from(idx as u64), Ty::U8),
+                            ));
                             return dst;
                         }
                     }
@@ -1242,7 +1373,11 @@ impl Lowerer {
                     }
                 }
 
-                let path = segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::");
+                let path = segments
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("::");
                 self.emit(Inst::Comment(format!("path: {}", path)));
                 dst
             }
@@ -1308,7 +1443,7 @@ impl Lowerer {
                             // revert!() — bare revert with no data
                             self.emit(Inst::Revert("Error".into(), vec![]));
                         }
-                        
+
                         self.alloc_reg()
                     }
                     "cross_call" => {
@@ -1321,8 +1456,12 @@ impl Lowerer {
                             match arg {
                                 MacroArg::Named(key, val) => {
                                     match key.name.as_str() {
-                                        "target" => { target_reg = Some(self.lower_expr(val)); }
-                                        "method" => { method_reg = Some(self.lower_expr(val)); }
+                                        "target" => {
+                                            target_reg = Some(self.lower_expr(val));
+                                        }
+                                        "method" => {
+                                            method_reg = Some(self.lower_expr(val));
+                                        }
                                         "callback" => {
                                             if let Expr::Literal(Literal::String(s), _) = val {
                                                 callback = Some(s.clone());
@@ -1385,13 +1524,21 @@ impl Lowerer {
                                 MacroArg::Positional(e) => {
                                     positional.push(e);
                                 }
-                                _ => { positional.push(match arg { MacroArg::Named(_, v) => v, MacroArg::Positional(v) => v }); }
+                                _ => {
+                                    positional.push(match arg {
+                                        MacroArg::Named(_, v) => v,
+                                        MacroArg::Positional(v) => v,
+                                    });
+                                }
                             }
                         }
 
                         let dst = self.alloc_reg();
                         if positional.is_empty() {
-                            self.emit(Inst::Const(dst, IrConst::Int(ethnum::U256::ZERO, crate::types::Ty::U64)));
+                            self.emit(Inst::Const(
+                                dst,
+                                IrConst::Int(ethnum::U256::ZERO, crate::types::Ty::U64),
+                            ));
                             return dst;
                         }
 
@@ -1400,7 +1547,8 @@ impl Lowerer {
 
                         // Try to extract method name from arg[1] if it's a string literal
                         let method_name = if positional.len() > 1 {
-                            if let Expr::Literal(crate::ast::Literal::String(s), _) = positional[1] {
+                            if let Expr::Literal(crate::ast::Literal::String(s), _) = positional[1]
+                            {
                                 Some(s.clone())
                             } else {
                                 None
@@ -1411,19 +1559,34 @@ impl Lowerer {
 
                         // Lower remaining args (skip target and method string)
                         let param_start = if method_name.is_some() { 2 } else { 1 };
-                        let param_regs: Vec<Reg> = positional[param_start..].iter()
+                        let param_regs: Vec<Reg> = positional[param_start..]
+                            .iter()
                             .map(|e| self.lower_expr(e))
                             .collect();
 
                         if let Some(method) = method_name {
-                            let typed_params: Vec<(Reg, Ty)> = param_regs.iter()
-                                .map(|r| (*r, Ty::U64)).collect();
-                            self.emit(Inst::ExtCall(dst, target, method, typed_params, Ty::U64, value_reg));
+                            let typed_params: Vec<(Reg, Ty)> =
+                                param_regs.iter().map(|r| (*r, Ty::U64)).collect();
+                            self.emit(Inst::ExtCall(
+                                dst,
+                                target,
+                                method,
+                                typed_params,
+                                Ty::U64,
+                                value_reg,
+                            ));
                         } else {
                             // No method name: emit as raw call (no selector)
                             // If value provided, emit ExtCall with empty method for value transfer
                             if let Some(val_r) = value_reg {
-                                self.emit(Inst::ExtCall(dst, target, String::new(), vec![], Ty::U64, Some(val_r)));
+                                self.emit(Inst::ExtCall(
+                                    dst,
+                                    target,
+                                    String::new(),
+                                    vec![],
+                                    Ty::U64,
+                                    Some(val_r),
+                                ));
                             } else {
                                 self.emit(Inst::RawCall(dst, target, param_regs));
                             }
@@ -1445,27 +1608,39 @@ impl Lowerer {
                                     value_expr = Some(val);
                                 }
                                 MacroArg::Positional(e) => positional.push(e),
-                                _ => { if let MacroArg::Named(_, v) = arg { positional.push(v); } }
+                                _ => {
+                                    if let MacroArg::Named(_, v) = arg {
+                                        positional.push(v);
+                                    }
+                                }
                             }
                         }
 
                         let dst = self.alloc_reg();
 
                         // First arg must be a contract name (path or ident)
-                        let contract_name = if let Some(Expr::Path(segments, _)) = positional.first() {
-                            segments.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("::")
-                        } else if let Some(Expr::Ident(ident)) = positional.first() {
-                            ident.name.clone()
-                        } else {
-                            self.emit(Inst::Comment("deploy! requires a contract name".into()));
-                            return dst;
-                        };
+                        let contract_name =
+                            if let Some(Expr::Path(segments, _)) = positional.first() {
+                                segments
+                                    .iter()
+                                    .map(|s| s.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("::")
+                            } else if let Some(Expr::Ident(ident)) = positional.first() {
+                                ident.name.clone()
+                            } else {
+                                self.emit(Inst::Comment("deploy! requires a contract name".into()));
+                                return dst;
+                            };
 
                         // Look up compiled bytecode
                         let deploy_bytes = match self.compiled_contracts.get(&contract_name) {
                             Some(bytes) => bytes.clone(),
                             None => {
-                                self.emit(Inst::Comment(format!("deploy!: contract '{}' not found in registry", contract_name)));
+                                self.emit(Inst::Comment(format!(
+                                    "deploy!: contract '{}' not found in registry",
+                                    contract_name
+                                )));
                                 return dst;
                             }
                         };
@@ -1476,27 +1651,41 @@ impl Lowerer {
                             if user_args.len() != ctor_params.len() {
                                 self.emit(Inst::Comment(format!(
                                     "deploy!: {}() expects {} args, got {}",
-                                    contract_name, ctor_params.len(), user_args.len()
+                                    contract_name,
+                                    ctor_params.len(),
+                                    user_args.len()
                                 )));
                             }
                         }
                         // No constructor defined but args provided
-                        if !self.contract_constructors.contains_key(&contract_name) && !user_args.is_empty() {
+                        if !self.contract_constructors.contains_key(&contract_name)
+                            && !user_args.is_empty()
+                        {
                             self.emit(Inst::Comment(format!(
                                 "deploy!: {} has no constructor, but {} args provided",
-                                contract_name, user_args.len()
+                                contract_name,
+                                user_args.len()
                             )));
                         }
 
                         // Lower constructor args (positional[1..]) with type info
-                        let arg_regs: Vec<Reg> = user_args.iter()
-                            .map(|e| self.lower_expr(e))
-                            .collect();
-                        let ctor_params = self.contract_constructors.get(&contract_name).cloned()
+                        let arg_regs: Vec<Reg> =
+                            user_args.iter().map(|e| self.lower_expr(e)).collect();
+                        let ctor_params = self
+                            .contract_constructors
+                            .get(&contract_name)
+                            .cloned()
                             .unwrap_or_default();
-                        let typed_args: Vec<(Reg, Ty)> = arg_regs.iter().zip(
-                            ctor_params.iter().map(|(_, ty)| ty).chain(std::iter::repeat(&Ty::U64))
-                        ).map(|(r, t)| (*r, t.clone())).collect();
+                        let typed_args: Vec<(Reg, Ty)> = arg_regs
+                            .iter()
+                            .zip(
+                                ctor_params
+                                    .iter()
+                                    .map(|(_, ty)| ty)
+                                    .chain(std::iter::repeat(&Ty::U64)),
+                            )
+                            .map(|(r, t)| (*r, t.clone()))
+                            .collect();
 
                         // Emit: store deploy bytes as a constant blob
                         let blob_reg = self.alloc_reg();
@@ -1521,8 +1710,12 @@ impl Lowerer {
             }
 
             Expr::StructInit(name_segments, fields, _) => {
-                let name = name_segments.first().map(|s| s.name.as_str()).unwrap_or("?");
-                let field_regs: Vec<(String, Reg)> = fields.iter()
+                let name = name_segments
+                    .first()
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("?");
+                let field_regs: Vec<(String, Reg)> = fields
+                    .iter()
                     .map(|f| (f.name.name.clone(), self.lower_expr(&f.value)))
                     .collect();
                 let dst = self.alloc_reg();
@@ -1555,7 +1748,9 @@ impl Lowerer {
                     self.push_scope();
                     match clause {
                         ElseClause::ElseBlock(block) => self.lower_block(block),
-                        ElseClause::ElseIf(else_if) => { self.lower_expr(else_if); }
+                        ElseClause::ElseIf(else_if) => {
+                            self.lower_expr(else_if);
+                        }
                     }
                     self.pop_scope();
                     self.emit(Inst::Jump(end_label));
@@ -1577,12 +1772,10 @@ impl Lowerer {
                 // Pattern check emits Branch(cmp, body_label, next_check_label).
                 // This ensures a failed match jumps to the NEXT pattern check,
                 // not the next arm's body.
-                let check_labels: Vec<Label> = (0..arms.len())
-                    .map(|_| self.func().alloc_label())
-                    .collect();
-                let body_labels: Vec<Label> = (0..arms.len())
-                    .map(|_| self.func().alloc_label())
-                    .collect();
+                let check_labels: Vec<Label> =
+                    (0..arms.len()).map(|_| self.func().alloc_label()).collect();
+                let body_labels: Vec<Label> =
+                    (0..arms.len()).map(|_| self.func().alloc_label()).collect();
 
                 // Jump to first check
                 self.emit(Inst::Jump(check_labels[0]));
@@ -1596,7 +1789,8 @@ impl Lowerer {
                         end_label // no match → fall to end
                     };
 
-                    self.func().push_block(check_labels[i], format!("match.check{}", i));
+                    self.func()
+                        .push_block(check_labels[i], format!("match.check{}", i));
 
                     match &arm.pattern {
                         Pattern::Wildcard(_) => {
@@ -1624,10 +1818,17 @@ impl Lowerer {
                             if segments.len() == 2 {
                                 let enum_name = &segments[0].name;
                                 let variant_name = &segments[1].name;
-                                if let Some(variants) = self.enum_defs.get(enum_name.as_str()).cloned() {
-                                    if let Some(idx) = variants.iter().position(|v| v == variant_name) {
+                                if let Some(variants) =
+                                    self.enum_defs.get(enum_name.as_str()).cloned()
+                                {
+                                    if let Some(idx) =
+                                        variants.iter().position(|v| v == variant_name)
+                                    {
                                         let pat_reg = self.alloc_reg();
-                                        self.emit(Inst::Const(pat_reg, IrConst::Int(U256::from(idx as u64), Ty::U8)));
+                                        self.emit(Inst::Const(
+                                            pat_reg,
+                                            IrConst::Int(U256::from(idx as u64), Ty::U8),
+                                        ));
                                         let cmp = self.alloc_reg();
                                         self.emit(Inst::Cmp(cmp, CmpOp::Eq, scrut, pat_reg));
                                         self.emit(Inst::Branch(cmp, body_label, next_check));
@@ -1661,7 +1862,8 @@ impl Lowerer {
 
                 // Emit all arm bodies
                 for (i, arm) in arms.iter().enumerate() {
-                    self.func().push_block(body_labels[i], format!("match.arm{}", i));
+                    self.func()
+                        .push_block(body_labels[i], format!("match.arm{}", i));
                     let arm_result = self.lower_expr(&arm.body);
                     self.emit(Inst::Cast(dst, arm_result, Ty::U64));
                     self.emit(Inst::Jump(end_label));
@@ -1731,7 +1933,10 @@ impl Lowerer {
     /// Lower an error expression (from require!/revert!) into (name, field_regs).
     fn lower_error_expr(&mut self, expr: &Expr) -> (String, Vec<Reg>) {
         if let Expr::StructInit(name_segments, fields, _) = expr {
-            let name = name_segments.first().map(|s| s.name.clone()).unwrap_or_default();
+            let name = name_segments
+                .first()
+                .map(|s| s.name.clone())
+                .unwrap_or_default();
             let regs: Vec<Reg> = fields.iter().map(|f| self.lower_expr(&f.value)).collect();
             (name, regs)
         } else {
@@ -1754,7 +1959,8 @@ mod tests {
 
     #[test]
     fn lower_minimal_contract() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract Token {
                 storage { supply: u256, }
 
@@ -1772,7 +1978,8 @@ mod tests {
                     return self.supply;
                 }
             }
-        "#);
+        "#,
+        );
 
         assert_eq!(ir.contract_name, "Token");
         assert_eq!(ir.functions.len(), 2);
@@ -1801,7 +2008,8 @@ mod tests {
 
     #[test]
     fn lower_arithmetic() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract T {
                 pub fn f() {
                     let a = 10;
@@ -1809,17 +2017,21 @@ mod tests {
                     let c = a + b;
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
         // Should have const, const, binop instructions
         let insts = &func.blocks[0].instructions;
-        assert!(insts.iter().any(|i| matches!(i, Inst::BinOp(_, BinOp::Add, _, _))));
+        assert!(insts
+            .iter()
+            .any(|i| matches!(i, Inst::BinOp(_, BinOp::Add, _, _))));
     }
 
     #[test]
     fn lower_storage_read_write() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract T {
                 storage { balance: u256, }
                 pub fn f() {
@@ -1827,19 +2039,27 @@ mod tests {
                     self.balance = 100;
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let all_insts: Vec<&Inst> = func.blocks.iter()
+        let all_insts: Vec<&Inst> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .collect();
-        assert!(all_insts.iter().any(|i| matches!(i, Inst::StorageGet(_, _))));
-        assert!(all_insts.iter().any(|i| matches!(i, Inst::StorageSet(_, _))));
+        assert!(all_insts
+            .iter()
+            .any(|i| matches!(i, Inst::StorageGet(_, _))));
+        assert!(all_insts
+            .iter()
+            .any(|i| matches!(i, Inst::StorageSet(_, _))));
     }
 
     #[test]
     fn lower_if_else() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract T {
                 pub fn f() {
                     if true {
@@ -1849,7 +2069,8 @@ mod tests {
                     }
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
         // Should have multiple blocks (entry, if.then, if.else, if.end)
@@ -1858,7 +2079,8 @@ mod tests {
 
     #[test]
     fn lower_for_loop() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract T {
                 pub fn f() {
                     for i in 0..10 {
@@ -1866,7 +2088,8 @@ mod tests {
                     }
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
         // Should have header, body, exit blocks
@@ -1875,17 +2098,21 @@ mod tests {
 
     #[test]
     fn lower_require() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract T {
                 error Fail {}
                 pub fn f() {
                     require!(true, Fail {});
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let all_insts: Vec<&Inst> = func.blocks.iter()
+        let all_insts: Vec<&Inst> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .collect();
         assert!(all_insts.iter().any(|i| matches!(i, Inst::Branch(_, _, _))));
@@ -1894,17 +2121,21 @@ mod tests {
 
     #[test]
     fn lower_emit() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract T {
                 event Transfer { from: Address, amount: u256, }
                 pub fn f() {
                     emit Transfer { from: msg.sender, amount: 100 };
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let all_insts: Vec<&Inst> = func.blocks.iter()
+        let all_insts: Vec<&Inst> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .collect();
         assert!(all_insts.iter().any(|i| matches!(i, Inst::Emit(_, _))));
@@ -1912,7 +2143,8 @@ mod tests {
 
     #[test]
     fn lower_enum_variant() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract T {
                 enum Status { Active, Paused, Closed }
                 pub fn f() {
@@ -1921,17 +2153,27 @@ mod tests {
                     let c = Status::Closed;
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let all_insts: Vec<&Inst> = func.blocks.iter()
+        let all_insts: Vec<&Inst> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .collect();
 
         // Active=0, Paused=1, Closed=2
-        let consts: Vec<U256> = all_insts.iter().filter_map(|i| {
-            if let Inst::Const(_, IrConst::Int(v, _)) = i { Some(*v) } else { None }
-        }).collect();
+        let consts: Vec<U256> = all_insts
+            .iter()
+            .filter_map(|i| {
+                if let Inst::Const(_, IrConst::Int(v, _)) = i {
+                    Some(*v)
+                } else {
+                    None
+                }
+            })
+            .collect();
         assert!(consts.contains(&U256::from(0u64)), "Active should be 0");
         assert!(consts.contains(&U256::from(1u64)), "Paused should be 1");
         assert!(consts.contains(&U256::from(2u64)), "Closed should be 2");
@@ -1939,7 +2181,8 @@ mod tests {
 
     #[test]
     fn lower_enum_match_compares() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract T {
                 enum Status { Active, Paused }
                 pub fn f() {
@@ -1951,48 +2194,69 @@ mod tests {
                     }
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let all_insts: Vec<&Inst> = func.blocks.iter()
+        let all_insts: Vec<&Inst> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .collect();
 
         // Should have Cmp instructions for enum variant matching (not just Jump)
-        let cmp_count = all_insts.iter()
+        let cmp_count = all_insts
+            .iter()
             .filter(|i| matches!(i, Inst::Cmp(_, CmpOp::Eq, _, _)))
             .count();
-        assert!(cmp_count >= 2, "should have at least 2 comparisons for Active and Paused, got {}", cmp_count);
+        assert!(
+            cmp_count >= 2,
+            "should have at least 2 comparisons for Active and Paused, got {}",
+            cmp_count
+        );
     }
 
     #[test]
     fn lower_const_inlining() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract T {
                 const MAX_SUPPLY: u256 = 1000000;
                 pub fn f() {
                     let x = MAX_SUPPLY;
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let all_insts: Vec<&Inst> = func.blocks.iter()
+        let all_insts: Vec<&Inst> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .collect();
 
         // Should inline 1000000, not emit a comment
         assert!(all_insts.iter().any(|i| {
-            if let Inst::Const(_, IrConst::Int(v, _)) = i { *v == U256::from(1000000u64) } else { false }
+            if let Inst::Const(_, IrConst::Int(v, _)) = i {
+                *v == U256::from(1000000u64)
+            } else {
+                false
+            }
         }));
         assert!(!all_insts.iter().any(|i| {
-            if let Inst::Comment(msg) = i { msg.contains("MAX_SUPPLY") } else { false }
+            if let Inst::Comment(msg) = i {
+                msg.contains("MAX_SUPPLY")
+            } else {
+                false
+            }
         }));
     }
 
     #[test]
     fn lower_msg_sender_builtin() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract T {
                 pub fn f() {
                     let sender = msg.sender;
@@ -2000,20 +2264,30 @@ mod tests {
                     let val = msg.value;
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let all_insts: Vec<&Inst> = func.blocks.iter()
+        let all_insts: Vec<&Inst> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .collect();
-        assert!(all_insts.iter().any(|i| matches!(i, Inst::Builtin(_, BuiltinOp::MsgSender))));
-        assert!(all_insts.iter().any(|i| matches!(i, Inst::Builtin(_, BuiltinOp::BlockTimestamp))));
-        assert!(all_insts.iter().any(|i| matches!(i, Inst::Builtin(_, BuiltinOp::MsgValue))));
+        assert!(all_insts
+            .iter()
+            .any(|i| matches!(i, Inst::Builtin(_, BuiltinOp::MsgSender))));
+        assert!(all_insts
+            .iter()
+            .any(|i| matches!(i, Inst::Builtin(_, BuiltinOp::BlockTimestamp))));
+        assert!(all_insts
+            .iter()
+            .any(|i| matches!(i, Inst::Builtin(_, BuiltinOp::MsgValue))));
     }
 
     #[test]
     fn lower_break_continue() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract T {
                 pub fn f() {
                     for i in 0..10 {
@@ -2023,14 +2297,18 @@ mod tests {
                     }
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let all_insts: Vec<&Inst> = func.blocks.iter()
+        let all_insts: Vec<&Inst> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .collect();
         // break should produce a Jump to the exit label
-        let jump_count = all_insts.iter()
+        let jump_count = all_insts
+            .iter()
             .filter(|i| matches!(i, Inst::Jump(_)))
             .count();
         assert!(jump_count >= 2); // at least: jump to header + break jump to exit
@@ -2038,7 +2316,8 @@ mod tests {
 
     #[test]
     fn lower_display() {
-        let ir = lower_src(r#"
+        let ir = lower_src(
+            r#"
             contract Token {
                 storage { supply: u256, }
                 #[constructor]
@@ -2046,7 +2325,8 @@ mod tests {
                     self.supply = supply;
                 }
             }
-        "#);
+        "#,
+        );
 
         // Just verify Display doesn't panic
         let output = format!("{}", ir);

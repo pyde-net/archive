@@ -19,12 +19,23 @@ struct Wallet {
     sk: FalconSecretKey,
 }
 
-async fn rpc_async(client: &reqwest::Client, url: &str, method: &str, params: &str) -> serde_json::Value {
+async fn rpc_async(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    params: &str,
+) -> serde_json::Value {
     let body = format!(
         r#"{{"jsonrpc":"2.0","method":"{}","params":[{}],"id":1}}"#,
         method, params
     );
-    match client.post(url).header("Content-Type", "application/json").body(body).send().await {
+    match client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+    {
         Ok(resp) => resp.json().await.unwrap_or_default(),
         Err(_) => serde_json::Value::Null,
     }
@@ -43,7 +54,10 @@ fn get_str(resp: &serde_json::Value) -> String {
 fn load_test_full_pipeline() {
     let accounts_path = match std::env::var("PYDE_ACCOUNTS_JSON") {
         Ok(p) => p,
-        Err(_) => { println!("SKIP: PYDE_ACCOUNTS_JSON not set"); return; }
+        Err(_) => {
+            println!("SKIP: PYDE_ACCOUNTS_JSON not set");
+            return;
+        }
     };
     let rpc_urls: Vec<String> = vec![
         "http://localhost:8545".into(),
@@ -52,23 +66,30 @@ fn load_test_full_pipeline() {
         "http://localhost:8548".into(),
     ];
 
-    let accounts_json: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&accounts_path).unwrap()
-    ).unwrap();
+    let accounts_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&accounts_path).unwrap()).unwrap();
     let chain_id = accounts_json["chainId"].as_u64().unwrap();
     let accts = accounts_json["accounts"].as_array().unwrap();
 
     // Load wallets
     let mut wallets: Vec<Wallet> = Vec::new();
     for acc in accts {
-        if acc.get("faucet").is_some() { continue; }
+        if acc.get("faucet").is_some() {
+            continue;
+        }
         let pk_hex = acc["privateKey"].as_str().unwrap().trim_start_matches("0x");
         let pk_bytes = hex::decode(pk_hex).unwrap();
-        if pk_bytes.len() != 897 + 1281 { continue; }
+        if pk_bytes.len() != 897 + 1281 {
+            continue;
+        }
         let pk = FalconPublicKey::from_bytes(&pk_bytes[..897]).unwrap();
         let sk = FalconSecretKey::from_bytes(&pk_bytes[897..]).unwrap();
         let address = derive_eoa_address(pk.as_bytes());
-        wallets.push(Wallet { address, _pk: pk, sk });
+        wallets.push(Wallet {
+            address,
+            _pk: pk,
+            sk,
+        });
     }
 
     // Each wallet sends 60 txs (nonce window = 64, leave margin)
@@ -165,10 +186,18 @@ fn load_test_full_pipeline() {
     for i in 0..num_contracts {
         let w = &wallets[i];
         let mut tx = Transaction {
-            from: w.address, to: [0u8; 32], value: 0, data: deploy_data.clone(),
-            gas_limit: 100_000_000, nonce: 0, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list: vec![],
-            deadline: None, chain_id, tx_type: TransactionType::Deploy,
+            from: w.address,
+            to: [0u8; 32],
+            value: 0,
+            data: deploy_data.clone(),
+            gas_limit: 100_000_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id,
+            tx_type: TransactionType::Deploy,
         };
         let hash = tx.hash();
         tx.signature = falcon_sign(&w.sk, &hash).unwrap().as_bytes().to_vec();
@@ -181,9 +210,14 @@ fn load_test_full_pipeline() {
     call_data.extend_from_slice(&100u64.to_le_bytes()); // n=100 iterations
 
     // Pre-compute nonces and tx params, then parallel sign with rayon
-    println!("  Building {} mixed transactions (60% transfers, 40% contract calls)...", total_txs);
+    println!(
+        "  Building {} mixed transactions (60% transfers, 40% contract calls)...",
+        total_txs
+    );
     let mut nonce_tracker: Vec<u64> = vec![0; wallets.len()];
-    for i in 0..num_contracts { nonce_tracker[i] = 1; }
+    for i in 0..num_contracts {
+        nonce_tracker[i] = 1;
+    }
 
     // Build unsigned tx descriptors (fast, single-threaded)
     struct TxDesc {
@@ -207,7 +241,11 @@ fn load_test_full_pipeline() {
 
     // Parallel signing with rayon (14 cores)
     use rayon::prelude::*;
-    println!("  Signing {} txs in parallel ({} cores)...", total_txs, rayon::current_num_threads());
+    println!(
+        "  Signing {} txs in parallel ({} cores)...",
+        total_txs,
+        rayon::current_num_threads()
+    );
     let sign_start = Instant::now();
 
     // Pre-compute contract addresses
@@ -215,37 +253,61 @@ fn load_test_full_pipeline() {
         .map(|i| pyde_account::address::derive_create_address(&wallets[i].address, 0))
         .collect();
 
-    let signed_txs: Vec<Vec<u8>> = descs.par_iter().map(|desc| {
-        let w = &wallets[desc.w_idx];
-        let mut tx = if desc.is_call {
-            Transaction {
-                from: w.address, to: contract_addrs[desc.contract_idx], value: 0,
-                data: call_data.clone(), gas_limit: 10_000_000, nonce: desc.nonce,
-                signature: vec![], fee_payer: FeePayer::Sender, access_list: vec![],
-                deadline: None, chain_id, tx_type: TransactionType::Standard,
-            }
-        } else {
-            Transaction {
-                from: w.address, to: recipient, value: 1, data: vec![],
-                gas_limit: 50_000, nonce: desc.nonce, signature: vec![],
-                fee_payer: FeePayer::Sender, access_list: vec![],
-                deadline: None, chain_id, tx_type: TransactionType::Standard,
-            }
-        };
-        let hash = tx.hash();
-        tx.signature = falcon_sign(&w.sk, &hash).unwrap().as_bytes().to_vec();
-        tx.to_bytes()
-    }).collect();
+    let signed_txs: Vec<Vec<u8>> = descs
+        .par_iter()
+        .map(|desc| {
+            let w = &wallets[desc.w_idx];
+            let mut tx = if desc.is_call {
+                Transaction {
+                    from: w.address,
+                    to: contract_addrs[desc.contract_idx],
+                    value: 0,
+                    data: call_data.clone(),
+                    gas_limit: 10_000_000,
+                    nonce: desc.nonce,
+                    signature: vec![],
+                    fee_payer: FeePayer::Sender,
+                    access_list: vec![],
+                    deadline: None,
+                    chain_id,
+                    tx_type: TransactionType::Standard,
+                }
+            } else {
+                Transaction {
+                    from: w.address,
+                    to: recipient,
+                    value: 1,
+                    data: vec![],
+                    gas_limit: 50_000,
+                    nonce: desc.nonce,
+                    signature: vec![],
+                    fee_payer: FeePayer::Sender,
+                    access_list: vec![],
+                    deadline: None,
+                    chain_id,
+                    tx_type: TransactionType::Standard,
+                }
+            };
+            let hash = tx.hash();
+            tx.signature = falcon_sign(&w.sk, &hash).unwrap().as_bytes().to_vec();
+            tx.to_bytes()
+        })
+        .collect();
 
     let sign_elapsed = sign_start.elapsed();
     let transfer_count = descs.iter().filter(|d| !d.is_call).count();
     let call_count = descs.iter().filter(|d| d.is_call).count();
-    println!("  Signed in {:.2}s ({:.0} signs/s) — {} transfers + {} contract calls\n",
-        sign_elapsed.as_secs_f64(), total_txs as f64 / sign_elapsed.as_secs_f64(),
-        transfer_count, call_count);
+    println!(
+        "  Signed in {:.2}s ({:.0} signs/s) — {} transfers + {} contract calls\n",
+        sign_elapsed.as_secs_f64(),
+        total_txs as f64 / sign_elapsed.as_secs_f64(),
+        transfer_count,
+        call_count
+    );
 
     // Also keep hex versions for HTTP fallback
-    let signed_txs_hex: Vec<String> = signed_txs.iter()
+    let signed_txs_hex: Vec<String> = signed_txs
+        .iter()
         .map(|b| format!("0x{}", hex::encode(b)))
         .collect();
 
@@ -264,7 +326,10 @@ fn load_test_full_pipeline() {
             .unwrap();
 
         // Deploy contracts — submit to ALL nodes for fastest inclusion
-        println!("  Deploying {} contracts (to all 4 nodes)...", deploy_txs.len());
+        println!(
+            "  Deploying {} contracts (to all 4 nodes)...",
+            deploy_txs.len()
+        );
         for dtx in deploy_txs.iter() {
             let params = format!("\"{}\"", dtx);
             // Submit to all 4 nodes simultaneously
@@ -278,12 +343,20 @@ fn load_test_full_pipeline() {
         println!("  Waiting for contract deployment...");
         for attempt in 0..40 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let resp = rpc_async(&client, &rpc_urls[0], "pyde_getCode",
-                &format!("\"0x{}\"", hex::encode(contract0))).await;
+            let resp = rpc_async(
+                &client,
+                &rpc_urls[0],
+                "pyde_getCode",
+                &format!("\"0x{}\"", hex::encode(contract0)),
+            )
+            .await;
             let code = get_str(&resp);
             if !code.is_empty() && code != "0x" {
-                println!("  Contracts deployed after {:.1}s ({} bytes code)",
-                    (attempt + 1) as f64 * 0.5, code.len() / 2 - 1);
+                println!(
+                    "  Contracts deployed after {:.1}s ({} bytes code)",
+                    (attempt + 1) as f64 * 0.5,
+                    code.len() / 2 - 1
+                );
                 break;
             }
             if attempt == 39 {
@@ -294,7 +367,8 @@ fn load_test_full_pipeline() {
         // Check node
         let resp = rpc_async(&client, &rpc_urls[0], "pyde_blockNumber", "").await;
         let start_block_hex = get_str(&resp);
-        let start_block = u64::from_str_radix(start_block_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+        let start_block =
+            u64::from_str_radix(start_block_hex.trim_start_matches("0x"), 16).unwrap_or(0);
         println!("  Start block: {} (0x{:x})", start_block, start_block);
 
         // Submit via fast binary TCP endpoint (port 9545) if available,
@@ -304,8 +378,11 @@ fn load_test_full_pipeline() {
         for port in [9545, 9546, 9547, 9548] {
             let addr = format!("127.0.0.1:{}", port);
             if std::net::TcpStream::connect_timeout(
-                &addr.parse().unwrap(), std::time::Duration::from_millis(100)
-            ).is_ok() {
+                &addr.parse().unwrap(),
+                std::time::Duration::from_millis(100),
+            )
+            .is_ok()
+            {
                 fast_tx_addrs.push(addr);
             }
         }
@@ -318,7 +395,9 @@ fn load_test_full_pipeline() {
         let raw_txs = &signed_txs;
 
         // Try binary endpoint first
-        let use_binary = tokio::net::TcpStream::connect(&fast_tx_addrs[0]).await.is_ok();
+        let use_binary = tokio::net::TcpStream::connect(&fast_tx_addrs[0])
+            .await
+            .is_ok();
 
         let submitted = Arc::new(AtomicU64::new(0));
         let errors = Arc::new(AtomicU64::new(0));
@@ -333,7 +412,9 @@ fn load_test_full_pipeline() {
             for c in 0..concurrency {
                 let start_idx = c * chunk_size;
                 let end_idx = (start_idx + chunk_size).min(raw_txs.len());
-                if start_idx >= raw_txs.len() { break; }
+                if start_idx >= raw_txs.len() {
+                    break;
+                }
                 let chunk: Vec<Vec<u8>> = raw_txs[start_idx..end_idx].to_vec();
                 let addr = fast_tx_addrs[c % fast_tx_addrs.len()].clone();
                 let sub = submitted.clone();
@@ -368,7 +449,9 @@ fn load_test_full_pipeline() {
                     }
                 }));
             }
-            for t in tasks { let _ = t.await; }
+            for t in tasks {
+                let _ = t.await;
+            }
         } else {
             println!("  Using HTTP RPC (fast TX endpoint not available)");
             let concurrency = 32usize;
@@ -378,7 +461,9 @@ fn load_test_full_pipeline() {
             for c in 0..concurrency {
                 let start_idx = c * chunk_size;
                 let end_idx = (start_idx + chunk_size).min(signed_txs_hex.len());
-                if start_idx >= signed_txs_hex.len() { break; }
+                if start_idx >= signed_txs_hex.len() {
+                    break;
+                }
                 let chunk: Vec<String> = signed_txs_hex[start_idx..end_idx].to_vec();
                 let url = rpc_urls[c % rpc_urls.len()].clone();
                 let cl = client.clone();
@@ -397,15 +482,22 @@ fn load_test_full_pipeline() {
                     }
                 }));
             }
-            for t in tasks { let _ = t.await; }
+            for t in tasks {
+                let _ = t.await;
+            }
         }
         let send_elapsed = send_start.elapsed();
         let sub_count = submitted.load(Ordering::Relaxed);
         let err_count = errors.load(Ordering::Relaxed);
         let submit_tps = sub_count as f64 / send_elapsed.as_secs_f64();
 
-        println!("  Submitted: {} ok, {} errors in {:.2}s ({:.0} submit/s)",
-            sub_count, err_count, send_elapsed.as_secs_f64(), submit_tps);
+        println!(
+            "  Submitted: {} ok, {} errors in {:.2}s ({:.0} submit/s)",
+            sub_count,
+            err_count,
+            send_elapsed.as_secs_f64(),
+            submit_tps
+        );
 
         // Wait for inclusion
         println!("  Waiting 10s for block inclusion...");
@@ -414,10 +506,16 @@ fn load_test_full_pipeline() {
         // Measure results
         let resp = rpc_async(&client, &rpc_urls[0], "pyde_blockNumber", "").await;
         let end_block_hex = get_str(&resp);
-        let end_block = u64::from_str_radix(end_block_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+        let end_block =
+            u64::from_str_radix(end_block_hex.trim_start_matches("0x"), 16).unwrap_or(0);
 
-        let resp = rpc_async(&client, &rpc_urls[0], "pyde_getBalance",
-            &format!("\"0x{}\"", hex::encode(recipient))).await;
+        let resp = rpc_async(
+            &client,
+            &rpc_urls[0],
+            "pyde_getBalance",
+            &format!("\"0x{}\"", hex::encode(recipient)),
+        )
+        .await;
         let bal_str = get_str(&resp);
         let executed: u64 = if bal_str.starts_with("0x") {
             u64::from_str_radix(bal_str.trim_start_matches("0x"), 16).unwrap_or(0)
@@ -431,17 +529,36 @@ fn load_test_full_pipeline() {
         // TPS during active submission period
         let active_tps = if send_elapsed.as_secs_f64() > 0.0 {
             executed as f64 / send_elapsed.as_secs_f64()
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         println!("\n  ========== RESULTS ==========");
-        println!("  Blocks:       {} ({} → {})", blocks, start_block, end_block);
+        println!(
+            "  Blocks:       {} ({} → {})",
+            blocks, start_block, end_block
+        );
         println!("  Block time:   {:.2}s", total_time / blocks as f64);
         println!("  Submitted:    {}", sub_count);
-        println!("  Executed:     {} ({:.1}% success)", executed, (executed as f64 / sub_count as f64) * 100.0);
-        println!("  Submit rate:  {:.0} tx/s ({}, 32 concurrent, 4 nodes)", submit_tps, if use_binary { "binary TCP" } else { "HTTP RPC" });
-        println!("  Sign rate:    {:.0} tx/s (FALCON-512)", total_txs as f64 / sign_elapsed.as_secs_f64());
+        println!(
+            "  Executed:     {} ({:.1}% success)",
+            executed,
+            (executed as f64 / sub_count as f64) * 100.0
+        );
+        println!(
+            "  Submit rate:  {:.0} tx/s ({}, 32 concurrent, 4 nodes)",
+            submit_tps,
+            if use_binary { "binary TCP" } else { "HTTP RPC" }
+        );
+        println!(
+            "  Sign rate:    {:.0} tx/s (FALCON-512)",
+            total_txs as f64 / sign_elapsed.as_secs_f64()
+        );
         println!("  Active TPS:   {:.0} (executed / submit time)", active_tps);
-        println!("  Overall TPS:  {:.0} (executed / total time incl. wait)", inclusion_tps);
+        println!(
+            "  Overall TPS:  {:.0} (executed / total time incl. wait)",
+            inclusion_tps
+        );
         println!("  ==============================\n");
 
         println!("  Grafana: http://localhost:3000 (dashboard: Pyde Devnet)");

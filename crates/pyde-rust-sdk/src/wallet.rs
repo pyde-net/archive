@@ -1,8 +1,11 @@
 use crate::client::Provider;
 use crate::error::{Result, SdkError};
 use crate::types::*;
-use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
-use pyde_crypto::falcon::{falcon_keygen, falcon_sign, FalconSecretKey, FalconPublicKey};
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use pyde_crypto::falcon::{falcon_keygen, falcon_sign, FalconPublicKey, FalconSecretKey};
 use pyde_crypto::poseidon2::poseidon2_hash;
 
 /// Encrypted keystore format (JSON file).
@@ -26,16 +29,24 @@ pub struct Wallet {
 impl Wallet {
     /// Generate a new random keypair (in-memory, not persisted).
     pub fn generate() -> Result<Self> {
-        let (pk, sk) = falcon_keygen()
-            .map_err(|e| SdkError::Signing(format!("keygen failed: {}", e)))?;
+        let (pk, sk) =
+            falcon_keygen().map_err(|e| SdkError::Signing(format!("keygen failed: {}", e)))?;
         let address = derive_eoa_address(pk.as_bytes());
-        Ok(Self { address, public_key: pk, secret_key: sk })
+        Ok(Self {
+            address,
+            public_key: pk,
+            secret_key: sk,
+        })
     }
 
     /// Create from existing key objects.
     pub fn from_keys(pk: FalconPublicKey, sk: FalconSecretKey) -> Self {
         let address = derive_eoa_address(pk.as_bytes());
-        Self { address, public_key: pk, secret_key: sk }
+        Self {
+            address,
+            public_key: pk,
+            secret_key: sk,
+        }
     }
 
     /// Create from a private key hex string.
@@ -48,7 +59,8 @@ impl Wallet {
         if bytes.len() != 897 + 1281 {
             return Err(SdkError::Signing(format!(
                 "private key must be {} bytes (897 pk + 1281 sk), got {}",
-                897 + 1281, bytes.len()
+                897 + 1281,
+                bytes.len()
             )));
         }
         let pk = FalconPublicKey::from_bytes(&bytes[..897])
@@ -66,7 +78,11 @@ impl Wallet {
         let pk = FalconPublicKey::from_bytes(&pk_bytes)
             .ok_or_else(|| SdkError::Signing("invalid public key in keystore".into()))?;
         let address = derive_eoa_address(pk.as_bytes());
-        Ok(Self { address, public_key: pk, secret_key: sk })
+        Ok(Self {
+            address,
+            public_key: pk,
+            secret_key: sk,
+        })
     }
 
     /// Generate a new keypair and save encrypted to a file.
@@ -75,8 +91,7 @@ impl Wallet {
         let keystore = wallet.to_keystore(password)?;
         let json = serde_json::to_string_pretty(&keystore)
             .map_err(|e| SdkError::Signing(format!("serialize: {}", e)))?;
-        std::fs::write(path, json)
-            .map_err(|e| SdkError::Signing(format!("write: {}", e)))?;
+        std::fs::write(path, json).map_err(|e| SdkError::Signing(format!("write: {}", e)))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -87,8 +102,8 @@ impl Wallet {
 
     /// Load a wallet from an encrypted keystore file.
     pub fn from_keystore(path: &std::path::Path, password: &str) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| SdkError::Signing(format!("read: {}", e)))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| SdkError::Signing(format!("read: {}", e)))?;
         let keystore: Keystore = serde_json::from_str(&content)
             .map_err(|e| SdkError::Signing(format!("parse: {}", e)))?;
 
@@ -99,7 +114,11 @@ impl Wallet {
             .ok_or_else(|| SdkError::Signing("invalid public key".into()))?;
 
         let address = derive_eoa_address(pk.as_bytes());
-        Ok(Self { address, public_key: pk, secret_key: sk })
+        Ok(Self {
+            address,
+            public_key: pk,
+            secret_key: sk,
+        })
     }
 
     /// Export wallet as encrypted keystore struct.
@@ -112,8 +131,7 @@ impl Wallet {
         let keystore = self.to_keystore(password)?;
         let json = serde_json::to_string_pretty(&keystore)
             .map_err(|e| SdkError::Signing(format!("serialize: {}", e)))?;
-        std::fs::write(path, json)
-            .map_err(|e| SdkError::Signing(format!("write: {}", e)))?;
+        std::fs::write(path, json).map_err(|e| SdkError::Signing(format!("write: {}", e)))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -126,11 +144,17 @@ impl Wallet {
     // Accessors
     // ========================================================================
 
-    pub fn address(&self) -> &Address { &self.address }
+    pub fn address(&self) -> &Address {
+        &self.address
+    }
 
-    pub fn address_hex(&self) -> String { format_address(&self.address) }
+    pub fn address_hex(&self) -> String {
+        format_address(&self.address)
+    }
 
-    pub fn public_key(&self) -> &FalconPublicKey { &self.public_key }
+    pub fn public_key(&self) -> &FalconPublicKey {
+        &self.public_key
+    }
 
     pub fn public_key_hex(&self) -> String {
         format!("0x{}", hex::encode(self.public_key.as_bytes()))
@@ -174,14 +198,27 @@ impl Wallet {
     // ========================================================================
 
     /// Build, sign, send a native transfer. Returns receipt (errors on revert).
-    pub async fn transfer(&self, provider: &Provider, to: &Address, amount: u128) -> Result<Receipt> {
+    pub async fn transfer(
+        &self,
+        provider: &Provider,
+        to: &Address,
+        amount: u128,
+    ) -> Result<Receipt> {
         let (nonce, chain_id) = provider.get_nonce_and_chain_id(&self.address).await?;
 
         let mut tx = Transaction {
-            from: self.address, to: *to, value: amount, data: vec![],
-            gas_limit: 21_000, nonce, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list: vec![],
-            deadline: None, chain_id, tx_type: TransactionType::Standard,
+            from: self.address,
+            to: *to,
+            value: amount,
+            data: vec![],
+            gas_limit: 21_000,
+            nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id,
+            tx_type: TransactionType::Standard,
         };
         self.sign_transaction(&mut tx)?;
         send_and_check(provider, &tx).await
@@ -196,28 +233,48 @@ impl Wallet {
 
     /// Build, sign, send a contract call. Returns receipt (errors on revert).
     pub async fn send_call(
-        &self, provider: &Provider, to: &Address, data: Vec<u8>, gas_limit: u64,
+        &self,
+        provider: &Provider,
+        to: &Address,
+        data: Vec<u8>,
+        gas_limit: u64,
     ) -> Result<Receipt> {
-        self.send_call_with_value(provider, to, data, 0, gas_limit).await
+        self.send_call_with_value(provider, to, data, 0, gas_limit)
+            .await
     }
 
     /// Build, sign, send a contract call with native token value.
     /// Automatically fetches access list via simulation for parallel scheduling.
     pub async fn send_call_with_value(
-        &self, provider: &Provider, to: &Address, data: Vec<u8>, value: u128, gas_limit: u64,
+        &self,
+        provider: &Provider,
+        to: &Address,
+        data: Vec<u8>,
+        value: u128,
+        gas_limit: u64,
     ) -> Result<Receipt> {
         let (nonce, chain_id) = provider.get_nonce_and_chain_id(&self.address).await?;
 
         // Fetch access list via simulation (enables parallel scheduling)
         let val = if value > 0 { Some(value) } else { None };
-        let access_list = provider.create_access_list(to, &data, Some(&self.address), val)
-            .await.unwrap_or_default();
+        let access_list = provider
+            .create_access_list(to, &data, Some(&self.address), val)
+            .await
+            .unwrap_or_default();
 
         let mut tx = Transaction {
-            from: self.address, to: *to, value, data,
-            gas_limit, nonce, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list,
-            deadline: None, chain_id, tx_type: TransactionType::Standard,
+            from: self.address,
+            to: *to,
+            value,
+            data,
+            gas_limit,
+            nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list,
+            deadline: None,
+            chain_id,
+            tx_type: TransactionType::Standard,
         };
         self.sign_transaction(&mut tx)?;
         send_and_check(provider, &tx).await
@@ -235,22 +292,38 @@ impl Wallet {
 
     /// Build, sign, send a contract deploy. Returns receipt (errors on revert).
     pub async fn deploy(
-        &self, provider: &Provider, deploy_data: Vec<u8>, gas_limit: u64,
+        &self,
+        provider: &Provider,
+        deploy_data: Vec<u8>,
+        gas_limit: u64,
     ) -> Result<Receipt> {
-        self.deploy_with_value(provider, deploy_data, 0, gas_limit).await
+        self.deploy_with_value(provider, deploy_data, 0, gas_limit)
+            .await
     }
 
     /// Build, sign, send a contract deploy with native token value (payable constructor).
     pub async fn deploy_with_value(
-        &self, provider: &Provider, deploy_data: Vec<u8>, value: u128, gas_limit: u64,
+        &self,
+        provider: &Provider,
+        deploy_data: Vec<u8>,
+        value: u128,
+        gas_limit: u64,
     ) -> Result<Receipt> {
         let (nonce, chain_id) = provider.get_nonce_and_chain_id(&self.address).await?;
 
         let mut tx = Transaction {
-            from: self.address, to: [0u8; 32], value, data: deploy_data,
-            gas_limit, nonce, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list: vec![],
-            deadline: None, chain_id, tx_type: TransactionType::Deploy,
+            from: self.address,
+            to: [0u8; 32],
+            value,
+            data: deploy_data,
+            gas_limit,
+            nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id,
+            tx_type: TransactionType::Deploy,
         };
         self.sign_transaction(&mut tx)?;
         send_and_check(provider, &tx).await
@@ -273,19 +346,38 @@ impl<'a> SignerProvider<'a> {
     }
 
     pub async fn send_call(&self, to: &Address, data: Vec<u8>, gas_limit: u64) -> Result<Receipt> {
-        self.wallet.send_call(self.provider, to, data, gas_limit).await
+        self.wallet
+            .send_call(self.provider, to, data, gas_limit)
+            .await
     }
 
-    pub async fn send_call_with_value(&self, to: &Address, data: Vec<u8>, value: u128, gas_limit: u64) -> Result<Receipt> {
-        self.wallet.send_call_with_value(self.provider, to, data, value, gas_limit).await
+    pub async fn send_call_with_value(
+        &self,
+        to: &Address,
+        data: Vec<u8>,
+        value: u128,
+        gas_limit: u64,
+    ) -> Result<Receipt> {
+        self.wallet
+            .send_call_with_value(self.provider, to, data, value, gas_limit)
+            .await
     }
 
     pub async fn deploy(&self, deploy_data: Vec<u8>, gas_limit: u64) -> Result<Receipt> {
-        self.wallet.deploy(self.provider, deploy_data, gas_limit).await
+        self.wallet
+            .deploy(self.provider, deploy_data, gas_limit)
+            .await
     }
 
-    pub async fn deploy_with_value(&self, deploy_data: Vec<u8>, value: u128, gas_limit: u64) -> Result<Receipt> {
-        self.wallet.deploy_with_value(self.provider, deploy_data, value, gas_limit).await
+    pub async fn deploy_with_value(
+        &self,
+        deploy_data: Vec<u8>,
+        value: u128,
+        gas_limit: u64,
+    ) -> Result<Receipt> {
+        self.wallet
+            .deploy_with_value(self.provider, deploy_data, value, gas_limit)
+            .await
     }
 
     pub async fn get_balance(&self) -> Result<u128> {
@@ -306,9 +398,15 @@ impl<'a> SignerProvider<'a> {
 // ============================================================================
 
 impl crate::signer::Signer for Wallet {
-    fn address(&self) -> &Address { &self.address }
-    fn sign_transaction(&self, tx: &mut Transaction) -> Result<()> { self.sign_transaction(tx) }
-    fn sign(&self, message: &[u8; 32]) -> Result<Vec<u8>> { self.sign(message) }
+    fn address(&self) -> &Address {
+        &self.address
+    }
+    fn sign_transaction(&self, tx: &mut Transaction) -> Result<()> {
+        self.sign_transaction(tx)
+    }
+    fn sign(&self, message: &[u8; 32]) -> Result<Vec<u8>> {
+        self.sign(message)
+    }
 }
 
 async fn send_and_check(provider: &Provider, tx: &Transaction) -> Result<Receipt> {
@@ -334,7 +432,10 @@ fn derive_aes_key(password: &str, salt: &[u8]) -> [u8; 32] {
 }
 
 fn encrypt_keystore(
-    pk: &FalconPublicKey, sk: &FalconSecretKey, address: &Address, password: &str,
+    pk: &FalconPublicKey,
+    sk: &FalconSecretKey,
+    address: &Address,
+    password: &str,
 ) -> Result<Keystore> {
     let salt: [u8; 16] = rand::random();
     let nonce_bytes: [u8; 12] = rand::random();
@@ -344,7 +445,8 @@ fn encrypt_keystore(
         .map_err(|e| SdkError::Signing(format!("AES init: {}", e)))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let encrypted = cipher.encrypt(nonce, sk.as_bytes())
+    let encrypted = cipher
+        .encrypt(nonce, sk.as_bytes())
         .map_err(|e| SdkError::Signing(format!("encrypt: {}", e)))?;
 
     Ok(Keystore {
@@ -374,7 +476,8 @@ fn decrypt_key(keystore: &Keystore, password: &str) -> Result<FalconSecretKey> {
     }
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let decrypted = cipher.decrypt(nonce, encrypted.as_slice())
+    let decrypted = cipher
+        .decrypt(nonce, encrypted.as_slice())
         .map_err(|_| SdkError::Signing("decryption failed — wrong password?".into()))?;
 
     FalconSecretKey::from_bytes(&decrypted)
@@ -395,10 +498,18 @@ mod tests {
     fn sign_and_verify() {
         let w = Wallet::generate().unwrap();
         let mut tx = Transaction {
-            from: *w.address(), to: [0xBB; 32], value: 100, data: vec![],
-            gas_limit: 21_000, nonce: 0, signature: vec![],
-            fee_payer: FeePayer::Sender, access_list: vec![],
-            deadline: None, chain_id: 1, tx_type: TransactionType::Standard,
+            from: *w.address(),
+            to: [0xBB; 32],
+            value: 100,
+            data: vec![],
+            gas_limit: 21_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Standard,
         };
         w.sign_transaction(&mut tx).unwrap();
         assert!(!tx.signature.is_empty());
@@ -518,7 +629,7 @@ mod tests {
         assert_eq!(parse_units("0.001", 9).unwrap(), 1_000_000);
         assert_eq!(parse_units("0", 9).unwrap(), 0);
         assert!(parse_units("1.0000000001", 9).is_err()); // too many decimals
-        // format_units
+                                                          // format_units
         assert_eq!(format_units(1_500_000_000, 9), "1.5");
         assert_eq!(format_units(1_000_000, 9), "0.001");
         assert_eq!(format_units(0, 9), "0.0");
@@ -529,6 +640,9 @@ mod tests {
         // custom decimals
         assert_eq!(parse_units("1.0", 18).unwrap(), 1_000_000_000_000_000_000);
         // roundtrip
-        assert_eq!(format_units(parse_units("123.456789", 9).unwrap(), 9), "123.456789");
+        assert_eq!(
+            format_units(parse_units("123.456789", 9).unwrap(), 9),
+            "123.456789"
+        );
     }
 }

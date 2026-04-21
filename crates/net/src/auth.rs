@@ -27,9 +27,11 @@
 //! module runs on top of that already-encrypted channel.
 
 use crate::peer::PeerManager;
-use libp2p::{request_response, PeerId};
 use libp2p::StreamProtocol;
-use pyde_crypto::falcon::{falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature};
+use libp2p::{request_response, PeerId};
+use pyde_crypto::falcon::{
+    falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -74,8 +76,7 @@ pub fn build_auth_resp(
     falcon_pk: &FalconPublicKey,
 ) -> Result<PydeAuthResp, String> {
     let msg = build_attestation_message(&req.nonce, responder_peer_id_bytes);
-    let sig = falcon_sign(falcon_sk, &msg)
-        .map_err(|e| format!("falcon_sign failed: {:?}", e))?;
+    let sig = falcon_sign(falcon_sk, &msg).map_err(|e| format!("falcon_sign failed: {:?}", e))?;
     Ok(PydeAuthResp {
         falcon_pubkey: falcon_pk.as_bytes().to_vec(),
         signature: sig.to_vec(),
@@ -228,16 +229,12 @@ mod tests {
     #[test]
     fn verify_rejects_stale_nonce() {
         let (pk, sk) = falcon_keygen().unwrap();
-        let req_signed = PydeAuthReq {
-            nonce: [0x11; 32],
-        };
+        let req_signed = PydeAuthReq { nonce: [0x11; 32] };
         let resp = build_auth_resp(&req_signed, PEER_ID_A, &sk, &pk).unwrap();
 
         // Fresh request with a different nonce — responder's old sig
         // should NOT verify against it.
-        let req_current = PydeAuthReq {
-            nonce: [0x22; 32],
-        };
+        let req_current = PydeAuthReq { nonce: [0x22; 32] };
         assert!(verify_auth_resp(&req_current, &resp, PEER_ID_A).is_none());
     }
 
@@ -306,9 +303,7 @@ mod tests {
 
     /// Build a genuine attestation using the EOA derived from the FALCON
     /// pubkey — matches the convention enforced by `apply_auth_response`.
-    fn build_real_attestation(
-        nonce: [u8; 32],
-    ) -> (PydeAuthResp, Vec<u8>, FalconSecretKey) {
+    fn build_real_attestation(nonce: [u8; 32]) -> (PydeAuthResp, Vec<u8>, FalconSecretKey) {
         let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let eoa = pyde_account::address::derive_eoa_address(&pk_bytes);
@@ -331,7 +326,10 @@ mod tests {
         let outcome = apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &committee);
         assert_eq!(outcome, AuthOutcome::StoredAsValidator);
         assert_eq!(mgr.peer_falcon_pubkey(&peer), Some(pk_bytes.as_slice()));
-        assert_eq!(mgr.get_peer(&peer).unwrap().role, crate::peer::PeerRole::Validator);
+        assert_eq!(
+            mgr.get_peer(&peer).unwrap().role,
+            crate::peer::PeerRole::Validator
+        );
         // Nonce consumed.
         assert!(!nonces.contains_key(&peer));
     }
@@ -351,7 +349,10 @@ mod tests {
         let outcome = apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &committee);
         assert_eq!(outcome, AuthOutcome::StoredAsNonValidator);
         assert_eq!(mgr.peer_falcon_pubkey(&peer), Some(pk_bytes.as_slice()));
-        assert_eq!(mgr.get_peer(&peer).unwrap().role, crate::peer::PeerRole::Unknown);
+        assert_eq!(
+            mgr.get_peer(&peer).unwrap().role,
+            crate::peer::PeerRole::Unknown
+        );
     }
 
     #[test]
@@ -379,8 +380,7 @@ mod tests {
         nonces.insert(peer, nonce_we_sent);
 
         let (resp_other_nonce, _, _) = build_real_attestation([0x22; 32]);
-        let outcome =
-            apply_auth_response(peer, &resp_other_nonce, &mut nonces, &mut mgr, &[]);
+        let outcome = apply_auth_response(peer, &resp_other_nonce, &mut nonces, &mut mgr, &[]);
         assert_eq!(outcome, AuthOutcome::VerifyFailed);
         assert!(mgr.peer_falcon_pubkey(&peer).is_none());
         // Nonce still consumed so the peer can't keep retrying the same slot.
@@ -424,8 +424,7 @@ mod tests {
         let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let eoa = pyde_account::address::derive_eoa_address(&pk_bytes);
-        let resp_a =
-            build_auth_resp(&PydeAuthReq { nonce: nonce_a }, &eoa, &sk, &pk).unwrap();
+        let resp_a = build_auth_resp(&PydeAuthReq { nonce: nonce_a }, &eoa, &sk, &pk).unwrap();
         assert_eq!(
             apply_auth_response(peer, &resp_a, &mut nonces, &mut mgr, &[]),
             AuthOutcome::StoredAsNonValidator
@@ -434,8 +433,7 @@ mod tests {
         // Same peer, same FALCON key, fresh nonce → still accepted.
         let nonce_b = [0xB2; 32];
         nonces.insert(peer, nonce_b);
-        let resp_b =
-            build_auth_resp(&PydeAuthReq { nonce: nonce_b }, &eoa, &sk, &pk).unwrap();
+        let resp_b = build_auth_resp(&PydeAuthReq { nonce: nonce_b }, &eoa, &sk, &pk).unwrap();
         assert_eq!(
             apply_auth_response(peer, &resp_b, &mut nonces, &mut mgr, &[]),
             AuthOutcome::StoredAsNonValidator

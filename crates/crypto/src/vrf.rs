@@ -64,7 +64,8 @@ fn compute_vrf_output(sk: &FalconSecretKey, input: &[u8]) -> VrfOutput {
 /// Build the message that gets signed/verified for the VRF proof.
 /// Includes the public key to bind the output to a specific key.
 fn build_proof_message(pk: &FalconPublicKey, input: &[u8], output: &VrfOutput) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(VRF_DOMAIN_PROOF.len() + pk.as_bytes().len() + input.len() + 32);
+    let mut msg =
+        Vec::with_capacity(VRF_DOMAIN_PROOF.len() + pk.as_bytes().len() + input.len() + 32);
     msg.extend_from_slice(VRF_DOMAIN_PROOF);
     msg.extend_from_slice(pk.as_bytes());
     msg.extend_from_slice(input);
@@ -75,7 +76,11 @@ fn build_proof_message(pk: &FalconPublicKey, input: &[u8], output: &VrfOutput) -
 /// Generate a VRF output and proof.
 /// The output is deterministic given (sk, input).
 /// The proof is a FALCON signature over (pk || input || output).
-pub fn vrf_prove(pk: &FalconPublicKey, sk: &FalconSecretKey, input: &[u8]) -> Result<(VrfOutput, VrfProof), &'static str> {
+pub fn vrf_prove(
+    pk: &FalconPublicKey,
+    sk: &FalconSecretKey,
+    input: &[u8],
+) -> Result<(VrfOutput, VrfProof), &'static str> {
     let output = compute_vrf_output(sk, input);
     let proof_msg = build_proof_message(pk, input, &output);
     let sig = falcon_sign(sk, &proof_msg)?;

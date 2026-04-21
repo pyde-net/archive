@@ -265,14 +265,24 @@ fn format_node(
     };
 
     match &node.event {
-        TraceEvent::Call { function_name, gas_start, target, .. } => {
+        TraceEvent::Call {
+            function_name,
+            gas_start,
+            target,
+            ..
+        } => {
             let addr_short = hex_short(target);
             output.push_str(&format!(
                 "{}{}[{}] {}::{}()\n",
                 prefix, connector, gas_start, addr_short, function_name
             ));
         }
-        TraceEvent::Return { success, gas_used, return_value, .. } => {
+        TraceEvent::Return {
+            success,
+            gas_used,
+            return_value,
+            ..
+        } => {
             if *success {
                 if *return_value != 0 {
                     output.push_str(&format!(
@@ -308,13 +318,26 @@ fn format_node(
             }
             return;
         }
-        TraceEvent::Deploy { address, code_size, gas_used, .. } => {
+        TraceEvent::Deploy {
+            address,
+            code_size,
+            gas_used,
+            ..
+        } => {
             output.push_str(&format!(
                 "{}{}deploy! → {}  ({} bytes, {} gas)\n",
-                prefix, connector, hex_short(address), code_size, gas_used
+                prefix,
+                connector,
+                hex_short(address),
+                code_size,
+                gas_used
             ));
         }
-        TraceEvent::Log { topic_count, data_size, .. } => {
+        TraceEvent::Log {
+            topic_count,
+            data_size,
+            ..
+        } => {
             if verbosity >= Verbosity::Full {
                 output.push_str(&format!(
                     "{}{}LOG ({} topics, {} bytes data)\n",

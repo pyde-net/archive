@@ -1,9 +1,7 @@
 //! Property tests for emergency pause/resume wire formats (slice 4.6).
 
 use proptest::prelude::*;
-use pyde_tx::multisig::{
-    EmergencyPausePayload, EmergencyResumePayload, SigEntry, MAX_SIGNERS,
-};
+use pyde_tx::multisig::{EmergencyPausePayload, EmergencyResumePayload, SigEntry, MAX_SIGNERS};
 
 /// Strategy: generate a `SigEntry` with any valid signer_index + a
 /// signature-sized byte vec within the range FalconSignature accepts

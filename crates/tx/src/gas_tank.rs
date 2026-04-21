@@ -63,11 +63,7 @@ pub fn deposit(account: &mut Account, amount: u128) {
 }
 
 /// Withdraw from a contract's gas tank. Returns error if insufficient or unauthorized.
-pub fn withdraw(
-    account: &mut Account,
-    amount: u128,
-    caller: &Address,
-) -> Result<(), String> {
+pub fn withdraw(account: &mut Account, amount: u128, caller: &Address) -> Result<(), String> {
     // Only the account itself can withdraw (owner = self_address)
     if *caller != account.address {
         return Err("only the contract owner can withdraw from gas tank".into());

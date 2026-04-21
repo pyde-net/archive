@@ -95,8 +95,7 @@ pub fn falcon_keygen() -> Result<(FalconPublicKey, FalconSecretKey), &'static st
 
 /// Sign a message with a FALCON-512 secret key.
 pub fn falcon_sign(sk: &FalconSecretKey, msg: &[u8]) -> Result<FalconSignature, &'static str> {
-    let kp = FnDsaKeyPair::from_private_key(&sk.0)
-        .map_err(|_| "invalid FALCON-512 secret key")?;
+    let kp = FnDsaKeyPair::from_private_key(&sk.0).map_err(|_| "invalid FALCON-512 secret key")?;
     let sig = kp
         .sign(msg, &DomainSeparation::Context(b"pyde-falcon-v1"))
         .map_err(|_| "FALCON-512 signing failed")?;
@@ -105,7 +104,13 @@ pub fn falcon_sign(sk: &FalconSecretKey, msg: &[u8]) -> Result<FalconSignature, 
 
 /// Verify a FALCON-512 signature.
 pub fn falcon_verify(pk: &FalconPublicKey, msg: &[u8], sig: &FalconSignature) -> bool {
-    FnDsaSig::verify(&sig.0, &pk.0, msg, &DomainSeparation::Context(b"pyde-falcon-v1")).is_ok()
+    FnDsaSig::verify(
+        &sig.0,
+        &pk.0,
+        msg,
+        &DomainSeparation::Context(b"pyde-falcon-v1"),
+    )
+    .is_ok()
 }
 
 /// Batch verify multiple FALCON-512 signatures.
@@ -218,7 +223,8 @@ mod tests {
     fn batch_verify_all_valid() {
         let (pk, sk) = falcon_keygen().unwrap();
         let msgs: &[&[u8]] = &[b"msg1", b"msg2", b"msg3"];
-        let sigs: Vec<FalconSignature> = msgs.iter().map(|m| falcon_sign(&sk, m).unwrap()).collect();
+        let sigs: Vec<FalconSignature> =
+            msgs.iter().map(|m| falcon_sign(&sk, m).unwrap()).collect();
         let items: Vec<_> = msgs
             .iter()
             .zip(sigs.iter())

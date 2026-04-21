@@ -9,8 +9,8 @@
 
 use std::env;
 use std::fs;
-use std::process;
 use std::path::Path;
+use std::process;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -56,7 +56,7 @@ fn read_source(path: &str) -> String {
     }
 }
 
-use otic::diagnostic::{Diagnostic, Level, format_diagnostics};
+use otic::diagnostic::{format_diagnostics, Diagnostic, Level};
 
 /// Run the full frontend pipeline: lex → parse → resolve → typecheck → safety.
 /// Returns the parsed file and source. Exits with rich diagnostics on error.
@@ -167,7 +167,9 @@ fn cmd_build(path: &str) {
         let mut single = otic::ast::SourceFile { items: Vec::new() };
         for item in &file.items {
             match item {
-                otic::ast::Item::Contract(c) if c.name.name == *name => single.items.push(item.clone()),
+                otic::ast::Item::Contract(c) if c.name.name == *name => {
+                    single.items.push(item.clone())
+                }
                 otic::ast::Item::Contract(_) => {}
                 _ => single.items.push(item.clone()),
             }
@@ -180,7 +182,11 @@ fn cmd_build(path: &str) {
         let json_path = if results.len() == 1 {
             Path::new(path).with_extension("json")
         } else {
-            let stem = Path::new(path).file_stem().unwrap_or_default().to_str().unwrap_or("out");
+            let stem = Path::new(path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or("out");
             Path::new(path).with_file_name(format!("{}_{}.json", stem, name.to_lowercase()))
         };
         if let Err(e) = fs::write(&json_path, &artifact) {
@@ -190,9 +196,15 @@ fn cmd_build(path: &str) {
 
         println!("  compiled {} → {}", path, json_path.display());
         println!("  contract:    {}", contract.name);
-        println!("  bytecode:    {} bytes ({} instructions)",
-            contract.bytecode.len(), contract.instruction_count);
-        println!("  constructor: {} bytes", contract.constructor_bytecode.len());
+        println!(
+            "  bytecode:    {} bytes ({} instructions)",
+            contract.bytecode.len(),
+            contract.instruction_count
+        );
+        println!(
+            "  constructor: {} bytes",
+            contract.constructor_bytecode.len()
+        );
         println!("  runtime:     {} bytes", contract.runtime_bytecode.len());
         println!("  functions:   {}", abi.functions.len());
         println!("  events:      {}", abi.events.len());
@@ -212,9 +224,7 @@ fn cmd_test(path: &str) {
     // Lower + codegen (no optimize for tests — preserve all test functions)
     let ir = otic::lower::lower(&file);
 
-    let test_fns: Vec<&otic::ir::IrFunction> = ir.functions.iter()
-        .filter(|f| f.is_test)
-        .collect();
+    let test_fns: Vec<&otic::ir::IrFunction> = ir.functions.iter().filter(|f| f.is_test).collect();
 
     if test_fns.is_empty() {
         println!("  {} — no #[test] functions found", path);
@@ -247,13 +257,24 @@ fn cmd_test(path: &str) {
         let mut result = None;
         loop {
             match vm.step() {
-                Ok(Some(r)) => { result = Some(r); break; }
-                Ok(None) => { steps += 1; if steps > 100_000 { break; } }
+                Ok(Some(r)) => {
+                    result = Some(r);
+                    break;
+                }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 100_000 {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
 
-        let should_panic = func.doc.as_ref().is_some_and(|d| d.contains("should_panic"));
+        let should_panic = func
+            .doc
+            .as_ref()
+            .is_some_and(|d| d.contains("should_panic"));
 
         let ok = match result {
             Some(pyde_vm::vm::ExecResult::Halt) => !should_panic,

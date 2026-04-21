@@ -144,10 +144,10 @@ impl SubnetLimiter {
 /// Single source of truth — used by both DDoS validation and channel validation.
 pub fn max_message_size(channel: Channel) -> usize {
     match channel {
-        Channel::Consensus => 64 * 1024,       // 64 KB (votes, view changes)
-        Channel::Transactions => 128 * 1024,    // 128 KB (encrypted transactions)
-        Channel::Blocks => 4 * 1024 * 1024,     // 4 MB (full blocks)
-        Channel::Sync => 8 * 1024 * 1024,       // 8 MB (state sync chunks)
+        Channel::Consensus => 64 * 1024,     // 64 KB (votes, view changes)
+        Channel::Transactions => 128 * 1024, // 128 KB (encrypted transactions)
+        Channel::Blocks => 4 * 1024 * 1024,  // 4 MB (full blocks)
+        Channel::Sync => 8 * 1024 * 1024,    // 8 MB (state sync chunks)
     }
 }
 
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn pow_challenge_verify_valid() {
         let challenge = PowChallenge::new([0xAB; 32], 4); // 4 leading zero bits
-        // Brute-force a valid nonce (low difficulty, should find quickly)
+                                                          // Brute-force a valid nonce (low difficulty, should find quickly)
         let mut nonce = 0u64;
         loop {
             if challenge.verify(nonce) {
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn pow_challenge_invalid_nonce() {
         let challenge = PowChallenge::new([0xAB; 32], 32); // very high difficulty
-        // A random nonce is extremely unlikely to have 32 leading zero bits
+                                                           // A random nonce is extremely unlikely to have 32 leading zero bits
         assert!(!challenge.verify(12345));
     }
 
@@ -368,8 +368,8 @@ mod tests {
     fn subnet_diversity_counts_distinct() {
         let ips = vec![
             IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
-            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)),   // same /16
-            IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)),   // different /16
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)), // same /16
+            IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)), // different /16
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), // different /16
         ];
         assert_eq!(subnet_diversity(&ips), 3); // 10.0, 10.1, 192.168
@@ -399,7 +399,11 @@ mod tests {
         let mut allowed = 0;
         let mut denied = 0;
         for _ in 0..20 {
-            if rl.try_consume() { allowed += 1; } else { denied += 1; }
+            if rl.try_consume() {
+                allowed += 1;
+            } else {
+                denied += 1;
+            }
         }
         assert_eq!(allowed, 5);
         assert_eq!(denied, 15);

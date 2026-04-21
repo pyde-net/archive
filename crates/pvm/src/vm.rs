@@ -528,39 +528,47 @@ impl Vm {
             Opcode::Add => {
                 let a = self.cpu.read_gp(d.rs1);
                 let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
-                self.cpu.write_gp(d.rd, a.checked_add(b).ok_or(Trap::Overflow)?);
+                self.cpu
+                    .write_gp(d.rd, a.checked_add(b).ok_or(Trap::Overflow)?);
                 self.pc += 4;
             }
             Opcode::Sub => {
                 let a = self.cpu.read_gp(d.rs1);
                 let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
-                self.cpu.write_gp(d.rd, a.checked_sub(b).ok_or(Trap::Underflow)?);
+                self.cpu
+                    .write_gp(d.rd, a.checked_sub(b).ok_or(Trap::Underflow)?);
                 self.pc += 4;
             }
             Opcode::Mul => {
                 let a = self.cpu.read_gp(d.rs1);
                 let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
-                self.cpu.write_gp(d.rd, a.checked_mul(b).ok_or(Trap::Overflow)?);
+                self.cpu
+                    .write_gp(d.rd, a.checked_mul(b).ok_or(Trap::Overflow)?);
                 self.pc += 4;
             }
             Opcode::Div => {
                 let a = self.cpu.read_gp(d.rs1);
                 let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
-                if b == 0 { return Err(Trap::DivisionByZero); }
+                if b == 0 {
+                    return Err(Trap::DivisionByZero);
+                }
                 self.cpu.write_gp(d.rd, a / b);
                 self.pc += 4;
             }
             Opcode::Mod => {
                 let a = self.cpu.read_gp(d.rs1);
                 let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
-                if b == 0 { return Err(Trap::DivisionByZero); }
+                if b == 0 {
+                    return Err(Trap::DivisionByZero);
+                }
                 self.cpu.write_gp(d.rd, a % b);
                 self.pc += 4;
             }
             Opcode::Addi => {
                 let a = self.cpu.read_gp(d.rs1);
                 let imm = sign_extend_18(d.rs2_or_imm) as i64;
-                self.cpu.write_gp(d.rd, ((a as i64).wrapping_add(imm)) as u64);
+                self.cpu
+                    .write_gp(d.rd, ((a as i64).wrapping_add(imm)) as u64);
                 self.pc += 4;
             }
             Opcode::And => {
@@ -601,7 +609,18 @@ impl Vm {
             Opcode::Sar => {
                 let a = self.cpu.read_gp(d.rs1) as i64;
                 let b = self.cpu.read_gp((d.rs2_or_imm & 0xF) as u8);
-                self.cpu.write_gp(d.rd, if b >= 64 { if a < 0 { u64::MAX } else { 0 } } else { (a >> b) as u64 });
+                self.cpu.write_gp(
+                    d.rd,
+                    if b >= 64 {
+                        if a < 0 {
+                            u64::MAX
+                        } else {
+                            0
+                        }
+                    } else {
+                        (a >> b) as u64
+                    },
+                );
                 self.pc += 4;
             }
             Opcode::Lt => {
@@ -636,10 +655,21 @@ impl Vm {
             }
 
             // --- Wide ops: delegate to cpu (pre-decoded, no re-encode) ---
-            Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv
-            | Opcode::Wmod | Opcode::Wand | Opcode::Wor | Opcode::Wxor
-            | Opcode::Wnot | Opcode::Wshift | Opcode::Wmov | Opcode::Narrow
-            | Opcode::Widen | Opcode::Weq | Opcode::Wlt => {
+            Opcode::Wadd
+            | Opcode::Wsub
+            | Opcode::Wmul
+            | Opcode::Wdiv
+            | Opcode::Wmod
+            | Opcode::Wand
+            | Opcode::Wor
+            | Opcode::Wxor
+            | Opcode::Wnot
+            | Opcode::Wshift
+            | Opcode::Wmov
+            | Opcode::Narrow
+            | Opcode::Widen
+            | Opcode::Weq
+            | Opcode::Wlt => {
                 let instr = crate::isa::encode(d.opcode, d.rd, d.rs1, d.rs2_or_imm);
                 self.cpu.exec_wide(instr)?;
                 self.pc += 4;
@@ -695,7 +725,8 @@ impl Vm {
                 let offset = sign_extend_18(d.rs2_or_imm) as i64;
                 let addr = safe_addr(base, offset)?;
                 let bytes = self.memory.load256(addr).map_err(|_| Trap::MemoryFault)?;
-                self.cpu.write_wide_checked(d.rd, U256::from_le_bytes(bytes))?;
+                self.cpu
+                    .write_wide_checked(d.rd, U256::from_le_bytes(bytes))?;
                 self.pc += 4;
             }
             Opcode::Wstore => {
@@ -797,7 +828,8 @@ impl Vm {
                     .map_err(|_| Trap::MemoryFault)?;
                 let hash = pyde_crypto::poseidon2::poseidon2_hash(&data);
                 let hash_bytes: [u8; 32] = hash.to_bytes();
-                self.cpu.write_wide_checked(d.rd, U256::from_le_bytes(hash_bytes))?;
+                self.cpu
+                    .write_wide_checked(d.rd, U256::from_le_bytes(hash_bytes))?;
                 self.pc += 4;
             }
             // --- Storage instructions ---
@@ -1129,13 +1161,17 @@ impl Vm {
                         // Wide/blob return: write return_data to parent heap (r12),
                         // set r1 = heap ptr, r2 = length. Caller reads via Wload/memory.
                         let heap = self.cpu.read_gp(12) as u32;
-                        if self.memory.checked_write_slice(heap, &result.return_data).is_ok() {
+                        if self
+                            .memory
+                            .checked_write_slice(heap, &result.return_data)
+                            .is_ok()
+                        {
                             self.cpu.write_gp(1, heap as u64);
                             self.cpu.write_gp(2, result.return_data.len() as u64);
                         } else {
                             // Write failed (OOB) — fall back to GP convention
                             let val = u64::from_le_bytes(
-                                result.return_data[..8].try_into().unwrap_or([0; 8])
+                                result.return_data[..8].try_into().unwrap_or([0; 8]),
                             );
                             self.cpu.write_gp(1, val);
                             self.cpu.write_gp(2, 0);
@@ -1163,7 +1199,11 @@ impl Vm {
                 if result.success && !result.return_data.is_empty() {
                     if result.return_data.len() > 8 {
                         let heap = self.cpu.read_gp(12) as u32;
-                        if self.memory.checked_write_slice(heap, &result.return_data).is_ok() {
+                        if self
+                            .memory
+                            .checked_write_slice(heap, &result.return_data)
+                            .is_ok()
+                        {
                             self.cpu.write_gp(1, heap as u64);
                             self.cpu.write_gp(2, result.return_data.len() as u64);
                         } else {
@@ -1236,7 +1276,8 @@ impl Vm {
                     if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                         return Err(Trap::OutOfGas);
                     }
-                    let data = self.memory
+                    let data = self
+                        .memory
                         .checked_read_slice(src_ptr, len)
                         .map_err(|_| Trap::MemoryFault)?;
                     self.memory
@@ -1260,15 +1301,18 @@ impl Vm {
                 let desc_ptr = self.cpu.read_gp(d.rs1) as u32;
 
                 // Read root (32 bytes)
-                let root_bytes = self.memory
+                let root_bytes = self
+                    .memory
                     .checked_read_slice(desc_ptr, 32)
                     .map_err(|_| Trap::MemoryFault)?;
                 // Read leaf (32 bytes)
-                let leaf_bytes = self.memory
+                let leaf_bytes = self
+                    .memory
                     .checked_read_slice(desc_ptr.wrapping_add(32), 32)
                     .map_err(|_| Trap::MemoryFault)?;
                 // Read proof length (number of siblings)
-                let proof_len = self.memory
+                let proof_len = self
+                    .memory
                     .load64(desc_ptr.wrapping_add(64))
                     .map_err(|_| Trap::MemoryFault)? as usize;
 
@@ -1296,7 +1340,8 @@ impl Vm {
                     let sib_offset = desc_ptr
                         .checked_add(72 + (i as u32) * 32)
                         .ok_or(Trap::MemoryFault)?;
-                    let sib_bytes = self.memory
+                    let sib_bytes = self
+                        .memory
                         .checked_read_slice(sib_offset, 32)
                         .map_err(|_| Trap::MemoryFault)?;
                     let sibling = pyde_crypto::hash::Hash256::from_slice(&sib_bytes);
@@ -1416,7 +1461,10 @@ impl Vm {
 
     /// Execute a single decoded instruction (for AOT host delegation).
     /// Temporarily injects the instruction at pc=0 and runs one step.
-    pub fn exec_single(&mut self, d: crate::isa::DecodedInstruction) -> Result<Option<ExecResult>, Trap> {
+    pub fn exec_single(
+        &mut self,
+        d: crate::isa::DecodedInstruction,
+    ) -> Result<Option<ExecResult>, Trap> {
         let saved_pc = self.pc;
         let saved_cache = std::mem::take(&mut self.decoded_cache);
         self.decoded_cache = vec![d];
@@ -1543,7 +1591,11 @@ impl Vm {
         } else {
             // r8 holds the call value if bit 13 of immediate is set (convention from codegen)
             let has_value = (d.rs2_or_imm >> 13) & 1 == 1;
-            let cv = if has_value { U256::from(self.cpu.read_gp(8)) } else { U256::ZERO };
+            let cv = if has_value {
+                U256::from(self.cpu.read_gp(8))
+            } else {
+                U256::ZERO
+            };
 
             // Transfer value: debit caller, credit callee
             let mut balances = self.ctx.balances.clone();
@@ -1713,12 +1765,8 @@ impl Vm {
         // Constructor runs in a child VM. Runtime is deployed.
         // If no valid header, use init_code as both constructor and runtime (legacy).
         let (constructor, runtime, constructor_args) = if init_code.len() >= 8 {
-            let clen = u32::from_le_bytes(
-                init_code[..4].try_into().unwrap_or([0; 4])
-            ) as usize;
-            let rlen = u32::from_le_bytes(
-                init_code[4..8].try_into().unwrap_or([0; 4])
-            ) as usize;
+            let clen = u32::from_le_bytes(init_code[..4].try_into().unwrap_or([0; 4])) as usize;
+            let rlen = u32::from_le_bytes(init_code[4..8].try_into().unwrap_or([0; 4])) as usize;
             if clen > 0 && rlen > 0 && 8 + clen + rlen <= init_code.len() {
                 let c = init_code[8..8 + clen].to_vec();
                 let r = init_code[8 + clen..8 + clen + rlen].to_vec();
@@ -1780,7 +1828,9 @@ impl Vm {
             child.warm_storage_keys = self.warm_storage_keys.clone();
             child.ext_call_depth = self.ext_call_depth + 1;
             child.calldata = constructor_args;
-            child.load(constructor_code).map_err(|_| Trap::MemoryFault)?;
+            child
+                .load(constructor_code)
+                .map_err(|_| Trap::MemoryFault)?;
 
             let output = child.execute();
             self.gas_used_total += output.gas_used;
@@ -1858,7 +1908,9 @@ mod tests {
     }
 
     fn instr_ri(op: Opcode, rd: u8, rs1: u8, imm: i32) -> [u8; 4] {
-        encode(op, rd, rs1, encode_immediate(imm).unwrap()).0.to_le_bytes()
+        encode(op, rd, rs1, encode_immediate(imm).unwrap())
+            .0
+            .to_le_bytes()
     }
 
     /// Helper: encode a LOAD/STORE instruction with width and offset.

@@ -62,58 +62,58 @@ pub enum TokenKind {
     As,
     Break,
     Continue,
-    SelfKw,    // `self`
-    TypeKw,    // `type` alias
+    SelfKw, // `self`
+    TypeKw, // `type` alias
 
     // === Attributes ===
     /// `#[...]` attribute (the content is stored as string)
     Attribute(String),
 
     // === Arithmetic operators ===
-    Plus,       // +   addition
-    Minus,      // -   subtraction / unary negation
-    Star,       // *   multiplication
-    Slash,      // /   division
-    Percent,    // %   modulo
+    Plus,    // +   addition
+    Minus,   // -   subtraction / unary negation
+    Star,    // *   multiplication
+    Slash,   // /   division
+    Percent, // %   modulo
 
     // === Bitwise operators ===
-    Amp,        // &   bitwise AND
-    Pipe,       // |   bitwise OR
-    Caret,      // ^   bitwise XOR
-    Tilde,      // ~   bitwise NOT (complement)
+    Amp,   // &   bitwise AND
+    Pipe,  // |   bitwise OR
+    Caret, // ^   bitwise XOR
+    Tilde, // ~   bitwise NOT (complement)
 
     // === Logical operators ===
-    AmpAmp,     // &&  logical AND (short-circuit)
-    PipePipe,   // ||  logical OR (short-circuit)
-    Bang,       // !   logical NOT
+    AmpAmp,   // &&  logical AND (short-circuit)
+    PipePipe, // ||  logical OR (short-circuit)
+    Bang,     // !   logical NOT
 
     // === Comparison operators ===
-    EqEq,       // ==  equal
-    BangEq,     // !=  not equal
-    Lt,         // <   less than
-    Gt,         // >   greater than
-    LtEq,       // <=  less than or equal
-    GtEq,       // >=  greater than or equal
+    EqEq,   // ==  equal
+    BangEq, // !=  not equal
+    Lt,     // <   less than
+    Gt,     // >   greater than
+    LtEq,   // <=  less than or equal
+    GtEq,   // >=  greater than or equal
 
     // === Shift operators ===
-    Shl,        // <<  shift left
-    Shr,        // >>  shift right
+    Shl, // <<  shift left
+    Shr, // >>  shift right
 
     // === Assignment operators ===
-    Eq,         // =   assign
-    PlusEq,     // +=  add-assign
-    MinusEq,    // -=  subtract-assign
-    StarEq,     // *=  multiply-assign
-    SlashEq,    // /=  divide-assign
-    PercentEq,  // %=  modulo-assign
-    AmpEq,      // &=  bitwise AND-assign
-    PipeEq,     // |=  bitwise OR-assign
-    CaretEq,    // ^=  bitwise XOR-assign
-    ShlEq,      // <<= shift-left-assign
-    ShrEq,      // >>= shift-right-assign
+    Eq,        // =   assign
+    PlusEq,    // +=  add-assign
+    MinusEq,   // -=  subtract-assign
+    StarEq,    // *=  multiply-assign
+    SlashEq,   // /=  divide-assign
+    PercentEq, // %=  modulo-assign
+    AmpEq,     // &=  bitwise AND-assign
+    PipeEq,    // |=  bitwise OR-assign
+    CaretEq,   // ^=  bitwise XOR-assign
+    ShlEq,     // <<= shift-left-assign
+    ShrEq,     // >>= shift-right-assign
 
     // === Range operator ===
-    DotDot,     // ..  range
+    DotDot, // ..  range
 
     // === Punctuation ===
     LBrace,     // {
@@ -182,14 +182,36 @@ impl TokenKind {
     pub fn is_keyword(&self) -> bool {
         matches!(
             self,
-            TokenKind::Contract | TokenKind::Storage | TokenKind::Struct
-            | TokenKind::Interface | TokenKind::Event | TokenKind::Error
-            | TokenKind::Enum | TokenKind::Const | TokenKind::Fn | TokenKind::Pub
-            | TokenKind::Let | TokenKind::Mut | TokenKind::If | TokenKind::Else
-            | TokenKind::For | TokenKind::While | TokenKind::Match | TokenKind::Return
-            | TokenKind::Emit | TokenKind::Try | TokenKind::Use | TokenKind::Module
-            | TokenKind::In | TokenKind::As | TokenKind::Break | TokenKind::Continue
-            | TokenKind::SelfKw | TokenKind::TypeKw | TokenKind::True | TokenKind::False
+            TokenKind::Contract
+                | TokenKind::Storage
+                | TokenKind::Struct
+                | TokenKind::Interface
+                | TokenKind::Event
+                | TokenKind::Error
+                | TokenKind::Enum
+                | TokenKind::Const
+                | TokenKind::Fn
+                | TokenKind::Pub
+                | TokenKind::Let
+                | TokenKind::Mut
+                | TokenKind::If
+                | TokenKind::Else
+                | TokenKind::For
+                | TokenKind::While
+                | TokenKind::Match
+                | TokenKind::Return
+                | TokenKind::Emit
+                | TokenKind::Try
+                | TokenKind::Use
+                | TokenKind::Module
+                | TokenKind::In
+                | TokenKind::As
+                | TokenKind::Break
+                | TokenKind::Continue
+                | TokenKind::SelfKw
+                | TokenKind::TypeKw
+                | TokenKind::True
+                | TokenKind::False
         )
     }
 
@@ -197,8 +219,10 @@ impl TokenKind {
     pub fn is_literal(&self) -> bool {
         matches!(
             self,
-            TokenKind::IntLiteral(_) | TokenKind::StringLiteral(_)
-            | TokenKind::True | TokenKind::False
+            TokenKind::IntLiteral(_)
+                | TokenKind::StringLiteral(_)
+                | TokenKind::True
+                | TokenKind::False
         )
     }
 
@@ -206,15 +230,38 @@ impl TokenKind {
     pub fn is_operator(&self) -> bool {
         matches!(
             self,
-            TokenKind::Plus | TokenKind::Minus | TokenKind::Star | TokenKind::Slash
-            | TokenKind::Percent | TokenKind::Amp | TokenKind::Pipe | TokenKind::Caret
-            | TokenKind::Tilde | TokenKind::AmpAmp | TokenKind::PipePipe | TokenKind::Bang
-            | TokenKind::EqEq | TokenKind::BangEq | TokenKind::Lt | TokenKind::Gt
-            | TokenKind::LtEq | TokenKind::GtEq | TokenKind::Shl | TokenKind::Shr
-            | TokenKind::Eq | TokenKind::PlusEq | TokenKind::MinusEq | TokenKind::StarEq
-            | TokenKind::SlashEq | TokenKind::PercentEq | TokenKind::AmpEq
-            | TokenKind::PipeEq | TokenKind::CaretEq | TokenKind::ShlEq
-            | TokenKind::ShrEq | TokenKind::DotDot
+            TokenKind::Plus
+                | TokenKind::Minus
+                | TokenKind::Star
+                | TokenKind::Slash
+                | TokenKind::Percent
+                | TokenKind::Amp
+                | TokenKind::Pipe
+                | TokenKind::Caret
+                | TokenKind::Tilde
+                | TokenKind::AmpAmp
+                | TokenKind::PipePipe
+                | TokenKind::Bang
+                | TokenKind::EqEq
+                | TokenKind::BangEq
+                | TokenKind::Lt
+                | TokenKind::Gt
+                | TokenKind::LtEq
+                | TokenKind::GtEq
+                | TokenKind::Shl
+                | TokenKind::Shr
+                | TokenKind::Eq
+                | TokenKind::PlusEq
+                | TokenKind::MinusEq
+                | TokenKind::StarEq
+                | TokenKind::SlashEq
+                | TokenKind::PercentEq
+                | TokenKind::AmpEq
+                | TokenKind::PipeEq
+                | TokenKind::CaretEq
+                | TokenKind::ShlEq
+                | TokenKind::ShrEq
+                | TokenKind::DotDot
         )
     }
 
@@ -222,10 +269,17 @@ impl TokenKind {
     pub fn is_assignment(&self) -> bool {
         matches!(
             self,
-            TokenKind::Eq | TokenKind::PlusEq | TokenKind::MinusEq | TokenKind::StarEq
-            | TokenKind::SlashEq | TokenKind::PercentEq | TokenKind::AmpEq
-            | TokenKind::PipeEq | TokenKind::CaretEq | TokenKind::ShlEq
-            | TokenKind::ShrEq
+            TokenKind::Eq
+                | TokenKind::PlusEq
+                | TokenKind::MinusEq
+                | TokenKind::StarEq
+                | TokenKind::SlashEq
+                | TokenKind::PercentEq
+                | TokenKind::AmpEq
+                | TokenKind::PipeEq
+                | TokenKind::CaretEq
+                | TokenKind::ShlEq
+                | TokenKind::ShrEq
         )
     }
 
@@ -233,11 +287,22 @@ impl TokenKind {
     pub fn is_punctuation(&self) -> bool {
         matches!(
             self,
-            TokenKind::LBrace | TokenKind::RBrace | TokenKind::LParen | TokenKind::RParen
-            | TokenKind::LBracket | TokenKind::RBracket | TokenKind::Comma
-            | TokenKind::Semicolon | TokenKind::Colon | TokenKind::ColonColon
-            | TokenKind::Dot | TokenKind::Arrow | TokenKind::FatArrow
-            | TokenKind::Hash | TokenKind::Underscore | TokenKind::Question
+            TokenKind::LBrace
+                | TokenKind::RBrace
+                | TokenKind::LParen
+                | TokenKind::RParen
+                | TokenKind::LBracket
+                | TokenKind::RBracket
+                | TokenKind::Comma
+                | TokenKind::Semicolon
+                | TokenKind::Colon
+                | TokenKind::ColonColon
+                | TokenKind::Dot
+                | TokenKind::Arrow
+                | TokenKind::FatArrow
+                | TokenKind::Hash
+                | TokenKind::Underscore
+                | TokenKind::Question
         )
     }
 

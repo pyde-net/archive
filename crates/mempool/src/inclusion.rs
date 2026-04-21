@@ -179,11 +179,15 @@ mod tests {
         let t1 = make_tx(&pk, 0xAA, 21_000);
         let t2 = make_tx(&pk, 0xBB, 21_000);
         let view = vec![(&t1, 5u64), (&t2, 5u64)];
-        let block_hashes: HashSet<[u8; 32]> =
-            [t1.hash(), t2.hash()].into_iter().collect();
+        let block_hashes: HashSet<[u8; 32]> = [t1.hash(), t2.hash()].into_iter().collect();
 
         let result = audit_inclusion(
-            view, &block_hashes, 42_000, /* slot */ 10, GRACE, GAS_CEILING,
+            view,
+            &block_hashes,
+            42_000,
+            /* slot */ 10,
+            GRACE,
+            GAS_CEILING,
         );
         assert!(result.is_clean());
     }
@@ -198,9 +202,7 @@ mod tests {
 
         // current_slot=10, first_seen=5, age=5 > grace=2 → aged
         // block_encrypted_gas=21_000 → gas_remaining=GAS_CEILING-21_000 (plenty)
-        let result = audit_inclusion(
-            view, &block_hashes, 21_000, 10, GRACE, GAS_CEILING,
-        );
+        let result = audit_inclusion(view, &block_hashes, 21_000, 10, GRACE, GAS_CEILING);
         assert!(!result.is_clean());
         assert_eq!(result.missing_older_than_grace, vec![censored.hash()]);
     }
@@ -227,8 +229,12 @@ mod tests {
         // Block's existing encrypted gas = ceiling - 10K → gas_remaining = 10K.
         // excluded.gas_limit = 50K > 10K, so exclusion is legitimate.
         let result = audit_inclusion(
-            view, &block_hashes,
-            GAS_CEILING - 10_000, 10, GRACE, GAS_CEILING,
+            view,
+            &block_hashes,
+            GAS_CEILING - 10_000,
+            10,
+            GRACE,
+            GAS_CEILING,
         );
         assert!(result.is_clean());
     }
@@ -251,8 +257,12 @@ mod tests {
         let block_hashes: HashSet<[u8; 32]> = HashSet::new();
 
         let result = audit_inclusion(
-            view, &block_hashes,
-            GAS_CEILING - 21_000, 10, GRACE, GAS_CEILING,
+            view,
+            &block_hashes,
+            GAS_CEILING - 21_000,
+            10,
+            GRACE,
+            GAS_CEILING,
         );
         assert_eq!(result.missing_older_than_grace, vec![boundary.hash()]);
     }

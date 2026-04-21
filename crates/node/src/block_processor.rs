@@ -73,22 +73,31 @@ impl BlockProcessor {
         let txs = &block.body.transactions;
         if chain.chain_id != 31337 && !txs.is_empty() {
             use rayon::prelude::*;
-            let sig_results: Vec<bool> = txs.par_iter().map(|tx| {
-                if tx.signature.is_empty() { return true; } // unsigned = skip (validated later)
-                let sender_key = pyde_state::keys::balance_key(&tx.from);
-                if let Some(acct_bytes) = state.get(&sender_key) {
-                    if let Some(acct) = pyde_account::types::Account::from_bytes(&acct_bytes) {
-                        if let pyde_account::types::AuthKeys::Single(ref pk) = acct.auth_keys {
-                            return tx.verify_signature(pk);
+            let sig_results: Vec<bool> = txs
+                .par_iter()
+                .map(|tx| {
+                    if tx.signature.is_empty() {
+                        return true;
+                    } // unsigned = skip (validated later)
+                    let sender_key = pyde_state::keys::balance_key(&tx.from);
+                    if let Some(acct_bytes) = state.get(&sender_key) {
+                        if let Some(acct) = pyde_account::types::Account::from_bytes(&acct_bytes) {
+                            if let pyde_account::types::AuthKeys::Single(ref pk) = acct.auth_keys {
+                                return tx.verify_signature(pk);
+                            }
                         }
                     }
-                }
-                true // no auth keys = system account, skip
-            }).collect();
+                    true // no auth keys = system account, skip
+                })
+                .collect();
             // Mark invalid signatures (they'll be rejected during execution)
             let invalid_count = sig_results.iter().filter(|&&ok| !ok).count();
             if invalid_count > 0 {
-                debug!(slot, invalid_sigs = invalid_count, "batch signature verification found invalid signatures");
+                debug!(
+                    slot,
+                    invalid_sigs = invalid_count,
+                    "batch signature verification found invalid signatures"
+                );
             }
         }
 
@@ -99,25 +108,28 @@ impl BlockProcessor {
         let mut total_gas = 0u64;
 
         // Helper: trigger background AOT compilation for contract calls
-        let trigger_aot = |tx: &pyde_tx::types::Transaction, state: &StateManager, cache: &Option<&std::sync::Arc<crate::aot_cache::AotCache>>| {
-            if let Some(cache) = cache {
-                // Only for contract calls (not deploys, not transfers)
-                if tx.tx_type == pyde_tx::types::TransactionType::Standard
-                    && tx.to != pyde_account::address::ZERO_ADDRESS
-                    && !cache.is_known(&tx.to)
-                {
-                    // Load bytecode and trigger background compilation
-                    let code_key = pyde_state::keys::code_key(&tx.to);
-                    if let Some(bytecode) = state.get(&code_key) {
-                        crate::aot_cache::compile_in_background(
-                            std::sync::Arc::clone(cache),
-                            tx.to,
-                            bytecode,
-                        );
+        let trigger_aot =
+            |tx: &pyde_tx::types::Transaction,
+             state: &StateManager,
+             cache: &Option<&std::sync::Arc<crate::aot_cache::AotCache>>| {
+                if let Some(cache) = cache {
+                    // Only for contract calls (not deploys, not transfers)
+                    if tx.tx_type == pyde_tx::types::TransactionType::Standard
+                        && tx.to != pyde_account::address::ZERO_ADDRESS
+                        && !cache.is_known(&tx.to)
+                    {
+                        // Load bytecode and trigger background compilation
+                        let code_key = pyde_state::keys::code_key(&tx.to);
+                        if let Some(bytecode) = state.get(&code_key) {
+                            crate::aot_cache::compile_in_background(
+                                std::sync::Arc::clone(cache),
+                                tx.to,
+                                bytecode,
+                            );
+                        }
                     }
                 }
-            }
-        };
+            };
 
         if groups.len() <= 1 {
             // Single group — execute sequentially but through StateOverlay
@@ -127,24 +139,43 @@ impl BlockProcessor {
             let mut overlay = StateOverlay::new(state as &dyn pyde_state::smt::StateAccess);
             for (i, tx) in txs.iter().enumerate() {
                 trigger_aot(tx, state, &aot_cache);
-                let aot_fn = aot_cache.as_ref()
+                let aot_fn = aot_cache
+                    .as_ref()
                     .filter(|c| !c.is_blacklisted(&tx.to))
                     .and_then(|c| c.get(&tx.to))
                     .map(|compiled| compiled.as_fn());
-                match pyde_tx::pipeline::execute_transaction_aot(tx, &mut overlay, &block_ctx, aot_fn) {
+                match pyde_tx::pipeline::execute_transaction_aot(
+                    tx,
+                    &mut overlay,
+                    &block_ctx,
+                    aot_fn,
+                ) {
                     Ok(receipt) => {
                         total_gas += receipt.effective_gas;
-                        debug!(slot, tx_index = i, gas = receipt.effective_gas, success = receipt.success, "tx executed");
+                        debug!(
+                            slot,
+                            tx_index = i,
+                            gas = receipt.effective_gas,
+                            success = receipt.success,
+                            "tx executed"
+                        );
                         receipts.push(receipt);
                     }
                     Err(e) => {
                         warn!(slot, tx_index = i, error = ?e, "tx execution failed");
                         let failed_receipt = pyde_tx::execution::Receipt {
-                            tx_hash: tx.hash(), success: false,
-                            gas_used: 0, gas_refund: 0, effective_gas: 0,
-                            fee_paid: 0, fee_burned: 0, fee_validator: 0, fee_treasury: 0,
+                            tx_hash: tx.hash(),
+                            success: false,
+                            gas_used: 0,
+                            gas_refund: 0,
+                            effective_gas: 0,
+                            fee_paid: 0,
+                            fee_burned: 0,
+                            fee_validator: 0,
+                            fee_treasury: 0,
                             return_data: format!("{:?}", e).into_bytes(),
-                            logs: vec![], state_root: sparse_merkle_tree::H256::zero(),
+                            logs: vec![],
+                            state_root: sparse_merkle_tree::H256::zero(),
                         };
                         receipts.push(failed_receipt);
                     }
@@ -160,37 +191,54 @@ impl BlockProcessor {
             // Each group gets a StateOverlay (reads from shared SMT, writes to local HashMap).
             // Groups run on separate rayon threads. After all groups complete, all writes
             // are merged into the main SMT via update_batch().
-            use rayon::prelude::*;
             use pyde_state::smt::StateOverlay;
+            use rayon::prelude::*;
 
             // Use StateManager as overlay base (reads from cache → SMT)
             let base: &dyn pyde_state::smt::StateAccess = state;
 
             // Execute each group in parallel
-            let group_results: Vec<Vec<(usize, Receipt, Vec<(sparse_merkle_tree::H256, Vec<u8>)>)>> = groups
+            let group_results: Vec<
+                Vec<(usize, Receipt, Vec<(sparse_merkle_tree::H256, Vec<u8>)>)>,
+            > = groups
                 .par_iter()
                 .map(|group| {
                     let mut overlay = StateOverlay::new(base);
                     let mut results = Vec::new();
 
                     for &tx_idx in &group.tx_indices {
-                        if tx_idx >= txs.len() { continue; }
+                        if tx_idx >= txs.len() {
+                            continue;
+                        }
                         let tx = &txs[tx_idx];
-                        let aot_fn = aot_cache.as_ref()
+                        let aot_fn = aot_cache
+                            .as_ref()
                             .filter(|c| !c.is_blacklisted(&tx.to))
                             .and_then(|c| c.get(&tx.to))
                             .map(|compiled| compiled.as_fn());
-                        match pyde_tx::pipeline::execute_transaction_aot(tx, &mut overlay, &block_ctx, aot_fn) {
+                        match pyde_tx::pipeline::execute_transaction_aot(
+                            tx,
+                            &mut overlay,
+                            &block_ctx,
+                            aot_fn,
+                        ) {
                             Ok(receipt) => {
                                 results.push((tx_idx, receipt, vec![]));
                             }
                             Err(e) => {
                                 let failed = pyde_tx::execution::Receipt {
-                                    tx_hash: tx.hash(), success: false,
-                                    gas_used: 0, gas_refund: 0, effective_gas: 0,
-                                    fee_paid: 0, fee_burned: 0, fee_validator: 0, fee_treasury: 0,
+                                    tx_hash: tx.hash(),
+                                    success: false,
+                                    gas_used: 0,
+                                    gas_refund: 0,
+                                    effective_gas: 0,
+                                    fee_paid: 0,
+                                    fee_burned: 0,
+                                    fee_validator: 0,
+                                    fee_treasury: 0,
                                     return_data: format!("{:?}", e).into_bytes(),
-                                    logs: vec![], state_root: sparse_merkle_tree::H256::zero(),
+                                    logs: vec![],
+                                    state_root: sparse_merkle_tree::H256::zero(),
                                 };
                                 results.push((tx_idx, failed, vec![]));
                             }
@@ -297,10 +345,7 @@ impl BlockProcessor {
 
             // Update circulating-supply counter. Read-modify-write.
             let current_supply = pyde_tx::pipeline::read_total_supply(state);
-            pyde_tx::pipeline::write_total_supply(
-                state,
-                current_supply.saturating_add(total_mint),
-            );
+            pyde_tx::pipeline::write_total_supply(state, current_supply.saturating_add(total_mint));
         }
 
         // 4c. Validator bootstrap subsidy (slice 4.4a).
@@ -339,10 +384,7 @@ impl BlockProcessor {
         let block_burn: u128 = receipts.iter().map(|r| r.fee_burned).sum();
         if block_burn > 0 {
             let current_burned = pyde_tx::pipeline::read_total_burned(state);
-            pyde_tx::pipeline::write_total_burned(
-                state,
-                current_burned.saturating_add(block_burn),
-            );
+            pyde_tx::pipeline::write_total_burned(state, current_burned.saturating_add(block_burn));
         }
 
         // 5. Merkle commit is handled by the CALLER (node event loop).
@@ -436,13 +478,12 @@ impl BlockProcessor {
                 ));
             }
         }
-        if !chain.is_genesis()
-            && header.slot <= chain.head_slot {
-                return Err(format!(
-                    "block slot {} is not ahead of head {}",
-                    header.slot, chain.head_slot
-                ));
-            }
+        if !chain.is_genesis() && header.slot <= chain.head_slot {
+            return Err(format!(
+                "block slot {} is not ahead of head {}",
+                header.slot, chain.head_slot
+            ));
+        }
         Ok(())
     }
 
@@ -495,8 +536,9 @@ impl BlockProcessor {
             let vrf_output_bytes = &header.vrf_proof[..32];
             let vrf_proof_bytes = &header.vrf_proof[32..];
 
-            let pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(&committee_keys[proposer_idx])
-                .ok_or("invalid committee public key for VRF verification")?;
+            let pk =
+                pyde_crypto::falcon::FalconPublicKey::from_bytes(&committee_keys[proposer_idx])
+                    .ok_or("invalid committee public key for VRF verification")?;
             let vrf_output = pyde_crypto::vrf::VrfOutput::from_hash_bytes(vrf_output_bytes);
             let vrf_proof = pyde_crypto::vrf::VrfProof::from_bytes(vrf_proof_bytes);
 
@@ -594,7 +636,8 @@ impl BlockProcessor {
         if total_gas > pyde_tx::fee::GAS_CEILING {
             return Err(format!(
                 "block gas {} exceeds ceiling {}",
-                total_gas, pyde_tx::fee::GAS_CEILING
+                total_gas,
+                pyde_tx::fee::GAS_CEILING
             ));
         }
 
@@ -611,10 +654,7 @@ impl BlockProcessor {
                         match &acct.auth_keys {
                             pyde_account::types::AuthKeys::Single(pk) => {
                                 if !tx.verify_signature(pk) {
-                                    return Err(format!(
-                                        "tx {} has invalid signature",
-                                        i
-                                    ));
+                                    return Err(format!("tx {} has invalid signature", i));
                                 }
                             }
                             pyde_account::types::AuthKeys::None => {
@@ -658,15 +698,8 @@ pub fn verify_decryptor_against_committed_root(
     block_plaintext_txs: &[Transaction],
     decryptor_encrypted_txs: &[pyde_mempool::encrypted::EncryptedTx],
 ) -> bool {
-    let enc_hashes: Vec<[u8; 32]> = decryptor_encrypted_txs
-        .iter()
-        .map(|e| e.hash())
-        .collect();
-    pyde_consensus::block::verify_tx_root(
-        committed_tx_root,
-        block_plaintext_txs,
-        &enc_hashes,
-    )
+    let enc_hashes: Vec<[u8; 32]> = decryptor_encrypted_txs.iter().map(|e| e.hash()).collect();
+    pyde_consensus::block::verify_tx_root(committed_tx_root, block_plaintext_txs, &enc_hashes)
 }
 
 /// Full decrypt + execute flow with MEV tx_root check.
@@ -729,7 +762,8 @@ pub fn try_decrypt_and_execute(
     let mut verified_enc_indices: Vec<usize> = Vec::with_capacity(decryptor.encrypted_txs.len());
     for (i, etx) in decryptor.encrypted_txs.iter().enumerate() {
         let sender_key = pyde_state::keys::balance_key(&etx.sender);
-        let sender_pk: Option<Vec<u8>> = state.get(&sender_key)
+        let sender_pk: Option<Vec<u8>> = state
+            .get(&sender_key)
             .and_then(|bytes| pyde_account::types::Account::from_bytes(&bytes))
             .and_then(|acct| match acct.auth_keys {
                 pyde_account::types::AuthKeys::Single(pk) => Some(pk),
@@ -798,7 +832,7 @@ pub fn try_decrypt_and_execute(
 mod tests {
     use super::*;
     use crate::chain::ChainState;
-    use crate::genesis::{initialize_genesis, devnet_genesis};
+    use crate::genesis::{devnet_genesis, initialize_genesis};
     use crate::state_manager::StateManager;
     use pyde_account::address::ZERO_ADDRESS;
     use pyde_consensus::block::{BlockBody, QuorumCert};
@@ -904,7 +938,10 @@ mod tests {
             body: BlockBody {
                 transactions: vec![tx],
                 encrypted_txs: vec![],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 1 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 1,
+                },
             },
             proposer_signature: vec![],
         };
@@ -917,7 +954,7 @@ mod tests {
         // but the block still processes — failed txs are skipped gracefully.
         // In production, genesis accounts need auth_keys set for real tx execution.
         assert_eq!(receipts.len(), 1); // failed tx now produces a failed receipt
-        assert!(!receipts[0].success);  // receipt marks failure
+        assert!(!receipts[0].success); // receipt marks failure
         assert_eq!(chain.head_slot, 1);
     }
 
@@ -944,7 +981,10 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -989,7 +1029,10 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -1036,7 +1079,10 @@ mod tests {
                 body: BlockBody {
                     transactions: vec![],
                     encrypted_txs: vec![],
-                    execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                    execution_schedule: ExecutionSchedule {
+                        groups: vec![],
+                        total_txs: 0,
+                    },
                 },
                 proposer_signature: vec![],
             };
@@ -1051,7 +1097,10 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -1074,7 +1123,10 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -1106,8 +1158,8 @@ mod tests {
         // is always an attempted fork).
         let chain = ChainState::genesis([0u8; 32], 31337);
         let header = dummy_header(50);
-        let err = BlockProcessor::validate_header_with_checkpoint(&header, &chain, Some(50))
-            .unwrap_err();
+        let err =
+            BlockProcessor::validate_header_with_checkpoint(&header, &chain, Some(50)).unwrap_err();
         assert!(err.contains("hard-final checkpoint"), "got: {}", err);
     }
 
@@ -1115,8 +1167,8 @@ mod tests {
     fn validate_header_rejects_block_below_checkpoint() {
         let chain = ChainState::genesis([0u8; 32], 31337);
         let header = dummy_header(49);
-        let err = BlockProcessor::validate_header_with_checkpoint(&header, &chain, Some(50))
-            .unwrap_err();
+        let err =
+            BlockProcessor::validate_header_with_checkpoint(&header, &chain, Some(50)).unwrap_err();
         assert!(err.contains("hard-final checkpoint"), "got: {}", err);
     }
 
@@ -1148,13 +1200,20 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
 
         let err = BlockProcessor::process_full_block_with_aot_and_checkpoint(
-            &mut chain, &mut state, &block, None, Some(100),
+            &mut chain,
+            &mut state,
+            &block,
+            None,
+            Some(100),
         )
         .expect_err("pre-checkpoint block must be rejected");
         assert!(err.contains("hard-final checkpoint"), "got: {}", err);
@@ -1180,7 +1239,7 @@ mod tests {
             None,
             1,
             vec![0xAA; 666],
-            &[seed; 32],        // to
+            &[seed; 32], // to
             (seed as u128) * 100,
             &[seed, seed, seed], // calldata
             &committee_pk,
@@ -1200,8 +1259,12 @@ mod tests {
 
         let enc_a = build_dummy_encrypted_tx(0xAA);
         let enc_b = build_dummy_encrypted_tx(0xBB);
-        let hash_a = pyde_mempool::encrypted::EncryptedTx::from_bytes(&enc_a).unwrap().hash();
-        let hash_b = pyde_mempool::encrypted::EncryptedTx::from_bytes(&enc_b).unwrap().hash();
+        let hash_a = pyde_mempool::encrypted::EncryptedTx::from_bytes(&enc_a)
+            .unwrap()
+            .hash();
+        let hash_b = pyde_mempool::encrypted::EncryptedTx::from_bytes(&enc_b)
+            .unwrap()
+            .hash();
 
         // Honest tx_root covers [A, B].
         let honest_root = pyde_consensus::block::compute_tx_root(&[], &[hash_a, hash_b]);
@@ -1215,7 +1278,10 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![enc_b, enc_a],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -1245,7 +1311,10 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![build_dummy_encrypted_tx(0xCC)], // surprise!
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -1260,7 +1329,9 @@ mod tests {
         let state = StateManager::open(tmp.path(), 1024).unwrap();
 
         let enc = build_dummy_encrypted_tx(0xAA);
-        let hash = pyde_mempool::encrypted::EncryptedTx::from_bytes(&enc).unwrap().hash();
+        let hash = pyde_mempool::encrypted::EncryptedTx::from_bytes(&enc)
+            .unwrap()
+            .hash();
         let tx_root = pyde_consensus::block::compute_tx_root(&[], &[hash]);
 
         let mut header = dummy_header(1);
@@ -1271,7 +1342,10 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![enc],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -1289,19 +1363,33 @@ mod tests {
     ) {
         let (pk, shares) = pyde_crypto::threshold::threshold_keygen(3, 2).unwrap();
         let enc_a = pyde_mempool::encrypted::encrypt_transaction(
-            [0xAA; 32], 0, 21_000, vec![], None, 1,
+            [0xAA; 32],
+            0,
+            21_000,
+            vec![],
+            None,
+            1,
             vec![0xAA; 666],
-            &[0x11; 32], 100,
+            &[0x11; 32],
+            100,
             &[0xAA, 0xAA],
             &pk,
-        ).unwrap();
+        )
+        .unwrap();
         let enc_b = pyde_mempool::encrypted::encrypt_transaction(
-            [0xBB; 32], 1, 21_000, vec![], None, 1,
+            [0xBB; 32],
+            1,
+            21_000,
+            vec![],
+            None,
+            1,
             vec![0xBB; 666],
-            &[0x22; 32], 200,
+            &[0x22; 32],
+            200,
             &[0xBB, 0xBB],
             &pk,
-        ).unwrap();
+        )
+        .unwrap();
         (pk, shares, enc_a, enc_b)
     }
 
@@ -1317,7 +1405,10 @@ mod tests {
         let body = BlockBody {
             transactions: vec![],
             encrypted_txs: enc_order.iter().map(|e| e.to_bytes()).collect(),
-            execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+            execution_schedule: ExecutionSchedule {
+                groups: vec![],
+                total_txs: 0,
+            },
         };
         let block = Block {
             header: header.clone(),
@@ -1346,13 +1437,14 @@ mod tests {
         store_block_with_encrypted_order(&bs, 1, &[&enc_a, &enc_b]);
 
         // Tampered decryptor: [B, A] — opposite of what tx_root committed to.
-        let mut tampered = pyde_mempool::decryption::BlockDecryptor::new(
-            vec![enc_b, enc_a],
-            2,
-        ).unwrap();
+        let mut tampered =
+            pyde_mempool::decryption::BlockDecryptor::new(vec![enc_b, enc_a], 2).unwrap();
 
         let outcome = try_decrypt_and_execute(
-            &bs, 1, &mut tampered, &mut state,
+            &bs,
+            1,
+            &mut tampered,
+            &mut state,
             /* gas_limit */ 400_000_000,
             /* base_fee  */ 1_000_000_000,
             /* chain_id  */ 1,
@@ -1383,18 +1475,22 @@ mod tests {
         let (_pk, shares, enc_a, enc_b) = build_two_encrypted_txs_with_keys();
         store_block_with_encrypted_order(&bs, 1, &[&enc_a, &enc_b]);
 
-        let mut honest = pyde_mempool::decryption::BlockDecryptor::new(
-            vec![enc_a, enc_b],
-            2,
-        ).unwrap();
+        let mut honest =
+            pyde_mempool::decryption::BlockDecryptor::new(vec![enc_a, enc_b], 2).unwrap();
         for ks in &shares[..2] {
             honest.add_member_shares(ks);
         }
         assert!(honest.all_ready(), "should have threshold shares");
 
         let outcome = try_decrypt_and_execute(
-            &bs, 1, &mut honest, &mut state,
-            400_000_000, 1_000_000_000, 1, [0u8; 32],
+            &bs,
+            1,
+            &mut honest,
+            &mut state,
+            400_000_000,
+            1_000_000_000,
+            1,
+            [0u8; 32],
         );
 
         assert!(
@@ -1411,14 +1507,18 @@ mod tests {
         let bs = crate::block_store::BlockStore::open(tmp.path()).unwrap();
 
         let (_pk, _shares, enc_a, enc_b) = build_two_encrypted_txs_with_keys();
-        let mut decryptor = pyde_mempool::decryption::BlockDecryptor::new(
-            vec![enc_a, enc_b],
-            2,
-        ).unwrap();
+        let mut decryptor =
+            pyde_mempool::decryption::BlockDecryptor::new(vec![enc_a, enc_b], 2).unwrap();
 
         let outcome = try_decrypt_and_execute(
-            &bs, 42, &mut decryptor, &mut state,
-            400_000_000, 1_000_000_000, 1, [0u8; 32],
+            &bs,
+            42,
+            &mut decryptor,
+            &mut state,
+            400_000_000,
+            1_000_000_000,
+            1,
+            [0u8; 32],
         );
 
         assert!(matches!(outcome, DecryptOutcome::HeaderMissing));

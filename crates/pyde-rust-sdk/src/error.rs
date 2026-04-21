@@ -63,7 +63,9 @@ pub type Result<T> = std::result::Result<T, SdkError>;
 
 /// Attempt to decode a revert reason from return data.
 fn decode_revert_reason(data: &[u8]) -> Option<String> {
-    if data.is_empty() { return None; }
+    if data.is_empty() {
+        return None;
+    }
     // Try length-prefixed string: [len:8 LE][utf8 bytes]
     if data.len() >= 8 {
         let len = u64::from_le_bytes(data[..8].try_into().ok()?) as usize;

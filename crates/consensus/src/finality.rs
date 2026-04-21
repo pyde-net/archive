@@ -13,7 +13,9 @@
 
 use crate::block::{QuorumCert, QUORUM_THRESHOLD};
 use pyde_account::address::Address;
-use pyde_crypto::falcon::{falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature};
+use pyde_crypto::falcon::{
+    falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature,
+};
 
 /// Finality level for a block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -236,7 +238,8 @@ impl FinalityTracker {
 
     /// Number of blocks with soft finality but no hard finality yet.
     pub fn unconfirmed_count(&self) -> u64 {
-        self.highest_soft_slot.saturating_sub(self.highest_hard_slot)
+        self.highest_soft_slot
+            .saturating_sub(self.highest_hard_slot)
     }
 
     /// Record soft finality for a block.

@@ -69,7 +69,11 @@ pub extern "C" fn host_wload(ctx: *mut VmCtx, addr: u64, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
     match vm.memory.load256(addr as u32) {
         Ok(bytes) => {
-            if vm.cpu.write_wide_checked(wd as u8, U256::from_le_bytes(bytes)).is_err() {
+            if vm
+                .cpu
+                .write_wide_checked(wd as u8, U256::from_le_bytes(bytes))
+                .is_err()
+            {
                 return 1;
             }
             0
@@ -138,16 +142,24 @@ pub extern "C" fn host_sload(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
     let data = vm.storage.get(&key).cloned().or_else(|| {
         if let Some(ref backend) = vm.storage_backend {
             let val = backend(&key);
-            if let Some(ref v) = val { vm.storage.insert(key, v.clone()); }
+            if let Some(ref v) = val {
+                vm.storage.insert(key, v.clone());
+            }
             val
-        } else { None }
+        } else {
+            None
+        }
     });
     let mut buf = [0u8; 32];
     if let Some(ref d) = data {
         let len = d.len().min(32);
         buf[..len].copy_from_slice(&d[..len]);
     }
-    if vm.cpu.write_wide_checked(wd as u8, U256::from_le_bytes(buf)).is_err() {
+    if vm
+        .cpu
+        .write_wide_checked(wd as u8, U256::from_le_bytes(buf))
+        .is_err()
+    {
         return 1;
     }
     0
@@ -168,9 +180,13 @@ pub extern "C" fn host_sloadg(ctx: *mut VmCtx, ws_slot: u64) -> u64 {
     let data = vm.storage.get(&key).cloned().or_else(|| {
         if let Some(ref backend) = vm.storage_backend {
             let val = backend(&key);
-            if let Some(ref v) = val { vm.storage.insert(key, v.clone()); }
+            if let Some(ref v) = val {
+                vm.storage.insert(key, v.clone());
+            }
             val
-        } else { None }
+        } else {
+            None
+        }
     });
     let mut buf = [0u8; 8];
     if let Some(ref d) = data {
@@ -254,7 +270,11 @@ pub extern "C" fn host_poseidon(ctx: *mut VmCtx, addr: u64, len: u64, wd: u64) -
     };
     let hash = pyde_crypto::poseidon2::poseidon2_hash(&data);
     let hash_bytes: [u8; 32] = hash.to_bytes();
-    if vm.cpu.write_wide_checked(wd as u8, U256::from_le_bytes(hash_bytes)).is_err() {
+    if vm
+        .cpu
+        .write_wide_checked(wd as u8, U256::from_le_bytes(hash_bytes))
+        .is_err()
+    {
         return 1;
     }
     0
@@ -490,7 +510,11 @@ pub extern "C" fn host_gas_remaining(ctx: *mut VmCtx) -> u64 {
 /// Host: get call value (256-bit) into wide register.
 pub extern "C" fn host_callvalue(ctx: *mut VmCtx, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    if vm.cpu.write_wide_checked(wd as u8, vm.ctx.call_value).is_err() {
+    if vm
+        .cpu
+        .write_wide_checked(wd as u8, vm.ctx.call_value)
+        .is_err()
+    {
         return 1;
     }
     0
@@ -499,7 +523,11 @@ pub extern "C" fn host_callvalue(ctx: *mut VmCtx, wd: u64) -> u64 {
 /// Host: get gas price into wide register.
 pub extern "C" fn host_gasprice(ctx: *mut VmCtx, wd: u64) -> u64 {
     let vm = unsafe { &mut *ctx };
-    if vm.cpu.write_wide_checked(wd as u8, vm.ctx.gas_price).is_err() {
+    if vm
+        .cpu
+        .write_wide_checked(wd as u8, vm.ctx.gas_price)
+        .is_err()
+    {
         return 1;
     }
     0
@@ -573,7 +601,13 @@ pub extern "C" fn host_sync_gp_from_vm(ctx: *mut VmCtx, regs_ptr: *mut u64) {
 /// Execute a single PVM instruction by calling vm.step() with the given decoded instruction.
 /// This is the cleanest way to support complex opcodes in AOT: just run one PVM step.
 /// Returns 0 on success, 1 on trap/error.
-pub extern "C" fn host_exec_opcode(ctx: *mut VmCtx, opcode: u64, rd: u64, rs1: u64, imm: u64) -> u64 {
+pub extern "C" fn host_exec_opcode(
+    ctx: *mut VmCtx,
+    opcode: u64,
+    rd: u64,
+    rs1: u64,
+    imm: u64,
+) -> u64 {
     let vm = unsafe { &mut *ctx };
     let d = pyde_vm::isa::DecodedInstruction {
         opcode: pyde_vm::isa::Opcode::from_u8(opcode as u8),
@@ -582,9 +616,9 @@ pub extern "C" fn host_exec_opcode(ctx: *mut VmCtx, opcode: u64, rd: u64, rs1: u
         rs2_or_imm: imm as u32,
     };
     match vm.exec_single(d) {
-        Ok(None) => 0,           // success, continue
-        Ok(Some(_)) => 2,        // halt/revert
-        Err(_) => 1,             // trap
+        Ok(None) => 0,    // success, continue
+        Ok(Some(_)) => 2, // halt/revert
+        Err(_) => 1,      // trap
     }
 }
 

@@ -71,7 +71,9 @@ pub fn encode_finality_vote(vote: &pyde_consensus::finality::FinalityVote) -> Ve
     enc.finish()
 }
 
-pub fn decode_finality_vote(data: &[u8]) -> Result<pyde_consensus::finality::FinalityVote, &'static str> {
+pub fn decode_finality_vote(
+    data: &[u8],
+) -> Result<pyde_consensus::finality::FinalityVote, &'static str> {
     let mut dec = Decoder::new(data);
     let tag_byte = dec.u8()?;
     if tag_byte != tag::CONSENSUS_FINALITY_VOTE {
@@ -116,18 +118,23 @@ pub fn decode_randomness_share(
 ) -> Result<(u64, pyde_consensus::epoch_randomness::RandomnessShare), &'static str> {
     let mut dec = Decoder::new(data);
     let t = dec.u8()?;
-    if t != tag::RANDOMNESS_SHARE { return Err("not a randomness share"); }
+    if t != tag::RANDOMNESS_SHARE {
+        return Err("not a randomness share");
+    }
     let epoch = dec.u64()?;
     let validator_index = dec.u8()?;
     let address = dec.bytes32()?;
     let output_bytes = dec.var_bytes()?;
     let proof_bytes = dec.var_bytes()?;
-    Ok((epoch, pyde_consensus::epoch_randomness::RandomnessShare {
-        validator_index,
-        address,
-        vrf_output: pyde_crypto::vrf::VrfOutput::from_hash_bytes(&output_bytes),
-        vrf_proof: pyde_crypto::vrf::VrfProof::from_bytes(&proof_bytes),
-    }))
+    Ok((
+        epoch,
+        pyde_consensus::epoch_randomness::RandomnessShare {
+            validator_index,
+            address,
+            vrf_output: pyde_crypto::vrf::VrfOutput::from_hash_bytes(&output_bytes),
+            vrf_proof: pyde_crypto::vrf::VrfProof::from_bytes(&proof_bytes),
+        },
+    ))
 }
 
 // ============================================================
@@ -145,7 +152,9 @@ pub fn encode_pss_refresh(epoch: u64, contribution_bytes: &[u8]) -> Vec<u8> {
 pub fn decode_pss_refresh(data: &[u8]) -> Result<(u64, Vec<u8>), &'static str> {
     let mut dec = Decoder::new(data);
     let t = dec.u8()?;
-    if t != tag::PSS_REFRESH { return Err("not a PSS refresh"); }
+    if t != tag::PSS_REFRESH {
+        return Err("not a PSS refresh");
+    }
     let epoch = dec.u64()?;
     let contribution = dec.var_bytes()?;
     Ok((epoch, contribution))
@@ -170,7 +179,9 @@ pub fn encode_resharing(target_epoch: u64, contribution_bytes: &[u8]) -> Vec<u8>
 pub fn decode_resharing(data: &[u8]) -> Result<(u64, Vec<u8>), &'static str> {
     let mut dec = Decoder::new(data);
     let t = dec.u8()?;
-    if t != tag::COMMITTEE_RESHARING { return Err("not a resharing"); }
+    if t != tag::COMMITTEE_RESHARING {
+        return Err("not a resharing");
+    }
     let target_epoch = dec.u64()?;
     let contribution = dec.var_bytes()?;
     Ok((target_epoch, contribution))
@@ -367,10 +378,14 @@ pub fn encode_compact_block(cb: &pyde_net::propagation::CompactBlock) -> Vec<u8>
     enc.finish()
 }
 
-pub fn decode_compact_block(data: &[u8]) -> Result<pyde_net::propagation::CompactBlock, &'static str> {
+pub fn decode_compact_block(
+    data: &[u8],
+) -> Result<pyde_net::propagation::CompactBlock, &'static str> {
     let mut dec = Decoder::new(data);
     let t = dec.u8()?;
-    if t != tag::COMPACT_BLOCK { return Err("not a compact block"); }
+    if t != tag::COMPACT_BLOCK {
+        return Err("not a compact block");
+    }
     let header = dec.var_bytes()?;
     let nonce = dec.u64()?;
     let sid_count = dec.u32()? as usize;
@@ -397,7 +412,10 @@ pub fn decode_compact_block(data: &[u8]) -> Result<pyde_net::propagation::Compac
 }
 
 /// Encode a request for missing block transactions.
-pub fn encode_get_block_txs(block_hash: &[u8; 32], missing_sids: &[pyde_net::propagation::ShortId]) -> Vec<u8> {
+pub fn encode_get_block_txs(
+    block_hash: &[u8; 32],
+    missing_sids: &[pyde_net::propagation::ShortId],
+) -> Vec<u8> {
     let mut enc = Encoder::new();
     enc.u8(tag::GET_BLOCK_TXS);
     enc.bytes32(block_hash);
@@ -435,7 +453,9 @@ pub fn encode_decryption_shares(msg: &DecryptionShareMsg) -> Vec<u8> {
 pub fn decode_decryption_shares(data: &[u8]) -> Result<DecryptionShareMsg, &'static str> {
     let mut dec = Decoder::new(data);
     let msg_tag = dec.u8()?;
-    if msg_tag != tag::DECRYPTION_SHARES { return Err("not a decryption shares message"); }
+    if msg_tag != tag::DECRYPTION_SHARES {
+        return Err("not a decryption shares message");
+    }
     let slot = dec.u64()?;
     let member_index = dec.u8()?;
     let count = dec.u16()? as usize;
@@ -443,7 +463,11 @@ pub fn decode_decryption_shares(data: &[u8]) -> Result<DecryptionShareMsg, &'sta
     for _ in 0..count {
         shares.push(dec.var_bytes()?);
     }
-    Ok(DecryptionShareMsg { slot, member_index, shares })
+    Ok(DecryptionShareMsg {
+        slot,
+        member_index,
+        shares,
+    })
 }
 
 // ============================================================
@@ -456,21 +480,39 @@ struct Encoder {
 
 impl Encoder {
     fn new() -> Self {
-        Self { buf: Vec::with_capacity(1024) }
+        Self {
+            buf: Vec::with_capacity(1024),
+        }
     }
 
-    fn u8(&mut self, v: u8) { self.buf.push(v); }
-    fn u16(&mut self, v: u16) { self.buf.extend_from_slice(&v.to_le_bytes()); }
-    fn u32(&mut self, v: u32) { self.buf.extend_from_slice(&v.to_le_bytes()); }
-    fn u64(&mut self, v: u64) { self.buf.extend_from_slice(&v.to_le_bytes()); }
-    fn u128(&mut self, v: u128) { self.buf.extend_from_slice(&v.to_le_bytes()); }
-    fn bytes32(&mut self, v: &[u8; 32]) { self.buf.extend_from_slice(v); }
+    fn u8(&mut self, v: u8) {
+        self.buf.push(v);
+    }
+    fn u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn u128(&mut self, v: u128) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn bytes32(&mut self, v: &[u8; 32]) {
+        self.buf.extend_from_slice(v);
+    }
     fn var_bytes(&mut self, v: &[u8]) {
         self.u32(v.len() as u32);
         self.buf.extend_from_slice(v);
     }
-    fn raw(&mut self, v: &[u8]) { self.buf.extend_from_slice(v); }
-    fn finish(self) -> Vec<u8> { self.buf }
+    fn raw(&mut self, v: &[u8]) {
+        self.buf.extend_from_slice(v);
+    }
+    fn finish(self) -> Vec<u8> {
+        self.buf
+    }
 }
 
 struct Decoder<'a> {
@@ -483,17 +525,23 @@ impl<'a> Decoder<'a> {
         Self { data, pos: 0 }
     }
 
-    fn remaining(&self) -> usize { self.data.len() - self.pos }
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
 
     fn u8(&mut self) -> Result<u8, &'static str> {
-        if self.remaining() < 1 { return Err("unexpected end of data"); }
+        if self.remaining() < 1 {
+            return Err("unexpected end of data");
+        }
         let v = self.data[self.pos];
         self.pos += 1;
         Ok(v)
     }
 
     fn u16(&mut self) -> Result<u16, &'static str> {
-        if self.remaining() < 2 { return Err("unexpected end of data"); }
+        if self.remaining() < 2 {
+            return Err("unexpected end of data");
+        }
         let mut buf = [0u8; 2];
         buf.copy_from_slice(&self.data[self.pos..self.pos + 2]);
         self.pos += 2;
@@ -501,7 +549,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn u32(&mut self) -> Result<u32, &'static str> {
-        if self.remaining() < 4 { return Err("unexpected end of data"); }
+        if self.remaining() < 4 {
+            return Err("unexpected end of data");
+        }
         let mut buf = [0u8; 4];
         buf.copy_from_slice(&self.data[self.pos..self.pos + 4]);
         self.pos += 4;
@@ -509,7 +559,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn u64(&mut self) -> Result<u64, &'static str> {
-        if self.remaining() < 8 { return Err("unexpected end of data"); }
+        if self.remaining() < 8 {
+            return Err("unexpected end of data");
+        }
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&self.data[self.pos..self.pos + 8]);
         self.pos += 8;
@@ -517,7 +569,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn u128(&mut self) -> Result<u128, &'static str> {
-        if self.remaining() < 16 { return Err("unexpected end of data"); }
+        if self.remaining() < 16 {
+            return Err("unexpected end of data");
+        }
         let mut buf = [0u8; 16];
         buf.copy_from_slice(&self.data[self.pos..self.pos + 16]);
         self.pos += 16;
@@ -525,7 +579,9 @@ impl<'a> Decoder<'a> {
     }
 
     fn bytes32(&mut self) -> Result<[u8; 32], &'static str> {
-        if self.remaining() < 32 { return Err("unexpected end of data"); }
+        if self.remaining() < 32 {
+            return Err("unexpected end of data");
+        }
         let mut buf = [0u8; 32];
         buf.copy_from_slice(&self.data[self.pos..self.pos + 32]);
         self.pos += 32;
@@ -534,14 +590,18 @@ impl<'a> Decoder<'a> {
 
     fn var_bytes(&mut self) -> Result<Vec<u8>, &'static str> {
         let len = self.u32()? as usize;
-        if self.remaining() < len { return Err("unexpected end of data"); }
+        if self.remaining() < len {
+            return Err("unexpected end of data");
+        }
         let v = self.data[self.pos..self.pos + len].to_vec();
         self.pos += len;
         Ok(v)
     }
 
     fn raw(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
-        if self.remaining() < len { return Err("unexpected end of data"); }
+        if self.remaining() < len {
+            return Err("unexpected end of data");
+        }
         let v = &self.data[self.pos..self.pos + len];
         self.pos += len;
         Ok(v)
@@ -571,7 +631,12 @@ fn decode_qc(dec: &mut Decoder) -> Result<QuorumCert, &'static str> {
     for _ in 0..sig_count {
         signatures.push(dec.var_bytes()?);
     }
-    Ok(QuorumCert { slot, block_hash, voter_bitmap, signatures })
+    Ok(QuorumCert {
+        slot,
+        block_hash,
+        voter_bitmap,
+        signatures,
+    })
 }
 
 // ============================================================
@@ -614,20 +679,32 @@ pub fn decode_block_header(data: &[u8]) -> Result<BlockHeader, &'static str> {
 fn encode_access_entry(enc: &mut Encoder, entry: &AccessEntry) {
     enc.bytes32(&entry.address);
     enc.u16(entry.reads.len() as u16);
-    for key in &entry.reads { enc.bytes32(key); }
+    for key in &entry.reads {
+        enc.bytes32(key);
+    }
     enc.u16(entry.writes.len() as u16);
-    for key in &entry.writes { enc.bytes32(key); }
+    for key in &entry.writes {
+        enc.bytes32(key);
+    }
 }
 
 fn decode_access_entry(dec: &mut Decoder) -> Result<AccessEntry, &'static str> {
     let address = dec.bytes32()?;
     let read_count = dec.u16()? as usize;
     let mut reads = Vec::with_capacity(read_count);
-    for _ in 0..read_count { reads.push(dec.bytes32()?); }
+    for _ in 0..read_count {
+        reads.push(dec.bytes32()?);
+    }
     let write_count = dec.u16()? as usize;
     let mut writes = Vec::with_capacity(write_count);
-    for _ in 0..write_count { writes.push(dec.bytes32()?); }
-    Ok(AccessEntry { address, reads, writes })
+    for _ in 0..write_count {
+        writes.push(dec.bytes32()?);
+    }
+    Ok(AccessEntry {
+        address,
+        reads,
+        writes,
+    })
 }
 
 pub fn encode_transaction(tx: &Transaction) -> Vec<u8> {
@@ -651,10 +728,14 @@ pub fn encode_transaction(tx: &Transaction) -> Vec<u8> {
     }
     // access list
     enc.u16(tx.access_list.len() as u16);
-    for entry in &tx.access_list { encode_access_entry(&mut enc, entry); }
+    for entry in &tx.access_list {
+        encode_access_entry(&mut enc, entry);
+    }
     // deadline
     enc.u8(tx.deadline.is_some() as u8);
-    if let Some(d) = tx.deadline { enc.u64(d); }
+    if let Some(d) = tx.deadline {
+        enc.u64(d);
+    }
     enc.u64(tx.chain_id);
     // tx_type
     enc.u8(tx.tx_type as u8);
@@ -678,13 +759,29 @@ pub fn decode_transaction(data: &[u8]) -> Result<Transaction, &'static str> {
     };
     let access_count = dec.u16()? as usize;
     let mut access_list = Vec::with_capacity(access_count);
-    for _ in 0..access_count { access_list.push(decode_access_entry(&mut dec)?); }
-    let deadline = if dec.u8()? == 1 { Some(dec.u64()?) } else { None };
+    for _ in 0..access_count {
+        access_list.push(decode_access_entry(&mut dec)?);
+    }
+    let deadline = if dec.u8()? == 1 {
+        Some(dec.u64()?)
+    } else {
+        None
+    };
     let chain_id = dec.u64()?;
     let tx_type = TransactionType::from_u8(dec.u8()?).ok_or("invalid tx_type tag")?;
     Ok(Transaction {
-        from, to, value, data: data_field, gas_limit, nonce, signature,
-        fee_payer, access_list, deadline, chain_id, tx_type,
+        from,
+        to,
+        value,
+        data: data_field,
+        gas_limit,
+        nonce,
+        signature,
+        fee_payer,
+        access_list,
+        deadline,
+        chain_id,
+        tx_type,
     })
 }
 
@@ -725,7 +822,9 @@ pub fn encode_block(block: &Block) -> Vec<u8> {
 pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
     let mut dec = Decoder::new(data);
     let msg_tag = dec.u8()?;
-    if msg_tag != tag::BLOCK { return Err("not a block message"); }
+    if msg_tag != tag::BLOCK {
+        return Err("not a block message");
+    }
     // Header
     let header_bytes = dec.var_bytes()?;
     let header = decode_block_header(&header_bytes)?;
@@ -739,18 +838,28 @@ pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
         transactions.push(decode_transaction(&tx_bytes)?);
     }
     // Encrypted transactions
-    let enc_count = if dec.remaining() >= 4 { dec.u32()? as usize } else { 0 };
+    let enc_count = if dec.remaining() >= 4 {
+        dec.u32()? as usize
+    } else {
+        0
+    };
     let mut encrypted_txs = Vec::with_capacity(enc_count);
     for _ in 0..enc_count {
         encrypted_txs.push(dec.var_bytes()?);
     }
     // Execution schedule
-    let group_count = if dec.remaining() >= 2 { dec.u16()? as usize } else { 0 };
+    let group_count = if dec.remaining() >= 2 {
+        dec.u16()? as usize
+    } else {
+        0
+    };
     let mut groups = Vec::with_capacity(group_count);
     for _ in 0..group_count {
         let idx_count = dec.u16()? as usize;
         let mut tx_indices = Vec::with_capacity(idx_count);
-        for _ in 0..idx_count { tx_indices.push(dec.u32()? as usize); }
+        for _ in 0..idx_count {
+            tx_indices.push(dec.u32()? as usize);
+        }
         groups.push(pyde_tx::parallel::ExecutionGroup { tx_indices });
     }
     let total_txs = transactions.len();
@@ -772,13 +881,22 @@ pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
 pub fn encode_consensus_message(msg: &ConsensusMessage) -> Vec<u8> {
     let mut enc = Encoder::new();
     match msg {
-        ConsensusMessage::Proposal { header, proposer_signature } => {
+        ConsensusMessage::Proposal {
+            header,
+            proposer_signature,
+        } => {
             enc.u8(tag::CONSENSUS_PROPOSAL);
             let hdr = encode_block_header(header);
             enc.var_bytes(&hdr);
             enc.var_bytes(proposer_signature);
         }
-        ConsensusMessage::Vote { slot, block_hash, voter_index, voter_address, signature } => {
+        ConsensusMessage::Vote {
+            slot,
+            block_hash,
+            voter_index,
+            voter_address,
+            signature,
+        } => {
             enc.u8(tag::CONSENSUS_VOTE);
             enc.u64(*slot);
             enc.bytes32(block_hash);
@@ -786,7 +904,13 @@ pub fn encode_consensus_message(msg: &ConsensusMessage) -> Vec<u8> {
             enc.bytes32(voter_address);
             enc.var_bytes(signature);
         }
-        ConsensusMessage::Timeout { slot, voter_index, voter_address, highest_qc, signature } => {
+        ConsensusMessage::Timeout {
+            slot,
+            voter_index,
+            voter_address,
+            highest_qc,
+            signature,
+        } => {
             enc.u8(tag::CONSENSUS_TIMEOUT);
             enc.u64(*slot);
             enc.u8(*voter_index);
@@ -794,7 +918,12 @@ pub fn encode_consensus_message(msg: &ConsensusMessage) -> Vec<u8> {
             encode_qc(&mut enc, highest_qc);
             enc.var_bytes(signature);
         }
-        ConsensusMessage::NewView { slot, highest_qc, voter_address, signature } => {
+        ConsensusMessage::NewView {
+            slot,
+            highest_qc,
+            voter_address,
+            signature,
+        } => {
             enc.u8(tag::CONSENSUS_NEW_VIEW);
             enc.u64(*slot);
             encode_qc(&mut enc, highest_qc);
@@ -813,31 +942,43 @@ pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, &'stati
             let hdr_bytes = dec.var_bytes()?;
             let header = decode_block_header(&hdr_bytes)?;
             let proposer_signature = dec.var_bytes()?;
-            Ok(ConsensusMessage::Proposal { header, proposer_signature })
-        }
-        tag::CONSENSUS_VOTE => {
-            Ok(ConsensusMessage::Vote {
-                slot: dec.u64()?,
-                block_hash: dec.bytes32()?,
-                voter_index: dec.u8()?,
-                voter_address: dec.bytes32()?,
-                signature: dec.var_bytes()?,
+            Ok(ConsensusMessage::Proposal {
+                header,
+                proposer_signature,
             })
         }
+        tag::CONSENSUS_VOTE => Ok(ConsensusMessage::Vote {
+            slot: dec.u64()?,
+            block_hash: dec.bytes32()?,
+            voter_index: dec.u8()?,
+            voter_address: dec.bytes32()?,
+            signature: dec.var_bytes()?,
+        }),
         tag::CONSENSUS_TIMEOUT => {
             let slot = dec.u64()?;
             let voter_index = dec.u8()?;
             let voter_address = dec.bytes32()?;
             let highest_qc = decode_qc(&mut dec)?;
             let signature = dec.var_bytes()?;
-            Ok(ConsensusMessage::Timeout { slot, voter_index, voter_address, highest_qc, signature })
+            Ok(ConsensusMessage::Timeout {
+                slot,
+                voter_index,
+                voter_address,
+                highest_qc,
+                signature,
+            })
         }
         tag::CONSENSUS_NEW_VIEW => {
             let slot = dec.u64()?;
             let highest_qc = decode_qc(&mut dec)?;
             let voter_address = dec.bytes32()?;
             let signature = dec.var_bytes()?;
-            Ok(ConsensusMessage::NewView { slot, highest_qc, voter_address, signature })
+            Ok(ConsensusMessage::NewView {
+                slot,
+                highest_qc,
+                voter_address,
+                signature,
+            })
         }
         _ => Err("unknown consensus message tag"),
     }
@@ -869,7 +1010,9 @@ pub fn encode_consensus_state(state: &pyde_consensus::hotstuff::ConsensusState) 
     enc.finish()
 }
 
-pub fn decode_consensus_state(data: &[u8]) -> Result<pyde_consensus::hotstuff::ConsensusState, &'static str> {
+pub fn decode_consensus_state(
+    data: &[u8],
+) -> Result<pyde_consensus::hotstuff::ConsensusState, &'static str> {
     let mut dec = Decoder::new(data);
     let version = dec.u8()?;
     if version != CONSENSUS_STATE_VERSION {
@@ -1169,7 +1312,11 @@ mod tests {
             tx.tx_type = ty;
             let bytes = encode_transaction(&tx);
             let restored = decode_transaction(&bytes).unwrap();
-            assert_eq!(restored.tx_type, ty, "tx_type roundtrip failed for {:?}", ty);
+            assert_eq!(
+                restored.tx_type, ty,
+                "tx_type roundtrip failed for {:?}",
+                ty
+            );
         }
     }
 
@@ -1184,8 +1331,12 @@ mod tests {
                 encrypted_txs: vec![],
                 execution_schedule: ExecutionSchedule {
                     groups: vec![
-                        pyde_tx::parallel::ExecutionGroup { tx_indices: vec![0] },
-                        pyde_tx::parallel::ExecutionGroup { tx_indices: vec![1] },
+                        pyde_tx::parallel::ExecutionGroup {
+                            tx_indices: vec![0],
+                        },
+                        pyde_tx::parallel::ExecutionGroup {
+                            tx_indices: vec![1],
+                        },
                     ],
                     total_txs: 2,
                 },
@@ -1199,8 +1350,14 @@ mod tests {
         assert_eq!(restored.header.slot, 10);
         assert_eq!(restored.body.transactions.len(), 2);
         assert_eq!(restored.body.execution_schedule.groups.len(), 2);
-        assert_eq!(restored.body.execution_schedule.groups[0].tx_indices, vec![0]);
-        assert_eq!(restored.body.execution_schedule.groups[1].tx_indices, vec![1]);
+        assert_eq!(
+            restored.body.execution_schedule.groups[0].tx_indices,
+            vec![0]
+        );
+        assert_eq!(
+            restored.body.execution_schedule.groups[1].tx_indices,
+            vec![1]
+        );
         assert_eq!(restored.proposer_signature.len(), 700);
     }
 
@@ -1220,7 +1377,13 @@ mod tests {
         let restored = decode_consensus_message(&bytes).unwrap();
 
         match restored {
-            ConsensusMessage::Vote { slot, block_hash, voter_index, signature, .. } => {
+            ConsensusMessage::Vote {
+                slot,
+                block_hash,
+                voter_index,
+                signature,
+                ..
+            } => {
                 assert_eq!(slot, 5);
                 assert_eq!(block_hash, [0xAA; 32]);
                 assert_eq!(voter_index, 3);
@@ -1241,7 +1404,10 @@ mod tests {
         let restored = decode_consensus_message(&bytes).unwrap();
 
         match restored {
-            ConsensusMessage::Proposal { header, proposer_signature } => {
+            ConsensusMessage::Proposal {
+                header,
+                proposer_signature,
+            } => {
                 assert_eq!(header.slot, 7);
                 assert_eq!(proposer_signature.len(), 600);
             }
@@ -1263,7 +1429,12 @@ mod tests {
         let restored = decode_consensus_message(&bytes).unwrap();
 
         match restored {
-            ConsensusMessage::Timeout { slot, voter_index, highest_qc, .. } => {
+            ConsensusMessage::Timeout {
+                slot,
+                voter_index,
+                highest_qc,
+                ..
+            } => {
                 assert_eq!(slot, 12);
                 assert_eq!(voter_index, 5);
                 assert_eq!(highest_qc.slot, 11);

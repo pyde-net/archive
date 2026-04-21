@@ -38,10 +38,7 @@ pub enum AuthKeys {
     /// Single FALCON-512 public key (standard EOA).
     Single(Vec<u8>),
     /// Multi-sig: list of keys + threshold required to authorize.
-    MultiSig {
-        keys: Vec<Vec<u8>>,
-        threshold: u32,
-    },
+    MultiSig { keys: Vec<Vec<u8>>, threshold: u32 },
 }
 
 impl AuthKeys {

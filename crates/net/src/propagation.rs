@@ -116,7 +116,9 @@ impl CompactBlock {
 /// Generate a random nonce for short ID computation.
 fn rand_nonce() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     // Mix timestamp with a counter for uniqueness
     t.as_nanos() as u64 ^ (t.as_secs().wrapping_mul(0x517cc1b727220a95))
 }

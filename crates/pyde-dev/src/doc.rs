@@ -16,11 +16,13 @@ pub fn run() -> Result<(), String> {
     let docs_dir = root.join(&config.compiler.out).join("docs");
 
     if !src_dir.exists() {
-        return Err(format!("source directory '{}' not found", src_dir.display()));
+        return Err(format!(
+            "source directory '{}' not found",
+            src_dir.display()
+        ));
     }
 
-    fs::create_dir_all(&docs_dir)
-        .map_err(|e| format!("cannot create docs directory: {}", e))?;
+    fs::create_dir_all(&docs_dir).map_err(|e| format!("cannot create docs directory: {}", e))?;
 
     let pattern = format!("{}/**/*.oti", src_dir.display());
     let files: Vec<_> = glob::glob(&pattern)
@@ -54,7 +56,8 @@ pub fn run() -> Result<(), String> {
         // Collect top-level items (outside contracts) for module-level docs
         let mut has_top_level = false;
         let mut top_level_md = String::new();
-        let file_stem = file.file_stem()
+        let file_stem = file
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
 
@@ -94,7 +97,11 @@ pub fn run() -> Result<(), String> {
                     if !s.fields.is_empty() {
                         top_level_md.push_str("| Field | Type |\n|-------|------|\n");
                         for field in &s.fields {
-                            top_level_md.push_str(&format!("| `{}` | `{}` |\n", field.name.name, format_type(&field.ty)));
+                            top_level_md.push_str(&format!(
+                                "| `{}` | `{}` |\n",
+                                field.name.name,
+                                format_type(&field.ty)
+                            ));
                         }
                         top_level_md.push('\n');
                     }
@@ -122,7 +129,11 @@ pub fn run() -> Result<(), String> {
                     if !e.fields.is_empty() {
                         top_level_md.push_str("| Field | Type |\n|-------|------|\n");
                         for field in &e.fields {
-                            top_level_md.push_str(&format!("| `{}` | `{}` |\n", field.name.name, format_type(&field.ty)));
+                            top_level_md.push_str(&format!(
+                                "| `{}` | `{}` |\n",
+                                field.name.name,
+                                format_type(&field.ty)
+                            ));
                         }
                         top_level_md.push('\n');
                     }
@@ -132,7 +143,11 @@ pub fn run() -> Result<(), String> {
                         top_level_md.push_str(&format!("# {}\n\n", file_stem));
                         has_top_level = true;
                     }
-                    top_level_md.push_str(&format!("## type {} = `{}`\n\n", t.name.name, format_type(&t.ty)));
+                    top_level_md.push_str(&format!(
+                        "## type {} = `{}`\n\n",
+                        t.name.name,
+                        format_type(&t.ty)
+                    ));
                 }
                 otic::ast::Item::Const(c) if c.is_pub => {
                     if !has_top_level {
@@ -163,7 +178,11 @@ pub fn run() -> Result<(), String> {
         }
     }
 
-    println!("\n  {} doc file(s) generated in {}", total_files, docs_dir.display());
+    println!(
+        "\n  {} doc file(s) generated in {}",
+        total_files,
+        docs_dir.display()
+    );
     Ok(())
 }
 
@@ -173,7 +192,9 @@ fn generate_contract_doc(contract: &otic::ast::ContractDef) -> String {
     md.push_str(&format!("# {}\n\n", contract.name.name));
 
     // Storage
-    let storage_fields: Vec<&otic::ast::StorageField> = contract.items.iter()
+    let storage_fields: Vec<&otic::ast::StorageField> = contract
+        .items
+        .iter()
         .filter_map(|item| {
             if let otic::ast::ContractItem::Storage(s) = item {
                 Some(s.fields.iter().collect::<Vec<_>>())
@@ -189,19 +210,30 @@ fn generate_contract_doc(contract: &otic::ast::ContractDef) -> String {
         md.push_str("| Field | Type |\n");
         md.push_str("|-------|------|\n");
         for field in &storage_fields {
-            md.push_str(&format!("| `{}` | `{}` |\n", field.name.name, format_type(&field.ty)));
+            md.push_str(&format!(
+                "| `{}` | `{}` |\n",
+                field.name.name,
+                format_type(&field.ty)
+            ));
         }
         md.push('\n');
     }
 
     // Functions
-    let functions: Vec<&otic::ast::FunctionDef> = contract.items.iter()
+    let functions: Vec<&otic::ast::FunctionDef> = contract
+        .items
+        .iter()
         .filter_map(|item| {
-            if let otic::ast::ContractItem::Function(f) = item { Some(f) } else { None }
+            if let otic::ast::ContractItem::Function(f) = item {
+                Some(f)
+            } else {
+                None
+            }
         })
         .collect();
 
-    let pub_fns: Vec<&&otic::ast::FunctionDef> = functions.iter()
+    let pub_fns: Vec<&&otic::ast::FunctionDef> = functions
+        .iter()
         .filter(|f| f.is_pub && !f.is_constructor() && !f.is_test())
         .collect();
     let constructor = functions.iter().find(|f| f.is_constructor());
@@ -245,9 +277,15 @@ fn generate_contract_doc(contract: &otic::ast::ContractDef) -> String {
     }
 
     // Events
-    let events: Vec<&otic::ast::EventDef> = contract.items.iter()
+    let events: Vec<&otic::ast::EventDef> = contract
+        .items
+        .iter()
         .filter_map(|item| {
-            if let otic::ast::ContractItem::Event(e) = item { Some(e) } else { None }
+            if let otic::ast::ContractItem::Event(e) = item {
+                Some(e)
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -265,7 +303,9 @@ fn generate_contract_doc(contract: &otic::ast::ContractDef) -> String {
                     let indexed = if field.indexed { "yes" } else { "" };
                     md.push_str(&format!(
                         "| `{}` | `{}` | {} |\n",
-                        field.name.name, format_type(&field.ty), indexed
+                        field.name.name,
+                        format_type(&field.ty),
+                        indexed
                     ));
                 }
                 md.push('\n');
@@ -274,9 +314,15 @@ fn generate_contract_doc(contract: &otic::ast::ContractDef) -> String {
     }
 
     // Errors
-    let errors: Vec<&otic::ast::ErrorDef> = contract.items.iter()
+    let errors: Vec<&otic::ast::ErrorDef> = contract
+        .items
+        .iter()
         .filter_map(|item| {
-            if let otic::ast::ContractItem::Error(e) = item { Some(e) } else { None }
+            if let otic::ast::ContractItem::Error(e) = item {
+                Some(e)
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -291,7 +337,11 @@ fn generate_contract_doc(contract: &otic::ast::ContractDef) -> String {
                 md.push_str("| Field | Type |\n");
                 md.push_str("|-------|------|\n");
                 for field in &error.fields {
-                    md.push_str(&format!("| `{}` | `{}` |\n", field.name.name, format_type(&field.ty)));
+                    md.push_str(&format!(
+                        "| `{}` | `{}` |\n",
+                        field.name.name,
+                        format_type(&field.ty)
+                    ));
                 }
                 md.push('\n');
             }
@@ -306,14 +356,23 @@ fn generate_interface_doc(iface: &otic::ast::InterfaceDef) -> String {
     md.push_str(&format!("# {} (Interface)\n\n", iface.name.name));
 
     for func in &iface.functions {
-        let params: Vec<String> = func.params.iter()
+        let params: Vec<String> = func
+            .params
+            .iter()
             .map(|p| format!("{}: {}", p.name.name, format_type(&p.ty)))
             .collect();
-        let ret = func.return_type.as_ref()
+        let ret = func
+            .return_type
+            .as_ref()
             .map(|t| format!(" -> {}", format_type(t)))
             .unwrap_or_default();
         md.push_str(&format!("### {}\n\n", func.name.name));
-        md.push_str(&format!("```\nfn {}({}){}\n```\n\n", func.name.name, params.join(", "), ret));
+        md.push_str(&format!(
+            "```\nfn {}({}){}\n```\n\n",
+            func.name.name,
+            params.join(", "),
+            ret
+        ));
     }
 
     md
@@ -327,18 +386,30 @@ fn format_function_sig(func: &otic::ast::FunctionDef) -> String {
         md.push_str(&format!("> {}\n\n", doc));
     }
 
-    let params: Vec<String> = func.params.iter()
+    let params: Vec<String> = func
+        .params
+        .iter()
         .map(|p| format!("{}: {}", p.name.name, format_type(&p.ty)))
         .collect();
-    let ret = func.return_type.as_ref()
+    let ret = func
+        .return_type
+        .as_ref()
         .map(|t| format!(" -> {}", format_type(t)))
         .unwrap_or_default();
 
     let mut attrs = Vec::new();
-    if func.is_view() { attrs.push("#[view]"); }
-    if func.is_payable() { attrs.push("#[payable]"); }
-    if func.is_reentrant() { attrs.push("#[reentrant]"); }
-    if func.is_constructor() { attrs.push("#[constructor]"); }
+    if func.is_view() {
+        attrs.push("#[view]");
+    }
+    if func.is_payable() {
+        attrs.push("#[payable]");
+    }
+    if func.is_reentrant() {
+        attrs.push("#[reentrant]");
+    }
+    if func.is_constructor() {
+        attrs.push("#[constructor]");
+    }
 
     let attr_line = if attrs.is_empty() {
         String::new()
@@ -346,7 +417,13 @@ fn format_function_sig(func: &otic::ast::FunctionDef) -> String {
         format!("{}\n", attrs.join(" "))
     };
 
-    md.push_str(&format!("```\n{}pub fn {}({}){}\n```\n", attr_line, func.name.name, params.join(", "), ret));
+    md.push_str(&format!(
+        "```\n{}pub fn {}({}){}\n```\n",
+        attr_line,
+        func.name.name,
+        params.join(", "),
+        ret
+    ));
     md
 }
 
@@ -368,12 +445,17 @@ fn format_type(ty: &otic::ast::Type) -> String {
             otic::ast::PrimitiveType::Bool => "bool",
             otic::ast::PrimitiveType::Address => "Address",
             otic::ast::PrimitiveType::StringType => "String",
-        }.to_string(),
+        }
+        .to_string(),
         otic::ast::Type::Bytes(_) => "bytes".to_string(),
         otic::ast::Type::Array(elem, size, _) => format!("[{}; {}]", format_type(elem), size),
         otic::ast::Type::Vec(elem, _) => format!("Vec<{}>", format_type(elem)),
         otic::ast::Type::Map(k, v, _) => format!("Map<{}, {}>", format_type(k), format_type(v)),
-        otic::ast::Type::Named(path) => path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join("::"),
+        otic::ast::Type::Named(path) => path
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect::<Vec<_>>()
+            .join("::"),
         otic::ast::Type::Tuple(types, _) => {
             let inner: Vec<String> = types.iter().map(format_type).collect();
             format!("({})", inner.join(", "))

@@ -118,14 +118,14 @@ impl BlockHeader {
     /// Excludes QC signatures/bitmap (large, and QC slot+hash suffice).
     pub fn hash(&self) -> [u8; 32] {
         let mut buf = Vec::with_capacity(192); // 8+8+32+32+32+32+8+32 = 184
-        buf.extend_from_slice(&self.slot.to_le_bytes());       // 8
-        buf.extend_from_slice(&self.epoch.to_le_bytes());      // 8
-        buf.extend_from_slice(&self.parent_hash);              // 32
-        buf.extend_from_slice(&self.proposer);                 // 32
+        buf.extend_from_slice(&self.slot.to_le_bytes()); // 8
+        buf.extend_from_slice(&self.epoch.to_le_bytes()); // 8
+        buf.extend_from_slice(&self.parent_hash); // 32
+        buf.extend_from_slice(&self.proposer); // 32
         buf.extend_from_slice(&poseidon2_hash(&self.vrf_proof).to_bytes()); // 32
-        buf.extend_from_slice(&self.tx_root);                  // 32
-        buf.extend_from_slice(&self.timestamp.to_le_bytes());  // 8
-        buf.extend_from_slice(&self.qc_previous.hash());       // 32 (hashed QC)
+        buf.extend_from_slice(&self.tx_root); // 32
+        buf.extend_from_slice(&self.timestamp.to_le_bytes()); // 8
+        buf.extend_from_slice(&self.qc_previous.hash()); // 32 (hashed QC)
         poseidon2_hash(&buf).to_bytes()
     }
 }
@@ -229,10 +229,7 @@ pub fn verify_tx_root(
 }
 
 /// Create the genesis block.
-pub fn genesis_block(
-    genesis_state_root: [u8; 32],
-    timestamp: u64,
-) -> Block {
+pub fn genesis_block(genesis_state_root: [u8; 32], timestamp: u64) -> Block {
     let header = BlockHeader {
         slot: 0,
         epoch: 0,
@@ -365,7 +362,10 @@ mod tests {
     #[test]
     fn tx_root_deterministic() {
         let tx = dummy_tx(0);
-        assert_eq!(compute_tx_root(&[tx.clone()], &[]), compute_tx_root(&[tx], &[]));
+        assert_eq!(
+            compute_tx_root(&[tx.clone()], &[]),
+            compute_tx_root(&[tx], &[])
+        );
     }
 
     #[test]
@@ -460,8 +460,8 @@ mod tests {
     fn has_quorum_for_dynamic() {
         let mut qc = QuorumCert::empty();
         qc.voter_bitmap = 0b11; // 2 votes
-        assert!(qc.has_quorum_for(2));  // 2/2 = quorum
-        assert!(qc.has_quorum_for(3));  // 2/3 = quorum (threshold=2)
+        assert!(qc.has_quorum_for(2)); // 2/2 = quorum
+        assert!(qc.has_quorum_for(3)); // 2/3 = quorum (threshold=2)
         assert!(!qc.has_quorum_for(4)); // 2/4, threshold=3
     }
 }

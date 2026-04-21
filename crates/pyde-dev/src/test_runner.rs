@@ -10,7 +10,11 @@ pub fn run(filter: Option<&str>, verbosity: u8) -> Result<(), String> {
     let (config, root) = project::load_config()?;
 
     // Resolve verbosity: CLI flag overrides pyde.toml config
-    let effective_verbosity = if verbosity > 0 { verbosity } else { config.testing.verbosity };
+    let effective_verbosity = if verbosity > 0 {
+        verbosity
+    } else {
+        config.testing.verbosity
+    };
     let trace_verbosity = Verbosity::from_count(effective_verbosity);
 
     // Build src/ contracts first (tests may depend on them)
@@ -121,7 +125,11 @@ pub fn run(filter: Option<&str>, verbosity: u8) -> Result<(), String> {
         let constructor_storage = if !compiled.constructor_bytecode.is_empty() {
             let mut vm = pyde_vm::vm::Vm::with_gas_limit(100_000_000);
             if let Err(e) = vm.load(&compiled.constructor_bytecode) {
-                eprintln!("  {} — constructor load error: {:?}, skipping", rel.display(), e);
+                eprintln!(
+                    "  {} — constructor load error: {:?}, skipping",
+                    rel.display(),
+                    e
+                );
                 total_skip += 1;
                 continue;
             }
@@ -182,7 +190,7 @@ pub fn run(filter: Option<&str>, verbosity: u8) -> Result<(), String> {
                         if let Some(ref expected) = meta.expected_error {
                             let expected_selector = otic::codegen::compute_selector(expected);
                             let actual_selector = if vm.return_data.len() >= 8 {
-                                u64::from_le_bytes(vm.return_data[..8].try_into().unwrap_or([0;8]))
+                                u64::from_le_bytes(vm.return_data[..8].try_into().unwrap_or([0; 8]))
                             } else {
                                 0
                             };
@@ -198,7 +206,10 @@ pub fn run(filter: Option<&str>, verbosity: u8) -> Result<(), String> {
                         }
                     }
                     _ => {
-                        println!("    FAIL {} — expected revert but got {:?}", meta.name, outcome);
+                        println!(
+                            "    FAIL {} — expected revert but got {:?}",
+                            meta.name, outcome
+                        );
                         false
                     }
                 }
@@ -220,7 +231,11 @@ pub fn run(filter: Option<&str>, verbosity: u8) -> Result<(), String> {
             };
 
             if ok {
-                let panic_tag = if meta.should_panic { " (expected panic)" } else { "" };
+                let panic_tag = if meta.should_panic {
+                    " (expected panic)"
+                } else {
+                    ""
+                };
                 println!("    PASS {}{} ({} gas)", meta.name, panic_tag, gas);
                 total_pass += 1;
             } else if !meta.should_panic || meta.expected_error.is_some() {
@@ -254,7 +269,10 @@ pub fn run(filter: Option<&str>, verbosity: u8) -> Result<(), String> {
     println!();
     println!(
         "  {} passed, {} failed, {} skipped ({:.2}s)",
-        total_pass, total_fail, total_skip, elapsed.as_secs_f64()
+        total_pass,
+        total_fail,
+        total_skip,
+        elapsed.as_secs_f64()
     );
 
     // Gas profiling summary
@@ -263,12 +281,19 @@ pub fn run(filter: Option<&str>, verbosity: u8) -> Result<(), String> {
         gas_profile.sort_by(|a, b| b.gas_used.cmp(&a.gas_used));
 
         let total_gas: u64 = gas_profile.iter().map(|e| e.gas_used).sum();
-        let max_name_len = gas_profile.iter().map(|e| e.test_name.len()).max().unwrap_or(20);
+        let max_name_len = gas_profile
+            .iter()
+            .map(|e| e.test_name.len())
+            .max()
+            .unwrap_or(20);
         let col_width = max_name_len.max(20);
 
         println!();
         println!("  Gas Profile");
-        println!("  {:<col_width$}  {:>12}  {:>8}  Status", "Test", "Gas Used", "% Limit");
+        println!(
+            "  {:<col_width$}  {:>12}  {:>8}  Status",
+            "Test", "Gas Used", "% Limit"
+        );
         println!("  {}", "-".repeat(col_width + 30));
         for entry in &gas_profile {
             let pct = (entry.gas_used as f64 / gas_limit as f64) * 100.0;
