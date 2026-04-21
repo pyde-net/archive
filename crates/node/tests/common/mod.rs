@@ -309,6 +309,29 @@ impl TestNetwork {
         Ok(())
     }
 
+    /// Restart a previously-killed node. The datadir is preserved
+    /// across kill/restart, so the child picks up from persisted
+    /// RocksDB state (chain head, validator key, etc.) instead of
+    /// re-applying genesis. Returns once the node's RPC is up again.
+    pub fn restart_node(&mut self, idx: usize) -> Result<(), String> {
+        let node = self
+            .nodes
+            .get_mut(idx)
+            .ok_or_else(|| format!("no node at index {}", idx))?;
+        if node.process.is_some() {
+            return Err(format!("node-{} is already running", idx));
+        }
+        start_node(node, &self.pyde_bin, self.dev)?;
+        let url = node.rpc_url();
+        let deadline = Instant::now() + Duration::from_secs(45);
+        if let Err(e) = wait_rpc_up(&url, deadline) {
+            thread::sleep(Duration::from_millis(200));
+            let snapshot = self.nodes[idx].output_snapshot();
+            return Err(format!("{}\n--- node-{} output ---\n{}", e, idx, snapshot));
+        }
+        Ok(())
+    }
+
     /// Read the `epoch` field from a committed block. Returns
     /// `Ok(None)` if the node hasn't committed that slot yet.
     pub fn epoch_of(&self, node_idx: usize, slot: u64) -> Result<Option<u64>, String> {
