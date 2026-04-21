@@ -263,6 +263,59 @@ impl TestNetwork {
         Ok(())
     }
 
+    /// Kill a running node by index. Returns error if the node is
+    /// not running. Used by fault-tolerance tests that take a
+    /// validator offline mid-run and watch the rest of the network
+    /// continue.
+    pub fn kill_node(&mut self, idx: usize) -> Result<(), String> {
+        let node = self
+            .nodes
+            .get_mut(idx)
+            .ok_or_else(|| format!("no node at index {}", idx))?;
+        if node.process.is_none() {
+            return Err(format!("node-{} is not running", idx));
+        }
+        node.kill();
+        Ok(())
+    }
+
+    /// Read the proposer address for a block at `slot` from `node_idx`'s
+    /// `pyde_getBlockByNumber`. Returns `Ok(None)` if the node has not
+    /// committed that slot yet (gap or pre-produced).
+    pub fn proposer_of(
+        &self,
+        node_idx: usize,
+        slot: u64,
+    ) -> Result<Option<[u8; 32]>, String> {
+        let params = format!("[{}]", slot);
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_getBlockByNumber",
+            &params,
+        )?;
+        if resp.contains(r#""result":null"#) {
+            return Ok(None);
+        }
+        // Response has `"proposer":"0x<64 hex>"`. Extract it.
+        let key = r#""proposer":"0x"#;
+        let start = resp.find(key).ok_or_else(|| {
+            format!("no proposer in getBlockByNumber({}) response: {}", slot, resp)
+        })?;
+        let tail = &resp[start + key.len()..];
+        let end = tail
+            .find('"')
+            .ok_or_else(|| format!("unterminated proposer: {}", resp))?;
+        let hex = &tail[..end];
+        let bytes = hex::decode(hex)
+            .map_err(|e| format!("decode proposer {}: {}", hex, e))?;
+        if bytes.len() != 32 {
+            return Err(format!("proposer address is {} bytes, expected 32", bytes.len()));
+        }
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&bytes);
+        Ok(Some(addr))
+    }
+
     /// Indices of every validator node.
     pub fn validator_indices(&self) -> Vec<usize> {
         self.nodes
