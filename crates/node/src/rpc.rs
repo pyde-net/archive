@@ -382,6 +382,12 @@ impl PydeApiServer for RpcServer {
             Some("stakeDeposit") => pyde_tx::types::TransactionType::StakeDeposit,
             Some("stakeWithdraw") => pyde_tx::types::TransactionType::StakeWithdraw,
             Some("deploy") => pyde_tx::types::TransactionType::Deploy,
+            // Slash txs carry double-sign evidence in the `data` field;
+            // the pipeline re-verifies both FALCON signatures against the
+            // accused validator's on-chain pubkey before debiting stake.
+            // Dev mode exposes this path so multi-node harness tests can
+            // submit forged evidence without routing through a proposer.
+            Some("slash") => pyde_tx::types::TransactionType::Slash,
             _ => {
                 if to == [0u8; 32] {
                     pyde_tx::types::TransactionType::Deploy
