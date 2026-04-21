@@ -90,6 +90,13 @@ pub enum Command {
         /// Chain ID (31337 = devnet, skips signature validation).
         #[arg(long, default_value = "31337")]
         chain_id: u64,
+
+        /// Block time in milliseconds (controls slot rate). Default 400
+        /// matches mainnet target. Lower values (e.g. 50-100) are
+        /// useful for tests that need to cross multi-slot boundaries
+        /// quickly — epoch rotation at slot 1000, finality depth, etc.
+        #[arg(long, default_value = "400")]
+        block_time_ms: u64,
     },
 
     /// Start a public faucet server.

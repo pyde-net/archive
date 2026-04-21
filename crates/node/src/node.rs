@@ -515,18 +515,20 @@ impl PydeNode {
         // --- Main event loop ---
         let mut shutdown_rx = self.shutdown.subscribe();
 
-        // Slot clock for block timing
-        // Slot clock: if resuming from persisted head, backdate genesis
-        // so current_slot() picks up where we left off.
+        // Slot clock for block timing. If resuming from persisted head,
+        // backdate genesis so current_slot() picks up where we left off.
+        // Block time comes from `[consensus].block_time_ms` (default
+        // 400); `with_block_time` clamps out-of-range values.
+        let block_time_ms = self.config.consensus.block_time_ms;
         let slot_clock = if saved_head > 0 {
-            let backdate_ms = saved_head * pyde_consensus::block::BLOCK_TIME_MS;
+            let backdate_ms = saved_head * block_time_ms;
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            SlotClock::new(now_ms.saturating_sub(backdate_ms))
+            SlotClock::with_block_time(now_ms.saturating_sub(backdate_ms), block_time_ms)
         } else {
-            SlotClock::new(0)
+            SlotClock::with_block_time(0, block_time_ms)
         };
         let mut last_slot = slot_clock.current_slot();
 

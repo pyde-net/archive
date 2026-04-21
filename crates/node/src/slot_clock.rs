@@ -1,8 +1,11 @@
 //! Slot clock: tracks the current slot based on wall clock time.
 //!
-//! Slot 0 starts at genesis timestamp. Each slot is 400ms.
+//! Slot 0 starts at genesis timestamp. Each slot defaults to 400ms
+//! but is configurable via `[consensus].block_time_ms` so tests can
+//! cross large slot counts (epoch boundaries) quickly.
 //! The slot clock determines when to propose, vote, and advance.
 
+#[cfg(test)]
 use pyde_consensus::block::BLOCK_TIME_MS;
 use std::time::{Duration, Instant};
 
@@ -12,14 +15,27 @@ pub struct SlotClock {
     genesis_instant: Instant,
     /// Genesis Unix timestamp in ms (for absolute time reference).
     genesis_timestamp_ms: u64,
-    /// Slot duration.
-    #[allow(dead_code)]
-    slot_duration: Duration,
+    /// Slot duration in ms — configurable via `[consensus].block_time_ms`.
+    block_time_ms: u64,
 }
 
 impl SlotClock {
-    /// Create a new slot clock. If genesis_timestamp_ms is 0, use current time.
+    /// Create a new slot clock at the default block time
+    /// (`BLOCK_TIME_MS` = 400 ms). If `genesis_timestamp_ms` is 0,
+    /// use the current wall clock. Kept for the in-module tests;
+    /// production code goes through `with_block_time` so the config
+    /// value actually takes effect.
+    #[cfg(test)]
     pub fn new(genesis_timestamp_ms: u64) -> Self {
+        Self::with_block_time(genesis_timestamp_ms, BLOCK_TIME_MS)
+    }
+
+    /// Create a new slot clock with a caller-supplied slot duration.
+    /// Values outside 10..=10_000 are clamped to 10 ms / 10 s — sub-
+    /// 10ms rates destabilize consensus on laptops and > 10s rates
+    /// are clearly a config error.
+    pub fn with_block_time(genesis_timestamp_ms: u64, block_time_ms: u64) -> Self {
+        let block_time_ms = block_time_ms.clamp(10, 10_000);
         let now_ms = current_time_ms();
         let genesis_instant = if genesis_timestamp_ms == 0 || genesis_timestamp_ms >= now_ms {
             // Genesis is now or in the future — start from current instant
@@ -37,14 +53,14 @@ impl SlotClock {
             } else {
                 genesis_timestamp_ms
             },
-            slot_duration: Duration::from_millis(BLOCK_TIME_MS),
+            block_time_ms,
         }
     }
 
     /// Current slot number based on elapsed time since genesis.
     pub fn current_slot(&self) -> u64 {
         let elapsed = self.genesis_instant.elapsed();
-        (elapsed.as_millis() as u64) / BLOCK_TIME_MS
+        (elapsed.as_millis() as u64) / self.block_time_ms
     }
 
     /// Time remaining in the current slot.
@@ -52,7 +68,7 @@ impl SlotClock {
     pub fn time_remaining(&self) -> Duration {
         let elapsed = self.genesis_instant.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
-        let slot_end_ms = (self.current_slot() + 1) * BLOCK_TIME_MS;
+        let slot_end_ms = (self.current_slot() + 1) * self.block_time_ms;
         let remaining = slot_end_ms.saturating_sub(elapsed_ms);
         Duration::from_millis(remaining)
     }
@@ -60,7 +76,7 @@ impl SlotClock {
     /// Duration until a specific slot starts.
     #[allow(dead_code)]
     pub fn duration_until_slot(&self, slot: u64) -> Duration {
-        let slot_start_ms = slot * BLOCK_TIME_MS;
+        let slot_start_ms = slot * self.block_time_ms;
         let elapsed_ms = self.genesis_instant.elapsed().as_millis() as u64;
         if slot_start_ms > elapsed_ms {
             Duration::from_millis(slot_start_ms - elapsed_ms)
@@ -71,19 +87,19 @@ impl SlotClock {
 
     /// Timestamp (Unix ms) for a given slot.
     pub fn slot_timestamp(&self, slot: u64) -> u64 {
-        self.genesis_timestamp_ms + slot * BLOCK_TIME_MS
+        self.genesis_timestamp_ms + slot * self.block_time_ms
     }
 
     /// Slot duration.
     #[allow(dead_code)]
     pub fn slot_duration(&self) -> Duration {
-        self.slot_duration
+        Duration::from_millis(self.block_time_ms)
     }
 
     /// Milliseconds elapsed within the current slot (0..400).
     pub fn ms_into_slot(&self) -> u64 {
         let elapsed_ms = self.genesis_instant.elapsed().as_millis() as u64;
-        elapsed_ms % BLOCK_TIME_MS
+        elapsed_ms % self.block_time_ms
     }
 }
 

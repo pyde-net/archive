@@ -48,6 +48,7 @@ fn main() {
             base_rpc_port,
             dev,
             chain_id,
+            block_time_ms,
         } => {
             if let Err(e) = genesis::generate_testnet(
                 &out,
@@ -57,6 +58,7 @@ fn main() {
                 base_rpc_port,
                 dev,
                 chain_id,
+                block_time_ms,
             ) {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
