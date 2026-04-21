@@ -65,6 +65,12 @@ pub enum Command {
         #[arg(long, default_value = "2")]
         validators: usize,
 
+        /// Number of non-validator full nodes (0-16). Full nodes relay
+        /// transactions and serve RPC but do not participate in
+        /// consensus. Ports continue after the validator range.
+        #[arg(long, default_value = "0")]
+        full_nodes: usize,
+
         /// Output directory for testnet files.
         #[arg(long, short, default_value = "./testnet")]
         out: std::path::PathBuf,

@@ -745,6 +745,7 @@ pub fn devnet_genesis() -> (GenesisConfig, Vec<DevnetAccount>) {
 pub fn generate_testnet(
     out_dir: &std::path::Path,
     num_validators: usize,
+    num_full_nodes: usize,
     base_port: u16,
     base_rpc_port: u16,
     dev_mode: bool,
@@ -756,6 +757,9 @@ pub fn generate_testnet(
 
     if !(2..=128).contains(&num_validators) {
         return Err("validators must be between 2 and 128".into());
+    }
+    if num_full_nodes > 16 {
+        return Err("full_nodes must be 0..=16".into());
     }
 
     fs::create_dir_all(out_dir)
@@ -870,8 +874,17 @@ pub fn generate_testnet(
 
     // Pre-generate node identity keys (Ed25519 for libp2p) so we know peer IDs
     // and can write full bootstrap multiaddrs in each config.
-    let mut node_keypairs: Vec<(libp2p::identity::Keypair, libp2p::PeerId)> = Vec::new();
-    for _ in 0..num_validators {
+    //
+    // Indexing convention: slots 0..num_validators hold validator keypairs;
+    // slots num_validators..num_validators+num_full_nodes hold full-node
+    // keypairs. Validator bootstrap lists include every OTHER validator;
+    // full-node bootstrap lists include every validator (but no other full
+    // nodes — they find each other via gossipsub once connected to a
+    // validator).
+    let total_nodes = num_validators + num_full_nodes;
+    let mut node_keypairs: Vec<(libp2p::identity::Keypair, libp2p::PeerId)> =
+        Vec::with_capacity(total_nodes);
+    for _ in 0..total_nodes {
         let kp = pyde_net::node::generate_keypair();
         let peer_id = libp2p::PeerId::from(kp.public());
         node_keypairs.push((kp, peer_id));
@@ -933,6 +946,95 @@ pub fn generate_testnet(
         let config_toml = format!(
             r#"[node]
 role = "validator"
+chain_id = {chain_id}
+datadir = "{datadir}"
+dev_mode = {dev}
+
+[network]
+port = {p2p_port}
+max_peers = 50
+max_inbound = 30
+max_outbound = 20
+rate_limit_per_ip = 5
+bootstrap_peers = {bootstrap}
+
+[consensus]
+block_time_ms = 400
+gas_target = 400000000
+gas_ceiling = 1600000000
+
+[storage]
+db_path = "state"
+cache_size = 65536
+
+[rpc]
+enabled = true
+listen = "127.0.0.1"
+port = {rpc_port}
+
+[metrics]
+enabled = true
+port = {metrics_port}
+
+[logging]
+level = "info"
+json = false
+"#,
+            datadir = node_dir.display(),
+            dev = dev_mode,
+            p2p_port = p2p_port,
+            rpc_port = rpc_port,
+            metrics_port = metrics_port,
+            bootstrap = bootstrap,
+        );
+
+        fs::write(node_dir.join("config.toml"), config_toml)
+            .map_err(|e| format!("failed to write config.toml: {}", e))?;
+    }
+
+    // Write per-full-node directories. Full nodes share the same genesis
+    // and threshold.pk as validators but have no validator.key, no
+    // threshold.share, and a config with role = "full". Their bootstrap
+    // list points to every validator.
+    for f in 0..num_full_nodes {
+        let i = num_validators + f;
+        let node_dir = out_dir.join(format!("node-{}", i));
+        fs::create_dir_all(&node_dir)
+            .map_err(|e| format!("failed to create {}: {}", node_dir.display(), e))?;
+
+        // node.key
+        let node_key_bytes = pyde_net::node::keypair_to_bytes(&node_keypairs[i].0)
+            .map_err(|e| format!("failed to serialize node key: {}", e))?;
+        fs::write(node_dir.join("node.key"), &node_key_bytes)
+            .map_err(|e| format!("failed to write node.key: {}", e))?;
+
+        // threshold.pk (shared — same for every node).
+        fs::write(node_dir.join("threshold.pk"), threshold_pk.to_bytes())
+            .map_err(|e| format!("failed to write threshold.pk: {}", e))?;
+
+        // Copy genesis.toml.
+        fs::write(node_dir.join("genesis.toml"), genesis_config.to_toml())
+            .map_err(|e| format!("failed to write genesis.toml: {}", e))?;
+
+        // Bootstrap list: all validators.
+        let mut bootstrap_addrs: Vec<String> = Vec::new();
+        for j in 0..num_validators {
+            let other_port = base_port + j as u16;
+            let other_peer_id = &node_keypairs[j].1;
+            bootstrap_addrs.push(format!(
+                "\"/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}\"",
+                other_port, other_peer_id
+            ));
+        }
+        let bootstrap = format!("[{}]", bootstrap_addrs.join(", "));
+
+        let p2p_port = base_port + i as u16;
+        let rpc_port = base_rpc_port + i as u16;
+        let metrics_port = 9090 + i as u16;
+
+        let config_toml = format!(
+            r#"[node]
+role = "full"
 chain_id = {chain_id}
 datadir = "{datadir}"
 dev_mode = {dev}
