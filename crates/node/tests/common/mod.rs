@@ -14,6 +14,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -37,6 +38,12 @@ pub struct TestNode {
 impl TestNode {
     pub fn rpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.rpc_port)
+    }
+
+    /// True if a child process is attached — i.e. the node has been
+    /// started and not yet explicitly killed.
+    pub fn is_running(&self) -> bool {
+        self.process.is_some()
     }
 
     pub fn kill(&mut self) {
@@ -63,7 +70,19 @@ impl Drop for TestNode {
 pub struct TestNetwork {
     pub nodes: Vec<TestNode>,
     pub chain_id: u64,
+    pyde_bin: PathBuf,
+    dev: bool,
+    /// Port reservations for deferred nodes. Dropped just before that
+    /// node is started so the child process can bind the same ports.
+    /// Keeps random OS processes from snatching the port during the
+    /// gap between testnet generation and `start_deferred()`.
+    deferred_port_holders: HashMap<usize, DeferredPortHolder>,
     _tempdir: TempDir,
+}
+
+struct DeferredPortHolder {
+    _udp: UdpSocket,
+    _tcp: TcpListener,
 }
 
 impl TestNetwork {
@@ -80,6 +99,35 @@ impl TestNetwork {
         full_nodes: usize,
         dev: bool,
     ) -> Result<Self, String> {
+        Self::spawn_mixed_inner(validators, full_nodes, 0, dev)
+    }
+
+    /// Same as `spawn_mixed`, but the last `deferred` full nodes have
+    /// their dirs + configs created and kept NOT running. Call
+    /// `start_deferred(idx)` later to bring each one online. Used to
+    /// test sync: let the live nodes build a chain, then start a cold
+    /// node and watch it catch up.
+    pub fn spawn_with_deferred_full_nodes(
+        validators: usize,
+        full_nodes: usize,
+        deferred: usize,
+        dev: bool,
+    ) -> Result<Self, String> {
+        if deferred > full_nodes {
+            return Err(format!(
+                "deferred ({}) must be <= full_nodes ({})",
+                deferred, full_nodes
+            ));
+        }
+        Self::spawn_mixed_inner(validators, full_nodes, deferred, dev)
+    }
+
+    fn spawn_mixed_inner(
+        validators: usize,
+        full_nodes: usize,
+        deferred: usize,
+        dev: bool,
+    ) -> Result<Self, String> {
         if !(2..=8).contains(&validators) {
             return Err(format!(
                 "validators must be 2..=8 for the harness; got {}",
@@ -93,6 +141,8 @@ impl TestNetwork {
             ));
         }
         let total = validators + full_nodes;
+        // The last `deferred` nodes stay cold; the rest start eagerly.
+        let first_deferred_idx = total - deferred;
 
         let tempdir = tempfile::tempdir().map_err(|e| format!("create tempdir: {}", e))?;
         let net_dir = tempdir.path().join("net");
@@ -104,23 +154,25 @@ impl TestNetwork {
         // `base_port + i`, so the range must be contiguous + free at
         // startup for EVERY node (validators + full nodes). We probe by
         // binding then immediately releasing.
-        let (p2p_base, _p2p_holders) = allocate_contiguous_udp_ports(total)?;
-        let (rpc_base, _rpc_holders) = allocate_contiguous_tcp_ports(total)?;
+        let (p2p_base, mut p2p_holders) = allocate_contiguous_udp_ports(total)?;
+        let (rpc_base, mut rpc_holders) = allocate_contiguous_tcp_ports(total)?;
 
         // Run `pyde testnet` to set up genesis + per-node configs.
         run_testnet_cli(
             &pyde_bin, validators, full_nodes, &net_dir, dev, chain_id, p2p_base, rpc_base,
         )?;
 
-        // Drop the port-holder sockets just before spawning. There's
-        // a tiny race window here where another process could grab
-        // one, but on a CI runner (and local dev) the window is
-        // microseconds and the collision probability is negligible.
-        drop(_p2p_holders);
-        drop(_rpc_holders);
+        // Port-holder strategy:
+        //   - For every node that starts NOW, drop its holders just
+        //     before spawn() — there's a tiny race window where another
+        //     process could snatch the port, but in practice the window
+        //     is microseconds.
+        //   - For deferred nodes, KEEP their holders alive in
+        //     `deferred_port_holders` so a 30s-later `start_deferred()`
+        //     doesn't race with system processes for that exact port.
+        let mut deferred_port_holders: HashMap<usize, DeferredPortHolder> = HashMap::new();
 
-        // Spawn validators, then full nodes. Same launch path for both;
-        // only the `--role` flag differs (read from config.toml).
+        // Build all TestNode entries; start only the non-deferred ones.
         let mut nodes: Vec<TestNode> = Vec::with_capacity(total);
         for i in 0..total {
             let role: &'static str = if i < validators { "validator" } else { "full" };
@@ -136,14 +188,30 @@ impl TestNetwork {
                 process: None,
                 output: Arc::new(Mutex::new(Vec::new())),
             };
-            start_node(&mut n, &pyde_bin, dev)?;
+            // Take this node's holders out of the shared vec.
+            let udp = p2p_holders.remove(0);
+            let tcp = rpc_holders.remove(0);
+            if i < first_deferred_idx {
+                // Drop holders, then spawn — the OS releases the ports
+                // immediately and the child grabs them on startup.
+                drop(udp);
+                drop(tcp);
+                start_node(&mut n, &pyde_bin, dev)?;
+            } else {
+                // Keep them reserved until start_deferred() is called.
+                deferred_port_holders.insert(i, DeferredPortHolder { _udp: udp, _tcp: tcp });
+            }
             nodes.push(n);
         }
 
-        // Wait for RPC up on every node. Generous deadline — first
-        // boot includes RocksDB init + libp2p bootstrap.
+        // Wait for RPC up only on started nodes. Deferred nodes have
+        // no process; their RPC port is still held by the OS at this
+        // point? No — the holders were dropped. Leave them alone.
         let deadline = Instant::now() + Duration::from_secs(45);
         for node in &nodes {
+            if node.process.is_none() {
+                continue;
+            }
             wait_rpc_up(&node.rpc_url(), deadline).map_err(|e| {
                 format!(
                     "{}\n--- node-{} ({}) output ---\n{}",
@@ -158,8 +226,41 @@ impl TestNetwork {
         Ok(Self {
             nodes,
             chain_id,
+            pyde_bin,
+            dev,
+            deferred_port_holders,
             _tempdir: tempdir,
         })
+    }
+
+    /// Start a previously-deferred node. Returns once its RPC is up.
+    pub fn start_deferred(&mut self, idx: usize) -> Result<(), String> {
+        if !self.deferred_port_holders.contains_key(&idx) {
+            return Err(format!(
+                "node-{} is not a deferred node (either never deferred or already started)",
+                idx
+            ));
+        }
+        let node = self
+            .nodes
+            .get_mut(idx)
+            .ok_or_else(|| format!("no node at index {}", idx))?;
+        if node.process.is_some() {
+            return Err(format!("node-{} is already running", idx));
+        }
+        // Release the port reservation AT THE MOMENT we spawn — gap
+        // between drop and child bind is microseconds, which closes
+        // the race window that caused EADDRINUSE in earlier runs.
+        drop(self.deferred_port_holders.remove(&idx));
+        start_node(node, &self.pyde_bin, self.dev)?;
+        let url = node.rpc_url();
+        let deadline = Instant::now() + Duration::from_secs(45);
+        if let Err(e) = wait_rpc_up(&url, deadline) {
+            thread::sleep(Duration::from_millis(200));
+            let snapshot = self.nodes[idx].output_snapshot();
+            return Err(format!("{}\n--- node-{} output ---\n{}", e, idx, snapshot));
+        }
+        Ok(())
     }
 
     /// Indices of every validator node.
