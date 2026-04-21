@@ -32,12 +32,15 @@ pub fn format_diagnostic(d: &Diagnostic, source: &str) -> String {
     // Level + message
     let level_str = match d.level {
         Level::Error => "\x1b[1;31merror\x1b[0m",     // bold red
-        Level::Warning => "\x1b[1;33mwarning\x1b[0m",  // bold yellow
+        Level::Warning => "\x1b[1;33mwarning\x1b[0m", // bold yellow
     };
     out.push_str(&format!("{}: \x1b[1m{}\x1b[0m\n", level_str, d.message));
 
     // Location
-    out.push_str(&format!(" \x1b[1;34m-->\x1b[0m {}:{}:{}\n", d.file, d.line, d.col));
+    out.push_str(&format!(
+        " \x1b[1;34m-->\x1b[0m {}:{}:{}\n",
+        d.file, d.line, d.col
+    ));
 
     // Source context
     if d.line > 0 {
@@ -52,8 +55,10 @@ pub fn format_diagnostic(d: &Diagnostic, source: &str) -> String {
             out.push_str(&format!(" {} \x1b[1;34m|\x1b[0m\n", padding));
 
             // Source line
-            out.push_str(&format!(" \x1b[1;34m{}\x1b[0m \x1b[1;34m|\x1b[0m {}\n",
-                d.line, lines[line_idx]));
+            out.push_str(&format!(
+                " \x1b[1;34m{}\x1b[0m \x1b[1;34m|\x1b[0m {}\n",
+                d.line, lines[line_idx]
+            ));
 
             // Caret line
             let col_idx = if d.col > 0 { (d.col - 1) as usize } else { 0 };
@@ -62,8 +67,10 @@ pub fn format_diagnostic(d: &Diagnostic, source: &str) -> String {
                 Level::Error => "\x1b[1;31m",
                 Level::Warning => "\x1b[1;33m",
             };
-            out.push_str(&format!(" {} \x1b[1;34m|\x1b[0m {}{}\x1b[0m\n",
-                padding, caret_color, carets));
+            out.push_str(&format!(
+                " {} \x1b[1;34m|\x1b[0m {}{}\x1b[0m\n",
+                padding, caret_color, carets
+            ));
         }
     }
 
@@ -79,16 +86,30 @@ pub fn format_diagnostics(diagnostics: &[Diagnostic], source: &str) -> String {
     }
 
     // Summary
-    let errors = diagnostics.iter().filter(|d| matches!(d.level, Level::Error)).count();
-    let warnings = diagnostics.iter().filter(|d| matches!(d.level, Level::Warning)).count();
+    let errors = diagnostics
+        .iter()
+        .filter(|d| matches!(d.level, Level::Error))
+        .count();
+    let warnings = diagnostics
+        .iter()
+        .filter(|d| matches!(d.level, Level::Warning))
+        .count();
 
     if errors > 0 || warnings > 0 {
         let mut parts = Vec::new();
         if errors > 0 {
-            parts.push(format!("\x1b[1;31m{} error{}\x1b[0m", errors, if errors == 1 { "" } else { "s" }));
+            parts.push(format!(
+                "\x1b[1;31m{} error{}\x1b[0m",
+                errors,
+                if errors == 1 { "" } else { "s" }
+            ));
         }
         if warnings > 0 {
-            parts.push(format!("\x1b[1;33m{} warning{}\x1b[0m", warnings, if warnings == 1 { "" } else { "s" }));
+            parts.push(format!(
+                "\x1b[1;33m{} warning{}\x1b[0m",
+                warnings,
+                if warnings == 1 { "" } else { "s" }
+            ));
         }
         out.push_str(&format!("{} emitted\n", parts.join(", ")));
     }
@@ -136,9 +157,27 @@ mod tests {
     #[test]
     fn format_summary() {
         let diagnostics = vec![
-            Diagnostic { level: Level::Error, message: "err1".into(), file: "t.oti".into(), line: 1, col: 1 },
-            Diagnostic { level: Level::Warning, message: "warn1".into(), file: "t.oti".into(), line: 2, col: 1 },
-            Diagnostic { level: Level::Error, message: "err2".into(), file: "t.oti".into(), line: 3, col: 1 },
+            Diagnostic {
+                level: Level::Error,
+                message: "err1".into(),
+                file: "t.oti".into(),
+                line: 1,
+                col: 1,
+            },
+            Diagnostic {
+                level: Level::Warning,
+                message: "warn1".into(),
+                file: "t.oti".into(),
+                line: 2,
+                col: 1,
+            },
+            Diagnostic {
+                level: Level::Error,
+                message: "err2".into(),
+                file: "t.oti".into(),
+                line: 3,
+                col: 1,
+            },
         ];
         let out = format_diagnostics(&diagnostics, "a\nb\nc");
         assert!(out.contains("2 errors"));

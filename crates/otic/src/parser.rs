@@ -57,12 +57,18 @@ impl Parser {
     // ========================================================================
 
     fn peek(&self) -> &TokenKind {
-        self.tokens.get(self.pos).map(|t| &t.kind).unwrap_or(&TokenKind::Eof)
+        self.tokens
+            .get(self.pos)
+            .map(|t| &t.kind)
+            .unwrap_or(&TokenKind::Eof)
     }
 
     fn peek_span(&self) -> Span {
         self.tokens.get(self.pos).map(|t| t.span).unwrap_or(Span {
-            line: 0, col: 0, offset: 0, len: 0,
+            line: 0,
+            col: 0,
+            offset: 0,
+            len: 0,
         })
     }
 
@@ -77,7 +83,12 @@ impl Parser {
     fn advance(&mut self) -> Token {
         let tok = self.tokens.get(self.pos).cloned().unwrap_or(Token {
             kind: TokenKind::Eof,
-            span: Span { line: 0, col: 0, offset: 0, len: 0 },
+            span: Span {
+                line: 0,
+                col: 0,
+                offset: 0,
+                len: 0,
+            },
         });
         self.pos += 1;
         tok
@@ -87,7 +98,11 @@ impl Parser {
         if self.at(kind) {
             Ok(self.advance())
         } else {
-            self.error(format!("expected {}, found {}", kind.description(), self.peek().description()));
+            self.error(format!(
+                "expected {}, found {}",
+                kind.description(),
+                self.peek().description()
+            ));
             Err(())
         }
     }
@@ -97,13 +112,19 @@ impl Parser {
             TokenKind::Ident(_) => {
                 let tok = self.advance();
                 if let TokenKind::Ident(name) = tok.kind {
-                    Ok(Ident { name, span: tok.span })
+                    Ok(Ident {
+                        name,
+                        span: tok.span,
+                    })
                 } else {
                     unreachable!()
                 }
             }
             _ => {
-                self.error(format!("expected identifier, found {}", self.peek().description()));
+                self.error(format!(
+                    "expected identifier, found {}",
+                    self.peek().description()
+                ));
                 Err(())
             }
         }
@@ -129,8 +150,17 @@ impl Parser {
                 offset: tok.span.offset + 1,
                 len: 1,
             };
-            self.tokens.insert(self.pos, Token { kind: TokenKind::Gt, span: gt_span });
-            Ok(Token { kind: TokenKind::Gt, span: tok.span })
+            self.tokens.insert(
+                self.pos,
+                Token {
+                    kind: TokenKind::Gt,
+                    span: gt_span,
+                },
+            );
+            Ok(Token {
+                kind: TokenKind::Gt,
+                span: tok.span,
+            })
         } else {
             self.error(format!("expected >, found {}", self.peek().description()));
             Err(())
@@ -151,8 +181,8 @@ impl Parser {
         if let TokenKind::Ident(ref s) = self.peek() {
             let suffix = s.strip_prefix('_').unwrap_or(s.as_str());
             match suffix {
-                "u8" | "u16" | "u32" | "u64" | "u128" | "u256"
-                | "i8" | "i16" | "i32" | "i64" | "i128" | "i256" => {
+                "u8" | "u16" | "u32" | "u64" | "u128" | "u256" | "i8" | "i16" | "i32" | "i64"
+                | "i128" | "i256" => {
                     self.advance();
                 }
                 _ => {}
@@ -168,12 +198,21 @@ impl Parser {
     fn recover_to_item(&mut self) {
         while !self.at_eof() {
             match self.peek() {
-                TokenKind::Contract | TokenKind::Struct | TokenKind::Enum
-                | TokenKind::Const | TokenKind::TypeKw | TokenKind::Interface
-                | TokenKind::Use | TokenKind::Module | TokenKind::Error
-                | TokenKind::Fn | TokenKind::Pub => return,
+                TokenKind::Contract
+                | TokenKind::Struct
+                | TokenKind::Enum
+                | TokenKind::Const
+                | TokenKind::TypeKw
+                | TokenKind::Interface
+                | TokenKind::Use
+                | TokenKind::Module
+                | TokenKind::Error
+                | TokenKind::Fn
+                | TokenKind::Pub => return,
                 TokenKind::Attribute(_) | TokenKind::DocComment(_) => return,
-                _ => { self.advance(); }
+                _ => {
+                    self.advance();
+                }
             }
         }
     }
@@ -182,11 +221,22 @@ impl Parser {
         while !self.at_eof() {
             match self.peek() {
                 TokenKind::RBrace => return,
-                TokenKind::Semicolon => { self.advance(); return; }
-                TokenKind::Let | TokenKind::Return | TokenKind::Emit
-                | TokenKind::For | TokenKind::While | TokenKind::If
-                | TokenKind::Break | TokenKind::Continue | TokenKind::Match => return,
-                _ => { self.advance(); }
+                TokenKind::Semicolon => {
+                    self.advance();
+                    return;
+                }
+                TokenKind::Let
+                | TokenKind::Return
+                | TokenKind::Emit
+                | TokenKind::For
+                | TokenKind::While
+                | TokenKind::If
+                | TokenKind::Break
+                | TokenKind::Continue
+                | TokenKind::Match => return,
+                _ => {
+                    self.advance();
+                }
             }
         }
     }
@@ -213,7 +263,9 @@ impl Parser {
             TokenKind::Pub => {
                 self.advance(); // eat 'pub'
                 match self.peek() {
-                    TokenKind::Fn => Ok(Item::Function(self.parse_function_with_doc(doc, attrs, true)?)),
+                    TokenKind::Fn => Ok(Item::Function(
+                        self.parse_function_with_doc(doc, attrs, true)?,
+                    )),
                     TokenKind::Const => Ok(Item::Const(self.parse_const(true)?)),
                     _ => {
                         self.error("expected 'fn' or 'const' after 'pub'".into());
@@ -221,9 +273,14 @@ impl Parser {
                     }
                 }
             }
-            TokenKind::Fn => Ok(Item::Function(self.parse_function_with_doc(doc, attrs, false)?)),
+            TokenKind::Fn => Ok(Item::Function(
+                self.parse_function_with_doc(doc, attrs, false)?,
+            )),
             _ => {
-                self.error(format!("expected item, found {}", self.peek().description()));
+                self.error(format!(
+                    "expected item, found {}",
+                    self.peek().description()
+                ));
                 Err(())
             }
         }
@@ -250,7 +307,10 @@ impl Parser {
         while let TokenKind::Attribute(_) = self.peek() {
             let tok = self.advance();
             if let TokenKind::Attribute(content) = tok.kind {
-                attrs.push(Attribute { content, span: tok.span });
+                attrs.push(Attribute {
+                    content,
+                    span: tok.span,
+                });
             }
         }
         attrs
@@ -273,12 +333,20 @@ impl Parser {
                 }
                 self.expect(&TokenKind::RBrace)?;
                 self.expect_semi()?;
-                return Ok(UseImport { path, items, span: start });
+                return Ok(UseImport {
+                    path,
+                    items,
+                    span: start,
+                });
             }
             path.push(self.expect_ident()?);
         }
         self.expect_semi()?;
-        Ok(UseImport { path, items: vec![], span: start })
+        Ok(UseImport {
+            path,
+            items: vec![],
+            span: start,
+        })
     }
 
     fn parse_module(&mut self) -> Result<ModuleDef, ()> {
@@ -304,7 +372,11 @@ impl Parser {
         }
 
         self.expect(&TokenKind::RBrace)?;
-        Ok(ContractDef { name, items, span: start })
+        Ok(ContractDef {
+            name,
+            items,
+            span: start,
+        })
     }
 
     fn parse_contract_item(&mut self) -> Result<ContractItem, ()> {
@@ -322,7 +394,9 @@ impl Parser {
             TokenKind::Pub => {
                 self.advance(); // eat 'pub'
                 match self.peek() {
-                    TokenKind::Fn => Ok(ContractItem::Function(self.parse_function_with_doc(doc, attrs, true)?)),
+                    TokenKind::Fn => Ok(ContractItem::Function(
+                        self.parse_function_with_doc(doc, attrs, true)?,
+                    )),
                     TokenKind::Const => Ok(ContractItem::Const(self.parse_const(true)?)),
                     _ => {
                         self.error("expected 'fn' or 'const' after 'pub'".into());
@@ -330,9 +404,14 @@ impl Parser {
                     }
                 }
             }
-            TokenKind::Fn => Ok(ContractItem::Function(self.parse_function_with_doc(doc, attrs, false)?)),
+            TokenKind::Fn => Ok(ContractItem::Function(
+                self.parse_function_with_doc(doc, attrs, false)?,
+            )),
             _ => {
-                self.error(format!("expected contract item, found {}", self.peek().description()));
+                self.error(format!(
+                    "expected contract item, found {}",
+                    self.peek().description()
+                ));
                 Err(())
             }
         }
@@ -342,11 +421,18 @@ impl Parser {
         while !self.at_eof() {
             match self.peek() {
                 TokenKind::RBrace => return,
-                TokenKind::Storage | TokenKind::Event | TokenKind::Error
-                | TokenKind::Struct | TokenKind::Enum | TokenKind::Const
-                | TokenKind::Fn | TokenKind::Pub => return,
+                TokenKind::Storage
+                | TokenKind::Event
+                | TokenKind::Error
+                | TokenKind::Struct
+                | TokenKind::Enum
+                | TokenKind::Const
+                | TokenKind::Fn
+                | TokenKind::Pub => return,
                 TokenKind::Attribute(_) | TokenKind::DocComment(_) => return,
-                _ => { self.advance(); }
+                _ => {
+                    self.advance();
+                }
             }
         }
     }
@@ -366,7 +452,11 @@ impl Parser {
             self.expect(&TokenKind::Colon)?;
             let ty = self.parse_type()?;
             let fspan = fname.span;
-            fields.push(StorageField { name: fname, ty, span: fspan });
+            fields.push(StorageField {
+                name: fname,
+                ty,
+                span: fspan,
+            });
             // Require comma between fields (trailing comma before } is optional)
             if !self.at(&TokenKind::RBrace) {
                 self.expect(&TokenKind::Comma)?;
@@ -376,7 +466,10 @@ impl Parser {
         }
 
         self.expect(&TokenKind::RBrace)?;
-        Ok(StorageBlock { fields, span: start })
+        Ok(StorageBlock {
+            fields,
+            span: start,
+        })
     }
 
     fn parse_event_with_doc(&mut self, doc: Option<String>) -> Result<EventDef, ()> {
@@ -388,7 +481,12 @@ impl Parser {
         let mut fields = Vec::new();
         while !self.at(&TokenKind::RBrace) && !self.at_eof() {
             let indexed = if let TokenKind::Attribute(ref s) = self.peek() {
-                if s == "indexed" { self.advance(); true } else { false }
+                if s == "indexed" {
+                    self.advance();
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             };
@@ -396,7 +494,12 @@ impl Parser {
             self.expect(&TokenKind::Colon)?;
             let ty = self.parse_type()?;
             let fspan = fname.span;
-            fields.push(EventField { name: fname, ty, indexed, span: fspan });
+            fields.push(EventField {
+                name: fname,
+                ty,
+                indexed,
+                span: fspan,
+            });
             if !self.at(&TokenKind::RBrace) {
                 self.expect(&TokenKind::Comma)?;
             } else {
@@ -405,7 +508,12 @@ impl Parser {
         }
 
         self.expect(&TokenKind::RBrace)?;
-        Ok(EventDef { name, doc, fields, span: start })
+        Ok(EventDef {
+            name,
+            doc,
+            fields,
+            span: start,
+        })
     }
 
     fn parse_error_def_with_doc(&mut self, doc: Option<String>) -> Result<ErrorDef, ()> {
@@ -420,7 +528,11 @@ impl Parser {
             self.expect(&TokenKind::Colon)?;
             let ty = self.parse_type()?;
             let fspan = fname.span;
-            fields.push(StructField { name: fname, ty, span: fspan });
+            fields.push(StructField {
+                name: fname,
+                ty,
+                span: fspan,
+            });
             if !self.at(&TokenKind::RBrace) {
                 self.expect(&TokenKind::Comma)?;
             } else {
@@ -429,7 +541,12 @@ impl Parser {
         }
 
         self.expect(&TokenKind::RBrace)?;
-        Ok(ErrorDef { name, doc, fields, span: start })
+        Ok(ErrorDef {
+            name,
+            doc,
+            fields,
+            span: start,
+        })
     }
 
     fn parse_struct(&mut self) -> Result<StructDef, ()> {
@@ -444,7 +561,11 @@ impl Parser {
             self.expect(&TokenKind::Colon)?;
             let ty = self.parse_type()?;
             let fspan = fname.span;
-            fields.push(StructField { name: fname, ty, span: fspan });
+            fields.push(StructField {
+                name: fname,
+                ty,
+                span: fspan,
+            });
             if !self.at(&TokenKind::RBrace) {
                 self.expect(&TokenKind::Comma)?;
             } else {
@@ -453,7 +574,11 @@ impl Parser {
         }
 
         self.expect(&TokenKind::RBrace)?;
-        Ok(StructDef { name, fields, span: start })
+        Ok(StructDef {
+            name,
+            fields,
+            span: start,
+        })
     }
 
     fn parse_enum(&mut self) -> Result<EnumDef, ()> {
@@ -477,7 +602,11 @@ impl Parser {
         }
 
         self.expect(&TokenKind::RBrace)?;
-        Ok(EnumDef { name, variants, span: start })
+        Ok(EnumDef {
+            name,
+            variants,
+            span: start,
+        })
     }
 
     fn parse_const(&mut self, is_pub: bool) -> Result<ConstDef, ()> {
@@ -495,7 +624,13 @@ impl Parser {
         let value = self.parse_expr()?;
         self.expect_semi()?;
 
-        Ok(ConstDef { name, ty, value, is_pub, span: start })
+        Ok(ConstDef {
+            name,
+            ty,
+            value,
+            is_pub,
+            span: start,
+        })
     }
 
     fn parse_type_alias(&mut self) -> Result<TypeAliasDef, ()> {
@@ -505,7 +640,11 @@ impl Parser {
         self.expect(&TokenKind::Eq)?;
         let ty = self.parse_type()?;
         self.expect_semi()?;
-        Ok(TypeAliasDef { name, ty, span: start })
+        Ok(TypeAliasDef {
+            name,
+            ty,
+            span: start,
+        })
     }
 
     fn parse_interface(&mut self) -> Result<InterfaceDef, ()> {
@@ -520,7 +659,11 @@ impl Parser {
         }
 
         self.expect(&TokenKind::RBrace)?;
-        Ok(InterfaceDef { name, functions, span: start })
+        Ok(InterfaceDef {
+            name,
+            functions,
+            span: start,
+        })
     }
 
     fn parse_interface_fn(&mut self) -> Result<InterfaceFnSig, ()> {
@@ -534,14 +677,24 @@ impl Parser {
             None
         };
         self.expect_semi()?;
-        Ok(InterfaceFnSig { name, params, return_type, span: start })
+        Ok(InterfaceFnSig {
+            name,
+            params,
+            return_type,
+            span: start,
+        })
     }
 
     // ========================================================================
     // Functions
     // ========================================================================
 
-    fn parse_function_with_doc(&mut self, doc: Option<String>, attrs: Vec<Attribute>, is_pub: bool) -> Result<FunctionDef, ()> {
+    fn parse_function_with_doc(
+        &mut self,
+        doc: Option<String>,
+        attrs: Vec<Attribute>,
+        is_pub: bool,
+    ) -> Result<FunctionDef, ()> {
         let start = self.peek_span();
         self.expect(&TokenKind::Fn)?;
         let name = self.expect_ident()?;
@@ -554,7 +707,14 @@ impl Parser {
         let body = self.parse_block()?;
 
         Ok(FunctionDef {
-            name, doc, attributes: attrs, is_pub, params, return_type, body, span: start,
+            name,
+            doc,
+            attributes: attrs,
+            is_pub,
+            params,
+            return_type,
+            body,
+            span: start,
         })
     }
 
@@ -599,22 +759,70 @@ impl Parser {
                 let name_str = name.clone();
                 match name_str.as_str() {
                     // Primitive types
-                    "u8" => { self.advance(); Ok(Type::Primitive(PrimitiveType::U8, span)) }
-                    "u16" => { self.advance(); Ok(Type::Primitive(PrimitiveType::U16, span)) }
-                    "u32" => { self.advance(); Ok(Type::Primitive(PrimitiveType::U32, span)) }
-                    "u64" => { self.advance(); Ok(Type::Primitive(PrimitiveType::U64, span)) }
-                    "u128" => { self.advance(); Ok(Type::Primitive(PrimitiveType::U128, span)) }
-                    "u256" => { self.advance(); Ok(Type::Primitive(PrimitiveType::U256, span)) }
-                    "i8" => { self.advance(); Ok(Type::Primitive(PrimitiveType::I8, span)) }
-                    "i16" => { self.advance(); Ok(Type::Primitive(PrimitiveType::I16, span)) }
-                    "i32" => { self.advance(); Ok(Type::Primitive(PrimitiveType::I32, span)) }
-                    "i64" => { self.advance(); Ok(Type::Primitive(PrimitiveType::I64, span)) }
-                    "i128" => { self.advance(); Ok(Type::Primitive(PrimitiveType::I128, span)) }
-                    "i256" => { self.advance(); Ok(Type::Primitive(PrimitiveType::I256, span)) }
-                    "bool" => { self.advance(); Ok(Type::Primitive(PrimitiveType::Bool, span)) }
-                    "Address" => { self.advance(); Ok(Type::Primitive(PrimitiveType::Address, span)) }
-                    "String" => { self.advance(); Ok(Type::Primitive(PrimitiveType::StringType, span)) }
-                    "bytes" => { self.advance(); Ok(Type::Bytes(span)) }
+                    "u8" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::U8, span))
+                    }
+                    "u16" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::U16, span))
+                    }
+                    "u32" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::U32, span))
+                    }
+                    "u64" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::U64, span))
+                    }
+                    "u128" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::U128, span))
+                    }
+                    "u256" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::U256, span))
+                    }
+                    "i8" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::I8, span))
+                    }
+                    "i16" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::I16, span))
+                    }
+                    "i32" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::I32, span))
+                    }
+                    "i64" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::I64, span))
+                    }
+                    "i128" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::I128, span))
+                    }
+                    "i256" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::I256, span))
+                    }
+                    "bool" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::Bool, span))
+                    }
+                    "Address" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::Address, span))
+                    }
+                    "String" => {
+                        self.advance();
+                        Ok(Type::Primitive(PrimitiveType::StringType, span))
+                    }
+                    "bytes" => {
+                        self.advance();
+                        Ok(Type::Bytes(span))
+                    }
                     // Generic types
                     "Vec" => {
                         self.advance();
@@ -643,7 +851,10 @@ impl Parser {
                 }
             }
             _ => {
-                self.error(format!("expected type, found {}", self.peek().description()));
+                self.error(format!(
+                    "expected type, found {}",
+                    self.peek().description()
+                ));
                 Err(())
             }
         }
@@ -657,7 +868,11 @@ impl Parser {
         let size = match self.peek() {
             TokenKind::IntLiteral(_) => {
                 let tok = self.advance();
-                if let TokenKind::IntLiteral(v) = tok.kind { v.as_u64() } else { 0 }
+                if let TokenKind::IntLiteral(v) = tok.kind {
+                    v.as_u64()
+                } else {
+                    0
+                }
             }
             _ => {
                 self.error("expected array size".into());
@@ -773,7 +988,13 @@ impl Parser {
         let initializer = self.parse_expr()?;
         self.expect_semi()?;
 
-        Ok(Stmt::Let(LetStmt { binding, is_mutable, ty, initializer, span: start }))
+        Ok(Stmt::Let(LetStmt {
+            binding,
+            is_mutable,
+            ty,
+            initializer,
+            span: start,
+        }))
     }
 
     fn parse_return_stmt(&mut self) -> Result<Stmt, ()> {
@@ -806,7 +1027,11 @@ impl Parser {
             self.expect(&TokenKind::Colon)?;
             let value = self.parse_expr()?;
             let fspan = fname.span;
-            fields.push(FieldInit { name: fname, value, span: fspan });
+            fields.push(FieldInit {
+                name: fname,
+                value,
+                span: fspan,
+            });
             if !self.at(&TokenKind::RBrace) {
                 self.expect(&TokenKind::Comma)?;
             } else {
@@ -816,7 +1041,11 @@ impl Parser {
 
         self.expect(&TokenKind::RBrace)?;
         self.expect_semi()?;
-        Ok(Stmt::Emit(EmitStmt { event_name, fields, span: start }))
+        Ok(Stmt::Emit(EmitStmt {
+            event_name,
+            fields,
+            span: start,
+        }))
     }
 
     fn parse_for_stmt(&mut self) -> Result<Stmt, ()> {
@@ -827,7 +1056,12 @@ impl Parser {
         let iterator = self.parse_expr()?;
         let body = self.parse_block()?;
 
-        Ok(Stmt::For(ForStmt { variable, iterator, body, span: start }))
+        Ok(Stmt::For(ForStmt {
+            variable,
+            iterator,
+            body,
+            span: start,
+        }))
     }
 
     fn parse_while_stmt(&mut self) -> Result<Stmt, ()> {
@@ -836,7 +1070,11 @@ impl Parser {
         let condition = self.parse_expr()?;
         let body = self.parse_block()?;
 
-        Ok(Stmt::While(WhileStmt { condition, body, span: start }))
+        Ok(Stmt::While(WhileStmt {
+            condition,
+            body,
+            span: start,
+        }))
     }
 
     /// Parse an expression statement, or an assignment if followed by `=`/`+=`/etc.
@@ -848,7 +1086,12 @@ impl Parser {
         if let Some(op) = self.try_parse_assign_op() {
             let value = self.parse_expr()?;
             self.expect_semi()?;
-            return Ok(Stmt::Assign(AssignStmt { target: expr, op, value, span: start }));
+            return Ok(Stmt::Assign(AssignStmt {
+                target: expr,
+                op,
+                value,
+                span: start,
+            }));
         }
 
         // Allow trailing expression without ; if it's the last thing before }
@@ -990,8 +1233,8 @@ impl Parser {
 
                     // Check for method call: expr.field(args) or expr.field{ value: v }(args)
                     // Lookahead: only treat { as value annotation if tokens are { value :
-                    let has_value_annotation = self.at(&TokenKind::LBrace)
-                        && self.lookahead_is_value_annotation();
+                    let has_value_annotation =
+                        self.at(&TokenKind::LBrace) && self.lookahead_is_value_annotation();
                     if has_value_annotation || self.at(&TokenKind::LParen) {
                         let call_value = if has_value_annotation {
                             let v = self.parse_call_value_annotation()?;
@@ -1034,7 +1277,9 @@ impl Parser {
     /// Check if the next tokens are `{ value :` (lookahead without consuming).
     fn lookahead_is_value_annotation(&self) -> bool {
         // Current token is `{`. Check if next is ident "value" and after that is `:`.
-        if self.pos + 2 >= self.tokens.len() { return false; }
+        if self.pos + 2 >= self.tokens.len() {
+            return false;
+        }
         let next = &self.tokens[self.pos + 1];
         let after = &self.tokens[self.pos + 2];
         matches!(&next.kind, TokenKind::Ident(name) if name == "value")
@@ -1046,7 +1291,10 @@ impl Parser {
         self.expect(&TokenKind::LBrace)?;
         let ident = self.expect_ident()?;
         if ident.name != "value" {
-            self.error(format!("expected 'value' in call annotation, got '{}'", ident.name));
+            self.error(format!(
+                "expected 'value' in call annotation, got '{}'",
+                ident.name
+            ));
             self.expect(&TokenKind::RBrace)?;
             return Ok(Expr::Literal(Literal::Int(ethnum::U256::ZERO), ident.span));
         }
@@ -1082,8 +1330,8 @@ impl Parser {
                 if let TokenKind::Ident(ref s) = self.peek() {
                     let suffix = s.strip_prefix('_').unwrap_or(s.as_str());
                     match suffix {
-                        "u8" | "u16" | "u32" | "u64" | "u128" | "u256"
-                        | "i8" | "i16" | "i32" | "i64" | "i128" | "i256" => {
+                        "u8" | "u16" | "u32" | "u64" | "u128" | "u256" | "i8" | "i16" | "i32"
+                        | "i64" | "i128" | "i256" => {
                             self.advance(); // consume suffix
                         }
                         _ => {}
@@ -1138,11 +1386,17 @@ impl Parser {
             // Wildcard _ (in match patterns, not really an expression)
             TokenKind::Underscore => {
                 self.advance();
-                Ok(Expr::Ident(Ident { name: "_".into(), span }))
+                Ok(Expr::Ident(Ident {
+                    name: "_".into(),
+                    span,
+                }))
             }
 
             _ => {
-                self.error(format!("expected expression, found {}", self.peek().description()));
+                self.error(format!(
+                    "expected expression, found {}",
+                    self.peek().description()
+                ));
                 Err(())
             }
         }
@@ -1168,7 +1422,12 @@ impl Parser {
             // Path followed by call: IERC20::at(token)
             if self.at(&TokenKind::LParen) {
                 let args = self.parse_call_args()?;
-                return Ok(Expr::Call(Box::new(Expr::Path(segments, span)), args, None, span));
+                return Ok(Expr::Call(
+                    Box::new(Expr::Path(segments, span)),
+                    args,
+                    None,
+                    span,
+                ));
             }
 
             // Path followed by struct init: MyStruct { ... }
@@ -1217,7 +1476,11 @@ impl Parser {
             self.expect(&TokenKind::Colon)?;
             let value = self.parse_expr()?;
             let fspan = fname.span;
-            fields.push(FieldInit { name: fname, value, span: fspan });
+            fields.push(FieldInit {
+                name: fname,
+                value,
+                span: fspan,
+            });
             self.eat(&TokenKind::Comma);
         }
 
@@ -1309,15 +1572,25 @@ impl Parser {
             self.advance(); // eat return
             let value = self.parse_expr()?;
             self.eat(&TokenKind::Comma);
-            let ret_stmt = Stmt::Return(ReturnStmt { value: Some(value), span: ret_span });
-            Expr::Block(Block { stmts: vec![ret_stmt], span: ret_span })
+            let ret_stmt = Stmt::Return(ReturnStmt {
+                value: Some(value),
+                span: ret_span,
+            });
+            Expr::Block(Block {
+                stmts: vec![ret_stmt],
+                span: ret_span,
+            })
         } else {
             let expr = self.parse_expr()?;
             self.eat(&TokenKind::Comma);
             expr
         };
 
-        Ok(MatchArm { pattern, body, span })
+        Ok(MatchArm {
+            pattern,
+            body,
+            span,
+        })
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, ()> {
@@ -1370,7 +1643,10 @@ impl Parser {
                 Ok(Pattern::Path(segments, span))
             }
             _ => {
-                self.error(format!("expected pattern, found {}", self.peek().description()));
+                self.error(format!(
+                    "expected pattern, found {}",
+                    self.peek().description()
+                ));
                 Err(())
             }
         }
@@ -1423,7 +1699,11 @@ impl Parser {
             let count = match self.peek() {
                 TokenKind::IntLiteral(_) => {
                     let tok = self.advance();
-                    if let TokenKind::IntLiteral(v) = tok.kind { v.as_u64() } else { 0 }
+                    if let TokenKind::IntLiteral(v) = tok.kind {
+                        v.as_u64()
+                    } else {
+                        0
+                    }
                 }
                 _ => {
                     self.error("expected array size literal".into());
@@ -1450,8 +1730,8 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethnum::U256;
     use crate::lexer::Lexer;
+    use ethnum::U256;
 
     fn parse(src: &str) -> (SourceFile, Vec<ParseError>) {
         let (tokens, lex_errors) = Lexer::new(src).tokenize();
@@ -1646,7 +1926,10 @@ contract Token {
             if let ContractItem::Function(f) = &c.items[0] {
                 if let Stmt::Let(l) = &f.body.stmts[0] {
                     // Top-level is Add
-                    assert!(matches!(l.initializer, Expr::Binary(_, BinaryOp::Add, _, _)));
+                    assert!(matches!(
+                        l.initializer,
+                        Expr::Binary(_, BinaryOp::Add, _, _)
+                    ));
                 } else {
                     panic!("expected let");
                 }
@@ -1716,7 +1999,8 @@ contract Token {
 
     #[test]
     fn parse_match_expr() {
-        let src = r#"contract T { fn f() { let x = match status { Status::Active => 1, _ => 0, }; } }"#;
+        let src =
+            r#"contract T { fn f() { let x = match status { Status::Active => 1, _ => 0, }; } }"#;
         let (_, errors) = parse(src);
         assert!(errors.is_empty());
     }
@@ -1821,7 +2105,9 @@ contract Token {
         if let Item::Contract(c) = &file.items[0] {
             if let ContractItem::Function(f) = &c.items[0] {
                 if let Stmt::Let(l) = &f.body.stmts[0] {
-                    assert!(matches!(&l.initializer, Expr::Literal(Literal::Int(v), _) if *v == U256::ZERO));
+                    assert!(
+                        matches!(&l.initializer, Expr::Literal(Literal::Int(v), _) if *v == U256::ZERO)
+                    );
                 }
             }
         }
@@ -1835,7 +2121,9 @@ contract Token {
         if let Item::Contract(c) = &file.items[0] {
             if let ContractItem::Function(f) = &c.items[0] {
                 if let Stmt::Let(l) = &f.body.stmts[0] {
-                    assert!(matches!(&l.initializer, Expr::Literal(Literal::Int(v), _) if *v == U256::from(100_000_000u64)));
+                    assert!(
+                        matches!(&l.initializer, Expr::Literal(Literal::Int(v), _) if *v == U256::from(100_000_000u64))
+                    );
                 }
             }
         }
@@ -1952,7 +2240,9 @@ contract Token {
         if let Item::Contract(c) = &file.items[0] {
             if let ContractItem::Function(f) = &c.items[0] {
                 if let Stmt::Let(l) = &f.body.stmts[0] {
-                    assert!(matches!(&l.initializer, Expr::Literal(Literal::Int(v), _) if *v == U256::ZERO));
+                    assert!(
+                        matches!(&l.initializer, Expr::Literal(Literal::Int(v), _) if *v == U256::ZERO)
+                    );
                 }
             }
         }
@@ -2110,7 +2400,10 @@ contract Token {
         let file = parse_ok(src);
         if let Item::Contract(c) = &file.items[0] {
             if let ContractItem::Event(e) = &c.items[0] {
-                assert_eq!(e.doc.as_deref(), Some("Emitted when tokens are transferred."));
+                assert_eq!(
+                    e.doc.as_deref(),
+                    Some("Emitted when tokens are transferred.")
+                );
             }
         }
     }
@@ -2126,7 +2419,10 @@ contract Token {
         let file = parse_ok(src);
         if let Item::Contract(c) = &file.items[0] {
             if let ContractItem::Error(e) = &c.items[0] {
-                assert_eq!(e.doc.as_deref(), Some("Sender does not have enough tokens."));
+                assert_eq!(
+                    e.doc.as_deref(),
+                    Some("Sender does not have enough tokens.")
+                );
             }
         }
     }

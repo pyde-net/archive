@@ -76,8 +76,8 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     flag_builder
         .set("opt_level", "speed")
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let isa_builder = cranelift_native::builder()
-        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    let isa_builder =
+        cranelift_native::builder().map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     let isa = isa_builder
         .finish(settings::Flags::new(flag_builder))
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
@@ -94,9 +94,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     // Main function: fn(regs: *mut u64, gas_limit: u64, vm_ctx: *mut Vm) -> u64
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(ptr_type)); // gp_regs
-    sig.params.push(AbiParam::new(I64));       // gas_limit
+    sig.params.push(AbiParam::new(I64)); // gas_limit
     sig.params.push(AbiParam::new(ptr_type)); // vm_ctx
-    sig.returns.push(AbiParam::new(I64));      // result
+    sig.returns.push(AbiParam::new(I64)); // result
 
     let func_id = module
         .declare_function("pvm_aot_entry", Linkage::Export, &sig)
@@ -109,7 +109,8 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     sig_load.params.push(AbiParam::new(I64));
     sig_load.params.push(AbiParam::new(I64));
     sig_load.returns.push(AbiParam::new(I64));
-    let fn_load = module.declare_function("host_load", Linkage::Import, &sig_load)
+    let fn_load = module
+        .declare_function("host_load", Linkage::Import, &sig_load)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_store(ctx, addr, value, width) -> u64
@@ -119,7 +120,8 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     sig_store.params.push(AbiParam::new(I64));
     sig_store.params.push(AbiParam::new(I64));
     sig_store.returns.push(AbiParam::new(I64));
-    let fn_store = module.declare_function("host_store", Linkage::Import, &sig_store)
+    let fn_store = module
+        .declare_function("host_store", Linkage::Import, &sig_store)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_sload(ctx, ws_slot, wd) -> u64
@@ -128,15 +130,18 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     sig_sload.params.push(AbiParam::new(I64));
     sig_sload.params.push(AbiParam::new(I64));
     sig_sload.returns.push(AbiParam::new(I64));
-    let fn_sload = module.declare_function("host_sload", Linkage::Import, &sig_sload)
+    let fn_sload = module
+        .declare_function("host_sload", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_sstore(ctx, ws_slot, wd) -> u64
-    let fn_sstore = module.declare_function("host_sstore", Linkage::Import, &sig_sload)
+    let fn_sstore = module
+        .declare_function("host_sstore", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_sstoreg(ctx, ws_slot, value) -> u64 (same signature as sload: ctx + 2 args)
-    let fn_sstoreg = module.declare_function("host_sstoreg", Linkage::Import, &sig_sload)
+    let fn_sstoreg = module
+        .declare_function("host_sstoreg", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_sdelete(ctx, ws_slot) -> u64 / host_sloadg(ctx, ws_slot) -> u64
@@ -144,15 +149,18 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     sig_sdel.params.push(AbiParam::new(ptr_type));
     sig_sdel.params.push(AbiParam::new(I64));
     sig_sdel.returns.push(AbiParam::new(I64));
-    let fn_sdelete = module.declare_function("host_sdelete", Linkage::Import, &sig_sdel)
+    let fn_sdelete = module
+        .declare_function("host_sdelete", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_sloadg(ctx, ws_slot) -> u64 (same signature as sdelete)
-    let fn_sloadg = module.declare_function("host_sloadg", Linkage::Import, &sig_sdel)
+    let fn_sloadg = module
+        .declare_function("host_sloadg", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_log(ctx, desc_ptr, num_topics) -> u64
-    let fn_log = module.declare_function("host_log", Linkage::Import, &sig_sload)
+    let fn_log = module
+        .declare_function("host_log", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_poseidon(ctx, addr, len, wd) -> u64
@@ -162,7 +170,8 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     sig_pos.params.push(AbiParam::new(I64));
     sig_pos.params.push(AbiParam::new(I64));
     sig_pos.returns.push(AbiParam::new(I64));
-    let fn_poseidon = module.declare_function("host_poseidon", Linkage::Import, &sig_pos)
+    let fn_poseidon = module
+        .declare_function("host_poseidon", Linkage::Import, &sig_pos)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     let mut ctx = module.make_context();
@@ -174,49 +183,63 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     sig_push.params.push(AbiParam::new(ptr_type));
     sig_push.params.push(AbiParam::new(I64));
     sig_push.returns.push(AbiParam::new(I64));
-    let fn_push = module.declare_function("host_push", Linkage::Import, &sig_push)
+    let fn_push = module
+        .declare_function("host_push", Linkage::Import, &sig_push)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_pop(ctx) -> u64
     let mut sig_pop = module.make_signature();
     sig_pop.params.push(AbiParam::new(ptr_type));
     sig_pop.returns.push(AbiParam::new(I64));
-    let fn_pop = module.declare_function("host_pop", Linkage::Import, &sig_pop)
+    let fn_pop = module
+        .declare_function("host_pop", Linkage::Import, &sig_pop)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // Environment host functions: (ctx) -> u64
     // host_caller(ctx, wd) -> u64, host_address(ctx, wd) -> u64
-    let fn_caller = module.declare_function("host_caller", Linkage::Import, &sig_sdel)
+    let fn_caller = module
+        .declare_function("host_caller", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let fn_address = module.declare_function("host_address", Linkage::Import, &sig_sdel)
+    let fn_address = module
+        .declare_function("host_address", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let fn_block_number = module.declare_function("host_block_number", Linkage::Import, &sig_pop)
+    let fn_block_number = module
+        .declare_function("host_block_number", Linkage::Import, &sig_pop)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let fn_timestamp = module.declare_function("host_timestamp", Linkage::Import, &sig_pop)
+    let fn_timestamp = module
+        .declare_function("host_timestamp", Linkage::Import, &sig_pop)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let fn_gas_remaining = module.declare_function("host_gas_remaining", Linkage::Import, &sig_pop)
+    let fn_gas_remaining = module
+        .declare_function("host_gas_remaining", Linkage::Import, &sig_pop)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     // (ctx, wd) -> u64
-    let fn_callvalue = module.declare_function("host_callvalue", Linkage::Import, &sig_sdel)
+    let fn_callvalue = module
+        .declare_function("host_callvalue", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let fn_gasprice = module.declare_function("host_gasprice", Linkage::Import, &sig_sdel)
+    let fn_gasprice = module
+        .declare_function("host_gasprice", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     // (ctx, addr, wd) -> u64
-    let fn_balance = module.declare_function("host_balance", Linkage::Import, &sig_sload)
+    let fn_balance = module
+        .declare_function("host_balance", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     // (ctx, val) -> u64
-    let fn_assert = module.declare_function("host_assert", Linkage::Import, &sig_sdel)
+    let fn_assert = module
+        .declare_function("host_assert", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     // (ctx, a, b) -> u64
-    let fn_memcpy = module.declare_function("host_memcpy", Linkage::Import, &sig_store)
+    let fn_memcpy = module
+        .declare_function("host_memcpy", Linkage::Import, &sig_store)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_wload(ctx, addr, wd) -> u64
-    let fn_wload = module.declare_function("host_wload", Linkage::Import, &sig_sload)
+    let fn_wload = module
+        .declare_function("host_wload", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_wstore(ctx, addr, ws) -> u64
-    let fn_wstore = module.declare_function("host_wstore", Linkage::Import, &sig_sload)
+    let fn_wstore = module
+        .declare_function("host_wstore", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_wide_alu(ctx, opcode, wd, ws1, ws2) -> u64
@@ -227,11 +250,13 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     sig_wide.params.push(AbiParam::new(I64));
     sig_wide.params.push(AbiParam::new(I64));
     sig_wide.returns.push(AbiParam::new(I64));
-    let fn_wide_alu = module.declare_function("host_wide_alu", Linkage::Import, &sig_wide)
+    let fn_wide_alu = module
+        .declare_function("host_wide_alu", Linkage::Import, &sig_wide)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_exec_opcode(ctx, opcode, rd, rs1, imm) -> u64 (same signature as wide_alu)
-    let fn_exec_opcode = module.declare_function("host_exec_opcode", Linkage::Import, &sig_wide)
+    let fn_exec_opcode = module
+        .declare_function("host_exec_opcode", Linkage::Import, &sig_wide)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_sync_gp_to_vm(ctx, regs_ptr) — copy external regs to vm.cpu.gp
@@ -239,9 +264,11 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let mut sig_sync_gp = module.make_signature();
     sig_sync_gp.params.push(AbiParam::new(ptr_type));
     sig_sync_gp.params.push(AbiParam::new(ptr_type));
-    let fn_sync_gp_to_vm = module.declare_function("host_sync_gp_to_vm", Linkage::Import, &sig_sync_gp)
+    let fn_sync_gp_to_vm = module
+        .declare_function("host_sync_gp_to_vm", Linkage::Import, &sig_sync_gp)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let fn_sync_gp_from_vm = module.declare_function("host_sync_gp_from_vm", Linkage::Import, &sig_sync_gp)
+    let fn_sync_gp_from_vm = module
+        .declare_function("host_sync_gp_from_vm", Linkage::Import, &sig_sync_gp)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_read_gp(ctx, reg_idx) -> u64 (reads GP register from VM)
@@ -249,7 +276,8 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     sig_read_gp.params.push(AbiParam::new(ptr_type));
     sig_read_gp.params.push(AbiParam::new(I64));
     sig_read_gp.returns.push(AbiParam::new(I64));
-    let fn_read_gp = module.declare_function("host_read_gp", Linkage::Import, &sig_read_gp)
+    let fn_read_gp = module
+        .declare_function("host_read_gp", Linkage::Import, &sig_read_gp)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_narrow(ctx, ws1, trap_out) -> u64 (returns narrowed value)
@@ -258,11 +286,13 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     sig_narrow.params.push(AbiParam::new(I64));
     sig_narrow.params.push(AbiParam::new(ptr_type)); // trap_out pointer
     sig_narrow.returns.push(AbiParam::new(I64));
-    let fn_narrow = module.declare_function("host_narrow", Linkage::Import, &sig_narrow)
+    let fn_narrow = module
+        .declare_function("host_narrow", Linkage::Import, &sig_narrow)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_widen(ctx, wd, gp_value) -> u64
-    let fn_widen = module.declare_function("host_widen", Linkage::Import, &sig_sload)
+    let fn_widen = module
+        .declare_function("host_widen", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_checked_add/sub/mul(a, b, trap_out) -> u64
@@ -271,15 +301,20 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     sig_checked.params.push(AbiParam::new(I64));
     sig_checked.params.push(AbiParam::new(ptr_type));
     sig_checked.returns.push(AbiParam::new(I64));
-    let fn_checked_add = module.declare_function("host_checked_add", Linkage::Import, &sig_checked)
+    let fn_checked_add = module
+        .declare_function("host_checked_add", Linkage::Import, &sig_checked)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let fn_checked_sub = module.declare_function("host_checked_sub", Linkage::Import, &sig_checked)
+    let fn_checked_sub = module
+        .declare_function("host_checked_sub", Linkage::Import, &sig_checked)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let fn_checked_mul = module.declare_function("host_checked_mul", Linkage::Import, &sig_checked)
+    let fn_checked_mul = module
+        .declare_function("host_checked_mul", Linkage::Import, &sig_checked)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let fn_checked_div = module.declare_function("host_checked_div", Linkage::Import, &sig_checked)
+    let fn_checked_div = module
+        .declare_function("host_checked_div", Linkage::Import, &sig_checked)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
-    let fn_checked_mod = module.declare_function("host_checked_mod", Linkage::Import, &sig_checked)
+    let fn_checked_mod = module
+        .declare_function("host_checked_mod", Linkage::Import, &sig_checked)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // Import host function references for use inside the function
@@ -331,11 +366,12 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
         builder.declare_var(Variable::from_u32(VAR_VM_CTX), ptr_type);
 
         // Stack-allocated trap flag for checked arithmetic (address passed to host fns)
-        let trap_flag_ss = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-            8,
-            0,
-        ));
+        let trap_flag_ss =
+            builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
 
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
@@ -394,7 +430,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
 
                 let gas_limit = builder.use_var(Variable::from_u32(VAR_GAS_LIMIT));
                 let limit_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, gas_limit, 0);
-                let over = builder.ins().icmp(IntCC::UnsignedGreaterThan, new_gas, gas_limit);
+                let over = builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThan, new_gas, gas_limit);
                 let oog = builder.ins().band(limit_nonzero, over);
 
                 let cont = builder.create_block();
@@ -433,7 +471,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         $builder.ins().iconst(I64, 0) // r0 always zero
                     } else {
                         let rp = $builder.use_var(Variable::from_u32(VAR_REGS_PTR));
-                        $builder.ins().load(I64, MemFlags::trusted(), rp, ($reg as i32) * 8)
+                        $builder
+                            .ins()
+                            .load(I64, MemFlags::trusted(), rp, ($reg as i32) * 8)
                     }
                 }};
             }
@@ -441,7 +481,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                 ($builder:expr, $reg:expr, $val:expr) => {{
                     if $reg != 0 {
                         let rp = $builder.use_var(Variable::from_u32(VAR_REGS_PTR));
-                        $builder.ins().store(MemFlags::trusted(), $val, rp, ($reg as i32) * 8);
+                        $builder
+                            .ins()
+                            .store(MemFlags::trusted(), $val, rp, ($reg as i32) * 8);
                     }
                 }};
             }
@@ -580,15 +622,24 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
 
                     // --- Wide register ops (host calls) ---
                     // Pure wide-to-wide: no GP interaction
-                    Opcode::Wadd | Opcode::Wsub | Opcode::Wmul | Opcode::Wdiv
-                    | Opcode::Wmod | Opcode::Wand | Opcode::Wor | Opcode::Wxor
-                    | Opcode::Wnot | Opcode::Wmov => {
+                    Opcode::Wadd
+                    | Opcode::Wsub
+                    | Opcode::Wmul
+                    | Opcode::Wdiv
+                    | Opcode::Wmod
+                    | Opcode::Wand
+                    | Opcode::Wor
+                    | Opcode::Wxor
+                    | Opcode::Wnot
+                    | Opcode::Wmov => {
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let op = builder.ins().iconst(I64, d.opcode.to_u8() as i64);
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let ws1 = builder.ins().iconst(I64, d.rs1 as i64);
                         let ws2 = builder.ins().iconst(I64, (d.rs2_or_imm & 0xF) as i64);
-                        let call = builder.ins().call(fn_wide_alu_ref, &[vm_ctx, op, wd, ws1, ws2]);
+                        let call = builder
+                            .ins()
+                            .call(fn_wide_alu_ref, &[vm_ctx, op, wd, ws1, ws2]);
                         let result = builder.inst_results(call)[0];
                         let trapped = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
@@ -604,7 +655,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let ws1 = builder.ins().iconst(I64, d.rs1 as i64);
                         let ws2 = builder.ins().iconst(I64, (d.rs2_or_imm & 0xF) as i64);
-                        let call = builder.ins().call(fn_wide_alu_ref, &[vm_ctx, op, wd, ws1, ws2]);
+                        let call = builder
+                            .ins()
+                            .call(fn_wide_alu_ref, &[vm_ctx, op, wd, ws1, ws2]);
                         let result = builder.inst_results(call)[0];
                         let trapped = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
@@ -622,13 +675,17 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let regs_ptr_val = builder.use_var(Variable::from_u32(VAR_REGS_PTR));
                         // Sync GP to VM (Wshift reads shift amount from a GP register)
-                        builder.ins().call(fn_sync_gp_to_vm_ref, &[vm_ctx, regs_ptr_val]);
+                        builder
+                            .ins()
+                            .call(fn_sync_gp_to_vm_ref, &[vm_ctx, regs_ptr_val]);
                         let op = builder.ins().iconst(I64, d.opcode.to_u8() as i64);
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let ws1 = builder.ins().iconst(I64, d.rs1 as i64);
                         // Pass full imm (direction bit + shift reg index), not truncated
                         let imm = builder.ins().iconst(I64, d.rs2_or_imm as i64);
-                        let call = builder.ins().call(fn_wide_alu_ref, &[vm_ctx, op, wd, ws1, imm]);
+                        let call = builder
+                            .ins()
+                            .call(fn_wide_alu_ref, &[vm_ctx, op, wd, ws1, imm]);
                         let result = builder.inst_results(call)[0];
                         let trapped = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
@@ -757,7 +814,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                             2 => {
                                 // GP register mode: sstoreg ws_slot, rd
                                 let rd_val = gp_read!(builder, d.rd);
-                                builder.ins().call(fn_sstoreg_ref, &[vm_ctx, ws_slot, rd_val])
+                                builder
+                                    .ins()
+                                    .call(fn_sstoreg_ref, &[vm_ctx, ws_slot, rd_val])
                             }
                             _ => {
                                 // Mode 1 (memory) not yet implemented → trap
@@ -793,7 +852,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let len = gp_read!(builder, len_reg);
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        let call = builder.ins().call(fn_poseidon_ref, &[vm_ctx, addr, len, wd]);
+                        let call = builder
+                            .ins()
+                            .call(fn_poseidon_ref, &[vm_ctx, addr, len, wd]);
                         let result = builder.inst_results(call)[0];
                         let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
@@ -868,14 +929,22 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let sub = d.rs2_or_imm;
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         match sub {
-                            0 => { builder.ins().call(fn_callvalue_ref, &[vm_ctx, wd]); }
-                            1 => { builder.ins().call(fn_gasprice_ref, &[vm_ctx, wd]); }
+                            0 => {
+                                builder.ins().call(fn_callvalue_ref, &[vm_ctx, wd]);
+                            }
+                            1 => {
+                                builder.ins().call(fn_gasprice_ref, &[vm_ctx, wd]);
+                            }
                             2 => {
                                 let addr = gp_read!(builder, d.rs1);
                                 builder.ins().call(fn_balance_ref, &[vm_ctx, addr, wd]);
                             }
-                            3 => { builder.ins().call(fn_caller_ref, &[vm_ctx, wd]); }  // CALLER
-                            4 => { builder.ins().call(fn_address_ref, &[vm_ctx, wd]); } // ADDRESS
+                            3 => {
+                                builder.ins().call(fn_caller_ref, &[vm_ctx, wd]);
+                            } // CALLER
+                            4 => {
+                                builder.ins().call(fn_address_ref, &[vm_ctx, wd]);
+                            } // ADDRESS
                             _ => {
                                 builder.ins().jump(trap_block, &[]);
                                 terminated = true;
@@ -897,7 +966,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let result = builder.inst_results(call)[0];
                         let should_revert = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
-                        builder.ins().brif(should_revert, revert_block, &[], cont, &[]);
+                        builder
+                            .ins()
+                            .brif(should_revert, revert_block, &[], cont, &[]);
                         builder.seal_block(cont);
                         builder.switch_to_block(cont);
                     }
@@ -940,7 +1011,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let desc_ptr = gp_read!(builder, d.rs1);
                         let num_topics = builder.ins().iconst(I64, (d.rs2_or_imm & 0x7) as i64);
-                        let call = builder.ins().call(fn_log_ref, &[vm_ctx, desc_ptr, num_topics]);
+                        let call = builder
+                            .ins()
+                            .call(fn_log_ref, &[vm_ctx, desc_ptr, num_topics]);
                         let result = builder.inst_results(call)[0];
                         let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
@@ -952,22 +1025,31 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                     // Complex opcodes delegated to the interpreter via host_exec_opcode.
                     // GP registers are synced to vm.cpu.gp before the call and reloaded after.
                     // Wide registers are already in the VM (managed by host_wide_alu/host_widen).
-                    Opcode::CallExt | Opcode::Delegate
-                    | Opcode::Create | Opcode::VerifySig | Opcode::MerkleVerify => {
+                    Opcode::CallExt
+                    | Opcode::Delegate
+                    | Opcode::Create
+                    | Opcode::VerifySig
+                    | Opcode::MerkleVerify => {
                         // Sync GP registers: external regs[] → vm.cpu.gp[]
                         let regs_ptr_val = builder.use_var(Variable::from_u32(VAR_REGS_PTR));
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        builder.ins().call(fn_sync_gp_to_vm_ref, &[vm_ctx, regs_ptr_val]);
+                        builder
+                            .ins()
+                            .call(fn_sync_gp_to_vm_ref, &[vm_ctx, regs_ptr_val]);
 
                         let op = builder.ins().iconst(I64, d.opcode.to_u8() as i64);
                         let rd_val = builder.ins().iconst(I64, d.rd as i64);
                         let rs1_val = builder.ins().iconst(I64, d.rs1 as i64);
                         let imm_val = builder.ins().iconst(I64, d.rs2_or_imm as i64);
-                        let call = builder.ins().call(fn_exec_opcode_ref, &[vm_ctx, op, rd_val, rs1_val, imm_val]);
+                        let call = builder
+                            .ins()
+                            .call(fn_exec_opcode_ref, &[vm_ctx, op, rd_val, rs1_val, imm_val]);
                         let result = builder.inst_results(call)[0];
 
                         // Sync GP registers back: vm.cpu.gp[] → external regs[]
-                        builder.ins().call(fn_sync_gp_from_vm_ref, &[vm_ctx, regs_ptr_val]);
+                        builder
+                            .ins()
+                            .call(fn_sync_gp_from_vm_ref, &[vm_ctx, regs_ptr_val]);
 
                         // Check result: 0=ok, 1=trap, 2=halt/revert
                         let is_trap = builder.ins().icmp_imm(IntCC::Equal, result, 1);
@@ -1043,10 +1125,12 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
         builder.finalize();
     }
 
-    module.define_function(func_id, &mut ctx)
+    module
+        .define_function(func_id, &mut ctx)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     module.clear_context(&mut ctx);
-    module.finalize_definitions()
+    module
+        .finalize_definitions()
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     let code_ptr = module.get_finalized_function(func_id);

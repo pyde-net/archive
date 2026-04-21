@@ -4,7 +4,7 @@
 
 use pyde_account::address::derive_eoa_address;
 use pyde_consensus::block::{BlockHeader, QuorumCert};
-use pyde_consensus::hotstuff::{ConsensusState, create_vote, verify_vote, try_form_qc};
+use pyde_consensus::hotstuff::{create_vote, try_form_qc, verify_vote, ConsensusState};
 use pyde_crypto::falcon::{falcon_keygen, falcon_sign, FalconPublicKey, FalconSecretKey};
 use pyde_crypto::poseidon2::poseidon2_hash;
 use pyde_state::smt::{PersistentSMT, StateAccess, StateOverlay};
@@ -63,31 +63,56 @@ fn make_transfer(from: &FundedAccount, to: &[u8; 32], value: u128) -> Transactio
         buf.extend_from_slice(&from.address);
         buf.push(0x04);
         buf
-    }).to_bytes();
+    })
+    .to_bytes();
     let to_slot = poseidon2_hash(&{
         let mut buf = Vec::with_capacity(33);
         buf.extend_from_slice(to);
         buf.push(0x04);
         buf
-    }).to_bytes();
+    })
+    .to_bytes();
     Transaction {
-        from: from.address, to: *to, value, data: vec![],
-        gas_limit: 21_000, nonce: from.nonce, signature: vec![],
+        from: from.address,
+        to: *to,
+        value,
+        data: vec![],
+        gas_limit: 21_000,
+        nonce: from.nonce,
+        signature: vec![],
         fee_payer: FeePayer::Sender,
         access_list: vec![
-            AccessEntry { address: from.address, reads: vec![], writes: vec![from_slot] },
-            AccessEntry { address: *to, reads: vec![], writes: vec![to_slot] },
+            AccessEntry {
+                address: from.address,
+                reads: vec![],
+                writes: vec![from_slot],
+            },
+            AccessEntry {
+                address: *to,
+                reads: vec![],
+                writes: vec![to_slot],
+            },
         ],
-        deadline: None, chain_id: 31337, tx_type: TransactionType::Standard,
+        deadline: None,
+        chain_id: 31337,
+        tx_type: TransactionType::Standard,
     }
 }
 
 fn make_deploy(from: &FundedAccount, data: Vec<u8>) -> Transaction {
     Transaction {
-        from: from.address, to: [0u8; 32], value: 0, data,
-        gas_limit: 200_000_000, nonce: from.nonce, signature: vec![],
-        fee_payer: FeePayer::Sender, access_list: vec![],
-        deadline: None, chain_id: 31337, tx_type: TransactionType::Deploy,
+        from: from.address,
+        to: [0u8; 32],
+        value: 0,
+        data,
+        gas_limit: 200_000_000,
+        nonce: from.nonce,
+        signature: vec![],
+        fee_payer: FeePayer::Sender,
+        access_list: vec![],
+        deadline: None,
+        chain_id: 31337,
+        tx_type: TransactionType::Deploy,
     }
 }
 
@@ -96,10 +121,18 @@ fn make_call(from: &FundedAccount, to: [u8; 32], method: &str, args: Vec<u8>) ->
     let mut data = selector.to_be_bytes().to_vec();
     data.extend_from_slice(&args);
     Transaction {
-        from: from.address, to, value: 0, data, gas_limit: 50_000_000, nonce: from.nonce,
-        signature: vec![], fee_payer: FeePayer::Sender,
+        from: from.address,
+        to,
+        value: 0,
+        data,
+        gas_limit: 50_000_000,
+        nonce: from.nonce,
+        signature: vec![],
+        fee_payer: FeePayer::Sender,
         access_list: vec![], // empty = no strict mode, all keys allowed
-        deadline: None, chain_id: 31337, tx_type: TransactionType::Standard,
+        deadline: None,
+        chain_id: 31337,
+        tx_type: TransactionType::Standard,
     }
 }
 
@@ -107,10 +140,18 @@ fn make_payable_call(from: &FundedAccount, to: [u8; 32], method: &str, value: u1
     let selector = otic::codegen::compute_selector(method);
     let data = selector.to_be_bytes().to_vec();
     Transaction {
-        from: from.address, to, value, data, gas_limit: 50_000_000, nonce: from.nonce,
-        signature: vec![], fee_payer: FeePayer::Sender,
+        from: from.address,
+        to,
+        value,
+        data,
+        gas_limit: 50_000_000,
+        nonce: from.nonce,
+        signature: vec![],
+        fee_payer: FeePayer::Sender,
         access_list: vec![],
-        deadline: None, chain_id: 31337, tx_type: TransactionType::Standard,
+        deadline: None,
+        chain_id: 31337,
+        tx_type: TransactionType::Standard,
     }
 }
 
@@ -345,39 +386,65 @@ fn production_simulation() {
 
     // Generate 4 validator keys (FALCON-512)
     let t0 = Instant::now();
-    let validators: Vec<ValidatorKeys> = (0..4).map(|_| {
-        let (pk, sk) = falcon_keygen().unwrap();
-        let address = derive_eoa_address(pk.as_bytes());
-        ValidatorKeys { pk, sk, address }
-    }).collect();
-    println!("  [SETUP] 4 validator keypairs: {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    let validators: Vec<ValidatorKeys> = (0..4)
+        .map(|_| {
+            let (pk, sk) = falcon_keygen().unwrap();
+            let address = derive_eoa_address(pk.as_bytes());
+            ValidatorKeys { pk, sk, address }
+        })
+        .collect();
+    println!(
+        "  [SETUP] 4 validator keypairs: {:.0}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Generate 200 funded accounts with FALCON keys
     let t0 = Instant::now();
-    let mut accounts: Vec<FundedAccount> = (0..200).into_par_iter().map(|_| {
-        let (pk, sk) = falcon_keygen().unwrap();
-        let address = derive_eoa_address(pk.as_bytes());
-        FundedAccount { pk, sk, address, nonce: 0 }
-    }).collect();
-    println!("  [SETUP] 200 funded accounts (parallel keygen): {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    let mut accounts: Vec<FundedAccount> = (0..200)
+        .into_par_iter()
+        .map(|_| {
+            let (pk, sk) = falcon_keygen().unwrap();
+            let address = derive_eoa_address(pk.as_bytes());
+            FundedAccount {
+                pk,
+                sk,
+                address,
+                nonce: 0,
+            }
+        })
+        .collect();
+    println!(
+        "  [SETUP] 200 funded accounts (parallel keygen): {:.0}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Fund all accounts in state
     let t0 = Instant::now();
     for acc in &accounts {
         let account = pyde_account::types::Account {
-            address: acc.address, nonce: 0, balance: 10_000_000_000_000_000,
+            address: acc.address,
+            nonce: 0,
+            balance: 10_000_000_000_000_000,
             code_hash: sparse_merkle_tree::H256::zero(),
             storage_root: sparse_merkle_tree::H256::zero(),
             account_type: pyde_account::types::AccountType::EOA,
             auth_keys: pyde_account::types::AuthKeys::Single(acc.pk.as_bytes().to_vec()),
-            gas_tank: 0, key_nonce: 0,
+            gas_tank: 0,
+            key_nonce: 0,
         };
         let key = pyde_state::keys::balance_key(&acc.address);
         smt.insert(key, account.to_bytes()).unwrap();
         let nonce_key = pyde_state::keys::nonce_key(&acc.address);
-        smt.insert(nonce_key, pyde_account::nonce::NonceState::new().to_bytes().to_vec()).unwrap();
+        smt.insert(
+            nonce_key,
+            pyde_account::nonce::NonceState::new().to_bytes().to_vec(),
+        )
+        .unwrap();
     }
-    println!("  [SETUP] Funded 200 accounts in state: {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "  [SETUP] Funded 200 accounts in state: {:.0}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     // ── 2. Compile all contracts ─────────────────────────────────────
     let t0 = Instant::now();
@@ -391,7 +458,10 @@ fn production_simulation() {
     let multisig_bin = compile_single(MULTISIG);
     let lottery_bin = compile_single(LOTTERY);
     let timelock_bin = compile_single(TIMELOCK);
-    println!("  [SETUP] Compiled 10 contract types: {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "  [SETUP] Compiled 10 contract types: {:.0}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     // ── 3. Block context (production chain_id=1, sig verification ON) ─
     let ctx = BlockContext {
@@ -444,7 +514,10 @@ fn production_simulation() {
     }
 
     let sign_time = t0.elapsed();
-    println!("    Signed 20 deploy txs (FALCON-512): {:.0}ms", sign_time.as_secs_f64() * 1000.0);
+    println!(
+        "    Signed 20 deploy txs (FALCON-512): {:.0}ms",
+        sign_time.as_secs_f64() * 1000.0
+    );
 
     // Verify all signatures
     let t0 = Instant::now();
@@ -455,9 +528,16 @@ fn production_simulation() {
         // separate collections. Collapsed to a direct index; caught by
         // slice 5.5 clippy sweep (clippy::if_same_then_else).
         let pk_bytes = accounts[i % 20].pk.as_bytes();
-        assert!(tx.verify_signature(pk_bytes), "sig verify failed for deploy tx {}", i);
+        assert!(
+            tx.verify_signature(pk_bytes),
+            "sig verify failed for deploy tx {}",
+            i
+        );
     }
-    println!("    Verified 20 sigs: {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    println!(
+        "    Verified 20 sigs: {:.0}ms",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Execute deploys
     let t0 = Instant::now();
@@ -476,8 +556,13 @@ fn production_simulation() {
     }
     let deploy_time = t0.elapsed();
     let deploy_tps = 20.0 / deploy_time.as_secs_f64();
-    println!("    Executed 20 deploys: {:.0}ms ({:.0} TPS) — {} ok, {} fail",
-        deploy_time.as_secs_f64() * 1000.0, deploy_tps, ok, fail);
+    println!(
+        "    Executed 20 deploys: {:.0}ms ({:.0} TPS) — {} ok, {} fail",
+        deploy_time.as_secs_f64() * 1000.0,
+        deploy_tps,
+        ok,
+        fail
+    );
     assert_eq!(fail, 0, "All deploys must succeed");
     assert_eq!(deployed_contracts.len(), 20);
 
@@ -502,7 +587,10 @@ fn production_simulation() {
 
     // Each validator creates a vote
     let mut consensus_states: Vec<ConsensusState> = (0..4).map(|_| ConsensusState::new()).collect();
-    let committee_keys: Vec<Vec<u8>> = validators.iter().map(|v| v.pk.as_bytes().to_vec()).collect();
+    let committee_keys: Vec<Vec<u8>> = validators
+        .iter()
+        .map(|v| v.pk.as_bytes().to_vec())
+        .collect();
     let mut votes = Vec::new();
 
     for i in 0..4 {
@@ -512,10 +600,15 @@ fn production_simulation() {
             i as u8,
             validators[i].address,
             &validators[i].sk,
-        ).unwrap();
+        )
+        .unwrap();
         if let Some(v) = vote {
             // Verify this vote
-            assert!(verify_vote(&v, validators[i].pk.as_bytes()), "vote {} failed verification", i);
+            assert!(
+                verify_vote(&v, validators[i].pk.as_bytes()),
+                "vote {} failed verification",
+                i
+            );
             votes.push(v);
         }
     }
@@ -524,7 +617,10 @@ fn production_simulation() {
     let block_hash = header.hash();
     let qc = try_form_qc(1, block_hash, &votes, &committee_keys);
     let consensus_time = t0.elapsed();
-    println!("    4 validators voted + QC formed: {:.0}ms", consensus_time.as_secs_f64() * 1000.0);
+    println!(
+        "    4 validators voted + QC formed: {:.0}ms",
+        consensus_time.as_secs_f64() * 1000.0
+    );
     assert!(qc.is_some(), "QC must form with 4/4 votes");
     let qc = qc.unwrap();
 
@@ -544,7 +640,10 @@ fn production_simulation() {
         transfer_txs.push(tx);
     }
     let sign_time = t0.elapsed();
-    println!("    Signed 2000 transfers (FALCON-512): {:.0}ms", sign_time.as_secs_f64() * 1000.0);
+    println!(
+        "    Signed 2000 transfers (FALCON-512): {:.0}ms",
+        sign_time.as_secs_f64() * 1000.0
+    );
 
     // Parallel execution
     let sched = schedule(&transfer_txs);
@@ -576,16 +675,27 @@ fn production_simulation() {
 
     let total = exec_elapsed + commit_elapsed;
     let total_tps = n_transfers / total.as_secs_f64();
-    println!("    EXEC (in-memory, parallel): {:.0}ms → {:.0} TPS ({} groups)",
-        exec_elapsed.as_secs_f64() * 1000.0, exec_tps, num_groups);
-    println!("    COMMIT (Merkle + RocksDB):  {:.0}ms ({} writes)",
-        commit_elapsed.as_secs_f64() * 1000.0, write_count);
-    println!("    TOTAL:                      {:.0}ms → {:.0} TPS",
-        total.as_secs_f64() * 1000.0, total_tps);
+    println!(
+        "    EXEC (in-memory, parallel): {:.0}ms → {:.0} TPS ({} groups)",
+        exec_elapsed.as_secs_f64() * 1000.0,
+        exec_tps,
+        num_groups
+    );
+    println!(
+        "    COMMIT (Merkle + RocksDB):  {:.0}ms ({} writes)",
+        commit_elapsed.as_secs_f64() * 1000.0,
+        write_count
+    );
+    println!(
+        "    TOTAL:                      {:.0}ms → {:.0} TPS",
+        total.as_secs_f64() * 1000.0,
+        total_tps
+    );
 
     // Consensus for block 2
     let header2 = BlockHeader {
-        slot: 2, epoch: 0,
+        slot: 2,
+        epoch: 0,
         parent_hash: block_hash,
         proposer: validators[1].address,
         vrf_proof: vec![],
@@ -596,7 +706,15 @@ fn production_simulation() {
     };
     let mut votes2 = Vec::new();
     for i in 0..4 {
-        if let Some(v) = create_vote(&mut consensus_states[i], &header2, i as u8, validators[i].address, &validators[i].sk).unwrap() {
+        if let Some(v) = create_vote(
+            &mut consensus_states[i],
+            &header2,
+            i as u8,
+            validators[i].address,
+            &validators[i].sk,
+        )
+        .unwrap()
+        {
             assert!(verify_vote(&v, validators[i].pk.as_bytes()));
             votes2.push(v);
         }
@@ -621,8 +739,14 @@ fn production_simulation() {
     let vault_addr = *deployed_contracts.get("Vault-0").unwrap();
     // Verify contract code still exists after parallel transfer block
     let vault_code = pyde_tx::pipeline::load_code(&smt, &vault_addr);
-    eprintln!("    [DBG] Vault code after Block 2: {:?}", vault_code.as_ref().map(|c| c.len()));
-    assert!(vault_code.is_some(), "Vault code should exist after Block 2");
+    eprintln!(
+        "    [DBG] Vault code after Block 2: {:?}",
+        vault_code.as_ref().map(|c| c.len())
+    );
+    assert!(
+        vault_code.is_some(),
+        "Vault code should exist after Block 2"
+    );
     let counter_addr = *deployed_contracts.get("Counter-9").unwrap();
     let lottery_addr = *deployed_contracts.get("Lottery-7").unwrap();
     let math_addr = *deployed_contracts.get("MathHeavy-4").unwrap();
@@ -683,7 +807,10 @@ fn production_simulation() {
     }
 
     let sign_time = t0.elapsed();
-    println!("    Signed 300 contract calls: {:.0}ms", sign_time.as_secs_f64() * 1000.0);
+    println!(
+        "    Signed 300 contract calls: {:.0}ms",
+        sign_time.as_secs_f64() * 1000.0
+    );
 
     // Execute sequentially (mixed workload, shared contract state)
     let t0 = Instant::now();
@@ -693,26 +820,38 @@ fn production_simulation() {
     let mut event_count = 0;
     for tx in &call_txs {
         match execute_transaction(tx, &mut smt, &ctx) {
-            Err(_) => { fail += 1; }
+            Err(_) => {
+                fail += 1;
+            }
             Ok(receipt) => {
                 if receipt.success {
                     ok += 1;
                     total_gas += receipt.gas_used;
                     event_count += receipt.logs.len();
-                } else { fail += 1; }
+                } else {
+                    fail += 1;
+                }
             }
         }
     }
     let call_time = t0.elapsed();
     let call_tps = ok as f64 / call_time.as_secs_f64();
-    println!("    Executed 300 calls: {:.0}ms — {} ok, {} fail",
-        call_time.as_secs_f64() * 1000.0, ok, fail);
+    println!(
+        "    Executed 300 calls: {:.0}ms — {} ok, {} fail",
+        call_time.as_secs_f64() * 1000.0,
+        ok,
+        fail
+    );
     println!("    Successful call TPS: {:.0}", call_tps);
-    println!("    Gas used: {}, Events emitted: {}", total_gas, event_count);
+    println!(
+        "    Gas used: {}, Events emitted: {}",
+        total_gas, event_count
+    );
 
     // Consensus for block 3
     let header3 = BlockHeader {
-        slot: 3, epoch: 0,
+        slot: 3,
+        epoch: 0,
         parent_hash: header2.hash(),
         proposer: validators[2].address,
         vrf_proof: vec![],
@@ -723,7 +862,15 @@ fn production_simulation() {
     };
     let mut votes3 = Vec::new();
     for i in 0..4 {
-        if let Some(v) = create_vote(&mut consensus_states[i], &header3, i as u8, validators[i].address, &validators[i].sk).unwrap() {
+        if let Some(v) = create_vote(
+            &mut consensus_states[i],
+            &header3,
+            i as u8,
+            validators[i].address,
+            &validators[i].sk,
+        )
+        .unwrap()
+        {
             assert!(verify_vote(&v, validators[i].pk.as_bytes()));
             votes3.push(v);
         }
@@ -741,15 +888,24 @@ fn production_simulation() {
     println!();
     println!("  Total transactions:     {}", total_txs);
     println!("  Total time:             {:.1}s", total_time.as_secs_f64());
-    println!("  Overall TPS:            {:.0}", total_txs as f64 / total_time.as_secs_f64());
+    println!(
+        "  Overall TPS:            {:.0}",
+        total_txs as f64 / total_time.as_secs_f64()
+    );
     println!();
     println!("  Contracts deployed:     {}", deployed_contracts.len());
     println!("  Events emitted:         {}", event_count);
     println!("  Consensus rounds:       3 (4 validators, QC formed each round)");
-    println!("  Signatures:             {} FALCON-512 (sign+verify)", total_txs * 2);
+    println!(
+        "  Signatures:             {} FALCON-512 (sign+verify)",
+        total_txs * 2
+    );
     println!();
     println!("  Deploy TPS:             {:.0}", deploy_tps);
-    println!("  Transfer TPS (parallel):{:.0} ({} groups)", total_tps, num_groups);
+    println!(
+        "  Transfer TPS (parallel):{:.0} ({} groups)",
+        total_tps, num_groups
+    );
     println!("  Contract call TPS:      {:.0}", call_tps);
     println!();
     println!("  Chain ID:               1 (production, sig verification ON)");

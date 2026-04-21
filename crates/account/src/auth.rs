@@ -29,11 +29,7 @@ pub enum AuthResult {
 /// For FALCON single-key: verify signature directly.
 /// For multi-sig: verify enough signatures meet threshold.
 /// For accounts with code_hash: return CustomValidation (caller must invoke contract).
-pub fn validate_signature(
-    account: &Account,
-    message: &[u8],
-    signatures: &[Vec<u8>],
-) -> AuthResult {
+pub fn validate_signature(account: &Account, message: &[u8], signatures: &[Vec<u8>]) -> AuthResult {
     // If account has custom validation code, defer to contract
     if account.code_hash != sparse_merkle_tree::H256::zero() && account.is_contract() {
         return AuthResult::CustomValidation;
@@ -138,7 +134,7 @@ pub fn build_rotation_message(account: &Account, new_keys: &AuthKeys) -> Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
 
     fn make_eoa_with_real_key() -> (Account, pyde_crypto::falcon::FalconSecretKey) {
@@ -195,7 +191,11 @@ mod tests {
 
         let mut account = Account::new_eoa(pk1.as_bytes());
         account.auth_keys = AuthKeys::MultiSig {
-            keys: vec![pk1.as_bytes().to_vec(), pk2.as_bytes().to_vec(), pk3.as_bytes().to_vec()],
+            keys: vec![
+                pk1.as_bytes().to_vec(),
+                pk2.as_bytes().to_vec(),
+                pk3.as_bytes().to_vec(),
+            ],
             threshold: 2,
         };
 
@@ -216,7 +216,11 @@ mod tests {
 
         let mut account = Account::new_eoa(pk1.as_bytes());
         account.auth_keys = AuthKeys::MultiSig {
-            keys: vec![pk1.as_bytes().to_vec(), pk2.as_bytes().to_vec(), pk3.as_bytes().to_vec()],
+            keys: vec![
+                pk1.as_bytes().to_vec(),
+                pk2.as_bytes().to_vec(),
+                pk3.as_bytes().to_vec(),
+            ],
             threshold: 2,
         };
 
@@ -271,7 +275,10 @@ mod tests {
         let new_keys = AuthKeys::Single(new_pk.as_bytes().to_vec());
 
         let rotation_msg = build_rotation_message(&account, &new_keys);
-        let wrong_sig = falcon_sign(&wrong_sk, &rotation_msg).unwrap().as_bytes().to_vec();
+        let wrong_sig = falcon_sign(&wrong_sk, &rotation_msg)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
 
         let result = rotate_keys(&account, new_keys, &[wrong_sig], &rotation_msg);
         assert!(result.is_none());

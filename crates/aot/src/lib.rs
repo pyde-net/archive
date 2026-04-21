@@ -8,7 +8,10 @@ pub mod codegen;
 pub mod host;
 
 pub use analysis::{analyze, AnalyzedProgram, BasicBlock};
-pub use codegen::{compile, decode_result, CompiledCode, RESULT_OUT_OF_GAS, RESULT_REVERT, RESULT_SUCCESS, RESULT_TRAP};
+pub use codegen::{
+    compile, decode_result, CompiledCode, RESULT_OUT_OF_GAS, RESULT_REVERT, RESULT_SUCCESS,
+    RESULT_TRAP,
+};
 
 /// Compile PVM bytecode end-to-end: analyze → codegen → native function.
 pub fn compile_bytecode(bytecode: &[u8]) -> Result<CompiledCode, Box<dyn std::error::Error>> {
@@ -27,7 +30,9 @@ mod tests {
     }
 
     fn instr_ri(op: Opcode, rd: u8, rs1: u8, imm: i32) -> [u8; 4] {
-        encode(op, rd, rs1, encode_immediate(imm).unwrap()).0.to_le_bytes()
+        encode(op, rd, rs1, encode_immediate(imm).unwrap())
+            .0
+            .to_le_bytes()
     }
 
     fn bytecode(instrs: &[[u8; 4]]) -> Vec<u8> {
@@ -134,9 +139,9 @@ mod tests {
     fn aot_branch_taken() {
         // BEQ r0, r0 → always taken (both zero)
         let code = bytecode(&[
-            instr_ri(Opcode::Beq, 0, 0, 8),          // [0] branch to [8]
-            instr_ri(Opcode::Addi, 1, 0, 99),        // [4] skipped
-            instr_bytes(Opcode::Halt, 0, 0, 0),      // [8]
+            instr_ri(Opcode::Beq, 0, 0, 8),     // [0] branch to [8]
+            instr_ri(Opcode::Addi, 1, 0, 99),   // [4] skipped
+            instr_bytes(Opcode::Halt, 0, 0, 0), // [8]
         ]);
         let (status, _, regs) = run_aot(&code, 0);
         assert_eq!(status, RESULT_SUCCESS);
@@ -146,10 +151,10 @@ mod tests {
     #[test]
     fn aot_branch_not_taken() {
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 1),         // [0] r1 = 1
-            instr_ri(Opcode::Beq, 1, 0, 8),          // [4] r1 != r0, not taken
-            instr_ri(Opcode::Addi, 2, 0, 42),        // [8] runs
-            instr_bytes(Opcode::Halt, 0, 0, 0),      // [12]
+            instr_ri(Opcode::Addi, 1, 0, 1),    // [0] r1 = 1
+            instr_ri(Opcode::Beq, 1, 0, 8),     // [4] r1 != r0, not taken
+            instr_ri(Opcode::Addi, 2, 0, 42),   // [8] runs
+            instr_bytes(Opcode::Halt, 0, 0, 0), // [12]
         ]);
         let (status, _, regs) = run_aot(&code, 0);
         assert_eq!(status, RESULT_SUCCESS);
@@ -160,11 +165,11 @@ mod tests {
     fn aot_loop_matches_interpreter() {
         // Loop: r1 = 10, r2 = 0; while r2 < r1: r2++
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 10),        // [0]
-            instr_ri(Opcode::Addi, 2, 0, 0),         // [4]
-            instr_ri(Opcode::Addi, 2, 2, 1),         // [8] loop body
-            instr_ri(Opcode::Blt, 2, 1, -4),         // [12] back to [8]
-            instr_bytes(Opcode::Halt, 0, 0, 0),      // [16]
+            instr_ri(Opcode::Addi, 1, 0, 10),   // [0]
+            instr_ri(Opcode::Addi, 2, 0, 0),    // [4]
+            instr_ri(Opcode::Addi, 2, 2, 1),    // [8] loop body
+            instr_ri(Opcode::Blt, 2, 1, -4),    // [12] back to [8]
+            instr_bytes(Opcode::Halt, 0, 0, 0), // [16]
         ]);
         compare_with_interpreter(&code, 0);
     }
@@ -174,8 +179,8 @@ mod tests {
     #[test]
     fn aot_gas_metering_basic() {
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 42),        // 3 gas
-            instr_bytes(Opcode::Halt, 0, 0, 0),      // 3 gas
+            instr_ri(Opcode::Addi, 1, 0, 42),   // 3 gas
+            instr_bytes(Opcode::Halt, 0, 0, 0), // 3 gas
         ]);
         let (status, gas_used, _) = run_aot(&code, 1_000_000);
         assert_eq!(status, RESULT_SUCCESS);
@@ -185,8 +190,8 @@ mod tests {
     #[test]
     fn aot_out_of_gas() {
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 42),        // 3 gas
-            instr_bytes(Opcode::Halt, 0, 0, 0),      // 3 gas — total 6
+            instr_ri(Opcode::Addi, 1, 0, 42),   // 3 gas
+            instr_bytes(Opcode::Halt, 0, 0, 0), // 3 gas — total 6
         ]);
         let (status, _, _) = run_aot(&code, 1); // only 1 gas available (needs 6)
         assert_eq!(status, RESULT_OUT_OF_GAS);
@@ -197,17 +202,17 @@ mod tests {
     #[test]
     fn aot_fibonacci_matches_interpreter() {
         let code = bytecode(&[
-            instr_ri(Opcode::Addi, 1, 0, 10),        // [0] r1 = 10
-            instr_ri(Opcode::Addi, 2, 0, 0),         // [4] r2 = 0 (fib_prev)
-            instr_ri(Opcode::Addi, 3, 0, 1),         // [8] r3 = 1 (fib_curr)
-            instr_ri(Opcode::Addi, 4, 0, 1),         // [12] r4 = 1 (counter)
-            instr_bytes(Opcode::Bge, 4, 1, 24),      // [16] if r4 >= r1, jump to [40] halt
-            instr_bytes(Opcode::Add, 5, 2, 3),       // [20] r5 = r2 + r3
-            instr_bytes(Opcode::Add, 2, 3, 0),       // [24] r2 = r3
-            instr_bytes(Opcode::Add, 3, 5, 0),       // [28] r3 = r5
-            instr_ri(Opcode::Addi, 4, 4, 1),         // [32] r4++
-            instr_ri(Opcode::Jmp, 0, 0, -20),        // [36] jmp to [16]
-            instr_bytes(Opcode::Halt, 0, 0, 0),      // [40]
+            instr_ri(Opcode::Addi, 1, 0, 10),   // [0] r1 = 10
+            instr_ri(Opcode::Addi, 2, 0, 0),    // [4] r2 = 0 (fib_prev)
+            instr_ri(Opcode::Addi, 3, 0, 1),    // [8] r3 = 1 (fib_curr)
+            instr_ri(Opcode::Addi, 4, 0, 1),    // [12] r4 = 1 (counter)
+            instr_bytes(Opcode::Bge, 4, 1, 24), // [16] if r4 >= r1, jump to [40] halt
+            instr_bytes(Opcode::Add, 5, 2, 3),  // [20] r5 = r2 + r3
+            instr_bytes(Opcode::Add, 2, 3, 0),  // [24] r2 = r3
+            instr_bytes(Opcode::Add, 3, 5, 0),  // [28] r3 = r5
+            instr_ri(Opcode::Addi, 4, 4, 1),    // [32] r4++
+            instr_ri(Opcode::Jmp, 0, 0, -20),   // [36] jmp to [16]
+            instr_bytes(Opcode::Halt, 0, 0, 0), // [40]
         ]);
         compare_with_interpreter(&code, 0);
     }
@@ -252,7 +257,9 @@ mod tests {
             let func = aot.as_fn();
             let mut regs = [0u64; 16];
             // Copy initial GP state from VM (r4=len, r5=ptr, r12=heap)
-            for i in 0..16 { regs[i] = vm_aot.cpu.read_gp(i as u8); }
+            for i in 0..16 {
+                regs[i] = vm_aot.cpu.read_gp(i as u8);
+            }
             let raw = unsafe { func(regs.as_mut_ptr(), 10_000_000, &mut vm_aot as *mut _) };
             let (status, _) = decode_result(raw);
             assert_eq!(status, RESULT_SUCCESS, "AOT increment should succeed");
@@ -262,15 +269,28 @@ mod tests {
             vm_interp.calldata = inc_sel.to_be_bytes().to_vec();
             vm_interp.load(runtime).unwrap();
             let out = vm_interp.execute();
-            assert_eq!(out.outcome, pyde_vm::vm::Outcome::Success, "Interpreter increment should succeed");
+            assert_eq!(
+                out.outcome,
+                pyde_vm::vm::Outcome::Success,
+                "Interpreter increment should succeed"
+            );
 
             // Compare storage — both should have count = 1
-            assert_eq!(vm_aot.storage.len(), vm_interp.storage.len(),
-                "Storage entry count mismatch");
+            assert_eq!(
+                vm_aot.storage.len(),
+                vm_interp.storage.len(),
+                "Storage entry count mismatch"
+            );
             for (k, v) in &vm_interp.storage {
                 let aot_v = vm_aot.storage.get(k);
-                assert_eq!(aot_v, Some(v),
-                    "Storage mismatch at key {}: interp={:?}, aot={:?}", k, v, aot_v);
+                assert_eq!(
+                    aot_v,
+                    Some(v),
+                    "Storage mismatch at key {}: interp={:?}, aot={:?}",
+                    k,
+                    v,
+                    aot_v
+                );
             }
         }
 
@@ -284,7 +304,9 @@ mod tests {
             vm_aot.load(runtime).unwrap();
             let func = aot.as_fn();
             let mut regs = [0u64; 16];
-            for i in 0..16 { regs[i] = vm_aot.cpu.read_gp(i as u8); }
+            for i in 0..16 {
+                regs[i] = vm_aot.cpu.read_gp(i as u8);
+            }
             let raw = unsafe { func(regs.as_mut_ptr(), 10_000_000, &mut vm_aot as *mut _) };
             let (status, _) = decode_result(raw);
             assert_eq!(status, RESULT_SUCCESS, "AOT add(5) should succeed");
@@ -297,8 +319,7 @@ mod tests {
 
             for (k, v) in &vm_interp.storage {
                 let aot_v = vm_aot.storage.get(k);
-                assert_eq!(aot_v, Some(v),
-                    "Storage mismatch after add(5)");
+                assert_eq!(aot_v, Some(v), "Storage mismatch after add(5)");
             }
         }
 
@@ -319,7 +340,9 @@ mod tests {
             vm_aot.load(runtime).unwrap();
             let func = aot.as_fn();
             let mut regs = [0u64; 16];
-            for i in 0..16 { regs[i] = vm_aot.cpu.read_gp(i as u8); }
+            for i in 0..16 {
+                regs[i] = vm_aot.cpu.read_gp(i as u8);
+            }
             let raw = unsafe { func(regs.as_mut_ptr(), 10_000_000, &mut vm_aot as *mut _) };
             let (status, _) = decode_result(raw);
             assert_eq!(status, RESULT_SUCCESS, "AOT get_count should succeed");
@@ -333,9 +356,13 @@ mod tests {
             assert_eq!(out.outcome, pyde_vm::vm::Outcome::Success);
 
             // Compare GP r1 (return value)
-            assert_eq!(regs[1], vm_interp.cpu.read_gp(1),
+            assert_eq!(
+                regs[1],
+                vm_interp.cpu.read_gp(1),
                 "get_count return value mismatch: aot={} interp={}",
-                regs[1], vm_interp.cpu.read_gp(1));
+                regs[1],
+                vm_interp.cpu.read_gp(1)
+            );
             assert_eq!(regs[1], 1, "get_count should return 1 after increment");
         }
     }
@@ -401,12 +428,17 @@ mod tests {
         // --- deposit() with msg.value ---
         let caller_addr = {
             let mut a = [0u8; 32];
-            a[0] = 0xAA; a[1] = 0xBB;
+            a[0] = 0xAA;
+            a[1] = 0xBB;
             a
         };
         let ctx = pyde_vm::vm::ExecutionContext {
             caller: caller_addr,
-            self_address: { let mut a = [0u8;32]; a[0]=0xCC; a },
+            self_address: {
+                let mut a = [0u8; 32];
+                a[0] = 0xCC;
+                a
+            },
             call_value: ethnum::U256::from(1_000_000u64),
             ..Default::default()
         };
@@ -416,8 +448,11 @@ mod tests {
         vm_interp.calldata = deposit_sel.to_be_bytes().to_vec();
         vm_interp.load(runtime).unwrap();
         let out_interp = vm_interp.execute();
-        assert_eq!(out_interp.outcome, pyde_vm::vm::Outcome::Success,
-            "Interpreter deposit should succeed");
+        assert_eq!(
+            out_interp.outcome,
+            pyde_vm::vm::Outcome::Success,
+            "Interpreter deposit should succeed"
+        );
 
         // AOT
         let mut vm_aot = pyde_vm::vm::Vm::with_gas_limit_and_context(50_000_000, ctx);
@@ -425,22 +460,38 @@ mod tests {
         vm_aot.load(runtime).unwrap();
         let func = aot.as_fn();
         let mut regs = [0u64; 16];
-        for i in 0..16 { regs[i] = vm_aot.cpu.read_gp(i as u8); }
+        for i in 0..16 {
+            regs[i] = vm_aot.cpu.read_gp(i as u8);
+        }
         let raw = unsafe { func(regs.as_mut_ptr(), 50_000_000, &mut vm_aot as *mut _) };
         let (status, _) = decode_result(raw);
         assert_eq!(status, RESULT_SUCCESS, "AOT deposit should succeed");
 
         // Compare storage
-        assert_eq!(vm_aot.storage.len(), vm_interp.storage.len(),
-            "Storage count: aot={} interp={}", vm_aot.storage.len(), vm_interp.storage.len());
+        assert_eq!(
+            vm_aot.storage.len(),
+            vm_interp.storage.len(),
+            "Storage count: aot={} interp={}",
+            vm_aot.storage.len(),
+            vm_interp.storage.len()
+        );
         for (k, v) in &vm_interp.storage {
-            assert_eq!(vm_aot.storage.get(k), Some(v),
-                "Storage mismatch at key {}", k);
+            assert_eq!(
+                vm_aot.storage.get(k),
+                Some(v),
+                "Storage mismatch at key {}",
+                k
+            );
         }
 
         // Compare events
-        assert_eq!(vm_aot.logs.len(), vm_interp.logs.len(),
-            "Event count: aot={} interp={}", vm_aot.logs.len(), vm_interp.logs.len());
+        assert_eq!(
+            vm_aot.logs.len(),
+            vm_interp.logs.len(),
+            "Event count: aot={} interp={}",
+            vm_aot.logs.len(),
+            vm_interp.logs.len()
+        );
         for (i, (a, b)) in vm_aot.logs.iter().zip(vm_interp.logs.iter()).enumerate() {
             assert_eq!(a.topics, b.topics, "Event {} topics mismatch", i);
             assert_eq!(a.data, b.data, "Event {} data mismatch", i);
@@ -454,7 +505,9 @@ mod tests {
         vm_aot2.storage = storage_snap.clone();
         vm_aot2.load(runtime).unwrap();
         let mut regs2 = [0u64; 16];
-        for i in 0..16 { regs2[i] = vm_aot2.cpu.read_gp(i as u8); }
+        for i in 0..16 {
+            regs2[i] = vm_aot2.cpu.read_gp(i as u8);
+        }
         let raw2 = unsafe { func(regs2.as_mut_ptr(), 50_000_000, &mut vm_aot2 as *mut _) };
         let (status2, _) = decode_result(raw2);
         assert_eq!(status2, RESULT_SUCCESS, "AOT get_total should succeed");
@@ -467,8 +520,16 @@ mod tests {
         assert_eq!(out2.outcome, pyde_vm::vm::Outcome::Success);
 
         // Compare wide return (r1=ptr, r2=len for u256 returns)
-        assert_eq!(regs2[1], vm_interp2.cpu.read_gp(1), "r1 mismatch on get_total");
-        assert_eq!(regs2[2], vm_interp2.cpu.read_gp(2), "r2 mismatch on get_total");
+        assert_eq!(
+            regs2[1],
+            vm_interp2.cpu.read_gp(1),
+            "r1 mismatch on get_total"
+        );
+        assert_eq!(
+            regs2[2],
+            vm_interp2.cpu.read_gp(2),
+            "r2 mismatch on get_total"
+        );
     }
 
     /// The hardest test: factory deploys child, cross-contract calls it,
@@ -563,8 +624,16 @@ mod tests {
         supply_bytes[..8].copy_from_slice(&1_000_000u64.to_le_bytes());
         calldata.extend_from_slice(&supply_bytes);
 
-        let factory_addr = { let mut a = [0u8; 32]; a[0] = 0xFF; a };
-        let caller = { let mut a = [0u8; 32]; a[0] = 0xAA; a };
+        let factory_addr = {
+            let mut a = [0u8; 32];
+            a[0] = 0xFF;
+            a
+        };
+        let caller = {
+            let mut a = [0u8; 32];
+            a[0] = 0xAA;
+            a
+        };
         let ctx = pyde_vm::vm::ExecutionContext {
             caller,
             self_address: factory_addr,
@@ -580,14 +649,22 @@ mod tests {
             if use_aot {
                 let func = aot.as_fn();
                 let mut regs = [0u64; 16];
-                for i in 0..16 { regs[i] = vm.cpu.read_gp(i as u8); }
+                for i in 0..16 {
+                    regs[i] = vm.cpu.read_gp(i as u8);
+                }
                 let raw = unsafe { func(regs.as_mut_ptr(), 100_000_000, &mut vm as *mut _) };
                 let (status, _) = decode_result(raw);
-                assert_eq!(status, RESULT_SUCCESS, "create_token should succeed (aot={use_aot})");
+                assert_eq!(
+                    status, RESULT_SUCCESS,
+                    "create_token should succeed (aot={use_aot})"
+                );
             } else {
                 let out = vm.execute();
-                assert_eq!(out.outcome, pyde_vm::vm::Outcome::Success,
-                    "create_token should succeed (interpreter)");
+                assert_eq!(
+                    out.outcome,
+                    pyde_vm::vm::Outcome::Success,
+                    "create_token should succeed (interpreter)"
+                );
             }
             vm
         };
@@ -596,20 +673,32 @@ mod tests {
         let vm_aot = run(true);
 
         // Both should have the same storage entries (keys AND values)
-        assert_eq!(vm_aot.storage.len(), vm_interp.storage.len(),
+        assert_eq!(
+            vm_aot.storage.len(),
+            vm_interp.storage.len(),
             "Storage count mismatch: aot={} interp={}",
-            vm_aot.storage.len(), vm_interp.storage.len());
+            vm_aot.storage.len(),
+            vm_interp.storage.len()
+        );
 
         for (k, v) in &vm_interp.storage {
             let aot_v = vm_aot.storage.get(k);
-            assert_eq!(aot_v, Some(v),
-                "Storage mismatch at key {}...", &k.to_string()[..20]);
+            assert_eq!(
+                aot_v,
+                Some(v),
+                "Storage mismatch at key {}...",
+                &k.to_string()[..20]
+            );
         }
 
         // Both should emit the same events
-        assert_eq!(vm_aot.logs.len(), vm_interp.logs.len(),
+        assert_eq!(
+            vm_aot.logs.len(),
+            vm_interp.logs.len(),
             "Event count mismatch: aot={} interp={}",
-            vm_aot.logs.len(), vm_interp.logs.len());
+            vm_aot.logs.len(),
+            vm_interp.logs.len()
+        );
         for (i, (a, b)) in vm_aot.logs.iter().zip(vm_interp.logs.iter()).enumerate() {
             assert_eq!(a.topics, b.topics, "Event {i} topics mismatch");
             assert_eq!(a.data, b.data, "Event {i} data mismatch");
@@ -633,17 +722,17 @@ mod tests {
         // Use r2 for success flag so r1 holds the child's return value.
         let imm: u32 = (3 & 0xF)            // len_reg = r3
             | ((7 & 0xF) << 4)              // gas_reg = r7
-            | ((2 & 0xF) << 8);             // result_reg = r2
+            | ((2 & 0xF) << 8); // result_reg = r2
         let heap = HEAP_START as i32;
         let caller_code = bytecode(&[
-            instr_ri(Opcode::Addi, 8, 0, heap),      // [0]  r8 = HEAP_START (calldata ptr)
-            instr_ri(Opcode::Addi, 6, 0, 99),        // [4]  r6 = 99
-            instr_bytes(Opcode::Store, 6, 8, 0x03),  // [8]  mem[HEAP_START] = 99 (64-bit)
-            instr_ri(Opcode::Addi, 3, 0, 8),         // [12] r3 = calldata len = 8
-            instr_ri(Opcode::Addi, 7, 0, 0),         // [16] r7 = gas = 0 (forward all)
+            instr_ri(Opcode::Addi, 8, 0, heap), // [0]  r8 = HEAP_START (calldata ptr)
+            instr_ri(Opcode::Addi, 6, 0, 99),   // [4]  r6 = 99
+            instr_bytes(Opcode::Store, 6, 8, 0x03), // [8]  mem[HEAP_START] = 99 (64-bit)
+            instr_ri(Opcode::Addi, 3, 0, 8),    // [12] r3 = calldata len = 8
+            instr_ri(Opcode::Addi, 7, 0, 0),    // [16] r7 = gas = 0 (forward all)
             instr_bytes(Opcode::CallExt, 0, 8, imm), // [20] call child at w0, calldata at r8
             // After: r1 = child's return (99), r2 = success flag
-            instr_bytes(Opcode::Halt, 0, 0, 0),      // [24]
+            instr_bytes(Opcode::Halt, 0, 0, 0), // [24]
         ]);
 
         // Set up target address in wide register 0
@@ -655,7 +744,8 @@ mod tests {
         let func = compiled.as_fn();
         let mut regs = [0u64; 16];
         let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
-        vm.cpu.write_wide(0, pyde_vm::wide::U256::from_le_bytes(target_addr));
+        vm.cpu
+            .write_wide(0, pyde_vm::wide::U256::from_le_bytes(target_addr));
         vm.contracts.insert(target_addr, callee_code.clone());
         let raw = unsafe { func(regs.as_mut_ptr(), 1_000_000, &mut vm as *mut _) };
         let (status, _gas_used) = decode_result(raw);

@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "pyde-dev", version, about = "Pyde smart contract development framework")]
+#[command(
+    name = "pyde-dev",
+    version,
+    about = "Pyde smart contract development framework"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

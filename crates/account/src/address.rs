@@ -93,7 +93,10 @@ mod tests {
 
     #[test]
     fn different_keys_different_addresses() {
-        assert_ne!(derive_eoa_address(&[0xAB; 897]), derive_eoa_address(&[0xCD; 897]));
+        assert_ne!(
+            derive_eoa_address(&[0xAB; 897]),
+            derive_eoa_address(&[0xCD; 897])
+        );
     }
 
     #[test]
@@ -155,7 +158,10 @@ mod tests {
     fn format_address_hex() {
         let addr = ZERO_ADDRESS;
         let s = format_address(&addr);
-        assert_eq!(s, "0x0000000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(
+            s,
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+        );
         assert_eq!(s.len(), 66); // 0x + 64 hex chars
     }
 

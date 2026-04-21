@@ -6,10 +6,10 @@
 //!
 //! This keeps the PVM 100% production-clean — no test features in the core VM.
 
+use crate::trace::{ExecutionTrace, TraceEvent};
 use ethnum::U256;
 use pyde_vm::isa::Opcode;
 use pyde_vm::vm::{ExecResult, Outcome, Vm};
-use crate::trace::{ExecutionTrace, TraceEvent};
 
 /// Magic cheatcode address: 32 bytes of 0xCC.
 pub const CHEATCODE_ADDRESS: [u8; 32] = [0xCC; 32];
@@ -28,13 +28,27 @@ pub mod selectors {
         hash
     }
 
-    pub fn warp() -> u32 { compute("warp") }
-    pub fn roll() -> u32 { compute("roll") }
-    pub fn prank() -> u32 { compute("prank") }
-    pub fn start_prank() -> u32 { compute("startPrank") }
-    pub fn stop_prank() -> u32 { compute("stopPrank") }
-    pub fn deal() -> u32 { compute("deal") }
-    pub fn make_addr() -> u32 { compute("makeAddr") }
+    pub fn warp() -> u32 {
+        compute("warp")
+    }
+    pub fn roll() -> u32 {
+        compute("roll")
+    }
+    pub fn prank() -> u32 {
+        compute("prank")
+    }
+    pub fn start_prank() -> u32 {
+        compute("startPrank")
+    }
+    pub fn stop_prank() -> u32 {
+        compute("stopPrank")
+    }
+    pub fn deal() -> u32 {
+        compute("deal")
+    }
+    pub fn make_addr() -> u32 {
+        compute("makeAddr")
+    }
 }
 
 /// State for persistent prank across calls.
@@ -129,10 +143,12 @@ pub fn execute_with_cheatcodes(vm: &mut Vm, cheat_state: &mut CheatcodeState) ->
 
         // Clear single-use prank after any non-cheatcode CallExt
         if let Some(d) = maybe_instr {
-            if d.opcode == Opcode::CallExt && !cheat_state.prank_persistent
-                && cheat_state.prank_caller.is_some() {
-                    cheat_state.prank_caller = None;
-                }
+            if d.opcode == Opcode::CallExt
+                && !cheat_state.prank_persistent
+                && cheat_state.prank_caller.is_some()
+            {
+                cheat_state.prank_caller = None;
+            }
         }
     };
 
@@ -172,7 +188,9 @@ pub fn execute_with_tracing(
                         let len_reg = (d.rs2_or_imm & 0xF) as u8;
                         let calldata_len = vm.cpu.read_gp(len_reg) as usize;
                         let result_reg = ((d.rs2_or_imm >> 8) & 0xF) as u8;
-                        if let Ok(calldata) = vm.memory.checked_read_slice(calldata_ptr, calldata_len) {
+                        if let Ok(calldata) =
+                            vm.memory.checked_read_slice(calldata_ptr, calldata_len)
+                        {
                             let success = handle_cheatcode(vm, cheat_state, &calldata);
                             vm.cpu.write_gp(result_reg, if success { 1 } else { 0 });
                         } else {
@@ -184,11 +202,12 @@ pub fn execute_with_tracing(
 
                     // Record call trace
                     let calldata_ptr = vm.cpu.read_gp(d.rs1) as u32;
-                    let selector = if let Ok(sel_bytes) = vm.memory.checked_read_slice(calldata_ptr, 4) {
-                        u32::from_be_bytes(sel_bytes[..4].try_into().unwrap_or([0; 4]))
-                    } else {
-                        0
-                    };
+                    let selector =
+                        if let Ok(sel_bytes) = vm.memory.checked_read_slice(calldata_ptr, 4) {
+                            u32::from_be_bytes(sel_bytes[..4].try_into().unwrap_or([0; 4]))
+                        } else {
+                            0
+                        };
                     trace.push(TraceEvent::Call {
                         target,
                         selector,
@@ -284,10 +303,12 @@ pub fn execute_with_tracing(
 
         // Clear single-use prank
         if let Some(d) = maybe_instr {
-            if d.opcode == Opcode::CallExt && !cheat_state.prank_persistent
-                && cheat_state.prank_caller.is_some() {
-                    cheat_state.prank_caller = None;
-                }
+            if d.opcode == Opcode::CallExt
+                && !cheat_state.prank_persistent
+                && cheat_state.prank_caller.is_some()
+            {
+                cheat_state.prank_caller = None;
+            }
         }
     };
 

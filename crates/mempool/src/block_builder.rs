@@ -121,10 +121,8 @@ pub fn build_block(
     let shuffled = apply_shuffle(&ordered, &permutation);
 
     // 3. Build parallel schedule from access lists
-    let access_lists: Vec<Vec<AccessEntry>> = shuffled
-        .iter()
-        .map(|tx| tx.access_list.clone())
-        .collect();
+    let access_lists: Vec<Vec<AccessEntry>> =
+        shuffled.iter().map(|tx| tx.access_list.clone()).collect();
     let execution_schedule = schedule_from_access_lists(&access_lists);
 
     ConstructedBlock {
@@ -172,7 +170,17 @@ mod tests {
         let sender = derive_eoa_address(sender_seed);
         let to = derive_eoa_address(b"to");
         let tx = encrypt_transaction(
-            sender, nonce, gas, access_list, None, 1, dummy_sig(), &to, 0, b"", pk,
+            sender,
+            nonce,
+            gas,
+            access_list,
+            None,
+            1,
+            dummy_sig(),
+            &to,
+            0,
+            b"",
+            pk,
         )
         .unwrap();
         pool.add(tx).unwrap();
@@ -187,8 +195,14 @@ mod tests {
 
         // Add 3 txs: 50K + 50K + 50K = 150K total
         for i in 0..3u64 {
-            add_tx(&mut pool, &pk, &i.to_le_bytes(), 0, 50_000,
-                make_access(i as u8, [i as u8; 32], false));
+            add_tx(
+                &mut pool,
+                &pk,
+                &i.to_le_bytes(),
+                0,
+                50_000,
+                make_access(i as u8, [i as u8; 32], false),
+            );
         }
 
         // Block gas limit of 100K → can fit at most 2
@@ -206,12 +220,30 @@ mod tests {
 
         let sender_seed = b"alice_key";
         // Add out of nonce order
-        add_tx(&mut pool, &pk, sender_seed, 2, 30_000,
-            make_access(1, [0x01; 32], false));
-        add_tx(&mut pool, &pk, sender_seed, 0, 30_000,
-            make_access(2, [0x02; 32], false));
-        add_tx(&mut pool, &pk, sender_seed, 1, 30_000,
-            make_access(3, [0x03; 32], false));
+        add_tx(
+            &mut pool,
+            &pk,
+            sender_seed,
+            2,
+            30_000,
+            make_access(1, [0x01; 32], false),
+        );
+        add_tx(
+            &mut pool,
+            &pk,
+            sender_seed,
+            0,
+            30_000,
+            make_access(2, [0x02; 32], false),
+        );
+        add_tx(
+            &mut pool,
+            &pk,
+            sender_seed,
+            1,
+            30_000,
+            make_access(3, [0x03; 32], false),
+        );
 
         // select_and_order should sort by nonce
         let ordered = select_and_order(&pool, 1_000_000, 0);
@@ -231,14 +263,32 @@ mod tests {
         let shared_key = [0xAA; 32];
 
         // tx0 and tx1 write to same key → conflict → same group
-        add_tx(&mut pool, &pk, b"sender0", 0, 30_000,
-            make_access(1, shared_key, true));
-        add_tx(&mut pool, &pk, b"sender1", 0, 30_000,
-            make_access(1, shared_key, true));
+        add_tx(
+            &mut pool,
+            &pk,
+            b"sender0",
+            0,
+            30_000,
+            make_access(1, shared_key, true),
+        );
+        add_tx(
+            &mut pool,
+            &pk,
+            b"sender1",
+            0,
+            30_000,
+            make_access(1, shared_key, true),
+        );
 
         // tx2 touches a different key → independent → own group
-        add_tx(&mut pool, &pk, b"sender2", 0, 30_000,
-            make_access(2, [0xBB; 32], false));
+        add_tx(
+            &mut pool,
+            &pk,
+            b"sender2",
+            0,
+            30_000,
+            make_access(2, [0xBB; 32], false),
+        );
 
         let block = build_block(&pool, 1_000_000, 0, &[0xCC; 32]);
         assert_eq!(block.transactions.len(), 3);
@@ -249,7 +299,8 @@ mod tests {
 
         // Verify no cross-group conflicts
         let groups = &block.execution_schedule.groups;
-        let access_lists: Vec<Vec<AccessEntry>> = block.transactions
+        let access_lists: Vec<Vec<AccessEntry>> = block
+            .transactions
             .iter()
             .map(|tx| tx.access_list.clone())
             .collect();
@@ -259,9 +310,12 @@ mod tests {
                     for &b in &g2.tx_indices {
                         assert!(
                             !pyde_tx::parallel::access_lists_conflict(
-                                &access_lists[a], &access_lists[b]
+                                &access_lists[a],
+                                &access_lists[b]
                             ),
-                            "cross-group conflict between tx {} and tx {}", a, b
+                            "cross-group conflict between tx {} and tx {}",
+                            a,
+                            b
                         );
                     }
                 }
@@ -277,8 +331,14 @@ mod tests {
         let mut pool = Mempool::new();
 
         for i in 0..10u64 {
-            add_tx(&mut pool, &pk, &i.to_le_bytes(), 0, 25_000,
-                make_access(i as u8, [i as u8; 32], false));
+            add_tx(
+                &mut pool,
+                &pk,
+                &i.to_le_bytes(),
+                0,
+                25_000,
+                make_access(i as u8, [i as u8; 32], false),
+            );
         }
 
         let block1 = build_block(&pool, 1_000_000, 0, &[0xAA; 32]);
@@ -296,8 +356,14 @@ mod tests {
         let mut pool = Mempool::new();
 
         for i in 0..5u64 {
-            add_tx(&mut pool, &pk, &i.to_le_bytes(), 0, 25_000,
-                make_access(i as u8, [i as u8; 32], false));
+            add_tx(
+                &mut pool,
+                &pk,
+                &i.to_le_bytes(),
+                0,
+                25_000,
+                make_access(i as u8, [i as u8; 32], false),
+            );
         }
 
         let block1 = build_block(&pool, 1_000_000, 0, &[0xAA; 32]);
@@ -327,14 +393,32 @@ mod tests {
         let mut pool = Mempool::new();
 
         // Alice: nonce 0, 1
-        add_tx(&mut pool, &pk, b"alice", 0, 25_000,
-            make_access(1, [0x01; 32], false));
-        add_tx(&mut pool, &pk, b"alice", 1, 25_000,
-            make_access(2, [0x02; 32], false));
+        add_tx(
+            &mut pool,
+            &pk,
+            b"alice",
+            0,
+            25_000,
+            make_access(1, [0x01; 32], false),
+        );
+        add_tx(
+            &mut pool,
+            &pk,
+            b"alice",
+            1,
+            25_000,
+            make_access(2, [0x02; 32], false),
+        );
 
         // Bob: nonce 0
-        add_tx(&mut pool, &pk, b"bob", 0, 25_000,
-            make_access(3, [0x03; 32], false));
+        add_tx(
+            &mut pool,
+            &pk,
+            b"bob",
+            0,
+            25_000,
+            make_access(3, [0x03; 32], false),
+        );
 
         let ordered = select_and_order(&pool, 1_000_000, 0);
         assert_eq!(ordered.len(), 3);

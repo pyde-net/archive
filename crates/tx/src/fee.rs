@@ -47,20 +47,22 @@ pub fn adjust_base_fee(
     let new_fee = if parent_gas_used > parent_gas_target {
         // Block over target → increase
         let gas_delta = parent_gas_used - parent_gas_target;
-        let fee_delta = parent_base_fee * gas_delta as u128
-            / parent_gas_target as u128
-            / ADJUSTMENT_DIVISOR;
+        let fee_delta =
+            parent_base_fee * gas_delta as u128 / parent_gas_target as u128 / ADJUSTMENT_DIVISOR;
         let fee_delta = fee_delta.max(1); // minimum increase of 1
         parent_base_fee + fee_delta
     } else {
         // Block under target → decrease
         let gas_delta = parent_gas_target - parent_gas_used;
-        let fee_delta = parent_base_fee * gas_delta as u128
-            / parent_gas_target as u128
-            / ADJUSTMENT_DIVISOR;
+        let fee_delta =
+            parent_base_fee * gas_delta as u128 / parent_gas_target as u128 / ADJUSTMENT_DIVISOR;
         // Ensure minimum decrease of 1 when there IS a delta, so small fees
         // don't get stuck due to integer division rounding to zero.
-        let fee_delta = if gas_delta > 0 { fee_delta.max(1) } else { fee_delta };
+        let fee_delta = if gas_delta > 0 {
+            fee_delta.max(1)
+        } else {
+            fee_delta
+        };
         parent_base_fee.saturating_sub(fee_delta)
     };
 
@@ -234,9 +236,9 @@ mod tests {
         assert!(fee_3x < fee_4x);
 
         // 2x target = +12.5%, 3x target = +25%, 4x target = +37.5%
-        assert_eq!(fee_2x - parent, parent / 8);      // +125,000
-        assert_eq!(fee_3x - parent, parent * 2 / 8);  // +250,000
-        assert_eq!(fee_4x - parent, parent * 3 / 8);  // +375,000
+        assert_eq!(fee_2x - parent, parent / 8); // +125,000
+        assert_eq!(fee_3x - parent, parent * 2 / 8); // +250,000
+        assert_eq!(fee_4x - parent, parent * 3 / 8); // +375,000
     }
 
     // ========== Genesis ==========

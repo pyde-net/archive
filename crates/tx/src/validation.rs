@@ -342,8 +342,8 @@ mod tests {
     fn invalid_signature_rejected() {
         let (mut tx, account, nonce) = make_valid_tx_and_account();
         tx.signature = vec![0xFF; 666]; // garbage sig
-        // Override default_ctx()'s dev_skip_signature so the sig check
-        // actually runs — the whole point of this test.
+                                        // Override default_ctx()'s dev_skip_signature so the sig check
+                                        // actually runs — the whole point of this test.
         let ctx = ValidationContext {
             dev_skip_signature: false,
             ..default_ctx()
@@ -358,7 +358,7 @@ mod tests {
     fn nonce_outside_window_rejected() {
         let (mut tx, _account, nonce) = make_valid_tx_and_account();
         tx.nonce = 100; // way outside [0, 15]
-        // Re-sign with correct hash
+                        // Re-sign with correct hash
         let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let account = Account {
@@ -523,8 +523,16 @@ mod tests {
     fn duplicate_access_list_address_rejected() {
         let (mut tx, _, _) = make_valid_tx_and_account();
         tx.access_list = vec![
-            AccessEntry { address: [0xAA; 32], reads: vec![], writes: vec![] },
-            AccessEntry { address: [0xAA; 32], reads: vec![], writes: vec![] }, // duplicate
+            AccessEntry {
+                address: [0xAA; 32],
+                reads: vec![],
+                writes: vec![],
+            },
+            AccessEntry {
+                address: [0xAA; 32],
+                reads: vec![],
+                writes: vec![],
+            }, // duplicate
         ];
         let err = validate_access_list(&tx).unwrap_err();
         assert!(matches!(err, ValidationError::InvalidAccessList(_)));
@@ -534,8 +542,16 @@ mod tests {
     fn valid_access_list_passes() {
         let (mut tx, _, _) = make_valid_tx_and_account();
         tx.access_list = vec![
-            AccessEntry { address: [0xAA; 32], reads: vec![[0x11; 32]], writes: vec![] },
-            AccessEntry { address: [0xBB; 32], reads: vec![], writes: vec![] },
+            AccessEntry {
+                address: [0xAA; 32],
+                reads: vec![[0x11; 32]],
+                writes: vec![],
+            },
+            AccessEntry {
+                address: [0xBB; 32],
+                reads: vec![],
+                writes: vec![],
+            },
         ];
         assert!(validate_access_list(&tx).is_ok());
     }

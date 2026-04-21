@@ -210,7 +210,9 @@ impl Memory {
 
     /// Read a contiguous byte range from memory.
     pub fn load_bytes(&self, addr: usize, len: usize) -> Vec<u8> {
-        (0..len).map(|i| self.read_byte((addr + i) as u32)).collect()
+        (0..len)
+            .map(|i| self.read_byte((addr + i) as u32))
+            .collect()
     }
 
     // --- Byte-level load/store ---
@@ -698,9 +700,9 @@ mod tests {
         // Simulate a token transfer: load code, write a few values to heap
         let code = vec![0x00; 52]; // 13 instructions
         m.load_code(&code).unwrap();
-        m.store64(HEAP_START, 1000).unwrap();        // sender balance
-        m.store64(HEAP_START + 8, 500).unwrap();     // receiver balance
-        m.store64(HEAP_START + 16, 50).unwrap();     // transfer amount
+        m.store64(HEAP_START, 1000).unwrap(); // sender balance
+        m.store64(HEAP_START + 8, 500).unwrap(); // receiver balance
+        m.store64(HEAP_START + 16, 50).unwrap(); // transfer amount
 
         // Should only have materialized code page(s) + 1 heap page
         let materialized = m.pages_materialized();

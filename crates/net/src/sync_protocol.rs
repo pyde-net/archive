@@ -16,32 +16,20 @@ pub enum SyncReq {
     /// Ask the peer for their chain tip (highest slot).
     GetChainTip,
     /// Request block data for a range of slots.
-    GetBlocks {
-        start_slot: u64,
-        count: u32,
-    },
+    GetBlocks { start_slot: u64, count: u32 },
     /// Request block headers only for a range of slots.
-    GetHeaders {
-        start_slot: u64,
-        count: u32,
-    },
+    GetHeaders { start_slot: u64, count: u32 },
     /// Request a full state snapshot at the peer's current state root.
     GetStateSnapshot,
     /// Request a single chunk of a state snapshot (for large states).
-    GetStateSnapshotChunk {
-        chunk_index: u32,
-        chunk_size: u32,
-    },
+    GetStateSnapshotChunk { chunk_index: u32, chunk_size: u32 },
 }
 
 /// Sync response from peer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SyncResp {
     /// Peer's chain tip.
-    ChainTip {
-        slot: u64,
-        block_hash: [u8; 32],
-    },
+    ChainTip { slot: u64, block_hash: [u8; 32] },
     /// Block data (serialized blocks).
     Blocks(Vec<Vec<u8>>),
     /// Block headers only.
@@ -79,14 +67,20 @@ mod tests {
 
     #[test]
     fn sync_req_serializes() {
-        let req = SyncReq::GetBlocks { start_slot: 100, count: 50 };
+        let req = SyncReq::GetBlocks {
+            start_slot: 100,
+            count: 50,
+        };
         let bytes = serde_json::to_vec(&req).unwrap();
         assert!(!bytes.is_empty());
     }
 
     #[test]
     fn sync_resp_serializes() {
-        let resp = SyncResp::ChainTip { slot: 42, block_hash: [0xAA; 32] };
+        let resp = SyncResp::ChainTip {
+            slot: 42,
+            block_hash: [0xAA; 32],
+        };
         let bytes = serde_json::to_vec(&resp).unwrap();
         assert!(!bytes.is_empty());
     }

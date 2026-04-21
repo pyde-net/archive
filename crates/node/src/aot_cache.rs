@@ -70,10 +70,7 @@ impl AotCache {
             while cache.len() >= self.max_size {
                 if let Some(evicted) = lru.pop_back() {
                     cache.remove(&evicted);
-                    tracing::trace!(
-                        contract = hex::encode(evicted),
-                        "AOT cache evicted (LRU)"
-                    );
+                    tracing::trace!(contract = hex::encode(evicted), "AOT cache evicted (LRU)");
                 } else {
                     break;
                 }
@@ -101,13 +98,24 @@ impl AotCache {
 
     /// Check if a contract is blacklisted from AOT.
     pub fn is_blacklisted(&self, address: &[u8; 32]) -> bool {
-        self.blacklisted.read().map(|s| s.contains(address)).unwrap_or(false)
+        self.blacklisted
+            .read()
+            .map(|s| s.contains(address))
+            .unwrap_or(false)
     }
 
     /// Check if a contract is already cached or being compiled.
     pub fn is_known(&self, address: &[u8; 32]) -> bool {
-        let cached = self.cache.read().map(|c| c.contains_key(address)).unwrap_or(false);
-        let compiling = self.compiling.read().map(|c| c.contains(address)).unwrap_or(false);
+        let cached = self
+            .cache
+            .read()
+            .map(|c| c.contains_key(address))
+            .unwrap_or(false);
+        let compiling = self
+            .compiling
+            .read()
+            .map(|c| c.contains(address))
+            .unwrap_or(false);
         cached || compiling
     }
 
@@ -133,35 +141,29 @@ impl AotCache {
 
 /// Spawn background JIT compilation for a contract.
 /// The compilation result is inserted into the LRU cache when done.
-pub fn compile_in_background(
-    cache: Arc<AotCache>,
-    address: [u8; 32],
-    bytecode: Vec<u8>,
-) {
+pub fn compile_in_background(cache: Arc<AotCache>, address: [u8; 32], bytecode: Vec<u8>) {
     if !cache.mark_compiling(address) {
         return; // already compiling or cached
     }
 
-    std::thread::spawn(move || {
-        match pyde_aot::compile_bytecode(&bytecode) {
-            Ok(compiled) => {
-                cache.insert(address, compiled);
-                tracing::debug!(
-                    contract = hex::encode(address),
-                    cached = cache.len(),
-                    capacity = cache.capacity(),
-                    "AOT compiled (LRU cache)"
-                );
-            }
-            Err(e) => {
-                tracing::debug!(
-                    contract = hex::encode(address),
-                    error = %e,
-                    "AOT compilation failed — interpreter fallback"
-                );
-                if let Ok(mut set) = cache.compiling.write() {
-                    set.remove(&address);
-                }
+    std::thread::spawn(move || match pyde_aot::compile_bytecode(&bytecode) {
+        Ok(compiled) => {
+            cache.insert(address, compiled);
+            tracing::debug!(
+                contract = hex::encode(address),
+                cached = cache.len(),
+                capacity = cache.capacity(),
+                "AOT compiled (LRU cache)"
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                contract = hex::encode(address),
+                error = %e,
+                "AOT compilation failed — interpreter fallback"
+            );
+            if let Ok(mut set) = cache.compiling.write() {
+                set.remove(&address);
             }
         }
     });

@@ -67,7 +67,10 @@ fn incremental_build_skips_unchanged() {
 
     // First build: compiles everything
     let result1 = pyde_dev::build::build_project(&config, root).unwrap();
-    assert!(!result1.contracts.is_empty(), "first build should produce contracts");
+    assert!(
+        !result1.contracts.is_empty(),
+        "first build should produce contracts"
+    );
     let artifact = root.join("out/Counter.json");
     assert!(artifact.exists(), "artifact should exist after first build");
     let first_mtime = fs::metadata(&artifact).unwrap().modified().unwrap();
@@ -80,7 +83,10 @@ fn incremental_build_skips_unchanged() {
 
     // Artifact mtime unchanged (file not rewritten)
     let second_mtime = fs::metadata(&artifact).unwrap().modified().unwrap();
-    assert_eq!(first_mtime, second_mtime, "artifact should not be rewritten for unchanged source");
+    assert_eq!(
+        first_mtime, second_mtime,
+        "artifact should not be rewritten for unchanged source"
+    );
 }
 
 #[test]
@@ -125,7 +131,10 @@ fn incremental_build_recompiles_on_change() {
     let second_content = fs::read_to_string(&artifact).unwrap();
 
     // Artifact should have different content (constructor changed)
-    assert_ne!(first_content, second_content, "artifact should change when source changes");
+    assert_ne!(
+        first_content, second_content,
+        "artifact should change when source changes"
+    );
 }
 
 // ============================================================================
@@ -151,9 +160,18 @@ fn e2e_init_build() {
     // Build
     let config = load_config(&project_dir);
     let result = pyde_dev::build::build_project(&config, &project_dir).unwrap();
-    assert!(!result.contracts.is_empty(), "build should produce at least one contract");
-    assert!(result.total_bytecode > 0, "bytecode size should be non-zero");
-    assert!(project_dir.join("out/Counter.json").exists(), "artifact should exist");
+    assert!(
+        !result.contracts.is_empty(),
+        "build should produce at least one contract"
+    );
+    assert!(
+        result.total_bytecode > 0,
+        "bytecode size should be non-zero"
+    );
+    assert!(
+        project_dir.join("out/Counter.json").exists(),
+        "artifact should exist"
+    );
 
     // Verify artifact has expected fields
     let artifact_json = fs::read_to_string(project_dir.join("out/Counter.json")).unwrap();

@@ -350,10 +350,10 @@ pub enum Inst {
 /// A constant value.
 #[derive(Clone, Debug)]
 pub enum IrConst {
-    Int(U256, Ty),       // integer with type (full 256-bit range)
+    Int(U256, Ty), // integer with type (full 256-bit range)
     Bool(bool),
     String(String),
-    Address([u8; 32]),   // Address::ZERO etc.
+    Address([u8; 32]), // Address::ZERO etc.
     Bytes(Vec<u8>),
     Unit,
 }
@@ -361,9 +361,18 @@ pub enum IrConst {
 /// Binary operations.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BinOp {
-    Add, Sub, Mul, Div, Mod,
-    BitAnd, BitOr, BitXor, Shl, Shr,
-    LogicalAnd, LogicalOr,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    LogicalAnd,
+    LogicalOr,
 }
 
 /// Unary operations.
@@ -377,7 +386,12 @@ pub enum UnOp {
 /// Comparison operations.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CmpOp {
-    Eq, NotEq, Lt, Gt, LtEq, GtEq,
+    Eq,
+    NotEq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
 }
 
 /// Built-in values.
@@ -413,7 +427,11 @@ impl fmt::Display for IrProgram {
         }
 
         for s in &self.struct_defs {
-            let fields: Vec<String> = s.fields.iter().map(|(n, t)| format!("{}: {}", n, t)).collect();
+            let fields: Vec<String> = s
+                .fields
+                .iter()
+                .map(|(n, t)| format!("{}: {}", n, t))
+                .collect();
             writeln!(f, "  struct {} {{ {} }}", s.name, fields.join(", "))?;
         }
 
@@ -422,20 +440,30 @@ impl fmt::Display for IrProgram {
         }
 
         for ev in &self.event_defs {
-            let fields: Vec<String> = ev.fields.iter().map(|ef| {
-                let idx = if ef.indexed { "#[indexed] " } else { "" };
-                format!("{}{}: {}", idx, ef.name, ef.ty)
-            }).collect();
+            let fields: Vec<String> = ev
+                .fields
+                .iter()
+                .map(|ef| {
+                    let idx = if ef.indexed { "#[indexed] " } else { "" };
+                    format!("{}{}: {}", idx, ef.name, ef.ty)
+                })
+                .collect();
             writeln!(f, "  event {} {{ {} }}", ev.name, fields.join(", "))?;
         }
 
         for err in &self.error_defs {
-            let fields: Vec<String> = err.fields.iter().map(|(n, t)| format!("{}: {}", n, t)).collect();
+            let fields: Vec<String> = err
+                .fields
+                .iter()
+                .map(|(n, t)| format!("{}: {}", n, t))
+                .collect();
             writeln!(f, "  error {} {{ {} }}", err.name, fields.join(", "))?;
         }
 
-        if !self.struct_defs.is_empty() || !self.enum_defs.is_empty()
-            || !self.event_defs.is_empty() || !self.error_defs.is_empty()
+        if !self.struct_defs.is_empty()
+            || !self.enum_defs.is_empty()
+            || !self.event_defs.is_empty()
+            || !self.error_defs.is_empty()
         {
             writeln!(f)?;
         }
@@ -450,10 +478,19 @@ impl fmt::Display for IrProgram {
 impl fmt::Display for IrFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let vis = if self.is_pub { "pub " } else { "" };
-        let params: Vec<String> = self.params.iter()
+        let params: Vec<String> = self
+            .params
+            .iter()
             .map(|(name, ty)| format!("{}: {}", name, ty))
             .collect();
-        writeln!(f, "  {}fn {}({}) -> {}:", vis, self.name, params.join(", "), self.return_ty)?;
+        writeln!(
+            f,
+            "  {}fn {}({}) -> {}:",
+            vis,
+            self.name,
+            params.join(", "),
+            self.return_ty
+        )?;
 
         for block in &self.blocks {
             writeln!(f, "    {}:  // {}", block.label, block.name)?;
@@ -475,10 +512,22 @@ impl fmt::Display for Inst {
             Inst::Cast(dst, src, ty) => write!(f, "{} = cast {} as {}", dst, src, ty),
             Inst::StorageGet(dst, name) => write!(f, "{} = storage.get \"{}\"", dst, name),
             Inst::StorageSet(name, val) => write!(f, "storage.set \"{}\", {}", name, val),
-            Inst::StorageMapGet(dst, name, key) => write!(f, "{} = storage.map_get \"{}\", {}", dst, name, key),
-            Inst::StorageMapSet(name, key, val) => write!(f, "storage.map_set \"{}\", {}, {}", name, key, val),
-            Inst::StorageNestedMapGet(dst, name, k1, k2) => write!(f, "{} = storage.nested_map_get \"{}\"[{}][{}]", dst, name, k1, k2),
-            Inst::StorageNestedMapSet(name, k1, k2, val) => write!(f, "storage.nested_map_set \"{}\"[{}][{}] = {}", name, k1, k2, val),
+            Inst::StorageMapGet(dst, name, key) => {
+                write!(f, "{} = storage.map_get \"{}\", {}", dst, name, key)
+            }
+            Inst::StorageMapSet(name, key, val) => {
+                write!(f, "storage.map_set \"{}\", {}, {}", name, key, val)
+            }
+            Inst::StorageNestedMapGet(dst, name, k1, k2) => write!(
+                f,
+                "{} = storage.nested_map_get \"{}\"[{}][{}]",
+                dst, name, k1, k2
+            ),
+            Inst::StorageNestedMapSet(name, k1, k2, val) => write!(
+                f,
+                "storage.nested_map_set \"{}\"[{}][{}] = {}",
+                name, k1, k2, val
+            ),
             Inst::Builtin(dst, op) => write!(f, "{} = builtin.{:?}", dst, op),
             Inst::Call(dst, name, args) => {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
@@ -489,22 +538,43 @@ impl fmt::Display for Inst {
                 write!(f, "{} = {}.{}({})", dst, obj, method, args_str.join(", "))
             }
             Inst::ExtCall(dst, addr, method, args, ret_ty, value_reg) => {
-                let args_str: Vec<String> = args.iter().map(|(r, t)| format!("{}:{}", r, t)).collect();
-                let val = value_reg.map(|r| format!("{{ value: {} }}", r)).unwrap_or_default();
-                write!(f, "{}: {} = ext_call {}, \"{}\"{}{}", dst, ret_ty, addr, method, val,
-                    if args_str.is_empty() { "()".to_string() } else { format!("({})", args_str.join(", ")) })
+                let args_str: Vec<String> =
+                    args.iter().map(|(r, t)| format!("{}:{}", r, t)).collect();
+                let val = value_reg
+                    .map(|r| format!("{{ value: {} }}", r))
+                    .unwrap_or_default();
+                write!(
+                    f,
+                    "{}: {} = ext_call {}, \"{}\"{}{}",
+                    dst,
+                    ret_ty,
+                    addr,
+                    method,
+                    val,
+                    if args_str.is_empty() {
+                        "()".to_string()
+                    } else {
+                        format!("({})", args_str.join(", "))
+                    }
+                )
             }
             Inst::Hash(dst, args) => {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
                 write!(f, "{} = hash({})", dst, args_str.join(", "))
             }
             Inst::StructInit(dst, name, fields) => {
-                let fields_str: Vec<String> = fields.iter().map(|(n, r)| format!("{}: {}", n, r)).collect();
+                let fields_str: Vec<String> = fields
+                    .iter()
+                    .map(|(n, r)| format!("{}: {}", n, r))
+                    .collect();
                 write!(f, "{} = {} {{ {} }}", dst, name, fields_str.join(", "))
             }
             Inst::FieldGet(dst, obj, sname, field) => {
-                if sname.is_empty() { write!(f, "{} = {}.{}", dst, obj, field) }
-                else { write!(f, "{} = {}:{}.{}", dst, obj, sname, field) }
+                if sname.is_empty() {
+                    write!(f, "{} = {}.{}", dst, obj, field)
+                } else {
+                    write!(f, "{} = {}:{}.{}", dst, obj, sname, field)
+                }
             }
             Inst::IndexGet(dst, obj, idx) => write!(f, "{} = {}[{}]", dst, obj, idx),
             Inst::IndexSet(obj, idx, val) => write!(f, "{}[{}] = {}", obj, idx, val),
@@ -519,36 +589,67 @@ impl fmt::Display for Inst {
             }
             Inst::ArrayRepeat(dst, val, count) => write!(f, "{} = [{}; {}]", dst, val, count),
             Inst::Emit(name, fields) => {
-                let args_str: Vec<String> = fields.iter().map(|(r, ty, idx)| {
-                    if *idx { format!("#[indexed] {}: {}", r, ty) } else { format!("{}: {}", r, ty) }
-                }).collect();
+                let args_str: Vec<String> = fields
+                    .iter()
+                    .map(|(r, ty, idx)| {
+                        if *idx {
+                            format!("#[indexed] {}: {}", r, ty)
+                        } else {
+                            format!("{}: {}", r, ty)
+                        }
+                    })
+                    .collect();
                 write!(f, "emit \"{}\"({})", name, args_str.join(", "))
             }
             Inst::Revert(name, fields) => {
                 let args_str: Vec<String> = fields.iter().map(|r| r.to_string()).collect();
                 write!(f, "revert \"{}\"({})", name, args_str.join(", "))
             }
-            Inst::CrossCall { target, method, args, callback } => {
+            Inst::CrossCall {
+                target,
+                method,
+                args,
+                callback,
+            } => {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
                 let cb = callback.as_deref().unwrap_or("none");
-                write!(f, "cross_call {}, {}({}) callback={}", target, method, args_str.join(", "), cb)
+                write!(
+                    f,
+                    "cross_call {}, {}({}) callback={}",
+                    target,
+                    method,
+                    args_str.join(", "),
+                    cb
+                )
             }
             Inst::RawCall(dst, target, args) => {
                 let args_str: Vec<String> = args.iter().map(|r| r.to_string()).collect();
                 write!(f, "{} = raw_call {}({})", dst, target, args_str.join(", "))
             }
             Inst::CreateContract(dst, blob, args, value_reg) => {
-                let args_str: Vec<String> = args.iter().map(|(r, t)| format!("{}:{}", r, t)).collect();
-                let val = value_reg.map(|r| format!("{{ value: {} }}", r)).unwrap_or_default();
-                write!(f, "{} = create({}{}, [{}])", dst, blob, val, args_str.join(", "))
+                let args_str: Vec<String> =
+                    args.iter().map(|(r, t)| format!("{}:{}", r, t)).collect();
+                let val = value_reg
+                    .map(|r| format!("{{ value: {} }}", r))
+                    .unwrap_or_default();
+                write!(
+                    f,
+                    "{} = create({}{}, [{}])",
+                    dst,
+                    blob,
+                    val,
+                    args_str.join(", ")
+                )
             }
             Inst::Jump(label) => write!(f, "jump {}", label),
             Inst::Branch(cond, then_l, else_l) => write!(f, "br {}, {}, {}", cond, then_l, else_l),
             Inst::Return(None) => write!(f, "ret"),
             Inst::Return(Some(val)) => write!(f, "ret {}", val),
             Inst::Phi(dst, entries) => {
-                let entries_str: Vec<String> = entries.iter()
-                    .map(|(l, r)| format!("[{}: {}]", l, r)).collect();
+                let entries_str: Vec<String> = entries
+                    .iter()
+                    .map(|(l, r)| format!("[{}: {}]", l, r))
+                    .collect();
                 write!(f, "{} = phi {}", dst, entries_str.join(", "))
             }
             Inst::MakeVec(dst, cap) => write!(f, "{} = vec::new(cap={})", dst, cap),

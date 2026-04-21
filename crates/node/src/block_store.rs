@@ -7,7 +7,7 @@
 
 use crate::wire;
 use pyde_consensus::block::BlockHeader;
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::path::Path;
 use tracing::info;
 
@@ -22,8 +22,8 @@ impl BlockStore {
         let db_path = datadir.join("blocks");
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        let db = DB::open(&opts, &db_path)
-            .map_err(|e| format!("failed to open block store: {}", e))?;
+        let db =
+            DB::open(&opts, &db_path).map_err(|e| format!("failed to open block store: {}", e))?;
         info!(path = %db_path.display(), "block store opened");
         Ok(Self { db })
     }
@@ -38,14 +38,16 @@ impl BlockStore {
         let mut slot_key = Vec::with_capacity(2 + 8);
         slot_key.extend_from_slice(b"h:");
         slot_key.extend_from_slice(&slot.to_le_bytes());
-        self.db.put(&slot_key, &header_bytes)
+        self.db
+            .put(&slot_key, &header_bytes)
             .map_err(|e| format!("failed to store header: {}", e))?;
 
         // hash → slot
         let mut hash_key = Vec::with_capacity(2 + 32);
         hash_key.extend_from_slice(b"i:");
         hash_key.extend_from_slice(&block_hash);
-        self.db.put(&hash_key, slot.to_le_bytes())
+        self.db
+            .put(&hash_key, slot.to_le_bytes())
             .map_err(|e| format!("failed to store hash index: {}", e))?;
 
         Ok(())
@@ -56,7 +58,10 @@ impl BlockStore {
         let mut key = Vec::with_capacity(10);
         key.extend_from_slice(b"h:");
         key.extend_from_slice(&slot.to_le_bytes());
-        self.db.get(&key).ok()?.and_then(|bytes| wire::decode_block_header(&bytes).ok())
+        self.db
+            .get(&key)
+            .ok()?
+            .and_then(|bytes| wire::decode_block_header(&bytes).ok())
     }
 
     /// Look up a slot by block hash.
@@ -81,13 +86,16 @@ impl BlockStore {
 
     /// Save the current head slot.
     pub fn put_head(&self, slot: u64) -> Result<(), String> {
-        self.db.put(b"meta:head", slot.to_le_bytes())
+        self.db
+            .put(b"meta:head", slot.to_le_bytes())
             .map_err(|e| format!("failed to store head: {}", e))
     }
 
     /// Load the saved head slot.
     pub fn get_head(&self) -> u64 {
-        self.db.get(b"meta:head").ok()
+        self.db
+            .get(b"meta:head")
+            .ok()
             .flatten()
             .map(|bytes| {
                 let mut buf = [0u8; 8];
@@ -109,7 +117,8 @@ impl BlockStore {
         let mut key = Vec::with_capacity(2 + 8);
         key.extend_from_slice(b"b:");
         key.extend_from_slice(&header.slot.to_le_bytes());
-        self.db.put(&key, raw_bytes)
+        self.db
+            .put(&key, raw_bytes)
             .map_err(|e| format!("failed to store block data: {}", e))
     }
 

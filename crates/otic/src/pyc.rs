@@ -19,7 +19,7 @@
 //! └────────────────────────────────────────┘
 //! ```
 
-use crate::abi::{ContractAbi, abi_to_json};
+use crate::abi::{abi_to_json, ContractAbi};
 use crate::codegen::CompiledContract;
 
 /// Magic bytes: "PYDE" in ASCII.
@@ -39,9 +39,9 @@ pub const SECTION_SOURCE_MAP: u8 = 5;
 
 /// Header flags — contract properties the node needs at deploy time
 /// without parsing the full ABI.
-pub const FLAG_HAS_CONSTRUCTOR: u16   = 1 << 0;  // run constructor bytecode at deploy
-pub const FLAG_HAS_PAYABLE: u16       = 1 << 1;  // contract accepts value transfers
-pub const FLAG_HAS_STORAGE: u16       = 1 << 2;  // contract uses persistent storage
+pub const FLAG_HAS_CONSTRUCTOR: u16 = 1 << 0; // run constructor bytecode at deploy
+pub const FLAG_HAS_PAYABLE: u16 = 1 << 1; // contract accepts value transfers
+pub const FLAG_HAS_STORAGE: u16 = 1 << 2; // contract uses persistent storage
 
 /// A parsed .pyc file.
 #[derive(Clone, Debug)]
@@ -122,7 +122,10 @@ pub fn decode(data: &[u8]) -> Result<PycFile, String> {
         return Err("file too small".into());
     }
     if data[0..4] != MAGIC {
-        return Err(format!("invalid magic: expected PYDE, got {:?}", &data[0..4]));
+        return Err(format!(
+            "invalid magic: expected PYDE, got {:?}",
+            &data[0..4]
+        ));
     }
 
     let version = u16::from_le_bytes([data[4], data[5]]);
@@ -140,8 +143,10 @@ pub fn decode(data: &[u8]) -> Result<PycFile, String> {
             return Err("truncated section table".into());
         }
         let ty = data[pos];
-        let offset = u32::from_le_bytes([data[pos+1], data[pos+2], data[pos+3], data[pos+4]]);
-        let length = u32::from_le_bytes([data[pos+5], data[pos+6], data[pos+7], data[pos+8]]);
+        let offset =
+            u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]);
+        let length =
+            u32::from_le_bytes([data[pos + 5], data[pos + 6], data[pos + 7], data[pos + 8]]);
         sections.push((ty, offset, length));
         pos += 9;
     }
@@ -168,15 +173,27 @@ pub fn decode(data: &[u8]) -> Result<PycFile, String> {
         }
     }
 
-    Ok(PycFile { version, flags, constructor, runtime, abi_json, storage_json })
+    Ok(PycFile {
+        version,
+        flags,
+        constructor,
+        runtime,
+        abi_json,
+        storage_json,
+    })
 }
 
 /// Generate storage schema JSON from ABI.
 fn storage_to_json(abi: &ContractAbi) -> String {
     let mut out = String::from("[");
     for (i, s) in abi.storage.iter().enumerate() {
-        out.push_str(&format!("{{\"name\":\"{}\",\"type\":\"{}\",\"slot\":{}}}", s.name, s.ty, s.slot));
-        if i + 1 < abi.storage.len() { out.push(','); }
+        out.push_str(&format!(
+            "{{\"name\":\"{}\",\"type\":\"{}\",\"slot\":{}}}",
+            s.name, s.ty, s.slot
+        ));
+        if i + 1 < abi.storage.len() {
+            out.push(',');
+        }
     }
     out.push(']');
     out
@@ -185,12 +202,12 @@ fn storage_to_json(abi: &ContractAbi) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::generate_abi;
+    use crate::codegen::CodeGen;
     use crate::lexer::Lexer;
-    use crate::parser::Parser;
     use crate::lower;
     use crate::optimize;
-    use crate::codegen::CodeGen;
-    use crate::abi::generate_abi;
+    use crate::parser::Parser;
 
     fn compile_pyc(src: &str) -> Vec<u8> {
         let (tokens, _) = Lexer::new(src).tokenize();
@@ -205,7 +222,8 @@ mod tests {
 
     #[test]
     fn pyc_encode_decode_roundtrip() {
-        let data = compile_pyc(r#"
+        let data = compile_pyc(
+            r#"
             contract Token {
                 storage { supply: u256, }
 
@@ -217,7 +235,8 @@ mod tests {
 
                 pub fn set_supply(v: u256) { self.supply = v; }
             }
-        "#);
+        "#,
+        );
 
         // Check magic
         assert_eq!(&data[0..4], &MAGIC);
@@ -226,7 +245,10 @@ mod tests {
         // Decode
         let pyc = decode(&data).expect("decode should succeed");
         assert_eq!(pyc.version, FORMAT_VERSION);
-        assert!(!pyc.runtime.is_empty(), "runtime bytecode should be non-empty");
+        assert!(
+            !pyc.runtime.is_empty(),
+            "runtime bytecode should be non-empty"
+        );
         assert!(pyc.abi_json.contains("\"contract\": \"Token\""));
         assert!(pyc.abi_json.contains("get_supply"));
         assert!(pyc.abi_json.contains("set_supply"));
@@ -248,16 +270,21 @@ mod tests {
 
     #[test]
     fn pyc_runtime_executable_on_pvm() {
-        let data = compile_pyc(r#"
+        let data = compile_pyc(
+            r#"
             contract T {
                 pub fn f() -> u64 { return 42; }
             }
-        "#);
+        "#,
+        );
         let pyc = decode(&data).unwrap();
 
         // The runtime bytecode should execute on PVM
         // (In production mode, needs calldata with selector. Skip for this test.)
         assert!(!pyc.runtime.is_empty());
-        assert!(pyc.runtime.len() % 4 == 0, "bytecode should be 4-byte aligned");
+        assert!(
+            pyc.runtime.len() % 4 == 0,
+            "bytecode should be 4-byte aligned"
+        );
     }
 }

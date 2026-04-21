@@ -215,7 +215,9 @@ impl FunctionDef {
     }
 
     pub fn is_sponsored(&self) -> bool {
-        self.attributes.iter().any(|a| a.content.starts_with("sponsored"))
+        self.attributes
+            .iter()
+            .any(|a| a.content.starts_with("sponsored"))
     }
 
     /// Returns the sponsorship kind: None, GasTank, or Paymaster(name).
@@ -237,7 +239,9 @@ impl FunctionDef {
     }
 
     pub fn has_should_panic(&self) -> bool {
-        self.attributes.iter().any(|a| a.content.starts_with("should_panic"))
+        self.attributes
+            .iter()
+            .any(|a| a.content.starts_with("should_panic"))
     }
 
     pub fn is_receive(&self) -> bool {
@@ -375,17 +379,17 @@ pub struct AssignStmt {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AssignOp {
-    Assign,      // =
-    AddAssign,   // +=
-    SubAssign,   // -=
-    MulAssign,   // *=
-    DivAssign,   // /=
-    ModAssign,   // %=
+    Assign,       // =
+    AddAssign,    // +=
+    SubAssign,    // -=
+    MulAssign,    // *=
+    DivAssign,    // /=
+    ModAssign,    // %=
     BitAndAssign, // &=
-    BitOrAssign, // |=
+    BitOrAssign,  // |=
     BitXorAssign, // ^=
-    ShlAssign,   // <<=
-    ShrAssign,   // >>=
+    ShlAssign,    // <<=
+    ShrAssign,    // >>=
 }
 
 #[derive(Clone, Debug)]
@@ -479,10 +483,24 @@ pub enum Literal {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BinaryOp {
-    Add, Sub, Mul, Div, Mod,
-    BitAnd, BitOr, BitXor, Shl, Shr,
-    LogicalAnd, LogicalOr,
-    Eq, NotEq, Lt, Gt, LtEq, GtEq,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    LogicalAnd,
+    LogicalOr,
+    Eq,
+    NotEq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
     Range,
 }
 

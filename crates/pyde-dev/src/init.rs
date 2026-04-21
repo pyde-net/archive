@@ -9,14 +9,10 @@ pub fn run(name: &str) -> Result<(), String> {
     }
 
     // Create project structure
-    fs::create_dir_all(root.join("src"))
-        .map_err(|e| format!("cannot create src/: {}", e))?;
-    fs::create_dir_all(root.join("test"))
-        .map_err(|e| format!("cannot create test/: {}", e))?;
-    fs::create_dir_all(root.join("script"))
-        .map_err(|e| format!("cannot create script/: {}", e))?;
-    fs::create_dir_all(root.join("lib"))
-        .map_err(|e| format!("cannot create lib/: {}", e))?;
+    fs::create_dir_all(root.join("src")).map_err(|e| format!("cannot create src/: {}", e))?;
+    fs::create_dir_all(root.join("test")).map_err(|e| format!("cannot create test/: {}", e))?;
+    fs::create_dir_all(root.join("script")).map_err(|e| format!("cannot create script/: {}", e))?;
+    fs::create_dir_all(root.join("lib")).map_err(|e| format!("cannot create lib/: {}", e))?;
 
     // Write pyde.toml
     fs::write(root.join("pyde.toml"), project::default_toml(name))

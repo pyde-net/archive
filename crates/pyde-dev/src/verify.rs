@@ -14,8 +14,15 @@ pub fn run(address: &str, contract: Option<&str>, network: &str) -> Result<(), S
             format!(
                 "network '{}' not found in pyde.toml (available: {})",
                 network,
-                if available.is_empty() { "none".to_string() }
-                else { available.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ") }
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
             )
         })?
         .clone();
@@ -32,8 +39,8 @@ pub fn run(address: &str, contract: Option<&str>, network: &str) -> Result<(), S
     // Read local runtime bytecode
     let json_str = fs::read_to_string(&artifact_path)
         .map_err(|e| format!("cannot read {}: {}", artifact_path.display(), e))?;
-    let artifact: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|e| format!("invalid artifact JSON: {}", e))?;
+    let artifact: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| format!("invalid artifact JSON: {}", e))?;
 
     let contract_name = artifact
         .get("contractName")
@@ -46,14 +53,19 @@ pub fn run(address: &str, contract: Option<&str>, network: &str) -> Result<(), S
         .trim_start_matches("0x");
 
     if local_hex.is_empty() {
-        return Err(format!("no runtime bytecode in artifact for {}", contract_name));
+        return Err(format!(
+            "no runtime bytecode in artifact for {}",
+            contract_name
+        ));
     }
 
-    let local_bytes = hex::decode(local_hex)
-        .map_err(|e| format!("invalid bytecode hex: {}", e))?;
+    let local_bytes = hex::decode(local_hex).map_err(|e| format!("invalid bytecode hex: {}", e))?;
 
     // Fetch on-chain bytecode
-    println!("  Verifying {} at {} on {}", contract_name, address, network);
+    println!(
+        "  Verifying {} at {} on {}",
+        contract_name, address, network
+    );
 
     let client = reqwest::blocking::Client::new();
     let body = serde_json::json!({
@@ -81,11 +93,14 @@ pub fn run(address: &str, contract: Option<&str>, network: &str) -> Result<(), S
         .trim_start_matches("0x");
 
     if onchain_hex.is_empty() {
-        return Err(format!("no code at {} — is the contract deployed?", address));
+        return Err(format!(
+            "no code at {} — is the contract deployed?",
+            address
+        ));
     }
 
-    let onchain_bytes = hex::decode(onchain_hex)
-        .map_err(|e| format!("invalid on-chain bytecode: {}", e))?;
+    let onchain_bytes =
+        hex::decode(onchain_hex).map_err(|e| format!("invalid on-chain bytecode: {}", e))?;
 
     // Compare
     if local_bytes == onchain_bytes {
@@ -98,9 +113,15 @@ pub fn run(address: &str, contract: Option<&str>, network: &str) -> Result<(), S
         println!("    Local:    {} bytes", local_bytes.len());
         println!("    On-chain: {} bytes", onchain_bytes.len());
         if local_bytes.len() != onchain_bytes.len() {
-            println!("    Size differs by {} bytes",
-                (local_bytes.len() as isize - onchain_bytes.len() as isize).unsigned_abs());
-        } else if let Some(pos) = local_bytes.iter().zip(onchain_bytes.iter()).position(|(a, b)| a != b) {
+            println!(
+                "    Size differs by {} bytes",
+                (local_bytes.len() as isize - onchain_bytes.len() as isize).unsigned_abs()
+            );
+        } else if let Some(pos) = local_bytes
+            .iter()
+            .zip(onchain_bytes.iter())
+            .position(|(a, b)| a != b)
+        {
             println!("    First difference at byte {}", pos);
         }
         return Err("verification failed — bytecode does not match".into());

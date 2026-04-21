@@ -61,14 +61,11 @@ pub fn infer_access_list(
     // Set up storage backend for simulation reads.
     // SAFETY: state is not mutated during simulation. The closure is dropped
     // before this function returns, so the reference remains valid.
-    let state_vtable = unsafe {
-        std::mem::transmute::<&dyn StateAccess, [usize; 2]>(state)
-    };
+    let state_vtable = unsafe { std::mem::transmute::<&dyn StateAccess, [usize; 2]>(state) };
     vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
         let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
-        let state_ref: &dyn StateAccess = unsafe {
-            std::mem::transmute::<[usize; 2], &dyn StateAccess>(state_vtable)
-        };
+        let state_ref: &dyn StateAccess =
+            unsafe { std::mem::transmute::<[usize; 2], &dyn StateAccess>(state_vtable) };
         state_ref.get(&smt_key)
     }));
 

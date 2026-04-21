@@ -164,14 +164,12 @@ mod tests {
     fn per_sender_cap_enforced() {
         let alice = [0x01; 32];
         // Send 20 txs from alice (cap is 16)
-        let pending: Vec<Transaction> = (0..20)
-            .map(|i| make_tx(alice, i, 21_000))
-            .collect();
+        let pending: Vec<Transaction> = (0..20).map(|i| make_tx(alice, i, 21_000)).collect();
 
         let (selected, remaining) = build_tx_list(pending, 100_000_000);
         assert_eq!(selected.len(), SENDER_CAP); // 16
         assert_eq!(remaining.len(), 4); // 20 - 16
-        // First 16 selected, nonce ordered
+                                        // First 16 selected, nonce ordered
         for (i, tx) in selected.iter().enumerate() {
             assert_eq!(tx.nonce, i as u64);
         }
@@ -202,9 +200,7 @@ mod tests {
         let alice = [0x01; 32];
         let bob = [0x02; 32];
         // Alice sends 100 txs, Bob sends 2
-        let mut pending: Vec<Transaction> = (0..100)
-            .map(|i| make_tx(alice, i, 21_000))
-            .collect();
+        let mut pending: Vec<Transaction> = (0..100).map(|i| make_tx(alice, i, 21_000)).collect();
         pending.push(make_tx(bob, 0, 21_000));
         pending.push(make_tx(bob, 1, 21_000));
 

@@ -1,5 +1,5 @@
 pub use pyde_account::address::{
-    derive_create_address, derive_create2_address, derive_eoa_address,
+    derive_create2_address, derive_create_address, derive_eoa_address,
 };
 pub use pyde_crypto::falcon::{FalconPublicKey, FalconSecretKey, FalconSignature};
 pub use pyde_tx::types::{AccessEntry, FeePayer, Transaction, TransactionType};
@@ -148,8 +148,8 @@ pub fn parse_address(s: &str) -> Result<Address, crate::SdkError> {
             hex.len()
         )));
     }
-    let bytes = hex::decode(hex)
-        .map_err(|e| crate::SdkError::InvalidAddress(format!("bad hex: {}", e)))?;
+    let bytes =
+        hex::decode(hex).map_err(|e| crate::SdkError::InvalidAddress(format!("bad hex: {}", e)))?;
     let mut addr = [0u8; 32];
     addr.copy_from_slice(&bytes);
     Ok(addr)
@@ -223,13 +223,21 @@ pub fn to_be_hex(value: u128, width: Option<usize>) -> String {
 pub fn concat_bytes(values: &[&[u8]]) -> Vec<u8> {
     let total: usize = values.iter().map(|v| v.len()).sum();
     let mut result = Vec::with_capacity(total);
-    for v in values { result.extend_from_slice(v); }
+    for v in values {
+        result.extend_from_slice(v);
+    }
     result
 }
 
 /// Zero-pad bytes to a specific length (left-pad).
 pub fn zero_pad_value(data: &[u8], length: usize) -> std::result::Result<Vec<u8>, String> {
-    if data.len() > length { return Err(format!("Value {} bytes exceeds pad length {}", data.len(), length)); }
+    if data.len() > length {
+        return Err(format!(
+            "Value {} bytes exceeds pad length {}",
+            data.len(),
+            length
+        ));
+    }
     let mut padded = vec![0u8; length];
     padded[length - data.len()..].copy_from_slice(data);
     Ok(padded)
@@ -261,7 +269,12 @@ pub const PYDE_DECIMALS: u32 = 9;
 /// parse_units("100", 18)  // Ok(100_000_000_000_000_000_000)
 /// ```
 pub fn parse_units(value: &str, decimals: u32) -> std::result::Result<u128, String> {
-    if decimals > 38 { return Err(format!("decimals {} exceeds u128 precision (max 38)", decimals)); }
+    if decimals > 38 {
+        return Err(format!(
+            "decimals {} exceeds u128 precision (max 38)",
+            decimals
+        ));
+    }
     let trimmed = value.trim();
     let negative = trimmed.starts_with('-');
     if negative {
@@ -269,7 +282,9 @@ pub fn parse_units(value: &str, decimals: u32) -> std::result::Result<u128, Stri
     }
 
     let parts: Vec<&str> = trimmed.split('.').collect();
-    if parts.len() > 2 { return Err(format!("Invalid numeric string: {}", value)); }
+    if parts.len() > 2 {
+        return Err(format!("Invalid numeric string: {}", value));
+    }
 
     let whole = parts[0];
     let fraction = if parts.len() == 2 { parts[1] } else { "" };
@@ -277,18 +292,24 @@ pub fn parse_units(value: &str, decimals: u32) -> std::result::Result<u128, Stri
     if fraction.len() > decimals as usize {
         return Err(format!(
             "Too many decimal places: \"{}\" has {} but only {} allowed",
-            value, fraction.len(), decimals
+            value,
+            fraction.len(),
+            decimals
         ));
     }
 
     // Validate chars
-    if !whole.chars().all(|c| c.is_ascii_digit()) || (!fraction.is_empty() && !fraction.chars().all(|c| c.is_ascii_digit())) {
+    if !whole.chars().all(|c| c.is_ascii_digit())
+        || (!fraction.is_empty() && !fraction.chars().all(|c| c.is_ascii_digit()))
+    {
         return Err(format!("Invalid numeric string: {}", value));
     }
 
     let padded = format!("{:0<width$}", fraction, width = decimals as usize);
     let combined = format!("{}{}", whole, padded);
-    combined.parse::<u128>().map_err(|e| format!("Overflow: {}", e))
+    combined
+        .parse::<u128>()
+        .map_err(|e| format!("Overflow: {}", e))
 }
 
 /// Format raw integer units to a human-readable amount.
@@ -298,7 +319,9 @@ pub fn parse_units(value: &str, decimals: u32) -> std::result::Result<u128, Stri
 /// format_units(1_000_000, 9)      // "0.001"
 /// ```
 pub fn format_units(value: u128, decimals: u32) -> String {
-    if decimals > 38 { return format!("{}", value); } // 10^39 overflows u128
+    if decimals > 38 {
+        return format!("{}", value);
+    } // 10^39 overflows u128
     let divisor = 10u128.pow(decimals);
     let whole = value / divisor;
     let remainder = value % divisor;

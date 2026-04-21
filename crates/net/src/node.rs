@@ -9,7 +9,8 @@ use crate::config::NetworkConfig;
 use crate::sync_protocol::{self, SyncReq, SyncResp};
 use libp2p::{
     gossipsub, identify, identity,
-    kad::{self, store::MemoryStore}, request_response,
+    kad::{self, store::MemoryStore},
+    request_response,
     swarm::NetworkBehaviour,
     Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
@@ -37,7 +38,9 @@ pub fn generate_keypair() -> identity::Keypair {
 
 /// Serialize a keypair to bytes for disk persistence.
 pub fn keypair_to_bytes(keypair: &identity::Keypair) -> Result<Vec<u8>, String> {
-    keypair.to_protobuf_encoding().map_err(|e| format!("keypair serialize error: {e}"))
+    keypair
+        .to_protobuf_encoding()
+        .map_err(|e| format!("keypair serialize error: {e}"))
 }
 
 /// Deserialize a keypair from bytes (loaded from disk).
@@ -53,7 +56,10 @@ pub fn keypair_from_bytes(bytes: &[u8]) -> Result<identity::Keypair, String> {
 /// and reload with `keypair_from_bytes()` on subsequent runs.
 ///
 /// Returns the Swarm and the local PeerId.
-pub fn create_node(config: &NetworkConfig, local_key: identity::Keypair) -> Result<(Swarm<PydeBehaviour>, PeerId), String> {
+pub fn create_node(
+    config: &NetworkConfig,
+    local_key: identity::Keypair,
+) -> Result<(Swarm<PydeBehaviour>, PeerId), String> {
     let local_peer_id = PeerId::from(local_key.public());
 
     // Build swarm
@@ -102,9 +108,7 @@ pub fn create_node(config: &NetworkConfig, local_key: identity::Keypair) -> Resu
             })
         })
         .map_err(|e| format!("behaviour error: {e}"))?
-        .with_swarm_config(|cfg| {
-            cfg.with_idle_connection_timeout(config.idle_timeout)
-        })
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(config.idle_timeout))
         .build();
 
     Ok((swarm, local_peer_id))
@@ -141,10 +145,7 @@ pub mod topics {
 }
 
 /// Dial bootstrap peers and add them to Kademlia.
-pub fn dial_bootstrap_peers(
-    swarm: &mut Swarm<PydeBehaviour>,
-    bootstrap_peers: &[String],
-) {
+pub fn dial_bootstrap_peers(swarm: &mut Swarm<PydeBehaviour>, bootstrap_peers: &[String]) {
     for addr_str in bootstrap_peers {
         if let Ok(addr) = addr_str.parse::<Multiaddr>() {
             // Extract PeerId from the multiaddr
@@ -158,7 +159,10 @@ pub fn dial_bootstrap_peers(
 
             if let Some(peer_id) = peer_id {
                 // Add to Kademlia routing table
-                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr.clone());
                 // Dial the peer
                 if let Err(e) = swarm.dial(addr) {
                     tracing::warn!(%peer_id, error = %e, "failed to dial bootstrap peer");

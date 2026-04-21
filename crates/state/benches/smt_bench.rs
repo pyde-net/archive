@@ -1,8 +1,8 @@
 use std::time::Instant;
 
 use pyde_state::backend::RocksDBBackend;
+use pyde_state::smt::PydeSMT;
 use pyde_state::smt::{key_from_seed, Poseidon2Hasher, SmtValue};
-use pyde_state::smt::{PydeSMT};
 use sparse_merkle_tree::SparseMerkleTree;
 use sparse_merkle_tree::H256;
 
@@ -33,7 +33,7 @@ fn bench_get() {
     println!("\n=== SMT get throughput ===\n");
 
     let mut smt = PydeSMT::new();
-    let keys: Vec<_> = (0..10_000).map(|i| key_from_seed(i)).collect();
+    let keys: Vec<_> = (0..10_000).map(key_from_seed).collect();
     for (i, k) in keys.iter().enumerate() {
         smt.insert(*k, format!("v{i}").into_bytes()).unwrap();
     }
@@ -45,14 +45,17 @@ fn bench_get() {
     }
     let elapsed = start.elapsed();
     let ops_sec = iterations as f64 / elapsed.as_secs_f64();
-    println!("  {iterations:>6} lookups:  {ops_sec:>10.0} ops/sec ({:.1}ms)", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "  {iterations:>6} lookups:  {ops_sec:>10.0} ops/sec ({:.1}ms)",
+        elapsed.as_secs_f64() * 1000.0
+    );
 }
 
 fn bench_proof() {
     println!("\n=== SMT proof generation & verification ===\n");
 
     let mut smt = PydeSMT::new();
-    let keys: Vec<_> = (0..1_000).map(|i| key_from_seed(i)).collect();
+    let keys: Vec<_> = (0..1_000).map(key_from_seed).collect();
     for (i, k) in keys.iter().enumerate() {
         smt.insert(*k, format!("v{i}").into_bytes()).unwrap();
     }
@@ -105,6 +108,7 @@ fn bench_batch_insert() {
 fn bench_rocksdb() {
     println!("\n=== RocksDB backend ===\n");
 
+    #[allow(clippy::upper_case_acronyms)] // SMT = Sparse Merkle Tree
     type SMT = SparseMerkleTree<Poseidon2Hasher, SmtValue, RocksDBBackend>;
 
     for count in [100u64, 1_000] {
@@ -127,7 +131,7 @@ fn bench_rocksdb() {
         );
 
         // Read benchmark
-        let keys: Vec<_> = (0..count).map(|i| key_from_seed(i)).collect();
+        let keys: Vec<_> = (0..count).map(key_from_seed).collect();
         let iterations = count;
         let start = Instant::now();
         for i in 0..iterations {
@@ -158,18 +162,15 @@ fn bench_update_all_scaling() {
         let ops_sec = count as f64 / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0;
         let within_budget = if ms < 400.0 { "OK" } else { "SLOW" };
-        println!(
-            "  {count:>6} updates:  {ops_sec:>10.0} ops/sec ({ms:.0}ms) [{within_budget}]"
-        );
+        println!("  {count:>6} updates:  {ops_sec:>10.0} ops/sec ({ms:.0}ms) [{within_budget}]");
     }
 }
-
 
 fn bench_witness() {
     println!("\n=== Witness generation & verification ===\n");
 
     let mut smt = PydeSMT::new();
-    let keys: Vec<_> = (0..1_000).map(|i| key_from_seed(i)).collect();
+    let keys: Vec<_> = (0..1_000).map(key_from_seed).collect();
     for (i, k) in keys.iter().enumerate() {
         smt.insert(*k, format!("v{i}").into_bytes()).unwrap();
     }
@@ -204,7 +205,7 @@ fn bench_snapshot() {
 
     for count in [100u64, 1_000, 10_000] {
         let mut smt = PydeSMT::new();
-        let keys: Vec<_> = (0..count).map(|i| key_from_seed(i)).collect();
+        let keys: Vec<_> = (0..count).map(key_from_seed).collect();
         for (i, k) in keys.iter().enumerate() {
             smt.insert(*k, format!("v{i}").into_bytes()).unwrap();
         }
@@ -219,9 +220,12 @@ fn bench_snapshot() {
 
         assert_eq!(restored.root(), smt.root());
 
-        let size_kb = snapshot.entries.iter()
-            .map(|(k, v)| 32 + v.len())
-            .sum::<usize>() as f64 / 1024.0;
+        let size_kb = snapshot
+            .entries
+            .iter()
+            .map(|(_k, v)| 32 + v.len())
+            .sum::<usize>() as f64
+            / 1024.0;
 
         println!(
             "  {count:>6} entries:  create {create_ms:>6.1}ms  restore {restore_ms:>6.1}ms  size {size_kb:.0}KB"

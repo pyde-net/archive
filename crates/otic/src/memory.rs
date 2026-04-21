@@ -2,7 +2,7 @@
 //! and defines Otigen-specific layout conventions.
 
 // Re-export PVM memory layout constants (single source of truth)
-pub use pyde_vm::memory::{HEAP_START, STACK_TOP, CODE_START};
+pub use pyde_vm::memory::{CODE_START, HEAP_START, STACK_TOP};
 
 /// Size of a u64 value in bytes.
 pub const WORD_SIZE: u32 = 8;

@@ -3,11 +3,10 @@ use crate::types::{BlockHeader, Log, LogFilter};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, oneshot};
+use tokio::sync::{broadcast, oneshot, Mutex};
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// WebSocket JSON-RPC provider with subscription support.
 ///
@@ -28,7 +27,9 @@ type WsStream = tokio_tungstenite::WebSocketStream<
 /// ws.close().await;
 /// ```
 pub struct WsProvider {
-    sender: Arc<Mutex<futures_util::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>>>,
+    sender: Arc<
+        Mutex<futures_util::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>>,
+    >,
     rpc_id: Arc<Mutex<u64>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
     new_heads_tx: broadcast::Sender<BlockHeader>,
@@ -76,7 +77,9 @@ impl WsProvider {
                     if let Some(result) = result {
                         if method.contains("subscription") {
                             // Try as block header
-                            if let Ok(header) = serde_json::from_value::<BlockHeader>(result.clone()) {
+                            if let Ok(header) =
+                                serde_json::from_value::<BlockHeader>(result.clone())
+                            {
                                 let _ = heads_tx.send(header);
                             }
                             // Try as log
@@ -119,7 +122,8 @@ impl WsProvider {
 
     /// Subscribe to new block headers.
     pub async fn subscribe_new_heads(&self) -> Result<broadcast::Receiver<BlockHeader>> {
-        self.rpc("pyde_subscribe", &[serde_json::json!("newHeads")]).await?;
+        self.rpc("pyde_subscribe", &[serde_json::json!("newHeads")])
+            .await?;
         Ok(self.new_heads_tx.subscribe())
     }
 
@@ -131,7 +135,11 @@ impl WsProvider {
 
     /// Subscribe to contract event logs matching a filter.
     pub async fn subscribe_logs(&self, filter: &LogFilter) -> Result<broadcast::Receiver<Log>> {
-        self.rpc("pyde_subscribeLogs", &[serde_json::to_value(filter).unwrap_or_default()]).await?;
+        self.rpc(
+            "pyde_subscribeLogs",
+            &[serde_json::to_value(filter).unwrap_or_default()],
+        )
+        .await?;
         Ok(self.logs_tx.subscribe())
     }
 
@@ -140,7 +148,12 @@ impl WsProvider {
     // ========================================================================
 
     pub async fn get_balance(&self, address: &[u8; 32]) -> Result<u128> {
-        let result = self.rpc("pyde_getBalance", &[serde_json::json!(format!("0x{}", hex::encode(address)))]).await?;
+        let result = self
+            .rpc(
+                "pyde_getBalance",
+                &[serde_json::json!(format!("0x{}", hex::encode(address)))],
+            )
+            .await?;
         let s = result.as_str().unwrap_or("0x0");
         u128::from_str_radix(s.trim_start_matches("0x"), 16)
             .map_err(|e| SdkError::InvalidResponse(format!("bad balance: {}", e)))
@@ -193,15 +206,22 @@ impl WsProvider {
 
         {
             let mut sink = self.sender.lock().await;
-            sink.send(tokio_tungstenite::tungstenite::Message::Text(msg.to_string()))
-                .await
-                .map_err(|e| SdkError::Connection(format!("WS send: {}", e)))?;
+            sink.send(tokio_tungstenite::tungstenite::Message::Text(
+                msg.to_string(),
+            ))
+            .await
+            .map_err(|e| SdkError::Connection(format!("WS send: {}", e)))?;
         }
 
-        let result = rx.await.map_err(|_| SdkError::Connection("WS response channel closed".into()))?;
+        let result = rx
+            .await
+            .map_err(|_| SdkError::Connection("WS response channel closed".into()))?;
         if let Some(err) = result.get("error") {
             return Err(SdkError::Rpc(err.to_string()));
         }
-        Ok(result.get("result").cloned().unwrap_or(serde_json::Value::Null))
+        Ok(result
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 }

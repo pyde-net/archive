@@ -88,7 +88,12 @@ pub struct PeerManager {
 }
 
 impl PeerManager {
-    pub fn new(max_peers: usize, max_inbound: usize, max_outbound: usize, rate_limit_per_ip: u32) -> Self {
+    pub fn new(
+        max_peers: usize,
+        max_inbound: usize,
+        max_outbound: usize,
+        rate_limit_per_ip: u32,
+    ) -> Self {
         Self {
             peers: HashMap::new(),
             max_peers,
@@ -106,12 +111,18 @@ impl PeerManager {
 
     /// Number of inbound connections.
     pub fn inbound_count(&self) -> usize {
-        self.peers.values().filter(|p| p.direction == Direction::Inbound).count()
+        self.peers
+            .values()
+            .filter(|p| p.direction == Direction::Inbound)
+            .count()
     }
 
     /// Number of outbound connections.
     pub fn outbound_count(&self) -> usize {
-        self.peers.values().filter(|p| p.direction == Direction::Outbound).count()
+        self.peers
+            .values()
+            .filter(|p| p.direction == Direction::Outbound)
+            .count()
     }
 
     /// Check if we can accept a new connection.
@@ -166,7 +177,8 @@ impl PeerManager {
     /// Prune expired rate limit entries to prevent unbounded HashMap growth.
     /// Call this periodically (e.g., once per block or every few seconds).
     pub fn prune_rate_limits(&mut self) {
-        self.rate_limits.retain(|_, (_, window_start)| window_start.elapsed().as_secs() < 60);
+        self.rate_limits
+            .retain(|_, (_, window_start)| window_start.elapsed().as_secs() < 60);
     }
 
     /// Add a connected peer. Returns false if limits exceeded.
@@ -208,7 +220,9 @@ impl PeerManager {
 
     /// Get validators only.
     pub fn validators(&self) -> impl Iterator<Item = &PeerInfo> {
-        self.peers.values().filter(|p| p.role == PeerRole::Validator)
+        self.peers
+            .values()
+            .filter(|p| p.role == PeerRole::Validator)
     }
 
     /// Record the FALCON pubkey attested by a peer during the auth
@@ -436,7 +450,10 @@ mod tests {
         assert!(mgr.set_falcon_pubkey(&id, vec![0xAA; 897]));
         assert!(!mgr.set_falcon_pubkey(&id, vec![0xBB; 897]));
         // First key sticks; the rebind attempt is ignored.
-        assert_eq!(mgr.peer_falcon_pubkey(&id), Some(vec![0xAA; 897].as_slice()));
+        assert_eq!(
+            mgr.peer_falcon_pubkey(&id),
+            Some(vec![0xAA; 897].as_slice())
+        );
     }
 
     #[test]

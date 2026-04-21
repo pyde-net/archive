@@ -10,33 +10,20 @@
 #[derive(Clone, Debug)]
 pub enum SyncRequest {
     /// Request block headers in a range.
-    GetHeaders {
-        start_slot: u64,
-        count: u32,
-    },
+    GetHeaders { start_slot: u64, count: u32 },
     /// Request full blocks in a range.
-    GetBlocks {
-        start_slot: u64,
-        count: u32,
-    },
+    GetBlocks { start_slot: u64, count: u32 },
     /// Request state witnesses for a block.
-    GetStateWitnesses {
-        block_hash: [u8; 32],
-    },
+    GetStateWitnesses { block_hash: [u8; 32] },
     /// Request a chunk of the state trie for snapshot sync.
     GetStateChunk {
         state_root: [u8; 32],
         path_prefix: Vec<u8>,
     },
     /// Request the validator set for an epoch.
-    GetEpochData {
-        epoch: u64,
-    },
+    GetEpochData { epoch: u64 },
     /// Request proof of a historical state entry.
-    GetHistoricalProof {
-        slot: u64,
-        key: [u8; 32],
-    },
+    GetHistoricalProof { slot: u64, key: [u8; 32] },
 }
 
 /// Sync response types (peer → node).
@@ -84,15 +71,9 @@ pub enum SyncState {
     /// Fully synced with the chain tip.
     Synced,
     /// Downloading headers.
-    SyncingHeaders {
-        current: u64,
-        target: u64,
-    },
+    SyncingHeaders { current: u64, target: u64 },
     /// Downloading block bodies.
-    SyncingBlocks {
-        current: u64,
-        target: u64,
-    },
+    SyncingBlocks { current: u64, target: u64 },
     /// Downloading state snapshot.
     SyncingState {
         chunks_received: u32,
@@ -106,13 +87,28 @@ impl SyncState {
         match self {
             SyncState::Synced => 100,
             SyncState::SyncingHeaders { current, target } => {
-                if *target == 0 { 100 } else { (current * 100 / target) as u32 }
+                if *target == 0 {
+                    100
+                } else {
+                    (current * 100 / target) as u32
+                }
             }
             SyncState::SyncingBlocks { current, target } => {
-                if *target == 0 { 100 } else { (current * 100 / target) as u32 }
+                if *target == 0 {
+                    100
+                } else {
+                    (current * 100 / target) as u32
+                }
             }
-            SyncState::SyncingState { chunks_received, chunks_total } => {
-                if *chunks_total == 0 { 100 } else { chunks_received * 100 / chunks_total }
+            SyncState::SyncingState {
+                chunks_received,
+                chunks_total,
+            } => {
+                if *chunks_total == 0 {
+                    100
+                } else {
+                    chunks_received * 100 / chunks_total
+                }
             }
         }
     }

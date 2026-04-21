@@ -9,27 +9,37 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
     // Unsigned integers
-    U8, U16, U32, U64, U128, U256,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    U256,
     // Signed integers
-    I8, I16, I32, I64, I128, I256,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    I256,
     // Other primitives
     Bool,
     Address,
     StringTy,
     Bytes,
     // Composite types
-    Array(Box<Ty>, u64),       // [T; N]
-    Vec(Box<Ty>),              // Vec<T>
-    Map(Box<Ty>, Box<Ty>),     // Map<K, V>
-    Tuple(Vec<Ty>),            // (T1, T2, ...)
+    Array(Box<Ty>, u64),   // [T; N]
+    Vec(Box<Ty>),          // Vec<T>
+    Map(Box<Ty>, Box<Ty>), // Map<K, V>
+    Tuple(Vec<Ty>),        // (T1, T2, ...)
     // Named types
-    Struct(String),            // struct name
-    Enum(String),              // enum name
+    Struct(String), // struct name
+    Enum(String),   // enum name
     // Contract/interface handles (address + typed method dispatch)
-    Contract(String),          // contract name — deploy!(Counter) returns this
-    Interface(String),         // interface name — IERC20::at(addr) returns this
+    Contract(String),  // contract name — deploy!(Counter) returns this
+    Interface(String), // interface name — IERC20::at(addr) returns this
     // Special
-    Unit,                      // void / no return
+    Unit, // void / no return
     /// Used for type inference when we don't know yet.
     Unknown,
     /// Used for error recovery — any type is compatible.
@@ -39,20 +49,37 @@ pub enum Ty {
 impl Ty {
     /// Whether this is a numeric type (arithmetic operations allowed).
     pub fn is_numeric(&self) -> bool {
-        matches!(self,
-            Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::U256
-            | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::I256
+        matches!(
+            self,
+            Ty::U8
+                | Ty::U16
+                | Ty::U32
+                | Ty::U64
+                | Ty::U128
+                | Ty::U256
+                | Ty::I8
+                | Ty::I16
+                | Ty::I32
+                | Ty::I64
+                | Ty::I128
+                | Ty::I256
         )
     }
 
     /// Whether this is an unsigned integer type.
     pub fn is_unsigned(&self) -> bool {
-        matches!(self, Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::U256)
+        matches!(
+            self,
+            Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::U256
+        )
     }
 
     /// Whether this is a signed integer type.
     pub fn is_signed(&self) -> bool {
-        matches!(self, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::I256)
+        matches!(
+            self,
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::I256
+        )
     }
 
     /// Whether this is an integer type (numeric, not bool).
@@ -76,7 +103,9 @@ impl Ty {
     /// Whether a cast from self to target is a widening (always safe) cast.
     /// Allows: u8→u64, u64→u256, i32→i64, u32→i64, and any numeric→larger numeric.
     pub fn can_widen_to(&self, target: &Ty) -> bool {
-        if self == target { return true; }
+        if self == target {
+            return true;
+        }
         match (self.bit_width(), target.bit_width()) {
             (Some(from), Some(to)) => {
                 if from <= to {
@@ -104,14 +133,25 @@ impl Ty {
 
     /// Whether two types are compatible for comparison (==, !=, <, >, etc.).
     pub fn is_comparable_with(&self, other: &Ty) -> bool {
-        if self == other { return true; }
-        if matches!(self, Ty::Error) || matches!(other, Ty::Error) { return true; }
-        if matches!(self, Ty::Unknown) || matches!(other, Ty::Unknown) { return true; }
+        if self == other {
+            return true;
+        }
+        if matches!(self, Ty::Error) || matches!(other, Ty::Error) {
+            return true;
+        }
+        if matches!(self, Ty::Unknown) || matches!(other, Ty::Unknown) {
+            return true;
+        }
         // Numeric types are comparable (implicit widening happens)
-        if self.is_numeric() && other.is_numeric() { return true; }
+        if self.is_numeric() && other.is_numeric() {
+            return true;
+        }
         // Enums are comparable with numerics (discriminant comparison)
         if (matches!(self, Ty::Enum(_)) && other.is_numeric())
-            || (self.is_numeric() && matches!(other, Ty::Enum(_))) { return true; }
+            || (self.is_numeric() && matches!(other, Ty::Enum(_)))
+        {
+            return true;
+        }
         // Arrays of same size with compatible elements
         if let (Ty::Array(a, n1), Ty::Array(b, n2)) = (self, other) {
             return n1 == n2 && a.is_comparable_with(b);
@@ -126,10 +166,24 @@ impl Ty {
 
     /// Whether a type can be used as a map key.
     pub fn is_hashable(&self) -> bool {
-        matches!(self,
-            Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 | Ty::U128 | Ty::U256
-            | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::I256
-            | Ty::Bool | Ty::Address | Ty::StringTy | Ty::Bytes
+        matches!(
+            self,
+            Ty::U8
+                | Ty::U16
+                | Ty::U32
+                | Ty::U64
+                | Ty::U128
+                | Ty::U256
+                | Ty::I8
+                | Ty::I16
+                | Ty::I32
+                | Ty::I64
+                | Ty::I128
+                | Ty::I256
+                | Ty::Bool
+                | Ty::Address
+                | Ty::StringTy
+                | Ty::Bytes
         )
     }
 }
@@ -159,7 +213,9 @@ impl fmt::Display for Ty {
             Ty::Tuple(types) => {
                 write!(f, "(")?;
                 for (i, t) in types.iter().enumerate() {
-                    if i > 0 { write!(f, ", ")?; }
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
                     write!(f, "{}", t)?;
                 }
                 write!(f, ")")

@@ -171,10 +171,14 @@ pub fn generate_abi(program: &IrProgram) -> ContractAbi {
     for s in &program.struct_defs {
         structs.push(AbiStruct {
             name: s.name.clone(),
-            fields: s.fields.iter().map(|(name, ty)| AbiParam {
-                name: name.clone(),
-                ty: ty_to_string(ty),
-            }).collect(),
+            fields: s
+                .fields
+                .iter()
+                .map(|(name, ty)| AbiParam {
+                    name: name.clone(),
+                    ty: ty_to_string(ty),
+                })
+                .collect(),
         });
     }
 
@@ -183,11 +187,16 @@ pub fn generate_abi(program: &IrProgram) -> ContractAbi {
     for e in &program.enum_defs {
         enums.push(AbiEnum {
             name: e.name.clone(),
-            variants: e.variants.iter().enumerate().map(|(i, name)| AbiEnumVariant {
-                name: name.clone(),
-                discriminant: i as u32,
-                fields: vec![], // simple enums have no associated data
-            }).collect(),
+            variants: e
+                .variants
+                .iter()
+                .enumerate()
+                .map(|(i, name)| AbiEnumVariant {
+                    name: name.clone(),
+                    discriminant: i as u32,
+                    fields: vec![], // simple enums have no associated data
+                })
+                .collect(),
         });
     }
 
@@ -235,7 +244,10 @@ pub fn abi_to_json(abi: &ContractAbi) -> String {
         if let Some(ref doc) = f.doc {
             out.push_str(&format!(
                 ",\n      \"doc\": \"{}\"",
-                doc.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "")
+                doc.replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "")
             ));
         }
         out.push('\n');
@@ -266,7 +278,10 @@ pub fn abi_to_json(abi: &ContractAbi) -> String {
         if let Some(ref doc) = e.doc {
             out.push_str(&format!(
                 ",\n      \"doc\": \"{}\"",
-                doc.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "")
+                doc.replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "")
             ));
         }
         out.push('\n');
@@ -297,7 +312,10 @@ pub fn abi_to_json(abi: &ContractAbi) -> String {
         if let Some(ref doc) = e.doc {
             out.push_str(&format!(
                 ",\n      \"doc\": \"{}\"",
-                doc.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "")
+                doc.replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n")
+                    .replace('\r', "")
             ));
         }
         out.push('\n');
@@ -330,11 +348,18 @@ pub fn abi_to_json(abi: &ContractAbi) -> String {
         out.push_str(&format!("      \"name\": \"{}\",\n", s.name));
         out.push_str("      \"fields\": [");
         for (j, f) in s.fields.iter().enumerate() {
-            out.push_str(&format!("{{\"name\":\"{}\",\"type\":\"{}\"}}", f.name, f.ty));
-            if j + 1 < s.fields.len() { out.push(','); }
+            out.push_str(&format!(
+                "{{\"name\":\"{}\",\"type\":\"{}\"}}",
+                f.name, f.ty
+            ));
+            if j + 1 < s.fields.len() {
+                out.push(',');
+            }
         }
         out.push_str("]\n    }");
-        if i + 1 < abi.structs.len() { out.push(','); }
+        if i + 1 < abi.structs.len() {
+            out.push(',');
+        }
         out.push('\n');
     }
     out.push_str("  ],\n");
@@ -346,11 +371,18 @@ pub fn abi_to_json(abi: &ContractAbi) -> String {
         out.push_str(&format!("      \"name\": \"{}\",\n", e.name));
         out.push_str("      \"variants\": [");
         for (j, v) in e.variants.iter().enumerate() {
-            out.push_str(&format!("{{\"name\":\"{}\",\"discriminant\":{}}}", v.name, v.discriminant));
-            if j + 1 < e.variants.len() { out.push(','); }
+            out.push_str(&format!(
+                "{{\"name\":\"{}\",\"discriminant\":{}}}",
+                v.name, v.discriminant
+            ));
+            if j + 1 < e.variants.len() {
+                out.push(',');
+            }
         }
         out.push_str("]\n    }");
-        if i + 1 < abi.enums.len() { out.push(','); }
+        if i + 1 < abi.enums.len() {
+            out.push(',');
+        }
         out.push('\n');
     }
     out.push_str("  ]\n");
@@ -365,7 +397,10 @@ pub fn artifact_to_json(abi: &ContractAbi, contract: &CompiledContract) -> Strin
     let mut out = String::new();
     out.push_str("{\n");
     out.push_str(&format!("  \"contractName\": \"{}\",\n", abi.contract_name));
-    out.push_str(&format!("  \"compiler\": \"otic {}\",\n", env!("CARGO_PKG_VERSION")));
+    out.push_str(&format!(
+        "  \"compiler\": \"otic {}\",\n",
+        env!("CARGO_PKG_VERSION")
+    ));
 
     // Bytecode (hex-encoded)
     out.push_str("  \"bytecode\": \"0x");
@@ -389,13 +424,18 @@ pub fn artifact_to_json(abi: &ContractAbi, contract: &CompiledContract) -> Strin
     out.push_str("\",\n");
 
     // Instruction count
-    out.push_str(&format!("  \"instructionCount\": {},\n", contract.instruction_count));
+    out.push_str(&format!(
+        "  \"instructionCount\": {},\n",
+        contract.instruction_count
+    ));
 
     // Function selectors
     out.push_str("  \"selectors\": {");
     for (i, (sel, name, _)) in contract.selectors.iter().enumerate() {
         out.push_str(&format!("\"0x{:08x}\":\"{}\"", sel, name));
-        if i + 1 < contract.selectors.len() { out.push(','); }
+        if i + 1 < contract.selectors.len() {
+            out.push(',');
+        }
     }
     out.push_str("},\n");
 
@@ -414,7 +454,9 @@ pub fn artifact_to_json(abi: &ContractAbi, contract: &CompiledContract) -> Strin
     }
 
     // Remove trailing newline, add comma
-    if out.ends_with('\n') { out.pop(); }
+    if out.ends_with('\n') {
+        out.pop();
+    }
     out.push_str(",\n");
 
     // Storage layout
@@ -424,7 +466,9 @@ pub fn artifact_to_json(abi: &ContractAbi, contract: &CompiledContract) -> Strin
             "    {{\"name\": \"{}\", \"type\": \"{}\", \"slot\": {}}}",
             s.name, s.ty, s.slot
         ));
-        if i + 1 < abi.storage.len() { out.push(','); }
+        if i + 1 < abi.storage.len() {
+            out.push(',');
+        }
         out.push('\n');
     }
     out.push_str("  ]\n");
@@ -603,9 +647,12 @@ mod tests {
         let hex = &json[start..end];
         let decoded: Vec<u8> = (0..hex.len())
             .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i+2], 16).unwrap())
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect();
-        assert_eq!(decoded, contract.runtime_bytecode, "decoded bytecode should match");
+        assert_eq!(
+            decoded, contract.runtime_bytecode,
+            "decoded bytecode should match"
+        );
 
         // Run the runtime bytecode on PVM with calldata
         let selector = compute_selector("add");
@@ -622,11 +669,20 @@ mod tests {
         loop {
             match vm.step() {
                 Ok(Some(_)) => break,
-                Ok(None) => { steps += 1; if steps > 1000 { break; } }
+                Ok(None) => {
+                    steps += 1;
+                    if steps > 1000 {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
 
-        assert_eq!(vm.cpu.read_gp(1), 42, "add(10, 32) from JSON artifact bytecode should be 42");
+        assert_eq!(
+            vm.cpu.read_gp(1),
+            42,
+            "add(10, 32) from JSON artifact bytecode should be 42"
+        );
     }
 }

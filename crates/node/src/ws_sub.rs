@@ -17,9 +17,11 @@ pub async fn start_ws_server(
     logs_tx: broadcast::Sender<serde_json::Value>,
 ) -> Result<std::net::SocketAddr, String> {
     let addr = format!("{}:{}", listen, port);
-    let listener = TcpListener::bind(&addr).await
+    let listener = TcpListener::bind(&addr)
+        .await
         .map_err(|e| format!("WS bind failed: {}", e))?;
-    let bound = listener.local_addr()
+    let bound = listener
+        .local_addr()
         .map_err(|e| format!("WS addr: {}", e))?;
 
     tokio::spawn(async move {
@@ -45,7 +47,10 @@ async fn handle_connection(
 ) {
     let ws = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
-        Err(e) => { debug!(error = %e, "WS handshake failed"); return; }
+        Err(e) => {
+            debug!(error = %e, "WS handshake failed");
+            return;
+        }
     };
 
     let (mut ws_sink, mut ws_stream) = ws.split();
@@ -84,7 +89,9 @@ async fn handle_connection(
                     let tx = out_tx.clone();
 
                     // Response
-                    let _ = out_tx.send(serde_json::json!({"jsonrpc":"2.0","id":id,"result":sub_id}).to_string());
+                    let _ = out_tx.send(
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":sub_id}).to_string(),
+                    );
 
                     tasks.push(tokio::spawn(async move {
                         loop {
@@ -95,7 +102,9 @@ async fn handle_connection(
                                         "method":"pyde_subscription",
                                         "params":{"subscription":sub_id,"result":header}
                                     });
-                                    if tx.send(notif.to_string()).is_err() { break; }
+                                    if tx.send(notif.to_string()).is_err() {
+                                        break;
+                                    }
                                 }
                                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                                 Err(_) => break,
@@ -110,7 +119,8 @@ async fn handle_connection(
                     let mut rx = logs_tx.subscribe();
                     let tx = out_tx.clone();
 
-                    let filter_addr = data.get("params")
+                    let filter_addr = data
+                        .get("params")
                         .and_then(|p| p.as_array())
                         .and_then(|a| a.first())
                         .and_then(|f| f.get("address"))
@@ -118,7 +128,9 @@ async fn handle_connection(
                         .map(|s| s.to_lowercase());
 
                     // Response
-                    let _ = out_tx.send(serde_json::json!({"jsonrpc":"2.0","id":id,"result":sub_id}).to_string());
+                    let _ = out_tx.send(
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":sub_id}).to_string(),
+                    );
 
                     debug!(sub_id, "logs subscription created");
 
@@ -127,7 +139,8 @@ async fn handle_connection(
                             match rx.recv().await {
                                 Ok(log) => {
                                     if let Some(ref addr) = filter_addr {
-                                        let log_addr = log.get("address")
+                                        let log_addr = log
+                                            .get("address")
                                             .and_then(|v| v.as_str())
                                             .map(|s| s.to_lowercase());
                                         if log_addr.as_deref() != Some(addr.as_str()) {
@@ -140,7 +153,9 @@ async fn handle_connection(
                                         "params":{"subscription":sub_id,"result":log}
                                     });
                                     debug!("forwarding log to WS client");
-                                    if tx.send(notif.to_string()).is_err() { break; }
+                                    if tx.send(notif.to_string()).is_err() {
+                                        break;
+                                    }
                                 }
                                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                                 Err(_) => break,
@@ -161,6 +176,8 @@ async fn handle_connection(
     }
 
     // Cleanup
-    for t in tasks { t.abort(); }
+    for t in tasks {
+        t.abort();
+    }
     writer.abort();
 }

@@ -62,13 +62,11 @@ fn constant_fold(func: &mut IrFunction) {
                                     .map(|val| IrConst::Int(val, lt.clone()))
                             }
                             // Boolean logic folding
-                            (IrConst::Bool(lb), IrConst::Bool(rb)) => {
-                                match op_copy {
-                                    BinOp::LogicalAnd => Some(IrConst::Bool(*lb && *rb)),
-                                    BinOp::LogicalOr => Some(IrConst::Bool(*lb || *rb)),
-                                    _ => None,
-                                }
-                            }
+                            (IrConst::Bool(lb), IrConst::Bool(rb)) => match op_copy {
+                                BinOp::LogicalAnd => Some(IrConst::Bool(*lb && *rb)),
+                                BinOp::LogicalOr => Some(IrConst::Bool(*lb || *rb)),
+                                _ => None,
+                            },
                             _ => None,
                         }
                     } else {
@@ -142,19 +140,35 @@ fn fold_binop(op: BinOp, lhs: U256, rhs: U256) -> Option<U256> {
         BinOp::Sub => lhs.checked_sub(rhs),
         BinOp::Mul => lhs.checked_mul(rhs),
         BinOp::Div => {
-            if rhs == U256::ZERO { None } else { Some(lhs / rhs) }
+            if rhs == U256::ZERO {
+                None
+            } else {
+                Some(lhs / rhs)
+            }
         }
         BinOp::Mod => {
-            if rhs == U256::ZERO { None } else { Some(lhs % rhs) }
+            if rhs == U256::ZERO {
+                None
+            } else {
+                Some(lhs % rhs)
+            }
         }
         BinOp::BitAnd => Some(lhs & rhs),
         BinOp::BitOr => Some(lhs | rhs),
         BinOp::BitXor => Some(lhs ^ rhs),
         BinOp::Shl => {
-            if rhs < U256::from(256u64) { Some(lhs << rhs.as_u64() as u32) } else { None }
+            if rhs < U256::from(256u64) {
+                Some(lhs << rhs.as_u64() as u32)
+            } else {
+                None
+            }
         }
         BinOp::Shr => {
-            if rhs < U256::from(256u64) { Some(lhs >> rhs.as_u64() as u32) } else { Some(U256::ZERO) }
+            if rhs < U256::from(256u64) {
+                Some(lhs >> rhs.as_u64() as u32)
+            } else {
+                Some(U256::ZERO)
+            }
         }
         BinOp::LogicalAnd | BinOp::LogicalOr => None, // operate on bools, not ints
     }
@@ -174,7 +188,11 @@ fn fold_cmp(op: CmpOp, lhs: U256, rhs: U256) -> bool {
 fn fold_unop(op: UnOp, val: U256) -> Option<U256> {
     match op {
         UnOp::Neg => {
-            if val == U256::ZERO { Some(U256::ZERO) } else { None } // can't negate unsigned
+            if val == U256::ZERO {
+                Some(U256::ZERO)
+            } else {
+                None
+            } // can't negate unsigned
         }
         UnOp::BitNot => Some(!val),
         UnOp::LogicalNot => None, // handled separately for bools
@@ -209,7 +227,9 @@ fn dead_code_eliminate(func: &mut IrFunction) {
 
     // Remove Comment instructions (they're debug-only)
     for block in &mut func.blocks {
-        block.instructions.retain(|inst| !matches!(inst, Inst::Comment(_)));
+        block
+            .instructions
+            .retain(|inst| !matches!(inst, Inst::Comment(_)));
     }
 }
 
@@ -248,7 +268,10 @@ fn find_reachable_blocks(func: &IrFunction) -> HashSet<Label> {
 }
 
 fn is_terminator(inst: &Inst) -> bool {
-    matches!(inst, Inst::Return(_) | Inst::Jump(_) | Inst::Branch(_, _, _) | Inst::Revert(_, _))
+    matches!(
+        inst,
+        Inst::Return(_) | Inst::Jump(_) | Inst::Branch(_, _, _) | Inst::Revert(_, _)
+    )
 }
 
 // ============================================================================
@@ -285,43 +308,144 @@ fn eliminate_unused_registers(func: &mut IrFunction) {
 fn collect_used_regs(inst: &Inst, used: &mut HashSet<Reg>) {
     match inst {
         Inst::Const(_, _) => {}
-        Inst::BinOp(_, _, lhs, rhs) => { used.insert(*lhs); used.insert(*rhs); }
-        Inst::UnOp(_, _, src) => { used.insert(*src); }
-        Inst::Cmp(_, _, lhs, rhs) => { used.insert(*lhs); used.insert(*rhs); }
-        Inst::Cast(_, src, _) => { used.insert(*src); }
-        Inst::StorageGet(_, _) => {}
-        Inst::StorageSet(_, val) => { used.insert(*val); }
-        Inst::StorageMapGet(_, _, key) => { used.insert(*key); }
-        Inst::StorageMapSet(_, key, val) => { used.insert(*key); used.insert(*val); }
-        Inst::StorageNestedMapGet(_, _, k1, k2) => { used.insert(*k1); used.insert(*k2); }
-        Inst::StorageNestedMapSet(_, k1, k2, val) => { used.insert(*k1); used.insert(*k2); used.insert(*val); }
-        Inst::Builtin(_, _) => {}
-        Inst::Call(_, _, args) => { for a in args { used.insert(*a); } }
-        Inst::MethodCall(_, obj, _, args) => { used.insert(*obj); for a in args { used.insert(*a); } }
-        Inst::ExtCall(_, addr, _, args, _, _) => { used.insert(*addr); for (a, _) in args { used.insert(*a); } }
-        Inst::Hash(_, args) => { for a in args { used.insert(*a); } }
-        Inst::StructInit(_, _, fields) => { for (_, r) in fields { used.insert(*r); } }
-        Inst::FieldGet(_, obj, _, _) => { used.insert(*obj); }
-        Inst::IndexGet(_, obj, idx) => { used.insert(*obj); used.insert(*idx); }
-        Inst::IndexSet(obj, idx, val) => { used.insert(*obj); used.insert(*idx); used.insert(*val); }
-        Inst::MakeTuple(_, regs) => { for r in regs { used.insert(*r); } }
-        Inst::TupleGet(_, tuple, _) => { used.insert(*tuple); }
-        Inst::MakeArray(_, regs) => { for r in regs { used.insert(*r); } }
-        Inst::ArrayRepeat(_, val, _) => { used.insert(*val); }
-        Inst::MakeVec(_, _) => {}
-        Inst::Emit(_, fields) => { for (r, _, _) in fields { used.insert(*r); } }
-        Inst::Revert(_, fields) => { for r in fields { used.insert(*r); } }
-        Inst::CrossCall { target, method, args, .. } => {
-            used.insert(*target); used.insert(*method);
-            for a in args { used.insert(*a); }
+        Inst::BinOp(_, _, lhs, rhs) => {
+            used.insert(*lhs);
+            used.insert(*rhs);
         }
-        Inst::RawCall(_, target, args) => { used.insert(*target); for a in args { used.insert(*a); } }
-        Inst::CreateContract(_, blob, args, _) => { used.insert(*blob); for (a, _) in args { used.insert(*a); } }
+        Inst::UnOp(_, _, src) => {
+            used.insert(*src);
+        }
+        Inst::Cmp(_, _, lhs, rhs) => {
+            used.insert(*lhs);
+            used.insert(*rhs);
+        }
+        Inst::Cast(_, src, _) => {
+            used.insert(*src);
+        }
+        Inst::StorageGet(_, _) => {}
+        Inst::StorageSet(_, val) => {
+            used.insert(*val);
+        }
+        Inst::StorageMapGet(_, _, key) => {
+            used.insert(*key);
+        }
+        Inst::StorageMapSet(_, key, val) => {
+            used.insert(*key);
+            used.insert(*val);
+        }
+        Inst::StorageNestedMapGet(_, _, k1, k2) => {
+            used.insert(*k1);
+            used.insert(*k2);
+        }
+        Inst::StorageNestedMapSet(_, k1, k2, val) => {
+            used.insert(*k1);
+            used.insert(*k2);
+            used.insert(*val);
+        }
+        Inst::Builtin(_, _) => {}
+        Inst::Call(_, _, args) => {
+            for a in args {
+                used.insert(*a);
+            }
+        }
+        Inst::MethodCall(_, obj, _, args) => {
+            used.insert(*obj);
+            for a in args {
+                used.insert(*a);
+            }
+        }
+        Inst::ExtCall(_, addr, _, args, _, _) => {
+            used.insert(*addr);
+            for (a, _) in args {
+                used.insert(*a);
+            }
+        }
+        Inst::Hash(_, args) => {
+            for a in args {
+                used.insert(*a);
+            }
+        }
+        Inst::StructInit(_, _, fields) => {
+            for (_, r) in fields {
+                used.insert(*r);
+            }
+        }
+        Inst::FieldGet(_, obj, _, _) => {
+            used.insert(*obj);
+        }
+        Inst::IndexGet(_, obj, idx) => {
+            used.insert(*obj);
+            used.insert(*idx);
+        }
+        Inst::IndexSet(obj, idx, val) => {
+            used.insert(*obj);
+            used.insert(*idx);
+            used.insert(*val);
+        }
+        Inst::MakeTuple(_, regs) => {
+            for r in regs {
+                used.insert(*r);
+            }
+        }
+        Inst::TupleGet(_, tuple, _) => {
+            used.insert(*tuple);
+        }
+        Inst::MakeArray(_, regs) => {
+            for r in regs {
+                used.insert(*r);
+            }
+        }
+        Inst::ArrayRepeat(_, val, _) => {
+            used.insert(*val);
+        }
+        Inst::MakeVec(_, _) => {}
+        Inst::Emit(_, fields) => {
+            for (r, _, _) in fields {
+                used.insert(*r);
+            }
+        }
+        Inst::Revert(_, fields) => {
+            for r in fields {
+                used.insert(*r);
+            }
+        }
+        Inst::CrossCall {
+            target,
+            method,
+            args,
+            ..
+        } => {
+            used.insert(*target);
+            used.insert(*method);
+            for a in args {
+                used.insert(*a);
+            }
+        }
+        Inst::RawCall(_, target, args) => {
+            used.insert(*target);
+            for a in args {
+                used.insert(*a);
+            }
+        }
+        Inst::CreateContract(_, blob, args, _) => {
+            used.insert(*blob);
+            for (a, _) in args {
+                used.insert(*a);
+            }
+        }
         Inst::Jump(_) => {}
-        Inst::Branch(cond, _, _) => { used.insert(*cond); }
-        Inst::Return(Some(val)) => { used.insert(*val); }
+        Inst::Branch(cond, _, _) => {
+            used.insert(*cond);
+        }
+        Inst::Return(Some(val)) => {
+            used.insert(*val);
+        }
         Inst::Return(None) => {}
-        Inst::Phi(_, entries) => { for (_, r) in entries { used.insert(*r); } }
+        Inst::Phi(_, entries) => {
+            for (_, r) in entries {
+                used.insert(*r);
+            }
+        }
         Inst::Comment(_) => {}
     }
 }
@@ -329,32 +453,53 @@ fn collect_used_regs(inst: &Inst, used: &mut HashSet<Reg>) {
 /// Get the destination register of an instruction, if it writes one.
 fn get_dest_reg(inst: &Inst) -> Option<Reg> {
     match inst {
-        Inst::Const(dst, _) | Inst::BinOp(dst, _, _, _) | Inst::UnOp(dst, _, _)
-        | Inst::Cmp(dst, _, _, _) | Inst::Cast(dst, _, _)
-        | Inst::StorageGet(dst, _) | Inst::StorageMapGet(dst, _, _)
+        Inst::Const(dst, _)
+        | Inst::BinOp(dst, _, _, _)
+        | Inst::UnOp(dst, _, _)
+        | Inst::Cmp(dst, _, _, _)
+        | Inst::Cast(dst, _, _)
+        | Inst::StorageGet(dst, _)
+        | Inst::StorageMapGet(dst, _, _)
         | Inst::StorageNestedMapGet(dst, _, _, _)
-        | Inst::Builtin(dst, _) | Inst::Call(dst, _, _)
-        | Inst::MethodCall(dst, _, _, _) | Inst::ExtCall(dst, _, _, _, _, _)
-        | Inst::Hash(dst, _) | Inst::StructInit(dst, _, _)
-        | Inst::FieldGet(dst, _, _, _) | Inst::IndexGet(dst, _, _)
-        | Inst::MakeTuple(dst, _) | Inst::TupleGet(dst, _, _)
-        | Inst::MakeArray(dst, _) | Inst::ArrayRepeat(dst, _, _)
+        | Inst::Builtin(dst, _)
+        | Inst::Call(dst, _, _)
+        | Inst::MethodCall(dst, _, _, _)
+        | Inst::ExtCall(dst, _, _, _, _, _)
+        | Inst::Hash(dst, _)
+        | Inst::StructInit(dst, _, _)
+        | Inst::FieldGet(dst, _, _, _)
+        | Inst::IndexGet(dst, _, _)
+        | Inst::MakeTuple(dst, _)
+        | Inst::TupleGet(dst, _, _)
+        | Inst::MakeArray(dst, _)
+        | Inst::ArrayRepeat(dst, _, _)
         | Inst::MakeVec(dst, _)
-        | Inst::RawCall(dst, _, _) | Inst::CreateContract(dst, _, _, _) | Inst::Phi(dst, _) => Some(*dst),
+        | Inst::RawCall(dst, _, _)
+        | Inst::CreateContract(dst, _, _, _)
+        | Inst::Phi(dst, _) => Some(*dst),
         _ => None,
     }
 }
 
 /// Does the instruction have side effects beyond writing to its destination register?
 fn has_side_effects(inst: &Inst) -> bool {
-    matches!(inst,
-        Inst::StorageSet(_, _) | Inst::StorageMapSet(_, _, _)
-        | Inst::StorageNestedMapSet(_, _, _, _)
-        | Inst::IndexSet(_, _, _)
-        | Inst::Emit(_, _) | Inst::Revert(_, _)
-        | Inst::CrossCall { .. } | Inst::RawCall(_, _, _) | Inst::CreateContract(_, _, _, _)
-        | Inst::Call(_, _, _) | Inst::MethodCall(_, _, _, _) | Inst::ExtCall(_, _, _, _, _, _)
-        | Inst::Jump(_) | Inst::Branch(_, _, _) | Inst::Return(_)
+    matches!(
+        inst,
+        Inst::StorageSet(_, _)
+            | Inst::StorageMapSet(_, _, _)
+            | Inst::StorageNestedMapSet(_, _, _, _)
+            | Inst::IndexSet(_, _, _)
+            | Inst::Emit(_, _)
+            | Inst::Revert(_, _)
+            | Inst::CrossCall { .. }
+            | Inst::RawCall(_, _, _)
+            | Inst::CreateContract(_, _, _, _)
+            | Inst::Call(_, _, _)
+            | Inst::MethodCall(_, _, _, _)
+            | Inst::ExtCall(_, _, _, _, _, _)
+            | Inst::Jump(_)
+            | Inst::Branch(_, _, _)
+            | Inst::Return(_)
     )
 }
 
@@ -376,8 +521,8 @@ pub fn count_total_instructions(program: &IrProgram) -> usize {
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
-    use crate::parser::Parser;
     use crate::lower;
+    use crate::parser::Parser;
 
     fn lower_and_optimize(src: &str) -> IrProgram {
         let (tokens, _) = Lexer::new(src).tokenize();
@@ -396,7 +541,8 @@ mod tests {
     #[test]
     fn fold_constant_arithmetic() {
         // Use the values so they aren't eliminated by unused reg pass
-        let ir = lower_and_optimize(r#"
+        let ir = lower_and_optimize(
+            r#"
             contract T {
                 storage { result: u256, }
                 pub fn f() {
@@ -405,37 +551,62 @@ mod tests {
                     self.result = 50 - 10;
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let consts: Vec<U256> = func.blocks.iter()
+        let consts: Vec<U256> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .filter_map(|i| {
-                if let Inst::Const(_, IrConst::Int(v, _)) = i { Some(*v) } else { None }
+                if let Inst::Const(_, IrConst::Int(v, _)) = i {
+                    Some(*v)
+                } else {
+                    None
+                }
             })
             .collect();
 
-        assert!(consts.contains(&U256::from(30u64)), "10+20 should fold to 30, got: {:?}", consts);
-        assert!(consts.contains(&U256::from(300u64)), "100*3 should fold to 300");
-        assert!(consts.contains(&U256::from(40u64)), "50-10 should fold to 40");
+        assert!(
+            consts.contains(&U256::from(30u64)),
+            "10+20 should fold to 30, got: {:?}",
+            consts
+        );
+        assert!(
+            consts.contains(&U256::from(300u64)),
+            "100*3 should fold to 300"
+        );
+        assert!(
+            consts.contains(&U256::from(40u64)),
+            "50-10 should fold to 40"
+        );
     }
 
     #[test]
     fn fold_constant_comparison() {
-        let ir = lower_and_optimize(r#"
+        let ir = lower_and_optimize(
+            r#"
             contract T {
                 storage { flag: bool, }
                 pub fn f() {
                     self.flag = 10 > 5;
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let bools: Vec<bool> = func.blocks.iter()
+        let bools: Vec<bool> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .filter_map(|i| {
-                if let Inst::Const(_, IrConst::Bool(v)) = i { Some(*v) } else { None }
+                if let Inst::Const(_, IrConst::Bool(v)) = i {
+                    Some(*v)
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -444,7 +615,8 @@ mod tests {
 
     #[test]
     fn fold_branch_on_constant() {
-        let ir = lower_and_optimize(r#"
+        let ir = lower_and_optimize(
+            r#"
             contract T {
                 pub fn f() {
                     if true {
@@ -454,11 +626,14 @@ mod tests {
                     }
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
         // The Branch on constant true should be folded to Jump
-        let has_branch = func.blocks.iter()
+        let has_branch = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .any(|i| matches!(i, Inst::Branch(_, _, _)));
         assert!(!has_branch, "constant branch should be folded to jump");
@@ -466,40 +641,54 @@ mod tests {
 
     #[test]
     fn eliminate_dead_code_after_return() {
-        let ir = lower_and_optimize(r#"
+        let ir = lower_and_optimize(
+            r#"
             contract T {
                 pub fn f() -> u256 {
                     return 42;
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
         // After return, no more instructions in that block
         let entry = &func.blocks[0];
-        let return_idx = entry.instructions.iter()
+        let return_idx = entry
+            .instructions
+            .iter()
             .position(|i| matches!(i, Inst::Return(_)));
         if let Some(idx) = return_idx {
-            assert_eq!(idx, entry.instructions.len() - 1,
-                "nothing should follow return");
+            assert_eq!(
+                idx,
+                entry.instructions.len() - 1,
+                "nothing should follow return"
+            );
         }
     }
 
     #[test]
     fn remove_comment_instructions() {
-        let ir = lower_and_optimize(r#"
+        let ir = lower_and_optimize(
+            r#"
             contract T {
                 pub fn f() {
                     let x = 1;
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let has_comments = func.blocks.iter()
+        let has_comments = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .any(|i| matches!(i, Inst::Comment(_)));
-        assert!(!has_comments, "comments should be stripped after optimization");
+        assert!(
+            !has_comments,
+            "comments should be stripped after optimization"
+        );
     }
 
     #[test]
@@ -518,13 +707,18 @@ mod tests {
         let after = count_total_instructions(&lower_and_optimize(src));
 
         // Optimization should reduce count (folded consts replace binops)
-        assert!(after <= before,
-            "optimized ({}) should have <= instructions than unoptimized ({})", after, before);
+        assert!(
+            after <= before,
+            "optimized ({}) should have <= instructions than unoptimized ({})",
+            after,
+            before
+        );
     }
 
     #[test]
     fn fold_boolean_logic() {
-        let ir = lower_and_optimize(r#"
+        let ir = lower_and_optimize(
+            r#"
             contract T {
                 storage { flag: bool, }
                 pub fn f() {
@@ -532,17 +726,28 @@ mod tests {
                     self.flag = true || false;
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
-        let bools: Vec<bool> = func.blocks.iter()
+        let bools: Vec<bool> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .filter_map(|i| {
-                if let Inst::Const(_, IrConst::Bool(v)) = i { Some(*v) } else { None }
+                if let Inst::Const(_, IrConst::Bool(v)) = i {
+                    Some(*v)
+                } else {
+                    None
+                }
             })
             .collect();
 
-        assert!(bools.contains(&false), "true && false should fold to false, got: {:?}", bools);
+        assert!(
+            bools.contains(&false),
+            "true && false should fold to false, got: {:?}",
+            bools
+        );
         assert!(bools.contains(&true), "true || false should fold to true");
     }
 
@@ -561,34 +766,49 @@ mod tests {
         let before = count_total_instructions(&lower_only(src));
         let after = count_total_instructions(&lower_and_optimize(src));
 
-        assert!(after < before,
-            "unused registers should be eliminated: before={}, after={}", before, after);
+        assert!(
+            after < before,
+            "unused registers should be eliminated: before={}, after={}",
+            before,
+            after
+        );
     }
 
     #[test]
     fn fold_nested_constants() {
         // 2 + 3 → 5, then 5 * 4 → 20 (if within same block)
-        let ir = lower_and_optimize(r#"
+        let ir = lower_and_optimize(
+            r#"
             contract T {
                 storage { result: u256, }
                 pub fn f() {
                     self.result = (2 + 3) * 4;
                 }
             }
-        "#);
+        "#,
+        );
 
         let func = &ir.functions[0];
         // Due to how lowering works, (2+3) becomes Add(%0,%1) → Const(5),
         // then 5*4 might be foldable if both are in known map
-        let consts: Vec<U256> = func.blocks.iter()
+        let consts: Vec<U256> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .filter_map(|i| {
-                if let Inst::Const(_, IrConst::Int(v, _)) = i { Some(*v) } else { None }
+                if let Inst::Const(_, IrConst::Int(v, _)) = i {
+                    Some(*v)
+                } else {
+                    None
+                }
             })
             .collect();
 
         // At minimum, 2+3=5 should be folded
-        assert!(consts.contains(&U256::from(5u64)) || consts.contains(&U256::from(20u64)),
-            "nested constants should fold, got: {:?}", consts);
+        assert!(
+            consts.contains(&U256::from(5u64)) || consts.contains(&U256::from(20u64)),
+            "nested constants should fold, got: {:?}",
+            consts
+        );
     }
 }

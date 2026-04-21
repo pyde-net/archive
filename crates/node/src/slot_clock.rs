@@ -32,7 +32,11 @@ impl SlotClock {
 
         Self {
             genesis_instant,
-            genesis_timestamp_ms: if genesis_timestamp_ms == 0 { now_ms } else { genesis_timestamp_ms },
+            genesis_timestamp_ms: if genesis_timestamp_ms == 0 {
+                now_ms
+            } else {
+                genesis_timestamp_ms
+            },
             slot_duration: Duration::from_millis(BLOCK_TIME_MS),
         }
     }

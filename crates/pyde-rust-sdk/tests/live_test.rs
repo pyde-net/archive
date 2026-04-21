@@ -26,12 +26,18 @@ const STRUCTURED: &str = "/tmp/pyde-ts-sdk-test/structured.json";
 
 fn key(index: usize) -> String {
     let p = "/tmp/pyde-live-test/node/devnet-keys.json";
-    let data = std::fs::read_to_string(p).expect("devnet-keys.json not found — start node with --dev");
+    let data =
+        std::fs::read_to_string(p).expect("devnet-keys.json not found — start node with --dev");
     let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-    parsed.as_array().unwrap()[index]["privateKey"].as_str().unwrap().to_string()
+    parsed.as_array().unwrap()[index]["privateKey"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
-fn provider() -> Provider { Provider::new("http://127.0.0.1:8545") }
+fn provider() -> Provider {
+    Provider::new("http://127.0.0.1:8545")
+}
 
 // ============================================================================
 // Group 1: Provider Basics
@@ -65,7 +71,11 @@ async fn g01_provider_basics() {
             Err(_) => continue, // block not stored in memory
         }
     }
-    assert!(current > 0, "node should have produced blocks (block_number={})", current);
+    assert!(
+        current > 0,
+        "node should have produced blocks (block_number={})",
+        current
+    );
 
     println!("[PASS] Group 1: Provider Basics (7/7)");
 }
@@ -93,7 +103,10 @@ async fn g02_wallet_transfer() {
     let nonce_before = p.get_nonce(w0.address()).await.unwrap();
     let r = w0.transfer(&p, w1.address(), 1_000_000).await.unwrap();
     assert!(r.success);
-    assert_eq!(p.get_balance(w1.address()).await.unwrap(), bal_before + 1_000_000);
+    assert_eq!(
+        p.get_balance(w1.address()).await.unwrap(),
+        bal_before + 1_000_000
+    );
     assert!(p.get_nonce(w0.address()).await.unwrap() > nonce_before);
 
     // Transfer to zero — should succeed or revert (deploy to zero)
@@ -108,7 +121,10 @@ async fn g02_wallet_transfer() {
 // ============================================================================
 #[tokio::test]
 async fn g03_deploy_no_args() {
-    if !Path::new(COUNTER).exists() { println!("[SKIP] counter.json not found"); return; }
+    if !Path::new(COUNTER).exists() {
+        println!("[SKIP] counter.json not found");
+        return;
+    }
     let p = provider();
     let w = Wallet::from_private_key(&key(4)).unwrap();
 
@@ -122,7 +138,10 @@ async fn g03_deploy_no_args() {
     assert!(!code.is_empty());
 
     // read count = 0
-    let result = p.call(&addr, &ContractCall::new("get_count").build()).await.unwrap();
+    let result = p
+        .call(&addr, &ContractCall::new("get_count").build())
+        .await
+        .unwrap();
     assert_eq!(decode_u64(&result), Some(0));
 
     println!("[PASS] Group 3: Deploy no args (3/3)");
@@ -133,16 +152,23 @@ async fn g03_deploy_no_args() {
 // ============================================================================
 #[tokio::test]
 async fn g04_deploy_with_args() {
-    if !Path::new(COUNTER_ARGS).exists() { println!("[SKIP] counter_args.json"); return; }
+    if !Path::new(COUNTER_ARGS).exists() {
+        println!("[SKIP] counter_args.json");
+        return;
+    }
     let p = provider();
     let w = Wallet::from_private_key(&key(5)).unwrap();
 
-    let deploy = DeployData::from_artifact(COUNTER_ARGS, &serde_json::json!({"initial": 42})).unwrap();
+    let deploy =
+        DeployData::from_artifact(COUNTER_ARGS, &serde_json::json!({"initial": 42})).unwrap();
     let dr = w.deploy(&p, deploy.build(), 100_000_000).await.unwrap();
     assert!(dr.success);
     let addr = dr.contract_address().unwrap();
 
-    let result = p.call(&addr, &ContractCall::new("get_count").build()).await.unwrap();
+    let result = p
+        .call(&addr, &ContractCall::new("get_count").build())
+        .await
+        .unwrap();
     assert_eq!(decode_u64(&result), Some(42));
 
     println!("[PASS] Group 4: Deploy with args (2/2)");
@@ -153,7 +179,10 @@ async fn g04_deploy_with_args() {
 // ============================================================================
 #[tokio::test]
 async fn g05_deploy_payable() {
-    if !Path::new(VAULT).exists() { println!("[SKIP] vault.json"); return; }
+    if !Path::new(VAULT).exists() {
+        println!("[SKIP] vault.json");
+        return;
+    }
     let p = provider();
     let w = Wallet::from_private_key(&key(6)).unwrap();
 
@@ -163,11 +192,17 @@ async fn g05_deploy_payable() {
     let addr = dr.contract_address().unwrap();
 
     // get_owner returns deployer address
-    let owner = p.call(&addr, &ContractCall::new("get_owner").build()).await.unwrap();
+    let owner = p
+        .call(&addr, &ContractCall::new("get_owner").build())
+        .await
+        .unwrap();
     assert!(!owner.is_empty());
 
     // get_balance = 0 (deployed with 0 value)
-    let bal = p.call(&addr, &ContractCall::new("get_balance").build()).await.unwrap();
+    let bal = p
+        .call(&addr, &ContractCall::new("get_balance").build())
+        .await
+        .unwrap();
     assert_eq!(decode_u64(&bal), Some(0));
 
     println!("[PASS] Group 5: Deploy payable (3/3)");
@@ -178,7 +213,9 @@ async fn g05_deploy_payable() {
 // ============================================================================
 #[tokio::test]
 async fn g06_contract_read_write() {
-    if !Path::new(COUNTER).exists() { return; }
+    if !Path::new(COUNTER).exists() {
+        return;
+    }
     let p = provider();
     let w = Wallet::from_private_key(&key(7)).unwrap();
 
@@ -189,17 +226,36 @@ async fn g06_contract_read_write() {
     let get = ContractCall::new("get_count").build();
 
     // increment
-    let ir = w.send_call(&p, &addr, ContractCall::new("increment").build(), 100_000_000).await.unwrap();
+    let ir = w
+        .send_call(
+            &p,
+            &addr,
+            ContractCall::new("increment").build(),
+            100_000_000,
+        )
+        .await
+        .unwrap();
     assert!(ir.success);
     assert_eq!(decode_u64(&p.call(&addr, &get).await.unwrap()), Some(1));
 
     // set_count(99)
-    let sr = w.send_call(&p, &addr, ContractCall::new("set_count").arg_u64(99).build(), 100_000_000).await.unwrap();
+    let sr = w
+        .send_call(
+            &p,
+            &addr,
+            ContractCall::new("set_count").arg_u64(99).build(),
+            100_000_000,
+        )
+        .await
+        .unwrap();
     assert!(sr.success);
     assert_eq!(decode_u64(&p.call(&addr, &get).await.unwrap()), Some(99));
 
     // simulate — should NOT change state (call is read-only)
-    let _sim = p.call(&addr, &ContractCall::new("set_count").arg_u64(50).build()).await.unwrap();
+    let _sim = p
+        .call(&addr, &ContractCall::new("set_count").arg_u64(50).build())
+        .await
+        .unwrap();
     assert_eq!(decode_u64(&p.call(&addr, &get).await.unwrap()), Some(99));
 
     println!("[PASS] Group 6: Contract Read/Write (5/5)");
@@ -210,25 +266,72 @@ async fn g06_contract_read_write() {
 // ============================================================================
 #[tokio::test]
 async fn g07_payable_functions() {
-    if !Path::new(VAULT).exists() { return; }
+    if !Path::new(VAULT).exists() {
+        return;
+    }
     let p = provider();
     let w = Wallet::from_private_key(&key(8)).unwrap();
 
     let deploy = DeployData::from_artifact(VAULT, &serde_json::json!({})).unwrap();
-    let addr = w.deploy(&p, deploy.build(), 100_000_000).await.unwrap().contract_address().unwrap();
+    let addr = w
+        .deploy(&p, deploy.build(), 100_000_000)
+        .await
+        .unwrap()
+        .contract_address()
+        .unwrap();
 
     // deposit with value
-    let dr = w.send_call_with_value(&p, &addr, ContractCall::new("deposit").build(), 1_000_000, 100_000_000).await.unwrap();
+    let dr = w
+        .send_call_with_value(
+            &p,
+            &addr,
+            ContractCall::new("deposit").build(),
+            1_000_000,
+            100_000_000,
+        )
+        .await
+        .unwrap();
     assert!(dr.success);
-    assert_eq!(decode_u64(&p.call(&addr, &ContractCall::new("get_balance").build()).await.unwrap()), Some(1_000_000));
+    assert_eq!(
+        decode_u64(
+            &p.call(&addr, &ContractCall::new("get_balance").build())
+                .await
+                .unwrap()
+        ),
+        Some(1_000_000)
+    );
 
     // withdraw
-    let wr = w.send_call(&p, &addr, ContractCall::new("withdraw").arg_u64(500_000).build(), 100_000_000).await.unwrap();
+    let wr = w
+        .send_call(
+            &p,
+            &addr,
+            ContractCall::new("withdraw").arg_u64(500_000).build(),
+            100_000_000,
+        )
+        .await
+        .unwrap();
     assert!(wr.success);
-    assert_eq!(decode_u64(&p.call(&addr, &ContractCall::new("get_balance").build()).await.unwrap()), Some(500_000));
+    assert_eq!(
+        decode_u64(
+            &p.call(&addr, &ContractCall::new("get_balance").build())
+                .await
+                .unwrap()
+        ),
+        Some(500_000)
+    );
 
     // deposit with value=0 (should succeed, payable)
-    let zr = w.send_call_with_value(&p, &addr, ContractCall::new("deposit").build(), 0, 100_000_000).await.unwrap();
+    let zr = w
+        .send_call_with_value(
+            &p,
+            &addr,
+            ContractCall::new("deposit").build(),
+            0,
+            100_000_000,
+        )
+        .await
+        .unwrap();
     assert!(zr.success);
 
     println!("[PASS] Group 7: Payable Functions (5/5)");
@@ -239,24 +342,71 @@ async fn g07_payable_functions() {
 // ============================================================================
 #[tokio::test]
 async fn g08_struct_types() {
-    if !Path::new(STRUCTURED).exists() { println!("[SKIP] structured.json"); return; }
+    if !Path::new(STRUCTURED).exists() {
+        println!("[SKIP] structured.json");
+        return;
+    }
     let p = provider();
     let w = Wallet::from_private_key(&key(9)).unwrap();
 
     let deploy = DeployData::from_artifact(STRUCTURED, &serde_json::json!({})).unwrap();
-    let addr = w.deploy(&p, deploy.build(), 100_000_000).await.unwrap().contract_address().unwrap();
+    let addr = w
+        .deploy(&p, deploy.build(), 100_000_000)
+        .await
+        .unwrap()
+        .contract_address()
+        .unwrap();
 
     // set_user(name=42, age=25, active=true)
-    let set_user = ContractCall::new("set_user").arg_u64(42).arg_u64(25).arg_bool(true).build();
+    let set_user = ContractCall::new("set_user")
+        .arg_u64(42)
+        .arg_u64(25)
+        .arg_bool(true)
+        .build();
     w.send_call(&p, &addr, set_user, 100_000_000).await.unwrap();
 
-    assert_eq!(decode_u64(&p.call(&addr, &ContractCall::new("get_user_name").build()).await.unwrap()), Some(42));
-    assert_eq!(decode_u64(&p.call(&addr, &ContractCall::new("get_user_age").build()).await.unwrap()), Some(25));
-    assert_eq!(decode_bool(&p.call(&addr, &ContractCall::new("get_user_active").build()).await.unwrap()), Some(true));
+    assert_eq!(
+        decode_u64(
+            &p.call(&addr, &ContractCall::new("get_user_name").build())
+                .await
+                .unwrap()
+        ),
+        Some(42)
+    );
+    assert_eq!(
+        decode_u64(
+            &p.call(&addr, &ContractCall::new("get_user_age").build())
+                .await
+                .unwrap()
+        ),
+        Some(25)
+    );
+    assert_eq!(
+        decode_bool(
+            &p.call(&addr, &ContractCall::new("get_user_active").build())
+                .await
+                .unwrap()
+        ),
+        Some(true)
+    );
 
     // enum-like status
-    w.send_call(&p, &addr, ContractCall::new("set_status").arg_u64(2).build(), 100_000_000).await.unwrap();
-    assert_eq!(decode_u64(&p.call(&addr, &ContractCall::new("get_status").build()).await.unwrap()), Some(2));
+    w.send_call(
+        &p,
+        &addr,
+        ContractCall::new("set_status").arg_u64(2).build(),
+        100_000_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        decode_u64(
+            &p.call(&addr, &ContractCall::new("get_status").build())
+                .await
+                .unwrap()
+        ),
+        Some(2)
+    );
 
     println!("[PASS] Group 8: Struct/Multi-field Types (4/4)");
 }
@@ -266,24 +416,44 @@ async fn g08_struct_types() {
 // ============================================================================
 #[tokio::test]
 async fn g09_events() {
-    if !Path::new(VAULT).exists() { return; }
+    if !Path::new(VAULT).exists() {
+        return;
+    }
     let p = provider();
     let w = Wallet::from_private_key(&key(0)).unwrap();
 
     let deploy = DeployData::from_artifact(VAULT, &serde_json::json!({})).unwrap();
-    let addr = w.deploy(&p, deploy.build(), 100_000_000).await.unwrap().contract_address().unwrap();
-    let dr = w.send_call_with_value(&p, &addr, ContractCall::new("deposit").build(), 5000, 100_000_000).await.unwrap();
+    let addr = w
+        .deploy(&p, deploy.build(), 100_000_000)
+        .await
+        .unwrap()
+        .contract_address()
+        .unwrap();
+    let dr = w
+        .send_call_with_value(
+            &p,
+            &addr,
+            ContractCall::new("deposit").build(),
+            5000,
+            100_000_000,
+        )
+        .await
+        .unwrap();
     assert!(dr.success);
 
     // Receipt should have logs
     assert!(!dr.logs.is_empty(), "deposit should emit logs");
 
     // getLogs
-    let logs = p.get_logs(&LogFilter {
-        from_block: None, to_block: None,
-        address: Some(format_address(&addr)),
-        topics: None,
-    }).await.unwrap();
+    let logs = p
+        .get_logs(&LogFilter {
+            from_block: None,
+            to_block: None,
+            address: Some(format_address(&addr)),
+            topics: None,
+        })
+        .await
+        .unwrap();
     assert!(!logs.is_empty(), "getLogs should return deposit events");
 
     println!("[PASS] Group 9: Events (5/5)");
@@ -294,14 +464,24 @@ async fn g09_events() {
 // ============================================================================
 #[tokio::test]
 async fn g10_gas_estimation() {
-    if !Path::new(COUNTER).exists() { return; }
+    if !Path::new(COUNTER).exists() {
+        return;
+    }
     let p = provider();
     let w = Wallet::from_private_key(&key(1)).unwrap();
 
     let deploy = DeployData::from_artifact(COUNTER, &serde_json::json!({})).unwrap();
-    let addr = w.deploy(&p, deploy.build(), 100_000_000).await.unwrap().contract_address().unwrap();
+    let addr = w
+        .deploy(&p, deploy.build(), 100_000_000)
+        .await
+        .unwrap()
+        .contract_address()
+        .unwrap();
 
-    let est = p.estimate_gas(&addr, &ContractCall::new("increment").build()).await.unwrap();
+    let est = p
+        .estimate_gas(&addr, &ContractCall::new("increment").build())
+        .await
+        .unwrap();
     assert!(est > 0 && est < 10_000_000);
 
     println!("[PASS] Group 10: Gas Estimation (3/3) est={}", est);
@@ -312,21 +492,45 @@ async fn g10_gas_estimation() {
 // ============================================================================
 #[tokio::test]
 async fn g11_decode_return_data() {
-    if !Path::new(COUNTER).exists() { return; }
+    if !Path::new(COUNTER).exists() {
+        return;
+    }
     let p = provider();
     let w = Wallet::from_private_key(&key(1)).unwrap();
 
     let deploy = DeployData::from_artifact(COUNTER, &serde_json::json!({})).unwrap();
-    let addr = w.deploy(&p, deploy.build(), 100_000_000).await.unwrap().contract_address().unwrap();
+    let addr = w
+        .deploy(&p, deploy.build(), 100_000_000)
+        .await
+        .unwrap()
+        .contract_address()
+        .unwrap();
 
     // void return (set_count) — return_data should be empty or 0
-    let sr = w.send_call(&p, &addr, ContractCall::new("set_count").arg_u64(42).build(), 100_000_000).await.unwrap();
+    let sr = w
+        .send_call(
+            &p,
+            &addr,
+            ContractCall::new("set_count").arg_u64(42).build(),
+            100_000_000,
+        )
+        .await
+        .unwrap();
     assert!(sr.success);
     // Void functions still have return_data from the pipeline
 
     // Non-void via ABI contract
-    let contract = Contract::from_artifact(COUNTER, addr, &p).unwrap().connect(&w);
-    let cr = contract.write("set_count", Some(&serde_json::json!({"val": 77})), 100_000_000).await.unwrap();
+    let contract = Contract::from_artifact(COUNTER, addr, &p)
+        .unwrap()
+        .connect(&w);
+    let cr = contract
+        .write(
+            "set_count",
+            Some(&serde_json::json!({"val": 77})),
+            100_000_000,
+        )
+        .await
+        .unwrap();
     assert!(cr.success);
     // void → decode_return_data should be None/Unit
     let decoded = cr.decode_return_data();
@@ -341,12 +545,16 @@ async fn g11_decode_return_data() {
 // ============================================================================
 #[tokio::test]
 async fn g12_interface_standalone() {
-    if !Path::new(COUNTER).exists() { return; }
+    if !Path::new(COUNTER).exists() {
+        return;
+    }
 
     let iface = Interface::from_artifact(COUNTER).unwrap();
 
     // encodeFunctionData
-    let data = iface.encode_function_data("set_count", &serde_json::json!({"val": 123})).unwrap();
+    let data = iface
+        .encode_function_data("set_count", &serde_json::json!({"val": 123}))
+        .unwrap();
     assert!(!data.is_empty());
 
     // decodeFunctionResult
@@ -367,7 +575,10 @@ async fn g12_interface_standalone() {
 async fn g13_websocket() {
     let ws = match WsProvider::connect("ws://127.0.0.1:8545").await {
         Ok(ws) => ws,
-        Err(e) => { println!("[SKIP] WS connect failed: {}", e); return; }
+        Err(e) => {
+            println!("[SKIP] WS connect failed: {}", e);
+            return;
+        }
     };
 
     let chain_id = ws.get_chain_id().await.unwrap();
@@ -383,10 +594,7 @@ async fn g13_websocket() {
     // Subscribe to new blocks
     let mut rx = ws.subscribe_new_heads().await.unwrap();
     // Wait for one block (max 3s)
-    let got_block = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        rx.recv()
-    ).await;
+    let got_block = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await;
     assert!(got_block.is_ok(), "should receive block header via WS");
 
     ws.close().await;
@@ -413,10 +621,33 @@ async fn g14_error_handling() {
         let p = provider();
         let w = Wallet::from_private_key(&key(9)).unwrap();
         let deploy = DeployData::from_artifact(STRUCTURED, &serde_json::json!({})).unwrap();
-        let addr = w.deploy(&p, deploy.build(), 100_000_000).await.unwrap().contract_address().unwrap();
+        let addr = w
+            .deploy(&p, deploy.build(), 100_000_000)
+            .await
+            .unwrap()
+            .contract_address()
+            .unwrap();
         // Set active=false, then call must_be_active → should revert
-        w.send_call(&p, &addr, ContractCall::new("set_user").arg_u64(0).arg_u64(0).arg_bool(false).build(), 100_000_000).await.unwrap();
-        let revert_result = w.send_call(&p, &addr, ContractCall::new("must_be_active").build(), 100_000_000).await;
+        w.send_call(
+            &p,
+            &addr,
+            ContractCall::new("set_user")
+                .arg_u64(0)
+                .arg_u64(0)
+                .arg_bool(false)
+                .build(),
+            100_000_000,
+        )
+        .await
+        .unwrap();
+        let revert_result = w
+            .send_call(
+                &p,
+                &addr,
+                ContractCall::new("must_be_active").build(),
+                100_000_000,
+            )
+            .await;
         assert!(revert_result.is_err() || !revert_result.unwrap().success);
     }
 
@@ -445,11 +676,20 @@ async fn g16_batch_rpc() {
     let w = Wallet::from_private_key(&key(0)).unwrap();
     let addr_hex = format_address(w.address());
 
-    let results = p.batch(&[
-        ("pyde_getBalance", &[serde_json::Value::String(addr_hex.clone())]),
-        ("pyde_getTransactionCount", &[serde_json::Value::String(addr_hex)]),
-        ("pyde_chainId", &[]),
-    ]).await.unwrap();
+    let results = p
+        .batch(&[
+            (
+                "pyde_getBalance",
+                &[serde_json::Value::String(addr_hex.clone())],
+            ),
+            (
+                "pyde_getTransactionCount",
+                &[serde_json::Value::String(addr_hex)],
+            ),
+            ("pyde_chainId", &[]),
+        ])
+        .await
+        .unwrap();
     assert_eq!(results.len(), 3);
     println!("[PASS] Group 16: Batch RPC (1/1)");
 }

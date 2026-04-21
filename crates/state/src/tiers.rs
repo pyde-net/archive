@@ -216,9 +216,7 @@ impl<W: StoreReadOps<SmtValue>, C: ColdStorage> StoreReadOps<SmtValue> for Tiere
         // Warm
         if let Ok(Some(val)) = self.warm.get_leaf(leaf_key) {
             *self.warm_hits.borrow_mut() += 1;
-            self.hot_leaves
-                .borrow_mut()
-                .insert(*leaf_key, val.clone());
+            self.hot_leaves.borrow_mut().insert(*leaf_key, val.clone());
             self.hot_leaf_access.borrow_mut().insert(*leaf_key, height);
             return Ok(Some(val));
         }
@@ -226,9 +224,7 @@ impl<W: StoreReadOps<SmtValue>, C: ColdStorage> StoreReadOps<SmtValue> for Tiere
         // Cold
         if let Some(val) = self.cold.get_leaf(leaf_key) {
             *self.cold_hits.borrow_mut() += 1;
-            self.hot_leaves
-                .borrow_mut()
-                .insert(*leaf_key, val.clone());
+            self.hot_leaves.borrow_mut().insert(*leaf_key, val.clone());
             self.hot_leaf_access.borrow_mut().insert(*leaf_key, height);
             return Ok(Some(val));
         }
@@ -238,9 +234,7 @@ impl<W: StoreReadOps<SmtValue>, C: ColdStorage> StoreReadOps<SmtValue> for Tiere
     }
 }
 
-impl<W: StoreWriteOps<SmtValue>, C: ColdStorage> StoreWriteOps<SmtValue>
-    for TieredBackend<W, C>
-{
+impl<W: StoreWriteOps<SmtValue>, C: ColdStorage> StoreWriteOps<SmtValue> for TieredBackend<W, C> {
     fn insert_branch(
         &mut self,
         node_key: BranchKey,
@@ -250,9 +244,7 @@ impl<W: StoreWriteOps<SmtValue>, C: ColdStorage> StoreWriteOps<SmtValue>
         self.hot_branches
             .borrow_mut()
             .insert(node_key.clone(), branch);
-        self.hot_branch_access
-            .borrow_mut()
-            .insert(node_key, height);
+        self.hot_branch_access.borrow_mut().insert(node_key, height);
         Ok(())
     }
 
@@ -276,10 +268,7 @@ impl<W: StoreWriteOps<SmtValue>, C: ColdStorage> StoreWriteOps<SmtValue>
         self.warm.remove_branch(node_key)
     }
 
-    fn remove_leaf(
-        &mut self,
-        leaf_key: &H256,
-    ) -> Result<(), sparse_merkle_tree::error::Error> {
+    fn remove_leaf(&mut self, leaf_key: &H256) -> Result<(), sparse_merkle_tree::error::Error> {
         self.hot_leaves.borrow_mut().remove(leaf_key);
         self.hot_leaf_access.borrow_mut().remove(leaf_key);
         self.warm.remove_leaf(leaf_key)
@@ -327,7 +316,9 @@ mod tests {
 
         // We need to write through a real SMT to populate correctly
         let mut warm_smt = SMT::new(H256::zero(), InMemoryBackend::new());
-        warm_smt.update(key, SmtValue(b"warm_data".to_vec())).unwrap();
+        warm_smt
+            .update(key, SmtValue(b"warm_data".to_vec()))
+            .unwrap();
         let root = *warm_smt.root();
         let warm_store = warm_smt.take_store();
 
@@ -405,7 +396,12 @@ mod tests {
     #[test]
     fn cold_storage_returns_none() {
         let cold = NullColdStorage;
-        assert!(cold.get_branch(&BranchKey { height: 0, node_key: H256::zero() }).is_none());
+        assert!(cold
+            .get_branch(&BranchKey {
+                height: 0,
+                node_key: H256::zero()
+            })
+            .is_none());
         assert!(cold.get_leaf(&H256::zero()).is_none());
     }
 }

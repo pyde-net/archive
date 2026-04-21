@@ -2,8 +2,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 /// Initialize the tracing subscriber based on config.
 pub fn init(level: &str, json: bool) {
-    let filter = EnvFilter::try_new(level)
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
 
     if json {
         fmt()

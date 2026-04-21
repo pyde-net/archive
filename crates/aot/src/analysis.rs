@@ -3,9 +3,7 @@
 //! Splits bytecode into basic blocks for efficient compilation. A basic block
 //! is a maximal sequence of instructions with one entry and one exit.
 
-use pyde_vm::isa::{
-    decode, sign_extend_18, total_gas, DecodedInstruction, Instruction, Opcode,
-};
+use pyde_vm::isa::{decode, sign_extend_18, total_gas, DecodedInstruction, Instruction, Opcode};
 
 /// A basic block in the PVM bytecode.
 #[derive(Clone, Debug)]
@@ -71,12 +69,7 @@ fn is_terminator(op: Opcode) -> bool {
 fn has_branch_target(op: Opcode) -> bool {
     matches!(
         op,
-        Opcode::Jmp
-            | Opcode::Beq
-            | Opcode::Bne
-            | Opcode::Blt
-            | Opcode::Bge
-            | Opcode::Call
+        Opcode::Jmp | Opcode::Beq | Opcode::Bne | Opcode::Blt | Opcode::Bge | Opcode::Call
     )
 }
 
@@ -172,7 +165,9 @@ mod tests {
     }
 
     fn instr_ri(op: Opcode, rd: u8, rs1: u8, imm: i32) -> [u8; 4] {
-        encode(op, rd, rs1, encode_immediate(imm).unwrap()).0.to_le_bytes()
+        encode(op, rd, rs1, encode_immediate(imm).unwrap())
+            .0
+            .to_le_bytes()
     }
 
     fn bytecode(instrs: &[[u8; 4]]) -> Vec<u8> {

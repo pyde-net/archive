@@ -10,8 +10,8 @@
 //! - Error recovery (skip to next valid token)
 //! - Source location tracking (line, column per token)
 
-use ethnum::U256;
 use crate::token::{Span, Token, TokenKind};
+use ethnum::U256;
 
 /// A lexer error with source location.
 #[derive(Clone, Debug, PartialEq)]
@@ -144,7 +144,8 @@ impl<'a> Lexer<'a> {
             if self.pos + 1 < self.src.len() && self.src[self.pos] == b'/' {
                 if self.src[self.pos + 1] == b'/' {
                     // Check for doc comment: ///
-                    if self.pos + 2 < self.src.len() && self.src[self.pos + 2] == b'/'
+                    if self.pos + 2 < self.src.len()
+                        && self.src[self.pos + 2] == b'/'
                         && (self.pos + 3 >= self.src.len() || self.src[self.pos + 3] != b'/')
                     {
                         // Doc comment — return as token
@@ -154,13 +155,15 @@ impl<'a> Lexer<'a> {
                         self.advance(); // /
                         self.advance(); // /
                         self.advance(); // /
-                        // Skip optional leading space
+                                        // Skip optional leading space
                         if self.peek() == Some(b' ') {
                             self.advance();
                         }
                         let content_start = self.pos;
                         while let Some(ch) = self.peek() {
-                            if ch == b'\n' { break; }
+                            if ch == b'\n' {
+                                break;
+                            }
                             self.advance();
                         }
                         let content = std::str::from_utf8(&self.src[content_start..self.pos])
@@ -399,9 +402,7 @@ impl<'a> Lexer<'a> {
             b'0'..=b'9' => self.lex_number(ch, start, start_line, start_col),
 
             // Identifier or keyword
-            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
-                self.lex_ident_or_keyword(ch, start)
-            }
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_ident_or_keyword(ch, start),
 
             // Unknown character — error recovery
             _ => {
@@ -505,7 +506,13 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn lex_number(&mut self, first: u8, _start: usize, start_line: u32, start_col: u32) -> TokenKind {
+    fn lex_number(
+        &mut self,
+        first: u8,
+        _start: usize,
+        start_line: u32,
+        start_col: u32,
+    ) -> TokenKind {
         // Check for hex: 0x...
         if first == b'0' && self.peek() == Some(b'x') {
             self.advance(); // consume 'x'
@@ -517,7 +524,8 @@ impl<'a> Lexer<'a> {
             match ch {
                 b'0'..=b'9' => {
                     self.advance();
-                    val = val.checked_mul(U256::from(10u64))
+                    val = val
+                        .checked_mul(U256::from(10u64))
                         .and_then(|v| v.checked_add(U256::from((ch - b'0') as u64)))
                         .unwrap_or_else(|| {
                             self.errors.push(LexError {
@@ -528,7 +536,9 @@ impl<'a> Lexer<'a> {
                             U256::ZERO
                         });
                 }
-                b'_' => { self.advance(); } // underscore separator
+                b'_' => {
+                    self.advance();
+                } // underscore separator
                 _ => break,
             }
         }
@@ -543,7 +553,8 @@ impl<'a> Lexer<'a> {
                 b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F' => {
                     self.advance();
                     has_digits = true;
-                    val = val.checked_mul(U256::from(16u64))
+                    val = val
+                        .checked_mul(U256::from(16u64))
                         .and_then(|v| v.checked_add(U256::from(hex_digit(ch) as u64)))
                         .unwrap_or_else(|| {
                             self.errors.push(LexError {
@@ -554,7 +565,9 @@ impl<'a> Lexer<'a> {
                             U256::ZERO
                         });
                 }
-                b'_' => { self.advance(); }
+                b'_' => {
+                    self.advance();
+                }
                 _ => break,
             }
         }
@@ -620,17 +633,42 @@ mod tests {
                    fn pub let mut if else for while match return emit try \
                    use module in as break continue self type true false";
         let kinds = lex(src);
-        assert_eq!(kinds, vec![
-            TokenKind::Contract, TokenKind::Storage, TokenKind::Struct,
-            TokenKind::Interface, TokenKind::Event, TokenKind::Error,
-            TokenKind::Enum, TokenKind::Const, TokenKind::Fn, TokenKind::Pub,
-            TokenKind::Let, TokenKind::Mut, TokenKind::If, TokenKind::Else,
-            TokenKind::For, TokenKind::While, TokenKind::Match, TokenKind::Return,
-            TokenKind::Emit, TokenKind::Try, TokenKind::Use, TokenKind::Module,
-            TokenKind::In, TokenKind::As, TokenKind::Break, TokenKind::Continue,
-            TokenKind::SelfKw, TokenKind::TypeKw, TokenKind::True, TokenKind::False,
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Contract,
+                TokenKind::Storage,
+                TokenKind::Struct,
+                TokenKind::Interface,
+                TokenKind::Event,
+                TokenKind::Error,
+                TokenKind::Enum,
+                TokenKind::Const,
+                TokenKind::Fn,
+                TokenKind::Pub,
+                TokenKind::Let,
+                TokenKind::Mut,
+                TokenKind::If,
+                TokenKind::Else,
+                TokenKind::For,
+                TokenKind::While,
+                TokenKind::Match,
+                TokenKind::Return,
+                TokenKind::Emit,
+                TokenKind::Try,
+                TokenKind::Use,
+                TokenKind::Module,
+                TokenKind::In,
+                TokenKind::As,
+                TokenKind::Break,
+                TokenKind::Continue,
+                TokenKind::SelfKw,
+                TokenKind::TypeKw,
+                TokenKind::True,
+                TokenKind::False,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     // ========== Identifiers ==========
@@ -638,25 +676,31 @@ mod tests {
     #[test]
     fn lex_identifiers() {
         let kinds = lex("foo bar_baz MyType _private x123");
-        assert_eq!(kinds, vec![
-            TokenKind::Ident("foo".into()),
-            TokenKind::Ident("bar_baz".into()),
-            TokenKind::Ident("MyType".into()),
-            TokenKind::Ident("_private".into()),
-            TokenKind::Ident("x123".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Ident("foo".into()),
+                TokenKind::Ident("bar_baz".into()),
+                TokenKind::Ident("MyType".into()),
+                TokenKind::Ident("_private".into()),
+                TokenKind::Ident("x123".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn underscore_is_wildcard() {
         let kinds = lex("_ => foo");
-        assert_eq!(kinds, vec![
-            TokenKind::Underscore,
-            TokenKind::FatArrow,
-            TokenKind::Ident("foo".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Underscore,
+                TokenKind::FatArrow,
+                TokenKind::Ident("foo".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     // ========== Numeric literals ==========
@@ -664,35 +708,44 @@ mod tests {
     #[test]
     fn lex_decimal_integers() {
         let kinds = lex("0 42 1000 999999");
-        assert_eq!(kinds, vec![
-            TokenKind::IntLiteral(U256::from(0u64)),
-            TokenKind::IntLiteral(U256::from(42u64)),
-            TokenKind::IntLiteral(U256::from(1000u64)),
-            TokenKind::IntLiteral(U256::from(999999u64)),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::IntLiteral(U256::from(0u64)),
+                TokenKind::IntLiteral(U256::from(42u64)),
+                TokenKind::IntLiteral(U256::from(1000u64)),
+                TokenKind::IntLiteral(U256::from(999999u64)),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_hex_integers() {
         let kinds = lex("0xFF 0x0 0xDEAD_BEEF 0xABCDEF");
-        assert_eq!(kinds, vec![
-            TokenKind::IntLiteral(U256::from(0xFFu64)),
-            TokenKind::IntLiteral(U256::from(0x0u64)),
-            TokenKind::IntLiteral(U256::from(0xDEAD_BEEFu64)),
-            TokenKind::IntLiteral(U256::from(0xABCDEFu64)),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::IntLiteral(U256::from(0xFFu64)),
+                TokenKind::IntLiteral(U256::from(0x0u64)),
+                TokenKind::IntLiteral(U256::from(0xDEAD_BEEFu64)),
+                TokenKind::IntLiteral(U256::from(0xABCDEFu64)),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_underscored_numbers() {
         let kinds = lex("1_000_000 0xFF_FF");
-        assert_eq!(kinds, vec![
-            TokenKind::IntLiteral(U256::from(1_000_000u64)),
-            TokenKind::IntLiteral(U256::from(0xFFFFu64)),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::IntLiteral(U256::from(1_000_000u64)),
+                TokenKind::IntLiteral(U256::from(0xFFFFu64)),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     // ========== String literals ==========
@@ -700,37 +753,43 @@ mod tests {
     #[test]
     fn lex_simple_string() {
         let kinds = lex(r#""hello world""#);
-        assert_eq!(kinds, vec![
-            TokenKind::StringLiteral("hello world".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::StringLiteral("hello world".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_string_with_escapes() {
         let kinds = lex(r#""hello\nworld\t\"foo\\bar""#);
-        assert_eq!(kinds, vec![
-            TokenKind::StringLiteral("hello\nworld\t\"foo\\bar".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::StringLiteral("hello\nworld\t\"foo\\bar".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_empty_string() {
         let kinds = lex(r#""""#);
-        assert_eq!(kinds, vec![
-            TokenKind::StringLiteral("".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![TokenKind::StringLiteral("".into()), TokenKind::Eof,]
+        );
     }
 
     #[test]
     fn lex_hex_escape_in_string() {
         let kinds = lex(r#""\x41\x42""#);
-        assert_eq!(kinds, vec![
-            TokenKind::StringLiteral("AB".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![TokenKind::StringLiteral("AB".into()), TokenKind::Eof,]
+        );
     }
 
     // ========== Operators ==========
@@ -738,56 +797,96 @@ mod tests {
     #[test]
     fn lex_arithmetic_operators() {
         let kinds = lex("+ - * / %");
-        assert_eq!(kinds, vec![
-            TokenKind::Plus, TokenKind::Minus, TokenKind::Star,
-            TokenKind::Slash, TokenKind::Percent, TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Plus,
+                TokenKind::Minus,
+                TokenKind::Star,
+                TokenKind::Slash,
+                TokenKind::Percent,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_comparison_operators() {
         let kinds = lex("== != < > <= >=");
-        assert_eq!(kinds, vec![
-            TokenKind::EqEq, TokenKind::BangEq, TokenKind::Lt, TokenKind::Gt,
-            TokenKind::LtEq, TokenKind::GtEq, TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::EqEq,
+                TokenKind::BangEq,
+                TokenKind::Lt,
+                TokenKind::Gt,
+                TokenKind::LtEq,
+                TokenKind::GtEq,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_logical_operators() {
         let kinds = lex("&& || !");
-        assert_eq!(kinds, vec![
-            TokenKind::AmpAmp, TokenKind::PipePipe, TokenKind::Bang,
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::AmpAmp,
+                TokenKind::PipePipe,
+                TokenKind::Bang,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_bitwise_operators() {
         let kinds = lex("& | ^ ~ << >>");
-        assert_eq!(kinds, vec![
-            TokenKind::Amp, TokenKind::Pipe, TokenKind::Caret,
-            TokenKind::Tilde, TokenKind::Shl, TokenKind::Shr, TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Amp,
+                TokenKind::Pipe,
+                TokenKind::Caret,
+                TokenKind::Tilde,
+                TokenKind::Shl,
+                TokenKind::Shr,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_assignment_operators() {
         let kinds = lex("= += -= *= /= %= &= |= ^= <<= >>=");
-        assert_eq!(kinds, vec![
-            TokenKind::Eq, TokenKind::PlusEq, TokenKind::MinusEq,
-            TokenKind::StarEq, TokenKind::SlashEq, TokenKind::PercentEq,
-            TokenKind::AmpEq, TokenKind::PipeEq, TokenKind::CaretEq,
-            TokenKind::ShlEq, TokenKind::ShrEq, TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Eq,
+                TokenKind::PlusEq,
+                TokenKind::MinusEq,
+                TokenKind::StarEq,
+                TokenKind::SlashEq,
+                TokenKind::PercentEq,
+                TokenKind::AmpEq,
+                TokenKind::PipeEq,
+                TokenKind::CaretEq,
+                TokenKind::ShlEq,
+                TokenKind::ShrEq,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_arrow_operators() {
         let kinds = lex("-> =>");
-        assert_eq!(kinds, vec![
-            TokenKind::Arrow, TokenKind::FatArrow, TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![TokenKind::Arrow, TokenKind::FatArrow, TokenKind::Eof,]
+        );
     }
 
     // ========== Punctuation ==========
@@ -795,13 +894,26 @@ mod tests {
     #[test]
     fn lex_punctuation() {
         let kinds = lex("{ } ( ) [ ] , ; : :: . .. ? #");
-        assert_eq!(kinds, vec![
-            TokenKind::LBrace, TokenKind::RBrace, TokenKind::LParen,
-            TokenKind::RParen, TokenKind::LBracket, TokenKind::RBracket,
-            TokenKind::Comma, TokenKind::Semicolon, TokenKind::Colon,
-            TokenKind::ColonColon, TokenKind::Dot, TokenKind::DotDot,
-            TokenKind::Question, TokenKind::Hash, TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::LBrace,
+                TokenKind::RBrace,
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::LBracket,
+                TokenKind::RBracket,
+                TokenKind::Comma,
+                TokenKind::Semicolon,
+                TokenKind::Colon,
+                TokenKind::ColonColon,
+                TokenKind::Dot,
+                TokenKind::DotDot,
+                TokenKind::Question,
+                TokenKind::Hash,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     // ========== Attributes ==========
@@ -809,35 +921,44 @@ mod tests {
     #[test]
     fn lex_attributes() {
         let kinds = lex("#[constructor] #[view] #[reentrant] #[parallel_safe]");
-        assert_eq!(kinds, vec![
-            TokenKind::Attribute("constructor".into()),
-            TokenKind::Attribute("view".into()),
-            TokenKind::Attribute("reentrant".into()),
-            TokenKind::Attribute("parallel_safe".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Attribute("constructor".into()),
+                TokenKind::Attribute("view".into()),
+                TokenKind::Attribute("reentrant".into()),
+                TokenKind::Attribute("parallel_safe".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_attribute_with_args() {
         let kinds = lex("#[role(ADMIN)] #[should_panic(expected = \"overflow\")]");
-        assert_eq!(kinds, vec![
-            TokenKind::Attribute("role(ADMIN)".into()),
-            TokenKind::Attribute("should_panic(expected = \"overflow\")".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Attribute("role(ADMIN)".into()),
+                TokenKind::Attribute("should_panic(expected = \"overflow\")".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_indexed_attribute() {
         let kinds = lex("#[indexed] #[test] #[sponsored] #[only_owner]");
-        assert_eq!(kinds, vec![
-            TokenKind::Attribute("indexed".into()),
-            TokenKind::Attribute("test".into()),
-            TokenKind::Attribute("sponsored".into()),
-            TokenKind::Attribute("only_owner".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Attribute("indexed".into()),
+                TokenKind::Attribute("test".into()),
+                TokenKind::Attribute("sponsored".into()),
+                TokenKind::Attribute("only_owner".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     // ========== Comments ==========
@@ -845,31 +966,40 @@ mod tests {
     #[test]
     fn lex_line_comment() {
         let kinds = lex("foo // this is a comment\nbar");
-        assert_eq!(kinds, vec![
-            TokenKind::Ident("foo".into()),
-            TokenKind::Ident("bar".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Ident("foo".into()),
+                TokenKind::Ident("bar".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_block_comment() {
         let kinds = lex("foo /* block comment */ bar");
-        assert_eq!(kinds, vec![
-            TokenKind::Ident("foo".into()),
-            TokenKind::Ident("bar".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Ident("foo".into()),
+                TokenKind::Ident("bar".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_nested_block_comment() {
         let kinds = lex("foo /* outer /* inner */ still comment */ bar");
-        assert_eq!(kinds, vec![
-            TokenKind::Ident("foo".into()),
-            TokenKind::Ident("bar".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Ident("foo".into()),
+                TokenKind::Ident("bar".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     // ========== Source locations ==========
@@ -891,11 +1021,14 @@ mod tests {
     fn lex_error_recovery() {
         let (kinds, errors) = lex_with_errors("foo @ bar");
         // Should skip '@' and continue
-        assert_eq!(kinds, vec![
-            TokenKind::Ident("foo".into()),
-            TokenKind::Ident("bar".into()),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Ident("foo".into()),
+                TokenKind::Ident("bar".into()),
+                TokenKind::Eof,
+            ]
+        );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("unexpected character"));
     }
@@ -971,61 +1104,73 @@ contract Token {
     #[test]
     fn lex_range_expression() {
         let kinds = lex("0..10");
-        assert_eq!(kinds, vec![
-            TokenKind::IntLiteral(U256::from(0u64)),
-            TokenKind::DotDot,
-            TokenKind::IntLiteral(U256::from(10u64)),
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::IntLiteral(U256::from(0u64)),
+                TokenKind::DotDot,
+                TokenKind::IntLiteral(U256::from(10u64)),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_generic_type() {
         // Map<Address, u256> should lex as individual tokens
         let kinds = lex("Map<Address, u256>");
-        assert_eq!(kinds, vec![
-            TokenKind::Ident("Map".into()),
-            TokenKind::Lt,
-            TokenKind::Ident("Address".into()),
-            TokenKind::Comma,
-            TokenKind::Ident("u256".into()),
-            TokenKind::Gt,
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Ident("Map".into()),
+                TokenKind::Lt,
+                TokenKind::Ident("Address".into()),
+                TokenKind::Comma,
+                TokenKind::Ident("u256".into()),
+                TokenKind::Gt,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_method_call_chain() {
         let kinds = lex("self.balances[msg.sender]");
-        assert_eq!(kinds, vec![
-            TokenKind::SelfKw,
-            TokenKind::Dot,
-            TokenKind::Ident("balances".into()),
-            TokenKind::LBracket,
-            TokenKind::Ident("msg".into()),
-            TokenKind::Dot,
-            TokenKind::Ident("sender".into()),
-            TokenKind::RBracket,
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::SelfKw,
+                TokenKind::Dot,
+                TokenKind::Ident("balances".into()),
+                TokenKind::LBracket,
+                TokenKind::Ident("msg".into()),
+                TokenKind::Dot,
+                TokenKind::Ident("sender".into()),
+                TokenKind::RBracket,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
     fn lex_require_macro() {
         let kinds = lex("require!(balance >= amount, InsufficientBalance {})");
-        assert_eq!(kinds, vec![
-            TokenKind::Ident("require".into()),
-            TokenKind::Bang,
-            TokenKind::LParen,
-            TokenKind::Ident("balance".into()),
-            TokenKind::GtEq,
-            TokenKind::Ident("amount".into()),
-            TokenKind::Comma,
-            TokenKind::Ident("InsufficientBalance".into()),
-            TokenKind::LBrace,
-            TokenKind::RBrace,
-            TokenKind::RParen,
-            TokenKind::Eof,
-        ]);
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Ident("require".into()),
+                TokenKind::Bang,
+                TokenKind::LParen,
+                TokenKind::Ident("balance".into()),
+                TokenKind::GtEq,
+                TokenKind::Ident("amount".into()),
+                TokenKind::Comma,
+                TokenKind::Ident("InsufficientBalance".into()),
+                TokenKind::LBrace,
+                TokenKind::RBrace,
+                TokenKind::RParen,
+                TokenKind::Eof,
+            ]
+        );
     }
 }

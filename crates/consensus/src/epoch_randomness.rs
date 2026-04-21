@@ -18,8 +18,8 @@
 
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{FalconPublicKey, FalconSecretKey};
-use pyde_crypto::poseidon2::poseidon2_many;
 use pyde_crypto::hash::Hash256;
+use pyde_crypto::poseidon2::poseidon2_many;
 use pyde_crypto::vrf::{vrf_prove, vrf_verify, VrfOutput, VrfProof};
 
 use crate::block::COMMITTEE_SIZE;
@@ -92,11 +92,7 @@ pub fn generate_share(
 /// Verify a randomness share from another validator.
 ///
 /// Returns true if the share is a valid VRF output for the given epoch.
-pub fn verify_share(
-    share: &RandomnessShare,
-    public_key: &FalconPublicKey,
-    epoch: u64,
-) -> bool {
+pub fn verify_share(share: &RandomnessShare, public_key: &FalconPublicKey, epoch: u64) -> bool {
     let input = randomness_vrf_input(epoch);
     vrf_verify(public_key, &input, &share.vrf_output, &share.vrf_proof)
 }
@@ -257,9 +253,7 @@ mod tests {
         let shares: Vec<RandomnessShare> = committee
             .iter()
             .enumerate()
-            .map(|(i, (pk, sk, addr))| {
-                generate_share(pk, sk, epoch, i as u8, *addr).unwrap()
-            })
+            .map(|(i, (pk, sk, addr))| generate_share(pk, sk, epoch, i as u8, *addr).unwrap())
             .collect();
 
         let result = combine_shares(&shares, epoch);
@@ -278,9 +272,7 @@ mod tests {
         let shares: Vec<RandomnessShare> = committee
             .iter()
             .enumerate()
-            .map(|(i, (pk, sk, addr))| {
-                generate_share(pk, sk, epoch, i as u8, *addr).unwrap()
-            })
+            .map(|(i, (pk, sk, addr))| generate_share(pk, sk, epoch, i as u8, *addr).unwrap())
             .collect();
 
         assert!(combine_shares(&shares, epoch).is_none());
@@ -294,9 +286,7 @@ mod tests {
         let shares: Vec<RandomnessShare> = committee
             .iter()
             .enumerate()
-            .map(|(i, (pk, sk, addr))| {
-                generate_share(pk, sk, epoch, i as u8, *addr).unwrap()
-            })
+            .map(|(i, (pk, sk, addr))| generate_share(pk, sk, epoch, i as u8, *addr).unwrap())
             .collect();
 
         let r1 = combine_shares(&shares, epoch).unwrap();
@@ -312,9 +302,7 @@ mod tests {
         let mut shares: Vec<RandomnessShare> = committee
             .iter()
             .enumerate()
-            .map(|(i, (pk, sk, addr))| {
-                generate_share(pk, sk, epoch, i as u8, *addr).unwrap()
-            })
+            .map(|(i, (pk, sk, addr))| generate_share(pk, sk, epoch, i as u8, *addr).unwrap())
             .collect();
 
         // Duplicate the last share — shouldn't count as an extra
@@ -334,9 +322,7 @@ mod tests {
         let all_shares: Vec<RandomnessShare> = committee
             .iter()
             .enumerate()
-            .map(|(i, (pk, sk, addr))| {
-                generate_share(pk, sk, epoch, i as u8, *addr).unwrap()
-            })
+            .map(|(i, (pk, sk, addr))| generate_share(pk, sk, epoch, i as u8, *addr).unwrap())
             .collect();
 
         // Subset A: first 85
@@ -363,9 +349,7 @@ mod tests {
         let shares: Vec<RandomnessShare> = committee
             .iter()
             .enumerate()
-            .map(|(i, (pk, sk, addr))| {
-                generate_share(pk, sk, epoch, i as u8, *addr).unwrap()
-            })
+            .map(|(i, (pk, sk, addr))| generate_share(pk, sk, epoch, i as u8, *addr).unwrap())
             .collect();
 
         // Forward order

@@ -11,7 +11,7 @@ fn bench_prove() {
 
     let start = Instant::now();
     for _ in 0..iterations {
-        std::hint::black_box(vrf_prove(&pk, &sk, std::hint::black_box(input)));
+        let _ = std::hint::black_box(vrf_prove(&pk, &sk, std::hint::black_box(input)));
     }
     let elapsed = start.elapsed();
     println!(

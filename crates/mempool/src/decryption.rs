@@ -9,9 +9,7 @@
 //! The decryption happens AFTER ordering is committed (QC formed).
 
 use crate::encrypted::{decrypt_payload, EncryptedTx};
-use pyde_crypto::threshold::{
-    generate_decryption_share, DecryptionShare, KeyShare,
-};
+use pyde_crypto::threshold::{generate_decryption_share, DecryptionShare, KeyShare};
 use pyde_tx::types::{FeePayer, Transaction, TransactionType};
 
 /// Decryption state for a single block's worth of encrypted transactions.
@@ -60,10 +58,7 @@ impl BlockDecryptor {
         }
 
         // Check for duplicate share index
-        if self.shares[tx_index]
-            .iter()
-            .any(|s| s.index == share.index)
-        {
+        if self.shares[tx_index].iter().any(|s| s.index == share.index) {
             return false;
         }
 
@@ -185,8 +180,17 @@ mod tests {
     ) -> EncryptedTx {
         let sender = derive_eoa_address(b"sender");
         encrypt_transaction(
-            sender, 0, 100_000, dummy_access_list(), None, 1,
-            vec![0xAA; 666], &to, value, calldata, pk,
+            sender,
+            0,
+            100_000,
+            dummy_access_list(),
+            None,
+            1,
+            vec![0xAA; 666],
+            &to,
+            value,
+            calldata,
+            pk,
         )
         .unwrap()
     }
@@ -291,8 +295,17 @@ mod tests {
         let to = derive_eoa_address(b"recipient");
 
         let enc_tx = encrypt_transaction(
-            sender, 42, 500_000, dummy_access_list(), Some(1_000_000), 7,
-            vec![0xAA; 666], &to, 999, b"data", &pk,
+            sender,
+            42,
+            500_000,
+            dummy_access_list(),
+            Some(1_000_000),
+            7,
+            vec![0xAA; 666],
+            &to,
+            999,
+            b"data",
+            &pk,
         )
         .unwrap();
 

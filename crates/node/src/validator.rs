@@ -1,31 +1,29 @@
 use pyde_account::address::Address;
-use pyde_consensus::block::{
-    Block, BlockBody, BlockHeader, QuorumCert, EPOCH_LENGTH,
+use pyde_consensus::block::quorum_for_committee;
+use pyde_consensus::block::{Block, BlockBody, BlockHeader, QuorumCert, EPOCH_LENGTH};
+use pyde_consensus::epoch_randomness::{
+    generate_share, verify_share, RandomnessCollector, RandomnessShare,
 };
-use pyde_consensus::finality::{FinalityTracker, FinalityVote, create_finality_vote, try_form_hard_finality};
+use pyde_consensus::finality::{
+    create_finality_vote, try_form_hard_finality, FinalityTracker, FinalityVote,
+};
 use pyde_consensus::hotstuff::{
-    ConsensusMessage, ConsensusState, create_vote, proposer_sign_message, try_form_qc, verify_vote,
+    create_vote, proposer_sign_message, try_form_qc, verify_vote, ConsensusMessage, ConsensusState,
 };
 use pyde_consensus::proposer::{compute_candidacy, ProposerCandidate};
-use pyde_crypto::vrf::VrfProof;
-use pyde_consensus::block::quorum_for_committee;
-use pyde_consensus::epoch_randomness::{
-    RandomnessCollector, RandomnessShare, generate_share, verify_share,
-};
-use pyde_crypto::threshold::{
-    RefreshContribution, ResharingContribution, aggregate_new_share, apply_refresh,
-    canonical_resharing_subset, generate_refresh_contribution, generate_resharing_contribution,
-    verify_refresh_contribution, verify_resharing_contribution,
-};
-use pyde_consensus::slashing::{
-    DoubleSignEvidence, slash_double_sign,
-};
+use pyde_consensus::slashing::{slash_double_sign, DoubleSignEvidence};
 use pyde_consensus::validator::VALIDATOR_STAKE;
 use pyde_consensus::view_change::{
-    TimeoutTracker, ViewChangeMessage, create_view_change, try_form_view_change_qc,
+    create_view_change, try_form_view_change_qc, TimeoutTracker, ViewChangeMessage,
 };
 use pyde_crypto::falcon::{FalconPublicKey, FalconSecretKey};
+use pyde_crypto::threshold::{
+    aggregate_new_share, apply_refresh, canonical_resharing_subset, generate_refresh_contribution,
+    generate_resharing_contribution, verify_refresh_contribution, verify_resharing_contribution,
+    RefreshContribution, ResharingContribution,
+};
 use pyde_crypto::threshold::{generate_decryption_share, DecryptionShare, KeyShare};
+use pyde_crypto::vrf::VrfProof;
 use pyde_mempool::decryption::BlockDecryptor;
 use pyde_mempool::encrypted::EncryptedTx;
 use pyde_tx::parallel::ExecutionSchedule;
@@ -71,11 +69,14 @@ pub fn load_validator_set_from_state(
 
     // Read validator count from state
     let count_key = pyde_state::keys::validator_count_key();
-    let count = state.get(&count_key)
+    let count = state
+        .get(&count_key)
         .map(|b| {
             if b.len() >= 8 {
                 u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]))
-            } else { 0 }
+            } else {
+                0
+            }
         })
         .unwrap_or(0);
 
@@ -120,16 +121,18 @@ pub fn load_validator_set_from_state(
 
 /// Process unbonding validators: return stake for those whose unbonding period expired.
 /// Called at each epoch boundary.
-pub fn process_unbonding(
-    state: &mut crate::state_manager::StateManager,
-    current_slot: u64,
-) {
+pub fn process_unbonding(state: &mut crate::state_manager::StateManager, current_slot: u64) {
     use pyde_consensus::validator::{UNBONDING_PERIOD, VALIDATOR_STAKE};
 
     let count_key = pyde_state::keys::validator_count_key();
-    let count = state.get(&count_key)
+    let count = state
+        .get(&count_key)
         .map(|b| {
-            if b.len() >= 8 { u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8])) } else { 0 }
+            if b.len() >= 8 {
+                u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]))
+            } else {
+                0
+            }
         })
         .unwrap_or(0);
 
@@ -172,8 +175,7 @@ pub fn process_unbonding(
                             if let Some(mut account) =
                                 pyde_account::types::Account::from_bytes(&account_bytes)
                             {
-                                account.balance =
-                                    account.balance.saturating_add(VALIDATOR_STAKE);
+                                account.balance = account.balance.saturating_add(VALIDATOR_STAKE);
                                 account.balance = account.balance.saturating_add(owed);
                                 let _ = state.insert(balance_key, account.to_bytes());
                                 tracing::info!(
@@ -550,13 +552,8 @@ impl ValidatorEngine {
         private_entropy.extend_from_slice(&self.epoch_randomness);
         let entropy = pyde_crypto::poseidon2::poseidon2_hash(&private_entropy);
 
-        let contribution = generate_refresh_contribution(
-            key_share.index,
-            n,
-            threshold,
-            epoch,
-            entropy.as_bytes(),
-        );
+        let contribution =
+            generate_refresh_contribution(key_share.index, n, threshold, epoch, entropy.as_bytes());
 
         self.pss_contributions = vec![contribution.clone()];
         self.pss_target_epoch = epoch;
@@ -574,12 +571,19 @@ impl ValidatorEngine {
 
         // Verify the contribution (zero-secret reconstruction check)
         if !verify_refresh_contribution(&contribution, threshold) {
-            warn!(from = contribution.from_index, "invalid PSS refresh contribution");
+            warn!(
+                from = contribution.from_index,
+                "invalid PSS refresh contribution"
+            );
             return false;
         }
 
         // Check for duplicate
-        if self.pss_contributions.iter().any(|c| c.from_index == contribution.from_index) {
+        if self
+            .pss_contributions
+            .iter()
+            .any(|c| c.from_index == contribution.from_index)
+        {
             return false;
         }
 
@@ -648,9 +652,7 @@ impl ValidatorEngine {
     /// gossip; after the window, the node stays locked out of this
     /// epoch's decryption and resumes normally on the next rotation.
     pub fn reshare_state_snapshot(&self) -> Option<crate::wire::ReshareState> {
-        if self.reshare_target_epoch == 0
-            && self.pending_reshare_rebroadcast.is_none()
-        {
+        if self.reshare_target_epoch == 0 && self.pending_reshare_rebroadcast.is_none() {
             return None;
         }
         Some(crate::wire::ReshareState {
@@ -780,7 +782,9 @@ impl ValidatorEngine {
     /// snapshot is empty. Panics on write failure — same safety-critical
     /// contract as other consensus-state persistence.
     fn persist_reshare_state(&self) {
-        let (Some(store), Some(snap)) = (self.consensus_store.as_ref(), self.reshare_state_snapshot()) else {
+        let (Some(store), Some(snap)) =
+            (self.consensus_store.as_ref(), self.reshare_state_snapshot())
+        else {
             return;
         };
         if let Err(e) = store.save_reshare_state(&snap) {
@@ -878,7 +882,11 @@ impl ValidatorEngine {
         }
 
         // Dedupe by old-index so a re-broadcast doesn't inflate our pool.
-        if self.reshare_contributions.iter().any(|c| c.from_old_index == contribution.from_old_index) {
+        if self
+            .reshare_contributions
+            .iter()
+            .any(|c| c.from_old_index == contribution.from_old_index)
+        {
             return false;
         }
         self.reshare_contributions.push(contribution);
@@ -927,7 +935,8 @@ impl ValidatorEngine {
             );
             return false;
         }
-        let canonical = match canonical_resharing_subset(&self.reshare_contributions, old_threshold) {
+        let canonical = match canonical_resharing_subset(&self.reshare_contributions, old_threshold)
+        {
             Some(c) => c,
             None => return false,
         };
@@ -967,7 +976,8 @@ impl ValidatorEngine {
             next_epoch,
             identity.committee_index,
             identity.address,
-        ).ok()?;
+        )
+        .ok()?;
 
         let mut collector = RandomnessCollector::new(next_epoch);
         collector.add_share(share.clone());
@@ -979,10 +989,7 @@ impl ValidatorEngine {
 
     /// Add a received randomness share from another committee member.
     /// Returns the new epoch randomness if threshold reached.
-    pub fn on_randomness_share(
-        &mut self,
-        share: RandomnessShare,
-    ) -> Option<[u8; 32]> {
+    pub fn on_randomness_share(&mut self, share: RandomnessShare) -> Option<[u8; 32]> {
         let collector = self.randomness_collector.as_mut()?;
 
         // Verify share against committee key
@@ -992,7 +999,11 @@ impl ValidatorEngine {
         }
         let pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(&self.committee_keys[idx])?;
         if !verify_share(&share, &pk, collector.epoch) {
-            warn!(epoch = collector.epoch, validator = idx, "invalid randomness share");
+            warn!(
+                epoch = collector.epoch,
+                validator = idx,
+                "invalid randomness share"
+            );
             return None;
         }
 
@@ -1057,7 +1068,12 @@ impl ValidatorEngine {
                     return None;
                 }
 
-                debug!(slot, score = candidate.score, threshold, "proposing (below VRF threshold)");
+                debug!(
+                    slot,
+                    score = candidate.score,
+                    threshold,
+                    "proposing (below VRF threshold)"
+                );
                 Some(candidate)
             }
             Err(e) => {
@@ -1071,11 +1087,7 @@ impl ValidatorEngine {
     /// committee key. Invalid proofs are rejected.
     ///
     /// The header.vrf_proof field is encoded as [vrf_output:32 || vrf_proof:N].
-    pub fn buffer_proposal(
-        &mut self,
-        header: &BlockHeader,
-        proposer_signature: &[u8],
-    ) -> bool {
+    pub fn buffer_proposal(&mut self, header: &BlockHeader, proposer_signature: &[u8]) -> bool {
         let slot = header.slot;
 
         // Don't buffer if we've already voted for this slot
@@ -1102,15 +1114,24 @@ impl ValidatorEngine {
         let proposer_idx = match proposer_idx {
             Some(idx) => idx,
             None => {
-                warn!(slot, proposer = hex::encode(header.proposer), "proposal from non-committee member");
+                warn!(
+                    slot,
+                    proposer = hex::encode(header.proposer),
+                    "proposal from non-committee member"
+                );
                 return false;
             }
         };
 
         // Reconstruct proposer's public key
-        let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&self.committee_keys[proposer_idx]) {
+        let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(
+            &self.committee_keys[proposer_idx],
+        ) {
             Some(pk) => pk,
-            None => { warn!(slot, "invalid committee public key"); return false; }
+            None => {
+                warn!(slot, "invalid committee public key");
+                return false;
+            }
         };
 
         // Verify proposer signature on block header.
@@ -1120,7 +1141,10 @@ impl ValidatorEngine {
             let block_hash = header.hash();
             let sig = match pyde_crypto::falcon::FalconSignature::from_bytes(proposer_signature) {
                 Some(s) => s,
-                None => { warn!(slot, "invalid proposer signature format"); return false; }
+                None => {
+                    warn!(slot, "invalid proposer signature format");
+                    return false;
+                }
             };
             let sign_msg = proposer_sign_message(slot, &block_hash);
             if !pyde_crypto::falcon::falcon_verify(&pk, &sign_msg, &sig) {
@@ -1194,7 +1218,9 @@ impl ValidatorEngine {
             // and a validator that cannot detect its own double-proposes
             // is worse than one that halts visibly.
             if let Some(store) = &self.consensus_store {
-                if let Err(e) = store.save_seen_proposal(slot, &header.proposer, header, proposer_signature) {
+                if let Err(e) =
+                    store.save_seen_proposal(slot, &header.proposer, header, proposer_signature)
+                {
                     error!(
                         error = %e,
                         slot,
@@ -1203,7 +1229,8 @@ impl ValidatorEngine {
                     panic!("seen-proposal persist failed: {}", e);
                 }
             }
-            self.seen_proposals.insert(proposal_key, (header.clone(), proposer_signature.to_vec()));
+            self.seen_proposals
+                .insert(proposal_key, (header.clone(), proposer_signature.to_vec()));
         }
 
         // Mark proposal received for timeout tracker
@@ -1218,7 +1245,12 @@ impl ValidatorEngine {
             vrf_score,
         });
 
-        debug!(slot, vrf_score, proposals = entry.len(), "proposal buffered");
+        debug!(
+            slot,
+            vrf_score,
+            proposals = entry.len(),
+            "proposal buffered"
+        );
         true
     }
 
@@ -1240,10 +1272,7 @@ impl ValidatorEngine {
     /// Select the best proposal (lowest VRF score) and vote for it.
     /// Called after the proposal collection window (100ms into the slot).
     /// Returns the vote to broadcast, or None if no proposals were buffered.
-    pub fn select_and_vote(
-        &mut self,
-        identity: &ValidatorIdentity,
-    ) -> Option<ConsensusMessage> {
+    pub fn select_and_vote(&mut self, identity: &ValidatorIdentity) -> Option<ConsensusMessage> {
         let slot = self.consensus.current_slot;
 
         // Don't double-vote
@@ -1322,16 +1351,14 @@ impl ValidatorEngine {
         // proposer's FALCON key. See proposer_sign_message for the format.
         let block_hash = header.hash();
         let sign_msg = proposer_sign_message(header.slot, &block_hash);
-        let proposer_signature = match pyde_crypto::falcon::falcon_sign(
-            &identity.secret_key,
-            &sign_msg,
-        ) {
-            Ok(sig) => sig.to_vec(),
-            Err(_) => {
-                warn!(slot, "failed to sign block header");
-                vec![]
-            }
-        };
+        let proposer_signature =
+            match pyde_crypto::falcon::falcon_sign(&identity.secret_key, &sign_msg) {
+                Ok(sig) => sig.to_vec(),
+                Err(_) => {
+                    warn!(slot, "failed to sign block header");
+                    vec![]
+                }
+            };
 
         Block {
             header,
@@ -1401,10 +1428,11 @@ impl ValidatorEngine {
 
         // Verify vote signature
         if voter_index < self.committee_keys.len()
-            && !verify_vote(&vote, &self.committee_keys[voter_index]) {
-                warn!(slot, voter_index, "invalid vote signature");
-                return None;
-            }
+            && !verify_vote(&vote, &self.committee_keys[voter_index])
+        {
+            warn!(slot, voter_index, "invalid vote signature");
+            return None;
+        }
 
         // --- Double-vote (equivocation) detection ---
         let vote_key = (slot, voter_index as u8);
@@ -1414,11 +1442,7 @@ impl ValidatorEngine {
         };
         if let Some((prev_hash, _prev_sig)) = self.seen_votes.get(&vote_key) {
             if *prev_hash != block_hash {
-                warn!(
-                    slot,
-                    voter_index,
-                    "DOUBLE VOTE DETECTED — equivocation"
-                );
+                warn!(slot, voter_index, "DOUBLE VOTE DETECTED — equivocation");
                 // Note: full evidence creation requires both vote messages.
                 // For now, log and flag. Full evidence submission (with both signatures)
                 // can be implemented when the slashing transaction type is added.
@@ -1427,7 +1451,9 @@ impl ValidatorEngine {
             // Persist BEFORE the in-memory insert. Panics on failure for
             // the same reason as the seen-proposal site above.
             if let Some(store) = &self.consensus_store {
-                if let Err(e) = store.save_seen_vote(slot, voter_index as u8, &block_hash, &vote_sig) {
+                if let Err(e) =
+                    store.save_seen_vote(slot, voter_index as u8, &block_hash, &vote_sig)
+                {
                     error!(
                         error = %e,
                         slot,
@@ -1463,7 +1489,8 @@ impl ValidatorEngine {
                     self.persist_consensus();
                 }
                 // Record soft finality
-                self.finality.record_soft_finality(slot, block_hash, qc.clone());
+                self.finality
+                    .record_soft_finality(slot, block_hash, qc.clone());
             }
             qc
         } else {
@@ -1526,13 +1553,9 @@ impl ValidatorEngine {
         // Try to form hard finality cert (dynamic quorum)
         let threshold = quorum_for_committee(self.committee_keys.len());
         if entry.len() >= threshold {
-            if let Some(cert) = try_form_hard_finality(
-                slot,
-                block_hash,
-                state_root,
-                entry,
-                &self.committee_keys,
-            ) {
+            if let Some(cert) =
+                try_form_hard_finality(slot, block_hash, state_root, entry, &self.committee_keys)
+            {
                 info!(slot, "hard finality achieved");
                 self.finality.record_hard_finality(cert);
                 // Slice 4.3: persist the new WS checkpoint so it survives
@@ -1551,7 +1574,9 @@ impl ValidatorEngine {
     /// publish the full checkpoint on the consensus topic so non-
     /// validator peers (and any validator that missed votes due to
     /// temporary network issues) can catch up on the WS anchor.
-    pub fn latest_finality_checkpoint(&self) -> Option<&pyde_consensus::finality::FinalityCheckpoint> {
+    pub fn latest_finality_checkpoint(
+        &self,
+    ) -> Option<&pyde_consensus::finality::FinalityCheckpoint> {
         self.finality.latest_checkpoint.as_ref()
     }
 
@@ -1659,9 +1684,10 @@ impl ValidatorEngine {
 
         // Resolve the accused signer to their committee index. A signer
         // not in the active committee cannot be slashed — drop.
-        let signer_pk = self.committee_keys.iter().find(|pk| {
-            pyde_account::address::derive_eoa_address(pk) == evidence.signer
-        });
+        let signer_pk = self
+            .committee_keys
+            .iter()
+            .find(|pk| pyde_account::address::derive_eoa_address(pk) == evidence.signer);
         let pk_bytes = match signer_pk {
             Some(pk) => pk.clone(),
             None => {
@@ -1952,7 +1978,10 @@ mod tests {
                 break;
             }
         }
-        assert!(found_proposer, "should find at least 1 slot to propose in 20 tries");
+        assert!(
+            found_proposer,
+            "should find at least 1 slot to propose in 20 tries"
+        );
     }
 
     #[test]
@@ -2012,11 +2041,15 @@ mod tests {
             state_root: [0u8; 32],
             timestamp: 0,
         };
-        engine.buffered_proposals.entry(slot).or_default().push(BufferedProposal {
-            header,
-            proposer_signature: vec![],
-            vrf_score: 0,
-        });
+        engine
+            .buffered_proposals
+            .entry(slot)
+            .or_default()
+            .push(BufferedProposal {
+                header,
+                proposer_signature: vec![],
+                vrf_score: 0,
+            });
 
         // Baseline: without the flag, select_and_vote produces a vote.
         let baseline_engine_clone_check = {
@@ -2060,11 +2093,15 @@ mod tests {
             state_root: [0u8; 32],
             timestamp: 0,
         };
-        engine.buffered_proposals.entry(slot).or_default().push(BufferedProposal {
-            header,
-            proposer_signature: vec![],
-            vrf_score: 0,
-        });
+        engine
+            .buffered_proposals
+            .entry(slot)
+            .or_default()
+            .push(BufferedProposal {
+                header,
+                proposer_signature: vec![],
+                vrf_score: 0,
+            });
 
         assert!(!engine.is_inclusion_violated(slot));
         let vote = engine.select_and_vote(&identities[1]);
@@ -2140,7 +2177,9 @@ mod tests {
             let trigger = incoming.reshare_aggregation_trigger_slot;
             assert!(incoming.consensus.current_slot < trigger);
             assert!(!incoming.try_aggregate_reshare_on_slot(
-                incoming.consensus.current_slot, 5, identity
+                incoming.consensus.current_slot,
+                5,
+                identity
             ));
             // Advance past the trigger; aggregation fires.
             let fire_at = trigger + 1;
@@ -2235,8 +2274,7 @@ mod tests {
                 e
             })
             .collect();
-        let mut helper_ids: Vec<ValidatorIdentity> =
-            (3..=6).map(make_identity).collect();
+        let mut helper_ids: Vec<ValidatorIdentity> = (3..=6).map(make_identity).collect();
         for (i, (engine, id)) in helpers.iter_mut().zip(helper_ids.iter_mut()).enumerate() {
             engine.prepare_for_reshare_reception(1, new_committee_keys.clone(), i + 3);
             for c in &contribs {
@@ -2246,7 +2284,10 @@ mod tests {
         }
         let mut all_shares = shares;
         for id in &helper_ids[..2] {
-            all_shares.push(generate_decryption_share(id.key_share.as_ref().unwrap(), &ct));
+            all_shares.push(generate_decryption_share(
+                id.key_share.as_ref().unwrap(),
+                &ct,
+            ));
         }
         let plaintext = combine_shares(&all_shares, 4, &ct).unwrap();
         assert_eq!(
@@ -2346,7 +2387,12 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let new_committee = vec![vec![0x11; 897], vec![0x22; 897], vec![0x33; 897], vec![0x44; 897]];
+        let new_committee = vec![
+            vec![0x11; 897],
+            vec![0x22; 897],
+            vec![0x33; 897],
+            vec![0x44; 897],
+        ];
 
         let trigger_slot;
         {
@@ -2404,7 +2450,10 @@ mod tests {
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
         let mut engine = ValidatorEngine::new([0u8; 32]);
         engine.attach_consensus_store(store);
-        assert!(engine.reshare_aggregated, "aggregated flag must survive restart");
+        assert!(
+            engine.reshare_aggregated,
+            "aggregated flag must survive restart"
+        );
     }
 
     #[test]
@@ -2461,7 +2510,7 @@ mod tests {
         let bad = generate_resharing_contribution(&old_shares[0], 4, 3, 1, b"e");
         // Flip one sub-share to break the polynomial.
         bad.to_bytes(); // sanity
-        // Expose a mutation path: rebuild via from_bytes after a byte flip.
+                        // Expose a mutation path: rebuild via from_bytes after a byte flip.
         let mut bytes = bad.to_bytes();
         // Corrupt a payload byte well past the 16-byte header.
         let corrupt_at = bytes.len() - 4;
@@ -2499,7 +2548,9 @@ mod tests {
         let mut id = identity_with_share(0, old_shares[0].clone());
 
         // Initial broadcast at slot 0.
-        engine.start_committee_reshare(7, &vec![vec![0xBB; 897]; 3], &id).unwrap();
+        engine
+            .start_committee_reshare(7, &vec![vec![0xBB; 897]; 3], &id)
+            .unwrap();
 
         // Same slot: should NOT re-broadcast (already-publishing slot).
         assert!(engine.maybe_rebroadcast_reshare().is_none());
@@ -2562,15 +2613,11 @@ mod tests {
 
         {
             let mut engine = ValidatorEngine::new([0u8; 32]);
-            engine.attach_consensus_store(Arc::new(
-                ConsensusStateStore::open(dir.path()).unwrap(),
-            ));
+            engine.attach_consensus_store(Arc::new(ConsensusStateStore::open(dir.path()).unwrap()));
             engine.install_bootstrap_ws_anchor(777);
         }
         let mut engine = ValidatorEngine::new([0u8; 32]);
-        engine.attach_consensus_store(Arc::new(
-            ConsensusStateStore::open(dir.path()).unwrap(),
-        ));
+        engine.attach_consensus_store(Arc::new(ConsensusStateStore::open(dir.path()).unwrap()));
         let cp = engine.finality.latest_checkpoint.as_ref().unwrap();
         assert_eq!(cp.slot, 777);
     }
@@ -2597,7 +2644,10 @@ mod tests {
             },
         };
         assert!(!engine.ingest_finality_checkpoint(stale));
-        assert_eq!(engine.finality.latest_checkpoint.as_ref().unwrap().slot, 100);
+        assert_eq!(
+            engine.finality.latest_checkpoint.as_ref().unwrap().slot,
+            100
+        );
     }
 
     #[test]
@@ -2632,9 +2682,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut engine = ValidatorEngine::new([0u8; 32]);
         engine.set_committee(vec![vec![0xAA; 897]; 4]);
-        engine.attach_consensus_store(Arc::new(
-            ConsensusStateStore::open(dir.path()).unwrap(),
-        ));
+        engine.attach_consensus_store(Arc::new(ConsensusStateStore::open(dir.path()).unwrap()));
 
         let valid = FinalityCheckpoint {
             slot: 500,
@@ -2649,14 +2697,15 @@ mod tests {
             },
         };
         assert!(engine.ingest_finality_checkpoint(valid));
-        assert_eq!(engine.finality.latest_checkpoint.as_ref().unwrap().slot, 500);
+        assert_eq!(
+            engine.finality.latest_checkpoint.as_ref().unwrap().slot,
+            500
+        );
 
         // Survives restart.
         drop(engine);
         let mut fresh = ValidatorEngine::new([0u8; 32]);
-        fresh.attach_consensus_store(Arc::new(
-            ConsensusStateStore::open(dir.path()).unwrap(),
-        ));
+        fresh.attach_consensus_store(Arc::new(ConsensusStateStore::open(dir.path()).unwrap()));
         assert_eq!(fresh.finality.latest_checkpoint.as_ref().unwrap().slot, 500);
     }
 
@@ -2683,7 +2732,10 @@ mod tests {
             },
         };
         assert!(engine.ingest_finality_checkpoint(cp));
-        assert_eq!(engine.finality.latest_checkpoint.as_ref().unwrap().slot, 200);
+        assert_eq!(
+            engine.finality.latest_checkpoint.as_ref().unwrap().slot,
+            200
+        );
     }
 
     // ========== Crash-restart safety tests ==========
@@ -2701,7 +2753,10 @@ mod tests {
         // --- Pre-crash: vote for slot 1 ---
         {
             let (mut engine, identities) = make_engine_with_committee(3);
-            committee_keys = identities.iter().map(|id| id.public_key.as_bytes().to_vec()).collect();
+            committee_keys = identities
+                .iter()
+                .map(|id| id.public_key.as_bytes().to_vec())
+                .collect();
             voter = make_identity(1);
 
             let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
@@ -2860,7 +2915,9 @@ mod tests {
         // Write evidence via an isolated store (simulating pre-crash state).
         {
             let store = ConsensusStateStore::open(dir.path()).unwrap();
-            store.save_seen_proposal(5, &proposer, &header, &sig).unwrap();
+            store
+                .save_seen_proposal(5, &proposer, &header, &sig)
+                .unwrap();
         }
 
         // Fresh engine attaches the same store and must restore the index.
@@ -2913,9 +2970,16 @@ mod tests {
             let store = ConsensusStateStore::open(dir.path()).unwrap();
             for slot in 1..=15u64 {
                 store
-                    .save_seen_proposal(slot, &[0xAA; 32], &evidence_header(slot, [0x33; 32]), &[0x11; 10])
+                    .save_seen_proposal(
+                        slot,
+                        &[0xAA; 32],
+                        &evidence_header(slot, [0x33; 32]),
+                        &[0x11; 10],
+                    )
                     .unwrap();
-                store.save_seen_vote(slot, 0, &[0x99; 32], &[0x22; 10]).unwrap();
+                store
+                    .save_seen_vote(slot, 0, &[0x99; 32], &[0x22; 10])
+                    .unwrap();
             }
         }
 
@@ -2959,8 +3023,12 @@ mod tests {
     #[test]
     fn drain_pending_evidence_empties_queue() {
         let mut engine = ValidatorEngine::new([0xAA; 32]);
-        engine.pending_evidence.push(evidence_fixture(1, [0xAB; 32]));
-        engine.pending_evidence.push(evidence_fixture(2, [0xCD; 32]));
+        engine
+            .pending_evidence
+            .push(evidence_fixture(1, [0xAB; 32]));
+        engine
+            .pending_evidence
+            .push(evidence_fixture(2, [0xCD; 32]));
 
         let drained = engine.drain_pending_evidence();
         assert_eq!(drained.len(), 2);
@@ -2977,7 +3045,9 @@ mod tests {
         // Simulates the failed-block-build recovery path: drain, fail to
         // build, push back, drain again.
         let mut engine = ValidatorEngine::new([0xAA; 32]);
-        engine.pending_evidence.push(evidence_fixture(7, [0x99; 32]));
+        engine
+            .pending_evidence
+            .push(evidence_fixture(7, [0x99; 32]));
 
         let drained = engine.drain_pending_evidence();
         assert_eq!(drained.len(), 1);
@@ -2991,7 +3061,9 @@ mod tests {
     #[test]
     fn push_evidence_appends_preserving_order() {
         let mut engine = ValidatorEngine::new([0xAA; 32]);
-        engine.pending_evidence.push(evidence_fixture(1, [0x01; 32]));
+        engine
+            .pending_evidence
+            .push(evidence_fixture(1, [0x01; 32]));
 
         engine.push_evidence(vec![
             evidence_fixture(2, [0x02; 32]),
@@ -3007,9 +3079,12 @@ mod tests {
     /// Build valid evidence signed by a real FALCON key. Registers
     /// `pk` as committee index 0 so ingest_evidence passes the
     /// signer-in-committee check.
-    fn valid_evidence_and_engine()
-        -> (ValidatorEngine, pyde_crypto::falcon::FalconSecretKey, DoubleSignEvidence, Address)
-    {
+    fn valid_evidence_and_engine() -> (
+        ValidatorEngine,
+        pyde_crypto::falcon::FalconSecretKey,
+        DoubleSignEvidence,
+        Address,
+    ) {
         use pyde_crypto::falcon::falcon_keygen;
 
         let (pk, sk) = falcon_keygen().unwrap();
@@ -3034,8 +3109,14 @@ mod tests {
             m.extend_from_slice(&hash_2);
             m
         };
-        let sig_1 = pyde_crypto::falcon::falcon_sign(&sk, &sign_1).unwrap().as_bytes().to_vec();
-        let sig_2 = pyde_crypto::falcon::falcon_sign(&sk, &sign_2).unwrap().as_bytes().to_vec();
+        let sig_1 = pyde_crypto::falcon::falcon_sign(&sk, &sign_1)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let sig_2 = pyde_crypto::falcon::falcon_sign(&sk, &sign_2)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
 
         let evidence = DoubleSignEvidence {
             slot,
@@ -3112,7 +3193,10 @@ mod tests {
             m.extend_from_slice(&h);
             m
         };
-        let sig = pyde_crypto::falcon::falcon_sign(&sk, &sign_msg).unwrap().as_bytes().to_vec();
+        let sig = pyde_crypto::falcon::falcon_sign(&sk, &sign_msg)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
         evidence.block_hash_1 = h;
         evidence.block_hash_2 = h;
         evidence.signature_1 = sig.clone();
@@ -3160,8 +3244,14 @@ mod tests {
                 m.extend_from_slice(&hash_2);
                 m
             };
-            let sig_1 = pyde_crypto::falcon::falcon_sign(&sk, &sign_1).unwrap().as_bytes().to_vec();
-            let sig_2 = pyde_crypto::falcon::falcon_sign(&sk, &sign_2).unwrap().as_bytes().to_vec();
+            let sig_1 = pyde_crypto::falcon::falcon_sign(&sk, &sign_1)
+                .unwrap()
+                .as_bytes()
+                .to_vec();
+            let sig_2 = pyde_crypto::falcon::falcon_sign(&sk, &sign_2)
+                .unwrap()
+                .as_bytes()
+                .to_vec();
 
             let evidence = DoubleSignEvidence {
                 slot,
@@ -3220,7 +3310,9 @@ mod tests {
         };
 
         let mut engine = ValidatorEngine::new([0xAA; 32]);
-        engine.pending_evidence.push(evidence_fixture(42, [0xFF; 32]));
+        engine
+            .pending_evidence
+            .push(evidence_fixture(42, [0xFF; 32]));
 
         let mut out = Vec::new();
         let next = engine.drain_evidence_into_slash_txs(&identity, 7, 1, &mut out);
@@ -3251,13 +3343,11 @@ mod tests {
 
         // Offender: produces the two conflicting signatures.
         let (offender_pk, offender_sk) = falcon_keygen().unwrap();
-        let offender_addr =
-            pyde_account::address::derive_eoa_address(offender_pk.as_bytes());
+        let offender_addr = pyde_account::address::derive_eoa_address(offender_pk.as_bytes());
 
         // Submitter: the validator building the block (and receiving the fee).
         let (submitter_pk, submitter_sk) = falcon_keygen().unwrap();
-        let submitter_addr =
-            pyde_account::address::derive_eoa_address(submitter_pk.as_bytes());
+        let submitter_addr = pyde_account::address::derive_eoa_address(submitter_pk.as_bytes());
 
         // Stand up an SMT with the offender registered as an Active
         // validator (status 0x00) and the submitter funded. Uses the
@@ -3281,8 +3371,7 @@ mod tests {
         // non-negative.
         pyde_tx::pipeline::increment_active_validator_count(&mut smt);
 
-        let mut submitter_account =
-            pyde_account::types::Account::new_eoa(submitter_pk.as_bytes());
+        let mut submitter_account = pyde_account::types::Account::new_eoa(submitter_pk.as_bytes());
         submitter_account.address = submitter_addr;
         submitter_account.balance = 1_000_000_000_000; // 1K PYDE, plenty for gas
         smt.insert(
@@ -3371,7 +3460,9 @@ mod tests {
         assert_eq!(entry.status, 0x02, "offender must be marked Ejected");
 
         // Submitter: balance increased by finder's fee (10% of stake) minus gas.
-        let raw = smt.get(&pyde_state::keys::balance_key(&submitter_addr)).unwrap();
+        let raw = smt
+            .get(&pyde_state::keys::balance_key(&submitter_addr))
+            .unwrap();
         let acc = pyde_account::types::Account::from_bytes(&raw).unwrap();
         let expected_fee = VALIDATOR_STAKE / 10;
         let gas_cost = receipt.gas_used as u128 * ctx.base_fee;
@@ -3391,7 +3482,8 @@ mod tests {
         // Simulate multi-node: each validator has its own engine for voting,
         // but votes are collected in one engine for QC formation.
         let (_, identities) = make_engine_with_committee(3);
-        let committee_keys: Vec<Vec<u8>> = identities.iter()
+        let committee_keys: Vec<Vec<u8>> = identities
+            .iter()
             .map(|id| id.public_key.as_bytes().to_vec())
             .collect();
 
@@ -3432,14 +3524,18 @@ mod tests {
             }
         }
 
-        assert!(qc_formed, "QC should form with 3 votes in 3-member committee (quorum=2)");
+        assert!(
+            qc_formed,
+            "QC should form with 3 votes in 3-member committee (quorum=2)"
+        );
     }
 
     #[test]
     fn two_node_qc_requires_both_votes() {
         // 2-member committee: quorum_for_committee(2) = 2
         let (_, identities) = make_engine_with_committee(2);
-        let committee_keys: Vec<Vec<u8>> = identities.iter()
+        let committee_keys: Vec<Vec<u8>> = identities
+            .iter()
             .map(|id| id.public_key.as_bytes().to_vec())
             .collect();
 
@@ -3473,7 +3569,10 @@ mod tests {
         collector.advance_slot();
 
         // First vote — not enough
-        assert!(collector.on_vote(votes[0].clone()).is_none(), "1/2 votes should not form QC");
+        assert!(
+            collector.on_vote(votes[0].clone()).is_none(),
+            "1/2 votes should not form QC"
+        );
 
         // Second vote — QC forms
         let qc = collector.on_vote(votes[1].clone());
@@ -3484,14 +3583,20 @@ mod tests {
     #[test]
     fn old_votes_pruned() {
         let mut engine = ValidatorEngine::new([0; 32]);
-        engine.votes.insert(1, SlotVotes {
-            block_hash: [0; 32],
-            votes: vec![],
-        });
-        engine.votes.insert(5, SlotVotes {
-            block_hash: [0; 32],
-            votes: vec![],
-        });
+        engine.votes.insert(
+            1,
+            SlotVotes {
+                block_hash: [0; 32],
+                votes: vec![],
+            },
+        );
+        engine.votes.insert(
+            5,
+            SlotVotes {
+                block_hash: [0; 32],
+                votes: vec![],
+            },
+        );
 
         // Advance past slot 15 to trigger pruning (prune < slot - 10 = 5)
         engine.consensus.current_slot = 14;
@@ -3513,7 +3618,10 @@ mod tests {
             vec![0xDD; 100],
             vec![],
             vec![],
-            ExecutionSchedule { groups: vec![], total_txs: 0 },
+            ExecutionSchedule {
+                groups: vec![],
+                total_txs: 0,
+            },
         );
 
         assert_eq!(block.slot(), 0);
@@ -3567,14 +3675,23 @@ mod tests {
         // Create an encrypted tx to generate shares for
         let to = derive_eoa_address(b"to");
         let enc_tx = pyde_mempool::encrypted::encrypt_transaction(
-            address, 0, 50_000,
+            address,
+            0,
+            50_000,
             vec![pyde_tx::types::AccessEntry {
                 address: derive_eoa_address(b"contract"),
                 reads: vec![[0x01; 32]],
                 writes: vec![],
             }],
-            None, 1, vec![0xAA; 666], &to, 0, b"", &tpk,
-        ).unwrap();
+            None,
+            1,
+            vec![0xAA; 666],
+            &to,
+            0,
+            b"",
+            &tpk,
+        )
+        .unwrap();
 
         let shares = engine.generate_decryption_shares(&identity, &[enc_tx]);
         assert!(shares.is_some());
@@ -3600,14 +3717,23 @@ mod tests {
 
         let to = derive_eoa_address(b"to");
         let enc_tx = pyde_mempool::encrypted::encrypt_transaction(
-            address, 0, 50_000,
+            address,
+            0,
+            50_000,
             vec![pyde_tx::types::AccessEntry {
                 address: derive_eoa_address(b"contract"),
                 reads: vec![[0x01; 32]],
                 writes: vec![],
             }],
-            None, 1, vec![0xAA; 666], &to, 0, b"", &tpk,
-        ).unwrap();
+            None,
+            1,
+            vec![0xAA; 666],
+            &to,
+            0,
+            b"",
+            &tpk,
+        )
+        .unwrap();
 
         let decryptor = engine.start_decryption(&identity, vec![enc_tx], 2).unwrap();
         assert_eq!(decryptor.tx_count(), 1);
@@ -3652,7 +3778,13 @@ mod tests {
             let state = StateManager::open(tmp.path(), 1024).unwrap();
             let block_store = BlockStore::open(tmp.path()).unwrap();
             let chain = ChainState::genesis(state.root(), chain_id);
-            Self { state, chain, block_store, key_share, _tmp: tmp }
+            Self {
+                state,
+                chain,
+                block_store,
+                key_share,
+                _tmp: tmp,
+            }
         }
     }
 
@@ -3685,7 +3817,10 @@ mod tests {
 
     fn e2e_signed_encrypted(
         tpk: &pyde_crypto::threshold::ThresholdPublicKey,
-        sender_keys: &(pyde_crypto::falcon::FalconPublicKey, pyde_crypto::falcon::FalconSecretKey),
+        sender_keys: &(
+            pyde_crypto::falcon::FalconPublicKey,
+            pyde_crypto::falcon::FalconSecretKey,
+        ),
         recipient: Address,
         value: u128,
         nonce: u64,
@@ -3693,13 +3828,23 @@ mod tests {
         let (pk, sk) = sender_keys;
         let sender = pyde_account::address::derive_eoa_address(pk.as_bytes());
         let template = encrypt_transaction(
-            sender, nonce, 100_000,
-            e2e_access_list(), None, 31337,
-            vec![0u8; 666], &recipient, value, b"",
+            sender,
+            nonce,
+            100_000,
+            e2e_access_list(),
+            None,
+            31337,
+            vec![0u8; 666],
+            &recipient,
+            value,
+            b"",
             tpk,
-        ).unwrap();
+        )
+        .unwrap();
         let hash = template.hash();
-        let sig = pyde_crypto::falcon::falcon_sign(sk, &hash).unwrap().to_vec();
+        let sig = pyde_crypto::falcon::falcon_sign(sk, &hash)
+            .unwrap()
+            .to_vec();
         EncryptedTx {
             sender,
             nonce,
@@ -3763,7 +3908,10 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: encrypted_body.clone(),
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -3787,7 +3935,9 @@ mod tests {
         // ride the consensus gossip topic post-QC; we collect them directly.
         let shares: Vec<_> = nodes
             .iter()
-            .map(|n| pyde_crypto::threshold::generate_decryption_share(&n.key_share, &enc_tx.ciphertext))
+            .map(|n| {
+                pyde_crypto::threshold::generate_decryption_share(&n.key_share, &enc_tx.ciphertext)
+            })
             .collect();
 
         // Every validator then runs the decrypt+execute path. Uses the
@@ -3851,29 +4001,47 @@ mod tests {
         let state = StateManager::open(tmp.path(), 1024).unwrap();
 
         let tx_a = encrypt_transaction(
-            [0xAA; 32], 0, 100_000,
-            e2e_access_list(), None, 31337,
-            vec![0xAA; 666], &[0x11; 32], 100, b"swap-a",
+            [0xAA; 32],
+            0,
+            100_000,
+            e2e_access_list(),
+            None,
+            31337,
+            vec![0xAA; 666],
+            &[0x11; 32],
+            100,
+            b"swap-a",
             &tpk,
-        ).unwrap();
+        )
+        .unwrap();
         let tx_b = encrypt_transaction(
-            [0xBB; 32], 1, 100_000,
-            e2e_access_list(), None, 31337,
-            vec![0xBB; 666], &[0x22; 32], 200, b"swap-b",
+            [0xBB; 32],
+            1,
+            100_000,
+            e2e_access_list(),
+            None,
+            31337,
+            vec![0xBB; 666],
+            &[0x22; 32],
+            200,
+            b"swap-b",
             &tpk,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Honest tx_root commits to [A, B]; tampered body ships [B, A].
-        let honest_tx_root = pyde_consensus::block::compute_tx_root(
-            &[], &[tx_a.hash(), tx_b.hash()],
-        );
+        let honest_tx_root =
+            pyde_consensus::block::compute_tx_root(&[], &[tx_a.hash(), tx_b.hash()]);
         let header = e2e_header(1, [0u8; 32], state.root(), honest_tx_root);
         let tampered = Block {
             header,
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![tx_b.to_bytes(), tx_a.to_bytes()],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -3898,17 +4066,33 @@ mod tests {
         let state = StateManager::open(tmp.path(), 1024).unwrap();
 
         let victim = encrypt_transaction(
-            [0xAA; 32], 0, 100_000,
-            e2e_access_list(), None, 31337,
-            vec![0xAA; 666], &[0x11; 32], 100, b"victim-swap",
+            [0xAA; 32],
+            0,
+            100_000,
+            e2e_access_list(),
+            None,
+            31337,
+            vec![0xAA; 666],
+            &[0x11; 32],
+            100,
+            b"victim-swap",
             &tpk,
-        ).unwrap();
+        )
+        .unwrap();
         let sandwich_front = encrypt_transaction(
-            [0xEE; 32], 0, 100_000,
-            e2e_access_list(), None, 31337,
-            vec![0xEE; 666], &[0x22; 32], 50_000, b"front",
+            [0xEE; 32],
+            0,
+            100_000,
+            e2e_access_list(),
+            None,
+            31337,
+            vec![0xEE; 666],
+            &[0x22; 32],
+            50_000,
+            b"front",
             &tpk,
-        ).unwrap();
+        )
+        .unwrap();
 
         let honest_tx_root = pyde_consensus::block::compute_tx_root(&[], &[victim.hash()]);
         let header = e2e_header(1, [0u8; 32], state.root(), honest_tx_root);
@@ -3917,7 +4101,10 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![sandwich_front.to_bytes(), victim.to_bytes()],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -3950,10 +4137,12 @@ mod tests {
         // Alice funded with proper on-chain auth key.
         let mut alice_account = pyde_account::types::Account::new_eoa(alice_keys.0.as_bytes());
         alice_account.balance = 10_000_000_000_000_000_000_u128;
-        state.insert(
-            pyde_state::keys::balance_key(&alice),
-            alice_account.to_bytes(),
-        ).unwrap();
+        state
+            .insert(
+                pyde_state::keys::balance_key(&alice),
+                alice_account.to_bytes(),
+            )
+            .unwrap();
         state.refresh_root();
 
         // Byzantine proposer forges: sender=alice, garbage sig, but the
@@ -3962,11 +4151,19 @@ mod tests {
         // but a 666-byte garbage blob is indistinguishable at mempool
         // structural check.)
         let template = encrypt_transaction(
-            alice, 0, 100_000,
-            e2e_access_list(), None, 31337,
-            vec![0xFF; 666], &attacker, 1_000, b"",
+            alice,
+            0,
+            100_000,
+            e2e_access_list(),
+            None,
+            31337,
+            vec![0xFF; 666],
+            &attacker,
+            1_000,
+            b"",
             &tpk,
-        ).unwrap();
+        )
+        .unwrap();
         let forged = EncryptedTx {
             sender: alice, // plaintext — attacker claims to be alice
             nonce: 0,
@@ -3990,7 +4187,10 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![forged.to_bytes()],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -4015,8 +4215,14 @@ mod tests {
         decryptor.add_share(0, shares[0].clone());
         decryptor.add_share(0, shares[1].clone());
         let outcome = try_decrypt_and_execute(
-            &bs, 1, &mut decryptor, &mut state,
-            400_000_000, 1_000_000_000, 31337, [0u8; 32],
+            &bs,
+            1,
+            &mut decryptor,
+            &mut state,
+            400_000_000,
+            1_000_000_000,
+            31337,
+            [0u8; 32],
         );
 
         // Outcome reports zero verified txs executed (the forged one
@@ -4059,16 +4265,18 @@ mod tests {
         let tx_a = e2e_signed_encrypted(&tpk, &sender_a_keys, [0x11; 32], 100, 0);
         let tx_b = e2e_signed_encrypted(&tpk, &sender_b_keys, [0x22; 32], 200, 0);
 
-        let committed_root = pyde_consensus::block::compute_tx_root(
-            &[], &[tx_a.hash(), tx_b.hash()],
-        );
+        let committed_root =
+            pyde_consensus::block::compute_tx_root(&[], &[tx_a.hash(), tx_b.hash()]);
         let header = e2e_header(1, [0u8; 32], [0u8; 32], committed_root);
         let block = Block {
             header: header.clone(),
             body: BlockBody {
                 transactions: vec![],
                 encrypted_txs: vec![tx_a.to_bytes(), tx_b.to_bytes()],
-                execution_schedule: ExecutionSchedule { groups: vec![], total_txs: 0 },
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
             },
             proposer_signature: vec![],
         };
@@ -4083,22 +4291,39 @@ mod tests {
             let addr = pyde_account::address::derive_eoa_address(keys.0.as_bytes());
             let mut acct = pyde_account::types::Account::new_eoa(keys.0.as_bytes());
             acct.balance = 10_000_000_000_000_000_000_u128;
-            state.insert(
-                pyde_state::keys::balance_key(&addr),
-                acct.to_bytes(),
-            ).unwrap();
+            state
+                .insert(pyde_state::keys::balance_key(&addr), acct.to_bytes())
+                .unwrap();
         }
         state.refresh_root();
 
         // Honest decryptor, committed order [A, B].
         let mut honest = BlockDecryptor::new(vec![tx_a.clone(), tx_b.clone()], 2).unwrap();
-        honest.add_share(0, pyde_crypto::threshold::generate_decryption_share(&shares[0], &tx_a.ciphertext));
-        honest.add_share(0, pyde_crypto::threshold::generate_decryption_share(&shares[1], &tx_a.ciphertext));
-        honest.add_share(1, pyde_crypto::threshold::generate_decryption_share(&shares[0], &tx_b.ciphertext));
-        honest.add_share(1, pyde_crypto::threshold::generate_decryption_share(&shares[1], &tx_b.ciphertext));
+        honest.add_share(
+            0,
+            pyde_crypto::threshold::generate_decryption_share(&shares[0], &tx_a.ciphertext),
+        );
+        honest.add_share(
+            0,
+            pyde_crypto::threshold::generate_decryption_share(&shares[1], &tx_a.ciphertext),
+        );
+        honest.add_share(
+            1,
+            pyde_crypto::threshold::generate_decryption_share(&shares[0], &tx_b.ciphertext),
+        );
+        honest.add_share(
+            1,
+            pyde_crypto::threshold::generate_decryption_share(&shares[1], &tx_b.ciphertext),
+        );
         let honest_outcome = try_decrypt_and_execute(
-            &bs, 1, &mut honest, &mut state,
-            400_000_000, 1_000_000_000, 31337, [0u8; 32],
+            &bs,
+            1,
+            &mut honest,
+            &mut state,
+            400_000_000,
+            1_000_000_000,
+            31337,
+            [0u8; 32],
         );
         assert!(
             matches!(honest_outcome, DecryptOutcome::Executed { tx_count: 2, .. }),
@@ -4110,8 +4335,14 @@ mod tests {
         // second-chance tx_root check in try_decrypt_and_execute.
         let mut tampered = BlockDecryptor::new(vec![tx_b, tx_a], 2).unwrap();
         let tampered_outcome = try_decrypt_and_execute(
-            &bs, 1, &mut tampered, &mut state,
-            400_000_000, 1_000_000_000, 31337, [0u8; 32],
+            &bs,
+            1,
+            &mut tampered,
+            &mut state,
+            400_000_000,
+            1_000_000_000,
+            31337,
+            [0u8; 32],
         );
         assert!(
             matches!(tampered_outcome, DecryptOutcome::TxRootMismatch),

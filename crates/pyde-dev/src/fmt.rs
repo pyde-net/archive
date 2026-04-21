@@ -253,8 +253,12 @@ fn count_braces(line: &str) -> (u32, u32) {
             break;
         }
 
-        if c == '{' { opens += 1; }
-        if c == '}' { closes += 1; }
+        if c == '{' {
+            opens += 1;
+        }
+        if c == '}' {
+            closes += 1;
+        }
     }
 
     (opens, closes)
@@ -291,7 +295,12 @@ mod tests {
         let input = "contract T {   \n    pub fn f() {   \n    }   \n}   \n";
         let output = format_source(input);
         for line in output.lines() {
-            assert_eq!(line, line.trim_end(), "trailing whitespace found: {:?}", line);
+            assert_eq!(
+                line,
+                line.trim_end(),
+                "trailing whitespace found: {:?}",
+                line
+            );
         }
     }
 
@@ -327,7 +336,8 @@ mod tests {
 
     #[test]
     fn else_block_indentation() {
-        let input = "contract T {\npub fn f() {\nif x > 0 {\nreturn 1;\n} else {\nreturn 0;\n}\n}\n}\n";
+        let input =
+            "contract T {\npub fn f() {\nif x > 0 {\nreturn 1;\n} else {\nreturn 0;\n}\n}\n}\n";
         let output = format_source(input);
         assert!(output.contains("        if x > 0 {"));
         assert!(output.contains("            return 1;"));

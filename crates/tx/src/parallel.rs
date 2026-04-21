@@ -48,7 +48,11 @@ impl ExecutionSchedule {
 
     /// Largest group size (bottleneck for sequential execution within a group).
     pub fn max_group_size(&self) -> usize {
-        self.groups.iter().map(|g| g.tx_indices.len()).max().unwrap_or(0)
+        self.groups
+            .iter()
+            .map(|g| g.tx_indices.len())
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -124,7 +128,10 @@ pub fn conflicts(tx_a: &Transaction, tx_b: &Transaction) -> bool {
         .access_list
         .iter()
         .flat_map(|entry| {
-            entry.reads.iter().chain(entry.writes.iter())
+            entry
+                .reads
+                .iter()
+                .chain(entry.writes.iter())
                 .map(move |k| (entry.address, *k))
         })
         .collect();
@@ -133,7 +140,10 @@ pub fn conflicts(tx_a: &Transaction, tx_b: &Transaction) -> bool {
         .access_list
         .iter()
         .flat_map(|entry| {
-            entry.reads.iter().chain(entry.writes.iter())
+            entry
+                .reads
+                .iter()
+                .chain(entry.writes.iter())
                 .map(move |k| (entry.address, *k))
         })
         .collect();
@@ -211,7 +221,9 @@ pub fn schedule(txs: &[Transaction]) -> ExecutionSchedule {
                 let addr_key = (entry.address, *key);
                 match write_owners.get(&addr_key) {
                     Some(&other) => uf.union(i, other),
-                    None => { write_owners.insert(addr_key, i); }
+                    None => {
+                        write_owners.insert(addr_key, i);
+                    }
                 }
             }
         }
@@ -273,7 +285,10 @@ pub fn access_lists_conflict(a: &[AccessEntry], b: &[AccessEntry]) -> bool {
     let all_a: HashSet<(Address, [u8; 32])> = a
         .iter()
         .flat_map(|entry| {
-            entry.reads.iter().chain(entry.writes.iter())
+            entry
+                .reads
+                .iter()
+                .chain(entry.writes.iter())
                 .map(move |k| (entry.address, *k))
         })
         .collect();
@@ -281,7 +296,10 @@ pub fn access_lists_conflict(a: &[AccessEntry], b: &[AccessEntry]) -> bool {
     let all_b: HashSet<(Address, [u8; 32])> = b
         .iter()
         .flat_map(|entry| {
-            entry.reads.iter().chain(entry.writes.iter())
+            entry
+                .reads
+                .iter()
+                .chain(entry.writes.iter())
                 .map(move |k| (entry.address, *k))
         })
         .collect();
@@ -319,7 +337,9 @@ pub fn schedule_from_access_lists(access_lists: &[Vec<AccessEntry>]) -> Executio
         if al.is_empty() {
             match empty_rep {
                 Some(rep) => uf.union(i, rep),
-                None => { empty_rep = Some(i); }
+                None => {
+                    empty_rep = Some(i);
+                }
             }
             continue;
         }
@@ -328,19 +348,27 @@ pub fn schedule_from_access_lists(access_lists: &[Vec<AccessEntry>]) -> Executio
                 let ak = (entry.address, *key);
                 match write_owners.get(&ak) {
                     Some(&other) => uf.union(i, other),
-                    None => { write_owners.insert(ak, i); }
+                    None => {
+                        write_owners.insert(ak, i);
+                    }
                 }
             }
             for key in &entry.reads {
                 let ak = (entry.address, *key);
                 if let Some(&writer) = write_owners.get(&ak) {
-                    if writer != i { uf.union(i, writer); }
+                    if writer != i {
+                        uf.union(i, writer);
+                    }
                 }
             }
         }
     }
     if let Some(rep) = empty_rep {
-        for i in 0..n { if i != rep { uf.union(i, rep); } }
+        for i in 0..n {
+            if i != rep {
+                uf.union(i, rep);
+            }
+        }
     }
 
     let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -528,9 +556,9 @@ mod tests {
         let key_a = [0xAA; 32];
         let key_b = [0xBB; 32];
         let txs = vec![
-            make_tx_with_access(vec![write_access(0x01, &[key_a])]),         // TX0: writes A
-            make_tx_with_access(vec![write_access(0x01, &[key_a, key_b])]),  // TX1: writes A, B
-            make_tx_with_access(vec![write_access(0x01, &[key_b])]),         // TX2: writes B
+            make_tx_with_access(vec![write_access(0x01, &[key_a])]), // TX0: writes A
+            make_tx_with_access(vec![write_access(0x01, &[key_a, key_b])]), // TX1: writes A, B
+            make_tx_with_access(vec![write_access(0x01, &[key_b])]), // TX2: writes B
         ];
 
         let schedule = schedule(&txs);
@@ -543,18 +571,18 @@ mod tests {
     fn mixed_conflict_and_independent() {
         let key_shared = [0xAA; 32];
         let txs = vec![
-            make_tx_with_access(vec![write_access(0x01, &[key_shared])]),     // TX0: conflicts with TX1
-            make_tx_with_access(vec![write_access(0x01, &[key_shared])]),     // TX1: conflicts with TX0
-            make_tx_with_access(vec![write_access(0x02, &[[0xBB; 32]])]),     // TX2: independent
-            make_tx_with_access(vec![write_access(0x03, &[[0xCC; 32]])]),     // TX3: independent
+            make_tx_with_access(vec![write_access(0x01, &[key_shared])]), // TX0: conflicts with TX1
+            make_tx_with_access(vec![write_access(0x01, &[key_shared])]), // TX1: conflicts with TX0
+            make_tx_with_access(vec![write_access(0x02, &[[0xBB; 32]])]), // TX2: independent
+            make_tx_with_access(vec![write_access(0x03, &[[0xCC; 32]])]), // TX3: independent
         ];
 
         let schedule = schedule(&txs);
         // TX0+TX1 = one group, TX2 = own group, TX3 = own group → 3 groups
         assert_eq!(schedule.group_count(), 3);
         assert_eq!(schedule.groups[0].tx_indices, vec![0, 1]); // conflict group
-        assert_eq!(schedule.groups[1].tx_indices, vec![2]);     // independent
-        assert_eq!(schedule.groups[2].tx_indices, vec![3]);     // independent
+        assert_eq!(schedule.groups[1].tx_indices, vec![2]); // independent
+        assert_eq!(schedule.groups[2].tx_indices, vec![3]); // independent
     }
 
     #[test]
@@ -565,10 +593,10 @@ mod tests {
         let key_a = [0xAA; 32];
         let key_b = [0xBB; 32];
         let txs = vec![
-            make_tx_with_access(vec![write_access(0x01, &[key_a])]),  // cluster 1
-            make_tx_with_access(vec![write_access(0x01, &[key_a])]),  // cluster 1
-            make_tx_with_access(vec![write_access(0x02, &[key_b])]),  // cluster 2
-            make_tx_with_access(vec![write_access(0x02, &[key_b])]),  // cluster 2
+            make_tx_with_access(vec![write_access(0x01, &[key_a])]), // cluster 1
+            make_tx_with_access(vec![write_access(0x01, &[key_a])]), // cluster 1
+            make_tx_with_access(vec![write_access(0x02, &[key_b])]), // cluster 2
+            make_tx_with_access(vec![write_access(0x02, &[key_b])]), // cluster 2
         ];
 
         let schedule = schedule(&txs);
@@ -583,9 +611,7 @@ mod tests {
     #[test]
     fn schedule_preserves_all_txs() {
         let txs: Vec<Transaction> = (0..10)
-            .map(|i| {
-                make_tx_with_access(vec![write_access(i as u8, &[[i as u8; 32]])])
-            })
+            .map(|i| make_tx_with_access(vec![write_access(i as u8, &[[i as u8; 32]])]))
             .collect();
 
         let schedule = schedule(&txs);
@@ -617,8 +643,12 @@ mod tests {
             for g2 in schedule.groups.iter().skip(i + 1) {
                 for &a in &g1.tx_indices {
                     for &b in &g2.tx_indices {
-                        assert!(!conflicts(&txs[a], &txs[b]),
-                            "tx {} and tx {} conflict but are in different groups", a, b);
+                        assert!(
+                            !conflicts(&txs[a], &txs[b]),
+                            "tx {} and tx {} conflict but are in different groups",
+                            a,
+                            b
+                        );
                     }
                 }
             }
@@ -634,9 +664,7 @@ mod tests {
 
     #[test]
     fn single_tx() {
-        let txs = vec![
-            make_tx_with_access(vec![write_access(0x01, &[[0xAA; 32]])]),
-        ];
+        let txs = vec![make_tx_with_access(vec![write_access(0x01, &[[0xAA; 32]])])];
         let schedule = schedule(&txs);
         assert_eq!(schedule.group_count(), 1);
         assert_eq!(schedule.groups[0].tx_indices, vec![0]);
@@ -719,7 +747,11 @@ mod tests {
                     signature: vec![],
                     fee_payer: FeePayer::Sender,
                     access_list: vec![AccessEntry {
-                        address: { let mut a = ZERO_ADDRESS; a[0] = 0xCC; a },
+                        address: {
+                            let mut a = ZERO_ADDRESS;
+                            a[0] = 0xCC;
+                            a
+                        },
                         reads: vec![],
                         writes: vec![hot_key],
                     }],
@@ -736,11 +768,11 @@ mod tests {
 
         assert_eq!(sched.total_txs, 10_000);
         assert_eq!(sched.group_count(), 100); // 100 hot keys → 100 groups
-        // Sanity floor for scheduler complexity — 200 ms is deliberately
-        // loose because this runs in a debug build under contention with
-        // the rest of `cargo test --workspace`. A regression to O(n²)
-        // would take seconds, which this catches; tighter timings belong
-        // in `cargo bench`, not in the regression suite.
+                                              // Sanity floor for scheduler complexity — 200 ms is deliberately
+                                              // loose because this runs in a debug build under contention with
+                                              // the rest of `cargo test --workspace`. A regression to O(n²)
+                                              // would take seconds, which this catches; tighter timings belong
+                                              // in `cargo bench`, not in the regression suite.
         assert!(
             elapsed.as_millis() < 200,
             "10K scheduling took {}ms, must be <200ms (expected ~few ms under release)",

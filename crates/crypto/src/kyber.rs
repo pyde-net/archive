@@ -93,12 +93,16 @@ impl SharedSecret {
 }
 
 fn ek_from_bytes(bytes: &[u8]) -> Result<ml_kem::EncapsulationKey768, &'static str> {
-    let arr: &[u8; EK_SIZE] = bytes.try_into().map_err(|_| "wrong encapsulation key size")?;
+    let arr: &[u8; EK_SIZE] = bytes
+        .try_into()
+        .map_err(|_| "wrong encapsulation key size")?;
     ml_kem::EncapsulationKey768::new(arr.into()).map_err(|_| "invalid encapsulation key")
 }
 
 fn dk_from_seed(bytes: &[u8]) -> Result<ml_kem::DecapsulationKey768, &'static str> {
-    let arr: &[u8; SEED_SIZE] = bytes.try_into().map_err(|_| "wrong decapsulation seed size")?;
+    let arr: &[u8; SEED_SIZE] = bytes
+        .try_into()
+        .map_err(|_| "wrong decapsulation seed size")?;
     let seed = Seed::from(*arr);
     Ok(ml_kem::DecapsulationKey768::from_seed(seed))
 }
@@ -113,7 +117,9 @@ pub fn kyber_keygen() -> Result<(KyberPublicKey, KyberSecretKey), &'static str> 
 }
 
 /// Encapsulate: generate a shared secret and ciphertext using the public key.
-pub fn kyber_encapsulate(pk: &KyberPublicKey) -> Result<(KyberCiphertext, SharedSecret), &'static str> {
+pub fn kyber_encapsulate(
+    pk: &KyberPublicKey,
+) -> Result<(KyberCiphertext, SharedSecret), &'static str> {
     let ek = ek_from_bytes(&pk.0)?;
     let (ct, ss) = ek.encapsulate();
     let mut secret = [0u8; 32];
@@ -122,9 +128,15 @@ pub fn kyber_encapsulate(pk: &KyberPublicKey) -> Result<(KyberCiphertext, Shared
 }
 
 /// Decapsulate: recover the shared secret from a ciphertext using the secret key.
-pub fn kyber_decapsulate(sk: &KyberSecretKey, ct: &KyberCiphertext) -> Result<SharedSecret, &'static str> {
+pub fn kyber_decapsulate(
+    sk: &KyberSecretKey,
+    ct: &KyberCiphertext,
+) -> Result<SharedSecret, &'static str> {
     let dk = dk_from_seed(&sk.0)?;
-    let ct_arr: &[u8; CT_SIZE] = ct.0.as_slice().try_into().map_err(|_| "wrong ciphertext size")?;
+    let ct_arr: &[u8; CT_SIZE] =
+        ct.0.as_slice()
+            .try_into()
+            .map_err(|_| "wrong ciphertext size")?;
     let ss = dk.decapsulate(ct_arr.into());
     let mut secret = [0u8; 32];
     secret.copy_from_slice(ss.as_slice());

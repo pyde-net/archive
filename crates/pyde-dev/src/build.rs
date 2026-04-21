@@ -109,9 +109,13 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
         if let Ok(entries) = std::fs::read_dir(&lib_dir) {
             for entry in entries.flatten() {
                 let pkg_path = entry.path();
-                if !pkg_path.is_dir() { continue; }
+                if !pkg_path.is_dir() {
+                    continue;
+                }
                 let pkg_name = entry.file_name().to_string_lossy().to_string();
-                if pkg_name.starts_with('@') { continue; } // skip @std
+                if pkg_name.starts_with('@') {
+                    continue;
+                } // skip @std
 
                 // Read package's pyde.toml for custom src dir
                 let pkg_src = project::load_config_from(&pkg_path.join("pyde.toml"))
@@ -121,7 +125,9 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
                     .unwrap_or_else(|| "src".to_string());
 
                 let pkg_src_dir = pkg_path.join(&pkg_src);
-                if !pkg_src_dir.exists() { continue; }
+                if !pkg_src_dir.exists() {
+                    continue;
+                }
 
                 let pattern = format!("{}/**/*.oti", pkg_src_dir.display());
                 let lib_files: Vec<PathBuf> = glob::glob(&pattern)
@@ -171,7 +177,9 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
                 otic::ast::Item::Const(c) if c.is_pub => exports.consts.push(c.name.name.clone()),
                 otic::ast::Item::TypeAlias(t) => exports.type_aliases.push(t.name.name.clone()),
                 // Only standalone pub functions are module-exportable (not contract methods)
-                otic::ast::Item::Function(f) if f.is_pub => exports.functions.push(f.name.name.clone()),
+                otic::ast::Item::Function(f) if f.is_pub => {
+                    exports.functions.push(f.name.name.clone())
+                }
                 _ => {}
             }
             // Collect items from within contracts (events, errors, structs — NOT functions)
@@ -180,9 +188,15 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
             if let otic::ast::Item::Contract(c) = item {
                 for ci in &c.items {
                     match ci {
-                        otic::ast::ContractItem::Event(e) => exports.events.push(e.name.name.clone()),
-                        otic::ast::ContractItem::Error(e) => exports.errors.push(e.name.name.clone()),
-                        otic::ast::ContractItem::Struct(s) => exports.structs.push(s.name.name.clone()),
+                        otic::ast::ContractItem::Event(e) => {
+                            exports.events.push(e.name.name.clone())
+                        }
+                        otic::ast::ContractItem::Error(e) => {
+                            exports.errors.push(e.name.name.clone())
+                        }
+                        otic::ast::ContractItem::Struct(s) => {
+                            exports.structs.push(s.name.name.clone())
+                        }
                         otic::ast::ContractItem::Enum(e) => exports.enums.push(e.name.name.clone()),
                         _ => {}
                     }
@@ -204,7 +218,8 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
         // Also register underscore variant (oti-math-lib → oti_math_lib).
         // The package's src dir may be custom (not necessarily "src").
         if let Ok(rel) = path.strip_prefix(&lib_dir) {
-            let components: Vec<&str> = rel.components()
+            let components: Vec<&str> = rel
+                .components()
                 .filter_map(|c| c.as_os_str().to_str())
                 .collect();
             // Layout: [pkg_name, src_dir_name, ...file.oti] — at least 3 components
@@ -212,22 +227,18 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
                 let pkg = components[0];
                 let pkg_us = pkg.replace('-', "_");
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    module_exports.entry(pkg.to_string())
+                    module_exports
+                        .entry(pkg.to_string())
                         .or_insert_with(|| exports.clone());
-                    module_exports.entry(pkg_us.clone())
+                    module_exports
+                        .entry(pkg_us.clone())
                         .or_insert_with(|| exports.clone());
                     if components.len() > 3 {
-                        let sub = components[2..components.len()-1].join("/");
-                        module_exports.insert(
-                            format!("{}/{}", pkg, sub),
-                            exports.clone(),
-                        );
+                        let sub = components[2..components.len() - 1].join("/");
+                        module_exports.insert(format!("{}/{}", pkg, sub), exports.clone());
                     }
                     // Also register "pkg_name/stem" for direct file access
-                    module_exports.insert(
-                        format!("{}/{}", pkg, stem),
-                        exports,
-                    );
+                    module_exports.insert(format!("{}/{}", pkg, stem), exports);
                 }
             }
         }
@@ -388,7 +399,11 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
 }
 
 /// Run the otic frontend pipeline. Returns Err with formatted diagnostics on failure.
-fn run_frontend(path: &Path, source: &str, module_exports: &HashMap<String, ModuleExports>) -> Result<(), String> {
+fn run_frontend(
+    path: &Path,
+    source: &str,
+    module_exports: &HashMap<String, ModuleExports>,
+) -> Result<(), String> {
     let path_str = path.to_string_lossy();
     let mut diagnostics = Vec::new();
 
@@ -421,7 +436,8 @@ fn run_frontend(path: &Path, source: &str, module_exports: &HashMap<String, Modu
     }
 
     // Convert ModuleExports to resolver's format (module_path → Vec<exported_name>)
-    let resolver_exports: otic::resolve::ExternalModuleExports = module_exports.iter()
+    let resolver_exports: otic::resolve::ExternalModuleExports = module_exports
+        .iter()
         .map(|(path, exports)| {
             let mut names = Vec::new();
             names.extend(exports.contracts.iter().cloned());
@@ -508,7 +524,8 @@ fn build_dependency_graph(
         // Also register underscore variant (oti-math-lib → oti_math_lib).
         // The src dir may be custom (not necessarily "src").
         if let Ok(rel) = path.strip_prefix(lib_dir) {
-            let components: Vec<&str> = rel.components()
+            let components: Vec<&str> = rel
+                .components()
                 .filter_map(|c| c.as_os_str().to_str())
                 .collect();
             if components.len() >= 3 {

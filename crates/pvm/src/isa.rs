@@ -94,8 +94,8 @@ pub enum Opcode {
     MerkleVerify = 0x32, // rd = verify_merkle_path(root, leaf, path)
 
     // --- 3.4.6 Assertions + Memory ---
-    Assert = 0x38,   // if rs1 == 0 then revert (assertion)
-    Memcpy = 0x39,   // copy gp[imm&0xF] bytes from mem[gp[rs1]] to mem[gp[rd]]
+    Assert = 0x38, // if rs1 == 0 then revert (assertion)
+    Memcpy = 0x39, // copy gp[imm&0xF] bytes from mem[gp[rs1]] to mem[gp[rd]]
     // 0x3A is now Wshift (wide shift); see definition above.
     // Until Phase 9, bulk writes use a WSTORE loop:
     //   for each 32-byte chunk: WSTORE to heap, advance pointer
@@ -517,21 +517,21 @@ pub fn gas_cost(op: Opcode) -> GasCost {
         Opcode::Bne => GasCost::new(3),
         Opcode::Blt => GasCost::new(3),
         Opcode::Bge => GasCost::new(3),
-        Opcode::Call => GasCost::new(50),   // frame setup + stack alloc
+        Opcode::Call => GasCost::new(50), // frame setup + stack alloc
         Opcode::Ret => GasCost::new(5),
 
         // Blockchain syscalls — calibrated against real I/O costs
-        Opcode::Sload => GasCost::new(100),     // warm access; +1800 cold surcharge in handler
-        Opcode::Sstore => GasCost::new(200),     // warm write; +1800 cold surcharge in handler
-        Opcode::Sdelete => GasCost::new(200),    // warm delete + refund in handler
+        Opcode::Sload => GasCost::new(100), // warm access; +1800 cold surcharge in handler
+        Opcode::Sstore => GasCost::new(200), // warm write; +1800 cold surcharge in handler
+        Opcode::Sdelete => GasCost::new(200), // warm delete + refund in handler
         Opcode::Caller => GasCost::new(5),
         Opcode::Callvalue => GasCost::new(5),
         Opcode::Blockhash => GasCost::new(20),
-        Opcode::CallExt => GasCost::new(2_500),  // child VM spawn + context setup
+        Opcode::CallExt => GasCost::new(2_500), // child VM spawn + context setup
         Opcode::Delegate => GasCost::new(2_500),
-        Opcode::Create => GasCost::new(32_000),  // compile + child VM + state writes
+        Opcode::Create => GasCost::new(32_000), // compile + child VM + state writes
         Opcode::Selfdestruct => GasCost::new(5_000),
-        Opcode::Log => GasCost::new(375),        // base; + 8 per byte dynamic in handler
+        Opcode::Log => GasCost::new(375), // base; + 8 per byte dynamic in handler
         Opcode::Revert => GasCost::new(3),
         Opcode::Halt => GasCost::new(3),
 
@@ -542,7 +542,7 @@ pub fn gas_cost(op: Opcode) -> GasCost {
 
         // Assertions + memory
         Opcode::Assert => GasCost::new(3),
-        Opcode::Memcpy => GasCost::new(5),  // base; + 3 per 8 bytes dynamic in handler
+        Opcode::Memcpy => GasCost::new(5), // base; + 3 per 8 bytes dynamic in handler
 
         // Wide comparisons
         Opcode::Weq => GasCost::new(4),
@@ -561,70 +561,70 @@ static TOTAL_GAS_TABLE: [u64; 64] = {
     let mut i = 0u8;
     loop {
         let cost = match i {
-            0x00 => Some(GasCost::new(4)),       // Weq
-            0x01 => Some(GasCost::new(3)),       // Add
-            0x02 => Some(GasCost::new(3)),       // Sub
-            0x03 => Some(GasCost::new(5)),       // Mul
-            0x04 => Some(GasCost::new(8)),       // Div
-            0x05 => Some(GasCost::new(8)),       // Mod
-            0x06 => Some(GasCost::new(3)),       // And
-            0x07 => Some(GasCost::new(3)),       // Or
-            0x08 => Some(GasCost::new(3)),       // Xor
-            0x09 => Some(GasCost::new(6)),       // Wadd
-            0x0A => Some(GasCost::new(6)),       // Wsub
-            0x0B => Some(GasCost::new(12)),      // Wmul
-            0x0C => Some(GasCost::new(15)),      // Wdiv
-            0x0D => Some(GasCost::new(15)),      // Wmod
-            0x0E => Some(GasCost::new(3)),       // Addi
-            0x0F => Some(GasCost::new(3)),       // Not
-            0x10 => Some(GasCost::new(5)),       // Load
-            0x11 => Some(GasCost::new(5)),       // Store
-            0x12 => Some(GasCost::new(5)),       // Push
-            0x13 => Some(GasCost::new(5)),       // Pop
-            0x14 => Some(GasCost::new(3)),       // Shl
-            0x15 => Some(GasCost::new(3)),       // Shr
-            0x16 => Some(GasCost::new(3)),       // Sar
-            0x17 => Some(GasCost::new(3)),       // Lt
-            0x18 => Some(GasCost::new(3)),       // Jmp
-            0x19 => Some(GasCost::new(3)),       // Beq
-            0x1A => Some(GasCost::new(3)),       // Bne
-            0x1B => Some(GasCost::new(3)),       // Blt
-            0x1C => Some(GasCost::new(3)),       // Bge
-            0x1D => Some(GasCost::new(50)),      // Call
-            0x1E => Some(GasCost::new(5)),       // Ret
-            0x1F => Some(GasCost::new(4)),       // Wnot
-            0x20 => Some(GasCost::new(100)),     // Sload
-            0x21 => Some(GasCost::new(200)),     // Sstore
-            0x22 => Some(GasCost::new(200)),     // Sdelete
-            0x23 => Some(GasCost::new(5)),       // Caller
-            0x24 => Some(GasCost::new(5)),       // Callvalue
-            0x25 => Some(GasCost::new(20)),      // Blockhash
-            0x26 => Some(GasCost::new(2_500)),   // CallExt
-            0x27 => Some(GasCost::new(2_500)),   // Delegate
-            0x28 => Some(GasCost::new(32_000)),  // Create
-            0x29 => Some(GasCost::new(5_000)),   // Selfdestruct
-            0x2A => Some(GasCost::new(375)),     // Log
-            0x2B => Some(GasCost::new(3)),       // Revert
-            0x2C => Some(GasCost::new(3)),       // Halt
-            0x2D => Some(GasCost::new(4)),       // Wand
-            0x2E => Some(GasCost::new(4)),       // Wor
-            0x2F => Some(GasCost::new(4)),       // Wxor
-            0x3A => Some(GasCost::new(4)),       // Wshift
-            0x30 => Some(GasCost::new(1_000)),   // Poseidon
-            0x31 => Some(GasCost::new(20_000)),  // VerifySig
-            0x32 => Some(GasCost::new(5_000)),   // MerkleVerify
-            0x33 => Some(GasCost::new(3)),       // Gt
-            0x34 => Some(GasCost::new(3)),       // Eq
-            0x35 => Some(GasCost::new(3)),       // Slt
-            0x36 => Some(GasCost::new(3)),       // Sgt
-            0x37 => Some(GasCost::new(8)),       // Wload
-            0x38 => Some(GasCost::new(3)),       // Assert
-            0x39 => Some(GasCost::new(5)),       // Memcpy
-            0x3B => Some(GasCost::new(8)),       // Wstore
-            0x3C => Some(GasCost::new(3)),       // Wmov
-            0x3D => Some(GasCost::new(3)),       // Narrow
-            0x3E => Some(GasCost::new(3)),       // Widen
-            0x3F => Some(GasCost::new(4)),       // Wlt
+            0x00 => Some(GasCost::new(4)),      // Weq
+            0x01 => Some(GasCost::new(3)),      // Add
+            0x02 => Some(GasCost::new(3)),      // Sub
+            0x03 => Some(GasCost::new(5)),      // Mul
+            0x04 => Some(GasCost::new(8)),      // Div
+            0x05 => Some(GasCost::new(8)),      // Mod
+            0x06 => Some(GasCost::new(3)),      // And
+            0x07 => Some(GasCost::new(3)),      // Or
+            0x08 => Some(GasCost::new(3)),      // Xor
+            0x09 => Some(GasCost::new(6)),      // Wadd
+            0x0A => Some(GasCost::new(6)),      // Wsub
+            0x0B => Some(GasCost::new(12)),     // Wmul
+            0x0C => Some(GasCost::new(15)),     // Wdiv
+            0x0D => Some(GasCost::new(15)),     // Wmod
+            0x0E => Some(GasCost::new(3)),      // Addi
+            0x0F => Some(GasCost::new(3)),      // Not
+            0x10 => Some(GasCost::new(5)),      // Load
+            0x11 => Some(GasCost::new(5)),      // Store
+            0x12 => Some(GasCost::new(5)),      // Push
+            0x13 => Some(GasCost::new(5)),      // Pop
+            0x14 => Some(GasCost::new(3)),      // Shl
+            0x15 => Some(GasCost::new(3)),      // Shr
+            0x16 => Some(GasCost::new(3)),      // Sar
+            0x17 => Some(GasCost::new(3)),      // Lt
+            0x18 => Some(GasCost::new(3)),      // Jmp
+            0x19 => Some(GasCost::new(3)),      // Beq
+            0x1A => Some(GasCost::new(3)),      // Bne
+            0x1B => Some(GasCost::new(3)),      // Blt
+            0x1C => Some(GasCost::new(3)),      // Bge
+            0x1D => Some(GasCost::new(50)),     // Call
+            0x1E => Some(GasCost::new(5)),      // Ret
+            0x1F => Some(GasCost::new(4)),      // Wnot
+            0x20 => Some(GasCost::new(100)),    // Sload
+            0x21 => Some(GasCost::new(200)),    // Sstore
+            0x22 => Some(GasCost::new(200)),    // Sdelete
+            0x23 => Some(GasCost::new(5)),      // Caller
+            0x24 => Some(GasCost::new(5)),      // Callvalue
+            0x25 => Some(GasCost::new(20)),     // Blockhash
+            0x26 => Some(GasCost::new(2_500)),  // CallExt
+            0x27 => Some(GasCost::new(2_500)),  // Delegate
+            0x28 => Some(GasCost::new(32_000)), // Create
+            0x29 => Some(GasCost::new(5_000)),  // Selfdestruct
+            0x2A => Some(GasCost::new(375)),    // Log
+            0x2B => Some(GasCost::new(3)),      // Revert
+            0x2C => Some(GasCost::new(3)),      // Halt
+            0x2D => Some(GasCost::new(4)),      // Wand
+            0x2E => Some(GasCost::new(4)),      // Wor
+            0x2F => Some(GasCost::new(4)),      // Wxor
+            0x3A => Some(GasCost::new(4)),      // Wshift
+            0x30 => Some(GasCost::new(1_000)),  // Poseidon
+            0x31 => Some(GasCost::new(20_000)), // VerifySig
+            0x32 => Some(GasCost::new(5_000)),  // MerkleVerify
+            0x33 => Some(GasCost::new(3)),      // Gt
+            0x34 => Some(GasCost::new(3)),      // Eq
+            0x35 => Some(GasCost::new(3)),      // Slt
+            0x36 => Some(GasCost::new(3)),      // Sgt
+            0x37 => Some(GasCost::new(8)),      // Wload
+            0x38 => Some(GasCost::new(3)),      // Assert
+            0x39 => Some(GasCost::new(5)),      // Memcpy
+            0x3B => Some(GasCost::new(8)),      // Wstore
+            0x3C => Some(GasCost::new(3)),      // Wmov
+            0x3D => Some(GasCost::new(3)),      // Narrow
+            0x3E => Some(GasCost::new(3)),      // Widen
+            0x3F => Some(GasCost::new(4)),      // Wlt
             _ => None,
         };
         table[i as usize] = match cost {
@@ -856,7 +856,8 @@ mod tests {
             let from_table = total_gas(op.to_u8());
             let from_func = gas_cost(op).cost() as u64;
             assert_eq!(
-                from_table, from_func,
+                from_table,
+                from_func,
                 "{:?} (0x{:02X}): table={} vs func={}",
                 op,
                 op.to_u8(),

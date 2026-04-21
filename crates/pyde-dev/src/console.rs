@@ -29,8 +29,15 @@ pub fn run(network: &str, signer: &crate::signer::Signer) -> Result<(), String> 
             format!(
                 "network '{}' not found in pyde.toml (available: {})",
                 network,
-                if available.is_empty() { "none".to_string() }
-                else { available.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ") }
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
             )
         })?
         .clone();
@@ -62,7 +69,16 @@ pub fn run(network: &str, signer: &crate::signer::Signer) -> Result<(), String> 
             continue;
         }
 
-        match handle_command(&client, &net.rpc_url, from, signer, &net, &mut nonce, line, &mut loaded_abi) {
+        match handle_command(
+            &client,
+            &net.rpc_url,
+            from,
+            signer,
+            &net,
+            &mut nonce,
+            line,
+            &mut loaded_abi,
+        ) {
             Ok(true) => break, // exit
             Ok(false) => {}
             Err(e) => eprintln!("  error: {}", e),
@@ -91,7 +107,9 @@ fn handle_command(
         "exit" | "quit" | "q" => return Ok(true),
 
         "help" => {
-            println!("  abi <path.json>                    — load contract ABI for type-aware encoding");
+            println!(
+                "  abi <path.json>                    — load contract ABI for type-aware encoding"
+            );
             println!("  call <address> <method>(<args>)   — read-only call");
             println!("  send <address> <method>(<args>)   — state-changing tx");
             println!("  balance <address>                  — query balance");
@@ -133,7 +151,12 @@ fn handle_command(
             if args.is_empty() {
                 return Err("usage: nonce <address>".into());
             }
-            let result = rpc_call(client, rpc_url, "pyde_getTransactionCount", &[json_str(args)])?;
+            let result = rpc_call(
+                client,
+                rpc_url,
+                "pyde_getTransactionCount",
+                &[json_str(args)],
+            )?;
             println!("  {}", result);
         }
 
@@ -154,8 +177,16 @@ fn handle_command(
             if args.is_empty() {
                 return Err("usage: receipt <tx_hash>".into());
             }
-            let result = rpc_call(client, rpc_url, "pyde_getTransactionReceipt", &[json_str(args)])?;
-            println!("  {}", serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()));
+            let result = rpc_call(
+                client,
+                rpc_url,
+                "pyde_getTransactionReceipt",
+                &[json_str(args)],
+            )?;
+            println!(
+                "  {}",
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+            );
         }
 
         "call" => {
@@ -213,7 +244,12 @@ fn handle_command(
             };
             signer.sign_transaction(&mut tx)?;
             let tx_hex = format!("0x{}", hex::encode(tx.to_bytes()));
-            let result = rpc_call(client, rpc_url, "pyde_sendRawTransaction", &[serde_json::json!(tx_hex)])?;
+            let result = rpc_call(
+                client,
+                rpc_url,
+                "pyde_sendRawTransaction",
+                &[serde_json::json!(tx_hex)],
+            )?;
             let tx_hash = result.as_str().unwrap_or("").to_string();
             println!("  tx: {} (signed ✓)", tx_hash);
             *nonce += 1;
@@ -231,7 +267,9 @@ fn handle_command(
 fn parse_hex_address(s: &str) -> Result<[u8; 32], String> {
     let hex = s.strip_prefix("0x").unwrap_or(s);
     let bytes = hex::decode(hex).map_err(|e| format!("invalid address hex: {}", e))?;
-    if bytes.len() != 32 { return Err(format!("address must be 32 bytes, got {}", bytes.len())); }
+    if bytes.len() != 32 {
+        return Err(format!("address must be 32 bytes, got {}", bytes.len()));
+    }
     let mut addr = [0u8; 32];
     addr.copy_from_slice(&bytes);
     Ok(addr)
@@ -264,23 +302,39 @@ fn parse_call_args(input: &str) -> Result<(String, String, Vec<String>), String>
 /// Load a contract ABI from a compiled .json artifact.
 /// Returns method_name → Vec<param_type_string>.
 fn load_abi(path: &str) -> Result<HashMap<String, Vec<String>>, String> {
-    let data = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read {}: {}", path, e))?;
-    let json: serde_json::Value = serde_json::from_str(&data)
-        .map_err(|e| format!("invalid JSON: {}", e))?;
+    let data = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("invalid JSON: {}", e))?;
 
     let mut methods = HashMap::new();
     // Support both top-level "functions" and nested "abi.functions"
-    let functions = json.get("functions").and_then(|v| v.as_array())
-        .or_else(|| json.get("abi").and_then(|a| a.get("functions")).and_then(|v| v.as_array()));
+    let functions = json
+        .get("functions")
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            json.get("abi")
+                .and_then(|a| a.get("functions"))
+                .and_then(|v| v.as_array())
+        });
     if let Some(functions) = functions {
         for f in functions {
-            let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let params: Vec<String> = f.get("params")
+            let name = f
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let params: Vec<String> = f
+                .get("params")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|p| {
-                    p.get("type").and_then(|t| t.as_str()).map(|s| s.to_string())
-                }).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| {
+                            p.get("type")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             if !name.is_empty() {
                 methods.insert(name, params);
@@ -315,17 +369,17 @@ fn encode_arg_typed(arg: &str, ty: Option<&str>) -> Vec<u8> {
             }
             addr.to_vec()
         }
-        Some("bool") => {
-            match arg {
-                "true" | "1" => 1u64.to_le_bytes().to_vec(),
-                _ => 0u64.to_le_bytes().to_vec(),
-            }
-        }
+        Some("bool") => match arg {
+            "true" | "1" => 1u64.to_le_bytes().to_vec(),
+            _ => 0u64.to_le_bytes().to_vec(),
+        },
         Some("String") => {
             let s = arg.trim_matches('"');
             let mut encoded = (s.len() as u64).to_le_bytes().to_vec();
             encoded.extend_from_slice(s.as_bytes());
-            while encoded.len() % 8 != 0 { encoded.push(0); }
+            while encoded.len() % 8 != 0 {
+                encoded.push(0);
+            }
             encoded
         }
         _ => encode_arg(arg), // fallback to auto-detect
@@ -373,10 +427,15 @@ fn compute_selector(name: &str) -> u32 {
 }
 
 fn get_nonce(client: &reqwest::blocking::Client, rpc_url: &str, address: &str) -> u64 {
-    rpc_call(client, rpc_url, "pyde_getTransactionCount", &[json_str(address)])
-        .ok()
-        .and_then(|v| v.as_str().and_then(|s| s.parse().ok()))
-        .unwrap_or(0)
+    rpc_call(
+        client,
+        rpc_url,
+        "pyde_getTransactionCount",
+        &[json_str(address)],
+    )
+    .ok()
+    .and_then(|v| v.as_str().and_then(|s| s.parse().ok()))
+    .unwrap_or(0)
 }
 
 fn json_str(s: &str) -> serde_json::Value {
@@ -406,7 +465,10 @@ fn rpc_call(
     if let Some(err) = json.get("error") {
         return Err(format!("{}", err));
     }
-    Ok(json.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    Ok(json
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 // ============================================================================
@@ -416,7 +478,9 @@ fn rpc_call(
 /// `pyde-dev call <address> <function>(<args>) --network devnet`
 pub fn cmd_call(address: &str, function: &str, network: &str) -> Result<(), String> {
     let (config, _) = crate::project::load_config()?;
-    let net = config.networks.get(network)
+    let net = config
+        .networks
+        .get(network)
         .ok_or_else(|| format!("network '{}' not found in pyde.toml", network))?;
 
     let (method, method_args) = parse_function(function)?;
@@ -445,9 +509,17 @@ pub fn cmd_call(address: &str, function: &str, network: &str) -> Result<(), Stri
 
 /// `pyde-dev send <address> <function> --network devnet`
 /// Signed state-changing transaction.
-pub fn cmd_send(address: &str, function: &str, network: &str, signer: &crate::signer::Signer, value: u128) -> Result<(), String> {
+pub fn cmd_send(
+    address: &str,
+    function: &str,
+    network: &str,
+    signer: &crate::signer::Signer,
+    value: u128,
+) -> Result<(), String> {
     let (config, _) = crate::project::load_config()?;
-    let net = config.networks.get(network)
+    let net = config
+        .networks
+        .get(network)
         .ok_or_else(|| format!("network '{}' not found in pyde.toml", network))?;
 
     let to = parse_hex_address(address)?;
@@ -460,7 +532,12 @@ pub fn cmd_send(address: &str, function: &str, network: &str, signer: &crate::si
 
     // Get nonce
     let client = reqwest::blocking::Client::new();
-    let nonce_result = rpc_call(&client, &net.rpc_url, "pyde_getTransactionCount", &[serde_json::json!(signer.address_hex())])?;
+    let nonce_result = rpc_call(
+        &client,
+        &net.rpc_url,
+        "pyde_getTransactionCount",
+        &[serde_json::json!(signer.address_hex())],
+    )?;
     let nonce: u64 = nonce_result.as_str().unwrap_or("0").parse().unwrap_or(0);
 
     // Build and sign
@@ -482,7 +559,12 @@ pub fn cmd_send(address: &str, function: &str, network: &str, signer: &crate::si
 
     // Send signed tx
     let tx_hex = format!("0x{}", hex::encode(tx.to_bytes()));
-    let result = rpc_call(&client, &net.rpc_url, "pyde_sendRawTransaction", &[serde_json::json!(tx_hex)])?;
+    let result = rpc_call(
+        &client,
+        &net.rpc_url,
+        "pyde_sendRawTransaction",
+        &[serde_json::json!(tx_hex)],
+    )?;
     let tx_hash = result.as_str().unwrap_or("").to_string();
 
     println!("  Tx Hash: {} (signed ✓)", tx_hash);
@@ -497,17 +579,34 @@ pub fn cmd_send(address: &str, function: &str, network: &str, signer: &crate::si
         "params": [tx_hash]
     });
     for attempt in 0..50 {
-        if attempt > 0 { std::thread::sleep(std::time::Duration::from_millis(100)); }
-        let resp = client.post(&net.rpc_url).json(&receipt_body).send()
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let resp = client
+            .post(&net.rpc_url)
+            .json(&receipt_body)
+            .send()
             .map_err(|e| format!("RPC error: {}", e))?;
-        let json: serde_json::Value = resp.json().map_err(|e| format!("invalid response: {}", e))?;
+        let json: serde_json::Value = resp
+            .json()
+            .map_err(|e| format!("invalid response: {}", e))?;
         if let Some(result) = json.get("result") {
             if !result.is_null() {
-                let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                let success = result
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 println!("  Success: {}", success);
-                let gas = result.get("gasUsed").and_then(|v| v.as_str()).unwrap_or("0");
+                let gas = result
+                    .get("gasUsed")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0");
                 println!("  Gas:     {}", gas);
-                return if success { Ok(()) } else { Err("transaction reverted".into()) };
+                return if success {
+                    Ok(())
+                } else {
+                    Err("transaction reverted".into())
+                };
             }
         }
     }
@@ -517,25 +616,47 @@ pub fn cmd_send(address: &str, function: &str, network: &str, signer: &crate::si
 /// `pyde-dev tx <hash> --network devnet`
 pub fn cmd_tx(hash: &str, network: &str) -> Result<(), String> {
     let (config, _) = crate::project::load_config()?;
-    let net = config.networks.get(network)
+    let net = config
+        .networks
+        .get(network)
         .ok_or_else(|| format!("network '{}' not found in pyde.toml", network))?;
 
     let client = reqwest::blocking::Client::new();
-    let result = rpc_call(&client, &net.rpc_url, "pyde_getTransactionReceipt", &[json_str(hash)])?;
+    let result = rpc_call(
+        &client,
+        &net.rpc_url,
+        "pyde_getTransactionReceipt",
+        &[json_str(hash)],
+    )?;
 
     if result.is_null() {
         println!("  Receipt not found (tx may be pending or invalid)");
     } else {
-        let success = result.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-        let gas = result.get("gasUsed").and_then(|v| v.as_str()).unwrap_or("0");
-        let return_data = result.get("returnData").and_then(|v| v.as_str()).unwrap_or("");
+        let success = result
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let gas = result
+            .get("gasUsed")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
+        let return_data = result
+            .get("returnData")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
-        println!("  Status:     {}", if success { "Success" } else { "Reverted" });
+        println!(
+            "  Status:     {}",
+            if success { "Success" } else { "Reverted" }
+        );
         println!("  Gas Used:   {}", gas);
         if !return_data.is_empty() && return_data != "0x" {
             println!("  Return:     {}", return_data);
         }
-        let fee_paid = result.get("feePaid").and_then(|v| v.as_str()).unwrap_or("0");
+        let fee_paid = result
+            .get("feePaid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
         println!("  Fee Paid:   {} quanta", fee_paid);
     }
     Ok(())
@@ -628,7 +749,10 @@ mod tests {
     fn encode_arg_typed_u256() {
         let bytes = encode_arg_typed("1000000", Some("u256"));
         assert_eq!(bytes.len(), 32);
-        assert_eq!(u128::from_le_bytes(bytes[..16].try_into().unwrap()), 1000000);
+        assert_eq!(
+            u128::from_le_bytes(bytes[..16].try_into().unwrap()),
+            1000000
+        );
         assert_eq!(&bytes[16..], &[0u8; 16]);
     }
 

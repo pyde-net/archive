@@ -131,13 +131,21 @@ impl ThresholdPublicKey {
 
     /// Deserialize from bytes.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 12 { return None; }
-        let n = u32::from_le_bytes([data[0],data[1],data[2],data[3]]) as usize;
-        let threshold = u32::from_le_bytes([data[4],data[5],data[6],data[7]]) as usize;
-        let pk_len = u32::from_le_bytes([data[8],data[9],data[10],data[11]]) as usize;
-        if data.len() < 12 + pk_len { return None; }
+        if data.len() < 12 {
+            return None;
+        }
+        let n = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let threshold = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        let pk_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        if data.len() < 12 + pk_len {
+            return None;
+        }
         let pk = KyberPublicKey::from_bytes(&data[12..12 + pk_len])?;
-        Some(Self { kyber_pk: pk, n, threshold })
+        Some(Self {
+            kyber_pk: pk,
+            n,
+            threshold,
+        })
     }
 }
 
@@ -164,14 +172,29 @@ impl KeyShare {
 
     /// Deserialize from bytes.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 12 { return None; }
-        let index = u64::from_le_bytes([data[0],data[1],data[2],data[3],data[4],data[5],data[6],data[7]]) as usize;
-        let count = u32::from_le_bytes([data[8],data[9],data[10],data[11]]) as usize;
-        if data.len() < 12 + count * 8 { return None; }
+        if data.len() < 12 {
+            return None;
+        }
+        let index = u64::from_le_bytes([
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+        ]) as usize;
+        let count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        if data.len() < 12 + count * 8 {
+            return None;
+        }
         let mut shares = Vec::with_capacity(count);
         for i in 0..count {
             let off = 12 + i * 8;
-            let val = u64::from_le_bytes([data[off],data[off+1],data[off+2],data[off+3],data[off+4],data[off+5],data[off+6],data[off+7]]);
+            let val = u64::from_le_bytes([
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+                data[off + 4],
+                data[off + 5],
+                data[off + 6],
+                data[off + 7],
+            ]);
             shares.push(gl(val));
         }
         Some(Self { index, shares })
@@ -199,14 +222,18 @@ impl DecryptionShare {
     }
 
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 12 { return None; }
+        if data.len() < 12 {
+            return None;
+        }
         let index = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
         let count = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
-        if data.len() < 12 + count * 8 { return None; }
+        if data.len() < 12 + count * 8 {
+            return None;
+        }
         let mut shares = Vec::with_capacity(count);
         for i in 0..count {
             let off = 12 + i * 8;
-            let val = u64::from_le_bytes(data[off..off+8].try_into().ok()?);
+            let val = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
             shares.push(gl(val));
         }
         Some(Self { index, shares })
@@ -256,18 +283,33 @@ impl ThresholdCiphertext {
 
     /// Deserialize from wire format.
     pub fn from_wire_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 8 { return None; }
-        let ct_len = u32::from_le_bytes([data[0],data[1],data[2],data[3]]) as usize;
-        if data.len() < 4 + ct_len + 4 { return None; }
+        if data.len() < 8 {
+            return None;
+        }
+        let ct_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if data.len() < 4 + ct_len + 4 {
+            return None;
+        }
         let kyber_ct = KyberCiphertext::from_bytes(&data[4..4 + ct_len])?;
         let msg_off = 4 + ct_len;
-        let msg_len = u32::from_le_bytes([data[msg_off],data[msg_off+1],data[msg_off+2],data[msg_off+3]]) as usize;
+        let msg_len = u32::from_le_bytes([
+            data[msg_off],
+            data[msg_off + 1],
+            data[msg_off + 2],
+            data[msg_off + 3],
+        ]) as usize;
         let msg_start = msg_off + 4;
-        if data.len() < msg_start + msg_len + 32 { return None; }
+        if data.len() < msg_start + msg_len + 32 {
+            return None;
+        }
         let encrypted_msg = data[msg_start..msg_start + msg_len].to_vec();
         let mut mac = [0u8; 32];
         mac.copy_from_slice(&data[msg_start + msg_len..msg_start + msg_len + 32]);
-        Some(Self { kyber_ct, encrypted_msg, mac })
+        Some(Self {
+            kyber_ct,
+            encrypted_msg,
+            mac,
+        })
     }
 }
 
@@ -292,7 +334,7 @@ fn derive_keystream(shared_secret: &SharedSecret, len: usize) -> Vec<u8> {
 
 fn compute_mac(shared_secret: &SharedSecret, ciphertext: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(8 + 32 + ciphertext.len()); // prefix(8) + secret(32) + ciphertext
-    // Domain-separate MAC from keystream by using a different prefix
+                                                                   // Domain-separate MAC from keystream by using a different prefix
     input.extend_from_slice(&[0xFF; 8]);
     input.extend_from_slice(shared_secret.as_bytes());
     input.extend_from_slice(ciphertext);
@@ -316,9 +358,16 @@ fn xor_bytes(data: &[u8], keystream: &[u8]) -> Vec<u8> {
 /// For mainnet, use a multi-party ceremony (K operators contribute randomness
 /// via MPC, security holds if any 1 is honest) followed by PSS epoch refresh
 /// (pss_refresh/apply_refresh) which dissolves the genesis trust after epoch 1.
-pub fn threshold_keygen(n: usize, threshold: usize) -> Result<(ThresholdPublicKey, Vec<KeyShare>), &'static str> {
-    if threshold > n { return Err("threshold must be <= n"); }
-    if threshold < 1 { return Err("threshold must be >= 1"); }
+pub fn threshold_keygen(
+    n: usize,
+    threshold: usize,
+) -> Result<(ThresholdPublicKey, Vec<KeyShare>), &'static str> {
+    if threshold > n {
+        return Err("threshold must be <= n");
+    }
+    if threshold < 1 {
+        return Err("threshold must be >= 1");
+    }
 
     let (pk, sk) = kyber_keygen()?;
 
@@ -366,7 +415,10 @@ pub fn threshold_keygen(n: usize, threshold: usize) -> Result<(ThresholdPublicKe
 }
 
 /// Encrypt a message using the committee's threshold public key.
-pub fn threshold_encrypt(tpk: &ThresholdPublicKey, msg: &[u8]) -> Result<ThresholdCiphertext, &'static str> {
+pub fn threshold_encrypt(
+    tpk: &ThresholdPublicKey,
+    msg: &[u8],
+) -> Result<ThresholdCiphertext, &'static str> {
     let (kyber_ct, ss) = kyber_encapsulate(&tpk.kyber_pk)?;
     let keystream = derive_keystream(&ss, msg.len());
     let encrypted_msg = xor_bytes(msg, &keystream);
@@ -416,7 +468,11 @@ fn ciphertext_binding_hash(ct: &ThresholdCiphertext) -> [u8; 32] {
 
 /// Derive the blinding mask for a specific share element.
 /// mask = H(ct_hash || validator_index || element_index) interpreted as a Goldilocks field element.
-fn derive_blinding_mask(ct_hash: &[u8; 32], validator_index: usize, elem_index: usize) -> Goldilocks {
+fn derive_blinding_mask(
+    ct_hash: &[u8; 32],
+    validator_index: usize,
+    elem_index: usize,
+) -> Goldilocks {
     let mut buf = Vec::with_capacity(48);
     buf.extend_from_slice(ct_hash);
     buf.extend_from_slice(&(validator_index as u64).to_le_bytes());
@@ -576,17 +632,21 @@ impl RefreshContribution {
 
     /// Deserialize from bytes.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 16 { return None; }
+        if data.len() < 16 {
+            return None;
+        }
         let from_index = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
         let n = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
         let elems = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
-        if data.len() < 16 + n * elems * 8 { return None; }
+        if data.len() < 16 + n * elems * 8 {
+            return None;
+        }
         let mut deltas = Vec::with_capacity(n);
         let mut off = 16;
         for _ in 0..n {
             let mut v = Vec::with_capacity(elems);
             for _ in 0..elems {
-                let val = u64::from_le_bytes(data[off..off+8].try_into().ok()?);
+                let val = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
                 v.push(gl(val));
                 off += 8;
             }
@@ -742,11 +802,15 @@ impl ResharingContribution {
     }
 
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 16 { return None; }
+        if data.len() < 16 {
+            return None;
+        }
         let from_old_index = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
         let n = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
         let elems = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
-        if data.len() < 16 + n * elems * 8 { return None; }
+        if data.len() < 16 + n * elems * 8 {
+            return None;
+        }
         let mut sub_shares = Vec::with_capacity(n);
         let mut off = 16;
         for _ in 0..n {
@@ -758,7 +822,10 @@ impl ResharingContribution {
             }
             sub_shares.push(row);
         }
-        Some(Self { from_old_index, sub_shares })
+        Some(Self {
+            from_old_index,
+            sub_shares,
+        })
     }
 
     /// Expose `new_n` (number of new committee members this contribution targets).
@@ -1220,10 +1287,7 @@ mod tests {
 
         // Generate contributions using fresh entropy
         for ks in &shares {
-            let fresh_random = random_goldilocks(
-                &new_epoch.to_le_bytes(),
-                ks.index * 7919,
-            );
+            let fresh_random = random_goldilocks(&new_epoch.to_le_bytes(), ks.index * 7919);
             let mut entropy_input = Vec::with_capacity(24);
             entropy_input.extend_from_slice(&new_epoch.to_le_bytes());
             entropy_input.extend_from_slice(&(ks.index as u64).to_le_bytes());

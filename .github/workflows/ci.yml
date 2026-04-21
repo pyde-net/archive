@@ -10,6 +10,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # `-D warnings` turns every clippy / rustc warning into an error.
+      # Slices 5.4 and 5.5 drove workspace warnings to zero; this job
+      # enforces that any new PR keeps it that way. The workspace-level
+      # `[workspace.lints.clippy]` block in the root Cargo.toml is the
+      # single source of truth for project-wide allows.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
   check:
     name: Check
     runs-on: ubuntu-latest

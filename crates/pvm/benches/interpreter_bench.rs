@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use pyde_vm::isa::{encode, encode_immediate, Opcode};
-use pyde_vm::vm::{ExecutionContext, ExecResult, Outcome, Vm, ZERO_ADDRESS};
+use pyde_vm::vm::{ExecResult, ExecutionContext, Outcome, Vm, ZERO_ADDRESS};
 use pyde_vm::wide::U256;
 
 /// Helper: encode an instruction to little-endian bytes.
@@ -10,7 +10,9 @@ fn instr_bytes(op: Opcode, rd: u8, rs1: u8, rs2_or_imm: u32) -> [u8; 4] {
 }
 
 fn instr_ri(op: Opcode, rd: u8, rs1: u8, imm: i32) -> [u8; 4] {
-    encode(op, rd, rs1, encode_immediate(imm).unwrap()).0.to_le_bytes()
+    encode(op, rd, rs1, encode_immediate(imm).unwrap())
+        .0
+        .to_le_bytes()
 }
 
 fn bytecode(instrs: &[[u8; 4]]) -> Vec<u8> {
@@ -28,20 +30,20 @@ fn bench_alu_throughput() {
 
     let loop_count: i32 = 100_000;
     let code = bytecode(&[
-        instr_ri(Opcode::Addi, 1, 0, loop_count),  // [0]  r1 = loop_count
-        instr_ri(Opcode::Addi, 2, 0, 0),            // [4]  r2 = 0 (counter)
-        instr_ri(Opcode::Addi, 3, 0, 42),           // [8]  r3 = 42
-        instr_ri(Opcode::Addi, 4, 0, 17),           // [12] r4 = 17
+        instr_ri(Opcode::Addi, 1, 0, loop_count), // [0]  r1 = loop_count
+        instr_ri(Opcode::Addi, 2, 0, 0),          // [4]  r2 = 0 (counter)
+        instr_ri(Opcode::Addi, 3, 0, 42),         // [8]  r3 = 42
+        instr_ri(Opcode::Addi, 4, 0, 17),         // [12] r4 = 17
         // loop body (6 ALU + 1 ADDI + 1 BLT = 8 instructions):
-        instr_bytes(Opcode::Add, 5, 3, 4),          // [16] r5 = r3 + r4
-        instr_bytes(Opcode::Sub, 6, 5, 4),          // [20] r6 = r5 - r4
-        instr_bytes(Opcode::Xor, 7, 5, 6),          // [24] r7 = r5 ^ r6
-        instr_bytes(Opcode::Shl, 8, 7, 3),          // [28] r8 = r7 << r3
-        instr_bytes(Opcode::Shr, 9, 8, 4),          // [32] r9 = r8 >> r4
-        instr_bytes(Opcode::And, 10, 9, 7),         // [36] r10 = r9 & r7
-        instr_ri(Opcode::Addi, 2, 2, 1),            // [40] r2++
-        instr_ri(Opcode::Blt, 2, 1, -28),           // [44] if r2 < r1, jump to [16]
-        instr_bytes(Opcode::Halt, 0, 0, 0),         // [48]
+        instr_bytes(Opcode::Add, 5, 3, 4),  // [16] r5 = r3 + r4
+        instr_bytes(Opcode::Sub, 6, 5, 4),  // [20] r6 = r5 - r4
+        instr_bytes(Opcode::Xor, 7, 5, 6),  // [24] r7 = r5 ^ r6
+        instr_bytes(Opcode::Shl, 8, 7, 3),  // [28] r8 = r7 << r3
+        instr_bytes(Opcode::Shr, 9, 8, 4),  // [32] r9 = r8 >> r4
+        instr_bytes(Opcode::And, 10, 9, 7), // [36] r10 = r9 & r7
+        instr_ri(Opcode::Addi, 2, 2, 1),    // [40] r2++
+        instr_ri(Opcode::Blt, 2, 1, -28),   // [44] if r2 < r1, jump to [16]
+        instr_bytes(Opcode::Halt, 0, 0, 0), // [48]
     ]);
 
     let setup_instrs = 4u64;
@@ -73,7 +75,10 @@ fn bench_alu_throughput() {
     println!("  Loop iterations:   {loop_count}");
     println!("  Instructions/run:  {total_instrs}");
     println!("  Runs:              {runs}");
-    println!("  Total time:        {:.2}ms", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "  Total time:        {:.2}ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
     println!("  Throughput:        {instrs_per_sec:>12.0} instructions/sec");
     println!("  Latency:           {ns_per_instr:>8.1} ns/instruction");
 }
@@ -135,24 +140,24 @@ fn bench_alu_with_trace() {
 fn transfer_code() -> Vec<u8> {
     bytecode(&[
         // SLOAD sender balance into w2 from slot w0
-        instr_bytes(Opcode::Sload, 2, 0, 0),       // [0]
+        instr_bytes(Opcode::Sload, 2, 0, 0), // [0]
         // NARROW w2 → r5
-        instr_bytes(Opcode::Narrow, 5, 2, 0),       // [4]
+        instr_bytes(Opcode::Narrow, 5, 2, 0), // [4]
         // Check: sender_balance >= transfer_amount (r6)
-        instr_ri(Opcode::Bge, 5, 6, 8),             // [8]
-        instr_bytes(Opcode::Revert, 0, 0, 0),       // [12]
+        instr_ri(Opcode::Bge, 5, 6, 8),       // [8]
+        instr_bytes(Opcode::Revert, 0, 0, 0), // [12]
         // Subtract from sender
-        instr_bytes(Opcode::Sub, 7, 5, 6),           // [16]
-        instr_bytes(Opcode::Widen, 2, 7, 0),         // [20]
-        instr_bytes(Opcode::Sstore, 2, 0, 0),        // [24]
+        instr_bytes(Opcode::Sub, 7, 5, 6),    // [16]
+        instr_bytes(Opcode::Widen, 2, 7, 0),  // [20]
+        instr_bytes(Opcode::Sstore, 2, 0, 0), // [24]
         // SLOAD receiver balance into w3 from slot w1
-        instr_bytes(Opcode::Sload, 3, 1, 0),         // [28]
-        instr_bytes(Opcode::Narrow, 8, 3, 0),        // [32]
+        instr_bytes(Opcode::Sload, 3, 1, 0),  // [28]
+        instr_bytes(Opcode::Narrow, 8, 3, 0), // [32]
         // Add to receiver
-        instr_bytes(Opcode::Add, 9, 8, 6),            // [36]
-        instr_bytes(Opcode::Widen, 3, 9, 0),          // [40]
-        instr_bytes(Opcode::Sstore, 3, 1, 0),         // [44]
-        instr_bytes(Opcode::Halt, 0, 0, 0),           // [48]
+        instr_bytes(Opcode::Add, 9, 8, 6),    // [36]
+        instr_bytes(Opcode::Widen, 3, 9, 0),  // [40]
+        instr_bytes(Opcode::Sstore, 3, 1, 0), // [44]
+        instr_bytes(Opcode::Halt, 0, 0, 0),   // [48]
     ])
 }
 
@@ -180,8 +185,10 @@ fn setup_transfer_vm(code: &[u8], gas_limit: u64) -> Vm {
 
     let sender_key = vm.derive_storage_key(sender_slot);
     let receiver_key = vm.derive_storage_key(receiver_slot);
-    vm.storage.insert(sender_key, 1000u64.to_le_bytes().to_vec());
-    vm.storage.insert(receiver_key, 500u64.to_le_bytes().to_vec());
+    vm.storage
+        .insert(sender_key, 1000u64.to_le_bytes().to_vec());
+    vm.storage
+        .insert(receiver_key, 500u64.to_le_bytes().to_vec());
 
     vm.load(code).unwrap();
     vm
@@ -207,7 +214,10 @@ fn bench_transfer_setup_cost() {
 
     let us_per_setup = elapsed.as_micros() as f64 / iterations as f64;
     println!("  Iterations:        {iterations}");
-    println!("  Total time:        {:.2}ms", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "  Total time:        {:.2}ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
     println!("  Latency:           {us_per_setup:>8.2} µs/setup");
 }
 
@@ -242,9 +252,18 @@ fn bench_transfer_execution_only() {
     let transfers_per_sec = iterations as f64 / exec_only.as_secs_f64();
 
     println!("  Iterations:        {iterations}");
-    println!("  Total (incl setup):{:.2}ms", elapsed_total.as_secs_f64() * 1000.0);
-    println!("  Setup overhead:    {:.2}ms", elapsed_setup.as_secs_f64() * 1000.0);
-    println!("  Execution only:    {:.2}ms", exec_only.as_secs_f64() * 1000.0);
+    println!(
+        "  Total (incl setup):{:.2}ms",
+        elapsed_total.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  Setup overhead:    {:.2}ms",
+        elapsed_setup.as_secs_f64() * 1000.0
+    );
+    println!(
+        "  Execution only:    {:.2}ms",
+        exec_only.as_secs_f64() * 1000.0
+    );
     println!("  Throughput:        {transfers_per_sec:>12.0} transfers/sec (execution only)");
     println!("  Latency:           {us_per_exec:>8.2} µs/transfer (execution only)");
 }
@@ -272,7 +291,10 @@ fn bench_transfer_full_lifecycle() {
     let us_per_transfer = elapsed.as_micros() as f64 / iterations as f64;
 
     println!("  Iterations:        {iterations}");
-    println!("  Total time:        {:.2}ms", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "  Total time:        {:.2}ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
     println!("  Throughput:        {transfers_per_sec:>12.0} transfers/sec (full lifecycle)");
     println!("  Latency:           {us_per_transfer:>8.2} µs/transfer (full lifecycle)");
 }

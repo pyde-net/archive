@@ -20,7 +20,7 @@ use crate::wire;
 use pyde_account::address::Address;
 use pyde_consensus::block::BlockHeader;
 use pyde_consensus::hotstuff::ConsensusState;
-use rocksdb::{DB, IteratorMode, Options, WriteBatch, WriteOptions};
+use rocksdb::{IteratorMode, Options, WriteBatch, WriteOptions, DB};
 use std::path::Path;
 use tracing::{debug, info, warn};
 
@@ -224,7 +224,10 @@ impl ConsensusStateStore {
             Ok(Some(bytes)) => {
                 let cp = wire::decode_finality_checkpoint(&bytes)
                     .map_err(|e| format!("failed to decode finality checkpoint: {}", e))?;
-                info!(slot = cp.slot, "weak-subjectivity checkpoint restored from disk");
+                info!(
+                    slot = cp.slot,
+                    "weak-subjectivity checkpoint restored from disk"
+                );
                 Ok(Some(cp))
             }
             Ok(None) => Ok(None),
@@ -333,7 +336,10 @@ impl ConsensusStateStore {
         let mut count = 0usize;
 
         for prefix in [PROPOSAL_PREFIX, VOTE_PREFIX] {
-            for item in self.db.iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward)) {
+            for item in self
+                .db
+                .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
+            {
                 let (k, _v) = match item {
                     Ok(kv) => kv,
                     Err(_) => continue,
@@ -552,7 +558,10 @@ mod tests {
 
         // Reopen — this is the crash-restart case
         let store = ConsensusStateStore::open(dir.path()).unwrap();
-        let loaded = store.load().unwrap().expect("state must persist across reopen");
+        let loaded = store
+            .load()
+            .unwrap()
+            .expect("state must persist across reopen");
         assert_eq!(loaded.current_slot, 100);
         assert_eq!(loaded.last_voted_slot, 100);
         assert_eq!(loaded.highest_qc.slot, 99);
@@ -588,7 +597,9 @@ mod tests {
         let header = dummy_header(10);
         let sig = vec![0xEE; 600];
 
-        store.save_seen_proposal(10, &proposer, &header, &sig).unwrap();
+        store
+            .save_seen_proposal(10, &proposer, &header, &sig)
+            .unwrap();
 
         let all = store.load_all_seen_proposals();
         assert_eq!(all.len(), 1);
@@ -625,8 +636,12 @@ mod tests {
 
         let a = [0xAA; 32];
         let b = [0xBB; 32];
-        store.save_seen_proposal(5, &a, &dummy_header(5), &[0x11; 10]).unwrap();
-        store.save_seen_proposal(5, &b, &dummy_header(5), &[0x22; 10]).unwrap();
+        store
+            .save_seen_proposal(5, &a, &dummy_header(5), &[0x11; 10])
+            .unwrap();
+        store
+            .save_seen_proposal(5, &b, &dummy_header(5), &[0x22; 10])
+            .unwrap();
 
         let all = store.load_all_seen_proposals();
         assert_eq!(all.len(), 2);
@@ -638,8 +653,12 @@ mod tests {
         let store = ConsensusStateStore::open(dir.path()).unwrap();
 
         for slot in 1..=15u64 {
-            store.save_seen_proposal(slot, &[0xAA; 32], &dummy_header(slot), &[0x11; 10]).unwrap();
-            store.save_seen_vote(slot, 0, &[0x77; 32], &[0x22; 10]).unwrap();
+            store
+                .save_seen_proposal(slot, &[0xAA; 32], &dummy_header(slot), &[0x11; 10])
+                .unwrap();
+            store
+                .save_seen_vote(slot, 0, &[0x77; 32], &[0x22; 10])
+                .unwrap();
         }
 
         assert_eq!(store.load_all_seen_proposals().len(), 15);
@@ -666,8 +685,12 @@ mod tests {
 
         {
             let store = ConsensusStateStore::open(dir.path()).unwrap();
-            store.save_seen_proposal(7, &proposer, &header, &sig).unwrap();
-            store.save_seen_vote(7, 3, &[0x99; 32], &vec![0xFF; 600]).unwrap();
+            store
+                .save_seen_proposal(7, &proposer, &header, &sig)
+                .unwrap();
+            store
+                .save_seen_vote(7, 3, &[0x99; 32], &vec![0xFF; 600])
+                .unwrap();
         }
 
         let store = ConsensusStateStore::open(dir.path()).unwrap();
@@ -778,8 +801,12 @@ mod tests {
         let store = ConsensusStateStore::open(dir.path()).unwrap();
 
         store.save(&populated_state()).unwrap();
-        store.save_seen_proposal(50, &[0xAA; 32], &dummy_header(50), &[0x11; 10]).unwrap();
-        store.save_seen_vote(50, 1, &[0x99; 32], &[0x22; 10]).unwrap();
+        store
+            .save_seen_proposal(50, &[0xAA; 32], &dummy_header(50), &[0x11; 10])
+            .unwrap();
+        store
+            .save_seen_vote(50, 1, &[0x99; 32], &[0x22; 10])
+            .unwrap();
 
         assert!(store.load().unwrap().is_some());
         assert_eq!(store.load_all_seen_proposals().len(), 1);
@@ -844,8 +871,11 @@ mod tests {
         let sync_tps = 1.0 / (sync_total.as_secs_f64() / ITERATIONS as f64);
 
         eprintln!();
-        eprintln!("=== ConsensusStateStore fsync cost ({} writes, {}-byte payload) ===",
-            ITERATIONS, bytes.len());
+        eprintln!(
+            "=== ConsensusStateStore fsync cost ({} writes, {}-byte payload) ===",
+            ITERATIONS,
+            bytes.len()
+        );
         eprintln!(
             "async (page cache): {:>8.1} µs/write  →  {:>9.0} writes/sec",
             async_per, async_tps

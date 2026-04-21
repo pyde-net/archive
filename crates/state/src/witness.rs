@@ -105,7 +105,10 @@ pub fn finalize_witness(
 ///
 /// The full node calls this before sending the block to validators.
 /// All keys get a single compiled Merkle proof (shared siblings deduplicated).
-pub fn generate_witnesses(smt: &PydeSMT, access_keys: &[Key]) -> Result<BlockWitness, &'static str> {
+pub fn generate_witnesses(
+    smt: &PydeSMT,
+    access_keys: &[Key],
+) -> Result<BlockWitness, &'static str> {
     let pre_root = smt.root();
 
     if access_keys.is_empty() {
@@ -185,7 +188,10 @@ pub fn witness_to_state_map(witness: &BlockWitness) -> std::collections::HashMap
 ///
 /// `diffs` is a list of (key, new_value) pairs. Empty value = deletion.
 /// Returns the new root after applying all diffs.
-pub fn compute_post_state_root(smt: &mut PydeSMT, diffs: Vec<(Key, Vec<u8>)>) -> Result<H256, &'static str> {
+pub fn compute_post_state_root(
+    smt: &mut PydeSMT,
+    diffs: Vec<(Key, Vec<u8>)>,
+) -> Result<H256, &'static str> {
     smt.update_all(diffs)
 }
 
@@ -243,7 +249,8 @@ mod tests {
     fn witness_verification_passes() {
         let mut smt = PydeSMT::new();
         for i in 0..10u64 {
-            smt.insert(key_from_seed(i), format!("val_{i}").into_bytes()).unwrap();
+            smt.insert(key_from_seed(i), format!("val_{i}").into_bytes())
+                .unwrap();
         }
         let keys: Vec<Key> = (0..10).map(key_from_seed).collect();
 
@@ -320,8 +327,8 @@ mod tests {
         expected.insert(key, b"new".to_vec()).unwrap();
         let expected_root = expected.root();
 
-        let stamped = finalize_witness(&mut witness, &mut smt, vec![(key, b"new".to_vec())])
-            .unwrap();
+        let stamped =
+            finalize_witness(&mut witness, &mut smt, vec![(key, b"new".to_vec())]).unwrap();
 
         assert!(witness.is_finalized());
         assert_eq!(witness.post_state_root, stamped);

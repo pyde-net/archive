@@ -181,30 +181,49 @@ fn hash_serialize_access_list(entries: &[serde_json::Value]) -> Vec<u8> {
 }
 
 fn serialize_one_access_entry(entry: &serde_json::Value, buf: &mut Vec<u8>) {
-    let addr = entry.get("address").and_then(|v| v.as_str())
+    let addr = entry
+        .get("address")
+        .and_then(|v| v.as_str())
         .map(|s| decode_hex(s).unwrap_or_default())
         .unwrap_or_default();
     let mut addr32 = [0u8; 32];
-    if addr.len() == 32 { addr32.copy_from_slice(&addr); }
+    if addr.len() == 32 {
+        addr32.copy_from_slice(&addr);
+    }
     buf.extend_from_slice(&addr32);
 
     let parse_keys = |field: &str| -> Vec<[u8; 32]> {
-        entry.get(field).and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|k| {
-                let b = decode_hex(k.as_str().unwrap_or("")).unwrap_or_default();
-                if b.len() == 32 { let mut k32 = [0u8; 32]; k32.copy_from_slice(&b); Some(k32) }
-                else { None }
-            }).collect())
+        entry
+            .get(field)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|k| {
+                        let b = decode_hex(k.as_str().unwrap_or("")).unwrap_or_default();
+                        if b.len() == 32 {
+                            let mut k32 = [0u8; 32];
+                            k32.copy_from_slice(&b);
+                            Some(k32)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     };
 
     let reads = parse_keys("reads");
     buf.extend_from_slice(&(reads.len() as u32).to_le_bytes());
-    for k in &reads { buf.extend_from_slice(k); }
+    for k in &reads {
+        buf.extend_from_slice(k);
+    }
 
     let writes = parse_keys("writes");
     buf.extend_from_slice(&(writes.len() as u32).to_le_bytes());
-    for k in &writes { buf.extend_from_slice(k); }
+    for k in &writes {
+        buf.extend_from_slice(k);
+    }
 }
 
 // ============================================================================
@@ -222,28 +241,32 @@ fn serialize_tx(v: &serde_json::Value, signature: &[u8]) -> Result<Vec<u8>, JsVa
     let tx_type = v.get("txType").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
 
     let mut buf = Vec::new();
-    buf.extend_from_slice(&from);                              // 32
-    buf.extend_from_slice(&to);                                // 32
-    buf.extend_from_slice(&value.to_le_bytes());               // 16
+    buf.extend_from_slice(&from); // 32
+    buf.extend_from_slice(&to); // 32
+    buf.extend_from_slice(&value.to_le_bytes()); // 16
     buf.extend_from_slice(&(data.len() as u32).to_le_bytes()); // 4
-    buf.extend_from_slice(&data);                              // var
-    buf.extend_from_slice(&gas_limit.to_le_bytes());           // 8
-    buf.extend_from_slice(&nonce.to_le_bytes());               // 8
+    buf.extend_from_slice(&data); // var
+    buf.extend_from_slice(&gas_limit.to_le_bytes()); // 8
+    buf.extend_from_slice(&nonce.to_le_bytes()); // 8
     buf.extend_from_slice(&(signature.len() as u16).to_le_bytes()); // 2
-    buf.extend_from_slice(signature);                          // ~666
+    buf.extend_from_slice(signature); // ~666
     buf.push(1); // fee_payer bytes len
     buf.push(0); // FeePayer::Sender tag
-    // access_list serialization
+                 // access_list serialization
     let al_entries = v.get("accessList").and_then(|a| a.as_array());
     let al_bytes = match al_entries {
         Some(entries) if !entries.is_empty() => serialize_access_list_entries(entries),
-        _ => { let mut b = Vec::new(); b.extend_from_slice(&0u32.to_le_bytes()); b }
+        _ => {
+            let mut b = Vec::new();
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b
+        }
     };
     buf.extend_from_slice(&(al_bytes.len() as u32).to_le_bytes()); // byte len prefix
     buf.extend_from_slice(&al_bytes);
     buf.push(0); // no deadline
-    buf.extend_from_slice(&chain_id.to_le_bytes());           // 8
-    buf.push(tx_type);                                         // 1
+    buf.extend_from_slice(&chain_id.to_le_bytes()); // 8
+    buf.push(tx_type); // 1
     Ok(buf)
 }
 
@@ -257,12 +280,15 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, JsValue> {
 }
 
 fn parse_addr(val: Option<&serde_json::Value>) -> Result<[u8; 32], JsValue> {
-    let s = val.and_then(|v| v.as_str()).unwrap_or(
-        "0x0000000000000000000000000000000000000000000000000000000000000000"
-    );
+    let s = val
+        .and_then(|v| v.as_str())
+        .unwrap_or("0x0000000000000000000000000000000000000000000000000000000000000000");
     let bytes = decode_hex(s)?;
     if bytes.len() != 32 {
-        return Err(JsValue::from_str(&format!("address must be 32 bytes, got {}", bytes.len())));
+        return Err(JsValue::from_str(&format!(
+            "address must be 32 bytes, got {}",
+            bytes.len()
+        )));
     }
     let mut addr = [0u8; 32];
     addr.copy_from_slice(&bytes);
@@ -271,9 +297,11 @@ fn parse_addr(val: Option<&serde_json::Value>) -> Result<[u8; 32], JsValue> {
 
 fn parse_u128(val: Option<&serde_json::Value>) -> u128 {
     val.and_then(|v| {
-        v.as_u64().map(|n| n as u128)
+        v.as_u64()
+            .map(|n| n as u128)
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-    }).unwrap_or(0)
+    })
+    .unwrap_or(0)
 }
 
 fn parse_hex_bytes(val: Option<&serde_json::Value>) -> Vec<u8> {

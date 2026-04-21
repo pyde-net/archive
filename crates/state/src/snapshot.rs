@@ -108,7 +108,10 @@ pub fn create_incremental(
 /// Apply an incremental snapshot to an SMT.
 /// Returns the new root, or None if the SMT's current root doesn't match
 /// the snapshot's from_root (indicating the diffs don't apply to this state).
-pub fn apply_incremental(smt: &mut PydeSMT, inc: &IncrementalSnapshot) -> Result<Option<H256>, &'static str> {
+pub fn apply_incremental(
+    smt: &mut PydeSMT,
+    inc: &IncrementalSnapshot,
+) -> Result<Option<H256>, &'static str> {
     // Validate that the current state matches the snapshot's base state
     if smt.root() != inc.from_root {
         return Ok(None);
@@ -253,7 +256,9 @@ mod tests {
         assert!(!inc.diffs.is_empty());
 
         // Apply incremental to old SMT
-        let result_root = apply_incremental(&mut old_smt, &inc).unwrap().expect("from_root should match");
+        let result_root = apply_incremental(&mut old_smt, &inc)
+            .unwrap()
+            .expect("from_root should match");
         assert_eq!(result_root, new_smt.root());
     }
 

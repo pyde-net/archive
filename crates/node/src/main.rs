@@ -6,15 +6,15 @@ mod chain;
 mod cli;
 mod config;
 mod consensus_store;
-mod faucet;
 mod fast_tx;
+mod faucet;
+mod genesis;
 mod logging;
 mod metrics;
 mod node;
-mod shutdown;
-mod genesis;
 mod receipt_store;
 mod rpc;
+mod shutdown;
 mod slot_clock;
 mod state_manager;
 mod sync;
@@ -48,12 +48,21 @@ fn main() {
             dev,
             chain_id,
         } => {
-            if let Err(e) = genesis::generate_testnet(&out, validators, base_port, base_rpc_port, dev, chain_id) {
+            if let Err(e) =
+                genesis::generate_testnet(&out, validators, base_port, base_rpc_port, dev, chain_id)
+            {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
             }
         }
-        Command::Faucet { rpc, port, amount, from, cooldown, private_key } => {
+        Command::Faucet {
+            rpc,
+            port,
+            amount,
+            from,
+            cooldown,
+            private_key,
+        } => {
             logging::init("info", false);
             let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
             rt.block_on(async {
@@ -105,8 +114,12 @@ fn main() {
                 metrics_port,
                 &bootstrap,
             );
-            if let Some(rp) = rpc_port { config.rpc.port = rp; }
-            if dev { config.node.dev_mode = true; }
+            if let Some(rp) = rpc_port {
+                config.rpc.port = rp;
+            }
+            if dev {
+                config.node.dev_mode = true;
+            }
 
             // Initialize logging first
             logging::init(&config.logging.level, config.logging.json);

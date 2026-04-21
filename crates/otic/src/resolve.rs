@@ -154,12 +154,17 @@ impl Resolver {
             in_contract: false,
             loop_depth: 0,
             builtin_types: vec![
-                "u8", "u16", "u32", "u64", "u128", "u256",
-                "i8", "i16", "i32", "i64", "i128", "i256",
-                "bool", "Address", "String", "bytes",
-                "Vec", "Map",
+                "u8", "u16", "u32", "u64", "u128", "u256", "i8", "i16", "i32", "i64", "i128",
+                "i256", "bool", "Address", "String", "bytes", "Vec", "Map",
             ],
-            builtin_fns: vec!["hash", "address", "gas_remaining", "bytes", "sig_verify", "sig_recover"],
+            builtin_fns: vec![
+                "hash",
+                "address",
+                "gas_remaining",
+                "bytes",
+                "sig_verify",
+                "sig_recover",
+            ],
             builtin_globals: vec!["msg", "block", "tx"],
             module_exports: HashMap::new(),
         }
@@ -195,7 +200,9 @@ impl Resolver {
         }
 
         ResolveResult {
-            symbols: SymbolTable { symbols: all_symbols },
+            symbols: SymbolTable {
+                symbols: all_symbols,
+            },
             errors: self.errors,
         }
     }
@@ -214,7 +221,10 @@ impl Resolver {
 
     fn declare(&mut self, name: &str, kind: SymbolKind, span: Span) {
         // Reject shadowing of all builtins: types, globals, and functions.
-        if matches!(kind, SymbolKind::LocalVar { .. } | SymbolKind::FnParam | SymbolKind::ForVar) {
+        if matches!(
+            kind,
+            SymbolKind::LocalVar { .. } | SymbolKind::FnParam | SymbolKind::ForVar
+        ) {
             if self.builtin_types.contains(&name) {
                 self.errors.push(ResolveError {
                     message: format!("cannot shadow builtin type '{}'", name),
@@ -253,8 +263,8 @@ impl Resolver {
                     _ => 255, // everything else shares a namespace
                 }
             };
-            let different_namespace = ns(&existing.kind) != ns(&kind)
-                && ns(&existing.kind) != 255 && ns(&kind) != 255;
+            let different_namespace =
+                ns(&existing.kind) != ns(&kind) && ns(&existing.kind) != 255 && ns(&kind) != 255;
 
             if !different_namespace {
                 self.errors.push(ResolveError {
@@ -268,11 +278,14 @@ impl Resolver {
             }
         }
 
-        scope.symbols.insert(name.to_string(), Symbol {
-            name: name.to_string(),
-            kind,
-            span,
-        });
+        scope.symbols.insert(
+            name.to_string(),
+            Symbol {
+                name: name.to_string(),
+                kind,
+                span,
+            },
+        );
     }
 
     fn lookup(&self, name: &str) -> Option<&Symbol> {
@@ -292,7 +305,8 @@ impl Resolver {
 
     /// Check if an item is exported by a module.
     fn is_exported(&self, module_path: &str, item_name: &str) -> bool {
-        self.module_exports.get(module_path)
+        self.module_exports
+            .get(module_path)
             .map(|exports| exports.iter().any(|e| e == item_name))
             .unwrap_or(false)
     }
@@ -304,8 +318,11 @@ impl Resolver {
         for scope in self.scopes.iter().rev() {
             if let Some(sym) = scope.symbols.get(name) {
                 match sym.kind {
-                    SymbolKind::Struct | SymbolKind::Enum | SymbolKind::TypeAlias
-                    | SymbolKind::Interface | SymbolKind::Contract => return true,
+                    SymbolKind::Struct
+                    | SymbolKind::Enum
+                    | SymbolKind::TypeAlias
+                    | SymbolKind::Interface
+                    | SymbolKind::Contract => return true,
                     _ => {}
                 }
             }
@@ -334,7 +351,9 @@ impl Resolver {
                 for v in &e.variants {
                     self.declare(
                         &format!("{}::{}", e.name.name, v.name),
-                        SymbolKind::EnumVariant { enum_name: e.name.name.clone() },
+                        SymbolKind::EnumVariant {
+                            enum_name: e.name.name.clone(),
+                        },
                         v.span,
                     );
                 }
@@ -350,7 +369,9 @@ impl Resolver {
                 for f in &i.functions {
                     self.declare(
                         &format!("{}::{}", i.name.name, f.name.name),
-                        SymbolKind::InterfaceFn { interface_name: i.name.name.clone() },
+                        SymbolKind::InterfaceFn {
+                            interface_name: i.name.name.clone(),
+                        },
                         f.name.span,
                     );
                 }
@@ -379,11 +400,7 @@ impl Resolver {
             match item {
                 ContractItem::Storage(s) => {
                     for field in &s.fields {
-                        self.declare(
-                            &field.name.name,
-                            SymbolKind::StorageField,
-                            field.name.span,
-                        );
+                        self.declare(&field.name.name, SymbolKind::StorageField, field.name.span);
                     }
                 }
                 ContractItem::Event(e) => {
@@ -400,7 +417,9 @@ impl Resolver {
                     for v in &e.variants {
                         self.declare(
                             &format!("{}::{}", e.name.name, v.name),
-                            SymbolKind::EnumVariant { enum_name: e.name.name.clone() },
+                            SymbolKind::EnumVariant {
+                                enum_name: e.name.name.clone(),
+                            },
                             v.span,
                         );
                     }
@@ -510,9 +529,26 @@ impl Resolver {
 
     /// Known standard library modules and their exports.
     const STD_MODULES: &'static [(&'static str, &'static [&'static str])] = &[
-        ("math", &["sqrt", "pow", "min", "max", "clamp", "mul_div", "abs_diff", "average", "log10",
-                   "checked_add", "checked_sub", "saturating_add", "saturating_sub",
-                   "wrapping_add", "wrapping_sub"]),
+        (
+            "math",
+            &[
+                "sqrt",
+                "pow",
+                "min",
+                "max",
+                "clamp",
+                "mul_div",
+                "abs_diff",
+                "average",
+                "log10",
+                "checked_add",
+                "checked_sub",
+                "saturating_add",
+                "saturating_sub",
+                "wrapping_add",
+                "wrapping_sub",
+            ],
+        ),
         ("hash", &["poseidon2", "poseidon2_pair", "poseidon2_many"]),
         ("signature", &["verify", "recover"]),
         ("token", &["IERC20", "IERC721", "INFT"]),
@@ -522,7 +558,9 @@ impl Resolver {
         // Validate std:: imports
         if import.path.len() >= 2 && import.path[0].name == "std" {
             let module_name = &import.path[1].name;
-            let known_module = Self::STD_MODULES.iter().find(|(name, _)| name == module_name);
+            let known_module = Self::STD_MODULES
+                .iter()
+                .find(|(name, _)| name == module_name);
 
             if known_module.is_none() {
                 self.error(
@@ -538,7 +576,10 @@ impl Resolver {
                 if let Some((_, exports)) = known_module {
                     if !exports.contains(&item_name.as_str()) {
                         self.error(
-                            format!("'{}' is not exported from 'std::{}'", item_name, module_name),
+                            format!(
+                                "'{}' is not exported from 'std::{}'",
+                                item_name, module_name
+                            ),
                             import.path[2].span,
                         );
                         return;
@@ -551,7 +592,10 @@ impl Resolver {
                 for item in &import.items {
                     if !exports.contains(&item.name.as_str()) {
                         self.error(
-                            format!("'{}' is not exported from 'std::{}'", item.name, module_name),
+                            format!(
+                                "'{}' is not exported from 'std::{}'",
+                                item.name, module_name
+                            ),
                             item.span,
                         );
                     }
@@ -589,11 +633,14 @@ impl Resolver {
         if import.path.len() >= 2 && import.items.is_empty() {
             // Check if the FULL path is a known module (module import: `use events::event;`)
             // or the last segment is an item (item import: `use events::event::Deposit;`)
-            let full_path = import.path.iter()
+            let full_path = import
+                .path
+                .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>()
                 .join("/");
-            let all_but_last = import.path[..import.path.len() - 1].iter()
+            let all_but_last = import.path[..import.path.len() - 1]
+                .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>()
                 .join("/");
@@ -614,13 +661,19 @@ impl Resolver {
                 }
                 let item = &import.path[import.path.len() - 1];
                 // Validate the item is actually exported (if we know the module)
-                if !all_but_last.is_empty() && self.is_known_module(&all_but_last)
-                    && !self.is_exported(&all_but_last, &item.name) {
-                        self.error(
-                            format!("'{}' is not exported from module '{}'", item.name, all_but_last.replace('/', "::")),
-                            item.span,
-                        );
-                    }
+                if !all_but_last.is_empty()
+                    && self.is_known_module(&all_but_last)
+                    && !self.is_exported(&all_but_last, &item.name)
+                {
+                    self.error(
+                        format!(
+                            "'{}' is not exported from module '{}'",
+                            item.name,
+                            all_but_last.replace('/', "::")
+                        ),
+                        item.span,
+                    );
+                }
                 self.declare(&item.name, SymbolKind::Contract, item.span);
             }
             return;
@@ -629,7 +682,9 @@ impl Resolver {
         if !import.items.is_empty() {
             // Grouped import: use module::path::{Item1, Item2};
             // ALL path segments are module path.
-            let module_path = import.path.iter()
+            let module_path = import
+                .path
+                .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>()
                 .join("/");
@@ -640,9 +695,14 @@ impl Resolver {
             }
             for item in &import.items {
                 // Validate each item is actually exported (if we know the module)
-                if self.is_known_module(&module_path) && !self.is_exported(&module_path, &item.name) {
+                if self.is_known_module(&module_path) && !self.is_exported(&module_path, &item.name)
+                {
                     self.error(
-                        format!("'{}' is not exported from module '{}'", item.name, module_path.replace('/', "::")),
+                        format!(
+                            "'{}' is not exported from module '{}'",
+                            item.name,
+                            module_path.replace('/', "::")
+                        ),
                         item.span,
                     );
                 }
@@ -727,7 +787,9 @@ impl Resolver {
                     LetBinding::Name(name) => {
                         self.declare(
                             &name.name,
-                            SymbolKind::LocalVar { is_mutable: l.is_mutable },
+                            SymbolKind::LocalVar {
+                                is_mutable: l.is_mutable,
+                            },
                             name.span,
                         );
                     }
@@ -735,7 +797,9 @@ impl Resolver {
                         for name in names {
                             self.declare(
                                 &name.name,
-                                SymbolKind::LocalVar { is_mutable: l.is_mutable },
+                                SymbolKind::LocalVar {
+                                    is_mutable: l.is_mutable,
+                                },
                                 name.span,
                             );
                         }
@@ -764,7 +828,10 @@ impl Resolver {
                     // Qualified: check first segment is a known module
                     let module = &e.event_name[0].name;
                     if self.lookup(module).is_none() {
-                        self.error(format!("undefined module '{}'", module), e.event_name[0].span);
+                        self.error(
+                            format!("undefined module '{}'", module),
+                            e.event_name[0].span,
+                        );
                     }
                 }
                 for field in &e.fields {
@@ -818,10 +885,7 @@ impl Resolver {
                     && !self.builtin_fns.contains(&ident.name.as_str())
                     && !self.builtin_globals.contains(&ident.name.as_str())
                 {
-                    self.error(
-                        format!("undefined variable '{}'", ident.name),
-                        ident.span,
-                    );
+                    self.error(format!("undefined variable '{}'", ident.name), ident.span);
                 }
             }
 
@@ -829,7 +893,10 @@ impl Resolver {
                 if !self.in_contract {
                     self.error(
                         "'self' can only be used inside a contract".into(),
-                        match expr { Expr::SelfExpr(s) => *s, _ => unreachable!() },
+                        match expr {
+                            Expr::SelfExpr(s) => *s,
+                            _ => unreachable!(),
+                        },
                     );
                 }
             }
@@ -869,15 +936,13 @@ impl Resolver {
                     {
                         // Check if it's a known module path (e.g., math_lib::percentage)
                         // or an enum variant (Status::Active)
-                        let qualified = segments.iter()
+                        let qualified = segments
+                            .iter()
                             .map(|s| s.name.as_str())
                             .collect::<Vec<_>>()
                             .join("::");
                         if self.lookup(&qualified).is_none() {
-                            self.error(
-                                format!("undefined name '{}'", first.name),
-                                first.span,
-                            );
+                            self.error(format!("undefined name '{}'", first.name), first.span);
                         }
                     }
                 }
@@ -885,12 +950,17 @@ impl Resolver {
 
             Expr::MacroCall(name, args, _span) => {
                 // Built-in macros: require!, revert!, cross_call!, raw_call!
-                let known_macros = ["require", "revert", "assert", "cross_call", "raw_call", "create", "deploy"];
+                let known_macros = [
+                    "require",
+                    "revert",
+                    "assert",
+                    "cross_call",
+                    "raw_call",
+                    "create",
+                    "deploy",
+                ];
                 if !known_macros.contains(&name.name.as_str()) {
-                    self.error(
-                        format!("unknown macro '{}!'", name.name),
-                        name.span,
-                    );
+                    self.error(format!("unknown macro '{}!'", name.name), name.span);
                 }
                 for arg in args {
                     match arg {
@@ -904,7 +974,10 @@ impl Resolver {
                 // Verify the struct/error name exists
                 if let Some(first) = name_segments.first() {
                     if !self.is_type_defined(&first.name)
-                        && !self.lookup(&first.name).map(|s| matches!(s.kind, SymbolKind::Error)).unwrap_or(false)
+                        && !self
+                            .lookup(&first.name)
+                            .map(|s| matches!(s.kind, SymbolKind::Error))
+                            .unwrap_or(false)
                         && self.lookup(&first.name).is_none()
                     {
                         self.error(
@@ -973,7 +1046,8 @@ impl Resolver {
             Pattern::Path(segments, _span) => {
                 // Verify enum variant path exists (e.g., Status::Active)
                 if segments.len() >= 2 {
-                    let qualified = segments.iter()
+                    let qualified = segments
+                        .iter()
                         .map(|s| s.name.as_str())
                         .collect::<Vec<_>>()
                         .join("::");
@@ -1023,42 +1097,49 @@ mod tests {
 
     #[test]
     fn resolve_minimal_contract() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract Token {
                 storage { supply: u256, }
                 pub fn get_supply() -> u256 {
                     return self.supply;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_local_variable() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 pub fn f() {
                     let x = 42;
                     let y = x + 1;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_function_params() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 pub fn transfer(to: Address, amount: u256) {
                     let total = amount + 1;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_for_loop_variable() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 pub fn f() {
                     for i in 0..10 {
@@ -1066,107 +1147,125 @@ mod tests {
                     }
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_struct_type() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 struct Point { x: u64, y: u64 }
                 pub fn f() {
                     let p = Point { x: 1, y: 2 };
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_enum_variant() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 enum Status { Active, Paused }
                 pub fn f() {
                     let s = Status::Active;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_const_reference() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 const MAX: u256 = 1000;
                 pub fn f() {
                     let x = MAX;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_event_emit() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 event Transfer { from: Address, to: Address, amount: u256, }
                 pub fn f() {
                     emit Transfer { from: msg.sender, to: msg.sender, amount: 100 };
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_error_in_require() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 error Unauthorized {}
                 pub fn f() {
                     require!(true, Unauthorized {});
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_self_in_contract() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 storage { balance: u256, }
                 pub fn f() {
                     self.balance = 100;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_builtin_globals() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 pub fn f() {
                     let sender = msg.sender;
                     let ts = block.timestamp;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_builtin_hash() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 pub fn f() {
                     let h = hash(42);
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_type_alias() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 type TokenId = u256;
                 storage { next_id: TokenId, }
@@ -1174,12 +1273,14 @@ mod tests {
                     return self.next_id;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_tuple_destructuring() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 pub fn get_pair() -> (u256, u256) {
                     return (1, 2);
@@ -1189,25 +1290,29 @@ mod tests {
                     let sum = a + b;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_forward_reference() {
         // Functions can call other functions defined later in the contract
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 pub fn f() {
                     self.helper();
                 }
                 fn helper() {}
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_interface_cross_call() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             interface IERC20 {
                 fn transfer(to: Address, amount: u256);
                 fn balance_of(owner: Address) -> u256;
@@ -1217,24 +1322,28 @@ mod tests {
                     let token = IERC20::at(msg.sender);
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_use_import() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             use std::math;
             contract T {
                 pub fn f() {
                     let x = math::sqrt(100);
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_grouped_import() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             use std::math::{sqrt, pow};
             contract T {
                 pub fn f() {
@@ -1242,66 +1351,84 @@ mod tests {
                     let y = pow(2, 10);
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn error_unknown_std_module() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             use std::banana;
             contract T {}
-        "#);
-        assert!(errors[0].message.contains("unknown standard library module 'std::banana'"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("unknown standard library module 'std::banana'"));
     }
 
     #[test]
     fn error_unknown_std_export() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             use std::math::pineapple;
             contract T {}
-        "#);
-        assert!(errors[0].message.contains("'pineapple' is not exported from 'std::math'"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("'pineapple' is not exported from 'std::math'"));
     }
 
     #[test]
     fn error_unknown_grouped_export() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             use std::math::{sqrt, banana};
             contract T {}
-        "#);
-        assert!(errors[0].message.contains("'banana' is not exported from 'std::math'"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("'banana' is not exported from 'std::math'"));
     }
 
     #[test]
     fn error_standalone_sqrt_without_import() {
         // sqrt(x) requires import — not a global function
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 pub fn f() {
                     let x = sqrt(100);
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("undefined variable 'sqrt'"));
     }
 
     #[test]
     fn resolve_standalone_sqrt_with_import() {
         // use std::math::sqrt; → sqrt(x) works
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             use std::math::sqrt;
             contract T {
                 pub fn f() {
                     let x = sqrt(100);
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_method_sqrt_without_import() {
         // x.sqrt() works on any numeric — no import needed
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 pub fn f() {
                     let x: u256 = 100;
@@ -1310,7 +1437,8 @@ mod tests {
                     let clamped = x.min(50);
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
@@ -1326,7 +1454,8 @@ mod tests {
 
     #[test]
     fn resolve_nested_scope() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 pub fn f() {
                     let x = 1;
@@ -1335,12 +1464,14 @@ mod tests {
                     }
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn resolve_match_with_enum() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 enum Status { Active, Paused, Closed }
                 pub fn f() {
@@ -1352,136 +1483,169 @@ mod tests {
                     }
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     // ========== Error detection ==========
 
     #[test]
     fn error_undefined_variable() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 pub fn f() {
                     let x = undefined_var;
                 }
             }
-        "#);
-        assert!(errors[0].message.contains("undefined variable 'undefined_var'"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("undefined variable 'undefined_var'"));
     }
 
     #[test]
     fn error_shadow_builtin_type() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 pub fn f() {
                     let Vec = 5;
                 }
             }
-        "#);
-        assert!(errors[0].message.contains("cannot shadow builtin type 'Vec'"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("cannot shadow builtin type 'Vec'"));
     }
 
     #[test]
     fn error_shadow_builtin_type_map() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 pub fn f() {
                     let Map = 10;
                 }
             }
-        "#);
-        assert!(errors[0].message.contains("cannot shadow builtin type 'Map'"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("cannot shadow builtin type 'Map'"));
     }
 
     #[test]
     fn error_shadow_builtin_msg() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 pub fn f() {
                     let msg = 10;
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("cannot shadow builtin 'msg'"));
     }
 
     #[test]
     fn error_shadow_builtin_tx() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 pub fn f() {
                     let tx = 10;
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("cannot shadow builtin 'tx'"));
     }
 
     #[test]
     fn error_undefined_type() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 storage { data: NonexistentType, }
             }
-        "#);
-        assert!(errors[0].message.contains("undefined type 'NonexistentType'"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("undefined type 'NonexistentType'"));
     }
 
     #[test]
     fn error_undefined_event() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 pub fn f() {
                     emit FakeEvent { x: 1 };
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("undefined event 'FakeEvent'"));
     }
 
     #[test]
     fn error_unknown_macro() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 pub fn f() {
                     fake_macro!(1, 2, 3);
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("unknown macro 'fake_macro!'"));
     }
 
     #[test]
     fn error_self_outside_contract() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             fn f() {
                 self.x = 1;
             }
-        "#);
-        assert!(errors[0].message.contains("'self' can only be used inside a contract"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("'self' can only be used inside a contract"));
     }
 
     #[test]
     fn error_duplicate_function() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 pub fn f() {}
                 pub fn f() {}
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("'f' is already defined"));
     }
 
     #[test]
     fn error_duplicate_storage_field() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 storage {
                     balance: u256,
                     balance: u64,
                 }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("'balance' is already defined"));
     }
 
@@ -1490,7 +1654,8 @@ mod tests {
     #[test]
     fn allow_same_name_event_and_error() {
         // Event and error can share a name — different namespaces
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 event TransferLocked { locked_until: u64, }
                 error TransferLocked { until: u64 }
@@ -1499,13 +1664,15 @@ mod tests {
                     require!(false, TransferLocked { until: 100 });
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn allow_same_name_storage_and_function() {
         // Storage field and function can share a name
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 storage { is_active: bool, }
                 #[view]
@@ -1513,38 +1680,46 @@ mod tests {
                     return self.is_active;
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn reject_duplicate_events() {
         // Two events with the same name — same namespace
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 event Transfer { from: Address, }
                 event Transfer { to: Address, }
             }
-        "#);
+        "#,
+        );
         assert!(errors[0].message.contains("'Transfer' is already defined"));
     }
 
     #[test]
     fn reject_duplicate_errors() {
         // Two errors with the same name — same namespace
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 error Unauthorized {}
                 error Unauthorized { reason: String }
             }
-        "#);
-        assert!(errors[0].message.contains("'Unauthorized' is already defined"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("'Unauthorized' is already defined"));
     }
 
     // ========== Break/continue validation ==========
 
     #[test]
     fn break_inside_for_loop() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 pub fn f() {
                     for i in 0..10 {
@@ -1552,12 +1727,14 @@ mod tests {
                     }
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn continue_inside_while_loop() {
-        resolve_ok(r#"
+        resolve_ok(
+            r#"
             contract T {
                 pub fn f() {
                     let mut i = 0;
@@ -1567,30 +1744,39 @@ mod tests {
                     }
                 }
             }
-        "#);
+        "#,
+        );
     }
 
     #[test]
     fn error_break_outside_loop() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 pub fn f() {
                     break;
                 }
             }
-        "#);
-        assert!(errors[0].message.contains("'break' can only be used inside a loop"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("'break' can only be used inside a loop"));
     }
 
     #[test]
     fn error_continue_outside_loop() {
-        let errors = resolve_err(r#"
+        let errors = resolve_err(
+            r#"
             contract T {
                 pub fn f() {
                     continue;
                 }
             }
-        "#);
-        assert!(errors[0].message.contains("'continue' can only be used inside a loop"));
+        "#,
+        );
+        assert!(errors[0]
+            .message
+            .contains("'continue' can only be used inside a loop"));
     }
 }

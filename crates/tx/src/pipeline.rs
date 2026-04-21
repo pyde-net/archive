@@ -499,9 +499,7 @@ fn execute_transaction_inner(
         TransactionType::ClaimAirdrop => {
             execute_claim_airdrop(tx, smt, block_ctx, &mut sender.balance)
         }
-        TransactionType::SweepAirdrop => {
-            execute_sweep_airdrop(tx, smt, block_ctx)
-        }
+        TransactionType::SweepAirdrop => execute_sweep_airdrop(tx, smt, block_ctx),
         TransactionType::MultisigTx => execute_multisig_spend(tx, smt),
         TransactionType::RotateMultisig => execute_rotate_multisig(tx, smt),
         TransactionType::EmergencyPause => execute_emergency_pause(tx, smt, block_ctx),
@@ -738,7 +736,9 @@ fn execute_in_pvm(
 
     // Batch-persist VM storage changes to SMT (single Merkle tree update + RocksDB write)
     if success && !vm.storage.is_empty() {
-        let entries: Vec<(H256, Vec<u8>)> = vm.storage.iter()
+        let entries: Vec<(H256, Vec<u8>)> = vm
+            .storage
+            .iter()
             .map(|(vm_key, value_bytes)| (H256::from(vm_key.to_le_bytes()), value_bytes.clone()))
             .collect();
         let _ = smt.update_all(entries);
@@ -757,7 +757,8 @@ fn execute_in_pvm(
         }
     }
 
-    let logs = vm.logs
+    let logs = vm
+        .logs
         .iter()
         .map(|log| LogEntry {
             address: log.address,
@@ -788,13 +789,7 @@ fn execute_in_pvm(
     } else {
         vm.return_data.clone() // revert data
     };
-    (
-        success,
-        vm.gas_used_total,
-        vm.gas_refund,
-        logs,
-        return_data,
-    )
+    (success, vm.gas_used_total, vm.gas_refund, logs, return_data)
 }
 
 /// Execute a block of transactions using parallel group scheduling.
@@ -824,10 +819,7 @@ pub fn read_rewards_per_validator(smt: &dyn pyde_state::smt::StateAccess) -> u12
 }
 
 /// Write the global rewards-per-validator accumulator.
-pub fn write_rewards_per_validator(
-    smt: &mut dyn pyde_state::smt::StateAccess,
-    value: u128,
-) {
+pub fn write_rewards_per_validator(smt: &mut dyn pyde_state::smt::StateAccess, value: u128) {
     let _ = smt.insert(
         pyde_state::keys::rewards_per_validator_key(),
         value.to_le_bytes().to_vec(),
@@ -839,16 +831,12 @@ pub fn write_rewards_per_validator(
 /// pre-initialization state, so block_reward math is correct at block 1
 /// even before the first `total_supply` write.
 pub fn read_total_supply(smt: &dyn pyde_state::smt::StateAccess) -> u128 {
-    read_u128_state(smt, pyde_state::keys::supply_key())
-        .unwrap_or(crate::fee::GENESIS_TOTAL_SUPPLY)
+    read_u128_state(smt, pyde_state::keys::supply_key()).unwrap_or(crate::fee::GENESIS_TOTAL_SUPPLY)
 }
 
 /// Write the global `total_supply` state variable.
 pub fn write_total_supply(smt: &mut dyn pyde_state::smt::StateAccess, value: u128) {
-    let _ = smt.insert(
-        pyde_state::keys::supply_key(),
-        value.to_le_bytes().to_vec(),
-    );
+    let _ = smt.insert(pyde_state::keys::supply_key(), value.to_le_bytes().to_vec());
 }
 
 /// Read cumulative fee burn counter (u128 LE, defaults to 0).
@@ -926,7 +914,10 @@ impl ValidatorSubsidySchedule {
         }
         let per_block = u128::from_le_bytes(bytes[0..16].try_into().ok()?);
         let end_slot = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
-        Some(Self { per_block, end_slot })
+        Some(Self {
+            per_block,
+            end_slot,
+        })
     }
 }
 
@@ -942,31 +933,21 @@ pub fn write_validator_subsidy(
     smt: &mut dyn pyde_state::smt::StateAccess,
     schedule: &ValidatorSubsidySchedule,
 ) {
-    let _ = smt.insert(
-        pyde_state::keys::validator_subsidy_key(),
-        schedule.encode(),
-    );
+    let _ = smt.insert(pyde_state::keys::validator_subsidy_key(), schedule.encode());
 }
 
 /// Read the multisig signer public keys (slice 4.5). Returns the raw
 /// byte list; caller decodes via `crate::multisig::decode_signer_set`.
-pub fn read_multisig_signers_raw(
-    smt: &dyn pyde_state::smt::StateAccess,
-) -> Option<Vec<u8>> {
+pub fn read_multisig_signers_raw(smt: &dyn pyde_state::smt::StateAccess) -> Option<Vec<u8>> {
     smt.get(&pyde_state::keys::multisig_signers_key())
 }
 
-pub fn read_multisig_signers(
-    smt: &dyn pyde_state::smt::StateAccess,
-) -> Option<Vec<Vec<u8>>> {
+pub fn read_multisig_signers(smt: &dyn pyde_state::smt::StateAccess) -> Option<Vec<Vec<u8>>> {
     let bytes = read_multisig_signers_raw(smt)?;
     crate::multisig::decode_signer_set(&bytes)
 }
 
-pub fn write_multisig_signers(
-    smt: &mut dyn pyde_state::smt::StateAccess,
-    pks: &[Vec<u8>],
-) {
+pub fn write_multisig_signers(smt: &mut dyn pyde_state::smt::StateAccess, pks: &[Vec<u8>]) {
     let _ = smt.insert(
         pyde_state::keys::multisig_signers_key(),
         crate::multisig::encode_signer_set(pks),
@@ -1021,10 +1002,7 @@ pub fn read_emergency_pause_end_slot(smt: &dyn pyde_state::smt::StateAccess) -> 
         .unwrap_or(0)
 }
 
-pub fn write_emergency_pause_end_slot(
-    smt: &mut dyn pyde_state::smt::StateAccess,
-    end_slot: u64,
-) {
+pub fn write_emergency_pause_end_slot(smt: &mut dyn pyde_state::smt::StateAccess, end_slot: u64) {
     let _ = smt.insert(
         pyde_state::keys::emergency_pause_end_slot_key(),
         end_slot.to_le_bytes().to_vec(),
@@ -1038,9 +1016,7 @@ pub fn is_paused(smt: &dyn pyde_state::smt::StateAccess, current_slot: u64) -> b
 }
 
 /// Read the airdrop Merkle root, if configured.
-pub fn read_airdrop_root(
-    smt: &dyn pyde_state::smt::StateAccess,
-) -> Option<[u8; 32]> {
+pub fn read_airdrop_root(smt: &dyn pyde_state::smt::StateAccess) -> Option<[u8; 32]> {
     let bytes = smt.get(&pyde_state::keys::airdrop_root_key())?;
     if bytes.len() == 32 {
         let mut root = [0u8; 32];
@@ -1214,8 +1190,7 @@ impl ValidatorEntry {
 // `pyde-consensus` depend on it directly — this eliminates the earlier
 // drift risk where the shadow copies could fork.
 use pyde_slashing::{
-    EVIDENCE_VERSION as SLASH_EVIDENCE_VERSION,
-    FINDER_FEE_PERCENT as SLASH_FINDER_FEE_PERCENT,
+    EVIDENCE_VERSION as SLASH_EVIDENCE_VERSION, FINDER_FEE_PERCENT as SLASH_FINDER_FEE_PERCENT,
     VALIDATOR_STAKE as SLASH_VALIDATOR_STAKE,
 };
 
@@ -1456,13 +1431,7 @@ fn execute_claim_airdrop(
     let deadline = match read_airdrop_deadline(smt) {
         Some(d) => d,
         None => {
-            return (
-                false,
-                gas,
-                0,
-                vec![],
-                b"airdrop not configured".to_vec(),
-            );
+            return (false, gas, 0, vec![], b"airdrop not configured".to_vec());
         }
     };
     if block_ctx.height > deadline {
@@ -1474,13 +1443,7 @@ fn execute_claim_airdrop(
     let root = match read_airdrop_root(smt) {
         Some(r) => r,
         None => {
-            return (
-                false,
-                gas,
-                0,
-                vec![],
-                b"airdrop root missing".to_vec(),
-            );
+            return (false, gas, 0, vec![], b"airdrop root missing".to_vec());
         }
     };
 
@@ -1513,23 +1476,11 @@ fn execute_claim_airdrop(
     let pool_addr = pyde_account::address::airdrop_pool_address();
     let mut pool = load_account(smt, &pool_addr);
     if pool.balance < payload.amount {
-        return (
-            false,
-            gas,
-            0,
-            vec![],
-            b"airdrop pool insufficient".to_vec(),
-        );
+        return (false, gas, 0, vec![], b"airdrop pool insufficient".to_vec());
     }
     pool.balance -= payload.amount;
     if store_account(smt, &pool).is_err() {
-        return (
-            false,
-            gas,
-            0,
-            vec![],
-            b"airdrop pool write failed".to_vec(),
-        );
+        return (false, gas, 0, vec![], b"airdrop pool write failed".to_vec());
     }
 
     *sender_balance = sender_balance.saturating_add(payload.amount);
@@ -1601,7 +1552,13 @@ fn execute_sweep_airdrop(
         );
     }
 
-    (true, AIRDROP_SWEEP_GAS, 0, vec![], residue.to_le_bytes().to_vec())
+    (
+        true,
+        AIRDROP_SWEEP_GAS,
+        0,
+        vec![],
+        residue.to_le_bytes().to_vec(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1673,7 +1630,13 @@ fn execute_multisig_spend(
 
     // Structural checks on the spend itself before any crypto work.
     if spend.value == 0 {
-        return (false, gas, 0, vec![], b"multisig value must be > 0".to_vec());
+        return (
+            false,
+            gas,
+            0,
+            vec![],
+            b"multisig value must be > 0".to_vec(),
+        );
     }
     if spend.target == [0u8; 32] {
         return (
@@ -1723,13 +1686,7 @@ fn execute_multisig_spend(
     let signer_pks = match read_multisig_signers(smt) {
         Some(p) => p,
         None => {
-            return (
-                false,
-                gas,
-                0,
-                vec![],
-                b"multisig not configured".to_vec(),
-            );
+            return (false, gas, 0, vec![], b"multisig not configured".to_vec());
         }
     };
     let threshold = read_multisig_threshold(smt);
@@ -1881,13 +1838,7 @@ fn execute_rotate_multisig(
     let current_signers = match read_multisig_signers(smt) {
         Some(p) => p,
         None => {
-            return (
-                false,
-                gas,
-                0,
-                vec![],
-                b"multisig not configured".to_vec(),
-            );
+            return (false, gas, 0, vec![], b"multisig not configured".to_vec());
         }
     };
     let current_threshold = read_multisig_threshold(smt);
@@ -1953,13 +1904,7 @@ fn multisig_ok(
     let signer_pks = match read_multisig_signers(smt) {
         Some(p) => p,
         None => {
-            return Err((
-                false,
-                gas,
-                0,
-                vec![],
-                b"multisig not configured".to_vec(),
-            ));
+            return Err((false, gas, 0, vec![], b"multisig not configured".to_vec()));
         }
     };
     let threshold = read_multisig_threshold(smt);
@@ -2036,13 +1981,7 @@ fn execute_emergency_pause(
     // entry (gate blocks non-Resume while paused) but kept as
     // defense-in-depth against future refactors.
     if is_paused(smt, block_ctx.height) {
-        return (
-            false,
-            gas,
-            0,
-            vec![],
-            b"chain already paused".to_vec(),
-        );
+        return (false, gas, 0, vec![], b"chain already paused".to_vec());
     }
 
     let nonce = read_multisig_nonce(smt);
@@ -2094,13 +2033,7 @@ fn execute_emergency_resume(
     // should reject resume submissions as a no-op waste of signer
     // coordination.
     if !is_paused(smt, block_ctx.height) {
-        return (
-            false,
-            gas,
-            0,
-            vec![],
-            b"chain already unpaused".to_vec(),
-        );
+        return (false, gas, 0, vec![], b"chain already unpaused".to_vec());
     }
 
     let nonce = read_multisig_nonce(smt);
@@ -3237,7 +3170,10 @@ mod tests {
         let val_data = smt.get(&val_key).unwrap();
         let entry = ValidatorEntry::decode(&val_data).expect("entry should decode");
         assert_eq!(entry.status, 0x01, "status should be Unbonding");
-        assert!(entry.exit_block.is_some(), "exit_block must be set when unbonding");
+        assert!(
+            entry.exit_block.is_some(),
+            "exit_block must be set when unbonding"
+        );
     }
 
     // ========== Phase 4 slice 4.1: ClaimReward + pool accrual ==========
@@ -3289,9 +3225,9 @@ mod tests {
         let (addr, sk) = deposit_validator(&mut smt, &ctx);
 
         // Read entry — last_claimed_at should equal current accumulator (500).
-        let entry = ValidatorEntry::decode(
-            &smt.get(&pyde_state::keys::validator_key(&addr)).unwrap(),
-        ).unwrap();
+        let entry =
+            ValidatorEntry::decode(&smt.get(&pyde_state::keys::validator_key(&addr)).unwrap())
+                .unwrap();
         assert_eq!(entry.last_claimed_at, 500);
 
         // Claim now with no further accrual → owed = 0.
@@ -3367,9 +3303,9 @@ mod tests {
         );
 
         // last_claimed_at must advance to current accumulator.
-        let entry = ValidatorEntry::decode(
-            &smt.get(&pyde_state::keys::validator_key(&addr)).unwrap(),
-        ).unwrap();
+        let entry =
+            ValidatorEntry::decode(&smt.get(&pyde_state::keys::validator_key(&addr)).unwrap())
+                .unwrap();
         assert_eq!(entry.last_claimed_at, ACCRUED);
     }
 
@@ -3383,9 +3319,17 @@ mod tests {
         write_rewards_per_validator(&mut smt, 10_000);
 
         let mut c1 = Transaction {
-            from: addr, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
-            nonce: 1, signature: vec![], fee_payer: FeePayer::Sender,
-            access_list: vec![], deadline: None, chain_id: 1,
+            from: addr,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 50_000,
+            nonce: 1,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
             tx_type: TransactionType::ClaimReward,
         };
         sign_tx(&mut c1, &sk);
@@ -3427,9 +3371,17 @@ mod tests {
         write_rewards_per_validator(&mut smt, 1_000_000);
 
         let mut claim = Transaction {
-            from: addr, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
-            nonce: 1, signature: vec![], fee_payer: FeePayer::Sender,
-            access_list: vec![], deadline: None, chain_id: 1,
+            from: addr,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 50_000,
+            nonce: 1,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
             tx_type: TransactionType::ClaimReward,
         };
         sign_tx(&mut claim, &sk);
@@ -3457,14 +3409,25 @@ mod tests {
         smt.insert(val_key, entry.encode()).unwrap();
 
         let mut claim = Transaction {
-            from: addr, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
-            nonce: 1, signature: vec![], fee_payer: FeePayer::Sender,
-            access_list: vec![], deadline: None, chain_id: 1,
+            from: addr,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 50_000,
+            nonce: 1,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
             tx_type: TransactionType::ClaimReward,
         };
         sign_tx(&mut claim, &sk);
         let r = execute_transaction(&claim, &mut smt, &ctx).unwrap();
-        assert!(r.success, "unbonding validator must be able to claim earned yield");
+        assert!(
+            r.success,
+            "unbonding validator must be able to claim earned yield"
+        );
         let owed = u128::from_le_bytes(r.return_data[..16].try_into().unwrap());
         assert_eq!(owed, 10_000_000_000);
     }
@@ -3478,9 +3441,17 @@ mod tests {
         fund_account_with_pk(&mut smt, &addr, 1_000_000_000_000, pk.as_bytes());
 
         let mut claim = Transaction {
-            from: addr, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
-            nonce: 0, signature: vec![], fee_payer: FeePayer::Sender,
-            access_list: vec![], deadline: None, chain_id: 1,
+            from: addr,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 50_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
             tx_type: TransactionType::ClaimReward,
         };
         sign_tx(&mut claim, &sk);
@@ -3514,9 +3485,17 @@ mod tests {
         assert_eq!(read_active_validator_count(&smt), 1);
 
         let mut withdraw = Transaction {
-            from: addr, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
-            nonce: 1, signature: vec![], fee_payer: FeePayer::Sender,
-            access_list: vec![], deadline: None, chain_id: 1,
+            from: addr,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 50_000,
+            nonce: 1,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
             tx_type: TransactionType::StakeWithdraw,
         };
         sign_tx(&mut withdraw, &sk);
@@ -3572,9 +3551,17 @@ mod tests {
         assert_eq!(total, 2);
 
         let mut withdraw = Transaction {
-            from: addr1, to: [0u8; 32], value: 0, data: vec![], gas_limit: 50_000,
-            nonce: 1, signature: vec![], fee_payer: FeePayer::Sender,
-            access_list: vec![], deadline: None, chain_id: 1,
+            from: addr1,
+            to: [0u8; 32],
+            value: 0,
+            data: vec![],
+            gas_limit: 50_000,
+            nonce: 1,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
             tx_type: TransactionType::StakeWithdraw,
         };
         sign_tx(&mut withdraw, &sk1);
@@ -3629,14 +3616,11 @@ mod tests {
         (smt, addr, sk)
     }
 
-    fn transfer_tx(
-        from: Address,
-        to: Address,
-        value: u128,
-        nonce: u64,
-    ) -> Transaction {
+    fn transfer_tx(from: Address, to: Address, value: u128, nonce: u64) -> Transaction {
         Transaction {
-            from, to, value,
+            from,
+            to,
+            value,
             data: vec![],
             gas_limit: 50_000,
             nonce,
@@ -3671,7 +3655,12 @@ mod tests {
         sign_tx(&mut tx, &sk);
         let err = execute_transaction(&tx, &mut smt, &ctx).unwrap_err();
         assert!(
-            matches!(err, PipelineError::Validation(crate::validation::ValidationError::InsufficientBalance { .. })),
+            matches!(
+                err,
+                PipelineError::Validation(
+                    crate::validation::ValidationError::InsufficientBalance { .. }
+                )
+            ),
             "pre-cliff transfer must be rejected with InsufficientBalance; got {:?}",
             err,
         );
@@ -3724,7 +3713,12 @@ mod tests {
         sign_tx(&mut tx, &sk);
         let err = execute_transaction(&tx, &mut smt, &ctx).unwrap_err();
         assert!(
-            matches!(err, PipelineError::Validation(crate::validation::ValidationError::InsufficientBalance { .. })),
+            matches!(
+                err,
+                PipelineError::Validation(
+                    crate::validation::ValidationError::InsufficientBalance { .. }
+                )
+            ),
             "transfer > unlocked must fail with InsufficientBalance; got {:?}",
             err,
         );
@@ -3906,7 +3900,12 @@ mod tests {
 
         let (submitter_pk, submitter_sk) = falcon_keygen().unwrap();
         let submitter_addr = derive_eoa_address(submitter_pk.as_bytes());
-        fund_account_with_pk(smt, &submitter_addr, submitter_balance, submitter_pk.as_bytes());
+        fund_account_with_pk(
+            smt,
+            &submitter_addr,
+            submitter_balance,
+            submitter_pk.as_bytes(),
+        );
 
         (
             offender_pk,
@@ -3972,16 +3971,17 @@ mod tests {
         let slot = 100;
         let hash = [0x01u8; 32];
         let sig = sign_proposer_for_test(&osk, slot, &hash);
-        let evidence = encode_evidence_for_test(
-            slot, &hash, &sig, &hash, &sig, &offender, &submitter,
-        );
+        let evidence =
+            encode_evidence_for_test(slot, &hash, &sig, &hash, &sig, &offender, &submitter);
         let tx = build_slash_tx(submitter, &ssk, evidence);
 
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(!receipt.success, "same-hash evidence is not equivocation");
 
         // State untouched.
-        let val_data = smt.get(&pyde_state::keys::validator_key(&offender)).unwrap();
+        let val_data = smt
+            .get(&pyde_state::keys::validator_key(&offender))
+            .unwrap();
         let entry = ValidatorEntry::decode(&val_data).unwrap();
         assert_eq!(entry.stake, SLASH_VALIDATOR_STAKE);
         assert_eq!(entry.status, 0x00);
@@ -4003,7 +4003,13 @@ mod tests {
         let sig_1 = sign_proposer_for_test(&osk, slot, &[0x01; 32]);
         let sig_2 = sign_proposer_for_test(&osk, slot, &[0x02; 32]);
         let evidence = encode_evidence_for_test(
-            slot, &[0x01; 32], &sig_1, &[0x02; 32], &sig_2, &ghost_signer, &submitter,
+            slot,
+            &[0x01; 32],
+            &sig_1,
+            &[0x02; 32],
+            &sig_2,
+            &ghost_signer,
+            &submitter,
         );
         let tx = build_slash_tx(submitter, &ssk, evidence);
 
@@ -4055,7 +4061,13 @@ mod tests {
         let sig_2 = sign_proposer_for_test(&osk, signed_slot, &hash_2);
 
         let evidence = encode_evidence_for_test(
-            evidence_slot, &hash_1, &sig_1, &hash_2, &sig_2, &offender, &submitter,
+            evidence_slot,
+            &hash_1,
+            &sig_1,
+            &hash_2,
+            &sig_2,
+            &offender,
+            &submitter,
         );
         let tx = build_slash_tx(submitter, &ssk, evidence);
 
@@ -4074,7 +4086,13 @@ mod tests {
         // Garbage bytes instead of valid FALCON sigs.
         let bad_sig = vec![0xDE; 666];
         let evidence = encode_evidence_for_test(
-            slot, &[0x01; 32], &bad_sig, &[0x02; 32], &bad_sig, &offender, &submitter,
+            slot,
+            &[0x01; 32],
+            &bad_sig,
+            &[0x02; 32],
+            &bad_sig,
+            &offender,
+            &submitter,
         );
         let tx = build_slash_tx(submitter, &ssk, evidence);
 
@@ -4241,8 +4259,7 @@ mod tests {
         // Install fixture for leaf 0, but have a different funded account
         // try to submit. Proof commits to leaf 0's address, so an impostor
         // fails verification.
-        let (_pk, _sk, _legit_claimer, proof) =
-            airdrop_fixture(&mut smt, leaves, 0, 10_000, 5_000);
+        let (_pk, _sk, _legit_claimer, proof) = airdrop_fixture(&mut smt, leaves, 0, 10_000, 5_000);
 
         let (imp_pk, imp_sk) = falcon_keygen().unwrap();
         let impostor = derive_eoa_address(imp_pk.as_bytes());
@@ -4370,8 +4387,7 @@ mod tests {
         let mut smt = PydeSMT::new();
         let ctx = make_block_ctx();
         let leaves = vec![([0xAA; 32], 1_000u128), ([0xBB; 32], 2_000u128)];
-        let (_pk, sk, claimer, proof) =
-            airdrop_fixture(&mut smt, leaves, 0, 10_000, 5_000);
+        let (_pk, sk, claimer, proof) = airdrop_fixture(&mut smt, leaves, 0, 10_000, 5_000);
 
         // Needed gas = 30_000 + proof.len() * 5_000. Set gas_limit to
         // exactly the intrinsic minimum (21_000) to trigger the early
@@ -4405,8 +4421,7 @@ mod tests {
         assert!(!receipt.success, "under-gassed claim must fail");
 
         // Pool untouched — the gas guard prevents state writes.
-        let pool_after =
-            load_account(&smt, &pyde_account::address::airdrop_pool_address()).balance;
+        let pool_after = load_account(&smt, &pyde_account::address::airdrop_pool_address()).balance;
         assert_eq!(pool_before, pool_after, "pool must not be debited");
         assert!(!is_airdrop_claimed(&smt, 0), "claimed flag must not be set");
     }
@@ -4441,8 +4456,7 @@ mod tests {
         let receipt = execute_transaction(&sweep_tx, &mut smt, &ctx).unwrap();
         assert!(!receipt.success, "under-gassed sweep must fail");
 
-        let pool_after =
-            load_account(&smt, &pyde_account::address::airdrop_pool_address()).balance;
+        let pool_after = load_account(&smt, &pyde_account::address::airdrop_pool_address()).balance;
         assert_eq!(pool_before, pool_after, "pool must not move");
     }
 
@@ -4641,7 +4655,10 @@ mod tests {
 
         let spend = make_spend([0xEE; 32], 500_000);
         let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
-        let payload = crate::multisig::MultisigPayload::Spend { spend: spend.clone(), sigs: sigs.clone() };
+        let payload = crate::multisig::MultisigPayload::Spend {
+            spend: spend.clone(),
+            sigs: sigs.clone(),
+        };
         let tx1 = build_multisig_spend_tx(submitter, &sub_sk, payload.clone());
         let r1 = execute_transaction(&tx1, &mut smt, &ctx).unwrap();
         assert!(r1.success);
@@ -4652,7 +4669,10 @@ mod tests {
         tx2.nonce = 1; // advance outer nonce (tx-level); inner multisig nonce is what matters
         sign_tx(&mut tx2, &sub_sk);
         let r2 = execute_transaction(&tx2, &mut smt, &ctx).unwrap();
-        assert!(!r2.success, "replay of exact payload must fail after nonce advance");
+        assert!(
+            !r2.success,
+            "replay of exact payload must fail after nonce advance"
+        );
     }
 
     #[test]
@@ -4766,9 +4786,11 @@ mod tests {
 
         // Treasury must not have been debited by the spend — nonce
         // also must be unchanged.
-        let treasury_after =
-            load_account(&smt, &pyde_account::address::treasury_address()).balance;
-        assert!(treasury_after >= treasury_before, "treasury must not lose value");
+        let treasury_after = load_account(&smt, &pyde_account::address::treasury_address()).balance;
+        assert!(
+            treasury_after >= treasury_before,
+            "treasury must not lose value"
+        );
         assert_eq!(read_multisig_nonce(&smt), 0);
     }
 
@@ -4798,8 +4820,7 @@ mod tests {
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(!receipt.success, "non-zero tx.to must reject");
 
-        let treasury_after =
-            load_account(&smt, &pyde_account::address::treasury_address()).balance;
+        let treasury_after = load_account(&smt, &pyde_account::address::treasury_address()).balance;
         assert!(treasury_after >= treasury_before);
         assert_eq!(read_multisig_nonce(&smt), 0);
     }
@@ -4968,7 +4989,10 @@ mod tests {
                     .to_vec(),
             },
         ];
-        let rpayload = crate::multisig::MultisigPayload::Rotate { rotate, sigs: rsigs };
+        let rpayload = crate::multisig::MultisigPayload::Rotate {
+            rotate,
+            sigs: rsigs,
+        };
         let rtx = build_multisig_rotate_tx(submitter, &sub_sk, rpayload);
         let rr = execute_transaction(&rtx, &mut smt, &ctx).unwrap();
         assert!(rr.success);
@@ -4988,7 +5012,10 @@ mod tests {
 
         // Spend signed by NEW signers should succeed.
         let new_sigs = sign_spend(&spend, &[&new_sk_a, &new_sk_b], &[0, 1], 1);
-        let new_payload = crate::multisig::MultisigPayload::Spend { spend, sigs: new_sigs };
+        let new_payload = crate::multisig::MultisigPayload::Spend {
+            spend,
+            sigs: new_sigs,
+        };
         let mut new_tx = build_multisig_spend_tx(submitter, &sub_sk, new_payload);
         new_tx.nonce = 2;
         sign_tx(&mut new_tx, &sub_sk);
@@ -5055,8 +5082,7 @@ mod tests {
         assert!(!receipt.success);
         // Treasury balance unchanged by multisig handler (may gain fee
         // share from gas distribution, but not spend).
-        let treasury_after =
-            load_account(&smt, &pyde_account::address::treasury_address()).balance;
+        let treasury_after = load_account(&smt, &pyde_account::address::treasury_address()).balance;
         assert!(
             treasury_after >= treasury_before,
             "treasury must not have been debited"
@@ -5431,7 +5457,10 @@ mod tests {
                     .to_vec(),
             },
         ];
-        let rpayload = crate::multisig::MultisigPayload::Rotate { rotate, sigs: rsigs };
+        let rpayload = crate::multisig::MultisigPayload::Rotate {
+            rotate,
+            sigs: rsigs,
+        };
         let mut rtx = build_multisig_rotate_tx(submitter, &sub_sk, rpayload);
         rtx.nonce = 1;
         sign_tx(&mut rtx, &sub_sk);

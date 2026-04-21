@@ -81,7 +81,10 @@ impl TxRelay {
     /// Remove transactions that were included in a finalized block.
     pub fn remove_included(&mut self, tx_hashes: &[[u8; 32]]) {
         self.mempool.remove_included(tx_hashes);
-        debug!(removed = tx_hashes.len(), "pruned included txs from mempool");
+        debug!(
+            removed = tx_hashes.len(),
+            "pruned included txs from mempool"
+        );
     }
 
     /// Prune expired transactions.
@@ -120,9 +123,19 @@ mod tests {
         let sender = derive_eoa_address(&nonce.to_le_bytes());
         let to = derive_eoa_address(b"to");
         encrypt_transaction(
-            sender, nonce, 50_000, dummy_access_list(), None, 1,
-            vec![0xAA; 666], &to, 0, b"", pk,
-        ).unwrap()
+            sender,
+            nonce,
+            50_000,
+            dummy_access_list(),
+            None,
+            1,
+            vec![0xAA; 666],
+            &to,
+            0,
+            b"",
+            pk,
+        )
+        .unwrap()
     }
 
     #[test]
