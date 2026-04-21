@@ -173,6 +173,170 @@ impl TestNetwork {
     pub fn state_root(&self, node_idx: usize) -> Result<String, String> {
         rpc_state_root(&self.nodes[node_idx].rpc_url())
     }
+
+    // --------------------------------------------------------------
+    // Tx lifecycle helpers (slice 6.2)
+    // --------------------------------------------------------------
+
+    /// Pre-funded addresses from `node-0`'s `genesis.toml`. Includes
+    /// every validator (staked account), 5 extra non-validator accounts,
+    /// and the faucet. Useful sources for test transfers.
+    pub fn funded_addresses(&self) -> Result<Vec<[u8; 32]>, String> {
+        let path = self.nodes[0].datadir.join("genesis.toml");
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read {}: {}", path.display(), e))?;
+        // Lightweight scrape of `address = "hex..."` lines. A full TOML
+        // decoder would pull in another dep; this is plenty for the
+        // harness's needs.
+        let mut out = Vec::new();
+        for line in content.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("address = \"") {
+                if let Some(hex) = rest.strip_suffix('"') {
+                    if let Ok(bytes) = hex::decode(hex) {
+                        if bytes.len() == 32 {
+                            let mut a = [0u8; 32];
+                            a.copy_from_slice(&bytes);
+                            // genesis.toml lists validators twice (once
+                            // in `[[allocations]]`, once in
+                            // `[[validators]]`) — dedupe.
+                            if !out.contains(&a) {
+                                out.push(a);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err(format!("no addresses found in {}", path.display()));
+        }
+        Ok(out)
+    }
+
+    /// Submit a dev-mode transfer from `from` to `to` for `value`
+    /// quanta via node `node_idx`. Returns the tx hash.
+    ///
+    /// No signature is constructed — devnet's `chain_id == 31337`
+    /// path in the RPC handler skips signature verification, and the
+    /// network was spawned with `dev = true` specifically to unlock
+    /// this path.
+    pub fn submit_transfer(
+        &self,
+        node_idx: usize,
+        from: &[u8; 32],
+        to: &[u8; 32],
+        value: u128,
+    ) -> Result<String, String> {
+        let params = format!(
+            r#"[{{"from":"0x{}","to":"0x{}","value":"{}","gas":100000}}]"#,
+            hex::encode(from),
+            hex::encode(to),
+            value
+        );
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_sendTransaction",
+            &params,
+        )?;
+        // `pyde_sendTransaction` returns a JSON-stringified object as
+        // its `result` field, so the raw wire format is:
+        //   {"jsonrpc":"2.0","id":1,"result":"{\"txHash\":\"0x...\"}"}
+        // The inner quotes are escaped. Scan for the escaped
+        // `txHash` pattern directly rather than trying to unescape
+        // the string first.
+        parse_escaped_tx_hash(&resp).map_err(|e| {
+            format!(
+                "pyde_sendTransaction parse failed: {}; raw response:\n{}",
+                e, resp
+            )
+        })
+    }
+
+    /// Balance in quanta. Returns `0` if the account is unknown.
+    pub fn get_balance(&self, node_idx: usize, address: &[u8; 32]) -> Result<u128, String> {
+        let params = format!(r#"["0x{}"]"#, hex::encode(address));
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_getBalance",
+            &params,
+        )?;
+        // `pyde_getBalance` returns the balance as a decimal string
+        // (see `balance.to_string()` in `rpc.rs::get_balance`). Not
+        // hex, despite the `0x`-ish feel of the sibling RPCs.
+        let raw = parse_hex_result(&resp)?;
+        raw.parse::<u128>()
+            .map_err(|e| format!("parse balance {:?}: {}", raw, e))
+    }
+
+    /// Get the receipt for a tx. Returns `Ok(None)` if the node has
+    /// not yet indexed the tx (e.g. it hasn't been included yet).
+    pub fn get_receipt(
+        &self,
+        node_idx: usize,
+        tx_hash: &str,
+    ) -> Result<Option<ReceiptView>, String> {
+        let params = format!(r#"["{}"]"#, tx_hash);
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_getTransactionReceipt",
+            &params,
+        )?;
+        // Response: `"result":null` or `"result":{...}`.
+        let body = resp.trim();
+        if body.contains(r#""result":null"#) {
+            return Ok(None);
+        }
+        // Extract success flag + block slot from JSON. Use simple
+        // string matching to avoid pulling serde into the harness.
+        let success = extract_bool_field(body, "status")
+            .or_else(|| extract_bool_field(body, "success"))
+            .unwrap_or(false);
+        let block_slot = extract_u64_field(body, "blockNumber")
+            .or_else(|| extract_u64_field(body, "slot"));
+        Ok(Some(ReceiptView {
+            raw: body.to_string(),
+            success,
+            block_slot,
+        }))
+    }
+
+    /// Poll every node until each reports a receipt for `tx_hash` or
+    /// the deadline elapses. Returns the per-node receipt snapshots.
+    pub fn wait_for_receipt_on_all(
+        &self,
+        tx_hash: &str,
+        timeout: Duration,
+    ) -> Result<Vec<ReceiptView>, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut all: Vec<Option<ReceiptView>> = Vec::with_capacity(self.nodes.len());
+            for n in &self.nodes {
+                all.push(self.get_receipt(n.index, tx_hash).ok().flatten());
+            }
+            if all.iter().all(|r| r.is_some()) {
+                return Ok(all.into_iter().map(Option::unwrap).collect());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "receipt for {} never appeared on all nodes within {:?}; per-node: {:?}",
+                    tx_hash,
+                    timeout,
+                    all.iter().map(|r| r.is_some()).collect::<Vec<_>>()
+                ));
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
+/// Lightweight receipt representation. Full receipt JSON is kept as
+/// `raw` so tests can drill into fields the harness doesn't expose.
+#[derive(Clone, Debug)]
+pub struct ReceiptView {
+    pub raw: String,
+    pub success: bool,
+    pub block_slot: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -400,4 +564,68 @@ fn parse_hex_result(resp: &str) -> Result<String, String> {
         .find('"')
         .ok_or_else(|| format!("unterminated result in {:?}", resp))?;
     Ok(tail[..end].to_string())
+}
+
+/// Extract the `txHash` from a `pyde_sendTransaction` response.
+///
+/// The handler in `crates/node/src/rpc.rs` wraps the hash in a
+/// JSON-stringified object (`Result<String, _>` where the string is
+/// itself a serialized JSON object). On the wire, that produces
+/// `"result":"{\"txHash\":\"0x...\"}"` — so we scan for the escaped
+/// `\"txHash\":\"` pattern directly.
+fn parse_escaped_tx_hash(resp: &str) -> Result<String, String> {
+    let needle = r#"\"txHash\":\""#;
+    let idx = resp
+        .find(needle)
+        .ok_or_else(|| format!("no txHash in {:?}", resp))?;
+    let tail = &resp[idx + needle.len()..];
+    let end = tail
+        .find(r#"\""#)
+        .ok_or_else(|| format!("unterminated txHash in {:?}", resp))?;
+    Ok(tail[..end].to_string())
+}
+
+/// Extract `"<field>": true|false` from a JSON blob. Returns `None`
+/// if the field isn't present. Tolerant of whitespace but assumes
+/// no nested object shares the key name.
+fn extract_bool_field(body: &str, field: &str) -> Option<bool> {
+    let needle = format!(r#""{}""#, field);
+    let start = body.find(&needle)? + needle.len();
+    let tail = &body[start..];
+    let colon = tail.find(':')? + 1;
+    let rest = tail[colon..].trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Extract `"<field>": 123` or `"<field>": "0x..."` as a u64.
+fn extract_u64_field(body: &str, field: &str) -> Option<u64> {
+    let needle = format!(r#""{}""#, field);
+    let start = body.find(&needle)? + needle.len();
+    let tail = &body[start..];
+    let colon = tail.find(':')? + 1;
+    let rest = tail[colon..].trim_start();
+    if rest.starts_with('"') {
+        // Quoted string — look for closing quote.
+        let inner = &rest[1..];
+        let end = inner.find('"')?;
+        let s = &inner[..end];
+        if let Some(hex) = s.strip_prefix("0x") {
+            u64::from_str_radix(hex, 16).ok()
+        } else {
+            s.parse().ok()
+        }
+    } else {
+        // Bare number — read until a non-digit.
+        let end = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        rest[..end].parse().ok()
+    }
 }
