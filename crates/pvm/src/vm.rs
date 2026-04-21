@@ -20,6 +20,13 @@
 //! - Gas cost prevents unbounded growth; memory freed after tx.
 //! - MEMCPY instruction for efficient reallocation (bulk memory copy with per-byte gas).
 
+// Compiler + VM internals pass around nested generics (HashMap of
+// Vec of tuples, etc.) where the shape IS the documentation; clippy
+// flags these as `type_complexity`. Adding aliases would add names
+// to learn without improving readability. Scoped allow at the
+// module level; narrow to specific items if this grows.
+#![allow(clippy::type_complexity)]
+
 use crate::cpu::{Cpu, Trap};
 use crate::isa::{
     decode, decode_mem_offset, decode_mem_width, sign_extend_18, DecodedInstruction, Instruction,
@@ -779,7 +786,7 @@ impl Vm {
                 let len = (d.rs2_or_imm & 0xF) as u8;
                 let byte_len = self.cpu.read_gp(len) as usize;
                 // Dynamic gas: 250 per 32 bytes (Poseidon2 permutation ≈ 250ns each)
-                let dynamic_gas = ((byte_len as u64 + 31) / 32) * 250;
+                let dynamic_gas = (byte_len as u64).div_ceil(32) * 250;
                 self.gas_used_total += dynamic_gas;
                 if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                     return Err(Trap::OutOfGas);
@@ -828,9 +835,9 @@ impl Vm {
                     }
                 });
                 // Cache backend result in overlay
-                if !self.storage.contains_key(&key) {
+                if let std::collections::hash_map::Entry::Vacant(e) = self.storage.entry(key) {
                     if let Some(ref val) = storage_value {
-                        self.storage.insert(key, val.clone());
+                        e.insert(val.clone());
                     }
                 }
 
@@ -850,7 +857,7 @@ impl Vm {
                         let ptr_reg = ((d.rs2_or_imm >> 2) & 0xF) as u8;
                         let ptr = self.cpu.read_gp(ptr_reg) as u32;
                         if let Some(data) = storage_value.as_ref() {
-                            let dynamic_gas = ((data.len() as u64 + 7) / 8) * 3;
+                            let dynamic_gas = (data.len() as u64).div_ceil(8) * 3;
                             self.gas_used_total += dynamic_gas;
                             if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                                 return Err(Trap::OutOfGas);
@@ -920,7 +927,7 @@ impl Vm {
                         let ptr = self.cpu.read_gp(ptr_reg) as u32;
                         let len = self.cpu.read_gp(len_reg) as usize;
                         // Dynamic gas: 3 per 8 bytes of data written to storage
-                        let dynamic_gas = ((len as u64 + 7) / 8) * 3;
+                        let dynamic_gas = (len as u64).div_ceil(8) * 3;
                         self.gas_used_total += dynamic_gas;
                         if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                             return Err(Trap::OutOfGas);
@@ -1224,7 +1231,7 @@ impl Vm {
                 let len = self.cpu.read_gp(len_reg) as usize;
                 if len > 0 {
                     // Charge dynamic gas: 3 per 8 bytes copied (same rate as Load/Store)
-                    let dynamic_gas = ((len as u64 + 7) / 8) * 3;
+                    let dynamic_gas = (len as u64).div_ceil(8) * 3;
                     self.gas_used_total += dynamic_gas;
                     if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                         return Err(Trap::OutOfGas);
@@ -3269,8 +3276,8 @@ mod tests {
         // w3 should contain first 32 bytes only
         let loaded = vm.cpu.read_wide(3);
         let bytes = loaded.to_le_bytes();
-        for i in 0..32 {
-            assert_eq!(bytes[i], (i + 1) as u8);
+        for (i, b) in bytes.iter().enumerate() {
+            assert_eq!(*b, (i + 1) as u8);
         }
     }
 

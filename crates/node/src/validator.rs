@@ -990,10 +990,7 @@ impl ValidatorEngine {
         if idx >= self.committee_keys.len() {
             return None;
         }
-        let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&self.committee_keys[idx]) {
-            Some(pk) => pk,
-            None => return None,
-        };
+        let pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(&self.committee_keys[idx])?;
         if !verify_share(&share, &pk, collector.epoch) {
             warn!(epoch = collector.epoch, validator = idx, "invalid randomness share");
             return None;
@@ -1403,12 +1400,11 @@ impl ValidatorEngine {
         };
 
         // Verify vote signature
-        if voter_index < self.committee_keys.len() {
-            if !verify_vote(&vote, &self.committee_keys[voter_index]) {
+        if voter_index < self.committee_keys.len()
+            && !verify_vote(&vote, &self.committee_keys[voter_index]) {
                 warn!(slot, voter_index, "invalid vote signature");
                 return None;
             }
-        }
 
         // --- Double-vote (equivocation) detection ---
         let vote_key = (slot, voter_index as u8);
@@ -2240,7 +2236,7 @@ mod tests {
             })
             .collect();
         let mut helper_ids: Vec<ValidatorIdentity> =
-            (3..=6).map(|i| make_identity(i)).collect();
+            (3..=6).map(make_identity).collect();
         for (i, (engine, id)) in helpers.iter_mut().zip(helper_ids.iter_mut()).enumerate() {
             engine.prepare_for_reshare_reception(1, new_committee_keys.clone(), i + 3);
             for c in &contribs {
@@ -2917,9 +2913,9 @@ mod tests {
             let store = ConsensusStateStore::open(dir.path()).unwrap();
             for slot in 1..=15u64 {
                 store
-                    .save_seen_proposal(slot, &[0xAA; 32], &evidence_header(slot, [0x33; 32]), &vec![0x11; 10])
+                    .save_seen_proposal(slot, &[0xAA; 32], &evidence_header(slot, [0x33; 32]), &[0x11; 10])
                     .unwrap();
-                store.save_seen_vote(slot, 0, &[0x99; 32], &vec![0x22; 10]).unwrap();
+                store.save_seen_vote(slot, 0, &[0x99; 32], &[0x22; 10]).unwrap();
             }
         }
 
@@ -3501,8 +3497,8 @@ mod tests {
         engine.consensus.current_slot = 14;
         engine.advance_slot(); // now at 15
 
-        assert!(engine.votes.get(&1).is_none()); // pruned
-        assert!(engine.votes.get(&5).is_some()); // kept (>= 5)
+        assert!(!engine.votes.contains_key(&1)); // pruned
+        assert!(engine.votes.contains_key(&5)); // kept (>= 5)
     }
 
     #[test]

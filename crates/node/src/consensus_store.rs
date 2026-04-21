@@ -625,8 +625,8 @@ mod tests {
 
         let a = [0xAA; 32];
         let b = [0xBB; 32];
-        store.save_seen_proposal(5, &a, &dummy_header(5), &vec![0x11; 10]).unwrap();
-        store.save_seen_proposal(5, &b, &dummy_header(5), &vec![0x22; 10]).unwrap();
+        store.save_seen_proposal(5, &a, &dummy_header(5), &[0x11; 10]).unwrap();
+        store.save_seen_proposal(5, &b, &dummy_header(5), &[0x22; 10]).unwrap();
 
         let all = store.load_all_seen_proposals();
         assert_eq!(all.len(), 2);
@@ -638,8 +638,8 @@ mod tests {
         let store = ConsensusStateStore::open(dir.path()).unwrap();
 
         for slot in 1..=15u64 {
-            store.save_seen_proposal(slot, &[0xAA; 32], &dummy_header(slot), &vec![0x11; 10]).unwrap();
-            store.save_seen_vote(slot, 0, &[0x77; 32], &vec![0x22; 10]).unwrap();
+            store.save_seen_proposal(slot, &[0xAA; 32], &dummy_header(slot), &[0x11; 10]).unwrap();
+            store.save_seen_vote(slot, 0, &[0x77; 32], &[0x22; 10]).unwrap();
         }
 
         assert_eq!(store.load_all_seen_proposals().len(), 15);
@@ -778,8 +778,8 @@ mod tests {
         let store = ConsensusStateStore::open(dir.path()).unwrap();
 
         store.save(&populated_state()).unwrap();
-        store.save_seen_proposal(50, &[0xAA; 32], &dummy_header(50), &vec![0x11; 10]).unwrap();
-        store.save_seen_vote(50, 1, &[0x99; 32], &vec![0x22; 10]).unwrap();
+        store.save_seen_proposal(50, &[0xAA; 32], &dummy_header(50), &[0x11; 10]).unwrap();
+        store.save_seen_vote(50, 1, &[0x99; 32], &[0x22; 10]).unwrap();
 
         assert!(store.load().unwrap().is_some());
         assert_eq!(store.load_all_seen_proposals().len(), 1);

@@ -60,7 +60,7 @@ impl BlockProcessor {
             height: slot,
             timestamp: block.header.timestamp,
             base_fee: chain.base_fee,
-            block_gas_limit: pyde_tx::fee::GAS_CEILING as u64,
+            block_gas_limit: pyde_tx::fee::GAS_CEILING,
             chain_id: chain.chain_id,
             validator_address: block.header.proposer,
             dev_skip_signature: false,
@@ -351,7 +351,7 @@ impl BlockProcessor {
         // on a background task, allowing the next block to start immediately.
 
         // 6. Adjust base fee for next block (EIP-1559)
-        let gas_target = pyde_tx::fee::GAS_TARGET as u64;
+        let gas_target = pyde_tx::fee::GAS_TARGET;
         chain.base_fee = adjust_base_fee(chain.base_fee, total_gas, gas_target);
 
         // 7. Advance chain head
@@ -397,7 +397,7 @@ impl BlockProcessor {
     ) -> Result<(u64, u64), String> {
         Self::validate_header_with_checkpoint(&header, chain, ws_checkpoint_slot)?;
 
-        let gas_target = pyde_tx::fee::GAS_TARGET as u64;
+        let gas_target = pyde_tx::fee::GAS_TARGET;
         chain.base_fee = adjust_base_fee(chain.base_fee, 0, gas_target);
         chain.advance(header);
 
@@ -436,14 +436,13 @@ impl BlockProcessor {
                 ));
             }
         }
-        if !chain.is_genesis() {
-            if header.slot <= chain.head_slot {
+        if !chain.is_genesis()
+            && header.slot <= chain.head_slot {
                 return Err(format!(
                     "block slot {} is not ahead of head {}",
                     header.slot, chain.head_slot
                 ));
             }
-        }
         Ok(())
     }
 

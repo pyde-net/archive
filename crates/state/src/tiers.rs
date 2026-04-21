@@ -294,6 +294,7 @@ mod tests {
     use sparse_merkle_tree::traits::Value;
     use sparse_merkle_tree::SparseMerkleTree;
 
+    #[allow(clippy::upper_case_acronyms)] // SMT = Sparse Merkle Tree
     type SMT<S> = SparseMerkleTree<Poseidon2Hasher, SmtValue, S>;
 
     fn make_tiered() -> TieredBackend<InMemoryBackend, NullColdStorage> {

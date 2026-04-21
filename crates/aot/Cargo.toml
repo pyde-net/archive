@@ -21,3 +21,6 @@ ethnum = "1"
 [[bench]]
 name = "aot_bench"
 harness = false
+
+[lints]
+workspace = true

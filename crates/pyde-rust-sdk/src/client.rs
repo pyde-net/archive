@@ -117,7 +117,7 @@ impl Provider {
     /// Static call with overrides (from, value, gas).
     pub async fn call_with(&self, to: &Address, data: &[u8], overrides: Option<&CallOverrides>) -> Result<Vec<u8>> {
         let mut params = serde_json::json!({
-            "from": overrides.and_then(|o| o.from.as_ref()).map(|a| format_address(a))
+            "from": overrides.and_then(|o| o.from.as_ref()).map(format_address)
                 .unwrap_or_else(|| "0x".to_string() + &"00".repeat(32)),
             "to": format_address(to),
             "data": format!("0x{}", hex::encode(data)),
@@ -138,7 +138,7 @@ impl Provider {
     /// Estimate gas with overrides (from, value, gas).
     pub async fn estimate_gas_with(&self, to: &Address, data: &[u8], overrides: Option<&CallOverrides>) -> Result<u64> {
         let mut params = serde_json::json!({
-            "from": overrides.and_then(|o| o.from.as_ref()).map(|a| format_address(a))
+            "from": overrides.and_then(|o| o.from.as_ref()).map(format_address)
                 .unwrap_or_else(|| "0x".to_string() + &"00".repeat(32)),
             "to": format_address(to),
             "data": format!("0x{}", hex::encode(data)),

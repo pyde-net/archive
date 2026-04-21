@@ -12,3 +12,6 @@ tracing = "0.1"
 [[bench]]
 name = "interpreter_bench"
 harness = false
+
+[lints]
+workspace = true

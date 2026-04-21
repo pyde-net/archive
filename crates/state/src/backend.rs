@@ -438,6 +438,7 @@ mod tests {
     use crate::smt::{key_from_seed, Poseidon2Hasher, SmtValue};
     use sparse_merkle_tree::SparseMerkleTree;
 
+    #[allow(clippy::upper_case_acronyms)] // SMT = Sparse Merkle Tree
     type SMT<S> = SparseMerkleTree<Poseidon2Hasher, SmtValue, S>;
 
     // ========== Task 0293: Backend get/put/delete roundtrip ==========

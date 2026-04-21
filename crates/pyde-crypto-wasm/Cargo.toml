@@ -23,3 +23,6 @@ hex = "0.4"
 [profile.release]
 opt-level = "s"
 lto = true
+
+[lints]
+workspace = true

@@ -24,17 +24,13 @@ pub struct Dependency {
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(default)]
+#[derive(Default)]
 pub struct TestSection {
     /// Default verbosity for execution traces (0=silent, 1=calls, 2=storage, 3=full).
     /// CLI -v flag overrides this.
     pub verbosity: u8,
 }
 
-impl Default for TestSection {
-    fn default() -> Self {
-        Self { verbosity: 0 }
-    }
-}
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct ProjectSection {

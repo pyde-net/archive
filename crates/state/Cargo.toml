@@ -13,3 +13,6 @@ tempfile = "3"
 [[bench]]
 name = "smt_bench"
 harness = false
+
+[lints]
+workspace = true

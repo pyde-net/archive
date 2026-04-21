@@ -374,12 +374,10 @@ mod tests {
     #[test]
     fn account_keys_all_different() {
         let a = test_addr(0xAAAA);
-        let keys = vec![
-            balance_key(&a),
+        let keys = [balance_key(&a),
             nonce_key(&a),
             code_key(&a),
-            code_hash_key(&a),
-        ];
+            code_hash_key(&a)];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {
                 assert_ne!(keys[i], keys[j], "collision between metadata {i} and {j}");

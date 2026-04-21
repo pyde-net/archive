@@ -28,7 +28,7 @@ proptest! {
         // Scripted sequence of (good_sig_count) per attempted spend.
         attempts in prop::collection::vec(0u8..=8, 1..=5),
     ) {
-        prop_assume!(threshold as u8 <= n_signers);
+        prop_assume!(threshold <= n_signers);
         let n = n_signers as usize;
         let mut smt = PydeSMT::new();
         let sks = install_multisig(&mut smt, n, threshold, 1_000_000_000);
@@ -37,8 +37,13 @@ proptest! {
         let ctx = block_ctx(100);
 
         let mut expected_nonce = 0u64;
+        // `outer_nonce` tracks the submitter's tx-level nonce. It happens
+        // to equal `i` in this loop, but the semantic is distinct (tx
+        // nonce, not attempt index) — keep the named binding rather
+        // than reusing `i`.
         let mut outer_nonce = 0u64;
 
+        #[allow(clippy::explicit_counter_loop)]
         for (i, good_sig_count) in attempts.iter().enumerate() {
             let good = (*good_sig_count as usize).min(n);
             let spend = multisig::MultisigSpend {
@@ -52,7 +57,7 @@ proptest! {
                 data_digest: [0xAA; 32],
             };
             let indices: Vec<u8> = (0..good as u8).collect();
-            let sks_slice: Vec<_> = sks[..good].iter().copied().collect();
+            let sks_slice: Vec<_> = sks[..good].to_vec();
             let sigs = sign_multisig_spend(&spend, &sks_slice, &indices, expected_nonce);
             let payload = multisig::MultisigPayload::Spend { spend, sigs };
             let tx = build_multisig_tx(submitter, sub_sk, payload.encode(), outer_nonce);
@@ -86,7 +91,7 @@ proptest! {
         threshold in 1u8..=8,
         good_sigs in 0u8..=8,
     ) {
-        prop_assume!(threshold as u8 <= n_signers);
+        prop_assume!(threshold <= n_signers);
         let n = n_signers as usize;
         let good = (good_sigs as usize).min(n);
 
@@ -150,7 +155,7 @@ proptest! {
         threshold in 2u8..=6,
         duration in 10u64..=1_000_000,
     ) {
-        prop_assume!(threshold as u8 <= n_signers);
+        prop_assume!(threshold <= n_signers);
         let n = n_signers as usize;
         let mut smt = PydeSMT::new();
         let sks = install_multisig(&mut smt, n, threshold, 1_000_000_000);
@@ -159,7 +164,7 @@ proptest! {
 
         // Pause with full threshold.
         let indices: Vec<u8> = (0..threshold).collect();
-        let sks_thr: Vec<_> = sks[..threshold as usize].iter().copied().collect();
+        let sks_thr: Vec<_> = sks[..threshold as usize].to_vec();
         let pause_sigs = sign_pause(duration, &sks_thr, &indices, 0);
         let pause_payload = multisig::EmergencyPausePayload {
             duration_slots: duration,

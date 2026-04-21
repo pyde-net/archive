@@ -7,3 +7,6 @@ edition = "2021"
 pyde-crypto = { path = "../crypto" }
 pyde-account = { path = "../account" }
 pyde-tx = { path = "../tx" }
+
+[lints]
+workspace = true

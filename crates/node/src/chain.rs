@@ -41,7 +41,7 @@ impl ChainState {
     /// Advance chain head after processing a block.
     pub fn advance(&mut self, header: BlockHeader) {
         let slot = header.slot;
-        let epoch = slot / EPOCH_LENGTH as u64;
+        let epoch = slot / EPOCH_LENGTH;
 
         self.head_slot = slot;
         self.epoch = epoch;
@@ -86,7 +86,7 @@ mod tests {
     fn dummy_header(slot: u64, parent_hash: [u8; 32]) -> BlockHeader {
         BlockHeader {
             slot,
-            epoch: slot / EPOCH_LENGTH as u64,
+            epoch: slot / EPOCH_LENGTH,
             parent_hash,
             proposer: ZERO_ADDRESS,
             vrf_proof: vec![],

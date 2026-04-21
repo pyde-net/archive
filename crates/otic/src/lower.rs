@@ -3,6 +3,13 @@
 //! Walks the AST and emits flat IR instructions into basic blocks.
 //! Variable names are mapped to virtual registers.
 
+// Compiler + VM internals pass around nested generics (HashMap of
+// Vec of tuples, etc.) where the shape IS the documentation; clippy
+// flags these as `type_complexity`. Adding aliases would add names
+// to learn without improving readability. Scoped allow at the
+// module level; narrow to specific items if this grows.
+#![allow(clippy::type_complexity)]
+
 use std::collections::HashMap;
 
 use ethnum::U256;
@@ -278,10 +285,8 @@ impl Lowerer {
             Expr::Index(obj, _, _) => {
                 if let Expr::FieldAccess(inner, field, _) = obj.as_ref() {
                     if matches!(inner.as_ref(), Expr::SelfExpr(_)) {
-                        if let Some(map_ty) = self.storage_types.get(&field.name) {
-                            if let Ty::Map(_, val_ty) = map_ty {
-                                return Some(*val_ty.clone());
-                            }
+                        if let Some(Ty::Map(_, val_ty)) = self.storage_types.get(&field.name) {
+                            return Some(*val_ty.clone());
                         }
                     }
                 }
@@ -803,14 +808,12 @@ impl Lowerer {
                         // Copy: existing_reg = value (critical for loops)
                         self.emit(Inst::Cast(existing, value, Ty::Unknown));
                     }
-                } else {
-                    if let Some(scope) = self.locals.last_mut() {
-                        scope.insert(ident.name.clone(), value);
-                    }
+                } else if let Some(scope) = self.locals.last_mut() {
+                    scope.insert(ident.name.clone(), value);
                 }
             }
             _ => {
-                self.emit(Inst::Comment(format!("unhandled assign target")));
+                self.emit(Inst::Comment("unhandled assign target".to_string()));
             }
         }
     }
@@ -1009,13 +1012,12 @@ impl Lowerer {
 
             Expr::FieldAccess(obj, field, _) => {
                 // self.field → storage.get
-                if matches!(obj.as_ref(), Expr::SelfExpr(_)) {
-                    if self.storage_slots.contains_key(&field.name) {
+                if matches!(obj.as_ref(), Expr::SelfExpr(_))
+                    && self.storage_slots.contains_key(&field.name) {
                         let dst = self.alloc_reg();
                         self.emit(Inst::StorageGet(dst, field.name.clone()));
                         return dst;
                     }
-                }
 
                 // msg.sender, msg.value, msg.data → builtins (cached per function)
                 if let Expr::Ident(ident) = obj.as_ref() {
@@ -1306,8 +1308,8 @@ impl Lowerer {
                             // revert!() — bare revert with no data
                             self.emit(Inst::Revert("Error".into(), vec![]));
                         }
-                        let dst = self.alloc_reg();
-                        dst
+                        
+                        self.alloc_reg()
                     }
                     "cross_call" => {
                         let mut target_reg = None;

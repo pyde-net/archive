@@ -245,7 +245,7 @@ mod tests {
         for i in 0..10u64 {
             smt.insert(key_from_seed(i), format!("val_{i}").into_bytes()).unwrap();
         }
-        let keys: Vec<Key> = (0..10).map(|i| key_from_seed(i)).collect();
+        let keys: Vec<Key> = (0..10).map(key_from_seed).collect();
 
         let witness = generate_witnesses(&smt, &keys).unwrap();
         assert!(verify_witnesses(&witness));
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn witness_state_map_matches_full_state() {
         let mut smt = PydeSMT::new();
-        let keys: Vec<Key> = (0..10).map(|i| key_from_seed(i)).collect();
+        let keys: Vec<Key> = (0..10).map(key_from_seed).collect();
         for (i, k) in keys.iter().enumerate() {
             smt.insert(*k, format!("val_{i}").into_bytes()).unwrap();
         }
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn batch_proof_smaller_than_individual() {
         let mut smt = PydeSMT::new();
-        let keys: Vec<Key> = (0..100).map(|i| key_from_seed(i)).collect();
+        let keys: Vec<Key> = (0..100).map(key_from_seed).collect();
         for (i, k) in keys.iter().enumerate() {
             smt.insert(*k, format!("v{i}").into_bytes()).unwrap();
         }

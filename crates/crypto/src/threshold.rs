@@ -1,3 +1,9 @@
+// Crypto-style index loops (`for i in 0..N { arr[i] = ... }`) read more
+// cleanly than clippy's preferred `iter_mut().enumerate()` when the
+// domain is fixed-size polynomial / share math and multiple arrays
+// share the index. Kept as-is throughout this module.
+#![allow(clippy::needless_range_loop)]
+
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -865,10 +871,10 @@ pub fn verify_resharing_contribution(
 /// `from_old_index` values. Returns `None` if fewer than `old_threshold`
 /// contributions are available. All new members converge on the same
 /// polynomial when they apply this rule.
-pub fn canonical_resharing_subset<'a>(
-    pool: &'a [ResharingContribution],
+pub fn canonical_resharing_subset(
+    pool: &[ResharingContribution],
     old_threshold: usize,
-) -> Option<Vec<&'a ResharingContribution>> {
+) -> Option<Vec<&ResharingContribution>> {
     if pool.len() < old_threshold {
         return None;
     }
@@ -1385,7 +1391,7 @@ mod tests {
         assert!(verify_resharing_contribution(&contrib, 5, 8));
 
         // Tamper: flip a value in one of the non-interpolation rows.
-        contrib.sub_shares[6][2] = contrib.sub_shares[6][2] + gl(1);
+        contrib.sub_shares[6][2] += gl(1);
         assert!(!verify_resharing_contribution(&contrib, 5, 8));
     }
 

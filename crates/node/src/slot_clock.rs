@@ -107,7 +107,7 @@ mod tests {
         let now_ms = current_time_ms();
         let clock = SlotClock::new(now_ms - 2000);
         let slot = clock.current_slot();
-        assert!(slot >= 4 && slot <= 6, "expected ~5, got {}", slot);
+        assert!((4..=6).contains(&slot), "expected ~5, got {}", slot);
     }
 
     #[test]

@@ -4,6 +4,13 @@
 //! Infers types for expressions, checks assignments, function calls,
 //! struct inits, emit statements, and casts.
 
+// Compiler + VM internals pass around nested generics (HashMap of
+// Vec of tuples, etc.) where the shape IS the documentation; clippy
+// flags these as `type_complexity`. Adding aliases would add names
+// to learn without improving readability. Scoped allow at the
+// module level; narrow to specific items if this grows.
+#![allow(clippy::type_complexity)]
+
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
@@ -121,6 +128,12 @@ pub struct TypeChecker {
     in_contract: bool,
     /// The expected return type of the current function (for return stmt checking).
     current_return_type: Option<Ty>,
+}
+
+impl Default for TypeChecker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TypeChecker {
@@ -535,8 +548,8 @@ impl TypeChecker {
         self.check_block(&func.body);
 
         // Check that non-void functions have a return path
-        if ret_ty != Ty::Unit && ret_ty != Ty::Unknown {
-            if !self.block_has_return(&func.body) {
+        if ret_ty != Ty::Unit && ret_ty != Ty::Unknown
+            && !self.block_has_return(&func.body) {
                 self.error(
                     format!(
                         "function '{}' must return {} but body may not return a value",
@@ -545,7 +558,6 @@ impl TypeChecker {
                     func.span,
                 );
             }
-        }
 
         self.current_return_type = None;
         self.env.pop_scope();
@@ -577,7 +589,7 @@ impl TypeChecker {
                             ElseClause::ElseIf(e) => {
                                 if let Expr::If(_, tb, ec, _) = e.as_ref() {
                                     self.block_has_return(tb)
-                                        && ec.as_ref().map_or(false, |c| match c {
+                                        && ec.as_ref().is_some_and(|c| match c {
                                             ElseClause::ElseBlock(b) => self.block_has_return(b),
                                             _ => false,
                                         })
@@ -758,15 +770,19 @@ impl TypeChecker {
         {
             match a.op {
                 AssignOp::Assign => {
-                    if target_ty != value_ty
+                    // Clippy offers a De-Morgan rewrite to a single big `!(A || B || ...)`,
+                    // but the chain-of-ANDs form with per-line comments is what makes
+                    // the compatibility matrix readable. Keeping as-is.
+                    #[allow(clippy::nonminimal_bool)]
+                    let type_mismatch = target_ty != value_ty
                         && !self.is_int_literal_compatible(&a.value, &target_ty)
                         && !value_ty.can_widen_to(&target_ty)
                         && !(target_ty.is_numeric() && value_ty.is_numeric()) // allow numeric narrowing
                         && !(target_ty.is_enum() && value_ty.is_enum()) // same-kind enum assignment
                         && !(target_ty.is_numeric() && value_ty.is_enum()) // Enum → numeric
                         && !(target_ty.is_enum() && value_ty.is_numeric()) // numeric → Enum
-                        && !self.is_compatible_init(&value_ty, &target_ty)
-                    {
+                        && !self.is_compatible_init(&value_ty, &target_ty);
+                    if type_mismatch {
                         self.error(
                             format!("type mismatch in assignment: {} = {}", target_ty, value_ty),
                             a.span,
@@ -961,12 +977,8 @@ impl TypeChecker {
                     }
                 }
                 // Address.balance → u256
-                if obj_ty == Ty::Address {
-                    match field.name.as_str() {
-                        "balance" => return Ty::U256,
-                        _ => {}
-                    }
-                }
+                if obj_ty == Ty::Address
+                    && field.name.as_str() == "balance" { return Ty::U256 }
                 // struct.field → field type
                 if let Ty::Struct(name) = &obj_ty {
                     if let Some(fields) = self.env.struct_defs.get(name) {

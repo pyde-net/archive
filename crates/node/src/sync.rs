@@ -522,7 +522,7 @@ impl ChainSync {
                 }
 
                 let cs = (*chunk_size as usize).max(1);
-                let total_chunks = ((snap.entries.len() + cs - 1) / cs).max(1) as u32;
+                let total_chunks = snap.entries.len().div_ceil(cs).max(1) as u32;
                 let start = (*chunk_index as usize) * cs;
 
                 if start >= snap.entries.len() {

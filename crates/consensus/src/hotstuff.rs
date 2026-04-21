@@ -303,6 +303,9 @@ pub fn create_timeout(
 }
 
 #[cfg(test)]
+// Same test-module rationale as `block.rs` — keep `&[tx.clone()]`
+// idiom for 1-element slice assertions rather than `from_ref` rewrite.
+#[allow(clippy::cloned_ref_to_slice_refs)]
 mod tests {
     use super::*;
     use crate::block::QuorumCert;

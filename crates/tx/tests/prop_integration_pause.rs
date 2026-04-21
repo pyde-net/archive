@@ -86,7 +86,7 @@ proptest! {
 
         // Pause.
         let indices: Vec<u8> = (0..t as u8).collect();
-        let sks_thr: Vec<_> = sks[..t].iter().copied().collect();
+        let sks_thr: Vec<_> = sks[..t].to_vec();
         let pause_sigs = sign_pause(duration, &sks_thr, &indices, 0);
         let pause_payload = multisig::EmergencyPausePayload {
             duration_slots: duration,
@@ -125,7 +125,7 @@ proptest! {
         let ctx = block_ctx(100);
 
         let indices: Vec<u8> = (0..t as u8).collect();
-        let sks_thr: Vec<_> = sks[..t].iter().copied().collect();
+        let sks_thr: Vec<_> = sks[..t].to_vec();
         let pause_sigs = sign_pause(duration, &sks_thr, &indices, 0);
         let pause_payload = multisig::EmergencyPausePayload {
             duration_slots: duration,
@@ -169,7 +169,7 @@ proptest! {
         let ctx = block_ctx(100);
 
         let indices: Vec<u8> = (0..t as u8).collect();
-        let sks_thr: Vec<_> = sks[..t].iter().copied().collect();
+        let sks_thr: Vec<_> = sks[..t].to_vec();
         let pause_sigs = sign_pause(duration, &sks_thr, &indices, 0);
         let pause_payload = multisig::EmergencyPausePayload {
             duration_slots: duration,
@@ -208,7 +208,7 @@ proptest! {
         let ctx_at_pause = block_ctx(pause_slot);
 
         let indices: Vec<u8> = (0..t as u8).collect();
-        let sks_thr: Vec<_> = sks[..t].iter().copied().collect();
+        let sks_thr: Vec<_> = sks[..t].to_vec();
         let pause_sigs = sign_pause(duration, &sks_thr, &indices, 0);
         let pause_payload = multisig::EmergencyPausePayload {
             duration_slots: duration,
