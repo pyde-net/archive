@@ -715,7 +715,7 @@ fn full_production_benchmark() {
     let metrics_path = dir.join("metrics.txt");
     let mut metrics_out = String::new();
     for m in &all_metrics {
-        let label = m.label.replace(' ', "_").replace('(', "").replace(')', "");
+        let label = m.label.replace(' ', "_").replace(['(', ')'], "");
         let tps = if m.exec_ms > 0.0 { m.ok_count as f64 / (m.exec_ms / 1000.0) } else { 0.0 };
         metrics_out += &format!("pyde_bench_tps{{workload=\"{}\"}} {:.0}\n", label, tps);
         metrics_out += &format!("pyde_bench_exec_ms{{workload=\"{}\"}} {:.1}\n", label, m.exec_ms);

@@ -205,7 +205,7 @@ pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<
 
     // Build selector → function info map for view/non-view detection
     let mut selector_info: std::collections::HashMap<u32, FnInfo> = std::collections::HashMap::new();
-    for (_, fns) in &build_result.contract_functions {
+    for fns in build_result.contract_functions.values() {
         for (name, _params, ret_ty) in fns {
             let sel = otic::codegen::compute_selector(name);
             selector_info.insert(sel, FnInfo {

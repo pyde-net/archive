@@ -140,6 +140,12 @@ pub struct Resolver {
     module_exports: ExternalModuleExports,
 }
 
+impl Default for Resolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Resolver {
     pub fn new() -> Self {
         Self {
@@ -608,14 +614,13 @@ impl Resolver {
                 }
                 let item = &import.path[import.path.len() - 1];
                 // Validate the item is actually exported (if we know the module)
-                if !all_but_last.is_empty() && self.is_known_module(&all_but_last) {
-                    if !self.is_exported(&all_but_last, &item.name) {
+                if !all_but_last.is_empty() && self.is_known_module(&all_but_last)
+                    && !self.is_exported(&all_but_last, &item.name) {
                         self.error(
                             format!("'{}' is not exported from module '{}'", item.name, all_but_last.replace('/', "::")),
                             item.span,
                         );
                     }
-                }
                 self.declare(&item.name, SymbolKind::Contract, item.span);
             }
             return;
@@ -899,7 +904,7 @@ impl Resolver {
                 // Verify the struct/error name exists
                 if let Some(first) = name_segments.first() {
                     if !self.is_type_defined(&first.name)
-                        && self.lookup(&first.name).map(|s| matches!(s.kind, SymbolKind::Error)).unwrap_or(false) == false
+                        && !self.lookup(&first.name).map(|s| matches!(s.kind, SymbolKind::Error)).unwrap_or(false)
                         && self.lookup(&first.name).is_none()
                     {
                         self.error(

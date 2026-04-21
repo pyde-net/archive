@@ -147,7 +147,7 @@ impl Mempool {
             clock_ms: wallclock_ms,
             max_size: DEFAULT_MAX_POOL_SIZE,
             current_block: 0,
-            block_gas_limit: pyde_tx::fee::GAS_CEILING as u64,
+            block_gas_limit: pyde_tx::fee::GAS_CEILING,
         }
     }
 
@@ -164,7 +164,7 @@ impl Mempool {
             clock_ms: wallclock_ms,
             max_size,
             current_block: 0,
-            block_gas_limit: pyde_tx::fee::GAS_CEILING as u64,
+            block_gas_limit: pyde_tx::fee::GAS_CEILING,
         }
     }
 
@@ -681,7 +681,7 @@ mod tests {
         let selected = pool.select_for_block(100_000, 0);
         let total_gas: u64 = selected.iter().map(|t| t.gas_limit).sum();
         assert!(total_gas <= 100_000);
-        assert!(selected.len() >= 1);
+        assert!(!selected.is_empty());
     }
 
     #[test]
@@ -779,7 +779,7 @@ mod tests {
     // `Mempool::set_clock`. (Regular comment, not a doc comment — `///`
     // doesn't attach to `thread_local!` macro items.)
     thread_local! {
-        static TEST_CLOCK: std::cell::Cell<u64> = std::cell::Cell::new(0);
+        static TEST_CLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
     fn test_clock_ms() -> u64 {
         TEST_CLOCK.with(|c| c.get())

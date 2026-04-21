@@ -455,7 +455,7 @@ fn ty_to_string(ty: &Ty) -> String {
         Ty::Vec(inner) => format!("Vec<{}>", ty_to_string(inner)),
         Ty::Map(k, v) => format!("Map<{}, {}>", ty_to_string(k), ty_to_string(v)),
         Ty::Tuple(items) => {
-            let parts: Vec<String> = items.iter().map(|t| ty_to_string(t)).collect();
+            let parts: Vec<String> = items.iter().map(ty_to_string).collect();
             format!("({})", parts.join(", "))
         }
         Ty::Struct(name) => name.clone(),

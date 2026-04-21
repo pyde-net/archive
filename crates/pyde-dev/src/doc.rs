@@ -139,7 +139,7 @@ pub fn run() -> Result<(), String> {
                         top_level_md.push_str(&format!("# {}\n\n", file_stem));
                         has_top_level = true;
                     }
-                    let ty_str = c.ty.as_ref().map(|t| format_type(t)).unwrap_or("unknown".into());
+                    let ty_str = c.ty.as_ref().map(format_type).unwrap_or("unknown".into());
                     top_level_md.push_str(&format!("## const {} : `{}`\n\n", c.name.name, ty_str));
                 }
                 _ => {}
@@ -375,7 +375,7 @@ fn format_type(ty: &otic::ast::Type) -> String {
         otic::ast::Type::Map(k, v, _) => format!("Map<{}, {}>", format_type(k), format_type(v)),
         otic::ast::Type::Named(path) => path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join("::"),
         otic::ast::Type::Tuple(types, _) => {
-            let inner: Vec<String> = types.iter().map(|t| format_type(t)).collect();
+            let inner: Vec<String> = types.iter().map(format_type).collect();
             format!("({})", inner.join(", "))
         }
     }

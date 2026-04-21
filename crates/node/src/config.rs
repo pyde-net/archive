@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 /// Top-level node configuration (loaded from TOML).
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct NodeConfig {
     #[serde(default)]
     pub node: NodeSection,
@@ -203,20 +204,6 @@ impl Default for LoggingSection {
     }
 }
 
-impl Default for NodeConfig {
-    fn default() -> Self {
-        Self {
-            node: NodeSection::default(),
-            network: NetworkSection::default(),
-            consensus: ConsensusSection::default(),
-            storage: StorageSection::default(),
-            rpc: RpcSection::default(),
-            fast_tx: FastTxSection::default(),
-            metrics: MetricsSection::default(),
-            logging: LoggingSection::default(),
-        }
-    }
-}
 
 impl NodeConfig {
     /// Load config from a TOML file, falling back to defaults for missing fields.

@@ -450,7 +450,7 @@ impl<'a> Contract<'a> {
                 buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
                 buf.extend_from_slice(bytes);
                 let pad = (8 - (bytes.len() % 8)) % 8;
-                buf.extend(std::iter::repeat(0u8).take(pad));
+                buf.extend(std::iter::repeat_n(0u8, pad));
             }
             "Bytes" | "bytes" => {
                 let s = value.as_str()
@@ -461,7 +461,7 @@ impl<'a> Contract<'a> {
                 buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
                 buf.extend_from_slice(&bytes);
                 let pad = (8 - (bytes.len() % 8)) % 8;
-                buf.extend(std::iter::repeat(0u8).take(pad));
+                buf.extend(std::iter::repeat_n(0u8, pad));
             }
             // Tuple "(T1, T2, ...)" — sequential fields, no length prefix
             _ if ty.starts_with('(') && ty.ends_with(')') => {
@@ -901,7 +901,7 @@ fn parse_json_i128(v: &serde_json::Value) -> Option<i128> {
 }
 
 fn parse_json_u256(v: &serde_json::Value) -> Option<ethnum::U256> {
-    v.as_u64().map(|n| ethnum::U256::from(n))
+    v.as_u64().map(ethnum::U256::from)
         .or_else(|| v.as_str().and_then(|s| {
             if let Some(hex) = s.strip_prefix("0x") {
                 ethnum::U256::from_str_radix(hex, 16).ok()
@@ -912,7 +912,7 @@ fn parse_json_u256(v: &serde_json::Value) -> Option<ethnum::U256> {
 }
 
 fn parse_json_i256(v: &serde_json::Value) -> Option<ethnum::I256> {
-    v.as_i64().map(|n| ethnum::I256::from(n))
+    v.as_i64().map(ethnum::I256::from)
         .or_else(|| v.as_u64().map(|n| ethnum::I256::from(n as i128)))
         .or_else(|| v.as_str().and_then(|s| {
             if let Some(hex) = s.strip_prefix("0x") {

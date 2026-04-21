@@ -28,3 +28,6 @@ rand = "0.8"
 
 # Error handling
 thiserror = "2"
+
+[lints]
+workspace = true

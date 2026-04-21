@@ -231,12 +231,12 @@ fn execute_transaction_inner(
         &mut gas_tank_balance,
         block_ctx.base_fee,
     )
-    .map_err(|e| PipelineError::ExecutionFailed(e))?;
+    .map_err(PipelineError::ExecutionFailed)?;
     sender.gas_tank = gas_tank_balance;
 
     // 5. Value transfer
     transfer_value(&mut sender.balance, &mut recipient.balance, tx.value)
-        .map_err(|e| PipelineError::ExecutionFailed(e))?;
+        .map_err(PipelineError::ExecutionFailed)?;
 
     // 6. PVM execution (if contract call or deployment)
     let (success, gas_used, gas_refund, logs, return_data) = match tx.tx_type {
@@ -729,7 +729,6 @@ fn execute_in_pvm(
         let ok = output.outcome == Outcome::Success;
         (ok, output.gas_used)
     };
-    let success = success;
 
     // Persist VM storage changes back to SMT.
     // Use the derived key directly (same as what the VM uses internally).
@@ -1866,7 +1865,7 @@ fn execute_rotate_multisig(
                 b"rotate contains malformed pk".to_vec(),
             );
         }
-        if seen.iter().any(|p| *p == pk.as_slice()) {
+        if seen.contains(&pk.as_slice()) {
             return (
                 false,
                 gas,
@@ -2611,6 +2610,10 @@ mod tests {
 
     // ========== E2E: Otigen compile → deploy → call (struct + Vec + while loop) ==========
 
+    // `arc_with_non_send_sync`: the storage_backend closure captures a
+    // raw `*const PydeSMT` pointer (!Send/!Sync). Single-thread test
+    // context; same rationale as otic/src/codegen.rs tests module.
+    #[allow(clippy::arc_with_non_send_sync)]
     #[test]
     fn e2e_rank_contract() {
         // Compile the RankTest contract from source
@@ -2702,7 +2705,7 @@ mod tests {
         calldata.extend_from_slice(&1u64.to_le_bytes()); // bid = 1
 
         let ctx = pyde_vm::vm::ExecutionContext {
-            self_address: contract_addr.into(),
+            self_address: contract_addr,
             ..Default::default()
         };
         let mut vm = pyde_vm::vm::Vm::with_gas_limit_and_context(100_000_000, ctx);

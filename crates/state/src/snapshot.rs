@@ -118,7 +118,7 @@ pub fn apply_incremental(smt: &mut PydeSMT, inc: &IncrementalSnapshot) -> Result
 
 /// Split a snapshot into chunks of `chunk_size` entries each.
 pub fn chunk_snapshot(snapshot: &Snapshot, chunk_size: usize) -> Vec<SnapshotChunk> {
-    let total_chunks = (snapshot.entries.len() + chunk_size - 1) / chunk_size;
+    let total_chunks = snapshot.entries.len().div_ceil(chunk_size);
     let total = total_chunks.max(1) as u32;
 
     snapshot
@@ -183,7 +183,7 @@ mod tests {
 
     fn populate_smt(count: u64) -> (PydeSMT, Vec<Key>) {
         let mut smt = PydeSMT::new();
-        let keys: Vec<Key> = (0..count).map(|i| key_from_seed(i)).collect();
+        let keys: Vec<Key> = (0..count).map(key_from_seed).collect();
         for (i, k) in keys.iter().enumerate() {
             smt.insert(*k, format!("val_{i}").into_bytes()).unwrap();
         }

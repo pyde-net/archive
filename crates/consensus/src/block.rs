@@ -25,7 +25,7 @@ pub fn quorum_for_committee(committee_size: usize) -> usize {
         return 0;
     }
     // ceil(2/3 * n) = (2*n + 2) / 3
-    (2 * committee_size + 2) / 3
+    (2 * committee_size).div_ceil(3)
 }
 
 /// Blocks per epoch (~1000 blocks, ~6.6 minutes at 400ms).
@@ -260,6 +260,11 @@ pub fn genesis_block(
 }
 
 #[cfg(test)]
+// `cloned_ref_to_slice_refs` — tests build 1-element `&[tx.clone()]`
+// slices for determinism assertions. The clone is harmless here and
+// the `std::slice::from_ref(&tx)` rewrite makes each call site noisier
+// without test-level benefit.
+#[allow(clippy::cloned_ref_to_slice_refs)]
 mod tests {
     use super::*;
     use pyde_account::address::derive_eoa_address;
@@ -414,6 +419,7 @@ mod tests {
     // ========== Epoch ==========
 
     #[test]
+    #[allow(clippy::erasing_op)] // `0 / EPOCH_LENGTH` is deliberate — the test's point is "genesis slot = epoch 0"
     fn epoch_from_slot() {
         assert_eq!(0 / EPOCH_LENGTH, 0);
         assert_eq!(999 / EPOCH_LENGTH, 0);

@@ -3,6 +3,22 @@
 //! These functions bridge between native code and VM state (memory, storage,
 //! crypto, events). The AOT code receives an opaque `*mut VmContext` pointer
 //! and calls these functions for any operation that touches VM state.
+//!
+//! ## Pointer safety contract
+//!
+//! Every function here is `extern "C"` and takes `*mut VmCtx` as its first
+//! argument. The pointer comes from the AOT JIT (`aot/src/codegen.rs`),
+//! which emits call-site code that loads a live `&mut Vm` address into the
+//! platform ABI's first register.
+//!
+//! Clippy's `not_unsafe_ptr_arg_deref` is correct in principle — these
+//! functions ARE unsafe to call with an invalid pointer. Marking every
+//! signature `unsafe extern "C" fn` would force matching `unsafe { }` blocks
+//! at every JIT emission site, which is purely ergonomic friction (the
+//! generated assembly already dereferences the pointer unconditionally).
+//! Reviewers of this module should verify the JIT's callsite emission
+//! whenever host signatures change.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use pyde_vm::vm::Vm;
 use pyde_vm::wide::U256;
@@ -539,8 +555,8 @@ pub extern "C" fn host_memcpy(ctx: *mut VmCtx, dst: u64, src: u64, len: u64) -> 
 pub extern "C" fn host_sync_gp_to_vm(ctx: *mut VmCtx, regs_ptr: *const u64) {
     let vm = unsafe { &mut *ctx };
     let regs = unsafe { std::slice::from_raw_parts(regs_ptr, 16) };
-    for i in 0..16 {
-        vm.cpu.write_gp(i as u8, regs[i]);
+    for (i, r) in regs.iter().enumerate() {
+        vm.cpu.write_gp(i as u8, *r);
     }
 }
 
@@ -549,8 +565,8 @@ pub extern "C" fn host_sync_gp_to_vm(ctx: *mut VmCtx, regs_ptr: *const u64) {
 pub extern "C" fn host_sync_gp_from_vm(ctx: *mut VmCtx, regs_ptr: *mut u64) {
     let vm = unsafe { &mut *ctx };
     let regs = unsafe { std::slice::from_raw_parts_mut(regs_ptr, 16) };
-    for i in 0..16 {
-        regs[i] = vm.cpu.read_gp(i as u8);
+    for (i, r) in regs.iter_mut().enumerate() {
+        *r = vm.cpu.read_gp(i as u8);
     }
 }
 

@@ -162,7 +162,7 @@ impl ContractCall {
         self.args.extend_from_slice(bytes);
         // Pad to 8-byte alignment
         let padding = (8 - (bytes.len() % 8)) % 8;
-        self.args.extend(std::iter::repeat(0u8).take(padding));
+        self.args.extend(std::iter::repeat_n(0u8, padding));
         self
     }
 
@@ -369,7 +369,7 @@ impl DeployData {
         self.args.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         self.args.extend_from_slice(bytes);
         let padding = (8 - (bytes.len() % 8)) % 8;
-        self.args.extend(std::iter::repeat(0u8).take(padding));
+        self.args.extend(std::iter::repeat_n(0u8, padding));
         self
     }
     // Raw bytes

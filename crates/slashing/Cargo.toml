@@ -5,3 +5,6 @@ edition = "2021"
 description = "Shared slashing constants and evidence schema version for Pyde. Leaf crate with zero deps — intentionally kept minimal so both pyde-tx (slash-tx handler) and pyde-consensus (slash-result computation) can depend on it without creating a dep cycle."
 
 [dependencies]
+
+[lints]
+workspace = true

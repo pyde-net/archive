@@ -248,7 +248,7 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
             }
 
             // Parse: "GET /path?query HTTP/1.1"
-            let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+            let parts: Vec<&str> = request_line.split_whitespace().collect();
             if parts.len() < 2 {
                 let _ = writer.write_all(json_response(400, r#"{"error":"bad request"}"#).as_bytes()).await;
                 return;
@@ -266,9 +266,9 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
                 "/faucet" => {
                     let address = query.split('&')
                         .find_map(|p| {
-                            let mut kv = p.splitn(2, '=');
-                            let k = kv.next()?;
-                            let v = kv.next()?;
+                            let (k, v) = p.split_once('=')?;
+                            
+                            
                             if k == "address" { Some(v.to_string()) } else { None }
                         });
 

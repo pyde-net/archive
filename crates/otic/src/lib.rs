@@ -2,6 +2,13 @@
 //!
 //! Pipeline: source → lexer → parser → resolve → type check → safety → IR → optimize → codegen → .pyc
 
+// Compiler + VM internals pass around nested generics (HashMap of
+// Vec of tuples, etc.) where the shape IS the documentation; clippy
+// flags these as `type_complexity`. Adding aliases would add names
+// to learn without improving readability. Scoped allow at the
+// module level; narrow to specific items if this grows.
+#![allow(clippy::type_complexity)]
+
 pub mod token;
 pub mod lexer;
 pub mod ast;
@@ -58,7 +65,7 @@ fn resolve_ast_type(ty: &ast::Type) -> Ty {
                 _ => Ty::Struct(name.to_string()),
             }
         }
-        ast::Type::Tuple(types, _) => Ty::Tuple(types.iter().map(|t| resolve_ast_type(t)).collect()),
+        ast::Type::Tuple(types, _) => Ty::Tuple(types.iter().map(resolve_ast_type).collect()),
     }
 }
 
@@ -83,7 +90,7 @@ fn extract_all_contract_signatures(
                             .map(|p| (p.name.name.clone(), resolve_ast_type(&p.ty)))
                             .collect();
                         let ret = f.return_type.as_ref()
-                            .map(|t| resolve_ast_type(t))
+                            .map(resolve_ast_type)
                             .unwrap_or(Ty::Unit);
                         pub_fns.push((f.name.name.clone(), params, ret));
                     }

@@ -265,7 +265,7 @@ fn load_test_full_pipeline() {
 
         // Deploy contracts — submit to ALL nodes for fastest inclusion
         println!("  Deploying {} contracts (to all 4 nodes)...", deploy_txs.len());
-        for (_i, dtx) in deploy_txs.iter().enumerate() {
+        for dtx in deploy_txs.iter() {
             let params = format!("\"{}\"", dtx);
             // Submit to all 4 nodes simultaneously
             for url in &rpc_urls {
@@ -327,7 +327,7 @@ fn load_test_full_pipeline() {
         if use_binary {
             println!("  Using fast binary TX endpoint (port 9545-9548)");
             let concurrency = 32usize;
-            let chunk_size = (raw_txs.len() + concurrency - 1) / concurrency;
+            let chunk_size = raw_txs.len().div_ceil(concurrency);
             let mut tasks = Vec::new();
 
             for c in 0..concurrency {
@@ -372,7 +372,7 @@ fn load_test_full_pipeline() {
         } else {
             println!("  Using HTTP RPC (fast TX endpoint not available)");
             let concurrency = 32usize;
-            let chunk_size = (signed_txs_hex.len() + concurrency - 1) / concurrency;
+            let chunk_size = signed_txs_hex.len().div_ceil(concurrency);
             let mut tasks = Vec::new();
 
             for c in 0..concurrency {

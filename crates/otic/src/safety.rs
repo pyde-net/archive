@@ -64,6 +64,12 @@ pub struct SafetyChecker {
     contract_functions: Vec<String>,
 }
 
+impl Default for SafetyChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SafetyChecker {
     pub fn new() -> Self {
         Self {
@@ -457,6 +463,7 @@ impl SafetyChecker {
     }
 
     /// Collect self.method() call targets from an expression.
+    #[allow(clippy::only_used_in_recursion)] // `&self` kept for call-site symmetry with sibling methods
     fn collect_calls_in_expr(&self, expr: &Expr, targets: &mut Vec<String>) {
         match expr {
             Expr::Call(callee, args, _, _) => {
@@ -597,6 +604,7 @@ impl SafetyChecker {
         }
     }
 
+    #[allow(clippy::only_used_in_recursion)] // `&self` kept for call-site symmetry with sibling methods
     fn is_storage_access(&self, expr: &Expr) -> bool {
         match expr {
             Expr::FieldAccess(obj, _, _) => {
@@ -652,7 +660,7 @@ impl SafetyChecker {
                     || self.expr_accesses_msg_value(&a.value)
             }
             Stmt::Return(r) => {
-                r.value.as_ref().map_or(false, |v| self.expr_accesses_msg_value(v))
+                r.value.as_ref().is_some_and(|v| self.expr_accesses_msg_value(v))
             }
             Stmt::Emit(e) => {
                 e.fields.iter().any(|f| self.expr_accesses_msg_value(&f.value))
@@ -696,7 +704,7 @@ impl SafetyChecker {
             Expr::If(cond, then_block, else_clause, _) => {
                 self.expr_accesses_msg_value(cond)
                     || self.block_accesses_msg_value(then_block)
-                    || else_clause.as_ref().map_or(false, |c| match c {
+                    || else_clause.as_ref().is_some_and(|c| match c {
                         ElseClause::ElseBlock(b) => self.block_accesses_msg_value(b),
                         ElseClause::ElseIf(e) => self.expr_accesses_msg_value(e),
                     })

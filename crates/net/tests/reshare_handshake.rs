@@ -114,26 +114,26 @@ async fn resharing_end_to_end_over_gossipsub() {
             }
             tokio::select! {
                 ev = swarm_a.select_next_some() => {
-                    match ev {
-                        SwarmEvent::Behaviour(GossipOnlyEvent::Gossipsub(
+                    if let SwarmEvent::Behaviour(GossipOnlyEvent::Gossipsub(
                             gossipsub::Event::Subscribed { peer_id: _, .. }
-                        )) => {
-                            // Gossipsub mesh is now ready between the two peers.
-                            // Drain the queued contributions.
-                            for bytes in to_publish.drain(..) {
-                                // Retry on publish error (topic may still be
-                                // bootstrapping heartbeats).
-                                let mut attempt = 0;
-                                while let Err(_) = swarm_a.behaviour_mut()
-                                    .gossipsub.publish(topic.clone(), bytes.clone())
-                                {
-                                    attempt += 1;
-                                    if attempt > 10 { break; }
-                                    tokio::time::sleep(Duration::from_millis(50)).await;
-                                }
+                        )) = ev {
+                        // Gossipsub mesh is now ready between the two peers.
+                        // Drain the queued contributions.
+                        for bytes in to_publish.drain(..) {
+                            // Retry on publish error (topic may still be
+                            // bootstrapping heartbeats).
+                            let mut attempt = 0;
+                            while swarm_a
+                                .behaviour_mut()
+                                .gossipsub
+                                .publish(topic.clone(), bytes.clone())
+                                .is_err()
+                            {
+                                attempt += 1;
+                                if attempt > 10 { break; }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
                             }
                         }
-                        _ => {}
                     }
                 }
                 ev = swarm_b.select_next_some() => {

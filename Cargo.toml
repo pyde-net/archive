@@ -18,6 +18,33 @@ members = [
     "crates/pyde-crypto-wasm",
 ]
 
+# Workspace-wide clippy lint configuration (slice 5.5).
+#
+# Each member crate picks these up via `[lints] workspace = true` in its
+# own Cargo.toml. The rationale for each allow:
+#
+# - `too_many_arguments`: consensus/pipeline functions naturally carry 8-12
+#   primitive args (slot + base_fee + chain_id + validator + ...). Packing
+#   into a struct adds indirection without improving readability.
+#
+# - `needless_range_loop`: crypto polynomial / share math (`for i in 0..N
+#   { arr[i] = ... }`) reads more cleanly than `iter_mut().enumerate()`
+#   when the domain is fixed-size and multiple arrays share the index.
+#
+# - `type_complexity`: compiler + VM internals pass around nested generics
+#   where the shape IS the documentation; aliasing would add names to
+#   learn without improving readability.
+#
+# - `doc_lazy_continuation` / `empty_line_after_doc_comments`: doc-format
+#   style preferences that vary between projects; ours aligns with the
+#   existing codebase rather than clippy's current defaults.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+type_complexity = "allow"
+doc_lazy_continuation = "allow"
+empty_line_after_doc_comments = "allow"
+
 # ── Release profile: maximum performance ──────────────────────────────
 [profile.release]
 opt-level = 3

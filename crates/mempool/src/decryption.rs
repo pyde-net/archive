@@ -32,7 +32,7 @@ impl BlockDecryptor {
     ///
     /// Returns an error if `threshold` is 0 or greater than 128 (committee size).
     pub fn new(encrypted_txs: Vec<EncryptedTx>, threshold: usize) -> Result<Self, String> {
-        if threshold < 1 || threshold > 128 {
+        if !(1..=128).contains(&threshold) {
             return Err(format!(
                 "decryption threshold must be in [1, 128], got {}",
                 threshold

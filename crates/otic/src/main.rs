@@ -253,7 +253,7 @@ fn cmd_test(path: &str) {
             }
         }
 
-        let should_panic = func.doc.as_ref().map_or(false, |d| d.contains("should_panic"));
+        let should_panic = func.doc.as_ref().is_some_and(|d| d.contains("should_panic"));
 
         let ok = match result {
             Some(pyde_vm::vm::ExecResult::Halt) => !should_panic,

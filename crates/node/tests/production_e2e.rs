@@ -313,9 +313,10 @@ fn production_signed_deploy_and_call() {
     std::thread::sleep(std::time::Duration::from_secs(5));
 
     // Verify get_count() = 1
+    let selector_hex = format!("{:08x}", otic::codegen::compute_selector("get_count"));
     let resp = rpc_call(&rpc, "pyde_call", &format!(
         r#"{{"from":"0x{}","to":"{}","data":"0x{}","gas":100000000}}"#,
-        hex::encode(address), contract_hex, format!("{:08x}", otic::codegen::compute_selector("get_count"))
+        hex::encode(address), contract_hex, selector_hex
     ));
     let count = get_result_string(&resp);
     println!("[{}] get_count() = {} (expected 0x1)", if count == "0x1" { "PASS" } else { "INFO" }, count);

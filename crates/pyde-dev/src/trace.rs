@@ -128,6 +128,12 @@ pub struct ExecutionTrace {
     pub depth: u32,
 }
 
+impl Default for ExecutionTrace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExecutionTrace {
     pub fn new() -> Self {
         Self {

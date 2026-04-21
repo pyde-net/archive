@@ -193,7 +193,7 @@ mod tests {
         let (pk2, sk2) = falcon_keygen().unwrap();
         let (pk3, _sk3) = falcon_keygen().unwrap();
 
-        let mut account = Account::new_eoa(&pk1.as_bytes().to_vec());
+        let mut account = Account::new_eoa(pk1.as_bytes());
         account.auth_keys = AuthKeys::MultiSig {
             keys: vec![pk1.as_bytes().to_vec(), pk2.as_bytes().to_vec(), pk3.as_bytes().to_vec()],
             threshold: 2,
@@ -214,7 +214,7 @@ mod tests {
         let (pk2, _sk2) = falcon_keygen().unwrap();
         let (pk3, _sk3) = falcon_keygen().unwrap();
 
-        let mut account = Account::new_eoa(&pk1.as_bytes().to_vec());
+        let mut account = Account::new_eoa(pk1.as_bytes());
         account.auth_keys = AuthKeys::MultiSig {
             keys: vec![pk1.as_bytes().to_vec(), pk2.as_bytes().to_vec(), pk3.as_bytes().to_vec()],
             threshold: 2,

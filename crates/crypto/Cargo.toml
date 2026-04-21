@@ -26,3 +26,6 @@ harness = false
 [[bench]]
 name = "vrf_bench"
 harness = false
+
+[lints]
+workspace = true

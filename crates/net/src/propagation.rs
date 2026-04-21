@@ -173,8 +173,8 @@ pub fn compute_erasure_params(block_size: usize) -> Option<ErasureParams> {
 
     // Target chunk size: 64KB
     let chunk_size = 64 * 1024;
-    let data_chunks = (block_size + chunk_size - 1) / chunk_size;
-    let parity_chunks = (data_chunks + 1) / 2; // 50% redundancy
+    let data_chunks = block_size.div_ceil(chunk_size);
+    let parity_chunks = data_chunks.div_ceil(2); // 50% redundancy
 
     Some(ErasureParams {
         data_chunks,

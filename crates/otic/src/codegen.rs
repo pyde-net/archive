@@ -19,6 +19,12 @@
 //!   - Dispatch entries decode calldata → arg registers → Call → Halt
 //!   - All functions end with Ret (dispatch wrapper emits Halt)
 
+// Register encoding patterns like `(14 & 0xF) << 2` are deliberately
+// written with the `& 0xF` mask to document the 4-bit-wide register
+// field. Clippy flags these as redundant when the constant already
+// fits; keeping them improves readability of the bit-packed immediate.
+#![allow(clippy::eq_op)]
+
 use std::collections::{HashMap, HashSet};
 
 use ethnum::U256;
@@ -280,6 +286,12 @@ pub struct CodeGen {
     current_label_remap: Option<HashMap<Label, Label>>,
     /// Current function's return type (for blob return serialization).
     current_return_ty: Ty,
+}
+
+impl Default for CodeGen {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CodeGen {
@@ -619,7 +631,7 @@ impl CodeGen {
 
     /// Fallback: search all structs for a field name (backward compat for untyped access).
     fn find_field_offset_any(&self, field_name: &str) -> u32 {
-        for (_sname, fmap) in &self.field_offsets {
+        for fmap in self.field_offsets.values() {
             if let Some((off, _)) = fmap.get(field_name) {
                 return *off;
             }
@@ -1041,7 +1053,7 @@ impl CodeGen {
                             );
                         }
                         // Advance heap past header + data (aligned)
-                        let total = memory::VEC_DATA_OFFSET as u32 + ((byte_len + 7) / 8) * 8;
+                        let total = memory::VEC_DATA_OFFSET + byte_len.div_ceil(8) * 8;
                         self.load_u32_to_reg(15, total);
                         self.emit_op(Opcode::Add, 12, 12, 15);
                     }
@@ -1846,7 +1858,7 @@ impl CodeGen {
             Inst::TupleGet(dst, tuple, idx) => {
                 let rd = self.alloc_gp(*dst);
                 let rt = self.get_reg(*tuple);
-                let offset = (*idx) * (memory::WORD_SIZE as u32);
+                let offset = (*idx) * memory::WORD_SIZE;
                 self.emit_load(rd, rt, offset as i32);
             }
 
@@ -1854,7 +1866,7 @@ impl CodeGen {
                 let rd = self.alloc_gp(*dst);
                 // Reserve header (16 bytes) + data, matching Vec layout for IndexGet
                 let data_size = (regs.len() as u32) * memory::WORD_SIZE;
-                let total = memory::VEC_DATA_OFFSET as u32 + data_size;
+                let total = memory::VEC_DATA_OFFSET + data_size;
                 self.emit_op(Opcode::Add, rd, 12, 0);
                 self.emit_op(Opcode::Addi, 12, 12, total);
                 // Write length/capacity header
@@ -1864,7 +1876,7 @@ impl CodeGen {
                                             // Write elements at VEC_DATA_OFFSET
                 for (i, reg) in regs.iter().enumerate() {
                     let r = self.get_reg(*reg);
-                    let offset = memory::VEC_DATA_OFFSET as u32 + (i as u32) * memory::WORD_SIZE;
+                    let offset = memory::VEC_DATA_OFFSET + (i as u32) * memory::WORD_SIZE;
                     self.emit_store(r, rd, offset as i32);
                 }
             }
@@ -1875,7 +1887,7 @@ impl CodeGen {
                 // Save val to stack — load_u32_to_reg(15, count) clobbers r15 (and r14 as scratch)
                 self.emit_op(Opcode::Push, rv, 0, 0);
                 let data_size = (*count as u32) * memory::WORD_SIZE;
-                let total = memory::VEC_DATA_OFFSET as u32 + data_size;
+                let total = memory::VEC_DATA_OFFSET + data_size;
                 self.emit_op(Opcode::Add, rd, 12, 0);
                 self.emit_op(Opcode::Addi, 12, 12, total);
                 self.load_u32_to_reg(15, *count as u32);
@@ -1884,7 +1896,7 @@ impl CodeGen {
                                             // Restore val from stack
                 self.emit_op(Opcode::Pop, 15, 0, 0); // r15 = val (restored)
                 for i in 0..*count {
-                    let offset = memory::VEC_DATA_OFFSET as u32 + (i as u32) * memory::WORD_SIZE;
+                    let offset = memory::VEC_DATA_OFFSET + (i as u32) * memory::WORD_SIZE;
                     self.emit_store(15, rd, offset as i32);
                 }
             }
@@ -2908,13 +2920,13 @@ impl CodeGen {
                         let offset = (i as u32) * memory::WORD_SIZE;
                         self.emit_op(Opcode::Push, val_reg, 0, 0);
                         // Load field value from struct
-                        if is_wide_type(&fty) {
+                        if is_wide_type(fty) {
                             self.emit_op(Opcode::Addi, 15, val_reg, offset);
                             self.emit_op(Opcode::Wload, WIDE_SCRATCH2, 15, 0);
-                            self.emit_serialize(&fty, WIDE_SCRATCH2);
+                            self.emit_serialize(fty, WIDE_SCRATCH2);
                         } else {
                             self.emit_load(14, val_reg, offset as i32);
-                            self.emit_serialize(&fty, 14);
+                            self.emit_serialize(fty, 14);
                         }
                         // Restore struct base for next field iteration
                         self.emit_op(Opcode::Pop, val_reg, 0, 0);
@@ -3426,8 +3438,8 @@ impl CodeGen {
                     for (i, (_, fty)) in fields.iter().enumerate() {
                         let offset = (i as u32) * memory::WORD_SIZE;
                         // Deserialize field from src into temp register, then store to struct
-                        if is_wide_type(&fty) {
-                            self.emit_deserialize(&fty, src_reg, 14); // wide → but we use 14 as GP temp
+                        if is_wide_type(fty) {
+                            self.emit_deserialize(fty, src_reg, 14); // wide → but we use 14 as GP temp
                                                                       // For wide fields in struct, store the wide value at struct+offset
                                                                       // Actually wide fields need 32 bytes but struct layout uses 8 per field (pointer)
                                                                       // This is a limitation — skip for now
@@ -3435,7 +3447,7 @@ impl CodeGen {
                             self.emit_op(Opcode::Push, 15, 0, 0);
                             self.emit_store(14, 15, offset as i32);
                         } else {
-                            self.emit_deserialize(&fty, src_reg, 14);
+                            self.emit_deserialize(fty, src_reg, 14);
                             // Store field value/pointer at struct[offset]
                             self.emit_op(Opcode::Pop, 15, 0, 0); // peek struct base
                             self.emit_op(Opcode::Push, 15, 0, 0);
@@ -3578,6 +3590,15 @@ pub fn compute_selector(name: &str) -> u32 {
 }
 
 #[cfg(test)]
+// `arc_with_non_send_sync`: the storage_backend closures in these tests
+// capture raw `*const PydeSMT` pointers, which are !Send/!Sync by design.
+// Tests run single-threaded against a local SMT, so the Arc here is used
+// purely as reference-counted storage, not for cross-thread sharing. The
+// alternative (switching the `storage_backend` field from Arc to Rc
+// project-wide) is a non-trivial refactor that only matters if we ever
+// parallelize VM execution across threads — which would require replacing
+// the raw pointer anyway. Scoped allow is the honest minimum here.
+#[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
@@ -4277,7 +4298,7 @@ mod tests {
         "#,
         );
         assert_eq!(compiled.bytecode.len(), compiled.instruction_count * 4);
-        assert!(compiled.bytecode.len() > 0);
+        assert!(!compiled.bytecode.is_empty());
     }
 
     #[test]
@@ -4294,7 +4315,7 @@ mod tests {
         "#,
         );
         assert_eq!(compiled.name, "Token");
-        assert!(compiled.bytecode.len() > 0);
+        assert!(!compiled.bytecode.is_empty());
         assert_eq!(compiled.selectors.len(), 1);
         assert_eq!(compiled.selectors[0].1, "get_supply");
     }
@@ -4973,7 +4994,7 @@ mod tests {
             "increment should succeed"
         );
         assert!(
-            vm.storage.len() > 0,
+            !vm.storage.is_empty(),
             "vm.storage should have entries after Sstore"
         );
     }
@@ -6043,7 +6064,7 @@ mod tests {
                         panic!("too many steps at step {}", steps);
                     }
                     // Print last 10 instructions before fault (around step 180-190)
-                    if steps >= 150 && steps <= 245 {
+                    if (150..=245).contains(&steps) {
                         let pc = vm.pc as usize;
                         if pc + 4 <= compiled.bytecode.len() {
                             let w = u32::from_le_bytes(

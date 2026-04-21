@@ -65,7 +65,7 @@ fn bytes_to_elements(data: &[u8]) -> Vec<Goldilocks> {
     if data.is_empty() {
         return vec![Goldilocks::ZERO];
     }
-    let mut elements = Vec::with_capacity((data.len() + CHUNK - 1) / CHUNK + 1);
+    let mut elements = Vec::with_capacity(data.len().div_ceil(CHUNK) + 1);
     for chunk in data.chunks(CHUNK) {
         let mut buf = [0u8; 8];
         buf[..chunk.len()].copy_from_slice(chunk);
@@ -111,7 +111,7 @@ pub fn poseidon2_pair(left: Hash256, right: Hash256) -> Hash256 {
 /// Hash multiple Hash256 values together (variable-length sponge).
 pub fn poseidon2_many(hashes: &[Hash256]) -> Hash256 {
     let sponge = make_sponge();
-    let elements: Vec<Goldilocks> = hashes.iter().flat_map(|h| hash256_to_elements(h)).collect();
+    let elements: Vec<Goldilocks> = hashes.iter().flat_map(hash256_to_elements).collect();
     let out = sponge.hash_iter(elements);
     elements_to_hash(out)
 }

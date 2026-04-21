@@ -543,9 +543,9 @@ impl PydeNode {
                             // Generate a fresh nonce, record it, send the request.
                             // We only authenticate to peers once; if a response is
                             // already pending we skip to avoid stacking nonces.
-                            if !pending_auth_nonces.contains_key(&peer) {
+                            if let std::collections::hash_map::Entry::Vacant(e) = pending_auth_nonces.entry(peer) {
                                 let nonce = pyde_net::auth::generate_nonce();
-                                pending_auth_nonces.insert(peer, nonce);
+                                e.insert(nonce);
                                 let req = pyde_net::auth::PydeAuthReq { nonce };
                                 let _ = swarm.behaviour_mut().auth.send_request(&peer, req);
                             }
@@ -1400,7 +1400,21 @@ impl PydeNode {
                                                                                 dev_skip_signature: false,
                                                                             };
                                                                             for dtx in &decrypted_txs {
-                                                                                match pyde_tx::pipeline::execute_transaction(dtx, &mut *state_w.smt_mut(), &block_ctx) {
+                                                                                // Bind the execute_transaction result BEFORE the
+                                                                                // match so the `state_w.smt_mut()` MutexGuard
+                                                                                // temporary is dropped at this semicolon. Without
+                                                                                // this binding the guard lives through the match
+                                                                                // body, which includes `receipts.write().await` —
+                                                                                // the tokio scheduler could move the future to
+                                                                                // another thread holding a std Mutex guard, a
+                                                                                // well-known deadlock / UB pattern. Surfaced by
+                                                                                // slice 5.5 clippy sweep.
+                                                                                let exec_result = pyde_tx::pipeline::execute_transaction(
+                                                                                    dtx,
+                                                                                    &mut *state_w.smt_mut(),
+                                                                                    &block_ctx,
+                                                                                );
+                                                                                match exec_result {
                                                                                     Ok(receipt) => {
                                                                                         let mut receipts_w = receipts.write().await;
                                                                                         receipts_w.insert_block_receipts(current_slot, vec![receipt]);
@@ -2041,10 +2055,11 @@ fn handle_swarm_event(
                 .as_ref()
                 .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot));
             chain_sync.on_response(request_id, response, chain, state, block_store, ws_slot);
-            // If chunked snapshot needs more chunks, signal the event loop
-            if chain_sync.needs_next_chunk().is_some() {
-                PostEventAction::ContinueSync // caller will request next chunk
-            } else if chain_sync.is_syncing() {
+            // Signal the event loop to continue if chunked snapshot needs
+            // more chunks OR we're otherwise still syncing. Both branches
+            // produced the same ContinueSync return — collapsed into a
+            // single `||` expression (spotted by slice 5.5 clippy sweep).
+            if chain_sync.needs_next_chunk().is_some() || chain_sync.is_syncing() {
                 PostEventAction::ContinueSync
             } else {
                 PostEventAction::None

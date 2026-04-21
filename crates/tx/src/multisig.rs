@@ -567,7 +567,7 @@ mod tests {
 
     #[test]
     fn signer_set_rejects_over_max() {
-        let mut bytes = vec![(MAX_SIGNERS + 1) as u8];
+        let mut bytes = vec![MAX_SIGNERS + 1];
         bytes.extend_from_slice(&vec![0u8; (MAX_SIGNERS as usize + 1) * 897]);
         assert!(decode_signer_set(&bytes).is_none());
     }

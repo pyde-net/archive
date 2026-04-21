@@ -268,7 +268,7 @@ pub fn run(filter: Option<&str>, verbosity: u8) -> Result<(), String> {
 
         println!();
         println!("  Gas Profile");
-        println!("  {:<col_width$}  {:>12}  {:>8}  {}", "Test", "Gas Used", "% Limit", "Status");
+        println!("  {:<col_width$}  {:>12}  {:>8}  Status", "Test", "Gas Used", "% Limit");
         println!("  {}", "-".repeat(col_width + 30));
         for entry in &gas_profile {
             let pct = (entry.gas_used as f64 / gas_limit as f64) * 100.0;

@@ -45,7 +45,7 @@ impl BlockStore {
         let mut hash_key = Vec::with_capacity(2 + 32);
         hash_key.extend_from_slice(b"i:");
         hash_key.extend_from_slice(&block_hash);
-        self.db.put(&hash_key, &slot.to_le_bytes())
+        self.db.put(&hash_key, slot.to_le_bytes())
             .map_err(|e| format!("failed to store hash index: {}", e))?;
 
         Ok(())

@@ -49,7 +49,7 @@ proptest! {
         threshold in 1u8..=6,
         value in 100u128..=100_000,
     ) {
-        prop_assume!(threshold as u8 <= n_signers);
+        prop_assume!(threshold <= n_signers);
         let n = n_signers as usize;
         let t = threshold as usize;
 
@@ -64,7 +64,7 @@ proptest! {
             data_digest: [0xAA; 32],
         };
         let indices: Vec<u8> = (0..t as u8).collect();
-        let sks_thr: Vec<_> = sks[..t].iter().copied().collect();
+        let sks_thr: Vec<_> = sks[..t].to_vec();
         let sigs = sign_multisig_spend(&spend, &sks_thr, &indices, 0);
         let payload = multisig::MultisigPayload::Spend {
             spend: spend.clone(),
@@ -93,7 +93,7 @@ proptest! {
         n_signers in 2u8..=6,
         threshold in 1u8..=6,
     ) {
-        prop_assume!(threshold as u8 <= n_signers);
+        prop_assume!(threshold <= n_signers);
         let n = n_signers as usize;
         let t = threshold as usize;
 
@@ -145,7 +145,7 @@ proptest! {
         n_signers in 2u8..=6,
         threshold in 1u8..=6,
     ) {
-        prop_assume!(threshold as u8 <= n_signers);
+        prop_assume!(threshold <= n_signers);
         let n = n_signers as usize;
         let t = threshold as usize;
 
@@ -185,7 +185,7 @@ proptest! {
             data_digest: [0xBB; 32],
         };
         let sindices: Vec<u8> = (0..t as u8).collect();
-        let sks_thr: Vec<_> = old_sks[..t].iter().copied().collect();
+        let sks_thr: Vec<_> = old_sks[..t].to_vec();
         let sigs = sign_multisig_spend(&spend, &sks_thr, &sindices, 1);
         let spayload = multisig::MultisigPayload::Spend { spend, sigs };
         let stx = build_multisig_tx(submitter, sub_sk, spayload.encode(), 1);

@@ -1001,7 +1001,7 @@ async fn parse_call_object(
         height: chain.head_slot,
         timestamp: chain.head_slot * 400,
         base_fee: chain.base_fee,
-        block_gas_limit: pyde_tx::fee::GAS_CEILING as u64,
+        block_gas_limit: pyde_tx::fee::GAS_CEILING,
         chain_id: chain.chain_id,
         validator_address: [0u8; 32],
         dev_skip_signature: false,

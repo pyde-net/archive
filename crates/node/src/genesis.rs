@@ -745,7 +745,7 @@ pub fn generate_testnet(
     use pyde_crypto::falcon::falcon_keygen;
     use std::fs;
 
-    if num_validators < 2 || num_validators > 128 {
+    if !(2..=128).contains(&num_validators) {
         return Err("validators must be between 2 and 128".into());
     }
 

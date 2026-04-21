@@ -449,12 +449,12 @@ fn production_simulation() {
     // Verify all signatures
     let t0 = Instant::now();
     for (i, tx) in deploy_txs.iter().enumerate() {
-        let acc_idx = i % 20;
-        let pk_bytes = if acc_idx < 10 {
-            accounts[acc_idx].pk.as_bytes()
-        } else {
-            accounts[acc_idx].pk.as_bytes()
-        };
+        // Both arms of the previous `if acc_idx < 10 { ... } else { ... }`
+        // indexed the same `accounts` vec with the same value — a leftover
+        // from a refactor where deploy vs non-deploy accounts lived in
+        // separate collections. Collapsed to a direct index; caught by
+        // slice 5.5 clippy sweep (clippy::if_same_then_else).
+        let pk_bytes = accounts[i % 20].pk.as_bytes();
         assert!(tx.verify_signature(pk_bytes), "sig verify failed for deploy tx {}", i);
     }
     println!("    Verified 20 sigs: {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);

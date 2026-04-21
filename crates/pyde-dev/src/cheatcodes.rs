@@ -43,6 +43,12 @@ pub struct CheatcodeState {
     pub prank_persistent: bool,
 }
 
+impl Default for CheatcodeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CheatcodeState {
     pub fn new() -> Self {
         Self {
@@ -123,11 +129,10 @@ pub fn execute_with_cheatcodes(vm: &mut Vm, cheat_state: &mut CheatcodeState) ->
 
         // Clear single-use prank after any non-cheatcode CallExt
         if let Some(d) = maybe_instr {
-            if d.opcode == Opcode::CallExt && !cheat_state.prank_persistent {
-                if cheat_state.prank_caller.is_some() {
+            if d.opcode == Opcode::CallExt && !cheat_state.prank_persistent
+                && cheat_state.prank_caller.is_some() {
                     cheat_state.prank_caller = None;
                 }
-            }
         }
     };
 
@@ -279,11 +284,10 @@ pub fn execute_with_tracing(
 
         // Clear single-use prank
         if let Some(d) = maybe_instr {
-            if d.opcode == Opcode::CallExt && !cheat_state.prank_persistent {
-                if cheat_state.prank_caller.is_some() {
+            if d.opcode == Opcode::CallExt && !cheat_state.prank_persistent
+                && cheat_state.prank_caller.is_some() {
                     cheat_state.prank_caller = None;
                 }
-            }
         }
     };
 
