@@ -1,5 +1,6 @@
 [package]
 name = "pyde-rust-sdk"
+license.workspace = true
 version = "0.1.0"
 edition = "2021"
 description = "Rust SDK for interacting with the Pyde blockchain"

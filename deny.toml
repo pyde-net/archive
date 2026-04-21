@@ -1,0 +1,94 @@
+# cargo-deny configuration (Phase 5 slice 5.7, plan task 051)
+#
+# Runs in CI via `cargo deny check`. Any new dep introducing a license
+# we haven't ratified, an active RustSec advisory, or a dup-version
+# explosion will fail the check.
+
+[graph]
+# Only audit the default build target; workspace is Unix-first for node.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+]
+
+[advisories]
+# Fail on any unhandled advisory. Known exceptions listed below with
+# explicit `ignore` entries that document *why* we accept the risk.
+version = 2
+yanked = "warn"
+ignore = [
+    # libp2p-quic 0.54.1 transitively pulls these. All three are TLS-
+    # layer issues in libp2p's QUIC transport, which we use only for
+    # validator-to-validator consensus traffic under an authenticated
+    # overlay (FALCON-signed peer IDs, allowlist). Upgrading requires
+    # libp2p 0.56+ which has API breakage we haven't scoped. Tracked
+    # as a dedicated follow-up slice.
+    "RUSTSEC-2025-0009", # ring 0.16: AES panic on overflow check
+    "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints
+    "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints
+
+    # Unmaintained crates transitively via libp2p + scroll deps. No
+    # CVE; just no upstream maintainer. Same libp2p-upgrade blocker.
+    "RUSTSEC-2025-0010", # ring <0.17 unmaintained
+    "RUSTSEC-2024-0436", # paste unmaintained
+]
+
+[licenses]
+# Licenses we're OK linking. MIT / Apache-2.0 / BSD-derivative family
+# covers the Rust ecosystem; MPL-2.0 + CDDL show up in a few RocksDB /
+# legacy deps. Anything else must be audited + added here explicitly.
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",            # weak-copyleft, file-scoped
+    "0BSD",
+]
+# Crate-specific license exceptions (not in `allow` list above).
+exceptions = [
+    # ring 0.16.20 bundles a custom OpenSSL + ISC license file that
+    # cargo-deny can't SPDX-resolve. Accepted for the libp2p-transitive
+    # path pending ring 0.17 upgrade (blocked on libp2p 0.56+).
+    { allow = ["LicenseRef-ring", "MIT", "ISC", "Apache-2.0"], crate = "ring" },
+]
+
+# Clarifications: map crates whose LICENSE files cargo-deny can't
+# parse into a LicenseRef the `exceptions` list above references.
+[[licenses.clarify]]
+crate = "ring"
+expression = "LicenseRef-ring"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+[bans]
+# Multiple versions of the same crate pulled into the graph often
+# indicate unaligned dep versions. `warn` here; promote to `deny`
+# after a dedicated slice that resolves existing duplicates.
+multiple-versions = "warn"
+wildcards = "allow"       # our own path-deps use version = "0.1.0"
+highlight = "all"
+# `deny` = never allow this crate at all. Empty list currently.
+deny = []
+# `skip` = known acceptable duplicates (populate as they appear).
+skip = []
+
+[sources]
+# Only allow deps from crates.io + our local workspace path entries.
+# Any git-dep slips in will fail this check.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

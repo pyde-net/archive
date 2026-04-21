@@ -36,6 +36,34 @@ jobs:
       # single source of truth for project-wide allows.
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Scans Cargo.lock against the RustSec advisory-db. Known
+      # exceptions live in `.cargo/audit.toml`; each one has an
+      # explanatory comment pointing at the blocker (e.g. libp2p
+      # upgrade pending).
+      - run: cargo install --locked cargo-audit || true
+      - run: cargo audit
+
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Broader supply-chain check: license compliance, advisory
+      # overlap with `cargo audit` (defense-in-depth), dup-version
+      # ban, and git/registry source policy. Config lives in
+      # `deny.toml` with rationale for each allow.
+      - run: cargo install --locked cargo-deny || true
+      - run: cargo deny check
+
   check:
     name: Check
     runs-on: ubuntu-latest
