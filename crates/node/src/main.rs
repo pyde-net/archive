@@ -42,15 +42,22 @@ fn main() {
         }
         Command::Testnet {
             validators,
+            full_nodes,
             out,
             base_port,
             base_rpc_port,
             dev,
             chain_id,
         } => {
-            if let Err(e) =
-                genesis::generate_testnet(&out, validators, base_port, base_rpc_port, dev, chain_id)
-            {
+            if let Err(e) = genesis::generate_testnet(
+                &out,
+                validators,
+                full_nodes,
+                base_port,
+                base_rpc_port,
+                dev,
+                chain_id,
+            ) {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
             }

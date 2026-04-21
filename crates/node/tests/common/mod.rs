@@ -70,12 +70,29 @@ impl TestNetwork {
     /// Spawn an N-validator testnet. `dev=true` uses `chain_id=31337`
     /// and skips signature validation (required for ad-hoc devnets).
     pub fn spawn(validators: usize, dev: bool) -> Result<Self, String> {
+        Self::spawn_mixed(validators, 0, dev)
+    }
+
+    /// Spawn V validators + F full nodes. Full nodes bootstrap to every
+    /// validator and relay txs but don't participate in consensus.
+    pub fn spawn_mixed(
+        validators: usize,
+        full_nodes: usize,
+        dev: bool,
+    ) -> Result<Self, String> {
         if !(2..=8).contains(&validators) {
             return Err(format!(
                 "validators must be 2..=8 for the harness; got {}",
                 validators
             ));
         }
+        if full_nodes > 4 {
+            return Err(format!(
+                "full_nodes must be 0..=4 for the harness; got {}",
+                full_nodes
+            ));
+        }
+        let total = validators + full_nodes;
 
         let tempdir = tempfile::tempdir().map_err(|e| format!("create tempdir: {}", e))?;
         let net_dir = tempdir.path().join("net");
@@ -85,13 +102,14 @@ impl TestNetwork {
         // Find contiguous free port ranges for p2p (UDP — used by QUIC)
         // and rpc (TCP). `pyde testnet` computes bootstrap multiaddrs as
         // `base_port + i`, so the range must be contiguous + free at
-        // startup. We probe by binding then immediately releasing.
-        let (p2p_base, _p2p_holders) = allocate_contiguous_udp_ports(validators)?;
-        let (rpc_base, _rpc_holders) = allocate_contiguous_tcp_ports(validators)?;
+        // startup for EVERY node (validators + full nodes). We probe by
+        // binding then immediately releasing.
+        let (p2p_base, _p2p_holders) = allocate_contiguous_udp_ports(total)?;
+        let (rpc_base, _rpc_holders) = allocate_contiguous_tcp_ports(total)?;
 
         // Run `pyde testnet` to set up genesis + per-node configs.
         run_testnet_cli(
-            &pyde_bin, validators, &net_dir, dev, chain_id, p2p_base, rpc_base,
+            &pyde_bin, validators, full_nodes, &net_dir, dev, chain_id, p2p_base, rpc_base,
         )?;
 
         // Drop the port-holder sockets just before spawning. There's
@@ -101,15 +119,17 @@ impl TestNetwork {
         drop(_p2p_holders);
         drop(_rpc_holders);
 
-        // Spawn all validators.
-        let mut nodes: Vec<TestNode> = Vec::with_capacity(validators);
-        for i in 0..validators {
+        // Spawn validators, then full nodes. Same launch path for both;
+        // only the `--role` flag differs (read from config.toml).
+        let mut nodes: Vec<TestNode> = Vec::with_capacity(total);
+        for i in 0..total {
+            let role: &'static str = if i < validators { "validator" } else { "full" };
             let node_dir = net_dir.join(format!("node-{}", i));
             let rpc_port = rpc_base + i as u16;
             let p2p_port = p2p_base + i as u16;
             let mut n = TestNode {
                 index: i,
-                role: "validator",
+                role,
                 rpc_port,
                 p2p_port,
                 datadir: node_dir,
@@ -126,9 +146,10 @@ impl TestNetwork {
         for node in &nodes {
             wait_rpc_up(&node.rpc_url(), deadline).map_err(|e| {
                 format!(
-                    "{}\n--- node-{} output ---\n{}",
+                    "{}\n--- node-{} ({}) output ---\n{}",
                     e,
                     node.index,
+                    node.role,
                     node.output_snapshot()
                 )
             })?;
@@ -139,6 +160,24 @@ impl TestNetwork {
             chain_id,
             _tempdir: tempdir,
         })
+    }
+
+    /// Indices of every validator node.
+    pub fn validator_indices(&self) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .filter(|n| n.role == "validator")
+            .map(|n| n.index)
+            .collect()
+    }
+
+    /// Indices of every full-node.
+    pub fn full_node_indices(&self) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .filter(|n| n.role == "full")
+            .map(|n| n.index)
+            .collect()
     }
 
     /// Poll each node's `pyde_blockNumber` until all ≥ `target_slot`
@@ -416,6 +455,7 @@ fn rand_port_seed(attempt: u32) -> u32 {
 fn run_testnet_cli(
     pyde: &Path,
     validators: usize,
+    full_nodes: usize,
     out: &Path,
     dev: bool,
     chain_id: u64,
@@ -426,6 +466,8 @@ fn run_testnet_cli(
     cmd.arg("testnet")
         .arg("--validators")
         .arg(validators.to_string())
+        .arg("--full-nodes")
+        .arg(full_nodes.to_string())
         .arg("--out")
         .arg(out)
         .arg("--base-port")
