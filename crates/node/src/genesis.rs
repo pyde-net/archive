@@ -445,8 +445,11 @@ pub fn initialize_genesis(
     }
 
     // 3. Write validator registry entries (for epoch committee selection).
-    // Each validator stored at validator_key(address) with serialized public key + stake.
-    // Format: [pk_len:4 LE][pk_bytes][stake:16 LE][status:1]
+    // Use `ValidatorEntry::encode()` so the wire format stays aligned
+    // with whatever `decode()` expects — the hand-rolled encoder here
+    // previously omitted the `last_claimed_at` field, which meant
+    // every decode() on a genesis entry returned None and the RPC
+    // + slash + stake paths silently saw an empty validator set.
     let mut val_count: u64 = 0;
     for val in &config.validators {
         let address = parse_hex_address(&val.address)?;
@@ -455,14 +458,16 @@ pub fn initialize_genesis(
             hex::decode(pk_hex).map_err(|e| format!("invalid validator pk for registry: {}", e))?;
         let stake = val.stake_u128()?;
 
-        let mut val_data = Vec::with_capacity(4 + pk_bytes.len() + 16 + 1);
-        val_data.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
-        val_data.extend_from_slice(&pk_bytes);
-        val_data.extend_from_slice(&stake.to_le_bytes());
-        val_data.push(0x00); // 0x00 = Active status
+        let entry = pyde_tx::pipeline::ValidatorEntry {
+            pk: pk_bytes,
+            stake,
+            status: 0x00, // Active
+            last_claimed_at: 0,
+            exit_block: None,
+        };
 
         let key = pyde_state::keys::validator_key(&address);
-        entries.push((key, val_data));
+        entries.push((key, entry.encode()));
 
         // Store address at index for enumeration
         let idx_key = pyde_state::keys::validator_index_key(val_count);

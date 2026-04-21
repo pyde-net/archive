@@ -368,6 +368,118 @@ impl TestNetwork {
     }
 
     // --------------------------------------------------------------
+    // Slashing helpers (slice 6.6)
+    // --------------------------------------------------------------
+
+    /// Read a validator's FALCON keypair from its datadir. Layout is
+    /// the one `generate_testnet` writes: `pk_len u32 LE || pk || sk`.
+    /// Returns `(pk_bytes, sk_bytes)`.
+    pub fn load_validator_key(
+        &self,
+        node_idx: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let path = self.nodes[node_idx].datadir.join("validator.key");
+        let raw = std::fs::read(&path)
+            .map_err(|e| format!("read {}: {}", path.display(), e))?;
+        if raw.len() < 4 {
+            return Err(format!("validator.key too short: {}", raw.len()));
+        }
+        let pk_len = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+        if raw.len() < 4 + pk_len {
+            return Err(format!(
+                "validator.key truncated: expected >= {} bytes, got {}",
+                4 + pk_len,
+                raw.len()
+            ));
+        }
+        let pk = raw[4..4 + pk_len].to_vec();
+        let sk = raw[4 + pk_len..].to_vec();
+        Ok((pk, sk))
+    }
+
+    /// Read the on-chain validator set via `pyde_getValidators`. Returns
+    /// a vec of (address, stake, status) tuples. `status` is "active",
+    /// "unbonding", or "exited".
+    pub fn get_validator_set(
+        &self,
+        node_idx: usize,
+    ) -> Result<Vec<(String, u128, String)>, String> {
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_getValidators",
+            "[]",
+        )?;
+        parse_validator_set(&resp)
+    }
+
+    /// Build the wire-format bytes for a `DoubleSignEvidence`.
+    /// Mirrors `pyde_node::wire::encode_double_sign_evidence` — kept
+    /// here rather than imported because `pyde_node` is a binary-only
+    /// crate (no `[lib]` target) and integration tests can't reach
+    /// into its modules.
+    ///
+    /// Layout (EVIDENCE_VERSION = 1):
+    ///   u8 version | u64 slot | [u8;32] hash1 | u32 len | sig1 bytes
+    ///             | [u8;32] hash2 | u32 len | sig2 bytes
+    ///             | [u8;32] signer | [u8;32] submitter
+    pub fn encode_double_sign_evidence_bytes(
+        slot: u64,
+        hash_1: &[u8; 32],
+        signature_1: &[u8],
+        hash_2: &[u8; 32],
+        signature_2: &[u8],
+        signer: &[u8; 32],
+        submitter: &[u8; 32],
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            1 + 8 + 32 + 4 + signature_1.len() + 32 + 4 + signature_2.len() + 32 + 32,
+        );
+        out.push(1u8); // version
+        out.extend_from_slice(&slot.to_le_bytes());
+        out.extend_from_slice(hash_1);
+        out.extend_from_slice(&(signature_1.len() as u32).to_le_bytes());
+        out.extend_from_slice(signature_1);
+        out.extend_from_slice(hash_2);
+        out.extend_from_slice(&(signature_2.len() as u32).to_le_bytes());
+        out.extend_from_slice(signature_2);
+        out.extend_from_slice(signer);
+        out.extend_from_slice(submitter);
+        out
+    }
+
+    /// Submit a double-sign Slash tx via `pyde_sendTransaction`.
+    /// `evidence_hex` is the output of `encode_double_sign_evidence`,
+    /// hex-encoded without the `0x` prefix. `submitter` is the address
+    /// that pays gas and receives the finder's fee.
+    pub fn submit_slash_tx(
+        &self,
+        node_idx: usize,
+        submitter: &[u8; 32],
+        evidence_hex: &str,
+    ) -> Result<String, String> {
+        // to = zero address; slash txs have no recipient. tx_type =
+        // "slash" triggers the TransactionType::Slash path added to
+        // the RPC handler for this slice.
+        let params = format!(
+            r#"[{{"from":"0x{}","to":"0x{}","value":"0","gas":500000,"data":"0x{}","txType":"slash"}}]"#,
+            hex::encode(submitter),
+            hex::encode([0u8; 32]),
+            evidence_hex,
+        );
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_sendTransaction",
+            &params,
+        )?;
+        parse_escaped_tx_hash(&resp).map_err(|e| {
+            format!(
+                "pyde_sendTransaction(slash) parse failed: {}; raw response:\n{}",
+                e, resp
+            )
+        })
+    }
+
+    // --------------------------------------------------------------
     // Tx lifecycle helpers (slice 6.2)
     // --------------------------------------------------------------
 
@@ -760,6 +872,55 @@ fn parse_hex_result(resp: &str) -> Result<String, String> {
         .find('"')
         .ok_or_else(|| format!("unterminated result in {:?}", resp))?;
     Ok(tail[..end].to_string())
+}
+
+/// Extract every validator (address, stake, status) from a
+/// `pyde_getValidators` response. Handler returns a real JSON object
+/// (not a stringified one), so the wire layout is
+///   `"result":{"count":N,"validators":[{"address":"0x..","stake":"N","status":"..","index":i},...]}`
+/// Uses simple string scanning to avoid pulling serde into the harness.
+fn parse_validator_set(resp: &str) -> Result<Vec<(String, u128, String)>, String> {
+    // Leave the `0x` prefix in the captured address so callers can
+    // compare against `format!("0x{}", hex::encode(addr))` directly.
+    let key_addr = r#""address":""#;
+    let key_stake = r#""stake":""#;
+    let key_status = r#""status":""#;
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(addr_start_rel) = resp[cursor..].find(key_addr) {
+        let addr_start = cursor + addr_start_rel + key_addr.len();
+        let addr_end_rel = resp[addr_start..]
+            .find('"')
+            .ok_or_else(|| format!("unterminated address in {:?}", &resp[addr_start..]))?;
+        let addr = resp[addr_start..addr_start + addr_end_rel].to_string();
+
+        // stake and status follow the address for the same validator object.
+        let after_addr = addr_start + addr_end_rel;
+        let stake_start_rel = resp[after_addr..]
+            .find(key_stake)
+            .ok_or("no stake field after address")?;
+        let stake_start = after_addr + stake_start_rel + key_stake.len();
+        let stake_end_rel = resp[stake_start..]
+            .find('"')
+            .ok_or("unterminated stake")?;
+        let stake: u128 = resp[stake_start..stake_start + stake_end_rel]
+            .parse()
+            .map_err(|e| format!("parse stake {}: {}", &resp[stake_start..stake_start + stake_end_rel], e))?;
+
+        let after_stake = stake_start + stake_end_rel;
+        let status_start_rel = resp[after_stake..]
+            .find(key_status)
+            .ok_or("no status field after stake")?;
+        let status_start = after_stake + status_start_rel + key_status.len();
+        let status_end_rel = resp[status_start..]
+            .find('"')
+            .ok_or("unterminated status")?;
+        let status = resp[status_start..status_start + status_end_rel].to_string();
+
+        out.push((addr, stake, status));
+        cursor = status_start + status_end_rel;
+    }
+    Ok(out)
 }
 
 /// Extract the `txHash` from a `pyde_sendTransaction` response.
