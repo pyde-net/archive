@@ -55,7 +55,16 @@ impl BlockProcessor {
         // 1. Validate header
         Self::validate_header_with_checkpoint(&block.header, chain, ws_checkpoint_slot)?;
 
-        // 2. Build block context for tx execution
+        // 2. Build block context for tx execution.
+        //
+        // `dev_skip_signature` follows `chain_id == 31337` (devnet) so the
+        // pipeline-level validation matches the batch-verification skip
+        // below and the `pyde_sendTransaction` RPC dev-mode gate. This is
+        // a chain-wide property (consensus would fork if half the nodes
+        // accepted unsigned txs and half rejected them), so tying it to
+        // chain_id — which is consensus-critical and identical across
+        // every validator — is the only sound choice.
+        let dev_skip_signature = chain.chain_id == 31337;
         let block_ctx = BlockContext {
             height: slot,
             timestamp: block.header.timestamp,
@@ -63,7 +72,7 @@ impl BlockProcessor {
             block_gas_limit: pyde_tx::fee::GAS_CEILING,
             chain_id: chain.chain_id,
             validator_address: block.header.proposer,
-            dev_skip_signature: false,
+            dev_skip_signature,
         };
 
         // 3. Batch signature verification (parallel across all CPU cores).
