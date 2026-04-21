@@ -86,6 +86,9 @@ struct DeferredPortHolder {
 }
 
 impl TestNetwork {
+    /// Default block time (400 ms/slot) — mainnet target.
+    const DEFAULT_BLOCK_TIME_MS: u64 = 400;
+
     /// Spawn an N-validator testnet. `dev=true` uses `chain_id=31337`
     /// and skips signature validation (required for ad-hoc devnets).
     pub fn spawn(validators: usize, dev: bool) -> Result<Self, String> {
@@ -99,7 +102,7 @@ impl TestNetwork {
         full_nodes: usize,
         dev: bool,
     ) -> Result<Self, String> {
-        Self::spawn_mixed_inner(validators, full_nodes, 0, dev)
+        Self::spawn_mixed_inner(validators, full_nodes, 0, dev, Self::DEFAULT_BLOCK_TIME_MS)
     }
 
     /// Same as `spawn_mixed`, but the last `deferred` full nodes have
@@ -119,7 +122,25 @@ impl TestNetwork {
                 deferred, full_nodes
             ));
         }
-        Self::spawn_mixed_inner(validators, full_nodes, deferred, dev)
+        Self::spawn_mixed_inner(
+            validators,
+            full_nodes,
+            deferred,
+            dev,
+            Self::DEFAULT_BLOCK_TIME_MS,
+        )
+    }
+
+    /// Spawn V validators at a custom block time (ms/slot). 400 is the
+    /// production default; 50-100 is useful for tests that need to
+    /// cross epoch boundaries (1000 slots) quickly. Block times < 50
+    /// tend to destabilize consensus on laptops under 4-subprocess load.
+    pub fn spawn_with_block_time(
+        validators: usize,
+        dev: bool,
+        block_time_ms: u64,
+    ) -> Result<Self, String> {
+        Self::spawn_mixed_inner(validators, 0, 0, dev, block_time_ms)
     }
 
     fn spawn_mixed_inner(
@@ -127,6 +148,7 @@ impl TestNetwork {
         full_nodes: usize,
         deferred: usize,
         dev: bool,
+        block_time_ms: u64,
     ) -> Result<Self, String> {
         if !(2..=8).contains(&validators) {
             return Err(format!(
@@ -159,7 +181,15 @@ impl TestNetwork {
 
         // Run `pyde testnet` to set up genesis + per-node configs.
         run_testnet_cli(
-            &pyde_bin, validators, full_nodes, &net_dir, dev, chain_id, p2p_base, rpc_base,
+            &pyde_bin,
+            validators,
+            full_nodes,
+            &net_dir,
+            dev,
+            chain_id,
+            p2p_base,
+            rpc_base,
+            block_time_ms,
         )?;
 
         // Port-holder strategy:
@@ -277,6 +307,37 @@ impl TestNetwork {
         }
         node.kill();
         Ok(())
+    }
+
+    /// Read the `epoch` field from a committed block. Returns
+    /// `Ok(None)` if the node hasn't committed that slot yet.
+    pub fn epoch_of(&self, node_idx: usize, slot: u64) -> Result<Option<u64>, String> {
+        let params = format!("[{}]", slot);
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_getBlockByNumber",
+            &params,
+        )?;
+        if resp.contains(r#""result":null"#) {
+            return Ok(None);
+        }
+        let key = r#""epoch":"#;
+        let start = resp
+            .find(key)
+            .ok_or_else(|| format!("no epoch field in response: {}", resp))?
+            + key.len();
+        let tail = &resp[start..];
+        let end = tail
+            .bytes()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if end == 0 {
+            return Err(format!("couldn't parse epoch from {}", tail));
+        }
+        let v: u64 = tail[..end]
+            .parse()
+            .map_err(|e| format!("parse epoch {}: {}", &tail[..end], e))?;
+        Ok(Some(v))
     }
 
     /// Read the proposer address for a block at `slot` from `node_idx`'s
@@ -727,6 +788,7 @@ fn run_testnet_cli(
     chain_id: u64,
     base_port: u16,
     base_rpc_port: u16,
+    block_time_ms: u64,
 ) -> Result<(), String> {
     let mut cmd = Command::new(pyde);
     cmd.arg("testnet")
@@ -741,7 +803,9 @@ fn run_testnet_cli(
         .arg("--base-rpc-port")
         .arg(base_rpc_port.to_string())
         .arg("--chain-id")
-        .arg(chain_id.to_string());
+        .arg(chain_id.to_string())
+        .arg("--block-time-ms")
+        .arg(block_time_ms.to_string());
     if dev {
         cmd.arg("--dev");
     }

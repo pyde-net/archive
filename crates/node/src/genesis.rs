@@ -755,6 +755,7 @@ pub fn generate_testnet(
     base_rpc_port: u16,
     dev_mode: bool,
     chain_id: u64,
+    block_time_ms: u64,
 ) -> Result<(), String> {
     use pyde_account::address::derive_eoa_address;
     use pyde_crypto::falcon::falcon_keygen;
@@ -964,7 +965,7 @@ rate_limit_per_ip = 5
 bootstrap_peers = {bootstrap}
 
 [consensus]
-block_time_ms = 400
+block_time_ms = {block_time_ms}
 gas_target = 400000000
 gas_ceiling = 1600000000
 
@@ -991,6 +992,7 @@ json = false
             rpc_port = rpc_port,
             metrics_port = metrics_port,
             bootstrap = bootstrap,
+            block_time_ms = block_time_ms,
         );
 
         fs::write(node_dir.join("config.toml"), config_toml)
@@ -1053,7 +1055,7 @@ rate_limit_per_ip = 5
 bootstrap_peers = {bootstrap}
 
 [consensus]
-block_time_ms = 400
+block_time_ms = {block_time_ms}
 gas_target = 400000000
 gas_ceiling = 1600000000
 
@@ -1080,6 +1082,7 @@ json = false
             rpc_port = rpc_port,
             metrics_port = metrics_port,
             bootstrap = bootstrap,
+            block_time_ms = block_time_ms,
         );
 
         fs::write(node_dir.join("config.toml"), config_toml)
