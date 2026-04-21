@@ -1,0 +1,22 @@
+# cargo-audit configuration (Phase 5 slice 5.7, plan task 050)
+#
+# Ignore list must stay in sync with deny.toml's `[advisories].ignore`.
+# The double-config is an artifact of cargo-audit and cargo-deny being
+# separate tools; both are wired into CI so both enforce the same
+# policy.
+
+[advisories]
+ignore = [
+    # Transitive via libp2p 0.54.1 — TLS-layer issues in the QUIC
+    # transport. Accepted under the authenticated-overlay assumption
+    # (FALCON-signed peer IDs + allowlist for validator traffic).
+    # Tracked for the libp2p 0.56+ upgrade slice.
+    "RUSTSEC-2025-0009", # ring 0.16: AES panic on overflow check
+    "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints
+    "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints
+    # Unmaintained — same libp2p-upgrade blocker.
+    "RUSTSEC-2025-0010", # ring <0.17 unmaintained
+    "RUSTSEC-2024-0436", # paste unmaintained
+    "RUSTSEC-2024-0384", # instant 0.1.x unmaintained (via libp2p-gossipsub futures-ticker)
+    "RUSTSEC-2026-0002", # lru IterMut Stacked Borrows soundness (via libp2p-swarm)
+]

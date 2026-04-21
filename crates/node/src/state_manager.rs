@@ -277,9 +277,8 @@ mod tests {
 
     #[test]
     fn snapshot_export_import_roundtrip() {
-        let dir1 = std::env::temp_dir().join("pyde-snap-export");
-        let _ = std::fs::remove_dir_all(&dir1);
-        let mut state1 = StateManager::open(&dir1, 1024).unwrap();
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut state1 = StateManager::open(dir1.path(), 1024).unwrap();
         let key_a = pyde_state::keys::balance_key(&[0x01; 32]);
         let key_b = pyde_state::keys::balance_key(&[0x02; 32]);
         state1
@@ -292,9 +291,8 @@ mod tests {
         let snapshot = state1.export_snapshot();
         assert_eq!(snapshot.len(), 2);
 
-        let dir2 = std::env::temp_dir().join("pyde-snap-import");
-        let _ = std::fs::remove_dir_all(&dir2);
-        let mut state2 = StateManager::open(&dir2, 1024).unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut state2 = StateManager::open(dir2.path(), 1024).unwrap();
         let root2 = state2.import_snapshot(snapshot).unwrap();
         assert_eq!(root1, root2);
         assert_eq!(state2.get(&key_a).unwrap(), 1000u128.to_le_bytes().to_vec());
@@ -303,9 +301,8 @@ mod tests {
 
     #[test]
     fn empty_snapshot() {
-        let dir = std::env::temp_dir().join("pyde-snap-empty");
-        let _ = std::fs::remove_dir_all(&dir);
-        let state = StateManager::open(&dir, 1024).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateManager::open(dir.path(), 1024).unwrap();
         assert!(state.export_snapshot().is_empty());
     }
 }

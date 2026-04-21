@@ -1,3 +1,10 @@
+[workspace.package]
+# Inherited by each member crate via `license.workspace = true` in its
+# own [package] block. Apache-2.0 is the default for the Pyde codebase.
+# Rationale: compatible with MIT/BSD ecosystem deps, allows commercial
+# relicensing of forks, and is the choice of most post-quantum chains.
+license = "Apache-2.0"
+
 [workspace]
 resolver = "2"
 members = [
