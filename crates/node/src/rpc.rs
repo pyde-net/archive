@@ -24,8 +24,12 @@ pub struct RpcState {
     pub tx_relay: Arc<RwLock<TxRelay>>,
     pub receipts: Arc<RwLock<ReceiptStore>>,
     /// Plain transaction queue (devnet mode — no threshold encryption).
-    /// Proposer drains this to build blocks.
-    pub pending_txs: Arc<RwLock<Vec<pyde_tx::types::Transaction>>>,
+    /// Proposer drains this to build blocks. Keyed by `tx.hash()` so
+    /// block-commit retains are O(|block|) instead of O(|mempool| ×
+    /// Poseidon2); under sustained load `Vec` grew into a quadratic
+    /// hotspot because every `retain` had to recompute a full tx
+    /// hash for every entry in the mempool.
+    pub pending_txs: Arc<RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>>,
     /// Committee threshold public key for encrypting transactions (MEV protection).
     pub threshold_pk: Option<pyde_crypto::threshold::ThresholdPublicKey>,
     /// Broadcast channel for new block headers (WebSocket subscriptions).
@@ -422,7 +426,7 @@ impl PydeApiServer for RpcServer {
 
         // Add to pending tx queue and gossip to network
         let mut pending = self.state.pending_txs.write().await;
-        pending.push(tx.clone());
+        pending.insert(tx_hash, tx.clone());
         let queue_size = pending.len();
         drop(pending);
 
@@ -457,7 +461,7 @@ impl PydeApiServer for RpcServer {
         let tx_hash = tx.hash();
 
         let mut pending = self.state.pending_txs.write().await;
-        pending.push(tx.clone());
+        pending.insert(tx_hash, tx.clone());
         drop(pending);
 
         // Gossip to P2P network

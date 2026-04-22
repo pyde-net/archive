@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 pub async fn start_fast_tx_listener(
     listen: &str,
     port: u16,
-    pending_txs: Arc<RwLock<Vec<pyde_tx::types::Transaction>>>,
+    pending_txs: Arc<RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>>,
     tx_gossip_tx: tokio::sync::mpsc::Sender<pyde_tx::types::Transaction>,
 ) -> Result<std::net::SocketAddr, String> {
     let addr = format!("{}:{}", listen, port);
@@ -57,7 +57,7 @@ pub async fn start_fast_tx_listener(
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
-    pending_txs: Arc<RwLock<Vec<pyde_tx::types::Transaction>>>,
+    pending_txs: Arc<RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>>,
     tx_gossip_tx: tokio::sync::mpsc::Sender<pyde_tx::types::Transaction>,
 ) {
     let mut accepted = 0u64;
@@ -100,7 +100,10 @@ async fn handle_connection(
         // Flush batch every 128 txs or when no more data is immediately available
         if batch.len() >= 128 {
             let mut pending = pending_txs.write().await;
-            pending.extend(batch.drain(..));
+            for tx in batch.drain(..) {
+                let h = tx.hash();
+                pending.insert(h, tx);
+            }
             drop(pending);
         }
     }
@@ -111,7 +114,10 @@ async fn handle_connection(
         for tx in &batch {
             let _ = tx_gossip_tx.send(tx.clone()).await;
         }
-        pending.extend(batch);
+        for tx in batch {
+            let h = tx.hash();
+            pending.insert(h, tx);
+        }
     }
 
     if accepted > 0 || errors > 0 {
