@@ -1,0 +1,551 @@
+//! Sustained-rate load generator — Phase 7 task 073 measurement
+//! instrument.
+//!
+//! Spawns its own 4-validator network via `common::TestNetwork` (native
+//! subprocess `pyde` binaries at `chain_id = 1`, FALCON sig verification
+//! ON), funds N senders from the faucet, then holds a target submit
+//! rate for a configurable duration and records steady-state throughput
+//! + inclusion. Native subprocesses (not Docker) — removes the Linux-VM
+//! hop on macOS.
+//!
+//! # Current state (2026-04-22, after this commit's two fixes)
+//!
+//! Task 073 (1 K TPS sustained 10 min) is **NOT YET MET**. Two real
+//! bottlenecks have been fixed as part of landing this test:
+//!
+//!   - `pending_txs` was a `Vec<Transaction>`; post-block `retain`
+//!     recomputed a full Poseidon2 per entry (`tx.hash()` uncached).
+//!     That was quadratic under load — at ~100 k mempool entries and
+//!     20 block txs, retain scanned 2 M Poseidon2 hashes (several
+//!     seconds per 400 ms slot). Fixed by switching to
+//!     `HashMap<TxHash, Transaction>`; retain is now O(|block|).
+//!   - Proposer `drain`-ed the full mempool to build its candidate
+//!     block. In Pyde's multi-proposer VRF scheme, every validator
+//!     proposes every slot and one wins the lottery; if our proposal
+//!     lost, the drained txs vanished (neither in pending nor in the
+//!     committed block). Under concentrated RPC load (e.g. this test)
+//!     gossip couldn't re-seed them fast enough within the 400 ms
+//!     slot, so every lost proposal = permanently lost txs. Fixed by
+//!     cloning (`pending.values().cloned()`) rather than draining;
+//!     the block-commit retain path already removes committed tx
+//!     hashes, so the mempool correctly retains non-committed txs
+//!     across slots.
+//!
+//! A remaining finding surfaces with these fixes in place: at 50 TPS
+//! × 30 s, every sender commits exactly SENDER_CAP (16) txs and then
+//! stops advancing. So one full round of block-packing works and the
+//! next round(s) apparently re-propose already-committed nonces but
+//! don't advance further. Likely interaction between the test's
+//! locally-tracked submit-nonce and the chain's nonce-state update
+//! path, or a stale-duplicate situation where pending still carries
+//! committed txs a slot after they landed. Tracked as follow-up perf
+//! work.
+//!
+//! # Run
+//!
+//!   cargo test -p pyde-node --test loadgen_sustained --release -- \
+//!     --ignored --nocapture
+//!
+//! # Knobs (env vars)
+//!
+//!   PYDE_LOADGEN_TPS       — target submit rate (default 100)
+//!   PYDE_LOADGEN_DURATION  — measurement duration in seconds (default 600)
+//!   PYDE_LOADGEN_WARMUP    — warm-up in seconds, not measured (default 30)
+//!   PYDE_LOADGEN_SENDERS   — funded sender count (default 50)
+
+mod common;
+
+use common::TestNetwork;
+use pyde_account::address::derive_eoa_address;
+use pyde_crypto::falcon::{falcon_keygen, falcon_sign, FalconSecretKey};
+use pyde_tx::types::{FeePayer, Transaction, TransactionType};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const CHAIN_ID: u64 = 1;
+const RECIPIENT: [u8; 32] = [0x42u8; 32];
+const TX_VALUE: u128 = 1;
+const FUND_PER_SENDER: u128 = 100_000_000_000; // 100 PYDE
+
+struct Wallet {
+    address: [u8; 32],
+    sk: FalconSecretKey,
+}
+
+#[test]
+#[ignore = "Phase 7 load test — spawns 4-node subprocess testnet, run with --ignored"]
+fn sustained_rate_load_test() {
+    let target_tps: u64 = env_var_u64("PYDE_LOADGEN_TPS", 100);
+    let duration_s: u64 = env_var_u64("PYDE_LOADGEN_DURATION", 600);
+    let warmup_s: u64 = env_var_u64("PYDE_LOADGEN_WARMUP", 30);
+    let num_senders: usize = env_var_u64("PYDE_LOADGEN_SENDERS", 50) as usize;
+
+    let per_acct_rate = target_tps as f64 / num_senders as f64;
+    let inflight_per_slot = per_acct_rate * 0.4;
+    assert!(
+        inflight_per_slot < 12.0,
+        "num_senders ({}) too low for target {} TPS — per-account rate {:.1}/s, in-flight/slot {:.1} near nonce window 16",
+        num_senders, target_tps, per_acct_rate, inflight_per_slot
+    );
+
+    println!("╔══════════════════════════════════════════════════════╗");
+    println!("║  Pyde Phase 7 — Sustained-Rate Load Test            ║");
+    println!("╠══════════════════════════════════════════════════════╣");
+    println!("  Target TPS:   {}", target_tps);
+    println!("  Duration:     {} s  (+ {} s warm-up, not measured)", duration_s, warmup_s);
+    println!("  Senders:      {} (per-account rate: {:.1} tx/s)", num_senders, per_acct_rate);
+    println!("  chain_id:     {} (FALCON sig verification ON)", CHAIN_ID);
+    println!("  Recipient:    0x{}", hex::encode(RECIPIENT));
+    println!("╚══════════════════════════════════════════════════════╝");
+
+    // --- Phase 0: spawn 4-validator testnet ---
+    println!("\n[0/3] Spawning 4-validator native testnet at chain_id = 1…");
+    let net = TestNetwork::spawn_with_chain_id(4, CHAIN_ID)
+        .unwrap_or_else(|e| panic!("spawn 4v@chain_id=1: {}", e));
+
+    // Wait for chain to warm up.
+    net.wait_for_slot(3, Duration::from_secs(30))
+        .unwrap_or_else(|e| panic!("chain warm-up: {}", e));
+
+    let (faucet_pk_bytes, faucet_sk_bytes) = net
+        .load_faucet_key()
+        .unwrap_or_else(|e| panic!("load faucet.key: {}", e));
+    let faucet_sk = FalconSecretKey::from_bytes(&faucet_sk_bytes)
+        .expect("invalid FALCON secret key");
+    let faucet_addr = derive_eoa_address(&faucet_pk_bytes);
+    println!("  faucet: 0x{}", hex::encode(faucet_addr));
+
+    let rpc_urls: Vec<String> = net.nodes.iter().map(|n| n.rpc_url()).collect();
+    println!("  nodes:  {:?}", rpc_urls);
+
+    // --- Phase 1: fund N sender wallets from faucet ---
+    println!("\n[1/3] Funding {} sender wallets from faucet…", num_senders);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let client = reqwest::Client::builder()
+        .tcp_keepalive(Duration::from_secs(60))
+        .pool_idle_timeout(Duration::from_secs(60))
+        .build()
+        .expect("reqwest client");
+
+    let setup_start = Instant::now();
+    let wallets: Vec<Arc<Wallet>> = runtime.block_on(async {
+        let mut wallets = Vec::with_capacity(num_senders);
+        for _ in 0..num_senders {
+            let (pk, sk) = falcon_keygen().expect("keygen");
+            let address = derive_eoa_address(pk.as_bytes());
+            wallets.push(Arc::new(Wallet { address, sk }));
+        }
+
+        let mut faucet_nonce = fetch_nonce(&client, &rpc_urls[0], &faucet_addr)
+            .await
+            .expect("faucet nonce");
+
+        let mut signed_hex: Vec<String> = Vec::with_capacity(num_senders);
+        for w in &wallets {
+            let mut tx = Transaction {
+                from: faucet_addr,
+                to: w.address,
+                value: FUND_PER_SENDER,
+                data: vec![],
+                gas_limit: 50_000,
+                nonce: faucet_nonce,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
+                access_list: vec![],
+                deadline: None,
+                chain_id: CHAIN_ID,
+                tx_type: TransactionType::Standard,
+            };
+            tx.signature = falcon_sign(&faucet_sk, &tx.hash())
+                .expect("fund sig")
+                .as_bytes()
+                .to_vec();
+            signed_hex.push(hex::encode(tx.to_bytes()));
+            faucet_nonce += 1;
+        }
+
+        // Nonce window is 16; stream in chunks of 15.
+        for chunk in signed_hex.chunks(15) {
+            for hex_tx in chunk {
+                let _ = rpc_send_raw(&client, &rpc_urls[0], hex_tx).await;
+            }
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+
+        let poll_deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut funded = 0usize;
+            for w in &wallets {
+                if fetch_balance(&client, &rpc_urls[0], &w.address)
+                    .await
+                    .unwrap_or(0)
+                    > 0
+                {
+                    funded += 1;
+                }
+            }
+            if funded == wallets.len() {
+                break;
+            }
+            if Instant::now() >= poll_deadline {
+                panic!("funding timed out: {}/{}", funded, wallets.len());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        wallets
+    });
+    println!(
+        "  ✓ {} wallets funded in {:.1} s",
+        wallets.len(),
+        setup_start.elapsed().as_secs_f64()
+    );
+
+    // --- Phase 2: sustained-rate submission ---
+    let rate_per_acct = target_tps as f64 / num_senders as f64;
+    let per_acct_interval = Duration::from_secs_f64(1.0 / rate_per_acct);
+    let total_run_s = warmup_s + duration_s;
+
+    println!(
+        "\n[2/3] Load run: {} s total ({} warm-up + {} measured)",
+        total_run_s, warmup_s, duration_s
+    );
+
+    let pre_recipient_balance = runtime
+        .block_on(async { fetch_balance(&client, &rpc_urls[0], &RECIPIENT).await })
+        .unwrap_or(0);
+    println!("  pre-run recipient balance: {}", pre_recipient_balance);
+
+    let submitted = Arc::new(AtomicU64::new(0));
+    let errors = Arc::new(AtomicU64::new(0));
+    let run_start = Instant::now();
+    let measurement_start_at = run_start + Duration::from_secs(warmup_s);
+    let run_deadline = run_start + Duration::from_secs(total_run_s);
+    let submitted_during_measure = Arc::new(AtomicU64::new(0));
+
+    runtime.block_on(async {
+        let mut tasks = Vec::with_capacity(num_senders);
+        for (i, w) in wallets.iter().enumerate() {
+            let wallet = w.clone();
+            let cli = client.clone();
+            let url = rpc_urls[i % rpc_urls.len()].clone();
+            let sub_total = submitted.clone();
+            let sub_measure = submitted_during_measure.clone();
+            let err = errors.clone();
+            let interval = per_acct_interval;
+            let measure_at = measurement_start_at;
+            let deadline = run_deadline;
+
+            tasks.push(tokio::spawn(async move {
+                let mut nonce = 0u64;
+                let mut next_submit = Instant::now();
+                loop {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    if now < next_submit {
+                        tokio::time::sleep(next_submit - now).await;
+                    }
+                    next_submit += interval;
+
+                    let mut tx = Transaction {
+                        from: wallet.address,
+                        to: RECIPIENT,
+                        value: TX_VALUE,
+                        data: vec![],
+                        gas_limit: 50_000,
+                        nonce,
+                        signature: vec![],
+                        fee_payer: FeePayer::Sender,
+                        access_list: vec![],
+                        deadline: None,
+                        chain_id: CHAIN_ID,
+                        tx_type: TransactionType::Standard,
+                    };
+                    let sig = match falcon_sign(&wallet.sk, &tx.hash()) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            err.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+                    tx.signature = sig.as_bytes().to_vec();
+                    let hex_tx = hex::encode(tx.to_bytes());
+
+                    match rpc_send_raw_fast(&cli, &url, &hex_tx).await {
+                        Ok(()) => {
+                            sub_total.fetch_add(1, Ordering::Relaxed);
+                            if Instant::now() >= measure_at {
+                                sub_measure.fetch_add(1, Ordering::Relaxed);
+                            }
+                            nonce += 1;
+                        }
+                        Err(_) => {
+                            err.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Progress reporter
+        let progress_sub = submitted.clone();
+        let progress_err = errors.clone();
+        let progress_end = run_deadline;
+        let progress_measure_at = measurement_start_at;
+        let progress_task = tokio::spawn(async move {
+            let mut last_count = 0u64;
+            let mut last_time = Instant::now();
+            while Instant::now() < progress_end {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let now = Instant::now();
+                let cur = progress_sub.load(Ordering::Relaxed);
+                let dt = (now - last_time).as_secs_f64();
+                let rate = (cur - last_count) as f64 / dt;
+                let phase = if now < progress_measure_at { "warmup" } else { "measure" };
+                println!(
+                    "  [{:>7}] +{} submits in {:.1}s → {:.0} tx/s (total: {}, errors: {})",
+                    phase,
+                    cur - last_count,
+                    dt,
+                    rate,
+                    cur,
+                    progress_err.load(Ordering::Relaxed),
+                );
+                last_count = cur;
+                last_time = now;
+            }
+        });
+
+        for t in tasks {
+            let _ = t.await;
+        }
+        let _ = progress_task.await;
+    });
+
+    let total_submits = submitted.load(Ordering::Relaxed);
+    let measure_submits = submitted_during_measure.load(Ordering::Relaxed);
+    let err_count = errors.load(Ordering::Relaxed);
+    let submit_tps_measure = measure_submits as f64 / duration_s as f64;
+    println!(
+        "\n  submit totals: {} total, {} during measurement ({:.0} tx/s), {} errors",
+        total_submits, measure_submits, submit_tps_measure, err_count
+    );
+
+    // --- Phase 3: settle + measure inclusion ---
+    let end_of_submit_balance = runtime
+        .block_on(async { fetch_balance(&client, &rpc_urls[0], &RECIPIENT).await })
+        .unwrap_or(0);
+
+    println!("\n[3/3] Settling 20 s for final inclusion…");
+    runtime.block_on(async {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+    });
+
+    let post_recipient_balance = runtime
+        .block_on(async { fetch_balance(&client, &rpc_urls[0], &RECIPIENT).await })
+        .unwrap_or(0);
+    let confirmed_at_end_of_submit =
+        end_of_submit_balance.saturating_sub(pre_recipient_balance) / TX_VALUE;
+    let confirmed_after_settle =
+        post_recipient_balance.saturating_sub(pre_recipient_balance) / TX_VALUE;
+
+    let measurement_elapsed = duration_s as f64;
+    let total_submit_elapsed = total_run_s as f64;
+    let submit_tps_overall = total_submits as f64 / total_submit_elapsed;
+    let warmup_submits = total_submits.saturating_sub(measure_submits);
+    let confirmed_measurement =
+        confirmed_after_settle.saturating_sub(warmup_submits as u128);
+    let inclusion_tps_steady = confirmed_measurement as f64 / measurement_elapsed;
+    let inclusion_efficiency = if measure_submits > 0 {
+        confirmed_measurement as f64 / measure_submits as f64
+    } else {
+        0.0
+    };
+
+    println!("\n╔══════════════════════════════════════════════════════╗");
+    println!("║  RESULTS                                             ║");
+    println!("╠══════════════════════════════════════════════════════╣");
+    println!("  Target:                 {} TPS for {} s", target_tps, duration_s);
+    println!("  Submitted (total):      {} txs over {:.0} s", total_submits, total_submit_elapsed);
+    println!("  Submitted (measured):   {} txs over {} s ({:.0} tx/s)", measure_submits, duration_s, submit_tps_measure);
+    println!("  Submit errors:          {}", err_count);
+    println!("  Confirmed @ submit-end: {} txs", confirmed_at_end_of_submit);
+    println!("  Confirmed @ +20 s:      {} txs", confirmed_after_settle);
+    println!("  Inclusion TPS steady:   {:.0} (measured window only)", inclusion_tps_steady);
+    println!("  Inclusion efficiency:   {:.1}%", inclusion_efficiency * 100.0);
+    println!("  Submit TPS overall:     {:.0}", submit_tps_overall);
+    println!("╚══════════════════════════════════════════════════════╝");
+
+    let pass_submit_threshold = (target_tps as f64 * 0.9) as u64;
+    let pass_inclusion_threshold = (target_tps as f64 * 0.9) as u64;
+
+    // Diagnostics: if the test is about to fail, dump node-0's
+    // stdout/stderr so we can see whether blocks are being produced,
+    // whether txs are landing, and any warnings from block_processor.
+    // Diagnostics on failure: nonces on chain tell us how many txs
+    // of each sender actually committed even if recipient-balance
+    // sampling timed out against an overloaded RPC.
+    if (submit_tps_measure as u64) < pass_submit_threshold || inclusion_efficiency < 0.9 {
+        let nonces: Vec<u64> = runtime.block_on(async {
+            let mut out = Vec::with_capacity(wallets.len());
+            for w in &wallets {
+                out.push(
+                    fetch_nonce(&client, &rpc_urls[0], &w.address)
+                        .await
+                        .unwrap_or(0),
+                );
+            }
+            out
+        });
+        let total_confirmed: u64 = nonces.iter().sum();
+        eprintln!(
+            "\n  diagnostic: {} txs committed across {} senders (min nonce {}, max {})",
+            total_confirmed,
+            wallets.len(),
+            nonces.iter().min().copied().unwrap_or(0),
+            nonces.iter().max().copied().unwrap_or(0),
+        );
+    }
+
+    assert!(
+        submit_tps_measure as u64 >= pass_submit_threshold,
+        "FAIL: submit rate {:.0} TPS < 90% of target {}",
+        submit_tps_measure,
+        target_tps
+    );
+    assert!(
+        inclusion_efficiency >= 0.9,
+        "FAIL: only {:.1}% of submitted txs confirmed",
+        inclusion_efficiency * 100.0
+    );
+    assert!(
+        inclusion_tps_steady as u64 >= pass_inclusion_threshold,
+        "FAIL: inclusion TPS {:.0} < 90% of target {}",
+        inclusion_tps_steady,
+        target_tps
+    );
+    println!(
+        "\n  ✓ PASS — target {} TPS, sustained submit {:.0}, sustained inclusion {:.0}",
+        target_tps, submit_tps_measure, inclusion_tps_steady
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn env_var_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+async fn rpc_call(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    params: &str,
+) -> serde_json::Value {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"{}","params":[{}]}}"#,
+        method, params
+    );
+    match client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) => r.json().await.unwrap_or(serde_json::Value::Null),
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
+async fn rpc_send_raw(client: &reqwest::Client, url: &str, tx_hex: &str) -> serde_json::Value {
+    rpc_call(
+        client,
+        url,
+        "pyde_sendRawTransaction",
+        &format!("\"0x{}\"", tx_hex),
+    )
+    .await
+}
+
+/// Returns `Ok` only when HTTP 200 AND the JSON-RPC body has no
+/// `"error"`. jsonrpsee returns HTTP 200 with an error body for
+/// nonce-too-high, mempool-full, invalid-sig — a bare status check
+/// would overcount successful submits.
+async fn rpc_send_raw_fast(
+    client: &reqwest::Client,
+    url: &str,
+    tx_hex: &str,
+) -> Result<(), ()> {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"pyde_sendRawTransaction","params":["0x{}"]}}"#,
+        tx_hex
+    );
+    let resp = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|_| ())?;
+    if !resp.status().is_success() {
+        return Err(());
+    }
+    let text = resp.text().await.map_err(|_| ())?;
+    if text.contains(r#""error""#) {
+        return Err(());
+    }
+    Ok(())
+}
+
+async fn fetch_nonce(
+    client: &reqwest::Client,
+    url: &str,
+    addr: &[u8; 32],
+) -> Option<u64> {
+    let resp = rpc_call(
+        client,
+        url,
+        "pyde_getTransactionCount",
+        &format!("\"0x{}\"", hex::encode(addr)),
+    )
+    .await;
+    let s = resp.get("result")?.as_str()?.to_string();
+    if let Some(h) = s.strip_prefix("0x") {
+        u64::from_str_radix(h, 16).ok()
+    } else {
+        s.parse().ok()
+    }
+}
+
+async fn fetch_balance(
+    client: &reqwest::Client,
+    url: &str,
+    addr: &[u8; 32],
+) -> Option<u128> {
+    let resp = rpc_call(
+        client,
+        url,
+        "pyde_getBalance",
+        &format!("\"0x{}\"", hex::encode(addr)),
+    )
+    .await;
+    let s = resp.get("result")?.as_str()?.to_string();
+    if let Some(h) = s.strip_prefix("0x") {
+        u128::from_str_radix(h, 16).ok()
+    } else {
+        s.parse().ok()
+    }
+}

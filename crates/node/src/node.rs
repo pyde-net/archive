@@ -209,8 +209,12 @@ impl PydeNode {
         // 3. Transaction relay / mempool + receipt store + pending tx queue
         let tx_relay = Arc::new(RwLock::new(TxRelay::new()));
         let receipts = Arc::new(RwLock::new(ReceiptStore::new()));
-        let pending_txs: Arc<RwLock<Vec<pyde_tx::types::Transaction>>> =
-            Arc::new(RwLock::new(Vec::new()));
+        // HashMap keyed by tx hash so `retain(|tx| !tx_hashes.contains(&tx.hash()))`
+        // — which recomputed a Poseidon2 per entry per block-commit and
+        // was quadratic under load — becomes O(|block|) remove loop.
+        let pending_txs: Arc<
+            RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>,
+        > = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
         // Mempool tx index for compact block reconstruction: tx_hash → wire-encoded bytes
         let mempool_index: Arc<RwLock<std::collections::HashMap<[u8; 32], Vec<u8>>>> =
@@ -619,7 +623,7 @@ impl PydeNode {
                             let tx_bytes = wire::encode_transaction(&tx);
                             mempool_index.write().await.insert(tx_hash, tx_bytes);
                             let mut pending = pending_txs.write().await;
-                            pending.push(tx);
+                            pending.insert(tx_hash, tx);
                             debug!(tx_hash = hex::encode(tx_hash), pending = pending.len(), "tx accepted from gossip");
                         }
                         PostEventAction::AddPeerToKademlia(peer_id, addrs) => {
@@ -786,7 +790,9 @@ impl PydeNode {
                                         }
                                         {
                                             let mut pending_w = pending_txs.write().await;
-                                            pending_w.retain(|tx| !tx_hashes.contains(&tx.hash()));
+                                            for h in &tx_hashes {
+                                                pending_w.remove(h);
+                                            }
                                         }
                                         info!(slot, txs = tc, gas, "compact block reconstructed and processed");
                                     }
@@ -803,7 +809,9 @@ impl PydeNode {
                             }
                             if !tx_hashes.is_empty() {
                                 let mut pending_w = pending_txs.write().await;
-                                pending_w.retain(|tx| !tx_hashes.contains(&tx.hash()));
+                                for h in &tx_hashes {
+                                    pending_w.remove(h);
+                                }
                             }
                         }
                         PostEventAction::AddDecryptionShares(msg) => {
@@ -1031,15 +1039,26 @@ impl PydeNode {
                             } else if let Some(identity) = validator_identity.as_ref() {
                                 // Check if we're the proposer
                                 if let Some(candidate) = engine.check_proposer(identity) {
-                                    // Build fair transaction list: nonce-ordered, interleaved, per-sender capped
-                                    let mut pending_w = pending_txs.write().await;
-                                    let all_pending: Vec<pyde_tx::types::Transaction> = pending_w.drain(..).collect();
+                                    // Build fair transaction list by CLONING from the mempool,
+                                    // NOT draining. Previously the proposer did `pending.drain()`
+                                    // — if our proposal lost the multi-proposer VRF lottery,
+                                    // the drained txs were neither in `pending` nor in the
+                                    // committed block, so they vanished until re-gossipped.
+                                    // Under concentrated RPC load (e.g. loadgen hitting one
+                                    // node), gossip can't spread the tx fast enough across
+                                    // the 400 ms slot, so the tx would be lost permanently.
+                                    // Cloning is cheap relative to the block-assembly work
+                                    // it feeds, and the block-commit retain path already
+                                    // removes committed tx hashes from the mempool, so the
+                                    // only txs kept are the ones that didn't make this
+                                    // block.
+                                    let pending_r = pending_txs.read().await;
+                                    let all_pending: Vec<pyde_tx::types::Transaction> =
+                                        pending_r.values().cloned().collect();
+                                    drop(pending_r);
                                     let gas_ceiling = self.config.consensus.gas_ceiling;
-                                    let (mut txs, remaining) = crate::block_builder::build_tx_list(all_pending, gas_ceiling);
-                                    if !remaining.is_empty() {
-                                        pending_w.extend(remaining);
-                                    }
-                                    drop(pending_w);
+                                    let (mut txs, _remaining) =
+                                        crate::block_builder::build_tx_list(all_pending, gas_ceiling);
 
                                     // Drain any queued double-sign evidence into Slash txs and
                                     // prepend them to the block. This is the detection → punishment
