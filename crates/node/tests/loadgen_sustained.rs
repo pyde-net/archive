@@ -286,6 +286,14 @@ fn sustained_rate_load_test() {
                         }
                         Err(_) => {
                             err.fetch_add(1, Ordering::Relaxed);
+                            // Back off a full slot on rejection. Usually an
+                            // InvalidNonce "too far ahead" — we've submitted
+                            // nonces faster than the chain can commit them
+                            // to advance `base`. Waiting a slot lets the
+                            // chain commit a block (or two), advancing the
+                            // window so the same tx validates on retry.
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            next_submit = Instant::now();
                         }
                     }
                 }
