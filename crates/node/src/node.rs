@@ -1232,6 +1232,38 @@ impl PydeNode {
                                                     slot = current_slot, txs = tc, gas,
                                                     "proposed and processed block"
                                                 );
+
+                                                // Remove plaintext tx hashes from the local
+                                                // pending queue and mempool_index. Without this,
+                                                // self-proposed blocks leave their txs in
+                                                // pending forever — the next slot's builder
+                                                // keeps re-selecting them, execution fails
+                                                // `BelowWindow` (nonce already consumed), and
+                                                // the block's 16-tx slot never fills with
+                                                // fresh txs. BlockProcessed in the gossip
+                                                // path handles the same cleanup for blocks
+                                                // received from peers; the self-proposal
+                                                // path must do it here too.
+                                                let committed_tx_hashes: Vec<[u8; 32]> = block
+                                                    .body
+                                                    .transactions
+                                                    .iter()
+                                                    .map(|tx| tx.hash())
+                                                    .collect();
+                                                if !committed_tx_hashes.is_empty() {
+                                                    {
+                                                        let mut pending_w = pending_txs.write().await;
+                                                        for h in &committed_tx_hashes {
+                                                            pending_w.remove(h);
+                                                        }
+                                                    }
+                                                    {
+                                                        let mut idx = mempool_index.write().await;
+                                                        for h in &committed_tx_hashes {
+                                                            idx.remove(h);
+                                                        }
+                                                    }
+                                                }
                                             }
                                             Err(e) => {
                                                 warn!(slot = current_slot, error = %e, "failed to process own block");
