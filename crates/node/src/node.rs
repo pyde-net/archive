@@ -540,6 +540,13 @@ impl PydeNode {
         let mut slot_interval = tokio::time::interval(std::time::Duration::from_millis(100)); // check slot every 100ms
         let mut maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        // Gossip retry: re-publish uncommitted pending txs every 2 slots.
+        // Closes the window where gossipsub NoSubscribers / mesh churn /
+        // subscription timing dropped the initial broadcast — without this,
+        // a tx could sit in a single node's pending forever if its first
+        // publish missed all peers. Capped to avoid re-publish bursts.
+        let mut gossip_retry_interval = tokio::time::interval(std::time::Duration::from_millis(800));
+        const GOSSIP_RETRY_MAX_TXS: usize = 1000;
 
         loop {
             tokio::select! {
@@ -1527,6 +1534,44 @@ impl PydeNode {
                     // Try to sync if we're behind
                     if chain_sync.is_syncing() {
                         chain_sync.request_next_batch(&mut swarm);
+                    }
+                }
+                _ = gossip_retry_interval.tick() => {
+                    // Re-publish uncommitted pending txs. The initial
+                    // gossipsub publish at RPC-ingress time is
+                    // best-effort: it can silently fail with
+                    // NoSubscribers if the mesh hasn't converged yet,
+                    // and there's no retry path in libp2p's gossipsub.
+                    // Without this, a tx submitted during startup /
+                    // mesh churn / subscription re-binding can sit in
+                    // exactly one node's pending forever, orphaning
+                    // that sender's nonce window — the root cause of
+                    // the "stuck at nonce N" stalls we saw under
+                    // loadgen. Cap to avoid re-publish bursts.
+                    let pending_r = pending_txs.read().await;
+                    let to_retry: Vec<pyde_tx::types::Transaction> = pending_r
+                        .values()
+                        .take(GOSSIP_RETRY_MAX_TXS)
+                        .cloned()
+                        .collect();
+                    drop(pending_r);
+                    if !to_retry.is_empty() {
+                        let topic = pyde_net::node::topics::transactions();
+                        let mut ok = 0;
+                        let mut nosub = 0;
+                        for tx in &to_retry {
+                            let bytes = wire::encode_transaction(tx);
+                            match swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes) {
+                                Ok(_) => ok += 1,
+                                Err(_) => nosub += 1,
+                            }
+                        }
+                        debug!(
+                            total = to_retry.len(),
+                            ok,
+                            nosub,
+                            "gossip retry"
+                        );
                     }
                 }
                 _ = maintenance_interval.tick() => {

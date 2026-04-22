@@ -12,6 +12,8 @@ use jsonrpsee::server::Server;
 use jsonrpsee::types::ErrorObjectOwned;
 use pyde_tx::execution::Receipt;
 use pyde_tx::pipeline::BlockContext;
+use pyde_tx::types::Transaction;
+use pyde_tx::validation::{validate_transaction, ValidationContext, ValidationError};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -421,6 +423,11 @@ impl PydeApiServer for RpcServer {
             tx_type,
         };
 
+        // Ingress validation — same canonical validator as `send_raw_transaction`.
+        // Dev-mode unsigned txs pass because `dev_skip_signature` is driven
+        // by chain_id == 31337 inside `ingress_validate`.
+        ingress_validate(&self.state.state, &self.state.chain, &tx).await?;
+
         // Compute tx hash (must match tx.hash() used in receipt generation)
         let tx_hash = tx.hash();
 
@@ -458,6 +465,11 @@ impl PydeApiServer for RpcServer {
                 pyde_tx::types::Transaction::from_bytes(&tx_bytes).ok_or("invalid tx encoding")
             })
             .map_err(|e| rpc_err(-32602, format!("invalid tx encoding: {}", e)))?;
+
+        // Ingress validation — reject invalid txs BEFORE polluting the
+        // mempool + gossip network. See `ingress_validate` docs.
+        ingress_validate(&self.state.state, &self.state.chain, &tx).await?;
+
         let tx_hash = tx.hash();
 
         let mut pending = self.state.pending_txs.write().await;
@@ -1096,6 +1108,64 @@ pub async fn start_rpc_server(
 // ============================================================
 // Helpers
 // ============================================================
+
+/// Validate a transaction at RPC ingress using the canonical
+/// `pyde_tx::validation` pipeline. Reads the sender's on-chain
+/// account + nonce + vesting lock + current chain state, feeds them
+/// to `validate_transaction`. Reject here = no pollution of the
+/// local mempool, no wasted gossip, no wasted proposer slot-budget.
+///
+/// The only intentional relaxation vs block-execution validation is
+/// the sig-skip rule: on chain_id==31337 (devnet) we skip FALCON
+/// verification so the `--dev` `pyde_sendTransaction` path (unsigned
+/// txs from pre-funded accounts) still works. Any other chain_id
+/// enforces sigs.
+async fn ingress_validate(
+    state: &Arc<RwLock<StateManager>>,
+    chain: &Arc<RwLock<ChainState>>,
+    tx: &Transaction,
+) -> Result<(), ErrorObjectOwned> {
+    let chain_r = chain.read().await;
+    let chain_id = chain_r.chain_id;
+    let base_fee = chain_r.base_fee;
+    let head_slot = chain_r.head_slot;
+    drop(chain_r);
+
+    let state_r = state.read().await;
+    let sender = pyde_tx::pipeline::load_account(&*state_r, &tx.from);
+    let nonce_state = pyde_tx::pipeline::load_nonce(&*state_r, &tx.from);
+    let sender_locked = pyde_tx::pipeline::read_vesting_schedule(&*state_r, &tx.from)
+        .map(|s| s.locked_at(head_slot))
+        .unwrap_or(0);
+    drop(state_r);
+
+    let ctx = ValidationContext {
+        block_height: head_slot,
+        base_fee,
+        block_gas_limit: pyde_tx::fee::GAS_CEILING,
+        chain_id,
+        dev_skip_signature: chain_id == 31337,
+        sender_locked,
+    };
+
+    validate_transaction(tx, &sender, &nonce_state, &ctx).map_err(|e| {
+        let code = match e {
+            ValidationError::InvalidSignature => -32001,
+            ValidationError::InvalidNonce(_) => -32002,
+            ValidationError::InsufficientBalance { .. } => -32003,
+            ValidationError::WrongChainId { .. } => -32004,
+            ValidationError::GasLimitTooLow { .. }
+            | ValidationError::GasLimitTooHigh { .. } => -32005,
+            ValidationError::DeadlineExpired { .. } => -32006,
+            ValidationError::TxTooLarge { .. } | ValidationError::CalldataTooLarge { .. } => {
+                -32007
+            }
+            ValidationError::InvalidAccessList(_) => -32008,
+            _ => -32000,
+        };
+        rpc_err(code, format!("ingress validation: {:?}", e))
+    })
+}
 
 fn rpc_err(code: i32, msg: String) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(code, msg, None::<()>)
