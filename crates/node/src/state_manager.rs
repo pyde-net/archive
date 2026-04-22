@@ -1,4 +1,5 @@
-use pyde_state::smt::{Key, PersistentSMT, StateAccess};
+use pyde_state::jmt_store::PersistentJMT;
+use pyde_state::smt::{Key, StateAccess};
 use sparse_merkle_tree::H256;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -8,7 +9,7 @@ use tracing::info;
 /// Pipelined state manager: separates read cache from Merkle commit.
 ///
 /// Architecture:
-///   StateOverlay (per-block) → cache (Arc<RwLock>) → PersistentSMT (Mutex)
+///   StateOverlay (per-block) → cache (Arc<RwLock>) → PersistentJMT (Mutex)
 ///
 /// - Execution: reads from cache (shared, fast), writes to overlay → cache
 /// - Background commit: takes SMT mutex, writes Merkle tree (slow, exclusive)
@@ -19,7 +20,7 @@ pub struct StateManager {
     cache: Arc<StdRwLock<HashMap<Key, Vec<u8>>>>,
     /// Persistent SMT: Merkle tree + RocksDB. Only touched during commit.
     /// Protected by Mutex so commit can run on a background thread.
-    smt: Arc<Mutex<PersistentSMT>>,
+    smt: Arc<Mutex<PersistentJMT>>,
     root: [u8; 32],
     tracked_keys: HashSet<Key>,
     pending_writes: Vec<(Key, Vec<u8>)>,
@@ -33,7 +34,7 @@ impl StateManager {
         let db_path = datadir.join("state");
         let db_path_str = db_path.to_str().ok_or("invalid db path")?;
 
-        let smt = PersistentSMT::open(db_path_str)?;
+        let smt = PersistentJMT::open(db_path_str)?;
         let root = smt.root().as_slice().try_into().unwrap_or([0u8; 32]);
 
         let is_empty = smt.is_empty();
@@ -160,13 +161,13 @@ impl StateManager {
     }
 
     /// Get a clone of the SMT Arc for background commit.
-    pub fn smt_handle(&self) -> Arc<Mutex<PersistentSMT>> {
+    pub fn smt_handle(&self) -> Arc<Mutex<PersistentJMT>> {
         self.smt.clone()
     }
 
     /// Commit writes to SMT on the current thread (called from background task).
     pub fn commit_writes_to_smt(
-        smt: &Arc<Mutex<PersistentSMT>>,
+        smt: &Arc<Mutex<PersistentJMT>>,
         entries: Vec<(Key, Vec<u8>)>,
     ) -> Result<[u8; 32], String> {
         let mut smt = smt.lock().map_err(|e| format!("smt lock: {}", e))?;
@@ -189,15 +190,15 @@ impl StateManager {
         }
     }
 
-    /// Get mutable SMT access. Returns MutexGuard (deref to PersistentSMT).
+    /// Get mutable SMT access. Returns MutexGuard (deref to PersistentJMT).
     /// Only used during genesis/startup — not during pipelined execution.
-    pub fn smt_mut(&self) -> std::sync::MutexGuard<'_, PersistentSMT> {
+    pub fn smt_mut(&self) -> std::sync::MutexGuard<'_, PersistentJMT> {
         self.smt.lock().expect("smt lock poisoned")
     }
 
     /// Get immutable SMT access. Returns MutexGuard.
     #[allow(dead_code)]
-    pub fn smt_ref(&self) -> std::sync::MutexGuard<'_, PersistentSMT> {
+    pub fn smt_ref(&self) -> std::sync::MutexGuard<'_, PersistentJMT> {
         self.smt.lock().expect("smt lock poisoned")
     }
 

@@ -7,6 +7,9 @@ edition = "2021"
 [dependencies]
 pyde-crypto = { path = "../crypto" }
 sparse-merkle-tree = "0.6"
+jmt = { version = "0.12", default-features = false, features = ["std"] }
+anyhow = "1"
+borsh = { version = "1", features = ["derive"] }
 rocksdb = "0.24"
 lru = "0.16"
 tempfile = "3"
