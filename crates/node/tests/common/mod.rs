@@ -102,7 +102,7 @@ impl TestNetwork {
         full_nodes: usize,
         dev: bool,
     ) -> Result<Self, String> {
-        Self::spawn_mixed_inner(validators, full_nodes, 0, dev, Self::DEFAULT_BLOCK_TIME_MS)
+        Self::spawn_mixed_inner(validators, full_nodes, 0, dev, Self::DEFAULT_BLOCK_TIME_MS, None)
     }
 
     /// Same as `spawn_mixed`, but the last `deferred` full nodes have
@@ -128,6 +128,7 @@ impl TestNetwork {
             deferred,
             dev,
             Self::DEFAULT_BLOCK_TIME_MS,
+            None,
         )
     }
 
@@ -140,7 +141,26 @@ impl TestNetwork {
         dev: bool,
         block_time_ms: u64,
     ) -> Result<Self, String> {
-        Self::spawn_mixed_inner(validators, 0, 0, dev, block_time_ms)
+        Self::spawn_mixed_inner(validators, 0, 0, dev, block_time_ms, None)
+    }
+
+    /// Spawn V validators with a caller-supplied `chain_id`. Any value
+    /// other than 31337 causes the block processor to ENFORCE FALCON
+    /// signature verification on every tx (see `block_processor.rs`
+    /// and `validation.rs`). Use with signed txs via
+    /// `pyde_sendRawTransaction`; `pyde_sendTransaction` (dev-mode
+    /// unsigned) is rejected because chain_id != 31337 doesn't unlock
+    /// the sig-skip. Dev flag is still true so other dev ergonomics
+    /// (auto-fund, log format) behave normally.
+    pub fn spawn_with_chain_id(validators: usize, chain_id: u64) -> Result<Self, String> {
+        Self::spawn_mixed_inner(
+            validators,
+            0,
+            0,
+            true,
+            Self::DEFAULT_BLOCK_TIME_MS,
+            Some(chain_id),
+        )
     }
 
     fn spawn_mixed_inner(
@@ -149,6 +169,7 @@ impl TestNetwork {
         deferred: usize,
         dev: bool,
         block_time_ms: u64,
+        chain_id_override: Option<u64>,
     ) -> Result<Self, String> {
         if !(2..=8).contains(&validators) {
             return Err(format!(
@@ -168,7 +189,8 @@ impl TestNetwork {
 
         let tempdir = tempfile::tempdir().map_err(|e| format!("create tempdir: {}", e))?;
         let net_dir = tempdir.path().join("net");
-        let chain_id = if dev { 31337 } else { rand_chain_id() };
+        let chain_id = chain_id_override
+            .unwrap_or_else(|| if dev { 31337 } else { rand_chain_id() });
         let pyde_bin = pyde_binary_path();
 
         // Find contiguous free port ranges for p2p (UDP — used by QUIC)
@@ -454,6 +476,119 @@ impl TestNetwork {
     // --------------------------------------------------------------
     // Slashing helpers (slice 6.6)
     // --------------------------------------------------------------
+
+    /// Read the faucet's FALCON keypair. `generate_testnet` writes
+    /// it to `<net_dir>/faucet.key` in the same layout as
+    /// `validator.key` (pk_len u32 LE || pk || sk). The faucet holds
+    /// 1T PYDE at genesis — plenty for deploy + call gas — and has
+    /// its pubkey installed as `AuthKeys::Single`, so signed txs
+    /// from it verify cleanly on any chain_id.
+    pub fn load_faucet_key(&self) -> Result<(Vec<u8>, Vec<u8>), String> {
+        // Any node's datadir sits at `<net_dir>/node-<i>`, and the
+        // faucet key lives at `<net_dir>/faucet.key`. Walk up from
+        // node-0's datadir.
+        let faucet_path = self.nodes[0]
+            .datadir
+            .parent()
+            .ok_or("node-0 datadir has no parent")?
+            .join("faucet.key");
+        let raw = std::fs::read(&faucet_path)
+            .map_err(|e| format!("read {}: {}", faucet_path.display(), e))?;
+        if raw.len() < 4 {
+            return Err(format!("faucet.key too short: {}", raw.len()));
+        }
+        let pk_len = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+        if raw.len() < 4 + pk_len {
+            return Err(format!(
+                "faucet.key truncated: expected >= {} bytes, got {}",
+                4 + pk_len,
+                raw.len()
+            ));
+        }
+        let pk = raw[4..4 + pk_len].to_vec();
+        let sk = raw[4 + pk_len..].to_vec();
+        Ok((pk, sk))
+    }
+
+    /// Submit a pre-signed `Transaction` via `pyde_sendRawTransaction`.
+    /// The tx must be wire-encoded via `Transaction::to_bytes()` and
+    /// correctly signed by the FALCON key installed as `AuthKeys::Single`
+    /// for its `from` address. Returns the submitted tx hash.
+    pub fn submit_raw_tx(
+        &self,
+        node_idx: usize,
+        tx_bytes: &[u8],
+    ) -> Result<String, String> {
+        let hex = hex::encode(tx_bytes);
+        let params = format!(r#"["0x{}"]"#, hex);
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_sendRawTransaction",
+            &params,
+        )?;
+        // Handler returns the tx hash as a plain hex string result
+        // (no JSON-stringified wrapper like pyde_sendTransaction).
+        parse_hex_result(&resp).map_err(|e| {
+            format!(
+                "pyde_sendRawTransaction parse failed: {}; raw response:\n{}",
+                e, resp
+            )
+        })
+    }
+
+    /// Read deployed contract code via `pyde_getCode`. Returns the
+    /// hex string WITHOUT the `0x` prefix; empty string if no code.
+    pub fn get_code(&self, node_idx: usize, address: &[u8; 32]) -> Result<String, String> {
+        let params = format!(r#"["0x{}"]"#, hex::encode(address));
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_getCode",
+            &params,
+        )?;
+        let hex = parse_hex_result(&resp)?;
+        Ok(hex.trim_start_matches("0x").to_string())
+    }
+
+    /// Execute a read-only call against a deployed contract via
+    /// `pyde_call`. `calldata` is the full calldata bytes (4-byte
+    /// selector + ABI-encoded args). Returns the result hex string
+    /// (WITHOUT `0x` prefix).
+    pub fn pyde_call_view(
+        &self,
+        node_idx: usize,
+        to: &[u8; 32],
+        calldata: &[u8],
+    ) -> Result<String, String> {
+        let params = format!(
+            r#"[{{"to":"0x{}","data":"0x{}","gas":10000000}}]"#,
+            hex::encode(to),
+            hex::encode(calldata),
+        );
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_call",
+            &params,
+        )?;
+        let hex = parse_hex_result(&resp)?;
+        Ok(hex.trim_start_matches("0x").to_string())
+    }
+
+    /// Extract the `returnData` field from a receipt's raw JSON.
+    /// Returns the decoded bytes (stripping the `0x` prefix).
+    /// For Deploy receipts, this is the contract address (32 bytes).
+    pub fn decode_return_data(raw: &str) -> Result<Vec<u8>, String> {
+        let key = r#""returnData":"0x"#;
+        let start = raw
+            .find(key)
+            .ok_or_else(|| format!("no returnData in receipt: {}", raw))?
+            + key.len();
+        let tail = &raw[start..];
+        let end = tail
+            .find('"')
+            .ok_or_else(|| format!("unterminated returnData: {}", raw))?;
+        hex::decode(&tail[..end])
+            .map_err(|e| format!("decode returnData hex {:?}: {}", &tail[..end], e))
+    }
 
     /// Read a validator's FALCON keypair from its datadir. Layout is
     /// the one `generate_testnet` writes: `pk_len u32 LE || pk || sk`.
