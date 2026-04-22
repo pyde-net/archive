@@ -4,18 +4,19 @@
 
 use pyde_account::address::derive_eoa_address;
 use pyde_crypto::falcon::falcon_keygen;
-use pyde_state::smt::{PersistentSMT, StateAccess, StateOverlay};
+use pyde_state::jmt_store::PersistentJMT;
+use pyde_state::smt::{StateAccess, StateOverlay};
 use pyde_tx::pipeline::{execute_transaction, BlockContext};
 use pyde_tx::types::*;
 use rayon::prelude::*;
 use std::time::Instant;
 
-/// Read-through cache: checks in-memory HashMap before hitting PersistentSMT.
+/// Read-through cache: checks in-memory HashMap before hitting PersistentJMT.
 /// This simulates the write-ahead cache pattern where recent block writes
 /// are served from memory while Merkle commits happen asynchronously.
 struct CachedSmt<'a> {
     cache: &'a std::collections::HashMap<sparse_merkle_tree::H256, Vec<u8>>,
-    base: &'a PersistentSMT,
+    base: &'a PersistentJMT,
 }
 
 impl<'a> StateAccess for CachedSmt<'a> {
@@ -41,7 +42,7 @@ impl<'a> StateAccess for CachedSmt<'a> {
     }
 }
 
-// SAFETY: CachedSmt is read-only and both HashMap and PersistentSMT are Sync
+// SAFETY: CachedSmt is read-only and both HashMap and PersistentJMT are Sync
 unsafe impl<'a> Sync for CachedSmt<'a> {}
 
 fn block_ctx(chain_id: u64) -> BlockContext {
@@ -62,12 +63,15 @@ fn block_ctx(chain_id: u64) -> BlockContext {
 fn bench_preloaded_mempool() {
     let dir = std::env::temp_dir().join("pyde-bench-mempool");
     let _ = std::fs::remove_dir_all(&dir);
-    let mut smt = PersistentSMT::open(dir.join("state").to_str().unwrap()).unwrap();
+    let mut smt = PersistentJMT::open(dir.join("state").to_str().unwrap()).unwrap();
     let ctx = block_ctx(31337); // devnet = skip sig verification for speed
 
-    // --- Phase 1: Generate 500 funded accounts ---
+    // --- Phase 1: Generate funded accounts ---
+    // Sized so every tx fits inside the per-sender nonce window
+    // (WINDOW_SIZE=16). With 10 000 senders × 10 nonces we exercise
+    // the full 100 k tx workload without artificial nonce-cap rejects.
     println!("\n========== PRE-LOADED MEMPOOL BENCHMARK ==========\n");
-    let num_accounts = 2000usize;
+    let num_accounts = 10_000usize;
     println!("  Generating {} accounts...", num_accounts);
 
     let accounts: Vec<([u8; 32], Vec<u8>, Vec<u8>)> = (0..num_accounts)
@@ -201,9 +205,10 @@ fn bench_preloaded_mempool() {
     );
 
     // --- Phase 3: Pre-sign 100K mixed txs in parallel ---
-    // 500 accounts × 60 nonces (within 64 window) = 30K txs
-    // For 100K: need more accounts or sequential block processing that advances nonces
-    let total_txs = (num_accounts * 60).min(100_000);
+    // 10 000 accounts × 10 nonces = 100 000 txs, all within
+    // the WINDOW_SIZE=16 nonce window so none get rejected as
+    // "out of window" — gives us a real chain-throughput number.
+    let total_txs = (num_accounts * 10).min(100_000);
     let recipient = [0x42u8; 32];
     let selector = otic::codegen::compute_selector("heavy_compute");
     let mut call_data = selector.to_be_bytes().to_vec();
@@ -291,7 +296,7 @@ fn bench_preloaded_mempool() {
 
     for batch in txs.chunks(batch_size) {
         let exec_start = Instant::now();
-        // Create a cached reader that checks write_cache → PersistentSMT
+        // Create a cached reader that checks write_cache → PersistentJMT
         let cached_base = CachedSmt {
             cache: &write_cache,
             base: &smt,
