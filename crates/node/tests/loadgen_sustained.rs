@@ -66,7 +66,12 @@ use std::time::{Duration, Instant};
 const CHAIN_ID: u64 = 1;
 const RECIPIENT: [u8; 32] = [0x42u8; 32];
 const TX_VALUE: u128 = 1;
-const FUND_PER_SENDER: u128 = 100_000_000_000; // 100 PYDE
+// 1 000 000 000 PYDE (= 10^18 base units). Fee per tx is gas_limit * base_fee,
+// and early blocks start at GENESIS_BASE_FEE = 50 gwei (5e10) until EIP-1559
+// adjusts downward. At 50k gas_limit that's ~2 500 PYDE upfront per tx; a
+// 10-minute run at 1 000 TPS / 50 senders = 12 000 txs/sender, so funding
+// has to cover ~30M PYDE of worst-case base-fee spend with headroom.
+const FUND_PER_SENDER: u128 = 1_000_000_000_000_000_000;
 
 struct Wallet {
     address: [u8; 32],
@@ -168,11 +173,52 @@ fn sustained_rate_load_test() {
             faucet_nonce += 1;
         }
 
+        async fn current_block(client: &reqwest::Client, url: &str) -> u64 {
+            let resp = rpc_call(client, url, "pyde_blockNumber", "[]").await;
+            resp.get("result")
+                .and_then(|v| v.as_str())
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0)
+        }
+
         // Nonce window is 16; stream in chunks of 15.
+        let mut chunk_idx = 0usize;
+        let stream_t0 = Instant::now();
+        let start_block = current_block(&client, &rpc_urls[0]).await;
         for chunk in signed_hex.chunks(15) {
+            let submit_t = Instant::now();
+            let mut ok = 0usize;
+            let mut err_samples: Vec<String> = Vec::new();
             for hex_tx in chunk {
-                let _ = rpc_send_raw(&client, &rpc_urls[0], hex_tx).await;
+                let resp = rpc_send_raw(&client, &rpc_urls[0], hex_tx).await;
+                if resp.get("error").is_some() {
+                    if err_samples.len() < 2 {
+                        err_samples.push(resp.to_string());
+                    }
+                } else {
+                    ok += 1;
+                }
             }
+            let submit_elapsed = submit_t.elapsed();
+            let faucet_nonce_now = fetch_nonce(&client, &rpc_urls[0], &faucet_addr)
+                .await
+                .unwrap_or(0);
+            let block_now = current_block(&client, &rpc_urls[0]).await;
+            println!(
+                "    chunk {}: {}/{} submitted ok in {:.0}ms (chain block={}, +{}, faucet nonce={}, t+{:.1}s)",
+                chunk_idx,
+                ok,
+                chunk.len(),
+                submit_elapsed.as_secs_f64() * 1000.0,
+                block_now,
+                block_now - start_block,
+                faucet_nonce_now,
+                stream_t0.elapsed().as_secs_f64()
+            );
+            for e in &err_samples {
+                println!("      sample error: {}", e);
+            }
+            chunk_idx += 1;
             tokio::time::sleep(Duration::from_millis(800)).await;
         }
 
@@ -192,6 +238,12 @@ fn sustained_rate_load_test() {
                 break;
             }
             if Instant::now() >= poll_deadline {
+                for (i, node) in net.nodes.iter().enumerate() {
+                    let snap = node.output_snapshot();
+                    let lines: Vec<&str> = snap.lines().collect();
+                    let tail = lines.iter().rev().take(120).rev().copied().collect::<Vec<_>>();
+                    eprintln!("\n=== node {} last 120 lines ===\n{}\n", i, tail.join("\n"));
+                }
                 panic!("funding timed out: {}/{}", funded, wallets.len());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -285,7 +337,20 @@ fn sustained_rate_load_test() {
                             nonce += 1;
                         }
                         Err(_) => {
-                            err.fetch_add(1, Ordering::Relaxed);
+                            let prev_err = err.fetch_add(1, Ordering::Relaxed);
+                            // Sample the first few rejections with the full
+                            // response body — gives us the actual error
+                            // reason (InvalidNonce, InsufficientBalance, …)
+                            // instead of a generic "submit errors N" count.
+                            if i == 0 && prev_err < 3 {
+                                let resp = rpc_send_raw(&cli, &url, &hex_tx).await;
+                                eprintln!(
+                                    "  [sender 0] nonce={} rejection #{}: {}",
+                                    nonce,
+                                    prev_err,
+                                    resp
+                                );
+                            }
                             // Back off a full slot on rejection. Usually an
                             // InvalidNonce "too far ahead" — we've submitted
                             // nonces faster than the chain can commit them
