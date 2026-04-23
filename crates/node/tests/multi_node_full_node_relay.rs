@@ -126,19 +126,22 @@ fn tx_via_full_node_reaches_validator() {
     assert!(
         post_sender < pre_sender,
         "sender balance did not decrease: pre {} post {}",
-        pre_sender, post_sender
+        pre_sender,
+        post_sender
     );
     let sender_debit = pre_sender - post_sender;
     assert!(
         sender_debit >= transfer_value,
         "sender debit {} < transfer_value {} (should include gas)",
-        sender_debit, transfer_value
+        sender_debit,
+        transfer_value
     );
     assert_eq!(
         post_recipient,
         pre_recipient + transfer_value,
         "recipient should receive exactly transfer_value; pre {} post {}",
-        pre_recipient, post_recipient
+        pre_recipient,
+        post_recipient
     );
 }
 

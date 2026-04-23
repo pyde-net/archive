@@ -26,8 +26,7 @@ use std::time::Duration;
 #[test]
 #[ignore = "multi-node — subprocess-based, run via --ignored"]
 fn double_sign_debits_stake() {
-    let net = TestNetwork::spawn(4, true)
-        .unwrap_or_else(|e| panic!("spawn 4v testnet: {}", e));
+    let net = TestNetwork::spawn(4, true).unwrap_or_else(|e| panic!("spawn 4v testnet: {}", e));
 
     // Chain needs to be alive and advancing for the slash tx to land.
     net.wait_for_slot(5, Duration::from_secs(45))

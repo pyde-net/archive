@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 #[test]
 #[ignore = "multi-node — subprocess-based, run via --ignored"]
 fn validator_failure_keeps_chain_live() {
-    let mut net = TestNetwork::spawn(4, true)
-        .unwrap_or_else(|e| panic!("spawn 4-validator testnet: {}", e));
+    let mut net =
+        TestNetwork::spawn(4, true).unwrap_or_else(|e| panic!("spawn 4-validator testnet: {}", e));
 
     // Let consensus warm up to a healthy depth. Generous timeout
     // because this test often runs concurrently with other
@@ -47,25 +47,27 @@ fn validator_failure_keeps_chain_live() {
     // funded_addresses dedupes). Node-i's validator key produces
     // address `funded[i]`.
     let killed_addr = funded[0];
-    let kill_slot = min_slot_over(&net, &[1, 2, 3])
-        .unwrap_or_else(|e| panic!("snapshot slot: {}", e));
+    let kill_slot =
+        min_slot_over(&net, &[1, 2, 3]).unwrap_or_else(|e| panic!("snapshot slot: {}", e));
     eprintln!(
         "about to kill node-0 (addr 0x{}) at slot {}",
         hex::encode(killed_addr),
         kill_slot
     );
 
-    net.kill_node(0).unwrap_or_else(|e| panic!("kill node-0: {}", e));
+    net.kill_node(0)
+        .unwrap_or_else(|e| panic!("kill node-0: {}", e));
 
     // Give the survivors a fresh 15 s to make progress. At 400 ms
     // block time, that's ~35 slots of headroom; we only require
     // slot to grow by >= 10 to call it "live".
     let target_slot = kill_slot + 10;
-    wait_for_slot_on_nodes(&net, &[1, 2, 3], target_slot, Duration::from_secs(60))
-        .unwrap_or_else(|e| {
+    wait_for_slot_on_nodes(&net, &[1, 2, 3], target_slot, Duration::from_secs(60)).unwrap_or_else(
+        |e| {
             let dumps = per_node_dump(&net);
             panic!("{}\n{}", e, dumps);
-        });
+        },
+    );
 
     // State roots must agree across the 3 survivors.
     let mut roots: Vec<(usize, String)> = Vec::new();
@@ -97,7 +99,8 @@ fn validator_failure_keeps_chain_live() {
             Ok(Some(p)) => {
                 inspected += 1;
                 assert_ne!(
-                    p, killed_addr,
+                    p,
+                    killed_addr,
                     "slot {} proposer is the killed node-0 (0x{})",
                     slot,
                     hex::encode(p)
@@ -125,7 +128,10 @@ fn min_slot_over(net: &TestNetwork, indices: &[usize]) -> Result<u64, String> {
         .filter(|(i, _)| indices.contains(i))
         .map(|(_, s)| s.ok_or_else(|| "missing slot on a node".to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    slots.into_iter().min().ok_or_else(|| "empty indices".into())
+    slots
+        .into_iter()
+        .min()
+        .ok_or_else(|| "empty indices".into())
 }
 
 fn wait_for_slot_on_nodes(

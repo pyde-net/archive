@@ -26,7 +26,12 @@ fn new_node_syncs_from_network() {
         .unwrap_or_else(|e| panic!("spawn 3v+1 deferred: {}", e));
 
     let fulls = net.full_node_indices();
-    assert_eq!(fulls.len(), 1, "expected exactly 1 full node, got {}", fulls.len());
+    assert_eq!(
+        fulls.len(),
+        1,
+        "expected exactly 1 full node, got {}",
+        fulls.len()
+    );
     let late_joiner = fulls[0];
 
     // Confirm the deferred node really is cold — no process attached.
@@ -45,8 +50,8 @@ fn new_node_syncs_from_network() {
     // Grab the validators' head before starting the joiner. The
     // joiner should at least reach this slot; it will likely go
     // further since blocks keep being produced.
-    let validator_head_at_join = min_validator_slot(&net)
-        .unwrap_or_else(|e| panic!("read validator head: {}", e));
+    let validator_head_at_join =
+        min_validator_slot(&net).unwrap_or_else(|e| panic!("read validator head: {}", e));
     eprintln!(
         "validator head at join: slot {} — starting node-{}",
         validator_head_at_join, late_joiner
@@ -59,18 +64,23 @@ fn new_node_syncs_from_network() {
     // Wait for the late joiner to reach at least the validator head
     // captured above. 60s is generous — validators make ~2 blocks/s
     // and block-sync requests are batched.
-    wait_for_node_to_reach(&net, late_joiner, validator_head_at_join, Duration::from_secs(60))
-        .unwrap_or_else(|e| {
-            let dumps = per_node_dump(&net);
-            panic!("{}\n{}", e, dumps);
-        });
+    wait_for_node_to_reach(
+        &net,
+        late_joiner,
+        validator_head_at_join,
+        Duration::from_secs(60),
+    )
+    .unwrap_or_else(|e| {
+        let dumps = per_node_dump(&net);
+        panic!("{}\n{}", e, dumps);
+    });
 
     // Catch-up done. Validate consistency at whatever slot the
     // joiner is now at. State root must match at least one validator
     // at the joiner's current head slot (the validators may be a few
     // slots ahead because the chain keeps moving).
-    let joiner_head = slot_of(&net, late_joiner)
-        .unwrap_or_else(|e| panic!("read joiner head: {}", e));
+    let joiner_head =
+        slot_of(&net, late_joiner).unwrap_or_else(|e| panic!("read joiner head: {}", e));
     eprintln!("joiner caught up to slot {}", joiner_head);
     assert!(
         joiner_head >= validator_head_at_join,
@@ -128,7 +138,9 @@ fn new_node_syncs_from_network() {
         assert!(
             gap <= 5,
             "validators raced too far past joiner: joiner slot {}, max validator slot {}, gap {}",
-            joiner_slot, max_val_slot, gap
+            joiner_slot,
+            max_val_slot,
+            gap
         );
         eprintln!(
             "no exact slot match (validators raced ahead by {} slots) — acceptable",
@@ -146,17 +158,15 @@ fn wait_for_slot_on_validators(
     let deadline = Instant::now() + timeout;
     let vids = net.validator_indices();
     loop {
-        let all_ok = vids.iter().all(|&i| {
-            slot_of(net, i).map(|s| s >= target_slot).unwrap_or(false)
-        });
+        let all_ok = vids
+            .iter()
+            .all(|&i| slot_of(net, i).map(|s| s >= target_slot).unwrap_or(false));
         if all_ok {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            let per_node: Vec<(usize, Option<u64>)> = vids
-                .iter()
-                .map(|&i| (i, slot_of(net, i).ok()))
-                .collect();
+            let per_node: Vec<(usize, Option<u64>)> =
+                vids.iter().map(|&i| (i, slot_of(net, i).ok())).collect();
             return Err(format!(
                 "wait_for_slot_on_validators({}) timed out: {:?}",
                 target_slot, per_node

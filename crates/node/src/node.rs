@@ -221,9 +221,8 @@ impl PydeNode {
         // periodically by the maintenance tick so a tx that never
         // commits (under sustained overload) doesn't live in memory
         // forever.
-        let pending_tx_times: Arc<
-            RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>,
-        > = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let pending_tx_times: Arc<RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
 
         // Mempool tx index for compact block reconstruction: tx_hash → wire-encoded bytes
         let mempool_index: Arc<RwLock<std::collections::HashMap<[u8; 32], Vec<u8>>>> =
@@ -556,7 +555,8 @@ impl PydeNode {
         // subscription timing dropped the initial broadcast — without this,
         // a tx could sit in a single node's pending forever if its first
         // publish missed all peers. Capped to avoid re-publish bursts.
-        let mut gossip_retry_interval = tokio::time::interval(std::time::Duration::from_millis(800));
+        let mut gossip_retry_interval =
+            tokio::time::interval(std::time::Duration::from_millis(800));
         const GOSSIP_RETRY_MAX_TXS: usize = 1000;
 
         loop {

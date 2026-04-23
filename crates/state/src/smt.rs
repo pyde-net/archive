@@ -296,10 +296,7 @@ impl PersistentSMT {
         self.inner
             .update(key, SmtValue(value))
             .map_err(|_| "SMT update failed")?;
-        self.inner
-            .store()
-            .flush()
-            .map_err(|_| "SMT flush failed")?;
+        self.inner.store().flush().map_err(|_| "SMT flush failed")?;
         Ok(self.root())
     }
 
@@ -309,10 +306,7 @@ impl PersistentSMT {
             self.inner
                 .update(*key, SmtValue::zero())
                 .map_err(|_| "SMT delete failed")?;
-            self.inner
-                .store()
-                .flush()
-                .map_err(|_| "SMT flush failed")?;
+            self.inner.store().flush().map_err(|_| "SMT flush failed")?;
         }
         Ok(existed)
     }
@@ -323,10 +317,7 @@ impl PersistentSMT {
         self.inner
             .update_all(leaves)
             .map_err(|_| "SMT batch update failed")?;
-        self.inner
-            .store()
-            .flush()
-            .map_err(|_| "SMT flush failed")?;
+        self.inner.store().flush().map_err(|_| "SMT flush failed")?;
         Ok(self.root())
     }
 

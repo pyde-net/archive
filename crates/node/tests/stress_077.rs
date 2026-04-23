@@ -66,11 +66,8 @@ fn fund_account(smt: &mut pyde_state::smt::PydeSMT, idx: u64) -> [u8; 32] {
         gas_tank: 0,
         key_nonce: 0,
     };
-    smt.insert(
-        pyde_state::keys::balance_key(&address),
-        account.to_bytes(),
-    )
-    .unwrap();
+    smt.insert(pyde_state::keys::balance_key(&address), account.to_bytes())
+        .unwrap();
     smt.insert(
         pyde_state::keys::nonce_key(&address),
         pyde_account::nonce::NonceState::new().to_bytes().to_vec(),
@@ -97,11 +94,8 @@ fn fund_recipient_only(smt: &mut pyde_state::smt::PydeSMT, idx: u64) -> [u8; 32]
         gas_tank: 0,
         key_nonce: 0,
     };
-    smt.insert(
-        pyde_state::keys::balance_key(&address),
-        account.to_bytes(),
-    )
-    .unwrap();
+    smt.insert(pyde_state::keys::balance_key(&address), account.to_bytes())
+        .unwrap();
     address
 }
 
@@ -219,10 +213,10 @@ fn task_077_wide_parallel_1000_transfers() {
     for r_addr in &recipients {
         let bal_key = pyde_state::keys::balance_key(r_addr);
         let bytes = smt.get(&bal_key).expect("recipient account exists");
-        let account = pyde_account::types::Account::from_bytes(&bytes)
-            .expect("account decodes");
+        let account = pyde_account::types::Account::from_bytes(&bytes).expect("account decodes");
         assert_eq!(
-            account.balance, 1_000,
+            account.balance,
+            1_000,
             "recipient {:?} should have received exactly 1000 quanta",
             hex::encode(r_addr)
         );

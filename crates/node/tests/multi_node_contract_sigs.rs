@@ -154,14 +154,18 @@ fn contract_deploy_and_call_with_real_sigs() {
     );
     for (i, c) in &codes[1..] {
         assert_eq!(
-            c, &reference_code,
+            c,
+            &reference_code,
             "code mismatch node-0 vs node-{}: {} vs {}",
             i,
             reference_code.len(),
             c.len()
         );
     }
-    eprintln!("code agreement: {} bytes on all 4 nodes", reference_code.len() / 2);
+    eprintln!(
+        "code agreement: {} bytes on all 4 nodes",
+        reference_code.len() / 2
+    );
 
     // ── 6. Build + sign + submit set_count(42) ──────────────────
     let selector = otic::codegen::compute_selector("set_count");
@@ -256,9 +260,7 @@ fn sign_tx(tx: &mut Transaction, sk: &FalconSecretKey) {
 fn compile_deploy_payload(src: &str) -> Vec<u8> {
     let c = otic::compile_all(src);
     let (_, cc) = &c[0];
-    let mut out = Vec::with_capacity(
-        8 + cc.constructor_bytecode.len() + cc.runtime_bytecode.len(),
-    );
+    let mut out = Vec::with_capacity(8 + cc.constructor_bytecode.len() + cc.runtime_bytecode.len());
     out.extend_from_slice(&(cc.constructor_bytecode.len() as u32).to_le_bytes());
     out.extend_from_slice(&(cc.runtime_bytecode.len() as u32).to_le_bytes());
     out.extend_from_slice(&cc.constructor_bytecode);

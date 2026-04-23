@@ -129,9 +129,7 @@ impl JmtRocksStore {
     pub fn open_tmp() -> Result<Self, String> {
         let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {}", e))?;
         let path = dir.keep();
-        let path_str = path
-            .to_str()
-            .ok_or("invalid UTF-8 in temp path")?;
+        let path_str = path.to_str().ok_or("invalid UTF-8 in temp path")?;
         Self::open(path_str)
     }
 
@@ -239,13 +237,14 @@ impl TreeReader for JmtRocksStore {
         } else {
             None
         };
-        self.value_cache.lock().unwrap().put(key_hash, result.clone());
+        self.value_cache
+            .lock()
+            .unwrap()
+            .put(key_hash, result.clone());
         Ok(result)
     }
 
-    fn get_rightmost_leaf(
-        &self,
-    ) -> anyhow::Result<Option<(NodeKey, jmt::storage::LeafNode)>> {
+    fn get_rightmost_leaf(&self) -> anyhow::Result<Option<(NodeKey, jmt::storage::LeafNode)>> {
         // Used during restore-from-snapshot. We persist rightmost on
         // every write_node_batch call; read it back here.
         let key = Self::meta_key(META_RIGHTMOST);
@@ -318,7 +317,8 @@ impl TreeWriter for JmtRocksStore {
             }
         }
         if let Some(rm) = rightmost {
-            let bytes = borsh::to_vec(&rm).map_err(|e| anyhow::anyhow!("rightmost encode: {}", e))?;
+            let bytes =
+                borsh::to_vec(&rm).map_err(|e| anyhow::anyhow!("rightmost encode: {}", e))?;
             batch.put(&Self::meta_key(META_RIGHTMOST), bytes);
         }
 
@@ -364,7 +364,9 @@ impl PersistentJMT {
                 tree.get_root_hash(v)
                     .map_err(|e| format!("recover root: {}", e))?
             }
-            None => RootHash(JellyfishMerkleTree::<JmtRocksStore, Poseidon2JmtHasher>::EMPTY_ROOT.0),
+            None => {
+                RootHash(JellyfishMerkleTree::<JmtRocksStore, Poseidon2JmtHasher>::EMPTY_ROOT.0)
+            }
         };
 
         // When no version exists, we haven't committed anything yet.
@@ -439,9 +441,7 @@ impl PersistentJMT {
         let value_set: Vec<(KeyHash, Option<OwnedValue>)> = entries
             .into_iter()
             .map(|(k, v)| {
-                let kh = KeyHash(
-                    <[u8; 32]>::try_from(k.as_slice()).expect("H256 is 32 bytes"),
-                );
+                let kh = KeyHash(<[u8; 32]>::try_from(k.as_slice()).expect("H256 is 32 bytes"));
                 // Empty value → tombstone (None); matches SMT::zero() semantics.
                 let val = if v.is_empty() { None } else { Some(v) };
                 (kh, val)

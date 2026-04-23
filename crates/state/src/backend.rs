@@ -462,7 +462,10 @@ impl<S: StoreReadOps<SmtValue>> StoreReadOps<SmtValue> for CachedBackend<S> {
         }
         *self.misses.lock().unwrap() += 1;
         let result = self.inner.get_leaf(leaf_key)?;
-        self.leaf_cache.lock().unwrap().put(*leaf_key, result.clone());
+        self.leaf_cache
+            .lock()
+            .unwrap()
+            .put(*leaf_key, result.clone());
         Ok(result)
     }
 }
@@ -547,12 +550,7 @@ impl BufferedWriteBackend {
 
     /// Flush all pending writes as a single RocksDB WriteBatch.
     pub fn flush(&self) -> Result<(), BackendError> {
-        let branches: Vec<_> = self
-            .pending_branches
-            .lock()
-            .unwrap()
-            .drain()
-            .collect();
+        let branches: Vec<_> = self.pending_branches.lock().unwrap().drain().collect();
         let leaves: Vec<_> = self.pending_leaves.lock().unwrap().drain().collect();
         if branches.is_empty() && leaves.is_empty() {
             return Ok(());
@@ -643,10 +641,7 @@ impl StoreWriteOps<SmtValue> for BufferedWriteBackend {
     }
 
     fn remove_leaf(&mut self, leaf_key: &H256) -> Result<(), sparse_merkle_tree::error::Error> {
-        self.pending_leaves
-            .lock()
-            .unwrap()
-            .insert(*leaf_key, None);
+        self.pending_leaves.lock().unwrap().insert(*leaf_key, None);
         Ok(())
     }
 }

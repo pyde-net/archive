@@ -102,8 +102,14 @@ fn sustained_rate_load_test() {
     println!("║  Pyde Phase 7 — Sustained-Rate Load Test            ║");
     println!("╠══════════════════════════════════════════════════════╣");
     println!("  Target TPS:   {}", target_tps);
-    println!("  Duration:     {} s  (+ {} s warm-up, not measured)", duration_s, warmup_s);
-    println!("  Senders:      {} (per-account rate: {:.1} tx/s)", num_senders, per_acct_rate);
+    println!(
+        "  Duration:     {} s  (+ {} s warm-up, not measured)",
+        duration_s, warmup_s
+    );
+    println!(
+        "  Senders:      {} (per-account rate: {:.1} tx/s)",
+        num_senders, per_acct_rate
+    );
     println!("  chain_id:     {} (FALCON sig verification ON)", CHAIN_ID);
     println!("  Recipient:    0x{}", hex::encode(RECIPIENT));
     println!("╚══════════════════════════════════════════════════════╝");
@@ -120,8 +126,8 @@ fn sustained_rate_load_test() {
     let (faucet_pk_bytes, faucet_sk_bytes) = net
         .load_faucet_key()
         .unwrap_or_else(|e| panic!("load faucet.key: {}", e));
-    let faucet_sk = FalconSecretKey::from_bytes(&faucet_sk_bytes)
-        .expect("invalid FALCON secret key");
+    let faucet_sk =
+        FalconSecretKey::from_bytes(&faucet_sk_bytes).expect("invalid FALCON secret key");
     let faucet_addr = derive_eoa_address(&faucet_pk_bytes);
     println!("  faucet: 0x{}", hex::encode(faucet_addr));
 
@@ -129,7 +135,10 @@ fn sustained_rate_load_test() {
     println!("  nodes:  {:?}", rpc_urls);
 
     // --- Phase 1: fund N sender wallets from faucet ---
-    println!("\n[1/3] Funding {} sender wallets from faucet…", num_senders);
+    println!(
+        "\n[1/3] Funding {} sender wallets from faucet…",
+        num_senders
+    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -350,9 +359,7 @@ fn sustained_rate_load_test() {
                                 let resp = rpc_send_raw(&cli, &url, &hex_tx).await;
                                 eprintln!(
                                     "  [sender 0] nonce={} rejection #{}: {}",
-                                    nonce,
-                                    prev_err,
-                                    resp
+                                    nonce, prev_err, resp
                                 );
                             }
                             // Back off a full slot on rejection. Usually an
@@ -383,7 +390,11 @@ fn sustained_rate_load_test() {
                 let cur = progress_sub.load(Ordering::Relaxed);
                 let dt = (now - last_time).as_secs_f64();
                 let rate = (cur - last_count) as f64 / dt;
-                let phase = if now < progress_measure_at { "warmup" } else { "measure" };
+                let phase = if now < progress_measure_at {
+                    "warmup"
+                } else {
+                    "measure"
+                };
                 println!(
                     "  [{:>7}] +{} submits in {:.1}s → {:.0} tx/s (total: {}, errors: {})",
                     phase,
@@ -435,8 +446,7 @@ fn sustained_rate_load_test() {
     let total_submit_elapsed = total_run_s as f64;
     let submit_tps_overall = total_submits as f64 / total_submit_elapsed;
     let warmup_submits = total_submits.saturating_sub(measure_submits);
-    let confirmed_measurement =
-        confirmed_after_settle.saturating_sub(warmup_submits as u128);
+    let confirmed_measurement = confirmed_after_settle.saturating_sub(warmup_submits as u128);
     let inclusion_tps_steady = confirmed_measurement as f64 / measurement_elapsed;
     let inclusion_efficiency = if measure_submits > 0 {
         confirmed_measurement as f64 / measure_submits as f64
@@ -447,14 +457,32 @@ fn sustained_rate_load_test() {
     println!("\n╔══════════════════════════════════════════════════════╗");
     println!("║  RESULTS                                             ║");
     println!("╠══════════════════════════════════════════════════════╣");
-    println!("  Target:                 {} TPS for {} s", target_tps, duration_s);
-    println!("  Submitted (total):      {} txs over {:.0} s", total_submits, total_submit_elapsed);
-    println!("  Submitted (measured):   {} txs over {} s ({:.0} tx/s)", measure_submits, duration_s, submit_tps_measure);
+    println!(
+        "  Target:                 {} TPS for {} s",
+        target_tps, duration_s
+    );
+    println!(
+        "  Submitted (total):      {} txs over {:.0} s",
+        total_submits, total_submit_elapsed
+    );
+    println!(
+        "  Submitted (measured):   {} txs over {} s ({:.0} tx/s)",
+        measure_submits, duration_s, submit_tps_measure
+    );
     println!("  Submit errors:          {}", err_count);
-    println!("  Confirmed @ submit-end: {} txs", confirmed_at_end_of_submit);
+    println!(
+        "  Confirmed @ submit-end: {} txs",
+        confirmed_at_end_of_submit
+    );
     println!("  Confirmed @ +20 s:      {} txs", confirmed_after_settle);
-    println!("  Inclusion TPS steady:   {:.0} (measured window only)", inclusion_tps_steady);
-    println!("  Inclusion efficiency:   {:.1}%", inclusion_efficiency * 100.0);
+    println!(
+        "  Inclusion TPS steady:   {:.0} (measured window only)",
+        inclusion_tps_steady
+    );
+    println!(
+        "  Inclusion efficiency:   {:.1}%",
+        inclusion_efficiency * 100.0
+    );
     println!("  Submit TPS overall:     {:.0}", submit_tps_overall);
     println!("╚══════════════════════════════════════════════════════╝");
 
@@ -499,7 +527,8 @@ fn sustained_rate_load_test() {
         let timing_lines: Vec<&str> = snap
             .lines()
             .filter(|l| {
-                l.contains("proposed and processed") && !l.contains("pending=0 ")
+                l.contains("proposed and processed")
+                    && !l.contains("pending=0 ")
                     && !l.contains("pending=0\n")
             })
             .collect();
@@ -543,8 +572,7 @@ fn sustained_rate_load_test() {
             .lines()
             .filter(|l| l.contains(" WARN ") || l.contains(" ERROR "))
             .collect();
-        let warn_tail: Vec<&str> =
-            warn_lines.iter().rev().take(30).rev().copied().collect();
+        let warn_tail: Vec<&str> = warn_lines.iter().rev().take(30).rev().copied().collect();
         eprintln!(
             "=== node 0 WARN/ERROR (last {}) ===\n{}\n",
             warn_tail.len(),
@@ -623,11 +651,7 @@ async fn rpc_send_raw(client: &reqwest::Client, url: &str, tx_hex: &str) -> serd
 /// `"error"`. jsonrpsee returns HTTP 200 with an error body for
 /// nonce-too-high, mempool-full, invalid-sig — a bare status check
 /// would overcount successful submits.
-async fn rpc_send_raw_fast(
-    client: &reqwest::Client,
-    url: &str,
-    tx_hex: &str,
-) -> Result<(), ()> {
+async fn rpc_send_raw_fast(client: &reqwest::Client, url: &str, tx_hex: &str) -> Result<(), ()> {
     let body = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"pyde_sendRawTransaction","params":["0x{}"]}}"#,
         tx_hex
@@ -650,11 +674,7 @@ async fn rpc_send_raw_fast(
     Ok(())
 }
 
-async fn fetch_nonce(
-    client: &reqwest::Client,
-    url: &str,
-    addr: &[u8; 32],
-) -> Option<u64> {
+async fn fetch_nonce(client: &reqwest::Client, url: &str, addr: &[u8; 32]) -> Option<u64> {
     let resp = rpc_call(
         client,
         url,
@@ -670,11 +690,7 @@ async fn fetch_nonce(
     }
 }
 
-async fn fetch_balance(
-    client: &reqwest::Client,
-    url: &str,
-    addr: &[u8; 32],
-) -> Option<u128> {
+async fn fetch_balance(client: &reqwest::Client, url: &str, addr: &[u8; 32]) -> Option<u128> {
     let resp = rpc_call(
         client,
         url,
