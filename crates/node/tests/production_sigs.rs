@@ -56,6 +56,7 @@ fn production_chain_id_1_full_lifecycle() {
         chain_id: 1,
         validator_address: validator,
         dev_skip_signature: false,
+        block_sigs_pre_verified: false,
     };
 
     // Generate 10 accounts with FALCON keys

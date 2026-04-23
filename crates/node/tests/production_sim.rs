@@ -472,6 +472,7 @@ fn production_simulation() {
         chain_id: 31337,
         validator_address: validators[0].address,
         dev_skip_signature: true,
+        block_sigs_pre_verified: false,
     };
 
     // ═══ BLOCK 1: Deploy 20 complex contracts ════════════════════════

@@ -3444,6 +3444,7 @@ mod tests {
             chain_id: 1,
             validator_address: [0xEE; 32],
             dev_skip_signature: false,
+            block_sigs_pre_verified: false,
         };
         let receipt = execute_transaction(&slash_txs[0], &mut smt, &ctx).unwrap();
         assert!(

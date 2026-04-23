@@ -53,6 +53,7 @@ pub fn block_ctx(height: u64) -> BlockContext {
         chain_id: 1,
         validator_address: derive_eoa_address(b"validator"),
         dev_skip_signature: true,
+        block_sigs_pre_verified: false,
     }
 }
 

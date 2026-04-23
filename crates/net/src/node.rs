@@ -68,10 +68,36 @@ pub fn create_node(
         .with_quic()
         .with_behaviour(|key| {
             // Gossipsub
+            // Gossipsub config tuned for throughput under sustained
+            // loadgen (task 074: 5K TPS × 10 min). Key knobs:
+            //
+            // - `ValidationMode::Permissive`: auto-accept+forward. In
+            //   Strict mode the application must call
+            //   `report_message_validation_result` for every inbound
+            //   message before it's re-gossiped to the rest of the
+            //   mesh. We don't call it, so Strict was effectively
+            //   disabling multi-hop propagation — each tx only reached
+            //   the direct peers of the first publisher, leaving other
+            //   proposers' mempools starved.
+            // - `mesh_n{,_low,_high}` pushed up so small committees
+            //   (4–8 validators) keep a full mesh instead of falling
+            //   back to lazy-gossip between churn events.
+            // - Heartbeat stays at the slot time so mesh stabilizes
+            //   once per slot.
+            // - Larger `max_transmit_size` for our compact-block relays.
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_millis(400)) // match block time
-                .validation_mode(gossipsub::ValidationMode::Strict)
-                .max_transmit_size(256 * 1024) // 256KB max message
+                .heartbeat_interval(Duration::from_millis(400))
+                .validation_mode(gossipsub::ValidationMode::Permissive)
+                .max_transmit_size(1024 * 1024) // 1 MB max message
+                .mesh_n(8)
+                .mesh_n_low(4)
+                .mesh_n_high(12)
+                .mesh_outbound_min(2)
+                .gossip_lazy(8)
+                .history_length(6)
+                .history_gossip(3)
+                .duplicate_cache_time(Duration::from_secs(60))
+                .flood_publish(true)
                 .build()
                 .map_err(|e| format!("gossipsub config error: {e}"))?;
 

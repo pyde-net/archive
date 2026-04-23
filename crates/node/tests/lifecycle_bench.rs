@@ -115,6 +115,7 @@ fn validator_block_lifecycle() {
         chain_id: 31337,
         validator_address: validators[0].address,
         dev_skip_signature: true,
+        block_sigs_pre_verified: false,
     };
 
     // Deploy contracts (not timed)

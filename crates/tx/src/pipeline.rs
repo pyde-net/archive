@@ -41,6 +41,15 @@ pub struct BlockContext {
     /// synthetic state. Production paths must leave this `false`. See
     /// `ValidationContext::dev_skip_signature`.
     pub dev_skip_signature: bool,
+    /// Caller guarantees every tx in the block has already had its
+    /// FALCON sig verified (e.g. via a parallel batch pass) and that
+    /// the batch returned *all-valid*. When set, execution skips the
+    /// per-tx sig check — the other validation steps (chain_id, nonce,
+    /// balance, gas limits, access list, deadline) still run. This is
+    /// a production-safe optimization: if ANY sig in the block was
+    /// invalid, the caller must leave this `false` so the execution
+    /// path still rejects the bad tx.
+    pub block_sigs_pre_verified: bool,
 }
 
 impl Default for BlockContext {
@@ -56,6 +65,7 @@ impl Default for BlockContext {
             chain_id: 0,
             validator_address: [0u8; 32],
             dev_skip_signature: false,
+            block_sigs_pre_verified: false,
         }
     }
 }
@@ -210,6 +220,7 @@ fn execute_transaction_inner(
         chain_id: block_ctx.chain_id,
         dev_skip_signature: block_ctx.dev_skip_signature,
         sender_locked,
+        sig_pre_verified: block_ctx.block_sigs_pre_verified,
     };
     validate_transaction(tx, &sender, &nonce_state, &val_ctx)?;
 
@@ -2140,6 +2151,7 @@ mod tests {
             // chain_id coupling. Individual tests override tx.signature
             // when they want to exercise signature validation.
             dev_skip_signature: true,
+            block_sigs_pre_verified: false,
         }
     }
 
@@ -2433,6 +2445,7 @@ mod tests {
             chain_id: 31337,
             validator_address: validator_addr,
             dev_skip_signature: true,
+            block_sigs_pre_verified: false,
         };
 
         let sel = |name: &str| -> u32 { otic::codegen::compute_selector(name) };

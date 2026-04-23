@@ -55,6 +55,7 @@ fn block_ctx(chain_id: u64) -> BlockContext {
         validator_address: [0u8; 32],
         // Bench fixture: skip sig verification when caller opts into devnet.
         dev_skip_signature: chain_id == 31337,
+        block_sigs_pre_verified: false,
     }
 }
 
