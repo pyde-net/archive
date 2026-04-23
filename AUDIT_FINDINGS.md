@@ -133,13 +133,20 @@
       Line 891 left alone: index value pushed inside an already-
       bounded loop, not a count driving allocation.
 
-- [ ] 205 — `⚠` **Persist double-vote evidence on detection.**
-      `crates/node/src/validator.rs:1443-1449` — the equivocation
-      branch only `warn!`s; only the "new vote" branch persists
-      via `ConsensusStateStore`. Crash between detection and next
-      slot drops the evidence, loses slashing + finder's fee.
-      Fix: on detection, save evidence via the store before
-      continuing; reuse task 014c persistence schema.
+- [x] 205 — `✓` **Persist double-vote evidence on detection.**
+      `crates/node/src/validator.rs` `on_vote` equivocation branch
+      now builds a full `DoubleSignEvidence` from the prior + current
+      votes (both sigs, both hashes, signer from `voter_address`) and
+      routes it through `ingest_evidence`, mirroring the existing
+      double-propose path (`on_proposal` at :1189). `ingest_evidence`
+      re-verifies both sigs, dedups on `(slot, signer)`, pushes to
+      `pending_evidence` + `broadcast_evidence`, and persists via
+      `ConsensusStateStore` before returning — crash between
+      detection and next slot can no longer drop the evidence.
+      New test `on_vote_detects_double_vote_and_queues_evidence`
+      feeds two conflicting votes from the same signer and asserts
+      the evidence lands in both queues with the correct sigs +
+      hashes + signer.
 
 - [ ] 206 — `✓` **Close task 028 structural-only fall-through.**
       `crates/node/src/rpc.rs:1117-1141` + `crates/mempool/src/

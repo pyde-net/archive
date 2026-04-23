@@ -1415,14 +1415,24 @@ impl ValidatorEngine {
     /// Handle an incoming vote: collect and try to form QC.
     /// Returns the QC if quorum is reached.
     pub fn on_vote(&mut self, vote: ConsensusMessage) -> Option<QuorumCert> {
-        // Extract slot and block_hash from vote
-        let (slot, block_hash, voter_index) = match &vote {
+        // Extract every field we'll need below so we don't have to
+        // re-match the variant later (and so `voter_address` is
+        // available for evidence construction in the double-vote
+        // detection branch).
+        let (slot, block_hash, voter_index, voter_address, vote_sig) = match &vote {
             ConsensusMessage::Vote {
                 slot,
                 block_hash,
                 voter_index,
-                ..
-            } => (*slot, *block_hash, *voter_index as usize),
+                voter_address,
+                signature,
+            } => (
+                *slot,
+                *block_hash,
+                *voter_index as usize,
+                *voter_address,
+                signature.clone(),
+            ),
             _ => return None,
         };
 
@@ -1436,16 +1446,41 @@ impl ValidatorEngine {
 
         // --- Double-vote (equivocation) detection ---
         let vote_key = (slot, voter_index as u8);
-        let vote_sig = match &vote {
-            ConsensusMessage::Vote { signature, .. } => signature.clone(),
-            _ => vec![],
-        };
-        if let Some((prev_hash, _prev_sig)) = self.seen_votes.get(&vote_key) {
-            if *prev_hash != block_hash {
-                warn!(slot, voter_index, "DOUBLE VOTE DETECTED — equivocation");
-                // Note: full evidence creation requires both vote messages.
-                // For now, log and flag. Full evidence submission (with both signatures)
-                // can be implemented when the slashing transaction type is added.
+        // Clone the prior vote out so we can drop the `seen_votes` borrow
+        // before calling `ingest_evidence` (which needs `&mut self`).
+        if let Some((prev_hash, prev_sig)) = self.seen_votes.get(&vote_key).cloned() {
+            if prev_hash != block_hash {
+                warn!(
+                    slot,
+                    voter_index,
+                    offender = hex::encode(voter_address),
+                    "DOUBLE VOTE DETECTED — equivocation"
+                );
+                // Construct evidence from both votes and route through
+                // `ingest_evidence`, mirroring the double-propose path.
+                // ingest_evidence re-verifies both signatures, dedups on
+                // (slot, signer), pushes to pending + broadcast queues,
+                // and persists to disk before returning — a crash between
+                // detection and the next slot can no longer drop the
+                // evidence (finder's-fee + slashing preserved).
+                let evidence = DoubleSignEvidence {
+                    slot,
+                    block_hash_1: prev_hash,
+                    signature_1: prev_sig,
+                    block_hash_2: block_hash,
+                    signature_2: vote_sig.clone(),
+                    signer: voter_address,
+                    // Filled in by whichever validator broadcasts the
+                    // Slash tx — typically the next block proposer.
+                    submitter: [0u8; 32],
+                };
+                if self.ingest_evidence(evidence) {
+                    info!(
+                        slot,
+                        offender = hex::encode(voter_address),
+                        "double-vote evidence queued for slashing"
+                    );
+                }
             }
         } else {
             // Persist BEFORE the in-memory insert. Panics on failure for
@@ -3202,6 +3237,69 @@ mod tests {
         evidence.signature_1 = sig.clone();
         evidence.signature_2 = sig;
         assert!(!engine.ingest_evidence(evidence));
+    }
+
+    #[test]
+    fn on_vote_detects_double_vote_and_queues_evidence() {
+        // Regression test for audit item 205: two Vote messages at the
+        // same slot from the same voter on different block hashes must
+        // produce DoubleSignEvidence in `pending_evidence` instead of
+        // just a log line. Before this fix, a validator that crashed
+        // between detection and the next slot lost the slashing signal.
+        use pyde_consensus::hotstuff::{proposer_sign_message, ConsensusMessage};
+        use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
+
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let signer = pyde_account::address::derive_eoa_address(&pk_bytes);
+
+        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        engine.set_committee(vec![pk_bytes]);
+
+        let slot = 7u64;
+        let hash_a = [0x01u8; 32];
+        let hash_b = [0x02u8; 32];
+
+        let sign_vote = |h: &[u8; 32]| -> Vec<u8> {
+            falcon_sign(&sk, &proposer_sign_message(slot, h))
+                .unwrap()
+                .as_bytes()
+                .to_vec()
+        };
+
+        let vote_a = ConsensusMessage::Vote {
+            slot,
+            block_hash: hash_a,
+            voter_index: 0,
+            voter_address: signer,
+            signature: sign_vote(&hash_a),
+        };
+        let vote_b = ConsensusMessage::Vote {
+            slot,
+            block_hash: hash_b,
+            voter_index: 0,
+            voter_address: signer,
+            signature: sign_vote(&hash_b),
+        };
+
+        // First vote: stored in seen_votes, no evidence.
+        let _ = engine.on_vote(vote_a);
+        assert!(engine.pending_evidence.is_empty());
+
+        // Second vote (same voter, different hash): equivocation.
+        let _ = engine.on_vote(vote_b);
+        assert_eq!(engine.pending_evidence.len(), 1);
+        let ev = &engine.pending_evidence[0];
+        assert_eq!(ev.slot, slot);
+        assert_eq!(ev.signer, signer);
+        assert_eq!(ev.block_hash_1, hash_a);
+        assert_eq!(ev.block_hash_2, hash_b);
+        assert!(!ev.signature_1.is_empty());
+        assert!(!ev.signature_2.is_empty());
+        assert_ne!(ev.signature_1, ev.signature_2);
+
+        // Also staged for P2P broadcast so other validators can slash.
+        assert_eq!(engine.drain_broadcast_evidence().len(), 1);
     }
 
     #[test]
