@@ -12,6 +12,20 @@
 //! change. Keys and roots are exposed as `sparse_merkle_tree::H256`
 //! just to keep the trait surface stable; internally they roundtrip to
 //! `jmt::KeyHash` / `jmt::RootHash` (both are `[u8; 32]` newtypes).
+//!
+//! ## Mutex lock policy (MAINNET_PLAN 060)
+//!
+//! `JmtRocksStore` and `PersistentJMT` use `std::sync::Mutex` on their
+//! read-caches (`node_cache`, `value_cache`) and version/root state
+//! (`current_version`, `current_root`). Every `.lock().unwrap()` on
+//! these is deliberate: a poisoned mutex signals that some other thread
+//! panicked while holding the lock, which for a state-path component
+//! means the in-memory cache or version snapshot is potentially
+//! inconsistent. Propagating the error would force every JMT caller to
+//! handle a condition with no meaningful recovery — the right response
+//! is to fail the node. Phase 1 safety work (001-014) ensures on-disk
+//! consensus state is fsync'd before a validator votes, so a panic here
+//! loses at most un-flushed cache entries.
 
 use borsh::BorshDeserialize;
 use jmt::storage::{HasPreimage, Node, NodeBatch, NodeKey, TreeReader, TreeWriter};
@@ -117,8 +131,12 @@ impl JmtRocksStore {
         opts.set_target_file_size_base(128 * 1024 * 1024);
 
         let db = rocksdb::DB::open(&opts, path).map_err(|e| format!("rocksdb open: {}", e))?;
-        let node_cap = std::num::NonZeroUsize::new(256 * 1024).unwrap();
-        let value_cap = std::num::NonZeroUsize::new(256 * 1024).unwrap();
+        // safe (MAINNET_PLAN 060): 256 * 1024 is a non-zero compile-
+        // time constant; `NonZeroUsize::new` returning `None` is
+        // unreachable for this literal. `.expect` makes the intent
+        // explicit rather than panicking through a bare `.unwrap`.
+        let node_cap = std::num::NonZeroUsize::new(256 * 1024).expect("256 K is non-zero");
+        let value_cap = std::num::NonZeroUsize::new(256 * 1024).expect("256 K is non-zero");
         Ok(Self {
             db,
             node_cache: Mutex::new(lru::LruCache::new(node_cap)),

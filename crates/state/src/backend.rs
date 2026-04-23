@@ -2,6 +2,25 @@
 //!
 //! Provides a trait abstraction over key-value stores, with implementations
 //! for in-memory (testing), RocksDB (production), and LRU-cached wrappers.
+//!
+//! ## Mutex lock policy (MAINNET_PLAN 060)
+//!
+//! `CachedBackend` and `BufferedWriteBackend` use `std::sync::Mutex` for
+//! interior mutability on their LRU caches and pending-write maps. Every
+//! call site uses `.lock().unwrap()` deliberately:
+//!
+//! - A poisoned mutex means some other thread panicked while holding the
+//!   lock, which for a state-path component means the in-memory state is
+//!   potentially inconsistent. Propagating the error would force every
+//!   caller (SMT traversal, block commit, proposer) to handle a condition
+//!   that has no meaningful recovery — the right response is to fail the
+//!   node.
+//! - Phase 1 safety work (tasks 001-014) ensures on-disk consensus state
+//!   is fsync'd before a validator votes, so a panic here loses at most
+//!   un-flushed cache entries; no BFT safety violation on restart.
+//! - Consolidating all "lock or die" sites under a single documented
+//!   policy keeps the hot path readable rather than papered over with
+//!   per-site `expect()` messages that all say the same thing.
 
 use sparse_merkle_tree::merge::MergeValue;
 use sparse_merkle_tree::traits::{StoreReadOps, StoreWriteOps};
