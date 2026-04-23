@@ -528,7 +528,15 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let a = gp_read!(builder, d.rs1);
                         let imm = sign_extend_18(d.rs2_or_imm) as i64;
                         let b = builder.ins().iconst(I64, imm);
-                        // ADDI doesn't overflow check in interpreter (immediate is small)
+                        // Addi wraps on overflow by design — the otic
+                        // compiler relies on this for constant materialisation
+                        // (e.g. `Addi rd, r0, -2` → u64::MAX-1 for the
+                        // reentrancy-guard slot) and for two's-complement
+                        // negation (`Not rd; Addi rd, rd, 1` → -a). Changing
+                        // to checked_add would break otic codegen and
+                        // every contract's stack-frame setup. Divergence
+                        // between AOT and interpreter is guarded by
+                        // `addi_aot_interp_wrap_parity` in tests.
                         let r = builder.ins().iadd(a, b);
                         gp_write!(builder, d.rd, r);
                     }

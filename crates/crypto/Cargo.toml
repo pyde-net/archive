@@ -11,6 +11,10 @@ p3-poseidon2 = "0.4"
 p3-symmetric = "0.4"
 falcon-rs = { version = "0.2", default-features = false, features = ["getrandom"] }
 ml-kem = { version = "0.3.0-rc.0", default-features = false, features = ["getrandom"] }
+# Constant-time comparison primitives. Used to compare MACs / secret
+# material without leaking timing side-channels. Default features
+# pull in `std`; we're no_std so turn them off.
+subtle = { version = "2", default-features = false }
 
 [[bench]]
 name = "poseidon2_bench"

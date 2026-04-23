@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 
 use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
 use p3_goldilocks::Goldilocks;
+use subtle::ConstantTimeEq;
 
 use crate::kyber::{
     kyber_decapsulate, kyber_encapsulate, kyber_keygen, KyberCiphertext, KyberPublicKey,
@@ -535,9 +536,11 @@ pub fn combine_shares(
     // Decapsulate to get shared secret
     let ss = kyber_decapsulate(&sk, &ct.kyber_ct).map_err(|_| "Kyber-768 decapsulation failed")?;
 
-    // Verify MAC
+    // Verify MAC in constant time — a variable-time `!=` would leak
+    // per-byte match progress via timing, enabling padding-oracle-style
+    // forgery of MACs against a live validator.
     let expected_mac = compute_mac(&ss, &ct.encrypted_msg);
-    if expected_mac != ct.mac {
+    if expected_mac.ct_eq(&ct.mac).unwrap_u8() == 0 {
         return Err("MAC verification failed");
     }
 
@@ -1103,6 +1106,26 @@ mod tests {
 
         let result = combine_shares(&dec_shares, T, &ct);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn tampered_mac_byte_fails_verification() {
+        // Regression test for the constant-time MAC check. Flips one
+        // bit of the MAC on an otherwise-valid ciphertext and confirms
+        // the mismatch branch fires with the generic error. Does not
+        // measure timing (unit-test timing is too noisy); its job is
+        // to exercise the `ct_eq` code path so any future regression
+        // that broke MAC-mismatch handling fails loudly.
+        let (tpk, shares) = setup();
+        let msg = b"tampered mac test";
+        let mut ct = threshold_encrypt(&tpk, msg).unwrap();
+        ct.mac[0] ^= 0x01;
+        let dec_shares: Vec<DecryptionShare> = shares[..T]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        let result = combine_shares(&dec_shares, T, &ct);
+        assert_eq!(result, Err("MAC verification failed"));
     }
 
     #[test]
