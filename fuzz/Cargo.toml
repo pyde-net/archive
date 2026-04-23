@@ -14,6 +14,7 @@ license = "Apache-2.0"
 #   cargo +nightly install cargo-fuzz         # one-time
 #   cargo +nightly fuzz run pvm_interpreter
 #   cargo +nightly fuzz run tx_decoder
+#   cargo +nightly fuzz run wire_transaction
 
 [package.metadata]
 cargo-fuzz = true
@@ -22,6 +23,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 pyde-vm = { path = "../crates/pvm" }
 pyde-tx = { path = "../crates/tx" }
+pyde-node = { path = "../crates/node" }
 
 [[bin]]
 name = "pvm_interpreter"
@@ -33,6 +35,13 @@ bench = false
 [[bin]]
 name = "tx_decoder"
 path = "fuzz_targets/tx_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_transaction"
+path = "fuzz_targets/wire_transaction.rs"
 test = false
 doc = false
 bench = false

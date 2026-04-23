@@ -7,17 +7,16 @@ would poison the stable-toolchain build.
 
 ## Targets
 
-| Target            | What it fuzzes                                    | Why it matters                                                                                |
-| ----------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `pvm_interpreter` | `Vm::load` + `Vm::execute` on arbitrary bytecode  | Contract-deploy bytecode is attacker-supplied; a panic here crashes validators post-deploy.   |
-| `tx_decoder`      | `pyde_tx::types::Transaction::from_bytes`         | RPC-ingress + gossip bytes hit this before validation. Must return `Option`, never panic.     |
+| Target              | What it fuzzes                                    | Why it matters                                                                                 |
+| ------------------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `pvm_interpreter`   | `Vm::load` + `Vm::execute` on arbitrary bytecode  | Contract-deploy bytecode is attacker-supplied; a panic here crashes validators post-deploy.    |
+| `tx_decoder`        | `pyde_tx::types::Transaction::from_bytes`         | RPC-ingress + gossip bytes hit this before validation. Must return `Option`, never panic.      |
+| `wire_transaction`  | `pyde_node::wire::decode_transaction`             | Compact-block + gossip decoder; distinct from `from_bytes`. Reached via `pyde-node`'s lib target. |
 
 ## Planned follow-up targets
 
-- `wire_transaction` / `wire_block` / `wire_consensus_message` —
-  blocked on exposing a lib target from `crates/node` (currently
-  bin-only). Once `pyde-node` has a `src/lib.rs` re-exporting
-  `wire`, these are one-liners.
+- `wire_block` / `wire_consensus_message` — the lib target now
+  exists, so these are one-liner additions once we want them.
 - `otic_parser` — fuzz `.oti` source parsing.
 - `falcon_verify` / `kyber_decrypt` — fuzz PQ crypto deserialisers
   (likely thin wrappers; real coverage comes from upstream fuzzing).
@@ -33,6 +32,7 @@ cargo +nightly install cargo-fuzz
 cd fuzz
 cargo +nightly fuzz run pvm_interpreter
 cargo +nightly fuzz run tx_decoder
+cargo +nightly fuzz run wire_transaction
 ```
 
 By default libfuzzer runs forever, discovering new inputs + storing
