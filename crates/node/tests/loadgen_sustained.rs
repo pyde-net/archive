@@ -85,6 +85,10 @@ fn sustained_rate_load_test() {
     let duration_s: u64 = env_var_u64("PYDE_LOADGEN_DURATION", 600);
     let warmup_s: u64 = env_var_u64("PYDE_LOADGEN_WARMUP", 30);
     let num_senders: usize = env_var_u64("PYDE_LOADGEN_SENDERS", 50) as usize;
+    // Per-sender fund override for workloads (like burst tests with many
+    // senders) where the default FUND_PER_SENDER×num_senders exceeds
+    // the faucet's genesis balance. Defaults to FUND_PER_SENDER.
+    let fund_per_sender: u128 = env_var_u64("PYDE_LOADGEN_FUND", FUND_PER_SENDER as u64) as u128;
 
     let per_acct_rate = target_tps as f64 / num_senders as f64;
     let inflight_per_slot = per_acct_rate * 0.4;
@@ -154,7 +158,7 @@ fn sustained_rate_load_test() {
             let mut tx = Transaction {
                 from: faucet_addr,
                 to: w.address,
-                value: FUND_PER_SENDER,
+                value: fund_per_sender,
                 data: vec![],
                 gas_limit: 50_000,
                 nonce: faucet_nonce,
