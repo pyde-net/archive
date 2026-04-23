@@ -64,6 +64,10 @@ pub fn infer_access_list(
     let state_vtable = unsafe { std::mem::transmute::<&dyn StateAccess, [usize; 2]>(state) };
     vm.storage_backend = Some(std::sync::Arc::new(move |key: &ethnum::U256| {
         let smt_key = sparse_merkle_tree::H256::from(key.to_le_bytes());
+        // SAFETY: reverse of the transmute above. `state` (the source
+        // of `state_vtable`) outlives every invocation — this closure
+        // runs only during `vm.execute()` which is joined before this
+        // function returns.
         let state_ref: &dyn StateAccess =
             unsafe { std::mem::transmute::<[usize; 2], &dyn StateAccess>(state_vtable) };
         state_ref.get(&smt_key)

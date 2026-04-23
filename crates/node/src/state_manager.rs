@@ -26,7 +26,16 @@ pub struct StateManager {
     pending_writes: Vec<(Key, Vec<u8>)>,
 }
 
-// StateManager is Send (for Arc<RwLock>/Arc<Mutex>)
+// SAFETY: every field of `StateManager` is already `Send`:
+// - `cache: Arc<StdRwLock<HashMap<Key, Vec<u8>>>>`     — Send
+// - `smt:   Arc<Mutex<PersistentJMT>>`                  — Send
+// - `root:  [u8; 32]`                                   — Send (Copy)
+// - `tracked_keys: HashSet<Key>`                        — Send
+// - `pending_writes: Vec<(Key, Vec<u8>)>`               — Send
+// The manual `Send` impl is a historical artefact from when the JMT
+// store had non-Send internals; kept explicit so future additions
+// that introduce a non-Send field break the build here, forcing a
+// conscious review rather than silently breaking tokio::spawn.
 unsafe impl Send for StateManager {}
 
 impl StateManager {

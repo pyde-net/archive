@@ -31,6 +31,10 @@ pub type VmCtx = Vm;
 /// Host: load from memory. Returns the value, or u64::MAX on fault.
 /// Width: 0=8bit, 1=16bit, 2=32bit, 3=64bit
 pub extern "C" fn host_load(ctx: *mut VmCtx, addr: u64, width: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     let addr = addr as u32;
     let result = match width {
@@ -48,6 +52,10 @@ pub extern "C" fn host_load(ctx: *mut VmCtx, addr: u64, width: u64) -> u64 {
 
 /// Host: store to memory. Returns 0 on success, 1 on fault.
 pub extern "C" fn host_store(ctx: *mut VmCtx, addr: u64, value: u64, width: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     let addr = addr as u32;
     let result = match width {
@@ -66,6 +74,10 @@ pub extern "C" fn host_store(ctx: *mut VmCtx, addr: u64, value: u64, width: u64)
 /// Host: load 256-bit value from memory into wide register.
 /// Returns 0 on success, 1 on fault (memory fault or invalid wide reg).
 pub extern "C" fn host_wload(ctx: *mut VmCtx, addr: u64, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     match vm.memory.load256(addr as u32) {
         Ok(bytes) => {
@@ -85,6 +97,10 @@ pub extern "C" fn host_wload(ctx: *mut VmCtx, addr: u64, wd: u64) -> u64 {
 /// Host: store 256-bit value from wide register to memory.
 /// Returns 0 on success, 1 on fault.
 pub extern "C" fn host_wstore(ctx: *mut VmCtx, addr: u64, ws: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     let val = match vm.cpu.read_wide_checked(ws as u8) {
         Ok(v) => v,
@@ -100,6 +116,10 @@ pub extern "C" fn host_wstore(ctx: *mut VmCtx, addr: u64, ws: u64) -> u64 {
 
 /// Host: push a 64-bit value to stack. Returns 0 on success, 1 on fault.
 pub extern "C" fn host_push(ctx: *mut VmCtx, value: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     match vm.memory.stack_alloc(8) {
         Ok(sp) => match vm.memory.store64(sp, value) {
@@ -116,6 +136,10 @@ pub extern "C" fn host_push(ctx: *mut VmCtx, value: u64) -> u64 {
 
 /// Host: pop a 64-bit value from stack. Returns the value, u64::MAX on fault.
 pub extern "C" fn host_pop(ctx: *mut VmCtx) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     let sp = vm.memory.stack_pointer;
     match vm.memory.load64(sp) {
@@ -132,6 +156,10 @@ pub extern "C" fn host_pop(ctx: *mut VmCtx) -> u64 {
 /// Host: sload wide register mode. Reads storage[slot_from_ws1] → wd.
 /// Returns 0 on success.
 pub extern "C" fn host_sload(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     let slot = match vm.cpu.read_wide_checked(ws_slot as u8) {
         Ok(v) => v,
@@ -168,6 +196,10 @@ pub extern "C" fn host_sload(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
 /// Host: sload GP register mode. Reads storage[slot_from_ws1] → rd (8 bytes).
 /// Returns the loaded value.
 pub extern "C" fn host_sloadg(ctx: *mut VmCtx, ws_slot: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     // Invalid wide reg → return 0. host_sloadg signals "no data" via 0,
     // matching the behavior when the slot is empty.
@@ -199,6 +231,10 @@ pub extern "C" fn host_sloadg(ctx: *mut VmCtx, ws_slot: u64) -> u64 {
 /// Host: sstore wide register mode. Writes storage[slot_from_ws1] = wd.
 /// Returns 0 on success, 1 if static mode violation.
 pub extern "C" fn host_sstore(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     if vm.static_mode {
         return 1;
@@ -220,6 +256,10 @@ pub extern "C" fn host_sstore(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
 /// Host: sstore GP register mode. Writes storage[slot_from_ws1] = rd (8 bytes).
 /// Returns 0 on success, 1 if static mode violation.
 pub extern "C" fn host_sstoreg(ctx: *mut VmCtx, ws_slot: u64, value: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     if vm.static_mode {
         return 1;
@@ -237,6 +277,10 @@ pub extern "C" fn host_sstoreg(ctx: *mut VmCtx, ws_slot: u64, value: u64) -> u64
 /// Host: sdelete. Clears storage[slot_from_ws1], grants refund if non-empty.
 /// Returns 0 on success, 1 if static mode violation.
 pub extern "C" fn host_sdelete(ctx: *mut VmCtx, ws_slot: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     if vm.static_mode {
         return 1;
@@ -261,6 +305,10 @@ pub extern "C" fn host_sdelete(ctx: *mut VmCtx, ws_slot: u64) -> u64 {
 /// Host: poseidon hash. Hashes memory[addr..addr+len] → wd.
 /// Returns 0 on success, 1 on fault.
 pub extern "C" fn host_poseidon(ctx: *mut VmCtx, addr: u64, len: u64, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     let addr = addr as u32;
     let len = len as usize;
@@ -287,6 +335,10 @@ pub extern "C" fn host_poseidon(ctx: *mut VmCtx, addr: u64, len: u64, wd: u64) -
 /// wd, ws1, ws2: wide register indices.
 /// Returns 0 on success, 1 on trap (overflow/underflow/div-by-zero).
 pub extern "C" fn host_wide_alu(ctx: *mut VmCtx, op_code: u64, wd: u64, ws1: u64, ws2: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     let instr = pyde_vm::isa::encode(
         pyde_vm::isa::Opcode::from_u8(op_code as u8),
@@ -303,10 +355,17 @@ pub extern "C" fn host_wide_alu(ctx: *mut VmCtx, op_code: u64, wd: u64, ws1: u64
 /// Host: narrow (wide → GP). Returns the narrowed u64 value.
 /// Sets *trap_out to 1 if value exceeds u64::MAX.
 pub extern "C" fn host_narrow(ctx: *mut VmCtx, ws1: u64, trap_out: *mut u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     let wide_val = match vm.cpu.read_wide_checked(ws1 as u8) {
         Ok(v) => v,
         Err(_) => {
+            // SAFETY: `trap_out` is a valid out-pointer provided by the
+            // AOT JIT (emitted alongside the call). See module-level
+            // pointer safety contract.
             unsafe {
                 *trap_out = 1;
             }
@@ -316,6 +375,9 @@ pub extern "C" fn host_narrow(ctx: *mut VmCtx, ws1: u64, trap_out: *mut u64) -> 
     let bytes = wide_val.to_le_bytes();
     // Check if any bytes above the first 8 are non-zero
     if bytes[8..].iter().any(|&b| b != 0) {
+        // SAFETY: `trap_out` is a valid out-pointer provided by the
+        // AOT JIT (emitted alongside the call). See module-level
+        // pointer safety contract.
         unsafe {
             *trap_out = 1;
         }
@@ -328,6 +390,10 @@ pub extern "C" fn host_narrow(ctx: *mut VmCtx, ws1: u64, trap_out: *mut u64) -> 
 
 /// Host: widen (GP → wide). Takes the GP value directly from AOT, writes to wide register.
 pub extern "C" fn host_widen(ctx: *mut VmCtx, wd: u64, gp_value: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     if vm
         .cpu
@@ -342,6 +408,10 @@ pub extern "C" fn host_widen(ctx: *mut VmCtx, wd: u64, gp_value: u64) -> u64 {
 /// Host: read a GP register value from the VM. Used by AOT to sync
 /// GP register state after wide ops that write to GP (Weq, Wlt).
 pub extern "C" fn host_read_gp(ctx: *mut VmCtx, reg: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     vm.cpu.read_gp(reg as u8)
 }
@@ -353,6 +423,9 @@ pub extern "C" fn host_checked_add(a: u64, b: u64, trap_out: *mut u64) -> u64 {
     match a.checked_add(b) {
         Some(r) => r,
         None => {
+            // SAFETY: `trap_out` is a valid out-pointer provided by the
+            // AOT JIT (emitted alongside the call). See module-level
+            // pointer safety contract.
             unsafe {
                 *trap_out = 1;
             }
@@ -366,6 +439,9 @@ pub extern "C" fn host_checked_sub(a: u64, b: u64, trap_out: *mut u64) -> u64 {
     match a.checked_sub(b) {
         Some(r) => r,
         None => {
+            // SAFETY: `trap_out` is a valid out-pointer provided by the
+            // AOT JIT (emitted alongside the call). See module-level
+            // pointer safety contract.
             unsafe {
                 *trap_out = 1;
             }
@@ -379,6 +455,9 @@ pub extern "C" fn host_checked_mul(a: u64, b: u64, trap_out: *mut u64) -> u64 {
     match a.checked_mul(b) {
         Some(r) => r,
         None => {
+            // SAFETY: `trap_out` is a valid out-pointer provided by the
+            // AOT JIT (emitted alongside the call). See module-level
+            // pointer safety contract.
             unsafe {
                 *trap_out = 1;
             }
@@ -390,6 +469,9 @@ pub extern "C" fn host_checked_mul(a: u64, b: u64, trap_out: *mut u64) -> u64 {
 /// Host: checked div. Returns result, sets *trap_out to 1 on div-by-zero.
 pub extern "C" fn host_checked_div(a: u64, b: u64, trap_out: *mut u64) -> u64 {
     if b == 0 {
+        // SAFETY: `trap_out` is a valid out-pointer provided by the
+        // AOT JIT (emitted alongside the call). See module-level
+        // pointer safety contract.
         unsafe {
             *trap_out = 1;
         }
@@ -401,6 +483,9 @@ pub extern "C" fn host_checked_div(a: u64, b: u64, trap_out: *mut u64) -> u64 {
 /// Host: checked mod. Returns result, sets *trap_out to 1 on div-by-zero.
 pub extern "C" fn host_checked_mod(a: u64, b: u64, trap_out: *mut u64) -> u64 {
     if b == 0 {
+        // SAFETY: `trap_out` is a valid out-pointer provided by the
+        // AOT JIT (emitted alongside the call). See module-level
+        // pointer safety contract.
         unsafe {
             *trap_out = 1;
         }
@@ -413,6 +498,10 @@ pub extern "C" fn host_checked_mod(a: u64, b: u64, trap_out: *mut u64) -> u64 {
 
 /// Host: emit log event. Returns 0 on success, 1 on static mode violation or fault.
 pub extern "C" fn host_log(ctx: *mut VmCtx, desc_ptr: u64, num_topics: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     if vm.static_mode {
         return 1;
@@ -462,6 +551,10 @@ pub extern "C" fn host_log(ctx: *mut VmCtx, desc_ptr: u64, num_topics: u64) -> u
 
 /// Host: get caller (msg.sender) into wide register wd.
 pub extern "C" fn host_caller(ctx: *mut VmCtx, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     if vm
         .cpu
@@ -475,6 +568,10 @@ pub extern "C" fn host_caller(ctx: *mut VmCtx, wd: u64) -> u64 {
 
 /// Host: get self address into wide register wd.
 pub extern "C" fn host_address(ctx: *mut VmCtx, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     if vm
         .cpu
@@ -491,24 +588,40 @@ pub extern "C" fn host_address(ctx: *mut VmCtx, wd: u64) -> u64 {
 
 /// Host: get block number.
 pub extern "C" fn host_block_number(ctx: *mut VmCtx) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     vm.ctx.block_number
 }
 
 /// Host: get timestamp.
 pub extern "C" fn host_timestamp(ctx: *mut VmCtx) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     vm.ctx.timestamp
 }
 
 /// Host: get gas remaining.
 pub extern "C" fn host_gas_remaining(ctx: *mut VmCtx) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     vm.gas_remaining()
 }
 
 /// Host: get call value (256-bit) into wide register.
 pub extern "C" fn host_callvalue(ctx: *mut VmCtx, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     if vm
         .cpu
@@ -522,6 +635,10 @@ pub extern "C" fn host_callvalue(ctx: *mut VmCtx, wd: u64) -> u64 {
 
 /// Host: get gas price into wide register.
 pub extern "C" fn host_gasprice(ctx: *mut VmCtx, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     if vm
         .cpu
@@ -535,6 +652,10 @@ pub extern "C" fn host_gasprice(ctx: *mut VmCtx, wd: u64) -> u64 {
 
 /// Host: get balance of address (in wide register ws) into wide register wd.
 pub extern "C" fn host_balance(ctx: *mut VmCtx, ws_addr: u64, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     let addr_u256 = match vm.cpu.read_wide_checked(ws_addr as u8) {
         Ok(v) => v,
@@ -559,6 +680,10 @@ pub extern "C" fn host_assert(_ctx: *mut VmCtx, val: u64) -> u64 {
 
 /// Host: memcpy — bulk memory copy. Returns 0 on success, 1 on fault.
 pub extern "C" fn host_memcpy(ctx: *mut VmCtx, dst: u64, src: u64, len: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     let len = len as usize;
     if len == 0 {
@@ -581,7 +706,14 @@ pub extern "C" fn host_memcpy(ctx: *mut VmCtx, dst: u64, src: u64, len: u64) -> 
 /// Copy GP registers from the AOT's external regs[] array into vm.cpu.gp[].
 /// Must be called before host_exec_opcode for opcodes that read GP state (CallExt, Create, etc.).
 pub extern "C" fn host_sync_gp_to_vm(ctx: *mut VmCtx, regs_ptr: *const u64) {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
+    // SAFETY: `regs_ptr` is the JIT-emitted address of the caller's
+    // 16-slot `u64` GP-mirror array; layout is fixed at codegen time
+    // (`aot/src/codegen.rs`) so the 16-element length is invariant.
     let regs = unsafe { std::slice::from_raw_parts(regs_ptr, 16) };
     for (i, r) in regs.iter().enumerate() {
         vm.cpu.write_gp(i as u8, *r);
@@ -591,7 +723,16 @@ pub extern "C" fn host_sync_gp_to_vm(ctx: *mut VmCtx, regs_ptr: *const u64) {
 /// Copy GP registers from vm.cpu.gp[] back into the AOT's external regs[] array.
 /// Must be called after host_exec_opcode for opcodes that modify GP state.
 pub extern "C" fn host_sync_gp_from_vm(ctx: *mut VmCtx, regs_ptr: *mut u64) {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
+    // SAFETY: `regs_ptr` is the JIT-emitted mutable address of the
+    // caller's 16-slot `u64` GP-mirror array; layout is fixed at
+    // codegen time (`aot/src/codegen.rs`) so the 16-element length
+    // is invariant. Exclusive access is guaranteed by the caller
+    // (the JIT serializes host_exec_opcode + sync pairs).
     let regs = unsafe { std::slice::from_raw_parts_mut(regs_ptr, 16) };
     for (i, r) in regs.iter_mut().enumerate() {
         *r = vm.cpu.read_gp(i as u8);
@@ -608,6 +749,10 @@ pub extern "C" fn host_exec_opcode(
     rs1: u64,
     imm: u64,
 ) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
     let d = pyde_vm::isa::DecodedInstruction {
         opcode: pyde_vm::isa::Opcode::from_u8(opcode as u8),
