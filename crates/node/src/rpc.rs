@@ -1116,11 +1116,15 @@ impl PydeApiServer for RpcServer {
 
         // Task 028: bind ciphertext to sender's on-chain FALCON pubkey.
         // Look up the sender's account; if a Single auth_key is registered,
-        // enforce full FALCON verification (receive_tx_verified). Accounts
-        // with no registered key (fresh / faucet / system) fall back to
-        // the structural-only path so devnet bootstrap still works. Mainnet
-        // users are expected to have an auth_key set, putting them on the
-        // verified path by default.
+        // enforce full FALCON verification (receive_tx_verified).
+        //
+        // Audit item 206: on production chain_ids the fall-through to the
+        // structural-only path is closed — accounts with no registered
+        // auth_key are REJECTED, because structural-only accepts any
+        // 500-1000 byte blob as a "signature" and lets an attacker spoof
+        // `sender = victim_address` for every fresh address. Devnet
+        // (chain_id == 31337) keeps the fall-through so faucet / bootstrap
+        // accounts can transact before their first key registration.
         let sender_pk_opt = {
             let state_r = self.state.state.read().await;
             let sender_key = pyde_state::keys::balance_key(&from);
@@ -1134,10 +1138,18 @@ impl PydeApiServer for RpcServer {
         };
 
         let mut relay = self.state.tx_relay.write().await;
-        let accepted = if let Some(sender_pk) = sender_pk_opt {
-            relay.receive_tx_verified(enc_tx, &sender_pk)
-        } else {
-            relay.receive_tx(enc_tx)
+        let accepted = match encrypted_tx_ingest_policy(sender_pk_opt, self.chain_id) {
+            EncryptedTxIngestPolicy::Verify(sender_pk) => {
+                relay.receive_tx_verified(enc_tx, &sender_pk)
+            }
+            EncryptedTxIngestPolicy::StructuralOnly => relay.receive_tx(enc_tx),
+            EncryptedTxIngestPolicy::Reject => {
+                return Err(rpc_err(
+                    -32001,
+                    "encrypted-tx sender has no registered auth_key; register one before submitting"
+                        .to_string(),
+                ));
+            }
         };
         if !accepted {
             return Err(rpc_err(
@@ -1352,6 +1364,40 @@ fn rpc_err(code: i32, msg: String) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(code, msg, None::<()>)
 }
 
+/// Policy choice for how to gate encrypted-tx RPC ingress against
+/// `send_encrypted_transaction`'s sender-FALCON binding (audit item
+/// 206). Split out as a pure function so the devnet/production
+/// branch is unit-testable without spinning up an `RpcServer`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EncryptedTxIngestPolicy {
+    /// Sender has an on-chain `Single` auth_key; route through full
+    /// FALCON verification against it.
+    Verify(Vec<u8>),
+    /// Devnet-only: sender has no registered key yet (faucet /
+    /// bootstrap account). Accept via structural-only — signature
+    /// length is sanity-checked, FALCON is not.
+    StructuralOnly,
+    /// Production: sender has no registered key. Reject so attackers
+    /// can't spoof `from = victim_fresh_address` through the
+    /// length-only path.
+    Reject,
+}
+
+/// See `EncryptedTxIngestPolicy`. `sender_pk` comes from the
+/// sender's on-chain account (`None` means either no account or an
+/// account with `AuthKeys::None`). `chain_id == 31337` identifies
+/// devnet; any other chain_id is treated as production.
+fn encrypted_tx_ingest_policy(
+    sender_pk: Option<Vec<u8>>,
+    chain_id: u64,
+) -> EncryptedTxIngestPolicy {
+    match sender_pk {
+        Some(pk) => EncryptedTxIngestPolicy::Verify(pk),
+        None if chain_id == 31337 => EncryptedTxIngestPolicy::StructuralOnly,
+        None => EncryptedTxIngestPolicy::Reject,
+    }
+}
+
 fn parse_address(input: &str) -> Result<[u8; 32], ErrorObjectOwned> {
     let hex_str = input.strip_prefix("0x").unwrap_or(input);
     let bytes =
@@ -1543,6 +1589,44 @@ mod tests {
     #[test]
     fn decode_u128_short_returns_zero() {
         assert_eq!(decode_u128(&[1, 2, 3]), 0);
+    }
+
+    #[test]
+    fn ingest_policy_verifies_when_auth_key_registered() {
+        let pk = vec![0x11u8; 900];
+        assert_eq!(
+            encrypted_tx_ingest_policy(Some(pk.clone()), 1),
+            EncryptedTxIngestPolicy::Verify(pk.clone())
+        );
+        // Devnet with a registered key still verifies — the
+        // structural-only branch is only for the no-key case.
+        assert_eq!(
+            encrypted_tx_ingest_policy(Some(pk.clone()), 31337),
+            EncryptedTxIngestPolicy::Verify(pk)
+        );
+    }
+
+    #[test]
+    fn ingest_policy_devnet_falls_through_without_key() {
+        assert_eq!(
+            encrypted_tx_ingest_policy(None, 31337),
+            EncryptedTxIngestPolicy::StructuralOnly
+        );
+    }
+
+    #[test]
+    fn ingest_policy_production_rejects_without_key() {
+        // Mainnet and any non-devnet chain_id must reject — otherwise
+        // an attacker can spoof `from = victim_fresh_address` through
+        // the length-only path.
+        for chain_id in [1u64, 2, 7, 1337, 1_000_000] {
+            assert_eq!(
+                encrypted_tx_ingest_policy(None, chain_id),
+                EncryptedTxIngestPolicy::Reject,
+                "chain_id {} must reject no-key encrypted tx",
+                chain_id
+            );
+        }
     }
 
     #[test]
