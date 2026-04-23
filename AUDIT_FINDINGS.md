@@ -148,18 +148,29 @@
       the evidence lands in both queues with the correct sigs +
       hashes + signer.
 
-- [ ] 206 — `✓` **Close task 028 structural-only fall-through.**
-      `crates/node/src/rpc.rs:1117-1141` + `crates/mempool/src/
-      pool.rs:370-384`. Encrypted-tx RPC ingress only runs full
-      FALCON verify when the sender has a registered `auth_key`;
-      senders with no registered key take the length-only path.
-      Every fresh address has this window — an attacker can forge
-      encrypted txs claiming `sender = victim_new_address` until
-      the victim registers. Plan marks 028 done but the fall-through
-      is mainnet-exploitable.
-      Fix: on `chain_id != devnet`, require either a registered
-      `auth_key` OR membership in a narrow faucet allowlist.
-      Devnet keeps the fall-through for bootstrap UX.
+- [x] 206 — `✓` **Close task 028 structural-only fall-through.**
+      `crates/node/src/rpc.rs` `send_encrypted_transaction` now
+      routes through a new `encrypted_tx_ingest_policy` helper with
+      three arms: `Verify(pk)` when sender has a registered
+      `Single` auth_key; `StructuralOnly` only on `chain_id ==
+      31337` (devnet) for faucet / bootstrap UX; `Reject` on every
+      other chain_id with RPC error `-32001`. 3 new unit tests
+      cover all three branches across representative chain_ids
+      (1, 2, 7, 1337, 1_000_000).
+
+      Follow-up flagged while investigating: the PLAINTEXT path
+      has an analogous issue — `validate_signature` in
+      `crates/tx/src/validation.rs:140-149` accepts any tx whose
+      sender account has `AuthKeys::None` without a signature
+      check ("System/contract accounts — no signature check at
+      this level"), and `load_account` at
+      `crates/tx/src/pipeline.rs:148-158` returns a default EOA
+      with `AuthKeys::None` for any address not yet in state.
+      Balance-check gates the fund-loss exploit (a fresh
+      attacker-chosen `from` has 0 balance, can't cover gas) but
+      DoS-style mempool pollution is still possible within the
+      M1/M3 caps. Not strictly a 206 fix; tracked as item **226**
+      below for a follow-up PR.
 
 - [ ] 207 — `⚠` **Encrypted-tx gossip flow (074b root cause).**
       Compact-block broadcast in `crates/node/src/node.rs` omits
@@ -302,6 +313,24 @@
       `crates/node/src/faucet.rs` is the RPC half only; no
       frontend / public API exposure.
 
+- [ ] 226 — `⚠` **Plaintext RPC path: `AuthKeys::None` sig-skip
+      analog.** Surfaced while closing 206.
+      `crates/tx/src/validation.rs:140-149` — `validate_signature`
+      accepts any tx whose sender account has `AuthKeys::None`
+      without a FALCON check (comment: "System/contract accounts
+      — no signature check at this level"). `load_account` at
+      `crates/tx/src/pipeline.rs:148-158` returns a default EOA
+      with `AuthKeys::None` for any address not yet in state, so
+      an attacker can submit `send_raw_transaction` with
+      `from = victim_fresh_address` and no signature and clear
+      `validate_signature`. Balance-check gates fund-loss (fresh
+      account has 0 balance) but the mempool pollution surface is
+      still non-zero within M1/M3 caps. Fix: at RPC ingress on
+      production chain_id, require the sender account to exist
+      with a registered auth_key (OR take a narrow
+      faucet-allowlist path), mirroring the 206 policy. Keep the
+      internal contract-to-contract path unaffected.
+
 ---
 
 ## Test-coverage follow-ups (not standalone fix items)
@@ -320,10 +349,10 @@ Fold into the relevant fix PRs above when possible:
 
 | ID  | Verified on | How | Verdict |
 |-----|-------------|-----|---------|
-| 201 | pending     | —   | —       |
-| 202 | 2026-04-23  | Read `crates/pvm/src/vm.rs:525-575` | Confirmed asymmetry |
-| 203 | 2026-04-23  | Read `threshold.rs:530-547` + `rg ConstantTimeEq crates/crypto/` (0 hits) | Confirmed |
-| 204 | 2026-04-23  | Agent-traced; self-check pending at fix time | Accepted |
-| 205 | 2026-04-23  | Read `validator.rs:1443-1466` | Confirmed: `else` persists, `if` only logs |
-| 206 | 2026-04-23  | Read `rpc.rs:1117-1148` + `pool.rs:370-384` | Confirmed fall-through on no-auth_key |
+| 201 | 2026-04-23  | Traced `on_finality_vote` + `persist_finality_checkpoint` call order | Real race but not BFT-critical; P1 (207a) |
+| 202 | 2026-04-23  | Read `crates/pvm/src/vm.rs:525-575` | Wrapping is by-design; shipped parity test |
+| 203 | 2026-04-23  | Read `threshold.rs:530-547` + `rg ConstantTimeEq crates/crypto/` (0 hits) | Confirmed; fixed with `ct_eq` |
+| 204 | 2026-04-23  | Full sweep of `wire.rs` decoders (18 sites) | Fixed with `u16/u32_count(max)` helpers |
+| 205 | 2026-04-23  | Read `validator.rs:1443-1466` | Confirmed: `else` persists, `if` only logs; routed through `ingest_evidence` |
+| 206 | 2026-04-23  | Read `rpc.rs:1117-1148` + `pool.rs:370-384` | Confirmed fall-through on no-auth_key; closed for non-devnet chain_id |
 | 207 | 2026-04-23  | Agent-traced against wire.rs compact-block encoding | Accepted; design decision needed |
