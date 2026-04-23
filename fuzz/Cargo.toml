@@ -1,0 +1,38 @@
+[package]
+name = "pyde-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+
+# Intentionally excluded from the root workspace (`Cargo.toml`'s
+# `[workspace] exclude = ["fuzz"]`). cargo-fuzz needs nightly +
+# -Cinstrument-coverage flags that would poison the workspace's
+# stable-toolchain build if we included it.
+#
+# Run with:
+#   cargo +nightly install cargo-fuzz         # one-time
+#   cargo +nightly fuzz run pvm_interpreter
+#   cargo +nightly fuzz run tx_decoder
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pyde-vm = { path = "../crates/pvm" }
+pyde-tx = { path = "../crates/tx" }
+
+[[bin]]
+name = "pvm_interpreter"
+path = "fuzz_targets/pvm_interpreter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_decoder"
+path = "fuzz_targets/tx_decoder.rs"
+test = false
+doc = false
+bench = false

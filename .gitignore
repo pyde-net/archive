@@ -2,3 +2,12 @@ target/
 .claude/
 pyde-book/
 ROADMAP.md
+
+# cargo-fuzz artefacts (task 053). Crate lives outside the workspace
+# and has its own Cargo.lock + target/ dir + corpus dir which we don't
+# commit. Fuzz crashes go into fuzz/artifacts/ and should also stay
+# out of the repo — they can be MB-sized and reproduce from the seed.
+fuzz/Cargo.lock
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
