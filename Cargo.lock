@@ -3584,6 +3584,7 @@ dependencies = [
  "p3-goldilocks",
  "p3-poseidon2",
  "p3-symmetric",
+ "subtle",
 ]
 
 [[package]]

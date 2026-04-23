@@ -93,14 +93,26 @@
       covering 9 adversarial `(imm1, imm2)` pairs including
       u64::MAX roll-over in both directions.
 
-- [ ] 203 — `✓` **Constant-time MAC verification in threshold
-      decryption.** `crates/crypto/src/threshold.rs:540` — `if
-      expected_mac != ct.mac` on 32 bytes of MAC, not constant-time.
-      Workspace-wide `rg "ConstantTimeEq|ct_eq|subtle::"` against
-      `crates/crypto/` returns zero hits.
-      Fix: add `subtle` crate, use `ct_eq`; sweep crates/crypto/
-      and crates/consensus/ for other `==`/`!=` on secret material
-      (shares, keys, signatures used as dedup keys).
+- [x] 203 — `✓` **Constant-time MAC verification in threshold
+      decryption.** Shipped: added `subtle = "2"` (no_std) as a
+      direct dep of `pyde-crypto`; `threshold.rs:540` now uses
+      `expected_mac.ct_eq(&ct.mac).unwrap_u8() == 0` instead of
+      `!=`. New regression test `tampered_mac_byte_fails_
+      verification` flips one MAC bit and asserts the mismatch
+      branch returns the generic error.
+      Sweep verdict: the other `==`/`!=` hits in `crates/crypto/`
+      and `crates/consensus/` are on public data (block hashes
+      used in slashing evidence + QC / finality lookup, share
+      indices that identify which validator contributed, length
+      comparisons on public-structure fields) — no additional
+      constant-time fixes needed today. One borderline site
+      (`threshold.rs:928` in `verify_resharing_contribution`,
+      comparing reconstructed polynomial evaluation against
+      sub-share) left alone: the compared values are destined
+      for cross-committee delivery and not secret from the new
+      committee; upgrading it is worth a look if PSS ever gets
+      a VSS commitment layer (see Deferred section of
+      `MAINNET_PLAN.md`).
 
 - [ ] 204 — `✓` **Wire-decoder unbounded `Vec::with_capacity`.**
       `crates/node/src/wire.rs:256-260, 361-370, 591-598, 760-764`
