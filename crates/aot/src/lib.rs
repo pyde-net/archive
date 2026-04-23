@@ -112,6 +112,34 @@ mod tests {
     }
 
     #[test]
+    fn addi_aot_interp_wrap_parity() {
+        // Addi wraps on overflow by design — the otic compiler relies on
+        // this for constant materialisation and two's-complement negation.
+        // This test closes audit finding 202 (divergence risk) by asserting
+        // AOT and interpreter wrap identically across adversarial inputs.
+        // Any future edit to one side that doesn't match the other fails
+        // here before shipping.
+        for (imm1, imm2) in [
+            (-1i32, 1i32),      // u64::MAX + 1 → 0
+            (-1, -1),           // u64::MAX + -1 → u64::MAX - 1
+            (-2, 2),            // u64::MAX - 1 + 2 → 0
+            (0, -1),            // 0 + -1 → u64::MAX (sign-extend)
+            (131071, 131071),   // +max18 + +max18 (no wrap)
+            (-131072, -131072), // -max18 + -max18 (wraps into u64 top)
+            (0, 0),             // no-op
+            (1, -1),            // 1 + -1 → 0
+            (-131072, 131071),  // -min18 + max18 → -1 → u64::MAX
+        ] {
+            let code = bytecode(&[
+                instr_ri(Opcode::Addi, 1, 0, imm1),
+                instr_ri(Opcode::Addi, 2, 1, imm2),
+                instr_bytes(Opcode::Halt, 0, 0, 0),
+            ]);
+            compare_with_interpreter(&code, 0);
+        }
+    }
+
+    #[test]
     fn aot_add_two_numbers() {
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 10),
