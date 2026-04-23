@@ -1170,8 +1170,14 @@ impl PydeApiServer for RpcServer {
                     Ok(header) => {
                         // Use try_send to avoid blocking — if the WS buffer is full, skip this header.
                         // Block headers arrive every 400ms; missing one is acceptable.
-                        let msg = jsonrpsee::SubscriptionMessage::from_json(&header).unwrap();
-                        let _ = sink.try_send(msg);
+                        // The JSON serialization is infallible for `header` (a
+                        // `serde_json::Value` we constructed ourselves), but we
+                        // handle the Err arm explicitly instead of `.unwrap()`
+                        // so a tokio::spawn task can never panic on malformed
+                        // input. (MAINNET_PLAN 060.)
+                        if let Ok(msg) = jsonrpsee::SubscriptionMessage::from_json(&header) {
+                            let _ = sink.try_send(msg);
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(_) => break,
@@ -1189,11 +1195,14 @@ impl PydeApiServer for RpcServer {
         let mut rx = self.state.pending_tx_tx.subscribe();
         tokio::spawn(async move {
             while let Ok(tx_hash) = rx.recv().await {
-                if sink
-                    .send(jsonrpsee::SubscriptionMessage::from_json(&tx_hash).unwrap())
-                    .await
-                    .is_err()
-                {
+                // MAINNET_PLAN 060: graceful Err arm instead of `.unwrap()` so
+                // a malformed tx_hash (unreachable for our code paths) can't
+                // panic the spawned task.
+                let msg = match jsonrpsee::SubscriptionMessage::from_json(&tx_hash) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if sink.send(msg).await.is_err() {
                     break;
                 }
             }
@@ -1225,11 +1234,14 @@ impl PydeApiServer for RpcServer {
                                 continue;
                             }
                         }
-                        if sink
-                            .send(jsonrpsee::SubscriptionMessage::from_json(&log).unwrap())
-                            .await
-                            .is_err()
-                        {
+                        // MAINNET_PLAN 060: graceful Err arm instead of
+                        // `.unwrap()` so a malformed log (unreachable for our
+                        // code paths) can't panic the spawned task.
+                        let msg = match jsonrpsee::SubscriptionMessage::from_json(&log) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        if sink.send(msg).await.is_err() {
                             break;
                         }
                     }
