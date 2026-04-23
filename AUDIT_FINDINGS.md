@@ -114,15 +114,24 @@
       a VSS commitment layer (see Deferred section of
       `MAINNET_PLAN.md`).
 
-- [ ] 204 — `✓` **Wire-decoder unbounded `Vec::with_capacity`.**
-      `crates/node/src/wire.rs:256-260, 361-370, 591-598, 760-764`
-      decode u16/u32 length fields straight into
-      `Vec::with_capacity` before validating. Gossipsub frame caps
-      (64 KB consensus / 128 KB tx) mitigate worst case, but nested
-      lists inside a legal frame can still force large allocations.
-      Fix: per-field constants (`MAX_VOTES`, `MAX_SIGS`,
-      `MAX_ACCESS`, `MAX_TIMEOUTS`) enforced after decode, before
-      any allocation.
+- [x] 204 — `✓` **Wire-decoder unbounded `Vec::with_capacity`.**
+      Audit called out 4 sites; full sweep found 18. Shipped:
+      - `MAX_DECODE_ITEMS = 1_000_000` umbrella cap in
+        `crates/node/src/wire.rs`.
+      - New `Decoder::u16_count(max)` / `u32_count(max)` helpers
+        that reject any length field above `max` before it drives
+        `Vec::with_capacity`.
+      - All 18 call sites migrated: 13 use the umbrella cap, 3 use
+        `COMMITTEE_SIZE` (finality cert sigs, reshare committee
+        keys, decryption shares), 2 use `MAX_SIGNERS` (multisig
+        signatures).
+      - 5 new tests: `decoder_u16_count_rejects_over_max`,
+        `decoder_u32_count_rejects_over_max`,
+        `decoder_count_at_max_is_accepted`,
+        `compact_block_rejects_huge_short_id_count`,
+        `decryption_shares_rejects_over_committee`.
+      Line 891 left alone: index value pushed inside an already-
+      bounded loop, not a count driving allocation.
 
 - [ ] 205 — `⚠` **Persist double-vote evidence on detection.**
       `crates/node/src/validator.rs:1443-1449` — the equivocation

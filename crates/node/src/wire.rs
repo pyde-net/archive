@@ -7,11 +7,21 @@
 //! for Pyde's P2P protocol and optimized for fast encode/decode.
 
 use pyde_account::address::Address;
-use pyde_consensus::block::{Block, BlockBody, BlockHeader, QuorumCert};
+use pyde_consensus::block::{Block, BlockBody, BlockHeader, QuorumCert, COMMITTEE_SIZE};
 use pyde_consensus::hotstuff::ConsensusMessage;
 use pyde_consensus::slashing::DoubleSignEvidence;
+use pyde_tx::multisig::MAX_SIGNERS;
 use pyde_tx::parallel::ExecutionSchedule;
 use pyde_tx::types::{AccessEntry, FeePayer, Transaction, TransactionType};
+
+/// Umbrella cap on any length field decoded from an untrusted wire
+/// message before `Vec::with_capacity` is called with it. Prevents a
+/// peer from forcing huge preallocations by stuffing a giant u32/u16
+/// count into a well-formed frame. 1M items is well above any
+/// legitimate protocol structure; sites with a tighter semantic
+/// bound (committee size, multisig signer set, etc.) pass that
+/// instead via `u16_count` / `u32_count`.
+const MAX_DECODE_ITEMS: usize = 1_000_000;
 
 /// Message type tags for wire encoding.
 pub mod tag {
@@ -253,7 +263,7 @@ pub fn decode_finality_checkpoint(
     let mut bitmap_bytes = [0u8; 16];
     bitmap_bytes.copy_from_slice(dec.raw(16)?);
     let voter_bitmap = u128::from_le_bytes(bitmap_bytes);
-    let sig_count = dec.u32()? as usize;
+    let sig_count = dec.u32_count(COMMITTEE_SIZE)?;
     let mut signatures = Vec::with_capacity(sig_count);
     for _ in 0..sig_count {
         signatures.push(dec.var_bytes()?);
@@ -339,7 +349,7 @@ pub fn decode_reshare_state(data: &[u8]) -> Result<ReshareState, &'static str> {
     } else {
         None
     };
-    let count = dec.u32()? as usize;
+    let count = dec.u32_count(COMMITTEE_SIZE)?;
     let mut new_committee_keys = Vec::with_capacity(count);
     for _ in 0..count {
         new_committee_keys.push(dec.var_bytes()?);
@@ -388,7 +398,7 @@ pub fn decode_compact_block(
     }
     let header = dec.var_bytes()?;
     let nonce = dec.u64()?;
-    let sid_count = dec.u32()? as usize;
+    let sid_count = dec.u32_count(MAX_DECODE_ITEMS)?;
     let mut short_tx_ids = Vec::with_capacity(sid_count);
     for _ in 0..sid_count {
         let mut sid = [0u8; pyde_net::propagation::SHORT_ID_LEN];
@@ -396,7 +406,7 @@ pub fn decode_compact_block(
         sid.copy_from_slice(raw);
         short_tx_ids.push(sid);
     }
-    let prefill_count = dec.u16()? as usize;
+    let prefill_count = dec.u16_count(MAX_DECODE_ITEMS)?;
     let mut prefilled_txs = Vec::with_capacity(prefill_count);
     for _ in 0..prefill_count {
         let idx = dec.u16()?;
@@ -458,7 +468,7 @@ pub fn decode_decryption_shares(data: &[u8]) -> Result<DecryptionShareMsg, &'sta
     }
     let slot = dec.u64()?;
     let member_index = dec.u8()?;
-    let count = dec.u16()? as usize;
+    let count = dec.u16_count(COMMITTEE_SIZE)?;
     let mut shares = Vec::with_capacity(count);
     for _ in 0..count {
         shares.push(dec.var_bytes()?);
@@ -558,6 +568,26 @@ impl<'a> Decoder<'a> {
         Ok(u32::from_le_bytes(buf))
     }
 
+    /// Read a `u16` length field and cap it at `max` before it drives
+    /// any `Vec::with_capacity`. See `MAX_DECODE_ITEMS` for rationale.
+    fn u16_count(&mut self, max: usize) -> Result<usize, &'static str> {
+        let n = self.u16()? as usize;
+        if n > max {
+            return Err("decoded count exceeds max");
+        }
+        Ok(n)
+    }
+
+    /// Read a `u32` length field and cap it at `max` before it drives
+    /// any `Vec::with_capacity`. See `MAX_DECODE_ITEMS` for rationale.
+    fn u32_count(&mut self, max: usize) -> Result<usize, &'static str> {
+        let n = self.u32()? as usize;
+        if n > max {
+            return Err("decoded count exceeds max");
+        }
+        Ok(n)
+    }
+
     fn u64(&mut self) -> Result<u64, &'static str> {
         if self.remaining() < 8 {
             return Err("unexpected end of data");
@@ -626,7 +656,7 @@ fn decode_qc(dec: &mut Decoder) -> Result<QuorumCert, &'static str> {
     let slot = dec.u64()?;
     let block_hash = dec.bytes32()?;
     let voter_bitmap = dec.u128()?;
-    let sig_count = dec.u16()? as usize;
+    let sig_count = dec.u16_count(MAX_SIGNERS as usize)?;
     let mut signatures = Vec::with_capacity(sig_count);
     for _ in 0..sig_count {
         signatures.push(dec.var_bytes()?);
@@ -690,12 +720,12 @@ fn encode_access_entry(enc: &mut Encoder, entry: &AccessEntry) {
 
 fn decode_access_entry(dec: &mut Decoder) -> Result<AccessEntry, &'static str> {
     let address = dec.bytes32()?;
-    let read_count = dec.u16()? as usize;
+    let read_count = dec.u16_count(MAX_DECODE_ITEMS)?;
     let mut reads = Vec::with_capacity(read_count);
     for _ in 0..read_count {
         reads.push(dec.bytes32()?);
     }
-    let write_count = dec.u16()? as usize;
+    let write_count = dec.u16_count(MAX_DECODE_ITEMS)?;
     let mut writes = Vec::with_capacity(write_count);
     for _ in 0..write_count {
         writes.push(dec.bytes32()?);
@@ -757,7 +787,7 @@ pub fn decode_transaction(data: &[u8]) -> Result<Transaction, &'static str> {
         2 => FeePayer::Paymaster(dec.bytes32()?),
         _ => return Err("invalid fee_payer tag"),
     };
-    let access_count = dec.u16()? as usize;
+    let access_count = dec.u16_count(MAX_DECODE_ITEMS)?;
     let mut access_list = Vec::with_capacity(access_count);
     for _ in 0..access_count {
         access_list.push(decode_access_entry(&mut dec)?);
@@ -831,7 +861,7 @@ pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
     // Proposer signature
     let proposer_signature = dec.var_bytes()?;
     // Transactions
-    let tx_count = dec.u32()? as usize;
+    let tx_count = dec.u32_count(MAX_DECODE_ITEMS)?;
     let mut transactions = Vec::with_capacity(tx_count);
     for _ in 0..tx_count {
         let tx_bytes = dec.var_bytes()?;
@@ -839,7 +869,7 @@ pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
     }
     // Encrypted transactions
     let enc_count = if dec.remaining() >= 4 {
-        dec.u32()? as usize
+        dec.u32_count(MAX_DECODE_ITEMS)?
     } else {
         0
     };
@@ -849,13 +879,13 @@ pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
     }
     // Execution schedule
     let group_count = if dec.remaining() >= 2 {
-        dec.u16()? as usize
+        dec.u16_count(MAX_DECODE_ITEMS)?
     } else {
         0
     };
     let mut groups = Vec::with_capacity(group_count);
     for _ in 0..group_count {
-        let idx_count = dec.u16()? as usize;
+        let idx_count = dec.u16_count(MAX_DECODE_ITEMS)?;
         let mut tx_indices = Vec::with_capacity(idx_count);
         for _ in 0..idx_count {
             tx_indices.push(dec.u32()? as usize);
@@ -1025,14 +1055,14 @@ pub fn decode_consensus_state(
     let last_committed_hash = dec.bytes32()?;
     let last_committed_slot = dec.u64()?;
 
-    let votes_count = dec.u16()? as usize;
+    let votes_count = dec.u16_count(MAX_DECODE_ITEMS)?;
     let mut pending_votes = Vec::with_capacity(votes_count);
     for _ in 0..votes_count {
         let msg_bytes = dec.var_bytes()?;
         pending_votes.push(decode_consensus_message(&msg_bytes)?);
     }
 
-    let timeouts_count = dec.u16()? as usize;
+    let timeouts_count = dec.u16_count(MAX_DECODE_ITEMS)?;
     let mut pending_timeouts = Vec::with_capacity(timeouts_count);
     for _ in 0..timeouts_count {
         let msg_bytes = dec.var_bytes()?;
@@ -1178,17 +1208,17 @@ pub fn decode_evidence_state(data: &[u8]) -> Result<EvidenceState, &'static str>
     if version != EVIDENCE_STATE_VERSION {
         return Err("unsupported evidence state version");
     }
-    let pending_count = dec.u16()? as usize;
+    let pending_count = dec.u16_count(MAX_DECODE_ITEMS)?;
     let mut pending = Vec::with_capacity(pending_count);
     for _ in 0..pending_count {
         pending.push(decode_double_sign_evidence(&dec.var_bytes()?)?);
     }
-    let broadcast_count = dec.u16()? as usize;
+    let broadcast_count = dec.u16_count(MAX_DECODE_ITEMS)?;
     let mut broadcast = Vec::with_capacity(broadcast_count);
     for _ in 0..broadcast_count {
         broadcast.push(decode_double_sign_evidence(&dec.var_bytes()?)?);
     }
-    let seen_count = dec.u32()? as usize;
+    let seen_count = dec.u32_count(MAX_DECODE_ITEMS)?;
     let mut seen = Vec::with_capacity(seen_count);
     for _ in 0..seen_count {
         let slot = dec.u64()?;
@@ -1644,5 +1674,59 @@ mod tests {
         let mut bytes = encode_evidence_state(&EvidenceState::default());
         bytes[0] = 0xFF;
         assert!(decode_evidence_state(&bytes).is_err());
+    }
+
+    // ========== Decoder count-bound guards ==========
+
+    #[test]
+    fn decoder_u32_count_rejects_over_max() {
+        let bytes = (MAX_DECODE_ITEMS as u32 + 1).to_le_bytes();
+        let mut dec = Decoder::new(&bytes);
+        assert_eq!(
+            dec.u32_count(MAX_DECODE_ITEMS),
+            Err("decoded count exceeds max")
+        );
+    }
+
+    #[test]
+    fn decoder_u16_count_rejects_over_max() {
+        let bytes = (COMMITTEE_SIZE as u16 + 1).to_le_bytes();
+        let mut dec = Decoder::new(&bytes);
+        assert_eq!(
+            dec.u16_count(COMMITTEE_SIZE),
+            Err("decoded count exceeds max")
+        );
+    }
+
+    #[test]
+    fn decoder_count_at_max_is_accepted() {
+        // Boundary: exactly max passes, one-over fails (exercised above).
+        let bytes = (MAX_DECODE_ITEMS as u32).to_le_bytes();
+        let mut dec = Decoder::new(&bytes);
+        assert_eq!(dec.u32_count(MAX_DECODE_ITEMS), Ok(MAX_DECODE_ITEMS));
+    }
+
+    #[test]
+    fn compact_block_rejects_huge_short_id_count() {
+        // Construct a compact-block frame by hand with sid_count set to
+        // MAX_DECODE_ITEMS + 1, proving the cap is wired through.
+        let mut bytes = vec![tag::COMPACT_BLOCK];
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // var_bytes(header) len = 0
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
+        bytes.extend_from_slice(&((MAX_DECODE_ITEMS as u32) + 1).to_le_bytes());
+        let result = decode_compact_block(&bytes);
+        assert_eq!(result.err(), Some("decoded count exceeds max"));
+    }
+
+    #[test]
+    fn decryption_shares_rejects_over_committee() {
+        // DecryptionShareMsg caps `shares` at COMMITTEE_SIZE. Hand-
+        // construct a frame with count = COMMITTEE_SIZE + 1.
+        let mut bytes = vec![tag::DECRYPTION_SHARES];
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // slot
+        bytes.push(0u8); // member_index
+        bytes.extend_from_slice(&((COMMITTEE_SIZE as u16) + 1).to_le_bytes());
+        let result = decode_decryption_shares(&bytes);
+        assert_eq!(result.err(), Some("decoded count exceeds max"));
     }
 }
