@@ -24,6 +24,9 @@ members = [
     "crates/pyde-rust-sdk",
     "crates/pyde-crypto-wasm",
 ]
+# cargo-fuzz needs nightly + libfuzzer-sys + `-Cinstrument-coverage`.
+# Keep it out of the stable workspace build (task 053, MAINNET_PLAN).
+exclude = ["fuzz"]
 
 # Workspace-wide clippy lint configuration (slice 5.5).
 #
