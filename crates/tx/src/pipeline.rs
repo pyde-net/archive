@@ -684,6 +684,12 @@ fn execute_in_pvm(
         unsafe { std::mem::transmute::<&dyn pyde_state::smt::StateAccess, [usize; 2]>(smt) };
     vm.storage_backend = Some(std::sync::Arc::new(move |key: &U256| {
         let smt_key = H256::from(key.to_le_bytes());
+        // SAFETY: reverse of the transmute above. `smt` (the source of
+        // `smt_vtable`) outlives every invocation of this closure —
+        // `execute_in_pvm` borrows `smt` mutably for the full PVM run
+        // and the closure is dropped before the borrow ends. The
+        // fat-pointer layout `[usize; 2]` is stable for the whole
+        // program (compile-time vtable).
         let smt_ref: &dyn pyde_state::smt::StateAccess = unsafe {
             std::mem::transmute::<[usize; 2], &dyn pyde_state::smt::StateAccess>(smt_vtable)
         };
@@ -695,6 +701,9 @@ fn execute_in_pvm(
     vm.code_backend = Some(std::sync::Arc::new(
         move |addr: &pyde_account::address::Address| {
             let code_key = pyde_state::keys::code_key(addr);
+            // SAFETY: same invariant as the storage_backend closure —
+            // `smt` outlives this closure for the duration of
+            // `execute_in_pvm`.
             let smt_ref: &dyn pyde_state::smt::StateAccess = unsafe {
                 std::mem::transmute::<[usize; 2], &dyn pyde_state::smt::StateAccess>(smt_vtable2)
             };
@@ -712,6 +721,15 @@ fn execute_in_pvm(
         let regs_ptr = vm.cpu.gp.as_mut_ptr();
         let saved_storage = vm.storage.clone();
         let saved_logs = vm.logs.clone();
+        // SAFETY: `func` is an `unsafe fn(*mut u64, u64, *mut Vm) ->
+        // u64` pointer produced by `pyde_aot::compile_bytecode` via
+        // Cranelift. The ABI is fixed; the three arguments match the
+        // JIT's entry-block parameter list (`aot/src/codegen.rs`).
+        // `regs_ptr` is a live pointer into `vm.cpu.gp` (which we own
+        // exclusively inside `execute_in_pvm`). `&mut vm as *mut _`
+        // is valid for the entire call. The AOT code only dereferences
+        // through the same host_* callbacks that carry their own
+        // SAFETY commentary (see `pyde-aot/src/host.rs`).
         let raw = unsafe { func(regs_ptr, tx.gas_limit, &mut vm as *mut _) };
         let (status, gas) = pyde_aot::decode_result(raw);
         if status == pyde_aot::RESULT_SUCCESS {

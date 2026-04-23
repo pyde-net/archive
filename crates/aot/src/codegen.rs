@@ -42,6 +42,15 @@ pub struct CompiledCode {
     pub instruction_count: usize,
 }
 
+// SAFETY: `CompiledCode` owns an immutable `*const u8` pointer into
+// a `JITModule`-managed memory region (`_module`). The region lives as
+// long as `_module` does, and `JITModule` itself is `Send + Sync` in
+// its relevant operations. The pointer is only ever dereferenced through
+// the fn-pointer transmutes below, which do not themselves mutate the
+// struct. Treating `CompiledCode` as shareable across threads is sound
+// as long as callers don't invoke `as_fn`/`as_fn_no_ctx` with aliasing
+// mutable state — the AOT host ABI takes `*mut u64` / `*mut VmCtx` per
+// call site, so each caller provides its own scratch registers and VM.
 unsafe impl Send for CompiledCode {}
 unsafe impl Sync for CompiledCode {}
 
@@ -55,11 +64,20 @@ impl CompiledCode {
     ///
     /// Returns: `(gas_used << 2) | status`
     pub fn as_fn(&self) -> unsafe fn(*mut u64, u64, *mut host::VmCtx) -> u64 {
+        // SAFETY: `code_ptr` points at the entry block emitted by
+        // Cranelift's `compile(...)` in this module. The entry block's
+        // ABI (three params, u64 return) is fixed by
+        // `finalize_function_signature` / `entry_block`; matches this
+        // function-pointer type. Memory is kept alive by `_module`.
         unsafe { std::mem::transmute(self.code_ptr) }
     }
 
     /// Convenience: run without VM context (ALU-only programs).
     pub fn as_fn_no_ctx(&self) -> unsafe fn(*mut u64, u64) -> u64 {
+        // SAFETY: same region as `as_fn`. Callers pass `null` / unused
+        // `VmCtx` so the 2-argument signature works via argument
+        // truncation on every supported ABI. Only legitimate for
+        // ALU-only programs per the doc comment.
         unsafe { std::mem::transmute(self.code_ptr) }
     }
 }
