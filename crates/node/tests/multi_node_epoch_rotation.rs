@@ -63,7 +63,8 @@ fn epoch_rotation_crosses_boundary() {
         .unwrap_or_else(|e| panic!("epoch of slot {}: {}", EPOCH_LENGTH - 1, e))
         .unwrap_or_else(|| panic!("node-0 missing block at slot {}", EPOCH_LENGTH - 1));
     assert_eq!(
-        e0, 0,
+        e0,
+        0,
         "slot {} should be epoch 0, got {}",
         EPOCH_LENGTH - 1,
         e0
@@ -74,11 +75,7 @@ fn epoch_rotation_crosses_boundary() {
         .epoch_of(0, EPOCH_LENGTH)
         .unwrap_or_else(|e| panic!("epoch of slot {}: {}", EPOCH_LENGTH, e))
         .unwrap_or_else(|| panic!("node-0 missing block at slot {}", EPOCH_LENGTH));
-    assert_eq!(
-        e1, 1,
-        "slot {} should be epoch 1, got {}",
-        EPOCH_LENGTH, e1
-    );
+    assert_eq!(e1, 1, "slot {} should be epoch 1, got {}", EPOCH_LENGTH, e1);
 
     // Block at slot target_slot (deep in epoch 1) matches too.
     let e_deep = net
@@ -116,7 +113,11 @@ fn epoch_rotation_crosses_boundary() {
         rotated_count,
         net.nodes.len()
     );
-    eprintln!("rotation log observed on {}/{} nodes", rotated_count, net.nodes.len());
+    eprintln!(
+        "rotation log observed on {}/{} nodes",
+        rotated_count,
+        net.nodes.len()
+    );
 }
 
 fn per_node_dump(net: &TestNetwork) -> String {

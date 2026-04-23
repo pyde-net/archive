@@ -19,8 +19,7 @@ use std::time::{Duration, Instant};
 #[test]
 #[ignore = "multi-node — subprocess-based, run via --ignored"]
 fn two_of_seven_offline_keeps_chain_live() {
-    let mut net = TestNetwork::spawn(7, true)
-        .unwrap_or_else(|e| panic!("spawn 7v: {}", e));
+    let mut net = TestNetwork::spawn(7, true).unwrap_or_else(|e| panic!("spawn 7v: {}", e));
 
     // Warm up to a healthy depth. 90s accommodates the contended-host
     // case where multiple multi-node binaries run in parallel.
@@ -40,8 +39,8 @@ fn two_of_seven_offline_keeps_chain_live() {
     let killed_addrs: Vec<[u8; 32]> = killed_indices.iter().map(|&i| funded[i]).collect();
     let survivors: Vec<usize> = (2..7).collect();
 
-    let kill_slot = min_slot_over(&net, &survivors)
-        .unwrap_or_else(|e| panic!("snapshot slot: {}", e));
+    let kill_slot =
+        min_slot_over(&net, &survivors).unwrap_or_else(|e| panic!("snapshot slot: {}", e));
     eprintln!(
         "killing {:?} at slot {} (survivors: {:?})",
         killed_indices, kill_slot, survivors
@@ -55,11 +54,12 @@ fn two_of_seven_offline_keeps_chain_live() {
     // live validators and quorum = 5, this is tight: every live
     // validator MUST vote on every slot. 90s is plenty.
     let target_slot = kill_slot + 10;
-    wait_for_slot_on_nodes(&net, &survivors, target_slot, Duration::from_secs(90))
-        .unwrap_or_else(|e| {
+    wait_for_slot_on_nodes(&net, &survivors, target_slot, Duration::from_secs(90)).unwrap_or_else(
+        |e| {
             let dumps = per_node_dump(&net);
             panic!("{}\n{}", e, dumps);
-        });
+        },
+    );
 
     // State roots must agree among the 5 survivors.
     let mut roots: Vec<(usize, String)> = Vec::new();
@@ -89,7 +89,8 @@ fn two_of_seven_offline_keeps_chain_live() {
                 inspected += 1;
                 for (idx, killed) in killed_indices.iter().zip(killed_addrs.iter()) {
                     assert_ne!(
-                        &p, killed,
+                        &p,
+                        killed,
                         "slot {} proposer is killed node-{} (0x{})",
                         slot,
                         idx,
@@ -119,7 +120,10 @@ fn min_slot_over(net: &TestNetwork, indices: &[usize]) -> Result<u64, String> {
         .filter(|(i, _)| indices.contains(i))
         .map(|(_, s)| s.ok_or_else(|| "missing slot on a node".to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    slots.into_iter().min().ok_or_else(|| "empty indices".into())
+    slots
+        .into_iter()
+        .min()
+        .ok_or_else(|| "empty indices".into())
 }
 
 fn wait_for_slot_on_nodes(

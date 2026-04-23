@@ -61,8 +61,7 @@ pub struct RpcState {
     /// (block builder, gossip handler, fast_tx ingress) don't have
     /// to change. Drift is tolerated — an entry missing from one map
     /// is just skipped by the eviction loop, not a correctness bug.
-    pub pending_tx_times:
-        Arc<RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
+    pub pending_tx_times: Arc<RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
     /// Committee threshold public key for encrypting transactions (MEV protection).
     pub threshold_pk: Option<pyde_crypto::threshold::ThresholdPublicKey>,
     /// Broadcast channel for new block headers (WebSocket subscriptions).
@@ -1325,12 +1324,11 @@ async fn ingress_validate(
             ValidationError::InvalidNonce(_) => -32002,
             ValidationError::InsufficientBalance { .. } => -32003,
             ValidationError::WrongChainId { .. } => -32004,
-            ValidationError::GasLimitTooLow { .. }
-            | ValidationError::GasLimitTooHigh { .. } => -32005,
-            ValidationError::DeadlineExpired { .. } => -32006,
-            ValidationError::TxTooLarge { .. } | ValidationError::CalldataTooLarge { .. } => {
-                -32007
+            ValidationError::GasLimitTooLow { .. } | ValidationError::GasLimitTooHigh { .. } => {
+                -32005
             }
+            ValidationError::DeadlineExpired { .. } => -32006,
+            ValidationError::TxTooLarge { .. } | ValidationError::CalldataTooLarge { .. } => -32007,
             ValidationError::InvalidAccessList(_) => -32008,
             _ => -32000,
         };

@@ -97,12 +97,15 @@ impl TestNetwork {
 
     /// Spawn V validators + F full nodes. Full nodes bootstrap to every
     /// validator and relay txs but don't participate in consensus.
-    pub fn spawn_mixed(
-        validators: usize,
-        full_nodes: usize,
-        dev: bool,
-    ) -> Result<Self, String> {
-        Self::spawn_mixed_inner(validators, full_nodes, 0, dev, Self::DEFAULT_BLOCK_TIME_MS, None)
+    pub fn spawn_mixed(validators: usize, full_nodes: usize, dev: bool) -> Result<Self, String> {
+        Self::spawn_mixed_inner(
+            validators,
+            full_nodes,
+            0,
+            dev,
+            Self::DEFAULT_BLOCK_TIME_MS,
+            None,
+        )
     }
 
     /// Same as `spawn_mixed`, but the last `deferred` full nodes have
@@ -189,8 +192,8 @@ impl TestNetwork {
 
         let tempdir = tempfile::tempdir().map_err(|e| format!("create tempdir: {}", e))?;
         let net_dir = tempdir.path().join("net");
-        let chain_id = chain_id_override
-            .unwrap_or_else(|| if dev { 31337 } else { rand_chain_id() });
+        let chain_id =
+            chain_id_override.unwrap_or_else(|| if dev { 31337 } else { rand_chain_id() });
         let pyde_bin = pyde_binary_path();
 
         // Find contiguous free port ranges for p2p (UDP — used by QUIC)
@@ -251,7 +254,13 @@ impl TestNetwork {
                 start_node(&mut n, &pyde_bin, dev)?;
             } else {
                 // Keep them reserved until start_deferred() is called.
-                deferred_port_holders.insert(i, DeferredPortHolder { _udp: udp, _tcp: tcp });
+                deferred_port_holders.insert(
+                    i,
+                    DeferredPortHolder {
+                        _udp: udp,
+                        _tcp: tcp,
+                    },
+                );
             }
             nodes.push(n);
         }
@@ -372,10 +381,7 @@ impl TestNetwork {
             .ok_or_else(|| format!("no epoch field in response: {}", resp))?
             + key.len();
         let tail = &resp[start..];
-        let end = tail
-            .bytes()
-            .take_while(|b| b.is_ascii_digit())
-            .count();
+        let end = tail.bytes().take_while(|b| b.is_ascii_digit()).count();
         if end == 0 {
             return Err(format!("couldn't parse epoch from {}", tail));
         }
@@ -388,11 +394,7 @@ impl TestNetwork {
     /// Read the proposer address for a block at `slot` from `node_idx`'s
     /// `pyde_getBlockByNumber`. Returns `Ok(None)` if the node has not
     /// committed that slot yet (gap or pre-produced).
-    pub fn proposer_of(
-        &self,
-        node_idx: usize,
-        slot: u64,
-    ) -> Result<Option<[u8; 32]>, String> {
+    pub fn proposer_of(&self, node_idx: usize, slot: u64) -> Result<Option<[u8; 32]>, String> {
         let params = format!("[{}]", slot);
         let resp = rpc_call(
             &self.nodes[node_idx].rpc_url(),
@@ -405,17 +407,22 @@ impl TestNetwork {
         // Response has `"proposer":"0x<64 hex>"`. Extract it.
         let key = r#""proposer":"0x"#;
         let start = resp.find(key).ok_or_else(|| {
-            format!("no proposer in getBlockByNumber({}) response: {}", slot, resp)
+            format!(
+                "no proposer in getBlockByNumber({}) response: {}",
+                slot, resp
+            )
         })?;
         let tail = &resp[start + key.len()..];
         let end = tail
             .find('"')
             .ok_or_else(|| format!("unterminated proposer: {}", resp))?;
         let hex = &tail[..end];
-        let bytes = hex::decode(hex)
-            .map_err(|e| format!("decode proposer {}: {}", hex, e))?;
+        let bytes = hex::decode(hex).map_err(|e| format!("decode proposer {}: {}", hex, e))?;
         if bytes.len() != 32 {
-            return Err(format!("proposer address is {} bytes, expected 32", bytes.len()));
+            return Err(format!(
+                "proposer address is {} bytes, expected 32",
+                bytes.len()
+            ));
         }
         let mut addr = [0u8; 32];
         addr.copy_from_slice(&bytes);
@@ -514,11 +521,7 @@ impl TestNetwork {
     /// The tx must be wire-encoded via `Transaction::to_bytes()` and
     /// correctly signed by the FALCON key installed as `AuthKeys::Single`
     /// for its `from` address. Returns the submitted tx hash.
-    pub fn submit_raw_tx(
-        &self,
-        node_idx: usize,
-        tx_bytes: &[u8],
-    ) -> Result<String, String> {
+    pub fn submit_raw_tx(&self, node_idx: usize, tx_bytes: &[u8]) -> Result<String, String> {
         let hex = hex::encode(tx_bytes);
         let params = format!(r#"["0x{}"]"#, hex);
         let resp = rpc_call(
@@ -540,11 +543,7 @@ impl TestNetwork {
     /// hex string WITHOUT the `0x` prefix; empty string if no code.
     pub fn get_code(&self, node_idx: usize, address: &[u8; 32]) -> Result<String, String> {
         let params = format!(r#"["0x{}"]"#, hex::encode(address));
-        let resp = rpc_call(
-            &self.nodes[node_idx].rpc_url(),
-            "pyde_getCode",
-            &params,
-        )?;
+        let resp = rpc_call(&self.nodes[node_idx].rpc_url(), "pyde_getCode", &params)?;
         let hex = parse_hex_result(&resp)?;
         Ok(hex.trim_start_matches("0x").to_string())
     }
@@ -564,11 +563,7 @@ impl TestNetwork {
             hex::encode(to),
             hex::encode(calldata),
         );
-        let resp = rpc_call(
-            &self.nodes[node_idx].rpc_url(),
-            "pyde_call",
-            &params,
-        )?;
+        let resp = rpc_call(&self.nodes[node_idx].rpc_url(), "pyde_call", &params)?;
         let hex = parse_hex_result(&resp)?;
         Ok(hex.trim_start_matches("0x").to_string())
     }
@@ -593,13 +588,9 @@ impl TestNetwork {
     /// Read a validator's FALCON keypair from its datadir. Layout is
     /// the one `generate_testnet` writes: `pk_len u32 LE || pk || sk`.
     /// Returns `(pk_bytes, sk_bytes)`.
-    pub fn load_validator_key(
-        &self,
-        node_idx: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+    pub fn load_validator_key(&self, node_idx: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
         let path = self.nodes[node_idx].datadir.join("validator.key");
-        let raw = std::fs::read(&path)
-            .map_err(|e| format!("read {}: {}", path.display(), e))?;
+        let raw = std::fs::read(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
         if raw.len() < 4 {
             return Err(format!("validator.key too short: {}", raw.len()));
         }
@@ -623,11 +614,7 @@ impl TestNetwork {
         &self,
         node_idx: usize,
     ) -> Result<Vec<(String, u128, String)>, String> {
-        let resp = rpc_call(
-            &self.nodes[node_idx].rpc_url(),
-            "pyde_getValidators",
-            "[]",
-        )?;
+        let resp = rpc_call(&self.nodes[node_idx].rpc_url(), "pyde_getValidators", "[]")?;
         parse_validator_set(&resp)
     }
 
@@ -780,11 +767,7 @@ impl TestNetwork {
     /// Balance in quanta. Returns `0` if the account is unknown.
     pub fn get_balance(&self, node_idx: usize, address: &[u8; 32]) -> Result<u128, String> {
         let params = format!(r#"["0x{}"]"#, hex::encode(address));
-        let resp = rpc_call(
-            &self.nodes[node_idx].rpc_url(),
-            "pyde_getBalance",
-            &params,
-        )?;
+        let resp = rpc_call(&self.nodes[node_idx].rpc_url(), "pyde_getBalance", &params)?;
         // `pyde_getBalance` returns the balance as a decimal string
         // (see `balance.to_string()` in `rpc.rs::get_balance`). Not
         // hex, despite the `0x`-ish feel of the sibling RPCs.
@@ -816,8 +799,8 @@ impl TestNetwork {
         let success = extract_bool_field(body, "status")
             .or_else(|| extract_bool_field(body, "success"))
             .unwrap_or(false);
-        let block_slot = extract_u64_field(body, "blockNumber")
-            .or_else(|| extract_u64_field(body, "slot"));
+        let block_slot =
+            extract_u64_field(body, "blockNumber").or_else(|| extract_u64_field(body, "slot"));
         Ok(Some(ReceiptView {
             raw: body.to_string(),
             success,
@@ -1122,12 +1105,16 @@ fn parse_validator_set(resp: &str) -> Result<Vec<(String, u128, String)>, String
             .find(key_stake)
             .ok_or("no stake field after address")?;
         let stake_start = after_addr + stake_start_rel + key_stake.len();
-        let stake_end_rel = resp[stake_start..]
-            .find('"')
-            .ok_or("unterminated stake")?;
+        let stake_end_rel = resp[stake_start..].find('"').ok_or("unterminated stake")?;
         let stake: u128 = resp[stake_start..stake_start + stake_end_rel]
             .parse()
-            .map_err(|e| format!("parse stake {}: {}", &resp[stake_start..stake_start + stake_end_rel], e))?;
+            .map_err(|e| {
+                format!(
+                    "parse stake {}: {}",
+                    &resp[stake_start..stake_start + stake_end_rel],
+                    e
+                )
+            })?;
 
         let after_stake = stake_start + stake_end_rel;
         let status_start_rel = resp[after_stake..]
@@ -1201,10 +1188,7 @@ fn extract_u64_field(body: &str, field: &str) -> Option<u64> {
         }
     } else {
         // Bare number — read until a non-digit.
-        let end = rest
-            .bytes()
-            .take_while(|b| b.is_ascii_digit())
-            .count();
+        let end = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
         rest[..end].parse().ok()
     }
 }

@@ -129,9 +129,11 @@ fn transfer_propagates_and_balances_match() {
     );
 
     assert_eq!(
-        post_recipient, pre_recipient + transfer_value,
+        post_recipient,
+        pre_recipient + transfer_value,
         "recipient should receive exactly transfer_value; pre {} post {}",
-        pre_recipient, post_recipient
+        pre_recipient,
+        post_recipient
     );
 }
 

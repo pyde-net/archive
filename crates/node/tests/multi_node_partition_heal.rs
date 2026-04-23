@@ -30,8 +30,7 @@ use std::time::{Duration, Instant};
 #[test]
 #[ignore = "multi-node — subprocess-based, run via --ignored"]
 fn partitioned_validator_heals_without_fork() {
-    let mut net = TestNetwork::spawn(4, true)
-        .unwrap_or_else(|e| panic!("spawn 4v: {}", e));
+    let mut net = TestNetwork::spawn(4, true).unwrap_or_else(|e| panic!("spawn 4v: {}", e));
 
     // Warm up: every node agrees on some history before we disrupt.
     net.wait_for_slot(20, Duration::from_secs(60))
@@ -62,8 +61,8 @@ fn partitioned_validator_heals_without_fork() {
 
     // Let the majority advance by at least 15 slots while node-3 is
     // gone, so the heal has something non-trivial to sync.
-    let kill_slot = min_slot_over(&net, &[0, 1, 2])
-        .unwrap_or_else(|e| panic!("snapshot slot: {}", e));
+    let kill_slot =
+        min_slot_over(&net, &[0, 1, 2]).unwrap_or_else(|e| panic!("snapshot slot: {}", e));
     let majority_target = kill_slot + 15;
     wait_for_slot_on_nodes(&net, &[0, 1, 2], majority_target, Duration::from_secs(60))
         .unwrap_or_else(|e| {
@@ -71,8 +70,8 @@ fn partitioned_validator_heals_without_fork() {
             panic!("majority progress: {}\n{}", e, dumps);
         });
 
-    let majority_head_at_heal = min_slot_over(&net, &[0, 1, 2])
-        .unwrap_or_else(|e| panic!("majority head: {}", e));
+    let majority_head_at_heal =
+        min_slot_over(&net, &[0, 1, 2]).unwrap_or_else(|e| panic!("majority head: {}", e));
     let majority_root_at_heal = net
         .state_root(0)
         .unwrap_or_else(|e| panic!("majority root: {}", e));
@@ -92,19 +91,15 @@ fn partitioned_validator_heals_without_fork() {
     // Wait for node-3 to catch up. The majority is still producing
     // blocks while node-3 syncs, so we target the head-at-heal slot,
     // not a higher moving target.
-    wait_for_node_to_reach(
-        &net,
-        3,
-        majority_head_at_heal,
-        Duration::from_secs(60),
-    )
-    .unwrap_or_else(|e| {
-        let dumps = per_node_dump(&net);
-        panic!("node-3 catch-up: {}\n{}", e, dumps);
-    });
+    wait_for_node_to_reach(&net, 3, majority_head_at_heal, Duration::from_secs(60)).unwrap_or_else(
+        |e| {
+            let dumps = per_node_dump(&net);
+            panic!("node-3 catch-up: {}\n{}", e, dumps);
+        },
+    );
 
-    let node3_head_after_heal = slot_of(&net, 3)
-        .unwrap_or_else(|e| panic!("node-3 post-heal head: {}", e));
+    let node3_head_after_heal =
+        slot_of(&net, 3).unwrap_or_else(|e| panic!("node-3 post-heal head: {}", e));
     eprintln!(
         "node-3 caught up to slot {} (majority-at-heal was {})",
         node3_head_after_heal, majority_head_at_heal
@@ -193,7 +188,10 @@ fn min_slot_over(net: &TestNetwork, indices: &[usize]) -> Result<u64, String> {
         .filter(|(i, _)| indices.contains(i))
         .map(|(_, s)| s.ok_or_else(|| "missing slot on a node".to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    slots.into_iter().min().ok_or_else(|| "empty indices".into())
+    slots
+        .into_iter()
+        .min()
+        .ok_or_else(|| "empty indices".into())
 }
 
 fn wait_for_slot_on_nodes(

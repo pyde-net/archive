@@ -24,9 +24,7 @@ pub async fn start_fast_tx_listener(
     listen: &str,
     port: u16,
     pending_txs: Arc<RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>>,
-    pending_tx_times: Arc<
-        RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>,
-    >,
+    pending_tx_times: Arc<RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
     tx_gossip_tx: tokio::sync::mpsc::Sender<pyde_tx::types::Transaction>,
 ) -> Result<std::net::SocketAddr, String> {
     let addr = format!("{}:{}", listen, port);
@@ -62,9 +60,7 @@ async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
     pending_txs: Arc<RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>>,
-    pending_tx_times: Arc<
-        RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>,
-    >,
+    pending_tx_times: Arc<RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
     tx_gossip_tx: tokio::sync::mpsc::Sender<pyde_tx::types::Transaction>,
 ) {
     let mut accepted = 0u64;
