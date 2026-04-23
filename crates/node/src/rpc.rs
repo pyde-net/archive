@@ -19,6 +19,15 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
+/// Maximum number of pending txs any single sender can have in the
+/// mempool (MAINNET_PLAN M1). Blocks one-account spam from filling a
+/// node's memory and starving honest traffic. Chosen well above the
+/// nonce-window size (16) so legitimate wallets doing batched
+/// replacements or fee bumps don't run into it in practice, but low
+/// enough that 100k mempool cap ÷ 128 = 782 distinct senders can still
+/// max out the mempool — matching typical pending-account counts.
+const MEMPOOL_SENDER_CAP: usize = 128;
+
 /// Shared node state accessible by RPC handlers.
 pub struct RpcState {
     pub chain: Arc<RwLock<ChainState>>,
@@ -32,6 +41,14 @@ pub struct RpcState {
     /// hotspot because every `retain` had to recompute a full tx
     /// hash for every entry in the mempool.
     pub pending_txs: Arc<RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>>,
+    /// Insertion timestamp for each tx in `pending_txs`, used for the
+    /// mempool TTL sweep (MAINNET_PLAN M2). Parallel to `pending_txs`
+    /// rather than inlined in its value type so existing call sites
+    /// (block builder, gossip handler, fast_tx ingress) don't have
+    /// to change. Drift is tolerated — an entry missing from one map
+    /// is just skipped by the eviction loop, not a correctness bug.
+    pub pending_tx_times:
+        Arc<RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
     /// Committee threshold public key for encrypting transactions (MEV protection).
     pub threshold_pk: Option<pyde_crypto::threshold::ThresholdPublicKey>,
     /// Broadcast channel for new block headers (WebSocket subscriptions).
@@ -116,6 +133,17 @@ pub trait PydeApi {
     /// Get a transaction receipt by tx hash.
     #[method(name = "pyde_getTransactionReceipt")]
     async fn get_transaction_receipt(
+        &self,
+        tx_hash: String,
+    ) -> Result<serde_json::Value, ErrorObjectOwned>;
+
+    /// Get a user-facing status for a tx: "not_found", "pending" (with
+    /// age), or "included" (with slot + success + gas). Complements
+    /// `getTransactionReceipt`, which only answers after commit —
+    /// this lets wallets show "still in mempool, submitted N seconds ago"
+    /// instead of "unknown". MAINNET_PLAN M4.
+    #[method(name = "pyde_getTransactionStatus")]
+    async fn get_transaction_status(
         &self,
         tx_hash: String,
     ) -> Result<serde_json::Value, ErrorObjectOwned>;
@@ -431,11 +459,28 @@ impl PydeApiServer for RpcServer {
         // Compute tx hash (must match tx.hash() used in receipt generation)
         let tx_hash = tx.hash();
 
-        // Add to pending tx queue and gossip to network
+        // Per-sender mempool cap (MAINNET_PLAN M1). Atomic with the
+        // insert under one write lock so the cap can't be raced by
+        // concurrent submissions.
         let mut pending = self.state.pending_txs.write().await;
+        let sender_count = pending.values().filter(|t| t.from == tx.from).count();
+        if sender_count >= MEMPOOL_SENDER_CAP {
+            return Err(rpc_err(
+                -32009,
+                format!(
+                    "mempool sender cap reached: {} pending txs from this sender (max {})",
+                    sender_count, MEMPOOL_SENDER_CAP
+                ),
+            ));
+        }
         pending.insert(tx_hash, tx.clone());
         let queue_size = pending.len();
         drop(pending);
+        self.state
+            .pending_tx_times
+            .write()
+            .await
+            .insert(tx_hash, std::time::Instant::now());
 
         // Gossip to P2P network so all nodes can include it
         let _ = self.state.tx_gossip_tx.send(tx).await;
@@ -472,9 +517,26 @@ impl PydeApiServer for RpcServer {
 
         let tx_hash = tx.hash();
 
+        // Per-sender mempool cap (MAINNET_PLAN M1). See send_transaction
+        // for rationale — atomic count+insert under one write lock.
         let mut pending = self.state.pending_txs.write().await;
+        let sender_count = pending.values().filter(|t| t.from == tx.from).count();
+        if sender_count >= MEMPOOL_SENDER_CAP {
+            return Err(rpc_err(
+                -32009,
+                format!(
+                    "mempool sender cap reached: {} pending txs from this sender (max {})",
+                    sender_count, MEMPOOL_SENDER_CAP
+                ),
+            ));
+        }
         pending.insert(tx_hash, tx.clone());
         drop(pending);
+        self.state
+            .pending_tx_times
+            .write()
+            .await
+            .insert(tx_hash, std::time::Instant::now());
 
         // Gossip to P2P network
         let _ = self.state.tx_gossip_tx.send(tx).await;
@@ -780,6 +842,42 @@ impl PydeApiServer for RpcServer {
             Some(receipt) => Ok(receipt_to_json(receipt)),
             None => Ok(serde_json::Value::Null),
         }
+    }
+
+    async fn get_transaction_status(
+        &self,
+        tx_hash: String,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        let hash = parse_hash(&tx_hash)?;
+
+        // 1. Committed? Return the receipt highlights.
+        if let Some(receipt) = self.state.receipts.read().await.get(&hash) {
+            return Ok(serde_json::json!({
+                "status": "included",
+                "success": receipt.success,
+                "gasUsed": format!("0x{:x}", receipt.gas_used),
+                "effectiveGas": format!("0x{:x}", receipt.effective_gas),
+            }));
+        }
+
+        // 2. Pending? Report age so wallets can render "X seconds ago".
+        if self.state.pending_txs.read().await.contains_key(&hash) {
+            let age_secs = self
+                .state
+                .pending_tx_times
+                .read()
+                .await
+                .get(&hash)
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+            return Ok(serde_json::json!({
+                "status": "pending",
+                "ageSecs": age_secs,
+            }));
+        }
+
+        // 3. Neither — never seen, or evicted by TTL sweep.
+        Ok(serde_json::json!({ "status": "not_found" }))
     }
 
     async fn get_logs(

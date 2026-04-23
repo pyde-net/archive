@@ -24,6 +24,9 @@ pub async fn start_fast_tx_listener(
     listen: &str,
     port: u16,
     pending_txs: Arc<RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>>,
+    pending_tx_times: Arc<
+        RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>,
+    >,
     tx_gossip_tx: tokio::sync::mpsc::Sender<pyde_tx::types::Transaction>,
 ) -> Result<std::net::SocketAddr, String> {
     let addr = format!("{}:{}", listen, port);
@@ -41,8 +44,9 @@ pub async fn start_fast_tx_listener(
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     let ptx = pending_txs.clone();
+                    let ptimes = pending_tx_times.clone();
                     let gtx = tx_gossip_tx.clone();
-                    tokio::spawn(handle_connection(stream, peer, ptx, gtx));
+                    tokio::spawn(handle_connection(stream, peer, ptx, ptimes, gtx));
                 }
                 Err(e) => {
                     warn!(error = %e, "fast_tx accept error");
@@ -58,6 +62,9 @@ async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
     pending_txs: Arc<RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>>,
+    pending_tx_times: Arc<
+        RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>,
+    >,
     tx_gossip_tx: tokio::sync::mpsc::Sender<pyde_tx::types::Transaction>,
 ) {
     let mut accepted = 0u64;
@@ -99,24 +106,35 @@ async fn handle_connection(
 
         // Flush batch every 128 txs or when no more data is immediately available
         if batch.len() >= 128 {
+            let now = std::time::Instant::now();
+            let hashes: Vec<[u8; 32]> = batch.iter().map(|tx| tx.hash()).collect();
             let mut pending = pending_txs.write().await;
             for tx in batch.drain(..) {
-                let h = tx.hash();
-                pending.insert(h, tx);
+                pending.insert(tx.hash(), tx);
             }
             drop(pending);
+            let mut times = pending_tx_times.write().await;
+            for h in &hashes {
+                times.insert(*h, now);
+            }
         }
     }
 
     // Flush remaining
     if !batch.is_empty() {
+        let now = std::time::Instant::now();
+        let hashes: Vec<[u8; 32]> = batch.iter().map(|tx| tx.hash()).collect();
         let mut pending = pending_txs.write().await;
         for tx in &batch {
             let _ = tx_gossip_tx.send(tx.clone()).await;
         }
         for tx in batch {
-            let h = tx.hash();
-            pending.insert(h, tx);
+            pending.insert(tx.hash(), tx);
+        }
+        drop(pending);
+        let mut times = pending_tx_times.write().await;
+        for h in &hashes {
+            times.insert(*h, now);
         }
     }
 
