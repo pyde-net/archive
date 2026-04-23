@@ -485,6 +485,69 @@ fn sustained_rate_load_test() {
         );
     }
 
+    // Always dump diagnostic views of node 0's log.
+    {
+        let snap = net.nodes[0].output_snapshot();
+
+        // (a) Peak-load proposer timing — pick slots with real
+        // work (pending > 100) from the middle of the run so we
+        // see the steady-state cost, not the drain-down tail.
+        let timing_lines: Vec<&str> = snap
+            .lines()
+            .filter(|l| {
+                l.contains("proposed and processed") && !l.contains("pending=0 ")
+                    && !l.contains("pending=0\n")
+            })
+            .collect();
+        let n = timing_lines.len();
+        let start = n.saturating_sub(30).max(n / 2);
+        let sample: Vec<&str> = timing_lines[start..].iter().copied().take(20).collect();
+        eprintln!(
+            "\n=== node 0 peak-load timing (mid-run sample, {}) ===\n{}\n",
+            sample.len(),
+            sample.join("\n")
+        );
+
+        // gas=0 diagnostics: count blocks by whether they executed
+        // successfully. If most blocks show txs>0 but gas=0, the
+        // block_processor is failing every tx (the symptom we saw
+        // under the old self-proposal bug).
+        let mut with_gas = 0usize;
+        let mut gas_zero_with_txs = 0usize;
+        let mut empty = 0usize;
+        for l in &timing_lines {
+            let has_txs = l.contains("txs=0") == false;
+            let has_gas = !l.contains("gas=0");
+            if !has_txs {
+                empty += 1;
+            } else if has_gas {
+                with_gas += 1;
+            } else {
+                gas_zero_with_txs += 1;
+            }
+        }
+        eprintln!(
+            "  block stats (node 0): empty={}, txs-with-gas={}, txs-but-gas=0={}",
+            empty, with_gas, gas_zero_with_txs
+        );
+
+        // (b) Any WARN/ERROR produced during the run. If blocks are
+        // committing with `gas=0`, the block_processor is either
+        // rejecting txs silently or logging `tx execution failed`
+        // here — this pass surfaces which.
+        let warn_lines: Vec<&str> = snap
+            .lines()
+            .filter(|l| l.contains(" WARN ") || l.contains(" ERROR "))
+            .collect();
+        let warn_tail: Vec<&str> =
+            warn_lines.iter().rev().take(30).rev().copied().collect();
+        eprintln!(
+            "=== node 0 WARN/ERROR (last {}) ===\n{}\n",
+            warn_tail.len(),
+            warn_tail.join("\n")
+        );
+    }
+
     assert!(
         submit_tps_measure as u64 >= pass_submit_threshold,
         "FAIL: submit rate {:.0} TPS < 90% of target {}",

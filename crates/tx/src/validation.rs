@@ -50,6 +50,12 @@ pub struct ValidationContext {
     /// before validation. Deducted from `sender.balance` when checking
     /// that `gas_cost + value` fits. Zero for accounts with no vesting.
     pub sender_locked: u128,
+    /// Caller has already verified this tx's FALCON signature (e.g. in
+    /// a parallel batch pass over the whole block). Skipping the
+    /// per-tx verify is only safe when the caller guarantees the sig
+    /// was actually checked and passed. Unlike `dev_skip_signature`,
+    /// this is production-safe when correctly set by the block path.
+    pub sig_pre_verified: bool,
 }
 
 /// Validation error with specific reason.
@@ -90,11 +96,13 @@ pub fn validate_transaction(
     // 1. Chain ID
     validate_chain_id(tx, ctx)?;
 
-    // 2. Signature. Skipping is only allowed when the caller explicitly
-    // sets `dev_skip_signature` — chain_id is NOT consulted here, so a
-    // misconfigured production validator with chain_id = 31337 cannot
+    // 2. Signature. Skipping is allowed only when the caller explicitly
+    // sets `dev_skip_signature` (test-only) or `sig_pre_verified`
+    // (production fast path where the block processor already ran a
+    // parallel batch verify). chain_id is NOT consulted here so a
+    // misconfigured mainnet validator with chain_id = 31337 cannot
     // accidentally accept forged transactions.
-    if !ctx.dev_skip_signature {
+    if !ctx.dev_skip_signature && !ctx.sig_pre_verified {
         validate_signature(tx, sender)?;
     }
 
@@ -317,6 +325,7 @@ mod tests {
             // overrides this field.
             dev_skip_signature: true,
             sender_locked: 0,
+            sig_pre_verified: false,
         }
     }
 

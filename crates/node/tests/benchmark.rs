@@ -16,6 +16,7 @@ fn block_ctx() -> BlockContext {
         validator_address: derive_eoa_address(b"validator"),
         // Synthetic bench transactions have no real FALCON sigs.
         dev_skip_signature: true,
+        block_sigs_pre_verified: false,
     }
 }
 

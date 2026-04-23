@@ -65,22 +65,19 @@ impl BlockProcessor {
         // chain_id — which is consensus-critical and identical across
         // every validator — is the only sound choice.
         let dev_skip_signature = chain.chain_id == 31337;
-        let block_ctx = BlockContext {
-            height: slot,
-            timestamp: block.header.timestamp,
-            base_fee: chain.base_fee,
-            block_gas_limit: pyde_tx::fee::GAS_CEILING,
-            chain_id: chain.chain_id,
-            validator_address: block.header.proposer,
-            dev_skip_signature,
-        };
 
         // 3. Batch signature verification (parallel across all CPU cores).
-        // Verify ALL signatures upfront before execution. This parallelizes the
-        // expensive FALCON-512 verification across rayon's thread pool.
-        // Devnet (chain_id=31337) skips this.
+        // Verify ALL signatures upfront before execution. This parallelizes
+        // the expensive FALCON-512 verification across rayon's thread pool.
+        // When every sig in the block passes we set
+        // `block_sigs_pre_verified = true` on the execution context so the
+        // per-tx pipeline can skip a second FALCON verify (the hot path
+        // responsible for ~70% of block-execution CPU under load). If any
+        // sig is bad we leave the flag `false` so the pipeline still
+        // rejects the bad tx during execution.
         let txs = &block.body.transactions;
-        if chain.chain_id != 31337 && !txs.is_empty() {
+        let mut all_sigs_valid = !dev_skip_signature;
+        if !dev_skip_signature && !txs.is_empty() {
             use rayon::prelude::*;
             let sig_results: Vec<bool> = txs
                 .par_iter()
@@ -99,16 +96,27 @@ impl BlockProcessor {
                     true // no auth keys = system account, skip
                 })
                 .collect();
-            // Mark invalid signatures (they'll be rejected during execution)
             let invalid_count = sig_results.iter().filter(|&&ok| !ok).count();
             if invalid_count > 0 {
                 debug!(
                     slot,
                     invalid_sigs = invalid_count,
-                    "batch signature verification found invalid signatures"
+                    "batch signature verification found invalid signatures — falling back to per-tx verify"
                 );
+                all_sigs_valid = false;
             }
         }
+
+        let block_ctx = BlockContext {
+            height: slot,
+            timestamp: block.header.timestamp,
+            base_fee: chain.base_fee,
+            block_gas_limit: pyde_tx::fee::GAS_CEILING,
+            chain_id: chain.chain_id,
+            validator_address: block.header.proposer,
+            dev_skip_signature,
+            block_sigs_pre_verified: all_sigs_valid,
+        };
 
         // 4. Execute transactions by group (Sealevel-style parallel execution).
         let groups = &block.body.execution_schedule.groups;
@@ -818,6 +826,7 @@ pub fn try_decrypt_and_execute(
         chain_id,
         validator_address: proposer_addr,
         dev_skip_signature: true,
+        block_sigs_pre_verified: false,
     };
     let mut receipts = Vec::with_capacity(decrypted_txs.len());
     for (i, dtx) in decrypted_txs.iter().enumerate() {

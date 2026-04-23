@@ -1059,13 +1059,20 @@ impl PydeNode {
                                     // removes committed tx hashes from the mempool, so the
                                     // only txs kept are the ones that didn't make this
                                     // block.
+                                    let slot_t0 = std::time::Instant::now();
+                                    let t_clone = std::time::Instant::now();
                                     let pending_r = pending_txs.read().await;
                                     let all_pending: Vec<pyde_tx::types::Transaction> =
                                         pending_r.values().cloned().collect();
+                                    let pending_len = pending_r.len();
                                     drop(pending_r);
+                                    let clone_ms = t_clone.elapsed().as_secs_f64() * 1000.0;
+
+                                    let t_build = std::time::Instant::now();
                                     let gas_ceiling = self.config.consensus.gas_ceiling;
                                     let (mut txs, _remaining) =
                                         crate::block_builder::build_tx_list(all_pending, gas_ceiling);
+                                    let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
 
                                     // Drain any queued double-sign evidence into Slash txs and
                                     // prepend them to the block. This is the detection → punishment
@@ -1134,6 +1141,7 @@ impl PydeNode {
                                             chain_id: self.config.node.chain_id,
                                             validator_address: identity.address,
                                             dev_skip_signature: false,
+                                            block_sigs_pre_verified: false,
                                         };
                                         pyde_tx::access_infer::infer_access_lists_batch(
                                             &mut txs, &*state_r, &infer_ctx,
@@ -1182,6 +1190,7 @@ impl PydeNode {
                                     // or nobody's block wins (timeout). In the rare case another
                                     // proposer's block wins for the same slot, our state diverges
                                     // but the gossip block handler rejects duplicate slots.
+                                    let t_exec = std::time::Instant::now();
                                     {
                                         let mut chain_w = chain.write().await;
                                         let mut state_w = state.write().await;
@@ -1228,8 +1237,17 @@ impl PydeNode {
                                                         }));
                                                     }
                                                 }
+                                                let exec_ms = t_exec.elapsed().as_secs_f64() * 1000.0;
+                                                let slot_ms = slot_t0.elapsed().as_secs_f64() * 1000.0;
                                                 info!(
-                                                    slot = current_slot, txs = tc, gas,
+                                                    slot = current_slot,
+                                                    txs = tc,
+                                                    gas,
+                                                    pending = pending_len,
+                                                    clone_ms,
+                                                    build_ms,
+                                                    exec_ms,
+                                                    slot_ms,
                                                     "proposed and processed block"
                                                 );
 
@@ -1487,6 +1505,7 @@ impl PydeNode {
                                                                                 chain_id: chain_w.chain_id,
                                                                                 validator_address: proposer,
                                                                                 dev_skip_signature: false,
+                                                                                block_sigs_pre_verified: false,
                                                                             };
                                                                             for dtx in &decrypted_txs {
                                                                                 // Bind the execute_transaction result BEFORE the

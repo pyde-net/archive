@@ -1146,6 +1146,8 @@ async fn ingress_validate(
         chain_id,
         dev_skip_signature: chain_id == 31337,
         sender_locked,
+        // Ingress path verifies sigs itself; nothing pre-verified them.
+        sig_pre_verified: false,
     };
 
     validate_transaction(tx, &sender, &nonce_state, &ctx).map_err(|e| {
@@ -1257,6 +1259,7 @@ async fn parse_call_object(
         chain_id: chain.chain_id,
         validator_address: [0u8; 32],
         dev_skip_signature: false,
+        block_sigs_pre_verified: false,
     };
     Ok((tx, block_ctx))
 }
