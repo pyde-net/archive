@@ -28,6 +28,20 @@ use tracing::info;
 /// max out the mempool — matching typical pending-account counts.
 const MEMPOOL_SENDER_CAP: usize = 128;
 
+/// Hard cap on total mempool size per node (MAINNET_PLAN M3). Under
+/// sustained overload the M2 TTL sweep drains the mempool, but a
+/// large burst can still push it past reasonable memory bounds
+/// before the 4-minute TTL kicks in. Rejecting at this cap bounds
+/// worst-case memory to roughly:
+///   100_000 tx × ~1.8 KB avg (FALCON sig dominates) = ~180 MB.
+/// Well inside a server budget; a laptop can also absorb this before
+/// swap pressure kicks in. We chose hard-reject over fee-priority
+/// eviction because our fee model has no per-tx priority signal —
+/// every tx at a given base_fee pays the same per gas unit. When the
+/// protocol grows a priority-fee field, M3 can upgrade to lowest-fee
+/// eviction.
+const MEMPOOL_GLOBAL_CAP: usize = 100_000;
+
 /// Shared node state accessible by RPC handlers.
 pub struct RpcState {
     pub chain: Arc<RwLock<ChainState>>,
@@ -459,11 +473,39 @@ impl PydeApiServer for RpcServer {
         // Compute tx hash (must match tx.hash() used in receipt generation)
         let tx_hash = tx.hash();
 
-        // Per-sender mempool cap (MAINNET_PLAN M1). Atomic with the
-        // insert under one write lock so the cap can't be raced by
-        // concurrent submissions.
+        // Global cap (M3) + per-sender cap (M1) + (sender, nonce) dedup
+        // (M6), all atomic with the insert under one write lock.
         let mut pending = self.state.pending_txs.write().await;
-        let sender_count = pending.values().filter(|t| t.from == tx.from).count();
+        if pending.len() >= MEMPOOL_GLOBAL_CAP {
+            return Err(rpc_err(
+                -32011,
+                format!(
+                    "mempool full: {} txs pending (cap {})",
+                    pending.len(),
+                    MEMPOOL_GLOBAL_CAP
+                ),
+            ));
+        }
+        let mut sender_count: usize = 0;
+        let mut duplicate_nonce = false;
+        for t in pending.values() {
+            if t.from == tx.from {
+                sender_count += 1;
+                if t.nonce == tx.nonce {
+                    duplicate_nonce = true;
+                    break;
+                }
+            }
+        }
+        if duplicate_nonce {
+            return Err(rpc_err(
+                -32010,
+                format!(
+                    "duplicate (sender, nonce)={} in mempool; cancel or wait for the existing tx to commit/expire",
+                    tx.nonce
+                ),
+            ));
+        }
         if sender_count >= MEMPOOL_SENDER_CAP {
             return Err(rpc_err(
                 -32009,
@@ -517,10 +559,39 @@ impl PydeApiServer for RpcServer {
 
         let tx_hash = tx.hash();
 
-        // Per-sender mempool cap (MAINNET_PLAN M1). See send_transaction
-        // for rationale — atomic count+insert under one write lock.
+        // Global cap + per-sender cap + dedup — same atomic check as
+        // send_transaction. See that handler for rationale.
         let mut pending = self.state.pending_txs.write().await;
-        let sender_count = pending.values().filter(|t| t.from == tx.from).count();
+        if pending.len() >= MEMPOOL_GLOBAL_CAP {
+            return Err(rpc_err(
+                -32011,
+                format!(
+                    "mempool full: {} txs pending (cap {})",
+                    pending.len(),
+                    MEMPOOL_GLOBAL_CAP
+                ),
+            ));
+        }
+        let mut sender_count: usize = 0;
+        let mut duplicate_nonce = false;
+        for t in pending.values() {
+            if t.from == tx.from {
+                sender_count += 1;
+                if t.nonce == tx.nonce {
+                    duplicate_nonce = true;
+                    break;
+                }
+            }
+        }
+        if duplicate_nonce {
+            return Err(rpc_err(
+                -32010,
+                format!(
+                    "duplicate (sender, nonce)={} in mempool; cancel or wait for the existing tx to commit/expire",
+                    tx.nonce
+                ),
+            ));
+        }
         if sender_count >= MEMPOOL_SENDER_CAP {
             return Err(rpc_err(
                 -32009,
