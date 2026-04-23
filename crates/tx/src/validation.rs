@@ -156,10 +156,29 @@ fn validate_signature(tx: &Transaction, sender: &Account) -> Result<(), Validati
 }
 
 fn validate_nonce(tx: &Transaction, nonce_state: &NonceState) -> Result<(), ValidationError> {
-    nonce_state
-        .validate(tx.nonce)
-        .map(|_| ())
-        .map_err(|e| ValidationError::InvalidNonce(format!("{:?}", e)))
+    match nonce_state.validate(tx.nonce) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            // Enrich the error with the lowest unused nonce in the
+            // current window so wallets can tell the user "you're
+            // waiting on nonce N to fill" instead of "your nonce is
+            // out of range, figure it out yourself." (MAINNET_PLAN M5.)
+            //
+            // The lowest unused nonce is `base` itself — every used
+            // bit at position 0 would have already advanced `base`.
+            // So `base` is always the next-needed slot if the window
+            // has any gaps. We also include `base + WINDOW_SIZE - 1`
+            // as the current upper bound so AboveWindow errors say
+            // exactly which range is acceptable.
+            let next_needed = nonce_state.base;
+            let window_max = nonce_state.max_nonce();
+            let msg = format!(
+                "{:?} (got {}, window [{}..{}], next usable {})",
+                e, tx.nonce, nonce_state.base, window_max, next_needed
+            );
+            Err(ValidationError::InvalidNonce(msg))
+        }
+    }
 }
 
 fn validate_balance(

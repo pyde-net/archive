@@ -637,17 +637,40 @@ impl PydeNode {
                         }
                         PostEventAction::AcceptTransaction(tx) => {
                             let tx_hash = tx.hash();
-                            // Index for compact block reconstruction
-                            let tx_bytes = wire::encode_transaction(&tx);
-                            mempool_index.write().await.insert(tx_hash, tx_bytes);
+                            // Global cap (M3) + (sender, nonce) dedup (M6)
+                            // on the gossip path too. Without these, a
+                            // busy gossip mesh can push this node past
+                            // its mempool budget or land a second-write
+                            // variant for an already-pending (sender,
+                            // nonce). Constants match rpc.rs — keep in
+                            // sync if those change.
+                            const GOSSIP_MEMPOOL_GLOBAL_CAP: usize = 100_000;
                             let mut pending = pending_txs.write().await;
-                            pending.insert(tx_hash, tx);
-                            debug!(tx_hash = hex::encode(tx_hash), pending = pending.len(), "tx accepted from gossip");
-                            drop(pending);
-                            pending_tx_times
-                                .write()
-                                .await
-                                .insert(tx_hash, std::time::Instant::now());
+                            if pending.len() >= GOSSIP_MEMPOOL_GLOBAL_CAP {
+                                debug!(
+                                    tx_hash = hex::encode(tx_hash),
+                                    cap = GOSSIP_MEMPOOL_GLOBAL_CAP,
+                                    "gossip tx dropped: mempool full"
+                                );
+                            } else if pending
+                                .values()
+                                .any(|t| t.from == tx.from && t.nonce == tx.nonce)
+                            {
+                                debug!(
+                                    tx_hash = hex::encode(tx_hash),
+                                    "gossip tx dropped: duplicate (sender, nonce)"
+                                );
+                            } else {
+                                let tx_bytes = wire::encode_transaction(&tx);
+                                mempool_index.write().await.insert(tx_hash, tx_bytes);
+                                pending.insert(tx_hash, tx);
+                                debug!(tx_hash = hex::encode(tx_hash), pending = pending.len(), "tx accepted from gossip");
+                                drop(pending);
+                                pending_tx_times
+                                    .write()
+                                    .await
+                                    .insert(tx_hash, std::time::Instant::now());
+                            }
                         }
                         PostEventAction::AddPeerToKademlia(peer_id, addrs) => {
                             for addr in &addrs {
