@@ -255,20 +255,19 @@
 
 > Parallelisable with 207 once P0 trivials are in.
 
-- [ ] 207a — `✓` **Hard-finality persistence ordering.**
-      Promoted from 201. `crates/node/src/validator.rs:1560-1566,
-      1628-1630, 758-762` — three call sites update
-      `self.finality.latest_checkpoint` in-memory via
-      `record_hard_finality` / direct assignment / synthetic-anchor
-      assignment, then call `persist_finality_checkpoint` which
-      reads the value back out of `self.finality`. Crash in the
-      window reverts the WS anchor on restart (self-heals via
-      peer gossip, but a non-self-healing window exists).
-      Fix: new `persist_finality_checkpoint_direct(&cp)` that
-      takes the checkpoint explicitly; call it BEFORE the
-      in-memory mutation at each of the three sites; keep the
-      current `persist_finality_checkpoint()` as a no-longer-used
-      thin wrapper (or remove) so no new site can regress.
+- [x] 207a — `✓` **Hard-finality persistence ordering.**
+      Shipped: new `persist_finality_checkpoint_direct(&cp)` takes
+      the checkpoint explicitly and writes it to disk before
+      returning. All three call sites — `install_bootstrap_ws_
+      anchor`, `on_finality_vote` (hard-finality cert path), and
+      `ingest_finality_checkpoint` (gossip path) — now construct
+      the checkpoint, fsync it via `_direct`, and ONLY then mutate
+      `self.finality`. Persist panics on I/O failure, which aborts
+      before the memory mutation, so the invariant "on-disk ≥
+      in-memory" holds across every crash window. Kept the old
+      `persist_finality_checkpoint()` as a thin `dead_code`
+      wrapper for tests + devnet bootstrap. 65 validator tests +
+      multi-node encrypted e2e still pass.
 
 - [ ] 208 — `⚠` **Committee rotation: clear old committee keys.**
       `crates/node/src/validator.rs:828-841` — `set_committee`
