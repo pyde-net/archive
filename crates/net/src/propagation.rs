@@ -141,6 +141,32 @@ pub struct BlockTxsResponse {
     pub transactions: Vec<Vec<u8>>,
 }
 
+/// Encrypted-tx bundle: proposer→validators payload carrying the
+/// block's `encrypted_txs: Vec<Vec<u8>>` out-of-band from the
+/// compact block. Resolves audit item 207 / 074b: the compact block
+/// has no room for encrypted_tx bodies, so non-proposer validators
+/// would otherwise never see them and their decryption shares would
+/// orphan.
+///
+/// Integrity is anchored by the existing `BlockHeader::tx_root`
+/// commitment (see `pyde_consensus::block::compute_tx_root`):
+/// receiver hashes each `encrypted_tx` byte blob as an `EncryptedTx`
+/// and calls `verify_tx_root` against the header from the matching
+/// compact block. Mismatch → reject. No per-bundle signature is
+/// needed for authenticity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncryptedTxBundle {
+    /// Slot the bundle is for.
+    pub slot: u64,
+    /// Hash of the block whose `tx_root` commits to this bundle.
+    /// Lets receivers match the bundle to its compact block even if
+    /// they arrive out of order.
+    pub block_hash: [u8; 32],
+    /// Encrypted-tx byte blobs in block order, identical to
+    /// `Block::body.encrypted_txs`.
+    pub encrypted_txs: Vec<Vec<u8>>,
+}
+
 // ========== Erasure Coding ==========
 
 /// An erasure-coded chunk of a block.
