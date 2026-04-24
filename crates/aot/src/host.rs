@@ -155,6 +155,14 @@ pub extern "C" fn host_pop(ctx: *mut VmCtx) -> u64 {
 
 /// Host: sload wide register mode. Reads storage[slot_from_ws1] → wd.
 /// Returns 0 on success.
+///
+/// Audit 228c — also charges the EIP-2929 cold-access surcharge
+/// (1800 gas) on first touch of a key per-tx, mirroring the
+/// interpreter's `Opcode::Sload` handler. Surcharge is added to
+/// `vm.memory.page_gas_used` so the AOT codegen drains it via
+/// `host_drain_page_gas` after the call (the field doubles as
+/// the AOT-drainable dynamic-gas accumulator, not just memory
+/// pages).
 pub extern "C" fn host_sload(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
     // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
     // safety contract (top of file). The AOT JIT's callsite emission
@@ -166,6 +174,10 @@ pub extern "C" fn host_sload(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
         Err(_) => return 1,
     };
     let key = vm.derive_storage_key(slot);
+    if !vm.warm_storage_keys.contains(&key) {
+        vm.warm_storage_keys.insert(key);
+        vm.memory.page_gas_used = vm.memory.page_gas_used.saturating_add(1800);
+    }
     // Check overlay first, then fall back to storage backend (SMT)
     let data = vm.storage.get(&key).cloned().or_else(|| {
         if let Some(ref backend) = vm.storage_backend {
@@ -208,6 +220,11 @@ pub extern "C" fn host_sloadg(ctx: *mut VmCtx, ws_slot: u64) -> u64 {
         Err(_) => return 0,
     };
     let key = vm.derive_storage_key(slot);
+    // Audit 228c: same EIP-2929 cold-access surcharge as host_sload.
+    if !vm.warm_storage_keys.contains(&key) {
+        vm.warm_storage_keys.insert(key);
+        vm.memory.page_gas_used = vm.memory.page_gas_used.saturating_add(1800);
+    }
     // Check overlay first, then fall back to storage backend (SMT)
     let data = vm.storage.get(&key).cloned().or_else(|| {
         if let Some(ref backend) = vm.storage_backend {
@@ -244,6 +261,11 @@ pub extern "C" fn host_sstore(ctx: *mut VmCtx, ws_slot: u64, wd: u64) -> u64 {
         Err(_) => return 1,
     };
     let key = vm.derive_storage_key(slot);
+    // Audit 228c: EIP-2929 cold-access surcharge on first Sstore.
+    if !vm.warm_storage_keys.contains(&key) {
+        vm.warm_storage_keys.insert(key);
+        vm.memory.page_gas_used = vm.memory.page_gas_used.saturating_add(1800);
+    }
     vm.journal_storage_write(&key);
     let value = match vm.cpu.read_wide_checked(wd as u8) {
         Ok(v) => v,
@@ -269,6 +291,11 @@ pub extern "C" fn host_sstoreg(ctx: *mut VmCtx, ws_slot: u64, value: u64) -> u64
         Err(_) => return 1,
     };
     let key = vm.derive_storage_key(slot);
+    // Audit 228c: EIP-2929 cold-access surcharge on first Sstoreg.
+    if !vm.warm_storage_keys.contains(&key) {
+        vm.warm_storage_keys.insert(key);
+        vm.memory.page_gas_used = vm.memory.page_gas_used.saturating_add(1800);
+    }
     vm.journal_storage_write(&key);
     vm.storage.insert(key, value.to_le_bytes().to_vec());
     0
@@ -290,6 +317,11 @@ pub extern "C" fn host_sdelete(ctx: *mut VmCtx, ws_slot: u64) -> u64 {
         Err(_) => return 1,
     };
     let key = vm.derive_storage_key(slot);
+    // Audit 228c: EIP-2929 cold-access surcharge on first Sdelete.
+    if !vm.warm_storage_keys.contains(&key) {
+        vm.warm_storage_keys.insert(key);
+        vm.memory.page_gas_used = vm.memory.page_gas_used.saturating_add(1800);
+    }
     vm.journal_storage_write(&key);
     if let Some(v) = vm.storage.get(&key) {
         if !v.is_empty() {
@@ -538,6 +570,14 @@ pub extern "C" fn host_log(ctx: *mut VmCtx, desc_ptr: u64, num_topics: u64) -> u
         Ok(d) => d,
         Err(_) => return 1,
     };
+
+    // Audit 228c: dynamic gas (matching interpreter's Opcode::Log
+    // at `pvm/src/vm.rs:1063`). Folded into the AOT-drainable
+    // accumulator so codegen picks it up via host_drain_page_gas.
+    let dynamic_gas = 100u64
+        .saturating_add((data_len as u64).saturating_mul(8))
+        .saturating_add((num_topics as u64).saturating_mul(50));
+    vm.memory.page_gas_used = vm.memory.page_gas_used.saturating_add(dynamic_gas);
 
     vm.logs.push(pyde_vm::vm::EventLog {
         address: vm.ctx.self_address,

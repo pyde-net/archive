@@ -483,6 +483,57 @@
       AOT/interp gas equality. Multi-node encrypted e2e still
       passes.
 
+- [x] 228c — `✓` **AOT gas-parity harness + storage/log fixes.**
+      Shipped: new `assert_gas_parity_with_state` helper for tests
+      that need pre-prepared VM state (storage/wide-regs/contracts).
+      Used to surface and fix:
+      
+      1. **Storage cold-access surcharge (1800 gas / EIP-2929).**
+         Interp Sload/Sstore/Sdelete charge 1800 on first touch
+         of a key per-tx; AOT host functions skipped this entirely.
+         Every storage access: AOT 200 vs interp 2000. Fixed: each
+         storage host fn now adds 1800 to `vm.memory.page_gas_used`
+         on first touch + inserts key into `vm.warm_storage_keys`.
+         Codegen drains via `emit_drain_page_gas!` after the call.
+      
+      2. **Log dynamic gas (`100 + data_len*8 + num_topics*50`).**
+         Interp `Opcode::Log` charges this; AOT host_log skipped
+         it. Every log emission diverged. Fixed: `host_log` adds
+         the dynamic charge to `page_gas_used`; codegen drains.
+      
+      3. **Sdelete refund parity.** Already worked via existing
+         `vm.gas_refund += 1500` in host_sdelete. Now verified
+         by an explicit parity test that compares both
+         `gas_used_total` AND `gas_refund` between paths.
+      
+      `vm.memory.page_gas_used` now serves as the
+      AOT-drainable dynamic-gas accumulator for any host
+      function that needs to charge gas the AOT can't see.
+      Field doc updated to reflect this. Drain helper name kept
+      (`host_drain_page_gas`) for branch hygiene; rename to
+      something more general (e.g. `host_drain_dynamic_gas`)
+      can land separately.
+      
+      Tests: 5 new parity tests
+      (`sload_cold_aot_gas_parity_with_interp`,
+      `sload_warm_aot_gas_parity_with_interp`,
+      `sstore_cold_aot_gas_parity_with_interp`,
+      `sdelete_aot_gas_parity_with_interp`,
+      `log_aot_gas_parity_with_interp`).
+      All 38 AOT tests + multi-node encrypted e2e pass.
+      
+      **Gaps surfaced but NOT fixed in this PR (tracked as
+      228d):**
+      - SstoreB / SloadB (mode 1 / memory mode) dynamic gas
+        per byte stored/loaded. Interp charges `(len/8)*3`;
+        AOT codegen falls through to wide-mode for SloadB
+        (loses semantics) and traps for SstoreB. Needs full
+        mode-1 implementation in AOT host + parity tests.
+      - OOG behavior parity (interp can OOG mid-op; AOT
+        OOGs at drain time). End state is identical because
+        of journal rollback, but the precise OOG point may
+        differ. Worth a stress test.
+
 - [x] 228b — `✓` **AOT delegated-op gas sync.** Shipped:
       `host_exec_opcode` ABI extended to take `gas_used_in` +
       `gas_limit_in` and return `(gas_used_out << 2) | result`
@@ -561,3 +612,4 @@ Fold into the relevant fix PRs above when possible:
 | 215 | 2026-04-24  | Traced interp `Memcpy` + `host_memcpy` + AOT codegen + `page_gas_used` drain; added gas-parity test that exposed 2 divergences (per-byte + per-page) | Fixed all three in one PR; surfaced 228 as follow-up |
 | 228a| 2026-04-24  | Enumerated AOT memory-touching host calls; gas-parity tests for each. Poseidon dynamic-gas divergence surfaced by the test harness | Fixed all 7 direct mem ops + poseidon dynamic gas; split 228b |
 | 228b| 2026-04-24  | Gas-parity test on CallExt exposed 2× double-charging (static gas in both bb prologue + delegated step); ABI change routes updated gas back into VAR_GAS_USED | Fixed sync + analysis.rs double-count |
+| 228c| 2026-04-24  | Wrote `assert_gas_parity_with_state` helper; targeted tests for Sload/Sstore/Sdelete cold + Log dynamic gas all failed before fix | Fixed via `page_gas_used` accumulator pattern; 5 new parity tests pass |

@@ -943,6 +943,174 @@ mod tests {
         assert_eq!(return_val, 99, "r1 should hold child's return value (99)");
     }
 
+    /// Run a program on both interp and AOT against pre-prepared VM
+    /// state (storage/wide-regs/contracts), asserting exact gas
+    /// parity. The closure receives the VM right after `with_gas_limit`
+    /// and before `load`, so callers can inject wide-reg values,
+    /// storage backends, contracts, etc.
+    ///
+    /// Audit 228c — used to surface every per-opcode gas divergence
+    /// between AOT and interpreter (storage cold-access, log
+    /// dynamic, gas refund, ...).
+    fn assert_gas_parity_with_state<F: FnMut(&mut pyde_vm::vm::Vm)>(
+        code: &[u8],
+        gas_limit: u64,
+        label: &str,
+        mut prepare: F,
+    ) {
+        // Interpreter
+        let mut interp_vm = pyde_vm::vm::Vm::with_gas_limit(gas_limit);
+        prepare(&mut interp_vm);
+        interp_vm.load(code).unwrap();
+        let _ = interp_vm.execute();
+        let interp_gas = interp_vm.gas_used_total;
+
+        // AOT
+        let compiled = compile_bytecode(code).unwrap();
+        let func = compiled.as_fn();
+        let mut regs = [0u64; 16];
+        let mut aot_vm = pyde_vm::vm::Vm::with_gas_limit(gas_limit);
+        prepare(&mut aot_vm);
+        let raw = unsafe { func(regs.as_mut_ptr(), gas_limit, &mut aot_vm as *mut _) };
+        let (aot_status, aot_gas) = decode_result(raw);
+
+        assert_eq!(
+            aot_status, RESULT_SUCCESS,
+            "{label}: AOT did not succeed (status={aot_status})"
+        );
+        assert_eq!(
+            aot_gas, interp_gas,
+            "{label}: AOT gas {aot_gas} != interp gas {interp_gas}"
+        );
+    }
+
+    #[test]
+    fn sload_cold_aot_gas_parity_with_interp() {
+        // Audit 228c — interp charges 1800 cold-access surcharge on
+        // first Sload of a key per-tx (EIP-2929). AOT host_sload
+        // skips this entirely. Same contract burns Sload base only
+        // on AOT vs base+1800 on interp.
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sload, 1, 0, 0), // sload w1, w0 (mode 0 = wide)
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity_with_state(&code, 1_000_000, "Sload cold", |vm| {
+            // w0 = arbitrary slot (key derivation handles it)
+            vm.cpu.write_wide(0, pyde_vm::wide::U256::from(0x1234u64));
+        });
+    }
+
+    #[test]
+    fn sload_warm_aot_gas_parity_with_interp() {
+        // After the first Sload, the second (same key) should be
+        // warm: just base, no surcharge.
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sload, 1, 0, 0),
+            instr_bytes(Opcode::Sload, 2, 0, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity_with_state(&code, 1_000_000, "Sload warm", |vm| {
+            vm.cpu.write_wide(0, pyde_vm::wide::U256::from(0x1234u64));
+        });
+    }
+
+    #[test]
+    fn sstore_cold_aot_gas_parity_with_interp() {
+        // Cold Sstore: 2000 base + 1800 surcharge.
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 0), // sstore w1 → slot in w0
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity_with_state(&code, 1_000_000, "Sstore cold", |vm| {
+            vm.cpu.write_wide(0, pyde_vm::wide::U256::from(0x1234u64));
+            vm.cpu.write_wide(1, pyde_vm::wide::U256::from(0xCAFEu64));
+        });
+    }
+
+    #[test]
+    fn sdelete_aot_gas_parity_with_interp() {
+        // Sdelete on a populated key: 2000 base + 1800 cold + 1500
+        // refund (interp at `pvm/src/vm.rs:996-1004`). Tests parity
+        // for both gas_used_total and gas_refund.
+        let code = bytecode(&[
+            instr_bytes(Opcode::Sstore, 1, 0, 0), // populate so refund applies
+            instr_bytes(Opcode::Sdelete, 0, 0, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let mut interp_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        interp_vm
+            .cpu
+            .write_wide(0, pyde_vm::wide::U256::from(0x1234u64));
+        interp_vm
+            .cpu
+            .write_wide(1, pyde_vm::wide::U256::from(0xCAFEu64));
+        interp_vm.load(&code).unwrap();
+        let _ = interp_vm.execute();
+        let interp_gas = interp_vm.gas_used_total;
+        let interp_refund = interp_vm.gas_refund;
+
+        let compiled = compile_bytecode(&code).unwrap();
+        let func = compiled.as_fn();
+        let mut regs = [0u64; 16];
+        let mut aot_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        aot_vm
+            .cpu
+            .write_wide(0, pyde_vm::wide::U256::from(0x1234u64));
+        aot_vm
+            .cpu
+            .write_wide(1, pyde_vm::wide::U256::from(0xCAFEu64));
+        let raw = unsafe { func(regs.as_mut_ptr(), 1_000_000, &mut aot_vm as *mut _) };
+        let (aot_status, aot_gas) = decode_result(raw);
+        let aot_refund = aot_vm.gas_refund;
+
+        assert_eq!(aot_status, RESULT_SUCCESS);
+        assert_eq!(
+            aot_gas, interp_gas,
+            "Sdelete gas parity broken: AOT={aot_gas} interp={interp_gas}"
+        );
+        assert_eq!(
+            aot_refund, interp_refund,
+            "Sdelete refund parity broken: AOT={aot_refund} interp={interp_refund}"
+        );
+    }
+
+    #[test]
+    fn log_aot_gas_parity_with_interp() {
+        // Log charges `100 + data_len*8 + num_topics*50` dynamic gas.
+        // AOT host_log doesn't. Test with 2 topics + 16 bytes of data
+        // → expected dynamic = 100 + 16*8 + 2*50 = 328 gas extra
+        // on interp vs AOT.
+        use pyde_vm::memory::HEAP_START;
+        let heap = HEAP_START as i32;
+        let imm = 2u32; // 2 topics
+        let code = bytecode(&[
+            // Set up descriptor at HEAP_START:
+            //   topic0 (32 zero bytes), topic1 (32 zero bytes),
+            //   data_ptr (8 bytes = HEAP_START+64+16),
+            //   data_len (8 bytes = 16)
+            instr_ri(Opcode::Addi, 1, 0, heap),
+            instr_ri(Opcode::Addi, 2, 0, heap + 64 + 16), // data_ptr value
+            instr_bytes(
+                Opcode::Store,
+                2,
+                1,
+                pyde_vm::isa::encode_mem_immediate(64, pyde_vm::isa::MemWidth::W64).unwrap(),
+            ), // mem[heap+64] = heap+80 (data ptr)
+            instr_ri(Opcode::Addi, 3, 0, 16),             // data_len value = 16
+            instr_bytes(
+                Opcode::Store,
+                3,
+                1,
+                pyde_vm::isa::encode_mem_immediate(72, pyde_vm::isa::MemWidth::W64).unwrap(),
+            ), // mem[heap+72] = 16
+            // log r1, 2 (descriptor at r1, 2 topics)
+            instr_bytes(Opcode::Log, 0, 1, imm),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity_with_state(&code, 1_000_000, "Log dynamic", |_vm| {});
+    }
+
     #[test]
     fn callext_aot_gas_parity_with_interp() {
         // Audit item 228b — delegated ops (CallExt/Delegate/Create/
