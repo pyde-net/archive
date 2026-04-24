@@ -25,5 +25,20 @@ hex = "0.4"
 opt-level = "s"
 lto = true
 
+# Disable wasm-opt — the bundled wasm-opt doesn't support the
+# bulk-memory ops that newer rustc/llvm emit for large crypto
+# routines (threshold_encrypt). Without this, `wasm-pack build
+# --release` aborts mid-optimisation. We lose a few % of size
+# reduction; correctness is unaffected.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[dev-dependencies]
+# Used only by the parity test in `src/lib.rs` — confirms the WASM-
+# inlined EncryptedTx wire format decodes cleanly with the
+# production decoder. If the formats ever drift, this test fails
+# loudly instead of the drift manifesting as silent wallet breakage.
+pyde-mempool = { path = "../mempool" }
+
 [lints]
 workspace = true

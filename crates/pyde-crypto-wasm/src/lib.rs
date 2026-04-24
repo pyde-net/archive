@@ -271,6 +271,195 @@ fn serialize_tx(v: &serde_json::Value, signature: &[u8]) -> Result<Vec<u8>, JsVa
 }
 
 // ============================================================================
+// Threshold encryption (MEV-protected tx flow)
+// ============================================================================
+
+/// Threshold-encrypt a payload against the committee's public key.
+/// `pk_hex` is the hex-encoded wire bytes from
+/// `pyde_getThresholdPublicKey`. `payload_hex` is the bytes to
+/// encrypt — typically `to (32) || value_le (16) || calldata`.
+///
+/// Returns hex of `ThresholdCiphertext::to_wire_bytes()` ready to
+/// embed in an `EncryptedTx`.
+#[wasm_bindgen(js_name = "thresholdEncrypt")]
+pub fn threshold_encrypt_wasm(pk_hex: &str, payload_hex: &str) -> Result<String, JsValue> {
+    let pk_bytes = decode_hex(pk_hex)?;
+    let pk = pyde_crypto::threshold::ThresholdPublicKey::from_bytes(&pk_bytes)
+        .ok_or_else(|| JsValue::from_str("invalid threshold public key"))?;
+    let payload = decode_hex(payload_hex)?;
+    let ct = pyde_crypto::threshold::threshold_encrypt(&pk, &payload)
+        .map_err(|e| JsValue::from_str(&format!("threshold encryption failed: {}", e)))?;
+    Ok(format!("0x{}", hex::encode(ct.to_wire_bytes())))
+}
+
+/// One-shot client-side EncryptedTx builder. Does everything a
+/// wallet needs for the MEV-protected flow in a single call:
+///
+///   1. Threshold-encrypt `(to || value_le || calldata)` with the
+///      committee pubkey.
+///   2. Assemble the EncryptedTx wire frame with `signature = []`.
+///   3. Compute `EncryptedTx::hash` (same formula the node uses).
+///   4. FALCON-sign the hash with the sender's secret key.
+///   5. Serialize the full wire frame.
+///
+/// `params_json` shape (all strings are `0x`-prefixed hex unless
+/// noted):
+/// ```ignore
+/// {
+///   "thresholdPk": "0x...",          // wire bytes from pyde_getThresholdPublicKey
+///   "sender": "0x...",               // 32-byte address
+///   "nonce": 0,                      // u64
+///   "gasLimit": 100000,              // u64
+///   "accessList": [                  // optional
+///     { "address": "0x...",
+///       "reads":  ["0x..."],
+///       "writes": ["0x..."] }
+///   ],
+///   "deadline": null,                // optional u64
+///   "chainId": 31337,                // u64
+///   "to": "0x...",                   // 32-byte address
+///   "value": "1000",                 // u128 decimal string
+///   "calldata": "0x..."              // hex bytes
+/// }
+/// ```
+///
+/// Returns hex of the wire-encoded EncryptedTx, ready to submit via
+/// `pyde_sendRawEncryptedTransaction`.
+#[wasm_bindgen(js_name = "buildRawEncryptedTx")]
+pub fn build_raw_encrypted_tx_wasm(params_json: &str, sk_hex: &str) -> Result<String, JsValue> {
+    let v: serde_json::Value = serde_json::from_str(params_json)
+        .map_err(|e| JsValue::from_str(&format!("bad JSON: {}", e)))?;
+
+    // Parse fields.
+    let tpk_bytes = decode_hex(
+        v.get("thresholdPk")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| JsValue::from_str("missing thresholdPk"))?,
+    )?;
+    let tpk = pyde_crypto::threshold::ThresholdPublicKey::from_bytes(&tpk_bytes)
+        .ok_or_else(|| JsValue::from_str("invalid threshold public key"))?;
+
+    let sender = parse_addr(v.get("sender"))?;
+    let nonce = v.get("nonce").and_then(|x| x.as_u64()).unwrap_or(0);
+    let gas_limit = v.get("gasLimit").and_then(|x| x.as_u64()).unwrap_or(100_000);
+    let chain_id = v.get("chainId").and_then(|x| x.as_u64()).unwrap_or(31337);
+    let deadline = v.get("deadline").and_then(|x| x.as_u64());
+    let to = parse_addr(v.get("to"))?;
+    let value = parse_u128(v.get("value"));
+    let calldata = parse_hex_bytes(v.get("data").or_else(|| v.get("calldata")));
+
+    // Encrypt (to || value_le || calldata) — same layout as Rust's
+    // encrypt_transaction.
+    let mut payload = Vec::with_capacity(48 + calldata.len());
+    payload.extend_from_slice(&to);
+    payload.extend_from_slice(&value.to_le_bytes());
+    payload.extend_from_slice(&calldata);
+    let ct = pyde_crypto::threshold::threshold_encrypt(&tpk, &payload)
+        .map_err(|e| JsValue::from_str(&format!("threshold encryption failed: {}", e)))?;
+    let ct_wire_bytes = ct.to_wire_bytes();
+
+    // Access list — empty by default.
+    let access_entries = v
+        .get("accessList")
+        .and_then(|a| a.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Compute EncryptedTx::hash — MUST match
+    // `pyde-mempool::encrypted::EncryptedTx::hash`:
+    //   poseidon2(sender || nonce_le || gas_le || chain_le || ct_hash)
+    // where ct_hash = poseidon2(ciphertext::to_bytes()).
+    let ct_for_hash = ct.to_bytes(); // no length prefixes — matches Rust
+    let ct_hash = poseidon2_hash(&ct_for_hash);
+    let mut hash_buf = Vec::with_capacity(32 + 8 + 8 + 8 + 32);
+    hash_buf.extend_from_slice(&sender);
+    hash_buf.extend_from_slice(&nonce.to_le_bytes());
+    hash_buf.extend_from_slice(&gas_limit.to_le_bytes());
+    hash_buf.extend_from_slice(&chain_id.to_le_bytes());
+    hash_buf.extend_from_slice(&ct_hash.to_bytes());
+    let enc_tx_hash = poseidon2_hash(&hash_buf).to_bytes();
+
+    // FALCON-sign the hash.
+    let sk_bytes = decode_hex(sk_hex)?;
+    let sk = pyde_crypto::falcon::FalconSecretKey::from_bytes(&sk_bytes)
+        .ok_or_else(|| JsValue::from_str("invalid secret key"))?;
+    let sig = pyde_crypto::falcon::falcon_sign(&sk, &enc_tx_hash)
+        .map_err(|e| JsValue::from_str(&format!("sign failed: {}", e)))?;
+    let signature = sig.as_bytes().to_vec();
+
+    // Serialize wire bytes. MUST match
+    // `pyde-mempool::encrypted::EncryptedTx::to_bytes`.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&sender);
+    buf.extend_from_slice(&nonce.to_le_bytes());
+    buf.extend_from_slice(&gas_limit.to_le_bytes());
+    buf.extend_from_slice(&chain_id.to_le_bytes());
+    buf.push(deadline.is_some() as u8);
+    if let Some(d) = deadline {
+        buf.extend_from_slice(&d.to_le_bytes());
+    }
+    // Access list (u32 count + entries).
+    buf.extend_from_slice(&(access_entries.len() as u32).to_le_bytes());
+    for entry in &access_entries {
+        serialize_encrypted_tx_access_entry(entry, &mut buf)?;
+    }
+    // Signature (u32 len + bytes).
+    buf.extend_from_slice(&(signature.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&signature);
+    // Ciphertext (u32 len + wire bytes).
+    buf.extend_from_slice(&(ct_wire_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&ct_wire_bytes);
+
+    Ok(format!("0x{}", hex::encode(&buf)))
+}
+
+/// Serialize one access-list entry for an EncryptedTx. Layout mirrors
+/// `pyde-mempool::encrypted::EncryptedTx::to_bytes` which uses u16
+/// read/write counts (distinct from the Transaction wire format which
+/// uses u32 here).
+fn serialize_encrypted_tx_access_entry(
+    entry: &serde_json::Value,
+    buf: &mut Vec<u8>,
+) -> Result<(), JsValue> {
+    let addr_bytes = parse_addr(entry.get("address"))?;
+    buf.extend_from_slice(&addr_bytes);
+
+    let parse_keys = |field: &str| -> Result<Vec<[u8; 32]>, JsValue> {
+        let arr = entry
+            .get(field)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(arr.len());
+        for k in arr {
+            let s = k
+                .as_str()
+                .ok_or_else(|| JsValue::from_str("access list key must be string"))?;
+            let b = decode_hex(s)?;
+            if b.len() != 32 {
+                return Err(JsValue::from_str("access list key must be 32 bytes"));
+            }
+            let mut k32 = [0u8; 32];
+            k32.copy_from_slice(&b);
+            out.push(k32);
+        }
+        Ok(out)
+    };
+
+    let reads = parse_keys("reads")?;
+    buf.extend_from_slice(&(reads.len() as u16).to_le_bytes());
+    for r in &reads {
+        buf.extend_from_slice(r);
+    }
+    let writes = parse_keys("writes")?;
+    buf.extend_from_slice(&(writes.len() as u16).to_le_bytes());
+    for w in &writes {
+        buf.extend_from_slice(w);
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Hex helpers
 // ============================================================================
 
@@ -308,4 +497,95 @@ fn parse_hex_bytes(val: Option<&serde_json::Value>) -> Vec<u8> {
     val.and_then(|v| v.as_str())
         .map(|s| hex::decode(s.trim_start_matches("0x")).unwrap_or_default())
         .unwrap_or_default()
+}
+
+// ============================================================================
+// Tests — format parity against the production EncryptedTx decoder.
+// ============================================================================
+//
+// These run only on the native target (not in the wasm bundle). The
+// assertion is: wire bytes produced by our inlined WASM builder must
+// decode cleanly with `pyde-mempool`'s real `EncryptedTx::from_bytes`,
+// with every field intact. This catches silent format drift between
+// WASM and the node.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyde_crypto::falcon::{falcon_keygen, falcon_verify, FalconPublicKey, FalconSignature};
+    use pyde_crypto::threshold::threshold_keygen;
+
+    #[test]
+    fn build_raw_encrypted_tx_decodes_with_production_decoder() {
+        let (tpk, _shares) = threshold_keygen(4, 3).unwrap();
+        let (pk, sk) = falcon_keygen().unwrap();
+        let sender = poseidon2_hash(pk.as_bytes()).to_bytes();
+        let to = [0xBBu8; 32];
+
+        let params = serde_json::json!({
+            "thresholdPk": format!("0x{}", hex::encode(tpk.to_bytes())),
+            "sender":      format!("0x{}", hex::encode(sender)),
+            "nonce":       7u64,
+            "gasLimit":    42_000u64,
+            "chainId":     31337u64,
+            "deadline":    1000u64,
+            "to":          format!("0x{}", hex::encode(to)),
+            "value":       "99",
+            "calldata":    format!("0x{}", hex::encode(b"hello encrypted")),
+        });
+        let sk_hex = format!("0x{}", hex::encode(sk.as_bytes()));
+
+        let wire_hex = build_raw_encrypted_tx_wasm(&params.to_string(), &sk_hex).unwrap();
+        let wire_bytes = hex::decode(wire_hex.trim_start_matches("0x")).unwrap();
+
+        // Decode with the REAL decoder from pyde-mempool. If this
+        // succeeds and every field matches, the WASM wire format
+        // is byte-compatible with the node.
+        let decoded = pyde_mempool::encrypted::EncryptedTx::from_bytes(&wire_bytes)
+            .expect("production decoder must accept WASM-built bytes");
+
+        assert_eq!(decoded.sender, sender);
+        assert_eq!(decoded.nonce, 7);
+        assert_eq!(decoded.gas_limit, 42_000);
+        assert_eq!(decoded.chain_id, 31337);
+        assert_eq!(decoded.deadline, Some(1000));
+        assert!(
+            !decoded.signature.is_empty(),
+            "signature must be populated after build"
+        );
+        // FALCON verify against the sender's pubkey — exact check
+        // the server's `receive_tx_verified` runs.
+        let falcon_pk = FalconPublicKey::from_bytes(pk.as_bytes()).unwrap();
+        let sig_obj = FalconSignature::from_bytes(&decoded.signature).unwrap();
+        assert!(
+            falcon_verify(&falcon_pk, &decoded.hash(), &sig_obj),
+            "signature produced by WASM must verify against sender pubkey"
+        );
+    }
+
+    #[test]
+    fn threshold_encrypt_primitive_roundtrips() {
+        // Encrypt via WASM primitive, decode via real
+        // ThresholdCiphertext::from_wire_bytes.
+        let (tpk, _) = threshold_keygen(4, 3).unwrap();
+        let payload = b"plaintext for primitive test";
+
+        let ct_hex = threshold_encrypt_wasm(
+            &format!("0x{}", hex::encode(tpk.to_bytes())),
+            &format!("0x{}", hex::encode(payload)),
+        )
+        .unwrap();
+        let ct_bytes = hex::decode(ct_hex.trim_start_matches("0x")).unwrap();
+
+        let decoded = pyde_crypto::threshold::ThresholdCiphertext::from_wire_bytes(&ct_bytes)
+            .expect("real decoder must accept WASM threshold_encrypt output");
+        assert_eq!(decoded.encrypted_len(), payload.len());
+    }
+
+    // Negative-path testing (invalid threshold pubkey, bad hex, etc.)
+    // is not run natively here: the workspace profile uses
+    // `panic = "abort"`, and `wasm_bindgen` functions cannot unwind a
+    // `JsValue` error across the FFI boundary on non-wasm targets —
+    // even for happy-path `Err(...)` returns the process aborts.
+    // These paths are exercised end-to-end via the `pyde-ts-sdk` jest
+    // suite once the wasm bundle is rebuilt.
 }

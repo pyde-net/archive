@@ -3596,6 +3596,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hex",
  "pyde-crypto",
+ "pyde-mempool",
  "serde",
  "serde_json",
  "wasm-bindgen",
