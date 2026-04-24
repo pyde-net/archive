@@ -184,10 +184,38 @@ pub trait PydeApi {
     /// Submit a transaction for threshold encryption and mempool inclusion.
     /// Accepts a JSON object with: from, to, value, data, gas, nonce, signature.
     /// The node encrypts it with the committee's threshold public key before adding to mempool.
+    ///
+    /// NOTE: server-side encryption means the RPC node sees the
+    /// plaintext (defeats MEV protection against a curious operator)
+    /// and the client's signature can't bind to the ciphertext (the
+    /// server chose the randomness). Dev / fallback path only. Real
+    /// clients should use `pyde_sendRawEncryptedTransaction` below.
     #[method(name = "pyde_sendEncryptedTransaction")]
     async fn send_encrypted_transaction(
         &self,
         tx_obj: serde_json::Value,
+    ) -> Result<String, ErrorObjectOwned>;
+
+    /// Canonical MEV-protected submission path. Accepts a fully
+    /// client-built + client-signed `EncryptedTx` as hex-encoded
+    /// wire bytes (`EncryptedTx::to_bytes`).
+    ///
+    /// The client is expected to:
+    ///   1. Fetch the committee pubkey via
+    ///      `pyde_getThresholdPublicKey`.
+    ///   2. Call `threshold_encrypt` on `(to, value, calldata)`
+    ///      locally (so the node never sees plaintext).
+    ///   3. Sign `EncryptedTx::hash()` with the sender's FALCON
+    ///      secret key. Because the client chose the ciphertext's
+    ///      randomness, the signature binds to a hash the client
+    ///      actually knows — unlike the server-side path above.
+    ///   4. Serialize via `to_bytes` and hex-encode.
+    ///
+    /// Returns the EncryptedTx hash on success.
+    #[method(name = "pyde_sendRawEncryptedTransaction")]
+    async fn send_raw_encrypted_transaction(
+        &self,
+        tx_hex: String,
     ) -> Result<String, ErrorObjectOwned>;
 
     // ========================================================================
@@ -1179,6 +1207,68 @@ impl PydeApiServer for RpcServer {
         info!(
             tx_hash = hex::encode(tx_hash),
             "encrypted tx accepted into mempool"
+        );
+        Ok(format!("0x{}", hex::encode(tx_hash)))
+    }
+
+    async fn send_raw_encrypted_transaction(
+        &self,
+        tx_hex: String,
+    ) -> Result<String, ErrorObjectOwned> {
+        // Decode hex-encoded EncryptedTx wire frame produced by the
+        // client via `EncryptedTx::to_bytes`.
+        let tx_bytes = hex::decode(tx_hex.strip_prefix("0x").unwrap_or(&tx_hex))
+            .map_err(|e| rpc_err(-32602, format!("invalid hex: {}", e)))?;
+        let enc_tx = pyde_mempool::encrypted::EncryptedTx::from_bytes(&tx_bytes)
+            .ok_or_else(|| rpc_err(-32602, "invalid EncryptedTx wire format".to_string()))?;
+
+        let from = enc_tx.sender;
+        let tx_hash = enc_tx.hash();
+
+        // Same ingest policy as the server-side path (audit item 206):
+        // mainnet requires the sender to have a registered auth_key,
+        // devnet falls through to structural-only for faucet UX. The
+        // key win over the server-side path is that the signature
+        // actually binds to a ciphertext the client knows about — so
+        // on mainnet the FALCON verify inside `receive_tx_verified`
+        // is meaningful, not a no-op length check.
+        let sender_pk_opt = {
+            let state_r = self.state.state.read().await;
+            let sender_key = pyde_state::keys::balance_key(&from);
+            state_r
+                .get(&sender_key)
+                .and_then(|bytes| pyde_account::types::Account::from_bytes(&bytes))
+                .and_then(|acct| match acct.auth_keys {
+                    pyde_account::types::AuthKeys::Single(pk) => Some(pk),
+                    _ => None,
+                })
+        };
+
+        let mut relay = self.state.tx_relay.write().await;
+        let accepted = match encrypted_tx_ingest_policy(sender_pk_opt, self.chain_id) {
+            EncryptedTxIngestPolicy::Verify(sender_pk) => {
+                relay.receive_tx_verified(enc_tx, &sender_pk)
+            }
+            EncryptedTxIngestPolicy::StructuralOnly => relay.receive_tx(enc_tx),
+            EncryptedTxIngestPolicy::Reject => {
+                return Err(rpc_err(
+                    -32001,
+                    "encrypted-tx sender has no registered auth_key; register one before submitting"
+                        .to_string(),
+                ));
+            }
+        };
+        if !accepted {
+            return Err(rpc_err(
+                -32000,
+                "tx rejected (duplicate, rate-limited, or signature failed verification)"
+                    .to_string(),
+            ));
+        }
+
+        info!(
+            tx_hash = hex::encode(tx_hash),
+            "raw encrypted tx accepted into mempool"
         );
         Ok(format!("0x{}", hex::encode(tx_hash)))
     }
