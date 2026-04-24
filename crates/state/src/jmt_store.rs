@@ -313,7 +313,7 @@ impl TreeWriter for JmtRocksStore {
                     value_cache.put(*key_hash, Some(bytes.clone()));
                 }
                 _ => {
-                    batch.put(&key, &[]);
+                    batch.put(&key, []);
                     value_cache.put(*key_hash, None);
                 }
             }
@@ -337,7 +337,7 @@ impl TreeWriter for JmtRocksStore {
         if let Some(rm) = rightmost {
             let bytes =
                 borsh::to_vec(&rm).map_err(|e| anyhow::anyhow!("rightmost encode: {}", e))?;
-            batch.put(&Self::meta_key(META_RIGHTMOST), bytes);
+            batch.put(Self::meta_key(META_RIGHTMOST), bytes);
         }
 
         self.db

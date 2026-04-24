@@ -549,7 +549,7 @@ fn sustained_rate_load_test() {
         let mut gas_zero_with_txs = 0usize;
         let mut empty = 0usize;
         for l in &timing_lines {
-            let has_txs = l.contains("txs=0") == false;
+            let has_txs = !l.contains("txs=0");
             let has_gas = !l.contains("gas=0");
             if !has_txs {
                 empty += 1;
