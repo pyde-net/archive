@@ -743,7 +743,11 @@ impl ValidatorEngine {
     /// it via config.
     pub fn install_bootstrap_ws_anchor(&mut self, slot: u64) {
         use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
-        self.finality.latest_checkpoint = Some(FinalityCheckpoint {
+        // Audit item 207a: persist BEFORE mutating in-memory state.
+        // If the store is attached and the write fails, persist
+        // panics — and we never touch `self.finality`, keeping the
+        // invariant that in-memory >= on-disk.
+        let cp = FinalityCheckpoint {
             slot,
             block_hash: [0u8; 32],
             state_root: [0u8; 32],
@@ -754,26 +758,50 @@ impl ValidatorEngine {
                 voter_bitmap: 0,
                 signatures: Vec::new(),
             },
-        });
+        };
+        self.persist_finality_checkpoint_direct(&cp);
+        self.finality.latest_checkpoint = Some(cp);
         if self.finality.highest_hard_slot < slot {
             self.finality.highest_hard_slot = slot;
         }
-        self.persist_finality_checkpoint();
     }
 
-    /// Persist the latest WS checkpoint to disk when a store is attached.
-    /// No-op when no store (devnet/tests) or no checkpoint yet. Panic-on-
-    /// fail because losing the WS anchor silently would re-open the
-    /// long-range-attack window after restart.
-    fn persist_finality_checkpoint(&self) {
-        let (Some(store), Some(cp)) = (
-            self.consensus_store.as_ref(),
-            self.finality.latest_checkpoint.as_ref(),
-        ) else {
+    /// Persist an explicit checkpoint to disk. Used by the three
+    /// call sites that advance the WS anchor (bootstrap install,
+    /// hard-finality vote, gossip ingest). Audit item 207a: the
+    /// previous `persist_finality_checkpoint()` read from
+    /// `self.finality.latest_checkpoint`, which forced callers to
+    /// mutate in-memory state BEFORE disk — opening a crash window
+    /// where memory said "slot N is finalized" but disk still said
+    /// "slot N-1". On restart the WS anchor would revert to N-1,
+    /// re-admitting long-range reorgs of N. Callers now pass the
+    /// cert they're about to install and invoke this FIRST, only
+    /// flipping in-memory state if the persist succeeds (panic on
+    /// failure aborts before the memory mutation).
+    fn persist_finality_checkpoint_direct(
+        &self,
+        cp: &pyde_consensus::finality::FinalityCheckpoint,
+    ) {
+        let Some(store) = self.consensus_store.as_ref() else {
             return;
         };
         if let Err(e) = store.save_finality_checkpoint(cp) {
             panic!("CRITICAL: finality checkpoint persistence failed — {}", e);
+        }
+    }
+
+    /// Persist whatever checkpoint is currently on `self.finality`.
+    /// Kept as a convenience wrapper for non-ordering-sensitive
+    /// callers (tests, and the `install_bootstrap_ws_anchor` dev-mode
+    /// path which is a bootstrap-only helper). New code on the hot
+    /// consensus path should use
+    /// `persist_finality_checkpoint_direct` and pass the cert
+    /// explicitly so the persist-before-memory invariant is visible
+    /// at the call site.
+    #[allow(dead_code)]
+    fn persist_finality_checkpoint(&self) {
+        if let Some(cp) = self.finality.latest_checkpoint.as_ref() {
+            self.persist_finality_checkpoint_direct(cp);
         }
     }
 
@@ -1592,12 +1620,21 @@ impl ValidatorEngine {
                 try_form_hard_finality(slot, block_hash, state_root, entry, &self.committee_keys)
             {
                 info!(slot, "hard finality achieved");
+                // Audit item 207a: persist BEFORE in-memory mutation.
+                // Construct the checkpoint explicitly here so we can
+                // fsync it first; if the write fails, panic aborts
+                // the process before `record_hard_finality` moves
+                // `self.finality` to a state that disk won't confirm
+                // on restart. Reverted-on-restart state was the
+                // long-range-attack re-opening the audit flagged.
+                let cp = pyde_consensus::finality::FinalityCheckpoint {
+                    slot: cert.slot,
+                    block_hash: cert.block_hash,
+                    state_root: cert.state_root,
+                    cert: cert.clone(),
+                };
+                self.persist_finality_checkpoint_direct(&cp);
                 self.finality.record_hard_finality(cert);
-                // Slice 4.3: persist the new WS checkpoint so it survives
-                // a crash. Panic-on-fail mirrors consensus_state persistence:
-                // losing the anchor silently could let a long-range chain
-                // through after restart.
-                self.persist_finality_checkpoint();
                 return true;
             }
         }
@@ -1660,8 +1697,12 @@ impl ValidatorEngine {
             }
         }
 
+        // Audit item 207a: persist BEFORE mutating in-memory state
+        // so a crash in the window can't leave in-memory ahead of
+        // disk. If the write fails, panic aborts before `latest_
+        // checkpoint` takes the new value.
+        self.persist_finality_checkpoint_direct(&cp);
         self.finality.latest_checkpoint = Some(cp);
-        self.persist_finality_checkpoint();
         true
     }
 
