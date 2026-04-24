@@ -172,6 +172,15 @@ pub trait PydeApi {
     #[method(name = "pyde_mempoolSize")]
     async fn mempool_size(&self) -> Result<String, ErrorObjectOwned>;
 
+    /// Return the committee's threshold public key (hex-encoded
+    /// wire bytes). Clients encrypt the private fields of an
+    /// `EncryptedTx` with this key locally before submitting via
+    /// `pyde_sendRawEncryptedTransaction`. Errors if the node has
+    /// no threshold committee configured (e.g. a dev node without
+    /// MEV protection wired up).
+    #[method(name = "pyde_getThresholdPublicKey")]
+    async fn get_threshold_public_key(&self) -> Result<String, ErrorObjectOwned>;
+
     /// Submit a transaction for threshold encryption and mempool inclusion.
     /// Accepts a JSON object with: from, to, value, data, gas, nonce, signature.
     /// The node encrypts it with the committee's threshold public key before adding to mempool.
@@ -1037,6 +1046,14 @@ impl PydeApiServer for RpcServer {
     async fn mempool_size(&self) -> Result<String, ErrorObjectOwned> {
         let relay = self.state.tx_relay.read().await;
         Ok(relay.mempool_size().to_string())
+    }
+
+    async fn get_threshold_public_key(&self) -> Result<String, ErrorObjectOwned> {
+        let pk =
+            self.state.threshold_pk.as_ref().ok_or_else(|| {
+                rpc_err(-32000, "threshold encryption not configured".to_string())
+            })?;
+        Ok(format!("0x{}", hex::encode(pk.to_bytes())))
     }
 
     async fn send_encrypted_transaction(
