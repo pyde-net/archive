@@ -341,7 +341,10 @@ pub fn build_raw_encrypted_tx_wasm(params_json: &str, sk_hex: &str) -> Result<St
 
     let sender = parse_addr(v.get("sender"))?;
     let nonce = v.get("nonce").and_then(|x| x.as_u64()).unwrap_or(0);
-    let gas_limit = v.get("gasLimit").and_then(|x| x.as_u64()).unwrap_or(100_000);
+    let gas_limit = v
+        .get("gasLimit")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(100_000);
     let chain_id = v.get("chainId").and_then(|x| x.as_u64()).unwrap_or(31337);
     let deadline = v.get("deadline").and_then(|x| x.as_u64());
     let to = parse_addr(v.get("to"))?;

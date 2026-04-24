@@ -886,6 +886,26 @@ impl PydeNode {
                                                 times_w.remove(h);
                                             }
                                         }
+                                        // Audit item 227 step 4: clear encrypted txs from
+                                        // the local tx_relay once the block committing
+                                        // them has been fully processed. The self-propose
+                                        // path deliberately does NOT do this — self-proposals
+                                        // can lose the multi-proposer VRF lottery, and
+                                        // removing on self-propose would permanently drop
+                                        // the tx even when a different validator's block
+                                        // wins the slot. Doing it here, after the block
+                                        // has actually been QC'd and processed, matches
+                                        // the P7a-2 plaintext fix.
+                                        if !block.body.encrypted_txs.is_empty() {
+                                            let enc_hashes: Vec<[u8; 32]> = block.body.encrypted_txs.iter()
+                                                .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+                                                .map(|etx| etx.hash())
+                                                .collect();
+                                            if !enc_hashes.is_empty() {
+                                                let mut relay_w = tx_relay.write().await;
+                                                relay_w.remove_included(&enc_hashes);
+                                            }
+                                        }
                                         info!(slot, txs = tc, gas, "compact block reconstructed and processed");
                                     }
                                     Err(e) => {
@@ -1408,15 +1428,17 @@ impl PydeNode {
                                         }
                                     }
 
-                                    // Remove included encrypted txs from mempool
-                                    if !block.body.encrypted_txs.is_empty() {
-                                        let enc_hashes: Vec<[u8; 32]> = block.body.encrypted_txs.iter()
-                                            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
-                                            .map(|etx| etx.hash())
-                                            .collect();
-                                        let mut relay_w = tx_relay.write().await;
-                                        relay_w.remove_included(&enc_hashes);
-                                    }
+                                    // Audit item 227 step 4: do NOT remove encrypted txs
+                                    // from tx_relay here. Self-proposals can lose the
+                                    // multi-proposer VRF lottery, and removing at self-
+                                    // propose time would permanently orphan the tx when
+                                    // a different validator's block wins the slot. The
+                                    // removal happens in the `ReconstructCompactBlock`
+                                    // handler once the committed block has been processed
+                                    // — if our block ends up being the winner, it arrives
+                                    // back to us via gossip like any other block and the
+                                    // cleanup fires there. If it loses, the tx stays in
+                                    // the mempool for future slots.
 
                                     // Store full block for sync serving + missing tx requests
                                     let full_block_bytes = wire::encode_block(&block);

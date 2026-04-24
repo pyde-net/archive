@@ -764,6 +764,126 @@ impl TestNetwork {
         })
     }
 
+    /// Submit a client-built, client-signed encrypted transfer and
+    /// return the encrypted-tx hash (hex). Exercises the full
+    /// MEV-protected flow end-to-end (audit items 207 + 227):
+    ///
+    ///   1. Fetch the committee's threshold pubkey via
+    ///      `pyde_getThresholdPublicKey`.
+    ///   2. Build an `EncryptedTx` locally (threshold-encrypt the
+    ///      private fields, FALCON-sign the hash).
+    ///   3. Submit via `pyde_sendRawEncryptedTransaction`.
+    ///
+    /// The sender must have a registered on-chain `AuthKeys::Single`
+    /// — `try_decrypt_and_execute` drops encrypted txs from senders
+    /// without one. Validator accounts satisfy this at genesis, so
+    /// callers typically pass a `load_validator_key` keypair here.
+    pub fn submit_encrypted_transfer(
+        &self,
+        rpc_node_idx: usize,
+        sender_pk_bytes: &[u8],
+        sender_sk_bytes: &[u8],
+        recipient: &[u8; 32],
+        value: u128,
+    ) -> Result<String, String> {
+        // 1. Threshold pubkey from the node.
+        let tpk_resp = rpc_call(
+            &self.nodes[rpc_node_idx].rpc_url(),
+            "pyde_getThresholdPublicKey",
+            "[]",
+        )?;
+        let tpk_hex = parse_hex_result(&tpk_resp)?;
+        let tpk_bytes = hex::decode(tpk_hex.trim_start_matches("0x"))
+            .map_err(|e| format!("decode threshold pk hex: {}", e))?;
+        let tpk = pyde_crypto::threshold::ThresholdPublicKey::from_bytes(&tpk_bytes)
+            .ok_or_else(|| "invalid threshold pk bytes".to_string())?;
+
+        // 2. Sender FALCON secret key.
+        let sk = pyde_crypto::falcon::FalconSecretKey::from_bytes(sender_sk_bytes)
+            .ok_or_else(|| "invalid sender secret key".to_string())?;
+        let sender = pyde_account::address::derive_eoa_address(sender_pk_bytes);
+
+        // 3. Current nonce.
+        let nonce_params = format!(r#"["0x{}"]"#, hex::encode(sender));
+        let nonce_resp = rpc_call(
+            &self.nodes[rpc_node_idx].rpc_url(),
+            "pyde_getTransactionCount",
+            &nonce_params,
+        )?;
+        // getTransactionCount returns "0x{hex}".
+        let nonce_hex = parse_hex_result(&nonce_resp)?;
+        let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16)
+            .map_err(|e| format!("parse nonce hex {:?}: {}", nonce_hex, e))?;
+
+        // 4. Build EncryptedTx with a placeholder signature, then
+        //    rewrite the signature field after hashing + signing.
+        //    Order matters: `EncryptedTx::hash()` covers the
+        //    ciphertext, so sign AFTER encryption.
+        // `mempool::pool::Mempool::check_core_validity` rejects txs
+        // with an empty access_list (`MissingAccessList`). Populate a
+        // minimal single-entry list for the recipient — parallel-exec
+        // scheduler needs SOMETHING here, and the exact content is
+        // plaintext on the wire so there's no MEV cost to including
+        // the recipient address.
+        let access_list = vec![pyde_tx::types::AccessEntry {
+            address: *recipient,
+            reads: Vec::new(),
+            writes: Vec::new(),
+        }];
+        let mut enc_tx = pyde_mempool::encrypted::encrypt_transaction(
+            sender,
+            nonce,
+            /* gas_limit */ 100_000,
+            access_list,
+            /* deadline */ None,
+            /* chain_id */ 31337,
+            /* signature */ Vec::new(),
+            recipient,
+            value,
+            /* calldata */ &[],
+            &tpk,
+        )
+        .map_err(|e| format!("threshold encryption failed: {}", e))?;
+        let tx_hash = enc_tx.hash();
+        let sig = pyde_crypto::falcon::falcon_sign(&sk, &tx_hash)
+            .map_err(|e| format!("FALCON sign failed: {}", e))?;
+        enc_tx.signature = sig.as_bytes().to_vec();
+
+        // Self-verify before wire-encoding so a failure here points
+        // at client-side sign logic rather than wire / server issues.
+        let self_pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(sender_pk_bytes)
+            .ok_or_else(|| "invalid sender public key".to_string())?;
+        let self_sig = pyde_crypto::falcon::FalconSignature::from_bytes(&enc_tx.signature)
+            .ok_or_else(|| "just-produced signature unparseable".to_string())?;
+        if !pyde_crypto::falcon::falcon_verify(&self_pk, &enc_tx.hash(), &self_sig) {
+            return Err("client-side self-verify of EncryptedTx signature failed".into());
+        }
+
+        // 5. Submit via the raw-encrypted RPC.
+        let wire = enc_tx.to_bytes();
+        // And round-trip verify — if to_bytes → from_bytes → hash
+        // doesn't match the hash we signed, the wire format drifted.
+        let roundtrip = pyde_mempool::encrypted::EncryptedTx::from_bytes(&wire)
+            .ok_or_else(|| "wire round-trip decode failed".to_string())?;
+        if roundtrip.hash() != tx_hash {
+            return Err(format!(
+                "wire round-trip hash drift: signed={} decoded={}",
+                hex::encode(tx_hash),
+                hex::encode(roundtrip.hash())
+            ));
+        }
+        if !pyde_crypto::falcon::falcon_verify(&self_pk, &roundtrip.hash(), &self_sig) {
+            return Err("post-roundtrip sig verify failed (server would see this too)".into());
+        }
+        let params = format!(r#"["0x{}"]"#, hex::encode(&wire));
+        let submit_resp = rpc_call(
+            &self.nodes[rpc_node_idx].rpc_url(),
+            "pyde_sendRawEncryptedTransaction",
+            &params,
+        )?;
+        parse_hex_result(&submit_resp).map(|s| s.to_string())
+    }
+
     /// Balance in quanta. Returns `0` if the account is unknown.
     pub fn get_balance(&self, node_idx: usize, address: &[u8; 32]) -> Result<u128, String> {
         let params = format!(r#"["0x{}"]"#, hex::encode(address));
