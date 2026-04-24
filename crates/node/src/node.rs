@@ -239,6 +239,17 @@ impl PydeNode {
             RwLock<std::collections::HashMap<u64, Vec<wire::DecryptionShareMsg>>>,
         > = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
+        // Queued encrypted-tx bundles (audit item 207). Proposers publish an
+        // EncryptedTxBundle alongside the compact block to deliver the
+        // block's encrypted_txs to validators that don't already have them
+        // in their local tx_relay. Keyed by (slot, block_hash) so the
+        // matching compact block can find its bundle on arrival
+        // regardless of which message reaches a given peer first.
+        // Pruned in the maintenance tick alongside queued_shares.
+        let queued_encrypted_bundles: Arc<
+            RwLock<std::collections::HashMap<(u64, [u8; 32]), Vec<Vec<u8>>>>,
+        > = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
         // 4. Chain sync
         let mut chain_sync = ChainSync::new();
         chain_sync.manager.local_tip = chain.read().await.head_slot;
@@ -698,6 +709,7 @@ impl PydeNode {
                                 Err(e) => { warn!(error = e, "invalid compact block header"); continue; }
                             };
                             let slot = header.slot;
+                            let block_hash = header.hash();
 
                             // Build mempool snapshot for reconstruction (plaintext + encrypted)
                             let idx = mempool_index.read().await;
@@ -713,6 +725,34 @@ impl PydeNode {
                                     let hash = etx.hash();
                                     let bytes = etx.to_bytes();
                                     mempool_txs.push((hash, bytes));
+                                }
+                            }
+
+                            // Audit item 207: pull encrypted_txs from any
+                            // queued bundle for this (slot, block_hash). The
+                            // proposer published the bundle alongside the
+                            // compact block exactly so non-proposer validators
+                            // that don't have the txs in local tx_relay can
+                            // still reconstruct. Remove the entry (single-use)
+                            // to keep the queue bounded. Integrity is checked
+                            // downstream by `verify_tx_root` inside
+                            // `BlockProcessor::process_full_block_with_aot_and_checkpoint`
+                            // (block_processor.rs:622), so a bundle whose
+                            // entries don't match the block header's tx_root
+                            // will fail block validation without extra logic
+                            // here.
+                            {
+                                let mut qb = queued_encrypted_bundles.write().await;
+                                if let Some(bundle_txs) = qb.remove(&(slot, block_hash)) {
+                                    for bytes in bundle_txs {
+                                        if let Some(etx) = pyde_mempool::encrypted::EncryptedTx::from_bytes(&bytes) {
+                                            mempool_txs.push((etx.hash(), bytes));
+                                        }
+                                    }
+                                    debug!(
+                                        slot,
+                                        "reassembled compact block using queued encrypted-tx bundle"
+                                    );
                                 }
                             }
 
@@ -870,6 +910,29 @@ impl PydeNode {
                                     times_w.remove(h);
                                 }
                             }
+                        }
+                        PostEventAction::BufferEncryptedBundle(bundle) => {
+                            // Drop stale bundles so the queue can't grow
+                            // unboundedly under adversarial / noisy gossip.
+                            // 100 slots matches the queued_shares window.
+                            let head = chain.read().await.head_slot;
+                            if bundle.slot + 100 < head {
+                                debug!(
+                                    slot = bundle.slot,
+                                    head,
+                                    "dropping stale encrypted-tx bundle"
+                                );
+                                continue;
+                            }
+                            let key = (bundle.slot, bundle.block_hash);
+                            let txs_count = bundle.encrypted_txs.len();
+                            let mut qb = queued_encrypted_bundles.write().await;
+                            qb.insert(key, bundle.encrypted_txs);
+                            debug!(
+                                slot = bundle.slot,
+                                encrypted_txs = txs_count,
+                                "buffered encrypted-tx bundle"
+                            );
                         }
                         PostEventAction::AddDecryptionShares(msg) => {
                             let slot = msg.slot;
@@ -1382,8 +1445,35 @@ impl PydeNode {
                                     );
                                     let compact_bytes = wire::encode_compact_block(&compact);
                                     let topic = pyde_net::node::topics::blocks();
-                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, compact_bytes) {
+                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), compact_bytes) {
                                         debug!(slot = current_slot, error = %e, "no gossipsub subscribers for block");
+                                    }
+
+                                    // Audit item 207: publish the encrypted_txs
+                                    // bundle alongside the compact block so
+                                    // non-proposer validators that don't have
+                                    // them in their local tx_relay can still
+                                    // reconstruct the block. Integrity is
+                                    // anchored by BlockHeader::tx_root on the
+                                    // receiver (see process_full_block_...).
+                                    if !block.body.encrypted_txs.is_empty() {
+                                        let bundle = pyde_net::propagation::EncryptedTxBundle {
+                                            slot: block.header.slot,
+                                            block_hash: block.header.hash(),
+                                            encrypted_txs: block.body.encrypted_txs.clone(),
+                                        };
+                                        let bundle_bytes = wire::encode_encrypted_tx_bundle(&bundle);
+                                        if let Err(e) = swarm
+                                            .behaviour_mut()
+                                            .gossipsub
+                                            .publish(topic, bundle_bytes)
+                                        {
+                                            debug!(
+                                                slot = current_slot,
+                                                error = %e,
+                                                "no gossipsub subscribers for encrypted-tx bundle"
+                                            );
+                                        }
                                     }
 
                                     // Broadcast proposal as consensus message
@@ -1753,6 +1843,11 @@ impl PydeNode {
                         dec_w.retain(|slot, _| *slot + 100 > head);
                         let mut q = queued_shares.write().await;
                         q.retain(|slot, _| *slot + 100 > head);
+                        // Audit item 207: prune queued encrypted-tx bundles
+                        // that never paired with a compact block (proposer
+                        // failure, gossip drop, or an adversarial orphan).
+                        let mut qb = queued_encrypted_bundles.write().await;
+                        qb.retain(|(slot, _), _| *slot + 100 > head);
                     }
                     let head = chain.read().await.head_slot;
                     debug!(
@@ -1823,6 +1918,11 @@ enum PostEventAction {
     },
     ReconstructCompactBlock(pyde_net::propagation::CompactBlock),
     AddDecryptionShares(wire::DecryptionShareMsg),
+    /// Buffered encrypted-tx bundle from a proposer. The main loop
+    /// stores it keyed by (slot, block_hash) so the matching compact
+    /// block can pull encrypted_txs out of it on arrival, regardless
+    /// of gossipsub ordering. Audit item 207.
+    BufferEncryptedBundle(pyde_net::propagation::EncryptedTxBundle),
     /// Send a `PydeAuthReq` to a newly connected peer. The main loop
     /// generates a fresh nonce, records it in `pending_auth_nonces`, and
     /// dispatches via the swarm.
@@ -1908,6 +2008,23 @@ fn handle_swarm_event(
                             }
                             Err(e) => {
                                 debug!(error = e, "failed to decode compact block");
+                            }
+                        }
+                        return PostEventAction::None;
+                    }
+
+                    // Encrypted-tx bundle (audit item 207): proposer delivers
+                    // the block's encrypted_txs to validators that don't
+                    // already have them in their local tx_relay. Buffered
+                    // until the matching compact block arrives.
+                    if !message.data.is_empty() && message.data[0] == wire::tag::ENCRYPTED_TX_BUNDLE
+                    {
+                        match wire::decode_encrypted_tx_bundle(&message.data) {
+                            Ok(bundle) => {
+                                return PostEventAction::BufferEncryptedBundle(bundle);
+                            }
+                            Err(e) => {
+                                debug!(error = e, "failed to decode encrypted-tx bundle");
                             }
                         }
                         return PostEventAction::None;
