@@ -169,6 +169,116 @@ mod tests {
         );
     }
 
+    /// Assert AOT and interpreter burn identical gas for a program
+    /// that runs to success on both paths. Used for audit item 228a
+    /// parity tests across memory-touching ops.
+    fn assert_gas_parity(code: &[u8], gas_limit: u64, label: &str) {
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(gas_limit);
+        vm.load(code).unwrap();
+        let _ = vm.execute();
+        let interp_gas = vm.gas_used_total;
+
+        let (aot_status, aot_gas, _) = run_aot(code, gas_limit);
+        assert_eq!(aot_status, RESULT_SUCCESS, "{label}: AOT did not succeed");
+        assert_eq!(
+            aot_gas, interp_gas,
+            "{label}: AOT gas {aot_gas} != interp gas {interp_gas}"
+        );
+    }
+
+    #[test]
+    fn load_aot_charges_page_gas_parity_with_interp() {
+        // Audit item 228a — host_load bumps vm.memory.page_gas_used
+        // via check_access; AOT must drain it into VAR_GAS_USED to
+        // match the interpreter's post-step drain.
+        let heap = pyde_vm::memory::HEAP_START as i32;
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap), // r1 = HEAP_START
+            // load r2, [r1 + 0], width=64
+            instr_bytes(
+                Opcode::Load,
+                2,
+                1,
+                pyde_vm::isa::encode_mem_immediate(0, pyde_vm::isa::MemWidth::W64).unwrap(),
+            ),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity(&code, 1_000_000, "Load page-gas parity");
+    }
+
+    #[test]
+    fn store_aot_charges_page_gas_parity_with_interp() {
+        let heap = pyde_vm::memory::HEAP_START as i32;
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap), // r1 = HEAP_START
+            instr_ri(Opcode::Addi, 2, 0, 42),   // r2 = value
+            // store r2, [r1 + 0], width=64
+            instr_bytes(
+                Opcode::Store,
+                2,
+                1,
+                pyde_vm::isa::encode_mem_immediate(0, pyde_vm::isa::MemWidth::W64).unwrap(),
+            ),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity(&code, 1_000_000, "Store page-gas parity");
+    }
+
+    #[test]
+    fn wload_aot_charges_page_gas_parity_with_interp() {
+        let heap = pyde_vm::memory::HEAP_START as i32;
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap),
+            // wload w0, [r1 + 0] — reads 32 bytes
+            instr_ri(Opcode::Wload, 0, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity(&code, 1_000_000, "Wload page-gas parity");
+    }
+
+    #[test]
+    fn wstore_aot_charges_page_gas_parity_with_interp() {
+        let heap = pyde_vm::memory::HEAP_START as i32;
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap),
+            // wstore w0, [r1 + 0] — writes 32 bytes (w0 is zero)
+            instr_ri(Opcode::Wstore, 0, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity(&code, 1_000_000, "Wstore page-gas parity");
+    }
+
+    #[test]
+    fn push_pop_aot_charges_page_gas_parity_with_interp() {
+        // Push writes to the stack page (fresh) → page_gas. Pop
+        // reads from the stack page (same page) → no additional
+        // page_gas since already touched. Together they exercise
+        // both host_push and host_pop drain paths.
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 99),
+            instr_bytes(Opcode::Push, 1, 0, 0),
+            instr_bytes(Opcode::Pop, 2, 0, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity(&code, 1_000_000, "Push/Pop page-gas parity");
+    }
+
+    #[test]
+    fn poseidon_aot_charges_page_gas_parity_with_interp() {
+        // host_poseidon reads `len` bytes from memory via
+        // checked_read_slice, which bumps page_gas_used for any
+        // fresh page touched. Must drain after.
+        let heap = pyde_vm::memory::HEAP_START as i32;
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap), // addr
+            instr_ri(Opcode::Addi, 5, 0, 64),   // len (fits in first heap page)
+            // poseidon w0 = hash(mem[r1..r1+r5])
+            instr_bytes(Opcode::Poseidon, 0, 1, 5),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity(&code, 1_000_000, "Poseidon page-gas parity");
+    }
+
     #[test]
     fn memcpy_aot_huge_len_traps() {
         // Audit item 215 — guest passing a huge len used to slip
