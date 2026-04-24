@@ -279,9 +279,24 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
         .declare_function("host_wide_alu", Linkage::Import, &sig_wide)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
-    // host_exec_opcode(ctx, opcode, rd, rs1, imm) -> u64 (same signature as wide_alu)
+    // host_exec_opcode(ctx, opcode, rd, rs1, imm, gas_used_in, gas_limit_in)
+    // -> packed u64 where: low 2 bits = result (0=ok, 1=trap, 2=halt/revert),
+    // high 62 bits = gas_used_out. Audit 228b: delegated ops must sync
+    // AOT's VAR_GAS_USED with vm.gas_used_total across the call, otherwise
+    // gas charged by step() inside the delegated execution is invisible
+    // to AOT and validators fork on any contract using CallExt / Delegate
+    // / Create / VerifySig / MerkleVerify.
+    let mut sig_exec_opcode = module.make_signature();
+    sig_exec_opcode.params.push(AbiParam::new(ptr_type)); // ctx
+    sig_exec_opcode.params.push(AbiParam::new(I64)); // opcode
+    sig_exec_opcode.params.push(AbiParam::new(I64)); // rd
+    sig_exec_opcode.params.push(AbiParam::new(I64)); // rs1
+    sig_exec_opcode.params.push(AbiParam::new(I64)); // imm
+    sig_exec_opcode.params.push(AbiParam::new(I64)); // gas_used_in
+    sig_exec_opcode.params.push(AbiParam::new(I64)); // gas_limit_in
+    sig_exec_opcode.returns.push(AbiParam::new(I64)); // packed
     let fn_exec_opcode = module
-        .declare_function("host_exec_opcode", Linkage::Import, &sig_wide)
+        .declare_function("host_exec_opcode", Linkage::Import, &sig_exec_opcode)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // host_sync_gp_to_vm(ctx, regs_ptr) — copy external regs to vm.cpu.gp
@@ -1172,6 +1187,13 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                     // Complex opcodes delegated to the interpreter via host_exec_opcode.
                     // GP registers are synced to vm.cpu.gp before the call and reloaded after.
                     // Wide registers are already in the VM (managed by host_wide_alu/host_widen).
+                    //
+                    // Audit 228b: the delegated step charges gas into
+                    // `vm.gas_used_total`, which is independent of AOT's
+                    // `VAR_GAS_USED`. Now passes current `VAR_GAS_USED` +
+                    // `VAR_GAS_LIMIT` into the host call, unpacks the
+                    // returned `(gas_used_out << 2) | result`, and folds
+                    // `gas_used_out` back into `VAR_GAS_USED`.
                     Opcode::CallExt
                     | Opcode::Delegate
                     | Opcode::Create
@@ -1188,15 +1210,48 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let rd_val = builder.ins().iconst(I64, d.rd as i64);
                         let rs1_val = builder.ins().iconst(I64, d.rs1 as i64);
                         let imm_val = builder.ins().iconst(I64, d.rs2_or_imm as i64);
-                        let call = builder
-                            .ins()
-                            .call(fn_exec_opcode_ref, &[vm_ctx, op, rd_val, rs1_val, imm_val]);
-                        let result = builder.inst_results(call)[0];
+                        let gas_used_in = builder.use_var(Variable::from_u32(VAR_GAS_USED));
+                        let gas_limit_in = builder.use_var(Variable::from_u32(VAR_GAS_LIMIT));
+                        let call = builder.ins().call(
+                            fn_exec_opcode_ref,
+                            &[
+                                vm_ctx,
+                                op,
+                                rd_val,
+                                rs1_val,
+                                imm_val,
+                                gas_used_in,
+                                gas_limit_in,
+                            ],
+                        );
+                        let raw = builder.inst_results(call)[0];
+
+                        // Unpack: low 2 bits = result, high 62 = gas_used_out.
+                        let result = builder.ins().band_imm(raw, 3);
+                        let gas_used_out = builder.ins().ushr_imm(raw, 2);
+                        builder.def_var(Variable::from_u32(VAR_GAS_USED), gas_used_out);
 
                         // Sync GP registers back: vm.cpu.gp[] → external regs[]
                         builder
                             .ins()
                             .call(fn_sync_gp_from_vm_ref, &[vm_ctx, regs_ptr_val]);
+
+                        // OOG if the updated VAR_GAS_USED is over VAR_GAS_LIMIT.
+                        // Belt-and-suspenders: step() also traps OOG internally
+                        // (result=1), but a successful step that exactly
+                        // saturated gas should map to the AOT's oog_block
+                        // rather than continuing.
+                        let gas_limit = builder.use_var(Variable::from_u32(VAR_GAS_LIMIT));
+                        let limit_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, gas_limit, 0);
+                        let over =
+                            builder
+                                .ins()
+                                .icmp(IntCC::UnsignedGreaterThan, gas_used_out, gas_limit);
+                        let oog = builder.ins().band(limit_nonzero, over);
+                        let after_oog = builder.create_block();
+                        builder.ins().brif(oog, oog_block, &[], after_oog, &[]);
+                        builder.seal_block(after_oog);
+                        builder.switch_to_block(after_oog);
 
                         // Check result: 0=ok, 1=trap, 2=halt/revert
                         let is_trap = builder.ins().icmp_imm(IntCC::Equal, result, 1);

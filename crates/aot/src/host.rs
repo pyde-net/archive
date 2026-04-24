@@ -775,32 +775,58 @@ pub extern "C" fn host_sync_gp_from_vm(ctx: *mut VmCtx, regs_ptr: *mut u64) {
     }
 }
 
-/// Execute a single PVM instruction by calling vm.step() with the given decoded instruction.
-/// This is the cleanest way to support complex opcodes in AOT: just run one PVM step.
-/// Returns 0 on success, 1 on trap/error.
+/// Execute a delegated opcode via the interpreter, syncing gas
+/// state in and out of the AOT.
+///
+/// Audit 228b — the AOT tracks gas in its own Cranelift SSA
+/// variable (`VAR_GAS_USED`), which is **independent** of
+/// `vm.gas_used_total`. Before this fix any gas charged by
+/// `step()` for a delegated opcode (CallExt / Delegate / Create
+/// / VerifySig / MerkleVerify) was lost the moment the host
+/// call returned. Now the AOT passes its current counter values
+/// in (`gas_used_in`, `gas_limit_in`), the interpreter runs
+/// with those values, and the updated `vm.gas_used_total` is
+/// packed into the high 62 bits of the return so codegen can
+/// fold it back into `VAR_GAS_USED`.
+///
+/// Returns: `(gas_used_out << 2) | result` where result is:
+///   0 = success, continue
+///   1 = trap (includes OutOfGas)
+///   2 = halt / revert
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn host_exec_opcode(
     ctx: *mut VmCtx,
     opcode: u64,
     rd: u64,
     rs1: u64,
     imm: u64,
+    gas_used_in: u64,
+    gas_limit_in: u64,
 ) -> u64 {
     // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
     // safety contract (top of file). The AOT JIT's callsite emission
     // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
     // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
+    // Sync gas state into the VM so step() can see the current
+    // counter and trap OOG at the right point.
+    vm.gas_used_total = gas_used_in;
+    vm.gas_limit = gas_limit_in;
     let d = pyde_vm::isa::DecodedInstruction {
         opcode: pyde_vm::isa::Opcode::from_u8(opcode as u8),
         rd: rd as u8,
         rs1: rs1 as u8,
         rs2_or_imm: imm as u32,
     };
-    match vm.exec_single(d) {
+    let result: u64 = match vm.exec_single(d) {
         Ok(None) => 0,    // success, continue
         Ok(Some(_)) => 2, // halt/revert
         Err(_) => 1,      // trap
-    }
+    };
+    // Pack gas_used_out into high 62 bits so AOT codegen can fold
+    // it back into VAR_GAS_USED. Gas values fit easily in 62 bits
+    // (block gas limit is 1.6B = ~2^30.5).
+    (vm.gas_used_total << 2) | result
 }
 
 /// List of all host function names and their function pointers, for
