@@ -1028,6 +1028,69 @@ mod tests {
     }
 
     #[test]
+    fn sstoreb_aot_gas_parity_with_interp() {
+        // Audit 228d — Sstore mode 1 (sstoreb): reads
+        // mem[ptr..ptr+len] and writes those bytes into storage.
+        // Charges 2000 base + 1800 cold + (len/8)*3 dynamic gas.
+        // AOT used to trap on mode 1; now wired through host_sstoreb.
+        use pyde_vm::memory::HEAP_START;
+        let heap = HEAP_START as i32;
+        let code = bytecode(&[
+            // Populate mem[heap..heap+24] with some bytes
+            instr_ri(Opcode::Addi, 1, 0, heap), // r1 = HEAP_START
+            instr_ri(Opcode::Addi, 2, 0, 0xABCD), // r2 = sentinel
+            instr_bytes(
+                Opcode::Store,
+                2,
+                1,
+                pyde_vm::isa::encode_mem_immediate(0, pyde_vm::isa::MemWidth::W64).unwrap(),
+            ),
+            instr_bytes(
+                Opcode::Store,
+                2,
+                1,
+                pyde_vm::isa::encode_mem_immediate(8, pyde_vm::isa::MemWidth::W64).unwrap(),
+            ),
+            instr_bytes(
+                Opcode::Store,
+                2,
+                1,
+                pyde_vm::isa::encode_mem_immediate(16, pyde_vm::isa::MemWidth::W64).unwrap(),
+            ),
+            instr_ri(Opcode::Addi, 3, 0, 24), // r3 = len = 24 bytes
+            // sstoreb: imm = 1 (mode) | (1 << 2) (ptr_reg=r1) | (3 << 6) (len_reg=r3)
+            instr_bytes(Opcode::Sstore, 0, 0, 1 | (1 << 2) | (3 << 6)),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity_with_state(&code, 1_000_000, "Sstoreb", |vm| {
+            vm.cpu.write_wide(0, pyde_vm::wide::U256::from(0x1234u64));
+        });
+    }
+
+    #[test]
+    fn sloadb_aot_gas_parity_with_interp() {
+        // Audit 228d — Sload mode 1 (sloadb): reads raw bytes from
+        // storage[slot] into memory, writes length to gp[rd].
+        // AOT used to fall through to wide mode (silently wrong).
+        // Now wired through host_sloadb. Pre-populate storage so
+        // there's data to load + dynamic gas applies.
+        use pyde_vm::memory::HEAP_START;
+        let heap = HEAP_START as i32;
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap),
+            // sloadb r2, w0, ptr_reg=r1: imm = 1 (mode) | (1 << 2) (ptr_reg)
+            instr_bytes(Opcode::Sload, 2, 0, 1 | (1 << 2)),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        assert_gas_parity_with_state(&code, 1_000_000, "Sloadb", |vm| {
+            vm.cpu.write_wide(0, pyde_vm::wide::U256::from(0x1234u64));
+            // Pre-populate the storage key with 24 bytes.
+            let key = vm.derive_storage_key(pyde_vm::wide::U256::from(0x1234u64));
+            vm.storage.insert(key, vec![0xAB; 24]);
+        });
+    }
+
+    #[test]
     fn sdelete_aot_gas_parity_with_interp() {
         // Sdelete on a populated key: 2000 base + 1800 cold + 1500
         // refund (interp at `pvm/src/vm.rs:996-1004`). Tests parity

@@ -301,6 +301,95 @@ pub extern "C" fn host_sstoreg(ctx: *mut VmCtx, ws_slot: u64, value: u64) -> u64
     0
 }
 
+/// Host: sloadb (Sload mode 1, memory/bulk-bytes mode).
+///
+/// Reads storage[slot_from_ws1] as raw bytes, writes them to
+/// `mem[ptr..ptr+len]`, and writes the length into gp[rd_idx].
+/// If the slot is empty, gp[rd_idx] = 0 and no memory write.
+///
+/// Audit 228d — interp at `pvm/src/vm.rs:898-914`. Charges:
+///   - EIP-2929 cold-access surcharge (1800) on first touch
+///   - dynamic gas `(len/8)*3` based on the loaded byte length
+///   - page-allocation gas for any fresh memory pages written
+/// All three are added to `vm.memory.page_gas_used`; codegen
+/// drains via `emit_drain_page_gas!` after the call.
+pub extern "C" fn host_sloadb(ctx: *mut VmCtx, ws_slot: u64, ptr: u64, rd_idx: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
+    let vm = unsafe { &mut *ctx };
+    let slot = match vm.cpu.read_wide_checked(ws_slot as u8) {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
+    let key = vm.derive_storage_key(slot);
+    if !vm.warm_storage_keys.contains(&key) {
+        vm.warm_storage_keys.insert(key);
+        vm.memory.page_gas_used = vm.memory.page_gas_used.saturating_add(1800);
+    }
+    let data = vm.storage.get(&key).cloned().or_else(|| {
+        if let Some(ref backend) = vm.storage_backend {
+            let val = backend(&key);
+            if let Some(ref v) = val {
+                vm.storage.insert(key, v.clone());
+            }
+            val
+        } else {
+            None
+        }
+    });
+    if let Some(d) = data {
+        let dynamic_gas = (d.len() as u64).div_ceil(8) * 3;
+        vm.memory.page_gas_used = vm.memory.page_gas_used.saturating_add(dynamic_gas);
+        if vm.memory.checked_write_slice(ptr as u32, &d).is_err() {
+            return 1;
+        }
+        vm.cpu.write_gp(rd_idx as u8, d.len() as u64);
+    } else {
+        vm.cpu.write_gp(rd_idx as u8, 0);
+    }
+    0
+}
+
+/// Host: sstoreb (Sstore mode 1, memory/bulk-bytes mode).
+///
+/// Reads `mem[ptr..ptr+len]` and writes those bytes into
+/// storage[slot_from_ws1].
+///
+/// Audit 228d — interp at `pvm/src/vm.rs:965-983`. Same gas
+/// accumulator pattern as `host_sloadb` (cold surcharge +
+/// dynamic + memory page-gas all into `page_gas_used`).
+pub extern "C" fn host_sstoreb(ctx: *mut VmCtx, ws_slot: u64, ptr: u64, len: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
+    let vm = unsafe { &mut *ctx };
+    if vm.static_mode {
+        return 1;
+    }
+    let slot = match vm.cpu.read_wide_checked(ws_slot as u8) {
+        Ok(v) => v,
+        Err(_) => return 1,
+    };
+    let key = vm.derive_storage_key(slot);
+    if !vm.warm_storage_keys.contains(&key) {
+        vm.warm_storage_keys.insert(key);
+        vm.memory.page_gas_used = vm.memory.page_gas_used.saturating_add(1800);
+    }
+    vm.journal_storage_write(&key);
+    let len = len as usize;
+    let dynamic_gas = (len as u64).div_ceil(8) * 3;
+    vm.memory.page_gas_used = vm.memory.page_gas_used.saturating_add(dynamic_gas);
+    let data = match vm.memory.checked_read_slice(ptr as u32, len) {
+        Ok(d) => d,
+        Err(_) => return 1,
+    };
+    vm.storage.insert(key, data);
+    0
+}
+
 /// Host: sdelete. Clears storage[slot_from_ws1], grants refund if non-empty.
 /// Returns 0 on success, 1 if static mode violation.
 pub extern "C" fn host_sdelete(ctx: *mut VmCtx, ws_slot: u64) -> u64 {
@@ -884,6 +973,8 @@ pub fn host_functions() -> Vec<(&'static str, *const u8)> {
         ("host_sstore", host_sstore as *const u8),
         ("host_sstoreg", host_sstoreg as *const u8),
         ("host_sdelete", host_sdelete as *const u8),
+        ("host_sloadb", host_sloadb as *const u8),
+        ("host_sstoreb", host_sstoreb as *const u8),
         ("host_poseidon", host_poseidon as *const u8),
         ("host_log", host_log as *const u8),
         ("host_wide_alu", host_wide_alu as *const u8),

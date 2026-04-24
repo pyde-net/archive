@@ -176,6 +176,16 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
         .declare_function("host_sloadg", Linkage::Import, &sig_sdel)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
+    // host_sloadb(ctx, ws_slot, ptr, rd_idx) -> u64 (4 i64 args + ptr) and
+    // host_sstoreb(ctx, ws_slot, ptr, len) -> u64 — both share `sig_store`'s
+    // (ptr_type, I64, I64, I64) -> I64 shape (audit 228d).
+    let fn_sloadb = module
+        .declare_function("host_sloadb", Linkage::Import, &sig_store)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    let fn_sstoreb = module
+        .declare_function("host_sstoreb", Linkage::Import, &sig_store)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+
     // host_log(ctx, desc_ptr, num_topics) -> u64
     let fn_log = module
         .declare_function("host_log", Linkage::Import, &sig_sload)
@@ -364,6 +374,8 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_sstore_ref = module.declare_func_in_func(fn_sstore, &mut ctx.func);
     let fn_sstoreg_ref = module.declare_func_in_func(fn_sstoreg, &mut ctx.func);
     let fn_sdelete_ref = module.declare_func_in_func(fn_sdelete, &mut ctx.func);
+    let fn_sloadb_ref = module.declare_func_in_func(fn_sloadb, &mut ctx.func);
+    let fn_sstoreb_ref = module.declare_func_in_func(fn_sstoreb, &mut ctx.func);
     let fn_sloadg_ref = module.declare_func_in_func(fn_sloadg, &mut ctx.func);
     let fn_log_ref = module.declare_func_in_func(fn_log, &mut ctx.func);
     let fn_exec_opcode_ref = module.declare_func_in_func(fn_exec_opcode, &mut ctx.func);
@@ -876,18 +888,41 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                             0 => {
                                 let wd = builder.ins().iconst(I64, d.rd as i64);
                                 builder.ins().call(fn_sload_ref, &[vm_ctx, ws_slot, wd]);
+                                emit_drain_page_gas!(builder);
+                            }
+                            1 => {
+                                // Memory mode (sloadb): writes raw storage
+                                // bytes to mem[ptr..ptr+len], length to
+                                // gp[rd]. Audit 228d — previously fell
+                                // through to wide mode silently. Now goes
+                                // through host_sloadb which handles cold
+                                // surcharge + dynamic gas + memory write.
+                                let ptr_reg = ((d.rs2_or_imm >> 2) & 0xF) as u8;
+                                let ptr = gp_read!(builder, ptr_reg);
+                                let rd_idx = builder.ins().iconst(I64, d.rd as i64);
+                                let call = builder
+                                    .ins()
+                                    .call(fn_sloadb_ref, &[vm_ctx, ws_slot, ptr, rd_idx]);
+                                let result = builder.inst_results(call)[0];
+                                emit_drain_page_gas!(builder);
+                                let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                                let cont = builder.create_block();
+                                builder.ins().brif(is_err, trap_block, &[], cont, &[]);
+                                builder.seal_block(cont);
+                                builder.switch_to_block(cont);
                             }
                             2 => {
                                 let call = builder.ins().call(fn_sloadg_ref, &[vm_ctx, ws_slot]);
                                 let result = builder.inst_results(call)[0];
                                 gp_write!(builder, d.rd, result);
+                                emit_drain_page_gas!(builder);
                             }
                             _ => {
                                 let wd = builder.ins().iconst(I64, d.rd as i64);
                                 builder.ins().call(fn_sload_ref, &[vm_ctx, ws_slot, wd]);
+                                emit_drain_page_gas!(builder);
                             }
                         }
-                        emit_drain_page_gas!(builder);
                     }
                     Opcode::Sstore => {
                         let mode = d.rs2_or_imm & 0x3;
@@ -897,6 +932,21 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                             0 => {
                                 let wd = builder.ins().iconst(I64, d.rd as i64);
                                 builder.ins().call(fn_sstore_ref, &[vm_ctx, ws_slot, wd])
+                            }
+                            1 => {
+                                // Memory mode (sstoreb): reads
+                                // mem[ptr..ptr+len] and writes to storage.
+                                // Audit 228d — previously trapped. Now
+                                // goes through host_sstoreb which handles
+                                // cold surcharge + dynamic gas + memory
+                                // read.
+                                let ptr_reg = ((d.rs2_or_imm >> 2) & 0xF) as u8;
+                                let len_reg = ((d.rs2_or_imm >> 6) & 0xF) as u8;
+                                let ptr = gp_read!(builder, ptr_reg);
+                                let len = gp_read!(builder, len_reg);
+                                builder
+                                    .ins()
+                                    .call(fn_sstoreb_ref, &[vm_ctx, ws_slot, ptr, len])
                             }
                             2 => {
                                 let rd_val = gp_read!(builder, d.rd);
