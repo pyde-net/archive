@@ -53,6 +53,11 @@ pub mod tag {
     pub const CONSENSUS_FINALITY_CHECKPOINT: u8 = 0x19;
     pub const GET_BLOCK_TXS: u8 = 0x04;
     pub const BLOCK_TXS_RESPONSE: u8 = 0x05;
+    /// Proposer-published bundle of encrypted_txs for a block (audit
+    /// item 207 / 074b). Published on the Blocks channel immediately
+    /// after the compact block. Integrity is anchored by the block
+    /// header's `tx_root` commitment — no per-bundle signature.
+    pub const ENCRYPTED_TX_BUNDLE: u8 = 0x06;
     pub const DECRYPTION_SHARES: u8 = 0x20;
 }
 
@@ -446,6 +451,48 @@ pub fn encode_block_txs_response(block_hash: &[u8; 32], txs: &[Vec<u8>]) -> Vec<
         enc.var_bytes(tx_bytes);
     }
     enc.finish()
+}
+
+/// Encode an `EncryptedTxBundle` for gossip on the Blocks channel.
+/// Proposer publishes immediately after `encode_compact_block`; the
+/// bundle carries the encrypted_tx byte blobs that the compact block
+/// omits. Integrity is anchored by the block header's `tx_root`
+/// commitment, verified on receive. See audit item 207.
+pub fn encode_encrypted_tx_bundle(bundle: &pyde_net::propagation::EncryptedTxBundle) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(tag::ENCRYPTED_TX_BUNDLE);
+    enc.u64(bundle.slot);
+    enc.bytes32(&bundle.block_hash);
+    enc.u32(bundle.encrypted_txs.len() as u32);
+    for tx_bytes in &bundle.encrypted_txs {
+        enc.var_bytes(tx_bytes);
+    }
+    enc.finish()
+}
+
+/// Decode an `EncryptedTxBundle`. Rejects oversized item counts via
+/// `u32_count(MAX_DECODE_ITEMS)`; per-entry byte length is indirectly
+/// bounded by the channel's frame-size cap (4 MB for Blocks).
+pub fn decode_encrypted_tx_bundle(
+    data: &[u8],
+) -> Result<pyde_net::propagation::EncryptedTxBundle, &'static str> {
+    let mut dec = Decoder::new(data);
+    let msg_tag = dec.u8()?;
+    if msg_tag != tag::ENCRYPTED_TX_BUNDLE {
+        return Err("not an encrypted-tx bundle message");
+    }
+    let slot = dec.u64()?;
+    let block_hash = dec.bytes32()?;
+    let count = dec.u32_count(MAX_DECODE_ITEMS)?;
+    let mut encrypted_txs = Vec::with_capacity(count);
+    for _ in 0..count {
+        encrypted_txs.push(dec.var_bytes()?);
+    }
+    Ok(pyde_net::propagation::EncryptedTxBundle {
+        slot,
+        block_hash,
+        encrypted_txs,
+    })
 }
 
 pub fn encode_decryption_shares(msg: &DecryptionShareMsg) -> Vec<u8> {
@@ -1728,5 +1775,70 @@ mod tests {
         bytes.extend_from_slice(&((COMMITTEE_SIZE as u16) + 1).to_le_bytes());
         let result = decode_decryption_shares(&bytes);
         assert_eq!(result.err(), Some("decoded count exceeds max"));
+    }
+
+    // ========== EncryptedTxBundle (audit item 207) ==========
+
+    #[test]
+    fn encrypted_bundle_empty_roundtrip() {
+        let bundle = pyde_net::propagation::EncryptedTxBundle {
+            slot: 0,
+            block_hash: [0u8; 32],
+            encrypted_txs: vec![],
+        };
+        let bytes = encode_encrypted_tx_bundle(&bundle);
+        let restored = decode_encrypted_tx_bundle(&bytes).unwrap();
+        assert_eq!(restored, bundle);
+    }
+
+    #[test]
+    fn encrypted_bundle_populated_roundtrip() {
+        let bundle = pyde_net::propagation::EncryptedTxBundle {
+            slot: 42,
+            block_hash: [0xABu8; 32],
+            encrypted_txs: vec![
+                vec![0x01, 0x02, 0x03],
+                vec![0xFF; 64],
+                vec![], // empty entry is legal — var_bytes handles it
+                vec![0xDE; 1024],
+            ],
+        };
+        let bytes = encode_encrypted_tx_bundle(&bundle);
+        let restored = decode_encrypted_tx_bundle(&bytes).unwrap();
+        assert_eq!(restored, bundle);
+    }
+
+    #[test]
+    fn encrypted_bundle_wrong_tag_fails() {
+        let bundle = pyde_net::propagation::EncryptedTxBundle {
+            slot: 1,
+            block_hash: [0u8; 32],
+            encrypted_txs: vec![],
+        };
+        let mut bytes = encode_encrypted_tx_bundle(&bundle);
+        bytes[0] = tag::COMPACT_BLOCK;
+        assert_eq!(
+            decode_encrypted_tx_bundle(&bytes).err(),
+            Some("not an encrypted-tx bundle message")
+        );
+    }
+
+    #[test]
+    fn encrypted_bundle_empty_frame_fails() {
+        assert!(decode_encrypted_tx_bundle(&[]).is_err());
+    }
+
+    #[test]
+    fn encrypted_bundle_rejects_huge_count() {
+        // Hand-construct a frame whose declared count exceeds
+        // MAX_DECODE_ITEMS; decode must reject before allocating.
+        let mut bytes = vec![tag::ENCRYPTED_TX_BUNDLE];
+        bytes.extend_from_slice(&42u64.to_le_bytes()); // slot
+        bytes.extend_from_slice(&[0u8; 32]); // block_hash
+        bytes.extend_from_slice(&((MAX_DECODE_ITEMS as u32) + 1).to_le_bytes());
+        assert_eq!(
+            decode_encrypted_tx_bundle(&bytes).err(),
+            Some("decoded count exceeds max")
+        );
     }
 }

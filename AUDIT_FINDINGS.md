@@ -172,19 +172,82 @@
       M1/M3 caps. Not strictly a 206 fix; tracked as item **226**
       below for a follow-up PR.
 
-- [ ] 207 — `⚠` **Encrypted-tx gossip flow (074b root cause).**
-      Compact-block broadcast in `crates/node/src/node.rs` omits
-      `encrypted_txs`; full blocks only served on-demand via
-      `GET_BLOCK_TXS` (`crates/node/src/wire.rs:415`). Non-proposer
+- [~] 207 — `⚠` **Encrypted-tx gossip flow (074b root cause).**
+      Compact-block broadcast omits `encrypted_txs`; full blocks
+      only served on-demand via `GET_BLOCK_TXS`. Non-proposer
       validators never see encrypted_tx lists → decryption shares
-      arrive orphaned and queue forever. Blocks the headline
-      MEV-protection claim and 074b.
-      Fix: design doc first, choose among:
-      (A) extend compact-block protocol with encrypted_tx short IDs;
-      (B) separate gossipsub topic for encrypted_txs, published by
-      proposer alongside the block;
-      (C) proactive full-block push to committee members.
-      Then implement + add `074b` loadgen pass.
+      arrive orphaned and queue forever. Blocks the MEV headline
+      and 074b.
+
+      **Design locked in: option (D) — proposer publishes a
+      dedicated `EncryptedTxBundle{slot, block_hash,
+      encrypted_txs: Vec<Vec<u8>>}` message on the Blocks
+      channel immediately after the compact block.**
+
+      Rationale over original options:
+      - (A) compact-block extension was the audit's default but
+        costs a wire-format version bump and three new resolution
+        paths (short-ID resolve → prefill check → GET_BLOCK_TXS
+        fallback). More failure modes per PR.
+      - (B) separate channel on Consensus topic — 64 KB cap too
+        tight for an encrypted-tx bundle at useful scale.
+      - (C) proactive full-block push — burns bandwidth at scale.
+      - (D) picked: proposer→validators message on the 4 MB
+        Blocks channel. No wire-format version bump to CompactBlock,
+        no new short-ID tables, one message type. Testnet-MVP
+        scale suits simplicity over efficiency; (A) upgrade
+        remains open for later (short-ID derivation is already
+        generic — `compute_short_id` takes any `[u8; 32]`).
+
+      **Integrity anchor: existing `tx_root`.** `BlockHeader::
+      tx_root` already commits to plaintext-tx hashes ++
+      encrypted-tx hashes in order (`crates/consensus/src/
+      block.rs:198`, load-bearing for MEV). Receiver reassembles
+      the bundle, computes `EncryptedTx::hash()` per entry, calls
+      `verify_tx_root(&header.tx_root, &plaintext_txs,
+      &encrypted_tx_hashes)`. Mismatch → reject. No new sigs.
+
+      **Implementation plan (3 PRs):**
+      1. **Wire + struct.** Add `EncryptedTxBundle` to
+         `crates/net/src/propagation.rs`; add tag +
+         encode/decode in `crates/node/src/wire.rs`; round-trip
+         tests. No behaviour change — wire only.
+      2. **Proposer + receiver plumbing.** Proposer publishes
+         the bundle immediately after `encode_compact_block`;
+         receiver queues bundle alongside compact block, runs
+         `verify_tx_root` when both arrive, hands full
+         `encrypted_txs` into the existing `BlockDecryptor`
+         pipeline so queued shares can drain.
+      3. **Multi-node integration + 074b.** Spawn a testnet,
+         submit via `pyde_sendEncryptedTransaction`, assert the
+         decrypted tx commits. Unblocks 074b loadgen.
+
+      **Non-issues deliberately excluded:**
+      - No per-bundle signature. `tx_root` verifies integrity.
+      - No ordering invariant beyond the block body's own order.
+        Ordering commitment to mempool-seen txs (task 024) is
+        unchanged.
+      - No encrypted-tx gossip outside of block context.
+        Users still submit via `pyde_sendEncryptedTransaction`
+        → `tx_relay` → Transactions channel, and the proposer
+        picks from their local mempool as today. The new
+        bundle is strictly a block-time proposer→validators
+        distribution mechanism.
+
+      **Known risks:**
+      - Bundle and compact block arrive out of order. Mitigation:
+        receiver queues either arrival and resolves when both
+        are present, with a slot-bounded TTL (drop if the slot
+        is already 2+ behind head).
+      - Proposer publishes bundle but a validator never receives
+        it (gossip gap). Same mitigation as today for
+        compact-block tx resolution: fall back to `GET_BLOCK_TXS`
+        with a new tag for encrypted-tx bodies.
+      - Malicious proposer omits bundle. Receiver doesn't have
+        encrypted_tx bytes; `verify_tx_root` fails if any
+        encrypted_tx is expected (tx_root non-zero from
+        encrypted inputs). Block is rejected at the validator,
+        QC won't form. Liveness impact only.
 
 ---
 
