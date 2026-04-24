@@ -334,10 +334,19 @@
       selection grinding attack the agent flagged is not
       reachable.
 
-- [ ] 214 — `⚠` **Per-peer rate limit on decryption shares.**
-      `crates/node/src/node.rs` consensus handler — frame-size
-      cap bounds per-message burst but no per-peer token bucket.
-      Add same `RateLimiter` pattern used for evidence (task 014d).
+- [x] 214 — `✓` **Per-peer rate limit on decryption shares.**
+      Shipped: `crates/node/src/node.rs` decryption-share gossip
+      branch now checks `peer_manager.get_peer(propagation_source)
+      .invalid_messages` against `DECRYPT_SHARE_SPAM_THRESHOLD = 5`
+      before decode, mirroring the slash-evidence pattern from
+      task 014d. Malformed shares bump `invalid_messages` via
+      `saturating_add(1)` in the decode-Err arm, so repeat
+      offenders cross the threshold and get dropped without CPU
+      cost on the next message. Honest committee shares decode
+      cleanly and never bump the counter. Also dropped dead
+      `process_full_block_with_aot` test wrapper (zero callers
+      after 210's `#[cfg(test)]` gate). Multi-node encrypted e2e
+      (`multi_node_encrypted_lifecycle` --ignored) still passes.
 
 - [ ] 215 — `⚠` **PVM `MEMCPY` + calldata u32 wrap.**
       `crates/pvm/src/vm.rs:1265-1288` (MEMCPY no src/dst overlap
@@ -444,3 +453,4 @@ Fold into the relevant fix PRs above when possible:
 | 205 | 2026-04-23  | Read `validator.rs:1443-1466` | Confirmed: `else` persists, `if` only logs; routed through `ingest_evidence` |
 | 206 | 2026-04-23  | Read `rpc.rs:1117-1148` + `pool.rs:370-384` | Confirmed fall-through on no-auth_key; closed for non-devnet chain_id |
 | 207 | 2026-04-23  | Agent-traced against wire.rs compact-block encoding | Accepted; design decision needed |
+| 214 | 2026-04-23  | Read decrypt-share branch + verified `PeerInfo::invalid_messages` reuse from 014d | Fixed with spam-threshold drop + decode-Err bump |
