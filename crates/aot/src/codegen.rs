@@ -999,13 +999,93 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.switch_to_block(cont);
                     }
                     Opcode::Memcpy => {
-                        // Memcpy handled by VM runtime call (AOT fallback)
+                        // Memcpy handled by VM runtime call (AOT fallback).
+                        //
+                        // Audit item 215 — fixes three consensus
+                        // divergences between AOT and interpreter:
+                        //
+                        //   1. Per-byte dynamic gas (3 per 8 bytes) was
+                        //      charged by the interpreter but not by
+                        //      AOT. AOT tracks gas in `VAR_GAS_USED`,
+                        //      not in `vm.gas_used_total`, so the
+                        //      charge is emitted here in the JIT.
+                        //
+                        //   2. Per-page allocation gas (PAGE_ALLOC_GAS
+                        //      per fresh page) was charged by the
+                        //      interpreter via the post-step drain at
+                        //      `pvm/src/vm.rs:1388`. AOT bypasses that
+                        //      loop. `host_memcpy` now returns the
+                        //      drained `page_gas_used` packed into the
+                        //      high 32 bits of its result; codegen
+                        //      folds it into VAR_GAS_USED here.
+                        //
+                        //   3. The previous emission discarded the
+                        //      fault return, so AOT silently continued
+                        //      on memory fault / oversized len. Now
+                        //      routes through `trap_block`.
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let dst = gp_read!(builder, d.rd);
                         let src = gp_read!(builder, d.rs1);
                         let len_reg = (d.rs2_or_imm & 0xF) as u8;
                         let len = gp_read!(builder, len_reg);
-                        builder.ins().call(fn_memcpy_ref, &[vm_ctx, dst, src, len]);
+
+                        // Per-byte dynamic_gas = ((len + 7) >> 3) * 3
+                        let seven = builder.ins().iconst(I64, 7);
+                        let len_plus_seven = builder.ins().iadd(len, seven);
+                        let chunks = builder.ins().ushr_imm(len_plus_seven, 3);
+                        let three = builder.ins().iconst(I64, 3);
+                        let dynamic_gas = builder.ins().imul(chunks, three);
+
+                        let gas_used = builder.use_var(Variable::from_u32(VAR_GAS_USED));
+                        let new_gas = builder.ins().iadd(gas_used, dynamic_gas);
+                        builder.def_var(Variable::from_u32(VAR_GAS_USED), new_gas);
+
+                        // OOG check after dynamic charge.
+                        let gas_limit = builder.use_var(Variable::from_u32(VAR_GAS_LIMIT));
+                        let limit_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, gas_limit, 0);
+                        let over =
+                            builder
+                                .ins()
+                                .icmp(IntCC::UnsignedGreaterThan, new_gas, gas_limit);
+                        let oog = builder.ins().band(limit_nonzero, over);
+                        let after_oog = builder.create_block();
+                        builder.ins().brif(oog, oog_block, &[], after_oog, &[]);
+                        builder.seal_block(after_oog);
+                        builder.switch_to_block(after_oog);
+
+                        // Call host_memcpy. Returns:
+                        //   low  32 bits: 0=success, 1=fault
+                        //   high 32 bits: page_gas to charge
+                        let call = builder.ins().call(fn_memcpy_ref, &[vm_ctx, dst, src, len]);
+                        let raw = builder.inst_results(call)[0];
+
+                        // Add page_gas (high 32) to gas counter.
+                        let page_gas = builder.ins().ushr_imm(raw, 32);
+                        let gas_used = builder.use_var(Variable::from_u32(VAR_GAS_USED));
+                        let new_gas = builder.ins().iadd(gas_used, page_gas);
+                        builder.def_var(Variable::from_u32(VAR_GAS_USED), new_gas);
+
+                        // OOG check after page-gas charge.
+                        let gas_limit = builder.use_var(Variable::from_u32(VAR_GAS_LIMIT));
+                        let limit_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, gas_limit, 0);
+                        let over =
+                            builder
+                                .ins()
+                                .icmp(IntCC::UnsignedGreaterThan, new_gas, gas_limit);
+                        let oog2 = builder.ins().band(limit_nonzero, over);
+                        let after_oog2 = builder.create_block();
+                        builder.ins().brif(oog2, oog_block, &[], after_oog2, &[]);
+                        builder.seal_block(after_oog2);
+                        builder.switch_to_block(after_oog2);
+
+                        // Fault check (low 32 bits != 0).
+                        let fault_mask = builder.ins().iconst(I64, 0xFFFFFFFFi64);
+                        let fault_bits = builder.ins().band(raw, fault_mask);
+                        let is_fault = builder.ins().icmp_imm(IntCC::NotEqual, fault_bits, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(is_fault, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
                     }
                     Opcode::Selfdestruct => {
                         // Selfdestruct halts execution after clearing storage

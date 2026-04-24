@@ -369,6 +369,17 @@ impl Vm {
             return Ok(());
         }
 
+        // Reject calldata too large to fit in PVM's u32 address space.
+        // Without this gate the `len as u32` truncations in
+        // `checked_write_slice` and `aligned_len as u32` below would
+        // silently wrap, leaving `heap_top` pointing into already-mapped
+        // calldata bytes (audit item 215). The natural ceiling is the
+        // remaining address space above HEAP_START.
+        let max_calldata = (crate::memory::MEMORY_SIZE as u64) - (heap_start as u64);
+        if len as u64 > max_calldata {
+            return Err(Trap::MemoryFault);
+        }
+
         // Bulk write calldata into memory at HEAP_START (single bounds check)
         self.memory
             .checked_write_slice(heap_start, &self.calldata)
@@ -1268,11 +1279,27 @@ impl Vm {
                 let dst_ptr = self.cpu.read_gp(d.rd) as u32;
                 let src_ptr = self.cpu.read_gp(d.rs1) as u32;
                 let len_reg = (d.rs2_or_imm & 0xF) as u8;
-                let len = self.cpu.read_gp(len_reg) as usize;
+                let len_u64 = self.cpu.read_gp(len_reg);
+                // Gate any len that doesn't fit in PVM's u32 address space —
+                // every downstream `as u32` cast (here and in `check_access`)
+                // would silently truncate otherwise, allowing a guest to
+                // pass a len that allocates an unbounded host-side `Vec`
+                // (audit item 215). MEMORY_SIZE is the natural ceiling
+                // because no guest copy can exceed total guest memory.
+                if len_u64 > crate::memory::MEMORY_SIZE as u64 {
+                    return Err(Trap::MemoryFault);
+                }
+                let len = len_u64 as usize;
                 if len > 0 {
-                    // Charge dynamic gas: 3 per 8 bytes copied (same rate as Load/Store)
+                    // Charge dynamic gas: 3 per 8 bytes copied (same rate as
+                    // Load/Store). `checked_add` so a crafted len that wraps
+                    // `gas_used_total` past `gas_limit` cannot slip past the
+                    // OutOfGas trap below.
                     let dynamic_gas = (len as u64).div_ceil(8) * 3;
-                    self.gas_used_total += dynamic_gas;
+                    self.gas_used_total = self
+                        .gas_used_total
+                        .checked_add(dynamic_gas)
+                        .ok_or(Trap::OutOfGas)?;
                     if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                         return Err(Trap::OutOfGas);
                     }
@@ -4269,5 +4296,78 @@ mod tests {
         vm.load(&code).unwrap();
         assert_eq!(vm.run().unwrap(), ExecResult::Halt);
         assert_eq!(vm.cpu.read_gp(1), 0);
+    }
+
+    // ========== Audit item 215: MEMCPY len truncation + calldata ==========
+
+    #[test]
+    fn memcpy_len_over_memory_size_traps_memory_fault() {
+        // Loading u64::MAX into a register and using it as the MEMCPY len
+        // would, before the fix, slip through `as u32` truncations and
+        // trigger a multi-GB host-side `Vec` allocation. Now traps cleanly.
+        let mut vm = Vm::with_gas_limit(10_000_000);
+        let heap = crate::memory::HEAP_START;
+        vm.cpu.write_gp(1, heap as u64); // dst
+        vm.cpu.write_gp(2, heap as u64); // src
+        vm.cpu.write_gp(5, u64::MAX); // len register
+                                      // memcpy r1, r2, len_reg=5
+        let code = bytecode(&[
+            instr_bytes(Opcode::Memcpy, 1, 2, 5),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap_err(), Trap::MemoryFault);
+    }
+
+    #[test]
+    fn memcpy_len_at_memory_size_boundary_is_accepted() {
+        // Exactly MEMORY_SIZE bytes is the largest legal len; anything
+        // bigger traps. Use a small src/dst inside heap to keep the
+        // copy itself bounded — the goal is to verify the gate, not
+        // exercise a real 4 MB copy in a unit test.
+        let mut vm = Vm::with_gas_limit(10_000_000);
+        let heap = crate::memory::HEAP_START;
+        vm.cpu.write_gp(1, heap as u64);
+        vm.cpu.write_gp(2, heap as u64);
+        vm.cpu.write_gp(5, 32); // small legal len
+        let code = bytecode(&[
+            instr_bytes(Opcode::Memcpy, 1, 2, 5),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+    }
+
+    #[test]
+    fn memcpy_gas_overflow_cannot_bypass_oog() {
+        // With gas_used_total seeded near u64::MAX, the dynamic-gas
+        // checked_add must trap rather than wrap. Without the fix the
+        // wrap put gas_used_total below gas_limit and the copy proceeded.
+        let mut vm = Vm::with_gas_limit(u64::MAX);
+        vm.gas_used_total = u64::MAX - 10;
+        let heap = crate::memory::HEAP_START;
+        vm.cpu.write_gp(1, heap as u64);
+        vm.cpu.write_gp(2, heap as u64);
+        vm.cpu.write_gp(5, 1024); // large enough that dynamic_gas > 10
+        let code = bytecode(&[
+            instr_bytes(Opcode::Memcpy, 1, 2, 5),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(vm.run().unwrap_err(), Trap::OutOfGas);
+    }
+
+    #[test]
+    fn map_calldata_oversize_traps_memory_fault() {
+        // Calldata larger than the available address space above
+        // HEAP_START would, before the fix, silently truncate via
+        // `as u32` and leave heap_top pointing into the calldata region.
+        // Construct a Vm directly with oversized calldata and call load,
+        // which invokes map_calldata.
+        let mut vm = Vm::new();
+        let max_calldata = crate::memory::MEMORY_SIZE - (crate::memory::HEAP_START as usize);
+        vm.calldata = vec![0u8; max_calldata + 1];
+        let code = bytecode(&[instr_bytes(Opcode::Halt, 0, 0, 0)]);
+        assert_eq!(vm.load(&code).unwrap_err(), Trap::MemoryFault);
     }
 }
