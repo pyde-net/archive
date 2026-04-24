@@ -309,6 +309,34 @@ impl Provider {
     }
 
     // ========================================================================
+    // MEV-protected (encrypted) transaction submission
+    // ========================================================================
+
+    /// Fetch the committee's threshold public key. Cache this per
+    /// session — the key only rotates when the committee does, and
+    /// rotation preserves the public key (only shares rotate).
+    pub async fn get_threshold_public_key(
+        &self,
+    ) -> Result<pyde_crypto::threshold::ThresholdPublicKey> {
+        let result = self.rpc("pyde_getThresholdPublicKey", &[]).await?;
+        let hex_str = result.as_str().ok_or_else(|| {
+            SdkError::Other("pyde_getThresholdPublicKey returned non-string".into())
+        })?;
+        crate::encrypted::parse_threshold_public_key(hex_str)
+    }
+
+    /// Submit a client-built, client-signed `EncryptedTx` (wire
+    /// bytes produced by `encrypted::build_raw_encrypted_tx`).
+    /// Returns the EncryptedTx hash.
+    pub async fn send_raw_encrypted_transaction(&self, enc_tx_bytes: &[u8]) -> Result<[u8; 32]> {
+        let hex = format!("0x{}", hex::encode(enc_tx_bytes));
+        let result = self
+            .rpc("pyde_sendRawEncryptedTransaction", &[json_str(&hex)])
+            .await?;
+        parse_tx_hash(&result)
+    }
+
+    // ========================================================================
     // Receipts
     // ========================================================================
 
