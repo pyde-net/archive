@@ -140,6 +140,55 @@ mod tests {
     }
 
     #[test]
+    fn memcpy_aot_charges_dynamic_gas_parity_with_interp() {
+        // Audit item 215 — host_memcpy used to skip the per-byte
+        // dynamic-gas charge that the interpreter pays. Same contract
+        // would burn different gas on AOT vs interp validators ⇒
+        // consensus fork. This test asserts gas parity for a 1024-byte
+        // copy.
+        let heap = pyde_vm::memory::HEAP_START as i32;
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap), // dst = HEAP_START
+            instr_ri(Opcode::Addi, 2, 0, heap), // src = HEAP_START
+            instr_ri(Opcode::Addi, 5, 0, 1024), // len = 1024
+            instr_bytes(Opcode::Memcpy, 1, 2, 5),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        vm.load(&code).unwrap();
+        let _ = vm.execute();
+        let interp_gas = vm.gas_used_total;
+
+        let (aot_status, aot_gas, _) = run_aot(&code, 1_000_000);
+        assert_eq!(aot_status, RESULT_SUCCESS);
+        assert_eq!(
+            aot_gas, interp_gas,
+            "AOT gas {aot_gas} != interp gas {interp_gas} — \
+             host_memcpy dynamic-gas / page-gas parity broken"
+        );
+    }
+
+    #[test]
+    fn memcpy_aot_huge_len_traps() {
+        // Audit item 215 — guest passing a huge len used to slip
+        // through `as u32` truncation in host_memcpy and either
+        // succeed silently (codegen ignored the fault return) or
+        // trigger an unbounded host allocation. Now the AOT must trap.
+        // ADDI r5, r0, -1 materialises u64::MAX in r5 by sign-extension.
+        let heap = pyde_vm::memory::HEAP_START as i32;
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap),
+            instr_ri(Opcode::Addi, 2, 0, heap),
+            instr_ri(Opcode::Addi, 5, 0, -1), // r5 = u64::MAX
+            instr_bytes(Opcode::Memcpy, 1, 2, 5),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let (aot_status, _, _) = run_aot(&code, 10_000_000);
+        assert_eq!(aot_status, RESULT_TRAP);
+    }
+
+    #[test]
     fn aot_add_two_numbers() {
         let code = bytecode(&[
             instr_ri(Opcode::Addi, 1, 0, 10),

@@ -348,11 +348,59 @@
       after 210's `#[cfg(test)]` gate). Multi-node encrypted e2e
       (`multi_node_encrypted_lifecycle` --ignored) still passes.
 
-- [ ] 215 — `⚠` **PVM `MEMCPY` + calldata u32 wrap.**
-      `crates/pvm/src/vm.rs:1265-1288` (MEMCPY no src/dst overlap
-      check) + `:364-388` (calldata `aligned_len = (len + 7) & !7`
-      can wrap `u32`). Potential heap/stack collision under
-      adversarial input. Pair with task 054 cargo-fuzz soak.
+- [x] 215 — `✓` **PVM MEMCPY + calldata u32 wrap.** Original audit
+      framing was wrong on the surface concerns — `MEMCPY` uses an
+      owned `Vec<u8>` intermediate (`checked_read_slice`) so guest
+      src/dst overlap is memmove-safe, not a memory-safety issue.
+      But investigation surfaced **three real consensus-critical
+      bugs** in the same opcode, fixed in this PR:
+      
+      1. **Interpreter MEMCPY len truncation** — `len: usize` from
+         `read_gp` flows into `checked_read_slice` → `check_access`,
+         which casts `len as u32` and silently wraps for any
+         `len > u32::MAX`. A guest passing `u64::MAX` would slip
+         past bounds checking and trigger `vec![0u8; huge_len]`
+         host-RAM DoS. Fixed by gating `len > MEMORY_SIZE → trap`
+         before the cast. Also switched gas-charge `+=` to
+         `checked_add` so a crafted len that wraps `gas_used_total`
+         past `gas_limit` cannot bypass OOG.
+      2. **AOT host_memcpy missing per-byte dynamic gas** —
+         interpreter charges `(len/8)*3` in its handler; AOT bypassed
+         it entirely (only static base gas of 5 was charged via the
+         block prologue). Same contract burned 384 vs 0 dynamic gas
+         on AOT vs interpreter validators ⇒ consensus fork on every
+         memcpy. Fixed by emitting the dynamic-gas charge in the
+         Cranelift codegen before the host call (AOT tracks gas in
+         a Cranelift SSA variable, not in `vm.gas_used_total`, so
+         charging it in `host_memcpy` would have been a no-op).
+      3. **AOT host_memcpy missing per-page allocation gas** —
+         interpreter drains `vm.memory.page_gas_used` (200 per
+         fresh page) into `gas_used_total` after every step at
+         `vm.rs:1388`. AOT bypasses that loop. `host_memcpy` now
+         packs the drained `page_gas_used` into the high 32 bits
+         of its return value; codegen folds it into `VAR_GAS_USED`
+         after the call. Plus: AOT codegen previously discarded
+         the host_memcpy fault return entirely — silently continued
+         on memory fault. Now routes through `trap_block`.
+      
+      `crates/pvm/src/vm.rs` `map_calldata` got the same defensive
+      gate (`len > MEMORY_SIZE - HEAP_START → trap`) — calldata is
+      bounded in practice by tx/block size so this is defense-in-
+      depth, not a known reachable bug.
+      
+      Tests: 4 PVM tests
+      (`memcpy_len_over_memory_size_traps_memory_fault`,
+      `memcpy_len_at_memory_size_boundary_is_accepted`,
+      `memcpy_gas_overflow_cannot_bypass_oog`,
+      `map_calldata_oversize_traps_memory_fault`) +
+      2 AOT tests
+      (`memcpy_aot_charges_dynamic_gas_parity_with_interp` —
+      asserts exact AOT/interp gas equality on a 1024-byte copy;
+      `memcpy_aot_huge_len_traps`).
+      
+      **Surfaced for follow-up: item 228 below** — the broader AOT
+      page-gas parity gap (Load/Store/wide-load/wide-store all
+      bypass the page-allocation gas the interpreter charges).
 
 - [ ] 216 — `⚠` **Poseidon2 spec-match test.**
       `crates/crypto/src/poseidon2.rs` — tests assert capacity but
@@ -410,6 +458,31 @@
       `crates/node/src/faucet.rs` is the RPC half only; no
       frontend / public API exposure.
 
+- [ ] 228 — `✓` **AOT page-gas parity across all memory ops.**
+      Surfaced while fixing 215. The interpreter drains
+      `vm.memory.page_gas_used` into `gas_used_total` at the end of
+      every step (`pvm/src/vm.rs:1388`), charging `PAGE_ALLOC_GAS`
+      (200) per fresh page touched. The AOT bypasses the step
+      loop entirely — every Load/Store/wide-load/wide-store and
+      any other memory-touching host call accumulates
+      `page_gas_used` in `vm.memory` but never folds it into the
+      AOT's SSA `VAR_GAS_USED` counter. Same contract touching
+      fresh memory pages burns different gas on AOT vs interpreter
+      validators → consensus fork on any contract with non-trivial
+      memory access. Item 215 fixed this for `MEMCPY` specifically
+      (host_memcpy now packs drained page_gas into the high 32
+      bits of its return value, codegen folds into VAR_GAS_USED).
+      Need to apply the same pattern to every other AOT memory
+      op. Scope: audit the full list of AOT-emitted memory ops,
+      either add the same pack/unpack to each host call or
+      insert a `host_drain_page_gas` drain call at the end of
+      each basic block. Consensus-critical; mainnet blocker once
+      AOT is enabled in production block-processing (currently
+      wired via `process_full_block_with_aot_and_checkpoint`).
+      Gate with an AOT-vs-interp gas-parity test harness that
+      runs every opcode through both paths and asserts gas
+      equality.
+
 - [ ] 226 — `⚠` **Plaintext RPC path: `AuthKeys::None` sig-skip
       analog.** Surfaced while closing 206.
       `crates/tx/src/validation.rs:140-149` — `validate_signature`
@@ -454,3 +527,4 @@ Fold into the relevant fix PRs above when possible:
 | 206 | 2026-04-23  | Read `rpc.rs:1117-1148` + `pool.rs:370-384` | Confirmed fall-through on no-auth_key; closed for non-devnet chain_id |
 | 207 | 2026-04-23  | Agent-traced against wire.rs compact-block encoding | Accepted; design decision needed |
 | 214 | 2026-04-23  | Read decrypt-share branch + verified `PeerInfo::invalid_messages` reuse from 014d | Fixed with spam-threshold drop + decode-Err bump |
+| 215 | 2026-04-24  | Traced interp `Memcpy` + `host_memcpy` + AOT codegen + `page_gas_used` drain; added gas-parity test that exposed 2 divergences (per-byte + per-page) | Fixed all three in one PR; surfaced 228 as follow-up |

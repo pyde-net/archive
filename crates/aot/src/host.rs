@@ -678,24 +678,48 @@ pub extern "C" fn host_assert(_ctx: *mut VmCtx, val: u64) -> u64 {
     }
 }
 
-/// Host: memcpy — bulk memory copy. Returns 0 on success, 1 on fault.
+/// Host: memcpy — bulk memory copy.
+///
+/// Returns a packed u64:
+///   - low  32 bits: 0 = success, 1 = fault
+///   - high 32 bits: page-allocation gas accumulated by `check_access`
+///     during this call (PAGE_ALLOC_GAS per fresh page touched)
+///
+/// The page-gas component MUST be folded into the AOT's gas counter
+/// by the codegen caller. The interpreter drains
+/// `vm.memory.page_gas_used` into `vm.gas_used_total` after every
+/// step (`pvm/src/vm.rs:1388`); the AOT bypasses that loop, so
+/// returning the drained amount here is the only way to keep AOT
+/// and interpreter gas in sync (audit item 215). Per-byte dynamic
+/// gas (3 per 8 bytes) is charged by codegen before this call.
 pub extern "C" fn host_memcpy(ctx: *mut VmCtx, dst: u64, src: u64, len: u64) -> u64 {
     // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
     // safety contract (top of file). The AOT JIT's callsite emission
     // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
     // first register before calling any host_* function.
     let vm = unsafe { &mut *ctx };
-    let len = len as usize;
     if len == 0 {
         return 0;
     }
-    match vm.memory.checked_read_slice(src as u32, len) {
-        Ok(data) => match vm.memory.checked_write_slice(dst as u32, &data) {
-            Ok(()) => 0,
-            Err(_) => 1,
-        },
-        Err(_) => 1,
+    // Gate any len that doesn't fit in PVM's u32 address space — the
+    // `as u32` casts on src/dst/len below would silently truncate
+    // otherwise. Same ceiling as the interpreter (audit item 215).
+    if len > pyde_vm::memory::MEMORY_SIZE as u64 {
+        return 1; // fault, no page gas
     }
+    let len = len as usize;
+    let result = match vm.memory.checked_read_slice(src as u32, len) {
+        Ok(data) => match vm.memory.checked_write_slice(dst as u32, &data) {
+            Ok(()) => 0u64,
+            Err(_) => 1u64,
+        },
+        Err(_) => 1u64,
+    };
+    // Drain page_gas_used regardless of outcome — partial reads on
+    // the fault path may have already touched pages.
+    let page_gas = vm.memory.page_gas_used;
+    vm.memory.page_gas_used = 0;
+    (page_gas << 32) | result
 }
 
 // ============================================================================
