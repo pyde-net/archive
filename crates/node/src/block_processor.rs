@@ -32,18 +32,6 @@ impl BlockProcessor {
         Self::process_full_block_with_aot_and_checkpoint(chain, state, block, None, None)
     }
 
-    /// Test-only wrapper with AOT cache but no WS checkpoint. Same
-    /// `#[cfg(test)]` rationale as `process_full_block` — audit 210.
-    #[cfg(test)]
-    pub fn process_full_block_with_aot(
-        chain: &mut ChainState,
-        state: &mut StateManager,
-        block: &Block,
-        aot_cache: Option<&std::sync::Arc<crate::aot_cache::AotCache>>,
-    ) -> Result<(u64, u64, Vec<Receipt>), String> {
-        Self::process_full_block_with_aot_and_checkpoint(chain, state, block, aot_cache, None)
-    }
-
     /// Full-block processing with an explicit weak-subjectivity checkpoint
     /// slot (Phase 4 slice 4.3). Callers that have a live `FinalityTracker`
     /// should pass `tracker.latest_checkpoint.as_ref().map(|c| c.slot)` —

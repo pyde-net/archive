@@ -2601,6 +2601,28 @@ fn handle_swarm_event(
                         if !message.data.is_empty()
                             && message.data[0] == wire::tag::DECRYPTION_SHARES
                         {
+                            // Audit item 214: rate-limit decryption share ingest
+                            // by peer-invalid-message score, same pattern as
+                            // evidence (014d). Every share costs a decode +
+                            // several DecryptionShare::from_bytes parses; a
+                            // peer that has already crossed the invalid-
+                            // message threshold on prior gossip gets dropped
+                            // here without further CPU cost. Honest committee
+                            // members stay well under the threshold because
+                            // their shares decode cleanly and bump nothing.
+                            const DECRYPT_SHARE_SPAM_THRESHOLD: u64 = 5;
+                            let propagator_invalid = peer_manager
+                                .get_peer(&propagation_source)
+                                .map(|p| p.invalid_messages)
+                                .unwrap_or(0);
+                            if propagator_invalid >= DECRYPT_SHARE_SPAM_THRESHOLD {
+                                debug!(
+                                    forwarder = %propagation_source,
+                                    invalid = propagator_invalid,
+                                    "dropping decryption shares from peer over spam threshold"
+                                );
+                                return PostEventAction::None;
+                            }
                             match wire::decode_decryption_shares(&message.data) {
                                 Ok(msg) => {
                                     debug!(
@@ -2613,6 +2635,15 @@ fn handle_swarm_event(
                                     return PostEventAction::AddDecryptionShares(msg);
                                 }
                                 Err(e) => {
+                                    // Bump peer invalid counter — repeat
+                                    // offenders cross the threshold and
+                                    // get dropped without decode next time.
+                                    if let Some(info) =
+                                        peer_manager.get_peer_mut(&propagation_source)
+                                    {
+                                        info.invalid_messages =
+                                            info.invalid_messages.saturating_add(1);
+                                    }
                                     debug!(error = e, "failed to decode decryption shares");
                                 }
                             }
