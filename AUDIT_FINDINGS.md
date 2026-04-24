@@ -534,6 +534,30 @@
         of journal rollback, but the precise OOG point may
         differ. Worth a stress test.
 
+- [x] 228d — `✓` **AOT SloadB/SstoreB (mode 1, bulk-bytes
+      storage).** Shipped: new `host_sloadb` and `host_sstoreb`
+      that mirror interp's `Opcode::Sload`/`Sstore` mode-1
+      handlers (`pvm/src/vm.rs:898-914` / `:965-983`). Both
+      charge:
+      - EIP-2929 cold-access surcharge (1800) on first touch,
+      - Dynamic gas `(len/8)*3` based on bytes stored/loaded,
+      - Plus the natural memory page-gas from `checked_read_slice` /
+        `checked_write_slice`,
+      
+      all into `vm.memory.page_gas_used`; codegen drains via
+      `emit_drain_page_gas!` after the call. Codegen now wires
+      mode 1 through these new host fns instead of falling
+      through to wide mode (Sload mode 1) or trapping (Sstore
+      mode 1). 2 new parity tests
+      (`sloadb_aot_gas_parity_with_interp`,
+      `sstoreb_aot_gas_parity_with_interp`) assert exact
+      gas equality. All 40 AOT tests + multi-node encrypted e2e
+      pass.
+      
+      OOG-timing parity stress test deferred — end state is
+      identical via journal rollback, exact trap-point divergence
+      is a polish item.
+
 - [x] 228b — `✓` **AOT delegated-op gas sync.** Shipped:
       `host_exec_opcode` ABI extended to take `gas_used_in` +
       `gas_limit_in` and return `(gas_used_out << 2) | result`
@@ -613,3 +637,4 @@ Fold into the relevant fix PRs above when possible:
 | 228a| 2026-04-24  | Enumerated AOT memory-touching host calls; gas-parity tests for each. Poseidon dynamic-gas divergence surfaced by the test harness | Fixed all 7 direct mem ops + poseidon dynamic gas; split 228b |
 | 228b| 2026-04-24  | Gas-parity test on CallExt exposed 2× double-charging (static gas in both bb prologue + delegated step); ABI change routes updated gas back into VAR_GAS_USED | Fixed sync + analysis.rs double-count |
 | 228c| 2026-04-24  | Wrote `assert_gas_parity_with_state` helper; targeted tests for Sload/Sstore/Sdelete cold + Log dynamic gas all failed before fix | Fixed via `page_gas_used` accumulator pattern; 5 new parity tests pass |
+| 228d| 2026-04-24  | Added `host_sloadb` + `host_sstoreb`; rerouted Sload/Sstore mode 1 in codegen; parity tests against interp's mode-1 handler | Fixed semantic + gas divergence on bulk-bytes storage |
