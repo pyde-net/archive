@@ -483,25 +483,36 @@
       AOT/interp gas equality. Multi-node encrypted e2e still
       passes.
 
-- [ ] 228b — `✓` **AOT delegated-op gas sync** (splits from 228).
-      Surfaced while scoping 228. Complex opcodes (`CallExt`,
-      `Delegate`, `Create`, `VerifySig`, `MerkleVerify`) are
-      emitted by AOT codegen as delegations to `host_exec_opcode`,
-      which calls `vm.exec_single` → `vm.step`. `step` charges
-      gas into `vm.gas_used_total`. But the AOT's SSA
-      `VAR_GAS_USED` is **independent** of `vm.gas_used_total` —
-      nothing syncs. Result: every cross-contract call,
-      signature verify, contract create, and merkle verify
-      charges **zero gas in AOT** while interpreter charges the
-      full amount. This is a much bigger divergence than 228a
-      (affects every delegated op, not just memory). Fix:
-      modify `host_exec_opcode` ABI to return a packed
-      (result, gas_delta) so codegen can fold the gas change
-      into `VAR_GAS_USED`. Alternative: save/restore
-      `vm.gas_used_total` around the call and compute the
-      delta. Tests: gas-parity harness for each of the 5
-      delegated opcodes. Mainnet-blocker per the item-215
-      decision to ship AOT on testnet.
+- [x] 228b — `✓` **AOT delegated-op gas sync.** Shipped:
+      `host_exec_opcode` ABI extended to take `gas_used_in` +
+      `gas_limit_in` and return `(gas_used_out << 2) | result`
+      so the AOT's `VAR_GAS_USED` can be synced in and out
+      across every delegated call. Codegen now:
+      (1) passes `VAR_GAS_USED` + `VAR_GAS_LIMIT` into the call;
+      (2) unpacks the returned gas_used_out back into
+      `VAR_GAS_USED`;
+      (3) OOG-checks the updated counter against the limit
+      after the sync (belt-and-suspenders; step() also traps
+      OOG internally).
+      
+      Also fixed: AOT `analysis.rs` was including delegated
+      opcodes (CallExt / Delegate / Create / VerifySig /
+      MerkleVerify) in `bb.gas_cost`, and `step()` inside
+      host_exec_opcode also charges each opcode's static gas
+      from the table. Result: every CallExt was charging 2×
+      its static gas in AOT (5000 vs 2500, caught by the
+      parity test). Fix: basic-block gas-cost sum now skips
+      delegated opcodes so the runtime step() is the single
+      source of truth for their static gas.
+      
+      Tests: 1 new gas-parity test (`callext_aot_gas_parity_
+      with_interp`) asserts exact AOT/interp gas equality for
+      a CallExt-heavy program. Existing functional tests
+      (`aot_callext_delegates_to_interpreter`,
+      `aot_factory_cross_contract_full`,
+      `aot_complex_contract_events_u256`,
+      `aot_real_counter_contract`) all still pass. Multi-node
+      encrypted e2e still passes.
 
 - [ ] 226 — `⚠` **Plaintext RPC path: `AuthKeys::None` sig-skip
       analog.** Surfaced while closing 206.
@@ -549,3 +560,4 @@ Fold into the relevant fix PRs above when possible:
 | 214 | 2026-04-23  | Read decrypt-share branch + verified `PeerInfo::invalid_messages` reuse from 014d | Fixed with spam-threshold drop + decode-Err bump |
 | 215 | 2026-04-24  | Traced interp `Memcpy` + `host_memcpy` + AOT codegen + `page_gas_used` drain; added gas-parity test that exposed 2 divergences (per-byte + per-page) | Fixed all three in one PR; surfaced 228 as follow-up |
 | 228a| 2026-04-24  | Enumerated AOT memory-touching host calls; gas-parity tests for each. Poseidon dynamic-gas divergence surfaced by the test harness | Fixed all 7 direct mem ops + poseidon dynamic gas; split 228b |
+| 228b| 2026-04-24  | Gas-parity test on CallExt exposed 2× double-charging (static gas in both bb prologue + delegated step); ABI change routes updated gas back into VAR_GAS_USED | Fixed sync + analysis.rs double-count |

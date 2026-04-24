@@ -942,4 +942,62 @@ mod tests {
         let return_val = vm.cpu.read_gp(1);
         assert_eq!(return_val, 99, "r1 should hold child's return value (99)");
     }
+
+    #[test]
+    fn callext_aot_gas_parity_with_interp() {
+        // Audit item 228b — delegated ops (CallExt/Delegate/Create/
+        // VerifySig/MerkleVerify) charge gas into `vm.gas_used_total`
+        // via step() but the AOT's VAR_GAS_USED is independent.
+        // Before 228b, AOT reported ~zero gas for delegated ops ⇒
+        // consensus fork with interpreter. This test asserts exact
+        // gas equality for a CallExt-heavy program.
+        use pyde_vm::memory::HEAP_START;
+
+        let callee_code = bytecode(&[
+            instr_bytes(Opcode::Load, 1, 5, 0x03),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let imm: u32 = (3 & 0xF) | ((7 & 0xF) << 4) | ((2 & 0xF) << 8);
+        let heap = HEAP_START as i32;
+        let caller_code = bytecode(&[
+            instr_ri(Opcode::Addi, 8, 0, heap),
+            instr_ri(Opcode::Addi, 6, 0, 99),
+            instr_bytes(Opcode::Store, 6, 8, 0x03),
+            instr_ri(Opcode::Addi, 3, 0, 8),
+            instr_ri(Opcode::Addi, 7, 0, 0),
+            instr_bytes(Opcode::CallExt, 0, 8, imm),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let mut target_addr = [0u8; 32];
+        target_addr[0] = 0xBB;
+
+        // --- Interpreter run ---
+        let mut interp_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        interp_vm
+            .cpu
+            .write_wide(0, pyde_vm::wide::U256::from_le_bytes(target_addr));
+        interp_vm.contracts.insert(target_addr, callee_code.clone());
+        interp_vm.load(&caller_code).unwrap();
+        let _ = interp_vm.execute();
+        let interp_gas = interp_vm.gas_used_total;
+
+        // --- AOT run ---
+        let compiled = compile_bytecode(&caller_code).unwrap();
+        let func = compiled.as_fn();
+        let mut regs = [0u64; 16];
+        let mut aot_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        aot_vm
+            .cpu
+            .write_wide(0, pyde_vm::wide::U256::from_le_bytes(target_addr));
+        aot_vm.contracts.insert(target_addr, callee_code.clone());
+        let raw = unsafe { func(regs.as_mut_ptr(), 1_000_000, &mut aot_vm as *mut _) };
+        let (aot_status, aot_gas) = decode_result(raw);
+
+        assert_eq!(aot_status, RESULT_SUCCESS);
+        assert_eq!(
+            aot_gas, interp_gas,
+            "CallExt gas parity broken: AOT={aot_gas} interp={interp_gas}"
+        );
+    }
 }

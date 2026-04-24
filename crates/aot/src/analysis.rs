@@ -136,7 +136,29 @@ pub fn analyze(bytecode: &[u8]) -> Result<AnalyzedProgram, AnalysisError> {
         let last_instr = (end / 4) as usize;
         let instrs = decoded[first_instr..last_instr].to_vec();
 
-        let block_gas: u64 = instrs.iter().map(|d| total_gas(d.opcode.to_u8())).sum();
+        // Audit 228b: the delegated opcodes (CallExt / Delegate /
+        // Create / VerifySig / MerkleVerify) run through
+        // `host_exec_opcode` → `vm.step()` at runtime, and `step()`
+        // itself charges each opcode's static gas from the table.
+        // If we also include their static gas in the basic-block
+        // prologue, AOT double-counts it (seen as a 2500-gas
+        // divergence on every CallExt in testing). Exclude them
+        // here so the delegated step() is the single source of
+        // truth for their static gas.
+        let block_gas: u64 = instrs
+            .iter()
+            .filter(|d| {
+                !matches!(
+                    d.opcode,
+                    Opcode::CallExt
+                        | Opcode::Delegate
+                        | Opcode::Create
+                        | Opcode::VerifySig
+                        | Opcode::MerkleVerify
+                )
+            })
+            .map(|d| total_gas(d.opcode.to_u8()))
+            .sum();
 
         blocks.push(BasicBlock {
             start_pc: start,
