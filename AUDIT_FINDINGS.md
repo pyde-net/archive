@@ -407,17 +407,40 @@
       not round counts (RF=8, RI=22 for Plonky3 default). Add a
       constants-match test pinned to the reference.
 
-- [ ] 217 — `⚠` **Witness oversize rejected without charging.**
-      `crates/state/src/witness.rs:149-173` — `verify_witnesses`
-      returns `false` on >1 MB witness with no gas charge.
-      Mitigated by the 1 MB gate; worth charging a minimum inspection
-      fee so RPC-reachable DoS is non-free.
+- [x] 217 — `✓` **Witness oversize rejected without charging.**
+      Closed on investigation, not currently a bug. Searched
+      every caller of `verify_witnesses`: **only tests and
+      benches** (`crates/state/benches/smt_bench.rs:193`,
+      same module's tests). No RPC handler, gossip handler, or
+      tx pipeline path verifies witnesses today. The `BlockWitness`
+      type lives in `crates/state/src/witness.rs` as
+      stateless-validator infrastructure that hasn't been wired
+      into the production block-processing path yet. The
+      audit's "RPC-reachable DoS" concern doesn't apply because
+      the surface isn't reachable. Re-open with a gas charge
+      when the stateless path lands (post-mainnet).
 
-- [ ] 218 — `✓` **Validator-only consensus channel: publish-time
-      guard.** `crates/net/src/channels.rs` enforces on inbound
-      validate; no pre-publish check. Belt-and-suspenders. Add
-      assertion before any `swarm.gossipsub.publish` on the
-      consensus topic.
+- [x] 218 — `✓` **Validator-only consensus channel: publish-time
+      guard.** Shipped: `crates/node/src/node.rs` now wraps
+      every consensus-topic publish in an `is_validator` gate.
+      Three sites covered:
+      - `PostEventAction::BroadcastConsensus` handler (the
+        general-purpose path)
+      - `PostEventAction::BroadcastConsensusMany` handler
+      - The engine-driven `maybe_rebroadcast_reshare` inline
+        publish in the slot tick.
+      
+      The other consensus publishes (epoch randomness share,
+      PSS refresh, committee reshare contribution) are already
+      inside `if let Some(identity) = validator_identity.as_ref()`
+      blocks, which by construction implies validator role.
+      The new gates are defense-in-depth — they catch any
+      future code path that builds a consensus message
+      without the validator-state precondition. Non-validator
+      attempts log `warn!` so the bug shows up in logs
+      instead of silently propagating to the wire.
+      
+      Multi-node encrypted e2e still passes; clippy clean.
 
 ---
 
@@ -638,3 +661,5 @@ Fold into the relevant fix PRs above when possible:
 | 228b| 2026-04-24  | Gas-parity test on CallExt exposed 2× double-charging (static gas in both bb prologue + delegated step); ABI change routes updated gas back into VAR_GAS_USED | Fixed sync + analysis.rs double-count |
 | 228c| 2026-04-24  | Wrote `assert_gas_parity_with_state` helper; targeted tests for Sload/Sstore/Sdelete cold + Log dynamic gas all failed before fix | Fixed via `page_gas_used` accumulator pattern; 5 new parity tests pass |
 | 228d| 2026-04-24  | Added `host_sloadb` + `host_sstoreb`; rerouted Sload/Sstore mode 1 in codegen; parity tests against interp's mode-1 handler | Fixed semantic + gas divergence on bulk-bytes storage |
+| 217 | 2026-04-24  | Searched every caller of `verify_witnesses`; only tests/benches. No production path verifies witnesses today | Not a bug; re-open if stateless validation wires into production |
+| 218 | 2026-04-24  | Wrapped BroadcastConsensus / BroadcastConsensusMany / maybe_rebroadcast_reshare in `is_validator` gates | Belt-and-suspenders egress guard added |

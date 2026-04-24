@@ -639,20 +639,43 @@ impl PydeNode {
                             }
                         }
                         PostEventAction::BroadcastConsensus(data) => {
-                            let topic = pyde_net::node::topics::consensus();
-                            if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
-                                warn!(error = %e, "failed to broadcast consensus message");
+                            // Audit 218: publish-time guard. The
+                            // consensus topic is validator-only on
+                            // ingress (`Channel::Consensus.validator_only()`
+                            // gates inbound at the libp2p layer). Add a
+                            // matching egress check here so a future
+                            // non-validator code path that constructs a
+                            // BroadcastConsensus action can't slip a
+                            // message onto the wire — belt-and-suspenders.
+                            if !is_validator {
+                                warn!(
+                                    "non-validator attempted BroadcastConsensus; dropped (audit 218)"
+                                );
+                            } else {
+                                let topic = pyde_net::node::topics::consensus();
+                                if let Err(e) =
+                                    swarm.behaviour_mut().gossipsub.publish(topic, data)
+                                {
+                                    warn!(error = %e, "failed to broadcast consensus message");
+                                }
                             }
                         }
                         PostEventAction::BroadcastConsensusMany(messages) => {
-                            let topic = pyde_net::node::topics::consensus();
-                            for data in messages {
-                                if let Err(e) = swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .publish(topic.clone(), data)
-                                {
-                                    warn!(error = %e, "failed to broadcast consensus message");
+                            if !is_validator {
+                                warn!(
+                                    count = messages.len(),
+                                    "non-validator attempted BroadcastConsensusMany; dropped (audit 218)"
+                                );
+                            } else {
+                                let topic = pyde_net::node::topics::consensus();
+                                for data in messages {
+                                    if let Err(e) = swarm
+                                        .behaviour_mut()
+                                        .gossipsub
+                                        .publish(topic.clone(), data)
+                                    {
+                                        warn!(error = %e, "failed to broadcast consensus message");
+                                    }
                                 }
                             }
                         }
@@ -1194,10 +1217,16 @@ impl PydeNode {
                             // online a few slots into the target epoch catch up
                             // without needing a dedicated sync protocol.
                             if let Some((target_epoch, bytes)) = engine.maybe_rebroadcast_reshare() {
-                                let msg = wire::encode_resharing(target_epoch, &bytes);
-                                let topic = pyde_net::node::topics::consensus();
-                                let _ = swarm.behaviour_mut().gossipsub.publish(topic, msg);
-                                debug!(target_epoch, "re-broadcast resharing contribution");
+                                if !is_validator {
+                                    warn!(
+                                        "non-validator attempted reshare rebroadcast; dropped (audit 218)"
+                                    );
+                                } else {
+                                    let msg = wire::encode_resharing(target_epoch, &bytes);
+                                    let topic = pyde_net::node::topics::consensus();
+                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic, msg);
+                                    debug!(target_epoch, "re-broadcast resharing contribution");
+                                }
                             }
 
                             // Task 034: deterministic aggregation trigger. We
