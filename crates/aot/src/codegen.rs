@@ -864,28 +864,30 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                     }
 
                     // --- Storage operations (host calls) ---
+                    // Audit 228c: each storage host fn writes the
+                    // EIP-2929 cold-access surcharge into
+                    // `vm.memory.page_gas_used`; codegen drains it
+                    // afterwards via `emit_drain_page_gas!`.
                     Opcode::Sload => {
                         let mode = d.rs2_or_imm & 0x3;
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let ws_slot = builder.ins().iconst(I64, d.rs1 as i64);
                         match mode {
                             0 => {
-                                // Wide register mode: sload wd, ws1
                                 let wd = builder.ins().iconst(I64, d.rd as i64);
                                 builder.ins().call(fn_sload_ref, &[vm_ctx, ws_slot, wd]);
                             }
                             2 => {
-                                // GP register mode: sloadg rd, ws1 → returns u64
                                 let call = builder.ins().call(fn_sloadg_ref, &[vm_ctx, ws_slot]);
                                 let result = builder.inst_results(call)[0];
                                 gp_write!(builder, d.rd, result);
                             }
                             _ => {
-                                // Mode 1 (memory) and others: delegate to wide mode for now
                                 let wd = builder.ins().iconst(I64, d.rd as i64);
                                 builder.ins().call(fn_sload_ref, &[vm_ctx, ws_slot, wd]);
                             }
                         }
+                        emit_drain_page_gas!(builder);
                     }
                     Opcode::Sstore => {
                         let mode = d.rs2_or_imm & 0x3;
@@ -893,26 +895,23 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let ws_slot = builder.ins().iconst(I64, d.rs1 as i64);
                         let call = match mode {
                             0 => {
-                                // Wide register mode: sstore ws_slot, wd
                                 let wd = builder.ins().iconst(I64, d.rd as i64);
                                 builder.ins().call(fn_sstore_ref, &[vm_ctx, ws_slot, wd])
                             }
                             2 => {
-                                // GP register mode: sstoreg ws_slot, rd
                                 let rd_val = gp_read!(builder, d.rd);
                                 builder
                                     .ins()
                                     .call(fn_sstoreg_ref, &[vm_ctx, ws_slot, rd_val])
                             }
                             _ => {
-                                // Mode 1 (memory) not yet implemented → trap
                                 builder.ins().jump(trap_block, &[]);
                                 terminated = true;
                                 continue;
                             }
                         };
                         let result = builder.inst_results(call)[0];
-                        // result = 1 means static mode violation → trap
+                        emit_drain_page_gas!(builder);
                         let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
                         builder.ins().brif(is_err, trap_block, &[], cont, &[]);
@@ -924,6 +923,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let ws_slot = builder.ins().iconst(I64, d.rs1 as i64);
                         let call = builder.ins().call(fn_sdelete_ref, &[vm_ctx, ws_slot]);
                         let result = builder.inst_results(call)[0];
+                        emit_drain_page_gas!(builder);
                         let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
                         builder.ins().brif(is_err, trap_block, &[], cont, &[]);
@@ -1168,7 +1168,12 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         break;
                     }
 
-                    // Log: emit event via host_log(ctx, desc_ptr, num_topics)
+                    // Log: emit event via host_log(ctx, desc_ptr, num_topics).
+                    // Audit 228c: host_log writes its dynamic gas
+                    // (`100 + data_len*8 + num_topics*50`) plus the
+                    // page-gas from reading topics + data into
+                    // `vm.memory.page_gas_used`; codegen drains both
+                    // via `emit_drain_page_gas!` after the call.
                     Opcode::Log => {
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let desc_ptr = gp_read!(builder, d.rs1);
@@ -1177,6 +1182,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                             .ins()
                             .call(fn_log_ref, &[vm_ctx, desc_ptr, num_topics]);
                         let result = builder.inst_results(call)[0];
+                        emit_drain_page_gas!(builder);
                         let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
                         builder.ins().brif(is_err, trap_block, &[], cont, &[]);
