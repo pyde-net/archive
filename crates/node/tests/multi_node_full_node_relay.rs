@@ -45,7 +45,7 @@ fn tx_via_full_node_reaches_validator() {
         .funded_addresses()
         .unwrap_or_else(|e| panic!("read funded: {}", e));
     assert!(
-        funded.len() >= 3 + 5 + 1,
+        funded.len() > 3 + 5,
         "expected >= 9 funded addresses (3 validators + 5 test + faucet), got {}",
         funded.len()
     );

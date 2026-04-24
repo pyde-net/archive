@@ -1176,9 +1176,8 @@ fn extract_u64_field(body: &str, field: &str) -> Option<u64> {
     let tail = &body[start..];
     let colon = tail.find(':')? + 1;
     let rest = tail[colon..].trim_start();
-    if rest.starts_with('"') {
+    if let Some(inner) = rest.strip_prefix('"') {
         // Quoted string — look for closing quote.
-        let inner = &rest[1..];
         let end = inner.find('"')?;
         let s = &inner[..end];
         if let Some(hex) = s.strip_prefix("0x") {
