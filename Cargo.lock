@@ -3697,6 +3697,7 @@ dependencies = [
  "hex",
  "pyde-account",
  "pyde-crypto",
+ "pyde-mempool",
  "pyde-tx",
  "rand 0.8.6",
  "reqwest",

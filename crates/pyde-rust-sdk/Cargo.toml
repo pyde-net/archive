@@ -10,6 +10,11 @@ description = "Rust SDK for interacting with the Pyde blockchain"
 pyde-crypto = { path = "../crypto" }
 pyde-tx = { path = "../tx" }
 pyde-account = { path = "../account" }
+# Pulled in for the client-side `EncryptedTx` builder (audit 227
+# step 3/4). Mempool only depends on crypto / account / tx — the
+# same set the SDK already has, so this is zero new transitive
+# surface.
+pyde-mempool = { path = "../mempool" }
 
 # Async HTTP + WebSocket
 reqwest = { version = "0.12", features = ["json"] }

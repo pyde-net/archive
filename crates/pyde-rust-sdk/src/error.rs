@@ -26,6 +26,9 @@ pub enum SdkError {
 
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 impl SdkError {
@@ -41,6 +44,7 @@ impl SdkError {
             SdkError::InvalidAddress(_) => "INVALID_ARGUMENT",
             SdkError::InvalidArgument(_) => "INVALID_ARGUMENT",
             SdkError::InvalidResponse(_) => "INVALID_RESPONSE",
+            SdkError::Other(_) => "OTHER",
         }
     }
 
