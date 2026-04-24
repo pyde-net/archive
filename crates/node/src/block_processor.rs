@@ -17,18 +17,24 @@ impl BlockProcessor {
     /// Executes each tx against the state, collects receipts, updates chain head.
     /// Optionally triggers AOT background compilation for new contracts.
     /// Returns (tx_count, total_gas_used, receipts).
-    #[allow(dead_code)]
+    /// Test-only wrapper that skips the WS checkpoint check. Audit
+    /// item 210: gated with `#[cfg(test)]` so production code cannot
+    /// accidentally call the non-enforcing variant and re-open the
+    /// long-range-attack window. Production must go through
+    /// `process_full_block_with_aot_and_checkpoint` with the live
+    /// `FinalityTracker`'s latest checkpoint slot.
+    #[cfg(test)]
     pub fn process_full_block(
         chain: &mut ChainState,
         state: &mut StateManager,
         block: &Block,
     ) -> Result<(u64, u64, Vec<Receipt>), String> {
-        Self::process_full_block_with_aot(chain, state, block, None)
+        Self::process_full_block_with_aot_and_checkpoint(chain, state, block, None, None)
     }
 
-    /// Process a full block with optional AOT cache for background compilation.
-    /// Delegates to the checkpoint-aware variant with `None` (no WS check).
-    #[allow(dead_code)]
+    /// Test-only wrapper with AOT cache but no WS checkpoint. Same
+    /// `#[cfg(test)]` rationale as `process_full_block` — audit 210.
+    #[cfg(test)]
     pub fn process_full_block_with_aot(
         chain: &mut ChainState,
         state: &mut StateManager,
