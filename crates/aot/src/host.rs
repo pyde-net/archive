@@ -678,20 +678,13 @@ pub extern "C" fn host_assert(_ctx: *mut VmCtx, val: u64) -> u64 {
     }
 }
 
-/// Host: memcpy — bulk memory copy.
+/// Host: memcpy — bulk memory copy. Returns 0 on success, 1 on fault.
 ///
-/// Returns a packed u64:
-///   - low  32 bits: 0 = success, 1 = fault
-///   - high 32 bits: page-allocation gas accumulated by `check_access`
-///     during this call (PAGE_ALLOC_GAS per fresh page touched)
-///
-/// The page-gas component MUST be folded into the AOT's gas counter
-/// by the codegen caller. The interpreter drains
-/// `vm.memory.page_gas_used` into `vm.gas_used_total` after every
-/// step (`pvm/src/vm.rs:1388`); the AOT bypasses that loop, so
-/// returning the drained amount here is the only way to keep AOT
-/// and interpreter gas in sync (audit item 215). Per-byte dynamic
-/// gas (3 per 8 bytes) is charged by codegen before this call.
+/// Per-byte dynamic gas (3 per 8 bytes, matching `pvm/src/vm.rs`
+/// Opcode::Memcpy) is charged by the AOT codegen before this call,
+/// and per-page allocation gas is drained via `host_drain_page_gas`
+/// after — AOT tracks gas in a Cranelift SSA variable, not in
+/// `vm.gas_used_total` (audit items 215 + 228a).
 pub extern "C" fn host_memcpy(ctx: *mut VmCtx, dst: u64, src: u64, len: u64) -> u64 {
     // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
     // safety contract (top of file). The AOT JIT's callsite emission
@@ -705,21 +698,40 @@ pub extern "C" fn host_memcpy(ctx: *mut VmCtx, dst: u64, src: u64, len: u64) -> 
     // `as u32` casts on src/dst/len below would silently truncate
     // otherwise. Same ceiling as the interpreter (audit item 215).
     if len > pyde_vm::memory::MEMORY_SIZE as u64 {
-        return 1; // fault, no page gas
+        return 1;
     }
     let len = len as usize;
-    let result = match vm.memory.checked_read_slice(src as u32, len) {
+    match vm.memory.checked_read_slice(src as u32, len) {
         Ok(data) => match vm.memory.checked_write_slice(dst as u32, &data) {
-            Ok(()) => 0u64,
-            Err(_) => 1u64,
+            Ok(()) => 0,
+            Err(_) => 1,
         },
-        Err(_) => 1u64,
-    };
-    // Drain page_gas_used regardless of outcome — partial reads on
-    // the fault path may have already touched pages.
-    let page_gas = vm.memory.page_gas_used;
+        Err(_) => 1,
+    }
+}
+
+/// Host: drain accumulated page-allocation gas.
+///
+/// Returns `vm.memory.page_gas_used` and resets it to 0. The
+/// interpreter folds this into `vm.gas_used_total` after every
+/// `step()` at `pvm/src/vm.rs:1388`, charging `PAGE_ALLOC_GAS` (200)
+/// per fresh page touched. The AOT tracks gas in a Cranelift SSA
+/// variable (`VAR_GAS_USED`) that is **independent** of
+/// `vm.gas_used_total`, so the drain has to be exposed as a host
+/// call and folded into the AOT's counter by codegen after every
+/// op that can bump `page_gas_used` via `check_access`
+/// (Load/Store/Wload/Wstore/Push/Pop/Poseidon/Memcpy). Without this
+/// drain, the same contract charges different gas on AOT vs
+/// interpreter validators ⇒ consensus fork (audit item 228a).
+pub extern "C" fn host_drain_page_gas(ctx: *mut VmCtx) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file). The AOT JIT's callsite emission
+    // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
+    // first register before calling any host_* function.
+    let vm = unsafe { &mut *ctx };
+    let drained = vm.memory.page_gas_used;
     vm.memory.page_gas_used = 0;
-    (page_gas << 32) | result
+    drained
 }
 
 // ============================================================================
@@ -822,6 +834,7 @@ pub fn host_functions() -> Vec<(&'static str, *const u8)> {
         ("host_balance", host_balance as *const u8),
         ("host_assert", host_assert as *const u8),
         ("host_memcpy", host_memcpy as *const u8),
+        ("host_drain_page_gas", host_drain_page_gas as *const u8),
         ("host_checked_add", host_checked_add as *const u8),
         ("host_checked_sub", host_checked_sub as *const u8),
         ("host_checked_mul", host_checked_mul as *const u8),

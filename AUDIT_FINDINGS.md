@@ -458,30 +458,50 @@
       `crates/node/src/faucet.rs` is the RPC half only; no
       frontend / public API exposure.
 
-- [ ] 228 — `✓` **AOT page-gas parity across all memory ops.**
-      Surfaced while fixing 215. The interpreter drains
-      `vm.memory.page_gas_used` into `gas_used_total` at the end of
-      every step (`pvm/src/vm.rs:1388`), charging `PAGE_ALLOC_GAS`
-      (200) per fresh page touched. The AOT bypasses the step
-      loop entirely — every Load/Store/wide-load/wide-store and
-      any other memory-touching host call accumulates
-      `page_gas_used` in `vm.memory` but never folds it into the
-      AOT's SSA `VAR_GAS_USED` counter. Same contract touching
-      fresh memory pages burns different gas on AOT vs interpreter
-      validators → consensus fork on any contract with non-trivial
-      memory access. Item 215 fixed this for `MEMCPY` specifically
-      (host_memcpy now packs drained page_gas into the high 32
-      bits of its return value, codegen folds into VAR_GAS_USED).
-      Need to apply the same pattern to every other AOT memory
-      op. Scope: audit the full list of AOT-emitted memory ops,
-      either add the same pack/unpack to each host call or
-      insert a `host_drain_page_gas` drain call at the end of
-      each basic block. Consensus-critical; mainnet blocker once
-      AOT is enabled in production block-processing (currently
-      wired via `process_full_block_with_aot_and_checkpoint`).
-      Gate with an AOT-vs-interp gas-parity test harness that
-      runs every opcode through both paths and asserts gas
-      equality.
+- [x] 228a — `✓` **AOT page-gas parity for direct memory ops.**
+      Shipped: new `host_drain_page_gas(ctx) -> u64` host function
+      that returns `vm.memory.page_gas_used` and resets to 0. New
+      `emit_drain_page_gas!` codegen macro folds the drained
+      amount into `VAR_GAS_USED` + runs the same OOG check the
+      block prologue uses. Applied after every direct memory op:
+      `Load`, `Store`, `Wload`, `Wstore`, `Push`, `Pop`,
+      `Poseidon`, `Memcpy`. Memcpy converted from 215's
+      pack-into-return-value to the uniform drain-macro pattern.
+      While writing parity tests, caught an additional divergence:
+      Poseidon charges `(len/32)*250` dynamic gas in the
+      interpreter but AOT was charging zero. Fixed by emitting
+      the dynamic charge in codegen before the host_poseidon
+      call, same pattern as memcpy's per-byte charge. Tests:
+      6 new gas-parity tests
+      (`load_aot_charges_page_gas_parity_with_interp`,
+      `store_aot_charges_page_gas_parity_with_interp`,
+      `wload_aot_charges_page_gas_parity_with_interp`,
+      `wstore_aot_charges_page_gas_parity_with_interp`,
+      `push_pop_aot_charges_page_gas_parity_with_interp`,
+      `poseidon_aot_charges_page_gas_parity_with_interp`) plus
+      the existing memcpy parity test, all asserting exact
+      AOT/interp gas equality. Multi-node encrypted e2e still
+      passes.
+
+- [ ] 228b — `✓` **AOT delegated-op gas sync** (splits from 228).
+      Surfaced while scoping 228. Complex opcodes (`CallExt`,
+      `Delegate`, `Create`, `VerifySig`, `MerkleVerify`) are
+      emitted by AOT codegen as delegations to `host_exec_opcode`,
+      which calls `vm.exec_single` → `vm.step`. `step` charges
+      gas into `vm.gas_used_total`. But the AOT's SSA
+      `VAR_GAS_USED` is **independent** of `vm.gas_used_total` —
+      nothing syncs. Result: every cross-contract call,
+      signature verify, contract create, and merkle verify
+      charges **zero gas in AOT** while interpreter charges the
+      full amount. This is a much bigger divergence than 228a
+      (affects every delegated op, not just memory). Fix:
+      modify `host_exec_opcode` ABI to return a packed
+      (result, gas_delta) so codegen can fold the gas change
+      into `VAR_GAS_USED`. Alternative: save/restore
+      `vm.gas_used_total` around the call and compute the
+      delta. Tests: gas-parity harness for each of the 5
+      delegated opcodes. Mainnet-blocker per the item-215
+      decision to ship AOT on testnet.
 
 - [ ] 226 — `⚠` **Plaintext RPC path: `AuthKeys::None` sig-skip
       analog.** Surfaced while closing 206.
@@ -528,3 +548,4 @@ Fold into the relevant fix PRs above when possible:
 | 207 | 2026-04-23  | Agent-traced against wire.rs compact-block encoding | Accepted; design decision needed |
 | 214 | 2026-04-23  | Read decrypt-share branch + verified `PeerInfo::invalid_messages` reuse from 014d | Fixed with spam-threshold drop + decode-Err bump |
 | 215 | 2026-04-24  | Traced interp `Memcpy` + `host_memcpy` + AOT codegen + `page_gas_used` drain; added gas-parity test that exposed 2 divergences (per-byte + per-page) | Fixed all three in one PR; surfaced 228 as follow-up |
+| 228a| 2026-04-24  | Enumerated AOT memory-touching host calls; gas-parity tests for each. Poseidon dynamic-gas divergence surfaced by the test harness | Fixed all 7 direct mem ops + poseidon dynamic gas; split 228b |

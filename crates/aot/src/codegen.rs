@@ -250,6 +250,13 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
         .declare_function("host_memcpy", Linkage::Import, &sig_store)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
+    // (ctx) -> u64 — returns vm.memory.page_gas_used, resets to 0.
+    // Folded into VAR_GAS_USED after every memory-touching op so AOT
+    // stays in gas lockstep with the interpreter (audit item 228a).
+    let fn_drain_page_gas = module
+        .declare_function("host_drain_page_gas", Linkage::Import, &sig_pop)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+
     // host_wload(ctx, addr, wd) -> u64
     let fn_wload = module
         .declare_function("host_wload", Linkage::Import, &sig_sload)
@@ -369,6 +376,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_balance_ref = module.declare_func_in_func(fn_balance, &mut ctx.func);
     let fn_assert_ref = module.declare_func_in_func(fn_assert, &mut ctx.func);
     let fn_memcpy_ref = module.declare_func_in_func(fn_memcpy, &mut ctx.func);
+    let fn_drain_page_gas_ref = module.declare_func_in_func(fn_drain_page_gas, &mut ctx.func);
     let fn_sync_gp_to_vm_ref = module.declare_func_in_func(fn_sync_gp_to_vm, &mut ctx.func);
     let fn_sync_gp_from_vm_ref = module.declare_func_in_func(fn_sync_gp_from_vm, &mut ctx.func);
 
@@ -476,6 +484,37 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                     let trapped = $builder.ins().icmp_imm(IntCC::NotEqual, flag, 0);
                     let cont = $builder.create_block();
                     $builder.ins().brif(trapped, $trap_block, &[], cont, &[]);
+                    $builder.seal_block(cont);
+                    $builder.switch_to_block(cont);
+                }};
+            }
+
+            // Helper macro: drain vm.memory.page_gas_used into
+            // VAR_GAS_USED, then run the same OOG check the block
+            // prologue uses. Call after every AOT-emitted op whose
+            // host implementation can bump `page_gas_used` through
+            // `check_access` (Load/Store/Wload/Wstore/Push/Pop/
+            // Poseidon/Memcpy). The interpreter drains after every
+            // step; AOT has to do it here per op, otherwise AOT
+            // and interp disagree on gas_used and the chain forks
+            // on any contract with non-trivial memory access
+            // (audit item 228a).
+            macro_rules! emit_drain_page_gas {
+                ($builder:expr) => {{
+                    let vm_ctx = $builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                    let call = $builder.ins().call(fn_drain_page_gas_ref, &[vm_ctx]);
+                    let drained = $builder.inst_results(call)[0];
+                    let gas_used = $builder.use_var(Variable::from_u32(VAR_GAS_USED));
+                    let new_gas = $builder.ins().iadd(gas_used, drained);
+                    $builder.def_var(Variable::from_u32(VAR_GAS_USED), new_gas);
+                    let gas_limit = $builder.use_var(Variable::from_u32(VAR_GAS_LIMIT));
+                    let limit_nonzero = $builder.ins().icmp_imm(IntCC::NotEqual, gas_limit, 0);
+                    let over = $builder
+                        .ins()
+                        .icmp(IntCC::UnsignedGreaterThan, new_gas, gas_limit);
+                    let oog = $builder.ins().band(limit_nonzero, over);
+                    let cont = $builder.create_block();
+                    $builder.ins().brif(oog, oog_block, &[], cont, &[]);
                     $builder.seal_block(cont);
                     $builder.switch_to_block(cont);
                 }};
@@ -627,6 +666,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_push_ref, &[vm_ctx, val]);
                         let result = builder.inst_results(call)[0];
+                        emit_drain_page_gas!(builder);
                         let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
                         builder.ins().brif(is_err, trap_block, &[], cont, &[]);
@@ -637,6 +677,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_pop_ref, &[vm_ctx]);
                         let result = builder.inst_results(call)[0];
+                        emit_drain_page_gas!(builder);
                         // Check for fault (u64::MAX)
                         let is_err = builder.ins().icmp_imm(IntCC::Equal, result, -1i64);
                         let cont = builder.create_block();
@@ -728,6 +769,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_wload_ref, &[vm_ctx, addr, wd]);
                         let result = builder.inst_results(call)[0];
+                        emit_drain_page_gas!(builder);
                         let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
                         builder.ins().brif(is_err, trap_block, &[], cont, &[]);
@@ -743,6 +785,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_wstore_ref, &[vm_ctx, addr, ws]);
                         let result = builder.inst_results(call)[0];
+                        emit_drain_page_gas!(builder);
                         let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
                         builder.ins().brif(is_err, trap_block, &[], cont, &[]);
@@ -789,6 +832,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let call = builder.ins().call(fn_load_ref, &[vm_ctx, addr, w]);
                         let result = builder.inst_results(call)[0];
+                        emit_drain_page_gas!(builder);
                         gp_write!(builder, d.rd, result);
                     }
                     Opcode::Store => {
@@ -801,6 +845,7 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let w = builder.ins().iconst(I64, width as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         builder.ins().call(fn_store_ref, &[vm_ctx, addr, val, w]);
+                        emit_drain_page_gas!(builder);
                     }
 
                     // --- Storage operations (host calls) ---
@@ -873,15 +918,44 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
 
                     // --- Crypto (host calls) ---
                     Opcode::Poseidon => {
+                        // Audit item 228a — interpreter charges 250 gas
+                        // per 32-byte chunk (`pvm/src/vm.rs` Poseidon
+                        // handler); AOT must charge the same. Emitted
+                        // inline because host_poseidon can't reach
+                        // VAR_GAS_USED. Plus page-gas drain after the
+                        // call for the memory read inside host_poseidon.
                         let addr = gp_read!(builder, d.rs1);
                         let len_reg = (d.rs2_or_imm & 0xF) as u8;
                         let len = gp_read!(builder, len_reg);
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+
+                        // dynamic_gas = ((len + 31) >> 5) * 250
+                        let thirty_one = builder.ins().iconst(I64, 31);
+                        let len_plus = builder.ins().iadd(len, thirty_one);
+                        let chunks = builder.ins().ushr_imm(len_plus, 5);
+                        let two_fifty = builder.ins().iconst(I64, 250);
+                        let dynamic_gas = builder.ins().imul(chunks, two_fifty);
+                        let gas_used = builder.use_var(Variable::from_u32(VAR_GAS_USED));
+                        let new_gas = builder.ins().iadd(gas_used, dynamic_gas);
+                        builder.def_var(Variable::from_u32(VAR_GAS_USED), new_gas);
+                        let gas_limit = builder.use_var(Variable::from_u32(VAR_GAS_LIMIT));
+                        let limit_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, gas_limit, 0);
+                        let over =
+                            builder
+                                .ins()
+                                .icmp(IntCC::UnsignedGreaterThan, new_gas, gas_limit);
+                        let oog = builder.ins().band(limit_nonzero, over);
+                        let after_oog = builder.create_block();
+                        builder.ins().brif(oog, oog_block, &[], after_oog, &[]);
+                        builder.seal_block(after_oog);
+                        builder.switch_to_block(after_oog);
+
                         let call = builder
                             .ins()
                             .call(fn_poseidon_ref, &[vm_ctx, addr, len, wd]);
                         let result = builder.inst_results(call)[0];
+                        emit_drain_page_gas!(builder);
                         let is_err = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
                         builder.ins().brif(is_err, trap_block, &[], cont, &[]);
@@ -999,30 +1073,19 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.switch_to_block(cont);
                     }
                     Opcode::Memcpy => {
-                        // Memcpy handled by VM runtime call (AOT fallback).
+                        // Memcpy via VM runtime call.
                         //
-                        // Audit item 215 — fixes three consensus
-                        // divergences between AOT and interpreter:
-                        //
-                        //   1. Per-byte dynamic gas (3 per 8 bytes) was
-                        //      charged by the interpreter but not by
-                        //      AOT. AOT tracks gas in `VAR_GAS_USED`,
-                        //      not in `vm.gas_used_total`, so the
-                        //      charge is emitted here in the JIT.
-                        //
-                        //   2. Per-page allocation gas (PAGE_ALLOC_GAS
-                        //      per fresh page) was charged by the
-                        //      interpreter via the post-step drain at
-                        //      `pvm/src/vm.rs:1388`. AOT bypasses that
-                        //      loop. `host_memcpy` now returns the
-                        //      drained `page_gas_used` packed into the
-                        //      high 32 bits of its result; codegen
-                        //      folds it into VAR_GAS_USED here.
-                        //
-                        //   3. The previous emission discarded the
-                        //      fault return, so AOT silently continued
-                        //      on memory fault / oversized len. Now
-                        //      routes through `trap_block`.
+                        // Gas parity with the interpreter (audit items
+                        // 215 + 228a):
+                        //   1. Per-byte dynamic gas (3 per 8 bytes)
+                        //      charged inline in the JIT before the
+                        //      host call.
+                        //   2. Per-page allocation gas drained via
+                        //      `emit_drain_page_gas!` after the host
+                        //      call, uniform with the other memory
+                        //      ops.
+                        //   3. host_memcpy fault return routed to
+                        //      `trap_block` (previously discarded).
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let dst = gp_read!(builder, d.rd);
                         let src = gp_read!(builder, d.rs1);
@@ -1053,35 +1116,13 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.seal_block(after_oog);
                         builder.switch_to_block(after_oog);
 
-                        // Call host_memcpy. Returns:
-                        //   low  32 bits: 0=success, 1=fault
-                        //   high 32 bits: page_gas to charge
+                        // host_memcpy: 0=success, 1=fault.
                         let call = builder.ins().call(fn_memcpy_ref, &[vm_ctx, dst, src, len]);
-                        let raw = builder.inst_results(call)[0];
+                        let result = builder.inst_results(call)[0];
 
-                        // Add page_gas (high 32) to gas counter.
-                        let page_gas = builder.ins().ushr_imm(raw, 32);
-                        let gas_used = builder.use_var(Variable::from_u32(VAR_GAS_USED));
-                        let new_gas = builder.ins().iadd(gas_used, page_gas);
-                        builder.def_var(Variable::from_u32(VAR_GAS_USED), new_gas);
+                        emit_drain_page_gas!(builder);
 
-                        // OOG check after page-gas charge.
-                        let gas_limit = builder.use_var(Variable::from_u32(VAR_GAS_LIMIT));
-                        let limit_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, gas_limit, 0);
-                        let over =
-                            builder
-                                .ins()
-                                .icmp(IntCC::UnsignedGreaterThan, new_gas, gas_limit);
-                        let oog2 = builder.ins().band(limit_nonzero, over);
-                        let after_oog2 = builder.create_block();
-                        builder.ins().brif(oog2, oog_block, &[], after_oog2, &[]);
-                        builder.seal_block(after_oog2);
-                        builder.switch_to_block(after_oog2);
-
-                        // Fault check (low 32 bits != 0).
-                        let fault_mask = builder.ins().iconst(I64, 0xFFFFFFFFi64);
-                        let fault_bits = builder.ins().band(raw, fault_mask);
-                        let is_fault = builder.ins().icmp_imm(IntCC::NotEqual, fault_bits, 0);
+                        let is_fault = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
                         let cont = builder.create_block();
                         builder.ins().brif(is_fault, trap_block, &[], cont, &[]);
                         builder.seal_block(cont);
