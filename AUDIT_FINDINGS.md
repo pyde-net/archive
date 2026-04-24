@@ -269,44 +269,70 @@
       wrapper for tests + devnet bootstrap. 65 validator tests +
       multi-node encrypted e2e still pass.
 
-- [ ] 208 — `⚠` **Committee rotation: clear old committee keys.**
-      `crates/node/src/validator.rs:828-841` — `set_committee`
-      overwrites but if a rotation is reverted mid-reshare, an
-      isolated old member can keep signing. Not fund-loss; quorum
-      dilution + liveness risk.
+- [x] 208 — `✓` **Committee rotation: clear old committee keys.**
+      Closed on investigation, not a bug. `set_committee` does
+      `self.committee_keys = keys;` — Rust's assignment drops the
+      old Vec (memory freed, no references remain); old pubkeys
+      aren't "lingering." Agent conflated this with a distinct
+      concern — "isolated old validator comes back with stale
+      state" — which is covered by weak-subjectivity checkpoints,
+      not by `set_committee`'s memory semantics.
 
-- [ ] 209 — `⚠` **PVM gas-metering audit.**
-      (a) verify `isa::total_gas(Opcode::Addi)` is non-zero (else
-      infinite `ADDI`-only loop is free);
-      (b) audit cold/warm storage tracking: `warm_storage_keys`
-      lives inside each `Vm`, so each parallel execution group
-      starts cold — over- or under-charging depending on group
-      merge semantics.
+- [x] 209 — `✓` **PVM gas-metering audit.** Closed on
+      investigation, both sub-concerns not bugs.
+      (a) `Opcode::Addi => GasCost::new(3)` at
+      `crates/pvm/src/isa.rs:480`. Non-zero; infinite-loop DoS
+      concern invalid. Test `total_gas_table_matches_gas_cost`
+      (`isa.rs:854`) enforces table consistency.
+      (b) `warm_storage_keys` per-tx is exactly EIP-2929
+      semantics — warm tracking is intentionally reset per tx.
+      Cross-tx warming within a parallel group isn't a feature
+      (and wouldn't be correct; two txs touching the same slot
+      both pay cold on their first access). Child calls inside
+      a single tx do inherit parent's warm keys (`vm.rs:1644`
+      clone, `:1684` extend), which matches Ethereum.
 
-- [ ] 210 — `⚠` **Weak-subjectivity enforcement API.**
-      `crates/node/src/block_processor.rs:45-56` —
-      `ws_checkpoint_slot` is `Option<u64>`; public variants pass
-      `None`. Easy to call a non-enforcing variant and re-open
-      long-range attack window. Make required or assert at entry.
+- [x] 210 — `✓` **Weak-subjectivity enforcement API.** Shipped:
+      the non-checkpoint public wrappers `process_full_block`
+      and `process_full_block_with_aot` are now `#[cfg(test)]`
+      so they can't be reached from production code. Production
+      callers (`sync.rs:242`, `node.rs:994 / 1494 / 2298`) all
+      go through `process_full_block_with_aot_and_checkpoint`
+      with the live tracker's `latest_checkpoint.slot`. Test
+      callers (`block_processor.rs` mod tests, `validator.rs`
+      mod tests) unaffected.
 
-- [ ] 211 — `⚠` **Kyber ciphertext domain separation.**
-      `crates/crypto/src/kyber.rs` — encapsulation has no explicit
-      chain_id/slot binding. Sender-FALCON binding (028) covers
-      the dominant replay vector; protocol-level binding is
-      defence-in-depth and required for cross-chain replay
-      resistance.
+- [x] 211 — `✓` **Kyber ciphertext domain separation.** Closed
+      on investigation, not a bug at the layer that matters. The
+      outer `EncryptedTx::hash()` already binds `(sender ||
+      nonce || gas_limit || chain_id || ct_hash)` and the FALCON
+      signature covers this hash. Cross-chain / cross-slot
+      replay is blocked at the envelope layer. Adding inner
+      Kyber context-binding would be defence-in-depth but isn't
+      load-bearing; the envelope is.
 
-- [ ] 212 — `⚠` **FALCON signature malleability check.**
-      Any site that dedups / slashes keyed on signature bytes
-      is brittle if the upstream `falcon` crate permits multiple
-      valid sigs per `(pk, msg)`. Verify upstream; add a
-      malleability proptest; add canonicalisation if needed.
+- [x] 212 — `✓` **FALCON signature malleability check.** Closed
+      on investigation, not a critical bug. Audit of dedup sites:
+      `seen_votes` (validator.rs) keys on `(slot, voter_index)`,
+      not sig bytes. `seen_evidence` (validator.rs) keys on
+      `(slot, signer address)`, not sig bytes. `seen_proposals`
+      keys on `(slot, proposer address)`, not sig bytes.
+      No production dedup uses signature bytes as the key, so
+      even if FALCON permits multiple valid sigs per (pk, msg),
+      none of Pyde's slashing / vote counting / evidence
+      submission logic is affected.
 
-- [ ] 213 — `⚠` **VRF input audit.**
-      `crates/crypto/src/vrf.rs` — confirm all VRF preimage
-      components are chain-determined (epoch, prev block hash,
-      slot). Any proposer-chooseable input opens committee
-      selection to grinding.
+- [x] 213 — `✓` **VRF input audit.** Closed on investigation,
+      not a bug. VRF inputs used on the consensus hot path:
+      - Proposer VRF (`validator.rs:1190`,
+        `block_processor.rs:568`): `epoch_randomness || slot_le`.
+        Both chain-deterministic (epoch_randomness is itself a
+        VRF output from the prior epoch; slot is a counter).
+      - Randomness VRF (`epoch_randomness.rs:64`): input is
+        `epoch`. Deterministic.
+      No proposer-chooseable inputs anywhere, so the committee-
+      selection grinding attack the agent flagged is not
+      reachable.
 
 - [ ] 214 — `⚠` **Per-peer rate limit on decryption shares.**
       `crates/node/src/node.rs` consensus handler — frame-size
