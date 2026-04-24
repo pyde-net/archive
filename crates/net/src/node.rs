@@ -149,9 +149,17 @@ pub mod topics {
         IdentTopic::new("pyde/consensus/1")
     }
 
-    /// Encrypted transactions from users.
+    /// Plaintext transactions from users.
     pub fn transactions() -> IdentTopic {
         IdentTopic::new("pyde/transactions/1")
+    }
+
+    /// Threshold-encrypted (MEV-protected) transactions. Separate
+    /// from plaintext transactions so the receive dispatcher can
+    /// decode the right wire format without probing. Audit item
+    /// 227 step 4 / option E.
+    pub fn encrypted_transactions() -> IdentTopic {
+        IdentTopic::new("pyde/encrypted_tx/1")
     }
 
     /// Proposed blocks and scheduled blocks.
@@ -166,7 +174,13 @@ pub mod topics {
 
     /// All topic names.
     pub fn all() -> Vec<IdentTopic> {
-        vec![consensus(), transactions(), blocks(), sync()]
+        vec![
+            consensus(),
+            transactions(),
+            encrypted_transactions(),
+            blocks(),
+            sync(),
+        ]
     }
 }
 
@@ -205,11 +219,16 @@ pub fn subscribe_topics(
     swarm: &mut Swarm<PydeBehaviour>,
     is_validator: bool,
 ) -> Result<(), String> {
-    // All nodes subscribe to transactions, blocks, sync
+    // All nodes subscribe to transactions (plaintext + encrypted), blocks, sync
     swarm
         .behaviour_mut()
         .gossipsub
         .subscribe(&topics::transactions())
+        .map_err(|e| format!("subscribe error: {e}"))?;
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&topics::encrypted_transactions())
         .map_err(|e| format!("subscribe error: {e}"))?;
     swarm
         .behaviour_mut()

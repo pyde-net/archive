@@ -16,6 +16,13 @@ use std::collections::HashSet;
 pub enum Channel {
     Consensus,
     Transactions,
+    /// MEV-protected (threshold-encrypted) transactions. Separate from
+    /// `Transactions` so the receive dispatcher doesn't have to probe
+    /// both plaintext + encrypted wire formats on every message —
+    /// they share a first-byte prefix (sender address), so type
+    /// confusion would otherwise be possible. Audit item 227
+    /// step 4 / option E.
+    EncryptedTransactions,
     Blocks,
     Sync,
 }
@@ -26,6 +33,7 @@ impl Channel {
         match self {
             Channel::Consensus => "pyde/consensus/1",
             Channel::Transactions => "pyde/transactions/1",
+            Channel::EncryptedTransactions => "pyde/encrypted_tx/1",
             Channel::Blocks => "pyde/blocks/1",
             Channel::Sync => "pyde/sync/1",
         }
@@ -41,6 +49,7 @@ impl Channel {
         match topic {
             "pyde/consensus/1" => Some(Channel::Consensus),
             "pyde/transactions/1" => Some(Channel::Transactions),
+            "pyde/encrypted_tx/1" => Some(Channel::EncryptedTransactions),
             "pyde/blocks/1" => Some(Channel::Blocks),
             "pyde/sync/1" => Some(Channel::Sync),
             _ => None,
@@ -52,6 +61,7 @@ impl Channel {
         &[
             Channel::Consensus,
             Channel::Transactions,
+            Channel::EncryptedTransactions,
             Channel::Blocks,
             Channel::Sync,
         ]
@@ -98,7 +108,8 @@ pub fn validate_message(msg: &NetworkMessage, is_validator_peer: bool) -> Valida
     // Check message size limits per channel
     let max_size = match msg.channel {
         Channel::Consensus => 64 * 1024,     // 64KB (votes, view changes)
-        Channel::Transactions => 128 * 1024, // 128KB (encrypted txs)
+        Channel::Transactions => 128 * 1024, // 128KB (plaintext txs)
+        Channel::EncryptedTransactions => 128 * 1024, // 128KB (same as plaintext)
         Channel::Blocks => 4 * 1024 * 1024,  // 4MB (full blocks)
         Channel::Sync => 8 * 1024 * 1024,    // 8MB (state chunks)
     };
@@ -188,7 +199,7 @@ mod tests {
 
     #[test]
     fn all_channels_count() {
-        assert_eq!(Channel::all().len(), 4);
+        assert_eq!(Channel::all().len(), 5);
     }
 
     #[test]

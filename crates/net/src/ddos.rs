@@ -145,7 +145,8 @@ impl SubnetLimiter {
 pub fn max_message_size(channel: Channel) -> usize {
     match channel {
         Channel::Consensus => 64 * 1024,     // 64 KB (votes, view changes)
-        Channel::Transactions => 128 * 1024, // 128 KB (encrypted transactions)
+        Channel::Transactions => 128 * 1024, // 128 KB (plaintext txs)
+        Channel::EncryptedTransactions => 128 * 1024, // 128 KB (encrypted txs)
         Channel::Blocks => 4 * 1024 * 1024,  // 4 MB (full blocks)
         Channel::Sync => 8 * 1024 * 1024,    // 8 MB (state sync chunks)
     }

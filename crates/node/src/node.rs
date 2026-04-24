@@ -445,6 +445,15 @@ impl PydeNode {
         // 10. Start RPC server if enabled
         let (tx_gossip_tx, mut tx_gossip_rx) =
             tokio::sync::mpsc::channel::<pyde_tx::types::Transaction>(1024);
+        // Audit item 227 step 4 / option E: RPC ingress side of the
+        // encrypted-tx gossip channel. After pyde_sendRawEncryptedTransaction
+        // accepts a tx into the local tx_relay, the RPC handler also
+        // pushes it here. The main loop forwards it to gossipsub on the
+        // encrypted-tx topic so every validator's tx_relay ends up with
+        // a copy — otherwise only the RPC-receiving node's proposer
+        // could ever include the tx in a block.
+        let (encrypted_tx_gossip_tx, mut encrypted_tx_gossip_rx) =
+            tokio::sync::mpsc::channel::<pyde_mempool::encrypted::EncryptedTx>(1024);
         // WebSocket subscription broadcast channels (created even if RPC disabled — cheap no-op)
         let (new_heads_tx, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
         let (pending_tx_tx, _) = tokio::sync::broadcast::channel::<String>(4096);
@@ -478,6 +487,7 @@ impl PydeNode {
                 logs_tx,
                 dev_mode: self.config.node.dev_mode,
                 tx_gossip_tx: tx_gossip_tx.clone(),
+                encrypted_tx_gossip_tx: encrypted_tx_gossip_tx.clone(),
             });
             match rpc::start_rpc_server(
                 &self.config.rpc.listen,
@@ -683,6 +693,149 @@ impl PydeNode {
                                     .insert(tx_hash, std::time::Instant::now());
                             }
                         }
+                        PostEventAction::QcFormedFromGossip { slot } => {
+                            // Audit item 227 step 4: QC just formed for
+                            // `slot` via an incoming gossip vote — the
+                            // original decrypt path at `select_and_vote`
+                            // only triggered when our OWN vote closed the
+                            // QC, which is rare in a 4+-node committee.
+                            // Mirror that logic here so the decrypt flow
+                            // starts regardless of which validator's vote
+                            // was the one.
+                            if !validator_identity
+                                .as_ref()
+                                .map(|id| id.key_share.is_some())
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            // Already started decryption for this slot? Skip.
+                            if pending_decryptors.read().await.contains_key(&slot) {
+                                continue;
+                            }
+                            let block = match block_store.get_block_raw(slot)
+                                .and_then(|b| wire::decode_block(&b).ok())
+                            {
+                                Some(b) => b,
+                                None => continue,
+                            };
+                            if block.body.encrypted_txs.is_empty() {
+                                continue;
+                            }
+                            let enc_txs: Vec<pyde_mempool::encrypted::EncryptedTx> = block
+                                .body
+                                .encrypted_txs
+                                .iter()
+                                .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+                                .collect();
+                            let tx_root_ok = crate::block_processor::verify_decryptor_against_committed_root(
+                                &block.header.tx_root,
+                                &block.body.transactions,
+                                &enc_txs,
+                            );
+                            if !tx_root_ok {
+                                error!(slot, "decrypt-time tx_root mismatch");
+                                continue;
+                            }
+                            let engine = match validator_engine.as_mut() {
+                                Some(e) => e,
+                                None => continue,
+                            };
+                            let threshold = pyde_consensus::block::quorum_for_committee(
+                                engine.committee_keys.len(),
+                            );
+                            let identity = validator_identity.as_ref().unwrap();
+                            if let Ok(mut decryptor) =
+                                pyde_mempool::decryption::BlockDecryptor::new(
+                                    enc_txs.clone(),
+                                    threshold,
+                                )
+                            {
+                                if let Some(ks) = &identity.key_share {
+                                    decryptor.add_member_shares(ks);
+                                }
+                                // Replay any shares that arrived before
+                                // the decryptor existed.
+                                {
+                                    let mut q = queued_shares.write().await;
+                                    if let Some(queued) = q.remove(&slot) {
+                                        for qmsg in &queued {
+                                            for (i, sb) in qmsg.shares.iter().enumerate() {
+                                                if let Some(s) = pyde_crypto::threshold::DecryptionShare::from_bytes(sb) {
+                                                    decryptor.add_share(i, s);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                pending_decryptors
+                                    .write()
+                                    .await
+                                    .insert(slot, decryptor);
+                            }
+                            // Broadcast our own decryption shares on the
+                            // consensus topic.
+                            if let Some(shares) =
+                                engine.generate_decryption_shares(identity, &enc_txs)
+                            {
+                                let msg = wire::DecryptionShareMsg {
+                                    slot,
+                                    member_index: identity.committee_index,
+                                    shares: shares.iter().map(|s| s.to_bytes()).collect(),
+                                };
+                                let share_bytes = wire::encode_decryption_shares(&msg);
+                                let topic = pyde_net::node::topics::consensus();
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .publish(topic, share_bytes);
+                                info!(
+                                    slot,
+                                    enc_txs = enc_txs.len(),
+                                    "broadcast decryption shares (gossip-QC)"
+                                );
+                            }
+                        }
+                        PostEventAction::AcceptEncryptedTransaction(enc_tx) => {
+                            // Audit item 227 step 4 / option E: inbound
+                            // from the encrypted-transactions gossip topic.
+                            // Route through the same ingress policy as the
+                            // RPC path so mainnet still enforces registered
+                            // auth_keys while devnet keeps the structural-
+                            // only fall-through.
+                            let from = enc_tx.sender;
+                            let tx_hash = enc_tx.hash();
+                            let sender_pk_opt = {
+                                let state_r = state.read().await;
+                                let sender_key = pyde_state::keys::balance_key(&from);
+                                state_r
+                                    .get(&sender_key)
+                                    .and_then(|b| pyde_account::types::Account::from_bytes(&b))
+                                    .and_then(|acct| match acct.auth_keys {
+                                        pyde_account::types::AuthKeys::Single(pk) => Some(pk),
+                                        _ => None,
+                                    })
+                            };
+                            let chain_id = chain.read().await.chain_id;
+                            let mut relay = tx_relay.write().await;
+                            let accepted = match (sender_pk_opt, chain_id) {
+                                (Some(pk), _) => relay.receive_tx_verified(enc_tx, &pk),
+                                (None, 31337) => relay.receive_tx(enc_tx),
+                                (None, _) => {
+                                    debug!(
+                                        tx_hash = hex::encode(tx_hash),
+                                        "dropped encrypted gossip tx: sender has no registered auth_key"
+                                    );
+                                    false
+                                }
+                            };
+                            if accepted {
+                                debug!(
+                                    tx_hash = hex::encode(tx_hash),
+                                    "encrypted tx accepted from gossip"
+                                );
+                            }
+                        }
                         PostEventAction::AddPeerToKademlia(peer_id, addrs) => {
                             for addr in &addrs {
                                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
@@ -886,7 +1039,33 @@ impl PydeNode {
                                                 times_w.remove(h);
                                             }
                                         }
-                                        info!(slot, txs = tc, gas, "compact block reconstructed and processed");
+                                        // Audit item 227 step 4: clear encrypted txs from
+                                        // the local tx_relay once the block committing
+                                        // them has been fully processed. The self-propose
+                                        // path deliberately does NOT do this — self-proposals
+                                        // can lose the multi-proposer VRF lottery, and
+                                        // removing on self-propose would permanently drop
+                                        // the tx even when a different validator's block
+                                        // wins the slot. Doing it here, after the block
+                                        // has actually been QC'd and processed, matches
+                                        // the P7a-2 plaintext fix.
+                                        if !block.body.encrypted_txs.is_empty() {
+                                            let enc_hashes: Vec<[u8; 32]> = block.body.encrypted_txs.iter()
+                                                .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+                                                .map(|etx| etx.hash())
+                                                .collect();
+                                            if !enc_hashes.is_empty() {
+                                                let mut relay_w = tx_relay.write().await;
+                                                relay_w.remove_included(&enc_hashes);
+                                            }
+                                        }
+                                        info!(
+                                            slot,
+                                            txs = tc,
+                                            encrypted = block.body.encrypted_txs.len(),
+                                            gas,
+                                            "compact block reconstructed and processed"
+                                        );
                                     }
                                     Err(e) => {
                                         debug!(slot, error = %e, "compact block rejected");
@@ -1408,15 +1587,17 @@ impl PydeNode {
                                         }
                                     }
 
-                                    // Remove included encrypted txs from mempool
-                                    if !block.body.encrypted_txs.is_empty() {
-                                        let enc_hashes: Vec<[u8; 32]> = block.body.encrypted_txs.iter()
-                                            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
-                                            .map(|etx| etx.hash())
-                                            .collect();
-                                        let mut relay_w = tx_relay.write().await;
-                                        relay_w.remove_included(&enc_hashes);
-                                    }
+                                    // Audit item 227 step 4: do NOT remove encrypted txs
+                                    // from tx_relay here. Self-proposals can lose the
+                                    // multi-proposer VRF lottery, and removing at self-
+                                    // propose time would permanently orphan the tx when
+                                    // a different validator's block wins the slot. The
+                                    // removal happens in the `ReconstructCompactBlock`
+                                    // handler once the committed block has been processed
+                                    // — if our block ends up being the winner, it arrives
+                                    // back to us via gossip like any other block and the
+                                    // cleanup fires there. If it loses, the tx stays in
+                                    // the mempool for future slots.
 
                                     // Store full block for sync serving + missing tx requests
                                     let full_block_bytes = wire::encode_block(&block);
@@ -1463,16 +1644,21 @@ impl PydeNode {
                                             encrypted_txs: block.body.encrypted_txs.clone(),
                                         };
                                         let bundle_bytes = wire::encode_encrypted_tx_bundle(&bundle);
-                                        if let Err(e) = swarm
+                                        match swarm
                                             .behaviour_mut()
                                             .gossipsub
                                             .publish(topic, bundle_bytes)
                                         {
-                                            debug!(
+                                            Ok(_) => debug!(
+                                                slot = current_slot,
+                                                entries = block.body.encrypted_txs.len(),
+                                                "published encrypted-tx bundle"
+                                            ),
+                                            Err(e) => debug!(
                                                 slot = current_slot,
                                                 error = %e,
                                                 "no gossipsub subscribers for encrypted-tx bundle"
-                                            );
+                                            ),
                                         }
                                     }
 
@@ -1727,6 +1913,21 @@ impl PydeNode {
                         debug!(tx_hash = hex::encode(tx.hash()), "gossiped tx to network");
                     }
                 }
+                Some(enc_tx) = encrypted_tx_gossip_rx.recv() => {
+                    // Audit item 227 step 4 / option E: fan out the
+                    // encrypted tx to other validators. Without this,
+                    // only the RPC-receiving node has it and only its
+                    // own proposals can include it — under multi-proposer
+                    // VRF the tx would be permanently orphaned.
+                    let tx_hash = enc_tx.hash();
+                    let tx_bytes = enc_tx.to_bytes();
+                    let topic = pyde_net::node::topics::encrypted_transactions();
+                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, tx_bytes) {
+                        debug!(error = %e, "failed to gossip encrypted tx");
+                    } else {
+                        debug!(tx_hash = hex::encode(tx_hash), "gossiped encrypted tx to network");
+                    }
+                }
                 _ = sync_interval.tick() => {
                     // Try to sync if we're behind
                     if chain_sync.is_syncing() {
@@ -1908,6 +2109,12 @@ enum PostEventAction {
     /// gossip and local detection arrive in the same tick).
     BroadcastConsensusMany(Vec<Vec<u8>>),
     AcceptTransaction(pyde_tx::types::Transaction),
+    /// Ingress from the encrypted-transactions gossip topic
+    /// (audit item 227 step 4 / option E). Main loop routes it
+    /// through `tx_relay.receive_tx_verified` or
+    /// `receive_tx` depending on whether the sender has a
+    /// registered `AuthKeys::Single` on-chain.
+    AcceptEncryptedTransaction(pyde_mempool::encrypted::EncryptedTx),
     #[allow(dead_code)]
     StoreReceipts(u64, Vec<pyde_tx::execution::Receipt>),
     AddPeerToKademlia(PeerId, Vec<libp2p::Multiaddr>),
@@ -1923,6 +2130,17 @@ enum PostEventAction {
     /// block can pull encrypted_txs out of it on arrival, regardless
     /// of gossipsub ordering. Audit item 207.
     BufferEncryptedBundle(pyde_net::propagation::EncryptedTxBundle),
+    /// A fresh QC just formed via an incoming gossip vote. Main loop
+    /// uses this to trigger the post-QC decryption flow — previously
+    /// that flow was only attached to `select_and_vote`'s local-QC
+    /// path, which in a 4+-node committee rarely fires (our vote is
+    /// typically not the 3rd/Nth that closes the QC; another
+    /// validator's is). Without this action the encrypted-tx
+    /// decryption never started on real multi-node networks.
+    /// Audit item 227 step 4 / option E.
+    QcFormedFromGossip {
+        slot: u64,
+    },
     /// Send a `PydeAuthReq` to a newly connected peer. The main loop
     /// generates a fresh nonce, records it in `pending_auth_nonces`, and
     /// dispatches via the swarm.
@@ -1994,6 +2212,24 @@ fn handle_swarm_event(
                         }
                         Err(e) => {
                             debug!(error = e, "failed to decode tx from gossip");
+                        }
+                    }
+                }
+                Some(Channel::EncryptedTransactions) => {
+                    debug!(bytes = message.data.len(), "received encrypted tx gossip");
+                    // Audit item 227 step 4 / option E: decode the
+                    // EncryptedTx wire frame and route it to the main
+                    // loop's action handler, which drops it into the
+                    // local tx_relay. The local tx_relay is what the
+                    // block builder pulls from when this node is the
+                    // winning proposer — without this path, only the
+                    // RPC-ingress node ever has the tx in its relay.
+                    match pyde_mempool::encrypted::EncryptedTx::from_bytes(&message.data) {
+                        Some(enc_tx) => {
+                            return PostEventAction::AcceptEncryptedTransaction(enc_tx);
+                        }
+                        None => {
+                            debug!("failed to decode encrypted tx from gossip");
                         }
                     }
                 }
@@ -2419,6 +2655,10 @@ fn handle_swarm_event(
                                         debug!(slot, voter_index, "received vote");
                                         if let Some(qc) = engine.on_vote(msg) {
                                             info!(slot, votes = qc.vote_count(), "QC formed");
+                                            // Audit item 227 step 4: notify main loop so
+                                            // the decrypt pipeline starts even when OUR
+                                            // own vote isn't the one that closes the QC.
+                                            return PostEventAction::QcFormedFromGossip { slot };
                                         }
                                     }
                                     ConsensusMessage::Timeout {

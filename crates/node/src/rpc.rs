@@ -17,7 +17,7 @@ use pyde_tx::validation::{validate_transaction, ValidationContext, ValidationErr
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Maximum number of pending txs any single sender can have in the
 /// mempool (MAINNET_PLAN M1). Blocks one-account spam from filling a
@@ -74,6 +74,13 @@ pub struct RpcState {
     pub dev_mode: bool,
     /// Channel to gossip submitted transactions to the P2P network.
     pub tx_gossip_tx: tokio::sync::mpsc::Sender<pyde_tx::types::Transaction>,
+    /// Audit item 227 step 4 / option E: encrypted-tx gossip side
+    /// channel. After `send_raw_encrypted_transaction` accepts a tx
+    /// into the local tx_relay, push a clone here so the node's
+    /// main loop can publish it on the encrypted-transactions
+    /// gossipsub topic — otherwise only this node's proposals can
+    /// ever include it.
+    pub encrypted_tx_gossip_tx: tokio::sync::mpsc::Sender<pyde_mempool::encrypted::EncryptedTx>,
 }
 
 /// Define the Pyde JSON-RPC API.
@@ -1224,6 +1231,10 @@ impl PydeApiServer for RpcServer {
 
         let from = enc_tx.sender;
         let tx_hash = enc_tx.hash();
+        // Clone for the gossip fan-out below. We gossip only after
+        // local acceptance so the ingress policy (auth_key lookup,
+        // sig verify) gates what the network sees.
+        let tx_for_gossip = enc_tx.clone();
 
         // Same ingest policy as the server-side path (audit item 206):
         // mainnet requires the sender to have a registered auth_key,
@@ -1270,6 +1281,23 @@ impl PydeApiServer for RpcServer {
             tx_hash = hex::encode(tx_hash),
             "raw encrypted tx accepted into mempool"
         );
+
+        // Audit item 227 step 4 / option E: fan out to validator
+        // peers so their tx_relays also have the tx — without this,
+        // only our own proposals can include it.
+        if self
+            .state
+            .encrypted_tx_gossip_tx
+            .send(tx_for_gossip)
+            .await
+            .is_err()
+        {
+            debug!(
+                tx_hash = hex::encode(tx_hash),
+                "encrypted-tx gossip channel closed — skipping fan-out"
+            );
+        }
+
         Ok(format!("0x{}", hex::encode(tx_hash)))
     }
 
