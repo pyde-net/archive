@@ -96,6 +96,25 @@ pub fn validate_transaction(
     // 1. Chain ID
     validate_chain_id(tx, ctx)?;
 
+    // 1.5 Audit 226 — reject AuthKeys::None senders on non-devnet
+    // chain_id. `validate_signature` short-circuits FALCON
+    // verification when the sender has `AuthKeys::None`, and
+    // `pyde_tx::pipeline::load_account` returns a default EOA with
+    // `AuthKeys::None` for any address never seen on chain. The gap
+    // lets an attacker submit a tx with `from = victim_fresh_address`
+    // that bypasses the signature check entirely. Balance gates
+    // direct fund-loss but a Paymaster fee_payer slips past balance
+    // and the tx pollutes the mempool / can land in a block.
+    //
+    // Gating here (not just at the RPC ingress in `rpc.rs`) makes the
+    // check a defense-in-depth invariant: any caller of
+    // `validate_transaction` — RPC, block validation, gossip — sees
+    // the same enforcement. Devnet (chain_id == 31337) keeps the
+    // relaxed behaviour for the faucet / bootstrap UX.
+    if ctx.chain_id != 31337 && matches!(sender.auth_keys, pyde_account::types::AuthKeys::None) {
+        return Err(ValidationError::InvalidSignature);
+    }
+
     // 2. Signature. Skipping is allowed only when the caller explicitly
     // sets `dev_skip_signature` (test-only) or `sig_pre_verified`
     // (production fast path where the block processor already ran a
@@ -629,5 +648,53 @@ mod tests {
         tx.data = vec![0u8; MAX_CALLDATA * 10];
         let err = validate_size(&tx).unwrap_err();
         assert!(matches!(err, ValidationError::CalldataTooLarge { .. }));
+    }
+
+    // ========== Audit 226: AuthKeys::None production reject ==========
+
+    #[test]
+    fn validate_transaction_rejects_authkeys_none_on_production() {
+        // A fresh (or contract / system) account has AuthKeys::None.
+        // On non-devnet chain_id this should be rejected at
+        // validate_transaction time so it can't slip past the
+        // signature short-circuit ("System/contract accounts — no
+        // signature check at this level"). Defense-in-depth alongside
+        // the rpc.rs ingress gate (audit 226).
+        let (tx, _, nonce_state) = make_valid_tx_and_account();
+        let mut victim_account = Account::new_eoa(&[]);
+        victim_account.address = tx.from;
+        victim_account.auth_keys = pyde_account::types::AuthKeys::None;
+        victim_account.balance = 1_000_000_000_000;
+        let ctx = ValidationContext {
+            chain_id: 1, // production
+            dev_skip_signature: false,
+            ..default_ctx()
+        };
+        let err = validate_transaction(&tx, &victim_account, &nonce_state, &ctx).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidSignature),
+            "expected InvalidSignature for AuthKeys::None on production, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_transaction_allows_authkeys_none_on_devnet() {
+        // chain_id == 31337 keeps the relaxed faucet/bootstrap UX:
+        // an unregistered account can still send unsigned txs.
+        let (mut tx, _, nonce_state) = make_valid_tx_and_account();
+        tx.chain_id = 31337;
+        let mut victim_account = Account::new_eoa(&[]);
+        victim_account.address = tx.from;
+        victim_account.auth_keys = pyde_account::types::AuthKeys::None;
+        victim_account.balance = 1_000_000_000_000;
+        let ctx = ValidationContext {
+            chain_id: 31337,
+            dev_skip_signature: true,
+            ..default_ctx()
+        };
+        // Should pass all the audit-226-related checks. Other rules
+        // may still apply (this just asserts 226 doesn't reject).
+        validate_transaction(&tx, &victim_account, &nonce_state, &ctx)
+            .expect("devnet must allow AuthKeys::None senders");
     }
 }
