@@ -3354,45 +3354,106 @@ fn handle_swarm_event(
 }
 
 /// Load validator FALCON signing key from disk.
-/// If `validator.key` doesn't exist, generates a new keypair and saves it.
-/// The key file format: `[pk_len:4 LE][pk_bytes][sk_bytes]`.
+///
+/// Two on-disk formats are supported (audit 221):
+///
+///   1. **Encrypted keystore** (preferred for any non-devnet
+///      deployment): JSON file matching `keystore::ValidatorKeystore`.
+///      Decrypted via the passphrase in the
+///      `PYDE_VALIDATOR_PASSPHRASE` env var.
+///   2. **Legacy raw bytes** `[pk_len:4 LE][pk_bytes][sk_bytes]`.
+///      Still accepted because devnet test infra writes this
+///      format and migrating that infra is out of scope. Logs
+///      a warning so operators see the deprecation path.
+///
+/// If `validator.key` doesn't exist, generates a new keypair.
+/// The new key is saved encrypted iff `PYDE_VALIDATOR_PASSPHRASE`
+/// is set; otherwise it falls back to the legacy raw format
+/// (preserving devnet ergonomics).
 fn load_validator_identity(datadir: &Path) -> Result<ValidatorIdentity, String> {
     let key_path = datadir.join("validator.key");
+    let passphrase = std::env::var("PYDE_VALIDATOR_PASSPHRASE").ok();
 
     let (pk, sk) = if key_path.exists() {
         let bytes = std::fs::read(&key_path)
             .map_err(|e| format!("failed to read {}: {}", key_path.display(), e))?;
 
-        // Format: pk_len(4 bytes LE) || pk_bytes || sk_bytes
-        if bytes.len() < 4 {
-            return Err("validator.key is corrupted (too short)".into());
+        // Try encrypted-keystore format first. JSON parse acts
+        // as the format-discriminator — raw-bytes always begins
+        // with a u32 LE for pk_len (FALCON-512 = 0x0381, first
+        // byte 0x81), so it cannot be confused with `{`-prefixed
+        // JSON.
+        if let Some(keystore) = crate::keystore::try_parse_keystore(&bytes) {
+            let pass = passphrase.clone().ok_or_else(|| {
+                "validator.key is encrypted but PYDE_VALIDATOR_PASSPHRASE is not set".to_string()
+            })?;
+            let (pk, sk) = crate::keystore::decrypt(&keystore, &pass)?;
+            info!(path = %key_path.display(), "loaded encrypted validator signing key");
+            (pk, sk)
+        } else {
+            // Format: pk_len(4 bytes LE) || pk_bytes || sk_bytes
+            if bytes.len() < 4 {
+                return Err("validator.key is corrupted (too short)".into());
+            }
+            let pk_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+            if bytes.len() < 4 + pk_len {
+                return Err("validator.key is corrupted (pk truncated)".into());
+            }
+            let pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(&bytes[4..4 + pk_len])
+                .ok_or("validator.key has invalid public key")?;
+            let sk = pyde_crypto::falcon::FalconSecretKey::from_bytes(&bytes[4 + pk_len..])
+                .ok_or("validator.key has invalid secret key")?;
+            tracing::warn!(
+                path = %key_path.display(),
+                "loaded validator signing key in legacy raw-bytes format — \
+                 set PYDE_VALIDATOR_PASSPHRASE and re-save to enable encryption \
+                 (audit 221)"
+            );
+            (pk, sk)
         }
-        let pk_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-        if bytes.len() < 4 + pk_len {
-            return Err("validator.key is corrupted (pk truncated)".into());
-        }
-        let pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(&bytes[4..4 + pk_len])
-            .ok_or("validator.key has invalid public key")?;
-        let sk = pyde_crypto::falcon::FalconSecretKey::from_bytes(&bytes[4 + pk_len..])
-            .ok_or("validator.key has invalid secret key")?;
-        info!(path = %key_path.display(), "loaded validator signing key");
-        (pk, sk)
     } else {
         // Generate new validator key
         let (pk, sk) = pyde_crypto::falcon::falcon_keygen()
             .map_err(|e| format!("failed to generate validator key: {}", e))?;
 
-        // Serialize: pk_len || pk || sk
-        let pk_bytes = pk.as_bytes();
-        let sk_bytes = sk.as_bytes();
-        let mut buf = Vec::with_capacity(4 + pk_bytes.len() + sk_bytes.len());
-        buf.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
-        buf.extend_from_slice(pk_bytes);
-        buf.extend_from_slice(sk_bytes);
+        // Save in encrypted format if a passphrase is available;
+        // otherwise fall back to legacy raw bytes for devnet
+        // ergonomics (existing test infra doesn't set the env
+        // var and shouldn't have to).
+        if let Some(pass) = passphrase.as_deref().filter(|p| !p.is_empty()) {
+            let keystore = crate::keystore::encrypt(&pk, &sk, pass)?;
+            let json = serde_json::to_vec_pretty(&keystore)
+                .map_err(|e| format!("failed to serialize keystore: {e}"))?;
+            std::fs::write(&key_path, &json)
+                .map_err(|e| format!("failed to write {}: {}", key_path.display(), e))?;
+            info!(
+                path = %key_path.display(),
+                "generated and encrypted new validator signing key"
+            );
+        } else {
+            let pk_bytes = pk.as_bytes();
+            let sk_bytes = sk.as_bytes();
+            let mut buf = Vec::with_capacity(4 + pk_bytes.len() + sk_bytes.len());
+            buf.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(pk_bytes);
+            buf.extend_from_slice(sk_bytes);
+            std::fs::write(&key_path, &buf)
+                .map_err(|e| format!("failed to write {}: {}", key_path.display(), e))?;
+            info!(
+                path = %key_path.display(),
+                "generated new validator signing key (unencrypted — set \
+                 PYDE_VALIDATOR_PASSPHRASE for encryption)"
+            );
+        }
 
-        std::fs::write(&key_path, &buf)
-            .map_err(|e| format!("failed to write {}: {}", key_path.display(), e))?;
-        info!(path = %key_path.display(), "generated new validator signing key");
+        // Tighten permissions on the key file regardless of
+        // format — readable only by the owning user.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+        }
+
         (pk, sk)
     };
 
