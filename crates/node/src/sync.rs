@@ -93,6 +93,14 @@ impl ChainSync {
 
     /// Try to request the next batch of blocks from a peer.
     /// Returns true if a request was sent.
+    ///
+    /// Audit 220: when the node is more than `SNAPSHOT_THRESHOLD`
+    /// slots behind the network tip and we haven't yet completed
+    /// initial sync, delegate to `request_state_snapshot` instead
+    /// of doing block-by-block catch-up. Cold-syncing 1M+ slots
+    /// one batch at a time is impractical at scale; the snapshot
+    /// path streams the SMT state in fixed-size chunks and lets
+    /// the node skip directly to recent slots.
     pub fn request_next_batch(&mut self, swarm: &mut Swarm<PydeBehaviour>) -> bool {
         if !self.manager.needs_sync() {
             return false;
@@ -101,6 +109,20 @@ impl ChainSync {
         // Don't send multiple concurrent requests
         if !self.pending.is_empty() {
             return false;
+        }
+
+        // Audit 220: prefer snapshot sync when we're far behind and
+        // haven't yet done initial sync. After initial sync finishes
+        // the node stays caught up via gossip + small block-by-block
+        // catch-up, so the threshold only fires for fresh nodes
+        // joining a long-running chain.
+        if self.should_use_snapshot_sync() {
+            info!(
+                slots_behind = self.manager.slots_behind(),
+                threshold = Self::SNAPSHOT_THRESHOLD,
+                "switching to snapshot sync for fast catch-up"
+            );
+            return self.request_state_snapshot(swarm);
         }
 
         // Pick a connected peer
@@ -152,7 +174,7 @@ impl ChainSync {
 
     /// Request a state snapshot from a peer (for fast sync when far behind).
     /// Uses chunked transfer for production, falls back to bulk for small states.
-    #[allow(dead_code)]
+    /// Auto-invoked from `request_next_batch` when far behind (audit 220).
     pub fn request_state_snapshot(&mut self, swarm: &mut Swarm<PydeBehaviour>) -> bool {
         let peer = match swarm.connected_peers().next() {
             Some(p) => *p,
@@ -192,9 +214,21 @@ impl ChainSync {
         debug!(chunk = next_index, "requesting next snapshot chunk");
     }
 
-    /// Threshold: if behind by more than this many slots, use snapshot sync.
-    #[allow(dead_code)]
+    /// Threshold: if behind by more than this many slots, use snapshot
+    /// sync (audit 220). 1000 slots = ~6.7 minutes at 400 ms/slot, well
+    /// past the point where block-by-block catch-up becomes wasteful.
     pub const SNAPSHOT_THRESHOLD: u64 = 1000;
+
+    /// True if the next sync request should use snapshot mode rather
+    /// than block-by-block. Pure predicate over the manager's local
+    /// state — extracted from `request_next_batch` so the threshold
+    /// logic is unit-testable without a live `Swarm`.
+    pub fn should_use_snapshot_sync(&self) -> bool {
+        !self.initial_sync_done
+            && self.snapshot_chunks.is_empty()
+            && self.snapshot_expected_root.is_none()
+            && self.manager.slots_behind() > Self::SNAPSHOT_THRESHOLD
+    }
 
     /// Handle a sync response from a peer.
     /// Returns the number of blocks processed.
@@ -661,6 +695,66 @@ mod tests {
 
         assert!(!sync.manager.needs_sync());
         assert!(sync.initial_sync_done);
+    }
+
+    // ========== Audit 220: snapshot-sync threshold trigger ==========
+
+    #[test]
+    fn snapshot_sync_triggers_when_far_behind() {
+        // Fresh node sees a peer at slot SNAPSHOT_THRESHOLD + 100 →
+        // should_use_snapshot_sync = true. Block-by-block sync would
+        // take ~SNAPSHOT_THRESHOLD requests, snapshot sync is one
+        // chunked transfer.
+        let mut sync = ChainSync::new();
+        sync.on_peer_tip(PeerId::random(), ChainSync::SNAPSHOT_THRESHOLD + 100);
+        assert!(
+            sync.should_use_snapshot_sync(),
+            "should switch to snapshot sync when slots_behind > threshold"
+        );
+    }
+
+    #[test]
+    fn snapshot_sync_skipped_when_close_enough() {
+        // Same node but only behind by half the threshold — block-by-
+        // block is fine.
+        let mut sync = ChainSync::new();
+        sync.on_peer_tip(PeerId::random(), ChainSync::SNAPSHOT_THRESHOLD / 2);
+        assert!(
+            !sync.should_use_snapshot_sync(),
+            "no snapshot sync when slots_behind ≤ threshold"
+        );
+    }
+
+    #[test]
+    fn snapshot_sync_skipped_after_initial_sync_done() {
+        // Once initial sync is done, even a far-behind situation
+        // (e.g. operator restored from backup) doesn't re-trigger
+        // snapshot sync — only fresh nodes use it. This guards
+        // against bouncing into snapshot mode mid-operation.
+        let mut sync = ChainSync::new();
+        sync.on_peer_tip(PeerId::random(), 5);
+        for slot in 1..=5 {
+            sync.on_block_processed(slot);
+        }
+        assert!(sync.initial_sync_done);
+        // Now suddenly see a peer way ahead.
+        sync.on_peer_tip(PeerId::random(), ChainSync::SNAPSHOT_THRESHOLD + 1000);
+        assert!(
+            !sync.should_use_snapshot_sync(),
+            "post-initial-sync nodes use block sync regardless of distance"
+        );
+    }
+
+    #[test]
+    fn snapshot_sync_skipped_when_already_in_progress() {
+        // If a snapshot download is in progress, don't re-request.
+        let mut sync = ChainSync::new();
+        sync.on_peer_tip(PeerId::random(), ChainSync::SNAPSHOT_THRESHOLD + 100);
+        sync.snapshot_expected_root = Some([0u8; 32]); // simulate in-flight
+        assert!(
+            !sync.should_use_snapshot_sync(),
+            "no double-request while snapshot is in flight"
+        );
     }
 
     /// Return a `(StateManager, TempDir)` pair. Callers must hold the
