@@ -3654,6 +3654,7 @@ dependencies = [
 name = "pyde-node"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "clap",
  "directories",
  "ethnum",
@@ -3675,6 +3676,7 @@ dependencies = [
  "pyde-state",
  "pyde-tx",
  "pyde-vm",
+ "rand 0.8.6",
  "rayon",
  "reqwest",
  "rocksdb",
