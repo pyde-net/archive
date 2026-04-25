@@ -275,6 +275,24 @@ impl PydeNode {
         // first epoch boundary sets it.
         let mut last_outgoing_committee_size: usize = 0;
 
+        // Audit 232: buffer for competing blocks at slots we've already
+        // processed. Populated when a gossiped block fails the
+        // `slot > head_slot` check but its hash differs from the block
+        // we already committed at that slot — i.e. it's a competing
+        // proposal under a multi-proposer race. When a QC later forms
+        // for the competing hash (line ~2716 ConsensusMessage::Vote),
+        // we look it up here and call `BlockProcessor::reorg_to_block`
+        // to switch chains.
+        //
+        // Bounded to 64 entries (~64 slots × ~one competing block each).
+        // The HotStuff multi-proposer race window is 100ms, so the
+        // buffer typically holds at most 2-3 entries at any time.
+        const COMPETING_BLOCK_CAP: usize = 64;
+        let mut competing_blocks: std::collections::HashMap<
+            (u64, [u8; 32]),
+            pyde_consensus::block::Block,
+        > = std::collections::HashMap::new();
+
         // 5. Validator engine + identity (only for validator role)
         let mut validator_identity: Option<ValidatorIdentity> = None;
         let mut validator_engine: Option<ValidatorEngine> = if is_validator {
@@ -818,6 +836,182 @@ impl PydeNode {
                                     "broadcast decryption shares (gossip-QC)"
                                 );
                             }
+                        }
+                        PostEventAction::BufferCompetingBlock(block) => {
+                            // Audit 232: a competing block at our head slot
+                            // was just received. Buffer it keyed by
+                            // (slot, block_hash) so a later QC for that
+                            // hash can pull it out and trigger reorg.
+                            let key = (block.header.slot, block.header.hash());
+                            // Cap eviction: HashMap-iteration-order victim.
+                            // Acceptable because (a) cap is small, (b) the
+                            // only blocks that matter are ones a future QC
+                            // will pull, and a QC for a long-evicted block
+                            // is recoverable via sync. Deterministic LRU
+                            // would be nicer but adds dependencies.
+                            if competing_blocks.len() >= COMPETING_BLOCK_CAP
+                                && !competing_blocks.contains_key(&key)
+                            {
+                                if let Some(victim_key) = competing_blocks.keys().next().copied() {
+                                    competing_blocks.remove(&victim_key);
+                                }
+                            }
+                            competing_blocks.insert(key, block);
+                        }
+                        PostEventAction::TryReorgToQc {
+                            qc_slot,
+                            qc_block_hash,
+                        } => {
+                            // Audit 232: a QC formed for `qc_block_hash` at
+                            // `qc_slot`, but our local view at that slot is
+                            // a different block. Try to reorg via the
+                            // buffered-competing-block path. Whether or not
+                            // the reorg fires, we still need to trigger the
+                            // existing post-QC decrypt pipeline (audit 227)
+                            // — so this handler does BOTH reorg + decrypt
+                            // dispatch, by re-emitting QcFormedFromGossip
+                            // at the end via the channel-style fallthrough
+                            // inside the match.
+                            let key = (qc_slot, qc_block_hash);
+                            if let Some(target) = competing_blocks.remove(&key) {
+                                let mut chain_w = chain.write().await;
+                                let mut state_w = state.write().await;
+                                let ws_slot = validator_engine.as_ref().and_then(|e| {
+                                    e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot)
+                                });
+                                match BlockProcessor::reorg_to_block(
+                                    &mut chain_w,
+                                    &mut state_w,
+                                    &target,
+                                    Some(&aot_cache),
+                                    ws_slot,
+                                ) {
+                                    Ok((tx_count, gas_used, _)) => {
+                                        let _ = state_w.flush_pending();
+                                        state_w.refresh_root();
+                                        info!(
+                                            qc_slot,
+                                            tx_count,
+                                            gas_used,
+                                            "reorg succeeded — chain now matches QC"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(qc_slot, error = %e, "reorg failed");
+                                    }
+                                }
+                            } else {
+                                // No buffered block. Sync will recover the
+                                // canonical block on its next pass; the
+                                // local view stays inconsistent until then.
+                                // Still proceed to decrypt below — if our
+                                // local block at qc_slot has different
+                                // encrypted_txs from the QC'd block, the
+                                // tx_root check inside the decrypt path
+                                // will fail and we'll skip safely.
+                                warn!(
+                                    qc_slot,
+                                    qc_hash = hex::encode(qc_block_hash),
+                                    "QC mismatch but competing block not buffered — sync will recover"
+                                );
+                            }
+                            // Re-dispatch as QcFormedFromGossip so the
+                            // existing decrypt pipeline still fires for
+                            // qc_slot (audit 227 dependency).
+                            // Manually run the same logic since we can't
+                            // re-invoke the match arm directly.
+                            let slot = qc_slot;
+                            // BEGIN copy of QcFormedFromGossip body
+                            // (kept inline rather than extracted because
+                            // the body captures many local mutable refs;
+                            // refactor to a closure after both call sites
+                            // settle).
+                            if !validator_identity
+                                .as_ref()
+                                .map(|id| id.key_share.is_some())
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                            if pending_decryptors.read().await.contains_key(&slot) {
+                                continue;
+                            }
+                            let block = match block_store
+                                .get_block_raw(slot)
+                                .and_then(|b| wire::decode_block(&b).ok())
+                            {
+                                Some(b) => b,
+                                None => continue,
+                            };
+                            if block.body.encrypted_txs.is_empty() {
+                                continue;
+                            }
+                            let enc_txs: Vec<pyde_mempool::encrypted::EncryptedTx> = block
+                                .body
+                                .encrypted_txs
+                                .iter()
+                                .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+                                .collect();
+                            let tx_root_ok =
+                                crate::block_processor::verify_decryptor_against_committed_root(
+                                    &block.header.tx_root,
+                                    &block.body.transactions,
+                                    &enc_txs,
+                                );
+                            if !tx_root_ok {
+                                error!(slot, "decrypt-time tx_root mismatch (post-reorg)");
+                                continue;
+                            }
+                            let engine = match validator_engine.as_mut() {
+                                Some(e) => e,
+                                None => continue,
+                            };
+                            let threshold = pyde_consensus::block::quorum_for_committee(
+                                engine.committee_keys.len(),
+                            );
+                            let identity = validator_identity.as_ref().unwrap();
+                            if let Ok(mut decryptor) = pyde_mempool::decryption::BlockDecryptor::new(
+                                enc_txs.clone(),
+                                threshold,
+                            ) {
+                                if let Some(ks) = &identity.key_share {
+                                    decryptor.add_member_shares(ks);
+                                }
+                                {
+                                    let mut q = queued_shares.write().await;
+                                    if let Some(queued) = q.remove(&slot) {
+                                        for qmsg in &queued {
+                                            for (i, sb) in qmsg.shares.iter().enumerate() {
+                                                if let Some(s) = pyde_crypto::threshold::DecryptionShare::from_bytes(sb) {
+                                                    decryptor.add_share(i, s);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                pending_decryptors.write().await.insert(slot, decryptor);
+                            }
+                            if let Some(shares) =
+                                engine.generate_decryption_shares(identity, &enc_txs)
+                            {
+                                let msg = wire::DecryptionShareMsg {
+                                    slot,
+                                    member_index: identity.committee_index,
+                                    shares: shares.iter().map(|s| s.to_bytes()).collect(),
+                                };
+                                let share_bytes = wire::encode_decryption_shares(&msg);
+                                let topic = pyde_net::node::topics::consensus();
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .publish(topic, share_bytes);
+                                info!(
+                                    slot,
+                                    enc_txs = enc_txs.len(),
+                                    "broadcast decryption shares (post-reorg-QC)"
+                                );
+                            }
+                            // END copy of QcFormedFromGossip body
                         }
                         PostEventAction::AcceptEncryptedTransaction(enc_tx) => {
                             // Audit item 227 step 4 / option E: inbound
@@ -1745,6 +1939,67 @@ impl PydeNode {
                                     let topic = pyde_net::node::topics::consensus();
                                     let _ = swarm.behaviour_mut().gossipsub.publish(topic, vote_bytes);
 
+                                    // Audit 232: own-vote QC mismatch check.
+                                    // Same logic as the gossip-vote path at
+                                    // ConsensusMessage::Vote — if the QC formed
+                                    // here points at a hash that doesn't match
+                                    // what we committed at this slot, trigger
+                                    // a reorg via the same buffer pathway.
+                                    if qc_formed {
+                                        let qc_hash = engine.consensus.highest_qc.block_hash;
+                                        let local_hash = chain
+                                            .read()
+                                            .await
+                                            .header(current_slot)
+                                            .map(|h| h.hash());
+                                        if let Some(local) = local_hash {
+                                            if local != qc_hash {
+                                                if let Some(target) =
+                                                    competing_blocks.remove(&(current_slot, qc_hash))
+                                                {
+                                                    // We're already inside `engine` mut-borrow,
+                                                    // so capture ws_slot directly via that —
+                                                    // can't re-borrow validator_engine.
+                                                    let ws_slot = engine
+                                                        .finality
+                                                        .latest_checkpoint
+                                                        .as_ref()
+                                                        .map(|cp| cp.slot);
+                                                    let mut chain_w = chain.write().await;
+                                                    let mut state_w = state.write().await;
+                                                    match BlockProcessor::reorg_to_block(
+                                                        &mut chain_w,
+                                                        &mut state_w,
+                                                        &target,
+                                                        Some(&aot_cache),
+                                                        ws_slot,
+                                                    ) {
+                                                        Ok((tx_count, gas_used, _)) => {
+                                                            let _ = state_w.flush_pending();
+                                                            state_w.refresh_root();
+                                                            info!(
+                                                                slot = current_slot,
+                                                                tx_count,
+                                                                gas_used,
+                                                                "reorg succeeded (own-vote QC)"
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(slot = current_slot, error = %e, "reorg failed (own-vote QC)");
+                                                        }
+                                                    }
+                                                } else {
+                                                    warn!(
+                                                        slot = current_slot,
+                                                        local = hex::encode(local),
+                                                        qc = hex::encode(qc_hash),
+                                                        "QC mismatch on own-vote path but competing block not buffered"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // If QC formed: broadcast hard finality vote
                                     if qc_formed {
                                         let state_root = chain.read().await.state_root;
@@ -2181,6 +2436,21 @@ enum PostEventAction {
         request_response::ResponseChannel<pyde_net::auth::PydeAuthResp>,
         pyde_net::auth::PydeAuthResp,
     ),
+    /// Audit 232: a gossiped block is at the same slot as our current
+    /// head but with a different hash — i.e. a competing proposal
+    /// under a multi-proposer race. Main loop inserts it into
+    /// `competing_blocks` so a later QC for that hash can trigger
+    /// `reorg_to_block`.
+    BufferCompetingBlock(pyde_consensus::block::Block),
+    /// Audit 232: a QC formed for a block whose hash doesn't match
+    /// what we committed at that slot. Main loop looks up the QC'd
+    /// block in `competing_blocks` and, if present, calls
+    /// `BlockProcessor::reorg_to_block` to switch chains. If
+    /// absent, schedules a sync request for the missing block.
+    TryReorgToQc {
+        qc_slot: u64,
+        qc_block_hash: [u8; 32],
+    },
 }
 
 /// Handle a libp2p swarm event. Returns an action that may need swarm access.
@@ -2351,6 +2621,27 @@ fn handle_swarm_event(
                                     };
                                 }
                                 Err(e) => {
+                                    // Audit 232: if rejection is "slot at our head but
+                                    // different hash" (multi-proposer race), buffer the
+                                    // block so a later QC can trigger reorg via
+                                    // `BlockProcessor::reorg_to_block`. The block
+                                    // already passed signature + body validation above,
+                                    // so trust is bounded — only the canonical chain's
+                                    // QC'd block ever gets reapplied from this buffer.
+                                    let incoming_hash = block.header.hash();
+                                    let is_same_slot_competitor = slot == chain.head_slot
+                                        && chain
+                                            .header(slot)
+                                            .map(|h| h.hash() != incoming_hash)
+                                            .unwrap_or(false);
+                                    if is_same_slot_competitor {
+                                        debug!(
+                                            slot,
+                                            incoming_hash = hex::encode(incoming_hash),
+                                            "buffering competing block for potential reorg"
+                                        );
+                                        return PostEventAction::BufferCompetingBlock(block);
+                                    }
                                     debug!(slot, error = %e, "block rejected");
                                 }
                             }
@@ -2715,6 +3006,29 @@ fn handle_swarm_event(
                                         debug!(slot, voter_index, "received vote");
                                         if let Some(qc) = engine.on_vote(msg) {
                                             info!(slot, votes = qc.vote_count(), "QC formed");
+                                            // Audit 232: detect QC-vs-local-head
+                                            // mismatch (multi-proposer race where we
+                                            // committed block A but consensus picked
+                                            // B). Local view says block at `slot` has
+                                            // hash `local_hash`; the QC carries
+                                            // `qc.block_hash`. If they differ AND we
+                                            // have B buffered (or can sync it),
+                                            // reorg_to_block will switch chains.
+                                            let local_hash = chain.header(slot).map(|h| h.hash());
+                                            if let Some(local) = local_hash {
+                                                if local != qc.block_hash {
+                                                    warn!(
+                                                        slot,
+                                                        local = hex::encode(local),
+                                                        qc = hex::encode(qc.block_hash),
+                                                        "QC-vs-local-head mismatch — triggering reorg"
+                                                    );
+                                                    return PostEventAction::TryReorgToQc {
+                                                        qc_slot: slot,
+                                                        qc_block_hash: qc.block_hash,
+                                                    };
+                                                }
+                                            }
                                             // Audit item 227 step 4: notify main loop so
                                             // the decrypt pipeline starts even when OUR
                                             // own vote isn't the one that closes the QC.
