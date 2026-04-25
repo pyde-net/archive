@@ -586,76 +586,85 @@ impl PydeApiServer for RpcServer {
     }
 
     async fn send_raw_transaction(&self, tx_hex: String) -> Result<String, ErrorObjectOwned> {
-        let hex_str = tx_hex.strip_prefix("0x").unwrap_or(&tx_hex);
-        let tx_bytes =
-            hex::decode(hex_str).map_err(|e| rpc_err(-32602, format!("invalid tx hex: {}", e)))?;
-        // Try wire format first, then Transaction::from_bytes (used by wallet CLI)
-        let tx = crate::wire::decode_transaction(&tx_bytes)
-            .or_else(|_| {
-                pyde_tx::types::Transaction::from_bytes(&tx_bytes).ok_or("invalid tx encoding")
-            })
-            .map_err(|e| rpc_err(-32602, format!("invalid tx encoding: {}", e)))?;
+        // Audit 222: record the RPC outcome via Prometheus. Wrapping
+        // the body in an async block lets `?` propagate through to
+        // `res`, then the counter fires regardless of success/failure
+        // before the result is returned.
+        let res: Result<String, ErrorObjectOwned> = async {
+            let hex_str = tx_hex.strip_prefix("0x").unwrap_or(&tx_hex);
+            let tx_bytes = hex::decode(hex_str)
+                .map_err(|e| rpc_err(-32602, format!("invalid tx hex: {}", e)))?;
+            // Try wire format first, then Transaction::from_bytes (used by wallet CLI)
+            let tx = crate::wire::decode_transaction(&tx_bytes)
+                .or_else(|_| {
+                    pyde_tx::types::Transaction::from_bytes(&tx_bytes).ok_or("invalid tx encoding")
+                })
+                .map_err(|e| rpc_err(-32602, format!("invalid tx encoding: {}", e)))?;
 
-        // Ingress validation — reject invalid txs BEFORE polluting the
-        // mempool + gossip network. See `ingress_validate` docs.
-        ingress_validate(&self.state.state, &self.state.chain, &tx).await?;
+            // Ingress validation — reject invalid txs BEFORE polluting the
+            // mempool + gossip network. See `ingress_validate` docs.
+            ingress_validate(&self.state.state, &self.state.chain, &tx).await?;
 
-        let tx_hash = tx.hash();
+            let tx_hash = tx.hash();
 
-        // Global cap + per-sender cap + dedup — same atomic check as
-        // send_transaction. See that handler for rationale.
-        let mut pending = self.state.pending_txs.write().await;
-        if pending.len() >= MEMPOOL_GLOBAL_CAP {
-            return Err(rpc_err(
-                -32011,
-                format!(
-                    "mempool full: {} txs pending (cap {})",
-                    pending.len(),
-                    MEMPOOL_GLOBAL_CAP
-                ),
-            ));
-        }
-        let mut sender_count: usize = 0;
-        let mut duplicate_nonce = false;
-        for t in pending.values() {
-            if t.from == tx.from {
-                sender_count += 1;
-                if t.nonce == tx.nonce {
-                    duplicate_nonce = true;
-                    break;
+            // Global cap + per-sender cap + dedup — same atomic check as
+            // send_transaction. See that handler for rationale.
+            let mut pending = self.state.pending_txs.write().await;
+            if pending.len() >= MEMPOOL_GLOBAL_CAP {
+                return Err(rpc_err(
+                    -32011,
+                    format!(
+                        "mempool full: {} txs pending (cap {})",
+                        pending.len(),
+                        MEMPOOL_GLOBAL_CAP
+                    ),
+                ));
+            }
+            let mut sender_count: usize = 0;
+            let mut duplicate_nonce = false;
+            for t in pending.values() {
+                if t.from == tx.from {
+                    sender_count += 1;
+                    if t.nonce == tx.nonce {
+                        duplicate_nonce = true;
+                        break;
+                    }
                 }
             }
-        }
-        if duplicate_nonce {
-            return Err(rpc_err(
-                -32010,
-                format!(
-                    "duplicate (sender, nonce)={} in mempool; cancel or wait for the existing tx to commit/expire",
-                    tx.nonce
-                ),
-            ));
-        }
-        if sender_count >= MEMPOOL_SENDER_CAP {
-            return Err(rpc_err(
-                -32009,
-                format!(
-                    "mempool sender cap reached: {} pending txs from this sender (max {})",
-                    sender_count, MEMPOOL_SENDER_CAP
-                ),
-            ));
-        }
-        pending.insert(tx_hash, tx.clone());
-        drop(pending);
-        self.state
-            .pending_tx_times
-            .write()
-            .await
-            .insert(tx_hash, std::time::Instant::now());
+            if duplicate_nonce {
+                return Err(rpc_err(
+                    -32010,
+                    format!(
+                        "duplicate (sender, nonce)={} in mempool; cancel or wait for the existing tx to commit/expire",
+                        tx.nonce
+                    ),
+                ));
+            }
+            if sender_count >= MEMPOOL_SENDER_CAP {
+                return Err(rpc_err(
+                    -32009,
+                    format!(
+                        "mempool sender cap reached: {} pending txs from this sender (max {})",
+                        sender_count, MEMPOOL_SENDER_CAP
+                    ),
+                ));
+            }
+            pending.insert(tx_hash, tx.clone());
+            drop(pending);
+            self.state
+                .pending_tx_times
+                .write()
+                .await
+                .insert(tx_hash, std::time::Instant::now());
 
-        // Gossip to P2P network
-        let _ = self.state.tx_gossip_tx.send(tx).await;
+            // Gossip to P2P network
+            let _ = self.state.tx_gossip_tx.send(tx).await;
 
-        Ok(format!("0x{}", hex::encode(tx_hash)))
+            Ok(format!("0x{}", hex::encode(tx_hash)))
+        }
+        .await;
+        crate::metrics::record_rpc_request("pyde_sendRawTransaction", res.is_ok());
+        res
     }
 
     async fn call(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
