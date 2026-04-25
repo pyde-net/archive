@@ -889,6 +889,9 @@ impl PydeNode {
                                     Ok((tx_count, gas_used, _)) => {
                                         let _ = state_w.flush_pending();
                                         state_w.refresh_root();
+                                        crate::metrics::record_reorg(
+                                            crate::metrics::ReorgOutcome::Succeeded,
+                                        );
                                         info!(
                                             qc_slot,
                                             tx_count,
@@ -897,6 +900,9 @@ impl PydeNode {
                                         );
                                     }
                                     Err(e) => {
+                                        crate::metrics::record_reorg(
+                                            crate::metrics::ReorgOutcome::Failed,
+                                        );
                                         warn!(qc_slot, error = %e, "reorg failed");
                                     }
                                 }
@@ -909,6 +915,9 @@ impl PydeNode {
                                 // encrypted_txs from the QC'd block, the
                                 // tx_root check inside the decrypt path
                                 // will fail and we'll skip safely.
+                                crate::metrics::record_reorg(
+                                    crate::metrics::ReorgOutcome::TargetNotBuffered,
+                                );
                                 warn!(
                                     qc_slot,
                                     qc_hash = hex::encode(qc_block_hash),
@@ -1220,8 +1229,15 @@ impl PydeNode {
                                         if !pending.is_empty() {
                                             let state_for_root = state.clone();
                                             tokio::spawn(async move {
-                                                // SMT mutex is separate from the state RwLock
+                                                // SMT mutex is separate from the state RwLock.
+                                                // Audit 222: time the commit so operators can
+                                                // alert on SMT/RocksDB pressure independent of
+                                                // pyde_block_processing_ms.
+                                                let commit_start = std::time::Instant::now();
                                                 if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(&smt_handle, pending) {
+                                                    crate::metrics::record_state_commit_ms(
+                                                        commit_start.elapsed().as_millis() as u64,
+                                                    );
                                                     // Update cached root (brief write lock)
                                                     if let Ok(mut sw) = state_for_root.try_write() {
                                                         sw.set_root(root);
@@ -1977,6 +1993,9 @@ impl PydeNode {
                                                         Ok((tx_count, gas_used, _)) => {
                                                             let _ = state_w.flush_pending();
                                                             state_w.refresh_root();
+                                                            crate::metrics::record_reorg(
+                                                                crate::metrics::ReorgOutcome::Succeeded,
+                                                            );
                                                             info!(
                                                                 slot = current_slot,
                                                                 tx_count,
@@ -1985,10 +2004,16 @@ impl PydeNode {
                                                             );
                                                         }
                                                         Err(e) => {
+                                                            crate::metrics::record_reorg(
+                                                                crate::metrics::ReorgOutcome::Failed,
+                                                            );
                                                             warn!(slot = current_slot, error = %e, "reorg failed (own-vote QC)");
                                                         }
                                                     }
                                                 } else {
+                                                    crate::metrics::record_reorg(
+                                                        crate::metrics::ReorgOutcome::TargetNotBuffered,
+                                                    );
                                                     warn!(
                                                         slot = current_slot,
                                                         local = hex::encode(local),
@@ -2260,11 +2285,27 @@ impl PydeNode {
                     // Periodic maintenance
                     let mut tx_relay_w = tx_relay.write().await;
                     tx_relay_w.prune_expired();
+                    let plain_mempool_size = pending_txs.read().await.len();
                     let mempool_size = tx_relay_w.mempool_size();
                     drop(tx_relay_w);
-                    crate::metrics::record_mempool(mempool_size);
+                    crate::metrics::record_mempool(plain_mempool_size);
+                    crate::metrics::record_encrypted_mempool(mempool_size);
                     let peer_count = swarm.connected_peers().count();
                     crate::metrics::record_peers(peer_count);
+
+                    // Audit 222: operator-actionable lag gauges.
+                    // block_lag = how far behind the gossip-observed
+                    // network tip; finality_lag = how far behind the
+                    // last hard-finality checkpoint. Stable values
+                    // for finality_lag are ~2 slots in steady state.
+                    let local_head = chain.read().await.head_slot;
+                    let network_tip = chain_sync.manager.network_tip;
+                    crate::metrics::record_block_lag(local_head, network_tip);
+                    let last_cp = validator_engine
+                        .as_ref()
+                        .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot))
+                        .unwrap_or(0);
+                    crate::metrics::record_finality_lag(local_head, last_cp);
 
                     // Plaintext mempool TTL sweep (MAINNET_PLAN M2).
                     // Any tx that's been pending for more than
