@@ -1324,7 +1324,7 @@ mod tests {
             }],
             deadline: Some(1000),
             chain_id: 1,
-            tx_type: TransactionType::Batch,
+            tx_type: TransactionType::Standard,
         }
     }
 
@@ -1369,17 +1369,16 @@ mod tests {
         assert_eq!(restored.access_list[0].writes.len(), 2);
         assert_eq!(restored.deadline, Some(1000));
         assert_eq!(restored.chain_id, 1);
-        assert!(matches!(restored.tx_type, TransactionType::Batch));
+        assert!(matches!(restored.tx_type, TransactionType::Standard));
     }
 
     #[test]
     fn tx_type_roundtrip_all_variants() {
-        // The prior decode hand-coded only Standard/Deploy/Batch and rejected
+        // The prior decode hand-coded only Standard/Deploy and rejected
         // StakeDeposit/StakeWithdraw; this guards against that class of regression.
         let variants = [
             TransactionType::Standard,
             TransactionType::Deploy,
-            TransactionType::Batch,
             TransactionType::StakeDeposit,
             TransactionType::StakeWithdraw,
             TransactionType::Slash,

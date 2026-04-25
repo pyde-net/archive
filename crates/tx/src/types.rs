@@ -15,8 +15,13 @@ pub enum TransactionType {
     Standard = 0,
     /// Contract deployment.
     Deploy = 1,
-    /// Batch transaction (multiple operations).
-    Batch = 2,
+    // tag 2 was reserved for `Batch` (multi-op tx). Removed
+    // before mainnet — the dispatch arm was a 21k-gas no-op
+    // footgun, never wired to real semantics. The numeric gap
+    // is intentional: if multi-op txs are ever added, allocate
+    // a fresh trailing tag (last + 1) and keep `from_u8(2)`
+    // returning None so any forged tx with tx_type = 2 fails
+    // decode rather than silently passing as a different type.
     /// Stake deposit: lock 10,000 PYDE and register as validator.
     /// tx.data = FALCON-512 public key (897 bytes).
     StakeDeposit = 3,
@@ -84,7 +89,9 @@ impl TransactionType {
         match v {
             0 => Some(Self::Standard),
             1 => Some(Self::Deploy),
-            2 => Some(Self::Batch),
+            // 2 was Batch — removed pre-mainnet, see enum comment.
+            // Keeping the gap means a forged tx with tx_type=2 fails
+            // decode rather than silently treating it as Standard.
             3 => Some(Self::StakeDeposit),
             4 => Some(Self::StakeWithdraw),
             5 => Some(Self::Slash),
@@ -517,7 +524,9 @@ mod tests {
         let all = [
             TransactionType::Standard,
             TransactionType::Deploy,
-            TransactionType::Batch,
+            // Batch removed pre-mainnet — the variant no longer
+            // exists in the enum. The roundtrip test below also
+            // explicitly asserts `from_u8(2)` returns None.
             TransactionType::StakeDeposit,
             TransactionType::StakeWithdraw,
             TransactionType::Slash,
@@ -541,6 +550,10 @@ mod tests {
         }
         // Unknown tags are rejected.
         assert_eq!(TransactionType::from_u8(255), None);
+        // Removed-pre-mainnet tag (Batch) must NOT silently decode
+        // — keeping the gap explicit prevents a future re-allocation
+        // of tag 2 from accidentally matching old forged txs.
+        assert_eq!(TransactionType::from_u8(2), None);
     }
 
     #[test]
