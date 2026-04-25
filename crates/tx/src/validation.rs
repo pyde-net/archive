@@ -96,6 +96,15 @@ pub fn validate_transaction(
     // 1. Chain ID
     validate_chain_id(tx, ctx)?;
 
+    // RegisterPubkey (audit 229) takes a separate validation path:
+    // no signature, no gas, no balance check, AuthKeys::None is the
+    // pre-condition (not a rejection). Routing it here keeps the
+    // 226 gate, signature check, and balance check below from
+    // tripping on its intentionally-unsigned shape.
+    if tx.tx_type == crate::types::TransactionType::RegisterPubkey {
+        return validate_register_pubkey(tx, sender, nonce_state);
+    }
+
     // 1.5 Audit 226 — reject AuthKeys::None senders on non-devnet
     // chain_id. `validate_signature` short-circuits FALCON
     // verification when the sender has `AuthKeys::None`, and
@@ -143,6 +152,63 @@ pub fn validate_transaction(
     // 8. Size
     validate_size(tx)?;
 
+    Ok(())
+}
+
+/// Validate a `TransactionType::RegisterPubkey` (audit 229).
+///
+/// Rules:
+///   - `tx.signature` is empty (the address-derivation check is
+///     the proof of pubkey ownership, no FALCON sig needed).
+///   - `tx.value == 0`, `tx.gas_limit == 0`: no transfer, no gas.
+///   - `tx.data.len() == FALCON_PUBLIC_KEY_LEN` (897 bytes).
+///   - `tx.from == Poseidon2(tx.data)`: the address derives from
+///     this pubkey, so only the keypair holder can produce it.
+///   - `sender.balance > 0`: account must have been funded already.
+///     Without this, an attacker can spam-register from millions of
+///     locally-generated keypairs and bloat state without spending
+///     anything.
+///   - `sender.auth_keys == AuthKeys::None`: one-time registration.
+///     Re-registration (or upgrading auth) goes through
+///     `pyde_account::auth::rotate` with a current-key signature.
+///   - Nonce check still applies — `tx.nonce` must be valid.
+fn validate_register_pubkey(
+    tx: &Transaction,
+    sender: &Account,
+    nonce_state: &NonceState,
+) -> Result<(), ValidationError> {
+    if !tx.signature.is_empty() {
+        return Err(ValidationError::InvalidSignature);
+    }
+    if tx.value != 0 {
+        return Err(ValidationError::InvalidPaymaster); // misuse — register tx must not transfer
+    }
+    if tx.gas_limit != 0 {
+        return Err(ValidationError::GasLimitTooHigh {
+            limit: tx.gas_limit,
+            max: 0,
+        });
+    }
+    if tx.data.len() != pyde_crypto::falcon::FalconPublicKey::SIZE {
+        return Err(ValidationError::InvalidSignature);
+    }
+    let derived = pyde_crypto::poseidon2::poseidon2_hash(&tx.data).to_bytes();
+    if derived != tx.from {
+        return Err(ValidationError::InvalidSignature);
+    }
+    if sender.balance == 0 {
+        return Err(ValidationError::InsufficientBalance {
+            required: 1,
+            available: 0,
+        });
+    }
+    if !matches!(sender.auth_keys, pyde_account::types::AuthKeys::None) {
+        // Already registered — refuse to re-register. Use the
+        // key-rotation flow (`pyde_account::auth::rotate`) instead.
+        return Err(ValidationError::InvalidSignature);
+    }
+    validate_nonce(tx, nonce_state)?;
+    validate_size(tx)?;
     Ok(())
 }
 
@@ -696,5 +762,150 @@ mod tests {
         // may still apply (this just asserts 226 doesn't reject).
         validate_transaction(&tx, &victim_account, &nonce_state, &ctx)
             .expect("devnet must allow AuthKeys::None senders");
+    }
+
+    // ========== Audit 229: RegisterPubkey tx type ==========
+
+    fn make_register_pubkey_tx_and_account() -> (Transaction, Account, NonceState) {
+        let (pk, _sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let address = derive_eoa_address(&pk_bytes);
+        // Build an account in the "funded but unregistered" state.
+        // Account::new_eoa(&[]) would set auth_keys = Single(empty),
+        // not None — start from the empty_account default instead.
+        let account = Account {
+            address,
+            nonce: 0,
+            balance: 1_000_000,
+            code_hash: sparse_merkle_tree::H256::zero(),
+            storage_root: sparse_merkle_tree::H256::zero(),
+            account_type: pyde_account::types::AccountType::EOA,
+            auth_keys: pyde_account::types::AuthKeys::None,
+            gas_tank: 0,
+            key_nonce: 0,
+        };
+        let tx = Transaction {
+            from: address,
+            to: ZERO_ADDRESS,
+            value: 0,
+            data: pk_bytes,
+            gas_limit: 0,
+            nonce: 0,
+            signature: vec![], // unsigned
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::RegisterPubkey,
+        };
+        (tx, account, NonceState::new())
+    }
+
+    #[test]
+    fn register_pubkey_happy_path_accepted() {
+        let (tx, account, nonce_state) = make_register_pubkey_tx_and_account();
+        let ctx = ValidationContext {
+            chain_id: 1,
+            dev_skip_signature: false,
+            ..default_ctx()
+        };
+        validate_transaction(&tx, &account, &nonce_state, &ctx)
+            .expect("happy-path RegisterPubkey must pass validation");
+    }
+
+    #[test]
+    fn register_pubkey_with_signature_rejected() {
+        // The whole point is the address-derivation check is the proof
+        // — no FALCON sig is needed. A non-empty signature signals
+        // confused intent; reject so we don't accidentally let an
+        // alternative auth flow slip in.
+        let (mut tx, account, nonce_state) = make_register_pubkey_tx_and_account();
+        tx.signature = vec![0xAB; 666];
+        let ctx = ValidationContext {
+            chain_id: 1,
+            dev_skip_signature: false,
+            ..default_ctx()
+        };
+        let err = validate_transaction(&tx, &account, &nonce_state, &ctx).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidSignature));
+    }
+
+    #[test]
+    fn register_pubkey_with_value_or_gas_rejected() {
+        let (mut tx, account, nonce_state) = make_register_pubkey_tx_and_account();
+        tx.value = 100;
+        let ctx = ValidationContext {
+            chain_id: 1,
+            dev_skip_signature: false,
+            ..default_ctx()
+        };
+        assert!(validate_transaction(&tx, &account, &nonce_state, &ctx).is_err());
+
+        tx.value = 0;
+        tx.gas_limit = 21_000;
+        let err = validate_transaction(&tx, &account, &nonce_state, &ctx).unwrap_err();
+        assert!(matches!(err, ValidationError::GasLimitTooHigh { .. }));
+    }
+
+    #[test]
+    fn register_pubkey_wrong_pubkey_for_address_rejected() {
+        // Attacker tries to register a pubkey that does NOT hash to
+        // tx.from. Address-derivation check rejects.
+        let (mut tx, account, nonce_state) = make_register_pubkey_tx_and_account();
+        let (other_pk, _) = falcon_keygen().unwrap();
+        tx.data = other_pk.as_bytes().to_vec();
+        // tx.from is still the original address (Poseidon2 of the original pk)
+        let ctx = ValidationContext {
+            chain_id: 1,
+            dev_skip_signature: false,
+            ..default_ctx()
+        };
+        let err = validate_transaction(&tx, &account, &nonce_state, &ctx).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidSignature));
+    }
+
+    #[test]
+    fn register_pubkey_wrong_data_size_rejected() {
+        let (mut tx, account, nonce_state) = make_register_pubkey_tx_and_account();
+        tx.data = vec![0xAB; 100]; // not 897 bytes
+        let ctx = ValidationContext {
+            chain_id: 1,
+            dev_skip_signature: false,
+            ..default_ctx()
+        };
+        let err = validate_transaction(&tx, &account, &nonce_state, &ctx).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidSignature));
+    }
+
+    #[test]
+    fn register_pubkey_zero_balance_rejected() {
+        // Account must have been funded already — otherwise an
+        // attacker can spam-register from millions of locally-generated
+        // keypairs and bloat state without spending anything.
+        let (tx, mut account, nonce_state) = make_register_pubkey_tx_and_account();
+        account.balance = 0;
+        let ctx = ValidationContext {
+            chain_id: 1,
+            dev_skip_signature: false,
+            ..default_ctx()
+        };
+        let err = validate_transaction(&tx, &account, &nonce_state, &ctx).unwrap_err();
+        assert!(matches!(err, ValidationError::InsufficientBalance { .. }));
+    }
+
+    #[test]
+    fn register_pubkey_already_registered_rejected() {
+        // One-time only. Re-registration goes through the
+        // key-rotation flow (`pyde_account::auth::rotate`) which
+        // requires a sig from the current key.
+        let (tx, mut account, nonce_state) = make_register_pubkey_tx_and_account();
+        account.auth_keys = pyde_account::types::AuthKeys::Single(vec![0xCD; 897]);
+        let ctx = ValidationContext {
+            chain_id: 1,
+            dev_skip_signature: false,
+            ..default_ctx()
+        };
+        let err = validate_transaction(&tx, &account, &nonce_state, &ctx).unwrap_err();
+        assert!(matches!(err, ValidationError::InvalidSignature));
     }
 }

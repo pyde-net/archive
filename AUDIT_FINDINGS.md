@@ -640,6 +640,48 @@
       asserting AuthKeys::None rejects on production and accepts
       on devnet. Multi-node encrypted e2e still passes.
 
+- [x] 229 — `✓` **`RegisterPubkey` tx type — bootstrap path for
+      pubkey registration.** Surfaced while shipping 226. Without
+      this, a fresh address that received funds had no way to
+      ever submit a tx because `validate_transaction` rejected
+      AuthKeys::None senders on production (the 226 fix), and
+      no protocol path could upgrade the account from
+      AuthKeys::None to AuthKeys::Single(pk).
+      
+      Shipped: new `TransactionType::RegisterPubkey = 13`. The
+      pubkey holder submits an unsigned tx with their FALCON
+      pubkey in `tx.data`; protocol verifies
+      `tx.from == Poseidon2(tx.data)` and registers
+      `auth_keys = Single(tx.data)`. Rules:
+      
+      - **No signature** — the address-derivation check is the
+        proof of pubkey ownership; only the keypair holder can
+        produce a pubkey that hashes to a given address.
+      - **No gas, no value** — fresh accounts have no balance
+        to spend; charging gas creates a chicken-and-egg.
+      - **Anyone can submit** — registering YOUR pubkey on YOUR
+        address is harmless (only the legit pubkey passes the
+        hash check; same-pubkey re-registration is a no-op;
+        different-pubkey rejected).
+      - **One-time only** — refuse if `auth_keys != None`. Key
+        rotation goes through the existing `pyde_account::auth::
+        rotate` flow which requires a current-key signature.
+      - **Balance > 0 required** — without this gate, an attacker
+        could spam-register from millions of locally-generated
+        keypairs and bloat state cheaply. Funding a recipient
+        first costs PYDE per address, naturally rate-limiting.
+      
+      Validation routed through `validate_register_pubkey` BEFORE
+      the audit-226 AuthKeys::None gate fires (otherwise the tx
+      type couldn't exist). Pipeline dispatch executes by setting
+      `sender.auth_keys = AuthKeys::Single(tx.data)` and returns
+      a zero-cost successful receipt.
+      
+      Tests: 7 unit tests covering happy path + every reject
+      branch (with-signature, with-value, with-gas, wrong-pubkey,
+      wrong-size, zero-balance, already-registered). All 229
+      pyde-tx tests + multi-node encrypted e2e pass.
+
 ---
 
 ## Test-coverage follow-ups (not standalone fix items)
@@ -674,3 +716,4 @@ Fold into the relevant fix PRs above when possible:
 | 217 | 2026-04-24  | Searched every caller of `verify_witnesses`; only tests/benches. No production path verifies witnesses today | Not a bug; re-open if stateless validation wires into production |
 | 218 | 2026-04-24  | Wrapped BroadcastConsensus / BroadcastConsensusMany / maybe_rebroadcast_reshare in `is_validator` gates | Belt-and-suspenders egress guard added |
 | 226 | 2026-04-25  | New `plaintext_tx_ingest_policy` mirrors 206 + same gate added in `validate_transaction` for defense-in-depth at block-validation | Closed at both RPC ingress and validation layers |
+| 229 | 2026-04-25  | New `TransactionType::RegisterPubkey`; address-derivation check (`from == Poseidon2(data)`) is the proof; gated by funded + unregistered + one-time | Bootstrap path for pubkey registration shipped |

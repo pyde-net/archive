@@ -66,6 +66,17 @@ pub enum TransactionType {
     /// Resume normal block processing (Phase 4 slice 4.6). Clears the
     /// pause flag. Same multisig-signed blob format as `EmergencyPause`.
     EmergencyResume = 12,
+    /// First-time pubkey registration (audit 229). `tx.data` carries
+    /// the FALCON-512 public key whose Poseidon2 hash equals
+    /// `tx.from`. No signature, no gas, no value. Allowed only when
+    /// the sender account exists with `balance > 0` and
+    /// `auth_keys == AuthKeys::None` (i.e. funded but never
+    /// registered). The address-derivation check is the proof of
+    /// pubkey ownership — only the keypair holder can produce a
+    /// pubkey that hashes to a given address. After execution,
+    /// `sender.auth_keys = AuthKeys::Single(tx.data)` and the
+    /// account can sign normal txs from then on.
+    RegisterPubkey = 13,
 }
 
 impl TransactionType {
@@ -84,6 +95,7 @@ impl TransactionType {
             10 => Some(Self::RotateMultisig),
             11 => Some(Self::EmergencyPause),
             12 => Some(Self::EmergencyResume),
+            13 => Some(Self::RegisterPubkey),
             _ => None,
         }
     }
@@ -516,6 +528,7 @@ mod tests {
             TransactionType::RotateMultisig,
             TransactionType::EmergencyPause,
             TransactionType::EmergencyResume,
+            TransactionType::RegisterPubkey,
         ];
         for ty in all {
             let tag = ty as u8;
