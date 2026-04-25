@@ -8,7 +8,7 @@
 //!
 //! Liveness: guaranteed if 86+ of 128 validators are honest and online.
 
-use crate::block::{BlockHeader, QuorumCert, QUORUM_THRESHOLD};
+use crate::block::{quorum_for_committee, BlockHeader, QuorumCert, QUORUM_THRESHOLD};
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{
     falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature,
@@ -191,7 +191,13 @@ pub fn try_form_view_change_qc(
         }
     }
 
-    if valid_count >= QUORUM_THRESHOLD as u32 {
+    // audit 234: use the dynamic threshold so devnet committees
+    // (which are smaller than the production 128) can still form
+    // a view-change QC. Hardcoding QUORUM_THRESHOLD = 86 made
+    // view-change effectively impossible on any committee with
+    // fewer than 86 validators.
+    let threshold = quorum_for_committee(committee_keys.len());
+    if valid_count >= threshold as u32 {
         Some(ViewChangeQC {
             slot,
             highest_qc,
@@ -309,6 +315,64 @@ mod tests {
 
         let vc_qc = try_form_view_change_qc(10, &messages, &keys);
         assert!(vc_qc.is_none());
+    }
+
+    // ========== audit 234: dynamic-threshold view-change QC ==========
+
+    /// Verify view-change QC forms with the BFT threshold for a
+    /// small (devnet) committee. Pre-fix this used the hardcoded
+    /// production threshold of 86, making view-change unable to
+    /// recover any committee smaller than 86 validators.
+    #[test]
+    fn view_change_qc_dynamic_threshold_small_committee() {
+        // 4-validator committee — quorum_for_committee(4) = ceil(8/3) = 3.
+        let mut messages = Vec::new();
+        let mut keys = Vec::new();
+        for i in 0..3u8 {
+            let (pk, sk) = falcon_keygen().unwrap();
+            let pk_bytes = pk.as_bytes().to_vec();
+            let addr = derive_eoa_address(&pk_bytes);
+            let msg = create_view_change(7, &QuorumCert::empty(), i, addr, &sk).unwrap();
+            messages.push(msg);
+            keys.push(pk_bytes);
+        }
+        // Pad to a 4th key — we have 3 valid messages, 4 committee slots.
+        let (pk4, _) = falcon_keygen().unwrap();
+        keys.push(pk4.as_bytes().to_vec());
+
+        // 3 valid view-change messages, committee_size=4, threshold=3 → QC.
+        let vc_qc = try_form_view_change_qc(7, &messages, &keys);
+        assert!(
+            vc_qc.is_some(),
+            "3 valid view-change messages on a 4-validator committee should form a QC (threshold 3)"
+        );
+        assert_eq!(vc_qc.unwrap().vote_count, 3);
+    }
+
+    /// Below-threshold view-change for a small committee must NOT
+    /// form a QC.
+    #[test]
+    fn view_change_qc_dynamic_threshold_below_quorum() {
+        // 4-validator committee: 2 messages, threshold 3 → no QC.
+        let mut messages = Vec::new();
+        let mut keys = Vec::new();
+        for i in 0..2u8 {
+            let (pk, sk) = falcon_keygen().unwrap();
+            let pk_bytes = pk.as_bytes().to_vec();
+            let addr = derive_eoa_address(&pk_bytes);
+            let msg = create_view_change(7, &QuorumCert::empty(), i, addr, &sk).unwrap();
+            messages.push(msg);
+            keys.push(pk_bytes);
+        }
+        for _ in 0..2 {
+            let (pk, _) = falcon_keygen().unwrap();
+            keys.push(pk.as_bytes().to_vec());
+        }
+        let vc_qc = try_form_view_change_qc(7, &messages, &keys);
+        assert!(
+            vc_qc.is_none(),
+            "2 view-change messages on a 4-validator committee must NOT form a QC (threshold 3)"
+        );
     }
 
     // ========== Task 0494: Multiple consecutive failures ==========

@@ -811,34 +811,58 @@
       wrong-size, zero-balance, already-registered). All 229
       pyde-tx tests + multi-node encrypted e2e pass.
 
-- [ ] 234 — **4-of-4 rolling-restart stall.** Surfaced by
-      `validator_churn` test. Killing all 4 validators of a
-      4-node committee in tight succession (one at a time, each
-      restarted before next is killed) reliably stalls the chain
-      on the 4th kill — the 3 alive nodes pin at the last
-      common slot and stop producing for ≥5s. Reproduces
-      regardless of rotation order ([0,1,2,3], [3,0,1,2] both
-      hit the stall on the 4th rotation). Likely root cause:
-      gossipsub mesh degradation after repeated peer
-      disconnect/reconnect cycles — the only never-restarted
-      node held the mesh together, and removing it leaves the
-      restarted-trio unable to form QCs (timing? mesh sparsity?
-      view-change repeatedly failing?).
+- [~] 234 — `✓` **View-change broken (empty signature + hardcoded
+      threshold) + 4-of-4 rolling-restart gossipsub mesh stall.**
+      Surfaced by `validator_churn` test then traced via
+      diagnostic instrumentation.
       
-      Mitigation in test: `validator_churn` covers 3-of-4
-      rotation (which reflects realistic operator cadence).
-      Production with 128 validators has more quorum margin
-      and slower rotation cadence, so this may not surface, but
-      worth investigating before testnet.
+      Root causes uncovered (3 separate bugs):
       
-      Investigation TODOs:
-      - Dump validator-engine logs at moment of stall: are
-        view-change messages going out? are they being
-        received? why no view-change-QC formation?
-      - Check gossipsub mesh state via metrics — peer count,
-        IHAVE/IWANT churn after multiple restarts.
-      - Try test with 7 validators (quorum 5, 2 down OK) — does
-        the stall move to N-1 of N kills?
+      1. **Empty view-change signature (FIXED).** `node.rs:2196`
+         called `engine.on_timeout(identity)` to construct a
+         properly-signed `ViewChangeMessage`, then THREW IT AWAY
+         (`_vc_msg`) and constructed a fresh `ConsensusMessage::
+         Timeout` with `signature: vec![]` for gossip. Receivers
+         verified the empty signature, rejected it, and
+         `try_form_view_change_qc` never reached quorum. Effect:
+         view-change has been entirely non-functional in
+         production code since the path was wired. Fix: forward
+         the signed `vc_msg` fields directly into the published
+         `Timeout`.
+      
+      2. **Hardcoded view-change threshold (FIXED).**
+         `view_change.rs:194` used `QUORUM_THRESHOLD as u32` (= 86,
+         the production constant) for the threshold check
+         regardless of actual `committee_keys.len()`. Devnet
+         committees of 4 validators would need 86 view-change
+         votes to form a QC — impossible. Fix: switch to
+         `quorum_for_committee(committee_keys.len())`, mirroring
+         `try_form_qc` in hotstuff.rs.
+      
+      3. **Gossipsub mesh degradation (still open).** Even with
+         #1 + #2 fixed, the 4-of-4 stall persists because
+         `gossipsub.publish` for the consensus topic returns
+         `InsufficientPeers` after the live nodes have been
+         through restart cycles. Only the never-restarted node
+         was holding the consensus-topic mesh together; removing
+         it leaves restarted peers unable to publish to each
+         other (their gossipsub state shows 0 peers in the
+         consensus mesh / 0 known subscribers). The 3-of-4
+         `validator_churn` test still passes because the chain
+         can advance via slots whose proposer is alive, with
+         view-change as the recovery path for missed-proposer
+         slots — but in 4-of-4, view-change publish itself fails.
+      
+      Open follow-ups for #3:
+      - Add periodic re-subscribe to `consensus` topic from the
+        validator side so restarted peers re-broadcast SUBSCRIBE
+        control messages to refresh peer subscriber state.
+      - Add a request-response fallback for view-change messages
+        when gossipsub publish returns `InsufficientPeers`
+        (direct point-to-point to known committee peers).
+      - Consider lowering `mesh_n_low` for small-committee
+        devnets — `mesh_n_low=4` is unsatisfiable with N=4
+        validators (max possible mesh peers = N-1 = 3).
 
 ---
 

@@ -2193,14 +2193,22 @@ impl PydeNode {
                         // Check for timeout (no proposal received within 200ms)
                         if engine.is_timed_out() {
                             if let Some(identity) = validator_identity.as_ref() {
-                                if let Some(_vc_msg) = engine.on_timeout(identity) {
+                                // audit 234: forward the signed view-change
+                                // message returned by `on_timeout`. Earlier
+                                // code constructed a fresh Timeout with
+                                // `signature: vec![]`, which receivers
+                                // rejected at signature verification — so
+                                // `try_form_view_change_qc` never reached
+                                // quorum and the chain stalled on any slot
+                                // where the assigned proposer was offline.
+                                if let Some(vc_msg) = engine.on_timeout(identity) {
                                     let vc_bytes = wire::encode_consensus_message(
                                         &pyde_consensus::hotstuff::ConsensusMessage::Timeout {
-                                            slot: current_slot,
-                                            voter_index: identity.committee_index,
-                                            voter_address: identity.address,
-                                            highest_qc: engine.consensus.highest_qc.clone(),
-                                            signature: vec![],
+                                            slot: vc_msg.slot,
+                                            voter_index: vc_msg.voter_index,
+                                            voter_address: vc_msg.voter_address,
+                                            highest_qc: vc_msg.highest_qc,
+                                            signature: vc_msg.signature,
                                         }
                                     );
                                     let topic = pyde_net::node::topics::consensus();
