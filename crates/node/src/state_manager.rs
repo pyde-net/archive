@@ -1,10 +1,17 @@
 use pyde_state::jmt_store::PersistentJMT;
-use pyde_state::smt::{Key, StateAccess};
+use pyde_state::smt::{Key, StateAccess, UndoEntry};
 use sparse_merkle_tree::H256;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
 use tracing::info;
+
+/// How many recent blocks' undo logs to keep in memory. Beyond
+/// this depth, reverts cannot be performed and the node would
+/// have to fall back to snapshot restore. 128 covers the
+/// HotStuff finality window (worst-case ~2 slots) plus generous
+/// headroom for partition-heal scenarios (audit 230).
+const MAX_UNDO_DEPTH: usize = 128;
 
 /// Pipelined state manager: separates read cache from Merkle commit.
 ///
@@ -24,6 +31,10 @@ pub struct StateManager {
     root: [u8; 32],
     tracked_keys: HashSet<Key>,
     pending_writes: Vec<(Key, Vec<u8>)>,
+    /// Per-block undo logs ordered by slot (newest last). VecDeque
+    /// for O(1) front pruning. Audit 230: drives `revert_to(slot)`
+    /// when consensus picks a different chain at the same slot.
+    block_undo_logs: VecDeque<(u64, Vec<UndoEntry>)>,
 }
 
 // SAFETY: every field of `StateManager` is already `Send`:
@@ -60,6 +71,7 @@ impl StateManager {
             root,
             tracked_keys: HashSet::new(),
             pending_writes: Vec::new(),
+            block_undo_logs: VecDeque::new(),
         })
     }
 
@@ -191,6 +203,116 @@ impl StateManager {
         self.root = root;
     }
 
+    /// Record per-block undo info (audit 230). Called by the
+    /// block processor immediately after a block's writes are
+    /// applied so a future `revert_to(slot - 1)` call can
+    /// reverse them.
+    ///
+    /// Logs older than `MAX_UNDO_DEPTH` are pruned from the front
+    /// — beyond that horizon, reverts are not possible and the
+    /// node falls back to snapshot restore.
+    pub fn record_block_undo(&mut self, slot: u64, entries: Vec<UndoEntry>) {
+        self.block_undo_logs.push_back((slot, entries));
+        while self.block_undo_logs.len() > MAX_UNDO_DEPTH {
+            self.block_undo_logs.pop_front();
+        }
+    }
+
+    /// True if the StateManager has at least one undo log
+    /// recorded for `slot` (or any later slot). Used by the
+    /// reorg path (audit 231) to verify the target depth is in
+    /// range before initiating a revert.
+    ///
+    /// Audit 230 ships the mechanism; the call site is added in
+    /// 231 — `#[allow(dead_code)]` keeps the build green while
+    /// the integration lands incrementally.
+    #[allow(dead_code)]
+    pub fn can_revert_to(&self, target_slot: u64) -> bool {
+        self.block_undo_logs
+            .front()
+            .map(|(s, _)| target_slot >= s.saturating_sub(1))
+            .unwrap_or(false)
+    }
+
+    /// Revert state to the end of `target_slot` by replaying
+    /// undo logs in reverse. Returns the number of blocks
+    /// reverted, or `Err(...)` if the target is beyond the
+    /// in-memory undo horizon.
+    ///
+    /// Walks `block_undo_logs` from the back, popping each log
+    /// whose slot is `> target_slot`, applying its old values
+    /// to the cache + scheduling them as pending SMT writes.
+    /// Stops when the next log on the back is at or before
+    /// `target_slot`.
+    ///
+    /// Audit 230 ships the mechanism; call site lights up in
+    /// 231 — `#[allow(dead_code)]` covers the gap.
+    #[allow(dead_code)]
+    pub fn revert_to(&mut self, target_slot: u64) -> Result<usize, String> {
+        // Range check: we can only revert if every slot above
+        // target is still in the in-memory log. The OLDEST log
+        // on the front represents the deepest reversible slot;
+        // anything older has been pruned.
+        if let Some((oldest_slot, _)) = self.block_undo_logs.front() {
+            if target_slot + 1 < *oldest_slot {
+                return Err(format!(
+                    "revert target {target_slot} is below oldest undo log at slot {oldest_slot}"
+                ));
+            }
+        }
+
+        let mut reverted = 0usize;
+        // Pop from the back until the back log's slot ≤ target_slot.
+        // For each popped log, apply old values to:
+        //   1. the in-memory cache (remove on None, insert otherwise)
+        //   2. the SMT (synchronously — revert must leave a coherent
+        //      view by return time, since callers expect to read
+        //      reverted state immediately)
+        while let Some((slot, _)) = self.block_undo_logs.back() {
+            if *slot <= target_slot {
+                break;
+            }
+            // Pop, then apply old values. Unwrap safe — peek was Some.
+            let (popped_slot, entries) = self.block_undo_logs.pop_back().unwrap();
+            let restore_writes: Vec<(Key, Vec<u8>)> = entries
+                .into_iter()
+                .map(|e| (e.key, e.old_value.unwrap_or_default()))
+                .collect();
+            // Cache: remove empty-value restores, insert non-empty.
+            if let Ok(mut cache) = self.cache.write() {
+                for (k, v) in &restore_writes {
+                    if v.is_empty() {
+                        cache.remove(k);
+                    } else {
+                        cache.insert(*k, v.clone());
+                    }
+                }
+            }
+            // SMT: persist the restore now so reads from the SMT
+            // tree (cache miss path) see the reverted view, and so
+            // the chain's `state_root` recomputed from this SMT
+            // matches the reverted slot's header.
+            if !restore_writes.is_empty() {
+                if let Ok(mut smt) = self.smt.lock() {
+                    if let Err(e) = smt.update_all(restore_writes) {
+                        return Err(format!("revert SMT update failed: {e}"));
+                    }
+                    // Refresh root after SMT mutation.
+                    self.root = smt.root().as_slice().try_into().unwrap_or([0u8; 32]);
+                }
+            }
+            reverted += 1;
+            tracing::debug!(slot = popped_slot, "reverted state at slot");
+        }
+        Ok(reverted)
+    }
+
+    /// Drain the in-memory undo log (testing / diagnostics).
+    #[allow(dead_code)]
+    pub fn undo_log_len(&self) -> usize {
+        self.block_undo_logs.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         if let Ok(smt) = self.smt.lock() {
             smt.is_empty()
@@ -314,5 +436,208 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = StateManager::open(dir.path(), 1024).unwrap();
         assert!(state.export_snapshot().is_empty());
+    }
+
+    // ========== Audit 230: per-block undo log + revert_to ==========
+
+    fn k(seed: u8) -> Key {
+        let mut a = [0u8; 32];
+        a[0] = seed;
+        a.into()
+    }
+
+    #[test]
+    fn revert_to_undoes_one_block() {
+        // Apply one block's writes, record undo, revert, and assert
+        // the cache + pending writes restore the pre-block view.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(dir.path(), 1024).unwrap();
+
+        // Pre-block: key_a = "before". Persist it via flush so the
+        // SMT also has it (revert path schedules SMT writes).
+        let key_a = k(0xA1);
+        state
+            .update_batch(vec![(key_a, b"before".to_vec())])
+            .unwrap();
+
+        // Block at slot 1: change key_a, add key_b. Capture undo
+        // (the pre-block values) and record.
+        let key_b = k(0xB2);
+        let undo = vec![
+            UndoEntry {
+                key: key_a,
+                old_value: Some(b"before".to_vec()),
+            },
+            UndoEntry {
+                key: key_b,
+                old_value: None, // didn't exist
+            },
+        ];
+        state
+            .update_batch(vec![(key_a, b"after".to_vec()), (key_b, b"new".to_vec())])
+            .unwrap();
+        state.record_block_undo(1, undo);
+        assert_eq!(state.undo_log_len(), 1);
+
+        // Pre-revert: cache has the new values.
+        assert_eq!(state.get(&key_a).unwrap(), b"after");
+        assert_eq!(state.get(&key_b).unwrap(), b"new");
+
+        // Revert to slot 0.
+        let n = state.revert_to(0).unwrap();
+        assert_eq!(n, 1, "exactly one block should be reverted");
+        assert_eq!(state.undo_log_len(), 0);
+
+        // Post-revert: cache restored.
+        assert_eq!(state.get(&key_a).unwrap(), b"before");
+        assert_eq!(state.get(&key_b), None);
+    }
+
+    #[test]
+    fn revert_to_pops_only_above_target() {
+        // Three blocks recorded, revert to slot 1: only blocks 2 and 3
+        // are popped; block 1's undo log stays in place.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(dir.path(), 1024).unwrap();
+
+        for slot in 1..=3 {
+            let key = k(slot as u8);
+            state.update_batch(vec![(key, vec![slot as u8])]).unwrap();
+            state.record_block_undo(
+                slot,
+                vec![UndoEntry {
+                    key,
+                    old_value: None,
+                }],
+            );
+        }
+        assert_eq!(state.undo_log_len(), 3);
+
+        let n = state.revert_to(1).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(state.undo_log_len(), 1);
+        // Block 1's write still present
+        assert_eq!(state.get(&k(1)).unwrap(), vec![1]);
+        // Blocks 2 and 3's writes reverted
+        assert_eq!(state.get(&k(2)), None);
+        assert_eq!(state.get(&k(3)), None);
+    }
+
+    #[test]
+    fn revert_to_below_oldest_log_errors() {
+        // Pruning means we can't revert past MAX_UNDO_DEPTH. Simulate
+        // by recording past the depth and asserting older logs were
+        // pruned + revert_to that depth errors.
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(dir.path(), 1024).unwrap();
+        // Write past MAX_UNDO_DEPTH (128) so the front gets pruned.
+        for slot in 1..=(MAX_UNDO_DEPTH as u64 + 5) {
+            state.record_block_undo(slot, vec![]);
+        }
+        assert_eq!(state.undo_log_len(), MAX_UNDO_DEPTH);
+        // Front log is now slot 6 (slots 1..=5 pruned).
+        // Reverting to slot 3 should be rejected.
+        let err = state.revert_to(3).unwrap_err();
+        assert!(err.contains("below oldest undo log"));
+    }
+
+    #[test]
+    fn revert_to_noop_when_target_is_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(dir.path(), 1024).unwrap();
+        state.record_block_undo(1, vec![]);
+        state.record_block_undo(2, vec![]);
+        let n = state.revert_to(2).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(state.undo_log_len(), 2);
+    }
+
+    #[test]
+    fn revert_to_restores_smt_root_to_snapshot() {
+        // Audit 230 — root-equality test. Without this, a revert
+        // could restore values at the cache level but produce a
+        // structurally different SMT (e.g. if "empty value" doesn't
+        // collapse the same way as "key absent"), leading to a
+        // root mismatch downstream.
+        //
+        // Mirrors what BlockProcessor does in production:
+        //   update_batch_deferred(writes) → flush_pending() → record_block_undo(slot, undo)
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(dir.path(), 1024).unwrap();
+
+        // Helper: simulate one "block" by capturing pre-block values,
+        // applying writes, flushing to SMT, recording undo. Returns
+        // the post-block root.
+        let apply_block = |s: &mut StateManager,
+                               slot: u64,
+                               writes: Vec<(Key, Vec<u8>)>|
+         -> [u8; 32] {
+            let undo: Vec<UndoEntry> = writes
+                .iter()
+                .map(|(k, _)| UndoEntry {
+                    key: *k,
+                    old_value: s.get(k),
+                })
+                .collect();
+            s.update_batch_deferred(writes).unwrap();
+            let root = s.flush_pending().unwrap();
+            s.record_block_undo(slot, undo);
+            root
+        };
+
+        // Block 1: set key_a, key_b
+        let _r1 = apply_block(
+            &mut state,
+            1,
+            vec![
+                (k(0xA1), b"a-v1".to_vec()),
+                (k(0xB2), b"b-v1".to_vec()),
+            ],
+        );
+        // Block 2: change key_a, set key_c
+        let r2_snapshot = apply_block(
+            &mut state,
+            2,
+            vec![
+                (k(0xA1), b"a-v2".to_vec()),
+                (k(0xC3), b"c-v1".to_vec()),
+            ],
+        );
+        // Block 3: change key_b, delete key_c (empty value), add key_d
+        let _r3 = apply_block(
+            &mut state,
+            3,
+            vec![
+                (k(0xB2), b"b-v2".to_vec()),
+                (k(0xC3), Vec::new()), // delete
+                (k(0xD4), b"d-v1".to_vec()),
+            ],
+        );
+
+        // Sanity: root advanced over time.
+        assert_ne!(r2_snapshot, _r1);
+        assert_ne!(_r3, r2_snapshot);
+
+        // Revert to slot 2 — root must match the slot-2 snapshot.
+        let reverted = state.revert_to(2).unwrap();
+        assert_eq!(reverted, 1);
+        assert_eq!(
+            state.root(),
+            r2_snapshot,
+            "post-revert root must equal the slot-2 snapshot"
+        );
+
+        // Cache + SMT both reflect slot-2 view.
+        assert_eq!(state.get(&k(0xA1)).unwrap(), b"a-v2"); // unchanged in block 3
+        assert_eq!(state.get(&k(0xB2)).unwrap(), b"b-v1"); // restored
+        assert_eq!(state.get(&k(0xC3)).unwrap(), b"c-v1"); // restored
+        assert_eq!(state.get(&k(0xD4)), None); // never existed before block 3
+
+        // Revert further to slot 1 — root must match block-1 root.
+        let reverted = state.revert_to(1).unwrap();
+        assert_eq!(reverted, 1);
+        assert_eq!(state.root(), _r1);
+        assert_eq!(state.get(&k(0xA1)).unwrap(), b"a-v1"); // restored
+        assert_eq!(state.get(&k(0xC3)), None); // restored to "absent"
     }
 }
