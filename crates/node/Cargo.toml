@@ -64,6 +64,7 @@ sparse-merkle-tree = "0.6"
 reqwest = { version = "0.12", features = ["json"] }
 otic = { path = "../otic" }
 tempfile = "3"
+pyde-rust-sdk = { path = "../pyde-rust-sdk" }
 
 [[bench]]
 name = "rpc_bench"

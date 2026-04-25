@@ -96,6 +96,26 @@ pub fn hash_transaction(tx_json: &str) -> Result<String, JsValue> {
     Ok(format!("0x{}", hex::encode(hash)))
 }
 
+/// Wire-encode a `TransactionType::RegisterPubkey` (audit 229) tx
+/// without signing. The address-derivation check (`from ==
+/// Poseidon2(data)`) IS the proof of pubkey ownership for this
+/// tx type, so a FALCON sig is neither needed nor accepted.
+/// Refuses to encode any other tx type — accidental misuse on a
+/// signed-tx path would be a hard-to-debug protocol violation.
+#[wasm_bindgen(js_name = "encodeRegisterPubkeyTx")]
+pub fn encode_register_pubkey_tx(tx_json: &str) -> Result<String, JsValue> {
+    let v: serde_json::Value = serde_json::from_str(tx_json)
+        .map_err(|e| JsValue::from_str(&format!("bad JSON: {}", e)))?;
+    let tx_type = v.get("txType").and_then(|v| v.as_u64()).unwrap_or(0);
+    if tx_type != 13 {
+        return Err(JsValue::from_str(
+            "encodeRegisterPubkeyTx only accepts txType=13 (RegisterPubkey)",
+        ));
+    }
+    let tx_bytes = serialize_tx(&v, &[])?;
+    Ok(format!("0x{}", hex::encode(&tx_bytes)))
+}
+
 /// Sign a transaction. Returns the signed tx bytes as hex (wire format).
 /// Accepts JSON tx fields + secretKey hex.
 #[wasm_bindgen(js_name = "signTransaction")]
