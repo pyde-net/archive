@@ -1466,9 +1466,16 @@ async fn ingress_validate(
         .unwrap_or(0);
     drop(state_r);
 
-    // Audit 226: gate the sender's auth_keys at ingress.
-    if let Err(msg) = plaintext_tx_ingest_policy(&sender.auth_keys, chain_id) {
-        return Err(rpc_err(-32001, format!("ingress validation: {msg}")));
+    // Audit 226: gate the sender's auth_keys at ingress. Skip for
+    // RegisterPubkey (audit 229) — the whole point of that tx type
+    // is to upgrade `AuthKeys::None` accounts to `Single(pk)`.
+    // `validate_register_pubkey` enforces its own stricter shape
+    // checks (data == FALCON pk, from == Poseidon2(data), funded,
+    // not already registered).
+    if tx.tx_type != pyde_tx::types::TransactionType::RegisterPubkey {
+        if let Err(msg) = plaintext_tx_ingest_policy(&sender.auth_keys, chain_id) {
+            return Err(rpc_err(-32001, format!("ingress validation: {msg}")));
+        }
     }
 
     let ctx = ValidationContext {

@@ -197,6 +197,46 @@ impl Wallet {
     // High-level helpers
     // ========================================================================
 
+    /// Register this wallet's FALCON public key on-chain (audit 229).
+    ///
+    /// Required ONCE per address before the wallet can submit any
+    /// signed tx. Pyde uses post-quantum FALCON-512 signatures, which
+    /// (unlike ECDSA) don't support pubkey recovery from a sig — so
+    /// the chain needs to know each address's pubkey separately. The
+    /// `RegisterPubkey` tx is unsigned and free; the address-derivation
+    /// check (`from == Poseidon2(pubkey)`) is the proof of pubkey
+    /// ownership.
+    ///
+    /// Pre-conditions enforced by the chain:
+    ///   - This account must exist with `balance > 0` (someone has to
+    ///     send you funds first).
+    ///   - The account must not be already registered.
+    ///
+    /// Typical first-tx flow for a new user:
+    ///   1. Generate wallet locally (`Wallet::generate()`).
+    ///   2. Receive funds at `wallet.address()` from a faucet or
+    ///      another user.
+    ///   3. Call `wallet.register_pubkey(&provider).await?` once.
+    ///   4. From now on, `transfer` / `send_call` etc. work normally.
+    pub async fn register_pubkey(&self, provider: &Provider) -> Result<Receipt> {
+        let (nonce, chain_id) = provider.get_nonce_and_chain_id(&self.address).await?;
+        let tx = Transaction {
+            from: self.address,
+            to: pyde_account::address::ZERO_ADDRESS,
+            value: 0,
+            data: self.public_key.as_bytes().to_vec(),
+            gas_limit: 0,
+            nonce,
+            signature: vec![], // unsigned by design — see audit 229
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id,
+            tx_type: TransactionType::RegisterPubkey,
+        };
+        send_and_check(provider, &tx).await
+    }
+
     /// Build, sign, send a native transfer. Returns receipt (errors on revert).
     pub async fn transfer(
         &self,

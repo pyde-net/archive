@@ -3670,6 +3670,7 @@ dependencies = [
  "pyde-crypto",
  "pyde-mempool",
  "pyde-net",
+ "pyde-rust-sdk",
  "pyde-slashing",
  "pyde-state",
  "pyde-tx",
