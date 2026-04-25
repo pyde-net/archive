@@ -811,6 +811,35 @@
       wrong-size, zero-balance, already-registered). All 229
       pyde-tx tests + multi-node encrypted e2e pass.
 
+- [ ] 234 — **4-of-4 rolling-restart stall.** Surfaced by
+      `validator_churn` test. Killing all 4 validators of a
+      4-node committee in tight succession (one at a time, each
+      restarted before next is killed) reliably stalls the chain
+      on the 4th kill — the 3 alive nodes pin at the last
+      common slot and stop producing for ≥5s. Reproduces
+      regardless of rotation order ([0,1,2,3], [3,0,1,2] both
+      hit the stall on the 4th rotation). Likely root cause:
+      gossipsub mesh degradation after repeated peer
+      disconnect/reconnect cycles — the only never-restarted
+      node held the mesh together, and removing it leaves the
+      restarted-trio unable to form QCs (timing? mesh sparsity?
+      view-change repeatedly failing?).
+      
+      Mitigation in test: `validator_churn` covers 3-of-4
+      rotation (which reflects realistic operator cadence).
+      Production with 128 validators has more quorum margin
+      and slower rotation cadence, so this may not surface, but
+      worth investigating before testnet.
+      
+      Investigation TODOs:
+      - Dump validator-engine logs at moment of stall: are
+        view-change messages going out? are they being
+        received? why no view-change-QC formation?
+      - Check gossipsub mesh state via metrics — peer count,
+        IHAVE/IWANT churn after multiple restarts.
+      - Try test with 7 validators (quorum 5, 2 down OK) — does
+        the stall move to N-1 of N kills?
+
 ---
 
 ## Test-coverage follow-ups (not standalone fix items)
