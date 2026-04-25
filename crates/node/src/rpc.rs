@@ -1466,6 +1466,11 @@ async fn ingress_validate(
         .unwrap_or(0);
     drop(state_r);
 
+    // Audit 226: gate the sender's auth_keys at ingress.
+    if let Err(msg) = plaintext_tx_ingest_policy(&sender.auth_keys, chain_id) {
+        return Err(rpc_err(-32001, format!("ingress validation: {msg}")));
+    }
+
     let ctx = ValidationContext {
         block_height: head_slot,
         base_fee,
@@ -1530,6 +1535,35 @@ fn encrypted_tx_ingest_policy(
         Some(pk) => EncryptedTxIngestPolicy::Verify(pk),
         None if chain_id == 31337 => EncryptedTxIngestPolicy::StructuralOnly,
         None => EncryptedTxIngestPolicy::Reject,
+    }
+}
+
+/// Plaintext-tx ingress policy, mirroring `encrypted_tx_ingest_policy`
+/// (audit 206) for the legacy plaintext path (audit 226).
+///
+/// `pyde_tx::validation::validate_signature` short-circuits FALCON
+/// verification when the sender account has `AuthKeys::None`
+/// ("System/contract accounts — no signature check at this level"),
+/// and `pyde_tx::pipeline::load_account` returns a default EOA with
+/// `AuthKeys::None` for any address that has never been seen on chain.
+/// The combination lets an attacker spoof `from = victim_fresh_address`
+/// past the signature check; balance gates fund-loss but a Paymaster
+/// fee_payer slips past balance too, polluting the mempool.
+///
+/// Policy:
+///   - Single / MultiSig: allow (validate_signature handles it).
+///   - None on devnet (chain_id == 31337): allow — the faucet /
+///     bootstrap UX needs unsigned txs from unregistered accounts.
+///   - None on any other chain_id: reject at ingress.
+fn plaintext_tx_ingest_policy(
+    auth_keys: &pyde_account::types::AuthKeys,
+    chain_id: u64,
+) -> Result<(), &'static str> {
+    match auth_keys {
+        pyde_account::types::AuthKeys::Single(_)
+        | pyde_account::types::AuthKeys::MultiSig { .. } => Ok(()),
+        pyde_account::types::AuthKeys::None if chain_id == 31337 => Ok(()),
+        pyde_account::types::AuthKeys::None => Err("sender has no registered auth_key (audit 226)"),
     }
 }
 
@@ -1760,6 +1794,47 @@ mod tests {
                 EncryptedTxIngestPolicy::Reject,
                 "chain_id {} must reject no-key encrypted tx",
                 chain_id
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_ingest_policy_allows_registered_keys() {
+        // Single auth_key allowed on every chain_id.
+        let pk = vec![0x11u8; 900];
+        for chain_id in [1u64, 7, 31337, 1_000_000] {
+            assert!(plaintext_tx_ingest_policy(
+                &pyde_account::types::AuthKeys::Single(pk.clone()),
+                chain_id,
+            )
+            .is_ok());
+        }
+        // MultiSig also allowed on every chain_id.
+        let multi = pyde_account::types::AuthKeys::MultiSig {
+            keys: vec![pk.clone()],
+            threshold: 1,
+        };
+        for chain_id in [1u64, 31337] {
+            assert!(plaintext_tx_ingest_policy(&multi, chain_id).is_ok());
+        }
+    }
+
+    #[test]
+    fn plaintext_ingest_policy_devnet_allows_no_auth_key() {
+        // chain_id == 31337 keeps the relaxed faucet/bootstrap UX.
+        assert!(plaintext_tx_ingest_policy(&pyde_account::types::AuthKeys::None, 31337).is_ok());
+    }
+
+    #[test]
+    fn plaintext_ingest_policy_production_rejects_no_auth_key() {
+        // Every non-devnet chain_id must reject so an attacker
+        // can't spoof `from = victim_fresh_address` past the
+        // sig-skip in validate_signature.
+        for chain_id in [1u64, 2, 7, 1337, 1_000_000] {
+            let err = plaintext_tx_ingest_policy(&pyde_account::types::AuthKeys::None, chain_id);
+            assert!(
+                err.is_err(),
+                "chain_id {chain_id} must reject AuthKeys::None"
             );
         }
     }

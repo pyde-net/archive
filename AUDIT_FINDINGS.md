@@ -612,23 +612,33 @@
       `aot_real_counter_contract`) all still pass. Multi-node
       encrypted e2e still passes.
 
-- [ ] 226 — `⚠` **Plaintext RPC path: `AuthKeys::None` sig-skip
-      analog.** Surfaced while closing 206.
-      `crates/tx/src/validation.rs:140-149` — `validate_signature`
-      accepts any tx whose sender account has `AuthKeys::None`
-      without a FALCON check (comment: "System/contract accounts
-      — no signature check at this level"). `load_account` at
-      `crates/tx/src/pipeline.rs:148-158` returns a default EOA
-      with `AuthKeys::None` for any address not yet in state, so
-      an attacker can submit `send_raw_transaction` with
-      `from = victim_fresh_address` and no signature and clear
-      `validate_signature`. Balance-check gates fund-loss (fresh
-      account has 0 balance) but the mempool pollution surface is
-      still non-zero within M1/M3 caps. Fix: at RPC ingress on
-      production chain_id, require the sender account to exist
-      with a registered auth_key (OR take a narrow
-      faucet-allowlist path), mirroring the 206 policy. Keep the
-      internal contract-to-contract path unaffected.
+- [x] 226 — `✓` **Plaintext RPC path: `AuthKeys::None` sig-skip
+      analog.** Surfaced while closing 206. Shipped at two layers:
+      
+      1. **RPC ingress gate** (`crates/node/src/rpc.rs`
+         `ingress_validate`) — new `plaintext_tx_ingest_policy`
+         helper rejects txs with `sender.auth_keys == None` on any
+         chain_id != 31337. Returns clear `-32001` error with
+         "audit 226" tag. Devnet keeps the relaxed faucet/bootstrap
+         UX. Mirrors the 206 policy (`encrypted_tx_ingest_policy`).
+      
+      2. **Validation defense-in-depth**
+         (`crates/tx/src/validation.rs` `validate_transaction`) —
+         same gate added BEFORE the existing
+         `dev_skip_signature` / `sig_pre_verified` branch so any
+         caller (RPC ingress, block-execution pipeline,
+         `sig_pre_verified` fast path) sees the same enforcement.
+         Closes a malicious-block-builder bypass: a validator
+         could otherwise include a `from = victim_fresh_address`
+         tx with `fee_payer = Paymaster(...)` in their proposed
+         block, slipping past both the signature short-circuit
+         AND the balance gate.
+      
+      Tests: 3 unit tests on `plaintext_tx_ingest_policy` covering
+      Single / MultiSig / None across devnet and mainnet
+      chain_ids; 2 integration tests on `validate_transaction`
+      asserting AuthKeys::None rejects on production and accepts
+      on devnet. Multi-node encrypted e2e still passes.
 
 ---
 
@@ -663,3 +673,4 @@ Fold into the relevant fix PRs above when possible:
 | 228d| 2026-04-24  | Added `host_sloadb` + `host_sstoreb`; rerouted Sload/Sstore mode 1 in codegen; parity tests against interp's mode-1 handler | Fixed semantic + gas divergence on bulk-bytes storage |
 | 217 | 2026-04-24  | Searched every caller of `verify_witnesses`; only tests/benches. No production path verifies witnesses today | Not a bug; re-open if stateless validation wires into production |
 | 218 | 2026-04-24  | Wrapped BroadcastConsensus / BroadcastConsensusMany / maybe_rebroadcast_reshare in `is_validator` gates | Belt-and-suspenders egress guard added |
+| 226 | 2026-04-25  | New `plaintext_tx_ingest_policy` mirrors 206 + same gate added in `validate_transaction` for defense-in-depth at block-validation | Closed at both RPC ingress and validation layers |
