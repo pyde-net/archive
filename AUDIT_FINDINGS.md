@@ -498,10 +498,21 @@
         per slot, popped LIFO to restore each layer correctly. A
         state-equality test (process A → reorg to B → assert root
         bit-matches fresh-apply-B) proves end-to-end correctness.
-      - **232 (next): receive-path integration**. Buffer competing
-        blocks at slot ≤ head_slot, trigger reorg on QC-vs-local-
-        head mismatch, multi-node partition test that produces
-        actual divergent chain and asserts convergence after heal.
+      - **232 (this PR): receive-path integration**. Buffers
+        competing blocks at slot ≤ head_slot via new
+        `PostEventAction::BufferCompetingBlock`. On QC formation
+        (both gossip-vote and own-vote paths), detects mismatch
+        between QC's `block_hash` and local `chain.headers[slot]`
+        and triggers `BlockProcessor::reorg_to_block` via new
+        `PostEventAction::TryReorgToQc`. The TryReorgToQc handler
+        also re-runs the post-QC decrypt pipeline so audit-227
+        encrypted-tx flow keeps working when reorgs happen.
+        Bounded competing-block buffer (cap 64). 222 unit tests +
+        multi-node encrypted e2e pass. The standalone multi-node
+        partition test that produces a deterministic divergent
+        chain is deferred to **233** (HotStuff with 2/3 honest
+        makes natural divergence rare; needs Byzantine-injection
+        test infra that's its own scope).
       
       Tests in 231: 3 BlockProcessor reorg tests
       (`reorg_to_block_state_matches_fresh_apply` proving root
