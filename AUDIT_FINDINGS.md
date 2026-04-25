@@ -479,25 +479,37 @@
       makes the bug rare in practice (failures are liveness
       not safety) but it's a real prod-readiness gap.
       
-      Splitting into 2 PRs:
-      - **230 (this PR): mechanism**. `StateOverlay::into_writes_with_undo`
-        captures pre-block values; `StateManager::record_block_undo`
-        + `revert_to(slot)` collect + replay them; `ChainState::revert`
-        rolls header history back. Wired into BlockProcessor's
-        single-group AND multi-group paths so every block now
-        emits an undo log. Mechanism is in place but NOT yet
-        triggered — `#[allow(dead_code)]` on the revert APIs.
-        Bounded to 128 recent blocks (memory cap).
-      - **231 (next): integration**. Fork-choice rule + reorg
-        trigger in node.rs receive path + multi-node partition
-        test that produces an actual divergent chain and asserts
-        convergence after heal.
+      Splitting into 3 PRs (was 2; 232 split off because the
+      receive-path wire-up + multi-node partition test deserve
+      their own review surface):
+      - **230 (shipped): mechanism**. `StateOverlay::into_writes_with_undo`
+        + `StateManager::revert_to` + `ChainState::revert`.
+        Wired into BlockProcessor's single-group + multi-group
+        paths so every block emits an undo log. Bounded to 128
+        recent blocks. APIs `#[allow(dead_code)]`.
+      - **231 (this PR): reorg primitive**. Adds
+        `BlockProcessor::reorg_to_block(target)` that orchestrates
+        the revert + reapply + WS-checkpoint guard. Crucially,
+        also fixes a 230 gap: block-reward / subsidy / total_burned
+        writes happen AFTER the overlay commit, so 230's undo log
+        was missing them. 231 captures pre-write snapshots for the
+        4 post-overlay keys (proposer balance, rewards-per-validator,
+        total-supply, total-burned) and records a second undo log
+        per slot, popped LIFO to restore each layer correctly. A
+        state-equality test (process A → reorg to B → assert root
+        bit-matches fresh-apply-B) proves end-to-end correctness.
+      - **232 (next): receive-path integration**. Buffer competing
+        blocks at slot ≤ head_slot, trigger reorg on QC-vs-local-
+        head mismatch, multi-node partition test that produces
+        actual divergent chain and asserts convergence after heal.
       
-      Tests in 230: 4 ChainState revert tests (basic, no-op,
-      forward-rejected, pruned-error, genesis-clear), 4
-      StateManager revert tests (one-block undo, partial pop,
-      depth-limit-error, no-op-at-head). All 218 pyde-node
-      unit tests + multi-node encrypted e2e pass.
+      Tests in 231: 3 BlockProcessor reorg tests
+      (`reorg_to_block_state_matches_fresh_apply` proving root
+      equality across the post-overlay undo path,
+      `reorg_to_block_rejects_forward_target`,
+      `reorg_to_block_refuses_past_ws_checkpoint`).
+      All 222 pyde-node unit tests + multi-node encrypted e2e
+      pass.
 
 - [ ] 224 — **Block explorer / indexer (plan 083).**
       No code. Plan tracks; listed here for visibility alongside

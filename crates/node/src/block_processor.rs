@@ -32,6 +32,81 @@ impl BlockProcessor {
         Self::process_full_block_with_aot_and_checkpoint(chain, state, block, None, None)
     }
 
+    /// Reorg the chain to a competing block at slot N (audit 231).
+    ///
+    /// Reverts chain header history + state to slot N-1, then
+    /// applies `target` as the new block at slot N. The caller is
+    /// responsible for fork-choice: this function trusts that
+    /// `target` is the canonical block at its slot. Typical
+    /// trigger: a QC arrives for `target.hash()` while
+    /// `chain.head_slot == target.slot` and
+    /// `chain.headers[target.slot].hash() != target.hash()`.
+    ///
+    /// Errors propagate from the underlying revert APIs:
+    ///   - `target.slot > chain.head_slot` → caller bug
+    ///     (forward "reverts" must use `process_full_block_…`)
+    ///   - revert depth exceeded → undo log was pruned, fall back
+    ///     to snapshot restore at the operator level
+    ///   - block validation failure → state was already reverted;
+    ///     caller should re-attempt sync from peers
+    ///
+    /// On success, returns the same `(tx_count, gas_used, receipts)`
+    /// tuple as `process_full_block_with_aot_and_checkpoint`.
+    ///
+    /// `#[allow(dead_code)]` because the receive-path wire-up (the
+    /// place that actually triggers reorg from gossip events) lands
+    /// in audit 232. Tests in this module exercise the function
+    /// directly to prove the mechanism is correct in isolation.
+    #[allow(dead_code)]
+    pub fn reorg_to_block(
+        chain: &mut ChainState,
+        state: &mut StateManager,
+        target: &Block,
+        aot_cache: Option<&std::sync::Arc<crate::aot_cache::AotCache>>,
+        ws_checkpoint_slot: Option<u64>,
+    ) -> Result<(u64, u64, Vec<Receipt>), String> {
+        let target_slot = target.header.slot;
+        if target_slot > chain.head_slot {
+            return Err(format!(
+                "reorg_to_block: target slot {target_slot} > head {} (use process_full_block_… for forward)",
+                chain.head_slot
+            ));
+        }
+        let pre_slot = target_slot.saturating_sub(1);
+
+        // Refuse to reorg past a hard-finalized checkpoint — HotStuff
+        // safety promises this can never happen with 2/3 honest, but
+        // a misconfigured peer or evidence-injection attack should
+        // never let us cross the WS line.
+        if let Some(cp) = ws_checkpoint_slot {
+            if target_slot <= cp {
+                return Err(format!(
+                    "reorg_to_block: target slot {target_slot} ≤ ws checkpoint {cp} (refusing to reorg past hard finality)"
+                ));
+            }
+        }
+
+        // Revert state first so process_full_block sees the
+        // pre-target view. If state revert fails (e.g., undo log
+        // pruned), abort BEFORE touching the chain header history
+        // so the caller can fall back cleanly.
+        state
+            .revert_to(pre_slot)
+            .map_err(|e| format!("reorg state revert failed: {e}"))?;
+        chain
+            .revert(pre_slot)
+            .map_err(|e| format!("reorg chain revert failed: {e}"))?;
+
+        // Re-apply the target block as if it were a fresh receive.
+        Self::process_full_block_with_aot_and_checkpoint(
+            chain,
+            state,
+            target,
+            aot_cache,
+            ws_checkpoint_slot,
+        )
+    }
+
     /// Full-block processing with an explicit weak-subjectivity checkpoint
     /// slot (Phase 4 slice 4.3). Callers that have a live `FinalityTracker`
     /// should pass `tracker.latest_checkpoint.as_ref().map(|c| c.slot)` —
@@ -193,10 +268,14 @@ impl BlockProcessor {
                 }
             }
             // Deferred batch commit — buffer writes, Merkle computed lazily.
-            // Audit 230: collect per-block undo entries alongside the
-            // writes so a future `state.revert_to(slot - 1)` can
-            // reverse this block when consensus picks a different
-            // chain at the same slot.
+            // Audit 230/231: per-block undo accumulates across BOTH the
+            // overlay writes AND the post-overlay direct writes (block
+            // reward / subsidy / total-burned). Captured here for the
+            // overlay; the direct-write portion is appended below.
+            // A single `record_block_undo` at the end of this fn
+            // would also work, but we record now so that if the post-
+            // overlay code panics, we still have partial-revert
+            // capability for the tx-level changes.
             let (writes, undo) = overlay.into_writes_with_undo();
             if !writes.is_empty() {
                 let _ = state.update_batch_deferred(writes);
@@ -325,6 +404,37 @@ impl BlockProcessor {
             state.record_block_undo(slot, undo);
         }
 
+        // Audit 231: snapshot pre-write values for every key the
+        // post-overlay direct writes (block reward / subsidy /
+        // total_burned) may modify. We don't know in advance whether
+        // each conditional branch will fire, so we snapshot ALL
+        // potentially-affected keys up front and let revert harmlessly
+        // restore "same value" entries for branches that didn't fire.
+        // The set is small (4 keys per block), so the overhead is
+        // negligible compared to the safety it gives the reorg path.
+        let proposer_balance_key = pyde_state::keys::balance_key(&block.header.proposer);
+        let rpv_key = pyde_state::keys::rewards_per_validator_key();
+        let supply_key = pyde_state::keys::supply_key();
+        let total_burned_key = pyde_state::keys::total_burned_key();
+        let post_overlay_undo = vec![
+            pyde_state::smt::UndoEntry {
+                key: proposer_balance_key,
+                old_value: state.get(&proposer_balance_key),
+            },
+            pyde_state::smt::UndoEntry {
+                key: rpv_key,
+                old_value: state.get(&rpv_key),
+            },
+            pyde_state::smt::UndoEntry {
+                key: supply_key,
+                old_value: state.get(&supply_key),
+            },
+            pyde_state::smt::UndoEntry {
+                key: total_burned_key,
+                old_value: state.get(&total_burned_key),
+            },
+        ];
+
         // 4. Block reward: mint + split between service + pool shares (Phase 4 slice 4.1).
         //
         //   - Total mint comes from the inflation schedule for `slot`.
@@ -425,6 +535,16 @@ impl BlockProcessor {
             let current_burned = pyde_tx::pipeline::read_total_burned(state);
             pyde_tx::pipeline::write_total_burned(state, current_burned.saturating_add(block_burn));
         }
+
+        // Audit 231: append the post-overlay undo snapshot. Recording
+        // it as a second log entry for `slot` (rather than merging
+        // with the overlay undo) means revert_to pops them in LIFO
+        // order — direct-write restores apply first, then overlay
+        // restores. This is the correct order: overlay reads at
+        // record time saw pre-block values, and the block-reward
+        // reads saw post-overlay values, so unwinding back-to-front
+        // restores each layer to its own "before" state.
+        state.record_block_undo(slot, post_overlay_undo);
 
         // 5. Merkle commit is handled by the CALLER (node event loop).
         // Block execution wrote to write_cache via update_batch_deferred.
@@ -1562,5 +1682,116 @@ mod tests {
         );
 
         assert!(matches!(outcome, DecryptOutcome::HeaderMissing));
+    }
+
+    // ========== Audit 231: reorg primitive ==========
+
+    fn empty_block_with_header(header: BlockHeader) -> Block {
+        Block {
+            header,
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![],
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
+            },
+            proposer_signature: vec![],
+        }
+    }
+
+    #[test]
+    fn reorg_to_block_state_matches_fresh_apply() {
+        // Audit 231 — the reorg primitive must produce state
+        // bit-identical to "process target block alone from
+        // baseline." Verifies that revert + reapply correctly
+        // restores ALL state-modifying paths in process_full_block,
+        // including the post-overlay direct writes (block reward,
+        // subsidy, total_burned).
+        //
+        // Two competing blocks at slot 1 with DIFFERENT proposers.
+        // Different proposers ⇒ different post-overlay state
+        // changes (service_share targets / supply increments tied
+        // to proposer existence). If the post-overlay undo
+        // capture (audit 231) is buggy, the reorg state will
+        // diverge from the fresh-apply state and the assert fires.
+        let mut header_a = dummy_header(1);
+        header_a.proposer = [0xAA; 32];
+        let block_a = empty_block_with_header(header_a);
+
+        let mut header_b = dummy_header(1);
+        header_b.proposer = [0xBB; 32];
+        let block_b = empty_block_with_header(header_b);
+
+        // 1. Independently compute "state if we processed B alone
+        //    from genesis" — this is our reference.
+        let expected_root = {
+            let tmp2 = tempfile::tempdir().unwrap();
+            let mut s = StateManager::open(tmp2.path(), 1024).unwrap();
+            let mut c = ChainState::genesis(s.root(), 31337);
+            BlockProcessor::process_full_block(&mut c, &mut s, &block_b).unwrap();
+            s.flush_pending().unwrap()
+        };
+
+        // 2. Process A on the test chain.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let mut chain = ChainState::genesis(state.root(), 31337);
+        BlockProcessor::process_full_block(&mut chain, &mut state, &block_a).unwrap();
+        state.flush_pending().unwrap();
+        assert_eq!(chain.head_slot, 1);
+
+        // 3. Reorg to B.
+        BlockProcessor::reorg_to_block(&mut chain, &mut state, &block_b, None, None).unwrap();
+        state.flush_pending().unwrap();
+        assert_eq!(chain.head_slot, 1, "head slot remains at 1 after reorg");
+
+        // 4. Assert: reorg state == fresh-B state.
+        assert_eq!(
+            state.root(),
+            expected_root,
+            "reorg state root must match fresh-apply-B root \
+             (post-overlay undo coverage check)"
+        );
+    }
+
+    #[test]
+    fn reorg_to_block_rejects_forward_target() {
+        // Forward "reorgs" are caller bugs — must error explicitly
+        // rather than silently corrupt state.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let mut chain = ChainState::genesis(state.root(), 31337);
+        chain.advance(dummy_header(1));
+
+        let block = empty_block_with_header(dummy_header(5));
+        let err =
+            BlockProcessor::reorg_to_block(&mut chain, &mut state, &block, None, None).unwrap_err();
+        assert!(err.contains("> head"));
+    }
+
+    #[test]
+    fn reorg_to_block_refuses_past_ws_checkpoint() {
+        // HotStuff finality says we never reorg past the latest
+        // hard-finality checkpoint. The reorg primitive must enforce
+        // this even if a buggy caller asks to reorg deeper.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let mut chain = ChainState::genesis(state.root(), 31337);
+
+        // Build chain to slot 5 so head is past the would-be checkpoint.
+        for slot in 1..=5 {
+            let block = empty_block_with_header(dummy_header(slot));
+            BlockProcessor::process_full_block(&mut chain, &mut state, &block).unwrap();
+            state.flush_pending().unwrap();
+        }
+
+        // Attempt to reorg to slot 3 with WS checkpoint at slot 4.
+        let block_at_3 = empty_block_with_header(dummy_header(3));
+        let err =
+            BlockProcessor::reorg_to_block(&mut chain, &mut state, &block_at_3, None, Some(4))
+                .unwrap_err();
+        assert!(err.contains("hard finality"));
     }
 }
