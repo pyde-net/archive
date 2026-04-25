@@ -452,10 +452,33 @@
       refusal when `chain_id == 1` and no bootstrap peers
       configured.
 
-- [ ] 220 — **Fast-sync / snapshot wiring.**
-      `crates/state/src/state_manager.rs:220-253` has
-      `export_snapshot` / `import_snapshot` but `crates/node/src/
-      sync.rs` never calls them. Cold-sync works; no fast-sync.
+- [x] 220 — `✓` **Fast-sync / snapshot wiring.** Investigation
+      found that snapshot endpoints (`request_state_snapshot`,
+      chunked `import_snapshot`) WERE already implemented in
+      `crates/node/src/sync.rs` and the response handler — what
+      was missing was the **auto-trigger**: nothing called
+      `request_state_snapshot` from production code, so a fresh
+      node always cold-synced block-by-block (impractical past
+      ~1000 slots).
+      
+      Shipped: `request_next_batch` now checks
+      `should_use_snapshot_sync()` first. Snapshot mode is
+      preferred when:
+      - initial sync isn't done yet (post-initial-sync nodes
+        keep using gossip + small block-batch catch-up to avoid
+        bouncing back into snapshot mode)
+      - no snapshot is already in flight
+      - `slots_behind > SNAPSHOT_THRESHOLD` (1000 slots,
+        ~6.7 minutes at 400 ms/slot)
+      
+      Predicate extracted as a separate fn for unit testability
+      (the swarm-mocking required to hit `request_state_snapshot`
+      directly is heavy). 4 new tests cover the trigger branches:
+      far-behind triggers, close-enough doesn't, post-initial
+      doesn't, in-flight doesn't double-request. Removed two
+      `#[allow(dead_code)]` annotations (`SNAPSHOT_THRESHOLD`
+      and `request_state_snapshot`) now that they're live. 231
+      pyde-node unit tests + multi-node encrypted e2e pass.
 
 - [x] 221 — `✓` **Operator keystore (encrypted-at-rest validator
       key).** Shipped: new `crates/node/src/keystore.rs` provides
