@@ -3567,6 +3567,7 @@ dependencies = [
 name = "pyde-consensus"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "pyde-account",
  "pyde-crypto",
  "pyde-slashing",
