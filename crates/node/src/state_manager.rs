@@ -568,40 +568,32 @@ mod tests {
         // Helper: simulate one "block" by capturing pre-block values,
         // applying writes, flushing to SMT, recording undo. Returns
         // the post-block root.
-        let apply_block = |s: &mut StateManager,
-                               slot: u64,
-                               writes: Vec<(Key, Vec<u8>)>|
-         -> [u8; 32] {
-            let undo: Vec<UndoEntry> = writes
-                .iter()
-                .map(|(k, _)| UndoEntry {
-                    key: *k,
-                    old_value: s.get(k),
-                })
-                .collect();
-            s.update_batch_deferred(writes).unwrap();
-            let root = s.flush_pending().unwrap();
-            s.record_block_undo(slot, undo);
-            root
-        };
+        let apply_block =
+            |s: &mut StateManager, slot: u64, writes: Vec<(Key, Vec<u8>)>| -> [u8; 32] {
+                let undo: Vec<UndoEntry> = writes
+                    .iter()
+                    .map(|(k, _)| UndoEntry {
+                        key: *k,
+                        old_value: s.get(k),
+                    })
+                    .collect();
+                s.update_batch_deferred(writes).unwrap();
+                let root = s.flush_pending().unwrap();
+                s.record_block_undo(slot, undo);
+                root
+            };
 
         // Block 1: set key_a, key_b
         let _r1 = apply_block(
             &mut state,
             1,
-            vec![
-                (k(0xA1), b"a-v1".to_vec()),
-                (k(0xB2), b"b-v1".to_vec()),
-            ],
+            vec![(k(0xA1), b"a-v1".to_vec()), (k(0xB2), b"b-v1".to_vec())],
         );
         // Block 2: change key_a, set key_c
         let r2_snapshot = apply_block(
             &mut state,
             2,
-            vec![
-                (k(0xA1), b"a-v2".to_vec()),
-                (k(0xC3), b"c-v1".to_vec()),
-            ],
+            vec![(k(0xA1), b"a-v2".to_vec()), (k(0xC3), b"c-v1".to_vec())],
         );
         // Block 3: change key_b, delete key_c (empty value), add key_d
         let _r3 = apply_block(
