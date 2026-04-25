@@ -506,6 +506,13 @@ fn execute_transaction_inner(
                 ),
             }
         }
+        TransactionType::RegisterPubkey => {
+            // Audit 229: validate_register_pubkey already enforced
+            // tx.from == Poseidon2(tx.data), sender.balance > 0, and
+            // sender.auth_keys == None. Just commit the registration.
+            sender.auth_keys = pyde_account::types::AuthKeys::Single(tx.data.clone());
+            (true, 0u64, 0u64, Vec::new(), Vec::new())
+        }
         TransactionType::Slash => execute_slash(tx, smt, &mut sender.balance),
         TransactionType::ClaimAirdrop => {
             execute_claim_airdrop(tx, smt, block_ctx, &mut sender.balance)
