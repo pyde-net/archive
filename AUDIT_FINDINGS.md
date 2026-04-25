@@ -468,10 +468,36 @@
       not instrumented. Grafana dashboards under `docker/grafana/`
       are minimal.
 
-- [ ] 223 — **Reorg handling.**
-      No explicit state-rollback / chain-tip-reversal code path
-      found. Document current reorg semantics; add explicit path
-      if gaps exist.
+- [~] 223 — `✓` **Reorg handling.** Investigation found
+      structural gaps: state is committed eagerly on block
+      receive (not after QC), `chain.head_slot` is monotonic
+      (no rollback), `VersionedState` exists in
+      `crates/state/src/versioning.rs` but is unwired, and
+      sync rejects any block at `slot ≤ head_slot` so a node
+      that committed the wrong block at slot N can never
+      recover via gossip. HotStuff + multi-proposer VRF
+      makes the bug rare in practice (failures are liveness
+      not safety) but it's a real prod-readiness gap.
+      
+      Splitting into 2 PRs:
+      - **230 (this PR): mechanism**. `StateOverlay::into_writes_with_undo`
+        captures pre-block values; `StateManager::record_block_undo`
+        + `revert_to(slot)` collect + replay them; `ChainState::revert`
+        rolls header history back. Wired into BlockProcessor's
+        single-group AND multi-group paths so every block now
+        emits an undo log. Mechanism is in place but NOT yet
+        triggered — `#[allow(dead_code)]` on the revert APIs.
+        Bounded to 128 recent blocks (memory cap).
+      - **231 (next): integration**. Fork-choice rule + reorg
+        trigger in node.rs receive path + multi-node partition
+        test that produces an actual divergent chain and asserts
+        convergence after heal.
+      
+      Tests in 230: 4 ChainState revert tests (basic, no-op,
+      forward-rejected, pruned-error, genesis-clear), 4
+      StateManager revert tests (one-block undo, partial pop,
+      depth-limit-error, no-op-at-head). All 218 pyde-node
+      unit tests + multi-node encrypted e2e pass.
 
 - [ ] 224 — **Block explorer / indexer (plan 083).**
       No code. Plan tracks; listed here for visibility alongside

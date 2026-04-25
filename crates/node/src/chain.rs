@@ -77,6 +77,79 @@ impl ChainState {
     pub fn is_genesis(&self) -> bool {
         self.head_slot == 0 && self.headers.is_empty()
     }
+
+    /// Revert the chain head back to `target_slot` (audit 230).
+    ///
+    /// Drops every header at slot > target_slot from the in-memory
+    /// header map, sets `head_slot = target_slot`, and restores
+    /// `state_root` to the target slot's stored header.
+    ///
+    /// Caller is responsible for matching state-side rollback via
+    /// `StateManager::revert_to(target_slot)` — these two together
+    /// form the complete reorg rollback (chain metadata + state).
+    /// They are intentionally separate so each subsystem can be
+    /// tested in isolation; `BlockProcessor` and the receive-path
+    /// fork-choice (audit 231) call them in sequence.
+    ///
+    /// Returns the number of headers dropped, or `Err(...)` if
+    /// `target_slot > head_slot` (caller bug — only backwards
+    /// reverts are valid) or if the target's header is not in
+    /// memory (header pruned beyond the 2-epoch window).
+    ///
+    /// Audit 230 ships the mechanism; call site lights up in
+    /// 231 — `#[allow(dead_code)]` covers the gap.
+    #[allow(dead_code)]
+    pub fn revert(&mut self, target_slot: u64) -> Result<usize, String> {
+        if target_slot > self.head_slot {
+            return Err(format!(
+                "ChainState::revert: target {target_slot} > head {} (only backwards reverts valid)",
+                self.head_slot
+            ));
+        }
+        if target_slot == self.head_slot {
+            return Ok(0);
+        }
+        // Genesis case: target_slot == 0 with no header for slot 0
+        // means revert all headers and reset to genesis state.
+        // Otherwise target's header must still be in memory.
+        let target_header = if target_slot == 0 {
+            None
+        } else {
+            match self.headers.get(&target_slot) {
+                Some(h) => Some(h.clone()),
+                None => {
+                    return Err(format!(
+                        "ChainState::revert: target slot {target_slot} header not in memory \
+                         (likely pruned beyond 2-epoch window — fall back to snapshot restore)"
+                    ));
+                }
+            }
+        };
+
+        let mut dropped = 0usize;
+        let to_drop: Vec<u64> = self
+            .headers
+            .keys()
+            .copied()
+            .filter(|s| *s > target_slot)
+            .collect();
+        for slot in to_drop {
+            if let Some(header) = self.headers.remove(&slot) {
+                self.hash_to_slot.remove(&header.hash());
+                dropped += 1;
+            }
+        }
+
+        self.head_slot = target_slot;
+        self.epoch = target_slot / EPOCH_LENGTH;
+        self.state_root = match target_header {
+            Some(h) => h.state_root,
+            None => [0u8; 32], // genesis state root
+        };
+
+        debug!(target_slot, dropped, "chain head reverted to target slot");
+        Ok(dropped)
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +211,80 @@ mod tests {
         assert!(chain.header(999).is_none()); // epoch 0, pruned
         assert!(chain.header(1000).is_some()); // epoch 1, kept
         assert!(chain.header(2500).is_some()); // epoch 2, kept
+    }
+
+    #[test]
+    fn revert_drops_headers_above_target() {
+        // Audit 230 — basic revert correctness.
+        let mut chain = ChainState::genesis([0; 32], 1);
+        // Build a chain of 5 headers.
+        let mut parent = [0u8; 32];
+        for slot in 1..=5 {
+            let header = dummy_header(slot, parent);
+            parent = header.hash();
+            chain.advance(header);
+        }
+        assert_eq!(chain.head_slot, 5);
+
+        // Revert to slot 3.
+        let dropped = chain.revert(3).unwrap();
+        assert_eq!(dropped, 2, "should drop slots 4 and 5");
+        assert_eq!(chain.head_slot, 3);
+        assert_eq!(chain.state_root, [3u8; 32]);
+        assert!(chain.header(4).is_none());
+        assert!(chain.header(5).is_none());
+        assert!(chain.header(3).is_some()); // target preserved
+    }
+
+    #[test]
+    fn revert_to_same_slot_is_noop() {
+        let mut chain = ChainState::genesis([0; 32], 1);
+        chain.advance(dummy_header(1, [0; 32]));
+        let dropped = chain.revert(1).unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(chain.head_slot, 1);
+    }
+
+    #[test]
+    fn revert_forward_rejected() {
+        // Forward "reverts" are caller bugs — must error explicitly.
+        let mut chain = ChainState::genesis([0; 32], 1);
+        chain.advance(dummy_header(1, [0; 32]));
+        let err = chain.revert(5).unwrap_err();
+        assert!(err.contains("only backwards reverts"));
+    }
+
+    #[test]
+    fn revert_to_pruned_target_errors() {
+        // If the target's header has been pruned beyond the 2-epoch
+        // window, revert must refuse rather than corrupt state.
+        // EPOCH_LENGTH = 1000, so building to slot 2500 prunes
+        // anything before slot 1000.
+        let mut chain = ChainState::genesis([0; 32], 1);
+        let mut parent = [0u8; 32];
+        for slot in 1..=2500 {
+            let header = dummy_header(slot, parent);
+            parent = header.hash();
+            chain.advance(header);
+        }
+        // Attempt to revert to slot 1 (pruned).
+        let err = chain.revert(1).unwrap_err();
+        assert!(err.contains("not in memory"));
+    }
+
+    #[test]
+    fn revert_to_genesis_clears_all() {
+        let mut chain = ChainState::genesis([0; 32], 1);
+        let mut parent = [0u8; 32];
+        for slot in 1..=3 {
+            let header = dummy_header(slot, parent);
+            parent = header.hash();
+            chain.advance(header);
+        }
+        let dropped = chain.revert(0).unwrap();
+        assert_eq!(dropped, 3);
+        assert_eq!(chain.head_slot, 0);
+        assert!(chain.is_genesis());
     }
 
     #[test]

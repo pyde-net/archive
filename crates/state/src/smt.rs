@@ -202,6 +202,17 @@ pub struct StateOverlay<'a> {
     writes: std::collections::HashMap<Key, Vec<u8>>,
 }
 
+/// One pre-block undo entry: the value of `key` BEFORE the block
+/// modified it. Used by `StateManager::revert_to` (audit 230) to
+/// reverse a committed block when consensus picks a different
+/// chain at the same slot.
+#[derive(Clone, Debug)]
+pub struct UndoEntry {
+    pub key: Key,
+    /// Pre-block value. `None` ⇒ key didn't exist before the block.
+    pub old_value: Option<Vec<u8>>,
+}
+
 impl<'a> StateOverlay<'a> {
     pub fn new(base: &'a dyn StateAccess) -> Self {
         Self {
@@ -213,6 +224,30 @@ impl<'a> StateOverlay<'a> {
     /// Collect all writes (for merging into the main SMT after parallel execution).
     pub fn into_writes(self) -> Vec<(Key, Vec<u8>)> {
         self.writes.into_iter().collect()
+    }
+
+    /// Like `into_writes` but ALSO returns one `UndoEntry` per write
+    /// — the value the key held in `base` BEFORE the overlay was
+    /// applied (audit 230). Reading old values requires the overlay
+    /// to be intact, so this method must run before `into_writes`
+    /// consumes `self`.
+    ///
+    /// `base` is the StateManager-or-SMT view at block-start; the
+    /// overlay's own writes are not yet in `base` (the overlay
+    /// commits in batch after execution finishes). Therefore
+    /// `base.get(key)` returns the pre-block value, which is the
+    /// correct undo target.
+    pub fn into_writes_with_undo(self) -> (Vec<(Key, Vec<u8>)>, Vec<UndoEntry>) {
+        let undo: Vec<UndoEntry> = self
+            .writes
+            .keys()
+            .map(|k| UndoEntry {
+                key: *k,
+                old_value: self.base.get(k),
+            })
+            .collect();
+        let writes: Vec<(Key, Vec<u8>)> = self.writes.into_iter().collect();
+        (writes, undo)
     }
 
     /// Number of write operations captured.

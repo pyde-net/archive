@@ -192,11 +192,16 @@ impl BlockProcessor {
                     }
                 }
             }
-            // Deferred batch commit — buffer writes, Merkle computed lazily
-            let writes = overlay.into_writes();
+            // Deferred batch commit — buffer writes, Merkle computed lazily.
+            // Audit 230: collect per-block undo entries alongside the
+            // writes so a future `state.revert_to(slot - 1)` can
+            // reverse this block when consensus picks a different
+            // chain at the same slot.
+            let (writes, undo) = overlay.into_writes_with_undo();
             if !writes.is_empty() {
                 let _ = state.update_batch_deferred(writes);
             }
+            state.record_block_undo(slot, undo);
         } else {
             // Multiple groups — TRUE PARALLEL EXECUTION via rayon + StateOverlay.
             // Each group gets a StateOverlay (reads from shared SMT, writes to local HashMap).
@@ -208,10 +213,16 @@ impl BlockProcessor {
             // Use StateManager as overlay base (reads from cache → SMT)
             let base: &dyn pyde_state::smt::StateAccess = state;
 
-            // Execute each group in parallel
-            let group_results: Vec<
+            // Execute each group in parallel.
+            // Audit 230: each group also returns its undo entries so
+            // the per-block undo log can be aggregated and recorded
+            // for `revert_to` (the multi-group path needs the same
+            // undo-collection coverage as the single-group path).
+            type GroupResults = (
                 Vec<(usize, Receipt, Vec<(sparse_merkle_tree::H256, Vec<u8>)>)>,
-            > = groups
+                Vec<pyde_state::smt::UndoEntry>,
+            );
+            let group_results: Vec<GroupResults> = groups
                 .par_iter()
                 .map(|group| {
                     let mut overlay = StateOverlay::new(base);
@@ -256,25 +267,38 @@ impl BlockProcessor {
                         }
                     }
 
-                    // Collect overlay writes
-                    let writes = overlay.into_writes();
+                    // Collect overlay writes + per-group undo (audit 230).
+                    let (writes, undo) = overlay.into_writes_with_undo();
                     // Attach writes to last result for merging
                     if let Some(last) = results.last_mut() {
                         last.2 = writes;
                     }
-                    results
+                    (results, undo)
                 })
                 .collect();
 
-            // Merge: collect all receipts (sorted by tx index) and all writes
+            // Merge: collect all receipts (sorted by tx index), all writes,
+            // and per-group undo entries (deduped — parallel groups touch
+            // disjoint keys by scheduler invariant, but defensive dedupe
+            // by key keeps things consistent if that invariant ever drifts).
             let mut all_results: Vec<(usize, Receipt)> = Vec::new();
             let mut all_writes: Vec<(sparse_merkle_tree::H256, Vec<u8>)> = Vec::new();
+            let mut undo_by_key: std::collections::HashMap<
+                pyde_state::smt::Key,
+                pyde_state::smt::UndoEntry,
+            > = std::collections::HashMap::new();
 
-            for group_result in group_results {
-                for (tx_idx, receipt, writes) in group_result {
+            for (per_tx_results, group_undo) in group_results {
+                for (tx_idx, receipt, writes) in per_tx_results {
                     total_gas += receipt.effective_gas;
                     all_results.push((tx_idx, receipt));
                     all_writes.extend(writes);
+                }
+                for entry in group_undo {
+                    // All groups read pre-block values from the same `base`,
+                    // so any duplicate-key entry has identical `old_value`.
+                    // First-write-wins is fine.
+                    undo_by_key.entry(entry.key).or_insert(entry);
                 }
             }
 
@@ -295,6 +319,10 @@ impl BlockProcessor {
                     groups.len()
                 );
             }
+
+            // Audit 230: record per-block undo log for reorg support.
+            let undo: Vec<pyde_state::smt::UndoEntry> = undo_by_key.into_values().collect();
+            state.record_block_undo(slot, undo);
         }
 
         // 4. Block reward: mint + split between service + pool shares (Phase 4 slice 4.1).
