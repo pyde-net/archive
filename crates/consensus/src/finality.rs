@@ -254,7 +254,32 @@ impl FinalityTracker {
     }
 
     /// Record hard finality and create a checkpoint.
+    ///
+    /// `latest_checkpoint` only advances when `cert.slot` is strictly
+    /// greater than the existing checkpoint slot — an out-of-order
+    /// older cert must NOT regress the checkpoint (else
+    /// `can_reorg` would re-open already-finalized blocks). The
+    /// pending status for the cert's (slot, block_hash) is still
+    /// promoted to Hard regardless of slot ordering, since a late
+    /// cert is still useful to confirm individual blocks.
     pub fn record_hard_finality(&mut self, cert: HardFinalityCert) {
+        // Pending promotion is unconditional — even a late-arriving
+        // cert is authoritative for its specific (slot, block_hash).
+        for status in &mut self.pending {
+            if status.slot == cert.slot && status.block_hash == cert.block_hash {
+                status.level = FinalityLevel::Hard;
+                status.hard_cert = Some(cert.clone());
+            }
+        }
+
+        let advances = match &self.latest_checkpoint {
+            Some(cp) => cert.slot > cp.slot,
+            None => true,
+        };
+        if !advances {
+            return;
+        }
+
         if cert.slot > self.highest_hard_slot {
             self.highest_hard_slot = cert.slot;
         }
@@ -264,19 +289,10 @@ impl FinalityTracker {
             state_root: cert.state_root,
             cert,
         };
-
-        // Update pending status
-        for status in &mut self.pending {
-            if status.slot == checkpoint.slot && status.block_hash == checkpoint.block_hash {
-                status.level = FinalityLevel::Hard;
-                status.hard_cert = Some(checkpoint.cert.clone());
-            }
-        }
-
         let checkpoint_slot = checkpoint.slot;
         self.latest_checkpoint = Some(checkpoint);
 
-        // Prune pending entries at or before the checkpoint
+        // Prune pending entries at or before the new checkpoint.
         self.pending.retain(|s| s.slot > checkpoint_slot);
     }
 
