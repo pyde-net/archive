@@ -13,6 +13,7 @@
 //! to reject impersonators faster (defense-in-depth, not a security fix).
 
 pub mod auth;
+pub mod blocks_protocol;
 pub mod channels;
 pub mod config;
 pub mod consensus_protocol;

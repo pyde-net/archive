@@ -49,10 +49,23 @@ pub enum ConsensusResp {
 }
 
 /// Create the request-response behaviour for consensus messages.
+///
+/// Audit 234 part 4 step 7: timeout lowered from the 10s default to
+/// 1500ms so OutboundFailure fires fast on stale connections. Under
+/// post-restart QUIC keepalive lag, `connected_peers()` reports peers
+/// whose substreams can't actually carry a request — the default 10s
+/// timeout meant several consensus rounds elapsed before failure was
+/// detected. With 1.5s we surface the failure within one slot
+/// (400ms slot × ~4 slots), the connection-cleanup handler in node.rs
+/// drops the stale connection, and the next dial reconnects fresh
+/// (gossipsub re-sends SUBSCRIBE only on first connection — dropping
+/// the stale connection is what makes the redial count as "first").
 pub fn consensus_behaviour() -> request_response::cbor::Behaviour<ConsensusReq, ConsensusResp> {
+    let cfg = request_response::Config::default()
+        .with_request_timeout(std::time::Duration::from_millis(1500));
     request_response::cbor::Behaviour::new(
         [(CONSENSUS_PROTOCOL, request_response::ProtocolSupport::Full)],
-        request_response::Config::default(),
+        cfg,
     )
 }
 

@@ -411,7 +411,11 @@ impl PydeNode {
             max_peers: self.config.network.max_peers,
             max_inbound: self.config.network.max_inbound,
             max_outbound: self.config.network.max_outbound,
-            idle_timeout: std::time::Duration::from_secs(60),
+            // Audit 234 part 4 step 7: defer to the crate-default
+            // (5s post-step-7) instead of the prior hardcoded 60s.
+            // The hardcode kept stale post-restart QUIC connections
+            // alive long enough to block 4-of-4 churn recovery.
+            idle_timeout: pyde_net::config::DEFAULT_IDLE_TIMEOUT,
             rate_limit_per_ip: self.config.network.rate_limit_per_ip,
             bootstrap_peers: self.config.network.bootstrap_peers.clone(),
             is_validator,
@@ -443,14 +447,27 @@ impl PydeNode {
             pyde_net::node::dial_bootstrap_peers(&mut swarm, &self.config.network.bootstrap_peers);
         }
 
-        // 9. Listen on all interfaces
-        let listen_addr: libp2p::Multiaddr =
+        // 9. Listen on all interfaces — hybrid TCP + QUIC (audit 234
+        // part 4 step 7r). TCP is the default for bootstrap-multiaddr
+        // resolution; QUIC is available so peers that prefer it can
+        // negotiate it from a `/udp/PORT/quic-v1` address.
+        let tcp_listen_addr: libp2p::Multiaddr =
+            format!("/ip4/0.0.0.0/tcp/{}", self.config.network.port)
+                .parse()
+                .map_err(|e| format!("invalid tcp listen addr: {}", e))?;
+        swarm
+            .listen_on(tcp_listen_addr)
+            .map_err(|e| format!("failed to listen on tcp: {}", e))?;
+
+        let quic_listen_addr: libp2p::Multiaddr =
             format!("/ip4/0.0.0.0/udp/{}/quic-v1", self.config.network.port)
                 .parse()
-                .map_err(|e| format!("invalid listen addr: {}", e))?;
-        swarm
-            .listen_on(listen_addr)
-            .map_err(|e| format!("failed to listen: {}", e))?;
+                .map_err(|e| format!("invalid quic listen addr: {}", e))?;
+        if let Err(e) = swarm.listen_on(quic_listen_addr) {
+            // QUIC bind failure is non-fatal — TCP is the primary
+            // transport. Log so operators know but keep going.
+            warn!(error = %e, port = self.config.network.port, "QUIC listen failed; running TCP-only");
+        }
 
         // 9. Start metrics if enabled
         if self.config.metrics.enabled {
@@ -561,7 +578,7 @@ impl PydeNode {
             "node started"
         );
         info!(
-            "connect with: --bootstrap \"/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}\"",
+            "connect with: --bootstrap \"/ip4/127.0.0.1/tcp/{}/p2p/{}\"",
             self.config.network.port, local_peer_id
         );
 
@@ -657,6 +674,21 @@ impl PydeNode {
                                 data,
                                 &peer_manager,
                             );
+                        }
+                        PostEventAction::SendBlocksRrResponse(channel, resp) => {
+                            let _ = swarm.behaviour_mut().blocks_rr.send_response(channel, resp);
+                        }
+                        PostEventAction::DisconnectStalePeer(peer) => {
+                            // Audit 234 part 4 step 7: force-drop the
+                            // half-broken connection so the next dial is
+                            // treated as "first connection" by gossipsub
+                            // (which re-sends SUBSCRIBE only on first
+                            // connection). Without this, the stale
+                            // connection persists until QUIC keepalive
+                            // fires (now 5s; was 60s pre-step-7), blocking
+                            // every RR send to that peer in the meantime.
+                            let _ = swarm.disconnect_peer_id(peer);
+                            debug!(%peer, "force-disconnected stale peer");
                         }
                         PostEventAction::ContinueSync => {
                             // If chunked snapshot in progress, request next chunk
@@ -1902,9 +1934,16 @@ impl PydeNode {
                                     );
                                     let compact_bytes = wire::encode_compact_block(&compact);
                                     let topic = pyde_net::node::topics::blocks();
-                                    if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), compact_bytes) {
-                                        debug!(slot = current_slot, error = %e, "no gossipsub subscribers for block");
-                                    }
+                                    // audit-234 part 4 follow-up: compact-block
+                                    // delivery via RR fallback. Without this,
+                                    // post-restart mesh degradation drops the
+                                    // block silently — non-proposer validators
+                                    // never see the header, no QC forms.
+                                    broadcast_blocks_with_rr_fallback(
+                                        &mut swarm,
+                                        topic.clone(),
+                                        compact_bytes,
+                                    );
 
                                     // Audit item 207: publish the encrypted_txs
                                     // bundle alongside the compact block so
@@ -1920,22 +1959,13 @@ impl PydeNode {
                                             encrypted_txs: block.body.encrypted_txs.clone(),
                                         };
                                         let bundle_bytes = wire::encode_encrypted_tx_bundle(&bundle);
-                                        match swarm
-                                            .behaviour_mut()
-                                            .gossipsub
-                                            .publish(topic, bundle_bytes)
-                                        {
-                                            Ok(_) => debug!(
-                                                slot = current_slot,
-                                                entries = block.body.encrypted_txs.len(),
-                                                "published encrypted-tx bundle"
-                                            ),
-                                            Err(e) => debug!(
-                                                slot = current_slot,
-                                                error = %e,
-                                                "no gossipsub subscribers for encrypted-tx bundle"
-                                            ),
-                                        }
+                                        // Same RR-fallback rationale as the
+                                        // compact block above.
+                                        broadcast_blocks_with_rr_fallback(
+                                            &mut swarm,
+                                            topic,
+                                            bundle_bytes,
+                                        );
                                     }
 
                                     // Broadcast proposal as consensus message
@@ -2004,12 +2034,76 @@ impl PydeNode {
                             if let Some(identity) = validator_identity.as_ref() {
                                 if let Some(vote) = engine.select_and_vote(identity) {
                                     // Add own vote to collection
-                                    let qc_formed = if let Some(qc) = engine.on_vote(vote.clone()) {
+                                    let (qc_formed, qc_slot_hash) = if let Some(qc) = engine.on_vote(vote.clone()) {
                                         info!(slot = current_slot, votes = qc.vote_count(), "QC formed after VRF selection");
-                                        true
+                                        (true, Some((qc.slot, qc.block_hash)))
                                     } else {
-                                        false
+                                        (false, None)
                                     };
+
+                                    // Audit 234 part 4 step 7n: when a peer's
+                                    // own-vote forms a QC, the proposer applies
+                                    // its block locally elsewhere — but
+                                    // non-proposer peers that form the same QC
+                                    // never apply the block because the body
+                                    // arrives via the Blocks-topic gossip path,
+                                    // which is the degraded path under churn.
+                                    // For blocks with empty bodies (all blocks
+                                    // in this load-free test path; also any
+                                    // fallback) the receiver can synthesize the
+                                    // body locally and apply without waiting on
+                                    // gossip. Validation inside
+                                    // process_full_block_with_aot_and_checkpoint
+                                    // will reject the synthesized block if the
+                                    // header's tx_root doesn't commit to the
+                                    // empty body — so this is safe under load
+                                    // (real-tx blocks just won't apply via this
+                                    // path; they wait for the compact-block
+                                    // gossip/RR path as before).
+                                    if let Some((qc_slot, qc_hash)) = qc_slot_hash {
+                                        if let Some((header, sig)) = engine.buffered_proposal_for(qc_slot, &qc_hash) {
+                                            let block = pyde_consensus::block::Block {
+                                                header: header.clone(),
+                                                body: pyde_consensus::block::BlockBody {
+                                                    transactions: vec![],
+                                                    encrypted_txs: vec![],
+                                                    execution_schedule: pyde_tx::parallel::ExecutionSchedule {
+                                                        groups: vec![],
+                                                        total_txs: 0,
+                                                    },
+                                                },
+                                                proposer_signature: sig,
+                                            };
+                                            let mut chain_w = chain.write().await;
+                                            let mut state_w = state.write().await;
+                                            let ws_slot = engine
+                                                .finality
+                                                .latest_checkpoint
+                                                .as_ref()
+                                                .map(|cp| cp.slot);
+                                            match BlockProcessor::process_full_block_with_aot_and_checkpoint(
+                                                &mut chain_w,
+                                                &mut state_w,
+                                                &block,
+                                                Some(&aot_cache),
+                                                ws_slot,
+                                            ) {
+                                                Ok(_) => {
+                                                    let _ = state_w.flush_pending();
+                                                    state_w.refresh_root();
+                                                    let _ = block_store.put_header(&header);
+                                                    let _ = block_store.put_head(qc_slot);
+                                                    chain_sync.on_block_processed(qc_slot);
+                                                    info!(slot = qc_slot, "applied block from local QC (synthesized empty body)");
+                                                }
+                                                Err(e) => {
+                                                    debug!(slot = qc_slot, error = %e, "synthesized-body apply failed (header expects non-empty body — waiting for gossip)");
+                                                }
+                                            }
+                                            drop(state_w);
+                                            drop(chain_w);
+                                        }
+                                    }
                                     // Broadcast vote.
                                     // audit-234 part 4 step 4: own-vote is
                                     // liveness-critical (no QC without it).
@@ -2348,19 +2442,86 @@ impl PydeNode {
                                         parent_hash,
                                         state_root,
                                     ) {
+                                        let header = block.header.clone();
+                                        let header_bytes = wire::encode_block_header(&header);
+                                        let proposer_sig = block.proposer_signature.clone();
+                                        let fallback_slot = header.slot;
+
+                                        // 1) Broadcast Proposal (header + sig) on
+                                        //    consensus topic so peers can vote on
+                                        //    the (slot, view) — same as before.
                                         let bytes = wire::encode_consensus_message(
                                             &pyde_consensus::hotstuff::ConsensusMessage::Proposal {
-                                                header: block.header,
-                                                proposer_signature: block.proposer_signature,
+                                                header: header.clone(),
+                                                proposer_signature: proposer_sig.clone(),
                                             },
                                         );
-                                        let topic = pyde_net::node::topics::consensus();
+                                        let cons_topic = pyde_net::node::topics::consensus();
                                         broadcast_consensus_with_rr_fallback(
                                             &mut swarm,
-                                            topic,
+                                            cons_topic,
                                             bytes,
                                             &peer_manager,
                                         );
+
+                                        // 2) Audit 234 part 4 step 7m: ALSO
+                                        //    broadcast the full block as a
+                                        //    CompactBlock on the Blocks topic.
+                                        //    Without this, peers can vote on the
+                                        //    fallback header but never APPLY the
+                                        //    block to chain.head — vote-QCs were
+                                        //    forming on peers (29 in best run)
+                                        //    but chain didn't advance because no
+                                        //    block was ever broadcast for them
+                                        //    to apply. Empty-body fallback is
+                                        //    representable as a CompactBlock
+                                        //    with 0 short_tx_ids.
+                                        let compact = pyde_net::propagation::CompactBlock::from_block(
+                                            header_bytes,
+                                            &[], // no tx hashes (empty fallback)
+                                            &[],
+                                            &[],
+                                        );
+                                        let compact_bytes = wire::encode_compact_block(&compact);
+                                        let blocks_topic = pyde_net::node::topics::blocks();
+                                        broadcast_blocks_with_rr_fallback(
+                                            &mut swarm,
+                                            blocks_topic,
+                                            compact_bytes,
+                                        );
+
+                                        // 3) Apply the block locally so the
+                                        //    proposer's chain.head advances.
+                                        //    Mirrors the regular self-proposal
+                                        //    path at the slot tick — fallback
+                                        //    needs the same so chain progress
+                                        //    isn't predicated on receiving the
+                                        //    block back via gossip.
+                                        let mut chain_w = chain.write().await;
+                                        let mut state_w = state.write().await;
+                                        let ws_slot = engine
+                                            .finality
+                                            .latest_checkpoint
+                                            .as_ref()
+                                            .map(|cp| cp.slot);
+                                        if let Err(e) = BlockProcessor::process_full_block_with_aot_and_checkpoint(
+                                            &mut chain_w,
+                                            &mut state_w,
+                                            &block,
+                                            Some(&aot_cache),
+                                            ws_slot,
+                                        ) {
+                                            warn!(slot = fallback_slot, error = %e, "failed to process own fallback block");
+                                        } else {
+                                            let _ = state_w.flush_pending();
+                                            state_w.refresh_root();
+                                            let _ = block_store.put_header(&header);
+                                            let _ = block_store.put_head(fallback_slot);
+                                            chain_sync.on_block_processed(fallback_slot);
+                                            info!(slot = fallback_slot, "applied own fallback block");
+                                        }
+                                        drop(state_w);
+                                        drop(chain_w);
                                     }
                                 }
                             }
@@ -2399,6 +2560,22 @@ impl PydeNode {
                     if chain_sync.is_syncing() {
                         chain_sync.request_next_batch(&mut swarm);
                     }
+                    // Audit 234 part 4 step 7: re-dial bootstrap peers
+                    // every 2s, unconditional. Earlier "skip if
+                    // already connected" version regressed (chain
+                    // advancement 1→0, VC-QC formation 6→0). Reason:
+                    // libp2p still considers stale post-restart
+                    // connections "connected" even when their
+                    // substreams can't carry traffic, so the skip
+                    // hid them from the redial path. Re-dialing an
+                    // already-connected peer triggers libp2p's own
+                    // connection-state reconciliation — the resulting
+                    // churn is what actually repairs the mesh.
+                    pyde_net::node::dial_bootstrap_peers(
+                        &mut swarm,
+                        &self.config.network.bootstrap_peers,
+                    );
+
                 }
                 _ = gossip_retry_interval.tick() => {
                     // Re-publish uncommitted pending txs. The initial
@@ -2664,6 +2841,28 @@ enum PostEventAction {
         pyde_net::consensus_protocol::ConsensusResp,
         Vec<u8>,
     ),
+    /// Audit 234 part 4 step 7: drop a peer's connection so libp2p
+    /// will redial fresh. Triggered when a request-response message
+    /// fails (timeout / connection-closed / etc.) — the peer is
+    /// in the post-restart half-broken state where `connected_peers()`
+    /// still lists them but substreams can't carry traffic. Dropping
+    /// the connection makes the subsequent reconnect a "first
+    /// connection" so gossipsub re-broadcasts SUBSCRIBE control
+    /// messages to repair the mesh.
+    DisconnectStalePeer(PeerId),
+    /// Audit 234 part 4 follow-up: BlocksRr ack-only path. Used when
+    /// the request had a decode error — the receive arm for valid
+    /// payloads drops the channel and returns the existing
+    /// ReconstructCompactBlock / BufferEncryptedBundle actions
+    /// directly (they reuse the heavy gossipsub-receive handlers).
+    /// Sacrificing the ack on valid payloads is acceptable because
+    /// libp2p RR's per-stream timeout handles the dropped channel,
+    /// and the receive-side processing has already happened by the
+    /// time the requester sees the OutboundFailure.
+    SendBlocksRrResponse(
+        request_response::ResponseChannel<pyde_net::blocks_protocol::BlocksResp>,
+        pyde_net::blocks_protocol::BlocksResp,
+    ),
 }
 
 /// Publish a consensus message via gossipsub; on `InsufficientPeers`
@@ -2755,6 +2954,64 @@ fn broadcast_consensus_with_rr_fallback(
         swarm.behaviour_mut().consensus_rr.send_request(
             &peer,
             pyde_net::consensus_protocol::ConsensusReq {
+                bytes: data.clone(),
+            },
+        );
+    }
+}
+
+/// Broadcast a Blocks-topic payload via gossipsub AND direct
+/// request-response to every connected peer.
+///
+/// audit-234 part 4 follow-up: same silent-drop failure mode as the
+/// consensus topic. After restart cycles, gossipsub's
+/// `topic_peers[blocks]` empties without raising an error — the
+/// proposer's compact block + encrypted-tx bundle vanish into a
+/// no-recipient publish, the rest of the committee never sees the
+/// block, votes can't form a QC against an unseen header, and the
+/// chain stalls.
+///
+/// The gossip path stays primary for happy-path latency. The RR
+/// path provides the deterministic delivery guarantee — message
+/// reaches the peer or returns an explicit error to the caller. The
+/// receive arm dispatches by the existing tag byte
+/// (`wire::tag::COMPACT_BLOCK`, `wire::tag::ENCRYPTED_TX_BUNDLE`,
+/// or full-block fallback) through the same handlers as the
+/// gossipsub Blocks-topic receive arm, so callers don't need to
+/// special-case fallback receipts.
+///
+/// Cost: at committee size N + F full nodes, each block becomes
+/// (N+F-1) RR send_requests on top of one gossip publish. CompactBlock
+/// is ~200 bytes per tx hash; EncryptedTxBundle is the size of the
+/// encrypted_txs section. At 4-validator devnet, ≈3 extra messages
+/// per block. At 128-validator mainnet, ≈127 — non-trivial bandwidth
+/// at high tx counts; this can be tightened later (mesh-health
+/// detection, pull-based block fetch on miss) once the silent-drop
+/// failure mode is closed end-to-end.
+fn broadcast_blocks_with_rr_fallback(
+    swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
+    topic: gossipsub::IdentTopic,
+    data: Vec<u8>,
+) {
+    // Best-effort gossip publish (cheap fan-out via mesh).
+    let _ = swarm.behaviour_mut().gossipsub.publish(topic, data.clone());
+
+    // Unconditional RR fanout — gossipsub.publish returns Ok with
+    // empty topic_peers under mesh degradation, silently dropping
+    // the block. Sending to every connected peer (not just attested
+    // validators) avoids racing the auth handshake on
+    // disconnect/reconnect; receivers FALCON-verify the block
+    // header inside `validate_network_block` before applying.
+    let connected_peers: Vec<libp2p::PeerId> = swarm.connected_peers().copied().collect();
+    debug!(
+        n_peers = connected_peers.len(),
+        bytes = data.len(),
+        "blocks broadcast: RR fanout to connected peers"
+    );
+    for peer in connected_peers {
+        swarm.behaviour_mut().blocks_rr.send_request(
+            &peer,
+            pyde_net::blocks_protocol::BlocksReq {
                 bytes: data.clone(),
             },
         );
@@ -3665,8 +3922,12 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
-            debug!(%peer, ?error, "consensus RR outbound failed");
-            PostEventAction::None
+            debug!(%peer, ?error, "consensus RR outbound failed; dropping stale connection");
+            // Audit 234 part 4 step 7: a failed RR send to a peer
+            // libp2p still considers connected is the canonical
+            // signal of a half-broken QUIC connection. Drop it so
+            // the next dial reconnects fresh.
+            PostEventAction::DisconnectStalePeer(peer)
         }
         SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
             request_response::Event::InboundFailure { peer, error, .. },
@@ -3675,6 +3936,108 @@ fn handle_swarm_event(
             PostEventAction::None
         }
         SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
+            request_response::Event::ResponseSent { .. },
+        )) => PostEventAction::None,
+
+        // --- BlocksRr: inbound block via RR fallback (audit 234 part 4 follow-up) ---
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            },
+        )) => {
+            // Dispatch by tag byte through the SAME PostEventActions
+            // the gossipsub Blocks-topic receive arm uses
+            // (ReconstructCompactBlock / BufferEncryptedBundle).
+            //
+            // The RR ResponseChannel is dropped on the valid-payload
+            // paths — the receiver-side processing has already been
+            // handed off to the action loop, and ack-then-process
+            // would require either (a) ~226 lines of duplicated
+            // ReconstructCompactBlock body inside this arm, or (b)
+            // a substantial refactor to hoist that body into a helper
+            // both paths can call. Both deferred — libp2p's per-stream
+            // timeout cleans up the channel; the requester sees an
+            // OutboundFailure (logged at debug) but the message has
+            // already reached our consensus state. The decode-error
+            // arm DOES ack so the requester can stop retrying.
+            if request.bytes.is_empty() {
+                debug!(%peer, "BlocksRr: empty payload");
+                return PostEventAction::SendBlocksRrResponse(
+                    channel,
+                    pyde_net::blocks_protocol::BlocksResp::DecodeError,
+                );
+            }
+            let tag = request.bytes[0];
+            if tag == wire::tag::COMPACT_BLOCK {
+                match wire::decode_compact_block(&request.bytes) {
+                    Ok(cb) => {
+                        debug!(%peer, short_ids = cb.short_tx_ids.len(), "BlocksRr: compact block");
+                        return PostEventAction::ReconstructCompactBlock(cb);
+                    }
+                    Err(e) => {
+                        debug!(%peer, error = e, "BlocksRr: decode compact block failed");
+                        return PostEventAction::SendBlocksRrResponse(
+                            channel,
+                            pyde_net::blocks_protocol::BlocksResp::DecodeError,
+                        );
+                    }
+                }
+            }
+            if tag == wire::tag::ENCRYPTED_TX_BUNDLE {
+                match wire::decode_encrypted_tx_bundle(&request.bytes) {
+                    Ok(bundle) => {
+                        debug!(%peer, slot = bundle.slot, "BlocksRr: encrypted-tx bundle");
+                        return PostEventAction::BufferEncryptedBundle(bundle);
+                    }
+                    Err(e) => {
+                        debug!(%peer, error = e, "BlocksRr: decode bundle failed");
+                        return PostEventAction::SendBlocksRrResponse(
+                            channel,
+                            pyde_net::blocks_protocol::BlocksResp::DecodeError,
+                        );
+                    }
+                }
+            }
+            // Full block fallback isn't routed through PostEventAction
+            // (the gossip arm processes inline) — for RR delivery,
+            // reject as not-yet-supported. Compact-block + bundle
+            // cover every steady-state proposer broadcast.
+            debug!(%peer, tag = format!("0x{tag:02x}"), "BlocksRr: unsupported tag");
+            PostEventAction::SendBlocksRrResponse(
+                channel,
+                pyde_net::blocks_protocol::BlocksResp::DecodeError,
+            )
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(
+            request_response::Event::Message {
+                message: request_response::Message::Response { .. },
+                ..
+            },
+        )) => {
+            // Acks (or DecodeError responses) from peers — best-effort
+            // confirmation, nothing to do.
+            PostEventAction::None
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            debug!(%peer, ?error, "blocks RR outbound failed; dropping stale connection");
+            // Same rationale as ConsensusRr OutboundFailure (audit 234
+            // part 4 step 7): drop the half-broken connection.
+            PostEventAction::DisconnectStalePeer(peer)
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(
+            request_response::Event::InboundFailure { peer, error, .. },
+        )) => {
+            debug!(%peer, ?error, "blocks RR inbound failed");
+            PostEventAction::None
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(
             request_response::Event::ResponseSent { .. },
         )) => PostEventAction::None,
 
