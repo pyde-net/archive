@@ -499,6 +499,8 @@ mod tests {
             last_voted_slot: 100,
             last_committed_hash: [0xCD; 32],
             last_committed_slot: 98,
+            target_height: 100,
+            current_view: 0,
             pending_votes: Vec::new(),
             pending_timeouts: Vec::new(),
         }

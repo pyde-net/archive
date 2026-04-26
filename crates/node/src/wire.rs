@@ -1065,7 +1065,11 @@ pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, &'stati
 // ConsensusState (for crash-safe persistence)
 // ============================================================
 
-const CONSENSUS_STATE_VERSION: u8 = 1;
+/// Version 2 (audit-234 part 4): adds `target_height` and
+/// `current_view` after the existing fields. Pre-mainnet: no
+/// migration support — devnets/tests start with a fresh store on
+/// version mismatch.
+const CONSENSUS_STATE_VERSION: u8 = 2;
 
 pub fn encode_consensus_state(state: &pyde_consensus::hotstuff::ConsensusState) -> Vec<u8> {
     let mut enc = Encoder::new();
@@ -1076,6 +1080,8 @@ pub fn encode_consensus_state(state: &pyde_consensus::hotstuff::ConsensusState) 
     enc.u64(state.last_voted_slot);
     enc.bytes32(&state.last_committed_hash);
     enc.u64(state.last_committed_slot);
+    enc.u64(state.target_height);
+    enc.u64(state.current_view);
     enc.u16(state.pending_votes.len() as u16);
     for msg in &state.pending_votes {
         enc.var_bytes(&encode_consensus_message(msg));
@@ -1101,6 +1107,8 @@ pub fn decode_consensus_state(
     let last_voted_slot = dec.u64()?;
     let last_committed_hash = dec.bytes32()?;
     let last_committed_slot = dec.u64()?;
+    let target_height = dec.u64()?;
+    let current_view = dec.u64()?;
 
     let votes_count = dec.u16_count(MAX_DECODE_ITEMS)?;
     let mut pending_votes = Vec::with_capacity(votes_count);
@@ -1123,6 +1131,8 @@ pub fn decode_consensus_state(
         last_voted_slot,
         last_committed_hash,
         last_committed_slot,
+        target_height,
+        current_view,
         pending_votes,
         pending_timeouts,
     })
@@ -1546,6 +1556,8 @@ mod tests {
         assert_eq!(restored.last_committed_slot, 0);
         assert_eq!(restored.last_committed_hash, [0u8; 32]);
         assert_eq!(restored.highest_qc.slot, 0);
+        assert_eq!(restored.target_height, 1);
+        assert_eq!(restored.current_view, 0);
         assert!(restored.pending_votes.is_empty());
         assert!(restored.pending_timeouts.is_empty());
     }
@@ -1559,6 +1571,8 @@ mod tests {
             last_voted_slot: 42,
             last_committed_hash: [0x77; 32],
             last_committed_slot: 40,
+            target_height: 41,
+            current_view: 2,
             pending_votes: vec![
                 ConsensusMessage::Vote {
                     slot: 42,
@@ -1593,6 +1607,8 @@ mod tests {
         assert_eq!(restored.last_voted_slot, 42);
         assert_eq!(restored.last_committed_hash, [0x77; 32]);
         assert_eq!(restored.last_committed_slot, 40);
+        assert_eq!(restored.target_height, 41);
+        assert_eq!(restored.current_view, 2);
         assert_eq!(restored.pending_votes.len(), 2);
         assert_eq!(restored.pending_timeouts.len(), 1);
 
