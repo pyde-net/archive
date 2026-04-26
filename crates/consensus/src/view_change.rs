@@ -17,6 +17,15 @@ use pyde_crypto::falcon::{
 /// Timeout duration before declaring proposer failure (milliseconds).
 pub const PROPOSAL_TIMEOUT_MS: u64 = 200;
 
+/// Audit 234 part 3: secondary timeout. After voting for a proposal,
+/// if no QC for the slot is observed within this window, the
+/// validator triggers view-change as a liveness fallback. Set well
+/// above the 400ms slot time so a healthy chain never trips it
+/// (a slot that gets its QC promptly clears the validator's
+/// state before this fires), but low enough that gossip-mesh
+/// inconsistency is recovered within a few seconds.
+pub const PROGRESS_TIMEOUT_MS: u64 = 2_000;
+
 /// Slot duration (milliseconds).
 pub const SLOT_DURATION_MS: u64 = 400;
 
@@ -212,8 +221,102 @@ pub fn try_form_view_change_qc(
 /// Determine the fallback proposer for a slot.
 /// The fallback is the committee member with the 2nd lowest VRF score.
 /// `sorted_scores` should be (address, score) sorted by score ascending.
+///
+/// Note: superseded by `fallback_leader_index((H, V), n)` for the
+/// audit-234 part 4 single-leader-per-view design. Kept for tests.
+#[allow(dead_code)]
 pub fn fallback_proposer(sorted_scores: &[(Address, u64)]) -> Option<Address> {
     sorted_scores.get(1).map(|(addr, _)| *addr)
+}
+
+/// Marker prefix in a `BlockHeader.vrf_proof` field signalling
+/// "this is a view-change fallback proposal, validate against the
+/// view-change-QC rather than VRF". The marker is followed by:
+///   - u64 LE: VC-QC slot (target_height the fallback is for)
+///   - u64 LE: view number the fallback was built at
+/// Total: 8 (marker) + 8 (slot) + 8 (view) = 24 bytes.
+pub const FALLBACK_PROPOSAL_MARKER: &[u8; 8] = b"FALLBACK";
+
+/// Audit-234 part 4 (CONSENSUS_INVARIANTS.md L2): deterministic
+/// fallback leader for the recovery view at `(height, view)`.
+/// All honest validators compute the same answer regardless of
+/// which view-change messages they observed, so the fallback
+/// proposer is unanimous without depending on the gossip mesh
+/// having delivered identical VC-message subsets to every peer.
+///
+/// The mapping `(H + V) mod n` is intentionally simple:
+///   - deterministic and cheap (no hashing)
+///   - rotates within a height: each failing view picks a different
+///     committee member, so a stuck leader is bypassed within at
+///     most n-1 view bumps
+///   - rotates across heights: even if every view-0 leader is
+///     honest-but-unreachable, the V≥1 fallback for the next height
+///     picks a different member
+///
+/// Pre-mainnet: if grinding-resistance becomes a concern (committee
+/// members predicting future leadership and timing out strategically),
+/// upgrade to `Poseidon2(epoch_randomness || H || V) mod n`. For now
+/// the simple modular sum is sufficient — V advances only on quorum
+/// timeout, not on individual proposer choice.
+pub fn fallback_leader_index(height: u64, view: u64, committee_size: usize) -> usize {
+    if committee_size == 0 {
+        return 0;
+    }
+    (height.wrapping_add(view) as usize) % committee_size
+}
+
+/// Deterministically pick the fallback proposer's committee index
+/// from a view-change-QC's voter bitmap: the lowest-indexed bit
+/// that is set.
+///
+/// Note: superseded by `fallback_leader_index((H, V), n)` for the
+/// audit-234 part 4 single-leader-per-view design. Bitmap-based
+/// selection failed under mesh inconsistency because different
+/// validators observed different VC-message subsets and computed
+/// different fallback leaders, splitting votes across the
+/// candidates. Kept dead for now; remove with the next view_change
+/// cleanup pass.
+#[allow(dead_code)]
+pub fn deterministic_fallback_index(voter_bitmap: u128) -> Option<u8> {
+    if voter_bitmap == 0 {
+        return None;
+    }
+    Some(voter_bitmap.trailing_zeros() as u8)
+}
+
+/// Build a `vrf_proof` field carrying the fallback marker + the
+/// view-change-QC's slot + the recovery view number. Receivers
+/// recognize this prefix and validate the proposer against
+/// `fallback_leader_index(slot, view, committee_size)` instead of
+/// running VRF verification.
+pub fn encode_fallback_proof(vc_qc_slot: u64, view: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(FALLBACK_PROPOSAL_MARKER.len() + 16);
+    buf.extend_from_slice(FALLBACK_PROPOSAL_MARKER);
+    buf.extend_from_slice(&vc_qc_slot.to_le_bytes());
+    buf.extend_from_slice(&view.to_le_bytes());
+    buf
+}
+
+/// True iff `vrf_proof` was produced by `encode_fallback_proof`.
+pub fn is_fallback_proof(vrf_proof: &[u8]) -> bool {
+    vrf_proof.len() >= FALLBACK_PROPOSAL_MARKER.len()
+        && &vrf_proof[..FALLBACK_PROPOSAL_MARKER.len()] == FALLBACK_PROPOSAL_MARKER
+}
+
+/// Decode a fallback proof produced by `encode_fallback_proof`,
+/// returning `(vc_qc_slot, view)`. Returns None if the buffer is
+/// not a fallback proof or is truncated.
+pub fn decode_fallback_proof(vrf_proof: &[u8]) -> Option<(u64, u64)> {
+    if !is_fallback_proof(vrf_proof) {
+        return None;
+    }
+    let after_marker = &vrf_proof[FALLBACK_PROPOSAL_MARKER.len()..];
+    if after_marker.len() < 16 {
+        return None;
+    }
+    let slot = u64::from_le_bytes(after_marker[0..8].try_into().ok()?);
+    let view = u64::from_le_bytes(after_marker[8..16].try_into().ok()?);
+    Some((slot, view))
 }
 
 /// Create an empty block header for when both primary and fallback fail.
@@ -382,6 +485,70 @@ mod tests {
         let scores = vec![([0x01; 32], 100), ([0x02; 32], 200), ([0x03; 32], 300)];
         let fallback = fallback_proposer(&scores).unwrap();
         assert_eq!(fallback, [0x02; 32]); // 2nd lowest
+    }
+
+    // ===== audit-234 part 4: (height, view) leader + fallback proof =====
+
+    #[test]
+    fn fallback_leader_index_deterministic_per_height_view() {
+        // Same (H, V) → same leader, regardless of call order.
+        for n in [3usize, 4, 7, 16, 128] {
+            for h in [0u64, 1, 5, 145, 1_000_000] {
+                for v in [0u64, 1, 2, 5] {
+                    let a = fallback_leader_index(h, v, n);
+                    let b = fallback_leader_index(h, v, n);
+                    assert_eq!(a, b, "non-deterministic at (H={h}, V={v}, n={n})");
+                    assert!(a < n, "leader index out of range at (H={h}, V={v}, n={n})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_leader_index_rotates_within_height() {
+        // Different views for the same height pick different leaders
+        // (within one full rotation). After n bumps the cycle repeats,
+        // which is fine — the chain only needs at most f failed views
+        // to reach an honest leader.
+        let n = 4;
+        let h = 145;
+        let leaders: std::collections::HashSet<usize> =
+            (0..(n as u64)).map(|v| fallback_leader_index(h, v, n)).collect();
+        assert_eq!(
+            leaders.len(),
+            n,
+            "n consecutive views should cover every committee slot exactly once"
+        );
+    }
+
+    #[test]
+    fn fallback_leader_index_zero_committee_safe() {
+        // Defensive: no panic on degenerate committee.
+        assert_eq!(fallback_leader_index(5, 0, 0), 0);
+    }
+
+    #[test]
+    fn fallback_proof_roundtrip() {
+        let proof = encode_fallback_proof(145, 3);
+        assert!(is_fallback_proof(&proof));
+        let decoded = decode_fallback_proof(&proof).expect("must decode");
+        assert_eq!(decoded, (145, 3));
+    }
+
+    #[test]
+    fn decode_fallback_proof_rejects_non_fallback() {
+        // VRF-shaped data (no fallback marker) returns None.
+        let vrf_like = vec![0xAB; 96];
+        assert!(decode_fallback_proof(&vrf_like).is_none());
+    }
+
+    #[test]
+    fn decode_fallback_proof_rejects_truncated() {
+        // Marker present but missing the view u64.
+        let mut truncated = FALLBACK_PROPOSAL_MARKER.to_vec();
+        truncated.extend_from_slice(&145u64.to_le_bytes()); // slot only, no view
+        assert!(is_fallback_proof(&truncated));
+        assert!(decode_fallback_proof(&truncated).is_none());
     }
 
     #[test]

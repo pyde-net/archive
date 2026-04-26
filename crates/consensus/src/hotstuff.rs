@@ -62,9 +62,29 @@ pub enum ConsensusMessage {
 }
 
 /// The state machine for a single validator's consensus participation.
+///
+/// Two distinct slot-like quantities live here. They are intentionally
+/// separate (audit-234 part 4 — see `crates/consensus/CONSENSUS_INVARIANTS.md`):
+///
+/// - `current_slot` is the wall-clock slot. Advanced by the engine tick
+///   every `SLOT_DURATION_MS`. Used for **timing decisions only**
+///   (when to time out, proposer-VRF input at view 0, epoch scheduling).
+///   It must NEVER be used as the recovery target: when recovery takes
+///   longer than a slot, `current_slot` drifts past the height we are
+///   actually trying to commit.
+///
+/// - `target_height` is the position in the chain we are currently
+///   trying to commit. Monotonically non-decreasing; only advances when
+///   a block at `target_height` reaches a vote-QC. View-change
+///   messages, fallback proposals, and timeout-tracker keys ALL use
+///   `target_height`, never `current_slot`.
+///
+/// `current_view` is the recovery attempt within `target_height`.
+/// 0 = happy-path proposer (VRF). ≥1 = view-change-driven fallback
+/// proposer. Resets to 0 every time `target_height` advances.
 #[derive(Clone, Debug)]
 pub struct ConsensusState {
-    /// Current slot.
+    /// Wall-clock slot (timing only — see struct doc).
     pub current_slot: u64,
     /// Current epoch.
     pub current_epoch: u64,
@@ -76,6 +96,12 @@ pub struct ConsensusState {
     pub last_committed_hash: [u8; 32],
     /// Last committed slot.
     pub last_committed_slot: u64,
+    /// The chain height we are currently trying to commit
+    /// (audit-234 part 4). See struct doc.
+    pub target_height: u64,
+    /// Recovery attempt within `target_height` (audit-234 part 4).
+    /// 0 = happy-path; ≥1 = view-change-driven fallback.
+    pub current_view: u64,
     /// Votes collected for current slot (if we're the next proposer).
     pub pending_votes: Vec<ConsensusMessage>,
     /// Timeout votes collected.
@@ -91,16 +117,46 @@ impl ConsensusState {
             last_voted_slot: 0,
             last_committed_hash: [0u8; 32],
             last_committed_slot: 0,
+            // Genesis is at slot 0; the first slot we try to commit is 1.
+            target_height: 1,
+            current_view: 0,
             pending_votes: Vec::new(),
             pending_timeouts: Vec::new(),
         }
     }
 
-    /// Advance to next slot.
+    /// Advance the wall-clock slot by one. Does NOT touch
+    /// `target_height` or `current_view` — those advance only when a
+    /// vote-QC forms (target_height) or a view-change-QC forms
+    /// (current_view).
     pub fn advance_slot(&mut self) {
         self.current_slot += 1;
         self.pending_votes.clear();
         self.pending_timeouts.clear();
+    }
+
+    /// Advance `target_height` to `new_height` and reset
+    /// `current_view` to 0. No-op if `new_height <= target_height`
+    /// (target is monotonic). Returns true iff the target advanced.
+    ///
+    /// Called by the engine after a vote-QC forms, signalling that
+    /// the current target has been certified and we are ready to
+    /// move on to the next height.
+    pub fn advance_target_height(&mut self, new_height: u64) -> bool {
+        if new_height > self.target_height {
+            self.target_height = new_height;
+            self.current_view = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Bump `current_view` by one, signalling a recovery attempt for
+    /// the current `target_height`. Called by the engine when a
+    /// view-change-QC forms.
+    pub fn bump_view(&mut self) {
+        self.current_view += 1;
     }
 }
 

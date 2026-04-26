@@ -314,16 +314,37 @@ pub struct ValidatorEngine {
     /// validator will not vote on the selected proposal for that slot.
     /// Soft enforcement — a 1/128 false positive just costs one vote.
     inclusion_violated_slots: std::collections::HashSet<u64>,
+    /// Audit 234 part 3: wall-clock timestamp (Unix ms) of the
+    /// most recent forward movement of `consensus.highest_qc.slot`,
+    /// AND the slot value at that moment. `is_timed_out` lazily
+    /// detects QC progress (current `highest_qc.slot` > the cached
+    /// one), updates both fields, then checks the
+    /// `PROGRESS_TIMEOUT_MS` deadline. Powers the
+    /// "no-progress" liveness fallback: if the chain hasn't
+    /// produced a new QC for `PROGRESS_TIMEOUT_MS`, the validator
+    /// triggers view-change regardless of whether a proposal was
+    /// received for the current slot. Without this, gossip-mesh
+    /// degradation can wedge the chain indefinitely — validators
+    /// that received the proposal vote and don't time out,
+    /// validators that didn't time out and view-change, and
+    /// neither path reaches quorum.
+    last_qc_progress_ms: u64,
+    last_seen_qc_slot: u64,
 }
 
 impl ValidatorEngine {
     /// Create a new validator engine at genesis.
     pub fn new(epoch_randomness: [u8; 32]) -> Self {
         let now_ms = current_time_ms();
+        let consensus = ConsensusState::new();
+        // audit-234 part 4: TimeoutTracker is keyed on `target_height`,
+        // not the wall-clock slot. ConsensusState::new() initializes
+        // target_height to 1 (the first slot we want to commit).
+        let initial_target = consensus.target_height;
         Self {
-            consensus: ConsensusState::new(),
+            consensus,
             finality: FinalityTracker::new(),
-            timeout: TimeoutTracker::new(0, now_ms),
+            timeout: TimeoutTracker::new(initial_target, now_ms),
             committee_keys: Vec::new(),
             epoch_randomness,
             votes: HashMap::new(),
@@ -337,6 +358,8 @@ impl ValidatorEngine {
             broadcast_evidence: Vec::new(),
             seen_evidence: std::collections::HashSet::new(),
             inclusion_violated_slots: std::collections::HashSet::new(),
+            last_qc_progress_ms: now_ms,
+            last_seen_qc_slot: 0,
             randomness_collector: None,
             pss_contributions: Vec::new(),
             pss_target_epoch: 0,
@@ -1124,6 +1147,15 @@ impl ValidatorEngine {
             return false;
         }
 
+        // Audit 234 part 3: fallback proposals (built by the
+        // deterministic fallback proposer after a view-change-QC
+        // forms) carry a marker in vrf_proof instead of VRF data.
+        // Validate the proposer against our local view-change-QC
+        // rather than running VRF verification.
+        if pyde_consensus::view_change::is_fallback_proof(&header.vrf_proof) {
+            return self.buffer_fallback_proposal(header, proposer_signature);
+        }
+
         // VRF data must be at least 32 bytes (output) + some proof bytes
         if header.vrf_proof.len() < 33 {
             warn!(slot, "proposal has missing or truncated VRF data");
@@ -1347,6 +1379,240 @@ impl ValidatorEngine {
         vote
     }
 
+    /// Validate + buffer a fallback proposal (audit 234 part 3).
+    /// Uses the local view-change-QC rather than VRF for proposer
+    /// authority. Returns true iff the proposal was buffered.
+    fn buffer_fallback_proposal(
+        &mut self,
+        header: &BlockHeader,
+        proposer_signature: &[u8],
+    ) -> bool {
+        let slot = header.slot;
+
+        // Local view-change-QC for this slot is required to
+        // recognize the legitimate fallback proposer. Without it,
+        // we have no way to validate the proposal; reject and let
+        // our own view-change-QC formation catch up.
+        if self.timeout.slot != slot || self.timeout.view_change_qc.is_none() {
+            debug!(slot, "fallback proposal received without local view-change-QC; deferring");
+            return false;
+        }
+        let vc_qc = self.timeout.view_change_qc.as_ref().unwrap();
+
+        // Verify the proposer is a committee member.
+        let proposer_idx = match self.committee_keys.iter().position(|k| {
+            pyde_account::address::derive_eoa_address(k) == header.proposer
+        }) {
+            Some(i) => i,
+            None => {
+                warn!(
+                    slot,
+                    proposer = hex::encode(header.proposer),
+                    "fallback proposal from non-committee member"
+                );
+                return false;
+            }
+        };
+        let _ = vc_qc;
+
+        // audit-234 part 4 (CONSENSUS_INVARIANTS.md L2): the proposer
+        // MUST be the deterministic leader for the view encoded in
+        // the proposal's fallback proof. The view comes from the
+        // proof, not from the receiver's local `current_view`,
+        // because honest validators may be ahead/behind on view
+        // bumps under partial connectivity. Computing the leader
+        // against the proposer-asserted view lets a receiver accept
+        // a valid fallback for a view it hasn't installed yet
+        // (it'll catch up when more VC messages arrive); rejecting
+        // mismatches still blocks attacker-built proposals at the
+        // wrong index.
+        let (proof_slot, proof_view) =
+            match pyde_consensus::view_change::decode_fallback_proof(&header.vrf_proof) {
+                Some(decoded) => decoded,
+                None => {
+                    warn!(slot, "fallback proposal has malformed fallback proof");
+                    return false;
+                }
+            };
+        if proof_slot != slot {
+            warn!(
+                slot,
+                proof_slot, "fallback proposal: proof slot does not match header slot"
+            );
+            return false;
+        }
+        let expected_leader = pyde_consensus::view_change::fallback_leader_index(
+            slot,
+            proof_view,
+            self.committee_keys.len(),
+        );
+        if proposer_idx != expected_leader {
+            warn!(
+                slot,
+                view = proof_view,
+                proposer = proposer_idx,
+                expected = expected_leader,
+                "fallback proposal: proposer is not the deterministic leader for this view"
+            );
+            return false;
+        }
+
+        // Verify proposer signature on the block header (same
+        // canonical message format as the regular path).
+        if proposer_signature.is_empty() {
+            warn!(slot, "fallback proposal missing proposer signature");
+            return false;
+        }
+        let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(
+            &self.committee_keys[proposer_idx],
+        ) {
+            Some(pk) => pk,
+            None => {
+                warn!(slot, "fallback proposer pk decode failed");
+                return false;
+            }
+        };
+        let sig = match pyde_crypto::falcon::FalconSignature::from_bytes(proposer_signature) {
+            Some(s) => s,
+            None => {
+                warn!(slot, "fallback proposer signature decode failed");
+                return false;
+            }
+        };
+        let block_hash = header.hash();
+        let sign_msg = proposer_sign_message(slot, &block_hash);
+        if !pyde_crypto::falcon::falcon_verify(&pk, &sign_msg, &sig) {
+            warn!(slot, "fallback proposer signature verification failed");
+            return false;
+        }
+
+        // Buffer with vrf_score = committee_index. When multiple
+        // alive validators each broadcast a fallback proposal,
+        // receivers' existing min-by-vrf_score selection picks the
+        // lowest committee_index — deterministic across all
+        // receivers without requiring identical view-change-QC
+        // bitmaps. Real proposals (if they arrive) have full
+        // 64-bit VRF scores from a hash, so a u8 committee_index
+        // never beats a real proposal in the rare race.
+        let entry = self.buffered_proposals.entry(slot).or_default();
+        entry.push(BufferedProposal {
+            header: header.clone(),
+            proposer_signature: proposer_signature.to_vec(),
+            vrf_score: proposer_idx as u64,
+        });
+        info!(slot, proposer_idx, "buffered fallback proposal");
+        true
+    }
+
+    /// If a view-change-QC has formed for the current slot AND we
+    /// are the deterministic fallback proposer (audit 234 part 3),
+    /// build the empty fallback block and return it for broadcast.
+    /// Otherwise returns None.
+    pub fn try_build_fallback_proposal(
+        &mut self,
+        identity: &ValidatorIdentity,
+        parent_hash: [u8; 32],
+        state_root: [u8; 32],
+    ) -> Option<Block> {
+        // audit-234 part 4 (CONSENSUS_INVARIANTS.md L1, O3): fallback
+        // proposals target `target_height`, not `current_slot`.
+        // Wall-clock drift during recovery would otherwise cause the
+        // fallback to be built for a slot the chain has already moved
+        // past.
+        let slot = self.consensus.target_height;
+        info!(mine = identity.committee_index, target_height = slot, current_slot = self.consensus.current_slot, "DBG try_build_fallback_proposal entered");
+        // NOTE: previously voting for slot does NOT disqualify us from
+        // being the fallback proposer (audit 234 part 3). The whole
+        // reason a view-change-QC exists at this slot is that the
+        // earlier vote-QC failed to reach quorum — we need a fresh
+        // proposal to break the wedge. The voted-slot dedup matters
+        // only against double-voting on the SAME proposal, which is
+        // enforced by HotStuff safety in `create_vote`.
+        if self.timeout.slot != slot {
+            info!(slot, timeout_slot = self.timeout.slot, "DBG fallback skip: timeout.slot != target_height");
+            return None;
+        }
+        if self.timeout.view_change_qc.is_none() {
+            return None;
+        }
+        // audit-234 part 4 (CONSENSUS_INVARIANTS.md L2): only the
+        // deterministic leader for `(target_height, current_view)`
+        // builds a fallback. Other validators return None. This
+        // collapses the multi-proposer fallback that was splitting
+        // votes under asymmetric gossip delivery — every honest
+        // receiver computes the same `fallback_leader_index`
+        // independently of which view-change messages it observed,
+        // so the only candidate proposal carries a single committee
+        // index that all receivers agree on.
+        let view = self.consensus.current_view;
+        let leader_idx = pyde_consensus::view_change::fallback_leader_index(
+            slot,
+            view,
+            self.committee_keys.len(),
+        );
+        if (identity.committee_index as usize) != leader_idx {
+            debug!(
+                slot,
+                view,
+                mine = identity.committee_index,
+                leader = leader_idx,
+                "fallback skip: not the deterministic leader for this view"
+            );
+            return None;
+        }
+        info!(
+            slot,
+            view,
+            mine = identity.committee_index,
+            "DBG fallback: I am the deterministic leader for (target_height, current_view); building"
+        );
+        // Don't double-build.
+        if self
+            .buffered_proposals
+            .get(&slot)
+            .is_some_and(|v| v.iter().any(|p| p.header.proposer == identity.address))
+        {
+            return None;
+        }
+
+        let vrf_proof = pyde_consensus::view_change::encode_fallback_proof(slot, view);
+        let header = BlockHeader {
+            slot,
+            epoch: slot / EPOCH_LENGTH,
+            parent_hash,
+            proposer: identity.address,
+            vrf_proof,
+            qc_previous: self.consensus.highest_qc.clone(),
+            tx_root: [0u8; 32],
+            state_root,
+            timestamp: current_time_ms(),
+        };
+
+        let block_hash = header.hash();
+        let sign_msg = proposer_sign_message(slot, &block_hash);
+        let proposer_signature = match pyde_crypto::falcon::falcon_sign(&identity.secret_key, &sign_msg) {
+            Ok(sig) => sig.to_vec(),
+            Err(_) => {
+                warn!(slot, "failed to sign fallback proposal");
+                return None;
+            }
+        };
+
+        info!(slot, "built fallback proposal as deterministic view-change fallback proposer");
+        Some(Block {
+            header,
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![],
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
+            },
+            proposer_signature,
+        })
+    }
+
     /// Build a block proposal for the current slot.
     /// Called when this validator is the proposer.
     pub fn build_proposal(
@@ -1551,6 +1817,15 @@ impl ValidatorEngine {
                 if mutated {
                     self.persist_consensus();
                 }
+                // audit-234 part 4 (CONSENSUS_INVARIANTS.md O2): a QC
+                // for slot `slot` certifies the block at that height.
+                // Advance `target_height` to `slot + 1` so subsequent
+                // recovery (view-change, fallback) targets the next
+                // height we need to commit, not the one we just
+                // certified. `advance_target_height` is monotonic
+                // (no-op if a later QC already advanced past us) and
+                // resets the timeout tracker for the new target.
+                self.advance_target_height(slot + 1);
                 // Record soft finality
                 self.finality
                     .record_soft_finality(slot, block_hash, qc.clone());
@@ -1564,7 +1839,15 @@ impl ValidatorEngine {
     /// Handle a slot timeout: create view change message.
     /// Returns the message to broadcast.
     pub fn on_timeout(&mut self, identity: &ValidatorIdentity) -> Option<ViewChangeMessage> {
-        let slot = self.consensus.current_slot;
+        // audit-234 part 4 (CONSENSUS_INVARIANTS.md L1, O3): the
+        // view-change message MUST target `target_height` — the
+        // oldest height we still need to commit — not the
+        // wall-clock `current_slot`. When recovery takes longer
+        // than `SLOT_DURATION_MS`, `current_slot` drifts and a
+        // VC msg keyed on it would target a slot the chain has
+        // already moved past, leaving the original failed slot
+        // permanently uncommitted.
+        let slot = self.consensus.target_height;
         match create_view_change(
             slot,
             &self.consensus.highest_qc,
@@ -1584,16 +1867,70 @@ impl ValidatorEngine {
     }
 
     /// Handle an incoming view change message.
-    /// Returns the ViewChangeQC if quorum is reached.
+    /// Returns true when a view-change-QC is installed in `self.timeout`.
+    ///
+    /// audit-234 part 4 (CONSENSUS_INVARIANTS.md L3): on the first
+    /// formation of a VC-QC for the current view, bump
+    /// `consensus.current_view`. The deterministic leader for the
+    /// new view (V+1) is then `fallback_leader_index(target_height,
+    /// current_view, n)`. The timeout tracker is reset so the new
+    /// view's leader gets a fresh proposal window — the VC-QC is
+    /// preserved on the new tracker so receivers know recovery is
+    /// in progress.
     pub fn on_view_change(&mut self, msg: ViewChangeMessage) -> bool {
         let slot = msg.slot;
+
+        // audit-234 part 4: ignore late VC messages for slots the
+        // chain has already moved past. Without this guard, a VC
+        // msg arriving after target_height advanced would re-form
+        // a VC-QC for the stale slot and clobber the current
+        // target's timeout tracker (since the first-formation
+        // check sees vc_qc=None and would install a fresh tracker
+        // keyed on the stale slot). target_height monotonicity
+        // means msg.slot < target_height is always stale; equal
+        // is the current target; greater is future and we accept
+        // it (the chain hasn't reached it yet but we'll need the
+        // VC state by the time it does).
+        if slot < self.consensus.target_height {
+            debug!(
+                slot,
+                target_height = self.consensus.target_height,
+                "ignoring stale view-change message"
+            );
+            return false;
+        }
+
         let entry = self.view_changes.entry(slot).or_default();
         entry.push(msg);
 
         // Try to form view change QC
         if let Some(vc_qc) = try_form_view_change_qc(slot, entry, &self.committee_keys) {
-            info!(slot, votes = vc_qc.vote_count, "view change QC formed");
-            self.timeout.view_change_qc = Some(vc_qc);
+            let first_formation = self.timeout.view_change_qc.is_none();
+            if first_formation {
+                self.consensus.bump_view();
+                self.persist_consensus();
+                info!(
+                    slot,
+                    votes = vc_qc.vote_count,
+                    new_view = self.consensus.current_view,
+                    "view change QC formed; bumped to view {}",
+                    self.consensus.current_view
+                );
+                // Fresh tracker for the new view so the leader has a
+                // full proposal window. Preserve the VC-QC so the
+                // receive-side gate in `buffer_fallback_proposal`
+                // and the build-side gate in
+                // `try_build_fallback_proposal` recognize that
+                // recovery is in progress.
+                let now_ms = current_time_ms();
+                let mut new_tracker = TimeoutTracker::new(slot, now_ms);
+                new_tracker.view_change_qc = Some(vc_qc);
+                self.timeout = new_tracker;
+            } else {
+                // VC-QC already installed — idempotent late-arriving
+                // VC messages just refresh the QC contents.
+                self.timeout.view_change_qc = Some(vc_qc);
+            }
             true
         } else {
             false
@@ -1873,14 +2210,20 @@ impl ValidatorEngine {
         next_nonce
     }
 
-    /// Advance to the next slot. Returns the new slot number.
+    /// Advance to the next wall-clock slot. Returns the new slot number.
+    ///
+    /// audit-234 part 4 (CONSENSUS_INVARIANTS.md O3): wall-clock tick
+    /// does NOT reset `self.timeout`. The tracker is keyed on
+    /// `target_height` and only resets when the chain progresses
+    /// (`advance_target_height`) or a view-change-QC bumps the view
+    /// (deferred to step 3). This way, an in-flight recovery for an
+    /// old failed slot is preserved across multiple wall-clock ticks
+    /// instead of being silently discarded each tick.
     pub fn advance_slot(&mut self) -> u64 {
         self.consensus.advance_slot();
         // current_slot changed + pending_votes/timeouts cleared.
         self.persist_consensus();
         let new_slot = self.consensus.current_slot;
-        let now_ms = current_time_ms();
-        self.timeout = TimeoutTracker::new(new_slot, now_ms);
 
         // Clean up old vote/view-change data (keep last 10 slots)
         if new_slot > 10 {
@@ -1905,10 +2248,72 @@ impl ValidatorEngine {
         new_slot
     }
 
+    /// Advance `target_height` to `new_height` and reset the timeout
+    /// tracker for the new height. No-op if `new_height` doesn't
+    /// advance the target. Persists the consensus state.
+    ///
+    /// audit-234 part 4 (CONSENSUS_INVARIANTS.md O2): called when a
+    /// vote-QC for the current target forms — the chain has moved
+    /// on, recovery state for the old height is no longer needed.
+    fn advance_target_height(&mut self, new_height: u64) {
+        if self.consensus.advance_target_height(new_height) {
+            let now_ms = current_time_ms();
+            self.timeout = TimeoutTracker::new(new_height, now_ms);
+            self.persist_consensus();
+            debug!(target_height = new_height, "advanced target_height");
+        }
+    }
+
     /// Check if the current slot has timed out.
-    pub fn is_timed_out(&self) -> bool {
+    ///
+    /// Two timeout paths (audit 234 part 3 added the second):
+    /// 1. **Primary**: no proposal received within
+    ///    `PROPOSAL_TIMEOUT_MS` of slot start. Standard HotStuff
+    ///    leader-failure path.
+    /// 2. **Secondary (progress)**: chain hasn't advanced — i.e.
+    ///    `consensus.highest_qc.slot` hasn't moved forward in
+    ///    `PROGRESS_TIMEOUT_MS`. Gossip-mesh degradation means
+    ///    some validators received the proposal and voted (their
+    ///    primary timer is suppressed) while others didn't,
+    ///    leaving neither path with quorum. Engine-level deadline
+    ///    that survives slot advances — only resets when the
+    ///    chain genuinely moves.
+    ///
+    /// In both cases the runtime's response is the same: build a
+    /// view-change message, broadcast it, await a view-change-QC
+    /// to install the fallback proposer.
+    ///
+    /// Takes `&mut self` because the secondary path lazily
+    /// refreshes `last_qc_progress_ms` whenever it observes
+    /// `highest_qc.slot` having advanced — keeps the bookkeeping
+    /// in one place rather than scattering across every QC-update
+    /// site.
+    pub fn is_timed_out(&mut self) -> bool {
         let now_ms = current_time_ms();
-        self.timeout.is_expired(now_ms)
+        // Refresh the engine-level progress timestamp lazily.
+        if self.consensus.highest_qc.slot > self.last_seen_qc_slot {
+            self.last_seen_qc_slot = self.consensus.highest_qc.slot;
+            self.last_qc_progress_ms = now_ms;
+        }
+        if self.timeout.is_expired(now_ms) {
+            return true;
+        }
+        let progressed = self.consensus.highest_qc.slot >= self.consensus.current_slot;
+        let already_view_changed = self.timeout.view_change_qc.is_some();
+        let elapsed = now_ms.saturating_sub(self.last_qc_progress_ms);
+        if !progressed
+            && !already_view_changed
+            && elapsed >= pyde_consensus::view_change::PROGRESS_TIMEOUT_MS
+        {
+            tracing::info!(
+                slot = self.consensus.current_slot,
+                highest_qc = self.consensus.highest_qc.slot,
+                elapsed_ms = elapsed,
+                "DBG: progress timeout firing"
+            );
+            return true;
+        }
+        false
     }
 
     // ========== Threshold Decryption (MEV Protection) ==========
@@ -4488,6 +4893,164 @@ mod tests {
             matches!(tampered_outcome, DecryptOutcome::TxRootMismatch),
             "reordered decryptor must be rejected; got {:?}",
             tampered_outcome
+        );
+    }
+
+    // ========================================================================
+    // audit-234 part 4: characterization tests for the (height, view) refactor.
+    //
+    // These tests express the post-fix behavior described in
+    // crates/consensus/CONSENSUS_INVARIANTS.md. They MUST FAIL on the current
+    // (audit-234 in-flight) state machine, which uses `current_slot` as the
+    // recovery target and permits multiple fallback proposers per slot.
+    //
+    // They turn green as steps 2-3 of the audit-234 fix sequence land:
+    //   - step 2: decouple `target_height` from `current_slot`
+    //   - step 3: single deterministic leader per (H, V)
+    //
+    // Marked `#[ignore]` so the workspace test suite stays green during the
+    // refactor; remove the ignore (or re-flip to active) when the
+    // corresponding step ships.
+    // ========================================================================
+
+    /// Invariant L1 (oldest-unresolved-height): when the wall-clock slot
+    /// has drifted past the slot we're trying to commit, view-change must
+    /// still target the FAILED slot, not the current wall-clock slot.
+    ///
+    /// CURRENT behavior: `on_timeout` reads `self.consensus.current_slot`,
+    /// so the view-change message targets the wrong slot whenever recovery
+    /// takes longer than `SLOT_DURATION_MS`. This is failure mode (1) in
+    /// the audit-234 part-4 diagnosis.
+    ///
+    /// POST-FIX behavior: `on_timeout` should target
+    /// `self.consensus.last_committed_slot + 1` — the oldest unresolved
+    /// height — regardless of how far `current_slot` has drifted.
+    #[test]
+    fn slot_drift_does_not_advance_target_height() {
+        let (mut engine, identities) = make_engine_with_committee(4);
+
+        // Bootstrap: pretend the chain has committed up through slot 144,
+        // and we are now trying to commit slot 145.
+        engine.consensus.last_committed_slot = 144;
+        engine.consensus.target_height = 145;
+        engine.consensus.current_view = 0;
+        engine.consensus.current_slot = 145;
+        engine.timeout = TimeoutTracker::new(145, current_time_ms());
+        let target_height = engine.consensus.target_height;
+        assert_eq!(target_height, 145);
+
+        // Wall-clock slot drifts during the recovery delay (gossip, RR
+        // delivery, view-change-QC formation). In a real run this is
+        // PROGRESS_TIMEOUT_MS / SLOT_DURATION_MS = 5 slot ticks.
+        for _ in 0..5 {
+            engine.advance_slot();
+        }
+        let drifted = engine.consensus.current_slot;
+        assert_eq!(drifted, 150, "wall-clock slot should have drifted");
+
+        // last_committed_slot is unchanged because no block at 145 has
+        // committed yet.
+        assert_eq!(
+            engine.consensus.last_committed_slot, 144,
+            "no block committed during the recovery window"
+        );
+
+        // Trigger view-change. Per L1, the resulting message MUST target
+        // the oldest unresolved height (145), not the drifted current
+        // slot (150). Today this assertion fails — vc_msg.slot == 150.
+        let vc_msg = engine
+            .on_timeout(&identities[0])
+            .expect("on_timeout should produce a view-change message");
+
+        assert_eq!(
+            vc_msg.slot, target_height,
+            "view-change must target the oldest unresolved height ({target_height}), \
+             not the drifted current_slot ({drifted}). \
+             See CONSENSUS_INVARIANTS.md L1."
+        );
+    }
+
+    /// Invariant L2 (single deterministic leader per (H, V)): when a
+    /// view-change-QC has formed for height H view V, exactly ONE
+    /// committee member produces a fallback proposal — the deterministic
+    /// leader `committee[fallback_index(H, V, n)]`. All other validators'
+    /// `try_build_fallback_proposal` returns None.
+    ///
+    /// CURRENT behavior: any validator with a local view-change-QC builds
+    /// a fallback proposal (the "any-validator" loosening documented in
+    /// `try_build_fallback_proposal` line 1491). With 4 validators each
+    /// holding a VC-QC, all 4 produce competing proposals. Under
+    /// asymmetric gossip delivery, votes split across the candidates and
+    /// no proposal reaches quorum. This is failure mode (2) in the
+    /// audit-234 part-4 diagnosis.
+    ///
+    /// POST-FIX behavior: only one validator (the deterministic leader
+    /// for (H, V)) produces Some(block); the other three return None.
+    #[test]
+    fn single_fallback_leader_per_view() {
+        let n = 4;
+
+        // Build n engines, each representing one validator's local state,
+        // all sharing the same committee.
+        let mut identities = Vec::new();
+        let mut keys = Vec::new();
+        for i in 0..n {
+            let id = make_identity(i as u8);
+            keys.push(id.public_key.as_bytes().to_vec());
+            identities.push(id);
+        }
+        let mut engines = Vec::new();
+        for _ in 0..n {
+            let mut engine = ValidatorEngine::new([0xAA; 32]);
+            engine.set_committee(keys.clone());
+            engine.advance_slot(); // → slot 1
+            engines.push(engine);
+        }
+        let target_slot = engines[0].consensus.current_slot;
+
+        // Every validator sends a view-change message for the target slot.
+        let vc_messages: Vec<_> = identities
+            .iter()
+            .map(|id| {
+                pyde_consensus::view_change::create_view_change(
+                    target_slot,
+                    &pyde_consensus::block::QuorumCert::empty(),
+                    id.committee_index,
+                    id.address,
+                    &id.secret_key,
+                )
+                .unwrap()
+            })
+            .collect();
+
+        // Each engine ingests every VC message → installs a VC-QC.
+        for engine in &mut engines {
+            for msg in &vc_messages {
+                engine.on_view_change(msg.clone());
+            }
+            assert!(
+                engine.timeout.view_change_qc.is_some(),
+                "each engine should have a view-change-QC for slot {target_slot}"
+            );
+        }
+
+        // Every engine tries to build a fallback proposal. Per L2, exactly
+        // ONE engine (the deterministic leader for (target_slot, V=1))
+        // should produce Some(block); the other three return None.
+        let proposals: Vec<_> = engines
+            .iter_mut()
+            .enumerate()
+            .map(|(i, engine)| {
+                engine.try_build_fallback_proposal(&identities[i], [0u8; 32], [0u8; 32])
+            })
+            .collect();
+
+        let proposal_count = proposals.iter().filter(|p| p.is_some()).count();
+        assert_eq!(
+            proposal_count, 1,
+            "exactly ONE validator should build a fallback per (H, V); got {proposal_count}. \
+             Today every validator with a local VC-QC builds, leading to vote splits under \
+             asymmetric gossip delivery. See CONSENSUS_INVARIANTS.md L2."
         );
     }
 }
