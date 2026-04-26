@@ -5,6 +5,7 @@
 //! identity has no authority over consensus, blocks, or transactions.
 
 use crate::auth::{self, PydeAuthReq, PydeAuthResp};
+use crate::blocks_protocol::{self, BlocksReq, BlocksResp};
 use crate::config::NetworkConfig;
 use crate::consensus_protocol::{self, ConsensusReq, ConsensusResp};
 use crate::sync_protocol::{self, SyncReq, SyncResp};
@@ -33,6 +34,10 @@ pub struct PydeBehaviour {
     /// Request-response for direct consensus message delivery — used as
     /// a fallback when gossipsub publish fails (audit 234 part 3).
     pub consensus_rr: request_response::cbor::Behaviour<ConsensusReq, ConsensusResp>,
+    /// Request-response for direct Blocks-topic delivery — same
+    /// silent-drop failure mode as consensus_rr (audit 234 part 4
+    /// follow-up).
+    pub blocks_rr: request_response::cbor::Behaviour<BlocksReq, BlocksResp>,
 }
 
 /// Generate a new node keypair. Call once on first run, then persist.
@@ -67,8 +72,28 @@ pub fn create_node(
     let local_peer_id = PeerId::from(local_key.public());
 
     // Build swarm
+    //
+    // Audit 234 part 4 step 7r: hybrid TCP + QUIC transport, Lighthouse
+    // pattern. TCP is the primary stack — explicit FIN/RST gives
+    // RTT-grade dead-peer detection on validator restart, important
+    // for churn recovery. QUIC is composed alongside via libp2p's
+    // builder so peers that prefer it (lower-latency 0-RTT handshake,
+    // multiplexing without HOL blocking) can negotiate it on the
+    // multiaddr. Bootstrap addresses default to TCP — operators can
+    // override with `/udp/PORT/quic-v1` multiaddrs to opt into QUIC
+    // for same-client peer pairs. Ethereum consensus clients
+    // (Lighthouse, Prysm) ship the same hybrid; ethlambda picked QUIC
+    // primary but their devnet hasn't been stress-tested under the
+    // SIGKILL-style churn pattern that surfaces QUIC's connection-
+    // state lag.
     let swarm = SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default().nodelay(true),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )
+        .map_err(|e| format!("tcp transport error: {e}"))?
         .with_quic()
         .with_behaviour(|key| {
             // Gossipsub
@@ -102,6 +127,12 @@ pub fn create_node(
                 .history_gossip(3)
                 .duplicate_cache_time(Duration::from_secs(60))
                 .flood_publish(true)
+                // Audit 234 part 4 step 7p: match ethlambda's
+                // `allow_self_origin = true`. Proposer's own block
+                // is delivered back to its own gossipsub handler,
+                // giving a uniform "block arrived from gossip" code
+                // path on both proposer and peers.
+                .allow_self_origin(true)
                 .build()
                 .map_err(|e| format!("gossipsub config error: {e}"))?;
 
@@ -132,6 +163,9 @@ pub fn create_node(
             // Direct consensus message delivery (audit 234 part 3).
             let consensus_rr = consensus_protocol::consensus_behaviour();
 
+            // Direct Blocks-topic delivery (audit 234 part 4 follow-up).
+            let blocks_rr = blocks_protocol::blocks_behaviour();
+
             Ok(PydeBehaviour {
                 gossipsub,
                 kademlia,
@@ -139,6 +173,7 @@ pub fn create_node(
                 sync,
                 auth,
                 consensus_rr,
+                blocks_rr,
             })
         })
         .map_err(|e| format!("behaviour error: {e}"))?

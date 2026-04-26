@@ -15,7 +15,19 @@ pub const DEFAULT_MAX_INBOUND: usize = 30;
 pub const DEFAULT_MAX_OUTBOUND: usize = 20;
 
 /// Connection idle timeout.
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// Audit 234 part 4 step 7p: effectively disabled (matches ethlambda's
+/// `idle_connection_timeout = u64::MAX`). Earlier we lowered this to
+/// 5s and 15s in attempts to drop stale post-restart QUIC connections
+/// faster — both regressed the system because legitimate connections
+/// have idle gaps during normal operation (gossipsub heartbeat is
+/// 400ms but RPC traffic is bursty, and connections spend most of
+/// their time idle between bursts). The proper layer for stale-peer
+/// detection is the reactive `DisconnectStalePeer` on RR
+/// OutboundFailure (1.5s timeout), not the swarm-level idle timer.
+/// ethlambda runs production devnets with this disabled and we follow
+/// their precedent.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60); // 1 hour, effectively disabled
 
 /// Rate limit: max inbound connections per second per IP.
 pub const DEFAULT_RATE_LIMIT_PER_IP: u32 = 5;

@@ -7,7 +7,7 @@ edition = "2021"
 [dependencies]
 pyde-crypto = { path = "../crypto" }
 pyde-account = { path = "../account" }
-libp2p = { version = "0.54", features = ["quic", "gossipsub", "kad", "noise", "yamux", "tokio", "macros", "identify", "request-response", "cbor", "serde"] }
+libp2p = { version = "0.54", features = ["tcp", "quic", "gossipsub", "kad", "noise", "yamux", "tokio", "macros", "identify", "request-response", "cbor", "serde"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

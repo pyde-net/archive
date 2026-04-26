@@ -937,7 +937,7 @@ pub fn generate_testnet(
                 let other_port = base_port + j as u16;
                 let other_peer_id = &node_keypairs[j].1;
                 bootstrap_addrs.push(format!(
-                    "\"/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}\"",
+                    "\"/ip4/127.0.0.1/tcp/{}/p2p/{}\"",
                     other_port, other_peer_id
                 ));
             }
@@ -1029,7 +1029,7 @@ json = false
             let other_port = base_port + j as u16;
             let other_peer_id = &node_keypairs[j].1;
             bootstrap_addrs.push(format!(
-                "\"/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}\"",
+                "\"/ip4/127.0.0.1/tcp/{}/p2p/{}\"",
                 other_port, other_peer_id
             ));
         }

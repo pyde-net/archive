@@ -1314,6 +1314,25 @@ impl ValidatorEngine {
         true
     }
 
+    /// Audit 234 part 4 step 7n: lookup the buffered proposal whose
+    /// header hashes to `block_hash`. Used by the slot tick after a
+    /// vote-QC forms locally — peer needs to APPLY the block, but
+    /// the body comes via gossip on the Blocks topic which is the
+    /// degraded path under churn. For empty blocks (fallback or no
+    /// txs), the caller can synthesize the body locally and apply
+    /// without waiting for the gossip-delivered full block.
+    pub fn buffered_proposal_for(
+        &self,
+        slot: u64,
+        block_hash: &[u8; 32],
+    ) -> Option<(BlockHeader, Vec<u8>)> {
+        self.buffered_proposals
+            .get(&slot)?
+            .iter()
+            .find(|p| p.header.hash() == *block_hash)
+            .map(|p| (p.header.clone(), p.proposer_signature.clone()))
+    }
+
     /// Flag a slot as having failed the mandatory-inclusion audit (task 026).
     /// Caller is the compact-block reception path in node.rs. A flagged slot
     /// causes `select_and_vote` to skip its vote for this proposal, whatever
