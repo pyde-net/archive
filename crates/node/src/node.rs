@@ -645,6 +645,19 @@ impl PydeNode {
                         PostEventAction::SendAuthResponse(channel, resp) => {
                             let _ = swarm.behaviour_mut().auth.send_response(channel, resp);
                         }
+                        PostEventAction::SendConsensusRrResponse(channel, resp) => {
+                            let _ = swarm.behaviour_mut().consensus_rr.send_response(channel, resp);
+                        }
+                        PostEventAction::SendConsensusRrResponseAndBroadcast(channel, resp, data) => {
+                            let _ = swarm.behaviour_mut().consensus_rr.send_response(channel, resp);
+                            let topic = pyde_net::node::topics::consensus();
+                            broadcast_consensus_with_rr_fallback(
+                                &mut swarm,
+                                topic,
+                                data,
+                                &peer_manager,
+                            );
+                        }
                         PostEventAction::ContinueSync => {
                             // If chunked snapshot in progress, request next chunk
                             if let Some(next_idx) = chain_sync.needs_next_chunk() {
@@ -671,11 +684,12 @@ impl PydeNode {
                                 );
                             } else {
                                 let topic = pyde_net::node::topics::consensus();
-                                if let Err(e) =
-                                    swarm.behaviour_mut().gossipsub.publish(topic, data)
-                                {
-                                    warn!(error = %e, "failed to broadcast consensus message");
-                                }
+                                broadcast_consensus_with_rr_fallback(
+                                    &mut swarm,
+                                    topic,
+                                    data,
+                                    &peer_manager,
+                                );
                             }
                         }
                         PostEventAction::BroadcastConsensusMany(messages) => {
@@ -687,13 +701,12 @@ impl PydeNode {
                             } else {
                                 let topic = pyde_net::node::topics::consensus();
                                 for data in messages {
-                                    if let Err(e) = swarm
-                                        .behaviour_mut()
-                                        .gossipsub
-                                        .publish(topic.clone(), data)
-                                    {
-                                        warn!(error = %e, "failed to broadcast consensus message");
-                                    }
+                                    broadcast_consensus_with_rr_fallback(
+                                        &mut swarm,
+                                        topic.clone(),
+                                        data,
+                                        &peer_manager,
+                                    );
                                 }
                             }
                         }
@@ -1434,7 +1447,12 @@ impl PydeNode {
                                 } else {
                                     let msg = wire::encode_resharing(target_epoch, &bytes);
                                     let topic = pyde_net::node::topics::consensus();
-                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic, msg);
+                                    broadcast_consensus_with_rr_fallback(
+                                        &mut swarm,
+                                        topic,
+                                        msg,
+                                        &peer_manager,
+                                    );
                                     debug!(target_epoch, "re-broadcast resharing contribution");
                                 }
                             }
@@ -1525,11 +1543,20 @@ impl PydeNode {
                                         );
 
                                         if let Some(identity) = validator_identity.as_ref() {
-                                            // Generate and broadcast epoch randomness share
+                                            // Generate and broadcast epoch randomness share.
+                                            // audit-234 part 4 step 4: RR fallback
+                                            // applied uniformly to every consensus-topic
+                                            // publish so epoch transitions don't stall
+                                            // on mesh degradation.
                                             if let Some(share) = engine.start_epoch_randomness(new_epoch + 1, identity) {
                                                 let share_bytes = wire::encode_randomness_share(new_epoch + 1, &share);
                                                 let topic = pyde_net::node::topics::consensus();
-                                                let _ = swarm.behaviour_mut().gossipsub.publish(topic, share_bytes);
+                                                broadcast_consensus_with_rr_fallback(
+                                                    &mut swarm,
+                                                    topic,
+                                                    share_bytes,
+                                                    &peer_manager,
+                                                );
                                             }
 
                                             // Generate and broadcast PSS refresh contribution
@@ -1537,7 +1564,12 @@ impl PydeNode {
                                             if let Some(contrib) = engine.start_pss_refresh(new_epoch + 1, identity) {
                                                 let contrib_bytes = wire::encode_pss_refresh(new_epoch + 1, &contrib.to_bytes());
                                                 let topic = pyde_net::node::topics::consensus();
-                                                let _ = swarm.behaviour_mut().gossipsub.publish(topic, contrib_bytes);
+                                                broadcast_consensus_with_rr_fallback(
+                                                    &mut swarm,
+                                                    topic,
+                                                    contrib_bytes,
+                                                    &peer_manager,
+                                                );
                                             }
 
                                             // Task 034: if we were in the outgoing committee and
@@ -1554,7 +1586,12 @@ impl PydeNode {
                                                         new_epoch, &contrib.to_bytes(),
                                                     );
                                                     let topic = pyde_net::node::topics::consensus();
-                                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic, contrib_bytes);
+                                                    broadcast_consensus_with_rr_fallback(
+                                                        &mut swarm,
+                                                        topic,
+                                                        contrib_bytes,
+                                                        &peer_manager,
+                                                    );
                                                 }
                                             }
                                         }
@@ -1908,7 +1945,21 @@ impl PydeNode {
                                     };
                                     let proposal_bytes = wire::encode_consensus_message(&proposal);
                                     let cons_topic = pyde_net::node::topics::consensus();
-                                    let _ = swarm.behaviour_mut().gossipsub.publish(cons_topic, proposal_bytes);
+                                    // audit-234 part 4 step 4: own-proposal is
+                                    // liveness-critical. Gossipsub publish on a
+                                    // degraded mesh (post-restart cycles)
+                                    // returns InsufficientPeers and the proposal
+                                    // never reaches voters → no QC forms. Route
+                                    // through the RR-fallback helper so a
+                                    // gossip miss falls back to direct
+                                    // request-response delivery to every known
+                                    // validator peer.
+                                    broadcast_consensus_with_rr_fallback(
+                                        &mut swarm,
+                                        cons_topic,
+                                        proposal_bytes,
+                                        &peer_manager,
+                                    );
 
                                     // Buffer our own proposal for VRF selection.
                                     // Voting happens after the proposal collection window.
@@ -1921,9 +1972,18 @@ impl PydeNode {
                                     for ev in engine.drain_broadcast_evidence() {
                                         let bytes = wire::encode_slash_evidence_msg(&ev);
                                         let topic = pyde_net::node::topics::consensus();
-                                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, bytes) {
-                                            warn!(error = ?e, "failed to publish slash evidence");
-                                        }
+                                        // audit-234 part 4 step 4: same RR
+                                        // fallback as own-proposal — slash
+                                        // evidence missing from peers under
+                                        // mesh degradation lets the offender
+                                        // escape unpunished if they crash
+                                        // before the next gossip retry.
+                                        broadcast_consensus_with_rr_fallback(
+                                            &mut swarm,
+                                            topic,
+                                            bytes,
+                                            &peer_manager,
+                                        );
                                     }
                                 } // end if mempool_size > 0
                                 }
@@ -1950,10 +2010,20 @@ impl PydeNode {
                                     } else {
                                         false
                                     };
-                                    // Broadcast vote
+                                    // Broadcast vote.
+                                    // audit-234 part 4 step 4: own-vote is
+                                    // liveness-critical (no QC without it).
+                                    // Use the RR fallback helper so a gossip
+                                    // miss on a degraded mesh still reaches
+                                    // the next proposer.
                                     let vote_bytes = wire::encode_consensus_message(&vote);
                                     let topic = pyde_net::node::topics::consensus();
-                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic, vote_bytes);
+                                    broadcast_consensus_with_rr_fallback(
+                                        &mut swarm,
+                                        topic,
+                                        vote_bytes,
+                                        &peer_manager,
+                                    );
 
                                     // Audit 232: own-vote QC mismatch check.
                                     // Same logic as the gossip-vote path at
@@ -2037,12 +2107,29 @@ impl PydeNode {
                                             let cert_formed = engine.on_finality_vote(fv.clone());
                                             let fv_bytes = wire::encode_finality_vote(&fv);
                                             let topic = pyde_net::node::topics::consensus();
-                                            let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), fv_bytes);
+                                            // audit-234 part 4 step 4: finality
+                                            // vote/cert via RR fallback. Hard
+                                            // finality progress is what
+                                            // anchors the WS checkpoint;
+                                            // dropping these on a degraded
+                                            // mesh leaves nodes unable to
+                                            // advance past their last anchor.
+                                            broadcast_consensus_with_rr_fallback(
+                                                &mut swarm,
+                                                topic.clone(),
+                                                fv_bytes,
+                                                &peer_manager,
+                                            );
                                             if cert_formed {
                                                 if let Some(cp) = engine.latest_finality_checkpoint() {
                                                     let cp_bytes =
                                                         wire::encode_finality_checkpoint_msg(cp);
-                                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic, cp_bytes);
+                                                    broadcast_consensus_with_rr_fallback(
+                                                        &mut swarm,
+                                                        topic,
+                                                        cp_bytes,
+                                                        &peer_manager,
+                                                    );
                                                 }
                                             }
                                         }
@@ -2105,7 +2192,12 @@ impl PydeNode {
                                                                 pending_decryptors.write().await.insert(current_slot, decryptor);
                                                             }
 
-                                                            // Broadcast our shares
+                                                            // Broadcast our shares.
+                                                            // audit-234 part 4 step 4: RR
+                                                            // fallback for decryption shares
+                                                            // — without these reaching the
+                                                            // committee, encrypted txs never
+                                                            // decrypt and the MEV path stalls.
                                                             if let Some(shares) = engine.generate_decryption_shares(identity, &enc_txs) {
                                                                 let msg = wire::DecryptionShareMsg {
                                                                     slot: current_slot,
@@ -2114,7 +2206,12 @@ impl PydeNode {
                                                                 };
                                                                 let share_bytes = wire::encode_decryption_shares(&msg);
                                                                 let topic = pyde_net::node::topics::consensus();
-                                                                let _ = swarm.behaviour_mut().gossipsub.publish(topic, share_bytes);
+                                                                broadcast_consensus_with_rr_fallback(
+                                                                    &mut swarm,
+                                                                    topic,
+                                                                    share_bytes,
+                                                                    &peer_manager,
+                                                                );
                                                                 info!(
                                                                     slot = current_slot,
                                                                     enc_txs = enc_txs.len(),
@@ -2207,12 +2304,64 @@ impl PydeNode {
                                             slot: vc_msg.slot,
                                             voter_index: vc_msg.voter_index,
                                             voter_address: vc_msg.voter_address,
-                                            highest_qc: vc_msg.highest_qc,
-                                            signature: vc_msg.signature,
+                                            highest_qc: vc_msg.highest_qc.clone(),
+                                            signature: vc_msg.signature.clone(),
                                         }
                                     );
                                     let topic = pyde_net::node::topics::consensus();
-                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic, vc_bytes);
+                                    broadcast_consensus_with_rr_fallback(
+                                        &mut swarm,
+                                        topic,
+                                        vc_bytes,
+                                        &peer_manager,
+                                    );
+                                    // audit 234 part 3: also process our own
+                                    // view-change message locally — gossipsub
+                                    // doesn't echo published messages back to
+                                    // us, so without this our own vote is
+                                    // missing from the local view-change-QC
+                                    // formation, leaving us short of quorum
+                                    // by one. With small committees this is
+                                    // the difference between QC forming and
+                                    // not.
+                                    engine.on_view_change(vc_msg);
+                                }
+                                // audit 234 part 3: regardless of whether we
+                                // just timed out, attempt to build a fallback
+                                // proposal if the conditions are met (we have
+                                // a view-change-QC for the current slot AND
+                                // we are the deterministic fallback proposer).
+                                // Catches the case where QC formed asynchronously
+                                // via a previous receive event but the build
+                                // didn't fire from there for any reason.
+                                if let Some(identity) = validator_identity.as_ref() {
+                                    let parent_hash = chain
+                                        .read()
+                                        .await
+                                        .headers
+                                        .get(&chain.read().await.head_slot)
+                                        .map(|h| h.hash())
+                                        .unwrap_or([0u8; 32]);
+                                    let state_root = chain.read().await.state_root;
+                                    if let Some(block) = engine.try_build_fallback_proposal(
+                                        identity,
+                                        parent_hash,
+                                        state_root,
+                                    ) {
+                                        let bytes = wire::encode_consensus_message(
+                                            &pyde_consensus::hotstuff::ConsensusMessage::Proposal {
+                                                header: block.header,
+                                                proposer_signature: block.proposer_signature,
+                                            },
+                                        );
+                                        let topic = pyde_net::node::topics::consensus();
+                                        broadcast_consensus_with_rr_fallback(
+                                            &mut swarm,
+                                            topic,
+                                            bytes,
+                                            &peer_manager,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2500,6 +2649,116 @@ enum PostEventAction {
         qc_slot: u64,
         qc_block_hash: [u8; 32],
     },
+    /// Audit 234 part 3: ack for an inbound consensus RR request.
+    /// Main loop dispatches via the swarm's ConsensusRr behaviour.
+    SendConsensusRrResponse(
+        request_response::ResponseChannel<pyde_net::consensus_protocol::ConsensusResp>,
+        pyde_net::consensus_protocol::ConsensusResp,
+    ),
+    /// Audit 234 part 3: an RR-receive of a Timeout caused a
+    /// view-change-QC to form, AND we are the deterministic
+    /// fallback proposer. The runtime acks the RR request and
+    /// broadcasts the fallback proposal in the same dispatch.
+    SendConsensusRrResponseAndBroadcast(
+        request_response::ResponseChannel<pyde_net::consensus_protocol::ConsensusResp>,
+        pyde_net::consensus_protocol::ConsensusResp,
+        Vec<u8>,
+    ),
+}
+
+/// Publish a consensus message via gossipsub; on `InsufficientPeers`
+/// (audit 234 part 3 — peer subscription state hasn't re-synced after
+/// restart cycles), fall back to direct point-to-point delivery via
+/// the consensus_rr request-response protocol to every authenticated
+/// validator peer. Without this fallback, view-change and proposal
+/// gossip can silently drop in the small window after restarts where
+/// libp2p gossipsub's `topic_peers[consensus]` map is empty even
+/// though TCP-level connections to validators are live.
+/// Audit 234 part 3: when a view-change-QC just formed, build the
+/// empty fallback block (if we are the deterministic fallback
+/// proposer) and return its wire-encoded `ConsensusMessage::
+/// Proposal` ready for broadcast. Returns None if we're not the
+/// fallback or we've already proposed.
+fn build_and_encode_fallback_proposal(
+    engine: &mut ValidatorEngine,
+    identity: Option<&ValidatorIdentity>,
+    chain: &ChainState,
+) -> Option<Vec<u8>> {
+    let identity = identity?;
+    let parent_hash = chain
+        .headers
+        .get(&chain.head_slot)
+        .map(|h| h.hash())
+        .unwrap_or([0u8; 32]);
+    let block = engine.try_build_fallback_proposal(identity, parent_hash, chain.state_root)?;
+    let msg = pyde_consensus::hotstuff::ConsensusMessage::Proposal {
+        header: block.header,
+        proposer_signature: block.proposer_signature,
+    };
+    Some(wire::encode_consensus_message(&msg))
+}
+
+fn broadcast_consensus_with_rr_fallback(
+    swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
+    topic: gossipsub::IdentTopic,
+    data: Vec<u8>,
+    _peer_manager: &pyde_net::peer::PeerManager,
+) {
+    // Best-effort gossip publish (cheap fan-out via mesh).
+    let _ = swarm.behaviour_mut().gossipsub.publish(topic, data.clone());
+
+    // audit-234 part 4 step 5 — RR fanout is **unconditional + to all
+    // connected peers**, not a fallback gated on gossip publish
+    // returning Err and not filtered by attested-validator role.
+    //
+    // Two failure modes the conservative version missed:
+    //
+    //   1. `gossipsub.publish` returns Ok even when `topic_peers` is
+    //      empty (message accepted into the internal buffer but goes
+    //      nowhere). Mesh degradation after restart cycles drops
+    //      `topic_peers` to zero without raising an error → silent
+    //      message loss. Fix: don't gate on Err.
+    //
+    //   2. On peer disconnect, `PeerManager::remove_peer` wipes the
+    //      attested validator role; on reconnect the new entry
+    //      defaults back to the unattested state until the FALCON
+    //      auth handshake re-completes (~tens of ms, longer if
+    //      QUIC connections keep timing out). Filtering by
+    //      `peer_manager.validators()` during that gap returns empty
+    //      → RR fan-out sends to no one. The 4-of-4 churn test
+    //      reproduced exactly this: peers reconnecting with QUIC
+    //      `TimedOut` errors mid-rotation, validator role transiently
+    //      absent on every restart cycle, RR fan-out empty.
+    //
+    // Fix: send to every connected peer. The consensus message is
+    // FALCON-signed and verified inside the engine (`try_form_view_
+    // change_qc`, `verify_vote`), so spam from unattested peers
+    // can't forge state — at worst it costs a verify per message.
+    // Non-committee peers (full nodes, light clients) will decode
+    // and either bail (no validator_engine) or no-op (msg from a
+    // non-committee voter index). The receive handler at the
+    // ConsensusRr arm already documents this: peer-level auth gating
+    // would race with the auth handshake re-completion after restart
+    // cycles — exactly the failure mode this fan-out exists to fix.
+    //
+    // Cost: at committee size N + F full nodes, each consensus
+    // message is (N+F-1) RR send_requests on top of one gossip
+    // publish. At N=4 (devnet) ≈3 extra messages. At N=128 (mainnet)
+    // ≈127, well under 100KB per slot at FALCON sig sizes —
+    // negligible against the gossip mesh's own per-message cost.
+    let connected_peers: Vec<libp2p::PeerId> = swarm.connected_peers().copied().collect();
+    debug!(
+        n_peers = connected_peers.len(),
+        "consensus broadcast: RR fanout to connected peers"
+    );
+    for peer in connected_peers {
+        swarm.behaviour_mut().consensus_rr.send_request(
+            &peer,
+            pyde_net::consensus_protocol::ConsensusReq {
+                bytes: data.clone(),
+            },
+        );
+    }
 }
 
 /// Handle a libp2p swarm event. Returns an action that may need swarm access.
@@ -3103,6 +3362,13 @@ fn handle_swarm_event(
                                             };
                                         if engine.on_view_change(vc_msg) {
                                             info!(slot, "view change QC formed — fallback proposer can proceed");
+                                            if let Some(bytes) = build_and_encode_fallback_proposal(
+                                                engine,
+                                                validator_identity.as_ref(),
+                                                chain,
+                                            ) {
+                                                return PostEventAction::BroadcastConsensus(bytes);
+                                            }
                                         }
                                     }
                                     ConsensusMessage::NewView {
@@ -3282,6 +3548,133 @@ fn handle_swarm_event(
             PostEventAction::None
         }
         SwarmEvent::Behaviour(PydeBehaviourEvent::Auth(
+            request_response::Event::ResponseSent { .. },
+        )) => PostEventAction::None,
+
+        // --- ConsensusRr: inbound consensus message via RR fallback ---
+        // (audit 234 part 3) Restarted nodes whose gossipsub mesh state
+        // hasn't fully re-synced still receive view-change messages this
+        // way. The bytes are the same wire encoding as on the gossipsub
+        // consensus topic so the receive logic decodes + processes
+        // identically.
+        SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            },
+        )) => {
+            // No peer-level auth check here — unlike the gossipsub
+            // consensus topic (audit 218), the message itself is
+            // FALCON-signed and verified inside `try_form_view_change_qc`
+            // against the on-chain committee_keys. Spam from unattested
+            // peers is bounded by libp2p RR's per-stream concurrency
+            // limits + the dedup logic in `engine.on_view_change`.
+            // Gating here on `is_consensus_authorized` would race with
+            // the auth handshake re-completion after restart cycles —
+            // exactly the failure mode this RR fallback exists to fix.
+            let mut pending_fallback_broadcast: Option<Vec<u8>> = None;
+            let resp = {
+                match wire::decode_consensus_message(&request.bytes) {
+                    Ok(msg) => {
+                        use pyde_consensus::hotstuff::ConsensusMessage;
+                        if let Some(engine) = validator_engine.as_mut() {
+                            match msg {
+                                ConsensusMessage::Timeout {
+                                    slot,
+                                    voter_index,
+                                    voter_address,
+                                    highest_qc,
+                                    signature,
+                                } => {
+                                    debug!(slot, voter_index, "received timeout via RR fallback");
+                                    let vc_msg =
+                                        pyde_consensus::view_change::ViewChangeMessage {
+                                            slot,
+                                            highest_qc,
+                                            voter_index,
+                                            voter_address,
+                                            signature,
+                                        };
+                                    if engine.on_view_change(vc_msg) {
+                                        info!(slot, "view change QC formed (via RR fallback) — fallback proposer can proceed");
+                                        if let Some(bytes) = build_and_encode_fallback_proposal(
+                                            engine,
+                                            validator_identity.as_ref(),
+                                            chain,
+                                        ) {
+                                            pending_fallback_broadcast = Some(bytes);
+                                        }
+                                    }
+                                }
+                                ConsensusMessage::Vote { slot, voter_index, .. } => {
+                                    // Audit 234 part 3: votes that fell back
+                                    // to RR (gossip publish failed) need to
+                                    // route through the same `on_vote` path
+                                    // as the gossip-receive arm. Otherwise
+                                    // vote-QCs for fallback proposals never
+                                    // form because votes are silently dropped
+                                    // here.
+                                    debug!(slot, voter_index, "received vote via RR fallback");
+                                    if let Some(qc) = engine.on_vote(msg) {
+                                        info!(slot, votes = qc.vote_count(), "QC formed (via RR fallback)");
+                                    }
+                                }
+                                ConsensusMessage::Proposal {
+                                    ref header,
+                                    ref proposer_signature,
+                                } => {
+                                    debug!(slot = header.slot, "received proposal via RR fallback");
+                                    engine.buffer_proposal(header, proposer_signature);
+                                }
+                                ConsensusMessage::NewView { slot, highest_qc, .. } => {
+                                    debug!(slot, "received new view via RR fallback");
+                                    if highest_qc.slot > engine.consensus.highest_qc.slot {
+                                        engine.consensus.highest_qc = highest_qc;
+                                    }
+                                }
+                            }
+                        }
+                        pyde_net::consensus_protocol::ConsensusResp::Ack
+                    }
+                    Err(e) => {
+                        debug!(%peer, error = e, "failed to decode consensus RR request");
+                        pyde_net::consensus_protocol::ConsensusResp::DecodeError
+                    }
+                }
+            };
+            match pending_fallback_broadcast {
+                Some(bytes) => PostEventAction::SendConsensusRrResponseAndBroadcast(
+                    channel, resp, bytes,
+                ),
+                None => PostEventAction::SendConsensusRrResponse(channel, resp),
+            }
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
+            request_response::Event::Message {
+                message: request_response::Message::Response { .. },
+                ..
+            },
+        )) => {
+            // Acks are best-effort confirmation; nothing to do.
+            PostEventAction::None
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            debug!(%peer, ?error, "consensus RR outbound failed");
+            PostEventAction::None
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
+            request_response::Event::InboundFailure { peer, error, .. },
+        )) => {
+            debug!(%peer, ?error, "consensus RR inbound failed");
+            PostEventAction::None
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
             request_response::Event::ResponseSent { .. },
         )) => PostEventAction::None,
 

@@ -6,6 +6,7 @@
 
 use crate::auth::{self, PydeAuthReq, PydeAuthResp};
 use crate::config::NetworkConfig;
+use crate::consensus_protocol::{self, ConsensusReq, ConsensusResp};
 use crate::sync_protocol::{self, SyncReq, SyncResp};
 use libp2p::{
     gossipsub, identify, identity,
@@ -29,6 +30,9 @@ pub struct PydeBehaviour {
     pub sync: request_response::cbor::Behaviour<SyncReq, SyncResp>,
     /// Request-response for FALCON peer attestation (tasks 029/030).
     pub auth: request_response::cbor::Behaviour<PydeAuthReq, PydeAuthResp>,
+    /// Request-response for direct consensus message delivery — used as
+    /// a fallback when gossipsub publish fails (audit 234 part 3).
+    pub consensus_rr: request_response::cbor::Behaviour<ConsensusReq, ConsensusResp>,
 }
 
 /// Generate a new node keypair. Call once on first run, then persist.
@@ -125,12 +129,16 @@ pub fn create_node(
             // FALCON peer-attestation protocol (tasks 029/030).
             let auth = auth::auth_behaviour();
 
+            // Direct consensus message delivery (audit 234 part 3).
+            let consensus_rr = consensus_protocol::consensus_behaviour();
+
             Ok(PydeBehaviour {
                 gossipsub,
                 kademlia,
                 identify,
                 sync,
                 auth,
+                consensus_rr,
             })
         })
         .map_err(|e| format!("behaviour error: {e}"))?

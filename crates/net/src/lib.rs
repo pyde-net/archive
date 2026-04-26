@@ -15,6 +15,7 @@
 pub mod auth;
 pub mod channels;
 pub mod config;
+pub mod consensus_protocol;
 pub mod ddos;
 pub mod discovery;
 pub mod node;
