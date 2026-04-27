@@ -786,6 +786,51 @@ impl TestNetwork {
         recipient: &[u8; 32],
         value: u128,
     ) -> Result<String, String> {
+        self.submit_encrypted_transfer_inner(
+            rpc_node_idx,
+            sender_pk_bytes,
+            sender_sk_bytes,
+            recipient,
+            value,
+            None,
+        )
+    }
+
+    /// Same as `submit_encrypted_transfer` but the caller supplies the
+    /// sender nonce instead of fetching it via RPC. Required for any
+    /// burst submission — back-to-back RPC calls return a stale
+    /// `getTransactionCount` until the previous submission commits, so
+    /// without explicit nonce control all but the first tx in a burst
+    /// would land at the same nonce and the duplicate-nonce mempool
+    /// gate would drop them.
+    pub fn submit_encrypted_transfer_with_nonce(
+        &self,
+        rpc_node_idx: usize,
+        sender_pk_bytes: &[u8],
+        sender_sk_bytes: &[u8],
+        recipient: &[u8; 32],
+        value: u128,
+        nonce: u64,
+    ) -> Result<String, String> {
+        self.submit_encrypted_transfer_inner(
+            rpc_node_idx,
+            sender_pk_bytes,
+            sender_sk_bytes,
+            recipient,
+            value,
+            Some(nonce),
+        )
+    }
+
+    fn submit_encrypted_transfer_inner(
+        &self,
+        rpc_node_idx: usize,
+        sender_pk_bytes: &[u8],
+        sender_sk_bytes: &[u8],
+        recipient: &[u8; 32],
+        value: u128,
+        explicit_nonce: Option<u64>,
+    ) -> Result<String, String> {
         // 1. Threshold pubkey from the node.
         let tpk_resp = rpc_call(
             &self.nodes[rpc_node_idx].rpc_url(),
@@ -803,17 +848,21 @@ impl TestNetwork {
             .ok_or_else(|| "invalid sender secret key".to_string())?;
         let sender = pyde_account::address::derive_eoa_address(sender_pk_bytes);
 
-        // 3. Current nonce.
-        let nonce_params = format!(r#"["0x{}"]"#, hex::encode(sender));
-        let nonce_resp = rpc_call(
-            &self.nodes[rpc_node_idx].rpc_url(),
-            "pyde_getTransactionCount",
-            &nonce_params,
-        )?;
-        // getTransactionCount returns "0x{hex}".
-        let nonce_hex = parse_hex_result(&nonce_resp)?;
-        let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16)
-            .map_err(|e| format!("parse nonce hex {:?}: {}", nonce_hex, e))?;
+        // 3. Current nonce — RPC if no explicit override.
+        let nonce = match explicit_nonce {
+            Some(n) => n,
+            None => {
+                let nonce_params = format!(r#"["0x{}"]"#, hex::encode(sender));
+                let nonce_resp = rpc_call(
+                    &self.nodes[rpc_node_idx].rpc_url(),
+                    "pyde_getTransactionCount",
+                    &nonce_params,
+                )?;
+                let nonce_hex = parse_hex_result(&nonce_resp)?;
+                u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16)
+                    .map_err(|e| format!("parse nonce hex {:?}: {}", nonce_hex, e))?
+            }
+        };
 
         // 4. Build EncryptedTx with a placeholder signature, then
         //    rewrite the signature field after hashing + signing.
@@ -882,6 +931,22 @@ impl TestNetwork {
             &params,
         )?;
         parse_hex_result(&submit_resp).map(|s| s.to_string())
+    }
+
+    /// Sender nonce reported by `pyde_getTransactionCount`. Used by
+    /// burst-style submitters to drive sequential nonces without
+    /// re-querying RPC after every send (which returns the stale
+    /// "last committed" value for back-to-back submissions).
+    pub fn get_nonce(&self, node_idx: usize, address: &[u8; 32]) -> Result<u64, String> {
+        let params = format!(r#"["0x{}"]"#, hex::encode(address));
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_getTransactionCount",
+            &params,
+        )?;
+        let raw = parse_hex_result(&resp)?;
+        u64::from_str_radix(raw.trim_start_matches("0x"), 16)
+            .map_err(|e| format!("parse nonce {:?}: {}", raw, e))
     }
 
     /// Balance in quanta. Returns `0` if the account is unknown.

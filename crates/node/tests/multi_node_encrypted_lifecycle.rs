@@ -45,7 +45,17 @@ fn encrypted_tx_decrypts_and_credits_recipient_on_all_nodes() {
 
     // Let bootstrap + gossip mesh converge. Submitting before the
     // encrypted-share path is fully warm tends to drop shares.
-    net.wait_for_slot(5, Duration::from_secs(45))
+    //
+    // Bumped from slot=5 to slot=15 (was flaky at 5: roughly 1-in-3
+    // runs missed the 60s decrypt deadline because the mesh hadn't
+    // settled and first-batch shares got dropped). Six extra slots
+    // (~2.4s at 400ms slot time) is enough for gossipsub mesh
+    // heartbeats to publish full subscriber lists across the
+    // 4-validator committee. Track this under the encrypted-tx
+    // gossip-warmup residual — flakiness here mirrors what
+    // operators see when a validator restarts mid-flow, since
+    // both paths re-run the same SUBSCRIBE/mesh handshake.
+    net.wait_for_slot(15, Duration::from_secs(45))
         .unwrap_or_else(|e| panic!("initial warm-up: {}", e));
 
     // Sender: validator 0's FALCON keypair. Has AuthKeys::Single
