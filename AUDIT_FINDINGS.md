@@ -864,6 +864,42 @@
         devnets — `mesh_n_low=4` is unsatisfiable with N=4
         validators (max possible mesh peers = N-1 = 3).
 
+- [x] 240 — `✓` **Multisig signing preimage missing `chain_id` —
+      cross-chain replay.** Found while compiling testnet-readiness
+      gaps. All four signed multisig preimages
+      (`MultisigSpend`, `MultisigRotate`, `EmergencyPausePayload`,
+      `EmergencyResumePayload`) hashed `nonce + action_label +
+      payload_fields` with no chain id. Two chains that share the
+      same FALCON multisig signer set (e.g., devnet 31337 and
+      mainnet 1) end up with the same treasury address and the
+      same signature space — a `MultisigTx` signed for nonce N on
+      devnet replays as a valid mainnet payload at the same nonce
+      position, draining the mainnet treasury. Same threat applies
+      to rotation, pause, and resume.
+
+      Fixed: prepended `chain_id: u64` to every signing-bytes
+      preimage and threaded `block_ctx.chain_id` through the four
+      execute handlers (`execute_multisig_spend`,
+      `execute_rotate_multisig`, `execute_emergency_pause`,
+      `execute_emergency_resume`) so verification rebuilds the
+      preimage with the active chain. Test helpers in
+      `crates/tx/tests/common/mod.rs` mirror via a
+      `TEST_CHAIN_ID` constant. New regression test
+      `cross_chain_spend_replay_rejected` builds a 3-of-3 quorum
+      under chain A and asserts the same sigs verify under chain
+      A but fail under chain B. 230 pyde-tx lib tests + all
+      integration proptests pass.
+
+      Risk-acceptance note: this is a wire-format break for any
+      already-signed preimage. No production multisig governance
+      has executed yet, so the break costs nothing operationally.
+      Wire `MULTISIG_VERSION` byte on the encoded payload is
+      unchanged (the encoded `MultisigPayload` doesn't carry the
+      preimage — only the sigs over it), so receivers already
+      reject inconsistent sigs and the only observable change is
+      that signers must include `chain_id` in the preimage they
+      hash.
+
 ---
 
 ## Test-coverage follow-ups (not standalone fix items)

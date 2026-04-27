@@ -107,7 +107,7 @@ proptest! {
             new_signer_pks: vec![new_pk],
             new_threshold: 1,
         };
-        let msg = rotate.signing_bytes(0);
+        let msg = rotate.signing_bytes(0, TEST_CHAIN_ID);
         let indices: Vec<u8> = (0..t as u8).collect();
         let sigs: Vec<multisig::SigEntry> = indices
             .iter()
@@ -160,7 +160,7 @@ proptest! {
             new_signer_pks: vec![new_pk],
             new_threshold: 1,
         };
-        let rmsg = rotate.signing_bytes(0);
+        let rmsg = rotate.signing_bytes(0, TEST_CHAIN_ID);
         let rindices: Vec<u8> = (0..t as u8).collect();
         let rsigs: Vec<multisig::SigEntry> = rindices
             .iter()

@@ -28,6 +28,12 @@ use std::sync::OnceLock;
 /// (MAX_SIGNERS = 16) plus headroom for submitters and random targets.
 pub const POOL_SIZE: usize = 32;
 
+/// Single chain id used by every integration-test fixture in this
+/// crate. Mirrors `block_ctx().chain_id` so the multisig signing
+/// helpers below produce signatures the production handlers will
+/// accept under that same context.
+pub const TEST_CHAIN_ID: u64 = 1;
+
 /// Lazily-initialized keypair pool.
 static POOL: OnceLock<Vec<(FalconPublicKey, FalconSecretKey)>> = OnceLock::new();
 
@@ -209,7 +215,7 @@ pub fn sign_multisig_spend(
     indices: &[u8],
     multisig_nonce: u64,
 ) -> Vec<multisig::SigEntry> {
-    let msg = spend.signing_bytes(multisig_nonce);
+    let msg = spend.signing_bytes(multisig_nonce, TEST_CHAIN_ID);
     sks.iter()
         .zip(indices)
         .map(|(sk, idx)| multisig::SigEntry {
@@ -229,7 +235,7 @@ pub fn sign_pause(
         duration_slots,
         sigs: vec![],
     };
-    let msg = msg_holder.signing_bytes(multisig_nonce);
+    let msg = msg_holder.signing_bytes(multisig_nonce, TEST_CHAIN_ID);
     sks.iter()
         .zip(indices)
         .map(|(sk, idx)| multisig::SigEntry {
@@ -244,7 +250,7 @@ pub fn sign_resume(
     indices: &[u8],
     multisig_nonce: u64,
 ) -> Vec<multisig::SigEntry> {
-    let msg = multisig::EmergencyResumePayload::signing_bytes(multisig_nonce);
+    let msg = multisig::EmergencyResumePayload::signing_bytes(multisig_nonce, TEST_CHAIN_ID);
     sks.iter()
         .zip(indices)
         .map(|(sk, idx)| multisig::SigEntry {

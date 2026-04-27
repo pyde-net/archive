@@ -127,11 +127,15 @@ impl EmergencyPausePayload {
     }
 
     /// Bytes over which signers compute their FALCON signature. The
-    /// signed preimage binds the action label, the multisig nonce,
-    /// AND the duration — so a signature authorizing a 100-slot pause
-    /// can't be replayed to authorize a 10M-slot pause.
-    pub fn signing_bytes(&self, nonce: u64) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + 5 + 8);
+    /// signed preimage binds the chain id, the action label, the
+    /// multisig nonce, AND the duration — so a signature authorizing
+    /// a 100-slot pause can't be replayed to authorize a 10M-slot
+    /// pause, and a signature collected on devnet (chain_id=31337)
+    /// can't be re-wrapped onto mainnet (chain_id=1) at the same
+    /// nonce.
+    pub fn signing_bytes(&self, nonce: u64, chain_id: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + 8 + 5 + 8);
+        buf.extend_from_slice(&chain_id.to_le_bytes());
         buf.extend_from_slice(&nonce.to_le_bytes());
         buf.extend_from_slice(b"PAUSE");
         buf.extend_from_slice(&self.duration_slots.to_le_bytes());
@@ -157,10 +161,13 @@ impl EmergencyResumePayload {
         Some(Self { sigs })
     }
 
-    /// Signed preimage for a resume: just the nonce + action label.
+    /// Signed preimage for a resume: chain_id + nonce + action label.
     /// Resume doesn't carry a duration — it's always a single action.
-    pub fn signing_bytes(nonce: u64) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + 6);
+    /// `chain_id` binds the signature to a single chain (cross-chain
+    /// replay defense); see `EmergencyPausePayload::signing_bytes`.
+    pub fn signing_bytes(nonce: u64, chain_id: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + 8 + 6);
+        buf.extend_from_slice(&chain_id.to_le_bytes());
         buf.extend_from_slice(&nonce.to_le_bytes());
         buf.extend_from_slice(b"RESUME");
         poseidon2_hash(&buf).to_bytes().to_vec()
@@ -172,8 +179,16 @@ impl MultisigSpend {
     /// the on-chain nonce so each signature is bound to a specific
     /// execution. Signers must coordinate on the current nonce before
     /// signing.
-    pub fn signing_bytes(&self, nonce: u64) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + 32 + 16 + 32);
+    ///
+    /// `chain_id` is prepended so a Spend signed on devnet
+    /// (chain_id=31337) cannot be re-wrapped onto mainnet
+    /// (chain_id=1) and drain the mainnet treasury at the same
+    /// nonce position. Without this binding the same FALCON multisig
+    /// keys (and hence the same treasury address) on two chains
+    /// would share a signature space.
+    pub fn signing_bytes(&self, nonce: u64, chain_id: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + 8 + 32 + 16 + 32);
+        buf.extend_from_slice(&chain_id.to_le_bytes());
         buf.extend_from_slice(&nonce.to_le_bytes());
         buf.extend_from_slice(&self.target);
         buf.extend_from_slice(&self.value.to_le_bytes());
@@ -210,8 +225,12 @@ impl MultisigSpend {
 }
 
 impl MultisigRotate {
-    pub fn signing_bytes(&self, nonce: u64) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + 1 + self.new_signer_pks.len() * 897 + 1);
+    /// Signed preimage for a signer-set rotation: chain_id + nonce
+    /// + new pubkey list + new threshold. `chain_id` prevents
+    /// cross-chain replay (see `MultisigSpend::signing_bytes`).
+    pub fn signing_bytes(&self, nonce: u64, chain_id: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + 8 + 1 + self.new_signer_pks.len() * 897 + 1);
+        buf.extend_from_slice(&chain_id.to_le_bytes());
         buf.extend_from_slice(&nonce.to_le_bytes());
         buf.push(self.new_signer_pks.len() as u8);
         for pk in &self.new_signer_pks {
@@ -459,6 +478,11 @@ mod tests {
     use super::*;
     use pyde_crypto::falcon::{falcon_keygen, falcon_sign, FalconSecretKey};
 
+    /// Synthetic chain id used by every signing-bytes test in this
+    /// module. Mirrors the production devnet id so the tests
+    /// exercise the same value space the integration paths see.
+    const TEST_CHAIN_ID: u64 = 31337;
+
     fn gen_signers(n: usize) -> (Vec<Vec<u8>>, Vec<FalconSecretKey>) {
         let mut pks = Vec::with_capacity(n);
         let mut sks = Vec::with_capacity(n);
@@ -580,7 +604,7 @@ mod tests {
             value: 100,
             data_digest: [0x44; 32],
         };
-        let msg = spend.signing_bytes(7);
+        let msg = spend.signing_bytes(7, TEST_CHAIN_ID);
         let sigs = vec![
             sign_at(&sks[0], &msg, 0),
             sign_at(&sks[2], &msg, 2),
@@ -598,7 +622,7 @@ mod tests {
             value: 0,
             data_digest: [0; 32],
         };
-        let msg = spend.signing_bytes(0);
+        let msg = spend.signing_bytes(0, TEST_CHAIN_ID);
         let sigs = vec![sign_at(&sks[1], &msg, 1), sign_at(&sks[1], &msg, 1)];
         let err = count_valid_sigs(&sigs, &pks, &msg).unwrap_err();
         assert!(err.contains("duplicate"));
@@ -612,9 +636,9 @@ mod tests {
             value: 0,
             data_digest: [0; 32],
         };
-        let msg = spend.signing_bytes(0);
+        let msg = spend.signing_bytes(0, TEST_CHAIN_ID);
         // Signer 2 signs a DIFFERENT message — should fail verify.
-        let wrong_msg = spend.signing_bytes(99);
+        let wrong_msg = spend.signing_bytes(99, TEST_CHAIN_ID);
         let sigs = vec![sign_at(&sks[0], &msg, 0), sign_at(&sks[2], &wrong_msg, 2)];
         let valid = count_valid_sigs(&sigs, &pks, &msg).unwrap();
         assert_eq!(valid, 1, "only signer 0's sig is valid");
@@ -628,7 +652,7 @@ mod tests {
             value: 0,
             data_digest: [0; 32],
         };
-        let msg = spend.signing_bytes(0);
+        let msg = spend.signing_bytes(0, TEST_CHAIN_ID);
         // signer_index = 99 is beyond MAX_SIGNERS → hard error.
         let sigs = vec![sign_at(&sks[0], &msg, 99)];
         let err = count_valid_sigs(&sigs, &pks, &msg).unwrap_err();
@@ -693,19 +717,24 @@ mod tests {
             sigs: vec![],
         };
         assert_ne!(
-            p1.signing_bytes(0),
-            p2.signing_bytes(0),
+            p1.signing_bytes(0, TEST_CHAIN_ID),
+            p2.signing_bytes(0, TEST_CHAIN_ID),
             "duration must affect signing bytes"
         );
         assert_ne!(
-            p1.signing_bytes(0),
-            p1.signing_bytes(1),
+            p1.signing_bytes(0, TEST_CHAIN_ID),
+            p1.signing_bytes(1, TEST_CHAIN_ID),
             "nonce must affect signing bytes"
         );
         assert_ne!(
-            p1.signing_bytes(0),
-            EmergencyResumePayload::signing_bytes(0),
+            p1.signing_bytes(0, TEST_CHAIN_ID),
+            EmergencyResumePayload::signing_bytes(0, TEST_CHAIN_ID),
             "action label must differentiate pause from resume"
+        );
+        assert_ne!(
+            p1.signing_bytes(0, TEST_CHAIN_ID),
+            p1.signing_bytes(0, TEST_CHAIN_ID + 1),
+            "chain_id must affect signing bytes"
         );
     }
 
@@ -716,6 +745,48 @@ mod tests {
             value: 123,
             data_digest: [0x66; 32],
         };
-        assert_ne!(spend.signing_bytes(0), spend.signing_bytes(1));
+        assert_ne!(
+            spend.signing_bytes(0, TEST_CHAIN_ID),
+            spend.signing_bytes(1, TEST_CHAIN_ID)
+        );
+    }
+
+    /// Cross-chain replay regression: a Spend signed at nonce N on
+    /// chain A must NOT verify against the same nonce N on chain B.
+    /// Without `chain_id` in the preimage this assertion passes for
+    /// the wrong reason; with the binding the second `count_valid_sigs`
+    /// must report zero valid sigs.
+    #[test]
+    fn cross_chain_spend_replay_rejected() {
+        let (pks, sks) = gen_signers(3);
+        let spend = MultisigSpend {
+            target: [0x77; 32],
+            value: 1_000,
+            data_digest: [0x88; 32],
+        };
+        let nonce = 5;
+
+        // Sign on chain A.
+        let chain_a = TEST_CHAIN_ID;
+        let chain_b = TEST_CHAIN_ID + 1;
+        let msg_a = spend.signing_bytes(nonce, chain_a);
+        let sigs_a: Vec<SigEntry> = (0..3u8)
+            .map(|i| sign_at(&sks[i as usize], &msg_a, i))
+            .collect();
+
+        // Quorum verifies on chain A — the path the legitimate
+        // execution takes.
+        let valid_on_a = count_valid_sigs(&sigs_a, &pks, &msg_a).unwrap();
+        assert_eq!(valid_on_a, 3);
+
+        // Replay attempt on chain B at the same nonce: rebuild the
+        // preimage with chain_b and feed the chain-A sigs through.
+        // None should verify.
+        let msg_b = spend.signing_bytes(nonce, chain_b);
+        let valid_on_b = count_valid_sigs(&sigs_a, &pks, &msg_b).unwrap();
+        assert_eq!(
+            valid_on_b, 0,
+            "chain-A sigs must not verify under chain-B preimage"
+        );
     }
 }

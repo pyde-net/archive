@@ -106,7 +106,10 @@ proptest! {
         prop_assume!((n1, t1, v1, d1) != (n2, t2, v2, d2));
         let s1 = MultisigSpend { target: t1, value: v1, data_digest: d1 };
         let s2 = MultisigSpend { target: t2, value: v2, data_digest: d2 };
-        prop_assert_ne!(s1.signing_bytes(n1), s2.signing_bytes(n2));
+        prop_assert_ne!(
+            s1.signing_bytes(n1, 1u64),
+            s2.signing_bytes(n2, 1u64)
+        );
     }
 
     /// Rotate signing_bytes must differ whenever the new set or
@@ -125,7 +128,10 @@ proptest! {
         prop_assume!((n1, pks1.clone(), t1) != (n2, pks2.clone(), t2));
         let r1 = MultisigRotate { new_signer_pks: pks1, new_threshold: t1 };
         let r2 = MultisigRotate { new_signer_pks: pks2, new_threshold: t2 };
-        prop_assert_ne!(r1.signing_bytes(n1), r2.signing_bytes(n2));
+        prop_assert_ne!(
+            r1.signing_bytes(n1, 1u64),
+            r2.signing_bytes(n2, 1u64)
+        );
     }
 
     /// `count_valid_sigs` must reject any slate with duplicate
