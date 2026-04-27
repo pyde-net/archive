@@ -3688,10 +3688,23 @@ fn handle_swarm_event(
                 },
             ..
         })) => {
-            let ws_slot = validator_engine
+            // Audit 241: hand the snapshot path the full WS anchor
+            // (slot + state_root) so it can reject snapshots that
+            // either regress past the checkpoint or land on a
+            // long-range fork at the anchor slot. Block-sync paths
+            // still derive just the slot internally.
+            let ws_checkpoint = validator_engine
                 .as_ref()
-                .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot));
-            chain_sync.on_response(request_id, response, chain, state, block_store, ws_slot);
+                .and_then(|e| e.finality.latest_checkpoint.as_ref())
+                .map(|cp| (cp.slot, cp.state_root));
+            chain_sync.on_response(
+                request_id,
+                response,
+                chain,
+                state,
+                block_store,
+                ws_checkpoint,
+            );
             // Signal the event loop to continue if chunked snapshot needs
             // more chunks OR we're otherwise still syncing. Both branches
             // produced the same ContinueSync return — collapsed into a

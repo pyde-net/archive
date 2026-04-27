@@ -230,14 +230,57 @@ impl ChainSync {
             && self.manager.slots_behind() > Self::SNAPSHOT_THRESHOLD
     }
 
+    /// Audit 241: WS-anchor admission check for snapshots. Returns
+    /// `Err(reason)` if the announced `(head_slot, state_root)` would
+    /// violate the weak-subjectivity anchor; `Ok(())` otherwise.
+    ///
+    /// `None` ws_checkpoint means first-time bootstrap — accept any
+    /// snapshot. With a checkpoint set, two cases reject:
+    /// - `head_slot < cp_slot`: snapshot would regress past the
+    ///   finalized anchor.
+    /// - `head_slot == cp_slot && state_root != cp_state_root`:
+    ///   snapshot's anchor-slot state diverges from canonical
+    ///   (long-range fork).
+    ///
+    /// Snapshots strictly beyond the anchor (`head_slot > cp_slot`)
+    /// pass this check; deeper root-vs-canonical-block matching for
+    /// post-anchor snapshots is a follow-up — would need per-slot
+    /// state-root tracking that the chain doesn't expose today.
+    fn check_snapshot_ws_anchor(
+        head_slot: u64,
+        state_root: &[u8; 32],
+        ws_checkpoint: Option<(u64, [u8; 32])>,
+    ) -> Result<(), &'static str> {
+        if let Some((cp_slot, cp_root)) = ws_checkpoint {
+            if head_slot < cp_slot {
+                return Err("snapshot head_slot is before WS checkpoint");
+            }
+            if head_slot == cp_slot && *state_root != cp_root {
+                return Err("snapshot state_root at WS checkpoint slot does not match");
+            }
+        }
+        Ok(())
+    }
+
     /// Handle a sync response from a peer.
     /// Returns the number of blocks processed.
     ///
-    /// `ws_checkpoint_slot` (slice 4.3) is the caller's live
-    /// weak-subjectivity anchor — `Some(cp_slot)` during normal
-    /// operation, `None` during first-time bootstrap. Blocks at or
-    /// before `cp_slot` are rejected even via sync to defend against
-    /// long-range attacks delivered through a compromised peer.
+    /// `ws_checkpoint` (slice 4.3) is the caller's live
+    /// weak-subjectivity anchor — `Some((cp_slot, cp_state_root))`
+    /// during normal operation, `None` during first-time bootstrap.
+    ///
+    /// Block-sync paths (Blocks/Headers): blocks at or before
+    /// `cp_slot` are rejected to defend against long-range attacks
+    /// delivered through a compromised peer.
+    ///
+    /// Audit 241: snapshot paths apply the same anchor rule:
+    /// snapshots whose `head_slot < cp_slot` are rejected outright
+    /// (would regress us past a finalized checkpoint), and snapshots
+    /// at exactly `head_slot == cp_slot` must announce a `state_root`
+    /// matching the checkpoint's root (otherwise they're a long-range
+    /// fork from the anchor). Without these guards, a malicious peer
+    /// can deliver a crypto-internally-valid snapshot from a divergent
+    /// chain and have it silently overwrite our state.
     pub fn on_response(
         &mut self,
         request_id: OutboundRequestId,
@@ -245,8 +288,9 @@ impl ChainSync {
         chain: &mut ChainState,
         state: &mut StateManager,
         block_store: &BlockStore,
-        ws_checkpoint_slot: Option<u64>,
+        ws_checkpoint: Option<(u64, [u8; 32])>,
     ) -> u64 {
+        let ws_checkpoint_slot = ws_checkpoint.map(|(s, _)| s);
         self.pending.remove(&request_id);
 
         match response {
@@ -346,6 +390,23 @@ impl ChainSync {
                     "received state snapshot"
                 );
 
+                // Audit 241: WS-anchor guard. Reject snapshots that
+                // would regress us past the finalized checkpoint, or
+                // that announce a divergent state_root at exactly the
+                // anchor slot (long-range fork).
+                if let Err(reason) =
+                    Self::check_snapshot_ws_anchor(head_slot, &state_root, ws_checkpoint)
+                {
+                    warn!(
+                        head_slot,
+                        announced_root = hex::encode(state_root),
+                        ws = ?ws_checkpoint.map(|(s, _)| s),
+                        reason,
+                        "rejecting state snapshot"
+                    );
+                    return 0;
+                }
+
                 match state.import_snapshot(entries) {
                     Ok(imported_root) => {
                         if imported_root == state_root {
@@ -380,6 +441,28 @@ impl ChainSync {
                 chunk_hash,
                 entries,
             } => {
+                // Audit 241: WS-anchor guard for the chunked path.
+                // Same admission rule as the single-shot path, applied
+                // on every chunk so a peer that flips the announced
+                // root mid-stream can't slip through. Reject also
+                // clears any partial state so a retry starts clean.
+                if let Err(reason) =
+                    Self::check_snapshot_ws_anchor(head_slot, &state_root, ws_checkpoint)
+                {
+                    warn!(
+                        head_slot,
+                        announced_root = hex::encode(state_root),
+                        ws = ?ws_checkpoint.map(|(s, _)| s),
+                        reason,
+                        "rejecting snapshot chunk"
+                    );
+                    self.snapshot_chunks.clear();
+                    self.snapshot_expected_root = None;
+                    self.snapshot_total_chunks = 0;
+                    self.snapshot_retry_count = 0;
+                    return 0;
+                }
+
                 // Verify chunk hash
                 let mut hash_buf = Vec::new();
                 for (k, v) in &entries {
@@ -772,6 +855,52 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bs = BlockStore::open(tmp.path()).unwrap();
         (bs, tmp)
+    }
+
+    // ========== Audit 241: snapshot WS-anchor admission ==========
+
+    #[test]
+    fn snapshot_ws_anchor_no_checkpoint_accepts_anything() {
+        // Bootstrap path: no checkpoint set, so nothing is rejected.
+        assert!(ChainSync::check_snapshot_ws_anchor(0, &[0u8; 32], None).is_ok());
+        assert!(ChainSync::check_snapshot_ws_anchor(1_000_000, &[0xAA; 32], None).is_ok());
+    }
+
+    #[test]
+    fn snapshot_ws_anchor_rejects_pre_checkpoint_slot() {
+        let cp = (500u64, [0xAA; 32]);
+        // Long-range fork: snapshot's head is BEFORE the WS anchor —
+        // applying it would regress past a finalized point.
+        let err = ChainSync::check_snapshot_ws_anchor(499, &[0xBB; 32], Some(cp)).unwrap_err();
+        assert!(err.contains("before WS checkpoint"));
+        // Even with a state_root that happens to match, slot wins.
+        let err = ChainSync::check_snapshot_ws_anchor(0, &[0xAA; 32], Some(cp)).unwrap_err();
+        assert!(err.contains("before WS checkpoint"));
+    }
+
+    #[test]
+    fn snapshot_ws_anchor_rejects_wrong_root_at_checkpoint_slot() {
+        let cp = (500u64, [0xAA; 32]);
+        // Same slot as the anchor but a divergent state_root: this is
+        // the long-range fork delivered as a snapshot — reject.
+        let err = ChainSync::check_snapshot_ws_anchor(500, &[0xBB; 32], Some(cp)).unwrap_err();
+        assert!(err.contains("does not match"));
+    }
+
+    #[test]
+    fn snapshot_ws_anchor_accepts_at_checkpoint_with_matching_root() {
+        let cp = (500u64, [0xAA; 32]);
+        assert!(ChainSync::check_snapshot_ws_anchor(500, &[0xAA; 32], Some(cp)).is_ok());
+    }
+
+    #[test]
+    fn snapshot_ws_anchor_accepts_post_checkpoint() {
+        let cp = (500u64, [0xAA; 32]);
+        // Strictly past the anchor: any state_root passes the slot
+        // guard — deeper root verification against canonical block at
+        // head_slot is a follow-up (needs per-slot root tracking).
+        assert!(ChainSync::check_snapshot_ws_anchor(501, &[0xBB; 32], Some(cp)).is_ok());
+        assert!(ChainSync::check_snapshot_ws_anchor(10_000, &[0xCC; 32], Some(cp)).is_ok());
     }
 
     #[test]

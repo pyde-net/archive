@@ -864,6 +864,47 @@
         devnets — `mesh_n_low=4` is unsatisfiable with N=4
         validators (max possible mesh peers = N-1 = 3).
 
+- [x] 241 — `✓` **Snapshot import bypasses weak-subjectivity
+      anchor.** Found while compiling testnet-readiness gaps. Both
+      `SyncResp::StateSnapshot` and `SyncResp::StateSnapshotChunk`
+      handlers in `crates/node/src/sync.rs` called
+      `state.import_snapshot(entries)` and only verified that the
+      flattened entries hash to the announced `state_root` —
+      no check that `head_slot` or `state_root` were consistent
+      with the live WS checkpoint. A malicious peer could deliver
+      a crypto-internally-valid snapshot from a long-range fork
+      (e.g., diverging at the WS anchor or earlier) and overwrite
+      our state with it; the block-sync paths already guarded
+      against this via `process_full_block_with_aot_and_checkpoint`,
+      but snapshot ingest had no equivalent.
+
+      Fixed: `on_response` now takes `Option<(u64, [u8; 32])>`
+      (slot + state_root from the live `FinalityCheckpoint`) and
+      both snapshot paths route through a new
+      `check_snapshot_ws_anchor(head_slot, state_root, ws_checkpoint)`
+      helper that rejects:
+      - `head_slot < cp_slot` — snapshot would regress past the
+        finalized anchor.
+      - `head_slot == cp_slot && state_root != cp_state_root` —
+        snapshot at the anchor slot lands on a different chain than
+        the canonical hard-final state.
+
+      Snapshots strictly past the anchor still pass the slot guard;
+      deeper "verify root against canonical block at head_slot" is a
+      follow-up — needs per-slot state-root tracking the chain
+      doesn't expose today. The chunked path applies the check on
+      every chunk so a peer that flips the announced root mid-stream
+      can't slip through, and clears any partial snapshot state on
+      reject so a retry starts fresh.
+
+      Tests: 5 new helper-level tests
+      (`snapshot_ws_anchor_no_checkpoint_accepts_anything`,
+      `snapshot_ws_anchor_rejects_pre_checkpoint_slot`,
+      `snapshot_ws_anchor_rejects_wrong_root_at_checkpoint_slot`,
+      `snapshot_ws_anchor_accepts_at_checkpoint_with_matching_root`,
+      `snapshot_ws_anchor_accepts_post_checkpoint`). 238 pyde-node
+      bin tests + 115 pyde-consensus lib tests pass.
+
 - [x] 240 — `✓` **Multisig signing preimage missing `chain_id` —
       cross-chain replay.** Found while compiling testnet-readiness
       gaps. All four signed multisig preimages
