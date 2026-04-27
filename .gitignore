@@ -3,6 +3,15 @@ target/
 pyde-book/
 ROADMAP.md
 
+# Operator-facing planning docs that live next to source for ergonomic
+# cross-reference but aren't part of the project's public history.
+# Keep these in sync with the corresponding doc in their target repo
+# (or the dedicated planning workspace) when content matters.
+MAINNET_PLAN.md
+BENCH_PLAN.md
+BENCH_CONTRACTS.md
+EXPLORER_PLAN.md
+
 # cargo-fuzz artefacts (task 053). Crate lives outside the workspace
 # and has its own Cargo.lock + target/ dir + corpus dir which we don't
 # commit. Fuzz crashes go into fuzz/artifacts/ and should also stay
