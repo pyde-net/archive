@@ -518,8 +518,8 @@ fn execute_transaction_inner(
             execute_claim_airdrop(tx, smt, block_ctx, &mut sender.balance)
         }
         TransactionType::SweepAirdrop => execute_sweep_airdrop(tx, smt, block_ctx),
-        TransactionType::MultisigTx => execute_multisig_spend(tx, smt),
-        TransactionType::RotateMultisig => execute_rotate_multisig(tx, smt),
+        TransactionType::MultisigTx => execute_multisig_spend(tx, smt, block_ctx),
+        TransactionType::RotateMultisig => execute_rotate_multisig(tx, smt, block_ctx),
         TransactionType::EmergencyPause => execute_emergency_pause(tx, smt, block_ctx),
         TransactionType::EmergencyResume => execute_emergency_resume(tx, smt, block_ctx),
         TransactionType::ClaimReward => {
@@ -1623,6 +1623,7 @@ const MULTISIG_ROTATE_PER_NEW_SIGNER_GAS: u64 = 10_000;
 fn execute_multisig_spend(
     tx: &Transaction,
     smt: &mut dyn pyde_state::smt::StateAccess,
+    block_ctx: &BlockContext,
 ) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
     let payload = match crate::multisig::MultisigPayload::decode(&tx.data) {
         Some(p) => p,
@@ -1731,7 +1732,7 @@ fn execute_multisig_spend(
     }
 
     let nonce = read_multisig_nonce(smt);
-    let msg = spend.signing_bytes(nonce);
+    let msg = spend.signing_bytes(nonce, block_ctx.chain_id);
     let valid = match crate::multisig::count_valid_sigs(&sigs, &signer_pks, &msg) {
         Ok(v) => v,
         Err(e) => return (false, gas, 0, vec![], e.as_bytes().to_vec()),
@@ -1788,6 +1789,7 @@ fn execute_multisig_spend(
 fn execute_rotate_multisig(
     tx: &Transaction,
     smt: &mut dyn pyde_state::smt::StateAccess,
+    block_ctx: &BlockContext,
 ) -> (bool, u64, u64, Vec<LogEntry>, Vec<u8>) {
     let payload = match crate::multisig::MultisigPayload::decode(&tx.data) {
         Some(p) => p,
@@ -1883,7 +1885,7 @@ fn execute_rotate_multisig(
     }
 
     let nonce = read_multisig_nonce(smt);
-    let msg = rotate.signing_bytes(nonce);
+    let msg = rotate.signing_bytes(nonce, block_ctx.chain_id);
     let valid = match crate::multisig::count_valid_sigs(&sigs, &current_signers, &msg) {
         Ok(v) => v,
         Err(e) => return (false, gas, 0, vec![], e.as_bytes().to_vec()),
@@ -2021,7 +2023,7 @@ fn execute_emergency_pause(
     }
 
     let nonce = read_multisig_nonce(smt);
-    let msg = payload.signing_bytes(nonce);
+    let msg = payload.signing_bytes(nonce, block_ctx.chain_id);
     if let Err(e) = multisig_ok(smt, &payload.sigs, &msg, gas) {
         return e;
     }
@@ -2073,7 +2075,7 @@ fn execute_emergency_resume(
     }
 
     let nonce = read_multisig_nonce(smt);
-    let msg = crate::multisig::EmergencyResumePayload::signing_bytes(nonce);
+    let msg = crate::multisig::EmergencyResumePayload::signing_bytes(nonce, block_ctx.chain_id);
     if let Err(e) = multisig_ok(smt, &payload.sigs, &msg, gas) {
         return e;
     }
@@ -4616,8 +4618,9 @@ mod tests {
         sks: &[&pyde_crypto::falcon::FalconSecretKey],
         indices: &[u8],
         nonce: u64,
+        chain_id: u64,
     ) -> Vec<crate::multisig::SigEntry> {
-        let msg = spend.signing_bytes(nonce);
+        let msg = spend.signing_bytes(nonce, chain_id);
         sks.iter()
             .zip(indices.iter())
             .map(|(sk, idx)| {
@@ -4642,7 +4645,7 @@ mod tests {
 
         let target = [0xEE; 32];
         let spend = make_spend(target, 1_000_000);
-        let sigs = sign_spend(&spend, &[&sks[0], &sks[1], &sks[2]], &[0, 1, 2], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1], &sks[2]], &[0, 1, 2], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
         let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
 
@@ -4672,7 +4675,7 @@ mod tests {
 
         let spend = make_spend([0xEE; 32], 1_000_000);
         // Only 2 sigs but threshold = 3.
-        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
         let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
 
@@ -4692,7 +4695,7 @@ mod tests {
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
         let spend = make_spend([0xEE; 32], 500_000);
-        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend {
             spend: spend.clone(),
             sigs: sigs.clone(),
@@ -4723,7 +4726,7 @@ mod tests {
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
         let spend = make_spend([0xEE; 32], 0);
-        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
         let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
@@ -4740,7 +4743,7 @@ mod tests {
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
         let spend = make_spend([0u8; 32], 1_000);
-        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
         let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
@@ -4757,7 +4760,7 @@ mod tests {
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
         let spend = make_spend(pyde_account::address::treasury_address(), 1_000);
-        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
         let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
@@ -4774,7 +4777,7 @@ mod tests {
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
         let spend = make_spend([0xEE; 32], 1_000_000);
-        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
         let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
@@ -4792,7 +4795,7 @@ mod tests {
 
         let spend = make_spend([0xEE; 32], 1_000);
         // Same signer_index twice — hard reject at sig-count stage.
-        let sigs = sign_spend(&spend, &[&sks[0], &sks[0]], &[0, 0], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[0]], &[0, 0], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
         let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
@@ -4813,7 +4816,7 @@ mod tests {
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
         let spend = make_spend(submitter, 500_000);
-        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
         let tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
 
@@ -4847,7 +4850,7 @@ mod tests {
 
         let target = [0xEE; 32];
         let spend = make_spend(target, 500_000);
-        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
         let mut tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
         tx.to = target; // non-zero tx.to — would clobber target credit
@@ -4881,7 +4884,7 @@ mod tests {
             new_signer_pks: new_pks.clone(),
             new_threshold: 3,
         };
-        let msg = rotate.signing_bytes(0);
+        let msg = rotate.signing_bytes(0, 1);
         let sigs = vec![
             crate::multisig::SigEntry {
                 signer_index: 0,
@@ -4925,7 +4928,7 @@ mod tests {
             new_signer_pks: vec![new_pk.as_bytes().to_vec()],
             new_threshold: 5, // > signer count
         };
-        let msg = rotate.signing_bytes(0);
+        let msg = rotate.signing_bytes(0, 1);
         let sigs = vec![
             crate::multisig::SigEntry {
                 signer_index: 0,
@@ -4964,7 +4967,7 @@ mod tests {
             new_signer_pks: vec![dup.clone(), dup.clone()],
             new_threshold: 1,
         };
-        let msg = rotate.signing_bytes(0);
+        let msg = rotate.signing_bytes(0, 1);
         let sigs = vec![
             crate::multisig::SigEntry {
                 signer_index: 0,
@@ -5010,7 +5013,7 @@ mod tests {
             new_signer_pks: new_pks,
             new_threshold: 2,
         };
-        let rmsg = rotate.signing_bytes(0);
+        let rmsg = rotate.signing_bytes(0, 1);
         let rsigs = vec![
             crate::multisig::SigEntry {
                 signer_index: 0,
@@ -5037,7 +5040,7 @@ mod tests {
 
         // Spend signed by OLD signers should now fail.
         let spend = make_spend([0xEE; 32], 1_000);
-        let old_sigs = sign_spend(&spend, &[&old_sks[0], &old_sks[1]], &[0, 1], 1);
+        let old_sigs = sign_spend(&spend, &[&old_sks[0], &old_sks[1]], &[0, 1], 1, 1);
         let old_payload = crate::multisig::MultisigPayload::Spend {
             spend: spend.clone(),
             sigs: old_sigs,
@@ -5049,7 +5052,7 @@ mod tests {
         assert!(!orr.success, "old signers must no longer authorize");
 
         // Spend signed by NEW signers should succeed.
-        let new_sigs = sign_spend(&spend, &[&new_sk_a, &new_sk_b], &[0, 1], 1);
+        let new_sigs = sign_spend(&spend, &[&new_sk_a, &new_sk_b], &[0, 1], 1, 1);
         let new_payload = crate::multisig::MultisigPayload::Spend {
             spend,
             sigs: new_sigs,
@@ -5107,7 +5110,7 @@ mod tests {
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
         let spend = make_spend([0xEE; 32], 1_000);
-        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0);
+        let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
         let mut tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
         // Needed: 50k base + 2*50k = 150k. Set below.
@@ -5135,12 +5138,13 @@ mod tests {
         indices: &[u8],
         duration_slots: u64,
         nonce: u64,
+        chain_id: u64,
     ) -> Vec<crate::multisig::SigEntry> {
         let stub = crate::multisig::EmergencyPausePayload {
             duration_slots,
             sigs: vec![],
         };
-        let msg = stub.signing_bytes(nonce);
+        let msg = stub.signing_bytes(nonce, chain_id);
         sks.iter()
             .zip(indices.iter())
             .map(|(sk, idx)| crate::multisig::SigEntry {
@@ -5157,8 +5161,9 @@ mod tests {
         sks: &[&pyde_crypto::falcon::FalconSecretKey],
         indices: &[u8],
         nonce: u64,
+        chain_id: u64,
     ) -> Vec<crate::multisig::SigEntry> {
-        let msg = crate::multisig::EmergencyResumePayload::signing_bytes(nonce);
+        let msg = crate::multisig::EmergencyResumePayload::signing_bytes(nonce, chain_id);
         sks.iter()
             .zip(indices.iter())
             .map(|(sk, idx)| crate::multisig::SigEntry {
@@ -5236,7 +5241,7 @@ mod tests {
 
         assert!(!is_paused(&smt, ctx.height));
 
-        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0, 1);
         let tx = build_pause_tx(submitter, &sub_sk, 500, sigs, 0);
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(receipt.success);
@@ -5258,11 +5263,11 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0, 1);
         let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
         execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
 
-        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1);
+        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1, 1);
         let resume_tx = build_resume_tx(submitter, &sub_sk, resume_sigs, 1);
         let r = execute_transaction(&resume_tx, &mut smt, &ctx).unwrap();
         assert!(r.success);
@@ -5280,7 +5285,7 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 10, 0);
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 10, 0, 1);
         let tx = build_pause_tx(submitter, &sub_sk, 10, sigs, 0);
         execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(is_paused(&smt, ctx.height));
@@ -5310,7 +5315,7 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 0, 0);
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 0, 0, 1);
         let tx = build_pause_tx(submitter, &sub_sk, 0, sigs, 0);
         let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(!r.success);
@@ -5328,7 +5333,7 @@ mod tests {
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
         let over = MAX_PAUSE_DURATION_SLOTS + 1;
-        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], over, 0);
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], over, 0, 1);
         let tx = build_pause_tx(submitter, &sub_sk, over, sigs, 0);
         let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(!r.success);
@@ -5344,7 +5349,7 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let sigs = sign_pause_sigs(&[&sks[0]], &[0], 500, 0);
+        let sigs = sign_pause_sigs(&[&sks[0]], &[0], 500, 0, 1);
         let tx = build_pause_tx(submitter, &sub_sk, 500, sigs, 0);
         let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(!r.success);
@@ -5361,12 +5366,12 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0, 1);
         let pause_tx = build_pause_tx(submitter, &sub_sk, 500, sigs.clone(), 0);
         execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
 
         // Resume so we can attempt re-pause.
-        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1);
+        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1, 1);
         let resume_tx = build_resume_tx(submitter, &sub_sk, resume_sigs, 1);
         execute_transaction(&resume_tx, &mut smt, &ctx).unwrap();
 
@@ -5392,7 +5397,7 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let sigs_over_500 = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let sigs_over_500 = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0, 1);
         let tx = build_pause_tx(submitter, &sub_sk, 100, sigs_over_500, 0);
         let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(!r.success, "duration tamper must fail sig verification");
@@ -5407,7 +5412,7 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 0);
+        let sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 0, 1);
         let tx = build_resume_tx(submitter, &sub_sk, sigs, 0);
         let r = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(!r.success);
@@ -5423,7 +5428,7 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0, 1);
         let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
         execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
 
@@ -5443,12 +5448,12 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0, 1);
         let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
         execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
 
         let spend = make_spend([0xEE; 32], 1_000);
-        let spend_sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 1);
+        let spend_sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 1, 1);
         let payload = crate::multisig::MultisigPayload::Spend {
             spend,
             sigs: spend_sigs,
@@ -5469,7 +5474,7 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0, 1);
         let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
         execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
 
@@ -5478,7 +5483,7 @@ mod tests {
             new_signer_pks: vec![new_pk.as_bytes().to_vec()],
             new_threshold: 1,
         };
-        let rmsg = rotate.signing_bytes(1);
+        let rmsg = rotate.signing_bytes(1, 1);
         let rsigs = vec![
             crate::multisig::SigEntry {
                 signer_index: 0,
@@ -5515,12 +5520,12 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0, 1);
         let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
         execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
         assert!(is_paused(&smt, ctx.height));
 
-        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1);
+        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1, 1);
         let resume_tx = build_resume_tx(submitter, &sub_sk, resume_sigs, 1);
         let r = execute_transaction(&resume_tx, &mut smt, &ctx).unwrap();
         assert!(r.success);
@@ -5536,11 +5541,11 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let pause_sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0, 1);
         let pause_tx = build_pause_tx(submitter, &sub_sk, 500, pause_sigs, 0);
         execute_transaction(&pause_tx, &mut smt, &ctx).unwrap();
 
-        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1);
+        let resume_sigs = sign_resume_sigs(&[&sks[0], &sks[1]], &[0, 1], 1, 1);
         let resume_tx = build_resume_tx(submitter, &sub_sk, resume_sigs, 1);
         execute_transaction(&resume_tx, &mut smt, &ctx).unwrap();
 
@@ -5560,7 +5565,7 @@ mod tests {
         let submitter = derive_eoa_address(sub_pk.as_bytes());
         fund_account_with_pk(&mut smt, &submitter, 5_000_000_000_000, sub_pk.as_bytes());
 
-        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0);
+        let sigs = sign_pause_sigs(&[&sks[0], &sks[1]], &[0, 1], 500, 0, 1);
         let mut tx = build_pause_tx(submitter, &sub_sk, 500, sigs, 0);
         tx.gas_limit = 50_000;
         sign_tx(&mut tx, &sub_sk);

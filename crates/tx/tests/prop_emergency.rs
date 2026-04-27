@@ -96,7 +96,7 @@ proptest! {
         prop_assume!((n1, d1) != (n2, d2));
         let p1 = EmergencyPausePayload { duration_slots: d1, sigs: vec![] };
         let p2 = EmergencyPausePayload { duration_slots: d2, sigs: vec![] };
-        prop_assert_ne!(p1.signing_bytes(n1), p2.signing_bytes(n2));
+        prop_assert_ne!(p1.signing_bytes(n1, 1u64), p2.signing_bytes(n2, 1u64));
     }
 
     /// Resume signing_bytes must differ by nonce.
@@ -107,8 +107,8 @@ proptest! {
     ) {
         prop_assume!(n1 != n2);
         prop_assert_ne!(
-            EmergencyResumePayload::signing_bytes(n1),
-            EmergencyResumePayload::signing_bytes(n2)
+            EmergencyResumePayload::signing_bytes(n1, 1u64),
+            EmergencyResumePayload::signing_bytes(n2, 1u64)
         );
     }
 
@@ -120,9 +120,9 @@ proptest! {
         nonce in 0u64..u64::MAX,
         duration in 1u64..=10_000_000,
     ) {
-        let pause_bytes =
-            EmergencyPausePayload { duration_slots: duration, sigs: vec![] }.signing_bytes(nonce);
-        let resume_bytes = EmergencyResumePayload::signing_bytes(nonce);
+        let pause_bytes = EmergencyPausePayload { duration_slots: duration, sigs: vec![] }
+            .signing_bytes(nonce, 1u64);
+        let resume_bytes = EmergencyResumePayload::signing_bytes(nonce, 1u64);
         prop_assert_ne!(pause_bytes, resume_bytes);
     }
 }
