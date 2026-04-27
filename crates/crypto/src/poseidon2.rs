@@ -312,6 +312,82 @@ mod tests {
             internal_rounds, 22,
             "Expected 22 internal rounds for 128-bit security"
         );
+        assert_eq!(
+            HL_GOLDILOCKS_8_EXTERNAL_ROUND_CONSTANTS[0].len(),
+            4,
+            "Expected 4 initial external rounds"
+        );
+        assert_eq!(
+            HL_GOLDILOCKS_8_EXTERNAL_ROUND_CONSTANTS[1].len(),
+            4,
+            "Expected 4 terminal external rounds"
+        );
+    }
+
+    /// Audit 216: pin the actual round-constant *values* (not just
+    /// counts). If Plonky3 ever ships changed constants for the
+    /// `HL_GOLDILOCKS_8_*` arrays — same shape, different values —
+    /// the count check above still passes but the hash digest below
+    /// changes and this test fails. Trips loudly so an operator
+    /// can review the upstream change before merging a dep bump.
+    ///
+    /// Procedure if upstream legitimately changes constants:
+    /// 1. Run this test, copy the actual hex from the failure.
+    /// 2. Update `EXPECTED_PIN` after manually verifying the new
+    ///    constants against the Plonky3 reference doc.
+    #[test]
+    fn round_constants_pin() {
+        // Serialise every constant as 8-byte little-endian, in
+        // declaration order: initial external rounds, terminal
+        // external rounds, then internal rounds. Matches the order
+        // `make_perm` consumes them in.
+        let mut buf = Vec::new();
+        for round in HL_GOLDILOCKS_8_EXTERNAL_ROUND_CONSTANTS[0].iter() {
+            for v in round.iter() {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for round in HL_GOLDILOCKS_8_EXTERNAL_ROUND_CONSTANTS[1].iter() {
+            for v in round.iter() {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for v in HL_GOLDILOCKS_8_INTERNAL_ROUND_CONSTANTS.iter() {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // Total: 8 external rounds × 8 elements + 22 internal × 1 element
+        //        = 64 + 22 = 86 u64 constants = 688 bytes.
+        assert_eq!(
+            buf.len(),
+            (8 * 8 + 22) * 8,
+            "constant byte count — shape changed"
+        );
+
+        let actual = poseidon2_hash(&buf);
+        let actual_hex = bytes_to_hex(actual.as_bytes());
+
+        // Pinned digest computed against the Plonky3 constants
+        // shipped at the time this test was written. Update only
+        // after manually re-verifying upstream against the
+        // Poseidon2 reference (https://eprint.iacr.org/2023/323).
+        const EXPECTED_PIN: &str =
+            "6bad88dc8fc2a8c8e591287265aed6ef50b586f71dd641cebc8d5b298a5ca715";
+
+        assert_eq!(
+            actual_hex, EXPECTED_PIN,
+            "Poseidon2 round constants drift detected. Actual digest: {}",
+            actual_hex
+        );
+    }
+
+    fn bytes_to_hex(bytes: &[u8]) -> alloc::string::String {
+        let mut out = alloc::string::String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+            out.push(char::from_digit((b & 0x0F) as u32, 16).unwrap());
+        }
+        out
     }
 
     #[test]
