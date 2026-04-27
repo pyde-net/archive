@@ -402,10 +402,24 @@
       page-gas parity gap (Load/Store/wide-load/wide-store all
       bypass the page-allocation gas the interpreter charges).
 
-- [ ] 216 — `⚠` **Poseidon2 spec-match test.**
-      `crates/crypto/src/poseidon2.rs` — tests assert capacity but
-      not round counts (RF=8, RI=22 for Plonky3 default). Add a
-      constants-match test pinned to the reference.
+- [x] 216 — `✓` **Poseidon2 spec-match test.**
+      `crates/crypto/src/poseidon2.rs` previously asserted capacity
+      and (recently) the round counts (RF=8, RI=22 for Plonky3
+      default), but not the round-constant *values*. A future
+      Plonky3 dep bump that changed any single `HL_GOLDILOCKS_8_*`
+      constant would silently slip past the count check.
+
+      Shipped: `round_constants_pin` test serialises every external
+      and internal round constant in declaration order to a fixed
+      688-byte buffer, hashes it via `poseidon2_hash`, and pins the
+      resulting digest against a hex constant
+      (`6bad88dc8fc2a8c8e591287265aed6ef50b586f71dd641cebc8d5b298a5ca715`).
+      If upstream legitimately changes constants, the failure
+      message prints the new digest so an operator can re-verify
+      against the Poseidon2 reference doc and update the pin in
+      one explicit, reviewable commit. Also tightened the count
+      test to assert the 4+4 split between initial and terminal
+      external rounds. 25 pyde-crypto poseidon2 tests pass.
 
 - [x] 217 — `✓` **Witness oversize rejected without charging.**
       Closed on investigation, not currently a bug. Searched
