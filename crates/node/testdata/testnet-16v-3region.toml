@@ -1,0 +1,118 @@
+# Canonical 16-validator / 3-region testnet topology (task 078).
+#
+# Hand the path to this file to `pyde testnet --validators 16 --node-addrs
+# ./crates/node/testdata/testnet-16v-3region.toml`. Each `[[nodes]]` entry
+# corresponds to node-N in the generated output directory and supplies the
+# (region, host, port) tuple that ends up baked into:
+#
+#   * the bootstrap_peers entries every other node sees
+#   * the [network].port that this node binds locally
+#   * a `# region:` comment at the top of this node's config.toml so
+#     operators can match the directory to their cloud target at a glance
+#
+# Customise hosts before running. The `validator-N.testnet.pyde.network`
+# names below are placeholders — substitute your actual DNS records (or
+# raw IPs) before regenerating, then commit the resulting per-node
+# directories to your deployment repo.
+#
+# Region distribution: 6 / 5 / 5 across us-east, eu-west, ap-southeast
+# matches the canonical 3-region geography we plan to operate against.
+# 16 validators yields 11/16 = 69% honest threshold, comfortably past
+# the 2f+1 BFT bound (need 11 of 16) so a full-region outage of 5 nodes
+# still leaves a quorum.
+
+[[nodes]]
+index = 0
+region = "us-east-1"
+host = "validator-0.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 1
+region = "us-east-1"
+host = "validator-1.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 2
+region = "us-east-1"
+host = "validator-2.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 3
+region = "us-east-1"
+host = "validator-3.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 4
+region = "us-east-1"
+host = "validator-4.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 5
+region = "us-east-1"
+host = "validator-5.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 6
+region = "eu-west-1"
+host = "validator-6.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 7
+region = "eu-west-1"
+host = "validator-7.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 8
+region = "eu-west-1"
+host = "validator-8.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 9
+region = "eu-west-1"
+host = "validator-9.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 10
+region = "eu-west-1"
+host = "validator-10.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 11
+region = "ap-southeast-1"
+host = "validator-11.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 12
+region = "ap-southeast-1"
+host = "validator-12.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 13
+region = "ap-southeast-1"
+host = "validator-13.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 14
+region = "ap-southeast-1"
+host = "validator-14.testnet.pyde.network"
+port = 30303
+
+[[nodes]]
+index = 15
+region = "ap-southeast-1"
+host = "validator-15.testnet.pyde.network"
+port = 30303
