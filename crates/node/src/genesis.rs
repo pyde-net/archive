@@ -745,8 +745,103 @@ pub fn devnet_genesis() -> (GenesisConfig, Vec<DevnetAccount>) {
     (config, accounts)
 }
 
+/// One node's public network identity for distributed-testnet generation.
+///
+/// `region` is informational metadata — it shows up as a comment in the
+/// generated `config.toml` so operators can quickly tell which node goes
+/// where during deployment, but it has no behavioural effect on the chain.
+///
+/// `host` may be a literal IP (`"203.0.113.5"`) or a DNS name
+/// (`"validator-0.testnet.pyde.network"`); both produce a valid
+/// libp2p multiaddr (`/dns4/...` if non-numeric, `/ip4/...` otherwise).
+#[derive(Clone, Debug)]
+pub struct NodeAddr {
+    pub region: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Top-level structure for the `--node-addrs` TOML file. Operators
+/// hand-author this once when planning the testnet topology, then pass
+/// it to `generate_testnet`. See
+/// `crates/node/testdata/testnet-16v-3region.toml` for the canonical
+/// 16-validator / 3-region example.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeAddrFile {
+    pub nodes: Vec<NodeAddrEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeAddrEntry {
+    pub index: usize,
+    pub region: String,
+    pub host: String,
+    pub port: u16,
+}
+
+impl NodeAddrFile {
+    /// Parse a `node-addrs.toml` file. Returns the entries sorted by
+    /// `index` so callers can index into the result directly.
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let bytes = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {}", path.display(), e))?;
+        let mut parsed: Self = toml::from_str(&bytes)
+            .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+        parsed.nodes.sort_by_key(|n| n.index);
+        // Ensure indexes are dense [0, n). Sparse files silently mis-map
+        // bootstrap entries to the wrong nodes, hard to diagnose later.
+        for (i, n) in parsed.nodes.iter().enumerate() {
+            if n.index != i {
+                return Err(format!(
+                    "node-addrs file has non-dense indexes — expected {} at position {}, got {}",
+                    i, i, n.index
+                ));
+            }
+        }
+        Ok(parsed)
+    }
+
+    pub fn into_addrs(self) -> Vec<NodeAddr> {
+        self.nodes
+            .into_iter()
+            .map(|n| NodeAddr {
+                region: n.region,
+                host: n.host,
+                port: n.port,
+            })
+            .collect()
+    }
+}
+
+/// Build a libp2p multiaddr from `(host, port, peer_id)`. Picks
+/// `/dns4/` for non-numeric hosts and `/ip4/` for IPv4 literals.
+fn build_multiaddr(host: &str, port: u16, peer_id: &libp2p::PeerId) -> String {
+    let is_ipv4 = host
+        .split('.')
+        .filter(|p| !p.is_empty())
+        .all(|p| p.parse::<u8>().is_ok())
+        && host.split('.').count() == 4;
+    if is_ipv4 {
+        format!("\"/ip4/{}/tcp/{}/p2p/{}\"", host, port, peer_id)
+    } else {
+        format!("\"/dns4/{}/tcp/{}/p2p/{}\"", host, port, peer_id)
+    }
+}
+
 /// Generate a multi-validator testnet directory.
 /// Creates: shared genesis.toml, per-node validator.key files, per-node config.toml files.
+///
+/// When `node_addrs` is `None`, the testnet is fully localhost
+/// (`127.0.0.1:base_port + i`) — same behaviour as before this fn took
+/// the parameter.
+///
+/// When `node_addrs` is `Some(addrs)`, each node's bootstrap list points
+/// at the real public host/port from `addrs`, the libp2p P2P bind port
+/// becomes `addrs[i].port` (instead of `base_port + i`), and a region
+/// comment appears at the top of each `config.toml`. RPC port still
+/// follows `base_rpc_port + i` (operators usually want RPC on a
+/// per-node-distinct local port for `pyde testnet` development; remote
+/// nodes can override via their config).
 pub fn generate_testnet(
     out_dir: &std::path::Path,
     num_validators: usize,
@@ -756,6 +851,7 @@ pub fn generate_testnet(
     dev_mode: bool,
     chain_id: u64,
     block_time_ms: u64,
+    node_addrs: Option<&[NodeAddr]>,
 ) -> Result<(), String> {
     use pyde_account::address::derive_eoa_address;
     use pyde_crypto::falcon::falcon_keygen;
@@ -766,6 +862,17 @@ pub fn generate_testnet(
     }
     if num_full_nodes > 16 {
         return Err("full_nodes must be 0..=16".into());
+    }
+
+    let total_nodes = num_validators + num_full_nodes;
+    if let Some(addrs) = node_addrs {
+        if addrs.len() != total_nodes {
+            return Err(format!(
+                "node_addrs has {} entries but expected {} (validators + full nodes)",
+                addrs.len(),
+                total_nodes
+            ));
+        }
     }
 
     fs::create_dir_all(out_dir)
@@ -887,7 +994,6 @@ pub fn generate_testnet(
     // full-node bootstrap lists include every validator (but no other full
     // nodes — they find each other via gossipsub once connected to a
     // validator).
-    let total_nodes = num_validators + num_full_nodes;
     let mut node_keypairs: Vec<(libp2p::identity::Keypair, libp2p::PeerId)> =
         Vec::with_capacity(total_nodes);
     for _ in 0..total_nodes {
@@ -930,27 +1036,45 @@ pub fn generate_testnet(
         fs::write(node_dir.join("genesis.toml"), genesis_config.to_toml())
             .map_err(|e| format!("failed to write genesis.toml: {}", e))?;
 
-        // Build bootstrap list: ALL other nodes (full mesh)
+        // Build bootstrap list: ALL other nodes (full mesh).
+        // node_addrs.is_some() → real public addresses; otherwise
+        // localhost mesh as before.
         let mut bootstrap_addrs: Vec<String> = Vec::new();
         for j in 0..num_validators {
             if j != i {
-                let other_port = base_port + j as u16;
                 let other_peer_id = &node_keypairs[j].1;
-                bootstrap_addrs.push(format!(
-                    "\"/ip4/127.0.0.1/tcp/{}/p2p/{}\"",
-                    other_port, other_peer_id
-                ));
+                bootstrap_addrs.push(match node_addrs {
+                    Some(addrs) => {
+                        build_multiaddr(&addrs[j].host, addrs[j].port, other_peer_id)
+                    }
+                    None => format!(
+                        "\"/ip4/127.0.0.1/tcp/{}/p2p/{}\"",
+                        base_port + j as u16,
+                        other_peer_id
+                    ),
+                });
             }
         }
         let bootstrap = format!("[{}]", bootstrap_addrs.join(", "));
 
-        // Write config.toml
-        let p2p_port = base_port + i as u16;
+        // Write config.toml. p2p_port follows node_addrs[i].port when
+        // distributed, else base_port + i (localhost convention).
+        let p2p_port = match node_addrs {
+            Some(addrs) => addrs[i].port,
+            None => base_port + i as u16,
+        };
         let rpc_port = base_rpc_port + i as u16;
         let metrics_port = 9090 + i as u16;
+        let region_comment = match node_addrs {
+            Some(addrs) => format!(
+                "# region: {}\n# host:   {}\n",
+                addrs[i].region, addrs[i].host
+            ),
+            None => String::new(),
+        };
 
         let config_toml = format!(
-            r#"[node]
+            r#"{region_comment}[node]
 role = "validator"
 chain_id = {chain_id}
 datadir = "{datadir}"
@@ -986,6 +1110,7 @@ port = {metrics_port}
 level = "info"
 json = false
 "#,
+            region_comment = region_comment,
             datadir = node_dir.display(),
             dev = dev_mode,
             p2p_port = p2p_port,
@@ -1026,21 +1151,34 @@ json = false
         // Bootstrap list: all validators.
         let mut bootstrap_addrs: Vec<String> = Vec::new();
         for j in 0..num_validators {
-            let other_port = base_port + j as u16;
             let other_peer_id = &node_keypairs[j].1;
-            bootstrap_addrs.push(format!(
-                "\"/ip4/127.0.0.1/tcp/{}/p2p/{}\"",
-                other_port, other_peer_id
-            ));
+            bootstrap_addrs.push(match node_addrs {
+                Some(addrs) => build_multiaddr(&addrs[j].host, addrs[j].port, other_peer_id),
+                None => format!(
+                    "\"/ip4/127.0.0.1/tcp/{}/p2p/{}\"",
+                    base_port + j as u16,
+                    other_peer_id
+                ),
+            });
         }
         let bootstrap = format!("[{}]", bootstrap_addrs.join(", "));
 
-        let p2p_port = base_port + i as u16;
+        let p2p_port = match node_addrs {
+            Some(addrs) => addrs[i].port,
+            None => base_port + i as u16,
+        };
         let rpc_port = base_rpc_port + i as u16;
         let metrics_port = 9090 + i as u16;
+        let region_comment = match node_addrs {
+            Some(addrs) => format!(
+                "# region: {}\n# host:   {}\n",
+                addrs[i].region, addrs[i].host
+            ),
+            None => String::new(),
+        };
 
         let config_toml = format!(
-            r#"[node]
+            r#"{region_comment}[node]
 role = "full"
 chain_id = {chain_id}
 datadir = "{datadir}"
@@ -1076,6 +1214,7 @@ port = {metrics_port}
 level = "info"
 json = false
 "#,
+            region_comment = region_comment,
             datadir = node_dir.display(),
             dev = dev_mode,
             p2p_port = p2p_port,
@@ -1249,6 +1388,153 @@ fn parse_hex_address(hex_str: &str) -> Result<Address, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========== Task 078: distributed-testnet generation ==========
+
+    fn read_config(out_dir: &std::path::Path, node_idx: usize) -> String {
+        std::fs::read_to_string(out_dir.join(format!("node-{}/config.toml", node_idx))).unwrap()
+    }
+
+    #[test]
+    fn build_multiaddr_picks_dns4_for_hostnames() {
+        let pid: libp2p::PeerId = libp2p::identity::Keypair::generate_ed25519().public().into();
+        let m = build_multiaddr("validator-0.testnet.example.com", 30303, &pid);
+        assert!(m.contains("/dns4/validator-0.testnet.example.com/"));
+        assert!(m.contains("/tcp/30303/"));
+        assert!(!m.contains("/ip4/"));
+    }
+
+    #[test]
+    fn build_multiaddr_picks_ip4_for_dotted_quad() {
+        let pid: libp2p::PeerId = libp2p::identity::Keypair::generate_ed25519().public().into();
+        let m = build_multiaddr("203.0.113.5", 30303, &pid);
+        assert!(m.contains("/ip4/203.0.113.5/"));
+        assert!(!m.contains("/dns4/"));
+    }
+
+    #[test]
+    fn node_addr_file_rejects_sparse_indexes() {
+        let toml_text = r#"
+            [[nodes]]
+            index = 0
+            region = "us"
+            host = "a"
+            port = 30303
+
+            [[nodes]]
+            index = 2
+            region = "us"
+            host = "c"
+            port = 30303
+        "#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("addrs.toml");
+        std::fs::write(&path, toml_text).unwrap();
+        let err = NodeAddrFile::load(&path).unwrap_err();
+        assert!(err.contains("non-dense"), "got: {err}");
+    }
+
+    #[test]
+    fn node_addr_file_loads_canonical_16v_3region_fixture() {
+        // The canonical fixture lives in `crates/node/testdata/`.
+        // This test is the regression check that the fixture stays in
+        // a parseable shape — if someone edits it badly, this fails.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/testnet-16v-3region.toml");
+        let file = NodeAddrFile::load(&path).expect("load fixture");
+        assert_eq!(file.nodes.len(), 16);
+        let regions: std::collections::HashSet<&str> =
+            file.nodes.iter().map(|n| n.region.as_str()).collect();
+        assert_eq!(regions.len(), 3, "fixture must distribute across 3 regions");
+    }
+
+    #[test]
+    fn generate_testnet_distributed_writes_dns4_bootstrap_and_region_comments() {
+        // 4-validator distributed config — small enough to keep the
+        // test fast, large enough to exercise the per-node region
+        // tagging + cross-host bootstrap construction.
+        let tmp = tempfile::tempdir().unwrap();
+        let addrs = vec![
+            NodeAddr {
+                region: "us-east-1".into(),
+                host: "validator-0.example.com".into(),
+                port: 30303,
+            },
+            NodeAddr {
+                region: "us-east-1".into(),
+                host: "validator-1.example.com".into(),
+                port: 30303,
+            },
+            NodeAddr {
+                region: "eu-west-1".into(),
+                host: "203.0.113.5".into(),
+                port: 30304,
+            },
+            NodeAddr {
+                region: "ap-southeast-1".into(),
+                host: "validator-3.example.com".into(),
+                port: 30305,
+            },
+        ];
+        generate_testnet(
+            tmp.path(),
+            4,
+            0,
+            30303,
+            8545,
+            true,
+            1,
+            400,
+            Some(&addrs),
+        )
+        .unwrap();
+
+        // node-0's config must:
+        //  - carry its own region/host as a comment header
+        //  - bind p2p_port = 30303 (its own addrs entry)
+        //  - bootstrap to nodes 1, 2, 3 via dns4 + ip4 entries
+        let cfg0 = read_config(tmp.path(), 0);
+        assert!(cfg0.contains("# region: us-east-1"));
+        assert!(cfg0.contains("# host:   validator-0.example.com"));
+        assert!(cfg0.contains("port = 30303"));
+        assert!(cfg0.contains("/dns4/validator-1.example.com/tcp/30303/"));
+        assert!(cfg0.contains("/ip4/203.0.113.5/tcp/30304/"));
+        assert!(cfg0.contains("/dns4/validator-3.example.com/tcp/30305/"));
+
+        // node-2's config must use its own port from addrs (30304)
+        // even though base_port was 30303.
+        let cfg2 = read_config(tmp.path(), 2);
+        assert!(cfg2.contains("# region: eu-west-1"));
+        assert!(cfg2.contains("port = 30304"));
+    }
+
+    #[test]
+    fn generate_testnet_localhost_mode_preserves_legacy_behaviour() {
+        // Without node_addrs, the function must produce exactly the
+        // pre-feature output: 127.0.0.1 multiaddrs, no region comment.
+        let tmp = tempfile::tempdir().unwrap();
+        generate_testnet(tmp.path(), 4, 0, 30303, 8545, true, 31337, 400, None).unwrap();
+
+        let cfg0 = read_config(tmp.path(), 0);
+        assert!(!cfg0.contains("# region:"));
+        assert!(cfg0.contains("/ip4/127.0.0.1/tcp/30304/"));
+        assert!(cfg0.contains("/ip4/127.0.0.1/tcp/30305/"));
+        assert!(cfg0.contains("/ip4/127.0.0.1/tcp/30306/"));
+    }
+
+    #[test]
+    fn generate_testnet_rejects_addrs_count_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let addrs = vec![NodeAddr {
+            region: "x".into(),
+            host: "h".into(),
+            port: 1,
+        }];
+        // 4 validators but only 1 addr → mismatch
+        let err = generate_testnet(tmp.path(), 4, 0, 30303, 8545, true, 1, 400, Some(&addrs))
+            .unwrap_err();
+        assert!(err.contains("entries but expected"), "got: {err}");
+    }
 
     #[test]
     fn devnet_genesis_has_10_accounts() {

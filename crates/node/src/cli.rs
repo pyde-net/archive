@@ -97,6 +97,16 @@ pub enum Command {
         /// quickly — epoch rotation at slot 1000, finality depth, etc.
         #[arg(long, default_value = "400")]
         block_time_ms: u64,
+
+        /// Optional path to a TOML file describing each node's
+        /// (region, host, port). When supplied, generated bootstrap
+        /// multiaddrs and per-node config.toml `port =` use the public
+        /// host/port from the file instead of `127.0.0.1:base_port+i`.
+        /// Required for any cross-region testnet — see
+        /// `crates/node/testdata/testnet-16v-3region.toml` for the
+        /// canonical example.
+        #[arg(long)]
+        node_addrs: Option<PathBuf>,
     },
 
     /// Start a public faucet server.

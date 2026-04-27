@@ -50,7 +50,22 @@ fn main() {
             dev,
             chain_id,
             block_time_ms,
+            node_addrs,
         } => {
+            // Distributed mode: load the per-node (region, host, port)
+            // table from the supplied TOML file. Localhost mode (no
+            // flag) keeps the historical 127.0.0.1 + base_port + i
+            // behaviour for `pyde testnet` development.
+            let addrs = match node_addrs.as_ref() {
+                Some(path) => match genesis::NodeAddrFile::load(path) {
+                    Ok(file) => Some(file.into_addrs()),
+                    Err(e) => {
+                        eprintln!("error reading --node-addrs: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+                None => None,
+            };
             if let Err(e) = genesis::generate_testnet(
                 &out,
                 validators,
@@ -60,6 +75,7 @@ fn main() {
                 dev,
                 chain_id,
                 block_time_ms,
+                addrs.as_deref(),
             ) {
                 eprintln!("error: {}", e);
                 std::process::exit(1);
