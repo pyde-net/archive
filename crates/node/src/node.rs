@@ -720,6 +720,68 @@ impl PydeNode {
                                 &peer_manager,
                             );
                         }
+                        PostEventAction::SendConsensusRrResponseAndAddShares(
+                            channel,
+                            resp,
+                            share_msg,
+                        ) => {
+                            // Phase 1 hardening (audit 074b): ack the
+                            // RR sender, then re-enter the same
+                            // AddDecryptionShares path the gossip arm
+                            // uses. Re-issuing as a PostEventAction
+                            // would require a self-pump; cleaner to
+                            // inline the same logic directly here. The
+                            // matched bodies are kept in sync — if the
+                            // gossip arm grows new behaviour, mirror it.
+                            let _ = swarm.behaviour_mut().consensus_rr.send_response(channel, resp);
+                            let slot = share_msg.slot;
+                            let mut dec_w = pending_decryptors.write().await;
+                            if let Some(decryptor) = dec_w.get_mut(&slot) {
+                                for (i, share_bytes) in share_msg.shares.iter().enumerate() {
+                                    if let Some(share) = pyde_crypto::threshold::DecryptionShare::from_bytes(share_bytes) {
+                                        decryptor.add_share(i, share);
+                                    }
+                                }
+                                if decryptor.all_ready() {
+                                    let chain_w = chain.read().await;
+                                    let base_fee = chain_w.base_fee;
+                                    let chain_id = chain_w.chain_id;
+                                    drop(chain_w);
+                                    let proposer = block_store
+                                        .get_header(slot)
+                                        .map(|h| h.proposer)
+                                        .unwrap_or([0u8; 32]);
+                                    let mut state_w = state.write().await;
+                                    let outcome = crate::block_processor::try_decrypt_and_execute(
+                                        &block_store,
+                                        slot,
+                                        decryptor,
+                                        &mut state_w,
+                                        self.config.consensus.gas_ceiling,
+                                        base_fee,
+                                        chain_id,
+                                        proposer,
+                                    );
+                                    drop(state_w);
+                                    if let crate::block_processor::DecryptOutcome::Executed {
+                                        tx_count,
+                                        receipts: slot_receipts,
+                                    } = outcome
+                                    {
+                                        info!(slot, txs = tx_count, "threshold reached via RR — decrypted + executed");
+                                        if !slot_receipts.is_empty() {
+                                            let mut receipts_w = receipts.write().await;
+                                            receipts_w.insert_block_receipts(slot, slot_receipts);
+                                        }
+                                    }
+                                    dec_w.remove(&slot);
+                                }
+                            } else {
+                                drop(dec_w);
+                                let mut q = queued_shares.write().await;
+                                q.entry(slot).or_default().push(share_msg);
+                            }
+                        }
                         PostEventAction::SendBlocksRrResponse(channel, resp) => {
                             let _ = swarm.behaviour_mut().blocks_rr.send_response(channel, resp);
                         }
@@ -905,7 +967,16 @@ impl PydeNode {
                                     .insert(slot, decryptor);
                             }
                             // Broadcast our own decryption shares on the
-                            // consensus topic.
+                            // consensus topic. Phase 1 hardening: route
+                            // through the audit-234 RR fallback so the
+                            // shares fan out point-to-point even when
+                            // gossipsub `topic_peers` is empty after a
+                            // restart cycle. Without the fallback the
+                            // proposer-side broadcast (the third site
+                            // below) would land but the gossip-QC and
+                            // post-reorg broadcasts would silently drop
+                            // — exactly the warm-up race the lifecycle
+                            // test was masking with `slot=15`.
                             if let Some(shares) =
                                 engine.generate_decryption_shares(identity, &enc_txs)
                             {
@@ -916,10 +987,12 @@ impl PydeNode {
                                 };
                                 let share_bytes = wire::encode_decryption_shares(&msg);
                                 let topic = pyde_net::node::topics::consensus();
-                                let _ = swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .publish(topic, share_bytes);
+                                broadcast_consensus_with_rr_fallback(
+                                    &mut swarm,
+                                    topic,
+                                    share_bytes,
+                                    &peer_manager,
+                                );
                                 info!(
                                     slot,
                                     enc_txs = enc_txs.len(),
@@ -1090,6 +1163,9 @@ impl PydeNode {
                                 }
                                 pending_decryptors.write().await.insert(slot, decryptor);
                             }
+                            // Phase 1 hardening: same RR fallback as
+                            // the gossip-QC broadcast above (audit 234
+                            // part 4 step 5).
                             if let Some(shares) =
                                 engine.generate_decryption_shares(identity, &enc_txs)
                             {
@@ -1100,10 +1176,12 @@ impl PydeNode {
                                 };
                                 let share_bytes = wire::encode_decryption_shares(&msg);
                                 let topic = pyde_net::node::topics::consensus();
-                                let _ = swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .publish(topic, share_bytes);
+                                broadcast_consensus_with_rr_fallback(
+                                    &mut swarm,
+                                    topic,
+                                    share_bytes,
+                                    &peer_manager,
+                                );
                                 info!(
                                     slot,
                                     enc_txs = enc_txs.len(),
@@ -2886,6 +2964,16 @@ enum PostEventAction {
         pyde_net::consensus_protocol::ConsensusResp,
         Vec<u8>,
     ),
+    /// Phase 1 hardening (audit 074b): decryption shares delivered
+    /// via RR fallback. The runtime acks the RR request and routes
+    /// the decoded `DecryptionShareMsg` through the same handler
+    /// the gossip path uses so dedup + threshold + decrypt-execute
+    /// all run identically.
+    SendConsensusRrResponseAndAddShares(
+        request_response::ResponseChannel<pyde_net::consensus_protocol::ConsensusResp>,
+        pyde_net::consensus_protocol::ConsensusResp,
+        wire::DecryptionShareMsg,
+    ),
     /// Audit 234 part 4 step 7: drop a peer's connection so libp2p
     /// will redial fresh. Triggered when a request-response message
     /// fails (timeout / connection-closed / etc.) — the peer is
@@ -3892,80 +3980,103 @@ fn handle_swarm_event(
             // the auth handshake re-completion after restart cycles —
             // exactly the failure mode this RR fallback exists to fix.
             let mut pending_fallback_broadcast: Option<Vec<u8>> = None;
+            let mut pending_share_msg: Option<wire::DecryptionShareMsg> = None;
             let resp = {
-                match wire::decode_consensus_message(&request.bytes) {
-                    Ok(msg) => {
-                        use pyde_consensus::hotstuff::ConsensusMessage;
-                        if let Some(engine) = validator_engine.as_mut() {
-                            match msg {
-                                ConsensusMessage::Timeout {
-                                    slot,
-                                    voter_index,
-                                    voter_address,
-                                    highest_qc,
-                                    signature,
-                                } => {
-                                    debug!(slot, voter_index, "received timeout via RR fallback");
-                                    let vc_msg =
-                                        pyde_consensus::view_change::ViewChangeMessage {
-                                            slot,
-                                            highest_qc,
-                                            voter_index,
-                                            voter_address,
-                                            signature,
-                                        };
-                                    if engine.on_view_change(vc_msg) {
-                                        info!(slot, "view change QC formed (via RR fallback) — fallback proposer can proceed");
-                                        if let Some(bytes) = build_and_encode_fallback_proposal(
-                                            engine,
-                                            validator_identity.as_ref(),
-                                            chain,
-                                        ) {
-                                            pending_fallback_broadcast = Some(bytes);
-                                        }
-                                    }
-                                }
-                                ConsensusMessage::Vote { slot, voter_index, .. } => {
-                                    // Audit 234 part 3: votes that fell back
-                                    // to RR (gossip publish failed) need to
-                                    // route through the same `on_vote` path
-                                    // as the gossip-receive arm. Otherwise
-                                    // vote-QCs for fallback proposals never
-                                    // form because votes are silently dropped
-                                    // here.
-                                    debug!(slot, voter_index, "received vote via RR fallback");
-                                    if let Some(qc) = engine.on_vote(msg) {
-                                        info!(slot, votes = qc.vote_count(), "QC formed (via RR fallback)");
-                                    }
-                                }
-                                ConsensusMessage::Proposal {
-                                    ref header,
-                                    ref proposer_signature,
-                                } => {
-                                    debug!(slot = header.slot, "received proposal via RR fallback");
-                                    engine.buffer_proposal(header, proposer_signature);
-                                }
-                                ConsensusMessage::NewView { slot, highest_qc, .. } => {
-                                    debug!(slot, "received new view via RR fallback");
-                                    if highest_qc.slot > engine.consensus.highest_qc.slot {
-                                        engine.consensus.highest_qc = highest_qc;
+                if let Ok(msg) = wire::decode_consensus_message(&request.bytes) {
+                    use pyde_consensus::hotstuff::ConsensusMessage;
+                    if let Some(engine) = validator_engine.as_mut() {
+                        match msg {
+                            ConsensusMessage::Timeout {
+                                slot,
+                                voter_index,
+                                voter_address,
+                                highest_qc,
+                                signature,
+                            } => {
+                                debug!(slot, voter_index, "received timeout via RR fallback");
+                                let vc_msg =
+                                    pyde_consensus::view_change::ViewChangeMessage {
+                                        slot,
+                                        highest_qc,
+                                        voter_index,
+                                        voter_address,
+                                        signature,
+                                    };
+                                if engine.on_view_change(vc_msg) {
+                                    info!(slot, "view change QC formed (via RR fallback) — fallback proposer can proceed");
+                                    if let Some(bytes) = build_and_encode_fallback_proposal(
+                                        engine,
+                                        validator_identity.as_ref(),
+                                        chain,
+                                    ) {
+                                        pending_fallback_broadcast = Some(bytes);
                                     }
                                 }
                             }
+                            ConsensusMessage::Vote { slot, voter_index, .. } => {
+                                // Audit 234 part 3: votes that fell back
+                                // to RR (gossip publish failed) need to
+                                // route through the same `on_vote` path
+                                // as the gossip-receive arm. Otherwise
+                                // vote-QCs for fallback proposals never
+                                // form because votes are silently dropped
+                                // here.
+                                debug!(slot, voter_index, "received vote via RR fallback");
+                                if let Some(qc) = engine.on_vote(msg) {
+                                    info!(slot, votes = qc.vote_count(), "QC formed (via RR fallback)");
+                                }
+                            }
+                            ConsensusMessage::Proposal {
+                                ref header,
+                                ref proposer_signature,
+                            } => {
+                                debug!(slot = header.slot, "received proposal via RR fallback");
+                                engine.buffer_proposal(header, proposer_signature);
+                            }
+                            ConsensusMessage::NewView { slot, highest_qc, .. } => {
+                                debug!(slot, "received new view via RR fallback");
+                                if highest_qc.slot > engine.consensus.highest_qc.slot {
+                                    engine.consensus.highest_qc = highest_qc;
+                                }
+                            }
                         }
-                        pyde_net::consensus_protocol::ConsensusResp::Ack
                     }
-                    Err(e) => {
-                        debug!(%peer, error = e, "failed to decode consensus RR request");
-                        pyde_net::consensus_protocol::ConsensusResp::DecodeError
-                    }
+                    pyde_net::consensus_protocol::ConsensusResp::Ack
+                } else if let Ok(share_msg) = wire::decode_decryption_shares(&request.bytes) {
+                    // Phase 1 hardening (audit 074b): decryption shares
+                    // also fall back to RR. The bytes are the same wire
+                    // encoding as on the gossipsub consensus topic; we
+                    // hand the decoded message off to the same
+                    // `AddDecryptionShares` handler the gossip path
+                    // uses, so dedup + threshold + decrypt-execute all
+                    // run identically. Without this branch, the new
+                    // RR fan-out at the broadcast sites would land
+                    // here as DecodeError on every peer — silent loss.
+                    debug!(
+                        slot = share_msg.slot,
+                        member = share_msg.member_index,
+                        "received decryption shares via RR fallback"
+                    );
+                    pending_share_msg = Some(share_msg);
+                    pyde_net::consensus_protocol::ConsensusResp::Ack
+                } else {
+                    debug!(%peer, "failed to decode consensus RR request as either ConsensusMessage or DecryptionShareMsg");
+                    pyde_net::consensus_protocol::ConsensusResp::DecodeError
                 }
             };
-            match pending_fallback_broadcast {
-                Some(bytes) => PostEventAction::SendConsensusRrResponseAndBroadcast(
-                    channel, resp, bytes,
-                ),
-                None => PostEventAction::SendConsensusRrResponse(channel, resp),
+            // Three-way dispatch: ack the RR sender, then route the
+            // decoded payload through the same PostEventAction queue
+            // as the gossip-receive arm. The three pending_* slots
+            // are mutually exclusive because the decode branches are.
+            if let Some(share_msg) = pending_share_msg {
+                PostEventAction::SendConsensusRrResponseAndAddShares(channel, resp, share_msg)
+            } else {
+                match pending_fallback_broadcast {
+                    Some(bytes) => PostEventAction::SendConsensusRrResponseAndBroadcast(
+                        channel, resp, bytes,
+                    ),
+                    None => PostEventAction::SendConsensusRrResponse(channel, resp),
+                }
             }
         }
         SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
