@@ -305,15 +305,19 @@ pub fn try_form_qc(
 /// where the S+1 block chains back to the S block (parent_hash matches).
 ///
 /// `headers` maps slot → BlockHeader for chain verification.
+/// `committee_size` is the active committee size for `block_slot`; the
+/// quorum threshold is computed from it via `quorum_for_committee` so
+/// devnet/testnet committees smaller than 128 form finality correctly.
 pub fn is_finalized(
     block_slot: u64,
     qc_chain: &[QuorumCert],
     headers: &std::collections::HashMap<u64, crate::block::BlockHeader>,
+    committee_size: usize,
 ) -> bool {
     // Find a valid QC for block_slot
     let qc_for_block = match qc_chain
         .iter()
-        .find(|qc| qc.slot == block_slot && qc.has_quorum())
+        .find(|qc| qc.slot == block_slot && qc.has_quorum_for(committee_size))
     {
         Some(qc) => qc,
         None => return false,
@@ -327,7 +331,7 @@ pub fn is_finalized(
     // Find a valid QC for block_slot+1
     let qc_for_next = match qc_chain
         .iter()
-        .find(|qc| qc.slot == block_slot + 1 && qc.has_quorum())
+        .find(|qc| qc.slot == block_slot + 1 && qc.has_quorum_for(committee_size))
     {
         Some(qc) => qc,
         None => return false,
@@ -533,9 +537,9 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert(6, header_6);
 
-        assert!(is_finalized(5, &[qc_5.clone(), qc_6.clone()], &headers));
-        assert!(!is_finalized(5, &[qc_5.clone()], &headers)); // missing QC for slot 6
-        assert!(!is_finalized(5, &[qc_6.clone()], &headers)); // missing QC for slot 5
+        assert!(is_finalized(5, &[qc_5.clone(), qc_6.clone()], &headers, 128));
+        assert!(!is_finalized(5, &[qc_5.clone()], &headers, 128)); // missing QC for slot 6
+        assert!(!is_finalized(5, &[qc_6.clone()], &headers, 128)); // missing QC for slot 5
 
         // Unrelated block at slot 6 (wrong parent) should NOT finalize
         let header_6_bad = BlockHeader {
@@ -554,7 +558,8 @@ mod tests {
         assert!(!is_finalized(
             5,
             &[qc_5.clone(), qc_6.clone()],
-            &bad_headers
+            &bad_headers,
+            128
         ));
     }
 

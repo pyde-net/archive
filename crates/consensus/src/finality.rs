@@ -11,7 +11,7 @@
 //! - Irreversibility: cannot revert without breaking BFT assumptions.
 //! - Use cases: bridge transfers, large settlements, governance.
 
-use crate::block::{QuorumCert, QUORUM_THRESHOLD};
+use crate::block::{quorum_for_committee, QuorumCert, QUORUM_THRESHOLD};
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{
     falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature,
@@ -63,8 +63,22 @@ impl HardFinalityCert {
         self.voter_bitmap.count_ones()
     }
 
+    /// Whether this cert has enough votes (>= 86/128) for the
+    /// production committee. Use `has_quorum_for(committee_size)`
+    /// when handling certs from a committee of unknown size — this
+    /// method assumes 128 and is only correct on mainnet-sized sets.
     pub fn has_quorum(&self) -> bool {
         self.vote_count() >= QUORUM_THRESHOLD as u32
+    }
+
+    /// Audit 235/236: dynamic-quorum check. Mirrors
+    /// `QuorumCert::has_quorum_for`. Required for any committee
+    /// smaller than 128 (devnet, testnet, smaller production
+    /// configurations) — the original `has_quorum()` hardcoded the
+    /// production threshold and could not form on devnets, just
+    /// like the view-change quorum bug fixed in audit-234.
+    pub fn has_quorum_for(&self, committee_size: usize) -> bool {
+        self.vote_count() >= quorum_for_committee(committee_size) as u32
     }
 }
 
@@ -91,14 +105,27 @@ fn finality_sign_message(slot: u64, block_hash: &[u8; 32], state_root: &[u8; 32]
 
 // ========== Soft Finality ==========
 
-/// Check if a block has reached soft finality (QC with 86+ votes).
-pub fn check_soft_finality(qc: &QuorumCert) -> bool {
-    qc.has_quorum()
+/// Check if a block has reached soft finality.
+///
+/// `committee_size` is the active committee for the block's slot;
+/// the quorum threshold is computed via `quorum_for_committee` so
+/// devnet/testnet committees smaller than 128 detect soft finality
+/// correctly. Hardcoding 86 here previously caused devnet QCs (which
+/// have far fewer than 86 votes) to never be flagged as soft-final,
+/// which silently broke `record_soft_finality` on every non-mainnet
+/// committee.
+pub fn check_soft_finality(qc: &QuorumCert, committee_size: usize) -> bool {
+    qc.has_quorum_for(committee_size)
 }
 
 /// Detect soft finality and return status.
-pub fn soft_finality_status(slot: u64, block_hash: [u8; 32], qc: &QuorumCert) -> FinalityStatus {
-    let level = if check_soft_finality(qc) {
+pub fn soft_finality_status(
+    slot: u64,
+    block_hash: [u8; 32],
+    qc: &QuorumCert,
+    committee_size: usize,
+) -> FinalityStatus {
+    let level = if check_soft_finality(qc, committee_size) {
         FinalityLevel::Soft
     } else {
         FinalityLevel::None
@@ -188,7 +215,14 @@ pub fn try_form_hard_finality(
         }
     }
 
-    if valid_count >= QUORUM_THRESHOLD as u32 {
+    // Audit 235: use the dynamic threshold so devnet committees
+    // (which are smaller than the production 128) can still form
+    // a hard-finality cert. Hardcoding QUORUM_THRESHOLD = 86 made
+    // hard finality effectively impossible on any committee with
+    // fewer than 86 validators — same bug pattern as the
+    // view-change quorum hardcode fixed in audit-234.
+    let threshold = quorum_for_committee(committee_keys.len());
+    if valid_count >= threshold as u32 {
         Some(HardFinalityCert {
             slot,
             block_hash,
@@ -243,8 +277,19 @@ impl FinalityTracker {
     }
 
     /// Record soft finality for a block.
-    pub fn record_soft_finality(&mut self, slot: u64, block_hash: [u8; 32], qc: QuorumCert) {
-        let status = soft_finality_status(slot, block_hash, &qc);
+    ///
+    /// `committee_size` is the active committee for `slot`; the
+    /// quorum threshold is derived from it so devnet committees can
+    /// also record soft finality (the previous hardcoded 86-of-128
+    /// silently dropped every devnet QC).
+    pub fn record_soft_finality(
+        &mut self,
+        slot: u64,
+        block_hash: [u8; 32],
+        qc: QuorumCert,
+        committee_size: usize,
+    ) {
+        let status = soft_finality_status(slot, block_hash, &qc, committee_size);
         if status.level == FinalityLevel::Soft {
             if slot > self.highest_soft_slot {
                 self.highest_soft_slot = slot;
@@ -351,19 +396,19 @@ mod tests {
     #[test]
     fn soft_finality_at_86_votes() {
         let qc = make_qc(5, 86);
-        assert!(check_soft_finality(&qc));
+        assert!(check_soft_finality(&qc, 128));
     }
 
     #[test]
     fn no_soft_finality_at_85_votes() {
         let qc = make_qc(5, 85);
-        assert!(!check_soft_finality(&qc));
+        assert!(!check_soft_finality(&qc, 128));
     }
 
     #[test]
     fn soft_finality_status_detected() {
         let qc = make_qc(5, 100);
-        let status = soft_finality_status(5, [0xAA; 32], &qc);
+        let status = soft_finality_status(5, [0xAA; 32], &qc, 128);
         assert_eq!(status.level, FinalityLevel::Soft);
     }
 
@@ -374,7 +419,7 @@ mod tests {
         // Soft finality is a property check, not time-based.
         // It's reached the moment the QC has 86+ votes.
         let qc = make_qc(5, 86);
-        assert!(check_soft_finality(&qc)); // instant
+        assert!(check_soft_finality(&qc, 128)); // instant
     }
 
     // ========== Task 0503: Hard finality with quorum ==========
@@ -404,6 +449,45 @@ mod tests {
         let cert = try_form_hard_finality(5, block_hash, state_root, &votes, &keys);
         assert!(cert.is_some());
         assert!(cert.unwrap().has_quorum());
+    }
+
+    /// Audit 235/236: hard finality must form on a sub-128 committee
+    /// using the dynamic quorum threshold. Previously the path was
+    /// hardcoded to QUORUM_THRESHOLD = 86 and silently failed on
+    /// every devnet/testnet committee. With the fix, a 4-validator
+    /// committee forms hard finality at 3-of-4 (the BFT 2f+1 quorum).
+    #[test]
+    fn hard_finality_forms_on_small_devnet_committee() {
+        let mut votes = Vec::new();
+        let mut keys = Vec::new();
+
+        let block_hash = [0xAA; 32];
+        let state_root = [0xCC; 32];
+
+        // 3-of-4 = quorum on a 4-validator devnet committee.
+        for i in 0..3u8 {
+            let (pk, sk) = falcon_keygen().unwrap();
+            let pk_bytes = pk.as_bytes().to_vec();
+            let addr = derive_eoa_address(&pk_bytes);
+
+            let vote = create_finality_vote(5, block_hash, state_root, i, addr, &sk).unwrap();
+            votes.push(vote);
+            keys.push(pk_bytes);
+        }
+        // 4th committee key with no vote.
+        let (pk4, _sk4) = falcon_keygen().unwrap();
+        keys.push(pk4.as_bytes().to_vec());
+
+        let cert = try_form_hard_finality(5, block_hash, state_root, &votes, &keys);
+        assert!(
+            cert.is_some(),
+            "hard finality must form at 3-of-4 on a devnet committee"
+        );
+        let cert = cert.unwrap();
+        assert!(cert.has_quorum_for(4));
+        // The mainnet-only `has_quorum()` shortcut still rejects it —
+        // anyone using that on a sub-128 committee is buggy.
+        assert!(!cert.has_quorum());
     }
 
     #[test]
@@ -506,7 +590,7 @@ mod tests {
 
         // Soft finality
         let qc = make_qc(10, 90);
-        tracker.record_soft_finality(10, [0xAA; 32], qc);
+        tracker.record_soft_finality(10, [0xAA; 32], qc, 128);
         assert_eq!(tracker.finality_level(10, &[0xAA; 32]), FinalityLevel::Soft);
 
         // Hard finality
@@ -533,7 +617,7 @@ mod tests {
 
         // Add soft finality for slots 5, 10, 15
         for slot in [5, 10, 15] {
-            tracker.record_soft_finality(slot, [slot as u8; 32], make_qc(slot, 90));
+            tracker.record_soft_finality(slot, [slot as u8; 32], make_qc(slot, 90), 128);
         }
         assert_eq!(tracker.pending.len(), 3);
 
@@ -560,7 +644,7 @@ mod tests {
 
         // Soft finality for slots 1-50
         for slot in 1..=50 {
-            tracker.record_soft_finality(slot, [slot as u8; 32], make_qc(slot, 90));
+            tracker.record_soft_finality(slot, [slot as u8; 32], make_qc(slot, 90), 128);
         }
         assert_eq!(tracker.unconfirmed_count(), 50);
 
@@ -582,7 +666,7 @@ mod tests {
 
         // Soft finality races ahead
         for slot in 1..=150 {
-            tracker.record_soft_finality(slot, [slot as u8; 32], make_qc(slot, 90));
+            tracker.record_soft_finality(slot, [slot as u8; 32], make_qc(slot, 90), 128);
         }
         assert_eq!(tracker.unconfirmed_count(), 150);
 

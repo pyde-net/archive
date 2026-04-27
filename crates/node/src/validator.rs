@@ -1845,9 +1845,15 @@ impl ValidatorEngine {
                 // (no-op if a later QC already advanced past us) and
                 // resets the timeout tracker for the new target.
                 self.advance_target_height(slot + 1);
-                // Record soft finality
-                self.finality
-                    .record_soft_finality(slot, block_hash, qc.clone());
+                // Record soft finality. Pass the active committee
+                // size so devnet/testnet committees (smaller than the
+                // production 128) compute the correct quorum threshold.
+                self.finality.record_soft_finality(
+                    slot,
+                    block_hash,
+                    qc.clone(),
+                    self.committee_keys.len(),
+                );
             }
             qc
         } else {
