@@ -172,7 +172,42 @@
       M1/M3 caps. Not strictly a 206 fix; tracked as item **226**
       below for a follow-up PR.
 
-- [~] 207 — `⚠` **Encrypted-tx gossip flow (074b root cause).**
+- [x] 207 — `✓` **Encrypted-tx gossip flow (074b root cause).**
+      *Design + implementation closed.* Validated by two
+      complementary multi-node integration tests:
+
+      **Lifecycle (single tx, audit 207 + 227 step 4):** submit via
+      `pyde_sendRawEncryptedTransaction`, proposer includes the
+      encrypted tx and publishes `EncryptedTxBundle` on the Blocks
+      channel, non-proposer validators reconstruct, run threshold
+      decryption, and credit the recipient on every node with
+      matching state roots. 5/5 stable runs, 5–24 s wall-time.
+
+      **Multi-sender burst (074b production-grade signal):**
+      `loadgen_encrypted_burst` test fans 10 encrypted transfers
+      from each of the 4 validator keys (40 concurrent submissions
+      total — past audit-027's 10-tx/s/sender rate cap on any
+      single sender). 5/5 stable runs at 100 % inclusion, 9.6–22 s
+      wall-time, ~2.4 encrypted-tx/s aggregate sustained.
+
+      Earlier "zero encrypted txs commit" finding from the original
+      074b investigation was a cold-spawn warm-up race, not a
+      protocol bug. Fixes:
+      - Bumped lifecycle warm-up from slot 5 to slot 15 — gossipsub
+        mesh needs ~6 s after spawn to publish full subscriber
+        lists; first-batch shares were dropped before that.
+      - Bumped burst-test inclusion deadline to 180 s — slow runs
+        can take 1.5 min on a contended laptop, well within
+        deadline now.
+
+      Remaining 074b work is sustained-rate loadgen (the 10 min ×
+      target-TPS shape), not protocol debug. Per-sender 10/sec rate
+      cap is the design ceiling; meaningful throughput targets need
+      either (a) many senders or (b) lifting the cap with a
+      different anti-spam mechanism. Tracked in MAINNET_PLAN.md.
+
+      Original problem statement (kept for audit trail):
+
       Compact-block broadcast omits `encrypted_txs`; full blocks
       only served on-demand via `GET_BLOCK_TXS`. Non-proposer
       validators never see encrypted_tx lists → decryption shares
