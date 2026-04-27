@@ -37,6 +37,49 @@ use tracing::{debug, error, info, warn};
 /// a censoring proposer can't hide behind latency.
 const MEV_INCLUSION_GRACE_SLOTS: u64 = 2;
 
+/// Audit 219: validate `(chain_id, bootstrap_peers)` at startup.
+///
+/// Returns `Err` for the one configuration that's catastrophic and
+/// silent without this guard: launching a mainnet node
+/// (`chain_id == 1`) with an empty `bootstrap_peers` list. That
+/// node would never discover peers, never sync, and produce a
+/// "fork of one" until an operator notices — by which point real
+/// state may have diverged. A hard refusal at the first line of
+/// `run()` makes the misconfiguration impossible to miss.
+///
+/// For other non-devnet chain ids (testnet, custom networks) we
+/// emit a warning but still allow startup — those chains may be
+/// in pre-launch states where a single-node bootstrap is
+/// intentional. Devnet (`chain_id == 31337`) is silent.
+pub fn check_bootstrap_config(
+    chain_id: u64,
+    bootstrap_peers: &[String],
+) -> Result<(), String> {
+    if !bootstrap_peers.is_empty() {
+        return Ok(());
+    }
+    const MAINNET_CHAIN_ID: u64 = 1;
+    const DEVNET_CHAIN_ID: u64 = 31337;
+    if chain_id == MAINNET_CHAIN_ID {
+        return Err(
+            "refusing to start mainnet (chain_id=1) with no bootstrap peers — \
+             set network.bootstrap_peers in config.toml before launch. \
+             A mainnet node with no peers produces an isolated fork that \
+             cannot sync to the canonical chain."
+                .to_string(),
+        );
+    }
+    if chain_id != DEVNET_CHAIN_ID {
+        warn!(
+            chain_id,
+            "no bootstrap_peers configured for a non-devnet chain — this node \
+             will not discover peers and cannot sync. Set network.bootstrap_peers \
+             in config.toml before launch."
+        );
+    }
+    Ok(())
+}
+
 /// The main Pyde node. Owns all subsystems.
 pub struct PydeNode {
     config: NodeConfig,
@@ -62,6 +105,16 @@ impl PydeNode {
             chain_id = self.config.node.chain_id,
             "starting pyde node"
         );
+
+        // Audit 219: hard-refuse to start a mainnet node with no
+        // bootstrap peers configured. Run this BEFORE any subsystem
+        // init so a misconfigured launch fails loudly at the first
+        // line of node startup, not after datadir/keystore/swarm
+        // setup partially completes.
+        check_bootstrap_config(
+            self.config.node.chain_id,
+            &self.config.network.bootstrap_peers,
+        )?;
 
         // Ensure data directory exists
         let datadir = &self.config.node.datadir;
@@ -429,21 +482,13 @@ impl PydeNode {
         subscribe_topics(&mut swarm, is_validator)?;
         info!("gossipsub topics subscribed");
 
-        // 8. Dial bootstrap peers. Empty on anything other than a single
-        // isolated devnet node is almost certainly misconfiguration —
-        // without peers the node produces a fork of one and can never
-        // sync. Warn loudly so operators catch this before genesis
-        // rather than after.
-        if self.config.network.bootstrap_peers.is_empty() {
-            if self.config.node.chain_id != 31337 {
-                warn!(
-                    chain_id = self.config.node.chain_id,
-                    "no bootstrap_peers configured for a non-devnet chain — this node will not \
-                     discover peers and cannot sync. Set network.bootstrap_peers in config.toml \
-                     before launch."
-                );
-            }
-        } else {
+        // 8. Dial bootstrap peers. Audit 219: the
+        // `check_bootstrap_config` call earlier in `run()` already
+        // hard-refused mainnet starts with no peers and warned for
+        // other non-devnet chains, so by the time we reach this
+        // point an empty list means devnet — which is fine for a
+        // single-node local devnet.
+        if !self.config.network.bootstrap_peers.is_empty() {
             pyde_net::node::dial_bootstrap_peers(&mut swarm, &self.config.network.bootstrap_peers);
         }
 
@@ -4281,5 +4326,56 @@ fn load_or_generate_identity(datadir: &Path) -> Result<libp2p::identity::Keypair
             .map_err(|e| format!("failed to write {}: {}", key_path.display(), e))?;
         info!(path = %key_path.display(), "generated new node identity");
         Ok(keypair)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========== Audit 219: bootstrap config startup guard ==========
+
+    #[test]
+    fn bootstrap_guard_rejects_empty_mainnet() {
+        let err = check_bootstrap_config(1, &[]).unwrap_err();
+        assert!(
+            err.contains("mainnet"),
+            "error must name mainnet so the operator knows what tripped, got: {err}"
+        );
+        assert!(err.contains("bootstrap_peers"));
+    }
+
+    #[test]
+    fn bootstrap_guard_accepts_mainnet_with_peers() {
+        let peers = vec!["/ip4/1.2.3.4/tcp/30303/p2p/12D3KooWfoo".to_string()];
+        assert!(check_bootstrap_config(1, &peers).is_ok());
+    }
+
+    #[test]
+    fn bootstrap_guard_accepts_devnet_with_no_peers() {
+        // Single-node local devnet is the one legitimate "no peers" case.
+        assert!(check_bootstrap_config(31337, &[]).is_ok());
+    }
+
+    #[test]
+    fn bootstrap_guard_accepts_testnet_with_no_peers_but_warns() {
+        // Non-mainnet, non-devnet (testnet ids etc.) is not a hard
+        // refusal — operators may legitimately spin up a single-node
+        // testnet pre-launch. The accompanying warn! is a side effect
+        // we don't assert here; the contract is "Ok, but logged".
+        assert!(check_bootstrap_config(2, &[]).is_ok());
+        assert!(check_bootstrap_config(7, &[]).is_ok());
+        assert!(check_bootstrap_config(1_000_000, &[]).is_ok());
+    }
+
+    #[test]
+    fn bootstrap_guard_accepts_any_chain_with_peers() {
+        let peers = vec!["/ip4/1.2.3.4/tcp/30303/p2p/12D3KooWfoo".to_string()];
+        for chain_id in [1u64, 2, 7, 31337, 1_000_000] {
+            assert!(
+                check_bootstrap_config(chain_id, &peers).is_ok(),
+                "chain_id {chain_id} with peers should pass"
+            );
+        }
     }
 }
