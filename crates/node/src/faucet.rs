@@ -3,10 +3,32 @@
 //! Usage: `pyde faucet --rpc http://127.0.0.1:8545 --from 0x... --port 8080`
 //!
 //! Endpoints:
-//!   GET /faucet?address=0x...  → sends PYDE, returns tx hash
-//!   GET /health                → {"status":"ok"}
+//!
+//!   GET  /                    → minimal HTML form (the "web UI" half
+//!                                of task 082 / audit 225). Loads a
+//!                                vanilla-JS page that POSTs to
+//!                                `/api/request`.
+//!   POST /api/request         → JSON `{"address": "0x..."}` body, the
+//!                                public API recommended for clients.
+//!                                Mirrors the example in
+//!                                `docs/connect-to-testnet.md` so the
+//!                                doc and the implementation stay in
+//!                                lock-step.
+//!   GET  /faucet?address=...  → legacy GET endpoint, kept for
+//!                                backwards compat with anything
+//!                                already wired to it.
+//!   GET  /health              → `{"status":"ok"}` for k8s / load
+//!                                balancer probes.
+//!
+//! Both dispense paths share a two-stage rate limiter: a request must
+//! pass BOTH the per-address cooldown and the per-IP cooldown to be
+//! served. A single attacker rotating addresses still hits the IP
+//! ceiling; a single victim behind shared NAT still gets their first
+//! drop. Cooldown windows are configurable via the CLI; defaults are
+//! 1h per address, 1h per IP.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -37,17 +59,29 @@ impl RateLimiter {
         }
     }
 
-    fn check(&self, address: &str) -> Result<(), u64> {
-        let mut map = self.last_request.lock().unwrap();
-        let addr = address.to_lowercase();
-        if let Some(last) = map.get(&addr) {
+    /// Check whether `key` (an address or an IP, normalised to
+    /// lowercase) is past its cooldown. Does NOT record the
+    /// request — call `record` only after both the address and IP
+    /// gates pass, otherwise a request that's blocked by IP would
+    /// reset the address timer (and vice versa).
+    fn check(&self, key: &str) -> Result<(), u64> {
+        let map = self.last_request.lock().unwrap();
+        let k = key.to_lowercase();
+        if let Some(last) = map.get(&k) {
             let elapsed = last.elapsed();
             if elapsed < self.cooldown {
                 return Err((self.cooldown - elapsed).as_secs());
             }
         }
-        map.insert(addr, Instant::now());
         Ok(())
+    }
+
+    /// Record a successful dispense. Caller must have already checked
+    /// every gate (address + IP) so the timer only advances on a
+    /// served request.
+    fn record(&self, key: &str) {
+        let mut map = self.last_request.lock().unwrap();
+        map.insert(key.to_lowercase(), Instant::now());
     }
 }
 
@@ -217,17 +251,126 @@ fn parse_hex_addr(hex: &str) -> Result<[u8; 32], String> {
 }
 
 fn json_response(status: u16, body: &str) -> String {
+    http_response(status, "application/json", body)
+}
+
+fn html_response(status: u16, body: &str) -> String {
+    http_response(status, "text/html; charset=utf-8", body)
+}
+
+fn http_response(status: u16, content_type: &str, body: &str) -> String {
     format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\n\r\n{}",
         status,
-        match status { 200 => "OK", 400 => "Bad Request", 429 => "Too Many Requests", 404 => "Not Found", _ => "Error" },
+        match status {
+            200 => "OK",
+            400 => "Bad Request",
+            429 => "Too Many Requests",
+            404 => "Not Found",
+            500 => "Internal Server Error",
+            _ => "Error",
+        },
+        content_type,
         body.len(),
         body
     )
 }
 
+/// Minimal vanilla-JS faucet UI. Single-page, no framework, no
+/// external assets — keeps the binary self-contained so operators
+/// don't need a separate static-file server. The page POSTs to
+/// `/api/request`; cooldown and error messages display inline.
+const FAUCET_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pyde Testnet Faucet</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+         max-width: 640px; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.6rem; margin-bottom: 0.2rem; }
+  p.lede { color: #666; margin-top: 0; }
+  form { margin-top: 2rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  input[type="text"] { flex: 1; min-width: 280px; padding: 0.6rem 0.8rem;
+                       font-family: ui-monospace, monospace; font-size: 0.95rem;
+                       border: 1px solid #ccc; border-radius: 6px; }
+  button { padding: 0.6rem 1.2rem; font-size: 0.95rem; border: 0; border-radius: 6px;
+           background: #2c5dff; color: white; cursor: pointer; }
+  button:disabled { background: #999; cursor: not-allowed; }
+  #out { margin-top: 1.5rem; padding: 0.8rem 1rem; border-radius: 6px;
+         font-family: ui-monospace, monospace; font-size: 0.9rem;
+         white-space: pre-wrap; word-break: break-all; }
+  .ok { background: #e7f7ec; border: 1px solid #a4d8b0; }
+  .err { background: #fdeaea; border: 1px solid #e0a3a3; }
+  .info { background: #f0f0f0; border: 1px solid #ccc; }
+  small { color: #888; }
+  a { color: #2c5dff; }
+</style>
+</head>
+<body>
+<h1>Pyde Testnet Faucet</h1>
+<p class="lede">Request test PYDE for development. One drop per address per cooldown window.</p>
+<form id="f">
+  <input id="addr" type="text" autocomplete="off" placeholder="0x... (32-byte address)" required>
+  <button id="btn" type="submit">Request</button>
+</form>
+<div id="out" class="info" style="display:none"></div>
+<p><small>Powered by the built-in <code>pyde faucet</code> service.
+See <a href="https://github.com/zarah-s/pyde/blob/main/docs/connect-to-testnet.md">connect-to-testnet docs</a>.</small></p>
+<script>
+const form = document.getElementById('f');
+const addrInput = document.getElementById('addr');
+const btn = document.getElementById('btn');
+const out = document.getElementById('out');
+function show(kind, msg) {
+  out.style.display = 'block';
+  out.className = kind;
+  out.textContent = msg;
+}
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const address = addrInput.value.trim();
+  btn.disabled = true;
+  show('info', 'Submitting...');
+  try {
+    const resp = await fetch('/api/request', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({address}),
+    });
+    const json = await resp.json();
+    if (resp.ok) {
+      show('ok', `Sent ${json.amount} PYDE to ${json.to}\n\ntx hash: ${json.txHash}`);
+    } else if (resp.status === 429) {
+      show('err', `Rate limited. Try again in ${json.retryAfter}s.`);
+    } else {
+      show('err', `Error: ${json.error || 'unknown'}`);
+    }
+  } catch (err) {
+    show('err', `Network error: ${err}`);
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
+"##;
+
+/// Pull a JSON `address` field out of a POSTed body. Tolerant of
+/// the most common client mistakes (extra whitespace, trailing
+/// newlines) but does not implement a full JSON parser; the request
+/// surface is small enough that `serde_json::from_str` is overkill.
+fn parse_post_body_address(body: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    json.get("address")?.as_str().map(|s| s.to_string())
+}
+
 pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
-    let limiter = Arc::new(RateLimiter::new(config.cooldown_secs));
+    let addr_limiter = Arc::new(RateLimiter::new(config.cooldown_secs));
+    let ip_limiter = Arc::new(RateLimiter::new(config.cooldown_secs));
     let rpc_url = Arc::new(config.rpc_url);
     let from = Arc::new(config.from_address);
     let amount = config.amount_pyde;
@@ -254,96 +397,269 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
         .map_err(|e| format!("failed to bind {}: {}", addr, e))?;
 
     tracing::info!("faucet started on http://{}", addr);
-    tracing::info!("  GET /faucet?address=0x... → {} PYDE", amount);
-    tracing::info!("  rate limit: {} seconds per address", config.cooldown_secs);
+    tracing::info!("  GET  /                   → web UI");
+    tracing::info!(
+        "  POST /api/request        → JSON body {{\"address\":\"0x...\"}} → {} PYDE",
+        amount
+    );
+    tracing::info!("  GET  /faucet?address=... → legacy GET endpoint");
+    tracing::info!("  GET  /health             → {{\"status\":\"ok\"}}");
+    tracing::info!(
+        "  rate limit: {}s per address AND {}s per IP",
+        config.cooldown_secs,
+        config.cooldown_secs
+    );
 
     loop {
-        let (stream, _) = listener
+        let (stream, peer_addr) = listener
             .accept()
             .await
             .map_err(|e| format!("accept: {}", e))?;
 
-        let limiter = limiter.clone();
+        let addr_limiter = addr_limiter.clone();
+        let ip_limiter = ip_limiter.clone();
         let rpc = rpc_url.clone();
         let from = from.clone();
         let signer = signer.clone();
 
         tokio::spawn(async move {
-            let (reader, mut writer) = tokio::io::split(stream);
-            let mut buf_reader = BufReader::new(reader);
-            let mut request_line = String::new();
-            if buf_reader.read_line(&mut request_line).await.is_err() {
-                return;
-            }
-
-            // Parse: "GET /path?query HTTP/1.1"
-            let parts: Vec<&str> = request_line.split_whitespace().collect();
-            if parts.len() < 2 {
-                let _ = writer
-                    .write_all(json_response(400, r#"{"error":"bad request"}"#).as_bytes())
-                    .await;
-                return;
-            }
-
-            let full_path = parts[1];
-            let (path, query) = if let Some(idx) = full_path.find('?') {
-                (&full_path[..idx], &full_path[idx + 1..])
-            } else {
-                (full_path, "")
-            };
-
-            let response = match path {
-                "/health" => json_response(200, r#"{"status":"ok"}"#),
-                "/faucet" => {
-                    let address = query.split('&').find_map(|p| {
-                        let (k, v) = p.split_once('=')?;
-
-                        if k == "address" {
-                            Some(v.to_string())
-                        } else {
-                            None
-                        }
-                    });
-
-                    match address {
-                        Some(addr) if addr.len() >= 64 => match limiter.check(&addr) {
-                            Err(secs) => json_response(
-                                429,
-                                &format!(r#"{{"error":"rate limited","retryAfter":{}}}"#, secs),
-                            ),
-                            Ok(()) => {
-                                match send_faucet_tx(
-                                    &rpc,
-                                    &from,
-                                    &addr,
-                                    amount,
-                                    signer.as_ref().as_ref(),
-                                )
-                                .await
-                                {
-                                    Ok(tx_hash) => {
-                                        tracing::info!(to = %addr, amount, tx_hash = %tx_hash, "faucet dispensed");
-                                        json_response(
-                                            200,
-                                            &format!(
-                                                r#"{{"txHash":"{}","amount":"{}","to":"{}"}}"#,
-                                                tx_hash, amount, addr
-                                            ),
-                                        )
-                                    }
-                                    Err(e) => {
-                                        json_response(500, &format!(r#"{{"error":"{}"}}"#, e))
-                                    }
-                                }
-                            }
-                        },
-                        _ => json_response(400, r#"{"error":"missing or invalid address"}"#),
-                    }
-                }
-                _ => json_response(404, r#"{"error":"not found"}"#),
-            };
-
-            let _ = writer.write_all(response.as_bytes()).await;
+            handle_connection(stream, peer_addr, addr_limiter, ip_limiter, rpc, from, amount, signer).await;
         });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_connection(
+    stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    addr_limiter: Arc<RateLimiter>,
+    ip_limiter: Arc<RateLimiter>,
+    rpc: Arc<String>,
+    from: Arc<String>,
+    amount: u64,
+    signer: Arc<Option<FaucetSigner>>,
+) {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut buf_reader = BufReader::new(reader);
+    let mut request_line = String::new();
+    if buf_reader.read_line(&mut request_line).await.is_err() {
+        return;
+    }
+
+    // Parse: "METHOD /path[?query] HTTP/1.1"
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        let _ = writer
+            .write_all(json_response(400, r#"{"error":"bad request"}"#).as_bytes())
+            .await;
+        return;
+    }
+    let method = parts[0];
+    let full_path = parts[1];
+    let (path, query) = if let Some(idx) = full_path.find('?') {
+        (&full_path[..idx], &full_path[idx + 1..])
+    } else {
+        (full_path, "")
+    };
+
+    // Read headers until empty line, capturing Content-Length so we
+    // can read the body for POST requests. Anything we don't need is
+    // discarded — small request surface, no need for a full HTTP lib.
+    let mut content_length: usize = 0;
+    loop {
+        let mut header_line = String::new();
+        if buf_reader.read_line(&mut header_line).await.is_err() {
+            return;
+        }
+        if header_line.trim().is_empty() {
+            break;
+        }
+        if let Some(rest) = header_line
+            .to_ascii_lowercase()
+            .strip_prefix("content-length:")
+        {
+            content_length = rest.trim().parse().unwrap_or(0);
+        }
+    }
+
+    let mut body = String::new();
+    if content_length > 0 {
+        // Cap body to a small upper bound — defensive against a
+        // misbehaving / malicious client claiming Content-Length:
+        // 1GB. The legitimate JSON body is < 100 bytes.
+        let cap = content_length.min(4096);
+        let mut buf = vec![0u8; cap];
+        use tokio::io::AsyncReadExt;
+        if buf_reader.read_exact(&mut buf).await.is_ok() {
+            body = String::from_utf8_lossy(&buf).into_owned();
+        }
+    }
+
+    let ip_key = peer_addr.ip().to_string();
+
+    let response = match (method, path) {
+        ("OPTIONS", _) => {
+            // CORS preflight — 204 with the headers from `http_response`
+            // is enough; browsers don't care about the body.
+            http_response(204, "text/plain", "")
+        }
+        ("GET", "/") | ("GET", "/index.html") => html_response(200, FAUCET_HTML),
+        ("GET", "/health") => json_response(200, r#"{"status":"ok"}"#),
+        ("POST", "/api/request") => {
+            match parse_post_body_address(&body) {
+                Some(addr) if addr.len() >= 64 => {
+                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref()).await
+                }
+                Some(_) => json_response(400, r#"{"error":"address must be 0x-prefixed 32-byte hex"}"#),
+                None => json_response(400, r#"{"error":"missing address field in JSON body"}"#),
+            }
+        }
+        ("GET", "/faucet") => {
+            // Legacy backwards-compat endpoint.
+            let address = query.split('&').find_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                if k == "address" {
+                    Some(v.to_string())
+                } else {
+                    None
+                }
+            });
+            match address {
+                Some(addr) if addr.len() >= 64 => {
+                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref()).await
+                }
+                _ => json_response(400, r#"{"error":"missing or invalid address"}"#),
+            }
+        }
+        _ => json_response(404, r#"{"error":"not found"}"#),
+    };
+
+    let _ = writer.write_all(response.as_bytes()).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_dispense(
+    address: &str,
+    ip_key: &str,
+    addr_limiter: &RateLimiter,
+    ip_limiter: &RateLimiter,
+    rpc: &str,
+    from: &str,
+    amount: u64,
+    signer: Option<&FaucetSigner>,
+) -> String {
+    // Both rate limits must pass. Check before dispense; record only
+    // after a successful send so a downstream RPC failure doesn't
+    // burn the cooldown window.
+    if let Err(secs) = addr_limiter.check(address) {
+        return json_response(
+            429,
+            &format!(r#"{{"error":"address rate limited","retryAfter":{}}}"#, secs),
+        );
+    }
+    if let Err(secs) = ip_limiter.check(ip_key) {
+        return json_response(
+            429,
+            &format!(r#"{{"error":"ip rate limited","retryAfter":{}}}"#, secs),
+        );
+    }
+    match send_faucet_tx(rpc, from, address, amount, signer).await {
+        Ok(tx_hash) => {
+            addr_limiter.record(address);
+            ip_limiter.record(ip_key);
+            tracing::info!(to = %address, ip = %ip_key, amount, tx_hash = %tx_hash, "faucet dispensed");
+            json_response(
+                200,
+                &format!(
+                    r#"{{"txHash":"{}","amount":"{}","to":"{}"}}"#,
+                    tx_hash, amount, address
+                ),
+            )
+        }
+        Err(e) => {
+            tracing::warn!(to = %address, ip = %ip_key, error = %e, "faucet dispense failed");
+            json_response(500, &format!(r#"{{"error":"{}"}}"#, e))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========== Task 082 / audit 225: faucet web UI + JSON API ==========
+
+    #[test]
+    fn parse_post_body_extracts_address_field() {
+        let body = r#"{"address":"0xabc123"}"#;
+        assert_eq!(parse_post_body_address(body), Some("0xabc123".into()));
+    }
+
+    #[test]
+    fn parse_post_body_tolerates_whitespace_and_extra_fields() {
+        let body = r#"{
+            "address": "0xdeadbeef",
+            "captcha": "ignored"
+        }"#;
+        assert_eq!(parse_post_body_address(body), Some("0xdeadbeef".into()));
+    }
+
+    #[test]
+    fn parse_post_body_returns_none_on_missing_address() {
+        assert_eq!(parse_post_body_address(r#"{"foo":"bar"}"#), None);
+    }
+
+    #[test]
+    fn parse_post_body_returns_none_on_invalid_json() {
+        assert_eq!(parse_post_body_address("not json"), None);
+        assert_eq!(parse_post_body_address(""), None);
+    }
+
+    #[test]
+    fn rate_limiter_does_not_consume_window_on_check() {
+        // Regression for the two-stage gate: a `check` that succeeds
+        // must NOT advance the timer, otherwise a request blocked by
+        // the *other* gate (e.g. IP) burns the address window for free.
+        let lim = RateLimiter::new(60);
+        assert!(lim.check("0xabc").is_ok());
+        assert!(lim.check("0xabc").is_ok(), "check must not arm cooldown");
+        lim.record("0xabc");
+        assert!(lim.check("0xabc").is_err(), "record must arm cooldown");
+    }
+
+    #[test]
+    fn rate_limiter_normalises_case() {
+        let lim = RateLimiter::new(60);
+        lim.record("0xABC");
+        assert!(lim.check("0xabc").is_err());
+        assert!(lim.check("0xAbC").is_err());
+    }
+
+    #[test]
+    fn html_response_advertises_correct_content_type() {
+        let r = html_response(200, "<p>hi</p>");
+        assert!(r.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(r.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(r.contains("Access-Control-Allow-Origin: *\r\n"));
+        assert!(r.ends_with("<p>hi</p>"));
+    }
+
+    #[test]
+    fn json_response_advertises_correct_content_type() {
+        let r = json_response(429, r#"{"error":"rate limited"}"#);
+        assert!(r.starts_with("HTTP/1.1 429 Too Many Requests\r\n"));
+        assert!(r.contains("Content-Type: application/json\r\n"));
+    }
+
+    #[test]
+    fn faucet_html_contains_form_and_api_endpoint() {
+        // Regression check on the embedded UI — must contain the
+        // form, the API endpoint it POSTs to, and an address input.
+        // If a future edit removes any of these, the page is no
+        // longer functional and this test catches it.
+        assert!(FAUCET_HTML.contains("<form"));
+        assert!(FAUCET_HTML.contains("/api/request"));
+        assert!(FAUCET_HTML.contains(r#"id="addr""#));
+        assert!(FAUCET_HTML.contains("Pyde Testnet Faucet"));
     }
 }
