@@ -446,11 +446,36 @@
 
 ## P2 — Pre-testnet-alpha hygiene
 
-- [ ] 219 — **Startup guard on empty `MAINNET_BOOTSTRAP`.**
-      `crates/net/src/discovery.rs:14` — empty array, allowed by
-      task 011's config-file-injection option. Add a startup
-      refusal when `chain_id == 1` and no bootstrap peers
-      configured.
+- [x] 219 — `✓` **Startup guard on empty `MAINNET_BOOTSTRAP`.**
+      `crates/net/src/discovery.rs:14` constants
+      (`MAINNET_BOOTSTRAP`, `TESTNET_BOOTSTRAP`) are empty arrays
+      pre-launch, allowed by task 011's config-file-injection
+      option. The previous behaviour: a `warn!` then proceed —
+      operators who missed the warn produced an isolated mainnet
+      "fork of one" until they noticed.
+
+      Shipped: new `check_bootstrap_config(chain_id, bootstrap_peers)`
+      helper in `crates/node/src/node.rs`, called at the very
+      first line of `PydeNode::run()` (before any datadir, key,
+      or swarm setup). Rules:
+      - `chain_id == 1` with empty bootstrap → hard refusal
+        returned as `Err(...)` from `run`.
+      - `chain_id != 31337` with empty bootstrap → `warn!` and
+        proceed (testnet pre-launch may legitimately bootstrap a
+        single node).
+      - Devnet (`31337`) → silent.
+
+      Inline post-init dial block at the bootstrap step is now a
+      simple "if non-empty, dial" — the guard already ran, so an
+      empty list at that point can only mean intentional devnet.
+
+      Tests: 5 unit tests in the new `node::tests` module
+      (`bootstrap_guard_rejects_empty_mainnet`,
+      `bootstrap_guard_accepts_mainnet_with_peers`,
+      `bootstrap_guard_accepts_devnet_with_no_peers`,
+      `bootstrap_guard_accepts_testnet_with_no_peers_but_warns`,
+      `bootstrap_guard_accepts_any_chain_with_peers`). 243
+      pyde-node bin tests pass.
 
 - [x] 220 — `✓` **Fast-sync / snapshot wiring.** Investigation
       found that snapshot endpoints (`request_state_snapshot`,
