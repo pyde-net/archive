@@ -194,7 +194,15 @@ pub fn try_form_view_change_qc(
             // Only accept a reported highest_qc if it actually has quorum —
             // otherwise a malicious validator could claim an arbitrarily high
             // slot with a fake (zero-vote) QC to manipulate the view change.
-            if msg.highest_qc.slot > highest_qc.slot && msg.highest_qc.has_quorum() {
+            //
+            // Audit 235/236 sweep: use `has_quorum_for(committee_keys.len())`
+            // not `has_quorum()` — the latter hardcodes 86 and silently
+            // rejected every devnet QC (which has 3-5 votes), making
+            // view-change unable to track highest_qc correctly on any
+            // committee smaller than 86.
+            if msg.highest_qc.slot > highest_qc.slot
+                && msg.highest_qc.has_quorum_for(committee_keys.len())
+            {
                 highest_qc = msg.highest_qc.clone();
             }
         }
