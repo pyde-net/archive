@@ -59,6 +59,32 @@ cargo build
 cargo test --workspace
 ```
 
+## Quickstart
+
+- [Connect a node to the testnet](./docs/connect-to-testnet.md) —
+  prerequisites, bootstrap config, sync verification, faucet, first
+  transaction.
+- [Run a validator](./docs/run-validator.md) — staking, key custody,
+  systemd unit, slashing rules, operator metrics.
+- [JSON-RPC reference](./docs/rpc-reference.md) — supported methods
+  with request/response shapes.
+
+For a local 4-node devnet today (testnet not yet live):
+
+```sh
+pyde testnet --validators 4 --out ./devnet --dev
+cd devnet && ./run.sh
+```
+
+For a 16-validator / 3-region cross-host testnet (operator-driven):
+
+```sh
+pyde testnet \
+  --validators 16 \
+  --out ./testnet \
+  --node-addrs ./crates/node/testdata/testnet-16v-3region.toml
+```
+
 ## License
 
 Proprietary. All rights reserved.
