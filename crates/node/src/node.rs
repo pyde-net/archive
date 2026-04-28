@@ -784,12 +784,12 @@ impl PydeNode {
                             qc_block_hash,
                         ) => {
                             // Path A: RR-receive of a Vote closed the soft
-                            // QC. Ack the RR sender, then trigger canonical
-                            // apply for the now-QC'd block. Mirrors the
-                            // standalone ApplyCanonicalAfterQc handler
-                            // body — duplicated until the call sites
-                            // settle and a helper extraction is worth its
-                            // 12-arg signature.
+                            // QC. Ack the RR sender, then run the same
+                            // canonical-apply orchestration as the
+                            // gossipsub `ApplyCanonicalAfterQc` handler at
+                            // line ~1190. The shared sub-helpers take a
+                            // `log_tag` to distinguish call sites in
+                            // operator logs.
                             let _ = swarm.behaviour_mut().consensus_rr.send_response(channel, resp);
                             let block = {
                                 let pbb = pending_block_bodies.read().await;
@@ -826,62 +826,32 @@ impl PydeNode {
                                     let smt_handle = state_w.smt_handle();
                                     drop(state_w);
                                     drop(chain_w);
-                                    if !pending_writes.is_empty() {
-                                        let commit_start = std::time::Instant::now();
-                                        if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(&smt_handle, pending_writes) {
-                                            crate::metrics::record_state_commit_ms(
-                                                commit_start.elapsed().as_millis() as u64,
-                                            );
-                                            let mut sw = state.write().await;
-                                            sw.set_root(root);
-                                            drop(sw);
-                                        }
-                                    }
-                                    let full_bytes = wire::encode_block(&block);
-                                    let _ = block_store.put_block(&block.header, &full_bytes);
-                                    let _ = block_store.put_head(qc_slot);
-                                    chain_sync.on_block_processed(qc_slot);
-                                    if !receipts_list.is_empty() {
-                                        let mut receipts_w = receipts.write().await;
-                                        receipts_w.insert_block_receipts(qc_slot, receipts_list.clone());
-                                    }
-                                    let _ = ws_heads.send(serde_json::json!({
-                                        "slot": format!("0x{:x}", qc_slot),
-                                        "timestamp": format!("0x{:x}", block.header.timestamp),
-                                        "proposer": format!("0x{}", hex::encode(block.header.proposer)),
-                                        "txCount": format!("0x{:x}", tc),
-                                    }));
-                                    for r in receipts_list.iter() {
-                                        for log in &r.logs {
-                                            let _ = ws_logs.send(serde_json::json!({
-                                                "address": format!("0x{}", hex::encode(log.address)),
-                                                "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
-                                                "data": format!("0x{}", hex::encode(&log.data)),
-                                            }));
-                                        }
-                                    }
-                                    let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
-                                        .map(|tx| tx.hash()).collect();
-                                    if !tx_hashes.is_empty() {
-                                        let mut idx = mempool_index.write().await;
-                                        for h in &tx_hashes { idx.remove(h); }
-                                        drop(idx);
-                                        let mut pending_w = pending_txs.write().await;
-                                        for h in &tx_hashes { pending_w.remove(h); }
-                                        drop(pending_w);
-                                        let mut times_w = pending_tx_times.write().await;
-                                        for h in &tx_hashes { times_w.remove(h); }
-                                    }
-                                    if !block.body.encrypted_txs.is_empty() {
-                                        let enc_hashes: Vec<[u8; 32]> = block.body.encrypted_txs.iter()
-                                            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
-                                            .map(|etx| etx.hash())
-                                            .collect();
-                                        if !enc_hashes.is_empty() {
-                                            let mut relay_w = tx_relay.write().await;
-                                            relay_w.remove_included(&enc_hashes);
-                                        }
-                                    }
+                                    commit_jmt_writes(&state, smt_handle, pending_writes).await;
+                                    persist_block_and_receipts(
+                                        &block_store,
+                                        &mut chain_sync,
+                                        &receipts,
+                                        &block,
+                                        qc_slot,
+                                        receipts_list,
+                                    )
+                                    .await;
+                                    emit_ws_events(
+                                        &ws_heads,
+                                        &ws_logs,
+                                        &block,
+                                        qc_slot,
+                                        tc,
+                                        receipts_list,
+                                    );
+                                    prune_committed_txs(
+                                        &mempool_index,
+                                        &pending_txs,
+                                        &pending_tx_times,
+                                        &tx_relay,
+                                        &block,
+                                    )
+                                    .await;
                                     {
                                         let mut pbb = pending_block_bodies.write().await;
                                         pbb.remove(&qc_block_hash);
@@ -893,132 +863,30 @@ impl PydeNode {
                                         proposer = hex::encode(block.header.proposer),
                                         "applied block from QC (canonical, RR path)"
                                     );
-                                    if let (Some(engine), Some(identity)) = (
-                                        validator_engine.as_mut(),
-                                        validator_identity.as_ref(),
-                                    ) {
-                                        let state_root = state.read().await.root();
-                                        if let Some(fv) = engine.create_finality_vote(
-                                            qc_slot,
-                                            qc_block_hash,
-                                            state_root,
-                                            identity,
-                                        ) {
-                                            let cert_formed =
-                                                engine.on_finality_vote(fv.clone());
-                                            let fv_bytes = wire::encode_finality_vote(&fv);
-                                            let topic = pyde_net::node::topics::consensus();
-                                            broadcast_consensus_with_rr_fallback(
-                                                &mut swarm,
-                                                topic.clone(),
-                                                fv_bytes,
-                                                &peer_manager,
-                                            );
-                                            if cert_formed {
-                                                if let Some(cp) =
-                                                    engine.latest_finality_checkpoint()
-                                                {
-                                                    let _ = block_store.put_finality_cert(cp);
-                                                    let cp_bytes =
-                                                        wire::encode_finality_checkpoint_msg(cp);
-                                                    broadcast_consensus_with_rr_fallback(
-                                                        &mut swarm,
-                                                        topic,
-                                                        cp_bytes,
-                                                        &peer_manager,
-                                                    );
-                                                    info!(
-                                                        slot = qc_slot,
-                                                        "hard finality cert formed (RR canonical-apply path)"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Audit-227 share broadcast — same logic
-                                    // as the gossip canonical-apply path.
-                                    // Duplicated for now (TODO: extract to a
-                                    // helper once the call sites settle).
-                                    if !block.body.encrypted_txs.is_empty()
-                                        && validator_identity
-                                            .as_ref()
-                                            .and_then(|id| id.key_share.as_ref())
-                                            .is_some()
-                                        && !pending_decryptors.read().await.contains_key(&qc_slot)
-                                    {
-                                        let enc_txs: Vec<pyde_mempool::encrypted::EncryptedTx> = block
-                                            .body
-                                            .encrypted_txs
-                                            .iter()
-                                            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
-                                            .collect();
-                                        let tx_root_ok = crate::block_processor::verify_decryptor_against_committed_root(
-                                            &block.header.tx_root,
-                                            &block.body.transactions,
-                                            &enc_txs,
-                                        );
-                                        if tx_root_ok {
-                                            if let Some(engine) = validator_engine.as_mut() {
-                                                let identity = validator_identity.as_ref().unwrap();
-                                                let threshold = pyde_consensus::block::quorum_for_committee(
-                                                    engine.committee_keys.len(),
-                                                );
-                                                if let Ok(mut decryptor) =
-                                                    pyde_mempool::decryption::BlockDecryptor::new(
-                                                        enc_txs.clone(),
-                                                        threshold,
-                                                    )
-                                                {
-                                                    if let Some(ks) = &identity.key_share {
-                                                        decryptor.add_member_shares(ks);
-                                                    }
-                                                    let mut q = queued_shares.write().await;
-                                                    if let Some(queued) = q.remove(&qc_slot) {
-                                                        for qmsg in &queued {
-                                                            for (i, sb) in qmsg.shares.iter().enumerate() {
-                                                                if let Some(s) = pyde_crypto::threshold::DecryptionShare::from_bytes(sb) {
-                                                                    decryptor.add_share(i, s);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    drop(q);
-                                                    pending_decryptors
-                                                        .write()
-                                                        .await
-                                                        .insert(qc_slot, decryptor);
-                                                }
-                                                if let Some(shares) =
-                                                    engine.generate_decryption_shares(identity, &enc_txs)
-                                                {
-                                                    let msg = wire::DecryptionShareMsg {
-                                                        slot: qc_slot,
-                                                        member_index: identity.committee_index,
-                                                        shares: shares.iter().map(|s| s.to_bytes()).collect(),
-                                                    };
-                                                    let share_bytes = wire::encode_decryption_shares(&msg);
-                                                    let topic = pyde_net::node::topics::consensus();
-                                                    broadcast_consensus_with_rr_fallback(
-                                                        &mut swarm,
-                                                        topic,
-                                                        share_bytes,
-                                                        &peer_manager,
-                                                    );
-                                                    info!(
-                                                        slot = qc_slot,
-                                                        enc_txs = enc_txs.len(),
-                                                        "broadcast decryption shares (RR canonical-apply)"
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            error!(
-                                                slot = qc_slot,
-                                                "decrypt-time tx_root mismatch (RR canonical-apply)"
-                                            );
-                                        }
-                                    }
+                                    cast_finality_vote_and_persist(
+                                        &mut validator_engine,
+                                        &validator_identity,
+                                        &state,
+                                        &block_store,
+                                        &mut swarm,
+                                        &peer_manager,
+                                        qc_slot,
+                                        qc_block_hash,
+                                        " (RR path)",
+                                    )
+                                    .await;
+                                    maybe_kick_decryption_pipeline(
+                                        &mut validator_engine,
+                                        &validator_identity,
+                                        &queued_shares,
+                                        &pending_decryptors,
+                                        &mut swarm,
+                                        &peer_manager,
+                                        &block,
+                                        qc_slot,
+                                        " (RR path)",
+                                    )
+                                    .await;
                                 }
                                 Err(e) => {
                                     drop(state_w);
@@ -1201,21 +1069,15 @@ impl PydeNode {
                             qc_slot,
                             qc_block_hash,
                         } => {
-                            // Path A canonical apply.
-                            //
-                            // Look up the block (committed by the QC) in
-                            // `pending_block_bodies`, run process_full_block,
-                            // commit the JMT diff, populate side-effects
-                            // (block_store, receipts, mempool prune,
-                            // ws_heads/ws_logs), and then cast our own
-                            // hard-finality vote with the now-canonical
-                            // `state.root()`. Same code shape as the
-                            // own-vote-forms-QC inline apply at
-                            // ~line 2284 — kept duplicated for now (the
-                            // surrounding context captures different sets
-                            // of locals on each path; extracting a helper
-                            // would mean ~12 args). When both paths
-                            // settle, fold into a shared `apply_qcd`.
+                            // Path A canonical apply. The body is split
+                            // into focused sub-helpers (commit_jmt_writes,
+                            // persist_block_and_receipts, emit_ws_events,
+                            // prune_committed_txs, cast_finality_vote_and_persist,
+                            // maybe_kick_decryption_pipeline) so this
+                            // handler reads as the orchestration layer
+                            // it is. Same body runs from the
+                            // RR-fallback handler at line ~780 with a
+                            // different log_tag.
                             let block = {
                                 let pbb = pending_block_bodies.read().await;
                                 match pbb.get(&qc_block_hash).cloned() {
@@ -1233,8 +1095,7 @@ impl PydeNode {
                             let mut state_w = state.write().await;
                             // Skip if we've already applied this slot
                             // (e.g. the own-vote-QC inline path got there
-                            // first this turn) — avoid double-apply
-                            // tripping the `slot <= head` validator.
+                            // first this turn).
                             if chain_w.head_slot >= qc_slot {
                                 drop(state_w);
                                 drop(chain_w);
@@ -1255,63 +1116,32 @@ impl PydeNode {
                                     let smt_handle = state_w.smt_handle();
                                     drop(state_w);
                                     drop(chain_w);
-                                    if !pending_writes.is_empty() {
-                                        let commit_start = std::time::Instant::now();
-                                        if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(&smt_handle, pending_writes) {
-                                            crate::metrics::record_state_commit_ms(
-                                                commit_start.elapsed().as_millis() as u64,
-                                            );
-                                            let mut sw = state.write().await;
-                                            sw.set_root(root);
-                                            drop(sw);
-                                        }
-                                    }
-                                    let full_bytes = wire::encode_block(&block);
-                                    let _ = block_store.put_block(&block.header, &full_bytes);
-                                    let _ = block_store.put_head(qc_slot);
-                                    chain_sync.on_block_processed(qc_slot);
-                                    if !receipts_list.is_empty() {
-                                        let mut receipts_w = receipts.write().await;
-                                        receipts_w.insert_block_receipts(qc_slot, receipts_list.clone());
-                                    }
-                                    let _ = ws_heads.send(serde_json::json!({
-                                        "slot": format!("0x{:x}", qc_slot),
-                                        "timestamp": format!("0x{:x}", block.header.timestamp),
-                                        "proposer": format!("0x{}", hex::encode(block.header.proposer)),
-                                        "txCount": format!("0x{:x}", tc),
-                                    }));
-                                    for r in receipts_list.iter() {
-                                        for log in &r.logs {
-                                            let _ = ws_logs.send(serde_json::json!({
-                                                "address": format!("0x{}", hex::encode(log.address)),
-                                                "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
-                                                "data": format!("0x{}", hex::encode(&log.data)),
-                                            }));
-                                        }
-                                    }
-                                    // Mempool / tx-relay cleanup.
-                                    let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
-                                        .map(|tx| tx.hash()).collect();
-                                    if !tx_hashes.is_empty() {
-                                        let mut idx = mempool_index.write().await;
-                                        for h in &tx_hashes { idx.remove(h); }
-                                        drop(idx);
-                                        let mut pending_w = pending_txs.write().await;
-                                        for h in &tx_hashes { pending_w.remove(h); }
-                                        drop(pending_w);
-                                        let mut times_w = pending_tx_times.write().await;
-                                        for h in &tx_hashes { times_w.remove(h); }
-                                    }
-                                    if !block.body.encrypted_txs.is_empty() {
-                                        let enc_hashes: Vec<[u8; 32]> = block.body.encrypted_txs.iter()
-                                            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
-                                            .map(|etx| etx.hash())
-                                            .collect();
-                                        if !enc_hashes.is_empty() {
-                                            let mut relay_w = tx_relay.write().await;
-                                            relay_w.remove_included(&enc_hashes);
-                                        }
-                                    }
+                                    commit_jmt_writes(&state, smt_handle, pending_writes).await;
+                                    persist_block_and_receipts(
+                                        &block_store,
+                                        &mut chain_sync,
+                                        &receipts,
+                                        &block,
+                                        qc_slot,
+                                        receipts_list,
+                                    )
+                                    .await;
+                                    emit_ws_events(
+                                        &ws_heads,
+                                        &ws_logs,
+                                        &block,
+                                        qc_slot,
+                                        tc,
+                                        receipts_list,
+                                    );
+                                    prune_committed_txs(
+                                        &mempool_index,
+                                        &pending_txs,
+                                        &pending_tx_times,
+                                        &tx_relay,
+                                        &block,
+                                    )
+                                    .await;
                                     {
                                         let mut pbb = pending_block_bodies.write().await;
                                         pbb.remove(&qc_block_hash);
@@ -1323,148 +1153,30 @@ impl PydeNode {
                                         proposer = hex::encode(block.header.proposer),
                                         "applied block from QC (canonical)"
                                     );
-
-                                    // Cast hard-finality vote post-canonical-apply
-                                    // — state.root() now reflects the canonical
-                                    // post-execution JMT root, so all honest
-                                    // validators converge on the same value and
-                                    // the cert can form.
-                                    if let (Some(engine), Some(identity)) = (
-                                        validator_engine.as_mut(),
-                                        validator_identity.as_ref(),
-                                    ) {
-                                        let state_root = state.read().await.root();
-                                        if let Some(fv) = engine.create_finality_vote(
-                                            qc_slot,
-                                            qc_block_hash,
-                                            state_root,
-                                            identity,
-                                        ) {
-                                            let cert_formed =
-                                                engine.on_finality_vote(fv.clone());
-                                            let fv_bytes = wire::encode_finality_vote(&fv);
-                                            let topic = pyde_net::node::topics::consensus();
-                                            broadcast_consensus_with_rr_fallback(
-                                                &mut swarm,
-                                                topic.clone(),
-                                                fv_bytes,
-                                                &peer_manager,
-                                            );
-                                            if cert_formed {
-                                                if let Some(cp) =
-                                                    engine.latest_finality_checkpoint()
-                                                {
-                                                    let _ = block_store.put_finality_cert(cp);
-                                                    let cp_bytes =
-                                                        wire::encode_finality_checkpoint_msg(cp);
-                                                    broadcast_consensus_with_rr_fallback(
-                                                        &mut swarm,
-                                                        topic,
-                                                        cp_bytes,
-                                                        &peer_manager,
-                                                    );
-                                                    info!(
-                                                        slot = qc_slot,
-                                                        "hard finality cert formed (canonical-apply path)"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Audit-227 step 4: kick off threshold
-                                    // decryption for the block's encrypted txs
-                                    // now that QC has formed and the block is
-                                    // canonical. Logic mirrors the original
-                                    // `QcFormedFromGossip` handler — kept
-                                    // here (instead of re-emitting that
-                                    // action) because the share broadcast
-                                    // only runs on validators that are also
-                                    // committee members holding a key share,
-                                    // and we already have the canonical block
-                                    // body in scope so the original
-                                    // `block_store.get_block_raw` lookup is
-                                    // unnecessary. No-op for plaintext-only
-                                    // blocks (most of the testnet load).
-                                    if !block.body.encrypted_txs.is_empty()
-                                        && validator_identity
-                                            .as_ref()
-                                            .and_then(|id| id.key_share.as_ref())
-                                            .is_some()
-                                        && !pending_decryptors.read().await.contains_key(&qc_slot)
-                                    {
-                                        let enc_txs: Vec<pyde_mempool::encrypted::EncryptedTx> = block
-                                            .body
-                                            .encrypted_txs
-                                            .iter()
-                                            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
-                                            .collect();
-                                        let tx_root_ok = crate::block_processor::verify_decryptor_against_committed_root(
-                                            &block.header.tx_root,
-                                            &block.body.transactions,
-                                            &enc_txs,
-                                        );
-                                        if tx_root_ok {
-                                            if let Some(engine) = validator_engine.as_mut() {
-                                                let identity = validator_identity.as_ref().unwrap();
-                                                let threshold = pyde_consensus::block::quorum_for_committee(
-                                                    engine.committee_keys.len(),
-                                                );
-                                                if let Ok(mut decryptor) =
-                                                    pyde_mempool::decryption::BlockDecryptor::new(
-                                                        enc_txs.clone(),
-                                                        threshold,
-                                                    )
-                                                {
-                                                    if let Some(ks) = &identity.key_share {
-                                                        decryptor.add_member_shares(ks);
-                                                    }
-                                                    let mut q = queued_shares.write().await;
-                                                    if let Some(queued) = q.remove(&qc_slot) {
-                                                        for qmsg in &queued {
-                                                            for (i, sb) in qmsg.shares.iter().enumerate() {
-                                                                if let Some(s) = pyde_crypto::threshold::DecryptionShare::from_bytes(sb) {
-                                                                    decryptor.add_share(i, s);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    drop(q);
-                                                    pending_decryptors
-                                                        .write()
-                                                        .await
-                                                        .insert(qc_slot, decryptor);
-                                                }
-                                                if let Some(shares) =
-                                                    engine.generate_decryption_shares(identity, &enc_txs)
-                                                {
-                                                    let msg = wire::DecryptionShareMsg {
-                                                        slot: qc_slot,
-                                                        member_index: identity.committee_index,
-                                                        shares: shares.iter().map(|s| s.to_bytes()).collect(),
-                                                    };
-                                                    let share_bytes = wire::encode_decryption_shares(&msg);
-                                                    let topic = pyde_net::node::topics::consensus();
-                                                    broadcast_consensus_with_rr_fallback(
-                                                        &mut swarm,
-                                                        topic,
-                                                        share_bytes,
-                                                        &peer_manager,
-                                                    );
-                                                    info!(
-                                                        slot = qc_slot,
-                                                        enc_txs = enc_txs.len(),
-                                                        "broadcast decryption shares (canonical-apply)"
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            error!(
-                                                slot = qc_slot,
-                                                "decrypt-time tx_root mismatch (canonical-apply)"
-                                            );
-                                        }
-                                    }
+                                    cast_finality_vote_and_persist(
+                                        &mut validator_engine,
+                                        &validator_identity,
+                                        &state,
+                                        &block_store,
+                                        &mut swarm,
+                                        &peer_manager,
+                                        qc_slot,
+                                        qc_block_hash,
+                                        "",
+                                    )
+                                    .await;
+                                    maybe_kick_decryption_pipeline(
+                                        &mut validator_engine,
+                                        &validator_identity,
+                                        &queued_shares,
+                                        &pending_decryptors,
+                                        &mut swarm,
+                                        &peer_manager,
+                                        &block,
+                                        qc_slot,
+                                        "",
+                                    )
+                                    .await;
                                 }
                                 Err(e) => {
                                     drop(state_w);
@@ -2540,31 +2252,11 @@ impl PydeNode {
                                                 ws_slot,
                                             ) {
                                                 Ok((tc, gas, ref receipts_list)) => {
-                                                    // PIPELINED state commit — same pattern as the
-                                                    // gossip-apply path (now removed) and the
-                                                    // proposer self-apply path: extract pending
-                                                    // writes, release locks, commit Merkle root in
-                                                    // a background task so the slot tick isn't
-                                                    // blocked on RocksDB.
                                                     let pending_writes = state_w.take_pending_writes();
                                                     let smt_handle = state_w.smt_handle();
                                                     drop(state_w);
                                                     drop(chain_w);
-
-                                                    if !pending_writes.is_empty() {
-                                                        let state_for_root = state.clone();
-                                                        tokio::spawn(async move {
-                                                            let commit_start = std::time::Instant::now();
-                                                            if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(&smt_handle, pending_writes) {
-                                                                crate::metrics::record_state_commit_ms(
-                                                                    commit_start.elapsed().as_millis() as u64,
-                                                                );
-                                                                if let Ok(mut sw) = state_for_root.try_write() {
-                                                                    sw.set_root(root);
-                                                                }
-                                                            }
-                                                        });
-                                                    }
+                                                    commit_jmt_writes(&state, smt_handle, pending_writes).await;
 
                                                     let full_bytes = wire::encode_block(&block);
                                                     let _ = block_store.put_block(&block.header, &full_bytes);
@@ -3482,6 +3174,267 @@ fn build_and_encode_fallback_proposal(
         proposer_signature: block.proposer_signature,
     };
     Some(wire::encode_consensus_message(&msg))
+}
+
+/// Path A canonical-apply sub-helper: synchronously commit the
+/// `take_pending_writes()` batch returned by `process_full_block` to
+/// the JMT, refresh the cached state root.
+///
+/// Sync (not spawned) to close the race against any subsequent
+/// rollback path — see `audit-230` rollback notes in the
+/// `state_manager` module.
+async fn commit_jmt_writes(
+    state: &std::sync::Arc<tokio::sync::RwLock<crate::state_manager::StateManager>>,
+    smt_handle: std::sync::Arc<std::sync::Mutex<pyde_state::jmt_store::PersistentJMT>>,
+    pending_writes: Vec<(pyde_state::smt::Key, Vec<u8>)>,
+) {
+    if pending_writes.is_empty() {
+        return;
+    }
+    let commit_start = std::time::Instant::now();
+    if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(
+        &smt_handle,
+        pending_writes,
+    ) {
+        crate::metrics::record_state_commit_ms(commit_start.elapsed().as_millis() as u64);
+        let mut sw = state.write().await;
+        sw.set_root(root);
+    }
+}
+
+/// Path A canonical-apply sub-helper: persist the canonical block and
+/// its receipts. Updates `chain_sync` so the sync manager knows this
+/// slot is committed.
+async fn persist_block_and_receipts(
+    block_store: &crate::block_store::BlockStore,
+    chain_sync: &mut crate::sync::ChainSync,
+    receipts: &std::sync::Arc<tokio::sync::RwLock<crate::receipt_store::ReceiptStore>>,
+    block: &pyde_consensus::block::Block,
+    qc_slot: u64,
+    receipts_list: &[pyde_tx::execution::Receipt],
+) {
+    let full_bytes = wire::encode_block(block);
+    let _ = block_store.put_block(&block.header, &full_bytes);
+    let _ = block_store.put_head(qc_slot);
+    chain_sync.on_block_processed(qc_slot);
+    if !receipts_list.is_empty() {
+        let mut receipts_w = receipts.write().await;
+        receipts_w.insert_block_receipts(qc_slot, receipts_list.to_vec());
+    }
+}
+
+/// Path A canonical-apply sub-helper: emit the per-block WS events
+/// (head + per-receipt log entries). Sync — `broadcast::Sender::send`
+/// doesn't block.
+fn emit_ws_events(
+    ws_heads: &tokio::sync::broadcast::Sender<serde_json::Value>,
+    ws_logs: &tokio::sync::broadcast::Sender<serde_json::Value>,
+    block: &pyde_consensus::block::Block,
+    qc_slot: u64,
+    tc: u64,
+    receipts_list: &[pyde_tx::execution::Receipt],
+) {
+    let _ = ws_heads.send(serde_json::json!({
+        "slot": format!("0x{:x}", qc_slot),
+        "timestamp": format!("0x{:x}", block.header.timestamp),
+        "proposer": format!("0x{}", hex::encode(block.header.proposer)),
+        "txCount": format!("0x{:x}", tc),
+    }));
+    for r in receipts_list.iter() {
+        for log in &r.logs {
+            let _ = ws_logs.send(serde_json::json!({
+                "address": format!("0x{}", hex::encode(log.address)),
+                "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+                "data": format!("0x{}", hex::encode(&log.data)),
+            }));
+        }
+    }
+}
+
+/// Path A canonical-apply sub-helper: drop committed tx hashes from the
+/// plaintext mempool indices and the encrypted-tx relay. Without this,
+/// committed txs would re-appear in the next block's selection set and
+/// fail with `BelowWindow` (nonce already consumed).
+async fn prune_committed_txs(
+    mempool_index: &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<[u8; 32], Vec<u8>>>>,
+    pending_txs: &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>>,
+    pending_tx_times: &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
+    tx_relay: &std::sync::Arc<tokio::sync::RwLock<crate::tx_relay::TxRelay>>,
+    block: &pyde_consensus::block::Block,
+) {
+    let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter().map(|tx| tx.hash()).collect();
+    if !tx_hashes.is_empty() {
+        let mut idx = mempool_index.write().await;
+        for h in &tx_hashes {
+            idx.remove(h);
+        }
+        drop(idx);
+        let mut pending_w = pending_txs.write().await;
+        for h in &tx_hashes {
+            pending_w.remove(h);
+        }
+        drop(pending_w);
+        let mut times_w = pending_tx_times.write().await;
+        for h in &tx_hashes {
+            times_w.remove(h);
+        }
+    }
+    if !block.body.encrypted_txs.is_empty() {
+        let enc_hashes: Vec<[u8; 32]> = block
+            .body
+            .encrypted_txs
+            .iter()
+            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+            .map(|etx| etx.hash())
+            .collect();
+        if !enc_hashes.is_empty() {
+            let mut relay_w = tx_relay.write().await;
+            relay_w.remove_included(&enc_hashes);
+        }
+    }
+}
+
+/// Path A canonical-apply sub-helper: cast this validator's hard-
+/// finality vote with the post-canonical-apply `state.root()`,
+/// broadcast it, locally aggregate via `on_finality_vote`, and on
+/// cert formation persist the cert + broadcast the checkpoint to
+/// non-validator peers so they advance their WS anchor.
+///
+/// `log_tag` distinguishes call-site origin in operator logs (e.g.
+/// "" for the primary canonical-apply path, " (RR path)" for the
+/// RR-fallback path).
+async fn cast_finality_vote_and_persist(
+    validator_engine: &mut Option<crate::validator::ValidatorEngine>,
+    validator_identity: &Option<crate::validator::ValidatorIdentity>,
+    state: &std::sync::Arc<tokio::sync::RwLock<crate::state_manager::StateManager>>,
+    block_store: &crate::block_store::BlockStore,
+    swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
+    peer_manager: &pyde_net::peer::PeerManager,
+    qc_slot: u64,
+    qc_block_hash: [u8; 32],
+    log_tag: &str,
+) {
+    let (Some(engine), Some(identity)) = (validator_engine.as_mut(), validator_identity.as_ref())
+    else {
+        return;
+    };
+    let state_root = state.read().await.root();
+    let Some(fv) = engine.create_finality_vote(qc_slot, qc_block_hash, state_root, identity) else {
+        return;
+    };
+    let cert_formed = engine.on_finality_vote(fv.clone());
+    let fv_bytes = wire::encode_finality_vote(&fv);
+    let topic = pyde_net::node::topics::consensus();
+    broadcast_consensus_with_rr_fallback(swarm, topic.clone(), fv_bytes, peer_manager);
+    if !cert_formed {
+        return;
+    }
+    let Some(cp) = engine.latest_finality_checkpoint() else {
+        return;
+    };
+    let _ = block_store.put_finality_cert(cp);
+    let cp_bytes = wire::encode_finality_checkpoint_msg(cp);
+    broadcast_consensus_with_rr_fallback(swarm, topic, cp_bytes, peer_manager);
+    info!(
+        slot = qc_slot,
+        "hard finality cert formed (canonical-apply path{})", log_tag
+    );
+}
+
+/// Path A canonical-apply sub-helper: kick off audit-227 threshold
+/// decryption for the canonical block's encrypted_txs. No-op for
+/// blocks with no encrypted txs (most testnet load) or for non-
+/// committee validators that don't hold a key share.
+async fn maybe_kick_decryption_pipeline(
+    validator_engine: &mut Option<crate::validator::ValidatorEngine>,
+    validator_identity: &Option<crate::validator::ValidatorIdentity>,
+    queued_shares: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<u64, Vec<wire::DecryptionShareMsg>>>,
+    >,
+    pending_decryptors: &std::sync::Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<u64, pyde_mempool::decryption::BlockDecryptor>,
+        >,
+    >,
+    swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
+    peer_manager: &pyde_net::peer::PeerManager,
+    block: &pyde_consensus::block::Block,
+    qc_slot: u64,
+    log_tag: &str,
+) {
+    if block.body.encrypted_txs.is_empty() {
+        return;
+    }
+    if validator_identity
+        .as_ref()
+        .and_then(|id| id.key_share.as_ref())
+        .is_none()
+    {
+        return;
+    }
+    if pending_decryptors.read().await.contains_key(&qc_slot) {
+        return;
+    }
+    let enc_txs: Vec<pyde_mempool::encrypted::EncryptedTx> = block
+        .body
+        .encrypted_txs
+        .iter()
+        .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+        .collect();
+    let tx_root_ok = crate::block_processor::verify_decryptor_against_committed_root(
+        &block.header.tx_root,
+        &block.body.transactions,
+        &enc_txs,
+    );
+    if !tx_root_ok {
+        error!(
+            slot = qc_slot,
+            "decrypt-time tx_root mismatch (canonical-apply{})", log_tag
+        );
+        return;
+    }
+    let Some(engine) = validator_engine.as_mut() else {
+        return;
+    };
+    let identity = validator_identity.as_ref().unwrap();
+    let threshold = pyde_consensus::block::quorum_for_committee(engine.committee_keys.len());
+    if let Ok(mut decryptor) =
+        pyde_mempool::decryption::BlockDecryptor::new(enc_txs.clone(), threshold)
+    {
+        if let Some(ks) = &identity.key_share {
+            decryptor.add_member_shares(ks);
+        }
+        let mut q = queued_shares.write().await;
+        if let Some(queued) = q.remove(&qc_slot) {
+            for qmsg in &queued {
+                for (i, sb) in qmsg.shares.iter().enumerate() {
+                    if let Some(s) = pyde_crypto::threshold::DecryptionShare::from_bytes(sb) {
+                        decryptor.add_share(i, s);
+                    }
+                }
+            }
+        }
+        drop(q);
+        pending_decryptors
+            .write()
+            .await
+            .insert(qc_slot, decryptor);
+    }
+    if let Some(shares) = engine.generate_decryption_shares(identity, &enc_txs) {
+        let msg = wire::DecryptionShareMsg {
+            slot: qc_slot,
+            member_index: identity.committee_index,
+            shares: shares.iter().map(|s| s.to_bytes()).collect(),
+        };
+        let share_bytes = wire::encode_decryption_shares(&msg);
+        let topic = pyde_net::node::topics::consensus();
+        broadcast_consensus_with_rr_fallback(swarm, topic, share_bytes, peer_manager);
+        info!(
+            slot = qc_slot,
+            enc_txs = enc_txs.len(),
+            "broadcast decryption shares (canonical-apply{})", log_tag
+        );
+    }
 }
 
 fn broadcast_consensus_with_rr_fallback(
