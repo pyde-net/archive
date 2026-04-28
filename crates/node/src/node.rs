@@ -497,22 +497,48 @@ impl PydeNode {
         // part 4 step 7r). TCP is the default for bootstrap-multiaddr
         // resolution; QUIC is available so peers that prefer it can
         // negotiate it from a `/udp/PORT/quic-v1` address.
+        //
+        // In dev mode, bind only to loopback and skip QUIC entirely.
+        // Two reasons:
+        //  - 0.0.0.0 binds advertise every reachable interface
+        //    (loopback + LAN + others) via Identify. With every node
+        //    running on the same host, peers learn 2-3 addresses for
+        //    each other, then libp2p races dials across all of them
+        //    and dedupes the losers — producing ~4 connection flaps
+        //    per second on a fully meshed 4-node localhost devnet,
+        //    enough to keep gossipsub mesh formation in constant
+        //    churn and drop ~33% of consensus messages.
+        //  - QUIC + TCP simultaneously is the same problem one
+        //    layer down: same peer reachable via two transports,
+        //    libp2p tries both. Single-transport dev mode dodges
+        //    that race.
+        // Production binds remain on 0.0.0.0 with both transports
+        // because real peers come from different hosts and the
+        // multi-address advertising is what makes connectivity work
+        // through NAT/firewall paths.
+        let bind_ip = if self.config.node.dev_mode {
+            "127.0.0.1"
+        } else {
+            "0.0.0.0"
+        };
         let tcp_listen_addr: libp2p::Multiaddr =
-            format!("/ip4/0.0.0.0/tcp/{}", self.config.network.port)
+            format!("/ip4/{}/tcp/{}", bind_ip, self.config.network.port)
                 .parse()
                 .map_err(|e| format!("invalid tcp listen addr: {}", e))?;
         swarm
             .listen_on(tcp_listen_addr)
             .map_err(|e| format!("failed to listen on tcp: {}", e))?;
 
-        let quic_listen_addr: libp2p::Multiaddr =
-            format!("/ip4/0.0.0.0/udp/{}/quic-v1", self.config.network.port)
-                .parse()
-                .map_err(|e| format!("invalid quic listen addr: {}", e))?;
-        if let Err(e) = swarm.listen_on(quic_listen_addr) {
-            // QUIC bind failure is non-fatal — TCP is the primary
-            // transport. Log so operators know but keep going.
-            warn!(error = %e, port = self.config.network.port, "QUIC listen failed; running TCP-only");
+        if !self.config.node.dev_mode {
+            let quic_listen_addr: libp2p::Multiaddr =
+                format!("/ip4/0.0.0.0/udp/{}/quic-v1", self.config.network.port)
+                    .parse()
+                    .map_err(|e| format!("invalid quic listen addr: {}", e))?;
+            if let Err(e) = swarm.listen_on(quic_listen_addr) {
+                // QUIC bind failure is non-fatal — TCP is the primary
+                // transport. Log so operators know but keep going.
+                warn!(error = %e, port = self.config.network.port, "QUIC listen failed; running TCP-only");
+            }
         }
 
         // 9. Start metrics if enabled
@@ -1238,10 +1264,59 @@ impl PydeNode {
                             }
                             // Proactively dial peers we learn about through Identify.
                             // This builds a mesh so nodes survive bootstrap node failure.
+                            //
+                            // We must dial only ONE address per peer. Identify
+                            // commonly returns multiple paths to the same node
+                            // (loopback + LAN + WAN), and parallel-dialing all
+                            // of them races libp2p's connection-deduplication:
+                            // both dials succeed, the second is force-closed
+                            // with `ApplicationClosed`, both ends log
+                            // "peer disconnected", and gossipsub re-meshes.
+                            // On a 4-node localhost devnet this produced ~1.5
+                            // connect/disconnect cycles per second per peer
+                            // and dropped ~80% of consensus messages, since
+                            // the mesh was never stable for a full slot.
+                            //
+                            // libp2p maintains the rest of the address list in
+                            // Kademlia (lines above), and on dial-failure it
+                            // walks alternatives via `DialOpts::addresses`
+                            // automatically, so dropping addresses here costs
+                            // nothing.
+                            //
+                            // Loopback is preferred for same-host peers — when
+                            // a peer announces `/ip4/127.0.0.1/...` alongside
+                            // a LAN address, the loopback path always wins on
+                            // latency and avoids NAT/firewall variability.
                             if !swarm.is_connected(&peer_id) {
-                                for addr in addrs {
-                                    if let Err(e) = swarm.dial(addr) {
-                                        debug!(error = %e, "failed to dial discovered peer");
+                                // Same peer-id ordering as
+                                // `dial_bootstrap_peers`: only the
+                                // lower peer-id dials, the higher
+                                // accepts inbound. Identify-driven
+                                // discovery can race with bootstrap on
+                                // a fresh devnet (peer learns of us
+                                // via DHT before our outbound from
+                                // bootstrap completes), and a parallel
+                                // dial in either direction triggers
+                                // the same dedupe-and-flap problem.
+                                let local = *swarm.local_peer_id();
+                                if local < peer_id {
+                                    let dial_addr = addrs
+                                        .iter()
+                                        .find(|a| {
+                                            a.iter().any(|p| {
+                                                matches!(
+                                                    p,
+                                                    libp2p::multiaddr::Protocol::Ip4(ip)
+                                                        if ip.is_loopback()
+                                                )
+                                            })
+                                        })
+                                        .cloned()
+                                        .or_else(|| addrs.first().cloned());
+                                    if let Some(addr) = dial_addr {
+                                        if let Err(e) = swarm.dial(addr) {
+                                            debug!(error = %e, "failed to dial discovered peer");
+                                        }
                                     }
                                 }
                             }
@@ -4093,12 +4168,36 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
-            debug!(%peer, ?error, "consensus RR outbound failed; dropping stale connection");
-            // Audit 234 part 4 step 7: a failed RR send to a peer
-            // libp2p still considers connected is the canonical
-            // signal of a half-broken QUIC connection. Drop it so
-            // the next dial reconnects fresh.
-            PostEventAction::DisconnectStalePeer(peer)
+            // Audit 234 part 4 step 7 originally disconnected the
+            // peer here on the theory that a failed RR send is the
+            // canonical signal of a half-broken QUIC connection.
+            // That works for the "real stale peer" case it targeted
+            // (post-restart QUIC half-open), but on a healthy mesh
+            // it creates a feedback loop: every slot tick the
+            // proposer fans out RR consensus messages, a few fail
+            // (substream not ready, peer momentarily busy, gossipsub
+            // heartbeat racing), each failure disconnects the peer,
+            // bootstrap re-dials 2s later, and the mesh never
+            // converges. On a 4-node localhost devnet that produced
+            // ~4 connect/disconnect cycles per second per peer.
+            //
+            // Only disconnect on `Timeout` — a 30-second-no-response
+            // failure is a real signal of a wedged connection. The
+            // common transient failures (`DialFailure`, `Io`,
+            // substream-closed-during-send) don't warrant disconnect;
+            // libp2p's own keep-alive will reap genuinely-dead
+            // connections.
+            let is_timeout = matches!(
+                error,
+                request_response::OutboundFailure::Timeout
+            );
+            if is_timeout {
+                debug!(%peer, ?error, "consensus RR timeout; dropping stale connection");
+                PostEventAction::DisconnectStalePeer(peer)
+            } else {
+                debug!(%peer, ?error, "consensus RR transient failure; keeping connection");
+                PostEventAction::None
+            }
         }
         SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
             request_response::Event::InboundFailure { peer, error, .. },
@@ -4197,10 +4296,21 @@ fn handle_swarm_event(
         SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
-            debug!(%peer, ?error, "blocks RR outbound failed; dropping stale connection");
-            // Same rationale as ConsensusRr OutboundFailure (audit 234
-            // part 4 step 7): drop the half-broken connection.
-            PostEventAction::DisconnectStalePeer(peer)
+            // Same rationale as ConsensusRr OutboundFailure: only
+            // disconnect on `Timeout`. Transient failures during slot-
+            // tick fanout would otherwise trigger a feedback loop on
+            // the bootstrap re-dial cycle.
+            let is_timeout = matches!(
+                error,
+                request_response::OutboundFailure::Timeout
+            );
+            if is_timeout {
+                debug!(%peer, ?error, "blocks RR timeout; dropping stale connection");
+                PostEventAction::DisconnectStalePeer(peer)
+            } else {
+                debug!(%peer, ?error, "blocks RR transient failure; keeping connection");
+                PostEventAction::None
+            }
         }
         SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(
             request_response::Event::InboundFailure { peer, error, .. },
