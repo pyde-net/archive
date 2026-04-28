@@ -282,6 +282,35 @@ impl PydeNode {
         let mempool_index: Arc<RwLock<std::collections::HashMap<[u8; 32], Vec<u8>>>> =
             Arc::new(RwLock::new(std::collections::HashMap::new()));
 
+        // Reconstructed full blocks awaiting QC, keyed by block hash.
+        //
+        // HotStuff QC-gated apply: a peer's compact block is
+        // reassembled into a full Block on receipt, but apply is
+        // deferred until the slot's vote-QC forms. Without this,
+        // non-proposer validators applied the proposer's block
+        // eagerly on gossip — chain_head advanced past current_slot
+        // before their own slot tick fired, hitting the
+        // `current_slot <= chain_head` skip in the proposer-build
+        // loop and collapsing the cluster into single-leader chains
+        // (one validator wins 100%, never rotates). The proposer's
+        // own self-apply path remains at the slot tick (it needs
+        // the post-execution state_root for its own header) — for
+        // the proposer-loses-VRF case, the QC-formed handler
+        // detects a chain/QC mismatch and rolls back via
+        // chain.revert + state.revert_to before applying the
+        // canonical block. The map is keyed by block_hash so the
+        // QC handler can look up the real body that matches the
+        // QC's hash; falls back to the audit-234 synthesized
+        // empty-body path when the body hasn't arrived yet
+        // (e.g., RR fallback delivered the QC vote before the
+        // gossip block body).
+        //
+        // Bounded by a slot-window prune in the maintenance tick
+        // so a stalled gossip peer can't pile up bodies forever.
+        let pending_block_bodies: Arc<
+            RwLock<std::collections::HashMap<[u8; 32], pyde_consensus::block::Block>>,
+        > = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
         // Pending block decryptors: slot → BlockDecryptor (collecting shares for threshold decryption)
         let pending_decryptors: Arc<
             RwLock<std::collections::HashMap<u64, pyde_mempool::decryption::BlockDecryptor>>,
@@ -1064,7 +1093,17 @@ impl PydeNode {
                             // at the end via the channel-style fallthrough
                             // inside the match.
                             let key = (qc_slot, qc_block_hash);
-                            if let Some(target) = competing_blocks.remove(&key) {
+                            // Audit-232 originally fed the buffer from the
+                            // FullBlock gossip path. With QC-gated apply, the
+                            // compact-block path now buffers in
+                            // `pending_block_bodies` instead. Check both so
+                            // reorg works regardless of which gossip channel
+                            // delivered the canonical block.
+                            let target = competing_blocks.remove(&key).or_else(|| {
+                                let pbb = pending_block_bodies.try_read().ok()?;
+                                pbb.get(&qc_block_hash).cloned()
+                            });
+                            if let Some(target) = target {
                                 let mut chain_w = chain.write().await;
                                 let mut state_w = state.write().await;
                                 let ws_slot = validator_engine.as_ref().and_then(|e| {
@@ -1455,101 +1494,41 @@ impl PydeNode {
                                 }
                             }
 
-                            // Validate and process with WS checkpoint (slice 4.3).
+                            // QC-gated apply: buffer the reconstructed
+                            // block, don't mutate chain or state yet.
+                            // The slot's vote-QC formation handler
+                            // (`select_and_vote` + the QC-formed branch
+                            // below) is responsible for applying
+                            // whichever block_hash the committee voted
+                            // for. Eager-applying here would race the
+                            // proposer-selection loop on every other
+                            // validator and collapse the cluster into a
+                            // leader-takes-all chain (see the
+                            // `pending_block_bodies` declaration up top
+                            // for the failure mode this replaces).
+                            //
+                            // We still need the inclusion-audit logic
+                            // ABOVE this point (it sets `inclusion_violated`
+                            // on the engine so the vote phase abstains
+                            // for slots that skipped mandatory txs) —
+                            // that part doesn't depend on apply.
+                            //
+                            // mempool / tx-relay cleanup that previously
+                            // ran on this branch is now done in the
+                            // QC-formed apply path so it fires once,
+                            // for the canonical block, regardless of
+                            // who proposed.
                             {
-                                let mut chain_w = chain.write().await;
-                                let mut state_w = state.write().await;
-                                let ws_slot = validator_engine
-                                    .as_ref()
-                                    .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot));
-                                match BlockProcessor::process_full_block_with_aot_and_checkpoint(&mut chain_w, &mut state_w, &block, Some(&aot_cache), ws_slot) {
-                                    Ok((tc, gas, ref receipts_list)) => {
-                                        // PIPELINED: extract writes + SMT handle, release lock
-                                        let pending = state_w.take_pending_writes();
-                                        let smt_handle = state_w.smt_handle();
-                                        drop(state_w);
-                                        drop(chain_w);
-
-                                        // Spawn background Merkle commit — doesn't hold state lock
-                                        if !pending.is_empty() {
-                                            let state_for_root = state.clone();
-                                            tokio::spawn(async move {
-                                                // SMT mutex is separate from the state RwLock.
-                                                // Audit 222: time the commit so operators can
-                                                // alert on SMT/RocksDB pressure independent of
-                                                // pyde_block_processing_ms.
-                                                let commit_start = std::time::Instant::now();
-                                                if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(&smt_handle, pending) {
-                                                    crate::metrics::record_state_commit_ms(
-                                                        commit_start.elapsed().as_millis() as u64,
-                                                    );
-                                                    // Update cached root (brief write lock)
-                                                    if let Ok(mut sw) = state_for_root.try_write() {
-                                                        sw.set_root(root);
-                                                    }
-                                                }
-                                            });
-                                        }
-
-                                        let full_bytes = wire::encode_block(&block);
-                                        let _ = block_store.put_block(&block.header, &full_bytes);
-                                        let _ = block_store.put_head(slot);
-                                        chain_sync.on_block_processed(slot);
-                                        if !receipts_list.is_empty() {
-                                            let mut receipts_w = receipts.write().await;
-                                            receipts_w.insert_block_receipts(slot, receipts_list.clone());
-                                        }
-                                        let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
-                                            .map(|tx| tx.hash()).collect();
-                                        {
-                                            let mut idx = mempool_index.write().await;
-                                            for h in &tx_hashes { idx.remove(h); }
-                                        }
-                                        {
-                                            let mut pending_w = pending_txs.write().await;
-                                            for h in &tx_hashes {
-                                                pending_w.remove(h);
-                                            }
-                                        }
-                                        {
-                                            let mut times_w = pending_tx_times.write().await;
-                                            for h in &tx_hashes {
-                                                times_w.remove(h);
-                                            }
-                                        }
-                                        // Audit item 227 step 4: clear encrypted txs from
-                                        // the local tx_relay once the block committing
-                                        // them has been fully processed. The self-propose
-                                        // path deliberately does NOT do this — self-proposals
-                                        // can lose the multi-proposer VRF lottery, and
-                                        // removing on self-propose would permanently drop
-                                        // the tx even when a different validator's block
-                                        // wins the slot. Doing it here, after the block
-                                        // has actually been QC'd and processed, matches
-                                        // the P7a-2 plaintext fix.
-                                        if !block.body.encrypted_txs.is_empty() {
-                                            let enc_hashes: Vec<[u8; 32]> = block.body.encrypted_txs.iter()
-                                                .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
-                                                .map(|etx| etx.hash())
-                                                .collect();
-                                            if !enc_hashes.is_empty() {
-                                                let mut relay_w = tx_relay.write().await;
-                                                relay_w.remove_included(&enc_hashes);
-                                            }
-                                        }
-                                        info!(
-                                            slot,
-                                            txs = tc,
-                                            encrypted = block.body.encrypted_txs.len(),
-                                            gas,
-                                            "compact block reconstructed and processed"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        debug!(slot, error = %e, "compact block rejected");
-                                    }
-                                }
+                                let mut pbb = pending_block_bodies.write().await;
+                                pbb.insert(block_hash, block.clone());
                             }
+                            debug!(
+                                slot,
+                                block_hash = hex::encode(block_hash),
+                                txs = block.body.transactions.len(),
+                                encrypted = block.body.encrypted_txs.len(),
+                                "compact block reconstructed and buffered (awaiting QC)"
+                            );
                         }
                         PostEventAction::BlockProcessed { slot, receipts: receipts_list, tx_hashes } => {
                             if !receipts_list.is_empty() {
@@ -2262,7 +2241,16 @@ impl PydeNode {
                                     // gossip/RR path as before).
                                     if let Some((qc_slot, qc_hash)) = qc_slot_hash {
                                         if let Some((header, sig)) = engine.buffered_proposal_for(qc_slot, &qc_hash) {
-                                            let block = pyde_consensus::block::Block {
+                                            // Prefer the real body buffered at gossip
+                                            // receipt; fall back to the audit-234
+                                            // synthesized empty body for blocks whose
+                                            // gossip body hasn't arrived yet (RR
+                                            // fallback can deliver the QC vote before
+                                            // the Blocks-topic payload).
+                                            let block = {
+                                                let pbb = pending_block_bodies.read().await;
+                                                pbb.get(&qc_hash).cloned()
+                                            }.unwrap_or_else(|| pyde_consensus::block::Block {
                                                 header: header.clone(),
                                                 body: pyde_consensus::block::BlockBody {
                                                     transactions: vec![],
@@ -2273,9 +2261,77 @@ impl PydeNode {
                                                     },
                                                 },
                                                 proposer_signature: sig,
-                                            };
+                                            });
                                             let mut chain_w = chain.write().await;
                                             let mut state_w = state.write().await;
+
+                                            // Three cases at QC time:
+                                            //   1. chain head < qc_slot — we never applied
+                                            //      anything for this slot; apply forward.
+                                            //   2. chain head == qc_slot && hashes match —
+                                            //      we ARE the winning proposer and self-
+                                            //      applied earlier in the tick (line ~2002,
+                                            //      needed for our header's state_root). The
+                                            //      block is already canonical; skip apply.
+                                            //   3. chain head == qc_slot && hashes differ —
+                                            //      we self-applied a block but lost the VRF
+                                            //      tournament. Roll back the speculative
+                                            //      slot via the audit-230 revert/revert_to
+                                            //      pair, then apply the canonical block.
+                                            //   4. chain head > qc_slot — multi-slot reorg
+                                            //      territory; defer to TryReorgToQc /
+                                            //      sync paths instead of trying here.
+                                            let need_apply = if chain_w.head_slot == qc_slot {
+                                                let our_block_hash = chain_w
+                                                    .header(qc_slot)
+                                                    .map(|h| h.hash());
+                                                if our_block_hash == Some(qc_hash) {
+                                                    debug!(slot = qc_slot, "QC matches our self-applied block — already canonical");
+                                                    false
+                                                } else {
+                                                    let target = qc_slot.saturating_sub(1);
+                                                    if let Err(e) = chain_w.revert(target) {
+                                                        warn!(slot = qc_slot, error = %e, "chain revert before QC apply failed");
+                                                    }
+                                                    match state_w.revert_to(target) {
+                                                        Ok(_) => {
+                                                            info!(
+                                                                slot = qc_slot,
+                                                                from = hex::encode(our_block_hash.unwrap_or([0u8; 32])),
+                                                                to = hex::encode(qc_hash),
+                                                                "rolled back speculative self-proposal — applying canonical block"
+                                                            );
+                                                            true
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(slot = qc_slot, error = %e, "state revert before QC apply failed");
+                                                            false
+                                                        }
+                                                    }
+                                                }
+                                            } else if chain_w.head_slot < qc_slot {
+                                                true
+                                            } else {
+                                                debug!(
+                                                    qc_slot,
+                                                    head = chain_w.head_slot,
+                                                    "QC behind our chain head — skipping (handled by reorg path)"
+                                                );
+                                                false
+                                            };
+
+                                            if !need_apply {
+                                                drop(state_w);
+                                                drop(chain_w);
+                                                // Drop buffered body even when we skip apply
+                                                // (winner case: we already have the canonical
+                                                // copy via self-apply; the buffered copy is
+                                                // a duplicate from gossip).
+                                                let mut pbb = pending_block_bodies.write().await;
+                                                pbb.remove(&qc_hash);
+                                                continue;
+                                            }
+
                                             let ws_slot = engine
                                                 .finality
                                                 .latest_checkpoint
@@ -2288,20 +2344,93 @@ impl PydeNode {
                                                 Some(&aot_cache),
                                                 ws_slot,
                                             ) {
-                                                Ok(_) => {
-                                                    let _ = state_w.flush_pending();
-                                                    state_w.refresh_root();
-                                                    let _ = block_store.put_header(&header);
+                                                Ok((tc, gas, ref receipts_list)) => {
+                                                    // PIPELINED state commit — same pattern as the
+                                                    // gossip-apply path (now removed) and the
+                                                    // proposer self-apply path: extract pending
+                                                    // writes, release locks, commit Merkle root in
+                                                    // a background task so the slot tick isn't
+                                                    // blocked on RocksDB.
+                                                    let pending_writes = state_w.take_pending_writes();
+                                                    let smt_handle = state_w.smt_handle();
+                                                    drop(state_w);
+                                                    drop(chain_w);
+
+                                                    if !pending_writes.is_empty() {
+                                                        let state_for_root = state.clone();
+                                                        tokio::spawn(async move {
+                                                            let commit_start = std::time::Instant::now();
+                                                            if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(&smt_handle, pending_writes) {
+                                                                crate::metrics::record_state_commit_ms(
+                                                                    commit_start.elapsed().as_millis() as u64,
+                                                                );
+                                                                if let Ok(mut sw) = state_for_root.try_write() {
+                                                                    sw.set_root(root);
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+
+                                                    let full_bytes = wire::encode_block(&block);
+                                                    let _ = block_store.put_block(&block.header, &full_bytes);
                                                     let _ = block_store.put_head(qc_slot);
                                                     chain_sync.on_block_processed(qc_slot);
-                                                    info!(slot = qc_slot, "applied block from local QC (synthesized empty body)");
+
+                                                    if !receipts_list.is_empty() {
+                                                        let mut receipts_w = receipts.write().await;
+                                                        receipts_w.insert_block_receipts(qc_slot, receipts_list.clone());
+                                                    }
+
+                                                    // Mempool / tx-relay cleanup — previously
+                                                    // run on the gossip-apply branch; moved
+                                                    // here so it fires once for the canonical
+                                                    // block.
+                                                    let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
+                                                        .map(|tx| tx.hash()).collect();
+                                                    if !tx_hashes.is_empty() {
+                                                        let mut idx = mempool_index.write().await;
+                                                        for h in &tx_hashes { idx.remove(h); }
+                                                        drop(idx);
+                                                        let mut pending_w = pending_txs.write().await;
+                                                        for h in &tx_hashes { pending_w.remove(h); }
+                                                        drop(pending_w);
+                                                        let mut times_w = pending_tx_times.write().await;
+                                                        for h in &tx_hashes { times_w.remove(h); }
+                                                    }
+                                                    if !block.body.encrypted_txs.is_empty() {
+                                                        let enc_hashes: Vec<[u8; 32]> = block.body.encrypted_txs.iter()
+                                                            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+                                                            .map(|etx| etx.hash())
+                                                            .collect();
+                                                        if !enc_hashes.is_empty() {
+                                                            let mut relay_w = tx_relay.write().await;
+                                                            relay_w.remove_included(&enc_hashes);
+                                                        }
+                                                    }
+
+                                                    // Drop the buffered body — kept around
+                                                    // only for the QC apply, not for sync
+                                                    // serving (block_store has the canonical
+                                                    // copy now).
+                                                    {
+                                                        let mut pbb = pending_block_bodies.write().await;
+                                                        pbb.remove(&qc_hash);
+                                                    }
+
+                                                    info!(
+                                                        slot = qc_slot,
+                                                        txs = tc,
+                                                        gas,
+                                                        proposer = hex::encode(block.header.proposer),
+                                                        "applied block from QC"
+                                                    );
                                                 }
                                                 Err(e) => {
-                                                    debug!(slot = qc_slot, error = %e, "synthesized-body apply failed (header expects non-empty body — waiting for gossip)");
+                                                    drop(state_w);
+                                                    drop(chain_w);
+                                                    debug!(slot = qc_slot, error = %e, "QC-gated apply failed");
                                                 }
                                             }
-                                            drop(state_w);
-                                            drop(chain_w);
                                         }
                                     }
                                     // Broadcast vote.
@@ -2908,6 +3037,11 @@ impl PydeNode {
                         // failure, gossip drop, or an adversarial orphan).
                         let mut qb = queued_encrypted_bundles.write().await;
                         qb.retain(|(slot, _), _| *slot + 100 > head);
+                        // Prune QC-gated apply buffer. Same window — a body
+                        // that hasn't been QC'd within 100 slots is from a
+                        // losing/stale proposal that no future QC will pull.
+                        let mut pbb = pending_block_bodies.write().await;
+                        pbb.retain(|_, block| block.header.slot + 100 > head);
                     }
                     let head = chain.read().await.head_slot;
                     debug!(
