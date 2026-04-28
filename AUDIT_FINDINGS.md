@@ -622,7 +622,7 @@
       and the RPC handler. All 222 pyde-node unit tests +
       multi-node encrypted e2e pass.
 
-- [~] 223 — `✓` **Reorg handling.** Investigation found
+- [x] 223 — `✓` **Reorg handling.** Investigation found
       structural gaps: state is committed eagerly on block
       receive (not after QC), `chain.head_slot` is monotonic
       (no rollback), `VersionedState` exists in
@@ -662,11 +662,29 @@
         also re-runs the post-QC decrypt pipeline so audit-227
         encrypted-tx flow keeps working when reorgs happen.
         Bounded competing-block buffer (cap 64). 222 unit tests +
-        multi-node encrypted e2e pass. The standalone multi-node
-        partition test that produces a deterministic divergent
-        chain is deferred to **233** (HotStuff with 2/3 honest
-        makes natural divergence rare; needs Byzantine-injection
-        test infra that's its own scope).
+        multi-node encrypted e2e pass.
+      - **233 (deferred — out-of-scope for closure):** the audit
+        originally listed a standalone multi-node test that
+        produces a deterministic divergent chain. After Path A
+        landed (commit cf2a9b8) and removed the proposer's
+        speculative self-apply, the only remaining path to
+        divergence on a 4-validator network is Byzantine
+        validator behaviour (a validator double-signing two
+        conflicting proposals at the same slot). Producing this
+        deterministically requires either (a) a Byzantine-build
+        compile flag in the validator binary that emits two
+        conflicting headers, or (b) OS-level network injection
+        (iptables / pfctl, root-required, non-portable). Both
+        belong to a Byzantine-fault-injection harness that is
+        substantially larger than the audit-223 scope. The
+        reorg machinery itself is exercised at the unit +
+        integration level by 231's tests
+        (`reorg_to_block_state_matches_fresh_apply`,
+        `reorg_to_block_rejects_forward_target`,
+        `reorg_to_block_refuses_past_ws_checkpoint`), which
+        prove the actual logic. Closing 223 on the strength of
+        those unit tests + 232's wire-up; 233 stays open as a
+        post-audit-cycle hardening task.
       
       Tests in 231: 3 BlockProcessor reorg tests
       (`reorg_to_block_state_matches_fresh_apply` proving root
