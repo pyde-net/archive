@@ -2588,7 +2588,25 @@ impl PydeNode {
 
                                     // If QC formed: broadcast hard finality vote
                                     if qc_formed {
-                                        let state_root = chain.read().await.state_root;
+                                        // The finality vote's state_root must be
+                                        // this validator's ACTUAL post-execution
+                                        // root, not chain.state_root. After the
+                                        // proposer-header fix, chain.state_root is
+                                        // 0x00…00 (per BlockHeader's "empty at
+                                        // proposal" semantics), so all validators
+                                        // would otherwise sign a zero state_root,
+                                        // making `try_form_hard_finality`'s
+                                        // state-root agreement check vacuous and
+                                        // letting any validator's divergent state
+                                        // be included in the cert. Reading
+                                        // `state.root()` is the canonical
+                                        // post-commit SMT root — every honest
+                                        // validator that executed the block
+                                        // deterministically produces the same
+                                        // value; honest-but-divergent validators
+                                        // have their votes correctly excluded
+                                        // from the cert.
+                                        let state_root = state.read().await.root();
                                         if let Some(fv) = engine.create_finality_vote(
                                             current_slot,
                                             engine.consensus.highest_qc.block_hash,
@@ -4263,7 +4281,53 @@ fn handle_swarm_event(
             let mut pending_fallback_broadcast: Option<Vec<u8>> = None;
             let mut pending_share_msg: Option<wire::DecryptionShareMsg> = None;
             let resp = {
-                if let Ok(msg) = wire::decode_consensus_message(&request.bytes) {
+                // Tag-byte routing: the consensus topic carries
+                // FinalityVote alongside the ConsensusMessage variants
+                // (Proposal/Vote/Timeout/NewView). Gossipsub-receive at
+                // line ~3706 routes these via the explicit tag byte
+                // because `decode_consensus_message` doesn't handle
+                // CONSENSUS_FINALITY_VOTE — the same routing has to
+                // happen here, otherwise finality votes broadcast via
+                // RR fallback are silently dropped on the receiver side
+                // and hard-finality cert formation never gathers a
+                // quorum of votes.
+                if !request.bytes.is_empty()
+                    && request.bytes[0] == wire::tag::CONSENSUS_FINALITY_VOTE
+                {
+                    if let Some(engine) = validator_engine.as_mut() {
+                        match wire::decode_finality_vote(&request.bytes) {
+                            Ok(fv) => {
+                                debug!(
+                                    slot = fv.slot,
+                                    voter = fv.voter_index,
+                                    "received finality vote via RR fallback"
+                                );
+                                if engine.on_finality_vote(fv) {
+                                    if let Some(cp) =
+                                        engine.latest_finality_checkpoint()
+                                    {
+                                        info!(
+                                            slot = cp.slot,
+                                            "hard finality cert formed (RR-receive)"
+                                        );
+                                        // Re-broadcast the checkpoint so
+                                        // non-validator peers can advance
+                                        // their WS anchor (mirrors the
+                                        // gossipsub-receive handler at
+                                        // line ~3720).
+                                        pending_fallback_broadcast = Some(
+                                            wire::encode_finality_checkpoint_msg(cp),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!(error = e, "RR-fallback finality vote decode failed");
+                            }
+                        }
+                    }
+                    pyde_net::consensus_protocol::ConsensusResp::Ack
+                } else if let Ok(msg) = wire::decode_consensus_message(&request.bytes) {
                     use pyde_consensus::hotstuff::ConsensusMessage;
                     if let Some(engine) = validator_engine.as_mut() {
                         match msg {
