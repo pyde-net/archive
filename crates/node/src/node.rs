@@ -1196,120 +1196,6 @@ impl PydeNode {
                                     .insert(tx_hash, std::time::Instant::now());
                             }
                         }
-                        PostEventAction::QcFormedFromGossip { slot } => {
-                            // Audit item 227 step 4: QC just formed for
-                            // `slot` via an incoming gossip vote — the
-                            // original decrypt path at `select_and_vote`
-                            // only triggered when our OWN vote closed the
-                            // QC, which is rare in a 4+-node committee.
-                            // Mirror that logic here so the decrypt flow
-                            // starts regardless of which validator's vote
-                            // was the one.
-                            if !validator_identity
-                                .as_ref()
-                                .map(|id| id.key_share.is_some())
-                                .unwrap_or(false)
-                            {
-                                continue;
-                            }
-                            // Already started decryption for this slot? Skip.
-                            if pending_decryptors.read().await.contains_key(&slot) {
-                                continue;
-                            }
-                            let block = match block_store.get_block_raw(slot)
-                                .and_then(|b| wire::decode_block(&b).ok())
-                            {
-                                Some(b) => b,
-                                None => continue,
-                            };
-                            if block.body.encrypted_txs.is_empty() {
-                                continue;
-                            }
-                            let enc_txs: Vec<pyde_mempool::encrypted::EncryptedTx> = block
-                                .body
-                                .encrypted_txs
-                                .iter()
-                                .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
-                                .collect();
-                            let tx_root_ok = crate::block_processor::verify_decryptor_against_committed_root(
-                                &block.header.tx_root,
-                                &block.body.transactions,
-                                &enc_txs,
-                            );
-                            if !tx_root_ok {
-                                error!(slot, "decrypt-time tx_root mismatch");
-                                continue;
-                            }
-                            let engine = match validator_engine.as_mut() {
-                                Some(e) => e,
-                                None => continue,
-                            };
-                            let threshold = pyde_consensus::block::quorum_for_committee(
-                                engine.committee_keys.len(),
-                            );
-                            let identity = validator_identity.as_ref().unwrap();
-                            if let Ok(mut decryptor) =
-                                pyde_mempool::decryption::BlockDecryptor::new(
-                                    enc_txs.clone(),
-                                    threshold,
-                                )
-                            {
-                                if let Some(ks) = &identity.key_share {
-                                    decryptor.add_member_shares(ks);
-                                }
-                                // Replay any shares that arrived before
-                                // the decryptor existed.
-                                {
-                                    let mut q = queued_shares.write().await;
-                                    if let Some(queued) = q.remove(&slot) {
-                                        for qmsg in &queued {
-                                            for (i, sb) in qmsg.shares.iter().enumerate() {
-                                                if let Some(s) = pyde_crypto::threshold::DecryptionShare::from_bytes(sb) {
-                                                    decryptor.add_share(i, s);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                pending_decryptors
-                                    .write()
-                                    .await
-                                    .insert(slot, decryptor);
-                            }
-                            // Broadcast our own decryption shares on the
-                            // consensus topic. Phase 1 hardening: route
-                            // through the audit-234 RR fallback so the
-                            // shares fan out point-to-point even when
-                            // gossipsub `topic_peers` is empty after a
-                            // restart cycle. Without the fallback the
-                            // proposer-side broadcast (the third site
-                            // below) would land but the gossip-QC and
-                            // post-reorg broadcasts would silently drop
-                            // — exactly the warm-up race the lifecycle
-                            // test was masking with `slot=15`.
-                            if let Some(shares) =
-                                engine.generate_decryption_shares(identity, &enc_txs)
-                            {
-                                let msg = wire::DecryptionShareMsg {
-                                    slot,
-                                    member_index: identity.committee_index,
-                                    shares: shares.iter().map(|s| s.to_bytes()).collect(),
-                                };
-                                let share_bytes = wire::encode_decryption_shares(&msg);
-                                let topic = pyde_net::node::topics::consensus();
-                                broadcast_consensus_with_rr_fallback(
-                                    &mut swarm,
-                                    topic,
-                                    share_bytes,
-                                    &peer_manager,
-                                );
-                                info!(
-                                    slot,
-                                    enc_txs = enc_txs.len(),
-                                    "broadcast decryption shares (gossip-QC)"
-                                );
-                            }
-                        }
                         PostEventAction::ApplyCanonicalAfterQc {
                             qc_slot,
                             qc_block_hash,
@@ -1609,185 +1495,6 @@ impl PydeNode {
                                 }
                             }
                             competing_blocks.insert(key, block);
-                        }
-                        PostEventAction::TryReorgToQc {
-                            qc_slot,
-                            qc_block_hash,
-                        } => {
-                            // Audit 232: a QC formed for `qc_block_hash` at
-                            // `qc_slot`, but our local view at that slot is
-                            // a different block. Try to reorg via the
-                            // buffered-competing-block path. Whether or not
-                            // the reorg fires, we still need to trigger the
-                            // existing post-QC decrypt pipeline (audit 227)
-                            // — so this handler does BOTH reorg + decrypt
-                            // dispatch, by re-emitting QcFormedFromGossip
-                            // at the end via the channel-style fallthrough
-                            // inside the match.
-                            let key = (qc_slot, qc_block_hash);
-                            // Audit-232 originally fed the buffer from the
-                            // FullBlock gossip path. With QC-gated apply, the
-                            // compact-block path now buffers in
-                            // `pending_block_bodies` instead. Check both so
-                            // reorg works regardless of which gossip channel
-                            // delivered the canonical block.
-                            let target = competing_blocks.remove(&key).or_else(|| {
-                                let pbb = pending_block_bodies.try_read().ok()?;
-                                pbb.get(&qc_block_hash).cloned()
-                            });
-                            if let Some(target) = target {
-                                let mut chain_w = chain.write().await;
-                                let mut state_w = state.write().await;
-                                let ws_slot = validator_engine.as_ref().and_then(|e| {
-                                    e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot)
-                                });
-                                match BlockProcessor::reorg_to_block(
-                                    &mut chain_w,
-                                    &mut state_w,
-                                    &target,
-                                    Some(&aot_cache),
-                                    ws_slot,
-                                ) {
-                                    Ok((tx_count, gas_used, _)) => {
-                                        let _ = state_w.flush_pending();
-                                        state_w.refresh_root();
-                                        crate::metrics::record_reorg(
-                                            crate::metrics::ReorgOutcome::Succeeded,
-                                        );
-                                        info!(
-                                            qc_slot,
-                                            tx_count,
-                                            gas_used,
-                                            "reorg succeeded — chain now matches QC"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        crate::metrics::record_reorg(
-                                            crate::metrics::ReorgOutcome::Failed,
-                                        );
-                                        warn!(qc_slot, error = %e, "reorg failed");
-                                    }
-                                }
-                            } else {
-                                // No buffered block. Sync will recover the
-                                // canonical block on its next pass; the
-                                // local view stays inconsistent until then.
-                                // Still proceed to decrypt below — if our
-                                // local block at qc_slot has different
-                                // encrypted_txs from the QC'd block, the
-                                // tx_root check inside the decrypt path
-                                // will fail and we'll skip safely.
-                                crate::metrics::record_reorg(
-                                    crate::metrics::ReorgOutcome::TargetNotBuffered,
-                                );
-                                warn!(
-                                    qc_slot,
-                                    qc_hash = hex::encode(qc_block_hash),
-                                    "QC mismatch but competing block not buffered — sync will recover"
-                                );
-                            }
-                            // Re-dispatch as QcFormedFromGossip so the
-                            // existing decrypt pipeline still fires for
-                            // qc_slot (audit 227 dependency).
-                            // Manually run the same logic since we can't
-                            // re-invoke the match arm directly.
-                            let slot = qc_slot;
-                            // BEGIN copy of QcFormedFromGossip body
-                            // (kept inline rather than extracted because
-                            // the body captures many local mutable refs;
-                            // refactor to a closure after both call sites
-                            // settle).
-                            if !validator_identity
-                                .as_ref()
-                                .map(|id| id.key_share.is_some())
-                                .unwrap_or(false)
-                            {
-                                continue;
-                            }
-                            if pending_decryptors.read().await.contains_key(&slot) {
-                                continue;
-                            }
-                            let block = match block_store
-                                .get_block_raw(slot)
-                                .and_then(|b| wire::decode_block(&b).ok())
-                            {
-                                Some(b) => b,
-                                None => continue,
-                            };
-                            if block.body.encrypted_txs.is_empty() {
-                                continue;
-                            }
-                            let enc_txs: Vec<pyde_mempool::encrypted::EncryptedTx> = block
-                                .body
-                                .encrypted_txs
-                                .iter()
-                                .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
-                                .collect();
-                            let tx_root_ok =
-                                crate::block_processor::verify_decryptor_against_committed_root(
-                                    &block.header.tx_root,
-                                    &block.body.transactions,
-                                    &enc_txs,
-                                );
-                            if !tx_root_ok {
-                                error!(slot, "decrypt-time tx_root mismatch (post-reorg)");
-                                continue;
-                            }
-                            let engine = match validator_engine.as_mut() {
-                                Some(e) => e,
-                                None => continue,
-                            };
-                            let threshold = pyde_consensus::block::quorum_for_committee(
-                                engine.committee_keys.len(),
-                            );
-                            let identity = validator_identity.as_ref().unwrap();
-                            if let Ok(mut decryptor) = pyde_mempool::decryption::BlockDecryptor::new(
-                                enc_txs.clone(),
-                                threshold,
-                            ) {
-                                if let Some(ks) = &identity.key_share {
-                                    decryptor.add_member_shares(ks);
-                                }
-                                {
-                                    let mut q = queued_shares.write().await;
-                                    if let Some(queued) = q.remove(&slot) {
-                                        for qmsg in &queued {
-                                            for (i, sb) in qmsg.shares.iter().enumerate() {
-                                                if let Some(s) = pyde_crypto::threshold::DecryptionShare::from_bytes(sb) {
-                                                    decryptor.add_share(i, s);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                pending_decryptors.write().await.insert(slot, decryptor);
-                            }
-                            // Phase 1 hardening: same RR fallback as
-                            // the gossip-QC broadcast above (audit 234
-                            // part 4 step 5).
-                            if let Some(shares) =
-                                engine.generate_decryption_shares(identity, &enc_txs)
-                            {
-                                let msg = wire::DecryptionShareMsg {
-                                    slot,
-                                    member_index: identity.committee_index,
-                                    shares: shares.iter().map(|s| s.to_bytes()).collect(),
-                                };
-                                let share_bytes = wire::encode_decryption_shares(&msg);
-                                let topic = pyde_net::node::topics::consensus();
-                                broadcast_consensus_with_rr_fallback(
-                                    &mut swarm,
-                                    topic,
-                                    share_bytes,
-                                    &peer_manager,
-                                );
-                                info!(
-                                    slot,
-                                    enc_txs = enc_txs.len(),
-                                    "broadcast decryption shares (post-reorg-QC)"
-                                );
-                            }
-                            // END copy of QcFormedFromGossip body
                         }
                         PostEventAction::AcceptEncryptedTransaction(enc_tx) => {
                             // Audit item 227 step 4 / option E: inbound
@@ -2765,8 +2472,8 @@ impl PydeNode {
                                             //      slot via the audit-230 revert/revert_to
                                             //      pair, then apply the canonical block.
                                             //   4. chain head > qc_slot — multi-slot reorg
-                                            //      territory; defer to TryReorgToQc /
-                                            //      sync paths instead of trying here.
+                                            //      territory; defer to the sync path
+                                            //      instead of trying here.
                                             let need_apply = if chain_w.head_slot == qc_slot {
                                                 let our_block_hash = chain_w
                                                     .header(qc_slot)
@@ -3648,22 +3355,12 @@ enum PostEventAction {
     /// block can pull encrypted_txs out of it on arrival, regardless
     /// of gossipsub ordering. Audit item 207.
     BufferEncryptedBundle(pyde_net::propagation::EncryptedTxBundle),
-    /// A fresh QC just formed via an incoming gossip vote. Main loop
-    /// uses this to trigger the post-QC decryption flow — previously
-    /// that flow was only attached to `select_and_vote`'s local-QC
-    /// path, which in a 4+-node committee rarely fires (our vote is
-    /// typically not the 3rd/Nth that closes the QC; another
-    /// validator's is). Without this action the encrypted-tx
-    /// decryption never started on real multi-node networks.
-    /// Audit item 227 step 4 / option E.
-    QcFormedFromGossip {
-        slot: u64,
-    },
     /// Path A: a soft-QC just formed (via gossip Vote, RR-fallback Vote,
     /// or our own Vote closing it) and the block whose hash equals
     /// `qc_block_hash` is sitting in `pending_block_bodies`. The main
     /// loop picks it up, runs the canonical apply (validate + execute
-    /// + cleanup + ws emit + finality-vote cast). Replaces the
+    /// + cleanup + ws emit + finality-vote cast + audit-227 decryption
+    /// share broadcast for blocks with encrypted_txs). Replaces the
     /// per-validator speculative self-apply path that used to do this
     /// at proposal time. Triggered from any QC-formation site so
     /// canonical execution happens exactly once per slot per node.
@@ -3688,15 +3385,6 @@ enum PostEventAction {
     /// `competing_blocks` so a later QC for that hash can trigger
     /// `reorg_to_block`.
     BufferCompetingBlock(pyde_consensus::block::Block),
-    /// Audit 232: a QC formed for a block whose hash doesn't match
-    /// what we committed at that slot. Main loop looks up the QC'd
-    /// block in `competing_blocks` and, if present, calls
-    /// `BlockProcessor::reorg_to_block` to switch chains. If
-    /// absent, schedules a sync request for the missing block.
-    TryReorgToQc {
-        qc_slot: u64,
-        qc_block_hash: [u8; 32],
-    },
     /// Audit 234 part 3: ack for an inbound consensus RR request.
     /// Main loop dispatches via the swarm's ConsensusRr behaviour.
     SendConsensusRrResponse(
