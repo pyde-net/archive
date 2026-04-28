@@ -1900,8 +1900,26 @@ impl PydeNode {
                                     let _tx_count = txs.len();
 
                                     // Build block with transactions
+                                    //
+                                    // `parent_hash` is the Poseidon2 hash of the
+                                    // parent BLOCK HEADER (per BlockHeader's doc and
+                                    // the chain-linking safety check in
+                                    // `pyde_consensus::hotstuff` line 342:
+                                    // `next_header.parent_hash == qc_for_block.block_hash`).
+                                    // The earlier code passed `chain_r.state_root`
+                                    // here, which never matched the parent's block
+                                    // hash — that silently broke HotStuff's
+                                    // chain-linking invariant on every consecutive
+                                    // block pair (the safety check was vacuously
+                                    // unsatisfiable, so the protocol was
+                                    // load-bearing on the audit-234 fallback paths
+                                    // for liveness). Genesis falls back to all-zeros
+                                    // per `Block::is_genesis`.
                                     let chain_r = chain.read().await;
-                                    let parent_hash = chain_r.state_root;
+                                    let parent_hash = chain_r
+                                        .header(chain_r.head_slot)
+                                        .map(|h| h.hash())
+                                        .unwrap_or([0u8; 32]);
                                     let _head = chain_r.head_slot;
                                     drop(chain_r);
 
@@ -1952,10 +1970,20 @@ impl PydeNode {
                                     vrf_data.extend_from_slice(candidate.vrf_output.as_bytes());
                                     vrf_data.extend_from_slice(candidate.vrf_proof.as_bytes());
 
+                                    // `state_root` is intentionally [0u8;32] at
+                                    // proposal time — per BlockHeader's doc, the
+                                    // post-execution root is set after optimistic
+                                    // execution at soft finality, then verified on
+                                    // re-execution and committed in the
+                                    // HardFinalityCert (so the header's state_root
+                                    // can't be a forged claim by the proposer).
+                                    // The earlier code passed `parent_hash` (which
+                                    // was already misset to parent's state_root)
+                                    // here too, doubling the bug.
                                     let block = engine.build_proposal(
                                         identity,
                                         parent_hash,
-                                        parent_hash,
+                                        [0u8; 32],
                                         tx_root,
                                         vrf_data,
                                         txs,
@@ -3273,7 +3301,9 @@ fn build_and_encode_fallback_proposal(
         .get(&chain.head_slot)
         .map(|h| h.hash())
         .unwrap_or([0u8; 32]);
-    let block = engine.try_build_fallback_proposal(identity, parent_hash, chain.state_root)?;
+    // state_root is intentionally [0u8;32] at proposal time — see the
+    // primary `build_proposal` call site for the rationale.
+    let block = engine.try_build_fallback_proposal(identity, parent_hash, [0u8; 32])?;
     let msg = pyde_consensus::hotstuff::ConsensusMessage::Proposal {
         header: block.header,
         proposer_signature: block.proposer_signature,
