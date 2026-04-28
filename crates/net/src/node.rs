@@ -228,7 +228,37 @@ pub mod topics {
 }
 
 /// Dial bootstrap peers and add them to Kademlia.
+///
+/// Avoids two libp2p flap sources that wreck consensus on a
+/// fully-meshed bootstrap config:
+///
+/// 1. **Simultaneous open.** With every node listing every other
+///    node, both peers in a pair dial each other concurrently;
+///    libp2p establishes both connections, then dedupes one with
+///    cause `None` (local close) or `ApplicationClosed`. On a 4-node
+///    localhost devnet that produced ~4 flaps/sec/peer and dropped
+///    ~33% of gossipsub block proposals, leaving each validator's
+///    `buffered_proposals` set holding only its own block at vote
+///    time — every node then voted for itself, formed a self-QC
+///    over a synth empty-body block, and the chain forked into N
+///    independent local chains. Mitigation: per-pair, only the
+///    LOWER peer-id dials; the higher accepts the inbound. Symmetric
+///    tie-break — both ends agree without coordination.
+///
+/// 2. **Re-dialing connected peers.** This function is called on a
+///    2-second tick to recover from post-restart mesh degradation,
+///    but firing the dial unconditionally has the same effect as #1
+///    on every tick — libp2p sees a connected peer being dialed,
+///    races the new connection against the live one, and dedupes.
+///    Mitigation: skip peers we already have a connection to. The
+///    earlier audit-234 comment said this gating "regressed" chain
+///    advancement, but that regression was specific to SIGKILL-style
+///    restarts where libp2p still considers a TCP-half-closed peer
+///    "connected"; the steady-state cost of re-dialing every tick
+///    is far worse than that edge case, which is better handled by
+///    explicit disconnect-then-redial.
 pub fn dial_bootstrap_peers(swarm: &mut Swarm<PydeBehaviour>, bootstrap_peers: &[String]) {
+    let local_peer_id = *swarm.local_peer_id();
     for addr_str in bootstrap_peers {
         if let Ok(addr) = addr_str.parse::<Multiaddr>() {
             // Extract PeerId from the multiaddr
@@ -241,12 +271,30 @@ pub fn dial_bootstrap_peers(swarm: &mut Swarm<PydeBehaviour>, bootstrap_peers: &
             });
 
             if let Some(peer_id) = peer_id {
-                // Add to Kademlia routing table
+                // Always seed Kademlia — even when we don't dial, the
+                // routing entry lets us answer DHT queries about this
+                // peer and lets discovery promote the address if
+                // we end up dialing later.
                 swarm
                     .behaviour_mut()
                     .kademlia
                     .add_address(&peer_id, addr.clone());
-                // Dial the peer
+                // Skip dialing peers with peer-ids higher than ours —
+                // they will dial us instead. This breaks the dial
+                // race symmetrically.
+                if local_peer_id >= peer_id {
+                    tracing::debug!(
+                        %peer_id,
+                        "skipping bootstrap dial (waiting for higher peer to dial us)"
+                    );
+                    continue;
+                }
+                // Skip dialing peers we already have a live
+                // connection to — re-dial only if the connection
+                // dropped.
+                if swarm.is_connected(&peer_id) {
+                    continue;
+                }
                 if let Err(e) = swarm.dial(addr) {
                     tracing::warn!(%peer_id, error = %e, "failed to dial bootstrap peer");
                 } else {
