@@ -75,6 +75,11 @@ const FUND_PER_SENDER: u128 = 1_000_000_000_000_000_000;
 
 struct Wallet {
     address: [u8; 32],
+    /// FALCON public key bytes — held to construct the
+    /// `RegisterPubkey` setup tx (audit 229) that audit 226 now
+    /// requires before any signed tx from this address is accepted
+    /// at the rpc ingress.
+    pk_bytes: Vec<u8>,
     sk: FalconSecretKey,
 }
 
@@ -155,7 +160,11 @@ fn sustained_rate_load_test() {
         for _ in 0..num_senders {
             let (pk, sk) = falcon_keygen().expect("keygen");
             let address = derive_eoa_address(pk.as_bytes());
-            wallets.push(Arc::new(Wallet { address, sk }));
+            wallets.push(Arc::new(Wallet {
+                address,
+                pk_bytes: pk.as_bytes().to_vec(),
+                sk,
+            }));
         }
 
         let mut faucet_nonce = fetch_nonce(&client, &rpc_urls[0], &faucet_addr)
@@ -261,6 +270,80 @@ fn sustained_rate_load_test() {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        // Audit 226: production chain (chain_id != 31337) rejects
+        // signed plaintext txs from senders with `AuthKeys::None`.
+        // Fresh keypairs are exactly that. Send the gas-free
+        // `RegisterPubkey` (audit 229) for each wallet at nonce 0
+        // before the load run; this binds the FALCON pubkey on
+        // chain so subsequent Standard txs pass the ingress gate.
+        let register_t0 = Instant::now();
+        let mut signed_register: Vec<String> = Vec::with_capacity(wallets.len());
+        for w in &wallets {
+            let tx = Transaction {
+                from: w.address,
+                to: [0u8; 32],
+                value: 0,
+                data: w.pk_bytes.clone(),
+                gas_limit: 0,
+                nonce: 0,
+                signature: vec![],
+                fee_payer: FeePayer::Sender,
+                access_list: vec![],
+                deadline: None,
+                chain_id: CHAIN_ID,
+                tx_type: TransactionType::RegisterPubkey,
+            };
+            signed_register.push(hex::encode(tx.to_bytes()));
+        }
+        // Stream registrations in parallel — they're independent
+        // (each is signed by address-derivation, not by sequence
+        // number across senders), so we can fire chunks concurrently
+        // across the 4 RPC nodes.
+        let mut futs = Vec::new();
+        for (i, hex_tx) in signed_register.iter().enumerate() {
+            let url = rpc_urls[i % rpc_urls.len()].clone();
+            let cli = client.clone();
+            let hex_tx = hex_tx.clone();
+            futs.push(async move {
+                let _ = rpc_send_raw(&cli, &url, &hex_tx).await;
+            });
+        }
+        // Buffered concurrency cap to avoid socket churn.
+        use futures_util::stream::{iter, StreamExt};
+        iter(futs).buffer_unordered(32).collect::<Vec<()>>().await;
+
+        let poll_deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut registered = 0usize;
+            for w in &wallets {
+                // After RegisterPubkey commits, sender's nonce
+                // base advances from 0 to 1. Use that as the
+                // confirmation signal.
+                if fetch_nonce(&client, &rpc_urls[0], &w.address)
+                    .await
+                    .unwrap_or(0)
+                    >= 1
+                {
+                    registered += 1;
+                }
+            }
+            if registered == wallets.len() {
+                break;
+            }
+            if Instant::now() >= poll_deadline {
+                panic!(
+                    "RegisterPubkey timed out: {}/{} confirmed",
+                    registered,
+                    wallets.len()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        println!(
+            "  ✓ {} pubkeys registered in {:.1} s",
+            wallets.len(),
+            register_t0.elapsed().as_secs_f64()
+        );
         wallets
     });
     println!(
@@ -305,7 +388,9 @@ fn sustained_rate_load_test() {
             let deadline = run_deadline;
 
             tasks.push(tokio::spawn(async move {
-                let mut nonce = 0u64;
+                // Nonce 0 was consumed by `RegisterPubkey` during
+                // setup (audit 229). First Standard tx is nonce 1.
+                let mut nonce = 1u64;
                 let mut next_submit = Instant::now();
                 loop {
                     let now = Instant::now();
@@ -524,10 +609,15 @@ fn sustained_rate_load_test() {
         // (a) Peak-load proposer timing — pick slots with real
         // work (pending > 100) from the middle of the run so we
         // see the steady-state cost, not the drain-down tail.
+        // Path A renamed the log line: "proposed and processed"
+        // (single-step) → "proposed block (awaiting QC for
+        // canonical apply)" (two-step). Match either so this
+        // diagnostic keeps working before/after Path A.
         let timing_lines: Vec<&str> = snap
             .lines()
             .filter(|l| {
-                l.contains("proposed and processed")
+                (l.contains("proposed and processed")
+                    || l.contains("proposed block (awaiting QC"))
                     && !l.contains("pending=0 ")
                     && !l.contains("pending=0\n")
             })
