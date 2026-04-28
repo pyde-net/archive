@@ -2,10 +2,12 @@
 //!
 //! Exposes chain state queries and transaction submission over HTTP.
 
+use crate::block_store::BlockStore;
 use crate::chain::ChainState;
 use crate::receipt_store::ReceiptStore;
 use crate::state_manager::StateManager;
 use crate::tx_relay::TxRelay;
+use crate::wire;
 use jsonrpsee::core::async_trait;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::server::Server;
@@ -48,6 +50,11 @@ pub struct RpcState {
     pub state: Arc<RwLock<StateManager>>,
     pub tx_relay: Arc<RwLock<TxRelay>>,
     pub receipts: Arc<RwLock<ReceiptStore>>,
+    /// Persistent block store. Used by `getBlockByNumber` to decode
+    /// the wire-encoded block body and surface full transaction
+    /// fields (from, to, value, nonce, tx_type) — the in-memory
+    /// `ChainState::header` only carries the merkle commitments.
+    pub block_store: Arc<BlockStore>,
     /// Plain transaction queue (devnet mode — no threshold encryption).
     /// Proposer drains this to build blocks. Keyed by `tx.hash()` so
     /// block-commit retains are O(|block|) instead of O(|mempool| ×
@@ -314,37 +321,79 @@ impl PydeApiServer for RpcServer {
     }
 
     async fn get_block_by_number(&self, slot: u64) -> Result<serde_json::Value, ErrorObjectOwned> {
-        let chain = self.state.chain.read().await;
-        match chain.header(slot) {
-            Some(header) => Ok(serde_json::json!({
-                "slot": header.slot,
-                "epoch": header.epoch,
-                "parentHash": format!("0x{}", hex::encode(header.parent_hash)),
-                "stateRoot": format!("0x{}", hex::encode(header.state_root)),
-                "txRoot": format!("0x{}", hex::encode(header.tx_root)),
-                "timestamp": format!("0x{:x}", header.timestamp),
-                "proposer": format!("0x{}", hex::encode(header.proposer)),
-            })),
-            None => Ok(serde_json::Value::Null),
-        }
+        // ChainState only keeps the last ~2 epochs of headers in
+        // memory; for older slots fall back to the persistent
+        // BlockStore so block-explorer-style range queries don't go
+        // dark past the in-memory window.
+        let header = {
+            let chain = self.state.chain.read().await;
+            match chain.header(slot) {
+                Some(h) => h.clone(),
+                None => match self.state.block_store.get_header(slot) {
+                    Some(h) => h,
+                    None => return Ok(serde_json::Value::Null),
+                },
+            }
+        };
+        let tx_hashes = self
+            .state
+            .receipts
+            .read()
+            .await
+            .tx_hashes_at_slot(slot)
+            .unwrap_or_default();
+        let block_hash = header.hash();
+        let transactions = decode_block_transactions(&self.state.block_store, slot);
+        Ok(serde_json::json!({
+            "slot": header.slot,
+            "epoch": header.epoch,
+            "blockHash": format!("0x{}", hex::encode(block_hash)),
+            "parentHash": format!("0x{}", hex::encode(header.parent_hash)),
+            "stateRoot": format!("0x{}", hex::encode(header.state_root)),
+            "txRoot": format!("0x{}", hex::encode(header.tx_root)),
+            "timestamp": format!("0x{:x}", header.timestamp),
+            "proposer": format!("0x{}", hex::encode(header.proposer)),
+            "transactionHashes": tx_hashes
+                .iter()
+                .map(|h| format!("0x{}", hex::encode(h)))
+                .collect::<Vec<_>>(),
+            "transactions": transactions,
+        }))
     }
 
     async fn get_block_by_hash(&self, hash: String) -> Result<serde_json::Value, ErrorObjectOwned> {
         let block_hash = parse_hash(&hash)?;
         let chain = self.state.chain.read().await;
-        match chain.header_by_hash(&block_hash) {
-            Some(header) => Ok(serde_json::json!({
-                "slot": header.slot,
-                "epoch": header.epoch,
-                "parentHash": format!("0x{}", hex::encode(header.parent_hash)),
-                "stateRoot": format!("0x{}", hex::encode(header.state_root)),
-                "txRoot": format!("0x{}", hex::encode(header.tx_root)),
-                "timestamp": format!("0x{:x}", header.timestamp),
-                "proposer": format!("0x{}", hex::encode(header.proposer)),
-                "hash": format!("0x{}", hex::encode(block_hash)),
-            })),
-            None => Err(rpc_err(-32602, "block not found for hash".to_string())),
-        }
+        let header = match chain.header_by_hash(&block_hash) {
+            Some(h) => h.clone(),
+            None => return Err(rpc_err(-32602, "block not found for hash".to_string())),
+        };
+        drop(chain);
+        let slot = header.slot;
+        let tx_hashes = self
+            .state
+            .receipts
+            .read()
+            .await
+            .tx_hashes_at_slot(slot)
+            .unwrap_or_default();
+        let transactions = decode_block_transactions(&self.state.block_store, slot);
+        Ok(serde_json::json!({
+            "slot": header.slot,
+            "epoch": header.epoch,
+            "blockHash": format!("0x{}", hex::encode(block_hash)),
+            "parentHash": format!("0x{}", hex::encode(header.parent_hash)),
+            "stateRoot": format!("0x{}", hex::encode(header.state_root)),
+            "txRoot": format!("0x{}", hex::encode(header.tx_root)),
+            "timestamp": format!("0x{:x}", header.timestamp),
+            "proposer": format!("0x{}", hex::encode(header.proposer)),
+            "hash": format!("0x{}", hex::encode(block_hash)),
+            "transactionHashes": tx_hashes
+                .iter()
+                .map(|h| format!("0x{}", hex::encode(h)))
+                .collect::<Vec<_>>(),
+            "transactions": transactions,
+        }))
     }
 
     async fn state_root(&self) -> Result<String, ErrorObjectOwned> {
@@ -1672,6 +1721,44 @@ async fn parse_call_object(
         block_sigs_pre_verified: false,
     };
     Ok((tx, block_ctx))
+}
+
+/// Decode the wire-encoded block at `slot` and emit one JSON object
+/// per transaction with the fields an indexer/explorer needs to
+/// render a tx without a second `getTransactionByHash` round-trip:
+/// hash, sender, recipient, value, nonce, gas_limit, tx_type. Falls
+/// back to an empty array if the block isn't on disk yet (genesis,
+/// or a slot that this node only saw a header for during sync).
+fn decode_block_transactions(
+    block_store: &BlockStore,
+    slot: u64,
+) -> Vec<serde_json::Value> {
+    let raw = match block_store.get_block_raw(slot) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+    let block = match wire::decode_block(&raw) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    block
+        .body
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(idx, tx)| {
+            serde_json::json!({
+                "hash": format!("0x{}", hex::encode(tx.hash())),
+                "from": format!("0x{}", hex::encode(tx.from)),
+                "to": format!("0x{}", hex::encode(tx.to)),
+                "value": tx.value.to_string(),
+                "nonce": tx.nonce,
+                "gasLimit": tx.gas_limit,
+                "txType": tx.tx_type as u8,
+                "indexInBlock": idx,
+            })
+        })
+        .collect()
 }
 
 fn receipt_to_json(receipt: &Receipt) -> serde_json::Value {

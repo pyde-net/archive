@@ -234,8 +234,9 @@ impl PydeNode {
             }
         };
 
-        // 3. Block store (persistent headers on disk)
-        let block_store = BlockStore::open(datadir)?;
+        // 3. Block store (persistent headers on disk). Arc'd so the
+        // RPC layer can read full block bodies without a second open.
+        let block_store = Arc::new(BlockStore::open(datadir)?);
         let saved_head = block_store.get_head();
 
         // 4. Chain state tracker (resume from saved head if available)
@@ -548,6 +549,7 @@ impl PydeNode {
                 state: state.clone(),
                 tx_relay: tx_relay.clone(),
                 receipts: receipts.clone(),
+                block_store: block_store.clone(),
                 pending_txs: pending_txs.clone(),
                 pending_tx_times: pending_tx_times.clone(),
                 threshold_pk: {
