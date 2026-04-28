@@ -2257,74 +2257,35 @@ impl PydeNode {
                                                     drop(state_w);
                                                     drop(chain_w);
                                                     commit_jmt_writes(&state, smt_handle, pending_writes).await;
-
-                                                    let full_bytes = wire::encode_block(&block);
-                                                    let _ = block_store.put_block(&block.header, &full_bytes);
-                                                    let _ = block_store.put_head(qc_slot);
-                                                    chain_sync.on_block_processed(qc_slot);
-
-                                                    if !receipts_list.is_empty() {
-                                                        let mut receipts_w = receipts.write().await;
-                                                        receipts_w.insert_block_receipts(qc_slot, receipts_list.clone());
-                                                    }
-
-                                                    // WebSocket subscribers — head + per-receipt
-                                                    // logs. Path A moved these out of the
-                                                    // proposer self-apply (no longer exists);
-                                                    // they fire here so subscribers see exactly
-                                                    // the canonical block events.
-                                                    let _ = ws_heads.send(serde_json::json!({
-                                                        "slot": format!("0x{:x}", qc_slot),
-                                                        "timestamp": format!("0x{:x}", block.header.timestamp),
-                                                        "proposer": format!("0x{}", hex::encode(block.header.proposer)),
-                                                        "txCount": format!("0x{:x}", tc),
-                                                    }));
-                                                    for r in receipts_list.iter() {
-                                                        for log in &r.logs {
-                                                            let _ = ws_logs.send(serde_json::json!({
-                                                                "address": format!("0x{}", hex::encode(log.address)),
-                                                                "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
-                                                                "data": format!("0x{}", hex::encode(&log.data)),
-                                                            }));
-                                                        }
-                                                    }
-
-                                                    // Mempool / tx-relay cleanup — previously
-                                                    // run on the gossip-apply branch; moved
-                                                    // here so it fires once for the canonical
-                                                    // block.
-                                                    let tx_hashes: Vec<[u8; 32]> = block.body.transactions.iter()
-                                                        .map(|tx| tx.hash()).collect();
-                                                    if !tx_hashes.is_empty() {
-                                                        let mut idx = mempool_index.write().await;
-                                                        for h in &tx_hashes { idx.remove(h); }
-                                                        drop(idx);
-                                                        let mut pending_w = pending_txs.write().await;
-                                                        for h in &tx_hashes { pending_w.remove(h); }
-                                                        drop(pending_w);
-                                                        let mut times_w = pending_tx_times.write().await;
-                                                        for h in &tx_hashes { times_w.remove(h); }
-                                                    }
-                                                    if !block.body.encrypted_txs.is_empty() {
-                                                        let enc_hashes: Vec<[u8; 32]> = block.body.encrypted_txs.iter()
-                                                            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
-                                                            .map(|etx| etx.hash())
-                                                            .collect();
-                                                        if !enc_hashes.is_empty() {
-                                                            let mut relay_w = tx_relay.write().await;
-                                                            relay_w.remove_included(&enc_hashes);
-                                                        }
-                                                    }
-
-                                                    // Drop the buffered body — kept around
-                                                    // only for the QC apply, not for sync
-                                                    // serving (block_store has the canonical
-                                                    // copy now).
+                                                    persist_block_and_receipts(
+                                                        &block_store,
+                                                        &mut chain_sync,
+                                                        &receipts,
+                                                        &block,
+                                                        qc_slot,
+                                                        receipts_list,
+                                                    )
+                                                    .await;
+                                                    emit_ws_events(
+                                                        &ws_heads,
+                                                        &ws_logs,
+                                                        &block,
+                                                        qc_slot,
+                                                        tc,
+                                                        receipts_list,
+                                                    );
+                                                    prune_committed_txs(
+                                                        &mempool_index,
+                                                        &pending_txs,
+                                                        &pending_tx_times,
+                                                        &tx_relay,
+                                                        &block,
+                                                    )
+                                                    .await;
                                                     {
                                                         let mut pbb = pending_block_bodies.write().await;
                                                         pbb.remove(&qc_hash);
                                                     }
-
                                                     info!(
                                                         slot = qc_slot,
                                                         txs = tc,
