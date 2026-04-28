@@ -136,6 +136,54 @@ impl BlockStore {
     pub fn has_block_data(&self, slot: u64) -> bool {
         self.get_block_raw(slot).is_some()
     }
+
+    // ========================================================================
+    // Hard-finality cert persistence
+    // ========================================================================
+    //
+    // Light clients and fresh-syncing nodes need to verify that a slot
+    // is hard-finalized — and to verify state proofs against the
+    // committed `state_root` at that slot. The HardFinalityCert lives
+    // only in `FinalityTracker` in-memory; without persistence the
+    // proof is lost on restart and cannot be served to peers.
+    //
+    // Stored under "c:{slot_le_bytes}" alongside the block at "b:".
+    // Wire format reuses `wire::encode_finality_checkpoint` so the
+    // bytes can be served as-is to peers via a future sync extension.
+    // Idempotent — repeated puts at the same slot overwrite with
+    // identical bytes (cert formation can fire multiple times per
+    // slot as peer votes arrive in different orders).
+
+    /// Store a `FinalityCheckpoint` (carrying the `HardFinalityCert`)
+    /// for `slot`. Idempotent.
+    pub fn put_finality_cert(
+        &self,
+        cp: &pyde_consensus::finality::FinalityCheckpoint,
+    ) -> Result<(), String> {
+        let mut key = Vec::with_capacity(2 + 8);
+        key.extend_from_slice(b"c:");
+        key.extend_from_slice(&cp.slot.to_le_bytes());
+        let bytes = crate::wire::encode_finality_checkpoint(cp);
+        self.db
+            .put(&key, &bytes)
+            .map_err(|e| format!("failed to store finality cert: {}", e))
+    }
+
+    /// Load the `FinalityCheckpoint` at `slot`, if one was persisted.
+    /// Returns `None` for slots that never reached hard finality, or
+    /// were finalized on a previous version that didn't persist
+    /// certs.
+    #[allow(dead_code)]
+    pub fn get_finality_cert(
+        &self,
+        slot: u64,
+    ) -> Option<pyde_consensus::finality::FinalityCheckpoint> {
+        let mut key = Vec::with_capacity(2 + 8);
+        key.extend_from_slice(b"c:");
+        key.extend_from_slice(&slot.to_le_bytes());
+        let bytes = self.db.get(&key).ok()??;
+        crate::wire::decode_finality_checkpoint(&bytes).ok()
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +256,45 @@ mod tests {
         assert_eq!(store.get_head(), 0);
         store.put_head(42).unwrap();
         assert_eq!(store.get_head(), 42);
+    }
+
+    #[test]
+    fn finality_cert_round_trip() {
+        use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+
+        let cp = FinalityCheckpoint {
+            slot: 7,
+            block_hash: [0xAA; 32],
+            state_root: [0xBB; 32],
+            cert: HardFinalityCert {
+                slot: 7,
+                block_hash: [0xAA; 32],
+                state_root: [0xBB; 32],
+                voter_bitmap: 0b0111, // 3-of-4 votes
+                signatures: vec![vec![0xCC; 64], vec![0xDD; 64], vec![0xEE; 64]],
+            },
+        };
+
+        // Missing slot returns None.
+        assert!(store.get_finality_cert(7).is_none());
+
+        // Round-trip a cert.
+        store.put_finality_cert(&cp).unwrap();
+        let loaded = store.get_finality_cert(7).expect("cert persisted");
+        assert_eq!(loaded.slot, 7);
+        assert_eq!(loaded.block_hash, [0xAA; 32]);
+        assert_eq!(loaded.cert.voter_bitmap, 0b0111);
+        assert_eq!(loaded.cert.signatures.len(), 3);
+        assert_eq!(loaded.cert.signatures[0], vec![0xCC; 64]);
+
+        // Idempotent overwrite — putting again with same data is fine.
+        store.put_finality_cert(&cp).unwrap();
+        let reloaded = store.get_finality_cert(7).unwrap();
+        assert_eq!(reloaded.cert.voter_bitmap, 0b0111);
+
+        // Different slots are independent.
+        assert!(store.get_finality_cert(8).is_none());
     }
 }
