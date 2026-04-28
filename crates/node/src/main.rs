@@ -13,6 +13,7 @@ mod keystore;
 mod logging;
 mod metrics;
 mod node;
+mod peer_book;
 mod receipt_store;
 mod rpc;
 mod shutdown;

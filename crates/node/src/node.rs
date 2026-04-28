@@ -351,6 +351,14 @@ impl PydeNode {
         let mut pending_auth_nonces: std::collections::HashMap<libp2p::PeerId, [u8; 32]> =
             std::collections::HashMap::new();
 
+        // Audit 234 follow-up: persistent peer book. Loaded at
+        // startup (used to seed the dial list below); populated
+        // on every `ConnectionEstablished`; persisted on a 30 s
+        // tick + at shutdown so a future restart can re-dial the
+        // exact peer set without relying on bootstrap+DHT to
+        // re-discover every edge.
+        let mut peer_book = crate::peer_book::PeerBook::load(&self.config.node.datadir);
+
         // Size of the committee that was in power at the last epoch boundary.
         // Feeds the `old_threshold` passed to `on_reshare_contribution` after
         // `engine.set_committee` has already advanced `engine.committee_keys`
@@ -520,6 +528,21 @@ impl PydeNode {
         // single-node local devnet.
         if !self.config.network.bootstrap_peers.is_empty() {
             pyde_net::node::dial_bootstrap_peers(&mut swarm, &self.config.network.bootstrap_peers);
+        }
+
+        // 8b. Audit 234 follow-up: also dial every peer the previous
+        // run ended up connected to. Bootstrap is the seed list (a
+        // few well-known validators); the peer book is the *full*
+        // set of edges the previous run had — including peers we
+        // discovered via DHT and might not be in the static
+        // bootstrap config. Without this, a restarted small-
+        // committee node can come back missing one or two edges,
+        // which is invisible until a different node dies.
+        // Skip-if-already-connected is handled inside
+        // `redial_saved_peers` so a peer in BOTH bootstrap and the
+        // book isn't dialed twice.
+        if peer_book.len() > 0 {
+            redial_saved_peers(&mut swarm, &peer_book);
         }
 
         // 9. Listen on all interfaces — hybrid TCP + QUIC (audit 234
@@ -716,6 +739,21 @@ impl PydeNode {
         let mut gossip_retry_interval =
             tokio::time::interval(std::time::Duration::from_millis(800));
         const GOSSIP_RETRY_MAX_TXS: usize = 1000;
+        // Audit 234 follow-up: snapshot the peer book to disk every
+        // 5 s. Aggressive enough that a node killed soon after
+        // startup (validator-churn tests warm up in ~12 s, then
+        // start killing) still has the freshly-observed peer set
+        // persisted; coarse enough that I/O cost is negligible
+        // (one small JSON write per 5 s = nothing). `kill -9` loses
+        // at most 5 s of new observations.
+        let mut peer_book_snapshot_interval =
+            tokio::time::interval(std::time::Duration::from_secs(5));
+        // First tick fires immediately on `interval()`; consume it
+        // here so the next firing is 5 s later, not on the very
+        // first poll of the select loop. (Without this we'd save
+        // an empty book at t=0 and then an immediate save at t=5
+        // — harmless but wasteful.)
+        peer_book_snapshot_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -750,15 +788,20 @@ impl PydeNode {
                         PostEventAction::SendSyncResponse(channel, response) => {
                             let _ = swarm.behaviour_mut().sync.send_response(channel, response);
                         }
-                        PostEventAction::SendAuthRequest(peer) => {
-                            // Generate a fresh nonce, record it, send the request.
-                            // We only authenticate to peers once; if a response is
-                            // already pending we skip to avoid stacking nonces.
-                            if let std::collections::hash_map::Entry::Vacant(e) = pending_auth_nonces.entry(peer) {
+                        PostEventAction::RecordPeerAndAuth { peer_id, multiaddr } => {
+                            // Audit 234 follow-up: persist the (peer, addr)
+                            // pair so a future restart re-dials it directly.
+                            // The book is snapshot to disk on a 30 s tick +
+                            // at shutdown.
+                            peer_book.record(peer_id, multiaddr);
+                            // Same auth-handshake kick that the original
+                            // ConnectionEstablished arm did before the
+                            // peer-book promotion was added.
+                            if let std::collections::hash_map::Entry::Vacant(e) = pending_auth_nonces.entry(peer_id) {
                                 let nonce = pyde_net::auth::generate_nonce();
                                 e.insert(nonce);
                                 let req = pyde_net::auth::PydeAuthReq { nonce };
-                                let _ = swarm.behaviour_mut().auth.send_request(&peer, req);
+                                let _ = swarm.behaviour_mut().auth.send_request(&peer_id, req);
                             }
                         }
                         PostEventAction::SendAuthResponse(channel, resp) => {
@@ -2955,8 +2998,26 @@ impl PydeNode {
                         }
                     }
                 }
+                _ = peer_book_snapshot_interval.tick() => {
+                    // Audit 234 follow-up: persist the (peer_id,
+                    // multiaddr) set so a future restart redials the
+                    // exact peer set instead of waiting for
+                    // bootstrap+DHT to re-discover every edge. Errors
+                    // logged but non-fatal — the previous snapshot on
+                    // disk remains valid; we'll retry on the next tick.
+                    if let Err(e) = peer_book.save(&self.config.node.datadir) {
+                        warn!(error = %e, "peer book snapshot failed");
+                    }
+                }
                 _ = shutdown_rx.recv() => {
                     info!("shutdown signal received, stopping node...");
+                    // Final peer-book snapshot on the way out so the
+                    // most-recent observations land on disk even if
+                    // we're between regular ticks. Best-effort —
+                    // shutdown proceeds either way.
+                    if let Err(e) = peer_book.save(&self.config.node.datadir) {
+                        warn!(error = %e, "peer book final snapshot failed");
+                    }
                     break;
                 }
             }
@@ -3024,10 +3085,6 @@ enum PostEventAction {
         qc_slot: u64,
         qc_block_hash: [u8; 32],
     },
-    /// Send a `PydeAuthReq` to a newly connected peer. The main loop
-    /// generates a fresh nonce, records it in `pending_auth_nonces`, and
-    /// dispatches via the swarm.
-    SendAuthRequest(PeerId),
     /// Reply to an inbound `PydeAuthReq` with a signed attestation over
     /// `(nonce, our_peer_id)`. The response channel holds the pending
     /// outbound stream to the requester.
@@ -3101,6 +3158,23 @@ enum PostEventAction {
         request_response::ResponseChannel<pyde_net::blocks_protocol::BlocksResp>,
         pyde_net::blocks_protocol::BlocksResp,
     ),
+    /// Audit 234 follow-up: record a `(PeerId, Multiaddr)` pair into the
+    /// persistent peer book AND fire the FALCON auth handshake (task
+    /// 029). Both are side-effects of `SwarmEvent::ConnectionEstablished`;
+    /// the runtime executes them as a unit so the auth-gated peer-book
+    /// promotion in `OnPeerAuthenticated` can correlate the freshly-
+    /// recorded `peer_id` with the authentication outcome.
+    ///
+    /// The book is persisted on a coarse cadence + at shutdown and
+    /// re-dialed at next startup, so a restarted validator restores
+    /// all its connections instead of relying on bootstrap+DHT to
+    /// re-discover every peer (which can leave one edge missing in
+    /// small committees and stall consensus when a different node
+    /// dies).
+    RecordPeerAndAuth {
+        peer_id: PeerId,
+        multiaddr: libp2p::Multiaddr,
+    },
 }
 
 /// Publish a consensus message via gossipsub; on `InsufficientPeers`
@@ -3517,6 +3591,59 @@ fn broadcast_blocks_with_rr_fallback(
             },
         );
     }
+}
+
+/// Audit 234 follow-up: dial every peer the previous run was
+/// connected to. Run once at startup, AFTER `dial_bootstrap_peers`
+/// so peers in both lists aren't double-dialed (the
+/// `is_connected` check below catches the duplicate).
+///
+/// Deliberately drops the `local_peer_id >= peer_id` dial-race
+/// guard that `dial_bootstrap_peers` carries. The guard exists to
+/// stop *sustained* symmetric dialing (each side periodically
+/// retrying bootstrap → both sides dialing each other on every
+/// retry → libp2p reaps the duplicate). This call is a one-shot
+/// at startup; the worst-case race is two TCP setups for the same
+/// peer, libp2p picks one, the other gets reaped — no sustained
+/// flap. Skipping the guard is what fixes the
+/// validator-churn-4-of-4 stall: with the guard in place,
+/// whichever side has the higher PeerId waits for the other to
+/// dial, but the other side isn't actively dialing us at startup
+/// either, so the connection never reforms and quorum can't
+/// reach 3-of-4.
+fn redial_saved_peers(
+    swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
+    peer_book: &crate::peer_book::PeerBook,
+) {
+    let local_peer_id = *swarm.local_peer_id();
+    let mut dialed = 0usize;
+    for (peer_id, addr) in peer_book.iter() {
+        if local_peer_id == *peer_id {
+            continue; // self
+        }
+        if swarm.is_connected(peer_id) {
+            continue;
+        }
+        // Seed Kademlia even if dial fails — DHT can use it later.
+        swarm
+            .behaviour_mut()
+            .kademlia
+            .add_address(peer_id, addr.clone());
+        match swarm.dial(addr.clone()) {
+            Ok(_) => {
+                dialed += 1;
+                debug!(%peer_id, %addr, "redialing saved peer");
+            }
+            Err(e) => {
+                debug!(%peer_id, %addr, error = %e, "saved-peer dial failed; bootstrap+DHT will retry");
+            }
+        }
+    }
+    info!(
+        saved = peer_book.len(),
+        dialed,
+        "redialed saved peers from peer book"
+    );
 }
 
 /// Handle a libp2p swarm event. Returns an action that may need swarm access.
@@ -4669,9 +4796,10 @@ fn handle_swarm_event(
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
         } => {
+            let remote_addr = endpoint.get_remote_address().clone();
             info!(
                 %peer_id,
-                addr = %endpoint.get_remote_address(),
+                addr = %remote_addr,
                 "peer connected"
             );
             // Track the peer so attested pubkeys can later be stored.
@@ -4684,9 +4812,16 @@ fn handle_swarm_event(
             let info = pyde_net::peer::PeerInfo::new(peer_id, direction);
             peer_manager.add_peer(info);
 
-            // Task 029: kick off the FALCON attestation handshake so the
-            // consensus filter (task 030) has a pubkey to check.
-            PostEventAction::SendAuthRequest(peer_id)
+            // Audit 234 follow-up: snapshot the (peer_id, multiaddr)
+            // for the persistent peer book AND kick off the FALCON
+            // attestation handshake (task 029). The runtime handles
+            // both as a unit; auth-gating for the book happens
+            // downstream so a malicious peer that fails attestation
+            // doesn't end up in the persisted set.
+            PostEventAction::RecordPeerAndAuth {
+                peer_id,
+                multiaddr: remote_addr,
+            }
         }
 
         // --- Peer disconnected ---
