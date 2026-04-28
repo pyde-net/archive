@@ -9,6 +9,7 @@ mod consensus_store;
 mod fast_tx;
 mod faucet;
 mod genesis;
+mod gossip_cache;
 mod keystore;
 mod logging;
 mod metrics;

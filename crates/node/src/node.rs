@@ -359,6 +359,17 @@ impl PydeNode {
         // re-discover every edge.
         let mut peer_book = crate::peer_book::PeerBook::load(&self.config.node.datadir);
 
+        // Audit 234 follow-up: gossip-publish cache. Stashes
+        // consensus / Blocks topic messages whose `gossipsub.publish`
+        // returned `InsufficientPeers` (the post-restart
+        // SUBSCRIBE-arrival race documented in rust-libp2p #5097).
+        // Replayed when a `gossipsub::Event::Subscribed` for the
+        // matching topic arrives — i.e. when the race finally
+        // resolves itself via heartbeat-driven re-subscription.
+        // Mirrors Lighthouse (Eth2 consensus client)'s
+        // `GossipCache` pattern.
+        let mut gossip_cache = crate::gossip_cache::GossipCache::new();
+
         // Size of the committee that was in power at the last epoch boundary.
         // Feeds the `old_threshold` passed to `on_reshare_contribution` after
         // `engine.set_committee` has already advanced `engine.committee_keys`
@@ -755,6 +766,15 @@ impl PydeNode {
         // — harmless but wasteful.)
         peer_book_snapshot_interval.tick().await;
 
+        // Audit 234 follow-up: prune expired entries from the
+        // gossip cache. Catches the case where a topic never gets
+        // re-subscribed (e.g. all peers permanently disconnected)
+        // — without periodic pruning, those entries would pin
+        // memory until the next `drain_topic` walked past them.
+        let mut gossip_cache_prune_interval =
+            tokio::time::interval(std::time::Duration::from_secs(15));
+        gossip_cache_prune_interval.tick().await; // skip immediate first firing
+
         loop {
             tokio::select! {
                 event = swarm.select_next_some() => {
@@ -788,6 +808,70 @@ impl PydeNode {
                         PostEventAction::SendSyncResponse(channel, response) => {
                             let _ = swarm.behaviour_mut().sync.send_response(channel, response);
                         }
+                        PostEventAction::ReplayCachedGossip(topic) => {
+                            // Audit 234 follow-up: race-resolution
+                            // replay. Drain every cached message
+                            // for this topic and re-publish via the
+                            // standard fan-out (gossipsub + RR).
+                            // If the second publish ALSO hits
+                            // `InsufficientPeers`, the helpers
+                            // re-stash — bounded by the per-message
+                            // TTL, so a permanent topic-empty
+                            // condition can't loop forever.
+                            let entries = gossip_cache.drain_topic(&topic);
+                            if !entries.is_empty() {
+                                debug!(
+                                    %topic,
+                                    count = entries.len(),
+                                    "replaying cached gossip after Subscribed event"
+                                );
+                                for data in entries {
+                                    // Reconstruct an IdentTopic from the
+                                    // hash by trying each known channel —
+                                    // gossipsub identifies topics via hash
+                                    // but `publish` wants a typed topic.
+                                    // This is the same pattern used at
+                                    // the Message-arm receive site.
+                                    let consensus_topic = pyde_net::node::topics::consensus();
+                                    let blocks_topic = pyde_net::node::topics::blocks();
+                                    if topic == consensus_topic.hash() {
+                                        broadcast_consensus_with_rr_fallback(
+                                            &mut swarm,
+                                            consensus_topic,
+                                            data,
+                                            &peer_manager,
+                                            &mut gossip_cache,
+                                        );
+                                    } else if topic == blocks_topic.hash() {
+                                        broadcast_blocks_with_rr_fallback(
+                                            &mut swarm,
+                                            blocks_topic,
+                                            data,
+                                            &mut gossip_cache,
+                                        );
+                                    }
+                                    // Other topics (transactions, sync)
+                                    // aren't cached — txs have their own
+                                    // gossip-retry path; sync is RR-only.
+                                }
+                            }
+                        }
+                        PostEventAction::AddExplicitGossipPeer(peer_id) => {
+                            // Audit 234 follow-up: pin a FALCON-
+                            // attested validator into gossipsub's
+                            // mesh. Explicit peers bypass scoring +
+                            // heartbeat-based pruning and stay in the
+                            // mesh as long as the connection is up.
+                            // `add_explicit_peer` immediately emits a
+                            // GRAFT control frame on every subscribed
+                            // topic, so messages start flowing without
+                            // waiting for a fresh SUBSCRIBE handshake.
+                            // Symmetric: when we attest to *them*,
+                            // their AddExplicitGossipPeer fires and
+                            // they pin us back.
+                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            debug!(%peer_id, "pinned validator into gossipsub mesh (explicit peer)");
+                        }
                         PostEventAction::RecordPeerAndAuth { peer_id, multiaddr } => {
                             // Audit 234 follow-up: persist the (peer, addr)
                             // pair so a future restart re-dials it directly.
@@ -818,6 +902,7 @@ impl PydeNode {
                                 topic,
                                 data,
                                 &peer_manager,
+                            &mut gossip_cache,
                             );
                         }
                         PostEventAction::SendConsensusRrResponseAndApplyQcd(
@@ -913,6 +998,7 @@ impl PydeNode {
                                         &block_store,
                                         &mut swarm,
                                         &peer_manager,
+                                        &mut gossip_cache,
                                         qc_slot,
                                         qc_block_hash,
                                         " (RR path)",
@@ -925,6 +1011,7 @@ impl PydeNode {
                                         &pending_decryptors,
                                         &mut swarm,
                                         &peer_manager,
+                                        &mut gossip_cache,
                                         &block,
                                         qc_slot,
                                         " (RR path)",
@@ -1050,6 +1137,7 @@ impl PydeNode {
                                     topic,
                                     data,
                                     &peer_manager,
+                                &mut gossip_cache,
                                 );
                             }
                         }
@@ -1067,6 +1155,7 @@ impl PydeNode {
                                         topic.clone(),
                                         data,
                                         &peer_manager,
+                                    &mut gossip_cache,
                                     );
                                 }
                             }
@@ -1203,6 +1292,7 @@ impl PydeNode {
                                         &block_store,
                                         &mut swarm,
                                         &peer_manager,
+                                        &mut gossip_cache,
                                         qc_slot,
                                         qc_block_hash,
                                         "",
@@ -1215,6 +1305,7 @@ impl PydeNode {
                                         &pending_decryptors,
                                         &mut swarm,
                                         &peer_manager,
+                                        &mut gossip_cache,
                                         &block,
                                         qc_slot,
                                         "",
@@ -1659,6 +1750,7 @@ impl PydeNode {
                                         topic,
                                         msg,
                                         &peer_manager,
+                                    &mut gossip_cache,
                                     );
                                     debug!(target_epoch, "re-broadcast resharing contribution");
                                 }
@@ -1763,6 +1855,7 @@ impl PydeNode {
                                                     topic,
                                                     share_bytes,
                                                     &peer_manager,
+                                                &mut gossip_cache,
                                                 );
                                             }
 
@@ -1776,6 +1869,7 @@ impl PydeNode {
                                                     topic,
                                                     contrib_bytes,
                                                     &peer_manager,
+                                                &mut gossip_cache,
                                                 );
                                             }
 
@@ -1798,6 +1892,7 @@ impl PydeNode {
                                                         topic,
                                                         contrib_bytes,
                                                         &peer_manager,
+                                                    &mut gossip_cache,
                                                     );
                                                 }
                                             }
@@ -2072,6 +2167,7 @@ impl PydeNode {
                                         &mut swarm,
                                         topic.clone(),
                                         compact_bytes,
+                                    &mut gossip_cache,
                                     );
 
                                     // Audit item 207: publish the encrypted_txs
@@ -2094,6 +2190,7 @@ impl PydeNode {
                                             &mut swarm,
                                             topic,
                                             bundle_bytes,
+                                        &mut gossip_cache,
                                         );
                                     }
 
@@ -2118,6 +2215,7 @@ impl PydeNode {
                                         cons_topic,
                                         proposal_bytes,
                                         &peer_manager,
+                                    &mut gossip_cache,
                                     );
 
                                     // Buffer our own proposal for VRF selection.
@@ -2142,6 +2240,7 @@ impl PydeNode {
                                             topic,
                                             bytes,
                                             &peer_manager,
+                                        &mut gossip_cache,
                                         );
                                     }
                                 } // end if mempool_size > 0
@@ -2358,6 +2457,7 @@ impl PydeNode {
                                         topic,
                                         vote_bytes,
                                         &peer_manager,
+                                    &mut gossip_cache,
                                     );
 
                                     // Audit 232: own-vote QC mismatch check.
@@ -2472,6 +2572,7 @@ impl PydeNode {
                                                 topic.clone(),
                                                 fv_bytes,
                                                 &peer_manager,
+                                            &mut gossip_cache,
                                             );
                                             if cert_formed {
                                                 if let Some(cp) = engine.latest_finality_checkpoint() {
@@ -2483,6 +2584,7 @@ impl PydeNode {
                                                         topic,
                                                         cp_bytes,
                                                         &peer_manager,
+                                                    &mut gossip_cache,
                                                     );
                                                 }
                                             }
@@ -2565,6 +2667,7 @@ impl PydeNode {
                                                                     topic,
                                                                     share_bytes,
                                                                     &peer_manager,
+                                                                &mut gossip_cache,
                                                                 );
                                                                 info!(
                                                                     slot = current_slot,
@@ -2668,6 +2771,7 @@ impl PydeNode {
                                         topic,
                                         vc_bytes,
                                         &peer_manager,
+                                    &mut gossip_cache,
                                     );
                                     // audit 234 part 3: also process our own
                                     // view-change message locally — gossipsub
@@ -2722,6 +2826,7 @@ impl PydeNode {
                                             cons_topic,
                                             bytes,
                                             &peer_manager,
+                                        &mut gossip_cache,
                                         );
 
                                         // 2) Audit 234 part 4 step 7m: ALSO
@@ -2748,6 +2853,7 @@ impl PydeNode {
                                             &mut swarm,
                                             blocks_topic,
                                             compact_bytes,
+                                        &mut gossip_cache,
                                         );
 
                                         // 3) Apply the block locally so the
@@ -2998,6 +3104,20 @@ impl PydeNode {
                         }
                     }
                 }
+                _ = gossip_cache_prune_interval.tick() => {
+                    // Drop expired entries so a topic with no live
+                    // subscribers doesn't pin stale messages.
+                    let before = gossip_cache.len();
+                    gossip_cache.prune_expired();
+                    let after = gossip_cache.len();
+                    if before != after {
+                        debug!(
+                            pruned = before - after,
+                            remaining = after,
+                            "gossip cache pruned"
+                        );
+                    }
+                }
                 _ = peer_book_snapshot_interval.tick() => {
                     // Audit 234 follow-up: persist the (peer_id,
                     // multiaddr) set so a future restart redials the
@@ -3175,6 +3295,26 @@ enum PostEventAction {
         peer_id: PeerId,
         multiaddr: libp2p::Multiaddr,
     },
+    /// Audit 234 follow-up: promote a FALCON-attested validator to
+    /// gossipsub's `explicit_peers` list. Explicit peers are pinned
+    /// into the topic mesh regardless of scoring, heartbeat-based
+    /// pruning, or transient SUBSCRIBE-control-frame loss after
+    /// restart. `add_explicit_peer` immediately emits a GRAFT on
+    /// every subscribed topic, so messages start flowing without
+    /// waiting for the next gossipsub heartbeat.
+    ///
+    /// Modelled on the validator-mesh-stability pattern Lighthouse
+    /// (Eth2 consensus client) and the other Eth2 clients use:
+    /// validators always pin each other into mesh, restart
+    /// recovery is automatic.
+    AddExplicitGossipPeer(PeerId),
+    /// Audit 234 follow-up: a peer just subscribed to `topic`. Drain
+    /// any messages we previously stashed for this topic (because
+    /// `gossipsub.publish` returned `InsufficientPeers` at the time)
+    /// and re-publish them. Closes the post-restart SUBSCRIBE-arrival
+    /// race by absorbing the window: we hold messages until we know
+    /// someone is listening, then send.
+    ReplayCachedGossip(libp2p::gossipsub::TopicHash),
 }
 
 /// Publish a consensus message via gossipsub; on `InsufficientPeers`
@@ -3345,6 +3485,7 @@ async fn cast_finality_vote_and_persist(
     block_store: &crate::block_store::BlockStore,
     swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
     peer_manager: &pyde_net::peer::PeerManager,
+    gossip_cache: &mut crate::gossip_cache::GossipCache,
     qc_slot: u64,
     qc_block_hash: [u8; 32],
     log_tag: &str,
@@ -3360,7 +3501,7 @@ async fn cast_finality_vote_and_persist(
     let cert_formed = engine.on_finality_vote(fv.clone());
     let fv_bytes = wire::encode_finality_vote(&fv);
     let topic = pyde_net::node::topics::consensus();
-    broadcast_consensus_with_rr_fallback(swarm, topic.clone(), fv_bytes, peer_manager);
+    broadcast_consensus_with_rr_fallback(swarm, topic.clone(), fv_bytes, peer_manager, gossip_cache);
     if !cert_formed {
         return;
     }
@@ -3369,7 +3510,7 @@ async fn cast_finality_vote_and_persist(
     };
     let _ = block_store.put_finality_cert(cp);
     let cp_bytes = wire::encode_finality_checkpoint_msg(cp);
-    broadcast_consensus_with_rr_fallback(swarm, topic, cp_bytes, peer_manager);
+    broadcast_consensus_with_rr_fallback(swarm, topic, cp_bytes, peer_manager, gossip_cache);
     info!(
         slot = qc_slot,
         "hard finality cert formed (canonical-apply path{})", log_tag
@@ -3393,6 +3534,7 @@ async fn maybe_kick_decryption_pipeline(
     >,
     swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
     peer_manager: &pyde_net::peer::PeerManager,
+    gossip_cache: &mut crate::gossip_cache::GossipCache,
     block: &pyde_consensus::block::Block,
     qc_slot: u64,
     log_tag: &str,
@@ -3463,7 +3605,7 @@ async fn maybe_kick_decryption_pipeline(
         };
         let share_bytes = wire::encode_decryption_shares(&msg);
         let topic = pyde_net::node::topics::consensus();
-        broadcast_consensus_with_rr_fallback(swarm, topic, share_bytes, peer_manager);
+        broadcast_consensus_with_rr_fallback(swarm, topic, share_bytes, peer_manager, gossip_cache);
         info!(
             slot = qc_slot,
             enc_txs = enc_txs.len(),
@@ -3477,9 +3619,19 @@ fn broadcast_consensus_with_rr_fallback(
     topic: gossipsub::IdentTopic,
     data: Vec<u8>,
     _peer_manager: &pyde_net::peer::PeerManager,
+    gossip_cache: &mut crate::gossip_cache::GossipCache,
 ) {
-    // Best-effort gossip publish (cheap fan-out via mesh).
-    let _ = swarm.behaviour_mut().gossipsub.publish(topic, data.clone());
+    // Best-effort gossip publish (cheap fan-out via mesh). On
+    // `InsufficientPeers` the message is stashed for replay when
+    // a peer subscribes to the topic — see the
+    // `gossipsub::Event::Subscribed` arm in `handle_swarm_event`.
+    let topic_hash = topic.hash();
+    if let Err(libp2p::gossipsub::PublishError::InsufficientPeers) =
+        swarm.behaviour_mut().gossipsub.publish(topic.clone(), data.clone())
+    {
+        debug!(topic = %topic_hash, bytes = data.len(), "consensus publish: InsufficientPeers; stashed for replay");
+        gossip_cache.stash(topic_hash, data.clone());
+    }
 
     // audit-234 part 4 step 5 — RR fanout is **unconditional + to all
     // connected peers**, not a fallback gated on gossip publish
@@ -3567,9 +3719,20 @@ fn broadcast_blocks_with_rr_fallback(
     swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
     topic: gossipsub::IdentTopic,
     data: Vec<u8>,
+    gossip_cache: &mut crate::gossip_cache::GossipCache,
 ) {
-    // Best-effort gossip publish (cheap fan-out via mesh).
-    let _ = swarm.behaviour_mut().gossipsub.publish(topic, data.clone());
+    // Best-effort gossip publish (cheap fan-out via mesh). Same
+    // stash-on-InsufficientPeers pattern as the consensus
+    // broadcast — without it, compact blocks silently dropped
+    // post-restart never get retried even though the RR fanout
+    // already ensures eventual delivery.
+    let topic_hash = topic.hash();
+    if let Err(libp2p::gossipsub::PublishError::InsufficientPeers) =
+        swarm.behaviour_mut().gossipsub.publish(topic.clone(), data.clone())
+    {
+        debug!(topic = %topic_hash, bytes = data.len(), "blocks publish: InsufficientPeers; stashed for replay");
+        gossip_cache.stash(topic_hash, data.clone());
+    }
 
     // Unconditional RR fanout — gossipsub.publish returns Ok with
     // empty topic_peers under mesh degradation, silently dropping
@@ -4281,6 +4444,21 @@ fn handle_swarm_event(
             PostEventAction::None
         }
 
+        // --- Gossipsub: a peer subscribed to a topic ---
+        SwarmEvent::Behaviour(PydeBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
+            peer_id,
+            topic,
+        })) => {
+            // Audit 234 follow-up: this is the moment the post-
+            // restart SUBSCRIBE-arrival race resolves. Replay any
+            // gossip messages we previously stashed for this topic
+            // — they returned `InsufficientPeers` at publish time
+            // because the peer's `topic_peers["consensus"]` entry
+            // was missing on our side. Now it's there.
+            debug!(%peer_id, %topic, "peer subscribed; replaying any cached gossip for topic");
+            PostEventAction::ReplayCachedGossip(topic)
+        }
+
         // --- Sync: inbound request from peer ---
         SwarmEvent::Behaviour(PydeBehaviourEvent::Sync(request_response::Event::Message {
             message:
@@ -4407,6 +4585,12 @@ fn handle_swarm_event(
             match outcome {
                 AuthOutcome::StoredAsValidator => {
                     info!(%peer, "peer attested as committee validator");
+                    // Audit 234 follow-up: pin attested validators
+                    // into gossipsub's mesh so consensus messages
+                    // flow even after a restart cycle leaves the
+                    // peer's `topic_peers["consensus"]` state stale
+                    // on the remote side.
+                    return PostEventAction::AddExplicitGossipPeer(peer);
                 }
                 AuthOutcome::StoredAsNonValidator => {
                     debug!(%peer, "peer attested as non-validator");
