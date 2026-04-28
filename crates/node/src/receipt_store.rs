@@ -84,6 +84,17 @@ impl ReceiptStore {
         self.receipts.len()
     }
 
+    /// Tx hashes committed at `slot`, in inclusion order. Returns
+    /// `None` for a slot that's been pruned or never indexed.
+    /// Used by `pyde_getBlockByNumber` to surface transactions in
+    /// the block-detail RPC response — the chain's `header(slot)`
+    /// only carries `tx_root`, so external indexers (block
+    /// explorers) need this to enumerate a slot's contents without
+    /// per-tx-hash lookups.
+    pub fn tx_hashes_at_slot(&self, slot: u64) -> Option<Vec<[u8; 32]>> {
+        self.slot_txs.get(&slot).cloned()
+    }
+
     fn prune_before(&mut self, slot: u64) {
         let slots_to_remove: Vec<u64> = self
             .slot_txs
