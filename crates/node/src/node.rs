@@ -1980,20 +1980,60 @@ impl PydeNode {
                                             .map(|cp| cp.slot);
                                         match BlockProcessor::process_full_block_with_aot_and_checkpoint(&mut chain_w, &mut state_w, &block, Some(&aot_cache), ws_slot) {
                                             Ok((tc, gas, ref receipts_list)) => {
-                                                // PIPELINED: background Merkle commit
+                                                // Commit speculative SMT writes
+                                                // synchronously.
+                                                //
+                                                // The earlier `tokio::spawn` was a
+                                                // perf optimization — overlap the
+                                                // Merkle commit with subsequent slot
+                                                // work — but it created a race against
+                                                // the QC-formed rollback path. When
+                                                // this proposer loses the VRF
+                                                // tournament, the QC handler runs
+                                                // `state.revert_to(slot - 1)` then
+                                                // applies the canonical block. If the
+                                                // background spawn for THIS block
+                                                // lagged past the revert (large state
+                                                // diff or SMT contention pushing it
+                                                // past the ~100ms vote-collection
+                                                // window), it would acquire the SMT
+                                                // mutex AFTER the revert and the
+                                                // canonical apply, overwriting both
+                                                // with the speculative writes — state
+                                                // root then drifts from the canonical
+                                                // chain on every reorg. Hard to
+                                                // observe (only fires under the
+                                                // proposer-loses-VRF + slow-SMT
+                                                // intersection), correctness-fatal
+                                                // when it does.
+                                                //
+                                                // Sync commit closes the race: by the
+                                                // time the QC handler runs, the
+                                                // speculative SMT write has either
+                                                // landed (revert can undo it) or
+                                                // never started (no race). Cost is
+                                                // a few ms of slot-tick blocking on
+                                                // small block writes — acceptable on
+                                                // a 400ms slot. For mainnet-scale
+                                                // throughput, a slot-tagged commit
+                                                // (drop stale spawn results post-
+                                                // revert) or a JoinHandle awaited by
+                                                // the rollback path can restore
+                                                // pipelining without the race.
                                                 let pending = state_w.take_pending_writes();
                                                 let smt_handle = state_w.smt_handle();
                                                 drop(state_w);
                                                 drop(chain_w);
                                                 if !pending.is_empty() {
-                                                    let state_for_root = state.clone();
-                                                    tokio::spawn(async move {
-                                                        if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(&smt_handle, pending) {
-                                                            if let Ok(mut sw) = state_for_root.try_write() {
-                                                                sw.set_root(root);
-                                                            }
-                                                        }
-                                                    });
+                                                    let commit_start = std::time::Instant::now();
+                                                    if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(&smt_handle, pending) {
+                                                        crate::metrics::record_state_commit_ms(
+                                                            commit_start.elapsed().as_millis() as u64,
+                                                        );
+                                                        let mut sw = state.write().await;
+                                                        sw.set_root(root);
+                                                        drop(sw);
+                                                    }
                                                 }
                                                 let _ = block_store.put_header(&block.header);
                                                 let _ = block_store.put_head(current_slot);
