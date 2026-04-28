@@ -918,6 +918,7 @@ impl PydeNode {
                                                 if let Some(cp) =
                                                     engine.latest_finality_checkpoint()
                                                 {
+                                                    let _ = block_store.put_finality_cert(cp);
                                                     let cp_bytes =
                                                         wire::encode_finality_checkpoint_msg(cp);
                                                     broadcast_consensus_with_rr_fallback(
@@ -1353,6 +1354,7 @@ impl PydeNode {
                                                 if let Some(cp) =
                                                     engine.latest_finality_checkpoint()
                                                 {
+                                                    let _ = block_store.put_finality_cert(cp);
                                                     let cp_bytes =
                                                         wire::encode_finality_checkpoint_msg(cp);
                                                     broadcast_consensus_with_rr_fallback(
@@ -2777,6 +2779,7 @@ impl PydeNode {
                                             );
                                             if cert_formed {
                                                 if let Some(cp) = engine.latest_finality_checkpoint() {
+                                                    let _ = block_store.put_finality_cert(cp);
                                                     let cp_bytes =
                                                         wire::encode_finality_checkpoint_msg(cp);
                                                     broadcast_consensus_with_rr_fallback(
@@ -3870,6 +3873,7 @@ fn handle_swarm_event(
                                         // broadcast so non-validator peers can
                                         // advance their WS anchor.
                                         if let Some(cp) = engine.latest_finality_checkpoint() {
+                                            let _ = block_store.put_finality_cert(cp);
                                             let msg = wire::encode_finality_checkpoint_msg(cp);
                                             return PostEventAction::BroadcastConsensus(msg);
                                         }
@@ -4457,6 +4461,7 @@ fn handle_swarm_event(
                                     if let Some(cp) =
                                         engine.latest_finality_checkpoint()
                                     {
+                                        let _ = block_store.put_finality_cert(cp);
                                         info!(
                                             slot = cp.slot,
                                             "hard finality cert formed (RR-receive)"
