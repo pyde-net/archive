@@ -4874,6 +4874,32 @@ fn handle_swarm_event(
                 ..
             },
         )) => {
+            // Per-peer spam threshold, mirroring audit item 214's
+            // pattern for decryption-share gossip. A peer that has
+            // already crossed the invalid-message threshold on prior
+            // gossip / RR delivery gets dropped here BEFORE the
+            // decode + reconstruct work — closes the "open 20 outbound
+            // connections, spam BlocksReq with bogus bytes" CPU-burn
+            // amplification vector. Honest proposers stay at 0
+            // because their compact blocks and bundles decode
+            // cleanly.
+            const BLOCKS_RR_SPAM_THRESHOLD: u64 = 5;
+            let invalid = peer_manager
+                .get_peer(&peer)
+                .map(|p| p.invalid_messages)
+                .unwrap_or(0);
+            if invalid >= BLOCKS_RR_SPAM_THRESHOLD {
+                debug!(
+                    %peer,
+                    invalid,
+                    "dropping BlocksRr from peer over spam threshold"
+                );
+                return PostEventAction::SendBlocksRrResponse(
+                    channel,
+                    pyde_net::blocks_protocol::BlocksResp::DecodeError,
+                );
+            }
+
             // Dispatch by tag byte through the SAME PostEventActions
             // the gossipsub Blocks-topic receive arm uses
             // (ReconstructCompactBlock / BufferEncryptedBundle).
@@ -4889,8 +4915,15 @@ fn handle_swarm_event(
             // OutboundFailure (logged at debug) but the message has
             // already reached our consensus state. The decode-error
             // arm DOES ack so the requester can stop retrying.
+            //
+            // Bumps `invalid_messages` on every malformed payload so
+            // repeat offenders cross BLOCKS_RR_SPAM_THRESHOLD and get
+            // dropped on subsequent requests without decode cost.
             if request.bytes.is_empty() {
                 debug!(%peer, "BlocksRr: empty payload");
+                if let Some(info) = peer_manager.get_peer_mut(&peer) {
+                    info.invalid_messages = info.invalid_messages.saturating_add(1);
+                }
                 return PostEventAction::SendBlocksRrResponse(
                     channel,
                     pyde_net::blocks_protocol::BlocksResp::DecodeError,
@@ -4905,6 +4938,9 @@ fn handle_swarm_event(
                     }
                     Err(e) => {
                         debug!(%peer, error = e, "BlocksRr: decode compact block failed");
+                        if let Some(info) = peer_manager.get_peer_mut(&peer) {
+                            info.invalid_messages = info.invalid_messages.saturating_add(1);
+                        }
                         return PostEventAction::SendBlocksRrResponse(
                             channel,
                             pyde_net::blocks_protocol::BlocksResp::DecodeError,
@@ -4920,6 +4956,9 @@ fn handle_swarm_event(
                     }
                     Err(e) => {
                         debug!(%peer, error = e, "BlocksRr: decode bundle failed");
+                        if let Some(info) = peer_manager.get_peer_mut(&peer) {
+                            info.invalid_messages = info.invalid_messages.saturating_add(1);
+                        }
                         return PostEventAction::SendBlocksRrResponse(
                             channel,
                             pyde_net::blocks_protocol::BlocksResp::DecodeError,
@@ -4932,6 +4971,9 @@ fn handle_swarm_event(
             // reject as not-yet-supported. Compact-block + bundle
             // cover every steady-state proposer broadcast.
             debug!(%peer, tag = format!("0x{tag:02x}"), "BlocksRr: unsupported tag");
+            if let Some(info) = peer_manager.get_peer_mut(&peer) {
+                info.invalid_messages = info.invalid_messages.saturating_add(1);
+            }
             PostEventAction::SendBlocksRrResponse(
                 channel,
                 pyde_net::blocks_protocol::BlocksResp::DecodeError,
