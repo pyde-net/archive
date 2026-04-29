@@ -52,6 +52,13 @@
 //!   PYDE_LOADGEN_DURATION  — measurement duration in seconds (default 600)
 //!   PYDE_LOADGEN_WARMUP    — warm-up in seconds, not measured (default 30)
 //!   PYDE_LOADGEN_SENDERS   — funded sender count (default 50)
+//!   PYDE_LOADGEN_ENCRYPTED — when "1"/"true", drives the encrypted-tx
+//!                            path (Kyber-768 encrypt + threshold-decrypt)
+//!                            instead of the plaintext path. Per-sender
+//!                            rate is capped at the audit-027 limit
+//!                            (10 enc-tx/s/sender); aggregate ceiling
+//!                            with default settings is 50 senders × 10
+//!                            = 500 enc-tx/s. Default: "0".
 
 mod common;
 
@@ -94,6 +101,13 @@ fn sustained_rate_load_test() {
     // senders) where the default FUND_PER_SENDER×num_senders exceeds
     // the faucet's genesis balance. Defaults to FUND_PER_SENDER.
     let fund_per_sender: u128 = env_var_u64("PYDE_LOADGEN_FUND", FUND_PER_SENDER as u64) as u128;
+    // Encrypted-path toggle: when set, switch tx submission from
+    // `pyde_sendRawTransaction` (plaintext) to `pyde_sendRawEncryptedTransaction`
+    // (Kyber-768 + threshold-decrypt). The wallets, funding, and
+    // RegisterPubkey path are reused — encrypted ingress requires a
+    // registered FALCON pubkey on the sender (`AuthKeys::Single`)
+    // and our faucet-funded wallets satisfy that after Phase 1.
+    let encrypted_path: bool = env_var_bool("PYDE_LOADGEN_ENCRYPTED", false);
 
     let per_acct_rate = target_tps as f64 / num_senders as f64;
     let inflight_per_slot = per_acct_rate * 0.4;
@@ -103,9 +117,31 @@ fn sustained_rate_load_test() {
         num_senders, target_tps, per_acct_rate, inflight_per_slot
     );
 
+    // Audit-027 enforces a per-sender rate cap on the encrypted
+    // mempool (`DEFAULT_MAX_TX_PER_WINDOW_PER_SENDER = 10` enc-tx/s).
+    // Above this, the RPC ingress rejects with rate-limited errors
+    // and the measurement becomes meaningless. Hard-fail early so
+    // the operator picks a sensible (target_tps, num_senders) pair.
+    if encrypted_path {
+        assert!(
+            per_acct_rate <= 10.0,
+            "encrypted path: per-account rate {:.1}/s exceeds audit-027 cap of 10 enc-tx/s/sender. \
+             Either lower PYDE_LOADGEN_TPS to ≤ {} or raise PYDE_LOADGEN_SENDERS to ≥ {}.",
+            per_acct_rate,
+            num_senders * 10,
+            (target_tps as f64 / 10.0).ceil() as u64,
+        );
+    }
+
+    let path_label = if encrypted_path {
+        "ENCRYPTED (Kyber-768 + threshold decrypt)"
+    } else {
+        "plaintext (pyde_sendRawTransaction)"
+    };
     println!("╔══════════════════════════════════════════════════════╗");
     println!("║  Pyde Phase 7 — Sustained-Rate Load Test            ║");
     println!("╠══════════════════════════════════════════════════════╣");
+    println!("  Path:         {}", path_label);
     println!("  Target TPS:   {}", target_tps);
     println!(
         "  Duration:     {} s  (+ {} s warm-up, not measured)",
@@ -367,6 +403,25 @@ fn sustained_rate_load_test() {
         .unwrap_or(0);
     println!("  pre-run recipient balance: {}", pre_recipient_balance);
 
+    // Fetch the committee threshold pubkey ONCE up-front when
+    // running the encrypted path. Per-tx fetches add one RPC
+    // round-trip per submission and would dominate latency at
+    // anything above a few tx/s.
+    let threshold_pk: Option<Arc<pyde_crypto::threshold::ThresholdPublicKey>> = if encrypted_path {
+        let bytes = runtime
+            .block_on(fetch_threshold_pk_bytes(&client, &rpc_urls[0]))
+            .unwrap_or_else(|| panic!("could not fetch threshold pubkey from {}", rpc_urls[0]));
+        let tpk = pyde_crypto::threshold::ThresholdPublicKey::from_bytes(&bytes)
+            .unwrap_or_else(|| panic!("threshold pubkey bytes ({} bytes) failed to decode", bytes.len()));
+        println!(
+            "  cached threshold pubkey: {} bytes (encrypted path)",
+            bytes.len()
+        );
+        Some(Arc::new(tpk))
+    } else {
+        None
+    };
+
     let submitted = Arc::new(AtomicU64::new(0));
     let errors = Arc::new(AtomicU64::new(0));
     let run_start = Instant::now();
@@ -386,10 +441,11 @@ fn sustained_rate_load_test() {
             let interval = per_acct_interval;
             let measure_at = measurement_start_at;
             let deadline = run_deadline;
+            let tpk = threshold_pk.clone();
 
             tasks.push(tokio::spawn(async move {
                 // Nonce 0 was consumed by `RegisterPubkey` during
-                // setup (audit 229). First Standard tx is nonce 1.
+                // setup (audit 229). First payload tx is nonce 1.
                 let mut nonce = 1u64;
                 let mut next_submit = Instant::now();
                 loop {
@@ -402,31 +458,43 @@ fn sustained_rate_load_test() {
                     }
                     next_submit += interval;
 
-                    let mut tx = Transaction {
-                        from: wallet.address,
-                        to: RECIPIENT,
-                        value: TX_VALUE,
-                        data: vec![],
-                        gas_limit: 50_000,
-                        nonce,
-                        signature: vec![],
-                        fee_payer: FeePayer::Sender,
-                        access_list: vec![],
-                        deadline: None,
-                        chain_id: CHAIN_ID,
-                        tx_type: TransactionType::Standard,
-                    };
-                    let sig = match falcon_sign(&wallet.sk, &tx.hash()) {
-                        Ok(s) => s,
-                        Err(_) => {
+                    // Build + sign the tx (encrypted or plaintext) on
+                    // a blocking thread — both paths involve
+                    // FALCON-sign (~1 ms) and the encrypted path
+                    // additionally runs a Kyber-768 encap. Off-loading
+                    // keeps the tokio runtime free for reqwest I/O.
+                    let wallet_for_build = wallet.clone();
+                    let tpk_for_build = tpk.clone();
+                    let build = tokio::task::spawn_blocking(move || {
+                        if let Some(tpk) = tpk_for_build {
+                            build_encrypted_tx_hex(
+                                &wallet_for_build,
+                                nonce,
+                                &RECIPIENT,
+                                TX_VALUE,
+                                CHAIN_ID,
+                                &tpk,
+                            )
+                        } else {
+                            build_plaintext_tx_hex(&wallet_for_build, nonce)
+                        }
+                    })
+                    .await;
+                    let hex_tx = match build {
+                        Ok(Ok(s)) => s,
+                        _ => {
                             err.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                     };
-                    tx.signature = sig.as_bytes().to_vec();
-                    let hex_tx = hex::encode(tx.to_bytes());
 
-                    match rpc_send_raw_fast(&cli, &url, &hex_tx).await {
+                    let result = if tpk.is_some() {
+                        rpc_send_raw_encrypted_fast(&cli, &url, &hex_tx).await
+                    } else {
+                        rpc_send_raw_fast(&cli, &url, &hex_tx).await
+                    };
+
+                    match result {
                         Ok(()) => {
                             sub_total.fetch_add(1, Ordering::Relaxed);
                             if Instant::now() >= measure_at {
@@ -436,23 +504,29 @@ fn sustained_rate_load_test() {
                         }
                         Err(_) => {
                             let prev_err = err.fetch_add(1, Ordering::Relaxed);
-                            // Sample the first few rejections with the full
-                            // response body — gives us the actual error
-                            // reason (InvalidNonce, InsufficientBalance, …)
-                            // instead of a generic "submit errors N" count.
+                            // Sample the first few rejections with the
+                            // full response body — gives us the actual
+                            // error reason (InvalidNonce, rate-limited,
+                            // InsufficientBalance, …) instead of a
+                            // generic "submit errors N" count.
                             if i == 0 && prev_err < 3 {
-                                let resp = rpc_send_raw(&cli, &url, &hex_tx).await;
+                                let resp = if tpk.is_some() {
+                                    rpc_send_raw_encrypted(&cli, &url, &hex_tx).await
+                                } else {
+                                    rpc_send_raw(&cli, &url, &hex_tx).await
+                                };
                                 eprintln!(
                                     "  [sender 0] nonce={} rejection #{}: {}",
                                     nonce, prev_err, resp
                                 );
                             }
-                            // Back off a full slot on rejection. Usually an
-                            // InvalidNonce "too far ahead" — we've submitted
-                            // nonces faster than the chain can commit them
-                            // to advance `base`. Waiting a slot lets the
-                            // chain commit a block (or two), advancing the
-                            // window so the same tx validates on retry.
+                            // Back off a full slot on rejection. Usually
+                            // an InvalidNonce "too far ahead" or a
+                            // per-sender rate-limit hit on the
+                            // encrypted path — waiting a slot lets the
+                            // chain commit a block (or two), advancing
+                            // the window so the same tx validates on
+                            // retry.
                             tokio::time::sleep(Duration::from_millis(400)).await;
                             next_submit = Instant::now();
                         }
@@ -735,6 +809,137 @@ async fn rpc_send_raw(client: &reqwest::Client, url: &str, tx_hex: &str) -> serd
         &format!("\"0x{}\"", tx_hex),
     )
     .await
+}
+
+async fn rpc_send_raw_encrypted(
+    client: &reqwest::Client,
+    url: &str,
+    tx_hex: &str,
+) -> serde_json::Value {
+    rpc_call(
+        client,
+        url,
+        "pyde_sendRawEncryptedTransaction",
+        &format!("\"0x{}\"", tx_hex),
+    )
+    .await
+}
+
+/// Same fast-path as `rpc_send_raw_fast` but targets the encrypted-tx
+/// ingress endpoint. Used by the encrypted variant of the load run.
+async fn rpc_send_raw_encrypted_fast(
+    client: &reqwest::Client,
+    url: &str,
+    tx_hex: &str,
+) -> Result<(), ()> {
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"pyde_sendRawEncryptedTransaction","params":["0x{}"]}}"#,
+        tx_hex
+    );
+    let resp = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|_| ())?;
+    if !resp.status().is_success() {
+        return Err(());
+    }
+    let text = resp.text().await.map_err(|_| ())?;
+    if text.contains(r#""error""#) {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Fetch the committee threshold pubkey via
+/// `pyde_getThresholdPublicKey`. The encrypted path needs this to
+/// build `EncryptedTx` ciphertexts; we cache it once at start-up
+/// rather than re-fetching per submission.
+async fn fetch_threshold_pk_bytes(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
+    let resp = rpc_call(client, url, "pyde_getThresholdPublicKey", "[]").await;
+    let s = resp.get("result")?.as_str()?.to_string();
+    let stripped = s.strip_prefix("0x").unwrap_or(&s);
+    hex::decode(stripped).ok()
+}
+
+/// Encode a signed plaintext transfer at `nonce` from `wallet` to
+/// `RECIPIENT`. Mirrors the inline build that the load loop did
+/// before; pulled out so the encrypted variant can share the same
+/// spawn_blocking shape.
+fn build_plaintext_tx_hex(wallet: &Wallet, nonce: u64) -> Result<String, ()> {
+    let mut tx = Transaction {
+        from: wallet.address,
+        to: RECIPIENT,
+        value: TX_VALUE,
+        data: vec![],
+        gas_limit: 50_000,
+        nonce,
+        signature: vec![],
+        fee_payer: FeePayer::Sender,
+        access_list: vec![],
+        deadline: None,
+        chain_id: CHAIN_ID,
+        tx_type: TransactionType::Standard,
+    };
+    let sig = falcon_sign(&wallet.sk, &tx.hash()).map_err(|_| ())?;
+    tx.signature = sig.as_bytes().to_vec();
+    Ok(hex::encode(tx.to_bytes()))
+}
+
+/// Build a signed encrypted transfer (Kyber-768 + threshold) at
+/// `nonce` from `wallet` to `recipient` for `value` quanta. Returns
+/// the wire-encoded `EncryptedTx` as hex, ready for
+/// `pyde_sendRawEncryptedTransaction`.
+///
+/// Mirrors `common::TestNetwork::submit_encrypted_transfer_inner`
+/// but inlined here so we can stay within the loadgen file's
+/// async/spawn_blocking model and reuse the cached threshold pubkey
+/// instead of refetching per call.
+fn build_encrypted_tx_hex(
+    wallet: &Wallet,
+    nonce: u64,
+    recipient: &[u8; 32],
+    value: u128,
+    chain_id: u64,
+    tpk: &pyde_crypto::threshold::ThresholdPublicKey,
+) -> Result<String, ()> {
+    // `Mempool::check_core_validity` rejects encrypted txs with an
+    // empty access_list. Add a single-entry list for the recipient.
+    let access_list = vec![pyde_tx::types::AccessEntry {
+        address: *recipient,
+        reads: Vec::new(),
+        writes: Vec::new(),
+    }];
+    let mut enc_tx = pyde_mempool::encrypted::encrypt_transaction(
+        wallet.address,
+        nonce,
+        /* gas_limit */ 100_000,
+        access_list,
+        /* deadline */ None,
+        chain_id,
+        /* signature */ Vec::new(),
+        recipient,
+        value,
+        /* calldata */ &[],
+        tpk,
+    )
+    .map_err(|_| ())?;
+    let tx_hash = enc_tx.hash();
+    let sig = falcon_sign(&wallet.sk, &tx_hash).map_err(|_| ())?;
+    enc_tx.signature = sig.as_bytes().to_vec();
+    Ok(hex::encode(enc_tx.to_bytes()))
+}
+
+/// Read a boolean env var. Truthy: "1", "true", "yes" (case-insensitive).
+/// Anything else (including unset) returns `default`.
+fn env_var_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+        Err(_) => default,
+    }
 }
 
 /// Returns `Ok` only when HTTP 200 AND the JSON-RPC body has no
