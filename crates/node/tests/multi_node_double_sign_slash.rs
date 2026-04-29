@@ -75,12 +75,16 @@ fn double_sign_debits_stake() {
     // Build forged-but-valid double-sign evidence. Slot is arbitrary;
     // the pipeline doesn't cross-check slot against actual block
     // history, only that the signatures verify over
-    // `proposer_sign_message(slot, hash)`.
+    // `proposer_sign_message(chain_id, slot, hash)`. Sigs MUST be
+    // produced under the local chain's `chain_id` — evidence signed
+    // for a different chain is rejected by the slash handler (the
+    // cross-chain replay defense).
     let slot: u64 = 100;
+    let chain_id = net.chain_id;
     let block_hash_1 = [0x11u8; 32];
     let block_hash_2 = [0x22u8; 32];
-    let msg_1 = proposer_sign_message(slot, &block_hash_1);
-    let msg_2 = proposer_sign_message(slot, &block_hash_2);
+    let msg_1 = proposer_sign_message(chain_id, slot, &block_hash_1);
+    let msg_2 = proposer_sign_message(chain_id, slot, &block_hash_2);
     let sig_1 = falcon_sign(&sk, &msg_1).expect("FALCON sign msg_1");
     let sig_2 = falcon_sign(&sk, &msg_2).expect("FALCON sign msg_2");
 

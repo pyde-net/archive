@@ -1156,10 +1156,13 @@ pub(crate) const EVIDENCE_VERSION: u8 = 1;
 ///   [u8; 32] signer
 ///   [u8; 32] submitter
 ///
-/// Carrying just the hashes (not full `BlockHeader`s) is enough because
-/// each signature is verified over `proposer_sign_message(slot, hash)`
-/// — the slot binding lives inside the signed message, not the wire
-/// format, so a third-party verifier needs nothing besides the hashes.
+/// Carrying just the hashes (not full `BlockHeader`s) is enough
+/// because each signature is verified over
+/// `proposer_sign_message(chain_id, slot, hash)`. The `chain_id` and
+/// `slot` bindings live inside the signed message, not the wire
+/// format, so a third-party verifier needs nothing besides the local
+/// chain's `chain_id`, the hashes, the signatures, and the signer's
+/// pubkey.
 pub fn encode_double_sign_evidence(evidence: &DoubleSignEvidence) -> Vec<u8> {
     let mut enc = Encoder::new();
     enc.u8(EVIDENCE_VERSION);

@@ -509,13 +509,14 @@ fn validator_block_lifecycle() {
     };
     let bh = hdr.hash();
     let mut votes = Vec::new();
+    const CHAIN_ID: u64 = 31337;
     for (i, v) in validators.iter().enumerate() {
-        if let Ok(Some(vote)) = create_vote(&mut cstates[i], &hdr, i as u8, v.address, &v.sk) {
-            assert!(verify_vote(&vote, v.pk.as_bytes()));
+        if let Ok(Some(vote)) = create_vote(CHAIN_ID, &mut cstates[i], &hdr, i as u8, v.address, &v.sk) {
+            assert!(verify_vote(CHAIN_ID, &vote, v.pk.as_bytes()));
             votes.push(vote);
         }
     }
-    let _ = try_form_qc(1, bh, &votes, &ckeys).unwrap();
+    let _ = try_form_qc(CHAIN_ID, 1, bh, &votes, &ckeys).unwrap();
     let consensus_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // ── RESULTS ──────────────────────────────────────────────

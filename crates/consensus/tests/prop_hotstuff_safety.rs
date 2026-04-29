@@ -25,6 +25,11 @@ use pyde_consensus::hotstuff::{
 use pyde_crypto::falcon::{falcon_keygen, falcon_sign, FalconPublicKey, FalconSecretKey};
 use std::sync::OnceLock;
 
+/// Arbitrary non-mainnet, non-devnet chain_id used by every property
+/// case so cross-chain replay regressions surface here rather than
+/// slipping past with hardcoded chain_id=0.
+const TEST_CHAIN_ID: u64 = 7;
+
 fn keys() -> &'static Vec<(FalconPublicKey, FalconSecretKey, Vec<u8>)> {
     static KEYS: OnceLock<Vec<(FalconPublicKey, FalconSecretKey, Vec<u8>)>> = OnceLock::new();
     KEYS.get_or_init(|| {
@@ -62,7 +67,7 @@ fn build_votes_for(slot: u64, block_hash: [u8; 32], voter_indices: &[u8]) -> Vec
         .map(|&i| {
             let (_, sk, pk) = &keys()[i as usize];
             let addr = derive_eoa_address(pk);
-            let msg = proposer_sign_message(slot, &block_hash);
+            let msg = proposer_sign_message(TEST_CHAIN_ID, slot, &block_hash);
             let sig = falcon_sign(sk, &msg).unwrap();
             ConsensusMessage::Vote {
                 slot,
@@ -93,7 +98,7 @@ proptest! {
         let mut last_voted = 0u64;
         for s in slots {
             let header = make_header(s, QuorumCert::empty(), 0);
-            let vote = create_vote(&mut state, &header, 0, addr, sk).unwrap();
+            let vote = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, sk).unwrap();
             if s > last_voted {
                 prop_assert!(vote.is_some(), "should vote for new slot {}", s);
                 prop_assert_eq!(state.last_voted_slot, s);
@@ -143,8 +148,8 @@ proptest! {
         let votes_b = build_votes_for(7, block_b, &byzantine);
 
         let keys_v = committee_keys();
-        let qc_a = try_form_qc(7, block_a, &votes_a, &keys_v);
-        let qc_b = try_form_qc(7, block_b, &votes_b, &keys_v);
+        let qc_a = try_form_qc(TEST_CHAIN_ID, 7, block_a, &votes_a, &keys_v);
+        let qc_b = try_form_qc(TEST_CHAIN_ID, 7, block_b, &votes_b, &keys_v);
 
         prop_assert!(qc_a.is_some(), "block_a should reach quorum (H={} + B={})", h, byzantine_count);
         prop_assert!(
@@ -182,7 +187,7 @@ proptest! {
                 signatures: vec![],
             };
             let header = make_header(slot, qc, slot as u8);
-            let _ = create_vote(&mut state, &header, 0, addr, sk).unwrap();
+            let _ = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, sk).unwrap();
 
             prop_assert!(
                 state.highest_qc.slot >= prev_highest,
@@ -210,7 +215,7 @@ proptest! {
         let votes = build_votes_for(11, block_hash, &voters);
         let keys_v = committee_keys();
         let threshold = quorum_for_committee(COMMITTEE_SIZE);
-        let qc = try_form_qc(11, block_hash, &votes, &keys_v);
+        let qc = try_form_qc(TEST_CHAIN_ID, 11, block_hash, &votes, &keys_v);
         if voter_count >= threshold {
             prop_assert!(
                 qc.is_some(),

@@ -13,16 +13,24 @@ use pyde_account::address::Address;
 use pyde_crypto::falcon::{falcon_verify, FalconPublicKey, FalconSignature};
 
 /// Canonical message bytes that both proposers and voters sign for a
-/// block at a given slot: `slot_le || block_hash`.
+/// block at a given slot: `chain_id_le || slot_le || block_hash`.
 ///
-/// The slot prefix binds the signature to a specific slot, preventing
-/// cross-slot replay of the same block hash. Both proposer signatures
-/// (on block headers) and vote signatures (on `Vote` messages) use this
-/// exact layout so slashing evidence can be verified with a single
-/// routine regardless of signature origin.
+/// The `chain_id` prefix binds every proposer/vote/evidence signature
+/// to a specific chain, preventing cross-chain replay even when two
+/// chains share the same FALCON committee keys. `BlockHeader::hash()`
+/// does not include `chain_id` directly — without this prefix, a vote
+/// signed on one chain would verify against the same block hash on
+/// another chain, and a double-sign on devnet would slash on testnet.
+///
+/// The `slot` prefix binds to a specific slot, preventing cross-slot
+/// replay of the same block hash. Both proposer signatures (on block
+/// headers) and vote signatures (on `Vote` messages) use this exact
+/// layout so slashing evidence can be verified with a single routine
+/// regardless of signature origin.
 #[inline]
-pub fn proposer_sign_message(slot: u64, block_hash: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(8 + 32);
+pub fn proposer_sign_message(chain_id: u64, slot: u64, block_hash: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(8 + 8 + 32);
+    msg.extend_from_slice(&chain_id.to_le_bytes());
     msg.extend_from_slice(&slot.to_le_bytes());
     msg.extend_from_slice(block_hash);
     msg
@@ -168,10 +176,15 @@ impl Default for ConsensusState {
 
 /// Vote on a proposed block. Returns a Vote message.
 ///
+/// `chain_id` is bound into the signed preimage so a vote signed on
+/// chain A cannot be replayed as a valid vote on chain B (see
+/// [`proposer_sign_message`]).
+///
 /// Safety rule: only vote if:
 /// 1. The proposal extends the highest QC we've seen
 /// 2. We haven't voted for this slot yet
 pub fn create_vote(
+    chain_id: u64,
     state: &mut ConsensusState,
     header: &BlockHeader,
     voter_index: u8,
@@ -193,10 +206,11 @@ pub fn create_vote(
         state.highest_qc = header.qc_previous.clone();
     }
 
-    // Sign (slot || block_hash) via the canonical proposer/vote message
-    // layout, binding the vote to a specific slot.
+    // Sign (chain_id || slot || block_hash) via the canonical
+    // proposer/vote message layout, binding the vote to a specific
+    // chain and slot.
     let block_hash = header.hash();
-    let vote_msg = proposer_sign_message(header.slot, &block_hash);
+    let vote_msg = proposer_sign_message(chain_id, header.slot, &block_hash);
     let sig =
         pyde_crypto::falcon::falcon_sign(voter_sk, &vote_msg).map_err(|_| "vote signing failed")?;
 
@@ -212,8 +226,11 @@ pub fn create_vote(
 }
 
 /// Verify a vote message against a validator's public key.
-/// The signature covers (slot || block_hash) to prevent cross-slot replay.
-pub fn verify_vote(vote: &ConsensusMessage, public_key: &[u8]) -> bool {
+///
+/// The signature covers `(chain_id || slot || block_hash)`. A vote signed
+/// on a different chain (different `chain_id`) will fail verification
+/// here even when the FALCON keys match — preventing cross-chain replay.
+pub fn verify_vote(chain_id: u64, vote: &ConsensusMessage, public_key: &[u8]) -> bool {
     match vote {
         ConsensusMessage::Vote {
             slot,
@@ -225,7 +242,7 @@ pub fn verify_vote(vote: &ConsensusMessage, public_key: &[u8]) -> bool {
                 Some(pk) => pk,
                 None => return false,
             };
-            let vote_msg = proposer_sign_message(*slot, block_hash);
+            let vote_msg = proposer_sign_message(chain_id, *slot, block_hash);
             let sig = match FalconSignature::from_bytes(signature) {
                 Some(s) => s,
                 None => return false,
@@ -239,6 +256,7 @@ pub fn verify_vote(vote: &ConsensusMessage, public_key: &[u8]) -> bool {
 /// Aggregate votes into a QuorumCert.
 /// Returns Some(QC) if quorum reached (86+ valid votes), None otherwise.
 pub fn try_form_qc(
+    chain_id: u64,
     slot: u64,
     block_hash: [u8; 32],
     votes: &[ConsensusMessage],
@@ -272,7 +290,7 @@ pub fn try_form_qc(
             }
 
             // Verify signature
-            if verify_vote(vote, &committee_keys[idx]) {
+            if verify_vote(chain_id, vote, &committee_keys[idx]) {
                 voter_bitmap |= 1u128 << idx;
                 signatures.push(signature.clone());
                 valid_count += 1;
@@ -346,15 +364,24 @@ pub fn is_finalized(
 }
 
 /// Create a timeout message when no valid proposal received within the timeout period.
+///
+/// NOTE: production view-change goes through
+/// `validator::on_timeout` → `view_change::create_view_change`. This
+/// function is only exercised by unit tests today; kept public for
+/// API stability. The `chain_id` prefix is bound for consistency with
+/// every other consensus signing surface so future production callers
+/// don't reintroduce a chain-replayable signature.
 pub fn create_timeout(
+    chain_id: u64,
     state: &ConsensusState,
     slot: u64,
     voter_index: u8,
     voter_address: Address,
     voter_sk: &pyde_crypto::falcon::FalconSecretKey,
 ) -> Result<ConsensusMessage, &'static str> {
-    let mut msg = Vec::new();
+    let mut msg = Vec::with_capacity(7 + 8 + 8); // "timeout"(7) + chain_id(8) + slot(8)
     msg.extend_from_slice(b"timeout");
+    msg.extend_from_slice(&chain_id.to_le_bytes());
     msg.extend_from_slice(&slot.to_le_bytes());
     let sig =
         pyde_crypto::falcon::falcon_sign(voter_sk, &msg).map_err(|_| "timeout signing failed")?;
@@ -377,6 +404,11 @@ mod tests {
     use crate::block::QuorumCert;
     use pyde_account::address::derive_eoa_address;
     use pyde_crypto::falcon::falcon_keygen;
+
+    /// Arbitrary non-mainnet, non-devnet chain_id used by every test
+    /// in this module so cross-chain replay regressions surface here
+    /// rather than slipping past with hardcoded chain_id=0.
+    const TEST_CHAIN_ID: u64 = 7;
 
     fn make_header(slot: u64, qc_slot: u64) -> BlockHeader {
         BlockHeader {
@@ -409,15 +441,35 @@ mod tests {
         let header = make_header(1, 0);
 
         // Create vote
-        let vote = create_vote(&mut state, &header, 0, addr, &sk)
+        let vote = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk)
             .unwrap()
             .unwrap();
         assert!(matches!(vote, ConsensusMessage::Vote { .. }));
 
         // Verify vote
-        assert!(verify_vote(&vote, &pk_bytes));
+        assert!(verify_vote(TEST_CHAIN_ID, &vote, &pk_bytes));
 
         assert_eq!(state.last_voted_slot, 1);
+    }
+
+    /// Cross-chain replay: a vote signed under one `chain_id` must NOT
+    /// verify under another even when FALCON keys match. Mirrors
+    /// audit-240's multisig regression.
+    #[test]
+    fn vote_cross_chain_replay_rejected() {
+        let mut state = ConsensusState::new();
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+
+        let header = make_header(1, 0);
+        let vote = create_vote(1, &mut state, &header, 0, addr, &sk)
+            .unwrap()
+            .unwrap();
+
+        assert!(verify_vote(1, &vote, &pk_bytes));
+        assert!(!verify_vote(2, &vote, &pk_bytes));
+        assert!(!verify_vote(31337, &vote, &pk_bytes));
     }
 
     #[test]
@@ -428,15 +480,13 @@ mod tests {
         let mut votes = Vec::new();
         let mut keys = Vec::new();
 
-        // Generate 86 valid votes (signature covers slot || block_hash)
+        // Generate 86 valid votes (signature covers chain_id || slot || block_hash)
         for i in 0..86u8 {
             let (pk, sk) = falcon_keygen().unwrap();
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let mut vote_msg = Vec::with_capacity(40);
-            vote_msg.extend_from_slice(&5u64.to_le_bytes());
-            vote_msg.extend_from_slice(&block_hash);
+            let vote_msg = proposer_sign_message(TEST_CHAIN_ID, 5, &block_hash);
             let sig = pyde_crypto::falcon::falcon_sign(&sk, &vote_msg).unwrap();
             votes.push(ConsensusMessage::Vote {
                 slot: 5,
@@ -453,7 +503,7 @@ mod tests {
             keys.push(vec![0; 897]);
         }
 
-        let qc = try_form_qc(5, block_hash, &votes, &keys);
+        let qc = try_form_qc(TEST_CHAIN_ID, 5, block_hash, &votes, &keys);
         assert!(qc.is_some());
         let qc = qc.unwrap();
         assert!(qc.has_quorum());
@@ -476,9 +526,7 @@ mod tests {
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let mut vote_msg = Vec::with_capacity(40);
-            vote_msg.extend_from_slice(&5u64.to_le_bytes());
-            vote_msg.extend_from_slice(&block_hash);
+            let vote_msg = proposer_sign_message(TEST_CHAIN_ID, 5, &block_hash);
             let sig = pyde_crypto::falcon::falcon_sign(&sk, &vote_msg).unwrap();
             votes.push(ConsensusMessage::Vote {
                 slot: 5,
@@ -494,7 +542,7 @@ mod tests {
             keys.push(vec![0; 897]);
         }
 
-        let qc = try_form_qc(5, block_hash, &votes, &keys);
+        let qc = try_form_qc(TEST_CHAIN_ID, 5, block_hash, &votes, &keys);
         assert!(qc.is_none());
     }
 
@@ -587,11 +635,11 @@ mod tests {
         let addr = derive_eoa_address(pk.as_bytes());
 
         let header = make_header(1, 0);
-        let vote1 = create_vote(&mut state, &header, 0, addr, &sk).unwrap();
+        let vote1 = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk).unwrap();
         assert!(vote1.is_some());
 
         // Try voting again for same slot
-        let vote2 = create_vote(&mut state, &header, 0, addr, &sk).unwrap();
+        let vote2 = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk).unwrap();
         assert!(vote2.is_none()); // rejected
     }
 
@@ -603,13 +651,13 @@ mod tests {
 
         // Vote for slot 5
         let header5 = make_header(5, 4);
-        create_vote(&mut state, &header5, 0, addr, &sk)
+        create_vote(TEST_CHAIN_ID, &mut state, &header5, 0, addr, &sk)
             .unwrap()
             .unwrap();
 
         // Try to vote for slot 3 (old)
         let header3 = make_header(3, 2);
-        let vote = create_vote(&mut state, &header3, 0, addr, &sk).unwrap();
+        let vote = create_vote(TEST_CHAIN_ID, &mut state, &header3, 0, addr, &sk).unwrap();
         assert!(vote.is_none());
     }
 
@@ -624,7 +672,7 @@ mod tests {
         assert_eq!(state.highest_qc.slot, 0);
 
         let header = make_header(5, 4); // QC for slot 4
-        create_vote(&mut state, &header, 0, addr, &sk)
+        create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk)
             .unwrap()
             .unwrap();
 
@@ -639,7 +687,7 @@ mod tests {
         let (pk, sk) = falcon_keygen().unwrap();
         let addr = derive_eoa_address(pk.as_bytes());
 
-        let timeout = create_timeout(&state, 5, 0, addr, &sk).unwrap();
+        let timeout = create_timeout(TEST_CHAIN_ID, &state, 5, 0, addr, &sk).unwrap();
         assert!(matches!(timeout, ConsensusMessage::Timeout { slot: 5, .. }));
     }
 }

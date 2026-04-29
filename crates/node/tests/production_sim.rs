@@ -5,6 +5,11 @@
 use pyde_account::address::derive_eoa_address;
 use pyde_consensus::block::{BlockHeader, QuorumCert};
 use pyde_consensus::hotstuff::{create_vote, try_form_qc, verify_vote, ConsensusState};
+
+/// Devnet chain_id used by every consensus signing call in this
+/// production-simulation test. Must match the `chain_id` field on the
+/// txs and block_ctx the test constructs (which all use 31337).
+const CHAIN_ID: u64 = 31337;
 use pyde_crypto::falcon::{falcon_keygen, falcon_sign, FalconPublicKey, FalconSecretKey};
 use pyde_crypto::poseidon2::poseidon2_hash;
 use pyde_state::smt::{PersistentSMT, StateAccess, StateOverlay};
@@ -596,6 +601,7 @@ fn production_simulation() {
 
     for i in 0..4 {
         let vote = create_vote(
+            CHAIN_ID,
             &mut consensus_states[i],
             &header,
             i as u8,
@@ -606,7 +612,7 @@ fn production_simulation() {
         if let Some(v) = vote {
             // Verify this vote
             assert!(
-                verify_vote(&v, validators[i].pk.as_bytes()),
+                verify_vote(CHAIN_ID, &v, validators[i].pk.as_bytes()),
                 "vote {} failed verification",
                 i
             );
@@ -616,7 +622,7 @@ fn production_simulation() {
 
     // Form QC
     let block_hash = header.hash();
-    let qc = try_form_qc(1, block_hash, &votes, &committee_keys);
+    let qc = try_form_qc(CHAIN_ID, 1, block_hash, &votes, &committee_keys);
     let consensus_time = t0.elapsed();
     println!(
         "    4 validators voted + QC formed: {:.0}ms",
@@ -708,6 +714,7 @@ fn production_simulation() {
     let mut votes2 = Vec::new();
     for i in 0..4 {
         if let Some(v) = create_vote(
+            CHAIN_ID,
             &mut consensus_states[i],
             &header2,
             i as u8,
@@ -716,11 +723,11 @@ fn production_simulation() {
         )
         .unwrap()
         {
-            assert!(verify_vote(&v, validators[i].pk.as_bytes()));
+            assert!(verify_vote(CHAIN_ID, &v, validators[i].pk.as_bytes()));
             votes2.push(v);
         }
     }
-    let qc2 = try_form_qc(2, header2.hash(), &votes2, &committee_keys);
+    let qc2 = try_form_qc(CHAIN_ID, 2, header2.hash(), &votes2, &committee_keys);
     assert!(qc2.is_some(), "QC2 must form");
 
     // Sync local nonce counters from state (parallel exec changed them)
@@ -864,6 +871,7 @@ fn production_simulation() {
     let mut votes3 = Vec::new();
     for i in 0..4 {
         if let Some(v) = create_vote(
+            CHAIN_ID,
             &mut consensus_states[i],
             &header3,
             i as u8,
@@ -872,11 +880,11 @@ fn production_simulation() {
         )
         .unwrap()
         {
-            assert!(verify_vote(&v, validators[i].pk.as_bytes()));
+            assert!(verify_vote(CHAIN_ID, &v, validators[i].pk.as_bytes()));
             votes3.push(v);
         }
     }
-    let qc3 = try_form_qc(3, header3.hash(), &votes3, &committee_keys);
+    let qc3 = try_form_qc(CHAIN_ID, 3, header3.hash(), &votes3, &committee_keys);
     assert!(qc3.is_some(), "QC3 must form");
 
     // ═══ SUMMARY ═════════════════════════════════════════════════════

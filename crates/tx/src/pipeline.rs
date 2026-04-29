@@ -513,7 +513,7 @@ fn execute_transaction_inner(
             sender.auth_keys = pyde_account::types::AuthKeys::Single(tx.data.clone());
             (true, 0u64, 0u64, Vec::new(), Vec::new())
         }
-        TransactionType::Slash => execute_slash(tx, smt, &mut sender.balance),
+        TransactionType::Slash => execute_slash(block_ctx.chain_id, tx, smt, &mut sender.balance),
         TransactionType::ClaimAirdrop => {
             execute_claim_airdrop(tx, smt, block_ctx, &mut sender.balance)
         }
@@ -1304,10 +1304,14 @@ fn decode_slash_evidence(data: &[u8]) -> Result<SlashEvidence, String> {
 /// Parse a serialized validator entry:
 /// `[pk_len:4 LE][pk][stake:16 LE][status:1]`.
 /// Returns `(pk_bytes, stake, status, status_offset)`.
-/// Canonical `(slot_le || block_hash)` bytes that proposers and voters
-/// sign. Mirrors `pyde_consensus::hotstuff::proposer_sign_message`.
-fn proposer_sign_message_bytes(slot: u64, block_hash: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(40);
+/// Canonical `(chain_id_le || slot_le || block_hash)` bytes that
+/// proposers and voters sign. Mirrors
+/// `pyde_consensus::hotstuff::proposer_sign_message` — kept here as a
+/// local copy to avoid a `pyde-tx` → `pyde-consensus` dep cycle. The
+/// `chain_id` prefix prevents cross-chain replay of slashing evidence.
+fn proposer_sign_message_bytes(chain_id: u64, slot: u64, block_hash: &[u8; 32]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(8 + 8 + 32);
+    msg.extend_from_slice(&chain_id.to_le_bytes());
     msg.extend_from_slice(&slot.to_le_bytes());
     msg.extend_from_slice(block_hash);
     msg
@@ -1318,7 +1322,12 @@ fn proposer_sign_message_bytes(slot: u64, block_hash: &[u8; 32]) -> Vec<u8> {
 /// by the outer pipeline match. On success, `submitter_balance` is
 /// credited the finder's fee and the offender's validator entry is
 /// updated in the SMT (stake zeroed, status = Ejected).
+///
+/// `chain_id` is the LOCAL chain's id; evidence signatures are
+/// re-verified against `(chain_id || slot || block_hash)` so a
+/// double-sign on a different chain cannot slash here.
 fn execute_slash(
+    chain_id: u64,
     tx: &Transaction,
     smt: &mut dyn pyde_state::smt::StateAccess,
     submitter_balance: &mut u128,
@@ -1368,8 +1377,8 @@ fn execute_slash(
         Some(s) => s,
         None => return failed(21_000, b"signature_2 malformed"),
     };
-    let msg_1 = proposer_sign_message_bytes(ev.slot, &ev.block_hash_1);
-    let msg_2 = proposer_sign_message_bytes(ev.slot, &ev.block_hash_2);
+    let msg_1 = proposer_sign_message_bytes(chain_id, ev.slot, &ev.block_hash_1);
+    let msg_2 = proposer_sign_message_bytes(chain_id, ev.slot, &ev.block_hash_2);
     if !pyde_crypto::falcon::falcon_verify(&pk, &msg_1, &sig_1)
         || !pyde_crypto::falcon::falcon_verify(&pk, &msg_2, &sig_2)
     {
@@ -3882,10 +3891,11 @@ mod tests {
 
     fn sign_proposer_for_test(
         sk: &pyde_crypto::falcon::FalconSecretKey,
+        chain_id: u64,
         slot: u64,
         block_hash: &[u8; 32],
     ) -> Vec<u8> {
-        let msg = proposer_sign_message_bytes(slot, block_hash);
+        let msg = proposer_sign_message_bytes(chain_id, slot, block_hash);
         falcon_sign(sk, &msg).unwrap().as_bytes().to_vec()
     }
 
@@ -3968,8 +3978,8 @@ mod tests {
         let slot = 100u64;
         let hash_1 = [0x01u8; 32];
         let hash_2 = [0x02u8; 32];
-        let sig_1 = sign_proposer_for_test(&osk, slot, &hash_1);
-        let sig_2 = sign_proposer_for_test(&osk, slot, &hash_2);
+        let sig_1 = sign_proposer_for_test(&osk, ctx.chain_id, slot, &hash_1);
+        let sig_2 = sign_proposer_for_test(&osk, ctx.chain_id, slot, &hash_2);
 
         let evidence = encode_evidence_for_test(
             slot, &hash_1, &sig_1, &hash_2, &sig_2, &offender, &submitter,
@@ -4010,7 +4020,7 @@ mod tests {
 
         let slot = 100;
         let hash = [0x01u8; 32];
-        let sig = sign_proposer_for_test(&osk, slot, &hash);
+        let sig = sign_proposer_for_test(&osk, ctx.chain_id, slot, &hash);
         let evidence =
             encode_evidence_for_test(slot, &hash, &sig, &hash, &sig, &offender, &submitter);
         let tx = build_slash_tx(submitter, &ssk, evidence);
@@ -4040,8 +4050,8 @@ mod tests {
         let (_opk, osk) = falcon_keygen().unwrap();
         let ghost_signer = [0xAB; 32]; // never registered
         let slot = 100;
-        let sig_1 = sign_proposer_for_test(&osk, slot, &[0x01; 32]);
-        let sig_2 = sign_proposer_for_test(&osk, slot, &[0x02; 32]);
+        let sig_1 = sign_proposer_for_test(&osk, ctx.chain_id, slot, &[0x01; 32]);
+        let sig_2 = sign_proposer_for_test(&osk, ctx.chain_id, slot, &[0x02; 32]);
         let evidence = encode_evidence_for_test(
             slot,
             &[0x01; 32],
@@ -4073,8 +4083,8 @@ mod tests {
         let slot = 100;
         let hash_1 = [0x01u8; 32];
         let hash_2 = [0x02u8; 32];
-        let sig_1 = sign_proposer_for_test(&osk, slot, &hash_1);
-        let sig_2 = sign_proposer_for_test(&osk, slot, &hash_2);
+        let sig_1 = sign_proposer_for_test(&osk, ctx.chain_id, slot, &hash_1);
+        let sig_2 = sign_proposer_for_test(&osk, ctx.chain_id, slot, &hash_2);
         let evidence = encode_evidence_for_test(
             slot, &hash_1, &sig_1, &hash_2, &sig_2, &offender, &submitter,
         );
@@ -4097,8 +4107,8 @@ mod tests {
         let signed_slot = 101u64; // wrong!
         let hash_1 = [0x01u8; 32];
         let hash_2 = [0x02u8; 32];
-        let sig_1 = sign_proposer_for_test(&osk, signed_slot, &hash_1);
-        let sig_2 = sign_proposer_for_test(&osk, signed_slot, &hash_2);
+        let sig_1 = sign_proposer_for_test(&osk, ctx.chain_id, signed_slot, &hash_1);
+        let sig_2 = sign_proposer_for_test(&osk, ctx.chain_id, signed_slot, &hash_2);
 
         let evidence = encode_evidence_for_test(
             evidence_slot,
@@ -4150,6 +4160,45 @@ mod tests {
         let tx = build_slash_tx(submitter, &ssk, vec![SLASH_EVIDENCE_VERSION, 0x00]);
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         assert!(!receipt.success);
+    }
+
+    /// Cross-chain replay: a double-sign signed under a foreign
+    /// `chain_id` must NOT slash on the local chain, even when the
+    /// FALCON keys match. Mirrors audit-240 multisig regression and
+    /// the consensus-layer cross-chain test.
+    #[test]
+    fn slash_tx_cross_chain_replay_rejected() {
+        let mut smt = PydeSMT::new();
+        let ctx = make_block_ctx(); // chain_id = 1
+        let (_opk, osk, offender, _spk, ssk, submitter) =
+            slash_fixture(&mut smt, SLASH_VALIDATOR_STAKE, 1_000_000_000_000);
+
+        let slot = 100u64;
+        let hash_1 = [0x01u8; 32];
+        let hash_2 = [0x02u8; 32];
+        // Sign evidence under a DIFFERENT chain_id than the local chain.
+        let foreign_chain_id = ctx.chain_id + 1;
+        let sig_1 = sign_proposer_for_test(&osk, foreign_chain_id, slot, &hash_1);
+        let sig_2 = sign_proposer_for_test(&osk, foreign_chain_id, slot, &hash_2);
+
+        let evidence = encode_evidence_for_test(
+            slot, &hash_1, &sig_1, &hash_2, &sig_2, &offender, &submitter,
+        );
+        let tx = build_slash_tx(submitter, &ssk, evidence);
+
+        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
+        assert!(
+            !receipt.success,
+            "evidence signed under a different chain_id must not slash here"
+        );
+
+        // State untouched.
+        let val_data = smt
+            .get(&pyde_state::keys::validator_key(&offender))
+            .unwrap();
+        let entry = ValidatorEntry::decode(&val_data).unwrap();
+        assert_eq!(entry.stake, SLASH_VALIDATOR_STAKE);
+        assert_eq!(entry.status, 0x00);
     }
 
     // ========== Slice 4.4b: airdrop claim + sweep ==========

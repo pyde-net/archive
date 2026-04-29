@@ -436,7 +436,7 @@ impl PydeNode {
                 }
             }
 
-            let mut engine = ValidatorEngine::new([0xAA; 32]); // devnet epoch randomness
+            let mut engine = ValidatorEngine::new(self.config.node.chain_id, [0xAA; 32]); // devnet epoch randomness
 
             // Attach persistent ConsensusState store. If a prior state exists,
             // it is loaded here — this is what prevents last_voted_slot or
@@ -3929,6 +3929,7 @@ fn handle_swarm_event(
                             // Validate block header (signature, VRF, proposer, QC)
                             if let Some(ref engine) = validator_engine {
                                 if let Err(e) = BlockProcessor::validate_network_block(
+                                    chain.chain_id,
                                     &block.header,
                                     &block.proposer_signature,
                                     &engine.committee_keys,
