@@ -147,11 +147,24 @@ async fn send_faucet_tx(
     to: &str,
     amount_pyde: u64,
     signer: Option<&FaucetSigner>,
+    signing_lock: &tokio::sync::Mutex<()>,
 ) -> Result<String, String> {
     let quanta = (amount_pyde as u128) * 1_000_000_000;
 
     let body = if let Some(signer) = signer {
-        // Signed path: fetch nonce, build + sign tx, send raw
+        // Signed path: fetch nonce, build + sign tx, send raw.
+        //
+        // The fetch-nonce → sign → submit sequence MUST be serialized
+        // across concurrent faucet requests. Two requests racing each
+        // other both fetch the same nonce N from the RPC node and sign
+        // two distinct txs at nonce N; the mempool's per-(sender,nonce)
+        // dedup (audit M6) accepts the first and rejects the second
+        // with a confusing `InvalidNonce` even though the user did
+        // nothing wrong. Holding `signing_lock` across the whole
+        // build+submit window is the minimum-mechanism fix — public
+        // faucets are rate-limited per address+IP so throughput cost
+        // is negligible.
+        let _guard = signing_lock.lock().await;
         let nonce = fetch_nonce(rpc_url, from).await?;
         let to_addr = parse_hex_addr(to)?;
         let chain_id = fetch_chain_id(rpc_url).await.unwrap_or(31337);
@@ -410,6 +423,12 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
         config.cooldown_secs
     );
 
+    // Single global lock that serializes the fetch-nonce → sign →
+    // submit window in `send_faucet_tx`. Two concurrent dispenses
+    // would otherwise race on the faucet's nonce — see the comment
+    // in `send_faucet_tx` for the mempool-dedup interaction.
+    let signing_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+
     loop {
         let (stream, peer_addr) = listener
             .accept()
@@ -421,9 +440,21 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
         let rpc = rpc_url.clone();
         let from = from.clone();
         let signer = signer.clone();
+        let signing_lock = signing_lock.clone();
 
         tokio::spawn(async move {
-            handle_connection(stream, peer_addr, addr_limiter, ip_limiter, rpc, from, amount, signer).await;
+            handle_connection(
+                stream,
+                peer_addr,
+                addr_limiter,
+                ip_limiter,
+                rpc,
+                from,
+                amount,
+                signer,
+                signing_lock,
+            )
+            .await;
         });
     }
 }
@@ -438,6 +469,7 @@ async fn handle_connection(
     from: Arc<String>,
     amount: u64,
     signer: Arc<Option<FaucetSigner>>,
+    signing_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut buf_reader = BufReader::new(reader);
@@ -508,7 +540,7 @@ async fn handle_connection(
         ("POST", "/api/request") => {
             match parse_post_body_address(&body) {
                 Some(addr) if addr.len() >= 64 => {
-                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref()).await
+                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref(), &signing_lock).await
                 }
                 Some(_) => json_response(400, r#"{"error":"address must be 0x-prefixed 32-byte hex"}"#),
                 None => json_response(400, r#"{"error":"missing address field in JSON body"}"#),
@@ -526,7 +558,7 @@ async fn handle_connection(
             });
             match address {
                 Some(addr) if addr.len() >= 64 => {
-                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref()).await
+                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref(), &signing_lock).await
                 }
                 _ => json_response(400, r#"{"error":"missing or invalid address"}"#),
             }
@@ -547,6 +579,7 @@ async fn serve_dispense(
     from: &str,
     amount: u64,
     signer: Option<&FaucetSigner>,
+    signing_lock: &tokio::sync::Mutex<()>,
 ) -> String {
     // Both rate limits must pass. Check before dispense; record only
     // after a successful send so a downstream RPC failure doesn't
@@ -563,7 +596,7 @@ async fn serve_dispense(
             &format!(r#"{{"error":"ip rate limited","retryAfter":{}}}"#, secs),
         );
     }
-    match send_faucet_tx(rpc, from, address, amount, signer).await {
+    match send_faucet_tx(rpc, from, address, amount, signer, signing_lock).await {
         Ok(tx_hash) => {
             addr_limiter.record(address);
             ip_limiter.record(ip_key);
