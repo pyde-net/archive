@@ -114,8 +114,17 @@ pub trait PydeApi {
     #[method(name = "pyde_blockNumber")]
     async fn block_number(&self) -> Result<String, ErrorObjectOwned>;
 
+    /// `pyde_getBlockByNumber(slot, full_tx?)`. The second parameter
+    /// is accepted for compatibility with Ethereum-style 2-arg
+    /// callers (e.g. `eth_getBlockByNumber(slot, true)`); both the
+    /// `transactions` and `transactionHashes` arrays are always
+    /// included in the response so the flag is currently informational.
     #[method(name = "pyde_getBlockByNumber")]
-    async fn get_block_by_number(&self, slot: u64) -> Result<serde_json::Value, ErrorObjectOwned>;
+    async fn get_block_by_number(
+        &self,
+        slot: u64,
+        full_tx: Option<bool>,
+    ) -> Result<serde_json::Value, ErrorObjectOwned>;
 
     /// Get block info by block hash.
     #[method(name = "pyde_getBlockByHash")]
@@ -320,7 +329,16 @@ impl PydeApiServer for RpcServer {
         Ok(format!("0x{:x}", chain.head_slot))
     }
 
-    async fn get_block_by_number(&self, slot: u64) -> Result<serde_json::Value, ErrorObjectOwned> {
+    async fn get_block_by_number(
+        &self,
+        slot: u64,
+        _full_tx: Option<bool>,
+    ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        // `_full_tx` is currently ignored — the response always
+        // includes both `transactions` and `transactionHashes` so any
+        // caller (Ethereum-style with `true`, terse with no arg) gets
+        // the data they wanted. Kept on the signature so jsonrpsee
+        // accepts the 2-positional-arg form without "Invalid params".
         // ChainState only keeps the last ~2 epochs of headers in
         // memory; for older slots fall back to the persistent
         // BlockStore so block-explorer-style range queries don't go
