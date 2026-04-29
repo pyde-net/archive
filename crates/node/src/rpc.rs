@@ -1313,7 +1313,7 @@ impl PydeApiServer for RpcServer {
         let tx_hash = enc_tx.hash();
         // Clone for the gossip fan-out below. We gossip only after
         // local acceptance so the ingress policy (auth_key lookup,
-        // sig verify) gates what the network sees.
+        // sig verify, nonce-window) gates what the network sees.
         let tx_for_gossip = enc_tx.clone();
 
         // Same ingest policy as the server-side path (audit item 206):
@@ -1323,17 +1323,66 @@ impl PydeApiServer for RpcServer {
         // actually binds to a ciphertext the client knows about — so
         // on mainnet the FALCON verify inside `receive_tx_verified`
         // is meaningful, not a no-op length check.
-        let sender_pk_opt = {
+        //
+        // While we have the read-lock open, also fetch the sender's
+        // current nonce state for the ingress window check below —
+        // saves a second state read on the hot path.
+        let (sender_pk_opt, nonce_state_opt) = {
             let state_r = self.state.state.read().await;
             let sender_key = pyde_state::keys::balance_key(&from);
-            state_r
+            let pk_opt = state_r
                 .get(&sender_key)
                 .and_then(|bytes| pyde_account::types::Account::from_bytes(&bytes))
                 .and_then(|acct| match acct.auth_keys {
                     pyde_account::types::AuthKeys::Single(pk) => Some(pk),
                     _ => None,
-                })
+                });
+            let ns_opt = state_r
+                .get(&pyde_state::keys::nonce_key(&from))
+                .map(|bytes| pyde_account::nonce::NonceState::from_bytes(&bytes));
+            (pk_opt, ns_opt)
         };
+
+        // Pre-check the nonce window at ingress. Without this, a
+        // submitter who can encrypt + FALCON-sign faster than the
+        // chain can decrypt + apply (true on any laptop the moment
+        // submit-rate exceeds chain-commit-rate) piles arbitrary
+        // future nonces into the encrypted mempool, where they sit
+        // unprocessable until their parent nonces commit. The mempool
+        // grows past the per-sender concurrent cap, submission
+        // collapses to errors, and from the operator's view the
+        // encrypted path appears to "stall under load" even though
+        // the chain is committing what it can.
+        //
+        // Rejecting above-window submissions at ingress flips the
+        // failure shape from "silent backlog → submitter sees
+        // TooManyConcurrent later" to "submitter gets a clean
+        // -32008 immediately and can back off". Also keeps mempool
+        // depth proportional to the actual in-flight window
+        // (`WINDOW_SIZE = 16` per sender) instead of the wall-clock
+        // submission rate.
+        if let Some(ns) = &nonce_state_opt {
+            if enc_tx.nonce >= ns.base + pyde_account::nonce::WINDOW_SIZE {
+                return Err(rpc_err(
+                    -32008,
+                    format!(
+                        "encrypted-tx nonce {} is past the in-flight window [{}, {}); submit when prior nonces commit",
+                        enc_tx.nonce,
+                        ns.base,
+                        ns.base + pyde_account::nonce::WINDOW_SIZE,
+                    ),
+                ));
+            }
+            if enc_tx.nonce < ns.base {
+                return Err(rpc_err(
+                    -32008,
+                    format!(
+                        "encrypted-tx nonce {} is below the chain's committed nonce {}",
+                        enc_tx.nonce, ns.base
+                    ),
+                ));
+            }
+        }
 
         let mut relay = self.state.tx_relay.write().await;
         let accepted = match encrypted_tx_ingest_policy(sender_pk_opt, self.chain_id) {

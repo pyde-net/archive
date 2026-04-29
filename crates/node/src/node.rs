@@ -1978,11 +1978,25 @@ impl PydeNode {
                                         }
                                     }
 
-                                    // Also collect encrypted txs from the threshold-encrypted mempool
+                                    // Also collect encrypted txs from the threshold-encrypted mempool.
+                                    //
+                                    // The MAX_ENCRYPTED_TXS_PER_BLOCK cap is what stops the
+                                    // chain from wedging above the per-validator decrypt-apply
+                                    // throughput: without it, gas-only selection greedily
+                                    // fills up to ~16 K encrypted-tx-equivalents per block,
+                                    // but receive-side decrypt+apply takes ~3-5 ms per tx
+                                    // and can't keep up with the proposer. `prune_committed_
+                                    // txs` then never fires for the in-flight set, so the
+                                    // proposer keeps re-selecting the same set every slot
+                                    // and the chain falls indefinitely behind. See the
+                                    // const's doc-comment in `pyde-mempool::pool` for the
+                                    // measurement that motivates the value.
                                     let encrypted_blobs = {
                                         let relay_r = tx_relay.read().await;
                                         let selected = relay_r.mempool().select_for_block(
-                                            gas_ceiling, current_slot,
+                                            gas_ceiling,
+                                            pyde_mempool::pool::MAX_ENCRYPTED_TXS_PER_BLOCK,
+                                            current_slot,
                                         );
                                         // Serialize each EncryptedTx to bytes for block inclusion
                                         selected.iter().map(|etx| etx.to_bytes()).collect::<Vec<Vec<u8>>>()

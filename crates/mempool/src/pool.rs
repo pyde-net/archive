@@ -37,6 +37,38 @@ pub const DEFAULT_MAX_CONCURRENT_PER_SENDER: u32 = 100;
 /// the "10 tx/s" mainnet target.
 pub const RATE_WINDOW_MS: u64 = 1000;
 
+/// Maximum encrypted txs the proposer will include in a single block.
+///
+/// Two separate constraints set this ceiling:
+///
+/// 1. **Wire format.** The committee broadcasts one
+///    `DecryptionShareMsg` per validator per slot, carrying one
+///    decryption share per encrypted tx in the block. The
+///    consensus-topic message budget is 64 KB and the wire decoder
+///    bounds the share count via `dec.u16_count(...)` — anything
+///    above the bound is silently rejected at deserialization, so
+///    the threshold never reaches and the encrypted_txs never
+///    decrypt. Setting the proposer-side cap below the decoder's
+///    bound is what keeps the broadcast self-consistent.
+///
+/// 2. **Per-validator decrypt + apply CPU.** Threshold-decrypt +
+///    apply for an encrypted tx costs ~3-5 ms per validator (Lagrange
+///    combine, Kyber decap, FALCON re-verify, state apply). Slot
+///    budget is 400 ms; leaving room for vote+QC means decrypt+apply
+///    should fit in ~200 ms ⇒ ~50 txs/block on laptop, ~200 on
+///    dedicated cores. Below this ceiling the chain commits steady;
+///    above it `prune_committed_txs` falls behind, the proposer
+///    re-includes the same set every slot, and the chain wedges.
+///
+/// 100/block hits the safe sweet-spot: comfortably under the wire
+/// decoder's 128-share bound (so encoded share messages round-trip
+/// cleanly), and high enough to not throttle laptop loadgen (which
+/// organically tops out at ~50/block under the audit-027 per-sender
+/// caps), while preventing the runaway pile-ups (5 000+-per-slot
+/// re-circle observed at 5 K-sender loadgen). Operator-config knob
+/// for cluster-class hardware lands in a follow-up.
+pub const MAX_ENCRYPTED_TXS_PER_BLOCK: usize = 100;
+
 /// Mempool validation error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MempoolError {
@@ -425,13 +457,32 @@ impl Mempool {
         &self.txs
     }
 
-    /// Select transactions for a block in arrival order, respecting gas limit.
+    /// Select transactions for a block in arrival order, respecting
+    /// the gas limit AND a per-block count cap.
+    ///
+    /// `max_count` bounds the number of encrypted txs the proposer
+    /// will include per block. Production callers pass
+    /// [`MAX_ENCRYPTED_TXS_PER_BLOCK`]; tests that don't care about
+    /// this dimension pass `usize::MAX` to fall back to gas-only
+    /// selection. See the constant's doc comment for the full
+    /// rationale (tl;dr: without it the proposer over-includes and
+    /// the receive-side decrypt+apply pipeline falls indefinitely
+    /// behind).
+    ///
     /// The proposer VRF-shuffles the selected set after this.
-    pub fn select_for_block(&self, block_gas_limit: u64, current_slot: u64) -> Vec<&EncryptedTx> {
+    pub fn select_for_block(
+        &self,
+        block_gas_limit: u64,
+        max_count: usize,
+        current_slot: u64,
+    ) -> Vec<&EncryptedTx> {
         let mut selected = Vec::new();
         let mut gas_used = 0u64;
 
         for tx in &self.txs {
+            if selected.len() >= max_count {
+                break;
+            }
             if tx.is_expired(current_slot) {
                 continue;
             }
@@ -717,7 +768,7 @@ mod tests {
         pool.add(make_enc_tx(&pk, 40_000, 2)).unwrap();
 
         // Block gas limit of 100K → picks 60K + 40K (or 60K + 50K... highest first)
-        let selected = pool.select_for_block(100_000, 0);
+        let selected = pool.select_for_block(100_000, usize::MAX, 0);
         let total_gas: u64 = selected.iter().map(|t| t.gas_limit).sum();
         assert!(total_gas <= 100_000);
         assert!(!selected.is_empty());
@@ -733,9 +784,44 @@ mod tests {
         pool.add(make_enc_tx(&pk, 60_000, 1)).unwrap(); // no deadline
 
         // At slot 300, first tx is expired
-        let selected = pool.select_for_block(1_000_000, 300);
+        let selected = pool.select_for_block(1_000_000, usize::MAX, 300);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].gas_limit, 60_000);
+    }
+
+    #[test]
+    fn select_for_block_caps_at_max_count() {
+        // Per-block cap is the brake on proposer over-inclusion
+        // (PR follow-up to the encrypted-path loadgen). With gas
+        // headroom for 5 txs but max_count=2, only 2 are selected.
+        let pk = make_pk();
+        let mut pool = Mempool::new();
+        // Lift rate limits so add() doesn't rate-limit us before the
+        // pool has the test-relevant txs.
+        pool.set_rate_limits(1_000, 1_000);
+        for nonce in 0..5 {
+            pool.add(make_enc_tx(&pk, 30_000, nonce)).unwrap();
+        }
+        // Gas room = 5×30k = 150k well under 1M, count cap = 2
+        let selected = pool.select_for_block(1_000_000, 2, 0);
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn select_for_block_uses_production_cap_const() {
+        // Sanity check: passing MAX_ENCRYPTED_TXS_PER_BLOCK behaves
+        // identically to passing the constant by value. Locks the
+        // production-call shape so a future refactor that shadows
+        // the constant fails this test.
+        let pk = make_pk();
+        let mut pool = Mempool::new();
+        pool.set_rate_limits(10_000, 10_000);
+        // Add more than the cap so the cap is the binding constraint.
+        for nonce in 0..(MAX_ENCRYPTED_TXS_PER_BLOCK as u64 + 5) {
+            pool.add(make_enc_tx(&pk, 30_000, nonce)).unwrap();
+        }
+        let selected = pool.select_for_block(1_000_000_000, MAX_ENCRYPTED_TXS_PER_BLOCK, 0);
+        assert_eq!(selected.len(), MAX_ENCRYPTED_TXS_PER_BLOCK);
     }
 
     // ========== Prune expired ==========

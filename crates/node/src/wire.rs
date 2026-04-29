@@ -515,7 +515,17 @@ pub fn decode_decryption_shares(data: &[u8]) -> Result<DecryptionShareMsg, &'sta
     }
     let slot = dec.u64()?;
     let member_index = dec.u8()?;
-    let count = dec.u16_count(COMMITTEE_SIZE)?;
+    // Bound the share count by the proposer-side cap on encrypted txs
+    // per block: the count IS one share per encrypted_tx the validator
+    // signed shares for, not (as the previous bound `COMMITTEE_SIZE`
+    // suggested) the committee size. With the old bound, any block
+    // carrying more than 128 encrypted_txs produced a share message
+    // that decoded-fail-silently on receivers ⇒ threshold never
+    // reached ⇒ encrypted_txs re-circulated forever (the actual root
+    // cause of the encrypted-path wedge above ~125 enc-tx/s on the
+    // laptop loadgen). Aligning the wire decoder with the proposer
+    // cap closes the silent-drop window.
+    let count = dec.u16_count(pyde_mempool::pool::MAX_ENCRYPTED_TXS_PER_BLOCK)?;
     let mut shares = Vec::with_capacity(count);
     for _ in 0..count {
         shares.push(dec.var_bytes()?);
