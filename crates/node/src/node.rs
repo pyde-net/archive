@@ -37,20 +37,24 @@ use tracing::{debug, error, info, warn};
 /// a censoring proposer can't hide behind latency.
 const MEV_INCLUSION_GRACE_SLOTS: u64 = 2;
 
-/// Audit 219: validate `(chain_id, bootstrap_peers)` at startup.
+/// Audit 219 + Tier 2.4: validate `(chain_id, bootstrap_peers)` at startup.
 ///
-/// Returns `Err` for the one configuration that's catastrophic and
-/// silent without this guard: launching a mainnet node
-/// (`chain_id == 1`) with an empty `bootstrap_peers` list. That
-/// node would never discover peers, never sync, and produce a
-/// "fork of one" until an operator notices — by which point real
-/// state may have diverged. A hard refusal at the first line of
-/// `run()` makes the misconfiguration impossible to miss.
+/// Returns `Err` for any non-devnet chain that would launch as an
+/// isolated "fork of one": no peers configured ⇒ no discovery ⇒ no
+/// sync. Mainnet (`chain_id == 1`) was the original audit-219 case;
+/// Tier 2.4 extends the gate to cover testnet and custom chains too,
+/// because the failure mode is identical the moment outsiders are
+/// expected to join — operators consistently miss `warn!`s and the
+/// resulting forks are reputational disasters during testnet rollout.
 ///
-/// For other non-devnet chain ids (testnet, custom networks) we
-/// emit a warning but still allow startup — those chains may be
-/// in pre-launch states where a single-node bootstrap is
-/// intentional. Devnet (`chain_id == 31337`) is silent.
+/// Devnet (`chain_id == 31337`) is silent: laptop-local single-node
+/// devnets are an explicit, intentional configuration.
+///
+/// Operators bringing up a brand-new testnet's first node MUST set
+/// `network.bootstrap_peers = []` via a non-empty placeholder list
+/// (e.g., their own multiaddr) so the gate is satisfied. This mirrors
+/// the operational reality — a network with no peers and no bootstrap
+/// is never a real network.
 pub fn check_bootstrap_config(
     chain_id: u64,
     bootstrap_peers: &[String],
@@ -60,24 +64,23 @@ pub fn check_bootstrap_config(
     }
     const MAINNET_CHAIN_ID: u64 = 1;
     const DEVNET_CHAIN_ID: u64 = 31337;
-    if chain_id == MAINNET_CHAIN_ID {
-        return Err(
-            "refusing to start mainnet (chain_id=1) with no bootstrap peers — \
-             set network.bootstrap_peers in config.toml before launch. \
-             A mainnet node with no peers produces an isolated fork that \
-             cannot sync to the canonical chain."
-                .to_string(),
-        );
+    if chain_id == DEVNET_CHAIN_ID {
+        return Ok(());
     }
-    if chain_id != DEVNET_CHAIN_ID {
-        warn!(
-            chain_id,
-            "no bootstrap_peers configured for a non-devnet chain — this node \
-             will not discover peers and cannot sync. Set network.bootstrap_peers \
-             in config.toml before launch."
-        );
-    }
-    Ok(())
+    let label = if chain_id == MAINNET_CHAIN_ID {
+        "mainnet"
+    } else {
+        "non-devnet chain"
+    };
+    Err(format!(
+        "refusing to start {} (chain_id={}) with no bootstrap peers — \
+         set network.bootstrap_peers in config.toml before launch. \
+         A node with no peers on a public chain produces an isolated \
+         fork that cannot sync to the canonical chain. \
+         For a fresh testnet bring-up, set bootstrap_peers to your \
+         genesis-node multiaddr(s) before starting any peer.",
+        label, chain_id
+    ))
 }
 
 /// The main Pyde node. Owns all subsystems.
@@ -5261,7 +5264,7 @@ fn load_or_generate_identity(datadir: &Path) -> Result<libp2p::identity::Keypair
 mod tests {
     use super::*;
 
-    // ========== Audit 219: bootstrap config startup guard ==========
+    // ========== Audit 219 + Tier 2.4: bootstrap config startup guard ==========
 
     #[test]
     fn bootstrap_guard_rejects_empty_mainnet() {
@@ -5285,15 +5288,36 @@ mod tests {
         assert!(check_bootstrap_config(31337, &[]).is_ok());
     }
 
+    /// Tier 2.4: testnet and other non-devnet chains MUST hard-refuse
+    /// startup with empty bootstrap_peers, mirroring audit-219's
+    /// mainnet gate. Outsiders running validators against a public
+    /// testnet expect a real network, not a silent fork-of-one — the
+    /// failure mode is identical to mainnet's.
     #[test]
-    fn bootstrap_guard_accepts_testnet_with_no_peers_but_warns() {
-        // Non-mainnet, non-devnet (testnet ids etc.) is not a hard
-        // refusal — operators may legitimately spin up a single-node
-        // testnet pre-launch. The accompanying warn! is a side effect
-        // we don't assert here; the contract is "Ok, but logged".
-        assert!(check_bootstrap_config(2, &[]).is_ok());
-        assert!(check_bootstrap_config(7, &[]).is_ok());
-        assert!(check_bootstrap_config(1_000_000, &[]).is_ok());
+    fn bootstrap_guard_rejects_empty_testnet_and_custom_chains() {
+        for chain_id in [2u64, 7, 1_000_000] {
+            let err = check_bootstrap_config(chain_id, &[]).unwrap_err();
+            assert!(
+                err.contains(&format!("chain_id={chain_id}")),
+                "error must name the chain_id, got: {err}"
+            );
+            assert!(
+                err.contains("bootstrap_peers"),
+                "error must name the missing config, got: {err}"
+            );
+        }
+    }
+
+    /// Tier 2.4: the error message must point operators bringing up a
+    /// fresh testnet at the right escape hatch — set bootstrap_peers
+    /// to their own genesis multiaddr(s) before starting any peer.
+    #[test]
+    fn bootstrap_guard_error_mentions_testnet_bringup_path() {
+        let err = check_bootstrap_config(2, &[]).unwrap_err();
+        assert!(
+            err.contains("testnet bring-up") || err.contains("genesis-node"),
+            "error must guide testnet operators to the escape hatch, got: {err}"
+        );
     }
 
     #[test]
