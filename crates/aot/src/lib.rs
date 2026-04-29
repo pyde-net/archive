@@ -140,6 +140,63 @@ mod tests {
     }
 
     #[test]
+    fn shl_aot_interp_parity_across_shift_counts() {
+        // Audit Tier 1C — interpreter (cpu.rs:164-189) treats
+        // `shift >= 64` as 0, but AOT codegen (codegen.rs:634-650) emits
+        // raw Cranelift `ishl` which masks the count to operand_size-1.
+        // `1u64 << 64` therefore yielded `1` on AOT and `0` on interp —
+        // a consensus fork on any contract that shifts by a value
+        // derived from user input.
+        for shift in [0u32, 1, 31, 32, 63, 64, 65, 127, 200, 255] {
+            for value in [1i32, -1, 0x4242, -0x4242] {
+                let code = bytecode(&[
+                    instr_ri(Opcode::Addi, 1, 0, value),         // r1 = value
+                    instr_ri(Opcode::Addi, 2, 0, shift as i32),  // r2 = shift
+                    instr_bytes(Opcode::Shl, 3, 1, 2),           // r3 = r1 << r2
+                    instr_bytes(Opcode::Halt, 0, 0, 0),
+                ]);
+                compare_with_interpreter(&code, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn shr_aot_interp_parity_across_shift_counts() {
+        // See shl_aot_interp_parity_across_shift_counts. AOT's `ushr`
+        // masks the count to 6 bits; interp returns 0 for `shift >= 64`.
+        for shift in [0u32, 1, 31, 32, 63, 64, 65, 127, 200, 255] {
+            for value in [1i32, -1, 0x4242, -0x4242] {
+                let code = bytecode(&[
+                    instr_ri(Opcode::Addi, 1, 0, value),         // r1 = value
+                    instr_ri(Opcode::Addi, 2, 0, shift as i32),  // r2 = shift
+                    instr_bytes(Opcode::Shr, 3, 1, 2),           // r3 = r1 >> r2 (unsigned)
+                    instr_bytes(Opcode::Halt, 0, 0, 0),
+                ]);
+                compare_with_interpreter(&code, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn sar_aot_interp_parity_across_shift_counts() {
+        // See shl_aot_interp_parity_across_shift_counts. Sar is the
+        // arithmetic right shift: interp fills with the sign bit when
+        // `shift >= 64` (returns 0 for non-negative, `-1` for negative);
+        // AOT's `sshr` masks to 6 bits and returned the unshifted value.
+        for shift in [0u32, 1, 31, 32, 63, 64, 65, 127, 200, 255] {
+            for value in [1i32, -1, 0x4242, -0x4242] {
+                let code = bytecode(&[
+                    instr_ri(Opcode::Addi, 1, 0, value),         // r1 = value
+                    instr_ri(Opcode::Addi, 2, 0, shift as i32),  // r2 = shift
+                    instr_bytes(Opcode::Sar, 3, 1, 2),           // r3 = r1 >>> r2 (signed)
+                    instr_bytes(Opcode::Halt, 0, 0, 0),
+                ]);
+                compare_with_interpreter(&code, 0);
+            }
+        }
+    }
+
+    #[test]
     fn memcpy_aot_charges_dynamic_gas_parity_with_interp() {
         // Audit item 215 — host_memcpy used to skip the per-byte
         // dynamic-gas charge that the interpreter pays. Same contract
