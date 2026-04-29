@@ -62,13 +62,13 @@ pub fn check_bootstrap_config(
     if !bootstrap_peers.is_empty() {
         return Ok(());
     }
-    const MAINNET_CHAIN_ID: u64 = 1;
-    const DEVNET_CHAIN_ID: u64 = 31337;
-    if chain_id == DEVNET_CHAIN_ID {
+    if chain_id == pyde_net::discovery::DEVNET_CHAIN_ID {
         return Ok(());
     }
-    let label = if chain_id == MAINNET_CHAIN_ID {
+    let label = if chain_id == pyde_net::discovery::MAINNET_CHAIN_ID {
         "mainnet"
+    } else if chain_id == pyde_net::discovery::TESTNET_CHAIN_ID {
+        "public testnet"
     } else {
         "non-devnet chain"
     };
@@ -5332,6 +5332,22 @@ mod tests {
             err.contains("testnet bring-up") || err.contains("genesis-node"),
             "error must guide testnet operators to the escape hatch, got: {err}"
         );
+    }
+
+    /// Tier 2.3: the canonical public testnet chain_id (7331)
+    /// produces an error that names "public testnet" specifically —
+    /// not the generic "non-devnet chain" fallback. Operators
+    /// reading the log line should recognize their network at a
+    /// glance.
+    #[test]
+    fn bootstrap_guard_labels_canonical_testnet_chain_id() {
+        let err = check_bootstrap_config(pyde_net::discovery::TESTNET_CHAIN_ID, &[])
+            .unwrap_err();
+        assert!(
+            err.contains("public testnet"),
+            "error must label canonical testnet (7331) as 'public testnet', got: {err}"
+        );
+        assert!(err.contains("chain_id=7331"));
     }
 
     #[test]
