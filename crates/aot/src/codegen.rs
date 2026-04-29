@@ -631,22 +631,45 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let r = builder.ins().bnot(a);
                         gp_write!(builder, d.rd, r);
                     }
+                    // Shift opcodes: interpreter (cpu.rs:164-189) treats
+                    // `shift >= 64` as zero-fill (Shl/Shr) or sign-fill
+                    // (Sar). Cranelift's ishl/ushr/sshr mask the shift
+                    // count to operand_size-1 (so `x << 64 == x << 0`),
+                    // which would diverge from the interpreter and fork
+                    // the chain on any contract that shifts by a value
+                    // ≥64. Select on `b >= 64` to match interp exactly.
                     Opcode::Shl => {
                         let a = gp_read!(builder, d.rs1);
                         let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
-                        let r = builder.ins().ishl(a, b);
+                        let oversize =
+                            builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b, 64);
+                        let shifted = builder.ins().ishl(a, b);
+                        let zero = builder.ins().iconst(I64, 0);
+                        let r = builder.ins().select(oversize, zero, shifted);
                         gp_write!(builder, d.rd, r);
                     }
                     Opcode::Shr => {
                         let a = gp_read!(builder, d.rs1);
                         let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
-                        let r = builder.ins().ushr(a, b);
+                        let oversize =
+                            builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b, 64);
+                        let shifted = builder.ins().ushr(a, b);
+                        let zero = builder.ins().iconst(I64, 0);
+                        let r = builder.ins().select(oversize, zero, shifted);
                         gp_write!(builder, d.rd, r);
                     }
                     Opcode::Sar => {
                         let a = gp_read!(builder, d.rs1);
                         let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
-                        let r = builder.ins().sshr(a, b);
+                        let oversize =
+                            builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b, 64);
+                        let shifted = builder.ins().sshr(a, b);
+                        // shift >= 64 fills with the sign bit: 0 for
+                        // non-negative, -1 (u64::MAX) for negative.
+                        // sshr_imm(a, 63) broadcasts the sign bit
+                        // across all 64 bits.
+                        let sign_fill = builder.ins().sshr_imm(a, 63);
+                        let r = builder.ins().select(oversize, sign_fill, shifted);
                         gp_write!(builder, d.rd, r);
                     }
 
