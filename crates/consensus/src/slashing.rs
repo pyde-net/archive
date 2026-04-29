@@ -65,23 +65,29 @@ pub struct SlashResult {
 /// Double-signing evidence: two different blocks signed for the same slot.
 ///
 /// Carries block *hashes* rather than full `BlockHeader`s because both
-/// the proposer signature and vote signature formats bind (slot || hash)
-/// directly — verifying the evidence requires nothing more than the
-/// hashes, the two FALCON signatures, and the signer's public key. This
-/// keeps the on-chain payload (`TransactionType::Slash` data field)
-/// small and lets the tx pipeline verify the evidence without depending
-/// on `BlockHeader` internals.
+/// the proposer signature and vote signature formats bind
+/// `(chain_id || slot || hash)` directly — verifying the evidence
+/// requires nothing more than the local chain's `chain_id`, the two
+/// hashes, the two FALCON signatures, and the signer's public key.
+/// This keeps the on-chain payload (`TransactionType::Slash` data
+/// field) small and lets the tx pipeline verify the evidence without
+/// depending on `BlockHeader` internals.
+///
+/// The struct itself does NOT carry `chain_id`: the verifier rebuilds
+/// the preimage with the LOCAL chain's `chain_id`, so a double-sign on
+/// chain A cannot be replayed as evidence on chain B. This mirrors the
+/// audit-240 multisig pattern.
 #[derive(Clone, Debug)]
 pub struct DoubleSignEvidence {
     /// The slot where double-signing occurred.
     pub slot: u64,
     /// Hash of the first block the signer signed for this slot.
     pub block_hash_1: [u8; 32],
-    /// FALCON signature over `proposer_sign_message(slot, block_hash_1)`.
+    /// FALCON signature over `proposer_sign_message(chain_id, slot, block_hash_1)`.
     pub signature_1: Vec<u8>,
     /// Hash of the second block — must differ from `block_hash_1`.
     pub block_hash_2: [u8; 32],
-    /// FALCON signature over `proposer_sign_message(slot, block_hash_2)`.
+    /// FALCON signature over `proposer_sign_message(chain_id, slot, block_hash_2)`.
     pub signature_2: Vec<u8>,
     /// Address of the signer being accused.
     pub signer: Address,
@@ -111,16 +117,21 @@ impl LivenessReport {
 
 // ========== Verification ==========
 
-/// Verify double-sign evidence.
+/// Verify double-sign evidence against the local chain's `chain_id`.
 ///
 /// Checks:
 /// 1. The two block hashes are different (otherwise it's not equivocation).
-/// 2. Both signatures verify over `(slot || block_hash)` against the
-///    accused signer's public key.
+/// 2. Both signatures verify over `(chain_id || slot || block_hash)`
+///    against the accused signer's public key.
 ///
-/// The slot binding lives inside the signed message, so a sig for slot
-/// N cannot be replayed as evidence of equivocation at slot M.
-pub fn verify_double_sign(evidence: &DoubleSignEvidence, public_key: &[u8]) -> bool {
+/// The `chain_id` binding prevents cross-chain replay: a double-sign
+/// on chain A is not valid evidence on chain B even when FALCON keys
+/// match. The slot binding prevents cross-slot replay within a chain.
+pub fn verify_double_sign(
+    chain_id: u64,
+    evidence: &DoubleSignEvidence,
+    public_key: &[u8],
+) -> bool {
     // Two distinct blocks (empty-or-equal hashes = not evidence).
     if evidence.block_hash_1 == evidence.block_hash_2 {
         return false;
@@ -139,8 +150,10 @@ pub fn verify_double_sign(evidence: &DoubleSignEvidence, public_key: &[u8]) -> b
         None => return false,
     };
 
-    let msg_1 = crate::hotstuff::proposer_sign_message(evidence.slot, &evidence.block_hash_1);
-    let msg_2 = crate::hotstuff::proposer_sign_message(evidence.slot, &evidence.block_hash_2);
+    let msg_1 =
+        crate::hotstuff::proposer_sign_message(chain_id, evidence.slot, &evidence.block_hash_1);
+    let msg_2 =
+        crate::hotstuff::proposer_sign_message(chain_id, evidence.slot, &evidence.block_hash_2);
     falcon_verify(&pk, &msg_1, &sig_1) && falcon_verify(&pk, &msg_2, &sig_2)
 }
 
@@ -165,9 +178,13 @@ fn compute_slash(stake: u128, offense: &SlashingOffense) -> (u128, u128) {
     (burned, finder_fee)
 }
 
-/// Process a double-sign slashing event.
-pub fn slash_double_sign(evidence: &DoubleSignEvidence, public_key: &[u8]) -> Option<SlashResult> {
-    if !verify_double_sign(evidence, public_key) {
+/// Process a double-sign slashing event against the local chain's `chain_id`.
+pub fn slash_double_sign(
+    chain_id: u64,
+    evidence: &DoubleSignEvidence,
+    public_key: &[u8],
+) -> Option<SlashResult> {
+    if !verify_double_sign(chain_id, evidence, public_key) {
         return None;
     }
 
@@ -286,14 +303,20 @@ mod tests {
         }
     }
 
+    /// Arbitrary non-mainnet, non-devnet chain_id used by every test in
+    /// this module so cross-chain replay regressions surface here.
+    const TEST_CHAIN_ID: u64 = 7;
+
     /// Helper: produce a proposer signature over the canonical
-    /// `(slot || block_hash)` message layout the production code uses.
+    /// `(chain_id || slot || block_hash)` message layout the production
+    /// code uses.
     fn sign_proposer(
         sk: &pyde_crypto::falcon::FalconSecretKey,
+        chain_id: u64,
         slot: u64,
         block_hash: &[u8; 32],
     ) -> Vec<u8> {
-        let msg = crate::hotstuff::proposer_sign_message(slot, block_hash);
+        let msg = crate::hotstuff::proposer_sign_message(chain_id, slot, block_hash);
         falcon_sign(sk, &msg).unwrap().as_bytes().to_vec()
     }
 
@@ -311,16 +334,16 @@ mod tests {
         let evidence = DoubleSignEvidence {
             slot: 100,
             block_hash_1: hash_1,
-            signature_1: sign_proposer(&sk, 100, &hash_1),
+            signature_1: sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash_1),
             block_hash_2: hash_2,
-            signature_2: sign_proposer(&sk, 100, &hash_2),
+            signature_2: sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash_2),
             signer: addr,
             submitter: derive_eoa_address(b"submitter"),
         };
 
-        assert!(verify_double_sign(&evidence, &pk_bytes));
+        assert!(verify_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes));
 
-        let result = slash_double_sign(&evidence, &pk_bytes).unwrap();
+        let result = slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes).unwrap();
         assert_eq!(result.offender, addr);
         assert_eq!(result.offense, SlashingOffense::DoubleSigning);
         assert!(result.ejected);
@@ -328,6 +351,37 @@ mod tests {
         // 100% slashed: 90% burned, 10% finder fee
         assert_eq!(result.amount_burned + result.finder_fee, VALIDATOR_STAKE);
         assert_eq!(result.finder_fee, VALIDATOR_STAKE / 10);
+    }
+
+    /// Cross-chain replay: a double-sign on chain A must NOT slash on
+    /// chain B even when FALCON keys match. Mirrors audit-240's
+    /// multisig regression — operators reuse FALCON keys across
+    /// devnet/staging/testnet during dev cycles.
+    #[test]
+    fn double_sign_cross_chain_replay_rejected() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+
+        let hash_1 = make_header(100, 1_000_000).hash();
+        let hash_2 = make_header(100, 2_000_000).hash();
+
+        // Evidence signed under chain_id = 1 (mainnet-like).
+        let evidence = DoubleSignEvidence {
+            slot: 100,
+            block_hash_1: hash_1,
+            signature_1: sign_proposer(&sk, 1, 100, &hash_1),
+            block_hash_2: hash_2,
+            signature_2: sign_proposer(&sk, 1, 100, &hash_2),
+            signer: addr,
+            submitter: derive_eoa_address(b"submitter"),
+        };
+
+        // Same evidence verifies on chain 1 but NOT on a different chain.
+        assert!(verify_double_sign(1, &evidence, &pk_bytes));
+        assert!(!verify_double_sign(2, &evidence, &pk_bytes));
+        assert!(!verify_double_sign(31337, &evidence, &pk_bytes));
+        assert!(slash_double_sign(2, &evidence, &pk_bytes).is_none());
     }
 
     // ========== Task 0515: False evidence rejected ==========
@@ -339,7 +393,7 @@ mod tests {
         let addr = derive_eoa_address(&pk_bytes);
 
         let hash = make_header(100, 1_000_000).hash();
-        let sig = sign_proposer(&sk, 100, &hash);
+        let sig = sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash);
 
         let evidence = DoubleSignEvidence {
             slot: 100,
@@ -351,8 +405,8 @@ mod tests {
             submitter: derive_eoa_address(b"submitter"),
         };
 
-        assert!(!verify_double_sign(&evidence, &pk_bytes));
-        assert!(slash_double_sign(&evidence, &pk_bytes).is_none());
+        assert!(!verify_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes));
+        assert!(slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes).is_none());
     }
 
     #[test]
@@ -367,21 +421,21 @@ mod tests {
         let evidence = DoubleSignEvidence {
             slot: 100,
             block_hash_1: hash_1,
-            signature_1: sign_proposer(&sk1, 100, &hash_1),
+            signature_1: sign_proposer(&sk1, TEST_CHAIN_ID, 100, &hash_1),
             block_hash_2: hash_2,
-            signature_2: sign_proposer(&sk1, 100, &hash_2),
+            signature_2: sign_proposer(&sk1, TEST_CHAIN_ID, 100, &hash_2),
             signer: addr,
             submitter: derive_eoa_address(b"submitter"),
         };
 
         // Wrong key → reject
-        assert!(!verify_double_sign(&evidence, pk2.as_bytes()));
+        assert!(!verify_double_sign(TEST_CHAIN_ID, &evidence, pk2.as_bytes()));
     }
 
     #[test]
     fn wrong_slot_rejected() {
-        // Signatures are bound to (slot || hash). If the signer attested
-        // to slot 101 but the evidence claims slot 100, the FALCON
+        // Signatures are bound to (chain_id || slot || hash). If the signer
+        // attested to slot 101 but the evidence claims slot 100, the FALCON
         // verify at slot 100 fails — no cross-slot replay possible.
         let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
@@ -394,14 +448,14 @@ mod tests {
             slot: 100,
             block_hash_1: hash_1,
             // Signed at the wrong slot (101) — verify at slot 100 rejects.
-            signature_1: sign_proposer(&sk, 101, &hash_1),
+            signature_1: sign_proposer(&sk, TEST_CHAIN_ID, 101, &hash_1),
             block_hash_2: hash_2,
-            signature_2: sign_proposer(&sk, 100, &hash_2),
+            signature_2: sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash_2),
             signer: addr,
             submitter: derive_eoa_address(b"submitter"),
         };
 
-        assert!(!verify_double_sign(&evidence, &pk_bytes));
+        assert!(!verify_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes));
     }
 
     // ========== Task 0513: Liveness slashes proportionally ==========
@@ -477,14 +531,14 @@ mod tests {
         let evidence = DoubleSignEvidence {
             slot: 100,
             block_hash_1: hash_1,
-            signature_1: sign_proposer(&sk, 100, &hash_1),
+            signature_1: sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash_1),
             block_hash_2: hash_2,
-            signature_2: sign_proposer(&sk, 100, &hash_2),
+            signature_2: sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash_2),
             signer: addr,
             submitter: derive_eoa_address(b"finder"),
         };
 
-        let result = slash_double_sign(&evidence, &pk_bytes).unwrap();
+        let result = slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes).unwrap();
         assert_eq!(result.finder_fee, VALIDATOR_STAKE * 10 / 100);
         assert_eq!(result.amount_burned, VALIDATOR_STAKE * 90 / 100);
     }
@@ -508,14 +562,14 @@ mod tests {
         let evidence = DoubleSignEvidence {
             slot: 100,
             block_hash_1: hash_1,
-            signature_1: sign_proposer(&sk, 100, &hash_1),
+            signature_1: sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash_1),
             block_hash_2: hash_2,
-            signature_2: sign_proposer(&sk, 100, &hash_2),
+            signature_2: sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash_2),
             signer: addr,
             submitter: derive_eoa_address(b"finder"),
         };
 
-        let result = slash_double_sign(&evidence, &pk_bytes).unwrap();
+        let result = slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes).unwrap();
         assert!(apply_slash(&mut set, &result, 500));
 
         // Stake reduced to 0 (100% slashed)

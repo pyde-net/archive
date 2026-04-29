@@ -212,6 +212,12 @@ struct BufferedProposal {
 /// Manages the HotStuff protocol state, VRF proposer selection,
 /// voting, QC formation, and finality tracking.
 pub struct ValidatorEngine {
+    /// Local chain id. Bound into every consensus signing preimage
+    /// (proposer headers, votes, view-change votes, slashing evidence)
+    /// so a signature created on one chain cannot be replayed on
+    /// another even when FALCON keys match. See
+    /// `pyde_consensus::hotstuff::proposer_sign_message`.
+    pub chain_id: u64,
     /// HotStuff consensus state (current slot, highest QC, etc.).
     pub consensus: ConsensusState,
     /// Finality tracker (soft/hard finality, checkpoints).
@@ -333,8 +339,11 @@ pub struct ValidatorEngine {
 }
 
 impl ValidatorEngine {
-    /// Create a new validator engine at genesis.
-    pub fn new(epoch_randomness: [u8; 32]) -> Self {
+    /// Create a new validator engine at genesis bound to a specific
+    /// `chain_id`. The `chain_id` is bound into every consensus signing
+    /// preimage so signatures cannot be replayed across chains even
+    /// when FALCON keys match.
+    pub fn new(chain_id: u64, epoch_randomness: [u8; 32]) -> Self {
         let now_ms = current_time_ms();
         let consensus = ConsensusState::new();
         // audit-234 part 4: TimeoutTracker is keyed on `target_height`,
@@ -342,6 +351,7 @@ impl ValidatorEngine {
         // target_height to 1 (the first slot we want to commit).
         let initial_target = consensus.target_height;
         Self {
+            chain_id,
             consensus,
             finality: FinalityTracker::new(),
             timeout: TimeoutTracker::new(initial_target, now_ms),
@@ -1206,7 +1216,7 @@ impl ValidatorEngine {
                     return false;
                 }
             };
-            let sign_msg = proposer_sign_message(slot, &block_hash);
+            let sign_msg = proposer_sign_message(self.chain_id, slot, &block_hash);
             if !pyde_crypto::falcon::falcon_verify(&pk, &sign_msg, &sig) {
                 warn!(slot, "proposer signature verification failed");
                 return false;
@@ -1499,7 +1509,7 @@ impl ValidatorEngine {
             }
         };
         let block_hash = header.hash();
-        let sign_msg = proposer_sign_message(slot, &block_hash);
+        let sign_msg = proposer_sign_message(self.chain_id, slot, &block_hash);
         if !pyde_crypto::falcon::falcon_verify(&pk, &sign_msg, &sig) {
             warn!(slot, "fallback proposer signature verification failed");
             return false;
@@ -1608,7 +1618,7 @@ impl ValidatorEngine {
         };
 
         let block_hash = header.hash();
-        let sign_msg = proposer_sign_message(slot, &block_hash);
+        let sign_msg = proposer_sign_message(self.chain_id, slot, &block_hash);
         let proposer_signature = match pyde_crypto::falcon::falcon_sign(&identity.secret_key, &sign_msg) {
             Ok(sig) => sig.to_vec(),
             Err(_) => {
@@ -1660,10 +1670,11 @@ impl ValidatorEngine {
             timestamp: current_time_ms(),
         };
 
-        // Sign the canonical (slot || block_hash) message with the
-        // proposer's FALCON key. See proposer_sign_message for the format.
+        // Sign the canonical (chain_id || slot || block_hash) message
+        // with the proposer's FALCON key. See proposer_sign_message
+        // for the format.
         let block_hash = header.hash();
-        let sign_msg = proposer_sign_message(header.slot, &block_hash);
+        let sign_msg = proposer_sign_message(self.chain_id, header.slot, &block_hash);
         let proposer_signature =
             match pyde_crypto::falcon::falcon_sign(&identity.secret_key, &sign_msg) {
                 Ok(sig) => sig.to_vec(),
@@ -1700,6 +1711,7 @@ impl ValidatorEngine {
 
         // Create vote (HotStuff safety rules enforced inside create_vote)
         match create_vote(
+            self.chain_id,
             &mut self.consensus,
             header,
             identity.committee_index,
@@ -1751,7 +1763,7 @@ impl ValidatorEngine {
 
         // Verify vote signature
         if voter_index < self.committee_keys.len()
-            && !verify_vote(&vote, &self.committee_keys[voter_index])
+            && !verify_vote(self.chain_id, &vote, &self.committee_keys[voter_index])
         {
             warn!(slot, voter_index, "invalid vote signature");
             return None;
@@ -1824,7 +1836,7 @@ impl ValidatorEngine {
         // Try to form QC (dynamic quorum based on actual committee size)
         let threshold = quorum_for_committee(self.committee_keys.len());
         if entry.votes.len() >= threshold {
-            let qc = try_form_qc(slot, block_hash, &entry.votes, &self.committee_keys);
+            let qc = try_form_qc(self.chain_id, slot, block_hash, &entry.votes, &self.committee_keys);
             if let Some(ref qc) = qc {
                 info!(slot, votes = qc.vote_count(), "QC formed");
                 // Update consensus state
@@ -1874,6 +1886,7 @@ impl ValidatorEngine {
         // permanently uncommitted.
         let slot = self.consensus.target_height;
         match create_view_change(
+            self.chain_id,
             slot,
             &self.consensus.highest_qc,
             identity.committee_index,
@@ -1929,7 +1942,7 @@ impl ValidatorEngine {
         entry.push(msg);
 
         // Try to form view change QC
-        if let Some(vc_qc) = try_form_view_change_qc(slot, entry, &self.committee_keys) {
+        if let Some(vc_qc) = try_form_view_change_qc(self.chain_id, slot, entry, &self.committee_keys) {
             let first_formation = self.timeout.view_change_qc.is_none();
             if first_formation {
                 self.consensus.bump_view();
@@ -2140,8 +2153,10 @@ impl ValidatorEngine {
 
         // slash_double_sign returns None if the sig/format verification
         // fails. We discard the SlashResult — only verification matters;
-        // the on-chain handler re-computes it from state.
-        if slash_double_sign(&evidence, &pk_bytes).is_none() {
+        // the on-chain handler re-computes it from state. The local
+        // chain's `chain_id` is bound into the verifier's preimage so
+        // evidence forged on a foreign chain is rejected here.
+        if slash_double_sign(self.chain_id, &evidence, &pk_bytes).is_none() {
             debug!(
                 slot = evidence.slot,
                 signer = hex::encode(evidence.signer),
@@ -2428,6 +2443,11 @@ mod tests {
     use pyde_account::address::derive_eoa_address;
     use pyde_crypto::falcon::falcon_keygen;
 
+    /// Arbitrary non-mainnet, non-devnet chain_id used by every test
+    /// in this module so cross-chain replay regressions surface here
+    /// rather than slipping past with hardcoded chain_id=0.
+    const TEST_CHAIN_ID: u64 = 7;
+
     fn make_identity(index: u8) -> ValidatorIdentity {
         let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
@@ -2451,20 +2471,20 @@ mod tests {
             identities.push(id);
         }
 
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         engine.set_committee(keys);
         (engine, identities)
     }
 
     #[test]
     fn engine_starts_at_genesis() {
-        let engine = ValidatorEngine::new([0; 32]);
+        let engine = ValidatorEngine::new(TEST_CHAIN_ID, [0; 32]);
         assert_eq!(engine.consensus.current_slot, 0);
     }
 
     #[test]
     fn advance_slot_increments() {
-        let mut engine = ValidatorEngine::new([0; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0; 32]);
         let new_slot = engine.advance_slot();
         assert_eq!(new_slot, 1);
         assert_eq!(engine.consensus.current_slot, 1);
@@ -2722,9 +2742,9 @@ mod tests {
         let new_committee_keys = vec![vec![0xAA; 897]; 6];
 
         // Two new members, independent engines — model separate nodes.
-        let mut engine_a = ValidatorEngine::new([0u8; 32]);
+        let mut engine_a = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         engine_a.set_committee(new_committee_keys.clone());
-        let mut engine_b = ValidatorEngine::new([0u8; 32]);
+        let mut engine_b = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         engine_b.set_committee(new_committee_keys.clone());
 
         engine_a.prepare_for_reshare_reception(1, new_committee_keys.clone(), 1);
@@ -2775,7 +2795,7 @@ mod tests {
         // Can't combine with only 2 of 4 required — add more honest shares.
         let mut helpers: Vec<ValidatorEngine> = (3..=6)
             .map(|_| {
-                let mut e = ValidatorEngine::new([0u8; 32]);
+                let mut e = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
                 e.set_committee(new_committee_keys.clone());
                 e
             })
@@ -2805,7 +2825,7 @@ mod tests {
     #[test]
     fn reshare_aggregation_waits_for_trigger() {
         let (_, old_shares) = threshold_keygen(4, 3).unwrap();
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         let new_committee = vec![vec![0xAA; 897]; 4];
         engine.prepare_for_reshare_reception(1, new_committee.clone(), 1);
         let mut id = make_identity(0);
@@ -2832,7 +2852,7 @@ mod tests {
         // doesn't fire — and `reshare_aggregated` stays false so a
         // subsequent slot tick with a fuller pool can succeed.
         let (_, old_shares) = threshold_keygen(4, 3).unwrap();
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         engine.prepare_for_reshare_reception(1, vec![vec![0xAA; 897]; 4], 1);
         let mut id = make_identity(0);
 
@@ -2902,7 +2922,7 @@ mod tests {
 
         let trigger_slot;
         {
-            let mut engine = ValidatorEngine::new([0xAA; 32]);
+            let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
             engine.set_committee(vec![vec![0x01; 897]; 4]);
             let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
             engine.attach_consensus_store(store);
@@ -2914,7 +2934,7 @@ mod tests {
 
         // Reopen store, reattach.
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         engine.attach_consensus_store(store);
 
         // Post-restore invariants.
@@ -2939,7 +2959,7 @@ mod tests {
 
         {
             let (_, old_shares) = threshold_keygen(4, 3).unwrap();
-            let mut engine = ValidatorEngine::new([0u8; 32]);
+            let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
             let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
             engine.attach_consensus_store(store);
             engine.prepare_for_reshare_reception(1, vec![vec![0xAA; 897]; 4], 1);
@@ -2954,7 +2974,7 @@ mod tests {
         }
 
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         engine.attach_consensus_store(store);
         assert!(
             engine.reshare_aggregated,
@@ -2969,7 +2989,7 @@ mod tests {
         let (_, old_shares) = threshold_keygen(3, 2).unwrap();
 
         {
-            let mut engine = ValidatorEngine::new([0u8; 32]);
+            let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
             engine.set_committee(vec![vec![0x01; 897]; 3]);
             let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
             engine.attach_consensus_store(store);
@@ -2981,7 +3001,7 @@ mod tests {
         }
 
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         engine.attach_consensus_store(store);
         assert!(
             engine.pending_reshare_rebroadcast.is_some(),
@@ -2994,7 +3014,7 @@ mod tests {
         // Departing member (not on new committee): prepare_for_reshare_reception
         // with index 0 → contributions get silently dropped, no share derived.
         let (_, old_shares) = threshold_keygen(4, 3).unwrap();
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         engine.prepare_for_reshare_reception(1, vec![vec![0xAA; 897]], /* our_new_index */ 0);
         let mut leaving = identity_with_share(0, old_shares[0].clone());
 
@@ -3008,7 +3028,7 @@ mod tests {
         // Tampered contribution: must fail internal consistency check and
         // NOT be counted toward threshold.
         let (_, old_shares) = threshold_keygen(4, 3).unwrap();
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         let new_committee = vec![vec![0xAA; 897]; 4];
         engine.prepare_for_reshare_reception(1, new_committee, 1);
         let mut new_id = make_identity(0);
@@ -3031,7 +3051,7 @@ mod tests {
         // double-count duplicates; subsequent calls with the same
         // `from_old_index` return false.
         let (_, old_shares) = threshold_keygen(4, 3).unwrap();
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         let new_committee = vec![vec![0xAA; 897]; 4];
         engine.prepare_for_reshare_reception(1, new_committee, 1);
         let mut new_id = make_identity(0);
@@ -3049,7 +3069,7 @@ mod tests {
         // Outgoing member stashes a contribution and re-broadcasts every
         // RESHARE_REBROADCAST_INTERVAL_SLOTS slots for RESHARE_REBROADCAST_SLOTS.
         let (_, old_shares) = threshold_keygen(3, 2).unwrap();
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         engine.set_committee(vec![vec![0xAA; 897]; 3]);
         let mut id = identity_with_share(0, old_shares[0].clone());
 
@@ -3092,7 +3112,7 @@ mod tests {
     #[test]
     fn reshare_rebroadcast_none_without_prior_start() {
         // maybe_rebroadcast with no stashed contribution → always None.
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         assert!(engine.maybe_rebroadcast_reshare().is_none());
         for _ in 0..20 {
             engine.advance_slot();
@@ -3104,7 +3124,7 @@ mod tests {
 
     #[test]
     fn install_bootstrap_ws_anchor_sets_checkpoint_slot() {
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         assert!(engine.finality.latest_checkpoint.is_none());
 
         engine.install_bootstrap_ws_anchor(500);
@@ -3118,11 +3138,11 @@ mod tests {
         let dir = tempdir().unwrap();
 
         {
-            let mut engine = ValidatorEngine::new([0u8; 32]);
+            let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
             engine.attach_consensus_store(Arc::new(ConsensusStateStore::open(dir.path()).unwrap()));
             engine.install_bootstrap_ws_anchor(777);
         }
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         engine.attach_consensus_store(Arc::new(ConsensusStateStore::open(dir.path()).unwrap()));
         let cp = engine.finality.latest_checkpoint.as_ref().unwrap();
         assert_eq!(cp.slot, 777);
@@ -3134,7 +3154,7 @@ mod tests {
         // than the current anchor could be a replay of an old message,
         // or a malicious peer trying to rewind the WS guard.
         use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         engine.install_bootstrap_ws_anchor(100);
 
         let stale = FinalityCheckpoint {
@@ -3161,7 +3181,7 @@ mod tests {
         // A validator cross-verifies sigs against their own committee.
         // A cert with fewer sigs than quorum must be rejected.
         use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         engine.set_committee(vec![vec![0xAA; 897]; 4]); // 4-member committee → quorum 3
         engine.install_bootstrap_ws_anchor(10);
 
@@ -3186,7 +3206,7 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         engine.set_committee(vec![vec![0xAA; 897]; 4]);
         engine.attach_consensus_store(Arc::new(ConsensusStateStore::open(dir.path()).unwrap()));
 
@@ -3210,7 +3230,7 @@ mod tests {
 
         // Survives restart.
         drop(engine);
-        let mut fresh = ValidatorEngine::new([0u8; 32]);
+        let mut fresh = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         fresh.attach_consensus_store(Arc::new(ConsensusStateStore::open(dir.path()).unwrap()));
         assert_eq!(fresh.finality.latest_checkpoint.as_ref().unwrap().slot, 500);
     }
@@ -3221,7 +3241,7 @@ mod tests {
         // Caller (non-validator full node) trusts the consensus-topic
         // filter (slice 3.4) to gate publication.
         use pyde_consensus::finality::{FinalityCheckpoint, HardFinalityCert};
-        let mut engine = ValidatorEngine::new([0u8; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
         // Do NOT set_committee → empty → non-validator mode.
         assert!(engine.committee_keys.is_empty());
 
@@ -3288,7 +3308,7 @@ mod tests {
         }
 
         // --- Post-crash: reopen and attempt to vote for slot 1 again ---
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         engine.set_committee(committee_keys);
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
         engine.attach_consensus_store(store);
@@ -3331,7 +3351,7 @@ mod tests {
 
         // Pre-crash: form a QC at slot 5, which becomes highest_qc.
         {
-            let mut engine = ValidatorEngine::new([0xAA; 32]);
+            let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
             let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
             engine.attach_consensus_store(store);
 
@@ -3348,7 +3368,7 @@ mod tests {
         }
 
         // Post-crash: reopen.
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
         engine.attach_consensus_store(store);
 
@@ -3362,7 +3382,7 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
         engine.attach_consensus_store(store);
 
@@ -3378,7 +3398,7 @@ mod tests {
         let dir = tempdir().unwrap();
 
         {
-            let mut engine = ValidatorEngine::new([0xAA; 32]);
+            let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
             let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
             engine.attach_consensus_store(store);
             for _ in 0..7 {
@@ -3387,7 +3407,7 @@ mod tests {
             assert_eq!(engine.consensus.current_slot, 7);
         }
 
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
         engine.attach_consensus_store(store);
         assert_eq!(engine.consensus.current_slot, 7);
@@ -3427,7 +3447,7 @@ mod tests {
         }
 
         // Fresh engine attaches the same store and must restore the index.
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
         engine.attach_consensus_store(store);
 
@@ -3453,7 +3473,7 @@ mod tests {
             store.save_seen_vote(12, 4, &block_hash, &sig).unwrap();
         }
 
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
         engine.attach_consensus_store(store);
 
@@ -3490,7 +3510,7 @@ mod tests {
         }
 
         // Attach, jump forward to slot 15, advancing triggers prune.
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
         engine.attach_consensus_store(Arc::clone(&store));
         // Sanity: reload pulled them all in.
@@ -3528,7 +3548,7 @@ mod tests {
 
     #[test]
     fn drain_pending_evidence_empties_queue() {
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         engine
             .pending_evidence
             .push(evidence_fixture(1, [0xAB; 32]));
@@ -3550,7 +3570,7 @@ mod tests {
     fn push_evidence_restores_queue() {
         // Simulates the failed-block-build recovery path: drain, fail to
         // build, push back, drain again.
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         engine
             .pending_evidence
             .push(evidence_fixture(7, [0x99; 32]));
@@ -3566,7 +3586,7 @@ mod tests {
 
     #[test]
     fn push_evidence_appends_preserving_order() {
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         engine
             .pending_evidence
             .push(evidence_fixture(1, [0x01; 32]));
@@ -3597,24 +3617,19 @@ mod tests {
         let pk_bytes = pk.as_bytes().to_vec();
         let signer = pyde_account::address::derive_eoa_address(&pk_bytes);
 
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         engine.set_committee(vec![pk_bytes]);
 
         let slot = 42u64;
         let hash_1 = [0x01u8; 32];
         let hash_2 = [0x02u8; 32];
-        let sign_1 = {
-            let mut m = Vec::with_capacity(40);
-            m.extend_from_slice(&slot.to_le_bytes());
-            m.extend_from_slice(&hash_1);
-            m
-        };
-        let sign_2 = {
-            let mut m = Vec::with_capacity(40);
-            m.extend_from_slice(&slot.to_le_bytes());
-            m.extend_from_slice(&hash_2);
-            m
-        };
+        // Build the canonical (chain_id || slot || block_hash) preimage —
+        // must match what `verify_double_sign` reconstructs for the
+        // engine's chain_id, otherwise FALCON verify rejects.
+        let sign_1 =
+            pyde_consensus::hotstuff::proposer_sign_message(TEST_CHAIN_ID, slot, &hash_1);
+        let sign_2 =
+            pyde_consensus::hotstuff::proposer_sign_message(TEST_CHAIN_ID, slot, &hash_2);
         let sig_1 = pyde_crypto::falcon::falcon_sign(&sk, &sign_1)
             .unwrap()
             .as_bytes()
@@ -3724,7 +3739,8 @@ mod tests {
         let pk_bytes = pk.as_bytes().to_vec();
         let signer = pyde_account::address::derive_eoa_address(&pk_bytes);
 
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        const TEST_CHAIN_ID: u64 = 7;
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         engine.set_committee(vec![pk_bytes]);
 
         let slot = 7u64;
@@ -3732,7 +3748,7 @@ mod tests {
         let hash_b = [0x02u8; 32];
 
         let sign_vote = |h: &[u8; 32]| -> Vec<u8> {
-            falcon_sign(&sk, &proposer_sign_message(slot, h))
+            falcon_sign(&sk, &proposer_sign_message(TEST_CHAIN_ID, slot, h))
                 .unwrap()
                 .as_bytes()
                 .to_vec()
@@ -3793,7 +3809,7 @@ mod tests {
             committee_pk = pk.as_bytes().to_vec();
             signer_addr = pyde_account::address::derive_eoa_address(&committee_pk);
 
-            let mut engine = ValidatorEngine::new([0xAA; 32]);
+            let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
             engine.set_committee(vec![committee_pk.clone()]);
             let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
             engine.attach_consensus_store(store);
@@ -3801,18 +3817,13 @@ mod tests {
             let slot = 50u64;
             let hash_1 = [0x01u8; 32];
             let hash_2 = [0x02u8; 32];
-            let sign_1 = {
-                let mut m = Vec::with_capacity(40);
-                m.extend_from_slice(&slot.to_le_bytes());
-                m.extend_from_slice(&hash_1);
-                m
-            };
-            let sign_2 = {
-                let mut m = Vec::with_capacity(40);
-                m.extend_from_slice(&slot.to_le_bytes());
-                m.extend_from_slice(&hash_2);
-                m
-            };
+            // Bind chain_id into the preimage so the engine's
+            // `ingest_evidence` (which rebuilds with self.chain_id =
+            // TEST_CHAIN_ID) actually verifies the sigs.
+            let sign_1 =
+                pyde_consensus::hotstuff::proposer_sign_message(TEST_CHAIN_ID, slot, &hash_1);
+            let sign_2 =
+                pyde_consensus::hotstuff::proposer_sign_message(TEST_CHAIN_ID, slot, &hash_2);
             let sig_1 = pyde_crypto::falcon::falcon_sign(&sk, &sign_1)
                 .unwrap()
                 .as_bytes()
@@ -3838,7 +3849,7 @@ mod tests {
         }
 
         // --- Run 2: reopen, attach, evidence must still be there ---
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         engine.set_committee(vec![committee_pk.clone()]);
         let store = Arc::new(ConsensusStateStore::open(dir.path()).unwrap());
         engine.attach_consensus_store(store);
@@ -3878,7 +3889,7 @@ mod tests {
             key_share: None,
         };
 
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         engine
             .pending_evidence
             .push(evidence_fixture(42, [0xFF; 32]));
@@ -3955,22 +3966,17 @@ mod tests {
         .unwrap();
 
         // Craft two real FALCON-signed attestations for the same slot —
-        // exactly what an equivocating proposer would produce.
+        // exactly what an equivocating proposer would produce. Use the
+        // chain_id we'll execute against (set on `ctx` below) so the
+        // pipeline's verifier rebuild matches.
+        let chain_id = 1u64;
         let slot = 100u64;
         let hash_1 = [0xA1u8; 32];
         let hash_2 = [0xA2u8; 32];
-        let sign_msg_1 = {
-            let mut m = Vec::with_capacity(40);
-            m.extend_from_slice(&slot.to_le_bytes());
-            m.extend_from_slice(&hash_1);
-            m
-        };
-        let sign_msg_2 = {
-            let mut m = Vec::with_capacity(40);
-            m.extend_from_slice(&slot.to_le_bytes());
-            m.extend_from_slice(&hash_2);
-            m
-        };
+        let sign_msg_1 =
+            pyde_consensus::hotstuff::proposer_sign_message(chain_id, slot, &hash_1);
+        let sign_msg_2 =
+            pyde_consensus::hotstuff::proposer_sign_message(chain_id, slot, &hash_2);
         let sig_1 = falcon_sign(&offender_sk, &sign_msg_1)
             .unwrap()
             .as_bytes()
@@ -3988,7 +3994,9 @@ mod tests {
             committee_index: 0,
             key_share: None,
         };
-        let mut engine = ValidatorEngine::new([0xAA; 32]);
+        // Engine is bound to the same chain_id as the block context so
+        // its `ingest_evidence` (when used) and on-chain handler agree.
+        let mut engine = ValidatorEngine::new(chain_id, [0xAA; 32]);
         engine.pending_evidence.push(DoubleSignEvidence {
             slot,
             block_hash_1: hash_1,
@@ -4001,7 +4009,7 @@ mod tests {
 
         // Drain into Slash txs.
         let mut slash_txs = Vec::new();
-        engine.drain_evidence_into_slash_txs(&identity, 0, 1, &mut slash_txs);
+        engine.drain_evidence_into_slash_txs(&identity, 0, chain_id, &mut slash_txs);
         assert_eq!(slash_txs.len(), 1);
 
         // Execute on the SMT.
@@ -4010,7 +4018,7 @@ mod tests {
             timestamp: 1_000_000,
             base_fee: 1_000,
             block_gas_limit: 400_000_000,
-            chain_id: 1,
+            chain_id,
             validator_address: [0xEE; 32],
             dev_skip_signature: false,
             block_sigs_pre_verified: false,
@@ -4072,7 +4080,7 @@ mod tests {
         // Each validator creates their vote using their own engine
         let mut votes = Vec::new();
         for id in &identities {
-            let mut voter_engine = ValidatorEngine::new([0xAA; 32]);
+            let mut voter_engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
             voter_engine.set_committee(committee_keys.clone());
             voter_engine.advance_slot();
             if let Some(vote) = voter_engine.on_proposal(&header, id) {
@@ -4082,7 +4090,7 @@ mod tests {
         assert_eq!(votes.len(), 3);
 
         // Collect votes in a single engine (simulates the proposer node)
-        let mut collector = ValidatorEngine::new([0xAA; 32]);
+        let mut collector = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         collector.set_committee(committee_keys);
         collector.advance_slot();
 
@@ -4124,7 +4132,7 @@ mod tests {
         // Each validator votes using their own engine
         let mut votes = Vec::new();
         for id in &identities {
-            let mut voter_engine = ValidatorEngine::new([0xAA; 32]);
+            let mut voter_engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
             voter_engine.set_committee(committee_keys.clone());
             voter_engine.advance_slot();
             if let Some(vote) = voter_engine.on_proposal(&header, id) {
@@ -4134,7 +4142,7 @@ mod tests {
         assert_eq!(votes.len(), 2);
 
         // Collector engine
-        let mut collector = ValidatorEngine::new([0xAA; 32]);
+        let mut collector = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         collector.set_committee(committee_keys);
         collector.advance_slot();
 
@@ -4152,7 +4160,7 @@ mod tests {
 
     #[test]
     fn old_votes_pruned() {
-        let mut engine = ValidatorEngine::new([0; 32]);
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0; 32]);
         engine.votes.insert(
             1,
             SlotVotes {
@@ -5024,9 +5032,10 @@ mod tests {
             keys.push(id.public_key.as_bytes().to_vec());
             identities.push(id);
         }
+        const TEST_CHAIN_ID: u64 = 7;
         let mut engines = Vec::new();
         for _ in 0..n {
-            let mut engine = ValidatorEngine::new([0xAA; 32]);
+            let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
             engine.set_committee(keys.clone());
             engine.advance_slot(); // → slot 1
             engines.push(engine);
@@ -5038,6 +5047,7 @@ mod tests {
             .iter()
             .map(|id| {
                 pyde_consensus::view_change::create_view_change(
+                    TEST_CHAIN_ID,
                     target_slot,
                     &pyde_consensus::block::QuorumCert::empty(),
                     id.committee_index,

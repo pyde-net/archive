@@ -648,7 +648,12 @@ impl BlockProcessor {
 
     /// Extended validation for blocks received from the network.
     /// Checks: proposer signature, proposer in committee, VRF proof, QC quorum.
+    ///
+    /// `chain_id` is bound into the proposer-signature preimage so a
+    /// header signed for a different chain is rejected even when the
+    /// FALCON keys match.
     pub fn validate_network_block(
+        chain_id: u64,
         header: &BlockHeader,
         proposer_signature: &[u8],
         committee_keys: &[Vec<u8>],
@@ -683,9 +688,10 @@ impl BlockProcessor {
         let block_hash = header.hash();
         let sig = pyde_crypto::falcon::FalconSignature::from_bytes(proposer_signature)
             .ok_or("invalid proposer signature format")?;
-        // Proposers sign `slot || block_hash` (canonical layout shared
-        // with votes) to prevent cross-slot signature replay.
-        let sign_msg = proposer_sign_message(slot, &block_hash);
+        // Proposers sign `chain_id || slot || block_hash` (canonical
+        // layout shared with votes) to prevent cross-slot AND
+        // cross-chain signature replay.
+        let sign_msg = proposer_sign_message(chain_id, slot, &block_hash);
         if !pyde_crypto::falcon::falcon_verify(&pk, &sign_msg, &sig) {
             return Err("proposer signature verification failed".into());
         }

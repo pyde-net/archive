@@ -119,22 +119,30 @@ impl TimeoutTracker {
 }
 
 /// Build the message that validators sign for view change.
-fn view_change_sign_message(slot: u64) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(19); // "view_change"(11) + slot(8)
+///
+/// Preimage: `b"view_change" || chain_id_le || slot_le`. The `chain_id`
+/// prefix prevents cross-chain replay: a timeout signed on chain A
+/// cannot be reused as a view-change vote on chain B even if both
+/// chains share the same FALCON keys (e.g., devnet vs testnet during
+/// operator dev cycles).
+fn view_change_sign_message(chain_id: u64, slot: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(27); // "view_change"(11) + chain_id(8) + slot(8)
     msg.extend_from_slice(b"view_change");
+    msg.extend_from_slice(&chain_id.to_le_bytes());
     msg.extend_from_slice(&slot.to_le_bytes());
     msg
 }
 
 /// Create a view change message when timeout is detected.
 pub fn create_view_change(
+    chain_id: u64,
     slot: u64,
     highest_qc: &QuorumCert,
     voter_index: u8,
     voter_address: Address,
     voter_sk: &FalconSecretKey,
 ) -> Result<ViewChangeMessage, &'static str> {
-    let msg = view_change_sign_message(slot);
+    let msg = view_change_sign_message(chain_id, slot);
     let sig = falcon_sign(voter_sk, &msg).map_err(|_| "view change signing failed")?;
 
     Ok(ViewChangeMessage {
@@ -146,13 +154,17 @@ pub fn create_view_change(
     })
 }
 
-/// Verify a view change message.
-pub fn verify_view_change(msg: &ViewChangeMessage, public_key: &[u8]) -> bool {
+/// Verify a view change message against the local chain's `chain_id`.
+///
+/// A timeout signed on a different chain (different `chain_id`) will
+/// fail verification here even when FALCON keys match — preventing
+/// cross-chain replay.
+pub fn verify_view_change(chain_id: u64, msg: &ViewChangeMessage, public_key: &[u8]) -> bool {
     let pk = match FalconPublicKey::from_bytes(public_key) {
         Some(pk) => pk,
         None => return false,
     };
-    let sign_msg = view_change_sign_message(msg.slot);
+    let sign_msg = view_change_sign_message(chain_id, msg.slot);
     let sig = match FalconSignature::from_bytes(&msg.signature) {
         Some(s) => s,
         None => return false,
@@ -163,6 +175,7 @@ pub fn verify_view_change(msg: &ViewChangeMessage, public_key: &[u8]) -> bool {
 /// Try to form a ViewChangeQC from collected messages.
 /// Returns Some(ViewChangeQC) if 86+ valid messages for the same slot.
 pub fn try_form_view_change_qc(
+    chain_id: u64,
     slot: u64,
     messages: &[ViewChangeMessage],
     committee_keys: &[Vec<u8>],
@@ -186,7 +199,7 @@ pub fn try_form_view_change_qc(
             continue;
         }
 
-        if verify_view_change(msg, &committee_keys[idx]) {
+        if verify_view_change(chain_id, msg, &committee_keys[idx]) {
             voter_bitmap |= 1u128 << idx;
             valid_count += 1;
 
@@ -355,6 +368,11 @@ mod tests {
     use pyde_account::address::derive_eoa_address;
     use pyde_crypto::falcon::falcon_keygen;
 
+    /// Arbitrary non-mainnet, non-devnet chain_id used by every test
+    /// in this module so cross-chain replay regressions surface here
+    /// rather than slipping past with hardcoded chain_id=0.
+    const TEST_CHAIN_ID: u64 = 7;
+
     // ========== Task 0493: Leader timeout → view change → new leader ==========
 
     #[test]
@@ -364,9 +382,9 @@ mod tests {
         let addr = derive_eoa_address(&pk_bytes);
         let qc = QuorumCert::empty();
 
-        let msg = create_view_change(5, &qc, 0, addr, &sk).unwrap();
+        let msg = create_view_change(TEST_CHAIN_ID, 5, &qc, 0, addr, &sk).unwrap();
         assert_eq!(msg.slot, 5);
-        assert!(verify_view_change(&msg, &pk_bytes));
+        assert!(verify_view_change(TEST_CHAIN_ID, &msg, &pk_bytes));
     }
 
     #[test]
@@ -376,8 +394,25 @@ mod tests {
         let addr = derive_eoa_address(pk1.as_bytes());
         let qc = QuorumCert::empty();
 
-        let msg = create_view_change(5, &qc, 0, addr, &sk1).unwrap();
-        assert!(!verify_view_change(&msg, pk2.as_bytes()));
+        let msg = create_view_change(TEST_CHAIN_ID, 5, &qc, 0, addr, &sk1).unwrap();
+        assert!(!verify_view_change(TEST_CHAIN_ID, &msg, pk2.as_bytes()));
+    }
+
+    /// Cross-chain replay: a view-change vote signed under one
+    /// `chain_id` must NOT verify under another even when FALCON keys
+    /// match. Mirrors audit-240's multisig regression.
+    #[test]
+    fn view_change_cross_chain_replay_rejected() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+        let qc = QuorumCert::empty();
+
+        let msg = create_view_change(1, 5, &qc, 0, addr, &sk).unwrap();
+        // Same key, same slot, different chain_id ⇒ verification fails.
+        assert!(verify_view_change(1, &msg, &pk_bytes));
+        assert!(!verify_view_change(2, &msg, &pk_bytes));
+        assert!(!verify_view_change(31337, &msg, &pk_bytes));
     }
 
     #[test]
@@ -391,7 +426,7 @@ mod tests {
             let addr = derive_eoa_address(&pk_bytes);
             let qc = QuorumCert::empty();
 
-            let msg = create_view_change(10, &qc, i, addr, &sk).unwrap();
+            let msg = create_view_change(TEST_CHAIN_ID, 10, &qc, i, addr, &sk).unwrap();
             messages.push(msg);
             keys.push(pk_bytes);
         }
@@ -400,7 +435,7 @@ mod tests {
             keys.push(vec![0; 897]);
         }
 
-        let vc_qc = try_form_view_change_qc(10, &messages, &keys);
+        let vc_qc = try_form_view_change_qc(TEST_CHAIN_ID, 10, &messages, &keys);
         assert!(vc_qc.is_some());
         assert!(vc_qc.unwrap().has_quorum());
     }
@@ -415,7 +450,8 @@ mod tests {
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let msg = create_view_change(10, &QuorumCert::empty(), i, addr, &sk).unwrap();
+            let msg =
+                create_view_change(TEST_CHAIN_ID, 10, &QuorumCert::empty(), i, addr, &sk).unwrap();
             messages.push(msg);
             keys.push(pk_bytes);
         }
@@ -424,7 +460,7 @@ mod tests {
             keys.push(vec![0; 897]);
         }
 
-        let vc_qc = try_form_view_change_qc(10, &messages, &keys);
+        let vc_qc = try_form_view_change_qc(TEST_CHAIN_ID, 10, &messages, &keys);
         assert!(vc_qc.is_none());
     }
 
@@ -443,7 +479,8 @@ mod tests {
             let (pk, sk) = falcon_keygen().unwrap();
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
-            let msg = create_view_change(7, &QuorumCert::empty(), i, addr, &sk).unwrap();
+            let msg =
+                create_view_change(TEST_CHAIN_ID, 7, &QuorumCert::empty(), i, addr, &sk).unwrap();
             messages.push(msg);
             keys.push(pk_bytes);
         }
@@ -452,7 +489,7 @@ mod tests {
         keys.push(pk4.as_bytes().to_vec());
 
         // 3 valid view-change messages, committee_size=4, threshold=3 → QC.
-        let vc_qc = try_form_view_change_qc(7, &messages, &keys);
+        let vc_qc = try_form_view_change_qc(TEST_CHAIN_ID, 7, &messages, &keys);
         assert!(
             vc_qc.is_some(),
             "3 valid view-change messages on a 4-validator committee should form a QC (threshold 3)"
@@ -471,7 +508,8 @@ mod tests {
             let (pk, sk) = falcon_keygen().unwrap();
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
-            let msg = create_view_change(7, &QuorumCert::empty(), i, addr, &sk).unwrap();
+            let msg =
+                create_view_change(TEST_CHAIN_ID, 7, &QuorumCert::empty(), i, addr, &sk).unwrap();
             messages.push(msg);
             keys.push(pk_bytes);
         }
@@ -479,7 +517,7 @@ mod tests {
             let (pk, _) = falcon_keygen().unwrap();
             keys.push(pk.as_bytes().to_vec());
         }
-        let vc_qc = try_form_view_change_qc(7, &messages, &keys);
+        let vc_qc = try_form_view_change_qc(TEST_CHAIN_ID, 7, &messages, &keys);
         assert!(
             vc_qc.is_none(),
             "2 view-change messages on a 4-validator committee must NOT form a QC (threshold 3)"
@@ -594,7 +632,7 @@ mod tests {
                 signatures: vec![],
             };
 
-            let msg = create_view_change(100, &qc, i, addr, &sk).unwrap();
+            let msg = create_view_change(TEST_CHAIN_ID, 100, &qc, i, addr, &sk).unwrap();
             messages.push(msg);
             keys.push(pk_bytes);
         }
@@ -603,7 +641,7 @@ mod tests {
             keys.push(vec![0; 897]);
         }
 
-        let vc_qc = try_form_view_change_qc(100, &messages, &keys).unwrap();
+        let vc_qc = try_form_view_change_qc(TEST_CHAIN_ID, 100, &messages, &keys).unwrap();
         // Should pick the highest QC (slot 85)
         assert_eq!(vc_qc.highest_qc.slot, 85);
     }
