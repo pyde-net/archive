@@ -134,7 +134,95 @@ pyde_encrypted_mempool_size    # MEV-protected mempool depth.
 A pre-built Grafana dashboard ships in `docker/grafana/`. Point it
 at your Prometheus scraper and import.
 
-## 6. Operational tasks
+## 6. Network exposure & firewall
+
+The default `config.toml` ships safe-by-default:
+
+| Endpoint | Default bind | Default port | Expose externally? |
+|---|---|---|---|
+| Consensus (libp2p) | `0.0.0.0` (TCP + QUIC) | `30303` | **Yes** — required for peer connections |
+| JSON-RPC | `127.0.0.1` | `8545` | **No** — loopback only by default |
+| Fast-tx (binary) | `0.0.0.0` | `9545` | Optional — only if you want public tx ingress |
+| Prometheus metrics | `127.0.0.1` | `9090` | **No** — loopback or VPN-only |
+
+Recommended firewall rules (UFW shown; adapt for nftables/cloud SG):
+
+```sh
+# Inbound: only the libp2p port and SSH
+sudo ufw allow 22/tcp
+sudo ufw allow 30303/tcp
+sudo ufw allow 30303/udp           # QUIC
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw enable
+```
+
+If you want to expose RPC publicly (e.g., to serve dApps), do
+**not** flip `network.listen = "0.0.0.0"` directly. Put a TLS reverse
+proxy in front:
+
+```nginx
+# /etc/nginx/sites-available/pyde-rpc
+server {
+    listen 443 ssl http2;
+    server_name rpc.your-domain.example;
+    ssl_certificate     /etc/letsencrypt/live/.../fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/.../privkey.pem;
+    location / {
+        proxy_pass http://127.0.0.1:8545;
+        proxy_http_version 1.1;
+        proxy_read_timeout 60s;
+        # Rate limit at the proxy — pyde_call gas is capped (audit
+        # Tier 1D) but per-IP request rate is not.
+        limit_req zone=rpc_per_ip burst=20 nodelay;
+    }
+}
+```
+
+Set `limit_req_zone $binary_remote_addr zone=rpc_per_ip:10m rate=10r/s;`
+in `nginx.conf` to cap each IP at 10 RPC/s.
+
+## 7. Logging
+
+Pyde uses [`tracing`](https://docs.rs/tracing) with env-filter
+configuration. Set `RUST_LOG` to control verbosity:
+
+| Setting | Use case | Disk usage (rough) |
+|---|---|---|
+| `RUST_LOG=warn` | Silent operations; alert-driven monitoring | ~10 MB/day |
+| `RUST_LOG=info` (default) | Production validators | ~100 MB/day |
+| `RUST_LOG=info,pyde_node=debug` | Debugging consensus issues | ~1 GB/day |
+| `RUST_LOG=debug` | Active troubleshooting only — high I/O cost | ~5+ GB/day |
+
+For systemd, set in the unit's `[Service]` section:
+
+```ini
+Environment="RUST_LOG=info"
+Environment="RUST_LOG_FORMAT=json"   # structured logs, ingestable by Loki/ELK
+```
+
+If you're shipping logs to a central pipeline, JSON format is
+preferred — the field names match `tracing` spans/events one-to-one.
+
+`journalctl` rotates and compresses automatically; standalone log
+files need `logrotate`:
+
+```
+# /etc/logrotate.d/pyde
+/var/log/pyde/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    sharedscripts
+    postrotate
+        systemctl reload pyde-validator > /dev/null 2>&1 || true
+    endscript
+}
+```
+
+## 8. Operational tasks
 
 ### Restart safely
 
@@ -145,6 +233,69 @@ exactly where it left off without re-voting on already-voted slots.
 
 Crash recovery is exercised by the `validator_crash_recovery` test
 (audit, see commit `03e051d`).
+
+### Restore from a snapshot (fast sync)
+
+A fresh node block-by-block-syncing from genesis is impractical
+past ~1000 slots. The node's snapshot-sync trigger (audit 220)
+fires automatically when:
+
+- initial sync hasn't completed yet, AND
+- no snapshot is already in flight, AND
+- `network_tip - head_slot > SNAPSHOT_THRESHOLD` (1000 slots)
+
+You don't have to do anything manually for this case — the node
+will request `StateSnapshot` from a peer that's at the network
+head, verify chunks against the live weak-subjectivity checkpoint
+(audit 241), and apply them in order. Watch for the log lines:
+
+```
+INFO snapshot sync requested  slots_behind=4321
+INFO snapshot import complete  state_root=...
+```
+
+If snapshot sync wedges (peer disconnects mid-import, root
+mismatch, etc.), stop the node, delete `<datadir>/state/` and
+`<datadir>/blocks/`, then restart. The node will re-issue the
+snapshot request from scratch. **Do not delete `<datadir>/keys/`
+or `<datadir>/consensus/`** — those hold your validator key and
+last-voted state; losing them risks a double-vote on restart.
+
+If a peer-supplied snapshot fails the WS-anchor check (audit 241
+guards this), the node refuses to import it and logs a warning:
+`snapshot import rejected: pre-checkpoint slot`. Switch peers and
+retry.
+
+### Rotate the validator FALCON key
+
+Compromised key, scheduled rotation, or hardware migration: submit
+an `auth_key.rotate` tx signed with the **current** key, naming
+the new pubkey. The on-chain `pyde_account::auth::rotate` flow
+verifies the old-key signature before installing the new one
+(`crates/account/src/auth.rs`).
+
+**Procedure:**
+
+1. Generate a new FALCON keypair (`pyde keygen --out validator-new.key`).
+2. Stop the validator: `sudo systemctl stop pyde-validator`.
+3. Submit the rotate tx from a separate signing host using the OLD
+   key. Wait for the tx to land in a hard-finalized block — query
+   `pyde_getTransactionReceipt` until you see a non-zero block_slot
+   AND that slot is ≤ the latest finality checkpoint.
+4. Replace `validator.key` on disk with the new keypair (encrypted
+   format; same `PYDE_VALIDATOR_PASSPHRASE`).
+5. Start the validator. New proposals + votes are signed with the
+   new key; old key is no longer recognized by the consensus
+   verifier.
+
+Cross-chain replay protection (`chain_id` in every signing preimage,
+PR #301) means your old testnet sigs aren't replayable on mainnet
+after rotation, but the rotation itself only affects the chain it's
+submitted on.
+
+> **Threshold-share rotation is separate** — that's PSS, runs every
+> epoch automatically, and doesn't require a manual tx (see "Rotate
+> threshold shares" below).
 
 ### Stake / unbond
 
@@ -207,13 +358,31 @@ days of unstaked liquidity, not just downtime.
 
 | Event | Detection | Slash | How to avoid |
 |---|---|---|---|
-| Double-sign | Two votes for the same slot at different block hashes | Full stake | Don't run two validators with the same key. Don't restore from a backup that includes votes already broadcast. |
-| Equivocation on proposal | Two proposals at the same slot | Full stake | Same as above. |
-| Extended downtime | TODO: not yet enforced | TBD | Healthy uptime monitoring. |
+| Double-sign | Two votes for the same slot at different block hashes | 100% of stake + ejection + forced unbonding | Don't run two validators with the same key. Don't restore from a backup that includes votes already broadcast. |
+| Equivocation on proposal | Two proposals at the same slot | 100% of stake + ejection + forced unbonding | Same as above. |
+| Liveness < 90% participation | Per-epoch participation report | 1% of stake (no ejection) | Healthy uptime; bound on `pyde_validator_missed_proposals_total` |
+| Liveness < 50% participation | Per-epoch participation report | 5% of stake + ejection | Same as above |
+| Liveness == 0% participation | Per-epoch participation report | 10% of stake + forced unbonding | Same as above |
 
-Double-sign evidence is gossiped as soon as it's detected, persisted
-to disk (audit 005, 014c), and applied via `TransactionType::Slash`
-once a validator includes it in a block.
+Double-sign and proposal equivocation are detected, gossiped, and
+auto-slashed in production (audits 005, 014c, 205). Evidence is
+persisted to disk as soon as it's detected and applied via
+`TransactionType::Slash` once a validator includes it in a block.
+
+> **Liveness slashing — current status:** the slashing mechanism
+> (`pyde_consensus::slashing::slash_liveness`) is implemented and
+> tested, but the per-epoch participation report that feeds it is
+> not yet wired into block production. Public testnet phases will
+> expose participation metrics (`pyde_validator_missed_proposals_total`)
+> for monitoring; on-chain liveness slashing turns on before mainnet.
+
+Cross-chain replay protection: every consensus signature
+(proposer, vote, view-change, evidence) is bound to the local
+chain's `chain_id` (PR #301), so a double-sign on devnet cannot
+slash you on testnet/mainnet even if you reuse FALCON keys across
+networks during dev cycles. Reusing keys is still bad operational
+hygiene (loss of one ⇒ loss of all), but it's no longer a
+chain-wiping mistake.
 
 ## Troubleshooting
 
