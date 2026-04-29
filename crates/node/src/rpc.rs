@@ -732,10 +732,14 @@ impl PydeApiServer for RpcServer {
         let data_hex = call_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
         let calldata =
             hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex)).unwrap_or_default();
-        let gas_limit: u64 = call_obj
-            .get("gas")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(100_000_000); // 100M default — Vec deserialization + loops need headroom
+        // Cap user-supplied gas at the block-level GAS_TARGET (400M).
+        // `pyde_call` runs synchronously on the public RPC node's CPU
+        // (never proposed into a block), so without an upper bound a
+        // malicious caller can pass `gas: u64::MAX` and burn CPU until
+        // the request times out. 400M leaves ample headroom over the
+        // 100M default for any legitimate view function — full block
+        // gas budgets are bounded by the same target.
+        let gas_limit: u64 = clamp_call_gas(call_obj.get("gas").and_then(|v| v.as_u64()));
 
         // Take a read-consistent snapshot of state for the entire call.
         // This prevents the background Merkle commit or block processor from
@@ -1569,6 +1573,28 @@ fn rpc_err(code: i32, msg: String) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(code, msg, None::<()>)
 }
 
+/// Default gas limit for `pyde_call` when the caller omits one. 100M
+/// covers Vec deserialization + loop-heavy view functions seen in
+/// real otic contracts.
+const CALL_GAS_DEFAULT: u64 = 100_000_000;
+
+/// Hard cap on `pyde_call` gas. `pyde_call` runs on the public RPC
+/// node's CPU and never reaches a block, so an unbounded
+/// caller-supplied gas value is a free CPU-burn DoS — a single
+/// `gas: u64::MAX` request would spin until the request timed out.
+/// 400M matches `pyde_tx::fee::GAS_TARGET`, the per-block target, so
+/// any view function shape that fits in a block fits in a call.
+const CALL_GAS_CAP: u64 = pyde_tx::fee::GAS_TARGET;
+
+/// Clamp a caller-supplied `gas` parameter for `pyde_call`. None → use
+/// the default; Some(g) → at most `CALL_GAS_CAP`.
+fn clamp_call_gas(supplied: Option<u64>) -> u64 {
+    match supplied {
+        None => CALL_GAS_DEFAULT,
+        Some(g) => g.min(CALL_GAS_CAP),
+    }
+}
+
 /// Policy choice for how to gate encrypted-tx RPC ingress against
 /// `send_encrypted_transaction`'s sender-FALCON binding (audit item
 /// 206). Split out as a pure function so the devnet/production
@@ -1861,6 +1887,30 @@ mod tests {
     #[test]
     fn decode_u128_short_returns_zero() {
         assert_eq!(decode_u128(&[1, 2, 3]), 0);
+    }
+
+    #[test]
+    fn clamp_call_gas_default_when_omitted() {
+        assert_eq!(clamp_call_gas(None), CALL_GAS_DEFAULT);
+    }
+
+    #[test]
+    fn clamp_call_gas_passes_through_below_cap() {
+        // Default sits below the cap, so it's preserved as-is.
+        assert_eq!(clamp_call_gas(Some(50_000_000)), 50_000_000);
+        assert_eq!(clamp_call_gas(Some(CALL_GAS_DEFAULT)), CALL_GAS_DEFAULT);
+        // Exact cap is allowed.
+        assert_eq!(clamp_call_gas(Some(CALL_GAS_CAP)), CALL_GAS_CAP);
+    }
+
+    #[test]
+    fn clamp_call_gas_caps_oversized_request() {
+        // The DoS vector: u64::MAX or any value above CALL_GAS_CAP must
+        // be clamped to CALL_GAS_CAP, otherwise a single call ties up
+        // the RPC node's CPU until the request times out.
+        assert_eq!(clamp_call_gas(Some(CALL_GAS_CAP + 1)), CALL_GAS_CAP);
+        assert_eq!(clamp_call_gas(Some(u64::MAX)), CALL_GAS_CAP);
+        assert_eq!(clamp_call_gas(Some(2 * CALL_GAS_CAP)), CALL_GAS_CAP);
     }
 
     #[test]
