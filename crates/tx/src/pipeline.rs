@@ -105,6 +105,83 @@ pub fn store_account(
     Ok(())
 }
 
+/// Apply the (final - initial) deltas the pipeline produced for an
+/// account against the latest SMT state at write time, then store
+/// (audit 307).
+///
+/// The pipeline loads `sender` and `recipient` once at the top of
+/// `execute_transaction` and mutates them through pre_charge,
+/// transfer_value, post_refund, and per-type handlers (e.g.
+/// ClaimReward credits sender, RegisterPubkey sets sender.auth_keys).
+/// In parallel, the fee-distribution path at the bottom of
+/// `execute_transaction` loads + credits + stores `validator` and
+/// `treasury` accounts directly via `store_account`. Per-type
+/// handlers that touch other accounts (ClaimAirdrop's pool,
+/// SweepAirdrop's pool/treasury, Slash's offender, etc.) do the
+/// same.
+///
+/// When `tx.from` or `tx.to` aliases any of those handler-written
+/// addresses (proposer submitting their own tx, self-transfer,
+/// ClaimAirdrop with `tx.to == airdrop_pool_address()`, ...), a
+/// blind `store_account(smt, &sender)` / `store_account(smt,
+/// &recipient)` overwrites the handler's state with the in-memory
+/// pipeline copy. Pre-audit-307 code did exactly that — the
+/// validator credit, treasury credit, pool debit, etc. were
+/// silently undone whenever they collided with the sender or
+/// recipient address.
+///
+/// The fix is to capture pre-mutation snapshots
+/// (`sender_initial`, `recipient_initial`) before any pipeline-
+/// side modification, and at write time:
+///   1. re-load the latest SMT state for the address;
+///   2. add `final.balance - initial.balance` (saturating);
+///   3. add `final.gas_tank - initial.gas_tank` (saturating);
+///   4. take `final.auth_keys` if the pipeline changed it
+///      (RegisterPubkey upgrade) — otherwise keep what's there;
+///   5. store.
+///
+/// This is correct under aliasing AND under self-transfer
+/// (where the sender apply runs first, recipient apply re-reads
+/// sender's just-stored state and adds `+tx.value` on top).
+pub fn apply_account_delta(
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    addr: &Address,
+    initial: &Account,
+    final_: &Account,
+) -> Result<(), PipelineError> {
+    let mut current = load_account(smt, addr);
+
+    // Balance delta. `i128` is wide enough: u128 deltas up to
+    // ±u128::MAX/2 are representable. Real Pyde txs operate on
+    // values bounded by total_supply (≪ 2^127) so saturating
+    // covers the tail.
+    let balance_delta = final_.balance as i128 - initial.balance as i128;
+    if balance_delta >= 0 {
+        current.balance = current.balance.saturating_add(balance_delta as u128);
+    } else {
+        current.balance = current.balance.saturating_sub((-balance_delta) as u128);
+    }
+
+    // gas_tank delta (FeePayer::GasTank path).
+    let gas_tank_delta = final_.gas_tank as i128 - initial.gas_tank as i128;
+    if gas_tank_delta >= 0 {
+        current.gas_tank = current.gas_tank.saturating_add(gas_tank_delta as u128);
+    } else {
+        current.gas_tank = current.gas_tank.saturating_sub((-gas_tank_delta) as u128);
+    }
+
+    // auth_keys: only override if the pipeline changed it
+    // (RegisterPubkey is the only handler that mutates
+    // sender.auth_keys today). Otherwise preserve whatever the
+    // SMT currently holds — covers a future handler that rotates
+    // auth_keys for the same address as sender/recipient.
+    if final_.auth_keys != initial.auth_keys {
+        current.auth_keys = final_.auth_keys.clone();
+    }
+
+    store_account(smt, &current)
+}
+
 /// Load a nonce state for an account. Returns default if not found.
 pub fn load_nonce(smt: &dyn pyde_state::smt::StateAccess, address: &Address) -> NonceState {
     let key = keys::nonce_key(address);
@@ -205,6 +282,21 @@ fn execute_transaction_inner(
     let mut sender = load_account(smt, &tx.from);
     let mut recipient = load_account(smt, &tx.to);
     let mut nonce_state = load_nonce(smt, &tx.from);
+
+    // Audit 307: snapshot pre-mutation account state so we can
+    // apply deltas (balance / gas_tank / auth_keys) against the
+    // latest SMT state at write time, instead of overwriting
+    // writes made by validator + treasury fee distribution and by
+    // per-type handlers. The clobber matters whenever a handler-
+    // mutated address aliases sender or recipient — e.g. a
+    // proposer submitting their own tx (tx.from == validator
+    // address), self-transfers (tx.from == tx.to), or
+    // ClaimAirdrop with tx.to == airdrop_pool_address(). Without
+    // these snapshots the late `store_account(smt, &sender)` /
+    // `store_account(smt, &recipient)` calls silently undo every
+    // such cross-write.
+    let sender_initial = sender.clone();
+    let recipient_initial = recipient.clone();
 
     // Compute vested-locked amount for the sender (slice 4.4). Senders
     // with no vesting schedule get 0 — their full balance is spendable.
@@ -619,9 +711,26 @@ fn execute_transaction_inner(
     // Burn (70%): implicit — charged from sender in step 3, never credited to anyone.
     // Total supply decreases by fee_dist.burned each transaction.
 
-    // 9. Save updated accounts
-    store_account(smt, &sender)?;
-    store_account(smt, &recipient)?;
+    // 9. Save updated accounts via delta-apply (audit 307).
+    //    `apply_account_delta` re-reads the latest SMT state for
+    //    each address, applies the (final - initial) deltas the
+    //    pipeline produced for sender / recipient, and stores. If
+    //    `tx.from` aliased the validator / treasury / handler-
+    //    written address, the credit applied at lines 609 / 616 /
+    //    inside the handler is preserved AND the pipeline's
+    //    debit + transfer + refund deltas land on top of it.
+    //
+    //    Self-transfer note: when `tx.to == tx.from`, both calls
+    //    target the same SMT key. The sender apply runs first
+    //    (storing pre-tx + sender deltas), the recipient apply
+    //    re-reads that stored value and applies the recipient
+    //    delta (+tx.value) on top. End state: pre-tx + (-debit
+    //    - tx.value + refund) + tx.value = pre-tx - debit +
+    //    refund. The pre-307 code clobbered sender's stored
+    //    state with the recipient's pre-tx + tx.value, dropping
+    //    the gas debit entirely (free self-transfers).
+    apply_account_delta(smt, &tx.from, &sender_initial, &sender)?;
+    apply_account_delta(smt, &tx.to, &recipient_initial, &recipient)?;
     store_nonce(smt, &tx.from, &nonce_state)?;
 
     // 10. Generate receipt
@@ -2329,6 +2438,158 @@ mod tests {
     }
 
     // ========== State persistence ==========
+
+    // ── Audit 307: writeback no-clobber regression tests ───────────
+
+    /// Self-transfer must pay gas. Pre-307, `store_account(smt,
+    /// &recipient)` ran AFTER `store_account(smt, &sender)` for
+    /// the same address, overwriting sender's debit with
+    /// recipient's pre-tx-balance + tx.value. End state: pre-tx +
+    /// tx.value (free + minted). After 307: pre-tx - gas_used.
+    #[test]
+    fn self_transfer_pays_gas_after_307() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let mut smt = PydeSMT::new();
+        let mut block_ctx = make_block_ctx();
+        // Use a non-aliasing validator address so the sender alone
+        // captures the clobber path under test.
+        block_ctx.validator_address = derive_eoa_address(b"validator-distinct");
+
+        let sender_addr = setup_funded_account(&mut smt, &pk_bytes, 100_000_000);
+        let tx = make_signed_tx(sender_addr, sender_addr, 1_000, 21_000, 0, &sk);
+        let receipt = execute_transaction(&tx, &mut smt, &block_ctx).unwrap();
+        assert!(receipt.success);
+
+        let final_balance = load_account(&smt, &sender_addr).balance;
+        let expected_gas_cost = 21_000u128 * block_ctx.base_fee;
+        // Pre-307 bug: final_balance == 100_000_000 + 1_000 (free).
+        // Post-307: final_balance == 100_000_000 - gas_cost.
+        assert!(
+            final_balance < 100_000_000,
+            "self-transfer must pay gas, balance = {}",
+            final_balance
+        );
+        assert_eq!(
+            final_balance,
+            100_000_000 - expected_gas_cost,
+            "self-transfer leaves only the gas debit; tx.value moves nowhere"
+        );
+    }
+
+    /// Proposer submitting their own tx earns the validator fee
+    /// credit. Pre-307: line-623 `store_account(smt, &sender)`
+    /// overwrote line-609's validator credit. After 307: sender
+    /// re-loads from SMT (with credit applied) and applies its
+    /// debit + refund deltas on top. End balance: pre-tx -
+    /// gas_paid + fee_dist.validator.
+    #[test]
+    fn proposer_self_tx_earns_validator_credit_after_307() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let mut smt = PydeSMT::new();
+        let mut block_ctx = make_block_ctx();
+
+        // Make the validator address == the sender address.
+        let sender_addr = setup_funded_account(&mut smt, &pk_bytes, 100_000_000);
+        block_ctx.validator_address = sender_addr;
+
+        let recipient_addr = derive_eoa_address(b"recipient");
+        let tx = make_signed_tx(sender_addr, recipient_addr, 1_000, 21_000, 0, &sk);
+        let receipt = execute_transaction(&tx, &mut smt, &block_ctx).unwrap();
+        assert!(receipt.success);
+
+        // The validator credit is 20% of effective_gas * base_fee
+        // (see distribute_fee). A non-zero credit confirms the
+        // line-609 store survived past the line-623 sender store.
+        let final_balance = load_account(&smt, &sender_addr).balance;
+        let gas_paid = receipt.gas_used as u128 * block_ctx.base_fee;
+        let validator_credit = (gas_paid * 20) / 100;
+        let expected = 100_000_000u128 - gas_paid - 1_000 + validator_credit;
+        assert_eq!(
+            final_balance, expected,
+            "proposer must keep the validator-fee credit after paying their own tx (audit 307)"
+        );
+    }
+
+    /// Recipient = validator: validator credit applied to recipient
+    /// is NOT clobbered by the late `store_account(smt, &recipient)`.
+    /// End balance: pre-tx + tx.value + fee_dist.validator.
+    #[test]
+    fn recipient_is_validator_keeps_credit_after_307() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let mut smt = PydeSMT::new();
+        let mut block_ctx = make_block_ctx();
+
+        let sender_addr = setup_funded_account(&mut smt, &pk_bytes, 100_000_000);
+
+        // Pre-fund the validator (= recipient) so we can verify
+        // the delta is applied on top of an existing balance.
+        let recipient_addr = derive_eoa_address(b"recipient-and-validator");
+        let mut recipient_account = Account::new_eoa(b"recipient-and-validator");
+        recipient_account.balance = 50_000_000;
+        store_account(&mut smt, &recipient_account).unwrap();
+        block_ctx.validator_address = recipient_addr;
+
+        let tx = make_signed_tx(sender_addr, recipient_addr, 1_000, 21_000, 0, &sk);
+        let receipt = execute_transaction(&tx, &mut smt, &block_ctx).unwrap();
+        assert!(receipt.success);
+
+        let final_balance = load_account(&smt, &recipient_addr).balance;
+        let gas_paid = receipt.gas_used as u128 * block_ctx.base_fee;
+        let validator_credit = (gas_paid * 20) / 100;
+        let expected = 50_000_000u128 + 1_000 + validator_credit;
+        assert_eq!(
+            final_balance, expected,
+            "recipient-as-validator must accumulate value transfer AND validator credit (audit 307)"
+        );
+    }
+
+    /// Sender = treasury: the 10% treasury credit applied at line
+    /// 614-616 survives past the late sender store.
+    #[test]
+    fn sender_is_treasury_keeps_credit_after_307() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let mut smt = PydeSMT::new();
+        let block_ctx = make_block_ctx();
+
+        // Build a sender whose address IS the treasury address by
+        // overriding the loaded account at the treasury slot.
+        let treasury_addr = pyde_account::address::treasury_address();
+        let mut treasury_eoa = Account::new_eoa(&pk_bytes);
+        // Force the address field to match the treasury slot.
+        treasury_eoa.address = treasury_addr;
+        treasury_eoa.balance = 100_000_000;
+        store_account(&mut smt, &treasury_eoa).unwrap();
+        store_nonce(&mut smt, &treasury_addr, &NonceState::new()).unwrap();
+
+        let recipient_addr = derive_eoa_address(b"recipient");
+        let mut tx = make_signed_tx(treasury_addr, recipient_addr, 1_000, 21_000, 0, &sk);
+        // The from address is the treasury slot which doesn't have
+        // sender's auth_keys; tests skip signature via
+        // dev_skip_signature in block_ctx, but we must still
+        // override tx.signature shape for `make_signed_tx`'s sig
+        // to be sane against `sender.auth_keys`. Re-build the sig
+        // against the (mutated) tx fields:
+        tx.signature = falcon_sign(&sk, &tx.hash())
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+
+        let receipt = execute_transaction(&tx, &mut smt, &block_ctx).unwrap();
+        assert!(receipt.success);
+
+        let final_balance = load_account(&smt, &treasury_addr).balance;
+        let gas_paid = receipt.gas_used as u128 * block_ctx.base_fee;
+        let treasury_credit = (gas_paid * 10) / 100;
+        let expected = 100_000_000u128 - gas_paid - 1_000 + treasury_credit;
+        assert_eq!(
+            final_balance, expected,
+            "sender-as-treasury must keep treasury credit after paying their own tx (audit 307)"
+        );
+    }
 
     #[test]
     fn state_root_changes_after_tx() {

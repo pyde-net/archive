@@ -130,25 +130,28 @@
 
 ### Pipeline / fee / state-corruption
 
-- [ ] 307 — `⚠` **Tx pipeline writeback clobbers per-type handler
+- [x] 307 — `✓` **Tx pipeline writeback clobbers per-type handler
       effects.**
-      Where: `crates/tx/src/pipeline.rs:622-624` — `sender` (loaded
-      :205) and `recipient` (:206) are unconditionally re-written
-      after the per-type handler runs. Silently undoes:
-      - `tx.from == tx.to` (self-transfer): gas debit dropped (free
-        tx).
-      - `tx.to == airdrop_pool_address()` on `ClaimAirdrop`: pool
-        debit clobbered → infinite mint. Same shape for
-        `SweepAirdrop`.
-      - `tx.from`/`tx.to == validator_address`: validator fee credit
-        overwritten. Same for treasury.
-      `MultisigTx` defends with three explicit guards (lines 1697,
-      1713, 1722); other handlers do not.
-      Fix: replace the late writeback with a unified-update pattern
-      (load → mutate in HashMap by-address → serialize each unique
-      account once at the end). OR add MultisigTx-style guards to
-      ClaimAirdrop / SweepAirdrop / Standard self-transfer / every
-      handler that touches non-sender/non-recipient accounts.
+      Shipped: snapshot `sender_initial` / `recipient_initial` at
+      the top of `execute_transaction`, then replace the late
+      `store_account(smt, &sender)` / `store_account(smt,
+      &recipient)` with a new `apply_account_delta` helper that
+      re-loads the latest SMT state, applies (final - initial)
+      deltas for `balance` / `gas_tank` / `auth_keys`, and stores.
+      The re-load picks up handler / validator / treasury writes
+      that landed at lines 609 / 616 / inside per-type handlers,
+      so the pipeline's debit + transfer + refund deltas land on
+      top of those credits instead of overwriting them.
+      Self-transfer handled correctly: sender apply runs first,
+      recipient apply re-reads sender's just-stored state and
+      adds `+tx.value` on top → end balance pre-tx − gas_paid.
+      4 new regression tests
+      (`self_transfer_pays_gas_after_307`,
+      `proposer_self_tx_earns_validator_credit_after_307`,
+      `recipient_is_validator_keeps_credit_after_307`,
+      `sender_is_treasury_keeps_credit_after_307`) confirm each
+      of the four clobber paths the audit identified is now
+      closed. All 91 pyde-tx pipeline tests pass.
 
 ### PVM / consensus-fork
 
