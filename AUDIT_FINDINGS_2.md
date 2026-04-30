@@ -52,17 +52,17 @@
       pyde-mempool tests pass; clippy clean; pyde-node downstream
       builds clean.
 
-- [ ] 302 — `✓` **RPC `send_encrypted_transaction` defaults
+- [x] 302 — `✓` **RPC `send_encrypted_transaction` defaults
       `chain_id = 1` (mainnet) when caller omits it.**
-      Where: `crates/node/src/rpc.rs:1214` —
-      `tx_obj.get("chainId").and_then(...).unwrap_or(1)`.
-      A wallet that omits `chainId` signs against mainnet; the tx
-      fails verification on the running chain (e.g., testnet 7331),
-      AND becomes a perfect replay candidate the moment mainnet
-      launches.
-      Fix: default to `self.chain_id`, OR reject when `chainId` is
-      missing with a clear `-32602` error. Mirror the same defaulting
-      pattern across every other RPC entry that accepts `chainId`.
+      Shipped: extracted `resolve_request_chain_id(supplied,
+      node_chain_id) -> Result<u64, String>` helper near the other
+      pure RPC helpers (`clamp_call_gas`, `encrypted_tx_ingest_policy`).
+      Three branches: missing → node's chain_id; matching → accepted;
+      mismatching → -32602 with a clear `"chainId mismatch: tx
+      claims X but node is on Y"` error. `send_encrypted_transaction`
+      now routes through it. 3 new unit tests covering each branch
+      across [1, 7, 7331, 31337, 1_000_000]. 20 pyde-node rpc tests
+      pass.
 
 - [ ] 303 — `⚠` **Faucet `chain_id` defaults to 31337 on RPC failure.**
       Where: `crates/node/src/faucet.rs:170, 251` — `fetch_chain_id`

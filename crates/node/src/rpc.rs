@@ -1211,7 +1211,17 @@ impl PydeApiServer for RpcServer {
             .unwrap_or("");
         let signature = hex::decode(signature_hex.strip_prefix("0x").unwrap_or(signature_hex))
             .unwrap_or_default();
-        let chain_id: u64 = tx_obj.get("chainId").and_then(|v| v.as_u64()).unwrap_or(1);
+        // Audit 302: never default `chainId` to mainnet. A wallet that
+        // omits the field gets the node's running chain_id; a wallet
+        // that supplies a different chain_id gets a clean -32602 so
+        // the misconfiguration surfaces immediately instead of
+        // producing a tx that fails verification on the target chain
+        // AND replays the moment any chain with the same id launches.
+        let chain_id = resolve_request_chain_id(
+            tx_obj.get("chainId").and_then(|v| v.as_u64()),
+            self.chain_id,
+        )
+        .map_err(|m| rpc_err(-32602, m))?;
 
         // Build access list (simplified: just the target contract)
         let access_list = if to != [0u8; 32] {
@@ -1662,6 +1672,27 @@ fn clamp_call_gas(supplied: Option<u64>) -> u64 {
     }
 }
 
+/// Resolve a caller-supplied `chainId` against the node's running
+/// chain_id. None → the node's chain_id (sane default for omitted
+/// fields). Some(v) where v == node.chain_id → accepted. Some(v)
+/// where v ≠ node.chain_id → an `Err` the caller should surface as
+/// JSON-RPC -32602.
+///
+/// Audit 302: the prior behavior defaulted missing `chainId` to 1
+/// (mainnet), so a wallet that omitted the field on testnet signed a
+/// tx bound to mainnet — the tx would fail verification on the local
+/// chain AND replay the moment a chain with id 1 launched.
+fn resolve_request_chain_id(supplied: Option<u64>, node_chain_id: u64) -> Result<u64, String> {
+    match supplied {
+        None => Ok(node_chain_id),
+        Some(v) if v == node_chain_id => Ok(v),
+        Some(v) => Err(format!(
+            "chainId mismatch: tx claims {} but node is on {}",
+            v, node_chain_id
+        )),
+    }
+}
+
 /// Policy choice for how to gate encrypted-tx RPC ingress against
 /// `send_encrypted_transaction`'s sender-FALCON binding (audit item
 /// 206). Split out as a pure function so the devnet/production
@@ -1978,6 +2009,41 @@ mod tests {
         assert_eq!(clamp_call_gas(Some(CALL_GAS_CAP + 1)), CALL_GAS_CAP);
         assert_eq!(clamp_call_gas(Some(u64::MAX)), CALL_GAS_CAP);
         assert_eq!(clamp_call_gas(Some(2 * CALL_GAS_CAP)), CALL_GAS_CAP);
+    }
+
+    #[test]
+    fn resolve_chain_id_defaults_to_node_when_missing() {
+        // Audit 302: a wallet that omits `chainId` gets the node's
+        // running chain_id, NOT a hardcoded mainnet=1 fallback.
+        for node_chain in [1u64, 7, 7331, 31337, 1_000_000] {
+            assert_eq!(
+                resolve_request_chain_id(None, node_chain).unwrap(),
+                node_chain,
+                "node {} should default to itself",
+                node_chain
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_chain_id_accepts_matching_value() {
+        for chain in [1u64, 7331, 31337] {
+            assert_eq!(
+                resolve_request_chain_id(Some(chain), chain).unwrap(),
+                chain
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_chain_id_rejects_mismatch() {
+        // Cross-chain replay surface: testnet 7331 must reject a
+        // mainnet=1 claim, and vice versa. Pre-fix this defaulted to
+        // 1, so the mismatch was masked.
+        assert!(resolve_request_chain_id(Some(1), 7331).is_err());
+        assert!(resolve_request_chain_id(Some(7331), 1).is_err());
+        assert!(resolve_request_chain_id(Some(31337), 7331).is_err());
+        assert!(resolve_request_chain_id(Some(7331), 31337).is_err());
     }
 
     #[test]
