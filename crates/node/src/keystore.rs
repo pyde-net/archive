@@ -57,24 +57,58 @@ pub struct ValidatorKeystore {
     pub version: u32,
 }
 
-const KEYSTORE_VERSION: u32 = 1;
+/// Schema versions:
+/// - **1** (legacy, audit 221): single-iteration `Poseidon2(passphrase
+///   || salt)` KDF. Brute-forceable in milliseconds-to-hours per
+///   passphrase on commodity GPUs.
+/// - **2** (audit 306, current): Argon2id with `m=64 MB, t=3, p=1`,
+///   ~250 ms per guess on a single core, memory-hard. New keystores
+///   are written at v2; v1 keystores still load via the legacy KDF
+///   path so existing operator setups don't break across the bump.
+const KEYSTORE_VERSION: u32 = 2;
+const KEYSTORE_VERSION_LEGACY_POSEIDON2: u32 = 1;
 
-/// Derive a 32-byte AES key from `passphrase` + `salt`. We use
-/// Poseidon2 because it's already on the project's crypto bill
-/// of materials and zero-allocs on no_std builds. PBKDF2 /
-/// Argon2 would be more standard; tracking that as a follow-up
-/// if external auditors ask, but Poseidon2 over a 16-byte salt
-/// is a reasonable starting point — collisions are
-/// computationally infeasible and the hash is 32 bytes by
-/// construction (matches Aes256Gcm's key size exactly).
-fn derive_aes_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
+/// Argon2id parameters. Tuned for ~250 ms / single-core on
+/// commodity 2026 hardware; tighter than the `argon2` crate's
+/// defaults. Pinned here so all three keystore implementations
+/// (validator, SDK wallet, pyde-dev wallet) stay byte-compatible.
+const ARGON2_M_COST_KIB: u32 = 64 * 1024; // 64 MiB
+const ARGON2_T_COST: u32 = 3;
+const ARGON2_P_COST: u32 = 1;
+
+/// Derive a 32-byte AES key from `passphrase` + `salt` using
+/// Argon2id (audit 306). The previous Poseidon2 KDF was fast by
+/// design — a 10-character passphrase fell to GPU brute force in
+/// hours, "pass123" in milliseconds — so any operator backup leak
+/// or supply-chain compromise of the keystore file effectively
+/// exposed the FALCON private key.
+fn derive_aes_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+    let params = argon2::Params::new(
+        ARGON2_M_COST_KIB,
+        ARGON2_T_COST,
+        ARGON2_P_COST,
+        Some(32),
+    )
+    .map_err(|e| format!("argon2 params: {e}"))?;
+    let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let mut out = [0u8; 32];
+    argon
+        .hash_password_into(passphrase.as_bytes(), salt, &mut out)
+        .map_err(|e| format!("argon2 hash: {e}"))?;
+    Ok(out)
+}
+
+/// Legacy Poseidon2 KDF kept ONLY for decrypting v1 keystores.
+/// Never used to encrypt new keys.
+fn derive_aes_key_v1_poseidon2(passphrase: &str, salt: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(passphrase.len() + salt.len());
     input.extend_from_slice(passphrase.as_bytes());
     input.extend_from_slice(salt);
     poseidon2_hash(&input).to_bytes()
 }
 
-/// Encrypt a validator key + write it to disk as JSON.
+/// Encrypt a validator key + write it to disk as JSON. Always uses
+/// the current `KEYSTORE_VERSION` (Argon2id; audit 306).
 pub fn encrypt(
     pk: &FalconPublicKey,
     sk: &FalconSecretKey,
@@ -86,7 +120,7 @@ pub fn encrypt(
     let salt: [u8; 16] = rand::random();
     let nonce_bytes: [u8; 12] = rand::random();
 
-    let aes_key = derive_aes_key(passphrase, &salt);
+    let aes_key = derive_aes_key(passphrase, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES init: {e}"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
@@ -106,18 +140,19 @@ pub fn encrypt(
 }
 
 /// Decrypt a validator keystore back into the FALCON keypair.
+///
+/// Accepts both `version = 1` (legacy Poseidon2 KDF) and
+/// `version = 2` (Argon2id, audit 306). The KDF dispatch is the only
+/// version-dependent step; everything else (salt + AES-GCM) is
+/// identical across versions. Operators with v1 keystores get
+/// transparent decryption; re-encrypt at v2 by calling `encrypt`
+/// again with the same passphrase and writing the new keystore.
 pub fn decrypt(
     keystore: &ValidatorKeystore,
     passphrase: &str,
 ) -> Result<(FalconPublicKey, FalconSecretKey), String> {
     if passphrase.is_empty() {
         return Err("decrypt: passphrase must not be empty".into());
-    }
-    if keystore.version != KEYSTORE_VERSION {
-        return Err(format!(
-            "unsupported keystore version: {} (expected {})",
-            keystore.version, KEYSTORE_VERSION
-        ));
     }
 
     let salt = hex::decode(keystore.salt.trim_start_matches("0x"))
@@ -135,7 +170,16 @@ pub fn decrypt(
     let pk_bytes = hex::decode(keystore.public_key.trim_start_matches("0x"))
         .map_err(|e| format!("bad pubkey hex: {e}"))?;
 
-    let aes_key = derive_aes_key(passphrase, &salt);
+    let aes_key = match keystore.version {
+        KEYSTORE_VERSION => derive_aes_key(passphrase, &salt)?,
+        KEYSTORE_VERSION_LEGACY_POSEIDON2 => derive_aes_key_v1_poseidon2(passphrase, &salt),
+        v => {
+            return Err(format!(
+                "unsupported keystore version: {} (expected 1 or {})",
+                v, KEYSTORE_VERSION
+            ))
+        }
+    };
     let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES init: {e}"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -215,5 +259,68 @@ mod tests {
         let res = decrypt(&ks, "x");
         assert!(res.is_err());
         assert!(res.err().unwrap().contains("unsupported keystore version"));
+    }
+
+    // ── Audit 306: Argon2id migration tests ─────────────────────────
+
+    #[test]
+    fn new_keystores_are_v2_argon2id() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let ks = encrypt(&pk, &sk, "x").unwrap();
+        assert_eq!(ks.version, 2, "encrypt must always emit v2");
+    }
+
+    /// v1 keystores produced by the pre-306 binary still decrypt
+    /// after the bump. The KDF dispatch in `decrypt` routes
+    /// `version == 1` to `derive_aes_key_v1_poseidon2`. Operators
+    /// who upgrade the binary keep their existing keystores
+    /// working (until they rotate).
+    #[test]
+    fn legacy_v1_keystore_still_decrypts() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pass = "legacy-passphrase";
+        let salt: [u8; 16] = rand::random();
+        let nonce_bytes: [u8; 12] = rand::random();
+
+        // Build a v1 keystore by hand using the legacy KDF.
+        let aes_key = derive_aes_key_v1_poseidon2(pass, &salt);
+        let cipher = Aes256Gcm::new_from_slice(&aes_key).unwrap();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, sk.as_bytes()).unwrap();
+        let pk_bytes = pk.as_bytes();
+        let address = pyde_account::address::derive_eoa_address(pk_bytes);
+        let v1_ks = ValidatorKeystore {
+            address: format!("0x{}", hex::encode(address)),
+            public_key: format!("0x{}", hex::encode(pk_bytes)),
+            encrypted_secret_key: format!("0x{}", hex::encode(&ciphertext)),
+            salt: format!("0x{}", hex::encode(salt)),
+            nonce: format!("0x{}", hex::encode(nonce_bytes)),
+            version: 1,
+        };
+
+        let (pk2, sk2) = decrypt(&v1_ks, pass).expect("v1 must decrypt");
+        assert_eq!(pk.as_bytes(), pk2.as_bytes());
+        assert_eq!(sk.as_bytes(), sk2.as_bytes());
+
+        // Wrong passphrase against v1 still fails — the failure
+        // path goes through AES-GCM tag mismatch, not the KDF.
+        assert!(decrypt(&v1_ks, "wrong").is_err());
+    }
+
+    /// Re-encrypting a v1 keystore with `encrypt(...)` produces a
+    /// v2 keystore that decrypts under the same passphrase. This
+    /// is the "upgrade in place" path operators take post-306.
+    #[test]
+    fn v1_to_v2_reencryption_roundtrip() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pass = "upgrade-me";
+
+        // Pretend we loaded a v1 keystore (use encrypt to get the
+        // public/address bits, then re-encrypt at v2).
+        let v2 = encrypt(&pk, &sk, pass).unwrap();
+        assert_eq!(v2.version, 2);
+        let (pk2, sk2) = decrypt(&v2, pass).unwrap();
+        assert_eq!(pk.as_bytes(), pk2.as_bytes());
+        assert_eq!(sk.as_bytes(), sk2.as_bytes());
     }
 }

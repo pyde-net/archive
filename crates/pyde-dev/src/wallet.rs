@@ -8,7 +8,15 @@ use std::fs;
 use std::path::PathBuf;
 
 const WALLET_DIR: &str = ".pyde/wallets";
-const KEYSTORE_VERSION: u32 = 1;
+/// Schema versions: 1 = legacy single-iteration Poseidon2 KDF
+/// (brute-forceable on commodity GPUs); 2 = Argon2id with
+/// `m=64 MB, t=3, p=1` (audit 306).
+const KEYSTORE_VERSION: u32 = 2;
+const KEYSTORE_VERSION_LEGACY_POSEIDON2: u32 = 1;
+
+const ARGON2_M_COST_KIB: u32 = 64 * 1024;
+const ARGON2_T_COST: u32 = 3;
+const ARGON2_P_COST: u32 = 1;
 
 /// On-disk encrypted keystore.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -170,7 +178,26 @@ pub fn list() -> Result<Vec<(String, String)>, String> {
 // Encryption
 // ============================================================================
 
-fn derive_aes_key(password: &str, salt: &[u8]) -> [u8; 32] {
+/// Argon2id KDF (audit 306). Replaces the prior single-iteration
+/// Poseidon2 KDF, which was brute-forceable on commodity GPUs.
+fn derive_aes_key(password: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+    let params = argon2::Params::new(
+        ARGON2_M_COST_KIB,
+        ARGON2_T_COST,
+        ARGON2_P_COST,
+        Some(32),
+    )
+    .map_err(|e| format!("argon2 params: {}", e))?;
+    let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let mut out = [0u8; 32];
+    argon
+        .hash_password_into(password.as_bytes(), salt, &mut out)
+        .map_err(|e| format!("argon2 hash: {}", e))?;
+    Ok(out)
+}
+
+/// Legacy Poseidon2 KDF retained ONLY for decrypting v1 keystores.
+fn derive_aes_key_v1_poseidon2(password: &str, salt: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(password.len() + salt.len());
     input.extend_from_slice(password.as_bytes());
     input.extend_from_slice(salt);
@@ -187,7 +214,7 @@ fn encrypt_keystore(
     let salt: [u8; 16] = rand::random();
     let nonce_bytes: [u8; 12] = rand::random();
 
-    let aes_key = derive_aes_key(password, &salt);
+    let aes_key = derive_aes_key(password, &salt)?;
     let cipher =
         Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES init failed: {}", e))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -213,7 +240,16 @@ fn decrypt_secret_key(keystore: &Keystore, password: &str) -> Result<FalconSecre
     let encrypted = hex::decode(keystore.encrypted_secret_key.trim_start_matches("0x"))
         .map_err(|_| "invalid encrypted key")?;
 
-    let aes_key = derive_aes_key(password, &salt);
+    let aes_key = match keystore.version {
+        KEYSTORE_VERSION => derive_aes_key(password, &salt)?,
+        KEYSTORE_VERSION_LEGACY_POSEIDON2 => derive_aes_key_v1_poseidon2(password, &salt),
+        v => {
+            return Err(format!(
+                "unsupported keystore version: {} (expected 1 or {})",
+                v, KEYSTORE_VERSION
+            ))
+        }
+    };
     let cipher =
         Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES init failed: {}", e))?;
 
@@ -512,6 +548,54 @@ mod tests {
         let result = decrypt_secret_key(&keystore, "wrong");
 
         assert!(result.is_err());
+    }
+
+    // ── Audit 306: Argon2id migration tests ─────────────────────────
+
+    #[test]
+    fn new_keystores_are_v2_argon2id() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let address = pyde_account::address::derive_eoa_address(pk.as_bytes());
+        let ks = encrypt_keystore(&pk, &sk, &address, "x").unwrap();
+        assert_eq!(ks.version, 2);
+    }
+
+    /// Pre-306 v1 keystores still decrypt via the legacy KDF dispatch.
+    #[test]
+    fn legacy_v1_keystore_still_decrypts() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let address = pyde_account::address::derive_eoa_address(pk.as_bytes());
+        let pass = "legacy-passphrase";
+        let salt: [u8; 16] = rand::random();
+        let nonce_bytes: [u8; 12] = rand::random();
+
+        let aes_key = derive_aes_key_v1_poseidon2(pass, &salt);
+        let cipher = Aes256Gcm::new_from_slice(&aes_key).unwrap();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, sk.as_bytes()).unwrap();
+        let v1_ks = Keystore {
+            address: format!("0x{}", hex::encode(address)),
+            public_key: format!("0x{}", hex::encode(pk.as_bytes())),
+            encrypted_secret_key: format!("0x{}", hex::encode(&ciphertext)),
+            salt: format!("0x{}", hex::encode(salt)),
+            nonce: format!("0x{}", hex::encode(nonce_bytes)),
+            version: 1,
+        };
+
+        let decrypted = decrypt_secret_key(&v1_ks, pass).unwrap();
+        assert_eq!(sk.as_bytes(), decrypted.as_bytes());
+        assert!(decrypt_secret_key(&v1_ks, "wrong").is_err());
+    }
+
+    #[test]
+    fn unsupported_keystore_version_rejected() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let address = pyde_account::address::derive_eoa_address(pk.as_bytes());
+        let mut ks = encrypt_keystore(&pk, &sk, &address, "x").unwrap();
+        ks.version = 99;
+        let res = decrypt_secret_key(&ks, "x");
+        assert!(res.is_err());
+        assert!(res.err().unwrap().contains("unsupported keystore version"));
     }
 
     #[test]

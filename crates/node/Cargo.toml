@@ -62,6 +62,11 @@ sparse-merkle-tree = "0.6"
 # Validator keystore encryption (audit 221).
 aes-gcm = "0.10"
 rand = "0.8"
+# Memory-hard KDF for keystore passphrases (audit 306). Argon2id
+# replaces the prior single-iteration Poseidon2 KDF; same crate
+# is used in pyde-rust-sdk + pyde-dev so all three keystore
+# implementations share compatible parameters.
+argon2 = "0.5"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "blocking"] }

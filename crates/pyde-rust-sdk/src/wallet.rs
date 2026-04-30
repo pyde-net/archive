@@ -461,10 +461,41 @@ async fn send_and_check(provider: &Provider, tx: &Transaction) -> Result<Receipt
 }
 
 // ============================================================================
-// Encryption (AES-256-GCM + Poseidon2 key derivation)
+// Encryption (AES-256-GCM + Argon2id key derivation, audit 306)
 // ============================================================================
 
-fn derive_aes_key(password: &str, salt: &[u8]) -> [u8; 32] {
+/// Schema versions:
+/// - **1** (legacy): single-iteration `Poseidon2(password || salt)`
+///   KDF. Brute-forceable in milliseconds-to-hours per password on
+///   commodity GPUs.
+/// - **2** (audit 306, current): Argon2id with `m=64 MB, t=3, p=1`,
+///   memory-hard. New keystores ship at v2; v1 still decrypts via
+///   the legacy KDF dispatch.
+const KEYSTORE_VERSION: u32 = 2;
+const KEYSTORE_VERSION_LEGACY_POSEIDON2: u32 = 1;
+
+const ARGON2_M_COST_KIB: u32 = 64 * 1024;
+const ARGON2_T_COST: u32 = 3;
+const ARGON2_P_COST: u32 = 1;
+
+fn derive_aes_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
+    let params = argon2::Params::new(
+        ARGON2_M_COST_KIB,
+        ARGON2_T_COST,
+        ARGON2_P_COST,
+        Some(32),
+    )
+    .map_err(|e| SdkError::Signing(format!("argon2 params: {}", e)))?;
+    let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let mut out = [0u8; 32];
+    argon
+        .hash_password_into(password.as_bytes(), salt, &mut out)
+        .map_err(|e| SdkError::Signing(format!("argon2 hash: {}", e)))?;
+    Ok(out)
+}
+
+/// Legacy Poseidon2 KDF retained ONLY for decrypting v1 keystores.
+fn derive_aes_key_v1_poseidon2(password: &str, salt: &[u8]) -> [u8; 32] {
     let mut input = Vec::with_capacity(password.len() + salt.len());
     input.extend_from_slice(password.as_bytes());
     input.extend_from_slice(salt);
@@ -480,7 +511,7 @@ fn encrypt_keystore(
     let salt: [u8; 16] = rand::random();
     let nonce_bytes: [u8; 12] = rand::random();
 
-    let aes_key = derive_aes_key(password, &salt);
+    let aes_key = derive_aes_key(password, &salt)?;
     let cipher = Aes256Gcm::new_from_slice(&aes_key)
         .map_err(|e| SdkError::Signing(format!("AES init: {}", e)))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -495,7 +526,7 @@ fn encrypt_keystore(
         encrypted_secret_key: format!("0x{}", hex::encode(&encrypted)),
         salt: format!("0x{}", hex::encode(salt)),
         nonce: format!("0x{}", hex::encode(nonce_bytes)),
-        version: 1,
+        version: KEYSTORE_VERSION,
     })
 }
 
@@ -507,7 +538,16 @@ fn decrypt_key(keystore: &Keystore, password: &str) -> Result<FalconSecretKey> {
     let encrypted = hex::decode(keystore.encrypted_secret_key.trim_start_matches("0x"))
         .map_err(|_| SdkError::Signing("bad encrypted key".into()))?;
 
-    let aes_key = derive_aes_key(password, &salt);
+    let aes_key = match keystore.version {
+        KEYSTORE_VERSION => derive_aes_key(password, &salt)?,
+        KEYSTORE_VERSION_LEGACY_POSEIDON2 => derive_aes_key_v1_poseidon2(password, &salt),
+        v => {
+            return Err(SdkError::Signing(format!(
+                "unsupported keystore version: {} (expected 1 or {})",
+                v, KEYSTORE_VERSION
+            )))
+        }
+    };
     let cipher = Aes256Gcm::new_from_slice(&aes_key)
         .map_err(|e| SdkError::Signing(format!("AES init: {}", e)))?;
 
@@ -619,6 +659,54 @@ mod tests {
         let w = Wallet::generate().unwrap();
         let keystore = w.to_keystore("correct").unwrap();
         assert!(Wallet::from_encrypted(&keystore, "wrong").is_err());
+    }
+
+    // ── Audit 306: Argon2id migration tests ─────────────────────────
+
+    #[test]
+    fn new_keystores_are_v2_argon2id() {
+        let w = Wallet::generate().unwrap();
+        let ks = w.to_keystore("x").unwrap();
+        assert_eq!(ks.version, 2);
+    }
+
+    /// v1 keystores produced by the pre-306 SDK still decrypt.
+    /// Build a v1 keystore by hand using the legacy Poseidon2 KDF
+    /// and confirm `decrypt_key` routes to the legacy path.
+    #[test]
+    fn legacy_v1_keystore_still_decrypts() {
+        let w = Wallet::generate().unwrap();
+        let pass = "legacy-passphrase";
+        let salt: [u8; 16] = rand::random();
+        let nonce_bytes: [u8; 12] = rand::random();
+
+        let aes_key = derive_aes_key_v1_poseidon2(pass, &salt);
+        let cipher = Aes256Gcm::new_from_slice(&aes_key).unwrap();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, w.secret_key.as_bytes()).unwrap();
+        let v1_ks = Keystore {
+            address: format!("0x{}", hex::encode(w.address())),
+            public_key: format!("0x{}", hex::encode(w.public_key.as_bytes())),
+            encrypted_secret_key: format!("0x{}", hex::encode(&ciphertext)),
+            salt: format!("0x{}", hex::encode(salt)),
+            nonce: format!("0x{}", hex::encode(nonce_bytes)),
+            version: 1,
+        };
+
+        let sk = decrypt_key(&v1_ks, pass).unwrap();
+        assert_eq!(sk.as_bytes(), w.secret_key.as_bytes());
+        assert!(decrypt_key(&v1_ks, "wrong").is_err());
+    }
+
+    #[test]
+    fn unsupported_keystore_version_rejected() {
+        let w = Wallet::generate().unwrap();
+        let mut ks = w.to_keystore("x").unwrap();
+        ks.version = 99;
+        let res = decrypt_key(&ks, "x");
+        assert!(res.is_err());
+        let msg = format!("{:?}", res.err().unwrap());
+        assert!(msg.contains("unsupported keystore version"));
     }
 
     #[test]

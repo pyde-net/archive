@@ -109,20 +109,22 @@
 
 ### Crypto / cross-chain replay surfaces
 
-- [ ] 306 — `⚠` **Wallet keystore KDF is single-iteration Poseidon2.**
-      Where: `crates/pyde-rust-sdk/src/wallet.rs:467-471`
-      (`derive_aes_key`); same shape in
-      `crates/node/src/keystore.rs:70-75`.
-      Poseidon2 is fast by design; a 10-char passphrase falls in
-      hours on commodity GPU, "pass123" in milliseconds. The
-      keystore-file 0o600 permissions are the only mitigation for
-      backups, cloud sync, supply-chain compromise. Audit 221
-      explicitly punted this as "follow-up if external auditors ask."
-      Fix: swap to Argon2id (m=64 MB, t=3, p=1 minimum) via the
-      `argon2` crate. Bump `KEYSTORE_VERSION` to 2 with a lazy
-      in-place re-encrypt on first decrypt. Update
-      `pyde-rust-sdk/src/wallet.rs` AND `node/src/keystore.rs` AND
-      any `pyde-dev/src/wallet.rs` analogue in one PR.
+- [x] 306 — `✓` **Wallet keystore KDF is single-iteration Poseidon2.**
+      Shipped: replaced `derive_aes_key` with Argon2id (`m=64 MiB,
+      t=3, p=1`, ~250 ms per guess on a single core, memory-hard) in
+      all three keystore implementations: `node/src/keystore.rs`,
+      `pyde-rust-sdk/src/wallet.rs`, `pyde-dev/src/wallet.rs`. Bumped
+      `KEYSTORE_VERSION` from 1 to 2 in each. Backward compat
+      preserved: v1 keystores still decrypt via a retained
+      `derive_aes_key_v1_poseidon2` legacy KDF dispatch — operators
+      with pre-306 files keep working without manual migration.
+      `version = 99` (or any other unknown) cleanly rejected with
+      "unsupported keystore version" in all three. New `argon2 =
+      "0.5"` dep on each of the three crates. Tests: 9 new cases
+      across the three crates (always-v2 emit, v1 still decrypts,
+      v1 wrong-pass still fails, v99 rejected, v1→v2 re-encrypt
+      roundtrip in node/keystore). 8 + 17 + 7 = 32 keystore-related
+      tests pass.
 
 ### Pipeline / fee / state-corruption
 

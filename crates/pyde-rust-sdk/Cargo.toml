@@ -31,6 +31,8 @@ ethnum = "1.5.2"
 # Encryption
 aes-gcm = "0.10"
 rand = "0.8"
+# Memory-hard KDF for keystore passphrases (audit 306).
+argon2 = "0.5"
 
 # Error handling
 thiserror = "2"
