@@ -64,16 +64,20 @@
       across [1, 7, 7331, 31337, 1_000_000]. 20 pyde-node rpc tests
       pass.
 
-- [ ] 303 — `⚠` **Faucet `chain_id` defaults to 31337 on RPC failure.**
-      Where: `crates/node/src/faucet.rs:170, 251` — `fetch_chain_id`
-      returns 31337 (`unwrap_or("0x7a69")`) on RPC error or malformed
-      response.
-      A transient RPC blip silently re-targets the faucet at devnet's
-      domain on a testnet operator host; signed txs then bind to the
-      wrong chain.
-      Fix: fail loudly on RPC error. Add a `--chain-id` CLI flag and
-      refuse-on-mismatch against the polled node. Aligns the faucet
-      with the testnet runbook's chain_id 7331 declaration.
+- [x] 303 — `✓` **Faucet `chain_id` defaults to 31337 on RPC failure.**
+      Shipped: removed the silent `"0x7a69"` default in
+      `fetch_chain_id`; missing/null result now propagates as `Err`.
+      Removed the per-request `unwrap_or(31337)` in `send_faucet_tx`
+      — chain_id is now pinned at boot via a new
+      `resolve_faucet_chain_id` helper that polls the node once,
+      caches the value, and (when `--chain-id` is supplied) refuses
+      to start on mismatch. New `--chain-id` CLI flag on
+      `pyde faucet` + `chain_id: Option<u64>` field on `FaucetConfig`.
+      Pure decision logic split into `check_pinned_chain_id` for unit
+      testing. 3 new unit tests covering unpinned / matching pin /
+      mismatch (mainnet↔testnet, devnet↔testnet). 12 faucet tests
+      pass; bonus: each dispense saves a `pyde_chainId` RPC
+      round-trip.
 
 - [ ] 304 — `⚠` **`AuthKeys::MultiSig` validation silently passes any
       tx.**

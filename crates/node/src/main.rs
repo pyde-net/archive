@@ -90,6 +90,7 @@ fn main() {
             from,
             cooldown,
             private_key,
+            chain_id,
         } => {
             logging::init("info", false);
             let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
@@ -101,6 +102,7 @@ fn main() {
                     from_address: from,
                     cooldown_secs: cooldown,
                     private_key_path: private_key,
+                    chain_id,
                 };
                 if let Err(e) = faucet::run_faucet(config).await {
                     tracing::error!("faucet error: {}", e);

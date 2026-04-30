@@ -136,6 +136,15 @@ pub enum Command {
         /// If omitted, uses unsigned dev mode transactions.
         #[arg(long)]
         private_key: Option<String>,
+
+        /// Operator-pinned chain_id (audit 303). When set, the faucet
+        /// polls the node at boot and refuses to start if the node
+        /// reports a different chain_id — catches misconfiguration
+        /// before any tx gets signed against the wrong chain. Use
+        /// `--chain-id 7331` for the public testnet, `--chain-id 1`
+        /// for mainnet, or omit on devnet bring-up.
+        #[arg(long)]
+        chain_id: Option<u64>,
     },
 }
 
