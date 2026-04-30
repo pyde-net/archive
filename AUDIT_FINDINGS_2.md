@@ -36,22 +36,21 @@
 
 ### Trivial single-file fixes (do first)
 
-- [ ] 301 — `✓` **`EncryptedTx::from_bytes` aborts node on hostile
+- [x] 301 — `✓` **`EncryptedTx::from_bytes` aborts node on hostile
       input.**
-      Where: `crates/mempool/src/encrypted.rs:106-181`. Multiple raw
-      slice indices (`data[off..off+32]`, `data[off..off+sig_len]`,
-      `data[off..off+ct_len]`) and `Vec::with_capacity(al_count as
-      usize)` over a user-controlled `u32`.
-      Combined with `panic = "abort"` (`Cargo.toml:63`), one malformed
-      `pyde_sendRawEncryptedTransaction` (or one peer-sent
-      `EncryptedTxBundle` blob, since `wire.rs:486` bounds the count
-      not blob size) **kills the node process**. Reachable
-      anonymously via RPC (`rpc.rs:1309`), gossip, and the
-      `inclusion::audit_block_inclusion` peer audit path.
-      Fix: rewrite `from_bytes` as a checked-cursor decoder mirroring
-      `node::wire::Decoder` — gate `al_count`, `sig_len`, `ct_len`
-      against explicit caps; add a fuzz target alongside the existing
-      `fuzz/` corpus.
+      Shipped: replaced raw slice indexing with a `Cursor` helper
+      mirroring `pyde_node::wire::Decoder` (audit-204 pattern). New
+      caps: `MAX_ACCESS_ENTRIES = 1024`,
+      `MAX_KEYS_PER_ACCESS_ENTRY = 1024`, `MAX_SIG_LEN = 1024`
+      (FALCON-512 ≤ 1000 in practice), `MAX_CT_LEN = MAX_TX_SIZE`,
+      plus an upfront `data.len() > MAX_TX_SIZE` rejection. 9 new
+      panic-free regression tests covering empty / truncated header
+      / oversize envelope / huge counts on access list, sig, ct,
+      per-entry keys / truncated signature / 256-length zero/0xFF
+      sweep + happy-path roundtrip. New `cargo-fuzz` target
+      `encrypted_tx_decoder` wired into `fuzz/Cargo.toml`. 75
+      pyde-mempool tests pass; clippy clean; pyde-node downstream
+      builds clean.
 
 - [ ] 302 — `✓` **RPC `send_encrypted_transaction` defaults
       `chain_id = 1` (mainnet) when caller omits it.**

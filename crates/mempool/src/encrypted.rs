@@ -17,6 +17,21 @@ use pyde_tx::types::AccessEntry;
 /// Maximum transaction size (128 KB).
 pub const MAX_TX_SIZE: usize = 128 * 1024;
 
+/// Decoder caps for `EncryptedTx::from_bytes`. Each length field a peer
+/// supplies must be capped before it drives a `Vec::with_capacity`,
+/// otherwise a single malformed RPC / gossip blob can request an
+/// allocation large enough to abort the process under
+/// `panic = "abort"`. Caps mirror the `pyde_node::wire::Decoder`
+/// pattern (audit-204) sized down for the encrypted-tx payload shape.
+const MAX_ACCESS_ENTRIES: usize = 1024;
+const MAX_KEYS_PER_ACCESS_ENTRY: usize = 1024;
+/// FALCON-512 signatures are ~600-690 bytes in practice; the pool's
+/// structural-only path accepts [500, 1000]. Cap at 1024 for headroom.
+const MAX_SIG_LEN: usize = 1024;
+/// Threshold ciphertext is bounded by the encrypted payload, which is
+/// itself bounded by the overall tx size limit.
+const MAX_CT_LEN: usize = MAX_TX_SIZE;
+
 /// An encrypted transaction in the mempool.
 /// Plaintext fields are visible for validation and scheduling.
 /// Encrypted fields are hidden until threshold decryption.
@@ -41,6 +56,80 @@ pub struct EncryptedTx {
     // === Encrypted fields (hidden) ===
     /// Threshold-encrypted payload: contains to, value, calldata.
     pub ciphertext: ThresholdCiphertext,
+}
+
+/// Bounds-checked cursor used by `EncryptedTx::from_bytes`. Mirrors
+/// `pyde_node::wire::Decoder` (audit-204) but lives here so the
+/// mempool crate doesn't take a node dependency. Every read returns
+/// `None` on underrun; length fields go through `u16_count` /
+/// `u32_count` so an attacker-supplied count is capped before any
+/// `Vec::with_capacity`.
+struct Cursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.remaining() < n {
+            return None;
+        }
+        let s = &self.data[self.pos..self.pos + n];
+        self.pos += n;
+        Some(s)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        let b = self.take(2)?;
+        Some(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let b = self.take(4)?;
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let b = self.take(8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(b);
+        Some(u64::from_le_bytes(a))
+    }
+
+    fn bytes32(&mut self) -> Option<[u8; 32]> {
+        let b = self.take(32)?;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(b);
+        Some(a)
+    }
+
+    fn u16_count(&mut self, max: usize) -> Option<usize> {
+        let n = self.u16()? as usize;
+        if n > max {
+            return None;
+        }
+        Some(n)
+    }
+
+    fn u32_count(&mut self, max: usize) -> Option<usize> {
+        let n = self.u32()? as usize;
+        if n > max {
+            return None;
+        }
+        Some(n)
+    }
 }
 
 impl EncryptedTx {
@@ -103,71 +192,53 @@ impl EncryptedTx {
     }
 
     /// Deserialize from bytes.
+    ///
+    /// Reachable from `pyde_sendRawEncryptedTransaction`, peer-sent
+    /// `EncryptedTxBundle` blobs, and `inclusion::audit_block_inclusion`
+    /// — every byte here is attacker-controlled. The decoder must
+    /// return `None` (never panic, never abort) for any input. Length
+    /// fields are capped before any `Vec::with_capacity` to avoid
+    /// allocation-amplification DoS.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
-        if data.len() < 57 {
+        if data.len() > MAX_TX_SIZE {
             return None;
-        } // minimum: 32+8+8+8+1
-        let mut off = 0;
-        let mut sender = [0u8; 32];
-        sender.copy_from_slice(&data[off..off + 32]);
-        off += 32;
-        let nonce = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
-        off += 8;
-        let gas_limit = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
-        off += 8;
-        let chain_id = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
-        off += 8;
-        let has_deadline = data[off];
-        off += 1;
+        }
+        let mut cur = Cursor::new(data);
+        let sender = cur.bytes32()?;
+        let nonce = cur.u64()?;
+        let gas_limit = cur.u64()?;
+        let chain_id = cur.u64()?;
+        let has_deadline = cur.u8()?;
         let deadline = if has_deadline != 0 {
-            let d = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
-            off += 8;
-            Some(d)
+            Some(cur.u64()?)
         } else {
             None
         };
-        // Access list
-        let al_count = u32::from_le_bytes(data[off..off + 4].try_into().ok()?) as usize;
-        off += 4;
+        let al_count = cur.u32_count(MAX_ACCESS_ENTRIES)?;
         let mut access_list = Vec::with_capacity(al_count);
         for _ in 0..al_count {
-            let mut addr = [0u8; 32];
-            addr.copy_from_slice(&data[off..off + 32]);
-            off += 32;
-            let rc = u16::from_le_bytes(data[off..off + 2].try_into().ok()?) as usize;
-            off += 2;
-            let mut reads = Vec::with_capacity(rc);
-            for _ in 0..rc {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(&data[off..off + 32]);
-                off += 32;
-                reads.push(k);
+            let address = cur.bytes32()?;
+            let read_count = cur.u16_count(MAX_KEYS_PER_ACCESS_ENTRY)?;
+            let mut reads = Vec::with_capacity(read_count);
+            for _ in 0..read_count {
+                reads.push(cur.bytes32()?);
             }
-            let wc = u16::from_le_bytes(data[off..off + 2].try_into().ok()?) as usize;
-            off += 2;
-            let mut writes = Vec::with_capacity(wc);
-            for _ in 0..wc {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(&data[off..off + 32]);
-                off += 32;
-                writes.push(k);
+            let write_count = cur.u16_count(MAX_KEYS_PER_ACCESS_ENTRY)?;
+            let mut writes = Vec::with_capacity(write_count);
+            for _ in 0..write_count {
+                writes.push(cur.bytes32()?);
             }
             access_list.push(pyde_tx::types::AccessEntry {
-                address: addr,
+                address,
                 reads,
                 writes,
             });
         }
-        // Signature
-        let sig_len = u32::from_le_bytes(data[off..off + 4].try_into().ok()?) as usize;
-        off += 4;
-        let signature = data[off..off + sig_len].to_vec();
-        off += sig_len;
-        // Ciphertext
-        let ct_len = u32::from_le_bytes(data[off..off + 4].try_into().ok()?) as usize;
-        off += 4;
-        let ciphertext =
-            pyde_crypto::threshold::ThresholdCiphertext::from_wire_bytes(&data[off..off + ct_len])?;
+        let sig_len = cur.u32_count(MAX_SIG_LEN)?;
+        let signature = cur.take(sig_len)?.to_vec();
+        let ct_len = cur.u32_count(MAX_CT_LEN)?;
+        let ct_bytes = cur.take(ct_len)?;
+        let ciphertext = pyde_crypto::threshold::ThresholdCiphertext::from_wire_bytes(ct_bytes)?;
         Some(Self {
             sender,
             nonce,
@@ -399,6 +470,169 @@ mod tests {
                 .unwrap();
 
         assert!(!enc_tx.is_expired(u64::MAX));
+    }
+
+    // ── from_bytes panic-free regression tests ─────────────────────
+    //
+    // The pre-audit-301 implementation panicked on malformed input
+    // (raw slice indexing on attacker-controlled offsets, plus
+    // `Vec::with_capacity(u32)` on attacker-controlled length fields).
+    // Combined with `panic = "abort"`, one malformed
+    // `pyde_sendRawEncryptedTransaction` could kill the node. These
+    // tests pin the new contract: any byte string returns `None`.
+
+    #[test]
+    fn from_bytes_empty_returns_none() {
+        assert!(EncryptedTx::from_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn from_bytes_truncated_header_returns_none() {
+        // 56 bytes = one short of the smallest valid header
+        // (sender + nonce + gas + chain + has_dl = 57).
+        for n in 0..57 {
+            let bytes = vec![0u8; n];
+            assert!(
+                EncryptedTx::from_bytes(&bytes).is_none(),
+                "len {} must reject",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn from_bytes_oversize_envelope_returns_none() {
+        let bytes = vec![0u8; MAX_TX_SIZE + 1];
+        assert!(EncryptedTx::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn from_bytes_huge_access_list_count_rejected() {
+        // Build a header that claims `MAX_ACCESS_ENTRIES + 1` access
+        // entries. The pre-fix decoder would call
+        // `Vec::with_capacity(huge)` and crash; the new decoder must
+        // reject before allocating.
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&[0u8; 32]); // sender
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
+        bytes.extend_from_slice(&21_000u64.to_le_bytes()); // gas
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // chain_id
+        bytes.push(0); // has_deadline = 0
+        bytes.extend_from_slice(&((MAX_ACCESS_ENTRIES as u32) + 1).to_le_bytes());
+        assert!(EncryptedTx::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn from_bytes_huge_signature_len_rejected() {
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&[0u8; 32]); // sender
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
+        bytes.extend_from_slice(&21_000u64.to_le_bytes()); // gas
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // chain_id
+        bytes.push(0); // has_deadline = 0
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 access entries
+        bytes.extend_from_slice(&((MAX_SIG_LEN as u32) + 1).to_le_bytes()); // huge sig_len
+        assert!(EncryptedTx::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn from_bytes_huge_ciphertext_len_rejected() {
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&[0u8; 32]); // sender
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
+        bytes.extend_from_slice(&21_000u64.to_le_bytes()); // gas
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // chain_id
+        bytes.push(0); // has_deadline = 0
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 access entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0-byte signature
+        bytes.extend_from_slice(&((MAX_CT_LEN as u32) + 1).to_le_bytes()); // huge ct_len
+        assert!(EncryptedTx::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn from_bytes_inner_keys_count_rejected() {
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&[0u8; 32]); // sender
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
+        bytes.extend_from_slice(&21_000u64.to_le_bytes()); // gas
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // chain_id
+        bytes.push(0); // has_deadline = 0
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 access entry
+        bytes.extend_from_slice(&[0u8; 32]); // entry address
+        bytes.extend_from_slice(&((MAX_KEYS_PER_ACCESS_ENTRY as u16) + 1).to_le_bytes());
+        assert!(EncryptedTx::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn from_bytes_truncated_signature_returns_none() {
+        // Claim a sig_len that exceeds remaining bytes.
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&21_000u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // empty access list
+        bytes.extend_from_slice(&100u32.to_le_bytes()); // sig_len = 100, but no bytes follow
+        assert!(EncryptedTx::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn from_bytes_roundtrip_with_real_payload() {
+        // Sanity: the new decoder still accepts a real, encoded
+        // EncryptedTx round-trip — i.e. the fix is panic-removal
+        // not behaviour change on the happy path.
+        let (pk, _) = make_threshold_keys();
+        let sender = derive_eoa_address(b"sender");
+        let to = derive_eoa_address(b"recipient");
+        let enc_tx = encrypt_transaction(
+            sender,
+            7,
+            21_000,
+            vec![pyde_tx::types::AccessEntry {
+                address: derive_eoa_address(b"contract"),
+                reads: vec![[1u8; 32], [2u8; 32]],
+                writes: vec![[3u8; 32]],
+            }],
+            Some(100),
+            7331,
+            vec![0xAB; 690],
+            &to,
+            42,
+            b"hello",
+            &pk,
+        )
+        .unwrap();
+        let bytes = enc_tx.to_bytes();
+        let decoded = EncryptedTx::from_bytes(&bytes).expect("happy path round-trip");
+        assert_eq!(decoded.sender, enc_tx.sender);
+        assert_eq!(decoded.nonce, enc_tx.nonce);
+        assert_eq!(decoded.gas_limit, enc_tx.gas_limit);
+        assert_eq!(decoded.chain_id, enc_tx.chain_id);
+        assert_eq!(decoded.deadline, enc_tx.deadline);
+        assert_eq!(decoded.access_list.len(), 1);
+        assert_eq!(decoded.signature, enc_tx.signature);
+    }
+
+    #[test]
+    fn from_bytes_fuzz_short_inputs_never_panic() {
+        // Sweep every length [0, 256] of zero-bytes and a handful of
+        // adversarially-shaped headers; the decoder must always
+        // return None or Some, never panic.
+        for n in 0..=256 {
+            let _ = EncryptedTx::from_bytes(&vec![0u8; n]);
+            let _ = EncryptedTx::from_bytes(&vec![0xFFu8; n]);
+        }
+        // Random-ish bit patterns to flush out subtle bugs.
+        for seed in 0u64..32 {
+            let mut bytes = Vec::with_capacity(512);
+            let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15);
+            for _ in 0..512 {
+                x = x.wrapping_mul(0x9E3779B97F4A7C15) ^ x.rotate_right(11);
+                bytes.push((x & 0xFF) as u8);
+            }
+            let _ = EncryptedTx::from_bytes(&bytes);
+        }
     }
 
     #[test]
