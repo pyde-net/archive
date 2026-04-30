@@ -79,33 +79,35 @@
       pass; bonus: each dispense saves a `pyde_chainId` RPC
       round-trip.
 
-- [ ] 304 — `⚠` **`AuthKeys::MultiSig` validation silently passes any
+- [x] 304 — `✓` **`AuthKeys::MultiSig` validation silently passes any
       tx.**
-      Where: `crates/tx/src/validation.rs:235-238` returns `Ok(())`
-      for any MultiSig sender ("// For now, skip"). Ingress at
-      `crates/node/src/rpc.rs:1722` whitelists MultiSig.
-      Anyone can drain a MultiSig EOA. Reachable today only via
-      genesis allocation that pre-sets MultiSig auth_keys (no prod
-      tx flow rotates to MultiSig yet), but the gate ships
-      unenforced — a pure footgun.
-      Fix: until multi-sig wire format + threshold check is
-      implemented, reject `AuthKeys::MultiSig` at validation AND
-      ingress, mirroring the audit-226 `AuthKeys::None` gate.
+      Shipped: `validate_transaction` now rejects MultiSig senders
+      on every `chain_id != 31337` (mirrors the audit-226 None gate
+      shape — same `InvalidSignature` error variant). RPC ingress
+      `plaintext_tx_ingest_policy` tightened to match: Single
+      always-OK, MultiSig devnet-only with a clear "MultiSig
+      auth_keys not yet enforced" error on production. 1 new
+      validation test (`validate_transaction_rejects_multisig_on_
+      production` over [1, 7, 7331, 1_000_000]) + 1 new ingress
+      test (`plaintext_ingest_policy_multisig_devnet_only`)
+      replacing the old "MultiSig allowed everywhere" assertion.
 
-- [ ] 305 — `⚠` **`FeePayer::Paymaster` mints fees, charges nothing;
+- [x] 305 — `✓` **`FeePayer::Paymaster` mints fees, charges nothing;
       `FeePayer::GasTank` inner address ignored.**
-      Where: `crates/tx/src/execution.rs:121-124` returns `Ok(0)` for
-      Paymaster ("settlement deferred to contract layer"). Post-exec
-      fee distribution credits validator (20%) + treasury (10%) of
-      `effective_gas * base_fee` from a 0 placeholder — every
-      Paymaster-marked tx is **free** AND **mints new supply**. For
-      `GasTank`, `crates/tx/src/execution.rs:105-120` debits
-      `sender.gas_tank` regardless of the encoded contract address,
-      so the entire sponsorship UX is decorative.
-      Fix: until paymaster contract integration ships, reject
-      `FeePayer::Paymaster` and `FeePayer::GasTank` at validation
-      AND RPC ingress for any non-devnet `chain_id`. Same pattern
-      as audit-206/226.
+      Shipped: `validate_transaction` now rejects both
+      `FeePayer::Paymaster(_)` and `FeePayer::GasTank(_)` on every
+      `chain_id != 31337` with `ValidationError::InvalidPaymaster`.
+      New `fee_payer_ingest_policy` helper at the RPC layer mirrors
+      the same gate at ingress (called from `ingress_validate`
+      before `validate_transaction`). Devnet keeps both for dev /
+      test ergonomics. 3 new RPC tests
+      (`fee_payer_ingest_policy_sender_always_ok`,
+      `..._paymaster_devnet_only`, `..._gas_tank_devnet_only`) +
+      3 new validation tests covering the production reject
+      branches and the devnet-allow branch + 1 pre-existing test
+      (`paymaster_skips_balance_check`) flipped to chain_id=31337
+      to keep its semantics. 235 pyde-tx + 24 pyde-node rpc tests
+      pass.
 
 ### Crypto / cross-chain replay surfaces
 

@@ -1605,9 +1605,9 @@ async fn ingress_validate(
         .unwrap_or(0);
     drop(state_r);
 
-    // Audit 226: gate the sender's auth_keys at ingress. Skip for
-    // RegisterPubkey (audit 229) — the whole point of that tx type
-    // is to upgrade `AuthKeys::None` accounts to `Single(pk)`.
+    // Audit 226 / 304: gate the sender's auth_keys at ingress. Skip
+    // for RegisterPubkey (audit 229) — the whole point of that tx
+    // type is to upgrade `AuthKeys::None` accounts to `Single(pk)`.
     // `validate_register_pubkey` enforces its own stricter shape
     // checks (data == FALCON pk, from == Poseidon2(data), funded,
     // not already registered).
@@ -1615,6 +1615,15 @@ async fn ingress_validate(
         if let Err(msg) = plaintext_tx_ingest_policy(&sender.auth_keys, chain_id) {
             return Err(rpc_err(-32001, format!("ingress validation: {msg}")));
         }
+    }
+
+    // Audit 305: gate fee_payer at ingress so Paymaster / GasTank
+    // never reach validation on production. Both paths are
+    // currently broken (Paymaster mints fees, GasTank ignores its
+    // encoded address) and would otherwise sit in the mempool
+    // until block-time validation rejected them.
+    if let Err(msg) = fee_payer_ingest_policy(&tx.fee_payer, chain_id) {
+        return Err(rpc_err(-32001, format!("ingress validation: {msg}")));
     }
 
     let ctx = ValidationContext {
@@ -1727,8 +1736,7 @@ fn encrypted_tx_ingest_policy(
     }
 }
 
-/// Plaintext-tx ingress policy, mirroring `encrypted_tx_ingest_policy`
-/// (audit 206) for the legacy plaintext path (audit 226).
+/// Plaintext-tx ingress policy (audit 206 / 226 / 304).
 ///
 /// `pyde_tx::validation::validate_signature` short-circuits FALCON
 /// verification when the sender account has `AuthKeys::None`
@@ -1739,20 +1747,59 @@ fn encrypted_tx_ingest_policy(
 /// past the signature check; balance gates fund-loss but a Paymaster
 /// fee_payer slips past balance too, polluting the mempool.
 ///
+/// `validate_signature` ALSO short-circuits `AuthKeys::MultiSig`
+/// ("Multi-sig validation is handled by the auth module / For now,
+/// skip"). Until the multi-sig wire format and threshold-check
+/// path land, any tx from a MultiSig-keyed account is accepted
+/// with no auth at all — the same footgun shape as the None case.
+///
 /// Policy:
-///   - Single / MultiSig: allow (validate_signature handles it).
+///   - Single: allow (validate_signature does the FALCON check).
 ///   - None on devnet (chain_id == 31337): allow — the faucet /
 ///     bootstrap UX needs unsigned txs from unregistered accounts.
-///   - None on any other chain_id: reject at ingress.
+///   - MultiSig on devnet: allow — keeps test infra that exercises
+///     the variant working.
+///   - None / MultiSig on any other chain_id: reject at ingress
+///     (audits 226, 304).
 fn plaintext_tx_ingest_policy(
     auth_keys: &pyde_account::types::AuthKeys,
     chain_id: u64,
 ) -> Result<(), &'static str> {
     match auth_keys {
-        pyde_account::types::AuthKeys::Single(_)
-        | pyde_account::types::AuthKeys::MultiSig { .. } => Ok(()),
+        pyde_account::types::AuthKeys::Single(_) => Ok(()),
         pyde_account::types::AuthKeys::None if chain_id == 31337 => Ok(()),
+        pyde_account::types::AuthKeys::MultiSig { .. } if chain_id == 31337 => Ok(()),
         pyde_account::types::AuthKeys::None => Err("sender has no registered auth_key (audit 226)"),
+        pyde_account::types::AuthKeys::MultiSig { .. } => {
+            Err("MultiSig auth_keys not yet enforced; rejecting on production (audit 304)")
+        }
+    }
+}
+
+/// Fee-payer ingress policy (audit 305). `FeePayer::Paymaster`
+/// currently mints fees out of thin air — `pre_execution_charge`
+/// returns Ok(0) for it ("settlement deferred to contract layer"),
+/// then post-execution distribution credits validator and treasury
+/// from a 0 placeholder. `FeePayer::GasTank` ignores the encoded
+/// contract address entirely; it silently debits the sender's own
+/// per-account `gas_tank` field, so the sponsorship UX is
+/// decorative. Both paths are unsafe to expose on production
+/// until the paymaster contract integration ships and the GasTank
+/// wiring honours its address parameter. Devnet keeps both for
+/// dev / test ergonomics.
+fn fee_payer_ingest_policy(
+    fee_payer: &pyde_tx::types::FeePayer,
+    chain_id: u64,
+) -> Result<(), &'static str> {
+    match fee_payer {
+        pyde_tx::types::FeePayer::Sender => Ok(()),
+        _ if chain_id == 31337 => Ok(()),
+        pyde_tx::types::FeePayer::Paymaster(_) => {
+            Err("FeePayer::Paymaster not yet wired; rejecting on production (audit 305)")
+        }
+        pyde_tx::types::FeePayer::GasTank(_) => {
+            Err("FeePayer::GasTank not yet wired; rejecting on production (audit 305)")
+        }
     }
 }
 
@@ -2085,8 +2132,9 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_ingest_policy_allows_registered_keys() {
-        // Single auth_key allowed on every chain_id.
+    fn plaintext_ingest_policy_allows_single_on_every_chain() {
+        // Single auth_key — the only universally-OK shape — allowed
+        // on every chain_id.
         let pk = vec![0x11u8; 900];
         for chain_id in [1u64, 7, 31337, 1_000_000] {
             assert!(plaintext_tx_ingest_policy(
@@ -2095,13 +2143,30 @@ mod tests {
             )
             .is_ok());
         }
-        // MultiSig also allowed on every chain_id.
+    }
+
+    /// Audit 304 — MultiSig is allowed on devnet for test infra
+    /// but REJECTED on every other chain_id. The validation path
+    /// silently passes any tx from a MultiSig sender; until the
+    /// multi-sig wire format + threshold check ship, that's an
+    /// open footgun.
+    #[test]
+    fn plaintext_ingest_policy_multisig_devnet_only() {
+        let pk = vec![0x11u8; 900];
         let multi = pyde_account::types::AuthKeys::MultiSig {
             keys: vec![pk.clone()],
             threshold: 1,
         };
-        for chain_id in [1u64, 31337] {
-            assert!(plaintext_tx_ingest_policy(&multi, chain_id).is_ok());
+        // Devnet: allowed (test ergonomics).
+        assert!(plaintext_tx_ingest_policy(&multi, 31337).is_ok());
+        // Every other chain_id: rejected.
+        for chain_id in [1u64, 2, 7, 7331, 1_000_000] {
+            let err = plaintext_tx_ingest_policy(&multi, chain_id);
+            assert!(
+                err.is_err(),
+                "chain_id {chain_id} must reject AuthKeys::MultiSig"
+            );
+            assert!(err.err().unwrap().contains("audit 304"));
         }
     }
 
@@ -2122,6 +2187,46 @@ mod tests {
                 err.is_err(),
                 "chain_id {chain_id} must reject AuthKeys::None"
             );
+        }
+    }
+
+    // ── Audit 305: fee_payer ingress gate ───────────────────────────
+
+    #[test]
+    fn fee_payer_ingest_policy_sender_always_ok() {
+        for chain_id in [1u64, 7, 7331, 31337, 1_000_000] {
+            assert!(
+                fee_payer_ingest_policy(&pyde_tx::types::FeePayer::Sender, chain_id).is_ok(),
+                "Sender must always pass at chain_id {chain_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn fee_payer_ingest_policy_paymaster_devnet_only() {
+        let paymaster = pyde_tx::types::FeePayer::Paymaster([0xAA; 32]);
+        assert!(fee_payer_ingest_policy(&paymaster, 31337).is_ok());
+        for chain_id in [1u64, 2, 7, 7331, 1_000_000] {
+            let err = fee_payer_ingest_policy(&paymaster, chain_id);
+            assert!(
+                err.is_err(),
+                "chain_id {chain_id} must reject FeePayer::Paymaster"
+            );
+            assert!(err.err().unwrap().contains("audit 305"));
+        }
+    }
+
+    #[test]
+    fn fee_payer_ingest_policy_gas_tank_devnet_only() {
+        let gas_tank = pyde_tx::types::FeePayer::GasTank([0xBB; 32]);
+        assert!(fee_payer_ingest_policy(&gas_tank, 31337).is_ok());
+        for chain_id in [1u64, 2, 7, 7331, 1_000_000] {
+            let err = fee_payer_ingest_policy(&gas_tank, chain_id);
+            assert!(
+                err.is_err(),
+                "chain_id {chain_id} must reject FeePayer::GasTank"
+            );
+            assert!(err.err().unwrap().contains("audit 305"));
         }
     }
 
