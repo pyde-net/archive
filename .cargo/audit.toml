@@ -14,9 +14,15 @@ ignore = [
     "RUSTSEC-2025-0009", # ring 0.16: AES panic on overflow check
     "RUSTSEC-2026-0098", # rustls-webpki: URI name constraints
     "RUSTSEC-2026-0099", # rustls-webpki: wildcard name constraints
+    "RUSTSEC-2026-0104", # rustls-webpki: CRL parsing panic (we don't use CRLs)
     # Unmaintained — same libp2p-upgrade blocker.
     "RUSTSEC-2025-0010", # ring <0.17 unmaintained
     "RUSTSEC-2024-0436", # paste unmaintained
     "RUSTSEC-2024-0384", # instant 0.1.x unmaintained (via libp2p-gossipsub futures-ticker)
     "RUSTSEC-2026-0002", # lru IterMut Stacked Borrows soundness (via libp2p-swarm)
+    # Transitive via reqwest's DNS resolver. Pyde nodes connect to a
+    # fixed set of RPC peers via hostname; DNS responses come from
+    # validator-controlled resolvers, not arbitrary attacker-chosen
+    # ones. Tracked for the reqwest/hickory bump slice.
+    "RUSTSEC-2026-0119", # hickory-proto 0.24.x: O(n²) name compression DoS
 ]

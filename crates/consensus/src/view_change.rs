@@ -558,8 +558,9 @@ mod tests {
         // to reach an honest leader.
         let n = 4;
         let h = 145;
-        let leaders: std::collections::HashSet<usize> =
-            (0..(n as u64)).map(|v| fallback_leader_index(h, v, n)).collect();
+        let leaders: std::collections::HashSet<usize> = (0..(n as u64))
+            .map(|v| fallback_leader_index(h, v, n))
+            .collect();
         assert_eq!(
             leaders.len(),
             n,

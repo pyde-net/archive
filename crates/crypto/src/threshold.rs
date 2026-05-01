@@ -1119,9 +1119,7 @@ mod tests {
         dec_shares[0].index = 0;
         let result = combine_shares(&dec_shares, T, &ct);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("invalid share index"));
+        assert!(result.unwrap_err().contains("invalid share index"));
     }
 
     #[test]
@@ -1139,9 +1137,7 @@ mod tests {
         dec_shares[0].index = 257;
         let result = combine_shares(&dec_shares, T, &ct);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("invalid share index"));
+        assert!(result.unwrap_err().contains("invalid share index"));
     }
 
     #[test]

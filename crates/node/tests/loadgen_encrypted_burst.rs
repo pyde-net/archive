@@ -54,8 +54,7 @@ const PASS_INCLUSION_PCT: f64 = 70.0;
 #[ignore = "multi-node — subprocess-based, run via --ignored"]
 fn encrypted_burst_inclusion_rate() {
     let per_sender = burst_per_sender();
-    let net =
-        TestNetwork::spawn(4, true).unwrap_or_else(|e| panic!("spawn 4-node testnet: {}", e));
+    let net = TestNetwork::spawn(4, true).unwrap_or_else(|e| panic!("spawn 4-node testnet: {}", e));
 
     net.wait_for_slot(15, Duration::from_secs(45))
         .unwrap_or_else(|e| panic!("warm-up to slot 15: {}", e));

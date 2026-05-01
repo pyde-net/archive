@@ -667,7 +667,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let a = gp_read!(builder, d.rs1);
                         let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let oversize =
-                            builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b, 64);
+                            builder
+                                .ins()
+                                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b, 64);
                         let shifted = builder.ins().ishl(a, b);
                         let zero = builder.ins().iconst(I64, 0);
                         let r = builder.ins().select(oversize, zero, shifted);
@@ -677,7 +679,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let a = gp_read!(builder, d.rs1);
                         let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let oversize =
-                            builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b, 64);
+                            builder
+                                .ins()
+                                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b, 64);
                         let shifted = builder.ins().ushr(a, b);
                         let zero = builder.ins().iconst(I64, 0);
                         let r = builder.ins().select(oversize, zero, shifted);
@@ -687,7 +691,9 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let a = gp_read!(builder, d.rs1);
                         let b = gp_read!(builder, (d.rs2_or_imm & 0xF) as u8);
                         let oversize =
-                            builder.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b, 64);
+                            builder
+                                .ins()
+                                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, b, 64);
                         let shifted = builder.ins().sshr(a, b);
                         // shift >= 64 fills with the sign bit: 0 for
                         // non-negative, -1 (u64::MAX) for negative.

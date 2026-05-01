@@ -745,7 +745,10 @@ mod tests {
 
         let keys = vec![vec![0u8; 897]; 128];
         let res = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk, &keys);
-        assert!(res.is_err(), "audit 311: create_vote must refuse fabricated qc_previous");
+        assert!(
+            res.is_err(),
+            "audit 311: create_vote must refuse fabricated qc_previous"
+        );
         // The HotStuff state must not have promoted the fake QC.
         assert_eq!(
             state.highest_qc.slot, pre_state_hqc_slot,
@@ -828,7 +831,12 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert(6, header_6);
 
-        assert!(is_finalized(5, &[qc_5.clone(), qc_6.clone()], &headers, 128));
+        assert!(is_finalized(
+            5,
+            &[qc_5.clone(), qc_6.clone()],
+            &headers,
+            128
+        ));
         assert!(!is_finalized(5, &[qc_5.clone()], &headers, 128)); // missing QC for slot 6
         assert!(!is_finalized(5, &[qc_6.clone()], &headers, 128)); // missing QC for slot 5
 

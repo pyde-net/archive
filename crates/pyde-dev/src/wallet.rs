@@ -181,13 +181,8 @@ pub fn list() -> Result<Vec<(String, String)>, String> {
 /// Argon2id KDF (audit 306). Replaces the prior single-iteration
 /// Poseidon2 KDF, which was brute-forceable on commodity GPUs.
 fn derive_aes_key(password: &str, salt: &[u8]) -> Result<[u8; 32], String> {
-    let params = argon2::Params::new(
-        ARGON2_M_COST_KIB,
-        ARGON2_T_COST,
-        ARGON2_P_COST,
-        Some(32),
-    )
-    .map_err(|e| format!("argon2 params: {}", e))?;
+    let params = argon2::Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+        .map_err(|e| format!("argon2 params: {}", e))?;
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut out = [0u8; 32];
     argon

@@ -46,7 +46,11 @@ fn max_live_head(net: &TestNetwork, exclude: Option<usize>) -> u64 {
         .unwrap_or(0)
 }
 
-fn wait_for_convergence(net: &TestNetwork, tolerance: u64, timeout: Duration) -> Result<(), String> {
+fn wait_for_convergence(
+    net: &TestNetwork,
+    tolerance: u64,
+    timeout: Duration,
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
         let slots: Vec<u64> = net
@@ -104,7 +108,9 @@ fn wait_for_node_slot(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(format!("node-{node_idx} stuck at {cur}, target {target_slot}"));
+            return Err(format!(
+                "node-{node_idx} stuck at {cur}, target {target_slot}"
+            ));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -146,12 +152,20 @@ fn rolling_restart_4_of_4() {
 
         net.restart_node(victim).unwrap();
         let target = max_live_head(&net, None) + 3;
-        wait_for_node_slot(&net, victim, target, Duration::from_secs(CATCHUP_TIMEOUT_SECS))
-            .unwrap();
-        wait_for_convergence(&net, 2, Duration::from_secs(CATCHUP_TIMEOUT_SECS))
-            .unwrap();
-        wait_for_steady_state(&net, STEADY_STATE_SLOTS, Duration::from_secs(CATCHUP_TIMEOUT_SECS))
-            .unwrap();
+        wait_for_node_slot(
+            &net,
+            victim,
+            target,
+            Duration::from_secs(CATCHUP_TIMEOUT_SECS),
+        )
+        .unwrap();
+        wait_for_convergence(&net, 2, Duration::from_secs(CATCHUP_TIMEOUT_SECS)).unwrap();
+        wait_for_steady_state(
+            &net,
+            STEADY_STATE_SLOTS,
+            Duration::from_secs(CATCHUP_TIMEOUT_SECS),
+        )
+        .unwrap();
         eprintln!("churn4: node-{victim} caught up + steady");
 
         let r0 = net.state_root(victim).unwrap();
@@ -165,7 +179,11 @@ fn rolling_restart_4_of_4() {
     }
 
     for n in &net.nodes {
-        assert!(n.is_running(), "node-{} died during 4-of-4 rotation", n.index);
+        assert!(
+            n.is_running(),
+            "node-{} died during 4-of-4 rotation",
+            n.index
+        );
     }
     eprintln!(
         "churn4: passed — rotated 4 of 4 validators, final head {}, all roots agree",

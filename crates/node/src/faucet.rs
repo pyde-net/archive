@@ -602,15 +602,28 @@ async fn handle_connection(
         }
         ("GET", "/") | ("GET", "/index.html") => html_response(200, FAUCET_HTML),
         ("GET", "/health") => json_response(200, r#"{"status":"ok"}"#),
-        ("POST", "/api/request") => {
-            match parse_post_body_address(&body) {
-                Some(addr) if addr.len() >= 64 => {
-                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref(), &signing_lock, chain_id).await
-                }
-                Some(_) => json_response(400, r#"{"error":"address must be 0x-prefixed 32-byte hex"}"#),
-                None => json_response(400, r#"{"error":"missing address field in JSON body"}"#),
+        ("POST", "/api/request") => match parse_post_body_address(&body) {
+            Some(addr) if addr.len() >= 64 => {
+                serve_dispense(
+                    &addr,
+                    &ip_key,
+                    &addr_limiter,
+                    &ip_limiter,
+                    &rpc,
+                    &from,
+                    amount,
+                    signer.as_ref().as_ref(),
+                    &signing_lock,
+                    chain_id,
+                )
+                .await
             }
-        }
+            Some(_) => json_response(
+                400,
+                r#"{"error":"address must be 0x-prefixed 32-byte hex"}"#,
+            ),
+            None => json_response(400, r#"{"error":"missing address field in JSON body"}"#),
+        },
         ("GET", "/faucet") => {
             // Legacy backwards-compat endpoint.
             let address = query.split('&').find_map(|p| {
@@ -623,7 +636,19 @@ async fn handle_connection(
             });
             match address {
                 Some(addr) if addr.len() >= 64 => {
-                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref(), &signing_lock, chain_id).await
+                    serve_dispense(
+                        &addr,
+                        &ip_key,
+                        &addr_limiter,
+                        &ip_limiter,
+                        &rpc,
+                        &from,
+                        amount,
+                        signer.as_ref().as_ref(),
+                        &signing_lock,
+                        chain_id,
+                    )
+                    .await
                 }
                 _ => json_response(400, r#"{"error":"missing or invalid address"}"#),
             }
@@ -653,7 +678,10 @@ async fn serve_dispense(
     if let Err(secs) = addr_limiter.check(address) {
         return json_response(
             429,
-            &format!(r#"{{"error":"address rate limited","retryAfter":{}}}"#, secs),
+            &format!(
+                r#"{{"error":"address rate limited","retryAfter":{}}}"#,
+                secs
+            ),
         );
     }
     if let Err(secs) = ip_limiter.check(ip_key) {

@@ -2573,10 +2573,7 @@ mod tests {
         // override tx.signature shape for `make_signed_tx`'s sig
         // to be sane against `sender.auth_keys`. Re-build the sig
         // against the (mutated) tx fields:
-        tx.signature = falcon_sign(&sk, &tx.hash())
-            .unwrap()
-            .as_bytes()
-            .to_vec();
+        tx.signature = falcon_sign(&sk, &tx.hash()).unwrap().as_bytes().to_vec();
 
         let receipt = execute_transaction(&tx, &mut smt, &block_ctx).unwrap();
         assert!(receipt.success);

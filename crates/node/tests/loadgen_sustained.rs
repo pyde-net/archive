@@ -411,8 +411,13 @@ fn sustained_rate_load_test() {
         let bytes = runtime
             .block_on(fetch_threshold_pk_bytes(&client, &rpc_urls[0]))
             .unwrap_or_else(|| panic!("could not fetch threshold pubkey from {}", rpc_urls[0]));
-        let tpk = pyde_crypto::threshold::ThresholdPublicKey::from_bytes(&bytes)
-            .unwrap_or_else(|| panic!("threshold pubkey bytes ({} bytes) failed to decode", bytes.len()));
+        let tpk =
+            pyde_crypto::threshold::ThresholdPublicKey::from_bytes(&bytes).unwrap_or_else(|| {
+                panic!(
+                    "threshold pubkey bytes ({} bytes) failed to decode",
+                    bytes.len()
+                )
+            });
         println!(
             "  cached threshold pubkey: {} bytes (encrypted path)",
             bytes.len()
@@ -690,8 +695,7 @@ fn sustained_rate_load_test() {
         let timing_lines: Vec<&str> = snap
             .lines()
             .filter(|l| {
-                (l.contains("proposed and processed")
-                    || l.contains("proposed block (awaiting QC"))
+                (l.contains("proposed and processed") || l.contains("proposed block (awaiting QC"))
                     && !l.contains("pending=0 ")
                     && !l.contains("pending=0\n")
             })

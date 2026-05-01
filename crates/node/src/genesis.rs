@@ -783,10 +783,10 @@ impl NodeAddrFile {
     /// Parse a `node-addrs.toml` file. Returns the entries sorted by
     /// `index` so callers can index into the result directly.
     pub fn load(path: &std::path::Path) -> Result<Self, String> {
-        let bytes = std::fs::read_to_string(path)
-            .map_err(|e| format!("read {}: {}", path.display(), e))?;
-        let mut parsed: Self = toml::from_str(&bytes)
-            .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+        let bytes =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+        let mut parsed: Self =
+            toml::from_str(&bytes).map_err(|e| format!("parse {}: {}", path.display(), e))?;
         parsed.nodes.sort_by_key(|n| n.index);
         // Ensure indexes are dense [0, n). Sparse files silently mis-map
         // bootstrap entries to the wrong nodes, hard to diagnose later.
@@ -1068,9 +1068,7 @@ pub fn generate_testnet(
             if j != i {
                 let other_peer_id = &node_keypairs[j].1;
                 bootstrap_addrs.push(match node_addrs {
-                    Some(addrs) => {
-                        build_multiaddr(&addrs[j].host, addrs[j].port, other_peer_id)
-                    }
+                    Some(addrs) => build_multiaddr(&addrs[j].host, addrs[j].port, other_peer_id),
                     None => format!(
                         "\"/ip4/127.0.0.1/tcp/{}/p2p/{}\"",
                         base_port + j as u16,
@@ -1421,7 +1419,9 @@ mod tests {
 
     #[test]
     fn build_multiaddr_picks_dns4_for_hostnames() {
-        let pid: libp2p::PeerId = libp2p::identity::Keypair::generate_ed25519().public().into();
+        let pid: libp2p::PeerId = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .into();
         let m = build_multiaddr("validator-0.testnet.example.com", 30303, &pid);
         assert!(m.contains("/dns4/validator-0.testnet.example.com/"));
         assert!(m.contains("/tcp/30303/"));
@@ -1430,7 +1430,9 @@ mod tests {
 
     #[test]
     fn build_multiaddr_picks_ip4_for_dotted_quad() {
-        let pid: libp2p::PeerId = libp2p::identity::Keypair::generate_ed25519().public().into();
+        let pid: libp2p::PeerId = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .into();
         let m = build_multiaddr("203.0.113.5", 30303, &pid);
         assert!(m.contains("/ip4/203.0.113.5/"));
         assert!(!m.contains("/dns4/"));
@@ -1500,18 +1502,7 @@ mod tests {
                 port: 30305,
             },
         ];
-        generate_testnet(
-            tmp.path(),
-            4,
-            0,
-            30303,
-            8545,
-            true,
-            1,
-            400,
-            Some(&addrs),
-        )
-        .unwrap();
+        generate_testnet(tmp.path(), 4, 0, 30303, 8545, true, 1, 400, Some(&addrs)).unwrap();
 
         // node-0's config must:
         //  - carry its own region/host as a comment header

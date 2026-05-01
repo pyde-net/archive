@@ -893,8 +893,7 @@ mod tests {
             .expect("devnet must allow Paymaster");
 
         tx.fee_payer = FeePayer::GasTank([0xBB; 32]);
-        validate_transaction(&tx, &account, &nonce_state, &ctx)
-            .expect("devnet must allow GasTank");
+        validate_transaction(&tx, &account, &nonce_state, &ctx).expect("devnet must allow GasTank");
     }
 
     // ========== Audit 229: RegisterPubkey tx type ==========

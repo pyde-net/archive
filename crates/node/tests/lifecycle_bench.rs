@@ -511,7 +511,15 @@ fn validator_block_lifecycle() {
     let mut votes = Vec::new();
     const CHAIN_ID: u64 = 31337;
     for (i, v) in validators.iter().enumerate() {
-        if let Ok(Some(vote)) = create_vote(CHAIN_ID, &mut cstates[i], &hdr, i as u8, v.address, &v.sk, &ckeys) {
+        if let Ok(Some(vote)) = create_vote(
+            CHAIN_ID,
+            &mut cstates[i],
+            &hdr,
+            i as u8,
+            v.address,
+            &v.sk,
+            &ckeys,
+        ) {
             assert!(verify_vote(CHAIN_ID, &vote, v.pk.as_bytes()));
             votes.push(vote);
         }

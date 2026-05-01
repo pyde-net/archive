@@ -803,11 +803,7 @@ pub extern "C" fn host_tx_hash(ctx: *mut VmCtx, wd: u64) -> u64 {
     // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
     // safety contract (top of file).
     let vm = unsafe { &mut *ctx };
-    if vm
-        .cpu
-        .write_wide_checked(wd as u8, vm.ctx.tx_hash)
-        .is_err()
-    {
+    if vm.cpu.write_wide_checked(wd as u8, vm.ctx.tx_hash).is_err() {
         return 1;
     }
     0
@@ -844,11 +840,7 @@ pub extern "C" fn host_blockhash(ctx: *mut VmCtx, height: u64, wd: u64) -> u64 {
     let current = vm.ctx.block_number;
     let hash = if height < current && current - height <= 256 {
         let idx = (current - height - 1) as usize;
-        vm.ctx
-            .block_hashes
-            .get(idx)
-            .copied()
-            .unwrap_or(U256::ZERO)
+        vm.ctx.block_hashes.get(idx).copied().unwrap_or(U256::ZERO)
     } else {
         U256::ZERO
     };

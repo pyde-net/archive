@@ -150,9 +150,9 @@ mod tests {
         for shift in [0u32, 1, 31, 32, 63, 64, 65, 127, 200, 255] {
             for value in [1i32, -1, 0x4242, -0x4242] {
                 let code = bytecode(&[
-                    instr_ri(Opcode::Addi, 1, 0, value),         // r1 = value
-                    instr_ri(Opcode::Addi, 2, 0, shift as i32),  // r2 = shift
-                    instr_bytes(Opcode::Shl, 3, 1, 2),           // r3 = r1 << r2
+                    instr_ri(Opcode::Addi, 1, 0, value),        // r1 = value
+                    instr_ri(Opcode::Addi, 2, 0, shift as i32), // r2 = shift
+                    instr_bytes(Opcode::Shl, 3, 1, 2),          // r3 = r1 << r2
                     instr_bytes(Opcode::Halt, 0, 0, 0),
                 ]);
                 compare_with_interpreter(&code, 0);
@@ -167,9 +167,9 @@ mod tests {
         for shift in [0u32, 1, 31, 32, 63, 64, 65, 127, 200, 255] {
             for value in [1i32, -1, 0x4242, -0x4242] {
                 let code = bytecode(&[
-                    instr_ri(Opcode::Addi, 1, 0, value),         // r1 = value
-                    instr_ri(Opcode::Addi, 2, 0, shift as i32),  // r2 = shift
-                    instr_bytes(Opcode::Shr, 3, 1, 2),           // r3 = r1 >> r2 (unsigned)
+                    instr_ri(Opcode::Addi, 1, 0, value),        // r1 = value
+                    instr_ri(Opcode::Addi, 2, 0, shift as i32), // r2 = shift
+                    instr_bytes(Opcode::Shr, 3, 1, 2),          // r3 = r1 >> r2 (unsigned)
                     instr_bytes(Opcode::Halt, 0, 0, 0),
                 ]);
                 compare_with_interpreter(&code, 0);
@@ -186,9 +186,9 @@ mod tests {
         for shift in [0u32, 1, 31, 32, 63, 64, 65, 127, 200, 255] {
             for value in [1i32, -1, 0x4242, -0x4242] {
                 let code = bytecode(&[
-                    instr_ri(Opcode::Addi, 1, 0, value),         // r1 = value
-                    instr_ri(Opcode::Addi, 2, 0, shift as i32),  // r2 = shift
-                    instr_bytes(Opcode::Sar, 3, 1, 2),           // r3 = r1 >>> r2 (signed)
+                    instr_ri(Opcode::Addi, 1, 0, value),        // r1 = value
+                    instr_ri(Opcode::Addi, 2, 0, shift as i32), // r2 = shift
+                    instr_bytes(Opcode::Sar, 3, 1, 2),          // r3 = r1 >>> r2 (signed)
                     instr_bytes(Opcode::Halt, 0, 0, 0),
                 ]);
                 compare_with_interpreter(&code, 0);
@@ -1474,8 +1474,7 @@ mod tests {
         ]);
         let mut aot_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
         aot_vm.ctx.block_number = 1000;
-        aot_vm.ctx.block_hashes =
-            vec![pyde_vm::wide::U256::from(0xFFFFu64); 300];
+        aot_vm.ctx.block_hashes = vec![pyde_vm::wide::U256::from(0xFFFFu64); 300];
         let compiled = compile_bytecode(&code_oow).unwrap();
         let func = compiled.as_fn();
         let mut regs = [0u64; 16];
