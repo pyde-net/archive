@@ -398,6 +398,124 @@
       (`aee961d`) is needed but deferred. ~30 commits in window
       (PRs #300-#310 inclusive).
 
+- [ ] 396 — `✓` **`new_node_syncs_from_network` (cold-start sync)
+      hangs at slot 0 for 60 s deadline.** Surfaced by running
+      `cargo test -p pyde-node --test multi_node_sync -- --ignored`
+      after the cycle-2 P0 + Wave A/B/C/D-partial merge.
+      **Predates this audit cycle** — the test fails identically
+      on `aee961d` (pre-audit baseline) and on HEAD: 3 validators
+      reach slot 50, the 4th node (cold full node) starts, libp2p
+      peer-connects to all 3 validators, then produces no further
+      INFO-level log lines for the 60 s deadline. Final assertion:
+      `node-3 did not reach slot 50 within 60s; last slot seen:
+      Some(0)`.
+
+      **Suspected cause.** Cold-start path either (a) never sends
+      `GetBlocks` to a peer (sync manager not seeded with
+      `network_tip`), or (b) sends but server response triggers a
+      validation rejection that's silent at INFO level. The "peer
+      connected" events fire 3 ms after node start — fast enough
+      that an early-window race (subscribe→tip-poll handshake)
+      could be losing the GetBlocks send.
+
+      **Where to look:**
+      - `crates/node/src/sync.rs` `next_request` / batch-trigger
+      - `crates/node/src/node.rs` `request_chain_tip` /
+        `update_network_tip` — confirm tip is acquired before
+        sync manager would start sending.
+      - DEBUG-level rerun (`RUST_LOG=pyde::sync=debug,pyde_net::sync_protocol=debug`)
+        will show whether GetBlocks ever leaves the wire.
+
+      **Reproducer:**
+      ```
+      cargo test -p pyde-node --test multi_node_sync -- \
+        --ignored --nocapture
+      ```
+
+      **Pre-launch impact:** validators bootstrap from a known
+      committee membership, not from cold-sync — every validator
+      starts at genesis simultaneously. Risk band: third-party
+      full-node operators who join an already-running testnet.
+      Workaround for ops: snapshot-sync (`SyncReq::GetSnapshot`
+      path is wired and clamped per audit 338) gives them a
+      starting point; block-sync from there appears to keep
+      working in the propagation/finality tests above. Flag in
+      the testnet runbook until fix lands.
+
+- [ ] 397 — `✓` **`epoch_rotation_crosses_boundary` exceeds 240 s
+      timeout reaching slot 1005 at `block_time_ms=100`.**
+      Surfaced same e2e run as #396. **Predates this audit cycle**
+      — fails identically on `aee961d` (244 s) and HEAD (243 s).
+      Test config asks for slot 1005 in 100 ms × 1005 = 100.5 s of
+      ideal-case slot ticks, with a 240 s deadline (2.4×
+      ideal-case headroom). Fails at 240 s, so actual slot rate is
+      < ~250 ms/slot — 2.5× slower than configured under 4-node
+      subprocess load on a laptop.
+
+      **Suspected cause.** Either
+      (a) `block_time_ms` plumbing isn't reaching every code path
+      (some loop still uses the 400 ms compile-time const), or
+      (b) consensus throughput under the 4-subprocess load on the
+      test machine just can't sustain 10 slots/s.
+
+      **Where to look:**
+      - `pyde_consensus::block::BLOCK_TIME_MS = 400` —
+        compile-time constant; runtime `block_time_ms` should
+        override it but call sites in `node.rs` /
+        `validator.rs` may still read the const.
+      - `tokio::time::interval` constructions for slot pacing.
+
+      **Reproducer:**
+      ```
+      cargo test -p pyde-node --test multi_node_epoch_rotation \
+        -- --ignored --nocapture
+      ```
+
+      **Pre-launch impact:** epoch boundaries on real testnet run
+      at the canonical 400 ms slot time, so they cross at ~6.7
+      min — no real-network deadline pressure. The test was
+      designed for fast iteration, not as a production gate.
+      Risk band: zero for testnet. Worth fixing before the chain
+      reaches its first real epoch boundary so the rotation code
+      path is exercised end-to-end at production speed.
+
+- [ ] 398 — `✓` **`tx_via_full_node_reaches_validator` fails:
+      tx submitted to full node never appears at validator within
+      30 s.** Surfaced same e2e run. **Predates this audit cycle**
+      — fails identically on `aee961d`.
+
+      Likely the same family of failure as #396 (sync/late-joiner
+      pathway): full node accepts the tx via RPC but doesn't relay
+      to the validator mesh. The full-node-relay path is
+      `tx_relay::handle_inbound_tx` → mempool insert →
+      gossipsub publish on `Channel::Transactions`. If the full
+      node hasn't subscribed or the validators aren't peering with
+      it, the tx sits in the full-node mempool forever.
+
+      **Pre-launch impact:** dApps targeting a public-facing full
+      node (the typical end-user setup) won't reach validators.
+      This IS a launch-blocking bug for production-grade public
+      RPC; for a testnet bring-up where users dial the validators
+      directly via RPC, it's a soft warning. Same bisect window
+      as #319 / #396; investigate together.
+
+- [ ] 399 — `✓` **`validator_churn` and `validator_churn_4_of_4`
+      both fail.** Surfaced same e2e run. **Predates this audit
+      cycle** — fails identically on `aee961d` (~30 s and ~37 s).
+
+      Tests cover validator restart-rejoin and 4-of-4 churn
+      scenarios. Both failures likely cluster with #396 (rejoining
+      validator behaves like a cold-start full-node from the
+      mesh's perspective; cold-start sync is broken). A fix to
+      #396 may resolve both by symmetry.
+
+      **Pre-launch impact:** mid-flight validator restart is a
+      core operability path; if a validator can't rejoin its own
+      committee after a process restart, ops can't safely bounce
+      a node for upgrades. Risk band: medium for testnet (we can
+      tell ops not to restart), high for mainnet. Same bisect
+      window as #319 / #396 / #398.
+
 ### Consensus / finality
 
 - [x] 320 — `✓` **Hard-finality `finality_sign_message` doesn't bind
