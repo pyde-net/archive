@@ -1217,8 +1217,15 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.switch_to_block(cont);
                     }
                     Opcode::Selfdestruct => {
-                        // Selfdestruct halts execution after clearing storage
-                        builder.ins().jump(success_block, &[]);
+                        // Audit 308: trap on Selfdestruct to match
+                        // the interpreter's hard refusal. Previous
+                        // AOT behaviour was a silent jump to
+                        // success_block (no storage clear, no halt)
+                        // — interpreter cleared shared storage, AOT
+                        // continued. Both were broken; both now trap
+                        // until per-contract storage namespacing
+                        // lands.
+                        builder.ins().jump(trap_block, &[]);
                         terminated = true;
                         break;
                     }
