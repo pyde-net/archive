@@ -572,11 +572,17 @@
       write" hazard). Combined with audit 221's encrypted-keystore
       path, secret-bearing files now ship at 0o600 from the
       moment a coordinator runs `pyde testnet`.
-- [ ] 345 — `⚠` **Missing `set_max_request_body_size` / batch caps
-      on jsonrpsee Server.** `crates/node/src/rpc.rs:1544-1546`.
-      Default ~10MB request lets a single connection saturate.
-      Configure explicit `max_request_body_size(1_048_576)` +
-      `max_response_body_size(16_777_216)`.
+- [x] 345 — `✓` **Missing `set_max_request_body_size` / batch caps
+      on jsonrpsee Server.** Shipped: `start_rpc_server` now builds
+      the jsonrpsee `Server` with `max_request_body_size(1 MB)`,
+      `max_response_body_size(16 MB)`, `max_connections(1024)`,
+      and `set_batch_request_config(Limit(32))`. The 1 MB request
+      cap fits the largest legitimate `pyde_call` calldata; the
+      16 MB response cap covers `pyde_getBlockByNumber(slot,
+      full_tx)` and broad `pyde_getLogs` queries; the 32-request
+      batch ceiling stops a single connection from rolling
+      thousands of cheap sub-requests through one HTTP frame.
+      24 rpc tests pass.
 - [ ] 346 — `⚠` **WS subscribe count uncapped per connection;
       unbounded mpsc backs each.** `crates/node/src/ws_sub.rs:59,
       70-176`. Cap `tasks.len()` at 16 per connection; switch

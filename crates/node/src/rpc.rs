@@ -1552,7 +1552,26 @@ pub async fn start_rpc_server(
         .parse()
         .map_err(|e| format!("invalid RPC address: {}", e))?;
 
+    // Audit 345: explicit body / batch caps on the jsonrpsee
+    // server. Pre-fix the server used jsonrpsee's defaults
+    // (~10 MB request body, no batch cap), so a single connection
+    // could send back-to-back 10 MB requests until the RPC
+    // process saturated. The numbers are chosen for `pyde_call` /
+    // `pyde_estimateGas` / `pyde_createAccessList` shapes —
+    // calldata + ABI args at typical contract sizes — plus
+    // headroom for `pyde_getLogs` / `pyde_getBlockByNumber(slot,
+    // full_tx)` response payloads.
+    const MAX_REQUEST_BODY_BYTES: u32 = 1_048_576;       // 1 MB
+    const MAX_RESPONSE_BODY_BYTES: u32 = 16_777_216;     // 16 MB
+    const MAX_CONNECTIONS: u32 = 1024;
+    const MAX_REQUESTS_PER_BATCH: u32 = 32;
     let server = Server::builder()
+        .max_request_body_size(MAX_REQUEST_BODY_BYTES)
+        .max_response_body_size(MAX_RESPONSE_BODY_BYTES)
+        .max_connections(MAX_CONNECTIONS)
+        .set_batch_request_config(jsonrpsee::server::BatchRequestConfig::Limit(
+            MAX_REQUESTS_PER_BATCH,
+        ))
         .build(addr)
         .await
         .map_err(|e| format!("failed to start RPC server: {}", e))?;
