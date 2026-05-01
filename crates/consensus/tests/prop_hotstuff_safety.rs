@@ -98,7 +98,9 @@ proptest! {
         let mut last_voted = 0u64;
         for s in slots {
             let header = make_header(s, QuorumCert::empty(), 0);
-            let vote = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, sk).unwrap();
+            // Audit 311: pass empty committee_keys; the empty
+            // qc_previous short-circuits verify_qc to true.
+            let vote = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, sk, &[]).unwrap();
             if s > last_voted {
                 prop_assert!(vote.is_some(), "should vote for new slot {}", s);
                 prop_assert_eq!(state.last_voted_slot, s);
@@ -180,14 +182,15 @@ proptest! {
 
         let mut prev_highest = state.highest_qc.slot;
         for (slot, qc_slot) in steps {
-            let qc = QuorumCert {
-                slot: qc_slot,
-                block_hash: [0xCC; 32],
-                voter_bitmap: (1u128 << 86) - 1,
-                signatures: vec![],
-            };
+            // Audit 311: build a QC whose `slot` field varies (the
+            // monotonicity invariant under test) but whose
+            // signatures actually pass verify_qc. The simplest
+            // shape is the empty QC sentinel — verify_qc accepts
+            // any (slot, empty bitmap) pair.
+            let mut qc = QuorumCert::empty();
+            qc.slot = qc_slot;
             let header = make_header(slot, qc, slot as u8);
-            let _ = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, sk).unwrap();
+            let _ = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, sk, &[]).unwrap();
 
             prop_assert!(
                 state.highest_qc.slot >= prev_highest,

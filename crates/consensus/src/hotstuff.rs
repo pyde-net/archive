@@ -190,6 +190,7 @@ pub fn create_vote(
     voter_index: u8,
     voter_address: Address,
     voter_sk: &pyde_crypto::falcon::FalconSecretKey,
+    committee_keys: &[Vec<u8>],
 ) -> Result<Option<ConsensusMessage>, &'static str> {
     // Safety: don't double-vote
     if header.slot <= state.last_voted_slot {
@@ -199,6 +200,15 @@ pub fn create_vote(
     // Safety: proposal must extend our highest QC
     if header.qc_previous.slot < state.highest_qc.slot {
         return Ok(None);
+    }
+
+    // Audit 311: verify every signature inside the proposed QC
+    // before promoting it into our HotStuff state. Pre-311 a
+    // Byzantine proposer could fabricate `qc_previous` (set the
+    // bitmap to claim quorum without any real votes), and we'd
+    // overwrite `state.highest_qc` with the lie.
+    if !verify_qc(&header.qc_previous, committee_keys, chain_id) {
+        return Err("invalid qc_previous: signature verification failed");
     }
 
     // Update highest QC if proposal's QC is newer
@@ -255,6 +265,14 @@ pub fn verify_vote(chain_id: u64, vote: &ConsensusMessage, public_key: &[u8]) ->
 
 /// Aggregate votes into a QuorumCert.
 /// Returns Some(QC) if quorum reached (86+ valid votes), None otherwise.
+///
+/// Audit 311: emits `signatures` sorted by voter_index ascending so
+/// `verify_qc` (and any future on-the-wire consumer) can pair
+/// `signatures[i]` with the `i`-th set bit of `voter_bitmap` without
+/// guessing arrival order. Pre-311 signatures were pushed in vote-
+/// arrival order, so two honest validators forming the same QC could
+/// produce different `signatures` Vec orderings — non-deterministic
+/// and unverifiable by bit-position.
 pub fn try_form_qc(
     chain_id: u64,
     slot: u64,
@@ -263,7 +281,9 @@ pub fn try_form_qc(
     committee_keys: &[Vec<u8>],
 ) -> Option<QuorumCert> {
     let mut voter_bitmap: u128 = 0;
-    let mut signatures = Vec::new();
+    // Track (voter_index, signature) pairs so we can sort by index
+    // before storing in the QC.
+    let mut indexed_sigs: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut valid_count = 0u32;
 
     for vote in votes {
@@ -292,7 +312,7 @@ pub fn try_form_qc(
             // Verify signature
             if verify_vote(chain_id, vote, &committee_keys[idx]) {
                 voter_bitmap |= 1u128 << idx;
-                signatures.push(signature.clone());
+                indexed_sigs.push((*voter_index, signature.clone()));
                 valid_count += 1;
             }
         }
@@ -300,6 +320,10 @@ pub fn try_form_qc(
 
     let threshold = quorum_for_committee(committee_keys.len());
     if valid_count >= threshold as u32 {
+        // Audit 311: sort by voter_index so signatures[i] aligns
+        // with the i-th set bit of voter_bitmap (low → high).
+        indexed_sigs.sort_by_key(|(idx, _)| *idx);
+        let signatures = indexed_sigs.into_iter().map(|(_, sig)| sig).collect();
         Some(QuorumCert {
             slot,
             block_hash,
@@ -309,6 +333,81 @@ pub fn try_form_qc(
     } else {
         None
     }
+}
+
+/// Verify every signature inside a QuorumCert against the
+/// `committee_keys` and the QC's slot + block_hash (audit 311).
+///
+/// Pre-311 the only check on an incoming QC was
+/// `qc.has_quorum_for(N)`, which counts the bitmap. The signatures
+/// inside were never re-verified, so a Byzantine proposer could
+/// fabricate `qc_previous = QuorumCert { voter_bitmap: u128::MAX,
+/// signatures: vec![] }` and validators accepted it. This call
+/// closes that hole at every place an external QC is consumed:
+///
+/// - `validate_network_block` (block_processor.rs) before applying
+///   the block.
+/// - `create_vote` (hotstuff.rs) before mutating
+///   `state.highest_qc`.
+///
+/// Returns false on any of:
+/// - bitmap claims fewer voters than `quorum_for_committee(N)`
+/// - signatures count != bitmap pop-count (malformed)
+/// - any voter_index exceeds committee size
+/// - any FALCON signature fails to verify against the matching
+///   committee public key
+///
+/// Empty QCs (`slot == 0` AND empty bitmap) are accepted as the
+/// genesis sentinel and short-circuit to true so genesis-bootstrap
+/// and pre-finality slots aren't blocked. Callers that need to
+/// distinguish "real" QCs from empty ones must check
+/// `qc.voter_bitmap != 0` themselves first.
+///
+/// `signatures` MUST be sorted by voter_index ascending — `try_form_qc`
+/// guarantees that ordering. A peer that hand-crafts a QC with a
+/// different ordering will hit the "sig n doesn't verify against
+/// validator k" branch and the whole QC is rejected.
+pub fn verify_qc(qc: &QuorumCert, committee_keys: &[Vec<u8>], chain_id: u64) -> bool {
+    // Genesis / empty QC: accept as a sentinel.
+    if qc.voter_bitmap == 0 && qc.signatures.is_empty() {
+        return true;
+    }
+    let n = committee_keys.len();
+    if n == 0 {
+        return false;
+    }
+    let pop = qc.voter_bitmap.count_ones() as usize;
+    if pop != qc.signatures.len() {
+        return false;
+    }
+    if pop < quorum_for_committee(n) {
+        return false;
+    }
+    let preimage = proposer_sign_message(chain_id, qc.slot, &qc.block_hash);
+    let mut sig_idx = 0usize;
+    for bit_pos in 0..128usize {
+        if qc.voter_bitmap & (1u128 << bit_pos) == 0 {
+            continue;
+        }
+        if bit_pos >= n {
+            // Bitmap claims a voter outside the committee — invalid.
+            return false;
+        }
+        let sig_bytes = &qc.signatures[sig_idx];
+        sig_idx += 1;
+        let pk = match FalconPublicKey::from_bytes(&committee_keys[bit_pos]) {
+            Some(pk) => pk,
+            None => return false,
+        };
+        let sig = match FalconSignature::from_bytes(sig_bytes) {
+            Some(s) => s,
+            None => return false,
+        };
+        if !falcon_verify(&pk, &preimage, &sig) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Check if a block has reached finality.
@@ -410,19 +509,25 @@ mod tests {
     /// rather than slipping past with hardcoded chain_id=0.
     const TEST_CHAIN_ID: u64 = 7;
 
+    /// Build a test header with an EMPTY qc_previous. Audit 311
+    /// requires `qc_previous` signatures to verify against
+    /// committee_keys; the unit tests in this module test
+    /// `create_vote`'s HotStuff safety rules, not QC
+    /// verification, so they use the empty-QC sentinel which
+    /// `verify_qc` short-circuits to `true`. Tests for QC
+    /// verification specifically (e.g.
+    /// `verify_qc_rejects_fabricated_bitmap`) build full
+    /// fixtures with real signatures.
     fn make_header(slot: u64, qc_slot: u64) -> BlockHeader {
+        let mut qc = QuorumCert::empty();
+        qc.slot = qc_slot;
         BlockHeader {
             slot,
             epoch: slot / 1000,
             parent_hash: [0xAA; 32],
             proposer: derive_eoa_address(&[0x01; 897]),
             vrf_proof: vec![],
-            qc_previous: QuorumCert {
-                slot: qc_slot,
-                block_hash: [0xBB; 32],
-                voter_bitmap: (1u128 << 86) - 1,
-                signatures: vec![],
-            },
+            qc_previous: qc,
             tx_root: [0; 32],
             state_root: [0; 32],
             timestamp: 1_000_000,
@@ -441,7 +546,7 @@ mod tests {
         let header = make_header(1, 0);
 
         // Create vote
-        let vote = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk)
+        let vote = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk, &[])
             .unwrap()
             .unwrap();
         assert!(matches!(vote, ConsensusMessage::Vote { .. }));
@@ -463,7 +568,7 @@ mod tests {
         let addr = derive_eoa_address(&pk_bytes);
 
         let header = make_header(1, 0);
-        let vote = create_vote(1, &mut state, &header, 0, addr, &sk)
+        let vote = create_vote(1, &mut state, &header, 0, addr, &sk, &[])
             .unwrap()
             .unwrap();
 
@@ -508,6 +613,144 @@ mod tests {
         let qc = qc.unwrap();
         assert!(qc.has_quorum());
         assert_eq!(qc.vote_count(), 86);
+    }
+
+    // ── Audit 311: verify_qc regression tests ──────────────────────
+
+    /// Empty QC sentinel (genesis / pre-finality) is accepted.
+    #[test]
+    fn verify_qc_accepts_empty_sentinel() {
+        let qc = QuorumCert::empty();
+        assert!(verify_qc(&qc, &[], TEST_CHAIN_ID));
+        // Even with a non-empty committee, the empty sentinel
+        // short-circuits to true.
+        assert!(verify_qc(&qc, &vec![vec![0u8; 897]; 4], TEST_CHAIN_ID));
+    }
+
+    /// A QC produced by `try_form_qc` from real votes verifies.
+    #[test]
+    fn verify_qc_accepts_well_formed_qc() {
+        let header = make_header(5, 4);
+        let block_hash = header.hash();
+        let mut votes = Vec::new();
+        let mut keys = Vec::new();
+        for i in 0..86u8 {
+            let (pk, sk) = falcon_keygen().unwrap();
+            let pk_bytes = pk.as_bytes().to_vec();
+            let addr = derive_eoa_address(&pk_bytes);
+            let vote_msg = proposer_sign_message(TEST_CHAIN_ID, 5, &block_hash);
+            let sig = pyde_crypto::falcon::falcon_sign(&sk, &vote_msg).unwrap();
+            votes.push(ConsensusMessage::Vote {
+                slot: 5,
+                block_hash,
+                voter_index: i,
+                voter_address: addr,
+                signature: sig.as_bytes().to_vec(),
+            });
+            keys.push(pk_bytes);
+        }
+        while keys.len() < 128 {
+            keys.push(vec![0; 897]);
+        }
+        let qc = try_form_qc(TEST_CHAIN_ID, 5, block_hash, &votes, &keys).unwrap();
+        assert!(verify_qc(&qc, &keys, TEST_CHAIN_ID));
+    }
+
+    /// A QC with `voter_bitmap = u128::MAX` and empty signatures —
+    /// the exact lie the audit-311 fix closes — is rejected.
+    /// Pre-fix `validate_network_block` and `create_vote` accepted
+    /// this and propagated it into HotStuff state.
+    #[test]
+    fn verify_qc_rejects_fabricated_bitmap_with_empty_sigs() {
+        let qc = QuorumCert {
+            slot: 5,
+            block_hash: [0xCC; 32],
+            voter_bitmap: u128::MAX,
+            signatures: vec![], // count_ones() = 128, len() = 0 → mismatch
+        };
+        let keys = vec![vec![0u8; 897]; 128];
+        assert!(!verify_qc(&qc, &keys, TEST_CHAIN_ID));
+    }
+
+    /// Bitmap pop_count >= quorum but sigs are random bytes that
+    /// don't verify against any committee key.
+    #[test]
+    fn verify_qc_rejects_garbage_signatures() {
+        let qc = QuorumCert {
+            slot: 5,
+            block_hash: [0xCC; 32],
+            voter_bitmap: (1u128 << 86) - 1, // 86 voters
+            signatures: vec![vec![0xAB; 690]; 86],
+        };
+        let mut keys = Vec::new();
+        for _ in 0..128 {
+            let (pk, _) = falcon_keygen().unwrap();
+            keys.push(pk.as_bytes().to_vec());
+        }
+        assert!(!verify_qc(&qc, &keys, TEST_CHAIN_ID));
+    }
+
+    /// A QC valid under chain_id A must NOT verify under chain_id B
+    /// (cross-chain replay protection — already on the per-vote
+    /// path; the verify_qc wrapper preserves it).
+    #[test]
+    fn verify_qc_rejects_cross_chain_replay() {
+        let header = make_header(5, 4);
+        let block_hash = header.hash();
+        let mut votes = Vec::new();
+        let mut keys = Vec::new();
+        for i in 0..86u8 {
+            let (pk, sk) = falcon_keygen().unwrap();
+            let pk_bytes = pk.as_bytes().to_vec();
+            let addr = derive_eoa_address(&pk_bytes);
+            let vote_msg = proposer_sign_message(TEST_CHAIN_ID, 5, &block_hash);
+            let sig = pyde_crypto::falcon::falcon_sign(&sk, &vote_msg).unwrap();
+            votes.push(ConsensusMessage::Vote {
+                slot: 5,
+                block_hash,
+                voter_index: i,
+                voter_address: addr,
+                signature: sig.as_bytes().to_vec(),
+            });
+            keys.push(pk_bytes);
+        }
+        while keys.len() < 128 {
+            keys.push(vec![0; 897]);
+        }
+        let qc = try_form_qc(TEST_CHAIN_ID, 5, block_hash, &votes, &keys).unwrap();
+        // Same QC under a different chain_id fails.
+        assert!(!verify_qc(&qc, &keys, TEST_CHAIN_ID + 1));
+    }
+
+    /// `create_vote` rejects a header whose qc_previous fails
+    /// verification — the in-memory `state.highest_qc` MUST NOT
+    /// be promoted to the lie.
+    #[test]
+    fn create_vote_rejects_fabricated_qc_previous() {
+        let mut state = ConsensusState::new();
+        let (_pk, sk) = falcon_keygen().unwrap();
+        let addr = derive_eoa_address(&[0x01; 897]);
+        let pre_state_hqc_slot = state.highest_qc.slot;
+
+        let mut header = make_header(5, 4);
+        // Replace the empty qc_previous with a fabricated one that
+        // would have slipped past pre-311 (bitmap claims quorum,
+        // signatures missing).
+        header.qc_previous = QuorumCert {
+            slot: 4,
+            block_hash: [0xCC; 32],
+            voter_bitmap: u128::MAX,
+            signatures: vec![],
+        };
+
+        let keys = vec![vec![0u8; 897]; 128];
+        let res = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk, &keys);
+        assert!(res.is_err(), "audit 311: create_vote must refuse fabricated qc_previous");
+        // The HotStuff state must not have promoted the fake QC.
+        assert_eq!(
+            state.highest_qc.slot, pre_state_hqc_slot,
+            "audit 311: highest_qc must not be mutated when verify_qc fails"
+        );
     }
 
     // ========== Task 0485: Insufficient votes ==========
@@ -635,11 +878,11 @@ mod tests {
         let addr = derive_eoa_address(pk.as_bytes());
 
         let header = make_header(1, 0);
-        let vote1 = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk).unwrap();
+        let vote1 = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk, &[]).unwrap();
         assert!(vote1.is_some());
 
         // Try voting again for same slot
-        let vote2 = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk).unwrap();
+        let vote2 = create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk, &[]).unwrap();
         assert!(vote2.is_none()); // rejected
     }
 
@@ -651,13 +894,13 @@ mod tests {
 
         // Vote for slot 5
         let header5 = make_header(5, 4);
-        create_vote(TEST_CHAIN_ID, &mut state, &header5, 0, addr, &sk)
+        create_vote(TEST_CHAIN_ID, &mut state, &header5, 0, addr, &sk, &[])
             .unwrap()
             .unwrap();
 
         // Try to vote for slot 3 (old)
         let header3 = make_header(3, 2);
-        let vote = create_vote(TEST_CHAIN_ID, &mut state, &header3, 0, addr, &sk).unwrap();
+        let vote = create_vote(TEST_CHAIN_ID, &mut state, &header3, 0, addr, &sk, &[]).unwrap();
         assert!(vote.is_none());
     }
 
@@ -672,7 +915,7 @@ mod tests {
         assert_eq!(state.highest_qc.slot, 0);
 
         let header = make_header(5, 4); // QC for slot 4
-        create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk)
+        create_vote(TEST_CHAIN_ID, &mut state, &header, 0, addr, &sk, &[])
             .unwrap()
             .unwrap();
 

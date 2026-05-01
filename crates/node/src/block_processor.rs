@@ -727,6 +727,22 @@ impl BlockProcessor {
             ));
         }
 
+        // 5. Audit 311: every signature inside `qc_previous` must
+        //    verify against the matching committee public key. The
+        //    bitmap-only `has_quorum_for` check above catches the
+        //    "claims not enough voters" case but lets a Byzantine
+        //    proposer fabricate `voter_bitmap = u128::MAX` with
+        //    empty/garbage `signatures` past the gate. Without
+        //    full FALCON verification, the lie propagated into
+        //    `state.highest_qc` (via `create_vote`) and downstream
+        //    finality records.
+        if !pyde_consensus::hotstuff::verify_qc(&header.qc_previous, committee_keys, chain_id) {
+            return Err(format!(
+                "previous QC at slot {} has invalid signatures (audit 311)",
+                header.qc_previous.slot
+            ));
+        }
+
         Ok(())
     }
 

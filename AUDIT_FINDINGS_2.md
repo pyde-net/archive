@@ -243,27 +243,36 @@
 
 ### Consensus
 
-- [ ] 311 — `✓` **No QC signature verification on incoming blocks.**
-      Where: `crates/node/src/block_processor.rs:721` —
-      `validate_network_block` only checks
-      `header.qc_previous.has_quorum_for(committee_size)`, which
-      counts the bitmap. Signatures inside the QC are NEVER
-      re-verified. `crates/consensus/src/hotstuff.rs:206` then
-      merges the unverified QC into `state.highest_qc`.
-      A Byzantine proposer can submit
-      `qc_previous = QuorumCert { voter_bitmap: u128::MAX,
-      signatures: vec![] }` and validators accept it, promoting the
-      lie into HotStuff state and downstream finality recording.
-      `verify_vote` exists but is only called inside `try_form_qc`
-      during local aggregation — there is no `verify_qc` anywhere
-      in the workspace.
-      Fix: add `QuorumCert::verify(&[Vec<u8>], chain_id) -> bool`
-      that iterates the bitmap, decodes each `signatures[i]`,
-      rebuilds `proposer_sign_message(chain_id, slot, block_hash)`,
-      runs `falcon_verify` per voter, asserts `valid_count >=
-      quorum_for_committee(N)`. Call from `validate_network_block`
-      AND `create_vote` BEFORE the `state.highest_qc` mutation at
-      `hotstuff.rs:206`.
+- [x] 311 — `✓` **No QC signature verification on incoming blocks.**
+      Shipped: new `pyde_consensus::hotstuff::verify_qc(qc,
+      committee_keys, chain_id) -> bool` walks the bitmap (low-to-
+      high), pairs each set bit with `qc.signatures[i]`, rebuilds
+      `proposer_sign_message(chain_id, qc.slot, qc.block_hash)`,
+      and runs `falcon_verify` per voter. Returns false on any of:
+      bitmap pop-count below quorum, signatures.len() ≠ pop-count,
+      voter_index out of committee, FALCON verify fail. Empty QCs
+      (bitmap == 0 AND signatures empty) short-circuit to true as
+      the genesis sentinel.
+      Wired in two production call sites:
+      - `validate_network_block` (block_processor.rs) — runs after
+        the bitmap pop-count check.
+      - `create_vote` (hotstuff.rs) — runs BEFORE mutating
+        `state.highest_qc`. New `committee_keys: &[Vec<u8>]`
+        parameter; threaded through every test/bench caller (15
+        sites updated).
+      Bonus determinism fix: `try_form_qc` now sorts signatures by
+      voter_index ascending, so two honest validators forming the
+      same QC produce identical `signatures` Vec orderings and
+      `verify_qc` can pair signatures with bitmap bits without
+      arrival-order ambiguity (closes the audit-310 P1 #18 note).
+      6 new tests
+      (`verify_qc_accepts_empty_sentinel`,
+      `verify_qc_accepts_well_formed_qc`,
+      `verify_qc_rejects_fabricated_bitmap_with_empty_sigs`,
+      `verify_qc_rejects_garbage_signatures`,
+      `verify_qc_rejects_cross_chain_replay`,
+      `create_vote_rejects_fabricated_qc_previous`). 124 consensus
+      tests pass; workspace builds clean.
 
 - [ ] 312 — `⚠` **Threshold MEV pipeline soundness gaps (3 issues, one
       PR).**

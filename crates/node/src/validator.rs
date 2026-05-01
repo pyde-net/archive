@@ -1709,7 +1709,10 @@ impl ValidatorEngine {
             self.timeout.receive_proposal();
         }
 
-        // Create vote (HotStuff safety rules enforced inside create_vote)
+        // Create vote (HotStuff safety rules enforced inside create_vote).
+        // Audit 311: pass committee_keys so create_vote can verify the
+        // FALCON signatures inside `header.qc_previous` before
+        // promoting it into our HotStuff `highest_qc`.
         match create_vote(
             self.chain_id,
             &mut self.consensus,
@@ -1717,6 +1720,7 @@ impl ValidatorEngine {
             identity.committee_index,
             identity.address,
             &identity.secret_key,
+            &self.committee_keys,
         ) {
             Ok(Some(vote)) => {
                 // create_vote mutated last_voted_slot and possibly highest_qc.
