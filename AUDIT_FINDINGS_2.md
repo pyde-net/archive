@@ -400,13 +400,18 @@
 
 ### Consensus / finality
 
-- [ ] 320 — `⚠` **Hard-finality `finality_sign_message` doesn't bind
-      `chain_id`.** `crates/consensus/src/finality.rs:97-104`. Audit
-      240's chain_id sweep missed this surface; cross-chain finality
-      replay is possible if FALCON keys are reused across chains.
-      Add `chain_id_le` to the preimage; thread through callers and
-      verifier. Mirror the `vote_cross_chain_replay_rejected` test
-      pattern.
+- [x] 320 — `✓` **Hard-finality `finality_sign_message` doesn't bind
+      `chain_id`.** Shipped: `finality_sign_message` now hashes
+      `tag(13) || chain_id_le(8) || slot_le(8) || block_hash(32) ||
+      state_root(32)`. `create_finality_vote`,
+      `verify_finality_vote`, `try_form_hard_finality` all take
+      `chain_id`; threaded through `validator.rs:1999, 2419` and the
+      finality-vote receive path in node.rs. Tests updated to use
+      `TEST_CHAIN_ID = 7` (mirrors hotstuff.rs convention) plus a
+      new `finality_vote_cross_chain_replay_rejected` regression
+      that asserts a vote signed under chain_id=1 fails to verify
+      under chain_id ∈ {2, 7331, 31337}. 17 finality tests pass;
+      125 consensus + 286 node-bin tests clean.
 - [ ] 321 — `⚠` **Header `parent_hash` not validated.**
       `crates/node/src/block_processor.rs:655-731`. No assertion
       that `header.parent_hash == chain.headers[head_slot].hash()`.

@@ -1995,9 +1995,14 @@ impl ValidatorEngine {
         // Try to form hard finality cert (dynamic quorum)
         let threshold = quorum_for_committee(self.committee_keys.len());
         if entry.len() >= threshold {
-            if let Some(cert) =
-                try_form_hard_finality(slot, block_hash, state_root, entry, &self.committee_keys)
-            {
+            if let Some(cert) = try_form_hard_finality(
+                self.chain_id,
+                slot,
+                block_hash,
+                state_root,
+                entry,
+                &self.committee_keys,
+            ) {
                 info!(slot, "hard finality achieved");
                 // Audit item 207a: persist BEFORE in-memory mutation.
                 // Construct the checkpoint explicitly here so we can
@@ -2417,6 +2422,7 @@ impl ValidatorEngine {
         identity: &ValidatorIdentity,
     ) -> Option<FinalityVote> {
         match create_finality_vote(
+            self.chain_id,
             slot,
             block_hash,
             state_root,
