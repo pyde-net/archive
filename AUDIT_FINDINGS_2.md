@@ -583,10 +583,15 @@
       batch ceiling stops a single connection from rolling
       thousands of cheap sub-requests through one HTTP frame.
       24 rpc tests pass.
-- [ ] 346 — `⚠` **WS subscribe count uncapped per connection;
-      unbounded mpsc backs each.** `crates/node/src/ws_sub.rs:59,
-      70-176`. Cap `tasks.len()` at 16 per connection; switch
-      `mpsc::unbounded_channel` → bounded with try_send drop.
+- [x] 346 — `✓` **WS subscribe count uncapped per connection;
+      unbounded mpsc backs each.** Shipped: replaced
+      `mpsc::unbounded_channel::<String>()` with
+      `mpsc::channel::<String>(256)` and converted every `out_tx.
+      send(...)` to `out_tx.try_send(...)` (drop on full, break the
+      pumping task on Closed). Added a `MAX_SUBS_PER_CONN = 16`
+      cap before each `tasks.push(tokio::spawn(...))`; over-cap
+      requests get a clear `-32603 "subscription cap reached
+      (16 per connection); audit 346"` reply.
 - [ ] 347 — `⚠` **Faucet rate-limiter map grows unbounded.**
       `crates/node/src/faucet.rs:50-86, 379-382, 541-545`. Validate
       address against `^0x[0-9a-fA-F]{64}$` BEFORE recording in the
