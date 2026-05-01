@@ -850,10 +850,11 @@ impl PydeApiServer for RpcServer {
         let data_hex = call_obj.get("data").and_then(|v| v.as_str()).unwrap_or("");
         let calldata =
             hex::decode(data_hex.strip_prefix("0x").unwrap_or(data_hex)).unwrap_or_default();
-        let gas_limit: u64 = call_obj
-            .get("gas")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1_000_000);
+        // Audit 342: cap caller-supplied gas at CALL_GAS_CAP — same DoS
+        // mitigation that audit-735bcef applied to `pyde_call`. Without
+        // this gate, a single estimateGas request with `gas: u64::MAX`
+        // spins the public RPC node's CPU until the request times out.
+        let gas_limit: u64 = clamp_call_gas(call_obj.get("gas").and_then(|v| v.as_u64()));
 
         if to == [0u8; 32] {
             // Deploy estimation
@@ -929,10 +930,10 @@ impl PydeApiServer for RpcServer {
             .and_then(|v| v.as_str())
             .and_then(|s| u128::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok())
             .unwrap_or(0);
-        let gas_limit: u64 = call_obj
-            .get("gas")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(50_000_000);
+        // Audit 342: same gas-cap mitigation as estimateGas + pyde_call.
+        // createAccessList runs the same simulator path so an
+        // unbounded `gas` parameter is the same DoS vector.
+        let gas_limit: u64 = clamp_call_gas(call_obj.get("gas").and_then(|v| v.as_u64()));
 
         if to == [0u8; 32] {
             // Deploy — no meaningful access list

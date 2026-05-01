@@ -539,10 +539,15 @@
       `validate_network_block` only runs when
       `validator_engine.is_some()`; non-validator full nodes accept
       any header. Add a `NonValidatorVerifier` mirror.
-- [ ] 342 — `⚠` **`pyde_estimateGas` and `pyde_createAccessList`
+- [x] 342 — `✓` **`pyde_estimateGas` and `pyde_createAccessList`
       lack the gas cap that audit 735bcef added to `pyde_call`.**
-      `crates/node/src/rpc.rs:853-856, 932-935`. Apply
-      `clamp_call_gas` at both sites.
+      Shipped: replaced raw `unwrap_or(1_000_000)` /
+      `unwrap_or(50_000_000)` defaults at `rpc.rs:853-856` and
+      `rpc.rs:932-935` with `clamp_call_gas(...)`, mirroring the
+      `pyde_call` mitigation. `clamp_call_gas`'s existing 3 unit
+      tests now cover both call sites since they share the helper;
+      explicit per-RPC tests would require a full `RpcState`
+      fixture (overhead unjustified for a one-line dispatch).
 - [ ] 343 — `⚠` **`config.toml` `chain_id` not cross-checked against
       `genesis.toml`.** `crates/node/src/node.rs:246`. Assert match
       in `PydeNode::run` after loading `genesis_config`; refuse
