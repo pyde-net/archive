@@ -516,11 +516,17 @@
       into `ConnectionEstablished` and `RateLimiter` per-peer for
       Transactions, or delete the file so nobody assumes protection
       that isn't there.
-- [ ] 336 — `⚠` **`PeerInfo.ip` never populated.**
-      `crates/net/src/peer.rs:40,303` + `crates/net/src/node.rs:5052`.
-      `is_rate_limited` always returns false because IP is never
-      parsed from the multiaddr. Set `info.ip` from
-      `endpoint.get_remote_address()` before `add_peer`.
+- [x] 336 — `✓` **`PeerInfo.ip` never populated.** Shipped: new
+      `pyde_net::peer::ip_from_multiaddr(&Multiaddr) ->
+      Option<IpAddr>` walks the protocol stack and returns the
+      first `Ip4` / `Ip6` segment. New `PeerInfo::with_ip(ip)`
+      builder. The `ConnectionEstablished` handler in
+      `node.rs` now extracts the ip from the remote multiaddr and
+      threads it into `PeerInfo` before `add_peer`. Pre-fix `info.
+      ip` was always `None`, so `is_rate_limited` short-circuited
+      false and `rate_limit_per_ip` silently did nothing. 5 new
+      tests covering ip4 / ip6 / quic-suffix / dnsaddr-returns-none
+      / `with_ip` builder. 22 peer tests pass.
 - [ ] 337 — `⚠` **`SyncReq::GetBlocks` count unbounded server-side.**
       `crates/node/src/sync.rs:587-610`. A peer with `count=u32::MAX`
       iterates ~4B slots. Clamp `count <= 256` before the loop.

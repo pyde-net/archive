@@ -5100,7 +5100,15 @@ fn handle_swarm_event(
                 libp2p::core::ConnectedPoint::Dialer { .. } => pyde_net::peer::Direction::Outbound,
                 libp2p::core::ConnectedPoint::Listener { .. } => pyde_net::peer::Direction::Inbound,
             };
-            let info = pyde_net::peer::PeerInfo::new(peer_id, direction);
+            // Audit 336: populate `info.ip` from the multiaddr so
+            // PeerManager's per-IP rate limiter actually fires.
+            // Pre-fix this field was always None and
+            // `is_rate_limited` silently returned false on every
+            // connection.
+            let mut info = pyde_net::peer::PeerInfo::new(peer_id, direction);
+            if let Some(ip) = pyde_net::peer::ip_from_multiaddr(&remote_addr) {
+                info = info.with_ip(ip);
+            }
             peer_manager.add_peer(info);
 
             // Audit 234 follow-up: snapshot the (peer_id, multiaddr)

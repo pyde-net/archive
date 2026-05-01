@@ -1,9 +1,28 @@
 //! Peer identity and connection tracking.
 
-use libp2p::PeerId;
+use libp2p::{Multiaddr, PeerId};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Instant;
+
+/// Extract the IPv4 / IPv6 address from a libp2p `Multiaddr` if any
+/// (audit 336). Walks the protocol stack and returns the first
+/// `Ip4(_)` or `Ip6(_)` segment. Pre-fix `PeerInfo.ip` was always
+/// left as `None` because the connection-established handler
+/// constructed `PeerInfo::new` without parsing the remote address;
+/// `is_rate_limited` therefore never fired and `rate_limit_per_ip`
+/// silently did nothing.
+pub fn ip_from_multiaddr(addr: &Multiaddr) -> Option<IpAddr> {
+    use libp2p::multiaddr::Protocol;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Ip4(v4) => return Some(IpAddr::V4(v4)),
+            Protocol::Ip6(v6) => return Some(IpAddr::V6(v6)),
+            _ => continue,
+        }
+    }
+    None
+}
 
 /// Peer connection direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +81,13 @@ impl PeerInfo {
             invalid_messages: 0,
             falcon_pubkey: None,
         }
+    }
+
+    /// Builder helper: set the remote IP, typically extracted from
+    /// the libp2p Multiaddr via `ip_from_multiaddr` (audit 336).
+    pub fn with_ip(mut self, ip: IpAddr) -> Self {
+        self.ip = Some(ip);
+        self
     }
 
     /// Reputation score (higher = better). Simple linear scoring.
@@ -304,6 +330,54 @@ mod tests {
         let mut info = PeerInfo::new(PeerId::random(), direction);
         info.ip = Some(ip);
         info
+    }
+
+    // ── Audit 336: ip_from_multiaddr + with_ip ───────────────────────
+
+    #[test]
+    fn ip_from_multiaddr_extracts_ip4() {
+        let ma: Multiaddr = "/ip4/192.168.1.42/tcp/30303".parse().unwrap();
+        assert_eq!(
+            ip_from_multiaddr(&ma),
+            Some("192.168.1.42".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn ip_from_multiaddr_extracts_ip6() {
+        let ma: Multiaddr = "/ip6/::1/tcp/30303".parse().unwrap();
+        assert_eq!(
+            ip_from_multiaddr(&ma),
+            Some("::1".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn ip_from_multiaddr_handles_quic_suffix() {
+        // libp2p QUIC multiaddrs have additional segments after the
+        // ip; the extractor should still find the ip4 / ip6 part.
+        let ma: Multiaddr = "/ip4/10.0.0.1/udp/30303/quic-v1".parse().unwrap();
+        assert_eq!(
+            ip_from_multiaddr(&ma),
+            Some("10.0.0.1".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn ip_from_multiaddr_dnsaddr_returns_none() {
+        // dns4 / dnsaddr multiaddrs don't carry a resolved IP — the
+        // extractor returns None rather than guessing.
+        let ma: Multiaddr = "/dns4/validator-0.testnet.example/tcp/30303"
+            .parse()
+            .unwrap();
+        assert_eq!(ip_from_multiaddr(&ma), None);
+    }
+
+    #[test]
+    fn peer_info_with_ip_builder() {
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let info = PeerInfo::new(PeerId::random(), Direction::Inbound).with_ip(ip);
+        assert_eq!(info.ip, Some(ip));
     }
 
     #[test]
