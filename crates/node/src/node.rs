@@ -83,6 +83,32 @@ pub fn check_bootstrap_config(
     ))
 }
 
+/// Audit 343: refuse startup when `config.toml [node].chain_id`
+/// disagrees with `genesis.toml`'s chain_id. Pre-fix, the runtime
+/// chain_id came from config.toml while the genesis state came
+/// from genesis.toml, with no consistency check. An operator who
+/// edits config.toml to set `chain_id = 7331` while genesis.toml
+/// still says 31337 would run with chain_id=7331 (binding
+/// signatures to that domain) against state computed for 31337 —
+/// confusing self-isolation. Worse, a forged genesis.toml
+/// claiming chain_id=1 would silently propagate onto mainnet's
+/// domain. The helper is split out so the comparison can be
+/// unit-tested without spinning up `PydeNode::run()`.
+pub fn check_config_genesis_chain_id_match(
+    config_chain_id: u64,
+    genesis_chain_id: u64,
+) -> Result<(), String> {
+    if config_chain_id != genesis_chain_id {
+        return Err(format!(
+            "chain_id mismatch (audit 343): config.toml says {} but genesis.toml says {} — \
+             refusing to start. Either update config.toml to match the genesis chain_id, \
+             or regenerate the genesis bundle with `pyde testnet --chain-id {}`.",
+            config_chain_id, genesis_chain_id, config_chain_id,
+        ));
+    }
+    Ok(())
+}
+
 /// The main Pyde node. Owns all subsystems.
 pub struct PydeNode {
     config: NodeConfig,
@@ -236,6 +262,13 @@ impl PydeNode {
                 crate::genesis::GenesisConfig::default()
             }
         };
+
+        // Audit 343: refuse to start if config.toml's chain_id
+        // disagrees with genesis.toml's.
+        check_config_genesis_chain_id_match(
+            self.config.node.chain_id,
+            genesis_config.chain_id,
+        )?;
 
         // 3. Block store (persistent headers on disk). Arc'd so the
         // RPC layer can read full block bodies without a second open.
@@ -5372,6 +5405,37 @@ mod tests {
                 check_bootstrap_config(chain_id, &peers).is_ok(),
                 "chain_id {chain_id} with peers should pass"
             );
+        }
+    }
+
+    // ── Audit 343: config.toml ↔ genesis.toml chain_id consistency ──
+
+    #[test]
+    fn config_genesis_chain_id_match_accepts_equal() {
+        for id in [1u64, 7, 7331, 31337, 1_000_000] {
+            assert!(
+                check_config_genesis_chain_id_match(id, id).is_ok(),
+                "matching chain_id {id} must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn config_genesis_chain_id_mismatch_rejects() {
+        // Common mishap shapes: operator edited config.toml without
+        // regenerating genesis.toml, or pulled a forged genesis.toml
+        // claiming a different chain than the runtime.
+        for (config_id, genesis_id) in [
+            (1u64, 31337),
+            (7331, 31337),
+            (7331, 1),
+            (31337, 7331),
+            (1, 7331),
+        ] {
+            let err = check_config_genesis_chain_id_match(config_id, genesis_id).unwrap_err();
+            assert!(err.contains("audit 343"));
+            assert!(err.contains(&format!("config.toml says {}", config_id)));
+            assert!(err.contains(&format!("genesis.toml says {}", genesis_id)));
         }
     }
 }

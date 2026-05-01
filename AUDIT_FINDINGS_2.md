@@ -548,10 +548,18 @@
       tests now cover both call sites since they share the helper;
       explicit per-RPC tests would require a full `RpcState`
       fixture (overhead unjustified for a one-line dispatch).
-- [ ] 343 — `⚠` **`config.toml` `chain_id` not cross-checked against
-      `genesis.toml`.** `crates/node/src/node.rs:246`. Assert match
-      in `PydeNode::run` after loading `genesis_config`; refuse
-      otherwise.
+- [x] 343 — `✓` **`config.toml` `chain_id` not cross-checked against
+      `genesis.toml`.** Shipped: new
+      `check_config_genesis_chain_id_match(config_id, genesis_id)`
+      helper next to `check_bootstrap_config` in `node.rs`.
+      Refuses startup with a clear error pointing operators at
+      either updating config.toml or regenerating the genesis
+      bundle. Wired in `PydeNode::run` immediately after the
+      genesis-config load + before any chain or block-store init.
+      2 new unit tests on the helper covering matching cases [1,
+      7, 7331, 31337, 1M] and 5 mismatch shapes (config↔genesis
+      pairs operators commonly mishandle: forgotten regen,
+      forged genesis, etc.).
 - [ ] 344 — `⚠` **`pyde testnet` writes keys with default umask.**
       `crates/node/src/genesis.rs:1018,1024,1028,1032,1036,1144,1145,
       1148,1286,1287`. Add `fs::set_permissions(0o600)` after every
