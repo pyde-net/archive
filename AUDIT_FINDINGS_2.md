@@ -412,11 +412,18 @@
       that asserts a vote signed under chain_id=1 fails to verify
       under chain_id ∈ {2, 7331, 31337}. 17 finality tests pass;
       125 consensus + 286 node-bin tests clean.
-- [ ] 321 — `⚠` **Header `parent_hash` not validated.**
-      `crates/node/src/block_processor.rs:655-731`. No assertion
-      that `header.parent_hash == chain.headers[head_slot].hash()`.
-      Add chain-link check to `validate_network_block` for
-      `slot > 1`; special-case `slot == 1` against `genesis_hash`.
+- [x] 321 — `✓` **Header `parent_hash` not validated.**
+      Shipped: `validate_network_block` now takes
+      `expected_parent_hash: Option<&[u8; 32]>` and rejects on
+      mismatch with a clear `"parent_hash mismatch ... audit 321"`
+      error. Caller in `node.rs:3947-3984` computes the expected
+      hash: `chain.genesis_hash` for slot=1, `chain.header(slot-1)
+      .hash()` for slot>1, `None` for the bootstrap case where
+      local headers aren't populated yet. The check fires BEFORE
+      the proposer-in-committee step so a forged block is rejected
+      cheaply. 4 new tests cover the four branches: mismatch
+      rejected, None skips, matching passes, genesis short-
+      circuits. 25 block_processor tests pass.
 - [ ] 322 — `⚠` **`RandomnessCollector::finalize` hardcodes 85-share
       threshold.** `crates/consensus/src/epoch_randomness.rs:189-202`.
       A 16-validator testnet (per the bring-up runbook) cannot

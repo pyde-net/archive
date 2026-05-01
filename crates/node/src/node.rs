@@ -3943,7 +3943,20 @@ fn handle_swarm_event(
                         Ok(block) => {
                             let slot = block.header.slot;
 
-                            // Validate block header (signature, VRF, proposer, QC)
+                            // Validate block header (signature, VRF, proposer, QC).
+                            // Audit 321: pass the expected parent_hash so the
+                            // header's chain-linking invariant is enforced.
+                            // For slot=1 use genesis_hash; for slot>1 use the
+                            // hash of the canonical block at head_slot. None
+                            // for the bootstrap case where we have no parent
+                            // yet (skips the check).
+                            let expected_parent = if slot == 1 {
+                                Some(chain.genesis_hash)
+                            } else if let Some(parent) = chain.header(slot - 1) {
+                                Some(parent.hash())
+                            } else {
+                                None
+                            };
                             if let Some(ref engine) = validator_engine {
                                 if let Err(e) = BlockProcessor::validate_network_block(
                                     chain.chain_id,
@@ -3951,6 +3964,7 @@ fn handle_swarm_event(
                                     &block.proposer_signature,
                                     &engine.committee_keys,
                                     &engine.epoch_randomness,
+                                    expected_parent.as_ref(),
                                 ) {
                                     warn!(slot, error = %e, "block header validation failed");
                                     return PostEventAction::None;

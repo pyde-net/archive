@@ -658,12 +658,35 @@ impl BlockProcessor {
         proposer_signature: &[u8],
         committee_keys: &[Vec<u8>],
         epoch_randomness: &[u8; 32],
+        expected_parent_hash: Option<&[u8; 32]>,
     ) -> Result<(), String> {
         let slot = header.slot;
 
         // Skip validation for genesis block
         if slot == 0 {
             return Ok(());
+        }
+
+        // Audit 321: header.parent_hash must match the expected
+        // parent (the local canonical block's hash at slot
+        // head_slot, or `genesis_hash` for slot == 1). Without
+        // this, a Byzantine proposer can produce a block at
+        // `slot = head_slot + 1` whose parent_hash references a
+        // sibling fork — `chain.advance(header)` blindly inserts
+        // it, breaking the chain-link invariant `is_finalized` is
+        // documented to depend on. Skipped when the caller passes
+        // `None` (used in tests + the no-history-yet bootstrap
+        // case where there is no canonical parent to compare
+        // against).
+        if let Some(expected) = expected_parent_hash {
+            if header.parent_hash != *expected {
+                return Err(format!(
+                    "parent_hash mismatch at slot {}: header claims {} but local canonical parent is {} (audit 321)",
+                    slot,
+                    hex::encode(header.parent_hash),
+                    hex::encode(expected),
+                ));
+            }
         }
 
         // 1. Proposer must be a committee member
@@ -1815,5 +1838,96 @@ mod tests {
             BlockProcessor::reorg_to_block(&mut chain, &mut state, &block_at_3, None, Some(4))
                 .unwrap_err();
         assert!(err.contains("hard finality"));
+    }
+
+    // ── Audit 321: header parent_hash chain validation ──────────────
+
+    /// validate_network_block rejects a block whose `parent_hash`
+    /// doesn't match the expected canonical parent. The check fires
+    /// BEFORE the proposer-signature step, so we don't need valid
+    /// sigs to exercise it (we DO need slot != 0 to skip the
+    /// genesis short-circuit).
+    #[test]
+    fn validate_network_block_rejects_parent_hash_mismatch_audit_321() {
+        let mut header = dummy_header(2);
+        header.parent_hash = [0xAA; 32]; // claimed parent
+        let expected = [0xBB; 32]; // canonical parent on local chain
+
+        let err = BlockProcessor::validate_network_block(
+            31337,
+            &header,
+            &[],          // proposer_signature — irrelevant, parent_hash check fires first
+            &[],          // committee_keys — same
+            &[0u8; 32],   // epoch_randomness
+            Some(&expected),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("parent_hash mismatch") && err.contains("audit 321"),
+            "expected parent_hash audit-321 error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_network_block_skips_parent_hash_when_none() {
+        // Bootstrap path passes None for the expected parent (e.g.
+        // first block after a snapshot-sync where local headers
+        // aren't populated). The parent_hash check is skipped; the
+        // proposer-in-committee check is what fails next on this
+        // dummy committee.
+        let header = dummy_header(2);
+        let err = BlockProcessor::validate_network_block(
+            31337,
+            &header,
+            &[],
+            &[],
+            &[0u8; 32],
+            None,
+        )
+        .unwrap_err();
+        // Did NOT fail with the audit-321 message — it failed
+        // farther down (proposer not in committee, or no sig).
+        assert!(!err.contains("audit 321"));
+    }
+
+    #[test]
+    fn validate_network_block_accepts_matching_parent_hash() {
+        // parent_hash matches expected → the audit-321 check passes
+        // and the next steps run. We assert the error text doesn't
+        // mention the parent_hash check (it'll fail later on
+        // proposer-in-committee with empty committee_keys).
+        let mut header = dummy_header(2);
+        header.parent_hash = [0xCD; 32];
+        let expected = [0xCD; 32];
+        let err = BlockProcessor::validate_network_block(
+            31337,
+            &header,
+            &[],
+            &[],
+            &[0u8; 32],
+            Some(&expected),
+        )
+        .unwrap_err();
+        assert!(
+            !err.contains("audit 321"),
+            "matching parent_hash must pass the audit-321 check, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_network_block_genesis_short_circuits() {
+        // slot == 0 short-circuits before the parent_hash check, so
+        // even with a non-matching expected parent the genesis path
+        // returns Ok(()).
+        let header = dummy_header(0);
+        let res = BlockProcessor::validate_network_block(
+            31337,
+            &header,
+            &[],
+            &[],
+            &[0u8; 32],
+            Some(&[0xFF; 32]),
+        );
+        assert!(res.is_ok());
     }
 }
