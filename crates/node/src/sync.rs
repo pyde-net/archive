@@ -585,11 +585,18 @@ impl ChainSync {
                 block_hash: chain.state_root,
             },
             SyncReq::GetBlocks { start_slot, count } => {
-                // Serve full wire-encoded blocks (header + body + signature).
-                // Skips empty slots (sparse block history — not every slot has a block).
+                // Audit 337: clamp the peer-supplied count before
+                // any iteration. Pre-fix, count was used directly
+                // (`as u64`) so a peer passing u32::MAX iterated
+                // ~4 billion slots, hammering RocksDB + chain
+                // header lookups before returning. Cap at
+                // MAX_GET_BLOCKS_COUNT = 256 — large enough for
+                // healthy bulk sync, small enough that a malicious
+                // request burns ≤ a few ms of server CPU.
+                const MAX_GET_BLOCKS_COUNT: u32 = 256;
+                let count = (*count).min(MAX_GET_BLOCKS_COUNT);
                 let mut blocks = Vec::new();
-                let end_slot = *start_slot + *count as u64;
-                // Scan up to end_slot or chain head, whichever is higher
+                let end_slot = *start_slot + count as u64;
                 let scan_end = end_slot.max(chain.head_slot + 1);
                 for slot in *start_slot..scan_end {
                     if let Some(raw) = block_store.get_block_raw(slot) {
@@ -598,7 +605,7 @@ impl ChainSync {
                         blocks.push(crate::wire::encode_block_header(header));
                     }
                     // Don't break on missing slots — blocks are sparse
-                    if blocks.len() >= *count as usize {
+                    if blocks.len() >= count as usize {
                         break;
                     }
                 }
@@ -609,8 +616,14 @@ impl ChainSync {
                 }
             }
             SyncReq::GetHeaders { start_slot, count } => {
+                // Audit 337: same clamp shape as GetBlocks above.
+                // Pre-fix `*start_slot..(*start_slot + *count as
+                // u64)` could iterate u32::MAX slots on a malformed
+                // request.
+                const MAX_GET_HEADERS_COUNT: u32 = 1024;
+                let count = (*count).min(MAX_GET_HEADERS_COUNT);
                 let mut headers = Vec::new();
-                for slot in *start_slot..(*start_slot + *count as u64) {
+                for slot in *start_slot..(*start_slot + count as u64) {
                     if let Some(header) = chain.header(slot) {
                         headers.push(crate::wire::encode_block_header(header));
                     } else {
@@ -665,7 +678,17 @@ impl ChainSync {
                     return SyncResp::NotFound;
                 }
 
-                let cs = (*chunk_size as usize).max(1);
+                // Audit 338: clamp peer-supplied chunk_size. Pre-fix
+                // `(*chunk_size as usize).max(1)` accepted any u32
+                // including u32::MAX, which sliced the entire
+                // `snap.entries` Vec into one response (defeats
+                // chunked transfer's whole purpose AND lets a
+                // peer trigger a full snapshot allocation per
+                // request). Cap at MAX_SNAPSHOT_CHUNK_SIZE = 50_000
+                // entries — well above the SNAPSHOT_CHUNK_SIZE
+                // operators actually use, but bounded.
+                const MAX_SNAPSHOT_CHUNK_SIZE: usize = 50_000;
+                let cs = (*chunk_size as usize).max(1).min(MAX_SNAPSHOT_CHUNK_SIZE);
                 let total_chunks = snap.entries.len().div_ceil(cs).max(1) as u32;
                 let start = (*chunk_index as usize) * cs;
 

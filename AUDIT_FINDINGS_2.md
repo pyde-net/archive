@@ -527,12 +527,17 @@
       false and `rate_limit_per_ip` silently did nothing. 5 new
       tests covering ip4 / ip6 / quic-suffix / dnsaddr-returns-none
       / `with_ip` builder. 22 peer tests pass.
-- [ ] 337 — `⚠` **`SyncReq::GetBlocks` count unbounded server-side.**
-      `crates/node/src/sync.rs:587-610`. A peer with `count=u32::MAX`
-      iterates ~4B slots. Clamp `count <= 256` before the loop.
-- [ ] 338 — `⚠` **`SyncReq::StateSnapshotChunk` chunk_size unbounded
-      server-side.** `crates/node/src/sync.rs:668-693`. Cap to e.g.
-      50_000 entries before slicing.
+- [x] 337 — `✓` **`SyncReq::GetBlocks` count unbounded server-side.**
+      Shipped: clamped to `MAX_GET_BLOCKS_COUNT = 256` before any
+      iteration. Same clamp shape applied to `SyncReq::GetHeaders`
+      (`MAX_GET_HEADERS_COUNT = 1024`) since the symmetric loop had
+      the same uncontrolled bound.
+- [x] 338 — `✓` **`SyncReq::StateSnapshotChunk` chunk_size unbounded
+      server-side.** Shipped: clamped to `MAX_SNAPSHOT_CHUNK_SIZE
+      = 50_000` entries. Pre-fix a peer requesting `chunk_size =
+      u32::MAX` sliced the whole `snap.entries` into one response,
+      defeating chunked transfer + driving full-snapshot
+      allocations per request. 17 sync tests pass.
 - [ ] 339 — `⚠` **`channels.rs::validate_message` /
       `discovery.rs::Discovery` ban list dead code.** Either wire
       both into receive paths or delete to match reality.
