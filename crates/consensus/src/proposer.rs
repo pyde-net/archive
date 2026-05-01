@@ -32,10 +32,32 @@ fn vrf_input(epoch_randomness: &[u8; 32], slot: u64) -> Vec<u8> {
 }
 
 /// Extract a u64 score from a VRF output (first 8 bytes, little-endian).
-fn score_from_output(output: &VrfOutput) -> u64 {
+/// Public so receivers (block_processor::validate_network_block) can
+/// recompute the score from a verified VRF output and check it
+/// against `vrf_proposer_threshold` (audit 323).
+pub fn score_from_output(output: &VrfOutput) -> u64 {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&output.as_bytes()[..8]);
     u64::from_le_bytes(buf)
+}
+
+/// Eligibility threshold for proposer selection given a committee
+/// size. A validator's VRF score must be `≤ threshold` to be eligible
+/// to propose at a given slot. Targets ~5 expected proposers per
+/// slot for reliability:
+///   threshold = min(u64::MAX, 5 * u64::MAX / committee_size)
+///   P(0 proposers) ≈ e^(-5) ≈ 0.67%  (virtually no empty slots)
+/// For small committees (≤ 5 members) every validator is eligible
+/// every slot (threshold = u64::MAX). Audit 323: lifted out of
+/// `validator::check_proposer` so the receive path
+/// (`validate_network_block`) can apply the same gate.
+pub fn vrf_proposer_threshold(committee_size: usize) -> u64 {
+    const TARGET_PROPOSERS: u64 = 5;
+    if committee_size as u64 <= TARGET_PROPOSERS {
+        u64::MAX
+    } else {
+        (u64::MAX / committee_size as u64).saturating_mul(TARGET_PROPOSERS)
+    }
 }
 
 /// A proposer candidate: validator address + VRF output + proof.
@@ -250,5 +272,47 @@ mod tests {
     #[test]
     fn empty_candidates_returns_none() {
         assert!(select_proposer(&[]).is_none());
+    }
+
+    // ── Audit 323: vrf_proposer_threshold helper ──────────────────────
+
+    #[test]
+    fn vrf_proposer_threshold_small_committee_is_max() {
+        // Committees ≤ 5 are too small for a meaningful eligibility
+        // gate; everyone proposes every slot (threshold = u64::MAX).
+        for n in 1..=5usize {
+            assert_eq!(
+                vrf_proposer_threshold(n),
+                u64::MAX,
+                "small committee n={n} must allow every score"
+            );
+        }
+    }
+
+    #[test]
+    fn vrf_proposer_threshold_scales_linearly_with_committee() {
+        // For committee_size N > 5, threshold ≈ 5 * u64::MAX / N.
+        // Verifies the formula picks the same expected number of
+        // eligible proposers regardless of N (~5/slot).
+        let t128 = vrf_proposer_threshold(128);
+        let t256 = vrf_proposer_threshold(256);
+        // Threshold is proportional to 1/N, so doubling N halves the
+        // threshold (within saturating_mul precision).
+        assert!(t128 > t256);
+        // Sanity: threshold for N=128 is ≈ 5/128 of u64::MAX.
+        let expected_128 = (u64::MAX / 128).saturating_mul(5);
+        assert_eq!(t128, expected_128);
+    }
+
+    #[test]
+    fn score_from_output_is_first_8_bytes_le() {
+        // The score must be the little-endian decoding of the first
+        // 8 bytes of the VRF output. Receivers (block_processor) and
+        // the local check_proposer derive the same value from the
+        // same VrfOutput.
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&0xCAFEBABE_u64.to_le_bytes());
+        let output = VrfOutput::from_hash_bytes(&bytes);
+        assert_eq!(score_from_output(&output), 0xCAFEBABE);
     }
 }

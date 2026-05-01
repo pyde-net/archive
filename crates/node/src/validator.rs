@@ -1112,18 +1112,12 @@ impl ValidatorEngine {
         ) {
             Ok(candidate) => {
                 // VRF threshold: only propose if score < threshold.
-                // Target ~5 expected proposers per slot for reliability:
-                //   threshold = min(U64::MAX, 5 * U64::MAX / committee_size)
-                //   P(0 proposers) ≈ e^(-5) ≈ 0.67% (virtually no empty slots)
-                //   Proposal buffering picks the lowest VRF score from candidates.
-                //
-                // For small committees (≤5), everyone proposes (threshold = MAX).
-                const TARGET_PROPOSERS: u64 = 5;
-                let threshold = if committee_size as u64 <= TARGET_PROPOSERS {
-                    u64::MAX // small committee: everyone proposes
-                } else {
-                    (u64::MAX / committee_size as u64).saturating_mul(TARGET_PROPOSERS)
-                };
+                // Audit 323: shared formula in
+                // `pyde_consensus::proposer::vrf_proposer_threshold`
+                // so the receive path (`validate_network_block`)
+                // applies the same gate.
+                let threshold =
+                    pyde_consensus::proposer::vrf_proposer_threshold(committee_size);
 
                 if candidate.score > threshold {
                     debug!(

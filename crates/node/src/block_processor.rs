@@ -720,6 +720,13 @@ impl BlockProcessor {
         }
 
         // 3. Verify VRF proof (encoded as [output:32 || proof:N])
+        // Audit 323: also asserts the VRF score is below the
+        // `vrf_proposer_threshold(committee_size)`. Pre-fix, the
+        // receiver only checked the proof was valid for the
+        // claimed output — any committee member could propose at
+        // every slot regardless of VRF score, multiplying the
+        // proposal-buffering surface and (via seen_proposals
+        // dedup) the slashing-framing attack window.
         if header.vrf_proof.len() >= 33 {
             let vrf_output_bytes = &header.vrf_proof[..32];
             let vrf_proof_bytes = &header.vrf_proof[32..];
@@ -736,6 +743,18 @@ impl BlockProcessor {
 
             if !pyde_crypto::vrf::vrf_verify(&pk, &vrf_input, &vrf_output, &vrf_proof) {
                 return Err("invalid VRF proof in block header".into());
+            }
+
+            let score = pyde_consensus::proposer::score_from_output(&vrf_output);
+            let threshold =
+                pyde_consensus::proposer::vrf_proposer_threshold(committee_keys.len());
+            if score > threshold {
+                return Err(format!(
+                    "VRF score {} above proposer threshold {} for committee size {} (audit 323)",
+                    score,
+                    threshold,
+                    committee_keys.len()
+                ));
             }
         }
 

@@ -440,12 +440,17 @@
       5`). Surfaced + fixed an off-by-one in the legacy
       `RANDOMNESS_THRESHOLD = 85` constant — `quorum_for_committee
       (128) = 86`. 13 epoch_randomness tests pass.
-- [ ] 323 — `⚠` **No proposer-VRF score threshold check on incoming
-      blocks.** `crates/node/src/block_processor.rs:699-717`. The
-      VRF *proof* is verified but not the *score* against the
-      eligibility threshold; any committee member can propose every
-      slot. Replicate the `check_proposer` threshold formula from
-      validator.rs.
+- [x] 323 — `✓` **No proposer-VRF score threshold check on incoming
+      blocks.** Shipped: extracted the threshold formula into
+      `pyde_consensus::proposer::vrf_proposer_threshold(committee_size)`
+      and the score helper into `score_from_output(&VrfOutput)`,
+      both `pub`. `validate_network_block` now extracts the score
+      from the verified VRF output and rejects when `score >
+      threshold`. `validator::check_proposer` switched to the
+      shared helper so producer and verifier can never drift.
+      3 new tests on the helpers (small-committee everyone-eligible
+      branch, linear scaling with N, `score_from_output` LE
+      decoding). 14 proposer tests pass; workspace builds clean.
 - [ ] 324 — `⚠` **`view_change_sign_message` doesn't bind
       `highest_qc`.** `crates/consensus/src/view_change.rs:128-134`.
       Middleboxes can swap `highest_qc` mid-flight. Include
