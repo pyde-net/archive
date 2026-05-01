@@ -455,10 +455,19 @@
       `highest_qc`.** `crates/consensus/src/view_change.rs:128-134`.
       Middleboxes can swap `highest_qc` mid-flight. Include
       `highest_qc.hash()` in the preimage.
-- [ ] 325 — `⚠` **No timestamp validation.**
-      `crates/node/src/block_processor.rs:181, 971`. Header
-      timestamp can be anything; require
-      `parent.timestamp < ts <= now_ms + DRIFT_TOLERANCE`.
+- [x] 325 — `⚠` **No timestamp validation.** **SHIPPED.**
+      Added `MAX_TIMESTAMP_DRIFT_MS = 15_000` constant and extended
+      `validate_network_block` with `parent_timestamp: Option<u64>`
+      + `now_ms: u64` parameters. Enforces
+      `parent.timestamp < header.timestamp` (when parent_ts known)
+      AND `header.timestamp ≤ now_ms + DRIFT`. Smart contracts read
+      `block.timestamp` via the PVM, so an unbounded proposer-set
+      timestamp is a contract-level attack vector. The gossip-block
+      call site in `node.rs` now pulls
+      `chain.header(slot-1).timestamp` for slot>1 (slot=1 falls back
+      to drift-only since the genesis header isn't tracked in
+      `chain.headers`). 4 new tests covering: ≤parent rejection,
+      far-future rejection, in-drift acceptance, None-parent skip.
 - [ ] 326 — `⚠` **`seen_evidence`, `seen_finality_votes` unbounded
       memory.** `crates/node/src/validator.rs:315`. Add prune loop
       mirroring `seen_proposals`/`seen_votes`.

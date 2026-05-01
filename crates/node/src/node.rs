@@ -3983,13 +3983,21 @@ fn handle_swarm_event(
                             // hash of the canonical block at head_slot. None
                             // for the bootstrap case where we have no parent
                             // yet (skips the check).
-                            let expected_parent = if slot == 1 {
-                                Some(chain.genesis_hash)
+                            // Audit 325: also pull the parent's timestamp
+                            // (slot>1 only — the genesis header isn't kept in
+                            // `chain.headers`, so slot=1 falls back to drift-
+                            // only checking).
+                            let (expected_parent, parent_timestamp) = if slot == 1 {
+                                (Some(chain.genesis_hash), None)
                             } else if let Some(parent) = chain.header(slot - 1) {
-                                Some(parent.hash())
+                                (Some(parent.hash()), Some(parent.timestamp))
                             } else {
-                                None
+                                (None, None)
                             };
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
                             if let Some(ref engine) = validator_engine {
                                 if let Err(e) = BlockProcessor::validate_network_block(
                                     chain.chain_id,
@@ -3998,6 +4006,8 @@ fn handle_swarm_event(
                                     &engine.committee_keys,
                                     &engine.epoch_randomness,
                                     expected_parent.as_ref(),
+                                    parent_timestamp,
+                                    now_ms,
                                 ) {
                                     warn!(slot, error = %e, "block header validation failed");
                                     return PostEventAction::None;

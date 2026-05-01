@@ -9,6 +9,15 @@ use pyde_tx::types::Transaction;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+/// Audit 325: maximum allowed clock-drift between a block's
+/// claimed timestamp and the local wall-clock at receive time, in
+/// milliseconds. A header with `timestamp > now_ms + DRIFT` is
+/// rejected. 15 s is generous (~37 slots at 400 ms) but matches
+/// realistic NTP skew between honest validators while still
+/// preventing arbitrary fake-future timestamps that smart contracts
+/// would observe via `block.timestamp`.
+pub const MAX_TIMESTAMP_DRIFT_MS: u64 = 15_000;
+
 /// Processes incoming blocks: validates header, executes transactions, updates state.
 pub struct BlockProcessor;
 
@@ -652,6 +661,13 @@ impl BlockProcessor {
     /// `chain_id` is bound into the proposer-signature preimage so a
     /// header signed for a different chain is rejected even when the
     /// FALCON keys match.
+    ///
+    /// `parent_timestamp` is the canonical parent header's
+    /// `timestamp` (matched 1:1 with `expected_parent_hash`). Audit
+    /// 325 enforces strictly-monotonic block timestamps when it is
+    /// `Some(_)`. `now_ms` is the receiver's wall-clock at validation
+    /// time; the header is rejected if its timestamp exceeds
+    /// `now_ms + MAX_TIMESTAMP_DRIFT_MS`.
     pub fn validate_network_block(
         chain_id: u64,
         header: &BlockHeader,
@@ -659,6 +675,8 @@ impl BlockProcessor {
         committee_keys: &[Vec<u8>],
         epoch_randomness: &[u8; 32],
         expected_parent_hash: Option<&[u8; 32]>,
+        parent_timestamp: Option<u64>,
+        now_ms: u64,
     ) -> Result<(), String> {
         let slot = header.slot;
 
@@ -687,6 +705,35 @@ impl BlockProcessor {
                     hex::encode(expected),
                 ));
             }
+        }
+
+        // Audit 325: timestamp must be strictly greater than the
+        // canonical parent's timestamp AND within
+        // `MAX_TIMESTAMP_DRIFT_MS` of local wall-clock. Smart
+        // contracts read `block.timestamp` via the PVM (e.g.,
+        // time-locked withdrawals), so an unbounded proposer-set
+        // value is a contract-level attack vector. The lower bound
+        // (parent.timestamp) prevents going-back-in-time replays;
+        // the upper bound (now_ms + drift) caps how far forward a
+        // proposer can skip the clock to satisfy a deadline. The
+        // parent check is skipped when `parent_timestamp` is `None`
+        // (bootstrap / snapshot-sync where local headers aren't
+        // populated) — matches the `expected_parent_hash` skip
+        // condition above. The drift check always runs.
+        if let Some(parent_ts) = parent_timestamp {
+            if header.timestamp <= parent_ts {
+                return Err(format!(
+                    "timestamp {} not strictly greater than parent timestamp {} at slot {} (audit 325)",
+                    header.timestamp, parent_ts, slot
+                ));
+            }
+        }
+        let max_future = now_ms.saturating_add(MAX_TIMESTAMP_DRIFT_MS);
+        if header.timestamp > max_future {
+            return Err(format!(
+                "timestamp {} exceeds local now_ms {} + drift {} at slot {} (audit 325)",
+                header.timestamp, now_ms, MAX_TIMESTAMP_DRIFT_MS, slot
+            ));
         }
 
         // 1. Proposer must be a committee member
@@ -1879,6 +1926,8 @@ mod tests {
             &[],          // committee_keys — same
             &[0u8; 32],   // epoch_randomness
             Some(&expected),
+            None,         // parent_timestamp — irrelevant, parent_hash fires first
+            header.timestamp.saturating_add(1), // now_ms — already past header
         )
         .unwrap_err();
         assert!(
@@ -1895,6 +1944,7 @@ mod tests {
         // proposer-in-committee check is what fails next on this
         // dummy committee.
         let header = dummy_header(2);
+        let now_ms = header.timestamp.saturating_add(1);
         let err = BlockProcessor::validate_network_block(
             31337,
             &header,
@@ -1902,6 +1952,8 @@ mod tests {
             &[],
             &[0u8; 32],
             None,
+            None,
+            now_ms,
         )
         .unwrap_err();
         // Did NOT fail with the audit-321 message — it failed
@@ -1918,6 +1970,7 @@ mod tests {
         let mut header = dummy_header(2);
         header.parent_hash = [0xCD; 32];
         let expected = [0xCD; 32];
+        let now_ms = header.timestamp.saturating_add(1);
         let err = BlockProcessor::validate_network_block(
             31337,
             &header,
@@ -1925,6 +1978,8 @@ mod tests {
             &[],
             &[0u8; 32],
             Some(&expected),
+            None,
+            now_ms,
         )
         .unwrap_err();
         assert!(
@@ -1946,7 +2001,148 @@ mod tests {
             &[],
             &[0u8; 32],
             Some(&[0xFF; 32]),
+            None,
+            header.timestamp.saturating_add(1),
         );
         assert!(res.is_ok());
+    }
+
+    // ── Audit 325: timestamp validation on incoming blocks ──────────
+
+    /// validate_network_block rejects a header whose timestamp is
+    /// not strictly greater than the canonical parent's timestamp.
+    /// Smart contracts read `block.timestamp` via the PVM, so a
+    /// regressing timestamp is a contract-level attack vector.
+    #[test]
+    fn validate_network_block_rejects_timestamp_le_parent_audit_325() {
+        let mut header = dummy_header(2);
+        header.parent_hash = [0xCD; 32];
+        let expected_parent_hash = [0xCD; 32];
+        // header.timestamp == parent_timestamp → reject (must be >)
+        let parent_ts = header.timestamp;
+        let now_ms = header.timestamp.saturating_add(1);
+        let err = BlockProcessor::validate_network_block(
+            31337,
+            &header,
+            &[],
+            &[],
+            &[0u8; 32],
+            Some(&expected_parent_hash),
+            Some(parent_ts),
+            now_ms,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("not strictly greater than parent timestamp")
+                && err.contains("audit 325"),
+            "expected audit-325 parent timestamp error, got: {err}"
+        );
+
+        // header.timestamp < parent_timestamp → also reject
+        let parent_ts_higher = header.timestamp.saturating_add(100);
+        let err = BlockProcessor::validate_network_block(
+            31337,
+            &header,
+            &[],
+            &[],
+            &[0u8; 32],
+            Some(&expected_parent_hash),
+            Some(parent_ts_higher),
+            now_ms,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("audit 325"),
+            "expected audit-325 error for past timestamp, got: {err}"
+        );
+    }
+
+    /// validate_network_block rejects a header whose timestamp is
+    /// further in the future than `MAX_TIMESTAMP_DRIFT_MS` past the
+    /// receiver's wall-clock. Caps how far a proposer can push the
+    /// clock to fake e.g. an expired-deadline race.
+    #[test]
+    fn validate_network_block_rejects_too_far_future_timestamp_audit_325() {
+        let mut header = dummy_header(2);
+        header.parent_hash = [0xCD; 32];
+        // Set a realistic future-skewed timestamp so the drift math
+        // doesn't saturate around 0. dummy_header uses slot*400 which
+        // is below the drift cap; a real header would carry a Unix-ms
+        // timestamp in the trillions.
+        header.timestamp = 2_000_000_000_000;
+        let expected_parent_hash = [0xCD; 32];
+        // now_ms is well below header.timestamp; drift exceeds cap.
+        let now_ms = header.timestamp - MAX_TIMESTAMP_DRIFT_MS - 1;
+        let err = BlockProcessor::validate_network_block(
+            31337,
+            &header,
+            &[],
+            &[],
+            &[0u8; 32],
+            Some(&expected_parent_hash),
+            None, // parent_ts — skip lower bound, isolate drift check
+            now_ms,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("exceeds local now_ms") && err.contains("audit 325"),
+            "expected audit-325 future-drift error, got: {err}"
+        );
+    }
+
+    /// Within drift tolerance the audit-325 check passes (and the
+    /// validation continues to the next step).
+    #[test]
+    fn validate_network_block_accepts_within_drift_audit_325() {
+        let mut header = dummy_header(2);
+        header.parent_hash = [0xCD; 32];
+        let expected_parent_hash = [0xCD; 32];
+        // now_ms slightly behind header.timestamp but within drift.
+        let now_ms = header
+            .timestamp
+            .saturating_sub(MAX_TIMESTAMP_DRIFT_MS / 2);
+        let err = BlockProcessor::validate_network_block(
+            31337,
+            &header,
+            &[],
+            &[],
+            &[0u8; 32],
+            Some(&expected_parent_hash),
+            Some(header.timestamp.saturating_sub(1)),
+            now_ms,
+        )
+        .unwrap_err();
+        assert!(
+            !err.contains("audit 325"),
+            "in-drift timestamp must pass audit-325 check, got: {err}"
+        );
+    }
+
+    /// `parent_timestamp = None` skips the lower-bound check
+    /// (bootstrap / slot-1 case), but the drift-upper-bound still
+    /// runs — symmetric with the `expected_parent_hash` skip.
+    #[test]
+    fn validate_network_block_skips_parent_timestamp_when_none() {
+        let mut header = dummy_header(2);
+        header.parent_hash = [0xCD; 32];
+        let expected_parent_hash = [0xCD; 32];
+        // header.timestamp is a sane value; with parent_ts = None,
+        // only the drift-upper-bound applies.
+        let now_ms = header.timestamp; // exactly matches
+        let err = BlockProcessor::validate_network_block(
+            31337,
+            &header,
+            &[],
+            &[],
+            &[0u8; 32],
+            Some(&expected_parent_hash),
+            None,
+            now_ms,
+        )
+        .unwrap_err();
+        assert!(
+            !err.contains("audit 325"),
+            "None parent_timestamp must skip audit-325 lower bound, got: {err}"
+        );
     }
 }
