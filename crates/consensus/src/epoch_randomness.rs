@@ -160,6 +160,13 @@ fn combine_shares_with_threshold(
 pub struct RandomnessCollector {
     /// Target epoch.
     pub epoch: u64,
+    /// Active committee size — drives the dynamic randomness
+    /// threshold (audit 322). Must equal the active committee size
+    /// for `epoch`. Pre-322 the threshold was hardcoded to
+    /// `RANDOMNESS_THRESHOLD = 85`, which made epoch randomness
+    /// impossible to advance on any committee smaller than 85
+    /// (every devnet + testnet pre-launch).
+    committee_size: usize,
     /// Collected shares (validated).
     shares: Vec<RandomnessShare>,
     /// Track which validators have submitted (by index).
@@ -167,10 +174,17 @@ pub struct RandomnessCollector {
 }
 
 impl RandomnessCollector {
-    pub fn new(epoch: u64) -> Self {
+    /// Build a collector for `epoch` with the active committee size.
+    /// Audit 322: `is_complete` / `finalize` use
+    /// `randomness_threshold_for(committee_size)` so a 4-validator
+    /// devnet completes at 3-of-4, mirroring how
+    /// `try_form_qc` / `try_form_hard_finality` use the dynamic
+    /// quorum after audits 234/235.
+    pub fn new(epoch: u64, committee_size: usize) -> Self {
         Self {
             epoch,
-            shares: Vec::with_capacity(COMMITTEE_SIZE),
+            committee_size,
+            shares: Vec::with_capacity(committee_size.max(COMMITTEE_SIZE)),
             seen: std::collections::HashSet::new(),
         }
     }
@@ -185,9 +199,10 @@ impl RandomnessCollector {
         true
     }
 
-    /// Whether enough shares have been collected.
+    /// Whether enough shares have been collected (uses the
+    /// committee-size-derived threshold from audit 322).
     pub fn is_complete(&self) -> bool {
-        self.shares.len() >= RANDOMNESS_THRESHOLD
+        self.shares.len() >= randomness_threshold_for(self.committee_size)
     }
 
     /// Number of shares collected so far.
@@ -195,10 +210,10 @@ impl RandomnessCollector {
         self.shares.len()
     }
 
-    /// Finalize: combine shares into epoch randomness.
-    /// Returns None if not enough shares.
+    /// Finalize: combine shares into epoch randomness using the
+    /// dynamic threshold. Returns None if not enough shares.
     pub fn finalize(&self) -> Option<EpochRandomness> {
-        combine_shares(&self.shares, self.epoch)
+        combine_shares_dynamic(&self.shares, self.epoch, self.committee_size)
     }
 }
 
@@ -368,10 +383,17 @@ mod tests {
 
     #[test]
     fn collector_workflow() {
-        let committee = make_committee(RANDOMNESS_THRESHOLD);
+        // Audit 322: collector now uses
+        // `randomness_threshold_for(committee_size)` instead of
+        // the hardcoded `RANDOMNESS_THRESHOLD`. For
+        // committee_size=128 the threshold is
+        // `ceil(2*128/3) = 86` (the legacy `RANDOMNESS_THRESHOLD =
+        // 85` constant was off-by-one vs `quorum_for_committee`).
+        let threshold = randomness_threshold_for(COMMITTEE_SIZE);
+        let committee = make_committee(threshold);
         let epoch = 30;
 
-        let mut collector = RandomnessCollector::new(epoch);
+        let mut collector = RandomnessCollector::new(epoch, COMMITTEE_SIZE);
         assert!(!collector.is_complete());
 
         for (i, (pk, sk, addr)) in committee.iter().enumerate() {
@@ -380,7 +402,7 @@ mod tests {
         }
 
         assert!(collector.is_complete());
-        assert_eq!(collector.share_count(), RANDOMNESS_THRESHOLD);
+        assert_eq!(collector.share_count(), threshold);
 
         let randomness = collector.finalize().unwrap();
         assert_eq!(randomness.epoch, epoch);
@@ -392,10 +414,55 @@ mod tests {
         let (pk, sk, addr) = &make_committee(1)[0];
         let epoch = 1;
 
-        let mut collector = RandomnessCollector::new(epoch);
+        let mut collector = RandomnessCollector::new(epoch, COMMITTEE_SIZE);
         let share = generate_share(pk, sk, epoch, 0, *addr).unwrap();
         assert!(collector.add_share(share.clone()));
         assert!(!collector.add_share(share)); // duplicate rejected
         assert_eq!(collector.share_count(), 1);
+    }
+
+    /// Audit 322: a 4-validator testnet committee must be able to
+    /// finalize epoch randomness at 3-of-4 (the dynamic quorum).
+    /// Pre-fix, RandomnessCollector used the hardcoded
+    /// `RANDOMNESS_THRESHOLD = 85`, so the 16-validator testnet
+    /// (and every smaller dev / staging committee) silently
+    /// stalled at the first epoch boundary forever.
+    #[test]
+    fn collector_completes_on_small_committee_audit_322() {
+        let committee = make_committee(4);
+        let epoch = 100;
+        let mut collector = RandomnessCollector::new(epoch, 4);
+        assert!(!collector.is_complete());
+
+        // 3-of-4 is the BFT quorum (= randomness_threshold_for(4)).
+        for (i, (pk, sk, addr)) in committee.iter().take(3).enumerate() {
+            let share = generate_share(pk, sk, epoch, i as u8, *addr).unwrap();
+            assert!(collector.add_share(share));
+        }
+        assert!(
+            collector.is_complete(),
+            "4-validator committee must complete at 3 shares (audit 322)"
+        );
+        let randomness = collector
+            .finalize()
+            .expect("finalize must produce randomness on a 4-validator committee (audit 322)");
+        assert_eq!(randomness.epoch, epoch);
+        assert_eq!(randomness.share_count, 3);
+        assert_ne!(randomness.randomness, [0u8; 32]);
+    }
+
+    #[test]
+    fn collector_below_dynamic_threshold_stays_incomplete() {
+        let committee = make_committee(7);
+        let epoch = 200;
+        let mut collector = RandomnessCollector::new(epoch, 7);
+        // randomness_threshold_for(7) = ceil(2/3 * 7) = 5.
+        // Submit only 4 shares — collector stays incomplete.
+        for (i, (pk, sk, addr)) in committee.iter().take(4).enumerate() {
+            let share = generate_share(pk, sk, epoch, i as u8, *addr).unwrap();
+            collector.add_share(share);
+        }
+        assert!(!collector.is_complete());
+        assert!(collector.finalize().is_none());
     }
 }

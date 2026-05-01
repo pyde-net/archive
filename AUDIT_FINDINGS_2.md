@@ -424,14 +424,22 @@
       cheaply. 4 new tests cover the four branches: mismatch
       rejected, None skips, matching passes, genesis short-
       circuits. 25 block_processor tests pass.
-- [ ] 322 — `⚠` **`RandomnessCollector::finalize` hardcodes 85-share
-      threshold.** `crates/consensus/src/epoch_randomness.rs:189-202`.
-      A 16-validator testnet (per the bring-up runbook) cannot
-      advance epoch randomness past the first epoch boundary
-      (1000 blocks). Same fix pattern as audits 234/235/236 —
-      thread `committee_size` through and use
-      `randomness_threshold_for(n) = n.div_ceil(3) + 1` (f+1 is
-      sufficient; 2/3 is overkill for unbiased reconstruction).
+- [x] 322 — `✓` **`RandomnessCollector::finalize` hardcodes 85-share
+      threshold.** Shipped: `RandomnessCollector` now stores the
+      active `committee_size` (passed at construction) and routes
+      `is_complete()` + `finalize()` through
+      `randomness_threshold_for(N) = quorum_for_committee(N)`.
+      `RandomnessCollector::new(epoch, committee_size)` is the new
+      signature; production caller in `validator.rs:1043` passes
+      `self.committee_keys.len()`. Mirrors audits 234/235/236
+      (dynamic quorum for QC + view-change + hard-finality).
+      2 new tests (`collector_completes_on_small_committee_audit_322`
+      proves a 4-validator devnet finalizes at 3-of-4;
+      `collector_below_dynamic_threshold_stays_incomplete` proves
+      4-of-7 stays incomplete since `randomness_threshold_for(7) =
+      5`). Surfaced + fixed an off-by-one in the legacy
+      `RANDOMNESS_THRESHOLD = 85` constant — `quorum_for_committee
+      (128) = 86`. 13 epoch_randomness tests pass.
 - [ ] 323 — `⚠` **No proposer-VRF score threshold check on incoming
       blocks.** `crates/node/src/block_processor.rs:699-717`. The
       VRF *proof* is verified but not the *score* against the

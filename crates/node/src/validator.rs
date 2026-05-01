@@ -1040,7 +1040,13 @@ impl ValidatorEngine {
         )
         .ok()?;
 
-        let mut collector = RandomnessCollector::new(next_epoch);
+        // Audit 322: pass the active committee size so the
+        // collector's threshold is `randomness_threshold_for(N)`
+        // instead of the hardcoded 85. Without this, devnet /
+        // testnet committees < 85 could never finalize epoch
+        // randomness.
+        let mut collector =
+            RandomnessCollector::new(next_epoch, self.committee_keys.len());
         collector.add_share(share.clone());
         self.randomness_collector = Some(collector);
 
