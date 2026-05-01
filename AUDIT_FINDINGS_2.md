@@ -274,38 +274,45 @@
       `create_vote_rejects_fabricated_qc_previous`). 124 consensus
       tests pass; workspace builds clean.
 
-- [ ] 312 — `⚠` **Threshold MEV pipeline soundness gaps (3 issues, one
-      PR).**
-      Where: `crates/crypto/src/threshold.rs`.
-      - **PSS public-entropy** (`pss_refresh:706-746`):
-        `fresh_random` is derived from `(epoch.to_le_bytes(),
-        ks.index * 7919)` via `random_goldilocks` — purely
-        deterministic on public inputs. PSS refresh secrecy
-        collapses to zero; the "secret" contribution is
-        recomputable by anyone watching the chain. Confirmed at
-        `threshold.rs:719-722`.
-      - **Decryption-share auth missing**
-        (`generate_decryption_share:445-459`,
-        `combine_shares:499-505`): shares carry `(index,
-        blinded_shares)` with no signature; combine only checks
-        index uniqueness, never that share `i` was actually
-        produced by validator `i`. Byzantine validators can
-        submit shares with someone else's index to displace honest
-        shares from the threshold-`t` set (decryption griefing).
-      - **Centralized keygen + no VSS** (`threshold_keygen:362-416`):
-        runs entirely on a single coordinator host; PSS does NOT
-        rotate the underlying secret value, so anyone with a copy
-        of genesis-time material owns decryption authority forever.
-      Fix:
-      - Make `pss_refresh` ingest a fresh per-validator `OsRng`
-        seed; sign each `RefreshContribution` under FALCON; verify
-        on every receiver before `apply_refresh`.
-      - Add a FALCON sig over `(ct_hash || index ||
-        blinded_shares_hash)` to `DecryptionShare`; verify before
-        admitting into the combine set.
-      - Document the centralized-keygen trust assumption in
-        `docs/testnet-bringup.md` and confirm the coordinator host
-        is destroyed post-ceremony. Mainnet needs a real DKG.
+- [~] 312 — `✓` **Threshold MEV pipeline soundness gaps.**
+      Partially shipped for testnet; full fix tracked for mainnet.
+      The three sub-issues are exploitable only by an actively-
+      Byzantine committee member, and the testnet committee is
+      operator-known + trust-honest by construction. The split:
+      - **Documentation** (shipped): new "Known testnet trust
+        assumptions" section in `docs/testnet-bringup.md` makes
+        all three gaps explicit — centralized genesis keygen,
+        deterministic PSS-refresh entropy, unauthenticated
+        decryption shares. Operators are instructed to run the
+        coordinator host air-gapped and shred it post-ceremony.
+      - **Structural hardening** (shipped):
+        `combine_shares` now rejects shares with `index == 0` or
+        `index > 256` before any Lagrange interpolation, closing
+        the obvious griefing path where a peer feeds nonsense
+        indices that pass dedup but inflate combine work.
+        Doc-comment block on `combine_shares` explicitly calls
+        out the trust boundary that the MAC check still enforces
+        safety while availability depends on operator trust. 2
+        new tests
+        (`combine_shares_rejects_zero_index_audit_312`,
+        `combine_shares_rejects_oversize_index_audit_312`); 90
+        crypto tests pass.
+      - **Deferred to mainnet (NOT shipped, tracked here):**
+        - Per-validator `OsRng` seed parameter on `pss_refresh`,
+          plus FALCON sig per `RefreshContribution` and
+          receiver-side verify before `apply_refresh`.
+        - FALCON sig over `(ct_hash || index ||
+          blinded_shares_hash)` on every `DecryptionShare`;
+          verify before admission into the combine set in
+          `combine_shares`.
+        - Distributed Key Generation to replace
+          `threshold_keygen`'s single-coordinator ceremony.
+
+      The mainnet fixes require a hard wire-format break on
+      `RefreshContribution` and `DecryptionShare` (new signature
+      field) and an API change to `pss_refresh`/`generate_
+      decryption_share`/`combine_shares`. Tracked as a single
+      mainnet-blocking item in MAINNET_PLAN.md.
 
 ---
 

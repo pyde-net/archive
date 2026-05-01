@@ -261,6 +261,60 @@ and [`run-validator.md` Slashing section](./run-validator.md#slashing--what-to-w
 
 ---
 
+## Known testnet trust assumptions (audit 312)
+
+The threshold-decryption MEV pipeline ships with three soundness
+gaps that are *acceptable for an operator-trusted testnet* but
+must be closed before mainnet. The testnet committee is assumed to
+be honest-majority + non-Byzantine. Operators should be aware of
+these so the threat model is explicit:
+
+1. **Centralized genesis keygen.** `pyde testnet` runs
+   `threshold_keygen` on a single coordinator host that produces
+   every validator's threshold-key share. Anyone with read access
+   to the coordinator filesystem at ceremony time owns the
+   threshold secret forever — PSS refresh rotates *shares*, not
+   the underlying secret value. **Coordinator hosts MUST be
+   destroyed (zeroed disks, evicted from any backup system) once
+   the bundles are distributed.** Treat the coordinator like a
+   one-shot HSM. Mainnet will replace this with a Distributed Key
+   Generation (DKG) protocol — tracked as
+   `AUDIT_FINDINGS_2.md` 312.
+
+2. **PSS refresh entropy is deterministic.** `pss_refresh` in
+   `crates/crypto/src/threshold.rs` derives "fresh randomness"
+   from `(epoch, validator_index)` via `random_goldilocks`,
+   which is a deterministic Poseidon2 hash. Anyone observing the
+   public epoch number can recompute every validator's "secret"
+   PSS contribution. PSS refresh therefore provides ZERO actual
+   secrecy on testnet — the protocol runs as documented but the
+   refresh ceremony is theatrical. Acceptable for a testnet
+   committee that trusts itself; mainnet must accept per-validator
+   `OsRng` entropy and FALCON-sign each contribution.
+
+3. **Decryption shares are not authenticated.**
+   `generate_decryption_share` produces `(index, blinded_shares)`
+   with no signature; `combine_shares` only checks index
+   uniqueness. A Byzantine committee member can submit shares
+   with someone else's index to displace honest shares from the
+   threshold-`t` set, griefing the entire decryption pipeline
+   until the proposer falls back to a smaller share set or times
+   out. Operator-trusted testnet committees won't exhibit this;
+   mainnet requires a FALCON signature over `(ct_hash || index ||
+   blinded_shares_hash)` with verification before admission into
+   the combine set.
+
+**Operator action required:** when generating a testnet bundle on
+the coordinator host, do the ceremony in an air-gapped /
+ephemeral-VM environment. After distributing the per-validator
+directories (encrypted, point-to-point per Phase 3), shred the
+bundle directory + zero the coordinator host's disk before
+returning it to general use. Keys produced on a compromised
+coordinator silently compromise the entire MEV pipeline for the
+testnet's lifetime.
+
+---
+
 ## Reference: testnet identity constants
 
 Defined in `crates/net/src/discovery.rs`:
