@@ -124,6 +124,45 @@ pub fn validate_transaction(
         return Err(ValidationError::InvalidSignature);
     }
 
+    // 1.6 Audit 304 — reject `AuthKeys::MultiSig` senders on
+    // non-devnet chain_id. `validate_signature` currently
+    // short-circuits MultiSig with a "// For now, skip" arm —
+    // any tx from a MultiSig-keyed account is accepted with no
+    // auth check at all. Reachable today only via genesis
+    // allocations that pre-set MultiSig (no production tx flow
+    // rotates an EOA to MultiSig yet), but the gate ships
+    // unenforced so it's a footgun. Mirror the audit-226 None
+    // gate: hard-reject on production, devnet keeps the relaxed
+    // shape so test infra that exercises the variant still works.
+    if ctx.chain_id != 31337
+        && matches!(
+            sender.auth_keys,
+            pyde_account::types::AuthKeys::MultiSig { .. }
+        )
+    {
+        return Err(ValidationError::InvalidSignature);
+    }
+
+    // 1.7 Audit 305 — reject `FeePayer::Paymaster` and
+    // `FeePayer::GasTank` on non-devnet chain_id. `Paymaster`
+    // currently mints fees out of thin air (`pre_execution_charge`
+    // returns Ok(0), then post-execution distribution credits
+    // validator + treasury anyway). `GasTank` ignores the encoded
+    // contract address entirely and silently debits the sender's
+    // own per-account gas_tank — the sponsorship UX is decorative.
+    // Both paths are unsafe to expose on production until the
+    // paymaster contract integration ships and the GasTank wiring
+    // honours its address parameter. Devnet keeps both for dev /
+    // test ergonomics.
+    if ctx.chain_id != 31337 {
+        match &tx.fee_payer {
+            crate::types::FeePayer::Sender => {}
+            crate::types::FeePayer::Paymaster(_) | crate::types::FeePayer::GasTank(_) => {
+                return Err(ValidationError::InvalidPaymaster);
+            }
+        }
+    }
+
     // 2. Signature. Skipping is allowed only when the caller explicitly
     // sets `dev_skip_signature` (test-only) or `sig_pre_verified`
     // (production fast path where the block processor already ran a
@@ -523,6 +562,9 @@ mod tests {
 
     #[test]
     fn paymaster_skips_balance_check() {
+        // Audit 305 hard-rejects Paymaster on production; this test
+        // exercises the same balance-check skip on devnet, where the
+        // variant is still permitted for dev / test ergonomics.
         let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let account = Account {
@@ -542,13 +584,14 @@ mod tests {
             fee_payer: FeePayer::Paymaster([0xFF; 32]),
             access_list: vec![],
             deadline: None,
-            chain_id: 1,
+            chain_id: 31337,
             tx_type: TransactionType::Standard,
         };
         let tx_hash = tx.hash();
         tx.signature = falcon_sign(&sk, &tx_hash).unwrap().as_bytes().to_vec();
 
-        let ctx = default_ctx();
+        let mut ctx = default_ctx();
+        ctx.chain_id = 31337;
         assert!(validate_transaction(&tx, &account, &nonce, &ctx).is_ok());
     }
 
@@ -762,6 +805,96 @@ mod tests {
         // may still apply (this just asserts 226 doesn't reject).
         validate_transaction(&tx, &victim_account, &nonce_state, &ctx)
             .expect("devnet must allow AuthKeys::None senders");
+    }
+
+    // ========== Audit 304: AuthKeys::MultiSig production reject ==========
+
+    #[test]
+    fn validate_transaction_rejects_multisig_on_production() {
+        // `validate_signature` short-circuits MultiSig with a "// For
+        // now, skip" arm — any tx from a MultiSig sender passes
+        // without an auth check. Until threshold-check + multi-sig
+        // wire format ship, hard-reject on every non-devnet chain_id.
+        let (mut tx, _, nonce_state) = make_valid_tx_and_account();
+        let mut victim = Account::new_eoa(&[]);
+        victim.address = tx.from;
+        victim.auth_keys = pyde_account::types::AuthKeys::MultiSig {
+            keys: vec![vec![0xAA; 897]],
+            threshold: 1,
+        };
+        victim.balance = 1_000_000_000_000;
+        for chain_id in [1u64, 7, 7331, 1_000_000] {
+            tx.chain_id = chain_id;
+            let mut ctx = default_ctx();
+            ctx.chain_id = chain_id;
+            ctx.dev_skip_signature = false;
+            let err = validate_transaction(&tx, &victim, &nonce_state, &ctx).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::InvalidSignature),
+                "chain_id {chain_id} must reject MultiSig, got {err:?}"
+            );
+        }
+    }
+
+    // ========== Audit 305: FeePayer::Paymaster / GasTank reject ==========
+
+    #[test]
+    fn validate_transaction_rejects_paymaster_on_production() {
+        // FeePayer::Paymaster currently mints fees out of thin air
+        // (pre_execution_charge returns Ok(0); post-execution
+        // distribution still credits validator + treasury). Reject
+        // until the paymaster contract integration ships.
+        let (mut tx, account, nonce_state) = make_valid_tx_and_account();
+        tx.fee_payer = FeePayer::Paymaster([0xAA; 32]);
+        for chain_id in [1u64, 7, 7331, 1_000_000] {
+            tx.chain_id = chain_id;
+            let mut ctx = default_ctx();
+            ctx.chain_id = chain_id;
+            let err = validate_transaction(&tx, &account, &nonce_state, &ctx).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::InvalidPaymaster),
+                "chain_id {chain_id} must reject FeePayer::Paymaster, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_transaction_rejects_gas_tank_on_production() {
+        // FeePayer::GasTank's encoded address is currently ignored;
+        // the debit always comes from sender.gas_tank, making the
+        // sponsorship UX decorative. Reject on production until the
+        // GasTank wiring honours its address.
+        let (mut tx, account, nonce_state) = make_valid_tx_and_account();
+        tx.fee_payer = FeePayer::GasTank([0xBB; 32]);
+        for chain_id in [1u64, 7, 7331, 1_000_000] {
+            tx.chain_id = chain_id;
+            let mut ctx = default_ctx();
+            ctx.chain_id = chain_id;
+            let err = validate_transaction(&tx, &account, &nonce_state, &ctx).unwrap_err();
+            assert!(
+                matches!(err, ValidationError::InvalidPaymaster),
+                "chain_id {chain_id} must reject FeePayer::GasTank, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_transaction_allows_paymaster_and_gas_tank_on_devnet() {
+        // Devnet (chain_id == 31337) keeps both fee_payer variants
+        // for dev / test ergonomics — they're broken-by-design but
+        // harmless inside a single-machine devnet.
+        let (mut tx, account, nonce_state) = make_valid_tx_and_account();
+        tx.chain_id = 31337;
+        let mut ctx = default_ctx();
+        ctx.chain_id = 31337;
+
+        tx.fee_payer = FeePayer::Paymaster([0xAA; 32]);
+        validate_transaction(&tx, &account, &nonce_state, &ctx)
+            .expect("devnet must allow Paymaster");
+
+        tx.fee_payer = FeePayer::GasTank([0xBB; 32]);
+        validate_transaction(&tx, &account, &nonce_state, &ctx)
+            .expect("devnet must allow GasTank");
     }
 
     // ========== Audit 229: RegisterPubkey tx type ==========

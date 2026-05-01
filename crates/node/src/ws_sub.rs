@@ -55,8 +55,17 @@ async fn handle_connection(
 
     let (mut ws_sink, mut ws_stream) = ws.split();
 
-    // Channel for outgoing messages — all writers send here, single consumer writes to WS
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    // Audit 346: bounded mpsc + per-connection subscription cap.
+    // Pre-fix the channel was `mpsc::unbounded_channel::<String>()`,
+    // so a slow / disconnected WS client backed up arbitrarily
+    // many queued strings in memory. Sub spawn count was also
+    // unbounded — a single connection could call `pyde_subscribe`
+    // thousands of times, spawning a tokio task per call. Bounded
+    // (256-message) outgoing channel + 16-subscription cap close
+    // both vectors.
+    const OUT_CHANNEL_CAP: usize = 256;
+    const MAX_SUBS_PER_CONN: usize = 16;
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(OUT_CHANNEL_CAP);
 
     // Spawn WS writer task
     let writer = tokio::spawn(async move {
@@ -83,13 +92,21 @@ async fn handle_connection(
 
             match method {
                 "pyde_subscribe" => {
+                    if tasks.len() >= MAX_SUBS_PER_CONN {
+                        let resp = serde_json::json!({
+                            "jsonrpc":"2.0","id":id,
+                            "error":{"code":-32603,"message":format!("subscription cap reached ({MAX_SUBS_PER_CONN} per connection); audit 346")}
+                        });
+                        let _ = out_tx.try_send(resp.to_string());
+                        continue;
+                    }
                     sub_counter += 1;
                     let sub_id = sub_counter;
                     let mut rx = heads_tx.subscribe();
                     let tx = out_tx.clone();
 
                     // Response
-                    let _ = out_tx.send(
+                    let _ = out_tx.try_send(
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":sub_id}).to_string(),
                     );
 
@@ -102,7 +119,13 @@ async fn handle_connection(
                                         "method":"pyde_subscription",
                                         "params":{"subscription":sub_id,"result":header}
                                     });
-                                    if tx.send(notif.to_string()).is_err() {
+                                    // Audit 346: bounded channel —
+                                    // try_send drops if a slow client
+                                    // can't keep up. Beats unbounded
+                                    // memory growth on a stuck WS.
+                                    if let Err(mpsc::error::TrySendError::Closed(_)) =
+                                        tx.try_send(notif.to_string())
+                                    {
                                         break;
                                     }
                                 }
@@ -114,6 +137,14 @@ async fn handle_connection(
                 }
 
                 "pyde_subscribeLogs" => {
+                    if tasks.len() >= MAX_SUBS_PER_CONN {
+                        let resp = serde_json::json!({
+                            "jsonrpc":"2.0","id":id,
+                            "error":{"code":-32603,"message":format!("subscription cap reached ({MAX_SUBS_PER_CONN} per connection); audit 346")}
+                        });
+                        let _ = out_tx.try_send(resp.to_string());
+                        continue;
+                    }
                     sub_counter += 1;
                     let sub_id = sub_counter;
                     let mut rx = logs_tx.subscribe();
@@ -128,7 +159,7 @@ async fn handle_connection(
                         .map(|s| s.to_lowercase());
 
                     // Response
-                    let _ = out_tx.send(
+                    let _ = out_tx.try_send(
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":sub_id}).to_string(),
                     );
 
@@ -153,7 +184,9 @@ async fn handle_connection(
                                         "params":{"subscription":sub_id,"result":log}
                                     });
                                     debug!("forwarding log to WS client");
-                                    if tx.send(notif.to_string()).is_err() {
+                                    if let Err(mpsc::error::TrySendError::Closed(_)) =
+                                        tx.try_send(notif.to_string())
+                                    {
                                         break;
                                     }
                                 }
@@ -169,7 +202,7 @@ async fn handle_connection(
                         "jsonrpc":"2.0","id":id,
                         "error":{"code":-32601,"message":"use HTTP RPC for queries, WS for subscriptions"}
                     });
-                    let _ = out_tx.send(resp.to_string());
+                    let _ = out_tx.try_send(resp.to_string());
                 }
             }
         }

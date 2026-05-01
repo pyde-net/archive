@@ -251,6 +251,26 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_balance = module
         .declare_function("host_balance", Linkage::Import, &sig_sload)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    // Audit 310: missing env subcodes (3..=6 of Caller/Callvalue) and
+    // Blockhash. Each mirrors the matching interpreter handler.
+    // (ctx) -> u64 — gp-write env values.
+    let fn_tx_nonce = module
+        .declare_function("host_tx_nonce", Linkage::Import, &sig_pop)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    let fn_tx_gas_limit = module
+        .declare_function("host_tx_gas_limit", Linkage::Import, &sig_pop)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    // (ctx, wd) -> u64 — wide-write env values.
+    let fn_tx_hash = module
+        .declare_function("host_tx_hash", Linkage::Import, &sig_sdel)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    let fn_block_proposer = module
+        .declare_function("host_block_proposer", Linkage::Import, &sig_sdel)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+    // (ctx, height, wd) -> u64.
+    let fn_blockhash = module
+        .declare_function("host_blockhash", Linkage::Import, &sig_sload)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
     // (ctx, val) -> u64
     let fn_assert = module
         .declare_function("host_assert", Linkage::Import, &sig_sdel)
@@ -401,6 +421,11 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
     let fn_callvalue_ref = module.declare_func_in_func(fn_callvalue, &mut ctx.func);
     let fn_gasprice_ref = module.declare_func_in_func(fn_gasprice, &mut ctx.func);
     let fn_balance_ref = module.declare_func_in_func(fn_balance, &mut ctx.func);
+    let fn_tx_nonce_ref = module.declare_func_in_func(fn_tx_nonce, &mut ctx.func);
+    let fn_tx_gas_limit_ref = module.declare_func_in_func(fn_tx_gas_limit, &mut ctx.func);
+    let fn_tx_hash_ref = module.declare_func_in_func(fn_tx_hash, &mut ctx.func);
+    let fn_block_proposer_ref = module.declare_func_in_func(fn_block_proposer, &mut ctx.func);
+    let fn_blockhash_ref = module.declare_func_in_func(fn_blockhash, &mut ctx.func);
     let fn_assert_ref = module.declare_func_in_func(fn_assert, &mut ctx.func);
     let fn_memcpy_ref = module.declare_func_in_func(fn_memcpy, &mut ctx.func);
     let fn_drain_page_gas_ref = module.declare_func_in_func(fn_drain_page_gas, &mut ctx.func);
@@ -753,7 +778,14 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let op = builder.ins().iconst(I64, d.opcode.to_u8() as i64);
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let ws1 = builder.ins().iconst(I64, d.rs1 as i64);
-                        let ws2 = builder.ins().iconst(I64, (d.rs2_or_imm & 0xF) as i64);
+                        // Audit 310: mask `& 0xFF` to match the
+                        // interpreter's `as u8` cast in cpu.rs.
+                        // Pre-310, AOT masked `& 0xF` so a hand-
+                        // crafted bytecode with rs2=0x15 (21) would
+                        // address wide-reg 5 in AOT but trap (>= 8)
+                        // in the interpreter — silent consensus
+                        // fork on adversarial input.
+                        let ws2 = builder.ins().iconst(I64, (d.rs2_or_imm & 0xFF) as i64);
                         let call = builder
                             .ins()
                             .call(fn_wide_alu_ref, &[vm_ctx, op, wd, ws1, ws2]);
@@ -771,7 +803,14 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let op = builder.ins().iconst(I64, d.opcode.to_u8() as i64);
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let ws1 = builder.ins().iconst(I64, d.rs1 as i64);
-                        let ws2 = builder.ins().iconst(I64, (d.rs2_or_imm & 0xF) as i64);
+                        // Audit 310: mask `& 0xFF` to match the
+                        // interpreter's `as u8` cast in cpu.rs.
+                        // Pre-310, AOT masked `& 0xF` so a hand-
+                        // crafted bytecode with rs2=0x15 (21) would
+                        // address wide-reg 5 in AOT but trap (>= 8)
+                        // in the interpreter — silent consensus
+                        // fork on adversarial input.
+                        let ws2 = builder.ins().iconst(I64, (d.rs2_or_imm & 0xFF) as i64);
                         let call = builder
                             .ins()
                             .call(fn_wide_alu_ref, &[vm_ctx, op, wd, ws1, ws2]);
@@ -863,12 +902,23 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.switch_to_block(cont);
                     }
                     Opcode::Widen => {
-                        // host_widen(ctx, wd, gp_value) -> 0
-                        // Pass the current AOT variable value directly
+                        // host_widen(ctx, wd, gp_value) -> 0/1
+                        // Audit 310: capture the fault return.
+                        // host_widen returns 1 if `wd >= 8` (write_
+                        // wide_checked failed). Pre-fix discarded
+                        // the result so AOT silently succeeded on
+                        // any rd > 7 while the interpreter trapped
+                        // — chain fork on adversarial bytecode.
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let wd = builder.ins().iconst(I64, d.rd as i64);
                         let gp_val = gp_read!(builder, d.rs1);
-                        builder.ins().call(fn_widen_ref, &[vm_ctx, wd, gp_val]);
+                        let call = builder.ins().call(fn_widen_ref, &[vm_ctx, wd, gp_val]);
+                        let result = builder.inst_results(call)[0];
+                        let trapped = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(trapped, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
                     }
 
                     // --- Memory operations (host calls) ---
@@ -894,8 +944,20 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let addr = builder.ins().iadd(base, off_val);
                         let w = builder.ins().iconst(I64, width as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        builder.ins().call(fn_store_ref, &[vm_ctx, addr, val, w]);
+                        // Audit 310: capture host_store's fault
+                        // return (1 = fault, 0 = success). Pre-fix
+                        // discarded the result, so any out-of-bounds
+                        // store silently succeeded on AOT but trapped
+                        // on the interpreter — chain fork on contract
+                        // bug or adversarial bytecode.
+                        let call = builder.ins().call(fn_store_ref, &[vm_ctx, addr, val, w]);
+                        let result = builder.inst_results(call)[0];
                         emit_drain_page_gas!(builder);
+                        let trapped = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(trapped, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
                     }
 
                     // --- Storage operations (host calls) ---
@@ -1097,12 +1159,20 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
 
                     // --- Environment queries (host calls) ---
                     Opcode::Caller => {
+                        // Audit 310: subcodes 0..=4 must match the
+                        // interpreter's `env_gp` table (vm.rs:50-55).
+                        // Pre-310 only handled 0..=2, so contracts
+                        // reading TX_NONCE (3) or TX_GAS_LIMIT (4)
+                        // succeeded on the interpreter and trapped
+                        // on AOT — silent consensus fork.
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let sub = d.rs2_or_imm;
                         let call = match sub {
                             0 => builder.ins().call(fn_block_number_ref, &[vm_ctx]),
                             1 => builder.ins().call(fn_timestamp_ref, &[vm_ctx]),
                             2 => builder.ins().call(fn_gas_remaining_ref, &[vm_ctx]),
+                            3 => builder.ins().call(fn_tx_nonce_ref, &[vm_ctx]),
+                            4 => builder.ins().call(fn_tx_gas_limit_ref, &[vm_ctx]),
                             _ => {
                                 builder.ins().jump(trap_block, &[]);
                                 terminated = true;
@@ -1113,37 +1183,58 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         gp_write!(builder, d.rd, result);
                     }
                     Opcode::Callvalue => {
+                        // Audit 310: subcodes 0..=6 must match the
+                        // interpreter's `env_wide` table (vm.rs:60-68).
+                        // Pre-310 only handled 0..=4, so contracts
+                        // reading TX_HASH (5) or BLOCK_PROPOSER (6)
+                        // returned 0 on AOT and the actual value on
+                        // the interpreter. Also captures the host
+                        // call's fault return (1 = wd >= 8) and
+                        // routes to trap_block; previously the rd ≥
+                        // 8 trap was silent on AOT.
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
                         let sub = d.rs2_or_imm;
                         let wd = builder.ins().iconst(I64, d.rd as i64);
-                        match sub {
-                            0 => {
-                                builder.ins().call(fn_callvalue_ref, &[vm_ctx, wd]);
-                            }
-                            1 => {
-                                builder.ins().call(fn_gasprice_ref, &[vm_ctx, wd]);
-                            }
+                        let call = match sub {
+                            0 => builder.ins().call(fn_callvalue_ref, &[vm_ctx, wd]),
+                            1 => builder.ins().call(fn_gasprice_ref, &[vm_ctx, wd]),
                             2 => {
                                 let addr = gp_read!(builder, d.rs1);
-                                builder.ins().call(fn_balance_ref, &[vm_ctx, addr, wd]);
+                                builder.ins().call(fn_balance_ref, &[vm_ctx, addr, wd])
                             }
-                            3 => {
-                                builder.ins().call(fn_caller_ref, &[vm_ctx, wd]);
-                            } // CALLER
-                            4 => {
-                                builder.ins().call(fn_address_ref, &[vm_ctx, wd]);
-                            } // ADDRESS
+                            3 => builder.ins().call(fn_caller_ref, &[vm_ctx, wd]),
+                            4 => builder.ins().call(fn_address_ref, &[vm_ctx, wd]),
+                            5 => builder.ins().call(fn_tx_hash_ref, &[vm_ctx, wd]),
+                            6 => builder.ins().call(fn_block_proposer_ref, &[vm_ctx, wd]),
                             _ => {
                                 builder.ins().jump(trap_block, &[]);
                                 terminated = true;
                                 break;
                             }
-                        }
+                        };
+                        let result = builder.inst_results(call)[0];
+                        let trapped = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(trapped, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
                     }
                     Opcode::Blockhash => {
-                        // Blockhash not yet fully supported in AOT — write zero
-                        let z = builder.ins().iconst(I64, 0);
-                        gp_write!(builder, d.rd, z);
+                        // Audit 310: implement via host_blockhash to
+                        // match the interpreter (vm.rs:806-822).
+                        // Pre-310 always wrote zero, so any contract
+                        // using BLOCKHASH for randomness or audit
+                        // forked the chain immediately.
+                        let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
+                        let height = gp_read!(builder, d.rs1);
+                        let wd = builder.ins().iconst(I64, d.rd as i64);
+                        let call = builder.ins().call(fn_blockhash_ref, &[vm_ctx, height, wd]);
+                        let result = builder.inst_results(call)[0];
+                        let trapped = builder.ins().icmp_imm(IntCC::NotEqual, result, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(trapped, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
                     }
 
                     // --- Assertions + Memory (host calls) ---
@@ -1217,8 +1308,15 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.switch_to_block(cont);
                     }
                     Opcode::Selfdestruct => {
-                        // Selfdestruct halts execution after clearing storage
-                        builder.ins().jump(success_block, &[]);
+                        // Audit 308: trap on Selfdestruct to match
+                        // the interpreter's hard refusal. Previous
+                        // AOT behaviour was a silent jump to
+                        // success_block (no storage clear, no halt)
+                        // — interpreter cleared shared storage, AOT
+                        // continued. Both were broken; both now trap
+                        // until per-contract storage namespacing
+                        // lands.
+                        builder.ins().jump(trap_block, &[]);
                         terminated = true;
                         break;
                     }

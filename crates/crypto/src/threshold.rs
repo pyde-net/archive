@@ -486,6 +486,19 @@ fn derive_blinding_mask(
 
 /// Combine decryption shares to recover the plaintext.
 /// Requires at least `threshold` shares.
+///
+/// **Audit 312 trust boundary (testnet):** this function does NOT
+/// authenticate that share `i` was actually produced by validator
+/// `i`. A Byzantine committee member can submit a share with
+/// someone else's index to displace honest shares from the
+/// threshold-`t` set. The MAC check inside
+/// `combine_shares` catches the resulting bad keystream so safety
+/// holds — but availability of the MEV pipeline does not. Treat
+/// this as an operator-trust assumption on testnet (see
+/// `docs/testnet-bringup.md` § "Known testnet trust assumptions").
+/// Mainnet will require each share to carry a FALCON sig over
+/// `(ct_hash || index || blinded_shares_hash)` and verify it
+/// before admission.
 pub fn combine_shares(
     shares: &[DecryptionShare],
     threshold: usize,
@@ -493,6 +506,21 @@ pub fn combine_shares(
 ) -> Result<Vec<u8>, &'static str> {
     if shares.len() < threshold {
         return Err("insufficient shares");
+    }
+
+    // Audit 312: structural sanity on the index field. `index` is
+    // 1-based per the Shamir scheme, so 0 is invalid; values
+    // larger than the realistic committee bound (≤ 128 today,
+    // see `crates/consensus/src/block.rs::COMMITTEE_SIZE`) cannot
+    // come from a legitimate share. Rejecting here closes the
+    // griefing vector where a Byzantine peer feeds nonsense
+    // indices that pass dedup but inflate Lagrange interpolation
+    // work proportionally.
+    const MAX_VALIDATOR_INDEX: usize = 256;
+    for share in shares.iter() {
+        if share.index == 0 || share.index > MAX_VALIDATOR_INDEX {
+            return Err("invalid share index (out of range 1..=256)");
+        }
     }
 
     // Check for duplicate indices
@@ -1072,6 +1100,48 @@ mod tests {
 
         let result = combine_shares(&dec_shares, T, &ct);
         assert!(result.is_err());
+    }
+
+    /// Audit 312: combine_shares rejects shares with `index == 0`
+    /// or `index > 256`. Closes the griefing path where a peer
+    /// hand-crafts shares with nonsense indices that pass the
+    /// dedup check but inflate Lagrange interpolation work.
+    #[test]
+    fn combine_shares_rejects_zero_index_audit_312() {
+        let (tpk, shares) = setup();
+        let msg = b"audit 312 zero index";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+        let mut dec_shares: Vec<DecryptionShare> = shares[..T]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        // Mutate one share's index to 0.
+        dec_shares[0].index = 0;
+        let result = combine_shares(&dec_shares, T, &ct);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("invalid share index"));
+    }
+
+    #[test]
+    fn combine_shares_rejects_oversize_index_audit_312() {
+        let (tpk, shares) = setup();
+        let msg = b"audit 312 oversize index";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+        let mut dec_shares: Vec<DecryptionShare> = shares[..T]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        // Mutate to an absurd index that no real committee would
+        // produce. MAX_VALIDATOR_INDEX = 256; 257 is the first
+        // out-of-range value.
+        dec_shares[0].index = 257;
+        let result = combine_shares(&dec_shares, T, &ct);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("invalid share index"));
     }
 
     #[test]

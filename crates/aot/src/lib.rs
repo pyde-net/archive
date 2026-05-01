@@ -1288,4 +1288,204 @@ mod tests {
             "CallExt gas parity broken: AOT={aot_gas} interp={interp_gas}"
         );
     }
+
+    // ── Audit 310: AOT/interpreter parity bundle ────────────────────
+
+    /// Reach for an OOB address with a Store and assert AOT now
+    /// traps (pre-310, AOT discarded the host_store fault return
+    /// and silently succeeded).
+    #[test]
+    fn store_oob_traps_on_aot_audit_310() {
+        // Address `MEMORY_SIZE` is one past the highest valid byte;
+        // any width-1 store there must trap on both interpreter and
+        // AOT. Build it as `r1 = MEMORY_SIZE`, then store to `[r1]`.
+        // ADDI uses an 18-bit signed immediate which can't reach
+        // MEMORY_SIZE in one step; build via shift.
+        let mem_size = pyde_vm::memory::MEMORY_SIZE as u64;
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        // Hand-poke the GP register so we don't have to encode a
+        // multi-instruction immediate construction.
+        vm.cpu.write_gp(1, mem_size);
+        // Code: STORE r2, [r1 + 0], W8; HALT
+        let code = bytecode(&[
+            instr_bytes(
+                Opcode::Store,
+                2,
+                1,
+                pyde_vm::isa::encode_mem_immediate(0, pyde_vm::isa::MemWidth::W8).unwrap(),
+            ),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        // Interpreter via direct execute()
+        vm.load(&code).unwrap();
+        let interp_outcome = vm.execute();
+        assert!(
+            matches!(interp_outcome.outcome, pyde_vm::vm::Outcome::Trap(_)),
+            "interpreter must trap on OOB store"
+        );
+
+        // AOT: pre-pop the same r1 then run.
+        let compiled = compile_bytecode(&code).unwrap();
+        let func = compiled.as_fn();
+        let mut regs = [0u64; 16];
+        regs[1] = mem_size;
+        let mut aot_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        let raw = unsafe { func(regs.as_mut_ptr(), 1_000_000, &mut aot_vm as *mut _) };
+        let (aot_status, _) = decode_result(raw);
+        assert_eq!(
+            aot_status, RESULT_TRAP,
+            "audit 310: OOB store must trap on AOT (was silently succeeding pre-fix)"
+        );
+    }
+
+    /// Caller env subcode 3 (TX_NONCE): pre-310 AOT trapped on
+    /// _ subcodes ≥ 3, but the interpreter handled 3 (TX_NONCE) +
+    /// 4 (TX_GAS_LIMIT). Both sides must now produce the same
+    /// register value.
+    #[test]
+    fn caller_env_tx_nonce_parity_audit_310() {
+        // CALLER r1, r0, sub=3 (TX_NONCE) then HALT.
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 1, 0, 3),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        vm.ctx.tx_nonce = 0xC0FFEE;
+        vm.load(&code).unwrap();
+        let _ = vm.execute();
+        let interp_r1 = vm.cpu.read_gp(1);
+        assert_eq!(interp_r1, 0xC0FFEE);
+
+        let compiled = compile_bytecode(&code).unwrap();
+        let func = compiled.as_fn();
+        let mut regs = [0u64; 16];
+        let mut aot_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        aot_vm.ctx.tx_nonce = 0xC0FFEE;
+        let raw = unsafe { func(regs.as_mut_ptr(), 1_000_000, &mut aot_vm as *mut _) };
+        let (aot_status, _) = decode_result(raw);
+        assert_eq!(aot_status, RESULT_SUCCESS);
+        assert_eq!(
+            regs[1], 0xC0FFEE,
+            "audit 310: AOT TX_NONCE must match interpreter"
+        );
+    }
+
+    #[test]
+    fn caller_env_tx_gas_limit_parity_audit_310() {
+        // CALLER r2, r0, sub=4 (TX_GAS_LIMIT)
+        let code = bytecode(&[
+            instr_bytes(Opcode::Caller, 2, 0, 4),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let compiled = compile_bytecode(&code).unwrap();
+        let func = compiled.as_fn();
+        let mut regs = [0u64; 16];
+        let mut aot_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        aot_vm.ctx.tx_gas_limit = 12_345_678;
+        let raw = unsafe { func(regs.as_mut_ptr(), 1_000_000, &mut aot_vm as *mut _) };
+        let (aot_status, _) = decode_result(raw);
+        assert_eq!(aot_status, RESULT_SUCCESS);
+        assert_eq!(regs[2], 12_345_678);
+    }
+
+    /// Callvalue env subcode 5 (TX_HASH): wide register write.
+    /// Pre-310 AOT trapped; post-310 it matches the interpreter's
+    /// `vm.ctx.tx_hash` value.
+    #[test]
+    fn callvalue_env_tx_hash_parity_audit_310() {
+        // CALLVALUE w0, r0, sub=5 — writes 256-bit tx_hash to w0.
+        let code = bytecode(&[
+            instr_bytes(Opcode::Callvalue, 0, 0, 5),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut aot_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        let expected = pyde_vm::wide::U256::from(0xDEADBEEFu64);
+        aot_vm.ctx.tx_hash = expected;
+        let compiled = compile_bytecode(&code).unwrap();
+        let func = compiled.as_fn();
+        let mut regs = [0u64; 16];
+        let raw = unsafe { func(regs.as_mut_ptr(), 1_000_000, &mut aot_vm as *mut _) };
+        let (aot_status, _) = decode_result(raw);
+        assert_eq!(aot_status, RESULT_SUCCESS);
+        assert_eq!(
+            aot_vm.cpu.read_wide(0),
+            expected,
+            "audit 310: AOT TX_HASH must match interpreter"
+        );
+    }
+
+    /// Callvalue env subcode 6 (BLOCK_PROPOSER): wide register
+    /// write of the proposer address.
+    #[test]
+    fn callvalue_env_block_proposer_parity_audit_310() {
+        let code = bytecode(&[
+            instr_bytes(Opcode::Callvalue, 0, 0, 6),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut aot_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        let mut proposer = [0u8; 32];
+        proposer[..4].copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        aot_vm.ctx.block_proposer = proposer;
+        let compiled = compile_bytecode(&code).unwrap();
+        let func = compiled.as_fn();
+        let mut regs = [0u64; 16];
+        let raw = unsafe { func(regs.as_mut_ptr(), 1_000_000, &mut aot_vm as *mut _) };
+        let (aot_status, _) = decode_result(raw);
+        assert_eq!(aot_status, RESULT_SUCCESS);
+        assert_eq!(
+            aot_vm.cpu.read_wide(0),
+            pyde_vm::wide::U256::from_le_bytes(proposer)
+        );
+    }
+
+    /// Blockhash: pre-310 AOT always wrote zero. Post-310 it
+    /// matches the interpreter (recent block hash from
+    /// `ctx.block_hashes`, zero outside the 256-block window).
+    #[test]
+    fn blockhash_parity_audit_310() {
+        // r1 = current_block - 1, then BLOCKHASH w0, r1.
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 99), // arbitrary "target height"
+            instr_bytes(Opcode::Blockhash, 0, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let mut aot_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        aot_vm.ctx.block_number = 100;
+        aot_vm.ctx.block_hashes = vec![pyde_vm::wide::U256::from(0xABCDEF12u64)];
+        let compiled = compile_bytecode(&code).unwrap();
+        let func = compiled.as_fn();
+        let mut regs = [0u64; 16];
+        let raw = unsafe { func(regs.as_mut_ptr(), 1_000_000, &mut aot_vm as *mut _) };
+        let (aot_status, _) = decode_result(raw);
+        assert_eq!(aot_status, RESULT_SUCCESS);
+        assert_eq!(
+            aot_vm.cpu.read_wide(0),
+            pyde_vm::wide::U256::from(0xABCDEF12u64),
+            "audit 310: AOT BLOCKHASH must read block_hashes[current - height - 1]"
+        );
+
+        // Out-of-window: target height = current - 257 → returns 0
+        // on both sides.
+        let code_oow = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, 1),
+            instr_bytes(Opcode::Blockhash, 0, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let mut aot_vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+        aot_vm.ctx.block_number = 1000;
+        aot_vm.ctx.block_hashes =
+            vec![pyde_vm::wide::U256::from(0xFFFFu64); 300];
+        let compiled = compile_bytecode(&code_oow).unwrap();
+        let func = compiled.as_fn();
+        let mut regs = [0u64; 16];
+        let raw = unsafe { func(regs.as_mut_ptr(), 1_000_000, &mut aot_vm as *mut _) };
+        let (aot_status, _) = decode_result(raw);
+        assert_eq!(aot_status, RESULT_SUCCESS);
+        assert_eq!(
+            aot_vm.cpu.read_wide(0),
+            pyde_vm::wide::U256::ZERO,
+            "audit 310: AOT BLOCKHASH must return 0 outside the 256-block window"
+        );
+    }
 }

@@ -1040,7 +1040,13 @@ impl ValidatorEngine {
         )
         .ok()?;
 
-        let mut collector = RandomnessCollector::new(next_epoch);
+        // Audit 322: pass the active committee size so the
+        // collector's threshold is `randomness_threshold_for(N)`
+        // instead of the hardcoded 85. Without this, devnet /
+        // testnet committees < 85 could never finalize epoch
+        // randomness.
+        let mut collector =
+            RandomnessCollector::new(next_epoch, self.committee_keys.len());
         collector.add_share(share.clone());
         self.randomness_collector = Some(collector);
 
@@ -1106,18 +1112,12 @@ impl ValidatorEngine {
         ) {
             Ok(candidate) => {
                 // VRF threshold: only propose if score < threshold.
-                // Target ~5 expected proposers per slot for reliability:
-                //   threshold = min(U64::MAX, 5 * U64::MAX / committee_size)
-                //   P(0 proposers) ≈ e^(-5) ≈ 0.67% (virtually no empty slots)
-                //   Proposal buffering picks the lowest VRF score from candidates.
-                //
-                // For small committees (≤5), everyone proposes (threshold = MAX).
-                const TARGET_PROPOSERS: u64 = 5;
-                let threshold = if committee_size as u64 <= TARGET_PROPOSERS {
-                    u64::MAX // small committee: everyone proposes
-                } else {
-                    (u64::MAX / committee_size as u64).saturating_mul(TARGET_PROPOSERS)
-                };
+                // Audit 323: shared formula in
+                // `pyde_consensus::proposer::vrf_proposer_threshold`
+                // so the receive path (`validate_network_block`)
+                // applies the same gate.
+                let threshold =
+                    pyde_consensus::proposer::vrf_proposer_threshold(committee_size);
 
                 if candidate.score > threshold {
                     debug!(
@@ -1709,7 +1709,10 @@ impl ValidatorEngine {
             self.timeout.receive_proposal();
         }
 
-        // Create vote (HotStuff safety rules enforced inside create_vote)
+        // Create vote (HotStuff safety rules enforced inside create_vote).
+        // Audit 311: pass committee_keys so create_vote can verify the
+        // FALCON signatures inside `header.qc_previous` before
+        // promoting it into our HotStuff `highest_qc`.
         match create_vote(
             self.chain_id,
             &mut self.consensus,
@@ -1717,6 +1720,7 @@ impl ValidatorEngine {
             identity.committee_index,
             identity.address,
             &identity.secret_key,
+            &self.committee_keys,
         ) {
             Ok(Some(vote)) => {
                 // create_vote mutated last_voted_slot and possibly highest_qc.
@@ -1991,9 +1995,14 @@ impl ValidatorEngine {
         // Try to form hard finality cert (dynamic quorum)
         let threshold = quorum_for_committee(self.committee_keys.len());
         if entry.len() >= threshold {
-            if let Some(cert) =
-                try_form_hard_finality(slot, block_hash, state_root, entry, &self.committee_keys)
-            {
+            if let Some(cert) = try_form_hard_finality(
+                self.chain_id,
+                slot,
+                block_hash,
+                state_root,
+                entry,
+                &self.committee_keys,
+            ) {
                 info!(slot, "hard finality achieved");
                 // Audit item 207a: persist BEFORE in-memory mutation.
                 // Construct the checkpoint explicitly here so we can
@@ -2413,6 +2422,7 @@ impl ValidatorEngine {
         identity: &ValidatorIdentity,
     ) -> Option<FinalityVote> {
         match create_finality_vote(
+            self.chain_id,
             slot,
             block_hash,
             state_root,

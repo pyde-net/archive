@@ -779,6 +779,85 @@ pub extern "C" fn host_gasprice(ctx: *mut VmCtx, wd: u64) -> u64 {
     0
 }
 
+/// Host: get tx_nonce (audit 310). Mirror env_gp::TX_NONCE
+/// in the interpreter (`pvm/src/vm.rs:779`).
+pub extern "C" fn host_tx_nonce(ctx: *mut VmCtx) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file).
+    let vm = unsafe { &mut *ctx };
+    vm.ctx.tx_nonce
+}
+
+/// Host: get tx_gas_limit (audit 310). Mirror env_gp::TX_GAS_LIMIT
+/// in the interpreter (`pvm/src/vm.rs:780`).
+pub extern "C" fn host_tx_gas_limit(ctx: *mut VmCtx) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file).
+    let vm = unsafe { &mut *ctx };
+    vm.ctx.tx_gas_limit
+}
+
+/// Host: get tx_hash (256-bit) into wide register wd (audit 310).
+/// Mirror env_wide::TX_HASH in the interpreter (`pvm/src/vm.rs:799`).
+pub extern "C" fn host_tx_hash(ctx: *mut VmCtx, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file).
+    let vm = unsafe { &mut *ctx };
+    if vm
+        .cpu
+        .write_wide_checked(wd as u8, vm.ctx.tx_hash)
+        .is_err()
+    {
+        return 1;
+    }
+    0
+}
+
+/// Host: get block_proposer (256-bit) into wide register wd
+/// (audit 310). Mirror env_wide::BLOCK_PROPOSER in the
+/// interpreter (`pvm/src/vm.rs:800`).
+pub extern "C" fn host_block_proposer(ctx: *mut VmCtx, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file).
+    let vm = unsafe { &mut *ctx };
+    if vm
+        .cpu
+        .write_wide_checked(
+            wd as u8,
+            pyde_vm::wide::U256::from_le_bytes(vm.ctx.block_proposer),
+        )
+        .is_err()
+    {
+        return 1;
+    }
+    0
+}
+
+/// Host: blockhash. Reads target block height from gp[rs1], writes
+/// the 256-bit hash into wide register wd (audit 310). Mirror
+/// `Opcode::Blockhash` in the interpreter (`pvm/src/vm.rs:806-822`),
+/// including the "only allow recent 256 blocks" gating.
+pub extern "C" fn host_blockhash(ctx: *mut VmCtx, height: u64, wd: u64) -> u64 {
+    // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
+    // safety contract (top of file).
+    let vm = unsafe { &mut *ctx };
+    let current = vm.ctx.block_number;
+    let hash = if height < current && current - height <= 256 {
+        let idx = (current - height - 1) as usize;
+        vm.ctx
+            .block_hashes
+            .get(idx)
+            .copied()
+            .unwrap_or(U256::ZERO)
+    } else {
+        U256::ZERO
+    };
+    if vm.cpu.write_wide_checked(wd as u8, hash).is_err() {
+        return 1;
+    }
+    0
+}
+
 /// Host: get balance of address (in wide register ws) into wide register wd.
 pub extern "C" fn host_balance(ctx: *mut VmCtx, ws_addr: u64, wd: u64) -> u64 {
     // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
@@ -989,6 +1068,13 @@ pub fn host_functions() -> Vec<(&'static str, *const u8)> {
         ("host_callvalue", host_callvalue as *const u8),
         ("host_gasprice", host_gasprice as *const u8),
         ("host_balance", host_balance as *const u8),
+        // Audit 310: env subcodes 3..=6 of Caller / Callvalue and
+        // Blockhash, missing pre-310.
+        ("host_tx_nonce", host_tx_nonce as *const u8),
+        ("host_tx_gas_limit", host_tx_gas_limit as *const u8),
+        ("host_tx_hash", host_tx_hash as *const u8),
+        ("host_block_proposer", host_block_proposer as *const u8),
+        ("host_blockhash", host_blockhash as *const u8),
         ("host_assert", host_assert as *const u8),
         ("host_memcpy", host_memcpy as *const u8),
         ("host_drain_page_gas", host_drain_page_gas as *const u8),

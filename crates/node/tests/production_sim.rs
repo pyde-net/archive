@@ -607,6 +607,7 @@ fn production_simulation() {
             i as u8,
             validators[i].address,
             &validators[i].sk,
+            &committee_keys,
         )
         .unwrap();
         if let Some(v) = vote {
@@ -720,6 +721,7 @@ fn production_simulation() {
             i as u8,
             validators[i].address,
             &validators[i].sk,
+            &committee_keys,
         )
         .unwrap()
         {
@@ -877,6 +879,7 @@ fn production_simulation() {
             i as u8,
             validators[i].address,
             &validators[i].sk,
+            &committee_keys,
         )
         .unwrap()
         {

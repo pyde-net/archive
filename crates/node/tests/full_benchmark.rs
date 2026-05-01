@@ -311,7 +311,7 @@ fn run_consensus(
     const CHAIN_ID: u64 = 31337;
     let mut votes = Vec::new();
     for (i, v) in validators.iter().enumerate() {
-        if let Ok(Some(vote)) = create_vote(CHAIN_ID, &mut states[i], &header, i as u8, v.address, &v.sk) {
+        if let Ok(Some(vote)) = create_vote(CHAIN_ID, &mut states[i], &header, i as u8, v.address, &v.sk, &committee_keys) {
             assert!(verify_vote(CHAIN_ID, &vote, v.pk.as_bytes()));
             votes.push(vote);
         }

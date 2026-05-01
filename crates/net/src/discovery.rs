@@ -10,10 +10,39 @@ use libp2p::{Multiaddr, PeerId};
 use std::collections::HashMap;
 use std::time::Instant;
 
+/// Pyde mainnet chain ID. Bound into every consensus signing
+/// preimage (proposer headers, votes, view-change votes, slashing
+/// evidence, multisig payloads) so a signature on one network
+/// cannot be replayed on another even when FALCON keys match.
+pub const MAINNET_CHAIN_ID: u64 = 1;
+
+/// Pyde public testnet chain ID. Distinct from devnet (`31337`)
+/// and mainnet (`1`). Operators bringing up alternative testnets
+/// should pick a different value to avoid replay collisions —
+/// the on-chain bootstrap-peer hard gate
+/// (`pyde_node::node::check_bootstrap_config`) only allows
+/// startup with explicit `bootstrap_peers` for any non-devnet
+/// chain, so a typo'd chain id can't silently produce a fork
+/// of one.
+pub const TESTNET_CHAIN_ID: u64 = 7331;
+
+/// Devnet chain ID. The only chain id at which a node may start
+/// with no bootstrap peers configured (laptop-local single-node
+/// devnets are an explicit, intentional configuration).
+pub const DEVNET_CHAIN_ID: u64 = 31337;
+
 /// Default bootstrap peers for mainnet (empty until launch).
 pub const MAINNET_BOOTSTRAP: &[&str] = &[];
 
-/// Default bootstrap peers for testnet.
+/// Default bootstrap peers for testnet. Empty here so the binary
+/// has no compile-time dependency on cloud DNS — operators inject
+/// their actual `[network].bootstrap_peers` via `config.toml` (the
+/// `pyde testnet --node-addrs <topology.toml>` flow does this
+/// automatically). The startup-time
+/// `check_bootstrap_config(chain_id, &bootstrap_peers)` gate hard-
+/// refuses any non-devnet chain that launches with this list still
+/// empty, so an operator who skips the inject step gets a clear
+/// error instead of a silent fork-of-one.
 pub const TESTNET_BOOTSTRAP: &[&str] = &[];
 
 /// Ban duration in seconds.

@@ -32,6 +32,8 @@ hex = "0.4"
 # Wallet encryption
 aes-gcm = "0.10"
 rand = "0.8"
+# Memory-hard KDF for keystore passphrases (audit 306).
+argon2 = "0.5"
 pyde-account = { path = "../account" }
 pyde-tx = { path = "../tx" }
 

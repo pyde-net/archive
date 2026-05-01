@@ -44,6 +44,13 @@ pub struct FaucetConfig {
     /// If provided, signs transactions via pyde_sendRawTransaction.
     /// If None, uses unsigned pyde_sendTransaction (dev mode only).
     pub private_key_path: Option<String>,
+    /// Operator-pinned chain_id (audit 303). If `Some(n)`, the
+    /// faucet polls the node at boot and refuses to start if the
+    /// node reports a different chain_id — catches misconfiguration
+    /// before any tx gets signed against the wrong chain. If `None`,
+    /// the faucet trusts whatever the node returns (devnet
+    /// ergonomics).
+    pub chain_id: Option<u64>,
 }
 
 struct RateLimiter {
@@ -141,6 +148,7 @@ impl FaucetSigner {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_faucet_tx(
     rpc_url: &str,
     from: &str,
@@ -148,6 +156,7 @@ async fn send_faucet_tx(
     amount_pyde: u64,
     signer: Option<&FaucetSigner>,
     signing_lock: &tokio::sync::Mutex<()>,
+    chain_id: u64,
 ) -> Result<String, String> {
     let quanta = (amount_pyde as u128) * 1_000_000_000;
 
@@ -167,7 +176,9 @@ async fn send_faucet_tx(
         let _guard = signing_lock.lock().await;
         let nonce = fetch_nonce(rpc_url, from).await?;
         let to_addr = parse_hex_addr(to)?;
-        let chain_id = fetch_chain_id(rpc_url).await.unwrap_or(31337);
+        // Audit 303: chain_id is pinned at boot in `run_faucet` and
+        // passed in here, eliminating both the per-request RPC
+        // round-trip AND the silent-default-to-devnet failure mode.
         let tx_bytes = signer.sign_transfer(&to_addr, quanta, nonce, chain_id);
         let tx_hex = format!("0x{}", hex::encode(&tx_bytes));
         serde_json::json!({
@@ -244,10 +255,14 @@ async fn fetch_chain_id(rpc_url: &str) -> Result<u64, String> {
         "method": "pyde_chainId", "params": []
     });
     let json = rpc_call(rpc_url, &serde_json::to_string(&body).unwrap()).await?;
+    // Audit 303: do NOT default to devnet on missing/null result. A
+    // transient RPC blip used to silently re-target the faucet at
+    // chain_id=31337, producing signed txs valid only on devnet
+    // even when the operator was running a public testnet.
     let hex = json
         .get("result")
         .and_then(|v| v.as_str())
-        .unwrap_or("0x7a69");
+        .ok_or_else(|| "pyde_chainId returned no result".to_string())?;
     u64::from_str_radix(hex.strip_prefix("0x").unwrap_or(hex), 16)
         .map_err(|_| format!("invalid chain_id: {}", hex))
 }
@@ -381,12 +396,60 @@ fn parse_post_body_address(body: &str) -> Option<String> {
     json.get("address")?.as_str().map(|s| s.to_string())
 }
 
+/// Pure pin-or-mismatch decision after the node has reported its
+/// chain_id. Split from the I/O wrapper so the branch logic is
+/// unit-testable (audit 303).
+fn check_pinned_chain_id(node_chain_id: u64, pinned: Option<u64>) -> Result<u64, String> {
+    match pinned {
+        None => Ok(node_chain_id),
+        Some(expected) if expected == node_chain_id => Ok(node_chain_id),
+        Some(expected) => Err(format!(
+            "faucet --chain-id={} but node reports {}; refusing to start (audit 303)",
+            expected, node_chain_id
+        )),
+    }
+}
+
+/// Resolve the faucet's chain_id at boot (audit 303).
+///
+/// - If the operator passes `--chain-id N`, poll the node and refuse
+///   to start if the node reports anything other than `N`.
+/// - If `--chain-id` was omitted, use whatever the node reports.
+///   This branch keeps devnet ergonomics (no flag needed for `pyde
+///   testnet` bring-up) while production deploys lock in a pinned
+///   value.
+///
+/// Either way, RPC errors propagate as `Err` instead of silently
+/// defaulting to chain_id 31337 — the prior behaviour silently
+/// re-targeted the faucet at devnet on any transient blip.
+async fn resolve_faucet_chain_id(rpc_url: &str, pinned: Option<u64>) -> Result<u64, String> {
+    let node_chain_id = fetch_chain_id(rpc_url).await.map_err(|e| {
+        format!(
+            "faucet failed to fetch chain_id from {}: {}; refusing to start (audit 303)",
+            rpc_url, e
+        )
+    })?;
+    check_pinned_chain_id(node_chain_id, pinned)
+}
+
 pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
     let addr_limiter = Arc::new(RateLimiter::new(config.cooldown_secs));
     let ip_limiter = Arc::new(RateLimiter::new(config.cooldown_secs));
     let rpc_url = Arc::new(config.rpc_url);
     let from = Arc::new(config.from_address);
     let amount = config.amount_pyde;
+
+    // Audit 303: pin chain_id at boot. Poll the node once; if the
+    // operator supplied `--chain-id`, refuse to start on mismatch
+    // so a misconfiguration surfaces before any tx gets signed.
+    // After this, the chain_id is held in `chain_id` and reused on
+    // every dispense — eliminates both the per-request RPC fetch
+    // AND the "default to devnet on RPC failure" hazard.
+    let chain_id = match resolve_faucet_chain_id(&rpc_url, config.chain_id).await {
+        Ok(id) => id,
+        Err(e) => return Err(e),
+    };
+    tracing::info!(chain_id, "faucet pinned to chain");
 
     // Load signing key if provided (production mode)
     let signer: Arc<Option<FaucetSigner>> = Arc::new(match &config.private_key_path {
@@ -453,6 +516,7 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
                 amount,
                 signer,
                 signing_lock,
+                chain_id,
             )
             .await;
         });
@@ -470,6 +534,7 @@ async fn handle_connection(
     amount: u64,
     signer: Arc<Option<FaucetSigner>>,
     signing_lock: Arc<tokio::sync::Mutex<()>>,
+    chain_id: u64,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut buf_reader = BufReader::new(reader);
@@ -540,7 +605,7 @@ async fn handle_connection(
         ("POST", "/api/request") => {
             match parse_post_body_address(&body) {
                 Some(addr) if addr.len() >= 64 => {
-                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref(), &signing_lock).await
+                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref(), &signing_lock, chain_id).await
                 }
                 Some(_) => json_response(400, r#"{"error":"address must be 0x-prefixed 32-byte hex"}"#),
                 None => json_response(400, r#"{"error":"missing address field in JSON body"}"#),
@@ -558,7 +623,7 @@ async fn handle_connection(
             });
             match address {
                 Some(addr) if addr.len() >= 64 => {
-                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref(), &signing_lock).await
+                    serve_dispense(&addr, &ip_key, &addr_limiter, &ip_limiter, &rpc, &from, amount, signer.as_ref().as_ref(), &signing_lock, chain_id).await
                 }
                 _ => json_response(400, r#"{"error":"missing or invalid address"}"#),
             }
@@ -580,6 +645,7 @@ async fn serve_dispense(
     amount: u64,
     signer: Option<&FaucetSigner>,
     signing_lock: &tokio::sync::Mutex<()>,
+    chain_id: u64,
 ) -> String {
     // Both rate limits must pass. Check before dispense; record only
     // after a successful send so a downstream RPC failure doesn't
@@ -596,7 +662,7 @@ async fn serve_dispense(
             &format!(r#"{{"error":"ip rate limited","retryAfter":{}}}"#, secs),
         );
     }
-    match send_faucet_tx(rpc, from, address, amount, signer, signing_lock).await {
+    match send_faucet_tx(rpc, from, address, amount, signer, signing_lock, chain_id).await {
         Ok(tx_hash) => {
             addr_limiter.record(address);
             ip_limiter.record(ip_key);
@@ -621,6 +687,44 @@ mod tests {
     use super::*;
 
     // ========== Task 082 / audit 225: faucet web UI + JSON API ==========
+
+    // ── Audit 303: chain_id pin / fail-loud ──────────────────────────
+
+    #[test]
+    fn check_pinned_chain_id_unpinned_uses_node_value() {
+        // No --chain-id flag → trust whatever the node reports.
+        // Devnet ergonomics: a `pyde testnet` bring-up with the
+        // matching faucet doesn't need to thread the chain_id.
+        for node in [1u64, 7, 7331, 31337, 1_000_000] {
+            assert_eq!(check_pinned_chain_id(node, None).unwrap(), node);
+        }
+    }
+
+    #[test]
+    fn check_pinned_chain_id_matching_pin_accepts() {
+        for node in [1u64, 7331, 31337] {
+            assert_eq!(check_pinned_chain_id(node, Some(node)).unwrap(), node);
+        }
+    }
+
+    #[test]
+    fn check_pinned_chain_id_mismatch_rejects() {
+        // Operator pinned testnet (7331), node is on mainnet (1) —
+        // refuse to sign anything.
+        let err = check_pinned_chain_id(1, Some(7331)).unwrap_err();
+        assert!(
+            err.contains("--chain-id=7331") && err.contains("reports 1"),
+            "expected mismatch error, got: {}",
+            err
+        );
+        // The reverse direction — operator pinned mainnet on a
+        // testnet node — must also refuse.
+        assert!(check_pinned_chain_id(7331, Some(1)).is_err());
+        // Devnet vs testnet mismatch: most common faucet
+        // misconfiguration in practice.
+        assert!(check_pinned_chain_id(31337, Some(7331)).is_err());
+        assert!(check_pinned_chain_id(7331, Some(31337)).is_err());
+    }
 
     #[test]
     fn parse_post_body_extracts_address_field() {

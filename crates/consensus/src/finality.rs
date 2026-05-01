@@ -94,9 +94,24 @@ pub struct FinalityVote {
 }
 
 /// Build the message validators sign for hard finality.
-fn finality_sign_message(slot: u64, block_hash: &[u8; 32], state_root: &[u8; 32]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(85); // "hard_finality"(13) + slot(8) + 2×hash(64)
+///
+/// Audit 320: binds `chain_id` into the preimage. Pre-fix, the
+/// preimage was `b"hard_finality" || slot || block_hash || state_root`
+/// — a hard-finality vote signed on devnet (chain_id=31337) verified
+/// as a hard-finality vote on testnet (chain_id=7331) when FALCON keys
+/// matched (the operator dev-cycle case the audit-240 sweep was built
+/// to close). Cross-chain finality replay is now blocked at the
+/// preimage layer, mirroring `proposer_sign_message` /
+/// `view_change_sign_message` / multisig.
+fn finality_sign_message(
+    chain_id: u64,
+    slot: u64,
+    block_hash: &[u8; 32],
+    state_root: &[u8; 32],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(93); // tag(13) + chain(8) + slot(8) + 2×hash(64)
     msg.extend_from_slice(b"hard_finality");
+    msg.extend_from_slice(&chain_id.to_le_bytes());
     msg.extend_from_slice(&slot.to_le_bytes());
     msg.extend_from_slice(block_hash);
     msg.extend_from_slice(state_root);
@@ -143,7 +158,9 @@ pub fn soft_finality_status(
 // ========== Hard Finality ==========
 
 /// Create a finality vote attesting to a block's state transition.
+/// Audit 320: `chain_id` binds the signed preimage to a specific chain.
 pub fn create_finality_vote(
+    chain_id: u64,
     slot: u64,
     block_hash: [u8; 32],
     state_root: [u8; 32],
@@ -151,7 +168,7 @@ pub fn create_finality_vote(
     voter_address: Address,
     voter_sk: &FalconSecretKey,
 ) -> Result<FinalityVote, &'static str> {
-    let msg = finality_sign_message(slot, &block_hash, &state_root);
+    let msg = finality_sign_message(chain_id, slot, &block_hash, &state_root);
     let sig = falcon_sign(voter_sk, &msg).map_err(|_| "finality vote signing failed")?;
 
     Ok(FinalityVote {
@@ -164,13 +181,13 @@ pub fn create_finality_vote(
     })
 }
 
-/// Verify a finality vote.
-pub fn verify_finality_vote(vote: &FinalityVote, public_key: &[u8]) -> bool {
+/// Verify a finality vote (audit 320: chain_id-bound preimage).
+pub fn verify_finality_vote(chain_id: u64, vote: &FinalityVote, public_key: &[u8]) -> bool {
     let pk = match FalconPublicKey::from_bytes(public_key) {
         Some(pk) => pk,
         None => return false,
     };
-    let msg = finality_sign_message(vote.slot, &vote.block_hash, &vote.state_root);
+    let msg = finality_sign_message(chain_id, vote.slot, &vote.block_hash, &vote.state_root);
     let sig = match FalconSignature::from_bytes(&vote.signature) {
         Some(s) => s,
         None => return false,
@@ -179,7 +196,10 @@ pub fn verify_finality_vote(vote: &FinalityVote, public_key: &[u8]) -> bool {
 }
 
 /// Try to form a hard finality certificate from collected finality votes.
+/// Audit 320: `chain_id` binds every per-vote verification to the
+/// active chain so cross-chain replay is impossible at the cert level.
 pub fn try_form_hard_finality(
+    chain_id: u64,
     slot: u64,
     block_hash: [u8; 32],
     state_root: [u8; 32],
@@ -208,7 +228,7 @@ pub fn try_form_hard_finality(
             continue;
         }
 
-        if verify_finality_vote(vote, &committee_keys[idx]) {
+        if verify_finality_vote(chain_id, vote, &committee_keys[idx]) {
             voter_bitmap |= 1u128 << idx;
             signatures.push(vote.signature.clone());
             valid_count += 1;
@@ -378,6 +398,12 @@ mod tests {
     use pyde_account::address::derive_eoa_address;
     use pyde_crypto::falcon::falcon_keygen;
 
+    /// Arbitrary non-mainnet, non-devnet chain_id used by every test
+    /// in this module so cross-chain replay regressions surface here
+    /// rather than slipping past with hardcoded chain_id=0
+    /// (audit 320, mirroring hotstuff.rs::TEST_CHAIN_ID).
+    const TEST_CHAIN_ID: u64 = 7;
+
     fn make_qc(slot: u64, votes: u32) -> QuorumCert {
         QuorumCert {
             slot,
@@ -437,7 +463,7 @@ mod tests {
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let vote = create_finality_vote(5, block_hash, state_root, i, addr, &sk).unwrap();
+            let vote = create_finality_vote(TEST_CHAIN_ID, 5, block_hash, state_root, i, addr, &sk).unwrap();
             votes.push(vote);
             keys.push(pk_bytes);
         }
@@ -446,7 +472,7 @@ mod tests {
             keys.push(vec![0; 897]);
         }
 
-        let cert = try_form_hard_finality(5, block_hash, state_root, &votes, &keys);
+        let cert = try_form_hard_finality(TEST_CHAIN_ID, 5, block_hash, state_root, &votes, &keys);
         assert!(cert.is_some());
         assert!(cert.unwrap().has_quorum());
     }
@@ -470,7 +496,7 @@ mod tests {
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let vote = create_finality_vote(5, block_hash, state_root, i, addr, &sk).unwrap();
+            let vote = create_finality_vote(TEST_CHAIN_ID, 5, block_hash, state_root, i, addr, &sk).unwrap();
             votes.push(vote);
             keys.push(pk_bytes);
         }
@@ -478,7 +504,7 @@ mod tests {
         let (pk4, _sk4) = falcon_keygen().unwrap();
         keys.push(pk4.as_bytes().to_vec());
 
-        let cert = try_form_hard_finality(5, block_hash, state_root, &votes, &keys);
+        let cert = try_form_hard_finality(TEST_CHAIN_ID, 5, block_hash, state_root, &votes, &keys);
         assert!(
             cert.is_some(),
             "hard finality must form at 3-of-4 on a devnet committee"
@@ -500,7 +526,7 @@ mod tests {
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], i, addr, &sk).unwrap();
+            let vote = create_finality_vote(TEST_CHAIN_ID, 5, [0xAA; 32], [0xCC; 32], i, addr, &sk).unwrap();
             votes.push(vote);
             keys.push(pk_bytes);
         }
@@ -509,7 +535,7 @@ mod tests {
             keys.push(vec![0; 897]);
         }
 
-        let cert = try_form_hard_finality(5, [0xAA; 32], [0xCC; 32], &votes, &keys);
+        let cert = try_form_hard_finality(TEST_CHAIN_ID, 5, [0xAA; 32], [0xCC; 32], &votes, &keys);
         assert!(cert.is_none());
     }
 
@@ -519,8 +545,8 @@ mod tests {
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
-        let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], 0, addr, &sk).unwrap();
-        assert!(verify_finality_vote(&vote, &pk_bytes));
+        let vote = create_finality_vote(TEST_CHAIN_ID, 5, [0xAA; 32], [0xCC; 32], 0, addr, &sk).unwrap();
+        assert!(verify_finality_vote(TEST_CHAIN_ID, &vote, &pk_bytes));
     }
 
     #[test]
@@ -529,8 +555,27 @@ mod tests {
         let (pk2, _sk2) = falcon_keygen().unwrap();
         let addr = derive_eoa_address(pk1.as_bytes());
 
-        let vote = create_finality_vote(5, [0xAA; 32], [0xCC; 32], 0, addr, &sk1).unwrap();
-        assert!(!verify_finality_vote(&vote, pk2.as_bytes()));
+        let vote = create_finality_vote(TEST_CHAIN_ID, 5, [0xAA; 32], [0xCC; 32], 0, addr, &sk1).unwrap();
+        assert!(!verify_finality_vote(TEST_CHAIN_ID, &vote, pk2.as_bytes()));
+    }
+
+    /// Audit 320: a finality vote signed under chain_id A must not
+    /// verify under chain_id B even when FALCON keys match. Mirrors
+    /// the cross-chain replay test on `proposer_sign_message`
+    /// (`crates/consensus/src/hotstuff.rs::vote_cross_chain_replay_rejected`).
+    #[test]
+    fn finality_vote_cross_chain_replay_rejected() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+
+        let vote = create_finality_vote(1, 5, [0xAA; 32], [0xCC; 32], 0, addr, &sk).unwrap();
+        // Signed under chain_id=1 (mainnet); verifies there.
+        assert!(verify_finality_vote(1, &vote, &pk_bytes));
+        // Same FALCON key on a different chain rejects the vote.
+        assert!(!verify_finality_vote(2, &vote, &pk_bytes));
+        assert!(!verify_finality_vote(7331, &vote, &pk_bytes));
+        assert!(!verify_finality_vote(31337, &vote, &pk_bytes));
     }
 
     // ========== Task 0504: Before hard finality can reorg ==========

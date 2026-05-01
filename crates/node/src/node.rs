@@ -62,13 +62,13 @@ pub fn check_bootstrap_config(
     if !bootstrap_peers.is_empty() {
         return Ok(());
     }
-    const MAINNET_CHAIN_ID: u64 = 1;
-    const DEVNET_CHAIN_ID: u64 = 31337;
-    if chain_id == DEVNET_CHAIN_ID {
+    if chain_id == pyde_net::discovery::DEVNET_CHAIN_ID {
         return Ok(());
     }
-    let label = if chain_id == MAINNET_CHAIN_ID {
+    let label = if chain_id == pyde_net::discovery::MAINNET_CHAIN_ID {
         "mainnet"
+    } else if chain_id == pyde_net::discovery::TESTNET_CHAIN_ID {
+        "public testnet"
     } else {
         "non-devnet chain"
     };
@@ -81,6 +81,32 @@ pub fn check_bootstrap_config(
          genesis-node multiaddr(s) before starting any peer.",
         label, chain_id
     ))
+}
+
+/// Audit 343: refuse startup when `config.toml [node].chain_id`
+/// disagrees with `genesis.toml`'s chain_id. Pre-fix, the runtime
+/// chain_id came from config.toml while the genesis state came
+/// from genesis.toml, with no consistency check. An operator who
+/// edits config.toml to set `chain_id = 7331` while genesis.toml
+/// still says 31337 would run with chain_id=7331 (binding
+/// signatures to that domain) against state computed for 31337 —
+/// confusing self-isolation. Worse, a forged genesis.toml
+/// claiming chain_id=1 would silently propagate onto mainnet's
+/// domain. The helper is split out so the comparison can be
+/// unit-tested without spinning up `PydeNode::run()`.
+pub fn check_config_genesis_chain_id_match(
+    config_chain_id: u64,
+    genesis_chain_id: u64,
+) -> Result<(), String> {
+    if config_chain_id != genesis_chain_id {
+        return Err(format!(
+            "chain_id mismatch (audit 343): config.toml says {} but genesis.toml says {} — \
+             refusing to start. Either update config.toml to match the genesis chain_id, \
+             or regenerate the genesis bundle with `pyde testnet --chain-id {}`.",
+            config_chain_id, genesis_chain_id, config_chain_id,
+        ));
+    }
+    Ok(())
 }
 
 /// The main Pyde node. Owns all subsystems.
@@ -236,6 +262,13 @@ impl PydeNode {
                 crate::genesis::GenesisConfig::default()
             }
         };
+
+        // Audit 343: refuse to start if config.toml's chain_id
+        // disagrees with genesis.toml's.
+        check_config_genesis_chain_id_match(
+            self.config.node.chain_id,
+            genesis_config.chain_id,
+        )?;
 
         // 3. Block store (persistent headers on disk). Arc'd so the
         // RPC layer can read full block bodies without a second open.
@@ -3943,7 +3976,28 @@ fn handle_swarm_event(
                         Ok(block) => {
                             let slot = block.header.slot;
 
-                            // Validate block header (signature, VRF, proposer, QC)
+                            // Validate block header (signature, VRF, proposer, QC).
+                            // Audit 321: pass the expected parent_hash so the
+                            // header's chain-linking invariant is enforced.
+                            // For slot=1 use genesis_hash; for slot>1 use the
+                            // hash of the canonical block at head_slot. None
+                            // for the bootstrap case where we have no parent
+                            // yet (skips the check).
+                            // Audit 325: also pull the parent's timestamp
+                            // (slot>1 only — the genesis header isn't kept in
+                            // `chain.headers`, so slot=1 falls back to drift-
+                            // only checking).
+                            let (expected_parent, parent_timestamp) = if slot == 1 {
+                                (Some(chain.genesis_hash), None)
+                            } else if let Some(parent) = chain.header(slot - 1) {
+                                (Some(parent.hash()), Some(parent.timestamp))
+                            } else {
+                                (None, None)
+                            };
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
                             if let Some(ref engine) = validator_engine {
                                 if let Err(e) = BlockProcessor::validate_network_block(
                                     chain.chain_id,
@@ -3951,6 +4005,9 @@ fn handle_swarm_event(
                                     &block.proposer_signature,
                                     &engine.committee_keys,
                                     &engine.epoch_randomness,
+                                    expected_parent.as_ref(),
+                                    parent_timestamp,
+                                    now_ms,
                                 ) {
                                     warn!(slot, error = %e, "block header validation failed");
                                     return PostEventAction::None;
@@ -5053,7 +5110,15 @@ fn handle_swarm_event(
                 libp2p::core::ConnectedPoint::Dialer { .. } => pyde_net::peer::Direction::Outbound,
                 libp2p::core::ConnectedPoint::Listener { .. } => pyde_net::peer::Direction::Inbound,
             };
-            let info = pyde_net::peer::PeerInfo::new(peer_id, direction);
+            // Audit 336: populate `info.ip` from the multiaddr so
+            // PeerManager's per-IP rate limiter actually fires.
+            // Pre-fix this field was always None and
+            // `is_rate_limited` silently returned false on every
+            // connection.
+            let mut info = pyde_net::peer::PeerInfo::new(peer_id, direction);
+            if let Some(ip) = pyde_net::peer::ip_from_multiaddr(&remote_addr) {
+                info = info.with_ip(ip);
+            }
             peer_manager.add_peer(info);
 
             // Audit 234 follow-up: snapshot the (peer_id, multiaddr)
@@ -5334,6 +5399,22 @@ mod tests {
         );
     }
 
+    /// Tier 2.3: the canonical public testnet chain_id (7331)
+    /// produces an error that names "public testnet" specifically —
+    /// not the generic "non-devnet chain" fallback. Operators
+    /// reading the log line should recognize their network at a
+    /// glance.
+    #[test]
+    fn bootstrap_guard_labels_canonical_testnet_chain_id() {
+        let err = check_bootstrap_config(pyde_net::discovery::TESTNET_CHAIN_ID, &[])
+            .unwrap_err();
+        assert!(
+            err.contains("public testnet"),
+            "error must label canonical testnet (7331) as 'public testnet', got: {err}"
+        );
+        assert!(err.contains("chain_id=7331"));
+    }
+
     #[test]
     fn bootstrap_guard_accepts_any_chain_with_peers() {
         let peers = vec!["/ip4/1.2.3.4/tcp/30303/p2p/12D3KooWfoo".to_string()];
@@ -5342,6 +5423,37 @@ mod tests {
                 check_bootstrap_config(chain_id, &peers).is_ok(),
                 "chain_id {chain_id} with peers should pass"
             );
+        }
+    }
+
+    // ── Audit 343: config.toml ↔ genesis.toml chain_id consistency ──
+
+    #[test]
+    fn config_genesis_chain_id_match_accepts_equal() {
+        for id in [1u64, 7, 7331, 31337, 1_000_000] {
+            assert!(
+                check_config_genesis_chain_id_match(id, id).is_ok(),
+                "matching chain_id {id} must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn config_genesis_chain_id_mismatch_rejects() {
+        // Common mishap shapes: operator edited config.toml without
+        // regenerating genesis.toml, or pulled a forged genesis.toml
+        // claiming a different chain than the runtime.
+        for (config_id, genesis_id) in [
+            (1u64, 31337),
+            (7331, 31337),
+            (7331, 1),
+            (31337, 7331),
+            (1, 7331),
+        ] {
+            let err = check_config_genesis_chain_id_match(config_id, genesis_id).unwrap_err();
+            assert!(err.contains("audit 343"));
+            assert!(err.contains(&format!("config.toml says {}", config_id)));
+            assert!(err.contains(&format!("genesis.toml says {}", genesis_id)));
         }
     }
 }
