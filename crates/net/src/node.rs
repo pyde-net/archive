@@ -360,7 +360,10 @@ mod tests {
 
     #[test]
     fn topic_count() {
-        assert_eq!(topics::all().len(), 4);
+        // consensus + transactions + encrypted_transactions + blocks + sync.
+        // Last bumped when `encrypted_transactions` shipped with the
+        // MEV-protected encrypted-tx flow (item 227).
+        assert_eq!(topics::all().len(), 5);
     }
 
     #[tokio::test]
