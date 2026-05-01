@@ -4494,8 +4494,14 @@ mod tests {
         }
 
         // Sanity: post-merge the child values are visible.
-        assert_eq!(vm.storage.get(&U256::from(1u32)), Some(&b"child-V1".to_vec()));
-        assert_eq!(vm.storage.get(&U256::from(2u32)), Some(&b"child-V2".to_vec()));
+        assert_eq!(
+            vm.storage.get(&U256::from(1u32)),
+            Some(&b"child-V1".to_vec())
+        );
+        assert_eq!(
+            vm.storage.get(&U256::from(2u32)),
+            Some(&b"child-V2".to_vec())
+        );
 
         // Parent reverts.
         vm.rollback_storage_pub();
@@ -4525,12 +4531,14 @@ mod tests {
         // Simulate a pre-309 merge (no journal call) and confirm
         // we'd have lost the revert ability — this just documents
         // the bug shape.
-        vm.storage.insert(U256::from(7u32), b"will-be-clobbered".to_vec());
+        vm.storage
+            .insert(U256::from(7u32), b"will-be-clobbered".to_vec());
         vm.journal_storage_write(&U256::from(7u32));
         // Parent did its own write — journaled.
         let pre_journal_count = vm.storage_journal_keys.len();
         // Now bulk-insert child values WITHOUT journaling (pre-309 shape):
-        vm.storage.insert(U256::from(7u32), b"child-clobber".to_vec());
+        vm.storage
+            .insert(U256::from(7u32), b"child-clobber".to_vec());
         vm.storage.insert(U256::from(8u32), b"child-new".to_vec());
         // No new journal entries because we skipped journal_storage_write.
         assert_eq!(vm.storage_journal_keys.len(), pre_journal_count);
@@ -4539,7 +4547,10 @@ mod tests {
         // K=7 IS rolled back (parent journaled it before the
         // simulated bulk insert), but K=8 leaks past revert —
         // exactly the pre-309 hazard.
-        assert_eq!(vm.storage.get(&U256::from(7u32)), Some(&b"will-be-clobbered".to_vec()));
+        assert_eq!(
+            vm.storage.get(&U256::from(7u32)),
+            Some(&b"will-be-clobbered".to_vec())
+        );
         assert_eq!(
             vm.storage.get(&U256::from(8u32)),
             Some(&b"child-new".to_vec()),

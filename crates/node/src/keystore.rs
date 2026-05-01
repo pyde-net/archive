@@ -83,13 +83,8 @@ const ARGON2_P_COST: u32 = 1;
 /// or supply-chain compromise of the keystore file effectively
 /// exposed the FALCON private key.
 fn derive_aes_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
-    let params = argon2::Params::new(
-        ARGON2_M_COST_KIB,
-        ARGON2_T_COST,
-        ARGON2_P_COST,
-        Some(32),
-    )
-    .map_err(|e| format!("argon2 params: {e}"))?;
+    let params = argon2::Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+        .map_err(|e| format!("argon2 params: {e}"))?;
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut out = [0u8; 32];
     argon

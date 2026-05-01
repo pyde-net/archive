@@ -1045,8 +1045,7 @@ impl ValidatorEngine {
         // instead of the hardcoded 85. Without this, devnet /
         // testnet committees < 85 could never finalize epoch
         // randomness.
-        let mut collector =
-            RandomnessCollector::new(next_epoch, self.committee_keys.len());
+        let mut collector = RandomnessCollector::new(next_epoch, self.committee_keys.len());
         collector.add_share(share.clone());
         self.randomness_collector = Some(collector);
 
@@ -1116,8 +1115,7 @@ impl ValidatorEngine {
                 // `pyde_consensus::proposer::vrf_proposer_threshold`
                 // so the receive path (`validate_network_block`)
                 // applies the same gate.
-                let threshold =
-                    pyde_consensus::proposer::vrf_proposer_threshold(committee_size);
+                let threshold = pyde_consensus::proposer::vrf_proposer_threshold(committee_size);
 
                 if candidate.score > threshold {
                     debug!(
@@ -1423,15 +1421,20 @@ impl ValidatorEngine {
         // we have no way to validate the proposal; reject and let
         // our own view-change-QC formation catch up.
         if self.timeout.slot != slot || self.timeout.view_change_qc.is_none() {
-            debug!(slot, "fallback proposal received without local view-change-QC; deferring");
+            debug!(
+                slot,
+                "fallback proposal received without local view-change-QC; deferring"
+            );
             return false;
         }
         let vc_qc = self.timeout.view_change_qc.as_ref().unwrap();
 
         // Verify the proposer is a committee member.
-        let proposer_idx = match self.committee_keys.iter().position(|k| {
-            pyde_account::address::derive_eoa_address(k) == header.proposer
-        }) {
+        let proposer_idx = match self
+            .committee_keys
+            .iter()
+            .position(|k| pyde_account::address::derive_eoa_address(k) == header.proposer)
+        {
             Some(i) => i,
             None => {
                 warn!(
@@ -1549,7 +1552,12 @@ impl ValidatorEngine {
         // fallback to be built for a slot the chain has already moved
         // past.
         let slot = self.consensus.target_height;
-        info!(mine = identity.committee_index, target_height = slot, current_slot = self.consensus.current_slot, "DBG try_build_fallback_proposal entered");
+        info!(
+            mine = identity.committee_index,
+            target_height = slot,
+            current_slot = self.consensus.current_slot,
+            "DBG try_build_fallback_proposal entered"
+        );
         // NOTE: previously voting for slot does NOT disqualify us from
         // being the fallback proposer (audit 234 part 3). The whole
         // reason a view-change-QC exists at this slot is that the
@@ -1558,12 +1566,14 @@ impl ValidatorEngine {
         // only against double-voting on the SAME proposal, which is
         // enforced by HotStuff safety in `create_vote`.
         if self.timeout.slot != slot {
-            info!(slot, timeout_slot = self.timeout.slot, "DBG fallback skip: timeout.slot != target_height");
+            info!(
+                slot,
+                timeout_slot = self.timeout.slot,
+                "DBG fallback skip: timeout.slot != target_height"
+            );
             return None;
         }
-        if self.timeout.view_change_qc.is_none() {
-            return None;
-        }
+        self.timeout.view_change_qc.as_ref()?;
         // audit-234 part 4 (CONSENSUS_INVARIANTS.md L2): only the
         // deterministic leader for `(target_height, current_view)`
         // builds a fallback. Other validators return None. This
@@ -1619,15 +1629,19 @@ impl ValidatorEngine {
 
         let block_hash = header.hash();
         let sign_msg = proposer_sign_message(self.chain_id, slot, &block_hash);
-        let proposer_signature = match pyde_crypto::falcon::falcon_sign(&identity.secret_key, &sign_msg) {
-            Ok(sig) => sig.to_vec(),
-            Err(_) => {
-                warn!(slot, "failed to sign fallback proposal");
-                return None;
-            }
-        };
+        let proposer_signature =
+            match pyde_crypto::falcon::falcon_sign(&identity.secret_key, &sign_msg) {
+                Ok(sig) => sig.to_vec(),
+                Err(_) => {
+                    warn!(slot, "failed to sign fallback proposal");
+                    return None;
+                }
+            };
 
-        info!(slot, "built fallback proposal as deterministic view-change fallback proposer");
+        info!(
+            slot,
+            "built fallback proposal as deterministic view-change fallback proposer"
+        );
         Some(Block {
             header,
             body: BlockBody {
@@ -1840,7 +1854,13 @@ impl ValidatorEngine {
         // Try to form QC (dynamic quorum based on actual committee size)
         let threshold = quorum_for_committee(self.committee_keys.len());
         if entry.votes.len() >= threshold {
-            let qc = try_form_qc(self.chain_id, slot, block_hash, &entry.votes, &self.committee_keys);
+            let qc = try_form_qc(
+                self.chain_id,
+                slot,
+                block_hash,
+                &entry.votes,
+                &self.committee_keys,
+            );
             if let Some(ref qc) = qc {
                 info!(slot, votes = qc.vote_count(), "QC formed");
                 // Update consensus state
@@ -1946,7 +1966,9 @@ impl ValidatorEngine {
         entry.push(msg);
 
         // Try to form view change QC
-        if let Some(vc_qc) = try_form_view_change_qc(self.chain_id, slot, entry, &self.committee_keys) {
+        if let Some(vc_qc) =
+            try_form_view_change_qc(self.chain_id, slot, entry, &self.committee_keys)
+        {
             let first_formation = self.timeout.view_change_qc.is_none();
             if first_formation {
                 self.consensus.bump_view();
@@ -3636,10 +3658,8 @@ mod tests {
         // Build the canonical (chain_id || slot || block_hash) preimage —
         // must match what `verify_double_sign` reconstructs for the
         // engine's chain_id, otherwise FALCON verify rejects.
-        let sign_1 =
-            pyde_consensus::hotstuff::proposer_sign_message(TEST_CHAIN_ID, slot, &hash_1);
-        let sign_2 =
-            pyde_consensus::hotstuff::proposer_sign_message(TEST_CHAIN_ID, slot, &hash_2);
+        let sign_1 = pyde_consensus::hotstuff::proposer_sign_message(TEST_CHAIN_ID, slot, &hash_1);
+        let sign_2 = pyde_consensus::hotstuff::proposer_sign_message(TEST_CHAIN_ID, slot, &hash_2);
         let sig_1 = pyde_crypto::falcon::falcon_sign(&sk, &sign_1)
             .unwrap()
             .as_bytes()
@@ -3983,10 +4003,8 @@ mod tests {
         let slot = 100u64;
         let hash_1 = [0xA1u8; 32];
         let hash_2 = [0xA2u8; 32];
-        let sign_msg_1 =
-            pyde_consensus::hotstuff::proposer_sign_message(chain_id, slot, &hash_1);
-        let sign_msg_2 =
-            pyde_consensus::hotstuff::proposer_sign_message(chain_id, slot, &hash_2);
+        let sign_msg_1 = pyde_consensus::hotstuff::proposer_sign_message(chain_id, slot, &hash_1);
+        let sign_msg_2 = pyde_consensus::hotstuff::proposer_sign_message(chain_id, slot, &hash_2);
         let sig_1 = falcon_sign(&offender_sk, &sign_msg_1)
             .unwrap()
             .as_bytes()

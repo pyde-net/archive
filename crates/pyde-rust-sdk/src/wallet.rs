@@ -479,13 +479,8 @@ const ARGON2_T_COST: u32 = 3;
 const ARGON2_P_COST: u32 = 1;
 
 fn derive_aes_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
-    let params = argon2::Params::new(
-        ARGON2_M_COST_KIB,
-        ARGON2_T_COST,
-        ARGON2_P_COST,
-        Some(32),
-    )
-    .map_err(|e| SdkError::Signing(format!("argon2 params: {}", e)))?;
+    let params = argon2::Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+        .map_err(|e| SdkError::Signing(format!("argon2 params: {}", e)))?;
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut out = [0u8; 32];
     argon

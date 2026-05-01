@@ -55,10 +55,7 @@ const MEV_INCLUSION_GRACE_SLOTS: u64 = 2;
 /// (e.g., their own multiaddr) so the gate is satisfied. This mirrors
 /// the operational reality — a network with no peers and no bootstrap
 /// is never a real network.
-pub fn check_bootstrap_config(
-    chain_id: u64,
-    bootstrap_peers: &[String],
-) -> Result<(), String> {
+pub fn check_bootstrap_config(chain_id: u64, bootstrap_peers: &[String]) -> Result<(), String> {
     if !bootstrap_peers.is_empty() {
         return Ok(());
     }
@@ -265,10 +262,7 @@ impl PydeNode {
 
         // Audit 343: refuse to start if config.toml's chain_id
         // disagrees with genesis.toml's.
-        check_config_genesis_chain_id_match(
-            self.config.node.chain_id,
-            genesis_config.chain_id,
-        )?;
+        check_config_genesis_chain_id_match(self.config.node.chain_id, genesis_config.chain_id)?;
 
         // 3. Block store (persistent headers on disk). Arc'd so the
         // RPC layer can read full block bodies without a second open.
@@ -588,7 +582,7 @@ impl PydeNode {
         // Skip-if-already-connected is handled inside
         // `redial_saved_peers` so a peer in BOTH bootstrap and the
         // book isn't dialed twice.
-        if peer_book.len() > 0 {
+        if !peer_book.is_empty() {
             redial_saved_peers(&mut swarm, &peer_book);
         }
 
@@ -3417,10 +3411,9 @@ async fn commit_jmt_writes(
         return;
     }
     let commit_start = std::time::Instant::now();
-    if let Ok(root) = crate::state_manager::StateManager::commit_writes_to_smt(
-        &smt_handle,
-        pending_writes,
-    ) {
+    if let Ok(root) =
+        crate::state_manager::StateManager::commit_writes_to_smt(&smt_handle, pending_writes)
+    {
         crate::metrics::record_state_commit_ms(commit_start.elapsed().as_millis() as u64);
         let mut sw = state.write().await;
         sw.set_root(root);
@@ -3481,9 +3474,15 @@ fn emit_ws_events(
 /// committed txs would re-appear in the next block's selection set and
 /// fail with `BelowWindow` (nonce already consumed).
 async fn prune_committed_txs(
-    mempool_index: &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<[u8; 32], Vec<u8>>>>,
-    pending_txs: &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>>,
-    pending_tx_times: &std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
+    mempool_index: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<[u8; 32], Vec<u8>>>,
+    >,
+    pending_txs: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<[u8; 32], pyde_tx::types::Transaction>>,
+    >,
+    pending_tx_times: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>,
+    >,
     tx_relay: &std::sync::Arc<tokio::sync::RwLock<crate::tx_relay::TxRelay>>,
     block: &pyde_consensus::block::Block,
 ) {
@@ -3551,7 +3550,13 @@ async fn cast_finality_vote_and_persist(
     let cert_formed = engine.on_finality_vote(fv.clone());
     let fv_bytes = wire::encode_finality_vote(&fv);
     let topic = pyde_net::node::topics::consensus();
-    broadcast_consensus_with_rr_fallback(swarm, topic.clone(), fv_bytes, peer_manager, gossip_cache);
+    broadcast_consensus_with_rr_fallback(
+        swarm,
+        topic.clone(),
+        fv_bytes,
+        peer_manager,
+        gossip_cache,
+    );
     if !cert_formed {
         return;
     }
@@ -3642,10 +3647,7 @@ async fn maybe_kick_decryption_pipeline(
             }
         }
         drop(q);
-        pending_decryptors
-            .write()
-            .await
-            .insert(qc_slot, decryptor);
+        pending_decryptors.write().await.insert(qc_slot, decryptor);
     }
     if let Some(shares) = engine.generate_decryption_shares(identity, &enc_txs) {
         let msg = wire::DecryptionShareMsg {
@@ -3659,7 +3661,8 @@ async fn maybe_kick_decryption_pipeline(
         info!(
             slot = qc_slot,
             enc_txs = enc_txs.len(),
-            "broadcast decryption shares (canonical-apply{})", log_tag
+            "broadcast decryption shares (canonical-apply{})",
+            log_tag
         );
     }
 }
@@ -3676,8 +3679,10 @@ fn broadcast_consensus_with_rr_fallback(
     // a peer subscribes to the topic — see the
     // `gossipsub::Event::Subscribed` arm in `handle_swarm_event`.
     let topic_hash = topic.hash();
-    if let Err(libp2p::gossipsub::PublishError::InsufficientPeers) =
-        swarm.behaviour_mut().gossipsub.publish(topic.clone(), data.clone())
+    if let Err(libp2p::gossipsub::PublishError::InsufficientPeers) = swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(topic.clone(), data.clone())
     {
         debug!(topic = %topic_hash, bytes = data.len(), "consensus publish: InsufficientPeers; stashed for replay");
         gossip_cache.stash(topic_hash, data.clone());
@@ -3777,8 +3782,10 @@ fn broadcast_blocks_with_rr_fallback(
     // post-restart never get retried even though the RR fanout
     // already ensures eventual delivery.
     let topic_hash = topic.hash();
-    if let Err(libp2p::gossipsub::PublishError::InsufficientPeers) =
-        swarm.behaviour_mut().gossipsub.publish(topic.clone(), data.clone())
+    if let Err(libp2p::gossipsub::PublishError::InsufficientPeers) = swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(topic.clone(), data.clone())
     {
         debug!(topic = %topic_hash, bytes = data.len(), "blocks publish: InsufficientPeers; stashed for replay");
         gossip_cache.stash(topic_hash, data.clone());
@@ -3854,8 +3861,7 @@ fn redial_saved_peers(
     }
     info!(
         saved = peer_book.len(),
-        dialed,
-        "redialed saved peers from peer book"
+        dialed, "redialed saved peers from peer book"
     );
 }
 
@@ -4758,9 +4764,7 @@ fn handle_swarm_event(
                                     "received finality vote via RR fallback"
                                 );
                                 if engine.on_finality_vote(fv) {
-                                    if let Some(cp) =
-                                        engine.latest_finality_checkpoint()
-                                    {
+                                    if let Some(cp) = engine.latest_finality_checkpoint() {
                                         let _ = block_store.put_finality_cert(cp);
                                         info!(
                                             slot = cp.slot,
@@ -4771,9 +4775,8 @@ fn handle_swarm_event(
                                         // their WS anchor (mirrors the
                                         // gossipsub-receive handler at
                                         // line ~3720).
-                                        pending_fallback_broadcast = Some(
-                                            wire::encode_finality_checkpoint_msg(cp),
-                                        );
+                                        pending_fallback_broadcast =
+                                            Some(wire::encode_finality_checkpoint_msg(cp));
                                     }
                                 }
                             }
@@ -4795,14 +4798,13 @@ fn handle_swarm_event(
                                 signature,
                             } => {
                                 debug!(slot, voter_index, "received timeout via RR fallback");
-                                let vc_msg =
-                                    pyde_consensus::view_change::ViewChangeMessage {
-                                        slot,
-                                        highest_qc,
-                                        voter_index,
-                                        voter_address,
-                                        signature,
-                                    };
+                                let vc_msg = pyde_consensus::view_change::ViewChangeMessage {
+                                    slot,
+                                    highest_qc,
+                                    voter_index,
+                                    voter_address,
+                                    signature,
+                                };
                                 if engine.on_view_change(vc_msg) {
                                     info!(slot, "view change QC formed (via RR fallback) — fallback proposer can proceed");
                                     if let Some(bytes) = build_and_encode_fallback_proposal(
@@ -4814,7 +4816,9 @@ fn handle_swarm_event(
                                     }
                                 }
                             }
-                            ConsensusMessage::Vote { slot, voter_index, .. } => {
+                            ConsensusMessage::Vote {
+                                slot, voter_index, ..
+                            } => {
                                 // Audit 234 part 3: votes that fell back
                                 // to RR (gossip publish failed) need to
                                 // route through the same `on_vote` path
@@ -4824,7 +4828,11 @@ fn handle_swarm_event(
                                 // here.
                                 debug!(slot, voter_index, "received vote via RR fallback");
                                 if let Some(qc) = engine.on_vote(msg) {
-                                    info!(slot, votes = qc.vote_count(), "QC formed (via RR fallback)");
+                                    info!(
+                                        slot,
+                                        votes = qc.vote_count(),
+                                        "QC formed (via RR fallback)"
+                                    );
                                     pending_apply_qcd = Some((slot, qc.block_hash));
                                 }
                             }
@@ -4835,7 +4843,9 @@ fn handle_swarm_event(
                                 debug!(slot = header.slot, "received proposal via RR fallback");
                                 engine.buffer_proposal(header, proposer_signature);
                             }
-                            ConsensusMessage::NewView { slot, highest_qc, .. } => {
+                            ConsensusMessage::NewView {
+                                slot, highest_qc, ..
+                            } => {
                                 debug!(slot, "received new view via RR fallback");
                                 if highest_qc.slot > engine.consensus.highest_qc.slot {
                                     engine.consensus.highest_qc = highest_qc;
@@ -4873,14 +4883,12 @@ fn handle_swarm_event(
             if let Some(share_msg) = pending_share_msg {
                 PostEventAction::SendConsensusRrResponseAndAddShares(channel, resp, share_msg)
             } else if let Some((qc_slot, qc_hash)) = pending_apply_qcd {
-                PostEventAction::SendConsensusRrResponseAndApplyQcd(
-                    channel, resp, qc_slot, qc_hash,
-                )
+                PostEventAction::SendConsensusRrResponseAndApplyQcd(channel, resp, qc_slot, qc_hash)
             } else {
                 match pending_fallback_broadcast {
-                    Some(bytes) => PostEventAction::SendConsensusRrResponseAndBroadcast(
-                        channel, resp, bytes,
-                    ),
+                    Some(bytes) => {
+                        PostEventAction::SendConsensusRrResponseAndBroadcast(channel, resp, bytes)
+                    }
                     None => PostEventAction::SendConsensusRrResponse(channel, resp),
                 }
             }
@@ -4916,10 +4924,7 @@ fn handle_swarm_event(
             // substream-closed-during-send) don't warrant disconnect;
             // libp2p's own keep-alive will reap genuinely-dead
             // connections.
-            let is_timeout = matches!(
-                error,
-                request_response::OutboundFailure::Timeout
-            );
+            let is_timeout = matches!(error, request_response::OutboundFailure::Timeout);
             if is_timeout {
                 debug!(%peer, ?error, "consensus RR timeout; dropping stale connection");
                 PostEventAction::DisconnectStalePeer(peer)
@@ -4939,16 +4944,14 @@ fn handle_swarm_event(
         )) => PostEventAction::None,
 
         // --- BlocksRr: inbound block via RR fallback (audit 234 part 4 follow-up) ---
-        SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(
-            request_response::Event::Message {
-                peer,
-                message:
-                    request_response::Message::Request {
-                        request, channel, ..
-                    },
-                ..
-            },
-        )) => {
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(request_response::Event::Message {
+            peer,
+            message:
+                request_response::Message::Request {
+                    request, channel, ..
+                },
+            ..
+        })) => {
             // Per-peer spam threshold, mirroring audit item 214's
             // pattern for decryption-share gossip. A peer that has
             // already crossed the invalid-message threshold on prior
@@ -5054,12 +5057,10 @@ fn handle_swarm_event(
                 pyde_net::blocks_protocol::BlocksResp::DecodeError,
             )
         }
-        SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(
-            request_response::Event::Message {
-                message: request_response::Message::Response { .. },
-                ..
-            },
-        )) => {
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(request_response::Event::Message {
+            message: request_response::Message::Response { .. },
+            ..
+        })) => {
             // Acks (or DecodeError responses) from peers — best-effort
             // confirmation, nothing to do.
             PostEventAction::None
@@ -5071,10 +5072,7 @@ fn handle_swarm_event(
             // disconnect on `Timeout`. Transient failures during slot-
             // tick fanout would otherwise trigger a feedback loop on
             // the bootstrap re-dial cycle.
-            let is_timeout = matches!(
-                error,
-                request_response::OutboundFailure::Timeout
-            );
+            let is_timeout = matches!(error, request_response::OutboundFailure::Timeout);
             if is_timeout {
                 debug!(%peer, ?error, "blocks RR timeout; dropping stale connection");
                 PostEventAction::DisconnectStalePeer(peer)
@@ -5406,8 +5404,7 @@ mod tests {
     /// glance.
     #[test]
     fn bootstrap_guard_labels_canonical_testnet_chain_id() {
-        let err = check_bootstrap_config(pyde_net::discovery::TESTNET_CHAIN_ID, &[])
-            .unwrap_err();
+        let err = check_bootstrap_config(pyde_net::discovery::TESTNET_CHAIN_ID, &[]).unwrap_err();
         assert!(
             err.contains("public testnet"),
             "error must label canonical testnet (7331) as 'public testnet', got: {err}"

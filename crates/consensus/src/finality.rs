@@ -463,7 +463,8 @@ mod tests {
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let vote = create_finality_vote(TEST_CHAIN_ID, 5, block_hash, state_root, i, addr, &sk).unwrap();
+            let vote = create_finality_vote(TEST_CHAIN_ID, 5, block_hash, state_root, i, addr, &sk)
+                .unwrap();
             votes.push(vote);
             keys.push(pk_bytes);
         }
@@ -496,7 +497,8 @@ mod tests {
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let vote = create_finality_vote(TEST_CHAIN_ID, 5, block_hash, state_root, i, addr, &sk).unwrap();
+            let vote = create_finality_vote(TEST_CHAIN_ID, 5, block_hash, state_root, i, addr, &sk)
+                .unwrap();
             votes.push(vote);
             keys.push(pk_bytes);
         }
@@ -526,7 +528,8 @@ mod tests {
             let pk_bytes = pk.as_bytes().to_vec();
             let addr = derive_eoa_address(&pk_bytes);
 
-            let vote = create_finality_vote(TEST_CHAIN_ID, 5, [0xAA; 32], [0xCC; 32], i, addr, &sk).unwrap();
+            let vote = create_finality_vote(TEST_CHAIN_ID, 5, [0xAA; 32], [0xCC; 32], i, addr, &sk)
+                .unwrap();
             votes.push(vote);
             keys.push(pk_bytes);
         }
@@ -545,7 +548,8 @@ mod tests {
         let pk_bytes = pk.as_bytes().to_vec();
         let addr = derive_eoa_address(&pk_bytes);
 
-        let vote = create_finality_vote(TEST_CHAIN_ID, 5, [0xAA; 32], [0xCC; 32], 0, addr, &sk).unwrap();
+        let vote =
+            create_finality_vote(TEST_CHAIN_ID, 5, [0xAA; 32], [0xCC; 32], 0, addr, &sk).unwrap();
         assert!(verify_finality_vote(TEST_CHAIN_ID, &vote, &pk_bytes));
     }
 
@@ -555,7 +559,8 @@ mod tests {
         let (pk2, _sk2) = falcon_keygen().unwrap();
         let addr = derive_eoa_address(pk1.as_bytes());
 
-        let vote = create_finality_vote(TEST_CHAIN_ID, 5, [0xAA; 32], [0xCC; 32], 0, addr, &sk1).unwrap();
+        let vote =
+            create_finality_vote(TEST_CHAIN_ID, 5, [0xAA; 32], [0xCC; 32], 0, addr, &sk1).unwrap();
         assert!(!verify_finality_vote(TEST_CHAIN_ID, &vote, pk2.as_bytes()));
     }
 

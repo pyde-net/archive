@@ -127,11 +127,7 @@ impl LivenessReport {
 /// The `chain_id` binding prevents cross-chain replay: a double-sign
 /// on chain A is not valid evidence on chain B even when FALCON keys
 /// match. The slot binding prevents cross-slot replay within a chain.
-pub fn verify_double_sign(
-    chain_id: u64,
-    evidence: &DoubleSignEvidence,
-    public_key: &[u8],
-) -> bool {
+pub fn verify_double_sign(chain_id: u64, evidence: &DoubleSignEvidence, public_key: &[u8]) -> bool {
     // Two distinct blocks (empty-or-equal hashes = not evidence).
     if evidence.block_hash_1 == evidence.block_hash_2 {
         return false;
@@ -429,7 +425,11 @@ mod tests {
         };
 
         // Wrong key → reject
-        assert!(!verify_double_sign(TEST_CHAIN_ID, &evidence, pk2.as_bytes()));
+        assert!(!verify_double_sign(
+            TEST_CHAIN_ID,
+            &evidence,
+            pk2.as_bytes()
+        ));
     }
 
     #[test]

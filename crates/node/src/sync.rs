@@ -688,7 +688,7 @@ impl ChainSync {
                 // entries — well above the SNAPSHOT_CHUNK_SIZE
                 // operators actually use, but bounded.
                 const MAX_SNAPSHOT_CHUNK_SIZE: usize = 50_000;
-                let cs = (*chunk_size as usize).max(1).min(MAX_SNAPSHOT_CHUNK_SIZE);
+                let cs = (*chunk_size as usize).clamp(1, MAX_SNAPSHOT_CHUNK_SIZE);
                 let total_chunks = snap.entries.len().div_ceil(cs).max(1) as u32;
                 let start = (*chunk_index as usize) * cs;
 

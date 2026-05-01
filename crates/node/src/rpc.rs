@@ -1561,8 +1561,8 @@ pub async fn start_rpc_server(
     // calldata + ABI args at typical contract sizes — plus
     // headroom for `pyde_getLogs` / `pyde_getBlockByNumber(slot,
     // full_tx)` response payloads.
-    const MAX_REQUEST_BODY_BYTES: u32 = 1_048_576;       // 1 MB
-    const MAX_RESPONSE_BODY_BYTES: u32 = 16_777_216;     // 16 MB
+    const MAX_REQUEST_BODY_BYTES: u32 = 1_048_576; // 1 MB
+    const MAX_RESPONSE_BODY_BYTES: u32 = 16_777_216; // 16 MB
     const MAX_CONNECTIONS: u32 = 1024;
     const MAX_REQUESTS_PER_BATCH: u32 = 32;
     let server = Server::builder()
@@ -1920,10 +1920,7 @@ async fn parse_call_object(
 /// hash, sender, recipient, value, nonce, gas_limit, tx_type. Falls
 /// back to an empty array if the block isn't on disk yet (genesis,
 /// or a slot that this node only saw a header for during sync).
-fn decode_block_transactions(
-    block_store: &BlockStore,
-    slot: u64,
-) -> Vec<serde_json::Value> {
+fn decode_block_transactions(block_store: &BlockStore, slot: u64) -> Vec<serde_json::Value> {
     let raw = match block_store.get_block_raw(slot) {
         Some(r) => r,
         None => return Vec::new(),
@@ -2095,10 +2092,7 @@ mod tests {
     #[test]
     fn resolve_chain_id_accepts_matching_value() {
         for chain in [1u64, 7331, 31337] {
-            assert_eq!(
-                resolve_request_chain_id(Some(chain), chain).unwrap(),
-                chain
-            );
+            assert_eq!(resolve_request_chain_id(Some(chain), chain).unwrap(), chain);
         }
     }
 

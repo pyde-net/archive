@@ -793,8 +793,7 @@ impl BlockProcessor {
             }
 
             let score = pyde_consensus::proposer::score_from_output(&vrf_output);
-            let threshold =
-                pyde_consensus::proposer::vrf_proposer_threshold(committee_keys.len());
+            let threshold = pyde_consensus::proposer::vrf_proposer_threshold(committee_keys.len());
             if score > threshold {
                 return Err(format!(
                     "VRF score {} above proposer threshold {} for committee size {} (audit 323)",
@@ -1922,11 +1921,11 @@ mod tests {
         let err = BlockProcessor::validate_network_block(
             31337,
             &header,
-            &[],          // proposer_signature — irrelevant, parent_hash check fires first
-            &[],          // committee_keys — same
-            &[0u8; 32],   // epoch_randomness
+            &[],        // proposer_signature — irrelevant, parent_hash check fires first
+            &[],        // committee_keys — same
+            &[0u8; 32], // epoch_randomness
             Some(&expected),
-            None,         // parent_timestamp — irrelevant, parent_hash fires first
+            None, // parent_timestamp — irrelevant, parent_hash fires first
             header.timestamp.saturating_add(1), // now_ms — already past header
         )
         .unwrap_err();
@@ -2033,8 +2032,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.contains("not strictly greater than parent timestamp")
-                && err.contains("audit 325"),
+            err.contains("not strictly greater than parent timestamp") && err.contains("audit 325"),
             "expected audit-325 parent timestamp error, got: {err}"
         );
 
@@ -2098,9 +2096,7 @@ mod tests {
         header.parent_hash = [0xCD; 32];
         let expected_parent_hash = [0xCD; 32];
         // now_ms slightly behind header.timestamp but within drift.
-        let now_ms = header
-            .timestamp
-            .saturating_sub(MAX_TIMESTAMP_DRIFT_MS / 2);
+        let now_ms = header.timestamp.saturating_sub(MAX_TIMESTAMP_DRIFT_MS / 2);
         let err = BlockProcessor::validate_network_block(
             31337,
             &header,
