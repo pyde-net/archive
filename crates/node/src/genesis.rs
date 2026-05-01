@@ -842,6 +842,29 @@ fn build_multiaddr(host: &str, port: u16, peer_id: &libp2p::PeerId) -> String {
 /// follows `base_rpc_port + i` (operators usually want RPC on a
 /// per-node-distinct local port for `pyde testnet` development; remote
 /// nodes can override via their config).
+/// Write a secret-bearing file (validator key, threshold share, etc.)
+/// and tighten permissions to 0o600 on Unix (audit 344). Default umask
+/// often leaves these world-readable, so any local user could walk away
+/// with FALCON signing material from a freshly-generated testnet
+/// bundle. Non-secret files (config.toml, genesis.toml, threshold.pk)
+/// are still written with `fs::write` directly.
+fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    std::fs::write(path, bytes)
+        .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            format!(
+                "failed to set 0o600 on {} (audit 344): {}",
+                path.display(),
+                e
+            )
+        })?;
+    }
+    Ok(())
+}
+
 pub fn generate_testnet(
     out_dir: &std::path::Path,
     num_validators: usize,
@@ -1015,18 +1038,19 @@ pub fn generate_testnet(
         key_buf.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
         key_buf.extend_from_slice(pk_bytes);
         key_buf.extend_from_slice(sk_bytes);
-        fs::write(node_dir.join("validator.key"), &key_buf)
-            .map_err(|e| format!("failed to write validator.key: {}", e))?;
+        // Audit 344: 0o600 on every secret-bearing file. Default
+        // umask leaves these world-readable; any local user on a
+        // multi-tenant box would walk away with FALCON signing
+        // material from a freshly-distributed testnet bundle.
+        write_secret_file(&node_dir.join("validator.key"), &key_buf)?;
 
         // Write node.key (pre-generated so we know the peer ID for bootstrap addrs)
         let node_key_bytes = pyde_net::node::keypair_to_bytes(&node_keypairs[i].0)
             .map_err(|e| format!("failed to serialize node key: {}", e))?;
-        fs::write(node_dir.join("node.key"), &node_key_bytes)
-            .map_err(|e| format!("failed to write node.key: {}", e))?;
+        write_secret_file(&node_dir.join("node.key"), &node_key_bytes)?;
 
         // Write threshold key share (binary) for MEV-protected decryption
-        fs::write(node_dir.join("threshold.share"), key_shares[i].to_bytes())
-            .map_err(|e| format!("failed to write threshold.share: {}", e))?;
+        write_secret_file(&node_dir.join("threshold.share"), &key_shares[i].to_bytes())?;
 
         // Write threshold public key (shared — same for all nodes)
         fs::write(node_dir.join("threshold.pk"), threshold_pk.to_bytes())
@@ -1134,11 +1158,10 @@ json = false
         fs::create_dir_all(&node_dir)
             .map_err(|e| format!("failed to create {}: {}", node_dir.display(), e))?;
 
-        // node.key
+        // node.key (audit 344: 0o600)
         let node_key_bytes = pyde_net::node::keypair_to_bytes(&node_keypairs[i].0)
             .map_err(|e| format!("failed to serialize node key: {}", e))?;
-        fs::write(node_dir.join("node.key"), &node_key_bytes)
-            .map_err(|e| format!("failed to write node.key: {}", e))?;
+        write_secret_file(&node_dir.join("node.key"), &node_key_bytes)?;
 
         // threshold.pk (shared — same for every node).
         fs::write(node_dir.join("threshold.pk"), threshold_pk.to_bytes())
@@ -1283,8 +1306,9 @@ json = false
     faucet_key_buf.extend_from_slice(&(faucet_pk_bytes.len() as u32).to_le_bytes());
     faucet_key_buf.extend_from_slice(faucet_pk_bytes);
     faucet_key_buf.extend_from_slice(faucet_sk_bytes);
-    fs::write(out_dir.join("faucet.key"), &faucet_key_buf)
-        .map_err(|e| format!("failed to write faucet.key: {}", e))?;
+    // Audit 344: 0o600 on the faucet's signing key — same shape as
+    // the validator keys above.
+    write_secret_file(&out_dir.join("faucet.key"), &faucet_key_buf)?;
 
     // Print summary
     println!("Testnet generated in {}", out_dir.display());
@@ -2184,5 +2208,43 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    /// Audit 344: write_secret_file tightens the file mode to 0o600
+    /// on Unix. Test creates a tempfile, writes via the helper, then
+    /// asserts the permission bits.
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_sets_0o600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+        write_secret_file(&path, b"sensitive bytes").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        // mode includes the file-type bits in the high nibble; mask
+        // to the permission bits and assert exactly 0o600 (rw-------).
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "audit 344: secret file must be 0o600, got 0o{:o}",
+            mode & 0o777
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_overwrites_with_0o600() {
+        // If a file already exists with permissive bits (0o644, the
+        // default umask shape), the second write must STILL tighten
+        // to 0o600. Catches the "writes new content but doesn't
+        // refresh permissions on existing file" hazard.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+        std::fs::write(&path, b"initial").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_secret_file(&path, b"updated").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

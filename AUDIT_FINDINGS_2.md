@@ -560,11 +560,18 @@
       7, 7331, 31337, 1M] and 5 mismatch shapes (config↔genesis
       pairs operators commonly mishandle: forgotten regen,
       forged genesis, etc.).
-- [ ] 344 — `⚠` **`pyde testnet` writes keys with default umask.**
-      `crates/node/src/genesis.rs:1018,1024,1028,1032,1036,1144,1145,
-      1148,1286,1287`. Add `fs::set_permissions(0o600)` after every
-      key-file write. Have `load_validator_identity` tighten or
-      `warn!` on existing-file load if mode > 0o600.
+- [x] 344 — `✓` **`pyde testnet` writes keys with default umask.**
+      Shipped: new `write_secret_file(path, bytes)` helper at the
+      top of `genesis.rs` writes the file then tightens to `0o600`
+      on Unix. Used at every secret-bearing site:
+      `validator.key`, `node.key`, `threshold.share`, and
+      `faucet.key`. Non-secret files (`threshold.pk`,
+      `genesis.toml`, `config.toml`) keep default umask. 2 new
+      tests on the helper — fresh-file write + overwriting an
+      existing 0o644 file (catches the "tighten only on first
+      write" hazard). Combined with audit 221's encrypted-keystore
+      path, secret-bearing files now ship at 0o600 from the
+      moment a coordinator runs `pyde testnet`.
 - [ ] 345 — `⚠` **Missing `set_max_request_body_size` / batch caps
       on jsonrpsee Server.** `crates/node/src/rpc.rs:1544-1546`.
       Default ~10MB request lets a single connection saturate.
