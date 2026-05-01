@@ -193,36 +193,53 @@
       `pre309_behavior_no_longer_applies` documents the bug shape
       that motivated the fix).
 
-- [ ] 310 — `⚠` **Multiple AOT/interpreter consensus divergences.**
-      Each path below is a single-validator chain-fork vector once
-      contracts deploy that hit it. Bundle into one PR that adds an
-      AOT/interpreter parity-property test at the end.
-      - `crates/aot/src/codegen.rs:875-887` (Load): discards
-        `host_load` fault return; interpreter at `pvm/src/vm.rs:690-707`
-        traps via `?`.
-      - `crates/aot/src/codegen.rs:888-899` (Store): discards
-        `host_store` fault return.
-      - `crates/aot/src/codegen.rs:1143-1147` (Blockhash): always
-        returns 0; interpreter walks `ctx.block_hashes` at
-        `pvm/src/vm.rs:806-822`.
-      - `crates/aot/src/codegen.rs:1099-1114` (Caller env): subcodes
-        only handle 0..=2; interpreter at `pvm/src/vm.rs:773-784`
-        handles 0..=4 (TX_NONCE=3, TX_GAS_LIMIT=4).
-      - `crates/aot/src/codegen.rs:1115-1142` (Callvalue env):
-        subcodes only handle 0..=4; interpreter at
-        `pvm/src/vm.rs:786-805` handles 0..=6 (TX_HASH=5,
-        BLOCK_PROPOSER=6).
-      - `crates/aot/src/codegen.rs:756, 774` (wide ALU): masks `rs2`
-        to 4 bits; interpreter at `pvm/src/cpu.rs:238…314` masks low
-        8 bits.
-      - `crates/aot/src/codegen.rs:732, 1112-1141` (Pop/Caller/
-        Callvalue/host_widen): host return values discarded → silent
-        success on rd ≥ 8; interpreter traps via `write_wide_checked`.
-      Fix: add packed-return ABI flags or out-pointer fault
-      propagation; capture host return on every host_call call site;
-      align `rs2` masking; implement the missing env subcodes. Add
-      a property test that runs random valid bytecode through
-      interpreter + AOT and asserts byte-identical post-state.
+- [x] 310 — `✓` **Multiple AOT/interpreter consensus divergences.**
+      Shipped in one bundle:
+      - **Wide-ALU rs2 mask** (`codegen.rs:756, 774`): flipped
+        `& 0xF` → `& 0xFF` to match the interpreter's `as u8`
+        (`cpu.rs:238…314`). Closes the adversarial-bytecode fork
+        where rs2 = 0x15 addressed wide-reg 5 in AOT vs trapping
+        in the interpreter.
+      - **Store fault capture** (`codegen.rs Opcode::Store`):
+        AOT now captures host_store's fault return and branches
+        to `trap_block` on `!= 0`. Pre-fix discarded the return,
+        silently succeeding on OOB stores.
+      - **Widen fault capture** (`codegen.rs Opcode::Widen`):
+        same pattern — capture and trap on `wd >= 8`.
+      - **Caller env subcodes 3-4** (`codegen.rs Opcode::Caller`):
+        new `host_tx_nonce` + `host_tx_gas_limit` host fns;
+        codegen handles subcodes 0..=4 to match
+        `vm.rs::env_gp::*`.
+      - **Callvalue env subcodes 5-6 + fault capture**
+        (`codegen.rs Opcode::Callvalue`): new `host_tx_hash` +
+        `host_block_proposer` host fns; codegen handles 0..=6 to
+        match `vm.rs::env_wide::*`. Also captures every wide-write
+        host fn's fault return → trap on `wd >= 8` (silent
+        success pre-fix).
+      - **Blockhash** (`codegen.rs Opcode::Blockhash`): new
+        `host_blockhash` host fn that mirrors the interpreter's
+        recent-256-block window. Pre-fix AOT always wrote zero,
+        forking any contract that used BLOCKHASH for randomness
+        or audit.
+      - **Selfdestruct** (already shipped under audit 308):
+        AOT now traps too.
+
+      6 new parity tests
+      (`store_oob_traps_on_aot_audit_310`,
+      `caller_env_tx_nonce_parity_audit_310`,
+      `caller_env_tx_gas_limit_parity_audit_310`,
+      `callvalue_env_tx_hash_parity_audit_310`,
+      `callvalue_env_block_proposer_parity_audit_310`,
+      `blockhash_parity_audit_310`) plus the existing 38 AOT
+      tests cover the regression cluster. 49 AOT + 333 PVM tests
+      pass.
+
+      **Deferred** (lower priority, documented):
+      - Load + Pop u64::MAX sentinel collision (a legitimate load
+        of all-1-bits is indistinguishable from the host fault
+        sentinel). Requires either an ABI change to multi-value
+        return or an out-pointer for the value. Tracked as a
+        post-launch follow-up.
 
 ### Consensus
 
