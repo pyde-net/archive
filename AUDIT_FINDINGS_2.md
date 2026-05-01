@@ -495,12 +495,16 @@
 
 ### Net
 
-- [ ] 333 — `⚠` **Gossipsub `max_transmit_size = 1MB` ≠ Blocks-channel
-      4MB cap.** `crates/net/src/node.rs:120` vs
-      `crates/net/src/channels.rs:113-114`. Encrypted-tx-heavy bundles
-      near 4 MB silently fail publish, dropping the block from
-      non-proposer mempools. Lift `max_transmit_size` to 4MB or
-      shrink the per-channel cap to 1MB.
+- [x] 333 — `✓` **Gossipsub `max_transmit_size = 1MB` ≠ Blocks-channel
+      4MB cap.** Shipped: lifted gossipsub
+      `max_transmit_size` to 4 MB to match the Blocks-channel
+      logical cap (`channels.rs:113-114`,
+      `ddos.rs:150-151`). Pre-fix a proposer publishing a compact
+      block + a heavy `EncryptedTxBundle` near the per-channel
+      ceiling had its publish silently fail at the gossipsub
+      layer. This is one component of the audit P1 #319 burst-
+      test stall — full investigation deferred but this
+      mismatch is closed.
 - [ ] 334 — `⚠` **No peer scoring config.**
       `crates/net/src/node.rs:117-129`. `with_peer_score(...)` is
       never called; `ValidationMode::Permissive`. Misbehaving peers

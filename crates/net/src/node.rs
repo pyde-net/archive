@@ -117,7 +117,18 @@ pub fn create_node(
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(Duration::from_millis(400))
                 .validation_mode(gossipsub::ValidationMode::Permissive)
-                .max_transmit_size(1024 * 1024) // 1 MB max message
+                // Audit 333: match the Blocks-channel logical cap
+                // (4 MB per `crates/net/src/channels.rs` +
+                // `ddos.rs`). Pre-fix this knob was 1 MB, so a
+                // proposer publishing a compact block + a heavy
+                // `EncryptedTxBundle` near the per-channel ceiling
+                // had its publish silently fail at the gossipsub
+                // layer — non-proposer mempools never received the
+                // bundle and the chain stalled on the encrypted-tx
+                // pipeline (see audit P1 #319 for the user-facing
+                // burst-test shape). Lifting to 4 MB closes the
+                // mismatch.
+                .max_transmit_size(4 * 1024 * 1024) // 4 MB max message
                 .mesh_n(8)
                 .mesh_n_low(4)
                 .mesh_n_high(12)
