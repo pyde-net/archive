@@ -101,6 +101,18 @@ impl SharedSecret {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Audit 360: an all-zero placeholder used by `combine_shares`
+    /// when Kyber decapsulation fails on attacker-crafted shares.
+    /// Lets the MAC-verify step still run (with a wrong ss) so the
+    /// caller returns a uniform `"decryption failed"` instead of
+    /// a Kyber-specific error that leaks oracle bits about which
+    /// pipeline stage the malformed shares broke. `pub(crate)`
+    /// because no public API should be constructing zero
+    /// shared-secrets — this is purely a constant-time helper.
+    pub(crate) fn zero_for_constant_time_mac_check() -> Self {
+        Self([0u8; 32])
+    }
 }
 
 fn ek_from_bytes(bytes: &[u8]) -> Result<ml_kem::EncapsulationKey768, &'static str> {

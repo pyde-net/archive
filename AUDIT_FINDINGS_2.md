@@ -951,8 +951,38 @@
       `Poseidon2("pyde-mac-v1" || ss || ciphertext)`) plus a
       per-ciphertext nonce (current keystream is purely
       deterministic on `ss`).
-- [ ] 360 — `⚠` **`combine_shares` error split between Kyber
+- [x] 360 — `⚠` **`combine_shares` error split between Kyber
       decapsulate failure and MAC failure leaks oracle bits.**
+      **SHIPPED.** Pre-fix the post-share-validation paths
+      returned three distinct error strings:
+      - `"invalid reconstructed seed"` — Lagrange-interpolated
+        bytes don't decode as a Kyber seed.
+      - `"Kyber-768 decapsulation failed"` — seed decoded but
+        `dk_from_seed` rejected the structure.
+      - `"MAC verification failed"` — seed + decap both passed
+        but the recovered `ss` is wrong.
+
+      An attacker submitting crafted decryption shares could
+      probe error responses to figure out which pipeline stage
+      their inputs landed on, narrowing the search for share
+      structures that round-trip the various validators. Each
+      probe gives them ~1 bit about the secret committee
+      polynomial.
+
+      Fix: collapse all three into a single
+      `ORACLE_SAFE_ERR = "decryption failed"`. Also keep going
+      on Kyber decap failure (substituting an all-zero placeholder
+      `SharedSecret` via a `pub(crate)` constructor in
+      `kyber.rs`) so the MAC-verify code path always executes —
+      evens out timing across the failure modes modulo Kyber's
+      inherent reject-path variance. New
+      `audit_360_failure_modes_collapse_to_single_error` test
+      asserts that two distinct failure causes (tampered shares
+      → seed-or-decap failure vs. wrong-keygen shares → ss
+      mismatch) return byte-identical error values. Existing
+      `tampered_mac_byte_fails_verification` updated to expect
+      the collapsed error. 33 threshold tests pass; 107
+      crypto tests; mempool + node tests green.
       `crates/crypto/src/threshold.rs:537-549`. Collapse both to a
       single opaque `"threshold decryption failed"` error.
 

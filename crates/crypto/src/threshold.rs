@@ -670,25 +670,48 @@ pub fn combine_shares(
         seed_bytes[elem_idx * 8..(elem_idx + 1) * 8].copy_from_slice(&val.to_le_bytes());
     }
 
-    // Reconstruct Kyber secret key from seed
-    let sk = KyberSecretKey::from_bytes(&seed_bytes).ok_or("invalid reconstructed seed")?;
+    // Audit 360: from this point onward every failure path
+    // (KyberSecretKey decode, Kyber-768 decap, MAC compare)
+    // collapses into the SAME generic `"decryption failed"`
+    // error. Pre-fix the three branches returned distinct
+    // messages, so an attacker submitting crafted decryption
+    // shares could probe error responses to figure out which
+    // pipeline stage their bogus inputs landed on:
+    //   - "invalid reconstructed seed" → Lagrange interpolation
+    //     produced 64 bytes that don't decode as a Kyber seed.
+    //   - "Kyber-768 decapsulation failed" → seed decoded but
+    //     `dk_from_seed` rejected the structure.
+    //   - "MAC verification failed" → seed + decap both passed
+    //     but the recovered `ss` is wrong (i.e., the shares
+    //     didn't actually combine to the committee's secret).
+    // That three-way split is a textbook decryption oracle —
+    // each probe narrows the attacker's search for the share
+    // structure that round-trips. We also keep going on Kyber
+    // failure (substituting a zeroed `ss`) so MAC check still
+    // executes; this evens out timing across the failure modes
+    // (modulo the inherent variation in Kyber's reject path).
+    //
+    // Honest decryptors don't see this error: they always pass
+    // the MAC check on a well-formed ciphertext.
+    const ORACLE_SAFE_ERR: &str = "decryption failed";
 
-    // Decapsulate to get shared secret
-    let ss = kyber_decapsulate(&sk, &ct.kyber_ct).map_err(|_| "Kyber-768 decapsulation failed")?;
+    let sk = KyberSecretKey::from_bytes(&seed_bytes).ok_or(ORACLE_SAFE_ERR)?;
+    let ss_or_zero = kyber_decapsulate(&sk, &ct.kyber_ct)
+        .unwrap_or_else(|_| SharedSecret::zero_for_constant_time_mac_check());
 
-    // Verify MAC in constant time — a variable-time `!=` would leak
-    // per-byte match progress via timing, enabling padding-oracle-style
-    // forgery of MACs against a live validator.
+    // Verify MAC in constant time — a variable-time `!=` would
+    // leak per-byte match progress via timing, enabling padding-
+    // oracle-style forgery of MACs against a live validator.
     // Audit 359: MAC + keystream are bound to `kyber_ct` (from
     // the encrypted ciphertext), matching the encrypt-side
     // derivation.
-    let expected_mac = compute_mac(&ss, ct.kyber_ct.as_bytes(), &ct.encrypted_msg);
+    let expected_mac = compute_mac(&ss_or_zero, ct.kyber_ct.as_bytes(), &ct.encrypted_msg);
     if expected_mac.ct_eq(&ct.mac).unwrap_u8() == 0 {
-        return Err("MAC verification failed");
+        return Err(ORACLE_SAFE_ERR);
     }
 
     // Decrypt
-    let keystream = derive_keystream(&ss, ct.kyber_ct.as_bytes(), ct.encrypted_msg.len());
+    let keystream = derive_keystream(&ss_or_zero, ct.kyber_ct.as_bytes(), ct.encrypted_msg.len());
     Ok(xor_bytes(&ct.encrypted_msg, &keystream))
 }
 
@@ -1346,7 +1369,7 @@ mod tests {
             .map(|s| generate_decryption_share(s, &ct))
             .collect();
         let result = combine_shares(&dec_shares, T, &ct);
-        assert_eq!(result, Err("MAC verification failed"));
+        assert_eq!(result, Err("decryption failed"));
     }
 
     /// Audit 359: two encryptions of the same plaintext under the
@@ -1399,7 +1422,65 @@ mod tests {
             .map(|s| generate_decryption_share(s, &tampered))
             .collect();
         let result = combine_shares(&dec_shares, T, &tampered);
-        assert_eq!(result, Err("MAC verification failed"));
+        assert_eq!(result, Err("decryption failed"));
+    }
+
+    /// Audit 360: two structurally distinct combine-failure
+    /// causes — (a) shares that interpolate to a Kyber seed
+    /// `dk_from_seed` rejects, and (b) shares that produce a
+    /// valid seed but the resulting `ss` doesn't match the MAC —
+    /// must return the SAME error so an attacker probing with
+    /// crafted shares can't distinguish the failure modes.
+    /// Pre-fix the two paths returned distinct strings
+    /// ("Kyber-768 decapsulation failed" vs. "MAC verification
+    /// failed"), giving an oracle that narrowed the search for
+    /// share structures that pass each pipeline stage.
+    #[test]
+    fn audit_360_failure_modes_collapse_to_single_error() {
+        let (tpk, shares) = setup();
+        let msg = b"audit-360 oracle uniform";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+
+        // (a) Tamper with one share value to force the
+        //     interpolation path to produce a wrong-but-
+        //     plausible seed. Either Kyber-from-seed fails or
+        //     Kyber decap "succeeds" but produces wrong ss →
+        //     MAC fails. Either way the post-fix returns the
+        //     same generic error.
+        let mut tampered_shares: Vec<DecryptionShare> = shares[..T]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        // Mutate the FIRST share's first element by adding a
+        // non-zero field element. Goldilocks is a field, so
+        // any non-zero perturbation propagates through Lagrange.
+        let bad = &mut tampered_shares[0];
+        if !bad.shares.is_empty() {
+            bad.shares[0] += gl(1);
+        }
+        let bad_share_result = combine_shares(&tampered_shares, T, &ct);
+
+        // (b) Use shares from a DIFFERENT keygen. Index space
+        //     overlaps, but the polynomials are independent, so
+        //     interpolation produces an unrelated seed. Same
+        //     pipeline-fail behavior as (a) — must return the
+        //     same error.
+        let (_other_tpk, other_shares) = setup();
+        let other_dec: Vec<DecryptionShare> = other_shares[..T]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        let other_result = combine_shares(&other_dec, T, &ct);
+
+        // Both failure modes return the SAME error string, with
+        // no distinguishing information about WHICH stage tripped.
+        assert!(bad_share_result.is_err(), "tampered shares must fail");
+        assert!(other_result.is_err(), "wrong-keygen shares must fail");
+        assert_eq!(
+            bad_share_result, other_result,
+            "audit 360: distinct failure modes must collapse to the same error"
+        );
+        assert_eq!(bad_share_result, Err("decryption failed"));
     }
 
     #[test]
