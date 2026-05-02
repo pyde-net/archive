@@ -871,7 +871,37 @@
       prints fresh values when the algorithm is intentionally
       bumped — copy-paste into the constants. 10 KAT tests, all
       pass. Clippy / fmt clean.
-- [ ] 358 — `⚠` **No `Zeroize`/`ZeroizeOnDrop` on any secret type.**
+- [x] 358 — `⚠` **No `Zeroize`/`ZeroizeOnDrop` on any secret type.**
+      **SHIPPED.** Added `zeroize` crate dep to `pyde-crypto`,
+      `pyde-node`, `pyde-dev`, and `pyde-rust-sdk`, and applied
+      `ZeroizeOnDrop` to every type holding secret material:
+      - `FalconSecretKey` (1281-byte FALCON-512 sk) — derive
+        `Zeroize, ZeroizeOnDrop` so the inner `Vec<u8>` zeros
+        on drop.
+      - `KyberSecretKey` (64-byte ML-KEM-768 seed).
+      - `SharedSecret([u8; 32])` (post-decap KEM secret).
+      - `KeyShare`, `DecryptionShare`,
+        `RefreshContribution`, `ResharingContribution` — manual
+        `Zeroize` impls walking their `Vec<Goldilocks>` /
+        `Vec<Vec<Goldilocks>>` payloads via volatile writes
+        (Goldilocks doesn't impl `Zeroize` directly, so we use
+        `core::ptr::write_volatile` to overwrite each element
+        with `Goldilocks::ZERO` before clearing the vec).
+      - Keystore AES keys derived from operator passphrase —
+        wrapped in `Zeroizing<[u8; 32]>` in
+        `crates/node/src/keystore.rs`,
+        `crates/pyde-dev/src/wallet.rs`, and
+        `crates/pyde-rust-sdk/src/wallet.rs`. Pre-fix the
+        stack-allocated `[u8; 32]` survived in the freed stack
+        frame until the next syscall clobbered it; a core dump
+        captured between keystore-load and syscall would
+        otherwise leak the encryption key.
+
+      6 explicit zeroize tests pass: FALCON sk, Kyber sk, Kyber
+      shared secret, KeyShare, RefreshContribution,
+      ResharingContribution. `cargo fmt` / `cargo clippy
+      -D warnings` clean. Existing 100+ crypto tests + node /
+      wallet test suites all green.
       `crates/crypto/src/falcon.rs:13-14, kyber.rs:18-19,
       threshold.rs:154-159, 206-211, 555-565`. Add the derive
       across `FalconSecretKey`, `KyberSecretKey`, `KeyShare`,

@@ -15,6 +15,13 @@ ml-kem = { version = "0.3.0-rc.0", default-features = false, features = ["getran
 # material without leaking timing side-channels. Default features
 # pull in `std`; we're no_std so turn them off.
 subtle = { version = "2", default-features = false }
+# Audit 358: ZeroizeOnDrop on secret-key / share types so drop()
+# overwrites the bytes with zeros instead of leaving them in
+# deallocated heap pages where a later allocation, swap-to-disk
+# page, or core dump could read them. `default-features = false`
+# keeps no_std compatibility; `derive` enables the proc-macro,
+# `alloc` enables Zeroize for `Vec<u8>` (our SK/share storage).
+zeroize = { version = "1", default-features = false, features = ["alloc", "derive"] }
 
 [[bench]]
 name = "poseidon2_bench"

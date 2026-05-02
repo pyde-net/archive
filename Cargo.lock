@@ -3609,6 +3609,7 @@ dependencies = [
  "p3-poseidon2",
  "p3-symmetric",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -3649,6 +3650,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "zeroize",
 ]
 
 [[package]]
@@ -3715,6 +3717,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -3737,6 +3740,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "zeroize",
 ]
 
 [[package]]

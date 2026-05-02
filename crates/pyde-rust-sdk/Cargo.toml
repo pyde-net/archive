@@ -33,6 +33,9 @@ aes-gcm = "0.10"
 rand = "0.8"
 # Memory-hard KDF for keystore passphrases (audit 306).
 argon2 = "0.5"
+# Audit 358: Zeroize wrapper for the AES key derived from
+# the SDK wallet password.
+zeroize = { version = "1", features = ["alloc"] }
 
 # Error handling
 thiserror = "2"

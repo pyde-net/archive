@@ -34,6 +34,10 @@ aes-gcm = "0.10"
 rand = "0.8"
 # Memory-hard KDF for keystore passphrases (audit 306).
 argon2 = "0.5"
+# Audit 358: Zeroizing<[u8; 32]> for the AES key derived from
+# the wallet password — prevents core-dump / freed-stack
+# disclosure of the encryption key.
+zeroize = { version = "1", features = ["alloc"] }
 pyde-account = { path = "../account" }
 pyde-tx = { path = "../tx" }
 

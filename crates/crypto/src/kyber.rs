@@ -4,6 +4,7 @@ use ml_kem::{
     kem::{Encapsulate, Kem, KeyExport},
     Decapsulate, MlKem768, Seed,
 };
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 // ML-KEM-768 sizes
 const EK_SIZE: usize = 1184; // encapsulation key
@@ -15,7 +16,13 @@ const SEED_SIZE: usize = 64; // decapsulation key seed
 pub struct KyberPublicKey(Vec<u8>);
 
 /// Kyber-768 (ML-KEM-768) secret key (decapsulation seed, 64 bytes).
-#[derive(Clone)]
+///
+/// Audit 358: `ZeroizeOnDrop` overwrites the seed when the
+/// value drops so the deallocated heap page can't be read by a
+/// later allocation, swap, or core dump. Holds the entire
+/// reconstructable secret — anyone with the seed can decapsulate
+/// every ciphertext addressed to this key.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct KyberSecretKey(Vec<u8>);
 
 /// Kyber-768 ciphertext (1088 bytes).
@@ -23,7 +30,11 @@ pub struct KyberSecretKey(Vec<u8>);
 pub struct KyberCiphertext(Vec<u8>);
 
 /// 32-byte shared secret from Kyber KEM.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Audit 358: `ZeroizeOnDrop`. The shared secret is the actual
+/// payload of any KEM exchange — leaking it post-use is as bad
+/// as leaking the long-term secret key for that one session.
+#[derive(Clone, Debug, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct SharedSecret([u8; 32]);
 
 impl KyberPublicKey {
@@ -203,6 +214,32 @@ mod tests {
         let bytes = sk.to_vec();
         let sk2 = KyberSecretKey::from_bytes(&bytes).unwrap();
         assert_eq!(sk.as_bytes(), sk2.as_bytes());
+    }
+
+    /// Audit 358: ZeroizeOnDrop on Kyber secret types.
+    #[test]
+    fn kyber_secret_key_zeroizes() {
+        use zeroize::Zeroize;
+        let (_pk, mut sk) = kyber_keygen().unwrap();
+        assert!(sk.as_bytes().iter().any(|b| *b != 0));
+        sk.zeroize();
+        assert!(
+            sk.as_bytes().is_empty() || sk.as_bytes().iter().all(|b| *b == 0),
+            "Kyber sk not zeroized"
+        );
+    }
+
+    #[test]
+    fn shared_secret_zeroizes() {
+        use zeroize::Zeroize;
+        let (pk, _sk) = kyber_keygen().unwrap();
+        let (_ct, mut ss) = kyber_encapsulate(&pk).unwrap();
+        assert!(ss.as_bytes().iter().any(|b| *b != 0));
+        ss.zeroize();
+        assert!(
+            ss.as_bytes().iter().all(|b| *b == 0),
+            "Kyber shared secret not zeroized"
+        );
     }
 
     #[test]

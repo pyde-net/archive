@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 
 use falcon::{DomainSeparation, FnDsaKeyPair, FnDsaSignature as FnDsaSig};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// FALCON-512 (FN-DSA-512) log-degree parameter.
 const LOGN: u32 = 9;
@@ -10,7 +11,15 @@ const LOGN: u32 = 9;
 pub struct FalconPublicKey(Vec<u8>);
 
 /// FALCON-512 secret key (1281 bytes).
-#[derive(Clone)]
+///
+/// Audit 358: `ZeroizeOnDrop` overwrites the inner `Vec<u8>`
+/// bytes with zeros when the value drops, instead of letting
+/// the allocator's free leave the secret bits in deallocated
+/// heap pages where a later allocation, swap-to-disk page, or
+/// core dump could read them. `Clone` is preserved (the
+/// existing wallet/keystore paths clone validator keys); each
+/// clone is independently zeroized on its own drop.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct FalconSecretKey(Vec<u8>);
 
 /// FALCON-512 signature (~666 bytes average).
@@ -261,5 +270,28 @@ mod tests {
         let msg = vec![0xABu8; 10_000];
         let sig = falcon_sign(&sk, &msg).unwrap();
         assert!(falcon_verify(&pk, &msg, &sig));
+    }
+
+    /// Audit 358: `Zeroize::zeroize()` must overwrite the inner
+    /// secret-key bytes with zeros. We can't reliably test
+    /// `Drop`-time zeroization across allocator pools (the
+    /// freed bytes may already be reused), but we CAN call
+    /// `zeroize()` explicitly and inspect the visible state.
+    #[test]
+    fn falcon_secret_key_zeroizes() {
+        use zeroize::Zeroize;
+        let (_pk, mut sk) = falcon_keygen().unwrap();
+        // Sanity: pre-zeroize, the sk bytes are NOT all-zero
+        // (FALCON-512 sk has ~1281 bytes of structured data).
+        assert!(sk.as_bytes().iter().any(|b| *b != 0));
+        sk.zeroize();
+        // After zeroize, every visible byte must be 0 (or the
+        // length must be 0 — Zeroize for Vec<u8> truncates to
+        // length 0 and overwrites the now-unused bytes).
+        assert!(
+            sk.as_bytes().is_empty() || sk.as_bytes().iter().all(|b| *b == 0),
+            "FALCON sk not zeroized: {} bytes of non-zero left",
+            sk.as_bytes().iter().filter(|b| **b != 0).count()
+        );
     }
 }

@@ -67,6 +67,13 @@ rand = "0.8"
 # is used in pyde-rust-sdk + pyde-dev so all three keystore
 # implementations share compatible parameters.
 argon2 = "0.5"
+# Audit 358: `Zeroizing<[u8; 32]>` wrapper for the AES key
+# derived from the operator passphrase. Without this the
+# stack-allocated key would survive in the freed stack frame
+# until the next function call clobbers it; a process core
+# dump captured between keystore-load and the next syscall
+# would leak the encryption key.
+zeroize = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "blocking"] }
