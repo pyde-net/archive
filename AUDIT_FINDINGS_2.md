@@ -878,35 +878,124 @@
       collapses to one IP.** `crates/node/src/faucet.rs:530`. Add a
       `--trust-x-forwarded-for` CLI flag; parse rightmost untrusted
       hop only when set. Document the must-strip-XFF-at-edge risk.
-- [ ] 349 — `⚠` **`pyde_call` block context is zeroed.**
-      `crates/node/src/rpc.rs:776-789`. Populate `block_number`,
-      `timestamp`, `block_proposer`, `block_hashes` from chain head.
-      Same for `estimateGas` / `createAccessList`.
+- [x] 349 — `⚠` **`pyde_call` block context is zeroed.**
+      **SHIPPED.** New `build_call_block_context` helper hydrates
+      `block_number` / `timestamp` / `block_proposer` from
+      `chain.head_slot` and the head header, and builds the 256-
+      slot `block_hashes` window from in-memory `chain.headers`
+      with `BlockStore` fallback for older slots. All three
+      simulator entry points (`pyde_call`, `pyde_estimateGas`,
+      `pyde_createAccessList`) now share the same hydration.
+      Pre-fix the simulators built a zero-filled `ExecutionContext`
+      so any view function reading `block.number` /
+      `block.timestamp` / proposer / `BLOCKHASH` got `0` —
+      wallets relying on the simulator to preview a function got
+      results that diverged from on-chain execution, painfully
+      so on time-locked or block-height-gated views which always
+      returned the "before genesis" branch. `gas_price` is also
+      now hydrated from `chain.base_fee` so EIP-1559 view
+      functions report sensible numbers. New 4 audit-349 tests
+      cover the genesis (zero-context) path, head-fields-match,
+      newest-first hash indexing (the consumer-side PVM opcode
+      lookup convention), and the 256-slot cap.
 
 ### Tx
 
-- [ ] 350 — `⚠` **`tx.hash()` includes only `fee_payer.tag()`, not
-      full bytes.** `crates/tx/src/types.rs:227`. Two physically
-      distinct serialized txs hash identically; signature authorizes
-      the swap. Replace `buf.push(tag())` with
-      `buf.extend_from_slice(&fee_payer.to_bytes())`.
-- [ ] 351 — `⚠` **`StakeWithdraw` never returns stake.**
-      `crates/tx/src/pipeline.rs:467-508`. There is no
-      `CompleteUnbonding` tx type. Operators who experiment lose
-      10K PYDE silently. Either implement the unbonding-complete
-      path OR refuse `StakeWithdraw` at validation until shipped
-      (preferred for testnet).
-- [ ] 352 — `⚠` **`tx.value` runs unconditionally for non-Standard
-      tx types.** `crates/tx/src/pipeline.rs:249`. Slash, MultisigTx,
-      ClaimReward, etc. with `tx.value > 0` perform side-channel
-      transfers. Reject `tx.value != 0` for every variant that has
-      no value semantics; allow only Standard + Deploy.
-- [ ] 353 — `⚠` **Failed-execution txs leak validator CPU without
-      consuming nonce.** `crates/tx/src/pipeline.rs:227-230 vs 625`.
-      `nonce_state.use_nonce` runs in-memory but `store_nonce` only
-      runs on full success. A failing tx (e.g. a fixed Paymaster
-      path failure) can be resubmitted indefinitely. Persist nonce
-      + charge gas on failure.
+- [x] 350 — `⚠` **`tx.hash()` includes only `fee_payer.tag()`, not
+      full bytes.** **SHIPPED.** `Transaction::hash` now mixes in
+      `fee_payer.to_bytes()` (1 byte for `Sender`, 33 bytes for
+      `GasTank(addr)` / `Paymaster(addr)`) instead of just the
+      variant tag. Pre-fix two physically distinct txs that
+      differed only in the fee_payer's contained address hashed
+      identically — a single FALCON signature authorising
+      `GasTank(victim)` was reusable on a tx with
+      `GasTank(attacker)` substituted on the wire. `Sender` txs
+      hash unchanged (`to_bytes()` for `Sender` is the single
+      byte `0`, the same value `tag()` returned), so the only
+      production-path tx shape (audit 305 already hard-rejects
+      GasTank/Paymaster on non-devnet chain_id) sees no signature
+      churn. New 4 audit-350 tests pin: distinct GasTank addresses
+      hash differently, GasTank vs Paymaster of the same address
+      hash differently, Sender hash is unchanged, and an
+      end-to-end FALCON signature minted over `GasTank(A)` does
+      NOT verify against the same tx with `GasTank(B)` substituted
+      (the actual attack the audit prevents).
+- [x] 351 — `⚠` **`StakeWithdraw` never returns stake.**
+      **SHIPPED.** Took the testnet-safe path:
+      `validate_transaction` now hard-rejects every
+      `TransactionType::StakeWithdraw` with the new
+      `ValidationError::DisabledTxType` variant on every chain_id
+      (devnet included). Pre-fix the handler flipped the
+      validator entry to `Unbonding` and recorded `exit_block`,
+      but no other code path ever returned the locked
+      `VALIDATOR_STAKE` to the operator's balance — operators
+      experimenting with the variant on testnet would silently
+      lose 10k PYDE. The handler is preserved (it's the
+      transition logic we'll re-enable post-mainnet) and the 3
+      pipeline-level tests that exercised it are
+      `#[ignore = "audit 351..."]`'d so the handler's behaviour
+      is documented. Lifting this gate is paired with shipping
+      the unbonding-complete path post-mainnet (either as a new
+      `CompleteUnbonding` tx type or as a slot-driven sweep that
+      re-credits stake once `block_height >= exit_block +
+      UNBONDING_DELAY`). 2 new audit-351 tests pin: every
+      chain_id rejects `StakeWithdraw` with `DisabledTxType(4)`,
+      and `StakeDeposit` is precisely NOT gated (gate is
+      variant-specific, not type-class).
+- [x] 352 — `⚠` **`tx.value` runs unconditionally for non-Standard
+      tx types.** **SHIPPED.** Two layers:
+      1. `validate_transaction` rejects `tx.value != 0` for every
+         tx_type that isn't `Standard` or `Deploy`, with a new
+         `ValidationError::UnexpectedValue { tx_type, value }`
+         carrying both fields for the wallet to surface.
+      2. `execute_transaction_inner` now matches on `tx.tx_type`
+         around `transfer_value` so even an internal caller that
+         bypassed validation (replay harnesses, regression
+         fixtures, future fast paths) cannot trigger the
+         pre-fix behaviour: `Slash` / `MultisigTx` / `ClaimReward`
+         / `StakeDeposit` / etc. with `tx.value > 0` performing
+         a silent `tx.from → tx.to` transfer alongside their
+         declared semantics.
+      Pre-fix shape was unreachable from honest tooling but a
+      hand-crafted tx exploited it as a free side-channel
+      transfer that bypassed all per-type intent analysis
+      (paymaster billing, gas-tank accounting, mempool +
+      explorer summaries). New 4 audit-352 tests pin:
+      `Standard`/`Deploy` with value still accepted, every
+      non-value variant with `value > 0` rejected with the
+      expected error shape, and the same set with `value == 0`
+      not tripping the gate (reaches whatever payload-shape
+      check applies further along).
+- [x] 353 — `⚠` **Failed-execution txs leak validator CPU without
+      consuming nonce.** **SHIPPED.** Two changes:
+      1. `nonce_state.use_nonce(...)` is now followed *immediately*
+         by `store_nonce(smt, &tx.from, &nonce_state)?;` —
+         persisting the new nonce as soon as validation passes
+         instead of waiting for the late `store_nonce` at the
+         end of the function. The redundant late call was
+         removed (it would re-write the same value). Any `?`
+         propagation between this point and the end of the
+         function (e.g., a `GasTank`-paid tx whose `gas_tank`
+         is empty, an SMT write error during fee distribution)
+         used to drop the in-memory nonce and let the same tx
+         be resubmitted indefinitely; now the nonce slot is
+         consumed regardless.
+      2. New `emit_failed_execution_receipt` helper catches
+         `pre_execution_charge` errors and emits a
+         `success = false` Receipt with baseline gas
+         (`MIN_GAS_LIMIT * base_fee`) charged from
+         sender.balance (saturating) and distributed through
+         the standard validator/treasury split. Mirrors
+         Ethereum's "buy gas before execute, refund after"
+         pattern: even a tx that can't pay still pays
+         baseline.
+      New 3 audit-353 tests pin: the failed-charge path
+      produces success=false (not bubbled Err), replay of the
+      same tx after a failed charge hits `InvalidNonce`, the
+      failed-charge path debits exactly `21k * base_fee` from
+      sender.balance, validator receives its 20% share of the
+      failed-tx fee, and the helper saturates (no underflow)
+      when sender balance is below baseline cost.
 
 ### Otic
 

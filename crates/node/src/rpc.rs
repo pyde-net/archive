@@ -772,19 +772,33 @@ impl PydeApiServer for RpcServer {
         let code_snapshot = state_r.snapshot_reader();
         drop(state_r); // release tokio lock — snapshot is self-contained
 
+        // Audit 349: hydrate block-context from the chain head so
+        // view functions reading block.number / block.timestamp /
+        // block.proposer / BLOCKHASH return live data instead of
+        // zeros. Read the chain lock briefly here; the snapshot
+        // copy means no lock is held during PVM execution.
+        let (block_number, timestamp, block_proposer, block_hashes) = {
+            let chain_r = self.state.chain.read().await;
+            build_call_block_context(&chain_r, &self.state.block_store)
+        };
+        let base_fee = {
+            let chain_r = self.state.chain.read().await;
+            chain_r.base_fee
+        };
+
         // Run PVM directly — no validation, no nonce/balance checks
         let ctx = pyde_vm::vm::ExecutionContext {
             caller: from,
             self_address: to,
             call_value: ethnum::U256::ZERO,
-            block_number: 0,
-            timestamp: 0,
-            gas_price: ethnum::U256::ZERO,
+            block_number,
+            timestamp,
+            gas_price: ethnum::U256::from(base_fee),
             tx_nonce: 0,
             tx_gas_limit: gas_limit,
             tx_hash: ethnum::U256::ZERO,
-            block_proposer: [0u8; 32],
-            block_hashes: vec![],
+            block_proposer,
+            block_hashes,
             balances: std::collections::HashMap::new(),
         };
 
@@ -870,18 +884,32 @@ impl PydeApiServer for RpcServer {
         let storage_snapshot = state_r.snapshot_reader();
         drop(state_r);
 
+        // Audit 349: same block-context hydration as `pyde_call`.
+        // estimateGas runs the same simulator path so divergent
+        // block context produces divergent gas estimates for any
+        // view function that reads block.number / timestamp /
+        // proposer / BLOCKHASH.
+        let (block_number, timestamp, block_proposer, block_hashes) = {
+            let chain_r = self.state.chain.read().await;
+            build_call_block_context(&chain_r, &self.state.block_store)
+        };
+        let base_fee = {
+            let chain_r = self.state.chain.read().await;
+            chain_r.base_fee
+        };
+
         let ctx = pyde_vm::vm::ExecutionContext {
             caller: from,
             self_address: to,
             call_value: ethnum::U256::ZERO,
-            block_number: 0,
-            timestamp: 0,
-            gas_price: ethnum::U256::ZERO,
+            block_number,
+            timestamp,
+            gas_price: ethnum::U256::from(base_fee),
             tx_nonce: 0,
             tx_gas_limit: gas_limit,
             tx_hash: ethnum::U256::ZERO,
-            block_proposer: [0u8; 32],
-            block_hashes: vec![],
+            block_proposer,
+            block_hashes,
             balances: std::collections::HashMap::new(),
         };
 
@@ -975,18 +1003,34 @@ impl PydeApiServer for RpcServer {
         let storage_snapshot = state_r.snapshot_reader();
         drop(state_r);
 
+        // Audit 349: same block-context hydration. createAccessList
+        // simulates the call to discover the touched storage keys;
+        // a contract that branches on block.number / timestamp /
+        // BLOCKHASH would otherwise produce a wrong access list
+        // (under-listing slots that the live tx will actually
+        // touch — strict-mode access lists then trap on those
+        // unlisted SLOAD/SSTOREs at execution time).
+        let (block_number, timestamp, block_proposer, block_hashes) = {
+            let chain_r = self.state.chain.read().await;
+            build_call_block_context(&chain_r, &self.state.block_store)
+        };
+        let base_fee = {
+            let chain_r = self.state.chain.read().await;
+            chain_r.base_fee
+        };
+
         let ctx = pyde_vm::vm::ExecutionContext {
             caller: from,
             self_address: to,
             call_value: ethnum::U256::from(value),
-            block_number: 0,
-            timestamp: 0,
-            gas_price: ethnum::U256::ZERO,
+            block_number,
+            timestamp,
+            gas_price: ethnum::U256::from(base_fee),
             tx_nonce: 0,
             tx_gas_limit: gas_limit,
             tx_hash: ethnum::U256::ZERO,
-            block_proposer: [0u8; 32],
-            block_hashes: vec![],
+            block_proposer,
+            block_hashes,
             balances: std::collections::HashMap::new(),
         };
 
@@ -1701,6 +1745,73 @@ fn clamp_call_gas(supplied: Option<u64>) -> u64 {
     }
 }
 
+/// Audit 349: assemble block-context fields for the RPC simulator
+/// path (`pyde_call` / `pyde_estimateGas` / `pyde_createAccessList`)
+/// from the live chain head. Pre-fix the simulators constructed a
+/// zero-filled `ExecutionContext` so any view function that read
+/// `block.number` / `block.timestamp` / the proposer address / a
+/// recent block hash got `0`. Wallets relying on the simulator to
+/// preview a function got results that diverged from on-chain
+/// execution — most painfully on time-locked or block-height-gated
+/// view functions, which always returned the "before genesis"
+/// branch.
+///
+/// We treat the simulator as executing AT the current head:
+///   * `block_number` = `head_slot`
+///   * `timestamp` = head header timestamp
+///   * `block_proposer` = head header proposer
+/// Recent block hashes for the `BLOCKHASH` opcode are loaded from
+/// the in-memory header cache (current + previous epoch) plus the
+/// persistent `BlockStore` for older slots, indexed so that
+/// `block_hashes[0]` is the most recent prior block (`head - 1`).
+/// The PVM clamps lookups to 256 blocks so we cap the vec at that.
+///
+/// At genesis (no blocks processed yet) the helper returns
+/// `(0, 0, [0; 32], vec![])` — semantically the same as pre-fix,
+/// but only at genesis where there's no head to read from.
+fn build_call_block_context(
+    chain: &crate::chain::ChainState,
+    block_store: &crate::block_store::BlockStore,
+) -> (u64, u64, [u8; 32], Vec<ethnum::U256>) {
+    if chain.is_genesis() {
+        return (0, 0, [0u8; 32], Vec::new());
+    }
+    let head_slot = chain.head_slot;
+    let (timestamp, proposer) = match chain.header(head_slot) {
+        Some(h) => (h.timestamp, h.proposer),
+        // Defensive fallback: head_slot was advanced but header
+        // hasn't landed yet (only possible during a brief window
+        // inside `advance`; ChainState writes are atomic from
+        // outside but in-process readers might race). Fall back
+        // to the persistent store.
+        None => match block_store.get_header(head_slot) {
+            Some(h) => (h.timestamp, h.proposer),
+            None => (0, [0u8; 32]),
+        },
+    };
+
+    // Build BLOCKHASH window: index 0 = head-1, index 1 = head-2,
+    // ... up to 256 entries. Skip slots we can't resolve (genesis,
+    // pruned, missing) by leaving them as zero — matches the PVM's
+    // "unknown → 0" convention on the dispatch side.
+    const BLOCKHASH_WINDOW: u64 = 256;
+    let mut block_hashes = Vec::with_capacity(BLOCKHASH_WINDOW as usize);
+    if head_slot > 0 {
+        let n = head_slot.min(BLOCKHASH_WINDOW);
+        for i in 1..=n {
+            let slot = head_slot - i;
+            let hash_bytes = chain
+                .header(slot)
+                .map(|h| h.hash())
+                .or_else(|| block_store.get_header(slot).map(|h| h.hash()))
+                .unwrap_or([0u8; 32]);
+            block_hashes.push(ethnum::U256::from_le_bytes(hash_bytes));
+        }
+    }
+
+    (head_slot, timestamp, proposer, block_hashes)
+}
+
 /// Resolve a caller-supplied `chainId` against the node's running
 /// chain_id. None → the node's chain_id (sane default for omitted
 /// fields). Some(v) where v == node.chain_id → accepted. Some(v)
@@ -2263,5 +2374,121 @@ mod tests {
         let json = receipt_to_json(&receipt);
         assert_eq!(json["success"], true);
         assert_eq!(json["gasUsed"], "0x5208");
+    }
+
+    // ========== Audit 349: build_call_block_context hydrates from chain head ==========
+
+    fn dummy_header_with(
+        slot: u64,
+        timestamp: u64,
+        proposer: pyde_account::address::Address,
+    ) -> pyde_consensus::block::BlockHeader {
+        pyde_consensus::block::BlockHeader {
+            slot,
+            epoch: 0,
+            parent_hash: [0u8; 32],
+            proposer,
+            vrf_proof: vec![0xAA; 50],
+            qc_previous: pyde_consensus::block::QuorumCert::empty(),
+            tx_root: [slot as u8; 32],
+            state_root: [slot as u8; 32],
+            timestamp,
+        }
+    }
+
+    /// At genesis (no headers landed yet) the helper returns
+    /// zero-defaults — semantically the same as pre-fix, but
+    /// scoped to the actual genesis case where there's no head
+    /// to read from.
+    #[test]
+    fn audit_349_genesis_returns_zero_context() {
+        let chain = crate::chain::ChainState::genesis([0xAA; 32], 7331);
+        let dir = tempfile::tempdir().unwrap();
+        let block_store = crate::block_store::BlockStore::open(dir.path()).unwrap();
+
+        let (block_number, timestamp, proposer, hashes) =
+            build_call_block_context(&chain, &block_store);
+
+        assert_eq!(block_number, 0);
+        assert_eq!(timestamp, 0);
+        assert_eq!(proposer, [0u8; 32]);
+        assert!(hashes.is_empty());
+    }
+
+    /// After advancing the head, `block_number`, `timestamp`, and
+    /// `block_proposer` come straight from the head header.
+    #[test]
+    fn audit_349_head_fields_match_chain_head() {
+        let mut chain = crate::chain::ChainState::genesis([0u8; 32], 7331);
+        let dir = tempfile::tempdir().unwrap();
+        let block_store = crate::block_store::BlockStore::open(dir.path()).unwrap();
+
+        let head_proposer = [0xCC; 32];
+        let head_timestamp = 1_715_000_000_000;
+        let head_slot = 42;
+        chain.advance(dummy_header_with(head_slot, head_timestamp, head_proposer));
+
+        let (block_number, timestamp, proposer, _) = build_call_block_context(&chain, &block_store);
+        assert_eq!(block_number, head_slot);
+        assert_eq!(timestamp, head_timestamp);
+        assert_eq!(proposer, head_proposer);
+    }
+
+    /// `block_hashes` is filled in newest-first order so
+    /// `block_hashes[0]` is the hash of `head - 1`. The PVM's
+    /// `BLOCKHASH` opcode at line ~810 of `crates/pvm/src/vm.rs`
+    /// indexes via `idx = current - height - 1`, so the producer
+    /// (this helper) must agree with the consumer (the PVM).
+    #[test]
+    fn audit_349_block_hashes_indexed_newest_first() {
+        let mut chain = crate::chain::ChainState::genesis([0u8; 32], 7331);
+        let dir = tempfile::tempdir().unwrap();
+        let block_store = crate::block_store::BlockStore::open(dir.path()).unwrap();
+
+        // Advance through slots 1..=5 with distinct timestamps so
+        // each header.hash() differs.
+        let mut slot_hashes: std::collections::HashMap<u64, [u8; 32]> =
+            std::collections::HashMap::new();
+        for slot in 1..=5u64 {
+            let h = dummy_header_with(slot, slot * 1000, [(slot * 17) as u8; 32]);
+            slot_hashes.insert(slot, h.hash());
+            chain.advance(h);
+        }
+
+        let (head_slot, _, _, hashes) = build_call_block_context(&chain, &block_store);
+        assert_eq!(head_slot, 5);
+
+        // Window has 5 entries: head-1=4, head-2=3, head-3=2,
+        // head-4=1, head-5=0 (genesis — no header, so zero).
+        assert_eq!(hashes.len(), 5);
+
+        let expect = |slot: u64| ethnum::U256::from_le_bytes(*slot_hashes.get(&slot).unwrap());
+        assert_eq!(hashes[0], expect(4), "block_hashes[0] must be hash(head-1)");
+        assert_eq!(hashes[1], expect(3));
+        assert_eq!(hashes[2], expect(2));
+        assert_eq!(hashes[3], expect(1));
+        assert_eq!(
+            hashes[4],
+            ethnum::U256::ZERO,
+            "slot 0 (genesis, no header recorded) → zero",
+        );
+    }
+
+    /// The window is capped at 256 — past that, older block
+    /// hashes are not surfaced (and the PVM's BLOCKHASH opcode
+    /// rejects them anyway).
+    #[test]
+    fn audit_349_block_hashes_capped_at_256() {
+        let mut chain = crate::chain::ChainState::genesis([0u8; 32], 7331);
+        let dir = tempfile::tempdir().unwrap();
+        let block_store = crate::block_store::BlockStore::open(dir.path()).unwrap();
+
+        // Advance past 256 to confirm the cap fires.
+        for slot in 1..=300u64 {
+            chain.advance(dummy_header_with(slot, slot * 1000, [slot as u8; 32]));
+        }
+
+        let (_, _, _, hashes) = build_call_block_context(&chain, &block_store);
+        assert_eq!(hashes.len(), 256, "BLOCKHASH window must cap at 256");
     }
 }

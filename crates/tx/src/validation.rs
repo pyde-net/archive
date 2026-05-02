@@ -83,6 +83,29 @@ pub enum ValidationError {
     WrongChainId { expected: u64, got: u64 },
     /// Paymaster address is invalid (zero address).
     InvalidPaymaster,
+    /// `tx.value != 0` on a tx_type that has no value semantics
+    /// (audit 352). Only `Standard` and `Deploy` carry a value
+    /// transfer; every other variant (Slash, MultisigTx,
+    /// ClaimReward, StakeDeposit, ...) used to silently move
+    /// `tx.value` quanta from `tx.from` to `tx.to` because
+    /// `transfer_value` ran before the per-type dispatch in
+    /// `execute_transaction_inner`. The handlers had no idea this
+    /// transfer happened, so a Slash tx with `value = 1_000` would
+    /// move 1k PYDE to the offender's address (or anyone else)
+    /// alongside the slashing logic — a side-channel transfer the
+    /// declared tx type implies nothing about. Now rejected at
+    /// validation so the malformed tx never reaches the pipeline.
+    UnexpectedValue { tx_type: u8, value: u128 },
+    /// `tx.tx_type` is currently disabled at the protocol level
+    /// (audit 351). `StakeWithdraw` flips a validator entry to
+    /// `Unbonding` but there is no `CompleteUnbonding` tx type —
+    /// the locked stake is never returned to the operator's
+    /// balance. Operators experimenting with the variant lose
+    /// `VALIDATOR_STAKE` PYDE silently. Pre-mainnet path is to
+    /// hard-reject the variant at validation; post-mainnet we
+    /// implement `CompleteUnbonding` (or fold the stake-return
+    /// logic into a slot-driven sweep) and lift this gate.
+    DisabledTxType(u8),
 }
 
 /// Validate a transaction against the sender's account and block context.
@@ -161,6 +184,54 @@ pub fn validate_transaction(
                 return Err(ValidationError::InvalidPaymaster);
             }
         }
+    }
+
+    // 1.8 Audit 352 — only `Standard` and `Deploy` carry value
+    // semantics. Pre-fix `execute_transaction_inner` ran
+    // `transfer_value(sender, recipient, tx.value)` before the
+    // per-type dispatch, so a Slash / MultisigTx / ClaimReward /
+    // StakeDeposit / etc. with `tx.value > 0` performed an
+    // undeclared `tx.from → tx.to` transfer alongside its
+    // declared semantics. The shape was unreachable from honest
+    // tooling but a hand-crafted tx exploited it as a free
+    // side-channel transfer that bypassed all per-type intent
+    // analysis (paymaster billing, gas-tank accounting,
+    // mempool / explorer summaries, etc.).
+    //
+    // Reject the malformed input at the earliest gate so the
+    // pipeline only ever sees value-bearing txs of types that
+    // know what to do with `tx.value`. `RegisterPubkey` is
+    // already rejected in its dedicated path (`tx.value == 0` is
+    // a hard precondition).
+    match tx.tx_type {
+        crate::types::TransactionType::Standard | crate::types::TransactionType::Deploy => {}
+        _ => {
+            if tx.value != 0 {
+                return Err(ValidationError::UnexpectedValue {
+                    tx_type: tx.tx_type as u8,
+                    value: tx.value,
+                });
+            }
+        }
+    }
+
+    // 1.9 Audit 351 — `StakeWithdraw` is disabled at the protocol
+    // level until `CompleteUnbonding` ships. The `StakeWithdraw`
+    // handler in `execute_transaction_inner` flips the validator
+    // entry to `Unbonding` and records `exit_block`, but no other
+    // code path ever returns the locked `VALIDATOR_STAKE` to the
+    // operator's balance. Operators who experiment with the
+    // variant on testnet would silently lose 10k PYDE — exactly
+    // the kind of footgun that erodes trust in the chain.
+    //
+    // Hard-reject at validation (the earliest gate) so the tx
+    // can't enter the mempool and can't land in a block. Lifting
+    // this gate is paired with shipping the unbonding-complete
+    // path post-mainnet (either as a new tx type or as a
+    // slot-driven sweep that re-credits stake once
+    // `block_height >= exit_block + UNBONDING_DELAY`).
+    if matches!(tx.tx_type, crate::types::TransactionType::StakeWithdraw) {
+        return Err(ValidationError::DisabledTxType(tx.tx_type as u8));
     }
 
     // 2. Signature. Skipping is allowed only when the caller explicitly
@@ -1039,5 +1110,158 @@ mod tests {
         };
         let err = validate_transaction(&tx, &account, &nonce_state, &ctx).unwrap_err();
         assert!(matches!(err, ValidationError::InvalidSignature));
+    }
+
+    // ========== Audit 352: tx.value rejected on non-Standard/Deploy types ==========
+
+    /// `Standard` is the only happy-path that carries value
+    /// semantics for the simple-transfer / contract-call shape; it
+    /// must continue to accept `tx.value > 0`.
+    #[test]
+    fn audit_352_standard_with_value_accepted() {
+        let (tx, account, nonce_state) = make_valid_tx_and_account();
+        assert_eq!(tx.tx_type, TransactionType::Standard);
+        assert!(tx.value > 0, "fixture has nonzero value");
+        let ctx = default_ctx();
+        validate_transaction(&tx, &account, &nonce_state, &ctx)
+            .expect("Standard with value must remain valid");
+    }
+
+    /// `Deploy` is the only other variant that carries value
+    /// semantics (CREATE-with-value).
+    #[test]
+    fn audit_352_deploy_with_value_accepted() {
+        let (mut tx, account, nonce_state) = make_valid_tx_and_account();
+        tx.tx_type = TransactionType::Deploy;
+        tx.to = ZERO_ADDRESS;
+        tx.value = 5_000;
+        let ctx = default_ctx();
+        validate_transaction(&tx, &account, &nonce_state, &ctx)
+            .expect("Deploy with value must remain valid");
+    }
+
+    /// Every non-Standard / non-Deploy variant with `tx.value > 0`
+    /// must be rejected. Pre-fix `transfer_value` ran
+    /// unconditionally before the per-type dispatch so a Slash tx
+    /// with `value = 1_000` quietly transferred 1k PYDE alongside
+    /// the slashing semantics — a side-channel transfer the
+    /// declared tx_type implied nothing about.
+    #[test]
+    fn audit_352_non_value_types_with_value_rejected() {
+        // Skip RegisterPubkey: it has its own pre-existing
+        // value-must-be-zero check inside `validate_register_pubkey`
+        // (returns `InvalidPaymaster` when `tx.value != 0`, see
+        // line ~223). The new gate runs ahead of that branch but
+        // RegisterPubkey is filtered before reaching it via the
+        // early routing on line ~104. This test exercises the
+        // remaining variants that flow through the new gate.
+        let non_value_types = [
+            TransactionType::StakeDeposit,
+            TransactionType::StakeWithdraw,
+            TransactionType::Slash,
+            TransactionType::ClaimReward,
+            TransactionType::ClaimAirdrop,
+            TransactionType::SweepAirdrop,
+            TransactionType::MultisigTx,
+            TransactionType::RotateMultisig,
+            TransactionType::EmergencyPause,
+            TransactionType::EmergencyResume,
+        ];
+        for ty in non_value_types {
+            let (mut tx, account, nonce_state) = make_valid_tx_and_account();
+            tx.tx_type = ty;
+            tx.value = 1_000;
+            let ctx = default_ctx();
+            let err = validate_transaction(&tx, &account, &nonce_state, &ctx)
+                .expect_err(&format!("{ty:?} with value=1000 must reject"));
+            match err {
+                ValidationError::UnexpectedValue {
+                    tx_type,
+                    value: 1_000,
+                } => assert_eq!(tx_type, ty as u8),
+                other => panic!("{ty:?}: expected UnexpectedValue, got {other:?}"),
+            }
+        }
+    }
+
+    // ========== Audit 351: StakeWithdraw disabled at validation ==========
+
+    /// `StakeWithdraw` flips a validator entry to `Unbonding` but
+    /// no other code path returns the locked stake to the
+    /// operator. Pre-fix, an operator submitting `StakeWithdraw`
+    /// silently lost their `VALIDATOR_STAKE` PYDE. The validation
+    /// gate must hard-reject the variant on every chain_id (devnet
+    /// included) until `CompleteUnbonding` ships.
+    #[test]
+    fn audit_351_stake_withdraw_rejected() {
+        let (mut tx, account, nonce_state) = make_valid_tx_and_account();
+        tx.tx_type = TransactionType::StakeWithdraw;
+        tx.value = 0; // 352 gate must not trip
+
+        for chain_id in [1u64, 7331, 31337] {
+            tx.chain_id = chain_id;
+            let mut ctx = default_ctx();
+            ctx.chain_id = chain_id;
+            let err = validate_transaction(&tx, &account, &nonce_state, &ctx)
+                .expect_err(&format!("chain_id {chain_id} must reject StakeWithdraw"));
+            match err {
+                ValidationError::DisabledTxType(t) => {
+                    assert_eq!(t, TransactionType::StakeWithdraw as u8)
+                }
+                other => panic!("chain_id {chain_id}: expected DisabledTxType, got {other:?}"),
+            }
+        }
+    }
+
+    /// `StakeDeposit` must continue to work — only `StakeWithdraw`
+    /// is gated. Confirms the audit-351 gate is precise (doesn't
+    /// over-reach to the deposit side).
+    #[test]
+    fn audit_351_stake_deposit_still_accepted() {
+        let (mut tx, account, nonce_state) = make_valid_tx_and_account();
+        tx.tx_type = TransactionType::StakeDeposit;
+        tx.value = 0;
+        let ctx = default_ctx();
+        // Validation may still fail for other reasons (payload
+        // shape, etc.), but must not trip on DisabledTxType.
+        if let Err(e) = validate_transaction(&tx, &account, &nonce_state, &ctx) {
+            assert!(
+                !matches!(e, ValidationError::DisabledTxType(_)),
+                "StakeDeposit must not be gated, got {e:?}",
+            );
+        }
+    }
+
+    /// Same set with `tx.value == 0` must continue to validate
+    /// (the gate is value-conditional, not type-conditional).
+    #[test]
+    fn audit_352_non_value_types_with_zero_value_accepted() {
+        let non_value_types = [
+            TransactionType::StakeDeposit,
+            TransactionType::StakeWithdraw,
+            TransactionType::Slash,
+            TransactionType::ClaimReward,
+            TransactionType::ClaimAirdrop,
+            TransactionType::SweepAirdrop,
+            TransactionType::MultisigTx,
+            TransactionType::RotateMultisig,
+            TransactionType::EmergencyPause,
+            TransactionType::EmergencyResume,
+        ];
+        for ty in non_value_types {
+            let (mut tx, account, nonce_state) = make_valid_tx_and_account();
+            tx.tx_type = ty;
+            tx.value = 0;
+            let ctx = default_ctx();
+            // Some types may still fail later checks (e.g. payload
+            // shape) — we only assert that the audit-352 gate
+            // does not fire.
+            if let Err(e) = validate_transaction(&tx, &account, &nonce_state, &ctx) {
+                assert!(
+                    !matches!(e, ValidationError::UnexpectedValue { .. }),
+                    "{ty:?} with value=0 must not trip UnexpectedValue, got {e:?}",
+                );
+            }
+        }
     }
 }

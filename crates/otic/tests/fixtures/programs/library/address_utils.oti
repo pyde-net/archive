@@ -160,20 +160,22 @@ pub fn to_bytes(addr: Address) -> bytes {
     return addr.to_bytes();
 }
 
-/// Compares two addresses for ordering. Returns -1, 0, or 1.
-pub fn compare(a: Address, b: Address) -> i8 {
+/// Compares two addresses for ordering. Returns 0 for less, 1 for
+/// equal, 2 for greater (unsigned-only encoding — audit 354 disabled
+/// signed types until the post-mainnet ISA adds Sdiv/Smod/Slt/Sgt/Sar).
+pub fn compare(a: Address, b: Address) -> u8 {
     let a_bytes: bytes = a.to_bytes();
     let b_bytes: bytes = b.to_bytes();
 
     for i in 0u64..20u64 {
         if a_bytes[i] < b_bytes[i] {
-            return -1i8;
+            return 0u8;
         }
         if a_bytes[i] > b_bytes[i] {
-            return 1i8;
+            return 2u8;
         }
     }
-    return 0i8;
+    return 1u8;
 }
 
 /// Sorts an address list in ascending byte-order using insertion sort.

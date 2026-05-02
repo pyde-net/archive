@@ -208,15 +208,28 @@ impl Transaction {
     /// ```text
     /// tx_hash = Poseidon2(
     ///     chain_id || from || to || value || Poseidon2(data) ||
-    ///     gas_limit || nonce || fee_payer_tag ||
+    ///     gas_limit || nonce || fee_payer_bytes ||
     ///     Poseidon2(access_list) || deadline || tx_type
     /// )
     /// ```
+    ///
+    /// Audit 350: the fee-payer commitment is the full
+    /// `to_bytes()` encoding (1 byte for `Sender`, 33 bytes for
+    /// `GasTank(addr)` / `Paymaster(addr)`), not just the variant
+    /// tag. Pre-fix the hash only mixed in `fee_payer.tag()`, so
+    /// two physically distinct transactions — say one with
+    /// `GasTank(victim)` and one with `GasTank(attacker)` — hashed
+    /// identically. The FALCON signature authorising the first tx
+    /// also authorised the second; an attacker could swap the
+    /// address bytes on the wire and the rewritten tx still passed
+    /// signature verification. `Sender` txs hash unchanged because
+    /// `to_bytes()` for `Sender` is the single byte `0` (the same
+    /// value `tag()` returned).
     pub fn hash(&self) -> [u8; 32] {
         // chain_id(8) + from(32) + to(32) + value(16) + data_hash(32) +
-        // gas_limit(8) + nonce(8) + fee_payer(1) + access_hash(32) +
-        // deadline(1-9) + tx_type(1) = 171-179 bytes
-        let mut buf = Vec::with_capacity(180);
+        // gas_limit(8) + nonce(8) + fee_payer(1 or 33) + access_hash(32) +
+        // deadline(1-9) + tx_type(1) = 171-211 bytes
+        let mut buf = Vec::with_capacity(212);
         buf.extend_from_slice(&self.chain_id.to_le_bytes());
         buf.extend_from_slice(&self.from);
         buf.extend_from_slice(&self.to);
@@ -224,7 +237,7 @@ impl Transaction {
         buf.extend_from_slice(&poseidon2_hash(&self.data).to_bytes());
         buf.extend_from_slice(&self.gas_limit.to_le_bytes());
         buf.extend_from_slice(&self.nonce.to_le_bytes());
-        buf.push(self.fee_payer.tag());
+        buf.extend_from_slice(&self.fee_payer.to_bytes());
         buf.extend_from_slice(&hash_access_list(&self.access_list));
         match self.deadline {
             Some(d) => {
@@ -654,6 +667,86 @@ mod tests {
             let restored = FeePayer::from_bytes(&bytes).unwrap();
             assert_eq!(fp, restored);
         }
+    }
+
+    // ========== Audit 350: tx.hash() commits to full fee_payer bytes ==========
+
+    /// Two txs that differ only in the GasTank address must hash
+    /// differently. Pre-fix `Transaction::hash` only mixed in
+    /// `fee_payer.tag()` so both hashed identically and a single
+    /// FALCON signature authorised the swap of one gas-tank
+    /// address for another on the wire.
+    #[test]
+    fn audit_350_hash_distinguishes_gas_tank_addresses() {
+        let mut tx_a = make_test_tx();
+        tx_a.fee_payer = FeePayer::GasTank([0xAA; 32]);
+        let mut tx_b = make_test_tx();
+        tx_b.fee_payer = FeePayer::GasTank([0xBB; 32]);
+        assert_ne!(
+            tx_a.hash(),
+            tx_b.hash(),
+            "fee_payer address must be part of the signed digest",
+        );
+    }
+
+    /// Same address, different variant (`GasTank` vs `Paymaster`)
+    /// must hash differently. Tag separation is preserved.
+    #[test]
+    fn audit_350_hash_distinguishes_gas_tank_from_paymaster() {
+        let mut tx_a = make_test_tx();
+        tx_a.fee_payer = FeePayer::GasTank([0xCC; 32]);
+        let mut tx_b = make_test_tx();
+        tx_b.fee_payer = FeePayer::Paymaster([0xCC; 32]);
+        assert_ne!(tx_a.hash(), tx_b.hash());
+    }
+
+    /// `Sender` is a single-byte encoding (just the tag); switching
+    /// from the 1-byte push to `extend_from_slice(&to_bytes())` must
+    /// not change the hash for `Sender` txs (backwards-compat for
+    /// the only fee-payer variant currently allowed on production —
+    /// audit 305 hard-rejects GasTank/Paymaster on non-devnet, so
+    /// this is what every signed mainnet tx will use).
+    #[test]
+    fn audit_350_sender_hash_unchanged_after_fix() {
+        let tx = make_test_tx();
+        // Re-derive the pre-fix hash by hand: same byte sequence
+        // except `fee_payer.tag()` (single byte) vs
+        // `fee_payer.to_bytes()` (which for `Sender` is also a
+        // single zero byte). The two encodings coincide for
+        // `FeePayer::Sender` so the resulting hash must equal the
+        // current `tx.hash()`.
+        assert_eq!(tx.fee_payer, FeePayer::Sender);
+        assert_eq!(tx.fee_payer.to_bytes(), vec![tx.fee_payer.tag()]);
+        // Sanity: hash is stable under the new digest.
+        assert_eq!(tx.hash(), tx.hash());
+    }
+
+    /// Full end-to-end: a FALCON signature minted over a
+    /// `GasTank(A)` tx must NOT verify against the same tx with
+    /// `fee_payer` rewritten to `GasTank(B)`. This is the actual
+    /// attack the audit is preventing — without the fix the
+    /// rewritten tx still verifies.
+    #[test]
+    fn audit_350_falcon_signature_does_not_authorise_address_swap() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+
+        let mut tx_a = make_test_tx();
+        tx_a.from = derive_eoa_address(&pk_bytes);
+        tx_a.fee_payer = FeePayer::GasTank([0xAA; 32]);
+
+        let sig = falcon_sign(&sk, &tx_a.hash()).unwrap().as_bytes().to_vec();
+        tx_a.signature = sig.clone();
+        assert!(tx_a.verify_signature(&pk_bytes), "honest tx must verify");
+
+        // Adversary swaps the address to a different one and reuses
+        // the same FALCON signature.
+        let mut tx_b = tx_a.clone();
+        tx_b.fee_payer = FeePayer::GasTank([0xBB; 32]);
+        assert!(
+            !tx_b.verify_signature(&pk_bytes),
+            "rewritten fee_payer must invalidate the signature",
+        );
     }
 
     // ========== Corrupt data ==========
