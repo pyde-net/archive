@@ -33,6 +33,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use pyde_crypto::falcon::{FalconPublicKey, FalconSecretKey};
 use pyde_crypto::poseidon2::poseidon2_hash;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// JSON-serialized validator keystore. Layout intentionally
 /// matches `pyde_rust_sdk::wallet::Keystore` so the same
@@ -82,24 +83,33 @@ const ARGON2_P_COST: u32 = 1;
 /// hours, "pass123" in milliseconds — so any operator backup leak
 /// or supply-chain compromise of the keystore file effectively
 /// exposed the FALCON private key.
-fn derive_aes_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+///
+/// Audit 358: returns `Zeroizing<[u8; 32]>` so the AES key is
+/// scrubbed from memory when the wrapper drops, instead of
+/// surviving in the freed stack frame until the next call
+/// clobbers it. A core dump captured between keystore-load and
+/// the next syscall would otherwise leak the encryption key.
+fn derive_aes_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
     let params = argon2::Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, Some(32))
         .map_err(|e| format!("argon2 params: {e}"))?;
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     argon
-        .hash_password_into(passphrase.as_bytes(), salt, &mut out)
+        .hash_password_into(passphrase.as_bytes(), salt, out.as_mut())
         .map_err(|e| format!("argon2 hash: {e}"))?;
     Ok(out)
 }
 
 /// Legacy Poseidon2 KDF kept ONLY for decrypting v1 keystores.
 /// Never used to encrypt new keys.
-fn derive_aes_key_v1_poseidon2(passphrase: &str, salt: &[u8]) -> [u8; 32] {
+///
+/// Audit 358: same Zeroizing wrapper so v1-keystore decrypt
+/// paths don't leave the AES key on the stack either.
+fn derive_aes_key_v1_poseidon2(passphrase: &str, salt: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut input = Vec::with_capacity(passphrase.len() + salt.len());
     input.extend_from_slice(passphrase.as_bytes());
     input.extend_from_slice(salt);
-    poseidon2_hash(&input).to_bytes()
+    Zeroizing::new(poseidon2_hash(&input).to_bytes())
 }
 
 /// Encrypt a validator key + write it to disk as JSON. Always uses
@@ -116,7 +126,8 @@ pub fn encrypt(
     let nonce_bytes: [u8; 12] = rand::random();
 
     let aes_key = derive_aes_key(passphrase, &salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES init: {e}"))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(aes_key.as_ref()).map_err(|e| format!("AES init: {e}"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, sk.as_bytes())
@@ -175,7 +186,8 @@ pub fn decrypt(
             ))
         }
     };
-    let cipher = Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES init: {e}"))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(aes_key.as_ref()).map_err(|e| format!("AES init: {e}"))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let sk_bytes = cipher
@@ -279,7 +291,7 @@ mod tests {
 
         // Build a v1 keystore by hand using the legacy KDF.
         let aes_key = derive_aes_key_v1_poseidon2(pass, &salt);
-        let cipher = Aes256Gcm::new_from_slice(&aes_key).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(aes_key.as_ref()).unwrap();
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher.encrypt(nonce, sk.as_bytes()).unwrap();
         let pk_bytes = pk.as_bytes();

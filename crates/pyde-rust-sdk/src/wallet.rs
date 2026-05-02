@@ -478,23 +478,25 @@ const ARGON2_M_COST_KIB: u32 = 64 * 1024;
 const ARGON2_T_COST: u32 = 3;
 const ARGON2_P_COST: u32 = 1;
 
-fn derive_aes_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
+/// Audit 358: returns `Zeroizing<[u8; 32]>` so the AES key is
+/// scrubbed when the wrapper drops.
+fn derive_aes_key(password: &str, salt: &[u8]) -> Result<zeroize::Zeroizing<[u8; 32]>> {
     let params = argon2::Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, Some(32))
         .map_err(|e| SdkError::Signing(format!("argon2 params: {}", e)))?;
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let mut out = [0u8; 32];
+    let mut out = zeroize::Zeroizing::new([0u8; 32]);
     argon
-        .hash_password_into(password.as_bytes(), salt, &mut out)
+        .hash_password_into(password.as_bytes(), salt, out.as_mut())
         .map_err(|e| SdkError::Signing(format!("argon2 hash: {}", e)))?;
     Ok(out)
 }
 
 /// Legacy Poseidon2 KDF retained ONLY for decrypting v1 keystores.
-fn derive_aes_key_v1_poseidon2(password: &str, salt: &[u8]) -> [u8; 32] {
+fn derive_aes_key_v1_poseidon2(password: &str, salt: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
     let mut input = Vec::with_capacity(password.len() + salt.len());
     input.extend_from_slice(password.as_bytes());
     input.extend_from_slice(salt);
-    poseidon2_hash(&input).to_bytes()
+    zeroize::Zeroizing::new(poseidon2_hash(&input).to_bytes())
 }
 
 fn encrypt_keystore(
@@ -507,7 +509,7 @@ fn encrypt_keystore(
     let nonce_bytes: [u8; 12] = rand::random();
 
     let aes_key = derive_aes_key(password, &salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&aes_key)
+    let cipher = Aes256Gcm::new_from_slice(aes_key.as_ref())
         .map_err(|e| SdkError::Signing(format!("AES init: {}", e)))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
@@ -543,7 +545,7 @@ fn decrypt_key(keystore: &Keystore, password: &str) -> Result<FalconSecretKey> {
             )))
         }
     };
-    let cipher = Aes256Gcm::new_from_slice(&aes_key)
+    let cipher = Aes256Gcm::new_from_slice(aes_key.as_ref())
         .map_err(|e| SdkError::Signing(format!("AES init: {}", e)))?;
 
     if nonce_bytes.len() != 12 {
@@ -676,7 +678,7 @@ mod tests {
         let nonce_bytes: [u8; 12] = rand::random();
 
         let aes_key = derive_aes_key_v1_poseidon2(pass, &salt);
-        let cipher = Aes256Gcm::new_from_slice(&aes_key).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(aes_key.as_ref()).unwrap();
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher.encrypt(nonce, w.secret_key.as_bytes()).unwrap();
         let v1_ks = Keystore {

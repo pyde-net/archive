@@ -10,12 +10,45 @@ use alloc::vec::Vec;
 use p3_field::{Field, PrimeCharacteristicRing, PrimeField64};
 use p3_goldilocks::Goldilocks;
 use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::kyber::{
     kyber_decapsulate, kyber_encapsulate, kyber_keygen, KyberCiphertext, KyberPublicKey,
     KyberSecretKey, SharedSecret,
 };
 use crate::poseidon2::poseidon2_hash;
+
+/// Audit 358: overwrite a `Vec<Goldilocks>` of secret share
+/// values with field-zero via volatile writes so the compiler
+/// can't optimize the zeroing away. `Goldilocks` is a u64-backed
+/// field element from `p3-goldilocks` that doesn't impl
+/// `zeroize::Zeroize`, so we go through the volatile-pointer
+/// route. After zeroing, `clear()` drops the length to 0; the
+/// `Vec`'s allocation is freed normally on drop, but the
+/// previously-secret bytes are now zero.
+fn zeroize_goldilocks_vec(v: &mut Vec<Goldilocks>) {
+    for el in v.iter_mut() {
+        // SAFETY: `el` is a valid mutable reference into the
+        // Vec's heap buffer; `write_volatile` writes a properly
+        // initialized value (`Goldilocks::ZERO`) of the same
+        // type. Volatile prevents the optimizer from eliding
+        // the write as "dead store" — without it Rust is free
+        // to omit the zeroing because the Vec is about to be
+        // dropped.
+        unsafe { core::ptr::write_volatile(el as *mut Goldilocks, Goldilocks::ZERO) };
+    }
+    v.clear();
+}
+
+/// Same as `zeroize_goldilocks_vec`, but for the nested
+/// `Vec<Vec<Goldilocks>>` shape used by refresh / resharing
+/// contributions (one inner vec per recipient validator).
+fn zeroize_goldilocks_vec_vec(v: &mut Vec<Vec<Goldilocks>>) {
+    for inner in v.iter_mut() {
+        zeroize_goldilocks_vec(inner);
+    }
+    v.clear();
+}
 
 // --- Goldilocks field arithmetic helpers ---
 
@@ -159,6 +192,25 @@ pub struct KeyShare {
     shares: Vec<Goldilocks>,
 }
 
+// Audit 358: a `KeyShare` is one validator's piece of the
+// reconstructable Kyber decapsulation seed. The `shares` vec is
+// the actual secret material; `index` is public metadata.
+// Zeroize on drop so the secret bytes don't sit in deallocated
+// heap pages.
+impl Zeroize for KeyShare {
+    fn zeroize(&mut self) {
+        zeroize_goldilocks_vec(&mut self.shares);
+    }
+}
+
+impl Drop for KeyShare {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for KeyShare {}
+
 impl KeyShare {
     /// Serialize to bytes: [index:8 LE][count:4 LE][share_0:8 LE]...[share_n:8 LE]
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -210,6 +262,27 @@ pub struct DecryptionShare {
     /// Share values.
     shares: Vec<Goldilocks>,
 }
+
+// Audit 358: a `DecryptionShare` is one validator's contribution
+// toward decapsulating a particular ciphertext. Reconstructing
+// the underlying decapsulation key requires `threshold` of these,
+// so a single share isn't a full secret — but a leaked share
+// still narrows the attacker's interpolation search space, and
+// in concert with other leaked / coerced shares it reconstructs
+// the key entirely. Zeroize on drop.
+impl Zeroize for DecryptionShare {
+    fn zeroize(&mut self) {
+        zeroize_goldilocks_vec(&mut self.shares);
+    }
+}
+
+impl Drop for DecryptionShare {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for DecryptionShare {}
 
 impl DecryptionShare {
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -318,12 +391,41 @@ impl ThresholdCiphertext {
 
 const SEED_ELEMENTS: usize = 8; // 64-byte seed = 8 × 8-byte elements
 
-fn derive_keystream(shared_secret: &SharedSecret, len: usize) -> Vec<u8> {
+/// Audit 359: domain-separation prefix for the keystream KDF.
+/// Prevents accidental cross-use of a keystream block as a MAC
+/// (or vice versa) if a future call site reorders the inputs.
+const KS_DOMAIN: &[u8] = b"pyde-threshold-keystream-v1";
+
+/// Audit 359: domain-separation prefix for the MAC.
+const MAC_DOMAIN: &[u8] = b"pyde-threshold-mac-v1";
+
+/// Audit 359: derive a Poseidon2-keyed keystream bound to BOTH
+/// the per-message Kyber shared_secret AND the kyber_ct that
+/// produced it. The ct binding is the per-message nonce —
+/// `kyber_encapsulate` returns a fresh randomized ct on every
+/// call, so two encryptions with the same plaintext produce
+/// different keystreams even if the shared_secret derivation
+/// somehow accidentally repeated (faulty RNG, replay).
+///
+/// Pre-fix the keystream was `Poseidon2(ss || counter)` with
+/// no per-message nonce — a single ss reuse leaked the XOR of
+/// the two plaintexts and the MAC key for both, giving an
+/// attacker forgery primitives against any future ciphertext
+/// under the same ss. Post-fix: even ss reuse only narrows the
+/// search if `kyber_ct` ALSO repeats, which would mean Kyber
+/// itself is broken.
+fn derive_keystream(shared_secret: &SharedSecret, kyber_ct: &[u8], len: usize) -> Vec<u8> {
+    // Bind the kyber_ct via its Poseidon2 hash so the keystream
+    // input stays a fixed 96 bytes (32 ss + 32 ct-hash + 8 ctr +
+    // domain prefix) regardless of ciphertext length.
+    let ct_fp = poseidon2_hash(kyber_ct);
     let mut keystream = Vec::with_capacity(len);
     let mut counter = 0u64;
     while keystream.len() < len {
-        let mut input = Vec::with_capacity(40);
+        let mut input = Vec::with_capacity(KS_DOMAIN.len() + 32 + 32 + 8);
+        input.extend_from_slice(KS_DOMAIN);
         input.extend_from_slice(shared_secret.as_bytes());
+        input.extend_from_slice(ct_fp.as_bytes());
         input.extend_from_slice(&counter.to_le_bytes());
         let block = poseidon2_hash(&input);
         keystream.extend_from_slice(block.as_bytes());
@@ -333,11 +435,18 @@ fn derive_keystream(shared_secret: &SharedSecret, len: usize) -> Vec<u8> {
     keystream
 }
 
-fn compute_mac(shared_secret: &SharedSecret, ciphertext: &[u8]) -> [u8; 32] {
-    let mut input = Vec::with_capacity(8 + 32 + ciphertext.len()); // prefix(8) + secret(32) + ciphertext
-                                                                   // Domain-separate MAC from keystream by using a different prefix
-    input.extend_from_slice(&[0xFF; 8]);
+/// Audit 359: same defense-in-depth treatment for the MAC.
+/// The MAC now keys on `(shared_secret, kyber_ct, encrypted_msg)`
+/// with a separate domain-separation prefix from the keystream.
+/// A MAC forgery against ciphertext A under shared_secret S no
+/// longer aids forging under ciphertext B even if the same S is
+/// somehow reused.
+fn compute_mac(shared_secret: &SharedSecret, kyber_ct: &[u8], ciphertext: &[u8]) -> [u8; 32] {
+    let ct_fp = poseidon2_hash(kyber_ct);
+    let mut input = Vec::with_capacity(MAC_DOMAIN.len() + 32 + 32 + ciphertext.len());
+    input.extend_from_slice(MAC_DOMAIN);
     input.extend_from_slice(shared_secret.as_bytes());
+    input.extend_from_slice(ct_fp.as_bytes());
     input.extend_from_slice(ciphertext);
     *poseidon2_hash(&input).as_bytes()
 }
@@ -421,9 +530,12 @@ pub fn threshold_encrypt(
     msg: &[u8],
 ) -> Result<ThresholdCiphertext, &'static str> {
     let (kyber_ct, ss) = kyber_encapsulate(&tpk.kyber_pk)?;
-    let keystream = derive_keystream(&ss, msg.len());
+    // Audit 359: keystream + MAC are bound to `kyber_ct` so a
+    // hypothetical Kyber-RNG repeat doesn't collapse to the same
+    // keystream / MAC key.
+    let keystream = derive_keystream(&ss, kyber_ct.as_bytes(), msg.len());
     let encrypted_msg = xor_bytes(msg, &keystream);
-    let mac = compute_mac(&ss, &encrypted_msg);
+    let mac = compute_mac(&ss, kyber_ct.as_bytes(), &encrypted_msg);
 
     Ok(ThresholdCiphertext {
         kyber_ct,
@@ -558,22 +670,48 @@ pub fn combine_shares(
         seed_bytes[elem_idx * 8..(elem_idx + 1) * 8].copy_from_slice(&val.to_le_bytes());
     }
 
-    // Reconstruct Kyber secret key from seed
-    let sk = KyberSecretKey::from_bytes(&seed_bytes).ok_or("invalid reconstructed seed")?;
+    // Audit 360: from this point onward every failure path
+    // (KyberSecretKey decode, Kyber-768 decap, MAC compare)
+    // collapses into the SAME generic `"decryption failed"`
+    // error. Pre-fix the three branches returned distinct
+    // messages, so an attacker submitting crafted decryption
+    // shares could probe error responses to figure out which
+    // pipeline stage their bogus inputs landed on:
+    //   - "invalid reconstructed seed" → Lagrange interpolation
+    //     produced 64 bytes that don't decode as a Kyber seed.
+    //   - "Kyber-768 decapsulation failed" → seed decoded but
+    //     `dk_from_seed` rejected the structure.
+    //   - "MAC verification failed" → seed + decap both passed
+    //     but the recovered `ss` is wrong (i.e., the shares
+    //     didn't actually combine to the committee's secret).
+    // That three-way split is a textbook decryption oracle —
+    // each probe narrows the attacker's search for the share
+    // structure that round-trips. We also keep going on Kyber
+    // failure (substituting a zeroed `ss`) so MAC check still
+    // executes; this evens out timing across the failure modes
+    // (modulo the inherent variation in Kyber's reject path).
+    //
+    // Honest decryptors don't see this error: they always pass
+    // the MAC check on a well-formed ciphertext.
+    const ORACLE_SAFE_ERR: &str = "decryption failed";
 
-    // Decapsulate to get shared secret
-    let ss = kyber_decapsulate(&sk, &ct.kyber_ct).map_err(|_| "Kyber-768 decapsulation failed")?;
+    let sk = KyberSecretKey::from_bytes(&seed_bytes).ok_or(ORACLE_SAFE_ERR)?;
+    let ss_or_zero = kyber_decapsulate(&sk, &ct.kyber_ct)
+        .unwrap_or_else(|_| SharedSecret::zero_for_constant_time_mac_check());
 
-    // Verify MAC in constant time — a variable-time `!=` would leak
-    // per-byte match progress via timing, enabling padding-oracle-style
-    // forgery of MACs against a live validator.
-    let expected_mac = compute_mac(&ss, &ct.encrypted_msg);
+    // Verify MAC in constant time — a variable-time `!=` would
+    // leak per-byte match progress via timing, enabling padding-
+    // oracle-style forgery of MACs against a live validator.
+    // Audit 359: MAC + keystream are bound to `kyber_ct` (from
+    // the encrypted ciphertext), matching the encrypt-side
+    // derivation.
+    let expected_mac = compute_mac(&ss_or_zero, ct.kyber_ct.as_bytes(), &ct.encrypted_msg);
     if expected_mac.ct_eq(&ct.mac).unwrap_u8() == 0 {
-        return Err("MAC verification failed");
+        return Err(ORACLE_SAFE_ERR);
     }
 
     // Decrypt
-    let keystream = derive_keystream(&ss, ct.encrypted_msg.len());
+    let keystream = derive_keystream(&ss_or_zero, ct.kyber_ct.as_bytes(), ct.encrypted_msg.len());
     Ok(xor_bytes(&ct.encrypted_msg, &keystream))
 }
 
@@ -602,6 +740,26 @@ pub struct RefreshContribution {
     /// Delta values for each validator (indexed 0..n), each containing SEED_ELEMENTS values.
     deltas: Vec<Vec<Goldilocks>>,
 }
+
+// Audit 358: `deltas[i]` is the share-refresh delta intended for
+// validator `i`. While each contribution is individually a
+// zero-secret share (constant term = 0), the deltas reveal the
+// random polynomial used to refresh — a leak across enough
+// contributions allows an attacker to reconstruct the underlying
+// key. Zeroize on drop.
+impl Zeroize for RefreshContribution {
+    fn zeroize(&mut self) {
+        zeroize_goldilocks_vec_vec(&mut self.deltas);
+    }
+}
+
+impl Drop for RefreshContribution {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for RefreshContribution {}
 
 /// Generate a refresh contribution for PSS.
 /// The validator generates random degree-(t-1) polynomials with zero constant term
@@ -813,6 +971,26 @@ pub struct ResharingContribution {
     /// Length = new_n. Each inner vec has length SEED_ELEMENTS.
     sub_shares: Vec<Vec<Goldilocks>>,
 }
+
+// Audit 358: `sub_shares[j-1][e]` is the share-transfer payload
+// for new committee member `j`. Together with the canonical
+// resharing subset, these reconstruct the same secret polynomial
+// — leaking enough of them across old committee members allows
+// an attacker to recover the underlying decapsulation key.
+// Zeroize on drop.
+impl Zeroize for ResharingContribution {
+    fn zeroize(&mut self) {
+        zeroize_goldilocks_vec_vec(&mut self.sub_shares);
+    }
+}
+
+impl Drop for ResharingContribution {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ResharingContribution {}
 
 impl ResharingContribution {
     /// Wire format:
@@ -1191,7 +1369,118 @@ mod tests {
             .map(|s| generate_decryption_share(s, &ct))
             .collect();
         let result = combine_shares(&dec_shares, T, &ct);
-        assert_eq!(result, Err("MAC verification failed"));
+        assert_eq!(result, Err("decryption failed"));
+    }
+
+    /// Audit 359: two encryptions of the same plaintext under the
+    /// same threshold pk must produce different keystreams,
+    /// different ciphertexts, AND different MACs — even though
+    /// `kyber_encapsulate`'s shared_secret derivation is the only
+    /// thing per-call randomized. The fix binds `kyber_ct` into
+    /// both KDFs as a per-message nonce, so a hypothetical
+    /// shared_secret repeat (broken Kyber RNG) doesn't collapse
+    /// to identical keystreams + MAC keys.
+    #[test]
+    fn audit_359_keystream_and_mac_unique_per_encryption() {
+        let (tpk, _shares) = setup();
+        let msg = b"audit-359 keystream uniqueness";
+        let ct1 = threshold_encrypt(&tpk, msg).unwrap();
+        let ct2 = threshold_encrypt(&tpk, msg).unwrap();
+        // Kyber-encap is randomized → distinct kyber_ct per call.
+        assert_ne!(
+            ct1.kyber_ct.as_bytes(),
+            ct2.kyber_ct.as_bytes(),
+            "Kyber encap must produce a fresh ct per call"
+        );
+        // With same plaintext + DIFFERENT kyber_ct, post-fix the
+        // keystream is distinct, so the encrypted message bytes
+        // are distinct, AND the MAC is distinct.
+        assert_ne!(ct1.encrypted_msg, ct2.encrypted_msg);
+        assert_ne!(ct1.mac, ct2.mac);
+    }
+
+    /// Audit 359: tampering with `kyber_ct` (without changing
+    /// the encrypted_msg or mac) must invalidate decryption,
+    /// because the MAC is keyed on `kyber_ct`. Pre-fix the MAC
+    /// only depended on `(ss, encrypted_msg)`, so a swapped
+    /// kyber_ct under the same shared_secret would silently
+    /// re-derive a different keystream and produce wrong
+    /// plaintext that still passed MAC verification.
+    #[test]
+    fn audit_359_kyber_ct_tampering_breaks_decrypt() {
+        let (tpk, shares) = setup();
+        let msg = b"audit-359 ct binding";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+
+        // Encrypt a SECOND message; swap its kyber_ct into the
+        // first ciphertext. ss differs → MAC mismatches.
+        let ct2 = threshold_encrypt(&tpk, b"different").unwrap();
+        let mut tampered = ct.clone();
+        tampered.kyber_ct = ct2.kyber_ct.clone();
+        let dec_shares: Vec<DecryptionShare> = shares[..T]
+            .iter()
+            .map(|s| generate_decryption_share(s, &tampered))
+            .collect();
+        let result = combine_shares(&dec_shares, T, &tampered);
+        assert_eq!(result, Err("decryption failed"));
+    }
+
+    /// Audit 360: two structurally distinct combine-failure
+    /// causes — (a) shares that interpolate to a Kyber seed
+    /// `dk_from_seed` rejects, and (b) shares that produce a
+    /// valid seed but the resulting `ss` doesn't match the MAC —
+    /// must return the SAME error so an attacker probing with
+    /// crafted shares can't distinguish the failure modes.
+    /// Pre-fix the two paths returned distinct strings
+    /// ("Kyber-768 decapsulation failed" vs. "MAC verification
+    /// failed"), giving an oracle that narrowed the search for
+    /// share structures that pass each pipeline stage.
+    #[test]
+    fn audit_360_failure_modes_collapse_to_single_error() {
+        let (tpk, shares) = setup();
+        let msg = b"audit-360 oracle uniform";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+
+        // (a) Tamper with one share value to force the
+        //     interpolation path to produce a wrong-but-
+        //     plausible seed. Either Kyber-from-seed fails or
+        //     Kyber decap "succeeds" but produces wrong ss →
+        //     MAC fails. Either way the post-fix returns the
+        //     same generic error.
+        let mut tampered_shares: Vec<DecryptionShare> = shares[..T]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        // Mutate the FIRST share's first element by adding a
+        // non-zero field element. Goldilocks is a field, so
+        // any non-zero perturbation propagates through Lagrange.
+        let bad = &mut tampered_shares[0];
+        if !bad.shares.is_empty() {
+            bad.shares[0] += gl(1);
+        }
+        let bad_share_result = combine_shares(&tampered_shares, T, &ct);
+
+        // (b) Use shares from a DIFFERENT keygen. Index space
+        //     overlaps, but the polynomials are independent, so
+        //     interpolation produces an unrelated seed. Same
+        //     pipeline-fail behavior as (a) — must return the
+        //     same error.
+        let (_other_tpk, other_shares) = setup();
+        let other_dec: Vec<DecryptionShare> = other_shares[..T]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        let other_result = combine_shares(&other_dec, T, &ct);
+
+        // Both failure modes return the SAME error string, with
+        // no distinguishing information about WHICH stage tripped.
+        assert!(bad_share_result.is_err(), "tampered shares must fail");
+        assert!(other_result.is_err(), "wrong-keygen shares must fail");
+        assert_eq!(
+            bad_share_result, other_result,
+            "audit 360: distinct failure modes must collapse to the same error"
+        );
+        assert_eq!(bad_share_result, Err("decryption failed"));
     }
 
     #[test]
@@ -1587,5 +1876,67 @@ mod tests {
             .map(|s| generate_decryption_share(s, &ct))
             .collect();
         assert_eq!(combine_shares(&dec_shares, 6, &ct).unwrap(), msg);
+    }
+
+    // ── Audit 358: ZeroizeOnDrop on threshold types ─────────────────
+
+    /// Pull a non-zero share value out of the inner Vec via the
+    /// wire format (the Vec is private). Used by the zeroize tests
+    /// to verify there was something to zero.
+    fn keyshare_has_nonzero_payload(s: &KeyShare) -> bool {
+        // serialized share has [index:8][count:4][shares:8*N], so any
+        // non-zero byte past the metadata header indicates non-zero
+        // share values.
+        let bytes = s.to_bytes();
+        bytes.len() > 12 && bytes[12..].iter().any(|b| *b != 0)
+    }
+
+    #[test]
+    fn key_share_zeroizes() {
+        let (_, mut shares) = setup();
+        let s = &mut shares[0];
+        assert!(
+            keyshare_has_nonzero_payload(s),
+            "fresh key share should carry non-zero secret material"
+        );
+        s.zeroize();
+        // After zeroize the inner shares vec is cleared (length 0).
+        // Re-serializing reflects that — only metadata remains.
+        let bytes = s.to_bytes();
+        let post_count = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        assert_eq!(post_count, 0, "key share count must be 0 post-zeroize");
+    }
+
+    #[test]
+    fn refresh_contribution_zeroizes() {
+        let mut contrib = generate_refresh_contribution(1, 6, 4, 0, b"e");
+        // Sanity: deltas have content.
+        let nonempty = contrib.deltas.iter().any(|inner| !inner.is_empty());
+        assert!(
+            nonempty,
+            "fresh refresh contribution should have non-empty deltas"
+        );
+        contrib.zeroize();
+        // After zeroize the outer + every inner vec is cleared.
+        assert!(
+            contrib.deltas.is_empty(),
+            "refresh contribution deltas not cleared post-zeroize"
+        );
+    }
+
+    #[test]
+    fn resharing_contribution_zeroizes() {
+        let (_, old_shares) = setup_epoch(6, 4);
+        let mut contrib = generate_resharing_contribution(&old_shares[0], 8, 5, 1, b"e");
+        let nonempty = contrib.sub_shares.iter().any(|inner| !inner.is_empty());
+        assert!(
+            nonempty,
+            "fresh resharing contribution should have non-empty sub_shares"
+        );
+        contrib.zeroize();
+        assert!(
+            contrib.sub_shares.is_empty(),
+            "resharing contribution sub_shares not cleared post-zeroize"
+        );
     }
 }

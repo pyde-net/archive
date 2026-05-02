@@ -8,3 +8,6 @@ pub mod kyber;
 pub mod poseidon2;
 pub mod threshold;
 pub mod vrf;
+
+#[cfg(test)]
+mod kat;

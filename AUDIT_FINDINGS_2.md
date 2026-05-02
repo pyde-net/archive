@@ -845,19 +845,105 @@
 
 ### Crypto
 
-- [ ] 357 — `⚠` **No KAT pinning for ml-kem 0.3.0-rc.x or falcon-rs
-      0.2.4.** `crates/crypto/Cargo.toml:13` and
-      `crates/crypto/src/falcon.rs:6`. Silent dep bump = silent
-      wire-format change. Pin a FIPS-203 KEM KAT and a FN-DSA
-      signature KAT in tests, mirroring audit-216's Poseidon2
-      round-constants pin.
-- [ ] 358 — `⚠` **No `Zeroize`/`ZeroizeOnDrop` on any secret type.**
+- [x] 357 — `⚠` **No KAT pinning for ml-kem 0.3.0-rc.x or falcon-rs
+      0.2.4.** **SHIPPED.** New `crates/crypto/src/kat.rs` pins
+      Known-Answer Tests for every primitive on the consensus
+      signing/verification path:
+      - **Poseidon2**: 3 vectors covering empty-input, short ASCII,
+        and a 64-byte multi-permutation absorb. Catches drift in
+        `p3-poseidon2` round constants, `p3-goldilocks` field
+        representation, and the padding-free sponge driver.
+      - **FALCON-512**: pinned `(pk, sk, msg, sig)` quadruple. Two
+        tests: (a) the pinned signature still verifies under the
+        pinned pk + msg (cross-version compat), (b) re-signing
+        with the pinned sk produces a fresh signature that still
+        verifies under the pinned pk (sk encoding sanity).
+      - **Kyber-768**: pinned `(sk_seed, ct, expected_shared_secret)`
+        triple. Decapsulate is deterministic given (sk, ct), so
+        any drift in `ml-kem` decapsulation, key encoding, or
+        shared-secret derivation produces different bytes.
+      - **VRF**: pinned `(pk, sk, input, output, proof)`. VRF
+        output is deterministic (Poseidon2-derived), so we assert
+        byte-equality. Proof is a FALCON signature (randomized),
+        so we assert verify still accepts it.
+
+      Plus `generate_kat_vectors` `#[ignore]`-gated dev tool that
+      prints fresh values when the algorithm is intentionally
+      bumped — copy-paste into the constants. 10 KAT tests, all
+      pass. Clippy / fmt clean.
+- [x] 358 — `⚠` **No `Zeroize`/`ZeroizeOnDrop` on any secret type.**
+      **SHIPPED.** Added `zeroize` crate dep to `pyde-crypto`,
+      `pyde-node`, `pyde-dev`, and `pyde-rust-sdk`, and applied
+      `ZeroizeOnDrop` to every type holding secret material:
+      - `FalconSecretKey` (1281-byte FALCON-512 sk) — derive
+        `Zeroize, ZeroizeOnDrop` so the inner `Vec<u8>` zeros
+        on drop.
+      - `KyberSecretKey` (64-byte ML-KEM-768 seed).
+      - `SharedSecret([u8; 32])` (post-decap KEM secret).
+      - `KeyShare`, `DecryptionShare`,
+        `RefreshContribution`, `ResharingContribution` — manual
+        `Zeroize` impls walking their `Vec<Goldilocks>` /
+        `Vec<Vec<Goldilocks>>` payloads via volatile writes
+        (Goldilocks doesn't impl `Zeroize` directly, so we use
+        `core::ptr::write_volatile` to overwrite each element
+        with `Goldilocks::ZERO` before clearing the vec).
+      - Keystore AES keys derived from operator passphrase —
+        wrapped in `Zeroizing<[u8; 32]>` in
+        `crates/node/src/keystore.rs`,
+        `crates/pyde-dev/src/wallet.rs`, and
+        `crates/pyde-rust-sdk/src/wallet.rs`. Pre-fix the
+        stack-allocated `[u8; 32]` survived in the freed stack
+        frame until the next syscall clobbered it; a core dump
+        captured between keystore-load and syscall would
+        otherwise leak the encryption key.
+
+      6 explicit zeroize tests pass: FALCON sk, Kyber sk, Kyber
+      shared secret, KeyShare, RefreshContribution,
+      ResharingContribution. `cargo fmt` / `cargo clippy
+      -D warnings` clean. Existing 100+ crypto tests + node /
+      wallet test suites all green.
       `crates/crypto/src/falcon.rs:13-14, kyber.rs:18-19,
       threshold.rs:154-159, 206-211, 555-565`. Add the derive
       across `FalconSecretKey`, `KyberSecretKey`, `KeyShare`,
       `DecryptionShare`. Wrap the local `seed_bytes` in
       `combine_shares` (line 516) with `Zeroizing`.
-- [ ] 359 — `⚠` **Threshold MAC keystream collision risk:
+- [x] 359 — `⚠` **Threshold MAC keystream collision risk.**
+      **SHIPPED.** Bound `kyber_ct` into both the keystream
+      derivation AND the MAC keying so a hypothetical Kyber-RNG
+      repeat (or any other reuse of `shared_secret`) can't
+      collapse two encryptions to the same keystream / MAC key.
+      Pre-fix:
+      ```
+      keystream = Poseidon2(ss || counter)
+      mac       = Poseidon2(0xFF*8 || ss || encrypted_msg)
+      ```
+      Post-fix:
+      ```
+      keystream = Poseidon2(KS_DOMAIN || ss || H(kyber_ct) || counter)
+      mac       = Poseidon2(MAC_DOMAIN || ss || H(kyber_ct) || encrypted_msg)
+      ```
+      The `kyber_ct` binding turns the Kyber ciphertext (which
+      Kyber's IND-CCA2 design already binds to a fresh `ss`) into
+      a per-message nonce we control. Even if Kyber's RNG were
+      compromised and produced the same `ss` twice, two
+      encryptions would still have different `kyber_ct`s →
+      different keystreams + MAC keys → no XOR-attack primitive.
+      Defense-in-depth against a broken/tampered Kyber.
+
+      Plus explicit `KS_DOMAIN` / `MAC_DOMAIN` byte prefixes so
+      a future call site that swaps argument order can't
+      accidentally produce a keystream block that also serves as
+      a MAC. 2 new tests:
+      - `audit_359_keystream_and_mac_unique_per_encryption`:
+        two encryptions of the same plaintext under the same
+        TPK produce distinct keystreams, ciphertexts, and MACs.
+      - `audit_359_kyber_ct_tampering_breaks_decrypt`: swapping
+        the `kyber_ct` in a ciphertext (under the same
+        `encrypted_msg`+`mac`) trips MAC verify. Pre-fix this
+        would have silently re-derived a wrong keystream.
+      32 threshold tests pass; 106 total crypto tests pass.
+      Mempool + node test suites green (no wire-format break
+      because `kyber_ct` was already part of `ThresholdCiphertext`).
       keystream + MAC share `ss` with weak prefix-disjoint domain
       separation.** `crates/crypto/src/threshold.rs:321-343`.
       Add explicit domain tags
@@ -865,8 +951,38 @@
       `Poseidon2("pyde-mac-v1" || ss || ciphertext)`) plus a
       per-ciphertext nonce (current keystream is purely
       deterministic on `ss`).
-- [ ] 360 — `⚠` **`combine_shares` error split between Kyber
+- [x] 360 — `⚠` **`combine_shares` error split between Kyber
       decapsulate failure and MAC failure leaks oracle bits.**
+      **SHIPPED.** Pre-fix the post-share-validation paths
+      returned three distinct error strings:
+      - `"invalid reconstructed seed"` — Lagrange-interpolated
+        bytes don't decode as a Kyber seed.
+      - `"Kyber-768 decapsulation failed"` — seed decoded but
+        `dk_from_seed` rejected the structure.
+      - `"MAC verification failed"` — seed + decap both passed
+        but the recovered `ss` is wrong.
+
+      An attacker submitting crafted decryption shares could
+      probe error responses to figure out which pipeline stage
+      their inputs landed on, narrowing the search for share
+      structures that round-trip the various validators. Each
+      probe gives them ~1 bit about the secret committee
+      polynomial.
+
+      Fix: collapse all three into a single
+      `ORACLE_SAFE_ERR = "decryption failed"`. Also keep going
+      on Kyber decap failure (substituting an all-zero placeholder
+      `SharedSecret` via a `pub(crate)` constructor in
+      `kyber.rs`) so the MAC-verify code path always executes —
+      evens out timing across the failure modes modulo Kyber's
+      inherent reject-path variance. New
+      `audit_360_failure_modes_collapse_to_single_error` test
+      asserts that two distinct failure causes (tampered shares
+      → seed-or-decap failure vs. wrong-keygen shares → ss
+      mismatch) return byte-identical error values. Existing
+      `tampered_mac_byte_fails_verification` updated to expect
+      the collapsed error. 33 threshold tests pass; 107
+      crypto tests; mempool + node tests green.
       `crates/crypto/src/threshold.rs:537-549`. Collapse both to a
       single opaque `"threshold decryption failed"` error.
 
