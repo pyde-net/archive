@@ -410,57 +410,43 @@ pub fn verify_qc(qc: &QuorumCert, committee_keys: &[Vec<u8>], chain_id: u64) -> 
     true
 }
 
-/// Check if a block has reached finality.
-///
-/// In pipelined HotStuff, a block at slot S is finalized when:
-/// - There is a QC for slot S (certifying the block)
-/// - There is a QC for slot S+1 that chains back to the block at slot S
-///   (the QC at S+1 must reference the block_hash certified by the QC at S)
-/// (Two consecutive chained QCs = finality)
-/// Check if a block at `block_slot` is finalized per pipelined HotStuff.
-/// Requires: QC at slot S with quorum, AND QC at slot S+1 with quorum
-/// where the S+1 block chains back to the S block (parent_hash matches).
-///
-/// `headers` maps slot → BlockHeader for chain verification.
-/// `committee_size` is the active committee size for `block_slot`; the
-/// quorum threshold is computed from it via `quorum_for_committee` so
-/// devnet/testnet committees smaller than 128 form finality correctly.
-pub fn is_finalized(
-    block_slot: u64,
-    qc_chain: &[QuorumCert],
-    headers: &std::collections::HashMap<u64, crate::block::BlockHeader>,
-    committee_size: usize,
-) -> bool {
-    // Find a valid QC for block_slot
-    let qc_for_block = match qc_chain
-        .iter()
-        .find(|qc| qc.slot == block_slot && qc.has_quorum_for(committee_size))
-    {
-        Some(qc) => qc,
-        None => return false,
-    };
-
-    // The QC must certify a real block (non-zero hash)
-    if qc_for_block.block_hash == [0u8; 32] {
-        return false;
-    }
-
-    // Find a valid QC for block_slot+1
-    let qc_for_next = match qc_chain
-        .iter()
-        .find(|qc| qc.slot == block_slot + 1 && qc.has_quorum_for(committee_size))
-    {
-        Some(qc) => qc,
-        None => return false,
-    };
-
-    // Verify chain linking: the block at slot+1 must reference the block at slot as parent
-    if let Some(next_header) = headers.get(&(block_slot + 1)) {
-        next_header.parent_hash == qc_for_block.block_hash && qc_for_next.block_hash != [0u8; 32]
-    } else {
-        false // can't verify chain without the header
-    }
-}
+// Audit 329: the canonical 2-chained-QC `is_finalized` rule was
+// removed from this module. Pyde does NOT use pipelined-HotStuff
+// finality; the production finality protocol is documented in
+// `pyde_consensus::finality` and consists of two separate
+// recordings:
+//
+//   1. Soft finality (pyde_consensus::finality::FinalityTracker
+//      ::record_soft_finality): set the moment a vote-QC for the
+//      slot is formed. Soft-final blocks are eligible for
+//      execution and gossip but can still be reverted by a
+//      reorg if the QC's underlying chain segment loses out to
+//      a competing fork (extremely rare but possible during
+//      view-changes).
+//
+//   2. Hard finality (FinalityTracker::record_hard_finality):
+//      set when a separate `FinalityVote` round produces a
+//      `FinalityCert` (≥ committee_quorum FALCON sigs over
+//      `(slot, block_hash, state_root)`). Hard-final blocks
+//      cannot be reverted; the explorer / WS clients use the
+//      `FinalityCheckpoint` carried alongside the cert as
+//      their reorg-safe anchor.
+//
+// The pre-329 `is_finalized(block_slot, qc_chain, headers,
+// committee_size)` helper checked the textbook 2-chained-QC
+// rule, but no production code path ever called it — the
+// dispatch above runs end-to-end on the soft+hard pair. Keeping
+// it around as documentation-only public API was actively
+// misleading: the comment chain in `block_processor.rs` and
+// `validator.rs` refers to "finality" without specifying which
+// of the two layers, and a reader landing on the helper would
+// reasonably assume the textbook rule was authoritative.
+//
+// The helper's tests (`pipelined_finality` etc.) were removed
+// alongside it. If we ever migrate to pipelined-HotStuff
+// finality (e.g., to drop the FinalityVote round), the textbook
+// rule is easy to reintroduce — `QuorumCert::has_quorum_for`
+// and `BlockHeader::parent_hash` are both still here.
 
 /// Create a timeout message when no valid proposal received within the timeout period.
 ///
@@ -792,75 +778,12 @@ mod tests {
         assert!(qc.is_none());
     }
 
-    // ========== Task 0486: Pipelined blocks ==========
-
-    #[test]
-    fn pipelined_finality() {
-        use crate::block::BlockHeader;
-        use pyde_account::address::ZERO_ADDRESS;
-        use std::collections::HashMap;
-
-        // Block at slot 5 is finalized when QCs exist for slot 5 and slot 6,
-        // AND the block at slot 6 chains to the block at slot 5.
-        let qc_5 = QuorumCert {
-            slot: 5,
-            block_hash: [0xAA; 32],
-            voter_bitmap: (1u128 << 86) - 1,
-            signatures: vec![],
-        };
-        let qc_6 = QuorumCert {
-            slot: 6,
-            block_hash: [0xBB; 32],
-            voter_bitmap: (1u128 << 86) - 1,
-            signatures: vec![],
-        };
-
-        // Block at slot 6 has parent_hash = block at slot 5's hash
-        let header_6 = BlockHeader {
-            slot: 6,
-            epoch: 0,
-            parent_hash: [0xAA; 32], // chains to block 5
-            proposer: ZERO_ADDRESS,
-            vrf_proof: vec![],
-            qc_previous: qc_5.clone(),
-            tx_root: [0; 32],
-            state_root: [0; 32],
-            timestamp: 0,
-        };
-
-        let mut headers = HashMap::new();
-        headers.insert(6, header_6);
-
-        assert!(is_finalized(
-            5,
-            &[qc_5.clone(), qc_6.clone()],
-            &headers,
-            128
-        ));
-        assert!(!is_finalized(5, &[qc_5.clone()], &headers, 128)); // missing QC for slot 6
-        assert!(!is_finalized(5, &[qc_6.clone()], &headers, 128)); // missing QC for slot 5
-
-        // Unrelated block at slot 6 (wrong parent) should NOT finalize
-        let header_6_bad = BlockHeader {
-            slot: 6,
-            epoch: 0,
-            parent_hash: [0xCC; 32], // does NOT chain to block 5
-            proposer: ZERO_ADDRESS,
-            vrf_proof: vec![],
-            qc_previous: QuorumCert::empty(),
-            tx_root: [0; 32],
-            state_root: [0; 32],
-            timestamp: 0,
-        };
-        let mut bad_headers = HashMap::new();
-        bad_headers.insert(6, header_6_bad);
-        assert!(!is_finalized(
-            5,
-            &[qc_5.clone(), qc_6.clone()],
-            &bad_headers,
-            128
-        ));
-    }
+    // Audit 329: the `pipelined_finality` test was removed
+    // alongside the textbook `is_finalized` helper it exercised.
+    // Production uses the FinalityTracker soft+hard split
+    // documented in `pyde_consensus::finality`; the textbook
+    // 2-chained-QC rule is not part of Pyde's finality protocol.
+    // See the rationale block above the deletion site for why.
 
     // ========== Task 0487: QC requires 86/128 ==========
 

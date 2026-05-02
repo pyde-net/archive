@@ -120,16 +120,35 @@ impl TimeoutTracker {
 
 /// Build the message that validators sign for view change.
 ///
-/// Preimage: `b"view_change" || chain_id_le || slot_le`. The `chain_id`
-/// prefix prevents cross-chain replay: a timeout signed on chain A
-/// cannot be reused as a view-change vote on chain B even if both
-/// chains share the same FALCON keys (e.g., devnet vs testnet during
-/// operator dev cycles).
-fn view_change_sign_message(chain_id: u64, slot: u64) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(27); // "view_change"(11) + chain_id(8) + slot(8)
+/// Preimage: `b"view_change" || chain_id_le || slot_le ||
+/// highest_qc.hash()`.
+///
+/// * `chain_id` prefix prevents cross-chain replay: a timeout signed
+///   on chain A cannot be reused as a view-change vote on chain B
+///   even if both chains share the same FALCON keys (e.g., devnet
+///   vs testnet during operator dev cycles).
+/// * `highest_qc.hash()` (audit 324) binds the QC carried in the
+///   payload to the FALCON signature. Pre-fix the message only
+///   committed to `(chain_id, slot)` while the gossip envelope
+///   carried `highest_qc` as an unauthenticated tag-along — a
+///   middlebox observing a legitimate `ViewChangeMessage` could
+///   strip the embedded `highest_qc` and replace it with a stale
+///   or empty QC; the FALCON signature still verified, and the
+///   `try_form_view_change_qc` aggregator picked the highest QC
+///   among the (now-fabricated) submissions. The visible damage
+///   on the testnet was a fallback proposer building atop a stale
+///   chain head, fork-creating in the worst case. With the
+///   `highest_qc.hash()` mix-in the signature commits to the QC
+///   the validator actually saw; any rewrite by a relay produces
+///   a payload whose `highest_qc.hash()` differs from the signed
+///   preimage, and `verify_view_change` rejects.
+fn view_change_sign_message(chain_id: u64, slot: u64, highest_qc: &QuorumCert) -> Vec<u8> {
+    // "view_change"(11) + chain_id(8) + slot(8) + qc_hash(32) = 59
+    let mut msg = Vec::with_capacity(59);
     msg.extend_from_slice(b"view_change");
     msg.extend_from_slice(&chain_id.to_le_bytes());
     msg.extend_from_slice(&slot.to_le_bytes());
+    msg.extend_from_slice(&highest_qc.hash());
     msg
 }
 
@@ -142,7 +161,7 @@ pub fn create_view_change(
     voter_address: Address,
     voter_sk: &FalconSecretKey,
 ) -> Result<ViewChangeMessage, &'static str> {
-    let msg = view_change_sign_message(chain_id, slot);
+    let msg = view_change_sign_message(chain_id, slot, highest_qc);
     let sig = falcon_sign(voter_sk, &msg).map_err(|_| "view change signing failed")?;
 
     Ok(ViewChangeMessage {
@@ -158,13 +177,16 @@ pub fn create_view_change(
 ///
 /// A timeout signed on a different chain (different `chain_id`) will
 /// fail verification here even when FALCON keys match — preventing
-/// cross-chain replay.
+/// cross-chain replay. Audit 324: the verifier rebuilds the preimage
+/// with the carried `msg.highest_qc`, so any relay that swapped the
+/// QC bytes mid-flight produces a payload whose `highest_qc.hash()`
+/// differs from the signed preimage and FALCON verification fails.
 pub fn verify_view_change(chain_id: u64, msg: &ViewChangeMessage, public_key: &[u8]) -> bool {
     let pk = match FalconPublicKey::from_bytes(public_key) {
         Some(pk) => pk,
         None => return false,
     };
-    let sign_msg = view_change_sign_message(chain_id, msg.slot);
+    let sign_msg = view_change_sign_message(chain_id, msg.slot, &msg.highest_qc);
     let sig = match FalconSignature::from_bytes(&msg.signature) {
         Some(s) => s,
         None => return false,
@@ -691,5 +713,95 @@ mod tests {
         assert_eq!(tracker.ms_until_timeout(1100), 100); // 100ms in
         assert_eq!(tracker.ms_until_timeout(1200), 0); // at timeout
         assert_eq!(tracker.ms_until_timeout(1500), 0); // past timeout
+    }
+
+    // ========== Audit 324: highest_qc bound into the FALCON preimage ==========
+
+    /// A signed view-change message whose `highest_qc` is rewritten
+    /// in flight by a relay (e.g., a middlebox swapping a fresh QC
+    /// for a stale one) must fail verification. Pre-fix the
+    /// signature only committed to `(chain_id, slot)`, so the swap
+    /// went undetected: `verify_view_change` accepted the rewritten
+    /// payload and `try_form_view_change_qc` would aggregate the
+    /// (now-fabricated) "highest" QC, biasing the fallback proposer
+    /// onto a stale chain head.
+    #[test]
+    fn audit_324_highest_qc_swap_breaks_signature() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+
+        // The QC the validator actually had locally (slot 9, real block).
+        let honest_qc = QuorumCert {
+            slot: 9,
+            block_hash: [0xAA; 32],
+            voter_bitmap: 0xFF_FF_FF_FF_FF_FF_FF_FF_FF_FF_FF_FF_FF_FF_FF_FFu128,
+            signatures: vec![],
+        };
+        let mut msg = create_view_change(TEST_CHAIN_ID, 10, &honest_qc, 0, addr, &sk).unwrap();
+        assert!(verify_view_change(TEST_CHAIN_ID, &msg, &pk_bytes));
+
+        // Adversary in the relay path swaps in a stale / empty QC
+        // while leaving the FALCON signature untouched.
+        msg.highest_qc = QuorumCert::empty();
+        assert!(
+            !verify_view_change(TEST_CHAIN_ID, &msg, &pk_bytes),
+            "swapping highest_qc must invalidate the FALCON signature",
+        );
+    }
+
+    /// Fine-grained variant: rewriting any single field of
+    /// `highest_qc` (slot, block_hash, voter_bitmap) — the three
+    /// fields folded into `QuorumCert::hash()` — must invalidate
+    /// the signature. Confirms the preimage commits to the QC
+    /// digest, not just one summary field.
+    #[test]
+    fn audit_324_highest_qc_field_rewrite_breaks_signature() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+
+        let qc = QuorumCert {
+            slot: 9,
+            block_hash: [0xAA; 32],
+            voter_bitmap: 0x1234,
+            signatures: vec![],
+        };
+        let original = create_view_change(TEST_CHAIN_ID, 10, &qc, 0, addr, &sk).unwrap();
+        assert!(verify_view_change(TEST_CHAIN_ID, &original, &pk_bytes));
+
+        // Slot rewrite.
+        let mut tampered = original.clone();
+        tampered.highest_qc.slot = 8;
+        assert!(!verify_view_change(TEST_CHAIN_ID, &tampered, &pk_bytes));
+
+        // block_hash rewrite.
+        let mut tampered = original.clone();
+        tampered.highest_qc.block_hash = [0xBB; 32];
+        assert!(!verify_view_change(TEST_CHAIN_ID, &tampered, &pk_bytes));
+
+        // voter_bitmap rewrite.
+        let mut tampered = original.clone();
+        tampered.highest_qc.voter_bitmap = 0xDEAD;
+        assert!(!verify_view_change(TEST_CHAIN_ID, &tampered, &pk_bytes));
+    }
+
+    /// Honest round-trip with a non-empty `highest_qc` continues to
+    /// succeed (regression-guard against the earlier
+    /// `view_change_message_created_and_verified` test which uses
+    /// `QuorumCert::empty()`).
+    #[test]
+    fn audit_324_nonempty_highest_qc_roundtrip_succeeds() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+        let qc = QuorumCert {
+            slot: 42,
+            block_hash: [0x77; 32],
+            voter_bitmap: 0x0F_0F_0F_0F,
+            signatures: vec![],
+        };
+        let msg = create_view_change(TEST_CHAIN_ID, 100, &qc, 1, addr, &sk).unwrap();
+        assert!(verify_view_change(TEST_CHAIN_ID, &msg, &pk_bytes));
     }
 }
