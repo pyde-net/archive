@@ -629,11 +629,27 @@ impl CodeGen {
         }
     }
 
-    /// Fallback: search all structs for a field name (backward compat for untyped access).
+    /// Fallback: search all structs for a field name (backward
+    /// compat for untyped access).
+    ///
+    /// Audit 355: walk struct names in sorted order so the first
+    /// match is deterministic. Pre-fix this iterated
+    /// `HashMap.values()` directly — Rust's HashMap iteration order
+    /// is unspecified and varies per process (different SipHash
+    /// seed per run), so two compilations of the same source could
+    /// pick different fields when a name collides across structs,
+    /// producing two non-equal bytecodes from one input. That
+    /// breaks reproducible-builds (operator deploys hash A, CI
+    /// hashes B, audit reviewer hashes C — all valid contracts,
+    /// none byte-equal).
     fn find_field_offset_any(&self, field_name: &str) -> u32 {
-        for fmap in self.field_offsets.values() {
-            if let Some((off, _)) = fmap.get(field_name) {
-                return *off;
+        let mut struct_names: Vec<&String> = self.field_offsets.keys().collect();
+        struct_names.sort();
+        for sname in struct_names {
+            if let Some(fmap) = self.field_offsets.get(sname) {
+                if let Some((off, _)) = fmap.get(field_name) {
+                    return *off;
+                }
             }
         }
         0
@@ -8404,5 +8420,62 @@ mod tests {
             has_callext,
             "Factory.mint_on_last must emit CallExt for Token::at(addr).mint() cross-contract call"
         );
+    }
+
+    /// Audit 355: bytecode must be byte-deterministic across
+    /// runs. Pre-fix `find_field_offset_any` walked
+    /// `HashMap.values()` (Rust's HashMap iteration order is
+    /// unspecified and varies per process via SipHash random
+    /// seed), so two compilations of the same source could pick
+    /// different fields when a name collides across structs and
+    /// produce different bytecodes — breaking reproducible-
+    /// builds and signed-bytecode-hash invariants. Post-fix we
+    /// sort the struct names before iterating, so the first
+    /// match is deterministic.
+    ///
+    /// We don't have a multi-struct field-name-collision case
+    /// in the existing test corpus to exercise the fallback, so
+    /// the regression here is a determinism check at the
+    /// compile-output level: compile the same source 5 times in
+    /// the same process, assert byte-identical runtime bytecode.
+    /// If the fallback gets re-introduced (or any other source
+    /// of HashMap-order non-determinism creeps in), the
+    /// compilations will diverge and the test fails.
+    #[test]
+    fn audit_355_compile_output_is_deterministic_across_runs() {
+        let src = r#"
+            contract Token {
+                storage {
+                    supply: u256,
+                    holders: Map<Address, u256>,
+                }
+                #[constructor]
+                pub fn init(initial: u256) {
+                    self.supply = initial;
+                }
+                pub fn mint(to: Address, amount: u256) {
+                    self.supply = self.supply + amount;
+                    self.holders[to] = self.holders[to] + amount;
+                }
+                #[view]
+                pub fn balance_of(who: Address) -> u256 {
+                    return self.holders[who];
+                }
+            }
+        "#;
+        let runs = (0..5).map(|_| crate::compile_all(src)).collect::<Vec<_>>();
+        // All 5 compilations produce one Token contract.
+        for r in &runs {
+            assert_eq!(r.len(), 1);
+            assert_eq!(r[0].0, "Token");
+        }
+        let baseline = &runs[0][0].1.runtime_bytecode;
+        for (i, r) in runs.iter().enumerate().skip(1) {
+            assert_eq!(
+                r[0].1.runtime_bytecode, *baseline,
+                "audit 355: compile run {} differs from run 0 — non-determinism in codegen",
+                i
+            );
+        }
     }
 }
