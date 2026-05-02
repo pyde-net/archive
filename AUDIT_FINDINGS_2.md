@@ -614,10 +614,25 @@
       3 new tests on the helpers (small-committee everyone-eligible
       branch, linear scaling with N, `score_from_output` LE
       decoding). 14 proposer tests pass; workspace builds clean.
-- [ ] 324 — `⚠` **`view_change_sign_message` doesn't bind
-      `highest_qc`.** `crates/consensus/src/view_change.rs:128-134`.
-      Middleboxes can swap `highest_qc` mid-flight. Include
-      `highest_qc.hash()` in the preimage.
+- [x] 324 — `⚠` **`view_change_sign_message` doesn't bind
+      `highest_qc`.** **SHIPPED.** `view_change_sign_message` now
+      takes `&QuorumCert` and folds `highest_qc.hash()` (which
+      itself binds slot + block_hash + voter_bitmap) into the
+      FALCON preimage. Pre-fix the message only committed to
+      `(chain_id, slot)` while the gossip envelope carried
+      `highest_qc` as an unauthenticated tag-along — a middlebox
+      observing a legitimate `ViewChangeMessage` could strip the
+      embedded `highest_qc` and swap a stale or empty QC; the
+      FALCON sig still verified, and `try_form_view_change_qc`'s
+      "highest QC" aggregator picked the fabricated value, biasing
+      the fallback proposer onto a stale chain head. With the QC
+      hash mixed in, any rewrite produces a payload whose
+      `highest_qc.hash()` differs from the signed preimage and
+      `verify_view_change` rejects. New 3 audit-324 tests pin:
+      swapping `highest_qc` to empty breaks the sig, rewriting any
+      single field of `highest_qc` (slot / block_hash /
+      voter_bitmap) breaks the sig, honest non-empty round-trip
+      still verifies.
 - [x] 325 — `⚠` **No timestamp validation.** **SHIPPED.**
       Added `MAX_TIMESTAMP_DRIFT_MS = 15_000` constant and extended
       `validate_network_block` with `parent_timestamp: Option<u64>`
@@ -634,10 +649,27 @@
 - [ ] 326 — `⚠` **`seen_evidence`, `seen_finality_votes` unbounded
       memory.** `crates/node/src/validator.rs:315`. Add prune loop
       mirroring `seen_proposals`/`seen_votes`.
-- [ ] 327 — `⚠` **Vote / view-change vec accept unbounded duplicates
-      pre-dedup.** `validator.rs:1830-1834, 1941-1942`. Dedup
-      on `(slot, voter_index)` BEFORE push to bound FALCON-verify
-      cost per slot.
+- [x] 327 — `⚠` **Vote / view-change vec accept unbounded duplicates
+      pre-dedup.** **SHIPPED.** Three call sites (`on_vote`,
+      `on_view_change`, `on_finality_vote`) now short-circuit on
+      `(slot, voter_index)` BEFORE pushing into the per-slot Vec
+      and BEFORE running FALCON verification:
+      * `on_vote` reuses `seen_votes` (already keyed on
+        `(slot, voter_index)`); same-hash replays drop pre-verify,
+        different-hash continues to the existing equivocation /
+        evidence path.
+      * `on_view_change` and `on_finality_vote` get new HashSets
+        (`seen_view_changes`, `seen_finality_votes`) keyed on
+        `(slot, voter_index)`. The slot-prune loop retains both
+        sets in lockstep with the Vecs.
+      Pre-fix `try_form_view_change_qc` and `try_form_hard_finality`
+      ran FALCON verification on every entry of the per-slot Vec,
+      so a peer flooding the same `(slot, voter_index)` repeats
+      forced O(N) FALCON re-verifies per QC-formation attempt —
+      the per-slot CPU cost grew unbounded with adversarial
+      gossip. Now any flood drops at the dedup gate. New 3
+      audit-327 tests pin: 100 vote replays leave per-slot Vec at
+      length 1, same for view-changes, same for finality votes.
 - [x] 328 — `⚠` **`compute_slash` uses fixed `VALIDATOR_STAKE`
       (10K), not actual current stake.** **SHIPPED.**
       `slash_double_sign` now takes a `current_stake: u128`
@@ -662,11 +694,26 @@
       zero-stake offender yields zero amounts (still ejected),
       liveness slash uses live stake, apply_slash debit equals
       promised slash exactly (no phantom mint).
-- [ ] 329 — `⚠` **`is_finalized` (2-chained-QC rule) is dead code.**
-      `crates/consensus/src/hotstuff.rs:329-364`. Production
-      records soft finality on the first QC; the documented chain
-      check never runs. Either wire it in or update the doc to
-      match.
+- [x] 329 — `⚠` **`is_finalized` (2-chained-QC rule) is dead code.**
+      **SHIPPED.** Took the doc-aligned path: deleted
+      `is_finalized` and its `pipelined_finality` test, and
+      replaced both with a long comment block at the deletion
+      site explaining what Pyde's actual finality protocol is
+      (the soft+hard split in `pyde_consensus::finality`). Pre-fix
+      the helper was textbook pipelined-HotStuff finality, but no
+      production code path ever called it — the dispatch runs
+      end-to-end through `FinalityTracker::record_soft_finality`
+      (set on the first vote-QC for a slot) and
+      `record_hard_finality` (set when a separate `FinalityVote`
+      round produces a `FinalityCert` with FALCON sigs over
+      `(slot, block_hash, state_root)`). Keeping the unused helper
+      around as documentation-only public API was actively
+      misleading: explorers / WS clients use the FinalityCheckpoint
+      as their reorg-safe anchor, and a reader landing on
+      `is_finalized` would reasonably assume the textbook rule was
+      authoritative when it isn't. The deletion comment makes it
+      easy to reintroduce the rule if Pyde ever migrates to
+      pipelined-HotStuff finality.
 
 ### State
 

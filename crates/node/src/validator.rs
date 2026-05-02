@@ -244,6 +244,22 @@ pub struct ValidatorEngine {
     /// Seen votes per slot: (slot, voter_index) → (block_hash, signature).
     /// Used to detect double-voting (equivocation).
     seen_votes: HashMap<(u64, u8), ([u8; 32], Vec<u8>)>,
+    /// Audit 327: dedup set for incoming view-change messages,
+    /// keyed on `(slot, voter_index)`. `on_view_change` checks
+    /// this BEFORE pushing to `view_changes` so a peer that
+    /// re-broadcasts the same VC message (legitimate gossip
+    /// reflood) or floods adversarial repeats cannot inflate the
+    /// per-slot Vec — `try_form_view_change_qc` runs FALCON
+    /// verification once per entry, so an unbounded Vec means
+    /// unbounded FALCON cost per QC-formation attempt.
+    /// Pruned alongside `view_changes` in the slot-prune loop.
+    seen_view_changes: std::collections::HashSet<(u64, u8)>,
+    /// Audit 327: dedup set for incoming finality votes, keyed
+    /// on `(slot, voter_index)`. Same rationale as
+    /// `seen_view_changes` — `try_form_hard_finality` re-verifies
+    /// every vote in the per-slot Vec, so a duplicate flood
+    /// re-pays FALCON cost per duplicate.
+    seen_finality_votes: std::collections::HashSet<(u64, u8)>,
     /// Collected double-sign evidence awaiting inclusion in a Slash tx.
     /// Drained by `drain_pending_evidence` when the block builder wants
     /// to construct slashing transactions. We hold the raw evidence here
@@ -364,6 +380,8 @@ impl ValidatorEngine {
             voted_slots: std::collections::HashSet::new(),
             seen_proposals: HashMap::new(),
             seen_votes: HashMap::new(),
+            seen_view_changes: std::collections::HashSet::new(),
+            seen_finality_votes: std::collections::HashSet::new(),
             pending_evidence: Vec::new(),
             broadcast_evidence: Vec::new(),
             seen_evidence: std::collections::HashSet::new(),
@@ -1779,6 +1797,26 @@ impl ValidatorEngine {
             _ => return None,
         };
 
+        // Audit 327: dedup BEFORE FALCON verify. A re-broadcast of
+        // an already-accepted vote (legitimate gossip reflood OR
+        // adversarial replay) used to incur a fresh FALCON-verify
+        // each time the message arrived; with this gate the cost
+        // is paid only on the first delivery.
+        //
+        // Only short-circuit when the prior seen-vote has the
+        // SAME `block_hash` — a different hash from the same
+        // voter is a double-vote and must continue down the
+        // verify + evidence path below so it can be reported
+        // for slashing. The post-verify branch later in this
+        // function still handles that case.
+        let vote_key = (slot, voter_index as u8);
+        if let Some((prev_hash, _)) = self.seen_votes.get(&vote_key) {
+            if *prev_hash == block_hash {
+                debug!(slot, voter_index, "dedup: replayed vote dropped pre-FALCON",);
+                return None;
+            }
+        }
+
         // Verify vote signature
         if voter_index < self.committee_keys.len()
             && !verify_vote(self.chain_id, &vote, &self.committee_keys[voter_index])
@@ -1788,7 +1826,8 @@ impl ValidatorEngine {
         }
 
         // --- Double-vote (equivocation) detection ---
-        let vote_key = (slot, voter_index as u8);
+        // Note: `vote_key` is already declared above for the audit-327
+        // dedup short-circuit. We re-use the same binding here.
         // Clone the prior vote out so we can drop the `seen_votes` borrow
         // before calling `ingest_evidence` (which needs `&mut self`).
         if let Some((prev_hash, prev_sig)) = self.seen_votes.get(&vote_key).cloned() {
@@ -1962,6 +2001,22 @@ impl ValidatorEngine {
             return false;
         }
 
+        // Audit 327: dedup BEFORE pushing into the per-slot Vec.
+        // `try_form_view_change_qc` runs FALCON verification on
+        // every entry in the Vec, so a peer that floods repeats
+        // of the same `(slot, voter_index)` would inflate the
+        // per-QC-attempt FALCON cost linearly. The HashSet entry
+        // is removed alongside the Vec in the slot-prune loop.
+        let dedup_key = (slot, msg.voter_index);
+        if !self.seen_view_changes.insert(dedup_key) {
+            debug!(
+                slot,
+                voter_index = msg.voter_index,
+                "dedup: replayed view-change dropped",
+            );
+            return false;
+        }
+
         let entry = self.view_changes.entry(slot).or_default();
         entry.push(msg);
 
@@ -2010,6 +2065,18 @@ impl ValidatorEngine {
         let slot = vote.slot;
         let block_hash = vote.block_hash;
         let state_root = vote.state_root;
+        let voter_index = vote.voter_index;
+
+        // Audit 327: dedup BEFORE pushing into the per-slot Vec.
+        // `try_form_hard_finality` runs FALCON verification on
+        // every entry of the Vec, so a peer flooding the same
+        // `(slot, voter_index)` would force a fresh FALCON-verify
+        // round per duplicate.
+        let dedup_key = (slot, voter_index);
+        if !self.seen_finality_votes.insert(dedup_key) {
+            debug!(slot, voter_index, "dedup: replayed finality vote dropped",);
+            return false;
+        }
 
         let entry = self.finality_votes.entry(slot).or_default();
         entry.push(vote);
@@ -2311,6 +2378,11 @@ impl ValidatorEngine {
             self.voted_slots.retain(|s| *s >= prune_before);
             self.seen_proposals.retain(|(s, _), _| *s >= prune_before);
             self.seen_votes.retain(|(s, _), _| *s >= prune_before);
+            // Audit 327: prune the dedup sets in lockstep with their
+            // backing per-slot Vecs so the sets don't grow unbounded
+            // for long-running validators.
+            self.seen_view_changes.retain(|(s, _)| *s >= prune_before);
+            self.seen_finality_votes.retain(|(s, _)| *s >= prune_before);
             // Mirror the same pruning on disk so the evidence index does not
             // grow unbounded. Best-effort: a failure here just delays cleanup.
             if let Some(store) = &self.consensus_store {
@@ -5130,6 +5202,146 @@ mod tests {
             "exactly ONE validator should build a fallback per (H, V); got {proposal_count}. \
              Today every validator with a local VC-QC builds, leading to vote splits under \
              asymmetric gossip delivery. See CONSENSUS_INVARIANTS.md L2."
+        );
+    }
+
+    // ========== Audit 327: dedup before FALCON-verify cost is paid ==========
+
+    /// A vote that's been accepted once must not push a second
+    /// entry into `votes[slot]` when re-broadcast (legitimate
+    /// gossip reflood) or replayed by an adversary. Pre-fix the
+    /// FALCON verify ran first, then the vote was pushed
+    /// unconditionally — every duplicate inflated the per-slot
+    /// Vec and the next QC-formation pass paid the FALCON cost
+    /// for each entry.
+    #[test]
+    fn audit_327_replayed_vote_dropped_pre_verify() {
+        use pyde_consensus::hotstuff::{proposer_sign_message, ConsensusMessage};
+        use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
+
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let signer = pyde_account::address::derive_eoa_address(&pk_bytes);
+
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
+        engine.set_committee(vec![pk_bytes.clone()]);
+
+        let slot = 9u64;
+        let hash = [0x42u8; 32];
+        let sig = falcon_sign(&sk, &proposer_sign_message(TEST_CHAIN_ID, slot, &hash))
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let make_vote = || ConsensusMessage::Vote {
+            slot,
+            block_hash: hash,
+            voter_index: 0,
+            voter_address: signer,
+            signature: sig.clone(),
+        };
+
+        // First delivery: accepted, pushed.
+        let _ = engine.on_vote(make_vote());
+        let entry = engine.votes.get(&slot).expect("vote stored");
+        assert_eq!(entry.votes.len(), 1);
+
+        // 100 replays of the byte-identical vote: dropped pre-verify.
+        for _ in 0..100 {
+            let _ = engine.on_vote(make_vote());
+        }
+        let entry = engine.votes.get(&slot).expect("still stored");
+        assert_eq!(
+            entry.votes.len(),
+            1,
+            "replays must NOT inflate the per-slot vote vec",
+        );
+    }
+
+    /// View-change message dedup: a peer flooding repeats of the
+    /// same `(slot, voter_index)` view-change must not inflate
+    /// `view_changes[slot]`. `try_form_view_change_qc` runs FALCON
+    /// verify on every entry, so the bound matters.
+    #[test]
+    fn audit_327_replayed_view_change_dropped() {
+        use pyde_crypto::falcon::falcon_keygen;
+
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let signer = pyde_account::address::derive_eoa_address(&pk_bytes);
+
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
+        engine.set_committee(vec![pk_bytes]);
+        // Set target_height so `slot >= target_height` passes.
+        engine.consensus.target_height = 5;
+
+        let slot = 5u64;
+        let qc = pyde_consensus::block::QuorumCert::empty();
+        let msg = pyde_consensus::view_change::create_view_change(
+            TEST_CHAIN_ID,
+            slot,
+            &qc,
+            0,
+            signer,
+            &sk,
+        )
+        .unwrap();
+
+        // First delivery: accepted.
+        engine.on_view_change(msg.clone());
+        assert_eq!(engine.view_changes.get(&slot).unwrap().len(), 1);
+
+        // 100 replays: dropped on dedup, vec stays at length 1.
+        for _ in 0..100 {
+            engine.on_view_change(msg.clone());
+        }
+        assert_eq!(
+            engine.view_changes.get(&slot).unwrap().len(),
+            1,
+            "replays must NOT inflate the per-slot view-change vec",
+        );
+    }
+
+    /// Finality-vote dedup: same rationale as view-change above,
+    /// applied to `finality_votes[slot]` which is the input to
+    /// `try_form_hard_finality`.
+    #[test]
+    fn audit_327_replayed_finality_vote_dropped() {
+        use pyde_consensus::finality::FinalityVote;
+        use pyde_crypto::falcon::falcon_keygen;
+
+        let (pk, _sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let signer = pyde_account::address::derive_eoa_address(&pk_bytes);
+
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
+        engine.set_committee(vec![pk_bytes]);
+
+        let slot = 11u64;
+        // The dedup gate runs BEFORE any FALCON verify, so the
+        // signature contents don't matter for this test — only the
+        // (slot, voter_index) tuple. A garbage signature lets us
+        // exercise the dedup path without depending on
+        // `finality_sign_message` (which is private to
+        // pyde_consensus::finality).
+        let vote = FinalityVote {
+            slot,
+            block_hash: [0x33u8; 32],
+            state_root: [0x44u8; 32],
+            voter_index: 0,
+            voter_address: signer,
+            signature: vec![0xEE; 666],
+        };
+
+        engine.on_finality_vote(vote.clone());
+        assert_eq!(engine.finality_votes.get(&slot).unwrap().len(), 1);
+
+        for _ in 0..100 {
+            engine.on_finality_vote(vote.clone());
+        }
+        assert_eq!(
+            engine.finality_votes.get(&slot).unwrap().len(),
+            1,
+            "replays must NOT inflate the per-slot finality vote vec",
         );
     }
 }
