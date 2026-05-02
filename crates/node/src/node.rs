@@ -917,6 +917,18 @@ impl PydeNode {
                                 let req = pyde_net::auth::PydeAuthReq { nonce };
                                 let _ = swarm.behaviour_mut().auth.send_request(&peer_id, req);
                             }
+                            // Audit 396: also poll this peer for their
+                            // chain tip. Without this kick, a fresh full
+                            // node connects, never learns the network is
+                            // ahead, sync_manager.network_tip stays at 0
+                            // (`is_behind` returns false), no GetBlocks
+                            // is ever sent — the node sits at slot 0
+                            // forever even though peers have a long
+                            // chain to share. The PostEventAction
+                            // variant existed for this purpose but was
+                            // never produced anywhere, so the cold-sync
+                            // path was dead from day one.
+                            chain_sync.request_chain_tip(&mut swarm, peer_id);
                         }
                         PostEventAction::SendAuthResponse(channel, resp) => {
                             let _ = swarm.behaviour_mut().auth.send_response(channel, resp);
@@ -1136,15 +1148,28 @@ impl PydeNode {
                             let _ = swarm.disconnect_peer_id(peer);
                             debug!(%peer, "force-disconnected stale peer");
                         }
-                        PostEventAction::ContinueSync => {
-                            // If chunked snapshot in progress, request next chunk
-                            if let Some(next_idx) = chain_sync.needs_next_chunk() {
-                                let peer = swarm.connected_peers().next().copied();
-                                if let Some(p) = peer {
-                                    chain_sync.request_next_chunk(&mut swarm, p, next_idx);
+                        PostEventAction::SyncedBlocksApplied {
+                            receipts_batch,
+                            continue_sync,
+                        } => {
+                            // Persist receipts produced by sync-applied
+                            // blocks. Held briefly under one lock — same
+                            // pattern as the QC-apply branch at line ~3470.
+                            if !receipts_batch.is_empty() {
+                                let mut receipts_w = receipts.write().await;
+                                for (slot, slot_receipts) in receipts_batch {
+                                    receipts_w.insert_block_receipts(slot, slot_receipts);
                                 }
-                            } else {
-                                chain_sync.request_next_batch(&mut swarm);
+                            }
+                            if continue_sync {
+                                if let Some(next_idx) = chain_sync.needs_next_chunk() {
+                                    let peer = swarm.connected_peers().next().copied();
+                                    if let Some(p) = peer {
+                                        chain_sync.request_next_chunk(&mut swarm, p, next_idx);
+                                    }
+                                } else {
+                                    chain_sync.request_next_batch(&mut swarm);
+                                }
                             }
                         }
                         PostEventAction::BroadcastConsensus(data) => {
@@ -1490,6 +1515,22 @@ impl PydeNode {
                             };
                             let slot = header.slot;
                             let block_hash = header.hash();
+                            // Audit 396: every compact block we observe
+                            // is a network-tip signal — even if local
+                            // reconstruction succeeds (empty block or
+                            // we already had every tx). Pre-fix the
+                            // tip update only fired on the
+                            // `missing.is_empty() == false` branch,
+                            // so a node that joined the cluster at
+                            // genesis (slot 0) and only ever saw empty
+                            // warm-up blocks never realized validators
+                            // were ahead — `is_behind` returned false,
+                            // no GetBlocks ever sent, `head_slot`
+                            // pinned at 0 forever. The full-node-relay
+                            // and validator-churn failures both
+                            // reduce to this same "tip never refreshed
+                            // from gossip" symptom.
+                            chain_sync.manager.update_network_tip(slot);
 
                             // Build mempool snapshot for reconstruction (plaintext + encrypted)
                             let idx = mempool_index.read().await;
@@ -3207,7 +3248,18 @@ enum PostEventAction {
     #[allow(dead_code)]
     RequestChainTip(PeerId),
     SendSyncResponse(request_response::ResponseChannel<SyncResp>, SyncResp),
-    ContinueSync,
+    /// Audit 396: emitted after a Sync RR response has been applied.
+    /// Carries the per-slot receipts batch produced by sync-applied
+    /// blocks so the action handler can persist them in the same
+    /// ReceiptStore the QC-apply path uses, and a flag indicating
+    /// whether sync should keep pulling more batches/chunks. Pre-fix
+    /// the receipts were silently dropped at the on_response call
+    /// site; full nodes that reached their head purely via sync had
+    /// no receipts to serve over `pyde_getTransactionReceipt`.
+    SyncedBlocksApplied {
+        receipts_batch: Vec<(u64, Vec<pyde_tx::execution::Receipt>)>,
+        continue_sync: bool,
+    },
     BroadcastConsensus(Vec<u8>),
     /// Batch-publish multiple consensus messages in one post-event
     /// action. Used for slashing evidence: a single received proposal
@@ -4577,7 +4629,15 @@ fn handle_swarm_event(
                 .as_ref()
                 .and_then(|e| e.finality.latest_checkpoint.as_ref())
                 .map(|cp| (cp.slot, cp.state_root));
-            chain_sync.on_response(
+            // Audit 396: on_response now returns the receipts produced
+            // by sync-applied blocks. Pre-fix the `_receipts` were
+            // dropped at the inner call site, so a node that reached
+            // its head purely via sync (cold-start joiner, full node
+            // catching up after start-up race) had no receipts to
+            // serve over RPC. Returned here so the action handler can
+            // persist them via the same ReceiptStore the QC-apply
+            // path uses.
+            let (_processed, receipts_batch) = chain_sync.on_response(
                 request_id,
                 response,
                 chain,
@@ -4589,8 +4649,14 @@ fn handle_swarm_event(
             // more chunks OR we're otherwise still syncing. Both branches
             // produced the same ContinueSync return — collapsed into a
             // single `||` expression (spotted by slice 5.5 clippy sweep).
-            if chain_sync.needs_next_chunk().is_some() || chain_sync.is_syncing() {
-                PostEventAction::ContinueSync
+            // Now also carries the receipts to persist alongside the
+            // continue signal.
+            let continue_sync = chain_sync.needs_next_chunk().is_some() || chain_sync.is_syncing();
+            if !receipts_batch.is_empty() || continue_sync {
+                PostEventAction::SyncedBlocksApplied {
+                    receipts_batch,
+                    continue_sync,
+                }
             } else {
                 PostEventAction::None
             }

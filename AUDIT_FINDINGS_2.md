@@ -398,49 +398,52 @@
       (`aee961d`) is needed but deferred. ~30 commits in window
       (PRs #300-#310 inclusive).
 
-- [ ] 396 — `✓` **`new_node_syncs_from_network` (cold-start sync)
-      hangs at slot 0 for 60 s deadline.** Surfaced by running
-      `cargo test -p pyde-node --test multi_node_sync -- --ignored`
-      after the cycle-2 P0 + Wave A/B/C/D-partial merge.
-      **Predates this audit cycle** — the test fails identically
-      on `aee961d` (pre-audit baseline) and on HEAD: 3 validators
-      reach slot 50, the 4th node (cold full node) starts, libp2p
-      peer-connects to all 3 validators, then produces no further
-      INFO-level log lines for the 60 s deadline. Final assertion:
-      `node-3 did not reach slot 50 within 60s; last slot seen:
-      Some(0)`.
+- [x] 396 — `✓` **Cold-start sync hung at slot 0.** **SHIPPED.**
+      Three independent gaps in the late-joiner pathway:
 
-      **Suspected cause.** Cold-start path either (a) never sends
-      `GetBlocks` to a peer (sync manager not seeded with
-      `network_tip`), or (b) sends but server response triggers a
-      validation rejection that's silent at INFO level. The "peer
-      connected" events fire 3 ms after node start — fast enough
-      that an early-window race (subscribe→tip-poll handshake)
-      could be losing the GetBlocks send.
+      **(a) `RequestChainTip` action was emitted nowhere.** The
+      `PostEventAction::RequestChainTip(peer)` variant existed
+      with a wired handler, but no event-loop branch ever
+      produced it. A fresh full node connected to peers, never
+      asked any of them for their chain tip, so
+      `sync_manager.network_tip` stayed at 0,
+      `is_behind` returned false, no `GetBlocks` ever fired.
+      Fix: `RecordPeerAndAuth` (the action emitted on every
+      `ConnectionEstablished`) now also calls
+      `chain_sync.request_chain_tip(&mut swarm, peer_id)`.
 
-      **Where to look:**
-      - `crates/node/src/sync.rs` `next_request` / batch-trigger
-      - `crates/node/src/node.rs` `request_chain_tip` /
-        `update_network_tip` — confirm tip is acquired before
-        sync manager would start sending.
-      - DEBUG-level rerun (`RUST_LOG=pyde::sync=debug,pyde_net::sync_protocol=debug`)
-        will show whether GetBlocks ever leaves the wire.
+      **(b) Compact-block gossip didn't refresh
+      `network_tip`.** `update_network_tip(slot)` only fired on
+      the `missing_txs.is_empty() == false` branch of
+      `ReconstructCompactBlock` — i.e., only when local
+      reconstruction needed sync help. Empty warm-up blocks
+      (which validators produce in droves at testnet startup)
+      reconstructed cleanly, so a node that joined at genesis
+      and only ever saw empty blocks never learned the
+      validators were ahead. Fix: hoist the
+      `update_network_tip(slot)` call to the top of the handler,
+      before the missing-tx branch.
 
-      **Reproducer:**
-      ```
-      cargo test -p pyde-node --test multi_node_sync -- \
-        --ignored --nocapture
-      ```
+      **(c) Sync-applied blocks dropped their receipts.**
+      `on_response` called
+      `process_full_block_with_aot_and_checkpoint(...)` but
+      destructured the result as `Ok((_, _, _receipts))` — the
+      receipts were discarded. A node that reached its head
+      purely via sync executed every tx but had no receipts to
+      serve over `pyde_getTransactionReceipt`. Fix: change
+      `on_response` return type to
+      `(u64, Vec<(u64, Vec<Receipt>)>)` and emit a new
+      `PostEventAction::SyncedBlocksApplied` that persists
+      receipts via the same `ReceiptStore` the QC-apply path
+      uses, then optionally continues sync.
 
-      **Pre-launch impact:** validators bootstrap from a known
-      committee membership, not from cold-sync — every validator
-      starts at genesis simultaneously. Risk band: third-party
-      full-node operators who join an already-running testnet.
-      Workaround for ops: snapshot-sync (`SyncReq::GetSnapshot`
-      path is wired and clamped per audit 338) gives them a
-      starting point; block-sync from there appears to keep
-      working in the propagation/finality tests above. Flag in
-      the testnet runbook until fix lands.
+      **Verification:** `multi_node_sync` ✅ passes (was the
+      direct repro). `multi_node_full_node_relay` now reaches the
+      receipt-divergence assertion (was failing 60 s prior at
+      "receipt never appeared on full node") — separate
+      pre-existing nonce-window test-infra issue surfaces next.
+      `validator_churn` failures are independent (view-change
+      stall, not sync) — see #399.
 
 - [ ] 397 — `✓` **`epoch_rotation_crosses_boundary` exceeds 240 s
       timeout reaching slot 1005 at `block_time_ms=100`.**
