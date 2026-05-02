@@ -907,7 +907,43 @@
       across `FalconSecretKey`, `KyberSecretKey`, `KeyShare`,
       `DecryptionShare`. Wrap the local `seed_bytes` in
       `combine_shares` (line 516) with `Zeroizing`.
-- [ ] 359 — `⚠` **Threshold MAC keystream collision risk:
+- [x] 359 — `⚠` **Threshold MAC keystream collision risk.**
+      **SHIPPED.** Bound `kyber_ct` into both the keystream
+      derivation AND the MAC keying so a hypothetical Kyber-RNG
+      repeat (or any other reuse of `shared_secret`) can't
+      collapse two encryptions to the same keystream / MAC key.
+      Pre-fix:
+      ```
+      keystream = Poseidon2(ss || counter)
+      mac       = Poseidon2(0xFF*8 || ss || encrypted_msg)
+      ```
+      Post-fix:
+      ```
+      keystream = Poseidon2(KS_DOMAIN || ss || H(kyber_ct) || counter)
+      mac       = Poseidon2(MAC_DOMAIN || ss || H(kyber_ct) || encrypted_msg)
+      ```
+      The `kyber_ct` binding turns the Kyber ciphertext (which
+      Kyber's IND-CCA2 design already binds to a fresh `ss`) into
+      a per-message nonce we control. Even if Kyber's RNG were
+      compromised and produced the same `ss` twice, two
+      encryptions would still have different `kyber_ct`s →
+      different keystreams + MAC keys → no XOR-attack primitive.
+      Defense-in-depth against a broken/tampered Kyber.
+
+      Plus explicit `KS_DOMAIN` / `MAC_DOMAIN` byte prefixes so
+      a future call site that swaps argument order can't
+      accidentally produce a keystream block that also serves as
+      a MAC. 2 new tests:
+      - `audit_359_keystream_and_mac_unique_per_encryption`:
+        two encryptions of the same plaintext under the same
+        TPK produce distinct keystreams, ciphertexts, and MACs.
+      - `audit_359_kyber_ct_tampering_breaks_decrypt`: swapping
+        the `kyber_ct` in a ciphertext (under the same
+        `encrypted_msg`+`mac`) trips MAC verify. Pre-fix this
+        would have silently re-derived a wrong keystream.
+      32 threshold tests pass; 106 total crypto tests pass.
+      Mempool + node test suites green (no wire-format break
+      because `kyber_ct` was already part of `ThresholdCiphertext`).
       keystream + MAC share `ss` with weak prefix-disjoint domain
       separation.** `crates/crypto/src/threshold.rs:321-343`.
       Add explicit domain tags

@@ -391,12 +391,41 @@ impl ThresholdCiphertext {
 
 const SEED_ELEMENTS: usize = 8; // 64-byte seed = 8 × 8-byte elements
 
-fn derive_keystream(shared_secret: &SharedSecret, len: usize) -> Vec<u8> {
+/// Audit 359: domain-separation prefix for the keystream KDF.
+/// Prevents accidental cross-use of a keystream block as a MAC
+/// (or vice versa) if a future call site reorders the inputs.
+const KS_DOMAIN: &[u8] = b"pyde-threshold-keystream-v1";
+
+/// Audit 359: domain-separation prefix for the MAC.
+const MAC_DOMAIN: &[u8] = b"pyde-threshold-mac-v1";
+
+/// Audit 359: derive a Poseidon2-keyed keystream bound to BOTH
+/// the per-message Kyber shared_secret AND the kyber_ct that
+/// produced it. The ct binding is the per-message nonce —
+/// `kyber_encapsulate` returns a fresh randomized ct on every
+/// call, so two encryptions with the same plaintext produce
+/// different keystreams even if the shared_secret derivation
+/// somehow accidentally repeated (faulty RNG, replay).
+///
+/// Pre-fix the keystream was `Poseidon2(ss || counter)` with
+/// no per-message nonce — a single ss reuse leaked the XOR of
+/// the two plaintexts and the MAC key for both, giving an
+/// attacker forgery primitives against any future ciphertext
+/// under the same ss. Post-fix: even ss reuse only narrows the
+/// search if `kyber_ct` ALSO repeats, which would mean Kyber
+/// itself is broken.
+fn derive_keystream(shared_secret: &SharedSecret, kyber_ct: &[u8], len: usize) -> Vec<u8> {
+    // Bind the kyber_ct via its Poseidon2 hash so the keystream
+    // input stays a fixed 96 bytes (32 ss + 32 ct-hash + 8 ctr +
+    // domain prefix) regardless of ciphertext length.
+    let ct_fp = poseidon2_hash(kyber_ct);
     let mut keystream = Vec::with_capacity(len);
     let mut counter = 0u64;
     while keystream.len() < len {
-        let mut input = Vec::with_capacity(40);
+        let mut input = Vec::with_capacity(KS_DOMAIN.len() + 32 + 32 + 8);
+        input.extend_from_slice(KS_DOMAIN);
         input.extend_from_slice(shared_secret.as_bytes());
+        input.extend_from_slice(ct_fp.as_bytes());
         input.extend_from_slice(&counter.to_le_bytes());
         let block = poseidon2_hash(&input);
         keystream.extend_from_slice(block.as_bytes());
@@ -406,11 +435,18 @@ fn derive_keystream(shared_secret: &SharedSecret, len: usize) -> Vec<u8> {
     keystream
 }
 
-fn compute_mac(shared_secret: &SharedSecret, ciphertext: &[u8]) -> [u8; 32] {
-    let mut input = Vec::with_capacity(8 + 32 + ciphertext.len()); // prefix(8) + secret(32) + ciphertext
-                                                                   // Domain-separate MAC from keystream by using a different prefix
-    input.extend_from_slice(&[0xFF; 8]);
+/// Audit 359: same defense-in-depth treatment for the MAC.
+/// The MAC now keys on `(shared_secret, kyber_ct, encrypted_msg)`
+/// with a separate domain-separation prefix from the keystream.
+/// A MAC forgery against ciphertext A under shared_secret S no
+/// longer aids forging under ciphertext B even if the same S is
+/// somehow reused.
+fn compute_mac(shared_secret: &SharedSecret, kyber_ct: &[u8], ciphertext: &[u8]) -> [u8; 32] {
+    let ct_fp = poseidon2_hash(kyber_ct);
+    let mut input = Vec::with_capacity(MAC_DOMAIN.len() + 32 + 32 + ciphertext.len());
+    input.extend_from_slice(MAC_DOMAIN);
     input.extend_from_slice(shared_secret.as_bytes());
+    input.extend_from_slice(ct_fp.as_bytes());
     input.extend_from_slice(ciphertext);
     *poseidon2_hash(&input).as_bytes()
 }
@@ -494,9 +530,12 @@ pub fn threshold_encrypt(
     msg: &[u8],
 ) -> Result<ThresholdCiphertext, &'static str> {
     let (kyber_ct, ss) = kyber_encapsulate(&tpk.kyber_pk)?;
-    let keystream = derive_keystream(&ss, msg.len());
+    // Audit 359: keystream + MAC are bound to `kyber_ct` so a
+    // hypothetical Kyber-RNG repeat doesn't collapse to the same
+    // keystream / MAC key.
+    let keystream = derive_keystream(&ss, kyber_ct.as_bytes(), msg.len());
     let encrypted_msg = xor_bytes(msg, &keystream);
-    let mac = compute_mac(&ss, &encrypted_msg);
+    let mac = compute_mac(&ss, kyber_ct.as_bytes(), &encrypted_msg);
 
     Ok(ThresholdCiphertext {
         kyber_ct,
@@ -640,13 +679,16 @@ pub fn combine_shares(
     // Verify MAC in constant time — a variable-time `!=` would leak
     // per-byte match progress via timing, enabling padding-oracle-style
     // forgery of MACs against a live validator.
-    let expected_mac = compute_mac(&ss, &ct.encrypted_msg);
+    // Audit 359: MAC + keystream are bound to `kyber_ct` (from
+    // the encrypted ciphertext), matching the encrypt-side
+    // derivation.
+    let expected_mac = compute_mac(&ss, ct.kyber_ct.as_bytes(), &ct.encrypted_msg);
     if expected_mac.ct_eq(&ct.mac).unwrap_u8() == 0 {
         return Err("MAC verification failed");
     }
 
     // Decrypt
-    let keystream = derive_keystream(&ss, ct.encrypted_msg.len());
+    let keystream = derive_keystream(&ss, ct.kyber_ct.as_bytes(), ct.encrypted_msg.len());
     Ok(xor_bytes(&ct.encrypted_msg, &keystream))
 }
 
@@ -1304,6 +1346,59 @@ mod tests {
             .map(|s| generate_decryption_share(s, &ct))
             .collect();
         let result = combine_shares(&dec_shares, T, &ct);
+        assert_eq!(result, Err("MAC verification failed"));
+    }
+
+    /// Audit 359: two encryptions of the same plaintext under the
+    /// same threshold pk must produce different keystreams,
+    /// different ciphertexts, AND different MACs — even though
+    /// `kyber_encapsulate`'s shared_secret derivation is the only
+    /// thing per-call randomized. The fix binds `kyber_ct` into
+    /// both KDFs as a per-message nonce, so a hypothetical
+    /// shared_secret repeat (broken Kyber RNG) doesn't collapse
+    /// to identical keystreams + MAC keys.
+    #[test]
+    fn audit_359_keystream_and_mac_unique_per_encryption() {
+        let (tpk, _shares) = setup();
+        let msg = b"audit-359 keystream uniqueness";
+        let ct1 = threshold_encrypt(&tpk, msg).unwrap();
+        let ct2 = threshold_encrypt(&tpk, msg).unwrap();
+        // Kyber-encap is randomized → distinct kyber_ct per call.
+        assert_ne!(
+            ct1.kyber_ct.as_bytes(),
+            ct2.kyber_ct.as_bytes(),
+            "Kyber encap must produce a fresh ct per call"
+        );
+        // With same plaintext + DIFFERENT kyber_ct, post-fix the
+        // keystream is distinct, so the encrypted message bytes
+        // are distinct, AND the MAC is distinct.
+        assert_ne!(ct1.encrypted_msg, ct2.encrypted_msg);
+        assert_ne!(ct1.mac, ct2.mac);
+    }
+
+    /// Audit 359: tampering with `kyber_ct` (without changing
+    /// the encrypted_msg or mac) must invalidate decryption,
+    /// because the MAC is keyed on `kyber_ct`. Pre-fix the MAC
+    /// only depended on `(ss, encrypted_msg)`, so a swapped
+    /// kyber_ct under the same shared_secret would silently
+    /// re-derive a different keystream and produce wrong
+    /// plaintext that still passed MAC verification.
+    #[test]
+    fn audit_359_kyber_ct_tampering_breaks_decrypt() {
+        let (tpk, shares) = setup();
+        let msg = b"audit-359 ct binding";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+
+        // Encrypt a SECOND message; swap its kyber_ct into the
+        // first ciphertext. ss differs → MAC mismatches.
+        let ct2 = threshold_encrypt(&tpk, b"different").unwrap();
+        let mut tampered = ct.clone();
+        tampered.kyber_ct = ct2.kyber_ct.clone();
+        let dec_shares: Vec<DecryptionShare> = shares[..T]
+            .iter()
+            .map(|s| generate_decryption_share(s, &tampered))
+            .collect();
+        let result = combine_shares(&dec_shares, T, &tampered);
         assert_eq!(result, Err("MAC verification failed"));
     }
 
