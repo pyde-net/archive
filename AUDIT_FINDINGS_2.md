@@ -845,12 +845,32 @@
 
 ### Crypto
 
-- [ ] 357 — `⚠` **No KAT pinning for ml-kem 0.3.0-rc.x or falcon-rs
-      0.2.4.** `crates/crypto/Cargo.toml:13` and
-      `crates/crypto/src/falcon.rs:6`. Silent dep bump = silent
-      wire-format change. Pin a FIPS-203 KEM KAT and a FN-DSA
-      signature KAT in tests, mirroring audit-216's Poseidon2
-      round-constants pin.
+- [x] 357 — `⚠` **No KAT pinning for ml-kem 0.3.0-rc.x or falcon-rs
+      0.2.4.** **SHIPPED.** New `crates/crypto/src/kat.rs` pins
+      Known-Answer Tests for every primitive on the consensus
+      signing/verification path:
+      - **Poseidon2**: 3 vectors covering empty-input, short ASCII,
+        and a 64-byte multi-permutation absorb. Catches drift in
+        `p3-poseidon2` round constants, `p3-goldilocks` field
+        representation, and the padding-free sponge driver.
+      - **FALCON-512**: pinned `(pk, sk, msg, sig)` quadruple. Two
+        tests: (a) the pinned signature still verifies under the
+        pinned pk + msg (cross-version compat), (b) re-signing
+        with the pinned sk produces a fresh signature that still
+        verifies under the pinned pk (sk encoding sanity).
+      - **Kyber-768**: pinned `(sk_seed, ct, expected_shared_secret)`
+        triple. Decapsulate is deterministic given (sk, ct), so
+        any drift in `ml-kem` decapsulation, key encoding, or
+        shared-secret derivation produces different bytes.
+      - **VRF**: pinned `(pk, sk, input, output, proof)`. VRF
+        output is deterministic (Poseidon2-derived), so we assert
+        byte-equality. Proof is a FALCON signature (randomized),
+        so we assert verify still accepts it.
+
+      Plus `generate_kat_vectors` `#[ignore]`-gated dev tool that
+      prints fresh values when the algorithm is intentionally
+      bumped — copy-paste into the constants. 10 KAT tests, all
+      pass. Clippy / fmt clean.
 - [ ] 358 — `⚠` **No `Zeroize`/`ZeroizeOnDrop` on any secret type.**
       `crates/crypto/src/falcon.rs:13-14, kyber.rs:18-19,
       threshold.rs:154-159, 206-211, 555-565`. Add the derive
