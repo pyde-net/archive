@@ -289,7 +289,7 @@ impl ChainSync {
         state: &mut StateManager,
         block_store: &BlockStore,
         ws_checkpoint: Option<(u64, [u8; 32])>,
-    ) -> u64 {
+    ) -> (u64, Vec<(u64, Vec<pyde_tx::execution::Receipt>)>) {
         let ws_checkpoint_slot = ws_checkpoint.map(|(s, _)| s);
         self.pending.remove(&request_id);
 
@@ -297,11 +297,21 @@ impl ChainSync {
             SyncResp::ChainTip { slot, block_hash } => {
                 self.manager.update_network_tip(slot);
                 info!(slot, hash = hex::encode(block_hash), "received chain tip");
-                0
+                (0, Vec::new())
             }
             SyncResp::Blocks(block_data) => {
                 let count = block_data.len();
                 let mut processed = 0u64;
+                // Audit 396: collect per-slot receipts so the caller
+                // can persist them via the same ReceiptStore the QC-
+                // apply path uses. Pre-fix the receipts produced by
+                // synced-block execution were dropped on the floor
+                // (`Ok((_, _, _receipts))`), so a full node that
+                // reached its head purely via sync — the late-joiner
+                // / full-node-relay paths — never had any receipts to
+                // serve over RPC even though it had executed every tx.
+                let mut receipts_batch: Vec<(u64, Vec<pyde_tx::execution::Receipt>)> =
+                    Vec::with_capacity(count);
 
                 for data in &block_data {
                     // Decode full block (header + body + signature)
@@ -324,12 +334,15 @@ impl ChainSync {
                                 None,
                                 ws_checkpoint_slot,
                             ) {
-                                Ok((tx_count, gas_used, _receipts)) => {
+                                Ok((tx_count, gas_used, receipts)) => {
                                     // Persist to disk for future sync serving
                                     let _ = block_store.put_block(&block.header, data);
                                     let _ = block_store.put_head(slot);
                                     self.manager.advance_local_tip(slot);
                                     processed += 1;
+                                    if !receipts.is_empty() {
+                                        receipts_batch.push((slot, receipts));
+                                    }
                                     debug!(slot, tx_count, gas_used, "synced block");
                                 }
                                 Err(e) => {
@@ -371,11 +384,11 @@ impl ChainSync {
                     head = chain.head_slot,
                     "sync batch processed"
                 );
-                processed
+                (processed, receipts_batch)
             }
             SyncResp::Headers(_) => {
                 debug!("received headers (not used in block sync)");
-                0
+                (0, Vec::new())
             }
             SyncResp::StateSnapshot {
                 state_root,
@@ -404,7 +417,7 @@ impl ChainSync {
                         reason,
                         "rejecting state snapshot"
                     );
-                    return 0;
+                    return (0, Vec::new());
                 }
 
                 match state.import_snapshot(entries) {
@@ -431,7 +444,7 @@ impl ChainSync {
                         warn!(error = %e, "failed to import state snapshot");
                     }
                 }
-                0
+                (0, Vec::new())
             }
             SyncResp::StateSnapshotChunk {
                 state_root,
@@ -460,7 +473,7 @@ impl ChainSync {
                     self.snapshot_expected_root = None;
                     self.snapshot_total_chunks = 0;
                     self.snapshot_retry_count = 0;
-                    return 0;
+                    return (0, Vec::new());
                 }
 
                 // Verify chunk hash
@@ -491,7 +504,7 @@ impl ChainSync {
                         );
                         // Don't store the bad chunk — needs_next_chunk() will re-request it
                     }
-                    return 0;
+                    return (0, Vec::new());
                 }
                 self.snapshot_retry_count = 0; // reset on success
 
@@ -551,7 +564,7 @@ impl ChainSync {
                         }
                     }
                 }
-                0
+                (0, Vec::new())
             }
             SyncResp::NotFound => {
                 // If we're mid-chunk-sync, abort — peer can't serve the snapshot
@@ -564,7 +577,7 @@ impl ChainSync {
                 } else {
                     warn!("peer doesn't have requested data");
                 }
-                0
+                (0, Vec::new())
             }
         }
     }

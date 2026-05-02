@@ -752,20 +752,64 @@ impl PydeNode {
         let mut shutdown_rx = self.shutdown.subscribe();
 
         // Slot clock for block timing. If resuming from persisted head,
-        // backdate genesis so current_slot() picks up where we left off.
-        // Block time comes from `[consensus].block_time_ms` (default
-        // 400); `with_block_time` clamps out-of-range values.
+        // Audit 399: derive the slot_clock anchor from the most
+        // recent block's `header.timestamp` minus
+        // `head_slot * block_time_ms`. block.timestamp is set by
+        // the proposer to `current_time_ms()` at proposal time, so
+        // it's a real Unix-ms wall-clock; subtracting
+        // `head_slot * block_time_ms` recovers the original
+        // genesis_instant. All validators that observed the same
+        // chain land on the same anchor.
+        //
+        // Pre-fix the slot_clock was backdated from `saved_head *
+        // block_time_ms` against `now`, anchoring slot 0 to "now -
+        // saved_head*400ms". After a restart, the backdated
+        // anchor sat further forward in wall-clock than the
+        // continuously-running validators' anchor (their
+        // genesis_instant had been "their startup wall-clock"),
+        // so a restarted node-0's `current_slot()` returned
+        // `saved_head` even when the live network was many slots
+        // ahead. `select_and_vote` keys off
+        // `consensus.current_slot` (which tracks the slot_clock),
+        // so the restarted validator kept voting on stale slots —
+        // a 4-of-4 cluster with one node down + one node muted by
+        // this clock skew dropped below 3-of-4 quorum and stalled.
+        //
+        // For fresh-start (saved_head = 0) and for tests where the
+        // genesis block's timestamp is 0 (testnet generator
+        // doesn't stamp wall-clock), fall back to genesis-anchor
+        // == `now` so all freshly-spawned nodes' slot_clocks agree
+        // (they started within ms of each other).
         let block_time_ms = self.config.consensus.block_time_ms;
-        let slot_clock = if saved_head > 0 {
-            let backdate_ms = saved_head * block_time_ms;
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            SlotClock::with_block_time(now_ms.saturating_sub(backdate_ms), block_time_ms)
+        let now_ms_for_anchor = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let slot_clock_anchor_ms = if saved_head > 0 {
+            // Pull the head's block.timestamp from the in-memory
+            // chain (just restored from disk above). That timestamp
+            // is wall-clock at proposal — subtract head*block_time
+            // to get the original genesis instant.
+            let head_block_ts = chain
+                .read()
+                .await
+                .header(saved_head)
+                .map(|h| h.timestamp)
+                .unwrap_or(0);
+            if head_block_ts > 0 {
+                head_block_ts.saturating_sub(saved_head * block_time_ms)
+            } else {
+                // Block timestamp wasn't set (legacy/test). Fall
+                // back to the original backdate-from-now logic.
+                now_ms_for_anchor.saturating_sub(saved_head * block_time_ms)
+            }
         } else {
-            SlotClock::with_block_time(0, block_time_ms)
+            // Fresh start: use 0 to make `with_block_time` anchor
+            // at `Instant::now()` — all peers spawned together
+            // share approximately the same instant.
+            0
         };
+        let slot_clock = SlotClock::with_block_time(slot_clock_anchor_ms, block_time_ms);
         let mut last_slot = slot_clock.current_slot();
 
         // Periodic timers
@@ -917,6 +961,18 @@ impl PydeNode {
                                 let req = pyde_net::auth::PydeAuthReq { nonce };
                                 let _ = swarm.behaviour_mut().auth.send_request(&peer_id, req);
                             }
+                            // Audit 396: also poll this peer for their
+                            // chain tip. Without this kick, a fresh full
+                            // node connects, never learns the network is
+                            // ahead, sync_manager.network_tip stays at 0
+                            // (`is_behind` returns false), no GetBlocks
+                            // is ever sent — the node sits at slot 0
+                            // forever even though peers have a long
+                            // chain to share. The PostEventAction
+                            // variant existed for this purpose but was
+                            // never produced anywhere, so the cold-sync
+                            // path was dead from day one.
+                            chain_sync.request_chain_tip(&mut swarm, peer_id);
                         }
                         PostEventAction::SendAuthResponse(channel, resp) => {
                             let _ = swarm.behaviour_mut().auth.send_response(channel, resp);
@@ -1136,15 +1192,28 @@ impl PydeNode {
                             let _ = swarm.disconnect_peer_id(peer);
                             debug!(%peer, "force-disconnected stale peer");
                         }
-                        PostEventAction::ContinueSync => {
-                            // If chunked snapshot in progress, request next chunk
-                            if let Some(next_idx) = chain_sync.needs_next_chunk() {
-                                let peer = swarm.connected_peers().next().copied();
-                                if let Some(p) = peer {
-                                    chain_sync.request_next_chunk(&mut swarm, p, next_idx);
+                        PostEventAction::SyncedBlocksApplied {
+                            receipts_batch,
+                            continue_sync,
+                        } => {
+                            // Persist receipts produced by sync-applied
+                            // blocks. Held briefly under one lock — same
+                            // pattern as the QC-apply branch at line ~3470.
+                            if !receipts_batch.is_empty() {
+                                let mut receipts_w = receipts.write().await;
+                                for (slot, slot_receipts) in receipts_batch {
+                                    receipts_w.insert_block_receipts(slot, slot_receipts);
                                 }
-                            } else {
-                                chain_sync.request_next_batch(&mut swarm);
+                            }
+                            if continue_sync {
+                                if let Some(next_idx) = chain_sync.needs_next_chunk() {
+                                    let peer = swarm.connected_peers().next().copied();
+                                    if let Some(p) = peer {
+                                        chain_sync.request_next_chunk(&mut swarm, p, next_idx);
+                                    }
+                                } else {
+                                    chain_sync.request_next_batch(&mut swarm);
+                                }
                             }
                         }
                         PostEventAction::BroadcastConsensus(data) => {
@@ -1490,6 +1559,46 @@ impl PydeNode {
                             };
                             let slot = header.slot;
                             let block_hash = header.hash();
+                            // Audit 396: a compact block far ahead of
+                            // our current head is a "we missed
+                            // something" signal, but it's a PROPOSAL
+                            // (not a finalized block) so we can't
+                            // bump `network_tip` to its slot directly
+                            // — `network_tip` should track finalized
+                            // heads, not proposed-but-not-QC'd slots.
+                            // Pre-fix the direct `update_network_tip`
+                            // here triggered GetBlocks for the
+                            // proposed slot, sync server returned
+                            // NotFound (full block doesn't exist
+                            // anywhere until QC + apply), and the
+                            // tight retry loop starved the consensus
+                            // message handler — a 4-of-4 committee
+                            // with one dead node stalled because the
+                            // live validators couldn't drain their
+                            // vote queues.
+                            //
+                            // Instead: re-poll a peer for their
+                            // canonical chain tip. The response
+                            // (`SyncResp::ChainTip`) reports
+                            // `chain.head_slot` — the peer's highest
+                            // applied block — which is what
+                            // `network_tip` should reflect. If the
+                            // peer is genuinely ahead, sync engages
+                            // for the right slots; if the peer is at
+                            // the same head as us (we just got a
+                            // proposal-in-flight), `is_behind`
+                            // returns false and sync stays idle.
+                            // The "head + 1" exclusion catches the
+                            // common natural-next-slot proposal
+                            // without an extra round-trip.
+                            let local_head = chain.read().await.head_slot;
+                            if slot > local_head.saturating_add(1) {
+                                let first_peer: Option<libp2p::PeerId> =
+                                    swarm.connected_peers().next().copied();
+                                if let Some(peer) = first_peer {
+                                    chain_sync.request_chain_tip(&mut swarm, peer);
+                                }
+                            }
 
                             // Build mempool snapshot for reconstruction (plaintext + encrypted)
                             let idx = mempool_index.read().await;
@@ -3207,7 +3316,18 @@ enum PostEventAction {
     #[allow(dead_code)]
     RequestChainTip(PeerId),
     SendSyncResponse(request_response::ResponseChannel<SyncResp>, SyncResp),
-    ContinueSync,
+    /// Audit 396: emitted after a Sync RR response has been applied.
+    /// Carries the per-slot receipts batch produced by sync-applied
+    /// blocks so the action handler can persist them in the same
+    /// ReceiptStore the QC-apply path uses, and a flag indicating
+    /// whether sync should keep pulling more batches/chunks. Pre-fix
+    /// the receipts were silently dropped at the on_response call
+    /// site; full nodes that reached their head purely via sync had
+    /// no receipts to serve over `pyde_getTransactionReceipt`.
+    SyncedBlocksApplied {
+        receipts_batch: Vec<(u64, Vec<pyde_tx::execution::Receipt>)>,
+        continue_sync: bool,
+    },
     BroadcastConsensus(Vec<u8>),
     /// Batch-publish multiple consensus messages in one post-event
     /// action. Used for slashing evidence: a single received proposal
@@ -4577,7 +4697,15 @@ fn handle_swarm_event(
                 .as_ref()
                 .and_then(|e| e.finality.latest_checkpoint.as_ref())
                 .map(|cp| (cp.slot, cp.state_root));
-            chain_sync.on_response(
+            // Audit 396: on_response now returns the receipts produced
+            // by sync-applied blocks. Pre-fix the `_receipts` were
+            // dropped at the inner call site, so a node that reached
+            // its head purely via sync (cold-start joiner, full node
+            // catching up after start-up race) had no receipts to
+            // serve over RPC. Returned here so the action handler can
+            // persist them via the same ReceiptStore the QC-apply
+            // path uses.
+            let (_processed, receipts_batch) = chain_sync.on_response(
                 request_id,
                 response,
                 chain,
@@ -4585,12 +4713,37 @@ fn handle_swarm_event(
                 block_store,
                 ws_checkpoint,
             );
+            // Audit 399: advance the validator engine's
+            // `target_height` to chain head + 1 so a restarted
+            // validator that just sync-applied blocks doesn't keep
+            // voting on the slot it was at before the crash. The
+            // QC-apply path already advances target_height inside
+            // `on_vote`'s success branch; the sync-apply path
+            // bypassed that, leaving target_height pinned at the
+            // pre-restart slot. Net effect: the restarted node
+            // received proposals for the live network's current
+            // slot but refused to vote (`select_and_vote` targets
+            // `target_height`, not the wall-clock slot). With one
+            // node killed AND one node effectively muted only 2 of
+            // 4 validators voted, so no QC formed and the chain
+            // stalled. `advance_target_height` is monotonic — it
+            // no-ops if the engine already advanced past us.
+            if let Some(engine) = validator_engine.as_mut() {
+                let next_target = chain.head_slot.saturating_add(1);
+                engine.advance_target_height_after_sync(next_target);
+            }
             // Signal the event loop to continue if chunked snapshot needs
             // more chunks OR we're otherwise still syncing. Both branches
             // produced the same ContinueSync return — collapsed into a
             // single `||` expression (spotted by slice 5.5 clippy sweep).
-            if chain_sync.needs_next_chunk().is_some() || chain_sync.is_syncing() {
-                PostEventAction::ContinueSync
+            // Now also carries the receipts to persist alongside the
+            // continue signal.
+            let continue_sync = chain_sync.needs_next_chunk().is_some() || chain_sync.is_syncing();
+            if !receipts_batch.is_empty() || continue_sync {
+                PostEventAction::SyncedBlocksApplied {
+                    receipts_batch,
+                    continue_sync,
+                }
             } else {
                 PostEventAction::None
             }

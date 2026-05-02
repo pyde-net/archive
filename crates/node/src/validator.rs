@@ -2335,6 +2335,17 @@ impl ValidatorEngine {
         }
     }
 
+    /// Audit 399: same monotonic advance as `advance_target_height`,
+    /// callable from outside the engine. Used by the sync-apply
+    /// path so a restarted validator's `target_height` follows the
+    /// chain head it just synced — without this, the engine keeps
+    /// voting on the slot it was at before the crash even after
+    /// the chain has moved on, and a 4-of-4 cluster with one node
+    /// down + one node effectively muted falls below quorum.
+    pub fn advance_target_height_after_sync(&mut self, new_height: u64) {
+        self.advance_target_height(new_height);
+    }
+
     /// Check if the current slot has timed out.
     ///
     /// Two timeout paths (audit 234 part 3 added the second):

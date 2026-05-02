@@ -398,6 +398,169 @@
       (`aee961d`) is needed but deferred. ~30 commits in window
       (PRs #300-#310 inclusive).
 
+- [x] 396 — `✓` **Cold-start sync hung at slot 0.** **SHIPPED.**
+      Three independent gaps in the late-joiner pathway:
+
+      **(a) `RequestChainTip` action was emitted nowhere.** The
+      `PostEventAction::RequestChainTip(peer)` variant existed
+      with a wired handler, but no event-loop branch ever
+      produced it. A fresh full node connected to peers, never
+      asked any of them for their chain tip, so
+      `sync_manager.network_tip` stayed at 0,
+      `is_behind` returned false, no `GetBlocks` ever fired.
+      Fix: `RecordPeerAndAuth` (the action emitted on every
+      `ConnectionEstablished`) now also calls
+      `chain_sync.request_chain_tip(&mut swarm, peer_id)`.
+
+      **(b) Compact-block gossip didn't refresh
+      `network_tip`.** `update_network_tip(slot)` only fired on
+      the `missing_txs.is_empty() == false` branch of
+      `ReconstructCompactBlock` — i.e., only when local
+      reconstruction needed sync help. Empty warm-up blocks
+      (which validators produce in droves at testnet startup)
+      reconstructed cleanly, so a node that joined at genesis
+      and only ever saw empty blocks never learned the
+      validators were ahead. Fix: hoist the
+      `update_network_tip(slot)` call to the top of the handler,
+      before the missing-tx branch.
+
+      **(c) Sync-applied blocks dropped their receipts.**
+      `on_response` called
+      `process_full_block_with_aot_and_checkpoint(...)` but
+      destructured the result as `Ok((_, _, _receipts))` — the
+      receipts were discarded. A node that reached its head
+      purely via sync executed every tx but had no receipts to
+      serve over `pyde_getTransactionReceipt`. Fix: change
+      `on_response` return type to
+      `(u64, Vec<(u64, Vec<Receipt>)>)` and emit a new
+      `PostEventAction::SyncedBlocksApplied` that persists
+      receipts via the same `ReceiptStore` the QC-apply path
+      uses, then optionally continues sync.
+
+      **Verification:** `multi_node_sync` ✅ passes (was the
+      direct repro). `multi_node_full_node_relay` now reaches the
+      receipt-divergence assertion (was failing 60 s prior at
+      "receipt never appeared on full node") — separate
+      pre-existing nonce-window test-infra issue surfaces next.
+      `validator_churn` failures are independent (view-change
+      stall, not sync) — see #399.
+
+- [ ] 397 — `✓` **`epoch_rotation_crosses_boundary` exceeds 240 s
+      timeout reaching slot 1005 at `block_time_ms=100`.**
+      Surfaced same e2e run as #396. **Predates this audit cycle**
+      — fails identically on `aee961d` (244 s) and HEAD (243 s).
+      Test config asks for slot 1005 in 100 ms × 1005 = 100.5 s of
+      ideal-case slot ticks, with a 240 s deadline (2.4×
+      ideal-case headroom). Fails at 240 s, so actual slot rate is
+      < ~250 ms/slot — 2.5× slower than configured under 4-node
+      subprocess load on a laptop.
+
+      **Suspected cause.** Either
+      (a) `block_time_ms` plumbing isn't reaching every code path
+      (some loop still uses the 400 ms compile-time const), or
+      (b) consensus throughput under the 4-subprocess load on the
+      test machine just can't sustain 10 slots/s.
+
+      **Where to look:**
+      - `pyde_consensus::block::BLOCK_TIME_MS = 400` —
+        compile-time constant; runtime `block_time_ms` should
+        override it but call sites in `node.rs` /
+        `validator.rs` may still read the const.
+      - `tokio::time::interval` constructions for slot pacing.
+
+      **Reproducer:**
+      ```
+      cargo test -p pyde-node --test multi_node_epoch_rotation \
+        -- --ignored --nocapture
+      ```
+
+      **Pre-launch impact:** epoch boundaries on real testnet run
+      at the canonical 400 ms slot time, so they cross at ~6.7
+      min — no real-network deadline pressure. The test was
+      designed for fast iteration, not as a production gate.
+      Risk band: zero for testnet. Worth fixing before the chain
+      reaches its first real epoch boundary so the rotation code
+      path is exercised end-to-end at production speed.
+
+- [ ] 398 — `✓` **`tx_via_full_node_reaches_validator` fails:
+      tx submitted to full node never appears at validator within
+      30 s.** Surfaced same e2e run. **Predates this audit cycle**
+      — fails identically on `aee961d`.
+
+      Likely the same family of failure as #396 (sync/late-joiner
+      pathway): full node accepts the tx via RPC but doesn't relay
+      to the validator mesh. The full-node-relay path is
+      `tx_relay::handle_inbound_tx` → mempool insert →
+      gossipsub publish on `Channel::Transactions`. If the full
+      node hasn't subscribed or the validators aren't peering with
+      it, the tx sits in the full-node mempool forever.
+
+      **Pre-launch impact:** dApps targeting a public-facing full
+      node (the typical end-user setup) won't reach validators.
+      This IS a launch-blocking bug for production-grade public
+      RPC; for a testnet bring-up where users dial the validators
+      directly via RPC, it's a soft warning. Same bisect window
+      as #319 / #396; investigate together.
+
+- [x] 399 — `✓` **Validator restart-rejoin stalled the chain.**
+      **SHIPPED.** Two distinct bugs in the late-joiner pathway,
+      surfaced when killing + restarting validators in the
+      `validator_churn` and `validator_churn_4_of_4` tests:
+
+      **(a) `slot_clock` anchor was wrong on restart.** The
+      original logic backdated genesis to `now - saved_head *
+      block_time_ms`. After a restart, this anchor sat further
+      forward in wall-clock than the still-running validators'
+      anchor (their `genesis_instant` was their original startup
+      time). Net effect: a restarted validator's `current_slot()`
+      returned `saved_head` while live peers were many slots
+      ahead. `select_and_vote` keys off
+      `consensus.current_slot` (which tracks `slot_clock`), so
+      the restarted validator kept proposing/voting on stale
+      slots. With one node killed AND one node muted by this
+      clock skew, a 4-of-4 cluster fell below 3-of-4 quorum and
+      stalled. Fix: derive the anchor from
+      `chain.headers[head_slot].timestamp - head_slot *
+      block_time_ms` — `block.timestamp` is wall-clock at
+      proposal time, so this recovers the original
+      `genesis_instant` that all validators share.
+
+      **(b) Compact-block tip-bump triggered NotFound sync
+      loops.** Pre-fix the `update_network_tip(slot)` call
+      inside `ReconstructCompactBlock` bumped the tip from any
+      proposal received via gossip — including
+      proposals-in-flight that hadn't QC'd yet. Sync engaged for
+      those slots, server returned NotFound (full block doesn't
+      exist anywhere until QC + apply), and the tight retry
+      loop starved the consensus message handler — votes
+      couldn't drain, no QC formed, chain stalled. Fix:
+      replaced direct `update_network_tip` with a
+      `request_chain_tip(peer)` re-poll for slots more than
+      `head + 1` ahead. The peer responds with their applied
+      head (`chain.head_slot` in `SyncResp::ChainTip`), which is
+      the right tip signal for sync.
+
+      **(c) `target_height` didn't advance for sync-applied
+      blocks.** The QC-apply path advances target_height via
+      `on_vote`'s success branch. The sync-apply path bypassed
+      that, leaving `target_height` pinned at the pre-restart
+      slot — the restarted validator received proposals for the
+      live network's current slot but its
+      `select_and_vote` targeted target_height, not wall-clock
+      slot. Fix: after `on_response` applies sync blocks, call
+      `engine.advance_target_height_after_sync(chain.head_slot
+      + 1)` so the engine follows along. `advance_target_height`
+      is monotonic, so it no-ops if the engine is already ahead.
+
+      **Verification:** `validator_churn` ✅ (47s),
+      `validator_churn_4_of_4` ✅ (69s),
+      `multi_node_full_node_relay` ✅ (5s — was secondary
+      symptom of (b)), `multi_node_sync` ✅ regression-free.
+      Full multi-node battery: 13/14 pass; only #397
+      (epoch_rotation 240s deadline at 100ms/slot under
+      4-subprocess load) remains as a doc'd test-config
+      limit.
+
 ### Consensus / finality
 
 - [x] 320 — `✓` **Hard-finality `finality_sign_message` doesn't bind
