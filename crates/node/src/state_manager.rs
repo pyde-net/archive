@@ -321,11 +321,19 @@ impl StateManager {
         }
     }
 
-    /// Get mutable SMT access. Returns MutexGuard (deref to PersistentJMT).
-    /// Only used during genesis/startup — not during pipelined execution.
-    pub fn smt_mut(&self) -> std::sync::MutexGuard<'_, PersistentJMT> {
-        self.smt.lock().expect("smt lock poisoned")
-    }
+    // Audit 332: `smt_mut()` was the escape hatch that let the
+    // decrypted-tx execution path bypass the StateManager's
+    // write-cache and undo-log machinery, silently breaking
+    // reorg consistency. Removed alongside the audit-332 fix —
+    // every state write now goes through `update_batch_deferred`
+    // (with `record_block_undo` for revertibility), and reads
+    // through the cache-aware `StateAccess` impl on
+    // `StateManager`. Adding a new `smt_mut`-style raw escape
+    // hatch should be considered a regression: the next caller
+    // will re-introduce the same skip-the-cache-and-undo-log
+    // bug class. Use `StateOverlay` for transactional execution
+    // contexts and `update_batch_deferred` for direct buffered
+    // writes.
 
     /// Get immutable SMT access. Returns MutexGuard.
     #[allow(dead_code)]

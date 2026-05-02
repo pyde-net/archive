@@ -1080,16 +1080,56 @@ pub fn try_decrypt_and_execute(
         dev_skip_signature: true,
         block_sigs_pre_verified: false,
     };
+    // Audit 332: route decrypted-tx execution through a
+    // `StateOverlay` over the StateManager so writes accumulate
+    // in the same write-cache + undo-log machinery the plaintext
+    // path uses. Pre-fix `execute_transaction(dtx, &mut
+    // *state.smt_mut(), &block_ctx)` wrote DIRECTLY into the
+    // underlying JMT, which:
+    //   1. Skipped the StateManager's overlay write-cache, so
+    //      subsequent reads via the cache returned stale pre-
+    //      decrypt values until the next cache invalidation.
+    //   2. Skipped `record_block_undo` entirely. A subsequent
+    //      `revert_to(slot - 1)` call (reorg path, audit 231)
+    //      would roll back the plaintext writes from the same
+    //      block but leave the decrypted-tx state in place,
+    //      producing a chain head with NEITHER the old nor the
+    //      new state — silent divergence.
+    //
+    // Post-fix: execute against an overlay whose `base` is the
+    // current StateManager view, then commit the overlay's
+    // writes via `update_batch_deferred` and append the undo
+    // entries via `record_block_undo`. The plaintext path
+    // already called `record_block_undo(slot, ...)` once for
+    // this slot during block apply; the second call here pushes
+    // a separate undo tuple that `revert_to` walks together with
+    // the first when rolling the slot back.
     let mut receipts = Vec::with_capacity(decrypted_txs.len());
-    for (i, dtx) in decrypted_txs.iter().enumerate() {
-        if !verified_enc_indices.contains(&i) {
-            continue;
+    {
+        use pyde_state::smt::StateAccess;
+        let mut overlay = pyde_state::smt::StateOverlay::new(state as &dyn StateAccess);
+        for (i, dtx) in decrypted_txs.iter().enumerate() {
+            if !verified_enc_indices.contains(&i) {
+                continue;
+            }
+            match execute_transaction(dtx, &mut overlay, &block_ctx) {
+                Ok(r) => receipts.push(r),
+                Err(e) => warn!(slot, error = ?e, "decrypted tx execution failed"),
+            }
         }
-        match execute_transaction(dtx, &mut *state.smt_mut(), &block_ctx) {
-            Ok(r) => receipts.push(r),
-            Err(e) => warn!(slot, error = ?e, "decrypted tx execution failed"),
+        let (writes, undo) = overlay.into_writes_with_undo();
+        if !writes.is_empty() {
+            let _ = state.update_batch_deferred(writes);
+        }
+        if !undo.is_empty() {
+            state.record_block_undo(slot, undo);
         }
     }
+    // Flush the deferred batch into the underlying JMT before
+    // recomputing root. Pre-fix the writes went directly to the
+    // SMT so refresh_root saw them immediately; post-fix they
+    // accumulate in `pending_writes` and need an explicit flush.
+    let _ = state.flush_pending();
     state.refresh_root();
 
     DecryptOutcome::Executed {

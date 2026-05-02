@@ -680,13 +680,37 @@
       commodity SSDs, well within the 400 ms slot budget. Combined
       with audit-330's atomic batch, the per-block commit is now a
       true crash-consistent durable write.
-- [ ] 332 — `⚠` **Decrypted-tx execution writes directly to SMT
-      bypassing cache + undo log.**
-      `crates/node/src/block_processor.rs:984` (try_decrypt_and_execute)
-      and `crates/node/src/node.rs:2732-2747` (single-node decrypt).
-      Reorg cannot revert decrypted-tx state; cache reads stale.
-      Funnel through `update_batch_deferred` and append a third
-      undo batch to `record_block_undo`.
+- [x] 332 — `⚠` **Decrypted-tx execution writes directly to SMT
+      bypassing cache + undo log.** **SHIPPED.** Both call sites
+      that executed decrypted txs (`block_processor::try_decrypt_and_execute`
+      and the single-node decrypt path in `node.rs`) used to call
+      `execute_transaction(dtx, &mut *state.smt_mut(), &block_ctx)`,
+      writing straight into the underlying JMT and bypassing the
+      StateManager's cache + undo log. Two consequences:
+      1. Cache reads returned stale pre-decrypt values until the
+         next invalidation.
+      2. `revert_to(slot - 1)` (reorg path, audit 231) only
+         walked the undo log and rolled back plaintext writes,
+         leaving decrypted-tx state stuck — silent state
+         divergence between the chain head and the data on disk.
+
+      Post-fix both paths route through a `StateOverlay` over the
+      StateManager, then commit via `update_batch_deferred` +
+      `record_block_undo` (matching the plaintext path). The
+      block_processor side already calls `record_block_undo(slot,
+      ...)` once for plaintext during apply; decrypted-tx execution
+      now appends a SECOND `(slot, undo)` tuple — `revert_to` walks
+      both together when rolling the slot back. Added explicit
+      `flush_pending()` before `refresh_root()` since
+      `update_batch_deferred` doesn't immediately push writes to
+      the underlying SMT.
+
+      Removed the `smt_mut()` escape hatch entirely so future
+      callers can't re-introduce the same skip-the-cache-and-undo
+      bug class. 298 node binary tests pass. The
+      `multi_node_encrypted_lifecycle` e2e test still passes after
+      the refactor (validators converge on the same post-decrypt
+      state root).
 
 ### Net
 

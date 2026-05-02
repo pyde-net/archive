@@ -2855,31 +2855,68 @@ impl PydeNode {
                                                                                 dev_skip_signature: false,
                                                                                 block_sigs_pre_verified: false,
                                                                             };
+                                                                            // Audit 332: same overlay+undo
+                                                                            // discipline as the block_processor
+                                                                            // path. Pre-fix this loop wrote each
+                                                                            // decrypted tx directly into
+                                                                            // `state_w.smt_mut()`, bypassing the
+                                                                            // StateManager write-cache and
+                                                                            // skipping `record_block_undo`. A
+                                                                            // reorg via `revert_to(slot - 1)`
+                                                                            // would leave decrypted-tx state
+                                                                            // applied even after rolling the
+                                                                            // surrounding block back, producing
+                                                                            // a divergent state.
+                                                                            use pyde_state::smt::StateAccess;
+                                                                            let mut overlay =
+                                                                                pyde_state::smt::StateOverlay::new(
+                                                                                    &*state_w as &dyn StateAccess,
+                                                                                );
+                                                                            let mut tx_receipts = Vec::with_capacity(
+                                                                                decrypted_txs.len(),
+                                                                            );
                                                                             for dtx in &decrypted_txs {
-                                                                                // Bind the execute_transaction result BEFORE the
-                                                                                // match so the `state_w.smt_mut()` MutexGuard
-                                                                                // temporary is dropped at this semicolon. Without
-                                                                                // this binding the guard lives through the match
-                                                                                // body, which includes `receipts.write().await` —
-                                                                                // the tokio scheduler could move the future to
-                                                                                // another thread holding a std Mutex guard, a
-                                                                                // well-known deadlock / UB pattern. Surfaced by
-                                                                                // slice 5.5 clippy sweep.
                                                                                 let exec_result = pyde_tx::pipeline::execute_transaction(
                                                                                     dtx,
-                                                                                    &mut *state_w.smt_mut(),
+                                                                                    &mut overlay,
                                                                                     &block_ctx,
                                                                                 );
                                                                                 match exec_result {
-                                                                                    Ok(receipt) => {
-                                                                                        let mut receipts_w = receipts.write().await;
-                                                                                        receipts_w.insert_block_receipts(current_slot, vec![receipt]);
-                                                                                    }
+                                                                                    Ok(receipt) => tx_receipts.push(receipt),
                                                                                     Err(e) => {
                                                                                         warn!(error = ?e, "failed to execute decrypted tx");
                                                                                     }
                                                                                 }
                                                                             }
+                                                                            let (writes, undo) =
+                                                                                overlay.into_writes_with_undo();
+                                                                            if !writes.is_empty() {
+                                                                                let _ = state_w
+                                                                                    .update_batch_deferred(writes);
+                                                                            }
+                                                                            if !undo.is_empty() {
+                                                                                state_w.record_block_undo(
+                                                                                    current_slot, undo,
+                                                                                );
+                                                                            }
+                                                                            // Persist receipts after the overlay
+                                                                            // commit so the caller sees them
+                                                                            // alongside the new state.
+                                                                            if !tx_receipts.is_empty() {
+                                                                                let mut receipts_w =
+                                                                                    receipts.write().await;
+                                                                                receipts_w.insert_block_receipts(
+                                                                                    current_slot,
+                                                                                    tx_receipts,
+                                                                                );
+                                                                            }
+                                                                            // Flush deferred writes before
+                                                                            // recomputing root; the overlay
+                                                                            // path buffers via
+                                                                            // `update_batch_deferred` so the
+                                                                            // SMT/JMT root only reflects them
+                                                                            // after `flush_pending`.
+                                                                            let _ = state_w.flush_pending();
                                                                             state_w.refresh_root();
                                                                         }
                                                                         Err(e) => warn!(error = %e, "decryption failed"),
