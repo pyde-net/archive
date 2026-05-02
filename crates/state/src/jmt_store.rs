@@ -189,9 +189,101 @@ impl JmtRocksStore {
         }
     }
 
-    fn set_latest_version(&self, version: Version) -> anyhow::Result<()> {
-        let key = Self::meta_key(META_LATEST_VERSION);
-        self.db.put(&key, version.to_be_bytes())?;
+    /// Audit 330: atomic commit that fuses the JMT node/value writes,
+    /// the rightmost-leaf marker, and the `META_LATEST_VERSION`
+    /// pointer into a single `rocksdb::WriteBatch`. RocksDB
+    /// guarantees all-or-nothing application of a write batch, so a
+    /// crash between the JMT-data writes and the version pointer is
+    /// no longer possible.
+    ///
+    /// Pre-fix `update_all` issued two sequential `db.write` /
+    /// `db.put` calls — `write_node_batch(&batch.node_batch)` then
+    /// `set_latest_version(next_version)`. A power loss / `kill -9` /
+    /// OOM between them left nodes for the new version persisted
+    /// while `META_LATEST_VERSION` still pointed at the old version,
+    /// permanently leaking the orphaned node-tree until a future
+    /// successful commit overwrote those slots. Worse: on restart
+    /// the recovered root was the OLD version's, but if anything
+    /// downstream was racing on already-published nodes it could
+    /// momentarily see a state ahead of the canonical version
+    /// pointer.
+    pub(crate) fn commit_atomic(
+        &self,
+        node_batch: &NodeBatch,
+        next_version: Version,
+    ) -> anyhow::Result<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+
+        // Nodes — same write set the trait impl produces.
+        let mut node_cache = self.node_cache.lock().unwrap();
+        for (node_key, node) in node_batch.nodes() {
+            let key = Self::node_key_bytes(node_key);
+            let value = borsh::to_vec(node).map_err(|e| anyhow::anyhow!("node encode: {}", e))?;
+            batch.put(&key, &value);
+            node_cache.put(node_key.clone(), Some(node.clone()));
+        }
+        drop(node_cache);
+
+        // Values.
+        let mut value_cache = self.value_cache.lock().unwrap();
+        for ((version, key_hash), maybe_value) in node_batch.values() {
+            let key = Self::value_key_bytes(*version, key_hash);
+            match maybe_value {
+                Some(bytes) if !bytes.is_empty() => {
+                    batch.put(&key, bytes);
+                    value_cache.put(*key_hash, Some(bytes.clone()));
+                }
+                _ => {
+                    batch.put(&key, []);
+                    value_cache.put(*key_hash, None);
+                }
+            }
+        }
+        drop(value_cache);
+
+        // Rightmost leaf — only present when the batch contains
+        // leaves; preserve the old "best in this batch" semantics.
+        let mut rightmost: Option<(NodeKey, jmt::storage::LeafNode)> = None;
+        for (node_key, node) in node_batch.nodes() {
+            if let Node::Leaf(leaf) = node {
+                let candidate = (node_key.clone(), leaf.clone());
+                rightmost = Some(match rightmost {
+                    None => candidate,
+                    Some(ref cur) if candidate.0.nibble_path() >= cur.0.nibble_path() => candidate,
+                    Some(cur) => cur,
+                });
+            }
+        }
+        if let Some(rm) = rightmost {
+            let bytes =
+                borsh::to_vec(&rm).map_err(|e| anyhow::anyhow!("rightmost encode: {}", e))?;
+            batch.put(Self::meta_key(META_RIGHTMOST), bytes);
+        }
+
+        // The atomicity-critical step: META_LATEST_VERSION goes into
+        // the SAME batch so it lands iff the nodes/values land.
+        batch.put(
+            Self::meta_key(META_LATEST_VERSION),
+            next_version.to_be_bytes(),
+        );
+
+        // Audit 331: fsync the WAL before returning. Pre-fix the
+        // default `WriteOptions` had `sync = false`, so a power
+        // loss / VM crash within RocksDB's WAL window (typically
+        // up to ~1 s) lost the most recent committed block —
+        // validators reopened at the previous version, every other
+        // node had moved on, and the recovering validator stalled
+        // until snapshot-sync caught it up. `set_sync(true)`
+        // forces an `fdatasync()` per commit; on commodity SSDs
+        // this adds ~1-5 ms of latency per block, well within the
+        // 400 ms slot budget. Combined with the audit-330 atomic
+        // batch, this turns the per-block commit into a true
+        // crash-consistent durable write.
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .write_opt(batch, &opts)
+            .map_err(|e| anyhow::anyhow!("rocksdb atomic commit: {}", e))?;
         Ok(())
     }
 }
@@ -289,6 +381,14 @@ impl HasPreimage for JmtRocksStore {
 }
 
 impl TreeWriter for JmtRocksStore {
+    /// Trait-required write entry. Application code should NOT call
+    /// this directly — it writes nodes/values without updating
+    /// `META_LATEST_VERSION`, leaving the version pointer stale.
+    /// The atomic commit path (`commit_atomic`) is the only callable
+    /// that bumps both together (audit 330). This impl exists so
+    /// the JMT crate's snapshot-restore path (`tree.restore_*`) can
+    /// stream node batches in; the caller is expected to set the
+    /// version pointer separately at the end of restore.
     fn write_node_batch(&self, node_batch: &NodeBatch) -> anyhow::Result<()> {
         let mut batch = rocksdb::WriteBatch::default();
 
@@ -471,12 +571,18 @@ impl PersistentJMT {
             .put_value_set(value_set, next_version)
             .map_err(|_| "JMT put_value_set failed")?;
 
+        // Audit 330: atomic commit — nodes, values, rightmost
+        // marker, AND `META_LATEST_VERSION` go into the same
+        // RocksDB WriteBatch. Pre-fix the two sequential writes
+        // (`write_node_batch` then `set_latest_version`) had a
+        // crash window between them: a power loss left orphaned
+        // node-tree pages persisted at `next_version` while the
+        // version pointer still referenced the previous version,
+        // permanently leaking storage until a later commit wrote
+        // over the same slots.
         self.store
-            .write_node_batch(&batch.node_batch)
-            .map_err(|_| "JMT write_node_batch failed")?;
-        self.store
-            .set_latest_version(next_version)
-            .map_err(|_| "JMT set_latest_version failed")?;
+            .commit_atomic(&batch.node_batch, next_version)
+            .map_err(|_| "JMT atomic commit failed")?;
 
         *version_guard = next_version;
         *self.current_root.lock().unwrap() = new_root;
@@ -579,5 +685,78 @@ mod tests {
         let r2 = jmt2.root();
 
         assert_eq!(r1, r2);
+    }
+
+    /// Audit 330: after a successful `update_all`, the
+    /// `META_LATEST_VERSION` pointer that
+    /// `JmtRocksStore::latest_version()` reads MUST match the
+    /// version the in-memory tracker advanced to. Pre-fix the two
+    /// were updated by separate `db.write` calls, so a crash
+    /// between them left the on-disk pointer stale; reopening the
+    /// store would resume at the OLD version even though the new
+    /// version's nodes were durable. This test confirms the post-
+    /// fix atomic commit keeps both halves in lockstep on the
+    /// happy path. (Crash-injection regression coverage requires
+    /// process-kill harness — captured separately in MAINNET_PLAN.)
+    #[test]
+    fn audit_330_atomic_commit_advances_version_pointer_atomically() {
+        let mut jmt = PersistentJMT::open_tmp().unwrap();
+        // Fresh store: latest_version is None.
+        assert!(jmt.store.latest_version().is_none());
+
+        jmt.insert(key_from_bytes(b"k1"), b"v1".to_vec()).unwrap();
+        let after_first = jmt.store.latest_version();
+        assert_eq!(after_first, Some(0), "first commit must publish v=0");
+
+        jmt.insert(key_from_bytes(b"k2"), b"v2".to_vec()).unwrap();
+        let after_second = jmt.store.latest_version();
+        assert_eq!(after_second, Some(1), "second commit must publish v=1");
+
+        // The version pointer and the readable tree state agree:
+        // every key inserted across the two commits is present at
+        // the latest version.
+        let tree = JellyfishMerkleTree::<_, Poseidon2JmtHasher>::new(&jmt.store);
+        let v = after_second.unwrap();
+        let kh1 = KeyHash(<[u8; 32]>::try_from(key_from_bytes(b"k1").as_slice()).unwrap());
+        let kh2 = KeyHash(<[u8; 32]>::try_from(key_from_bytes(b"k2").as_slice()).unwrap());
+        assert_eq!(tree.get(kh1, v).unwrap().as_deref(), Some(b"v1".as_ref()));
+        assert_eq!(tree.get(kh2, v).unwrap().as_deref(), Some(b"v2".as_ref()));
+    }
+
+    /// Audit 330: confirm the WriteBatch path on `commit_atomic`
+    /// covers nodes + values + version + rightmost together. We
+    /// can't peek at RocksDB's on-disk WAL from a unit test, but
+    /// we can pre-construct a non-trivial node batch and check
+    /// the post-commit reads agree with the version pointer.
+    #[test]
+    fn audit_330_commit_atomic_writes_full_set_in_one_batch() {
+        let mut jmt = PersistentJMT::open_tmp().unwrap();
+        // 3-leaf batch to exercise inner nodes + rightmost.
+        let entries = vec![
+            (key_from_bytes(b"a"), b"1".to_vec()),
+            (key_from_bytes(b"b"), b"2".to_vec()),
+            (key_from_bytes(b"c"), b"3".to_vec()),
+        ];
+        let root_before = jmt.root();
+        jmt.update_all(entries.clone()).unwrap();
+        let root_after = jmt.root();
+        assert_ne!(root_before, root_after);
+
+        // After commit_atomic, all three components reflect the
+        // new commit:
+        //   1. version pointer advanced (read via latest_version)
+        //   2. tree readable at the new version (get returns values)
+        //   3. rightmost-leaf marker present (get_rightmost_leaf
+        //      returns Some — required for snapshot-restore code)
+        use jmt::storage::TreeReader;
+        assert_eq!(jmt.store.latest_version(), Some(0));
+        for (k, v) in &entries {
+            assert_eq!(jmt.get(k).as_deref(), Some(&v[..]));
+        }
+        let rm = jmt.store.get_rightmost_leaf().unwrap();
+        assert!(
+            rm.is_some(),
+            "rightmost leaf must be persisted in same atomic batch"
+        );
     }
 }
