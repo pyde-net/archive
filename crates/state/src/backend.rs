@@ -594,9 +594,21 @@ impl BufferedWriteBackend {
             }
         }
 
+        // Audit 331: per-block flush is the durability boundary —
+        // fsync the WAL before returning. Default WriteOptions
+        // (sync=false) meant a power loss inside RocksDB's WAL
+        // window (~1 s) silently rolled back the last committed
+        // block, leaving the validator behind the network on
+        // restart. `set_sync(true)` forces an fdatasync per flush;
+        // ~1-5 ms cost on commodity SSDs, well within slot budget.
+        // The legacy SMT path is preserved during the JMT
+        // migration (audit 215); both paths fsync at the per-block
+        // commit point now.
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
         self.inner
             .db
-            .write(batch)
+            .write_opt(batch, &opts)
             .map_err(|e| BackendError::RocksDB(e.to_string()))
     }
 }
