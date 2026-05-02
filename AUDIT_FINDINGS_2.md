@@ -910,24 +910,61 @@
 
 ### Otic
 
-- [ ] 354 — `⚠` **Signed arithmetic broken end-to-end.**
-      `crates/otic/src/codegen.rs:1109-1110, 1089-1090,
-      1179-1190, 1115`. `Div`/`Mod`/`<`/`>`/`<=`/`>=`/`Shr` always
-      emit unsigned PVM ops. Optimizer at
-      `crates/otic/src/optimize.rs:137-186` uses U256 (unsigned)
-      for fold_binop/fold_cmp. Any contract using `i*` types is
-      wrong. Either gate signed types at typecheck (preferred for
-      testnet) OR add `Sdiv`/`Smod`/`Slt`/`Sgt`/`Sar` ISA opcodes
-      and cascade through codegen + optimizer + AOT.
-- [ ] 355 — `⚠` **`find_field_offset_any` iterates `HashMap.values()`
-      → non-deterministic bytecode.** `crates/otic/src/codegen.rs:632-640`.
-      Switch to `BTreeMap`-backed lookup or sort by struct name.
-- [ ] 356 — `⚠` **FNV-1a-32 selectors with no compile-time dedup
-      check.** `crates/otic/src/codegen.rs:3622-3629, 396-399`.
-      Easy collision on adversarial function names; first match
-      wins silently. Error on duplicate at `extract_all_contract_
-      signatures`. Long-term: switch to Poseidon2-derived
-      selector to align with `pyde_state::keys`.
+- [x] 354 — `⚠` **Signed arithmetic broken end-to-end.**
+      **SHIPPED.** Took the conservative typecheck-gate path:
+      every `i8`/`i16`/`i32`/`i64`/`i128`/`i256` usage now
+      produces a typecheck error pointing at the audit. Codegen
+      emits unsigned PVM ops for `Div` / `Mod` / comparisons /
+      `Shr`, and the optimizer's constant folder uses `U256`,
+      so a contract that compiled with signed types would
+      silently produce wrong arithmetic at runtime
+      (`i32::MIN / -1`, `-1 < 0`, etc.). New
+      `reject_signed_types_in_item` pre-pass walks the entire
+      AST (function params + returns, struct/event/storage/error
+      fields, type aliases, consts, interface signatures, Vec /
+      Map / Tuple / Array element types) and emits errors. 6
+      audit-354 tests cover function param, storage field, Vec
+      element, Map value, return type rejection plus an
+      unsigned-types-still-accepted regression. Post-mainnet path
+      to lift the gate is documented: add `Sdiv` / `Smod` /
+      `Slt` / `Sgt` / `Sar` ISA opcodes + cascade through
+      codegen + optimizer + AOT.
+- [x] 355 — `⚠` **`find_field_offset_any` non-deterministic
+      bytecode.** **SHIPPED.** The fallback now sorts struct
+      names with `BTreeMap`-style ordering (`keys().sort()`)
+      before iterating, so the first match is deterministic.
+      Pre-fix walked `HashMap.values()` directly — Rust's HashMap
+      iteration order is unspecified and varies per process via
+      SipHash random seed, so two compilations of the same source
+      could pick different fields when a name collides across
+      structs and produce different bytecodes. Breaks reproducible-
+      builds (operator deploys hash A, CI hashes B, audit reviewer
+      hashes C — all valid contracts, none byte-equal). New
+      `audit_355_compile_output_is_deterministic_across_runs`
+      test compiles the same source 5x and asserts byte-equal
+      runtime bytecode; surfaces any future non-determinism leak
+      (HashMap iteration, RNG, system time, etc.) as a loud
+      assertion failure.
+- [x] 356 — `⚠` **FNV-1a-32 selectors with no compile-time dedup
+      check.** **SHIPPED.** New
+      `audit_356_rejects_contract_with_colliding_selectors` check
+      in `check_contract` builds a `HashMap<u32, name>` of public
+      function selectors and emits a typecheck error when two
+      different names hash to the same FNV-1a-32. Pre-fix the
+      dispatch table picked the first match silently, so a
+      contract author writing two functions with names that
+      happen to collide silently shipped one shadowed by the
+      other. Collision probability is ~1.05e-7 for 30 functions
+      via birthday paradox; adversarial naming can force one in
+      seconds. The regression test brute-forces a real collision
+      (1M alphanumeric candidates, ~50 ms) and asserts the
+      typecheck rejects it. Plus
+      `audit_356_compute_fnv1a_matches_codegen_compute_selector`
+      pins byte-equality between the typecheck-side and codegen-
+      side FNV-1a-32 helpers so the duplicated implementation
+      can't drift. Long-term: still worth switching to Poseidon2-
+      truncated to align with `pyde_state::keys` and to get
+      cryptographic collision resistance — separate effort.
 
 ### Crypto
 

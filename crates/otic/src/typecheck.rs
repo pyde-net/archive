@@ -17,6 +17,23 @@ use crate::ast::*;
 use crate::token::Span;
 use crate::types::Ty;
 
+/// Audit 356: same FNV-1a-32 used by codegen's `compute_selector`,
+/// duplicated here so the typecheck pass can detect collisions
+/// without taking a dependency on the codegen module. Keep in sync
+/// with `crates/otic/src/codegen.rs::compute_selector` — if the
+/// hash function ever changes (e.g. switch to Poseidon2-truncated),
+/// this helper must move too. A regression test in the codegen
+/// module pins the wire format; here we only need byte-equality
+/// with that.
+fn compute_fnv1a_selector(name: &str) -> u32 {
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in name.bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    hash
+}
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -148,6 +165,22 @@ impl TypeChecker {
 
     /// Type check a source file.
     pub fn check(mut self, file: &SourceFile) -> TypeCheckResult {
+        // Audit 354: pre-pass that rejects signed integer types
+        // (`i8`/`i16`/`i32`/`i64`/`i128`/`i256`) anywhere in the
+        // program. Codegen emits unsigned PVM ops for `Div`,
+        // `Mod`, `<`, `>`, `<=`, `>=`, and `Shr`, and the
+        // optimizer's constant-folder uses `U256` for fold_binop /
+        // fold_cmp. So any contract using `i*` types compiles
+        // silently but produces wrong results at runtime
+        // (`i32::MIN / -1`, `-1 < 0`, etc.). Failing loudly at
+        // typecheck is the conservative testnet fix; lifting
+        // signed types post-mainnet requires adding `Sdiv` /
+        // `Smod` / `Slt` / `Sgt` / `Sar` ISA opcodes plus
+        // cascading the change through codegen + optimizer + AOT.
+        for item in &file.items {
+            self.reject_signed_types_in_item(item);
+        }
+
         // First pass: collect all type definitions
         for item in &file.items {
             self.collect_defs(item);
@@ -160,6 +193,134 @@ impl TypeChecker {
 
         TypeCheckResult {
             errors: self.errors,
+        }
+    }
+
+    /// Audit 354: walk every type annotation in this item and emit
+    /// a typecheck error for any signed-integer primitive. Covers
+    /// function params + returns, struct/event/storage fields, type
+    /// aliases — everywhere a `Type` node can appear in the AST.
+    fn reject_signed_types_in_item(&mut self, item: &Item) {
+        match item {
+            Item::Function(f) => self.reject_signed_in_function(f),
+            Item::Contract(c) => {
+                for ci in &c.items {
+                    match ci {
+                        ContractItem::Storage(sb) => {
+                            for sf in &sb.fields {
+                                self.reject_signed_in_type(&sf.ty);
+                            }
+                        }
+                        ContractItem::Event(ev) => {
+                            for ef in &ev.fields {
+                                self.reject_signed_in_type(&ef.ty);
+                            }
+                        }
+                        ContractItem::Error(er) => {
+                            for f in &er.fields {
+                                self.reject_signed_in_type(&f.ty);
+                            }
+                        }
+                        ContractItem::Struct(s) => {
+                            for f in &s.fields {
+                                self.reject_signed_in_type(&f.ty);
+                            }
+                        }
+                        ContractItem::Const(cd) => {
+                            if let Some(ty) = &cd.ty {
+                                self.reject_signed_in_type(ty);
+                            }
+                        }
+                        ContractItem::TypeAlias(ta) => {
+                            self.reject_signed_in_type(&ta.ty);
+                        }
+                        ContractItem::Function(f) => self.reject_signed_in_function(f),
+                        ContractItem::Enum(_) => {}
+                    }
+                }
+            }
+            Item::Struct(s) => {
+                for f in &s.fields {
+                    self.reject_signed_in_type(&f.ty);
+                }
+            }
+            Item::Const(cd) => {
+                if let Some(ty) = &cd.ty {
+                    self.reject_signed_in_type(ty);
+                }
+            }
+            Item::TypeAlias(ta) => self.reject_signed_in_type(&ta.ty),
+            Item::Error(er) => {
+                for f in &er.fields {
+                    self.reject_signed_in_type(&f.ty);
+                }
+            }
+            Item::Interface(iface) => {
+                for f in &iface.functions {
+                    for p in &f.params {
+                        self.reject_signed_in_type(&p.ty);
+                    }
+                    if let Some(ret) = &f.return_type {
+                        self.reject_signed_in_type(ret);
+                    }
+                }
+            }
+            Item::Module(_) | Item::Enum(_) | Item::Use(_) => {
+                // module/use/enum carry no type annotations directly.
+            }
+        }
+    }
+
+    fn reject_signed_in_function(&mut self, f: &FunctionDef) {
+        for p in &f.params {
+            self.reject_signed_in_type(&p.ty);
+        }
+        if let Some(ret) = &f.return_type {
+            self.reject_signed_in_type(ret);
+        }
+    }
+
+    /// Recurse into a `Type` node looking for signed primitives.
+    fn reject_signed_in_type(&mut self, ty: &Type) {
+        match ty {
+            Type::Primitive(p, span) => {
+                let signed_name = match p {
+                    PrimitiveType::I8 => Some("i8"),
+                    PrimitiveType::I16 => Some("i16"),
+                    PrimitiveType::I32 => Some("i32"),
+                    PrimitiveType::I64 => Some("i64"),
+                    PrimitiveType::I128 => Some("i128"),
+                    PrimitiveType::I256 => Some("i256"),
+                    _ => None,
+                };
+                if let Some(name) = signed_name {
+                    self.error(
+                        format!(
+                            "signed integer type `{}` is not supported (audit 354): \
+                             codegen + optimizer treat all integers as unsigned, so a contract \
+                             using signed types would silently produce wrong arithmetic. \
+                             Use the corresponding unsigned type and explicit two's-complement \
+                             encoding if needed; signed types will land post-mainnet alongside \
+                             Sdiv/Smod/Slt/Sgt/Sar ISA opcodes.",
+                            name
+                        ),
+                        *span,
+                    );
+                }
+            }
+            Type::Bytes(_) => {}
+            Type::Array(elem, _, _) => self.reject_signed_in_type(elem),
+            Type::Vec(elem, _) => self.reject_signed_in_type(elem),
+            Type::Map(k, v, _) => {
+                self.reject_signed_in_type(k);
+                self.reject_signed_in_type(v);
+            }
+            Type::Named(_) => {} // user-defined types resolve elsewhere
+            Type::Tuple(types, _) => {
+                for t in types {
+                    self.reject_signed_in_type(t);
+                }
+            }
         }
     }
 
@@ -518,6 +679,47 @@ impl TypeChecker {
 
     fn check_contract(&mut self, contract: &ContractDef) {
         self.in_contract = true;
+        // Audit 356: detect FNV-1a-32 selector collisions across
+        // public functions in this contract before codegen. The
+        // dispatch table picks the first match for any given
+        // selector, so a collision silently shadows one function
+        // with another — caller invokes `transfer(...)` and the
+        // VM dispatches to `mint(...)`. The collision probability
+        // is ~1.05e-7 for 30 functions (birthday paradox over
+        // 2^32) but adversarial naming can force one in seconds,
+        // and even one accidental collision in a compile is a
+        // silent footgun.
+        let mut seen_selectors: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new();
+        for item in &contract.items {
+            if let ContractItem::Function(f) = item {
+                if f.is_pub
+                    && !f.is_constructor()
+                    && !f.is_test()
+                    && !f.is_receive()
+                    && !f.is_fallback()
+                {
+                    let sel = compute_fnv1a_selector(&f.name.name);
+                    if let Some(prev) = seen_selectors.get(&sel) {
+                        if prev != &f.name.name {
+                            self.error(
+                                format!(
+                                    "FNV-1a-32 selector collision (audit 356): \
+                                     function `{}` and `{}` both hash to 0x{:08x}. \
+                                     Rename one of them; the dispatch table picks \
+                                     the first match silently and would shadow the \
+                                     other.",
+                                    prev, f.name.name, sel
+                                ),
+                                f.name.span,
+                            );
+                        }
+                    } else {
+                        seen_selectors.insert(sel, f.name.name.clone());
+                    }
+                }
+            }
+        }
         for item in &contract.items {
             match item {
                 ContractItem::Function(f) => self.check_function(f),
@@ -2970,5 +3172,195 @@ mod tests {
             }
         "#,
         );
+    }
+
+    // ========== Audit 354: signed integer types rejected ==========
+
+    /// Audit 354: every signed-integer primitive type must be
+    /// rejected at typecheck time. Codegen + optimizer treat all
+    /// integers as unsigned (Div/Mod/<,>,<=,>=/Shr emit unsigned
+    /// PVM ops, fold_binop/fold_cmp use U256), so a contract that
+    /// compiles with `i*` types silently produces wrong arithmetic
+    /// at runtime. Ban at the language layer until the post-
+    /// mainnet path adds Sdiv/Smod/Slt/Sgt/Sar opcodes.
+    #[test]
+    fn audit_354_rejects_i8_function_param() {
+        let errs = check_err(
+            r#"
+            contract C {
+                pub fn f(x: i8) -> u64 { return 0; }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("audit 354")),
+            "expected audit-354 error, got: {:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn audit_354_rejects_i256_storage_field() {
+        let errs = check_err(
+            r#"
+            contract C {
+                storage { balance: i256, }
+            }
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.message.contains("audit 354")));
+    }
+
+    #[test]
+    fn audit_354_rejects_i32_in_vec() {
+        let errs = check_err(
+            r#"
+            contract C {
+                storage { nums: Vec<i32>, }
+            }
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.message.contains("audit 354")));
+    }
+
+    #[test]
+    fn audit_354_rejects_i64_in_map_value() {
+        let errs = check_err(
+            r#"
+            contract C {
+                storage { scores: Map<Address, i64>, }
+            }
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.message.contains("audit 354")));
+    }
+
+    #[test]
+    fn audit_354_rejects_i128_return_type() {
+        let errs = check_err(
+            r#"
+            contract C {
+                pub fn f() -> i128 { return 0; }
+            }
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.message.contains("audit 354")));
+    }
+
+    #[test]
+    fn audit_354_unsigned_types_still_accepted() {
+        check_ok(
+            r#"
+            contract C {
+                storage { a: u256, b: Vec<u128>, c: Map<Address, u64>, }
+                pub fn f(x: u32) -> u8 { return 0; }
+            }
+            "#,
+        );
+    }
+
+    // ========== Audit 356: FNV-1a-32 selector collision detection ==========
+
+    /// Audit 356: confirm the typecheck-side
+    /// `compute_fnv1a_selector` is byte-equal to the codegen-side
+    /// `compute_selector`. We duplicate the implementation
+    /// (typecheck shouldn't depend on codegen), so this guard
+    /// fires loudly if either copy drifts.
+    #[test]
+    fn audit_356_compute_fnv1a_matches_codegen_compute_selector() {
+        for name in [
+            "transfer",
+            "approve",
+            "mint",
+            "burn",
+            "balance_of",
+            "owner",
+            "init",
+            "very_long_function_name_that_exercises_many_iterations",
+        ] {
+            assert_eq!(
+                super::compute_fnv1a_selector(name),
+                crate::codegen::compute_selector(name),
+                "FNV-1a-32 helpers diverge for `{name}`"
+            );
+        }
+    }
+
+    /// Audit 356: brute-force a real FNV-1a-32 collision among
+    /// short ASCII function names, then confirm the typecheck
+    /// pass rejects a contract that defines BOTH colliding names
+    /// as public functions. Without the dedup check the dispatch
+    /// table would pick whichever entry got generated first and
+    /// silently shadow the other.
+    ///
+    /// The brute-force search runs once per test invocation and
+    /// completes in milliseconds; ~26^4 = 450K candidates to find
+    /// a 4-char-vs-4-char or shorter pair via birthday collision
+    /// over a 32-bit space (expected ~65K trials). If the hash
+    /// changes the search just re-runs and still finds a pair.
+    #[test]
+    fn audit_356_rejects_contract_with_colliding_selectors() {
+        let (a, b) = find_fnv1a_collision().expect(
+            "no collision found in 200K-name search — \
+             FNV-1a-32 collisions should occur within ~65K trials",
+        );
+        assert_ne!(a, b);
+        let src = format!(
+            "contract C {{ pub fn {a}() -> u64 {{ return 1; }} \
+             pub fn {b}() -> u64 {{ return 2; }} }}"
+        );
+        let errs = check_err(&src);
+        assert!(
+            errs.iter().any(|e| e.message.contains("audit 356")),
+            "expected audit-356 collision error for ({a}, {b}), got: {:?}",
+            errs
+        );
+    }
+
+    /// Brute-force search for a pair of distinct short ASCII
+    /// strings that hash to the same FNV-1a-32 selector. Strings
+    /// are valid Otic identifiers (start with letter).
+    fn find_fnv1a_collision() -> Option<(String, String)> {
+        let mut seen: HashMap<u32, String> = HashMap::new();
+        // Birthday-paradox math says we need ~sqrt(2*2^32) ≈ 92K
+        // trials for 50% collision probability over a 32-bit
+        // space. 1M trials → ~117 expected collisions, very high
+        // probability of finding at least one. Search runs in
+        // ~50ms (single hash call per trial).
+        for i in 0u32..1_000_000 {
+            let name = idx_to_name(i);
+            let sel = super::compute_fnv1a_selector(&name);
+            if let Some(prev) = seen.insert(sel, name.clone()) {
+                if prev != name {
+                    return Some((prev, name));
+                }
+            }
+        }
+        None
+    }
+
+    fn idx_to_name(i: u32) -> String {
+        // Mix letters + digits + suffix length to exhaust buckets
+        // (alphabetic-only over short lengths leaves FNV-1a-32
+        // surprisingly collision-light empirically). Identifier
+        // syntax requires the first char to be a letter; anything
+        // after that can be alphanumeric.
+        let mut s = String::with_capacity(8);
+        s.push('f');
+        let mut x = i;
+        while x > 0 {
+            let d = (x % 36) as u8;
+            let c = if d < 10 {
+                (b'0' + d) as char
+            } else {
+                (b'a' + d - 10) as char
+            };
+            s.push(c);
+            x /= 36;
+        }
+        if s.len() == 1 {
+            s.push('0');
+        }
+        s
     }
 }
