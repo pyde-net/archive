@@ -51,6 +51,19 @@ pub struct NetworkConfig {
     pub bootstrap_peers: Vec<String>,
     /// Whether this node is a validator.
     pub is_validator: bool,
+    /// Audit 340: chain_id baked into the libp2p `identify`
+    /// protocol-version string so peers from a different chain
+    /// can be detected and dropped at handshake time. Pre-fix
+    /// the protocol version was the static "/pyde/1.0.0" so a
+    /// node from chain 12345 happily handshook with a node from
+    /// chain 7331 — both passed the libp2p identity check, slot
+    /// into Kademlia, and exchanged gossipsub topic
+    /// subscriptions before any application-layer message
+    /// revealed the chain mismatch. Post-fix the protocol
+    /// version is `/pyde/1.0.0/<chain_id>` and the
+    /// `IdentifyEvent::Received` handler disconnects on
+    /// mismatch.
+    pub chain_id: u64,
 }
 
 impl Default for NetworkConfig {
@@ -64,6 +77,10 @@ impl Default for NetworkConfig {
             rate_limit_per_ip: DEFAULT_RATE_LIMIT_PER_IP,
             bootstrap_peers: Vec::new(),
             is_validator: false,
+            // Default to devnet chain_id; production callers
+            // ALWAYS set this from `[node].chain_id` in
+            // config.toml.
+            chain_id: 31337,
         }
     }
 }
