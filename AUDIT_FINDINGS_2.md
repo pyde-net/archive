@@ -502,22 +502,64 @@
       directly via RPC, it's a soft warning. Same bisect window
       as #319 / #396; investigate together.
 
-- [ ] 399 — `✓` **`validator_churn` and `validator_churn_4_of_4`
-      both fail.** Surfaced same e2e run. **Predates this audit
-      cycle** — fails identically on `aee961d` (~30 s and ~37 s).
+- [x] 399 — `✓` **Validator restart-rejoin stalled the chain.**
+      **SHIPPED.** Two distinct bugs in the late-joiner pathway,
+      surfaced when killing + restarting validators in the
+      `validator_churn` and `validator_churn_4_of_4` tests:
 
-      Tests cover validator restart-rejoin and 4-of-4 churn
-      scenarios. Both failures likely cluster with #396 (rejoining
-      validator behaves like a cold-start full-node from the
-      mesh's perspective; cold-start sync is broken). A fix to
-      #396 may resolve both by symmetry.
+      **(a) `slot_clock` anchor was wrong on restart.** The
+      original logic backdated genesis to `now - saved_head *
+      block_time_ms`. After a restart, this anchor sat further
+      forward in wall-clock than the still-running validators'
+      anchor (their `genesis_instant` was their original startup
+      time). Net effect: a restarted validator's `current_slot()`
+      returned `saved_head` while live peers were many slots
+      ahead. `select_and_vote` keys off
+      `consensus.current_slot` (which tracks `slot_clock`), so
+      the restarted validator kept proposing/voting on stale
+      slots. With one node killed AND one node muted by this
+      clock skew, a 4-of-4 cluster fell below 3-of-4 quorum and
+      stalled. Fix: derive the anchor from
+      `chain.headers[head_slot].timestamp - head_slot *
+      block_time_ms` — `block.timestamp` is wall-clock at
+      proposal time, so this recovers the original
+      `genesis_instant` that all validators share.
 
-      **Pre-launch impact:** mid-flight validator restart is a
-      core operability path; if a validator can't rejoin its own
-      committee after a process restart, ops can't safely bounce
-      a node for upgrades. Risk band: medium for testnet (we can
-      tell ops not to restart), high for mainnet. Same bisect
-      window as #319 / #396 / #398.
+      **(b) Compact-block tip-bump triggered NotFound sync
+      loops.** Pre-fix the `update_network_tip(slot)` call
+      inside `ReconstructCompactBlock` bumped the tip from any
+      proposal received via gossip — including
+      proposals-in-flight that hadn't QC'd yet. Sync engaged for
+      those slots, server returned NotFound (full block doesn't
+      exist anywhere until QC + apply), and the tight retry
+      loop starved the consensus message handler — votes
+      couldn't drain, no QC formed, chain stalled. Fix:
+      replaced direct `update_network_tip` with a
+      `request_chain_tip(peer)` re-poll for slots more than
+      `head + 1` ahead. The peer responds with their applied
+      head (`chain.head_slot` in `SyncResp::ChainTip`), which is
+      the right tip signal for sync.
+
+      **(c) `target_height` didn't advance for sync-applied
+      blocks.** The QC-apply path advances target_height via
+      `on_vote`'s success branch. The sync-apply path bypassed
+      that, leaving `target_height` pinned at the pre-restart
+      slot — the restarted validator received proposals for the
+      live network's current slot but its
+      `select_and_vote` targeted target_height, not wall-clock
+      slot. Fix: after `on_response` applies sync blocks, call
+      `engine.advance_target_height_after_sync(chain.head_slot
+      + 1)` so the engine follows along. `advance_target_height`
+      is monotonic, so it no-ops if the engine is already ahead.
+
+      **Verification:** `validator_churn` ✅ (47s),
+      `validator_churn_4_of_4` ✅ (69s),
+      `multi_node_full_node_relay` ✅ (5s — was secondary
+      symptom of (b)), `multi_node_sync` ✅ regression-free.
+      Full multi-node battery: 13/14 pass; only #397
+      (epoch_rotation 240s deadline at 100ms/slot under
+      4-subprocess load) remains as a doc'd test-config
+      limit.
 
 ### Consensus / finality
 

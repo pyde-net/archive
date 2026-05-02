@@ -752,20 +752,64 @@ impl PydeNode {
         let mut shutdown_rx = self.shutdown.subscribe();
 
         // Slot clock for block timing. If resuming from persisted head,
-        // backdate genesis so current_slot() picks up where we left off.
-        // Block time comes from `[consensus].block_time_ms` (default
-        // 400); `with_block_time` clamps out-of-range values.
+        // Audit 399: derive the slot_clock anchor from the most
+        // recent block's `header.timestamp` minus
+        // `head_slot * block_time_ms`. block.timestamp is set by
+        // the proposer to `current_time_ms()` at proposal time, so
+        // it's a real Unix-ms wall-clock; subtracting
+        // `head_slot * block_time_ms` recovers the original
+        // genesis_instant. All validators that observed the same
+        // chain land on the same anchor.
+        //
+        // Pre-fix the slot_clock was backdated from `saved_head *
+        // block_time_ms` against `now`, anchoring slot 0 to "now -
+        // saved_head*400ms". After a restart, the backdated
+        // anchor sat further forward in wall-clock than the
+        // continuously-running validators' anchor (their
+        // genesis_instant had been "their startup wall-clock"),
+        // so a restarted node-0's `current_slot()` returned
+        // `saved_head` even when the live network was many slots
+        // ahead. `select_and_vote` keys off
+        // `consensus.current_slot` (which tracks the slot_clock),
+        // so the restarted validator kept voting on stale slots —
+        // a 4-of-4 cluster with one node down + one node muted by
+        // this clock skew dropped below 3-of-4 quorum and stalled.
+        //
+        // For fresh-start (saved_head = 0) and for tests where the
+        // genesis block's timestamp is 0 (testnet generator
+        // doesn't stamp wall-clock), fall back to genesis-anchor
+        // == `now` so all freshly-spawned nodes' slot_clocks agree
+        // (they started within ms of each other).
         let block_time_ms = self.config.consensus.block_time_ms;
-        let slot_clock = if saved_head > 0 {
-            let backdate_ms = saved_head * block_time_ms;
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            SlotClock::with_block_time(now_ms.saturating_sub(backdate_ms), block_time_ms)
+        let now_ms_for_anchor = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let slot_clock_anchor_ms = if saved_head > 0 {
+            // Pull the head's block.timestamp from the in-memory
+            // chain (just restored from disk above). That timestamp
+            // is wall-clock at proposal — subtract head*block_time
+            // to get the original genesis instant.
+            let head_block_ts = chain
+                .read()
+                .await
+                .header(saved_head)
+                .map(|h| h.timestamp)
+                .unwrap_or(0);
+            if head_block_ts > 0 {
+                head_block_ts.saturating_sub(saved_head * block_time_ms)
+            } else {
+                // Block timestamp wasn't set (legacy/test). Fall
+                // back to the original backdate-from-now logic.
+                now_ms_for_anchor.saturating_sub(saved_head * block_time_ms)
+            }
         } else {
-            SlotClock::with_block_time(0, block_time_ms)
+            // Fresh start: use 0 to make `with_block_time` anchor
+            // at `Instant::now()` — all peers spawned together
+            // share approximately the same instant.
+            0
         };
+        let slot_clock = SlotClock::with_block_time(slot_clock_anchor_ms, block_time_ms);
         let mut last_slot = slot_clock.current_slot();
 
         // Periodic timers
@@ -1515,22 +1559,46 @@ impl PydeNode {
                             };
                             let slot = header.slot;
                             let block_hash = header.hash();
-                            // Audit 396: every compact block we observe
-                            // is a network-tip signal — even if local
-                            // reconstruction succeeds (empty block or
-                            // we already had every tx). Pre-fix the
-                            // tip update only fired on the
-                            // `missing.is_empty() == false` branch,
-                            // so a node that joined the cluster at
-                            // genesis (slot 0) and only ever saw empty
-                            // warm-up blocks never realized validators
-                            // were ahead — `is_behind` returned false,
-                            // no GetBlocks ever sent, `head_slot`
-                            // pinned at 0 forever. The full-node-relay
-                            // and validator-churn failures both
-                            // reduce to this same "tip never refreshed
-                            // from gossip" symptom.
-                            chain_sync.manager.update_network_tip(slot);
+                            // Audit 396: a compact block far ahead of
+                            // our current head is a "we missed
+                            // something" signal, but it's a PROPOSAL
+                            // (not a finalized block) so we can't
+                            // bump `network_tip` to its slot directly
+                            // — `network_tip` should track finalized
+                            // heads, not proposed-but-not-QC'd slots.
+                            // Pre-fix the direct `update_network_tip`
+                            // here triggered GetBlocks for the
+                            // proposed slot, sync server returned
+                            // NotFound (full block doesn't exist
+                            // anywhere until QC + apply), and the
+                            // tight retry loop starved the consensus
+                            // message handler — a 4-of-4 committee
+                            // with one dead node stalled because the
+                            // live validators couldn't drain their
+                            // vote queues.
+                            //
+                            // Instead: re-poll a peer for their
+                            // canonical chain tip. The response
+                            // (`SyncResp::ChainTip`) reports
+                            // `chain.head_slot` — the peer's highest
+                            // applied block — which is what
+                            // `network_tip` should reflect. If the
+                            // peer is genuinely ahead, sync engages
+                            // for the right slots; if the peer is at
+                            // the same head as us (we just got a
+                            // proposal-in-flight), `is_behind`
+                            // returns false and sync stays idle.
+                            // The "head + 1" exclusion catches the
+                            // common natural-next-slot proposal
+                            // without an extra round-trip.
+                            let local_head = chain.read().await.head_slot;
+                            if slot > local_head.saturating_add(1) {
+                                let first_peer: Option<libp2p::PeerId> =
+                                    swarm.connected_peers().next().copied();
+                                if let Some(peer) = first_peer {
+                                    chain_sync.request_chain_tip(&mut swarm, peer);
+                                }
+                            }
 
                             // Build mempool snapshot for reconstruction (plaintext + encrypted)
                             let idx = mempool_index.read().await;
@@ -4645,6 +4713,25 @@ fn handle_swarm_event(
                 block_store,
                 ws_checkpoint,
             );
+            // Audit 399: advance the validator engine's
+            // `target_height` to chain head + 1 so a restarted
+            // validator that just sync-applied blocks doesn't keep
+            // voting on the slot it was at before the crash. The
+            // QC-apply path already advances target_height inside
+            // `on_vote`'s success branch; the sync-apply path
+            // bypassed that, leaving target_height pinned at the
+            // pre-restart slot. Net effect: the restarted node
+            // received proposals for the live network's current
+            // slot but refused to vote (`select_and_vote` targets
+            // `target_height`, not the wall-clock slot). With one
+            // node killed AND one node effectively muted only 2 of
+            // 4 validators voted, so no QC formed and the chain
+            // stalled. `advance_target_height` is monotonic — it
+            // no-ops if the engine already advanced past us.
+            if let Some(engine) = validator_engine.as_mut() {
+                let next_target = chain.head_slot.saturating_add(1);
+                engine.advance_target_height_after_sync(next_target);
+            }
             // Signal the event loop to continue if chunked snapshot needs
             // more chunks OR we're otherwise still syncing. Both branches
             // produced the same ContinueSync return — collapsed into a
