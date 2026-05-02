@@ -11,7 +11,7 @@ use pyde_consensus::hotstuff::{
     create_vote, proposer_sign_message, try_form_qc, verify_vote, ConsensusMessage, ConsensusState,
 };
 use pyde_consensus::proposer::{compute_candidacy, ProposerCandidate};
-use pyde_consensus::slashing::{slash_double_sign, DoubleSignEvidence};
+use pyde_consensus::slashing::{verify_double_sign, DoubleSignEvidence};
 use pyde_consensus::validator::VALIDATOR_STAKE;
 use pyde_consensus::view_change::{
     create_view_change, try_form_view_change_qc, TimeoutTracker, ViewChangeMessage,
@@ -2182,12 +2182,17 @@ impl ValidatorEngine {
             }
         };
 
-        // slash_double_sign returns None if the sig/format verification
-        // fails. We discard the SlashResult — only verification matters;
-        // the on-chain handler re-computes it from state. The local
-        // chain's `chain_id` is bound into the verifier's preimage so
-        // evidence forged on a foreign chain is rejected here.
-        if slash_double_sign(self.chain_id, &evidence, &pk_bytes).is_none() {
+        // Audit 328: switch to `verify_double_sign` here — the
+        // ingest path only cares whether the FALCON signatures
+        // verify under the local chain_id. The on-chain handler
+        // (`pyde_tx::pipeline::execute_slash`) re-runs verification
+        // and computes the slash amount from the live validator
+        // entry's `stake` (so the burned + finder_fee numbers
+        // honour the offender's actual stake, not the constant
+        // `VALIDATOR_STAKE`). Calling `slash_double_sign` here
+        // would force us to invent a stake parameter just to throw
+        // away the result.
+        if !verify_double_sign(self.chain_id, &evidence, &pk_bytes) {
             debug!(
                 slot = evidence.slot,
                 signer = hex::encode(evidence.signer),

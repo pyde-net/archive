@@ -13,7 +13,7 @@
 //! Evidence submitter receives 10% finder's fee from slashed stake.
 //! No time limit on evidence — previous epoch evidence is still valid.
 
-use crate::validator::{ValidatorSet, ValidatorStatus, VALIDATOR_STAKE};
+use crate::validator::{ValidatorSet, ValidatorStatus};
 use pyde_account::address::Address;
 use pyde_crypto::falcon::{falcon_verify, FalconPublicKey, FalconSignature};
 
@@ -103,6 +103,15 @@ pub struct LivenessReport {
     pub slots_participated: u64,
     /// Total slots in the epoch.
     pub total_slots: u64,
+    /// The validator's stake at the time the report was assembled
+    /// (audit 328). Slash percentages are computed against this
+    /// number, not the genesis-time `VALIDATOR_STAKE` constant, so
+    /// a repeat offender whose stake has already been reduced by a
+    /// prior slash gets a proportional second hit instead of a
+    /// flat 10k-PYDE-equivalent that the live stake can no longer
+    /// pay. Consumers must populate this from the live validator
+    /// entry (`Validator::stake` / `ValidatorEntry::stake`).
+    pub current_stake: u128,
 }
 
 impl LivenessReport {
@@ -175,16 +184,30 @@ fn compute_slash(stake: u128, offense: &SlashingOffense) -> (u128, u128) {
 }
 
 /// Process a double-sign slashing event against the local chain's `chain_id`.
+///
+/// Audit 328: `current_stake` is the live stake of the offender at
+/// the moment the slash is computed. Pre-fix the function used the
+/// constant `VALIDATOR_STAKE` (10k PYDE) regardless of the
+/// offender's actual stake, so a repeat offender whose stake had
+/// already been reduced by a prior slash got a `SlashResult`
+/// promising `amount_burned + finder_fee = 10_000` even if their
+/// remaining stake was, say, 500. Any caller crediting those
+/// numbers to validator/treasury would over-credit and leave a
+/// phantom shortage in the subsequent `apply_slash` step (which
+/// clamps the actual debit to whatever stake exists). Now the
+/// slash is computed against `current_stake` so the returned
+/// numbers always honour what's actually available.
 pub fn slash_double_sign(
     chain_id: u64,
     evidence: &DoubleSignEvidence,
     public_key: &[u8],
+    current_stake: u128,
 ) -> Option<SlashResult> {
     if !verify_double_sign(chain_id, evidence, public_key) {
         return None;
     }
 
-    let (burned, finder_fee) = compute_slash(VALIDATOR_STAKE, &SlashingOffense::DoubleSigning);
+    let (burned, finder_fee) = compute_slash(current_stake, &SlashingOffense::DoubleSigning);
 
     Some(SlashResult {
         offender: evidence.signer,
@@ -197,6 +220,13 @@ pub fn slash_double_sign(
 }
 
 /// Process liveness slashing based on participation rate.
+///
+/// Audit 328: slash percentages (1% / 5% / 10%) are applied to
+/// `report.current_stake` — the validator's stake at the time the
+/// report was assembled — not the constant `VALIDATOR_STAKE`. A
+/// repeat offender whose stake has already been halved by a prior
+/// slash now pays the percentage against the halved amount, which
+/// is the only number the chain can actually debit.
 pub fn slash_liveness(report: &LivenessReport) -> Option<SlashResult> {
     let pct = report.participation_percent();
 
@@ -210,7 +240,7 @@ pub fn slash_liveness(report: &LivenessReport) -> Option<SlashResult> {
         return None; // >= 90% participation, no slash
     };
 
-    let (burned, finder_fee) = compute_slash(VALIDATOR_STAKE, &offense);
+    let (burned, finder_fee) = compute_slash(report.current_stake, &offense);
     let ejected = matches!(
         offense,
         SlashingOffense::LivenessMajor | SlashingOffense::LivenessAbsent
@@ -276,6 +306,7 @@ pub fn apply_slash(
 mod tests {
     use super::*;
     use crate::block::{BlockHeader, QuorumCert};
+    use crate::validator::VALIDATOR_STAKE;
     use pyde_account::address::derive_eoa_address;
     use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
 
@@ -339,7 +370,8 @@ mod tests {
 
         assert!(verify_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes));
 
-        let result = slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes).unwrap();
+        let result =
+            slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes, VALIDATOR_STAKE).unwrap();
         assert_eq!(result.offender, addr);
         assert_eq!(result.offense, SlashingOffense::DoubleSigning);
         assert!(result.ejected);
@@ -377,7 +409,7 @@ mod tests {
         assert!(verify_double_sign(1, &evidence, &pk_bytes));
         assert!(!verify_double_sign(2, &evidence, &pk_bytes));
         assert!(!verify_double_sign(31337, &evidence, &pk_bytes));
-        assert!(slash_double_sign(2, &evidence, &pk_bytes).is_none());
+        assert!(slash_double_sign(2, &evidence, &pk_bytes, VALIDATOR_STAKE).is_none());
     }
 
     // ========== Task 0515: False evidence rejected ==========
@@ -402,7 +434,7 @@ mod tests {
         };
 
         assert!(!verify_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes));
-        assert!(slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes).is_none());
+        assert!(slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes, VALIDATOR_STAKE).is_none());
     }
 
     #[test]
@@ -466,6 +498,7 @@ mod tests {
             validator: derive_eoa_address(b"val"),
             slots_participated: 900,
             total_slots: 1000,
+            current_stake: VALIDATOR_STAKE,
         };
         assert!(slash_liveness(&report).is_none());
     }
@@ -476,6 +509,7 @@ mod tests {
             validator: derive_eoa_address(b"val"),
             slots_participated: 890,
             total_slots: 1000,
+            current_stake: VALIDATOR_STAKE,
         };
         let result = slash_liveness(&report).unwrap();
         assert_eq!(result.offense, SlashingOffense::LivenessMinor);
@@ -491,6 +525,7 @@ mod tests {
             validator: derive_eoa_address(b"val"),
             slots_participated: 490,
             total_slots: 1000,
+            current_stake: VALIDATOR_STAKE,
         };
         let result = slash_liveness(&report).unwrap();
         assert_eq!(result.offense, SlashingOffense::LivenessMajor);
@@ -507,6 +542,7 @@ mod tests {
             validator: derive_eoa_address(b"val"),
             slots_participated: 0,
             total_slots: 1000,
+            current_stake: VALIDATOR_STAKE,
         };
         let result = slash_liveness(&report).unwrap();
         assert_eq!(result.offense, SlashingOffense::LivenessAbsent);
@@ -538,7 +574,8 @@ mod tests {
             submitter: derive_eoa_address(b"finder"),
         };
 
-        let result = slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes).unwrap();
+        let result =
+            slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes, VALIDATOR_STAKE).unwrap();
         assert_eq!(result.finder_fee, VALIDATOR_STAKE * 10 / 100);
         assert_eq!(result.amount_burned, VALIDATOR_STAKE * 90 / 100);
     }
@@ -569,7 +606,8 @@ mod tests {
             submitter: derive_eoa_address(b"finder"),
         };
 
-        let result = slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes).unwrap();
+        let result =
+            slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes, VALIDATOR_STAKE).unwrap();
         assert!(apply_slash(&mut set, &result, 500));
 
         // Stake reduced to 0 (100% slashed)
@@ -591,6 +629,7 @@ mod tests {
             validator: addr,
             slots_participated: 890,
             total_slots: 1000,
+            current_stake: VALIDATOR_STAKE,
         };
 
         let result = slash_liveness(&report).unwrap();
@@ -615,5 +654,141 @@ mod tests {
             offense: SlashingOffense::DoubleSigning,
         };
         assert!(!apply_slash(&mut set, &result, 0));
+    }
+
+    // ========== Audit 328: slash uses live stake, not VALIDATOR_STAKE ==========
+
+    /// Repeat offender double-sign: a validator whose stake has
+    /// already been reduced by a prior slash gets a `SlashResult`
+    /// scaled to the live stake. Pre-fix `slash_double_sign`
+    /// always computed the slash against the constant
+    /// `VALIDATOR_STAKE` (10_000), so a validator whose remaining
+    /// stake was 500 still got `amount_burned + finder_fee =
+    /// 10_000` — a number that the on-chain debit could never
+    /// match, leaving callers crediting validator/treasury with
+    /// 9_500 of unbacked tokens.
+    #[test]
+    fn audit_328_double_sign_repeat_offender_scales_to_live_stake() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+
+        let hash_1 = make_header(100, 1_000_000).hash();
+        let hash_2 = make_header(100, 2_000_000).hash();
+        let evidence = DoubleSignEvidence {
+            slot: 100,
+            block_hash_1: hash_1,
+            signature_1: sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash_1),
+            block_hash_2: hash_2,
+            signature_2: sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash_2),
+            signer: addr,
+            submitter: derive_eoa_address(b"finder"),
+        };
+
+        // Validator's remaining stake after a prior slash:
+        // half of the original VALIDATOR_STAKE.
+        let live_stake: u128 = VALIDATOR_STAKE / 2;
+        let result = slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes, live_stake).unwrap();
+
+        // 100% of live_stake = live_stake. 90% burn / 10% finder.
+        assert_eq!(
+            result.amount_burned + result.finder_fee,
+            live_stake,
+            "total slash must equal live stake, not VALIDATOR_STAKE",
+        );
+        assert_eq!(result.finder_fee, live_stake / 10);
+        assert_eq!(result.amount_burned, live_stake - live_stake / 10);
+    }
+
+    /// Zero-stake offender (already drained by prior slashes):
+    /// the result is non-None (signature still verified) but the
+    /// amounts are zero. apply_slash on this is a no-op, which
+    /// is the correct behaviour.
+    #[test]
+    fn audit_328_double_sign_zero_stake_yields_zero_amounts() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+
+        let hash_1 = make_header(100, 1_000_000).hash();
+        let hash_2 = make_header(100, 2_000_000).hash();
+        let evidence = DoubleSignEvidence {
+            slot: 100,
+            block_hash_1: hash_1,
+            signature_1: sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash_1),
+            block_hash_2: hash_2,
+            signature_2: sign_proposer(&sk, TEST_CHAIN_ID, 100, &hash_2),
+            signer: addr,
+            submitter: derive_eoa_address(b"finder"),
+        };
+
+        let result = slash_double_sign(TEST_CHAIN_ID, &evidence, &pk_bytes, 0).unwrap();
+        assert_eq!(result.amount_burned, 0);
+        assert_eq!(result.finder_fee, 0);
+        // Verification flags still reflect double-sign semantics.
+        assert!(result.ejected);
+        assert!(result.forced_unbonding);
+    }
+
+    /// Repeat offender liveness slash: the percentage applies to
+    /// the live `current_stake`, not the constant VALIDATOR_STAKE.
+    /// 5% of a halved stake is 5% of the halved value, not 5% of
+    /// the original.
+    #[test]
+    fn audit_328_liveness_repeat_offender_scales_to_live_stake() {
+        let report = LivenessReport {
+            validator: derive_eoa_address(b"val"),
+            slots_participated: 490,
+            total_slots: 1000,
+            current_stake: VALIDATOR_STAKE / 2,
+        };
+        let result = slash_liveness(&report).unwrap();
+        // 5% of (VALIDATOR_STAKE / 2)
+        let live = VALIDATOR_STAKE / 2;
+        let expected = live * 5 / 100;
+        assert_eq!(
+            result.amount_burned + result.finder_fee,
+            expected,
+            "liveness slash must scale to live stake",
+        );
+    }
+
+    /// `apply_slash` clamps the validator's stake to 0 when the
+    /// promised slash exceeds the live stake (e.g., the pre-fix
+    /// behaviour where SlashResult promised 10_000 but the live
+    /// stake was 500). With the live-stake fix the promised
+    /// amount and the actual debit are now identical, so the
+    /// clamp is exercised only in degenerate cases.
+    #[test]
+    fn audit_328_apply_slash_with_live_stake_no_phantom_mint() {
+        let mut set = ValidatorSet::new();
+        let (addr, pk) = make_validator(1);
+        // Register with full stake, then manually halve it (mimic a
+        // prior slash that left the validator with 5_000 PYDE).
+        set.register(addr, pk, VALIDATOR_STAKE, 0).unwrap();
+        set.validators[0].stake = VALIDATOR_STAKE / 2;
+
+        let live_stake = set.validators[0].stake;
+
+        let report = LivenessReport {
+            validator: addr,
+            slots_participated: 0, // 0% → 10% slash
+            total_slots: 1000,
+            current_stake: live_stake,
+        };
+        let result = slash_liveness(&report).unwrap();
+
+        let total_promised = result.amount_burned + result.finder_fee;
+        let pre_apply_stake = set.validators[0].stake;
+        assert!(apply_slash(&mut set, &result, 1000));
+        let post_apply_stake = set.validators[0].stake;
+
+        // The actual stake reduction must match the promised slash
+        // (no phantom mint, no shortage).
+        assert_eq!(
+            pre_apply_stake - post_apply_stake,
+            total_promised,
+            "pre→post stake delta must equal promised slash exactly",
+        );
     }
 }

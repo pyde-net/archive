@@ -638,11 +638,30 @@
       pre-dedup.** `validator.rs:1830-1834, 1941-1942`. Dedup
       on `(slot, voter_index)` BEFORE push to bound FALCON-verify
       cost per slot.
-- [ ] 328 — `⚠` **`compute_slash` uses fixed `VALIDATOR_STAKE`
-      (10K), not actual current stake.**
-      `crates/consensus/src/slashing.rs:163-179, 244-277`. Pass
-      `validator.stake` from the live entry to keep
-      `total_burned`/`finder_fee` consistent for repeat offenders.
+- [x] 328 — `⚠` **`compute_slash` uses fixed `VALIDATOR_STAKE`
+      (10K), not actual current stake.** **SHIPPED.**
+      `slash_double_sign` now takes a `current_stake: u128`
+      parameter and `LivenessReport` carries `current_stake: u128`;
+      both feed `compute_slash` so the returned `amount_burned +
+      finder_fee` honours the offender's live stake instead of the
+      genesis-time constant. Pre-fix a repeat offender whose stake
+      had already been halved by a prior slash got a SlashResult
+      promising the full 10k-PYDE-equivalent — a number the
+      subsequent `apply_slash` could not actually debit (it clamps
+      to 0), so any caller crediting `amount_burned` to the
+      treasury would over-credit and leave a phantom shortage.
+      The on-chain `pyde_tx::pipeline::execute_slash` was already
+      doing the right thing (`entry.stake.min(SLASH_VALIDATOR_STAKE)`),
+      so the production money-flow path is unaffected; the fix is
+      to the public consensus-layer API used by the gossip-side
+      ingestion harness and downstream slash-routing tooling.
+      Node-side `ingest_evidence` switched from `slash_double_sign`
+      to `verify_double_sign` since it only cared about signature
+      validity (the SlashResult was discarded). New 4 audit-328
+      tests pin: repeat offender's slash scales to half-stake,
+      zero-stake offender yields zero amounts (still ejected),
+      liveness slash uses live stake, apply_slash debit equals
+      promised slash exactly (no phantom mint).
 - [ ] 329 — `⚠` **`is_finalized` (2-chained-QC rule) is dead code.**
       `crates/consensus/src/hotstuff.rs:329-364`. Production
       records soft finality on the first QC; the documented chain
