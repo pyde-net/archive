@@ -532,6 +532,34 @@ impl PydeNode {
             None
         };
 
+        // Audit 341: full-node header validation requires committee
+        // keys + epoch randomness too. Pre-fix only validators ran
+        // `validate_network_block`, so a non-validator full node
+        // accepted any block whose header signature was bytes-shaped
+        // — a Byzantine peer could feed it a block with a bogus
+        // proposer (FALCON-signed by a stranger key, VRF-faked, QC
+        // empty) and the full node would persist + relay it. The
+        // audit fix is "always validate"; for that we need
+        // committee_keys + epoch_randomness on every node, not just
+        // validators. Recompute the committee from `genesis_config`
+        // — same logic the validator branch above runs. Devnet uses
+        // a fixed epoch_randomness of `[0xAA; 32]`; production
+        // networks rotate it via threshold randomness shares
+        // (audit 320/322 finalize the binding). For testnet we
+        // anchor to the genesis committee; full nodes that need
+        // post-rotation accuracy will rebuild the committee on
+        // epoch boundary just like validators.
+        let mut committee_keys_for_validation: Vec<Vec<u8>> = Vec::new();
+        if !genesis_config.validators.is_empty() {
+            for val in genesis_config.validators.iter() {
+                let pk_bytes =
+                    hex::decode(val.public_key.strip_prefix("0x").unwrap_or(&val.public_key))
+                        .map_err(|e| format!("invalid validator pk in genesis: {}", e))?;
+                committee_keys_for_validation.push(pk_bytes);
+            }
+        }
+        let epoch_randomness_for_validation: [u8; 32] = [0xAA; 32];
+
         // 5. Load or generate node identity (persistent across restarts)
         let keypair = load_or_generate_identity(datadir)?;
         let peer_id = libp2p::PeerId::from(keypair.public());
@@ -551,6 +579,10 @@ impl PydeNode {
             rate_limit_per_ip: self.config.network.rate_limit_per_ip,
             bootstrap_peers: self.config.network.bootstrap_peers.clone(),
             is_validator,
+            // Audit 340: bake chain_id into the identify
+            // protocol-version so cross-chain peers can be
+            // detected at handshake time.
+            chain_id: self.config.node.chain_id,
         };
 
         // 6. Create libp2p swarm
@@ -870,6 +902,8 @@ impl PydeNode {
                             &mut peer_manager,
                             &mut pending_auth_nonces,
                             last_outgoing_committee_size,
+                            &committee_keys_for_validation,
+                            &epoch_randomness_for_validation,
                         )
                     };
 
@@ -4036,6 +4070,12 @@ fn handle_swarm_event(
     peer_manager: &mut pyde_net::peer::PeerManager,
     pending_auth_nonces: &mut std::collections::HashMap<PeerId, [u8; 32]>,
     last_outgoing_committee_size: usize,
+    // Audit 341: full-node validation fallback. Validators
+    // override these via their engine; non-validator full nodes
+    // use them to validate gossip block headers without skipping
+    // the check.
+    committee_keys_for_validation: &[Vec<u8>],
+    epoch_randomness_for_validation: &[u8; 32],
 ) -> PostEventAction {
     match event {
         // --- Gossipsub message received ---
@@ -4161,13 +4201,35 @@ fn handle_swarm_event(
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_millis() as u64;
-                            if let Some(ref engine) = validator_engine {
+                            // Audit 341: validate the header on
+                            // EVERY node, not just validators.
+                            // Validators use their engine's live
+                            // committee/epoch state; full nodes
+                            // fall back to the
+                            // genesis-derived committee +
+                            // epoch_randomness loaded at startup.
+                            // Skipping validation on the full-node
+                            // path used to let a Byzantine peer
+                            // ship a block with a bogus proposer
+                            // signature past the chain head, and
+                            // the full node would persist + relay
+                            // it without checking.
+                            let (committee_keys_ref, epoch_rand_ref): (&[Vec<u8>], &[u8; 32]) =
+                                if let Some(ref engine) = validator_engine {
+                                    (engine.committee_keys.as_slice(), &engine.epoch_randomness)
+                                } else {
+                                    (
+                                        committee_keys_for_validation,
+                                        epoch_randomness_for_validation,
+                                    )
+                                };
+                            if !committee_keys_ref.is_empty() {
                                 if let Err(e) = BlockProcessor::validate_network_block(
                                     chain.chain_id,
                                     &block.header,
                                     &block.proposer_signature,
-                                    &engine.committee_keys,
-                                    &engine.epoch_randomness,
+                                    committee_keys_ref,
+                                    epoch_rand_ref,
                                     expected_parent.as_ref(),
                                     parent_timestamp,
                                     now_ms,
@@ -5346,6 +5408,24 @@ fn handle_swarm_event(
             ..
         })) => {
             debug!(%peer_id, addrs = info.listen_addrs.len(), "identify received");
+            // Audit 340: chain_id is baked into the identify
+            // protocol-version string (`/pyde/1.0.0/<chain_id>`).
+            // A peer from a different chain is benign at the
+            // libp2p layer (their FALCON peer-attestation also
+            // fails downstream) but takes up Kademlia + gossipsub
+            // resources until that downstream check fires. Drop
+            // the connection here to keep the routing table
+            // chain-clean.
+            let expected_proto_prefix = format!("/pyde/1.0.0/{}", chain.chain_id);
+            if info.protocol_version != expected_proto_prefix {
+                warn!(
+                    %peer_id,
+                    got = %info.protocol_version,
+                    expected = %expected_proto_prefix,
+                    "peer protocol/chain mismatch — disconnecting"
+                );
+                return PostEventAction::DisconnectStalePeer(peer_id);
+            }
             if !info.listen_addrs.is_empty() {
                 PostEventAction::AddPeerToKademlia(peer_id, info.listen_addrs)
             } else {

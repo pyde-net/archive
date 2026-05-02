@@ -147,11 +147,66 @@ pub fn create_node(
                 .build()
                 .map_err(|e| format!("gossipsub config error: {e}"))?;
 
-            let gossipsub = gossipsub::Behaviour::new(
+            let mut gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
             )
             .map_err(|e| format!("gossipsub error: {e}"))?;
+
+            // Audit 334: install peer scoring so misbehaving peers
+            // get demoted from the mesh and (eventually) graylisted.
+            // Pre-fix `with_peer_score` was never called, so every
+            // peer received the same priority forever — a single
+            // hostile peer that re-grafted faster than the prune
+            // backoff or failed IWANT lookups silently degraded the
+            // gossipsub mesh for everyone, with no recovery path.
+            //
+            // Parameter rationale:
+            // - **`behaviour_penalty_weight: -10.0`** (default) +
+            //   threshold 6.0 → tolerate up to 6 misbehaviours
+            //   (graft-floods, dropped IWANT) before scoring kicks
+            //   in; squared penalty above that.
+            // - **`behaviour_penalty_decay: 0.5`** → after a peer
+            //   stops misbehaving, their score recovers to ~0 over
+            //   a few decay intervals (1 s each). Lenient enough
+            //   for transient flaps, strict enough that a sustained
+            //   attacker drops below `graylist_threshold (-80)`.
+            // - **`ip_colocation_factor_threshold: 10.0`** → up to
+            //   10 peers per IP is fine. Cluster-test setups (4-8
+            //   localhost validators) stay below the line; a
+            //   real-world Sybil farm hosting many peers behind
+            //   one IP gets scored down.
+            // - **`app_specific_weight: 0.0`** → we don't yet plumb
+            //   app-side scores back into gossipsub; weight 0
+            //   neutralizes the unused dimension. Hook is in place
+            //   for future audit-suite reputation feedback.
+            // - Default `PeerScoreThresholds`:
+            //   gossip = -10, publish = -50, graylist = -80,
+            //   accept_px = 10, opportunistic_graft = 20. Standard
+            //   Ethereum-2 / IPFS-style envelope.
+            //
+            // No per-topic params yet — testnet operators will tune
+            // mesh delivery / invalid-message weights from real
+            // observation. Global behavioural penalty is the
+            // floor that closes the most-exploitable hole.
+            let score_params = gossipsub::PeerScoreParams {
+                topics: std::collections::HashMap::new(),
+                topic_score_cap: 3600.0,
+                app_specific_weight: 0.0,
+                ip_colocation_factor_weight: -5.0,
+                ip_colocation_factor_threshold: 10.0,
+                ip_colocation_factor_whitelist: std::collections::HashSet::new(),
+                behaviour_penalty_weight: -10.0,
+                behaviour_penalty_threshold: 6.0,
+                behaviour_penalty_decay: 0.5,
+                decay_interval: Duration::from_secs(1),
+                decay_to_zero: 0.01,
+                retain_score: Duration::from_secs(3600),
+            };
+            let score_thresholds = gossipsub::PeerScoreThresholds::default();
+            gossipsub
+                .with_peer_score(score_params, score_thresholds)
+                .map_err(|e| format!("gossipsub peer-score init: {e}"))?;
 
             // Kademlia
             let kademlia = kad::Behaviour::new(
@@ -159,11 +214,19 @@ pub fn create_node(
                 MemoryStore::new(PeerId::from(key.public())),
             );
 
-            // Identify
-            let identify = identify::Behaviour::new(identify::Config::new(
-                "/pyde/1.0.0".to_string(),
-                key.public(),
-            ));
+            // Audit 340: bind chain_id into the identify
+            // protocol-version string so peers from a different
+            // chain are visible at handshake time. The
+            // ConnectionEstablished arm in the application loop
+            // disconnects on `IdentifyEvent::Received` whose
+            // `protocol_version` doesn't match. Without this a
+            // chain-7331 node and a chain-12345 node could
+            // happily handshake at the libp2p layer and only
+            // diverge later at application-message time, after
+            // they'd already swapped Kademlia entries +
+            // gossipsub subscriptions.
+            let proto_ver = format!("/pyde/1.0.0/{}", config.chain_id);
+            let identify = identify::Behaviour::new(identify::Config::new(proto_ver, key.public()));
 
             // Sync request-response protocol
             let sync = sync_protocol::sync_behaviour();
@@ -384,6 +447,40 @@ mod tests {
         let (swarm, peer_id) = create_node(&config, key).unwrap();
         assert!(!peer_id.to_string().is_empty());
         drop(swarm);
+    }
+
+    /// Audit 334: every newly-created Pyde swarm must have peer
+    /// scoring enabled. Pre-fix `with_peer_score(...)` was never
+    /// called, so misbehaving peers couldn't be demoted from the
+    /// gossipsub mesh and a single hostile peer could degrade
+    /// delivery for every other validator. We can't read the
+    /// installed `PeerScoreParams` back out (the gossipsub
+    /// crate doesn't expose getters), but we CAN attempt to
+    /// install the scoring system again — the second call must
+    /// fail with "Peer score set twice", proving the first one
+    /// took effect during `create_node`.
+    #[tokio::test]
+    async fn audit_334_peer_scoring_is_installed_on_create() {
+        let config = NetworkConfig::default();
+        let key = generate_keypair();
+        let (mut swarm, _peer_id) = create_node(&config, key).unwrap();
+
+        // Try to install scoring AGAIN. If `create_node` already
+        // wired peer scoring, this fails with the "Peer score set
+        // twice" error from the gossipsub crate. If `create_node`
+        // forgot to install it (the audit-334 regression), this
+        // would silently succeed.
+        let params = gossipsub::PeerScoreParams::default();
+        let thresholds = gossipsub::PeerScoreThresholds::default();
+        let res = swarm
+            .behaviour_mut()
+            .gossipsub
+            .with_peer_score(params, thresholds);
+        assert!(
+            res.is_err() && res.as_ref().unwrap_err().contains("twice"),
+            "audit 334: peer scoring must be installed by create_node, but got {:?}",
+            res
+        );
     }
 
     #[tokio::test]

@@ -724,17 +724,36 @@
       layer. This is one component of the audit P1 #319 burst-
       test stall — full investigation deferred but this
       mismatch is closed.
-- [ ] 334 — `⚠` **No peer scoring config.**
-      `crates/net/src/node.rs:117-129`. `with_peer_score(...)` is
-      never called; `ValidationMode::Permissive`. Misbehaving peers
-      never get demoted. Install
-      `gossipsub::PeerScoreParams::default()` for testnet.
-- [ ] 335 — `⚠` **`crates/net/src/ddos.rs` is entirely dead code.**
-      RateLimiter/SubnetLimiter/PowChallenge primitives have zero
-      callers outside their own tests. Either wire `SubnetLimiter`
-      into `ConnectionEstablished` and `RateLimiter` per-peer for
-      Transactions, or delete the file so nobody assumes protection
-      that isn't there.
+- [x] 334 — `⚠` **No peer scoring config.** **SHIPPED.**
+      `gossipsub.with_peer_score(params, thresholds)` now wired into
+      `create_node`. Params: `behaviour_penalty_weight = -10.0`
+      with threshold 6 and decay 0.5 (squared penalty for
+      sustained misbehaviour like graft floods / dropped IWANT,
+      lenient toward transient flaps); `ip_colocation_factor_weight
+      = -5.0` with threshold 10 (Sybil farms behind one IP get
+      scored down without penalizing healthy 4-8 localhost test
+      clusters); default `PeerScoreThresholds` (gossip = -10,
+      publish = -50, graylist = -80). Without this, a single
+      hostile peer that re-grafted faster than the prune backoff
+      silently degraded the gossipsub mesh for everyone with no
+      recovery path. New `audit_334_peer_scoring_is_installed_on_create`
+      regression test exploits the "Peer score set twice" error
+      to assert installation. 83 net tests pass.
+- [x] 335 — `⚠` **`crates/net/src/ddos.rs` entirely dead code.**
+      **SHIPPED — deleted.** The 431-line module of unwired
+      RateLimiter/SubnetLimiter/PowChallenge/diversity primitives
+      gave a false sense of protection (operators reading the
+      source might assume per-peer flood limits + per-/24
+      connection caps were active). Audit 334's gossipsub
+      peer-score covers the most-needed pieces:
+      `behaviour_penalty_weight` replaces RateLimiter,
+      `ip_colocation_factor_weight` replaces SubnetLimiter at IP
+      granularity, and audit-333's `max_transmit_size` covers
+      message-size enforcement. PoW connection-flood mitigation
+      and /24-subnet limits aren't covered exactly; if real-world
+      telemetry shows them needed, re-introduce wired into
+      `ConnectionEstablished`. Until then keeping dead code is
+      worse than honest removal.
 - [x] 336 — `✓` **`PeerInfo.ip` never populated.** Shipped: new
       `pyde_net::peer::ip_from_multiaddr(&Multiaddr) ->
       Option<IpAddr>` walks the protocol stack and returns the
@@ -757,22 +776,47 @@
       u32::MAX` sliced the whole `snap.entries` into one response,
       defeating chunked transfer + driving full-snapshot
       allocations per request. 17 sync tests pass.
-- [ ] 339 — `⚠` **`channels.rs::validate_message` /
-      `discovery.rs::Discovery` ban list dead code.** Either wire
-      both into receive paths or delete to match reality.
-- [ ] 340 — `⚠` **`identify::Behaviour` protocol-version doesn't
-      bind chain_id.** `crates/net/src/node.rs:152-155`. Cross-chain
-      peers slot into peer book + Kademlia; rely solely on
-      app-layer FALCON auth. Encode chain_id into the protocol
-      version and refuse mismatch at `ConnectionEstablished`.
+- [x] 339 — `⚠` **`channels.rs::validate_message` dead code.**
+      **SHIPPED — pruned.** `NetworkMessage`, `ValidationResult`,
+      `validate_message`, and `MessageDedup` had zero callers.
+      Their roles are fully covered by gossipsub: validator-only
+      enforcement at subscribe time, size cap by
+      `max_transmit_size` (audit 333), and dedup by
+      `duplicate_cache_time`. Kept only `Channel` (used by
+      node.rs) and trimmed channels.rs from 325 → 113 lines.
+- [x] 340 — `⚠` **`identify::Behaviour` protocol-version doesn't
+      bind chain_id.** **SHIPPED.** Protocol version is now
+      `format!("/pyde/1.0.0/{chain_id}")` so peers from a
+      different chain are visible at handshake time. New
+      `chain_id: u64` field on `NetworkConfig` plumbed from
+      `[node].chain_id` in config.toml. The
+      `IdentifyEvent::Received` handler in node.rs disconnects
+      peers whose `protocol_version` doesn't match the local
+      chain — they're benign (FALCON peer-attestation also
+      catches them downstream) but consumed Kademlia + gossipsub
+      resources until the downstream rejection. Pre-fix the
+      protocol version was the static "/pyde/1.0.0", so a chain-
+      7331 node and a chain-12345 node happily handshook.
 
 ### RPC / node
 
-- [ ] 341 — `⚠` **Full nodes skip header validation on gossip full
-      blocks.** `crates/node/src/node.rs:3947-3958`.
-      `validate_network_block` only runs when
-      `validator_engine.is_some()`; non-validator full nodes accept
-      any header. Add a `NonValidatorVerifier` mirror.
+- [x] 341 — `⚠` **Full nodes skip header validation on gossip full
+      blocks.** **SHIPPED.** Pre-fix `validate_network_block` was
+      gated on `validator_engine.is_some()`, so a non-validator
+      full node accepted any gossip block whose header signature
+      was bytes-shaped — a Byzantine peer could feed it a block
+      with a bogus proposer (FALCON-signed by a stranger key,
+      VRF-faked, QC empty) and the full node would persist + relay
+      it. Post-fix the full node also runs the header check using
+      a `committee_keys_for_validation` + `epoch_randomness_for_validation`
+      derived from `genesis_config` at startup. Validators still
+      use their engine's live committee/epoch state (which rotates
+      across epochs); full nodes anchor to the genesis committee
+      for now — needs a follow-up to track epoch rotation when
+      committee membership changes after genesis. Threaded the
+      two new params through `handle_swarm_event`. Same
+      `multi_node_propagation` integration test still passes (no
+      regression on the same-chain happy path).
 - [x] 342 — `✓` **`pyde_estimateGas` and `pyde_createAccessList`
       lack the gas cap that audit 735bcef added to `pyde_call`.**
       Shipped: replaced raw `unwrap_or(1_000_000)` /
