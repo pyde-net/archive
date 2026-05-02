@@ -26,6 +26,25 @@ macro_rules! typecheck_fixture {
             }
         }
     };
+    // Ignore variant — for fixtures that legitimately need signed
+    // types (lat/lng coordinates, temperatures, Elo deltas) and are
+    // gated by audit 354 until the post-mainnet ISA adds Sdiv /
+    // Smod / Slt / Sgt / Sar opcodes. Re-enabling these is a
+    // mechanical step once audit 354 is lifted.
+    (ignore = $reason:literal, $name:ident, $path:expr) => {
+        #[test]
+        #[ignore = $reason]
+        fn $name() {
+            let src = include_str!($path);
+            let errors = typecheck_file(src);
+            if !errors.is_empty() {
+                for e in &errors {
+                    eprintln!("  {}", e);
+                }
+                panic!("{} had {} type errors", stringify!($name), errors.len());
+            }
+        }
+    };
 }
 
 // === ERC20 ===
@@ -148,6 +167,7 @@ typecheck_fixture!(
 );
 typecheck_fixture!(typecheck_coin_flip, "fixtures/programs/games/coin_flip.oti");
 typecheck_fixture!(
+    ignore = "audit 354: signed types disabled until post-mainnet ISA opcodes (Elo deltas)",
     typecheck_chess_wager,
     "fixtures/programs/games/chess_wager.oti"
 );
@@ -278,6 +298,8 @@ typecheck_fixture!(
     "fixtures/programs/patterns/bytes_and_crypto.oti"
 );
 typecheck_fixture!(
+    ignore =
+        "audit 354: signed types disabled until post-mainnet ISA opcodes (lat/lng, temperatures)",
     typecheck_nested_types,
     "fixtures/programs/patterns/nested_types.oti"
 );
@@ -302,7 +324,11 @@ typecheck_fixture!(
 );
 
 // === Supply Chain ===
-typecheck_fixture!(typecheck_tracking, "fixtures/programs/supply/tracking.oti");
+typecheck_fixture!(
+    ignore = "audit 354: signed types disabled until post-mainnet ISA opcodes (temperature deltas)",
+    typecheck_tracking,
+    "fixtures/programs/supply/tracking.oti"
+);
 typecheck_fixture!(
     typecheck_certification,
     "fixtures/programs/supply/certification.oti"
