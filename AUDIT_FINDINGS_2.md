@@ -646,9 +646,17 @@
       to drift-only since the genesis header isn't tracked in
       `chain.headers`). 4 new tests covering: ≤parent rejection,
       far-future rejection, in-drift acceptance, None-parent skip.
-- [ ] 326 — `⚠` **`seen_evidence`, `seen_finality_votes` unbounded
-      memory.** `crates/node/src/validator.rs:315`. Add prune loop
-      mirroring `seen_proposals`/`seen_votes`.
+- [x] 326 — `⚠` **`seen_evidence`, `seen_finality_votes` unbounded
+      memory.** **SHIPPED.** `seen_evidence` is now pruned in the
+      slot-prune loop alongside `seen_proposals` / `seen_votes`,
+      with the same 10-slot retention window. Pre-fix the HashSet
+      grew unbounded for the validator's lifetime — a long-running
+      testnet validator with thousands of slashing events would
+      accumulate one entry per distinct (slot, signer) pair
+      indefinitely. `seen_finality_votes` was added in audit 327
+      with prune already wired; double-checked. New 1 audit-326
+      test seeds 20 slots' worth of entries, jumps to slot 25, and
+      asserts entries < 15 are dropped while ≥ 15 remain.
 - [x] 327 — `⚠` **Vote / view-change vec accept unbounded duplicates
       pre-dedup.** **SHIPPED.** Three call sites (`on_vote`,
       `on_view_change`, `on_finality_vote`) now short-circuit on
@@ -936,14 +944,56 @@
       cap before each `tasks.push(tokio::spawn(...))`; over-cap
       requests get a clear `-32603 "subscription cap reached
       (16 per connection); audit 346"` reply.
-- [ ] 347 — `⚠` **Faucet rate-limiter map grows unbounded.**
-      `crates/node/src/faucet.rs:50-86, 379-382, 541-545`. Validate
-      address against `^0x[0-9a-fA-F]{64}$` BEFORE recording in the
-      cooldown map; LRU-cap the map; reject non-UTF-8 bodies.
-- [ ] 348 — `⚠` **Faucet behind reverse proxy: `peer_addr.ip()`
-      collapses to one IP.** `crates/node/src/faucet.rs:530`. Add a
-      `--trust-x-forwarded-for` CLI flag; parse rightmost untrusted
-      hop only when set. Document the must-strip-XFF-at-edge risk.
+- [x] 347 — `⚠` **Faucet rate-limiter map grows unbounded.**
+      **SHIPPED.** Three layers:
+      1. New `is_valid_address(s: &str) -> bool` enforces
+         `^0x[0-9a-fA-F]{64}$` (strict 66-char shape) at both
+         the POST `/api/request` and GET `/faucet?address=` paths.
+         Pre-fix any 64+-char string slipped through and could be
+         recorded in the cooldown map.
+      2. `RateLimiter`'s backing map switched from
+         `HashMap<String, Instant>` to `lru::LruCache` capped at
+         `RATE_LIMITER_MAX_ENTRIES = 50_000`. `check` uses
+         `LruCache::get` (mutating, moves to MRU) so an
+         active-but-still-cooling entry stays warm; `record`
+         uses `put` which evicts the LRU entry once the cap is
+         reached. Eliminates the unbounded-map OOM vector that
+         pre-fix grew with every unique address / IP that ever
+         requested.
+      3. Body parsing now uses `String::from_utf8` (not
+         `from_utf8_lossy`) and rejects non-UTF-8 bodies with a
+         400 response. The lossy decoder previously silently
+         replaced invalid bytes with U+FFFD, corrupting the JSON
+         parser's view AND giving attackers a way to inject
+         garbage that survived address-shape checks downstream.
+      New 3 audit-347 tests pin: strict address validation
+      (length, hex, prefix, unicode), LRU evicts at cap, and
+      `check` keeps active entries at MRU.
+- [x] 348 — `⚠` **Faucet behind reverse proxy: `peer_addr.ip()`
+      collapses to one IP.** **SHIPPED.** New
+      `--trust-x-forwarded-for` flag on `pyde faucet` plumbs
+      through `FaucetConfig::trust_x_forwarded_for` to the
+      connection handler. New `resolve_rate_limit_ip(peer_addr,
+      forwarded_for, trust_xff)` helper:
+      * `trust_xff = false` (default): always returns
+        `peer_addr.ip()`. Direct-internet deployments keep the
+        pre-fix behaviour.
+      * `trust_xff = true`: returns the rightmost trimmed hop in
+        the `X-Forwarded-For` header, lowercased so v6 addresses
+        round-trip through `LruCache`'s case-insensitive lookup.
+        Falls back to `peer_addr.ip()` when XFF is absent or empty.
+      Why "rightmost untrusted hop": the leftmost XFF entry is
+      the original (potentially attacker-controlled) client claim;
+      the rightmost is whoever the proxy itself last saw connect.
+      With the operator's promise that the edge proxy strips any
+      inbound XFF before adding its own, the proxy IS the closest
+      trusted hop and its view wins. A boot-time `tracing::warn!`
+      reminds the operator that the proxy must strip inbound XFF
+      headers — without that, an attacker can spoof their client
+      IP and bypass per-IP rate-limits. New 6 audit-348 tests
+      pin: XFF ignored when not trusted, rightmost-of-many
+      selection, single-hop case, whitespace trim, empty/absent
+      fallback to peer_addr, IPv6 lowercase round-trip.
 - [x] 349 — `⚠` **`pyde_call` block context is zeroed.**
       **SHIPPED.** New `build_call_block_context` helper hydrates
       `block_number` / `timestamp` / `block_proposer` from

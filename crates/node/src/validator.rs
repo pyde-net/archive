@@ -2383,6 +2383,25 @@ impl ValidatorEngine {
             // for long-running validators.
             self.seen_view_changes.retain(|(s, _)| *s >= prune_before);
             self.seen_finality_votes.retain(|(s, _)| *s >= prune_before);
+            // Audit 326: `seen_evidence` is keyed on
+            // `(slot, signer)` and gates evidence ingestion to
+            // dedup local re-detection + gossip arrivals. Pre-fix
+            // it grew for the entire lifetime of the validator —
+            // a long-running testnet validator with thousands of
+            // slashing events would accumulate one entry per
+            // distinct (slot, signer) pair indefinitely. Prune
+            // mirrors `seen_proposals` / `seen_votes`: drop
+            // entries older than the 10-slot retention window.
+            //
+            // Re-broadcast risk: if a peer resurfaces evidence
+            // for `slot < prune_before`, the dedup gate misses
+            // and the evidence enters `pending_evidence` +
+            // `broadcast_evidence` again. That's a one-shot
+            // amplification per stale evidence — gossip's own
+            // de-dup handles the second hop, and the on-disk
+            // evidence store (pruned via `prune_evidence_before`)
+            // is the durability anchor. Acceptable trade.
+            self.seen_evidence.retain(|(s, _)| *s >= prune_before);
             // Mirror the same pruning on disk so the evidence index does not
             // grow unbounded. Best-effort: a failure here just delays cleanup.
             if let Some(store) = &self.consensus_store {
@@ -5304,6 +5323,39 @@ mod tests {
     /// Finality-vote dedup: same rationale as view-change above,
     /// applied to `finality_votes[slot]` which is the input to
     /// `try_form_hard_finality`.
+    /// Audit 326: `seen_evidence` is pruned in the slot-prune
+    /// loop. Pre-fix it grew unbounded for the entire validator
+    /// lifetime — a long-running testnet validator with
+    /// thousands of slashing events would accumulate one entry
+    /// per distinct (slot, signer) indefinitely.
+    #[test]
+    fn audit_326_seen_evidence_pruned_in_slot_loop() {
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
+
+        // Seed seen_evidence at slots 1..=20 directly (bypasses
+        // the verify path so we don't depend on FALCON keys).
+        for slot in 1..=20u64 {
+            let signer: Address = {
+                let mut a = [0u8; 32];
+                a[0] = slot as u8;
+                a
+            };
+            engine.seen_evidence.insert((slot, signer));
+        }
+        assert_eq!(engine.seen_evidence.len(), 20);
+
+        // Jump to slot 25 — prune_before = 15. Entries at slots
+        // 1..=14 must drop; 15..=20 must remain.
+        engine.consensus.current_slot = 24;
+        engine.advance_slot(); // new_slot = 25
+
+        assert!(
+            engine.seen_evidence.iter().all(|(s, _)| *s >= 15),
+            "seen_evidence retained entries older than prune_before",
+        );
+        assert_eq!(engine.seen_evidence.len(), 6, "slots 15..=20");
+    }
+
     #[test]
     fn audit_327_replayed_finality_vote_dropped() {
         use pyde_consensus::finality::FinalityVote;
