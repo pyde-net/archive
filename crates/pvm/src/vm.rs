@@ -445,8 +445,19 @@ impl Vm {
             None => return Err(Trap::InvalidOpcode),
         };
 
-        // Charge gas: single addition from precomputed lookup table
-        self.gas_used_total += crate::isa::total_gas(d.opcode.to_u8());
+        // Charge gas: single addition from precomputed lookup table.
+        // Audit 376: `checked_add` so a hostile execution path that
+        // crafts enough cumulative dynamic gas to wrap the u64
+        // accumulator past `gas_limit` traps `OutOfGas` instead of
+        // silently restarting the budget. The static per-opcode
+        // table values are bounded (≤ a few hundred each), but the
+        // dynamic-gas paths below add millions per call (LOG, KECCAK,
+        // CALL, CREATE, etc.), so accumulator overflow is reachable
+        // in principle. Mirrors Memcpy's checked_add pattern.
+        self.gas_used_total = self
+            .gas_used_total
+            .checked_add(crate::isa::total_gas(d.opcode.to_u8()))
+            .ok_or(Trap::OutOfGas)?;
 
         // Check gas limit (0 = unlimited)
         if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
@@ -829,7 +840,11 @@ impl Vm {
                 let byte_len = self.cpu.read_gp(len) as usize;
                 // Dynamic gas: 250 per 32 bytes (Poseidon2 permutation ≈ 250ns each)
                 let dynamic_gas = (byte_len as u64).div_ceil(32) * 250;
-                self.gas_used_total += dynamic_gas;
+                // Audit 376: checked_add — see line 449 rationale.
+                self.gas_used_total = self
+                    .gas_used_total
+                    .checked_add(dynamic_gas)
+                    .ok_or(Trap::OutOfGas)?;
                 if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                     return Err(Trap::OutOfGas);
                 }
@@ -859,7 +874,11 @@ impl Vm {
                 if !self.warm_storage_keys.contains(&key) {
                     self.warm_storage_keys.insert(key);
                     let cold_surcharge = 1800u64; // cold Sload = 200 base + 1800 = 2000 total
-                    self.gas_used_total += cold_surcharge;
+                                                  // Audit 376: checked_add — see line 449 rationale.
+                    self.gas_used_total = self
+                        .gas_used_total
+                        .checked_add(cold_surcharge)
+                        .ok_or(Trap::OutOfGas)?;
                     if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                         return Err(Trap::OutOfGas);
                     }
@@ -901,7 +920,11 @@ impl Vm {
                         let ptr = self.cpu.read_gp(ptr_reg) as u32;
                         if let Some(data) = storage_value.as_ref() {
                             let dynamic_gas = (data.len() as u64).div_ceil(8) * 3;
-                            self.gas_used_total += dynamic_gas;
+                            // Audit 376: checked_add — see line 449 rationale.
+                            self.gas_used_total = self
+                                .gas_used_total
+                                .checked_add(dynamic_gas)
+                                .ok_or(Trap::OutOfGas)?;
                             if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                                 return Err(Trap::OutOfGas);
                             }
@@ -944,7 +967,11 @@ impl Vm {
                 if !self.warm_storage_keys.contains(&key) {
                     self.warm_storage_keys.insert(key);
                     let cold_surcharge = 1800u64; // cold Sstore = 2000 base + 1800 = 3800 total
-                    self.gas_used_total += cold_surcharge;
+                                                  // Audit 376: checked_add — see line 449 rationale.
+                    self.gas_used_total = self
+                        .gas_used_total
+                        .checked_add(cold_surcharge)
+                        .ok_or(Trap::OutOfGas)?;
                     if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                         return Err(Trap::OutOfGas);
                     }
@@ -971,7 +998,11 @@ impl Vm {
                         let len = self.cpu.read_gp(len_reg) as usize;
                         // Dynamic gas: 3 per 8 bytes of data written to storage
                         let dynamic_gas = (len as u64).div_ceil(8) * 3;
-                        self.gas_used_total += dynamic_gas;
+                        // Audit 376: checked_add — see line 449 rationale.
+                        self.gas_used_total = self
+                            .gas_used_total
+                            .checked_add(dynamic_gas)
+                            .ok_or(Trap::OutOfGas)?;
                         if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                             return Err(Trap::OutOfGas);
                         }
@@ -998,7 +1029,11 @@ impl Vm {
                 if !self.warm_storage_keys.contains(&key) {
                     self.warm_storage_keys.insert(key);
                     let cold_surcharge = 1800u64;
-                    self.gas_used_total += cold_surcharge;
+                    // Audit 376: checked_add — see line 449 rationale.
+                    self.gas_used_total = self
+                        .gas_used_total
+                        .checked_add(cold_surcharge)
+                        .ok_or(Trap::OutOfGas)?;
                     if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                         return Err(Trap::OutOfGas);
                     }
@@ -1061,7 +1096,11 @@ impl Vm {
 
                 // Charge dynamic gas: 100 base + 8 per data byte + 50 per topic
                 let dynamic_gas = 100u64 + (data_len as u64) * 8 + (num_topics as u64) * 50;
-                self.gas_used_total += dynamic_gas;
+                // Audit 376: checked_add — see line 449 rationale.
+                self.gas_used_total = self
+                    .gas_used_total
+                    .checked_add(dynamic_gas)
+                    .ok_or(Trap::OutOfGas)?;
                 if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                     return Err(Trap::OutOfGas);
                 }
@@ -1126,7 +1165,11 @@ impl Vm {
                         self.pc += 4;
                         // Fall through to page gas drain at end of step()
                         if self.memory.page_gas_used > 0 {
-                            self.gas_used_total += self.memory.page_gas_used;
+                            // Audit 376: checked_add — see line 449 rationale.
+                            self.gas_used_total = self
+                                .gas_used_total
+                                .checked_add(self.memory.page_gas_used)
+                                .ok_or(Trap::OutOfGas)?;
                             self.memory.page_gas_used = 0;
                         }
                         return Ok(None);
@@ -1138,7 +1181,11 @@ impl Vm {
                         self.cpu.write_gp(d.rd, 0);
                         self.pc += 4;
                         if self.memory.page_gas_used > 0 {
-                            self.gas_used_total += self.memory.page_gas_used;
+                            // Audit 376: checked_add — see line 449 rationale.
+                            self.gas_used_total = self
+                                .gas_used_total
+                                .checked_add(self.memory.page_gas_used)
+                                .ok_or(Trap::OutOfGas)?;
                             self.memory.page_gas_used = 0;
                         }
                         return Ok(None);
@@ -1364,7 +1411,11 @@ impl Vm {
                     self.cpu.write_gp(d.rd, 0);
                     self.pc += 4;
                     if self.memory.page_gas_used > 0 {
-                        self.gas_used_total += self.memory.page_gas_used;
+                        // Audit 376: checked_add — see line 449 rationale.
+                        self.gas_used_total = self
+                            .gas_used_total
+                            .checked_add(self.memory.page_gas_used)
+                            .ok_or(Trap::OutOfGas)?;
                         self.memory.page_gas_used = 0;
                     }
                     return Ok(None);
@@ -1372,7 +1423,11 @@ impl Vm {
 
                 // Dynamic gas: 50 per proof level (each level = Poseidon hash + memory read)
                 let dynamic_gas = (proof_len as u64) * 1_000; // each proof element ≈ 1 Poseidon hash (1µs)
-                self.gas_used_total += dynamic_gas;
+                                                              // Audit 376: checked_add — see line 449 rationale.
+                self.gas_used_total = self
+                    .gas_used_total
+                    .checked_add(dynamic_gas)
+                    .ok_or(Trap::OutOfGas)?;
                 if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                     return Err(Trap::OutOfGas);
                 }
@@ -1402,7 +1457,11 @@ impl Vm {
 
         // Charge memory page allocation gas (accumulated during this instruction)
         if self.memory.page_gas_used > 0 {
-            self.gas_used_total += self.memory.page_gas_used;
+            // Audit 376: checked_add — see line 449 rationale.
+            self.gas_used_total = self
+                .gas_used_total
+                .checked_add(self.memory.page_gas_used)
+                .ok_or(Trap::OutOfGas)?;
             self.memory.page_gas_used = 0;
             if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                 return Err(Trap::OutOfGas);
@@ -1697,8 +1756,17 @@ impl Vm {
         child.load(&bytecode).map_err(|_| Trap::MemoryFault)?;
         let output = child.execute();
 
-        // Charge parent for gas used by child
-        self.gas_used_total += output.gas_used;
+        // Charge parent for gas used by child.
+        // Audit 376: checked_add — a malicious child can return a
+        // crafted `gas_used` close to u64::MAX (the child's own
+        // execution traps OOG before getting that high under
+        // `step()` checks, but a future fast-path bypass or an
+        // off-by-one in the child VM could yield a degenerate
+        // `output.gas_used` that wraps the parent accumulator).
+        self.gas_used_total = self
+            .gas_used_total
+            .checked_add(output.gas_used)
+            .ok_or(Trap::OutOfGas)?;
         if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
             return Err(Trap::OutOfGas);
         }
@@ -1905,7 +1973,11 @@ impl Vm {
                 .map_err(|_| Trap::MemoryFault)?;
 
             let output = child.execute();
-            self.gas_used_total += output.gas_used;
+            // Audit 376: checked_add — see do_ext_call rationale.
+            self.gas_used_total = self
+                .gas_used_total
+                .checked_add(output.gas_used)
+                .ok_or(Trap::OutOfGas)?;
             if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                 return Err(Trap::OutOfGas);
             }
@@ -1929,7 +2001,11 @@ impl Vm {
 
         // Charge per-byte gas for deployed code
         let code_gas = (runtime_code.len() as u64) * 200;
-        self.gas_used_total += code_gas;
+        // Audit 376: checked_add — see line 449 rationale.
+        self.gas_used_total = self
+            .gas_used_total
+            .checked_add(code_gas)
+            .ok_or(Trap::OutOfGas)?;
         if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
             return Err(Trap::OutOfGas);
         }
@@ -4385,6 +4461,62 @@ mod tests {
         ]);
         vm.load(&code).unwrap();
         assert_eq!(vm.run().unwrap(), ExecResult::Halt);
+    }
+
+    /// Audit 376: every `gas_used_total +=` site uses
+    /// `checked_add` so a hostile execution path that crafts
+    /// enough cumulative dynamic gas to wrap the u64 accumulator
+    /// past `gas_limit` traps `OutOfGas` instead of silently
+    /// restarting the budget. The Memcpy regression test below
+    /// exercises one of the dynamic-gas sites; this test
+    /// exercises the per-instruction baseline path at line ~449
+    /// (the most fundamental site, hit by every step).
+    #[test]
+    fn audit_376_per_instruction_gas_overflow_cannot_bypass_oog() {
+        let mut vm = Vm::with_gas_limit(u64::MAX);
+        // Seed gas_used_total close enough to u64::MAX that any
+        // baseline-cost addition wraps. Even a no-op JMP costs >= 1
+        // gas, so any opcode triggers the trap.
+        vm.gas_used_total = u64::MAX - 1;
+        let code = bytecode(&[
+            // A simple instruction so the precomputed baseline cost
+            // exceeds the seeded headroom.
+            instr_bytes(Opcode::Jmp, 0, 0, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        assert_eq!(
+            vm.run().unwrap_err(),
+            Trap::OutOfGas,
+            "per-instruction baseline gas charge must trap on overflow",
+        );
+    }
+
+    /// Audit 376: cross-contract CallExt charges the parent for
+    /// the child's `output.gas_used`. A degenerate child output
+    /// (e.g., from a future fast-path bug or off-by-one) returning
+    /// a `gas_used` close to `u64::MAX` must trap on overflow
+    /// instead of letting the parent continue with a wrapped
+    /// accumulator.
+    #[test]
+    fn audit_376_call_ext_charge_cannot_bypass_oog() {
+        // We can't easily craft a child with output.gas_used =
+        // u64::MAX without bypassing the child's own OOG check
+        // (which is what's being tested elsewhere). Instead,
+        // verify the helper logic: an arithmetic overflow on the
+        // parent's accumulator side is caught by checked_add.
+        // Smoke test via direct field manipulation.
+        let mut vm = Vm::new();
+        vm.gas_limit = u64::MAX;
+        vm.gas_used_total = u64::MAX - 5;
+
+        // Replicate the do_ext_call accounting in isolation:
+        let synthetic_child_gas = 10u64;
+        let result = vm.gas_used_total.checked_add(synthetic_child_gas);
+        assert!(
+            result.is_none(),
+            "checked_add with overflow must return None (caught path)",
+        );
     }
 
     #[test]

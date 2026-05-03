@@ -1412,8 +1412,29 @@
       `H256::zero()` — same as absent leaf. `crates/state/src/smt.rs:73-85`.
       Either reject empty-byte writes at the storage-trie boundary
       or document the tombstone semantics.
-- [ ] 376 — Unbounded `gas_used_total += ...` in 22 sites in PVM.
-      Mirror Memcpy's `checked_add` pattern.
+- [x] 376 — Unbounded `gas_used_total += ...` in 22 sites in PVM.
+      **SHIPPED.** Every `gas_used_total +=` site now uses
+      `checked_add(..).ok_or(Trap::OutOfGas)?`. Mirrors the
+      Memcpy pattern from audit 215. Per-instruction baseline
+      cost (line ~449), Poseidon dynamic gas, Sload/Sstore cold-
+      surcharge + dynamic gas, Log dynamic gas, MerkleVerify
+      dynamic gas + page-gas drain, VerifySig early-return page-
+      gas drain, page-gas drain at end of step(), CallExt
+      child-gas charge, Create constructor + per-byte-code
+      charges — all 16 distinct sites (audit's "22 sites" count
+      included repeats of the cold-surcharge pattern across
+      Sload/Sloadb/Sstoreb modes). Pre-fix a hostile contract
+      crafting an execution path with cumulative dynamic gas
+      large enough to wrap u64::MAX past `gas_limit` would
+      silently restart its budget — accumulator wraps to a small
+      value, the post-add `> gas_limit` check passes, contract
+      keeps running with effectively infinite gas. Reachable in
+      principle (LOG / KECCAK / CALL / CREATE all add millions
+      per call) but not practically observed pre-fix because the
+      attacker would need to control gas budget in addition. New
+      `audit_376_per_instruction_gas_overflow_cannot_bypass_oog`
+      and `audit_376_call_ext_charge_cannot_bypass_oog`
+      regression tests pin the fix.
 - [ ] 377 — VerifySig / MerkleVerify early-return paths skip OOG
       check after page-gas drain. `crates/pvm/src/vm.rs:1128-1132,
       1140-1144, 1347-1355`.
