@@ -179,6 +179,32 @@ pub fn apply_account_delta(
         current.auth_keys = final_.auth_keys.clone();
     }
 
+    // Audit 307 follow-up: `account.nonce` is the per-sender
+    // CREATE-address counter (`derive_create_address(tx.from,
+    // sender.nonce)` in the Deploy handler). Pre-fix this field
+    // was the only mutation `apply_account_delta` failed to
+    // propagate — the Deploy handler set
+    // `sender.nonce += 1` in-memory but the late write-back here
+    // never touched `current.nonce`, so the stored counter
+    // stayed at zero forever. Result: every Deploy from the same
+    // sender derived the same address (`create_address(sender,
+    // 0)`), with each new contract silently overwriting the
+    // previous one's runtime bytecode at that address. The
+    // failure was usually invisible (most test fixtures only
+    // deploy one contract per sender) but
+    // `reentrancy_attack_blocked` and any production multi-deploy
+    // flow would break.
+    //
+    // Override semantics (not a numeric delta) match the
+    // auth_keys path above: the pipeline is the only mutator and
+    // its final value is authoritative. Concurrent
+    // sender/recipient aliasing isn't a concern because Deploy
+    // can't have `tx.to == tx.from` (CREATE addresses are
+    // post-derived from the sender's pre-mutation nonce).
+    if final_.nonce != initial.nonce {
+        current.nonce = final_.nonce;
+    }
+
     store_account(smt, &current)
 }
 
@@ -2571,6 +2597,76 @@ mod tests {
     // ========== State persistence ==========
 
     // ── Audit 307: writeback no-clobber regression tests ───────────
+
+    /// Audit 307 follow-up: `apply_account_delta` must persist
+    /// `account.nonce` increments from the Deploy handler. Pre-fix
+    /// the function only handled `balance`, `gas_tank`, and
+    /// `auth_keys` — `nonce` was loaded fresh from SMT and stored
+    /// without applying the deploy-time `+= 1`. Result: every
+    /// Deploy from the same sender derived
+    /// `create_address(sender, 0)` and silently overwrote the
+    /// previously-deployed contract's runtime bytecode at that
+    /// address. The first regression to catch this was
+    /// `pyde-node`'s `reentrancy_attack_blocked` integration test
+    /// (deploys two contracts back-to-back, both ended up at the
+    /// same address, so the "attacker" overwrote the "vault" and
+    /// the rest of the test went sideways).
+    #[test]
+    fn deploy_increments_persisted_nonce_after_307() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let mut smt = PydeSMT::new();
+        let block_ctx = make_block_ctx();
+
+        let sender_addr = setup_funded_account(&mut smt, &pk_bytes, 1_000_000_000);
+        let initial_nonce = load_account(&smt, &sender_addr).nonce;
+        assert_eq!(initial_nonce, 0, "fresh account starts at nonce 0");
+
+        // Deploy 1.
+        let mut tx1 = make_signed_tx(sender_addr, ZERO_ADDRESS, 0, 50_000, 0, &sk);
+        tx1.tx_type = TransactionType::Deploy;
+        tx1.data = b"contract bytecode #1".to_vec();
+        let h1 = tx1.hash();
+        tx1.signature = falcon_sign(&sk, &h1).unwrap().as_bytes().to_vec();
+        let receipt1 = execute_transaction(&tx1, &mut smt, &block_ctx).unwrap();
+        assert!(receipt1.success);
+        let addr1: [u8; 32] = receipt1.return_data.as_slice().try_into().unwrap();
+
+        // The persisted account.nonce MUST be 1 now.
+        let after_deploy1 = load_account(&smt, &sender_addr).nonce;
+        assert_eq!(
+            after_deploy1, 1,
+            "account.nonce must be persisted as 1 after first Deploy",
+        );
+
+        // Deploy 2 — must derive a DIFFERENT address from Deploy 1.
+        let mut tx2 = make_signed_tx(sender_addr, ZERO_ADDRESS, 0, 50_000, 1, &sk);
+        tx2.tx_type = TransactionType::Deploy;
+        tx2.data = b"contract bytecode #2".to_vec();
+        let h2 = tx2.hash();
+        tx2.signature = falcon_sign(&sk, &h2).unwrap().as_bytes().to_vec();
+        let receipt2 = execute_transaction(&tx2, &mut smt, &block_ctx).unwrap();
+        assert!(receipt2.success);
+        let addr2: [u8; 32] = receipt2.return_data.as_slice().try_into().unwrap();
+
+        assert_ne!(
+            addr1, addr2,
+            "back-to-back Deploys must derive distinct addresses (got the same!)",
+        );
+
+        // Verify each address holds its own bytecode.
+        let code1 = load_code(&smt, &addr1).expect("contract #1 code present");
+        let code2 = load_code(&smt, &addr2).expect("contract #2 code present");
+        assert_eq!(code1, b"contract bytecode #1");
+        assert_eq!(code2, b"contract bytecode #2");
+
+        // The persisted nonce after Deploy 2 must be 2.
+        let after_deploy2 = load_account(&smt, &sender_addr).nonce;
+        assert_eq!(
+            after_deploy2, 2,
+            "account.nonce must be persisted as 2 after second Deploy",
+        );
+    }
 
     /// Self-transfer must pay gas. Pre-307, `store_account(smt,
     /// &recipient)` ran AFTER `store_account(smt, &sender)` for
