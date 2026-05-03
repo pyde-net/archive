@@ -153,6 +153,26 @@
       of the four clobber paths the audit identified is now
       closed. All 91 pyde-tx pipeline tests pass.
 
+      **Follow-up (2026-05): missing `account.nonce` propagation.**
+      `apply_account_delta` originally handled `balance`,
+      `gas_tank`, and `auth_keys`, but `account.nonce` was the
+      lone field the pipeline mutates that wasn't propagated.
+      The Deploy handler does `sender.nonce += 1` to advance the
+      CREATE-address counter, but the late write-back loaded
+      sender fresh from SMT and stored without applying that
+      increment — so the persisted counter stayed at 0 and every
+      Deploy from the same sender resolved to
+      `create_address(sender, 0)`, with each new contract
+      silently overwriting the previous one's runtime bytecode.
+      Surfaced by `pyde-node`'s `reentrancy_attack_blocked`
+      integration test (deploys two contracts back-to-back; the
+      attacker overwrote the vault, all subsequent calls hit
+      no-code paths). Fix: mirror the auth_keys override
+      semantics — if `final_.nonce != initial.nonce`, set
+      `current.nonce = final_.nonce`. New
+      `deploy_increments_persisted_nonce_after_307` regression
+      test in pyde-tx pins the fix.
+
 ### PVM / consensus-fork
 
 - [x] 308 — `✓` **PVM `Selfdestruct` clears the entire shared
