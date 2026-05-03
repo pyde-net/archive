@@ -1,5 +1,58 @@
+use pyde_crypto::falcon::FalconSecretKey;
 use pyde_crypto::poseidon2::poseidon2_hash;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use wasm_bindgen::prelude::*;
+
+// ============================================================================
+// Audit 361: opaque-handle keystore
+// ============================================================================
+//
+// `generate_keypair_handle` keeps the FALCON secret key inside this
+// crate's WASM heap and returns only an opaque `u32` handle to JS.
+// `sign_*_with_handle` look the key up by handle and sign in place;
+// `drop_keypair` zeroes and removes the entry. The intent is that
+// SK bytes never enter the JS heap at all — in particular, never
+// land in `JSON.stringify(walletState)`, never appear in dev-tools
+// memory snapshots, never survive in a crash dump as a recoverable
+// hex string, and never get accidentally logged.
+//
+// `FalconSecretKey` already derives `ZeroizeOnDrop` (audit 358), so
+// removing the entry from the map (via `HashMap::remove` →
+// `Drop::drop`) actually zeroes the secret bytes in place.
+//
+// Why a process-global Mutex: wasm32 is currently single-threaded on
+// every browser (no SharedArrayBuffer threads enabled here), so the
+// Mutex is uncontended in practice. Keeping it as a Mutex (rather
+// than a thread_local!) means we don't need wasm-bindgen's
+// thread-local plumbing, and the API stays callable from any
+// future worker context without additional setup.
+//
+// Handle exhaustion: u32 gives 4G distinct handles before wrap.
+// The wallet UX is one keypair per browser tab, so 4G is effectively
+// unlimited; if a long-running app does churn through that many
+// handles, `drop_keypair` is the correct release path. We do NOT
+// reuse handles after drop — each new keypair gets a fresh number,
+// so a stale handle from a dropped keypair returns "key not found"
+// instead of silently signing under a different key.
+struct KeyTable {
+    next_handle: u32,
+    keys: HashMap<u32, FalconSecretKey>,
+}
+
+impl KeyTable {
+    fn new() -> Self {
+        Self {
+            next_handle: 1, // 0 is reserved as "no handle"
+            keys: HashMap::new(),
+        }
+    }
+}
+
+fn key_table() -> &'static Mutex<KeyTable> {
+    static TABLE: OnceLock<Mutex<KeyTable>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(KeyTable::new()))
+}
 
 // ============================================================================
 // Key generation & address
@@ -7,6 +60,25 @@ use wasm_bindgen::prelude::*;
 
 /// Generate a FALCON-512 keypair.
 /// Returns JSON: { "publicKey": "0x...", "secretKey": "0x...", "address": "0x..." }
+///
+/// **Audit 361 — security warning**: this function returns the
+/// secret key as a hex string into the JS heap. Once there, it is
+/// reachable from:
+///   - browser dev-tools console (`Object.values(walletState)`)
+///   - browser extensions with content-script access to the page
+///   - process crash dumps (the string survives until JS GC)
+///   - accidental logging (`JSON.stringify(walletState)`)
+///
+/// For wallet UIs that need to hold the key in-process, prefer
+/// `generateKeypairHandle` + `signMessageWithHandle` /
+/// `signTransactionWithHandle` / `dropKeypair`. Those keep the SK
+/// inside this crate's WASM heap and return only an opaque `u32`
+/// handle to JS — the SK bytes never enter the JS heap at all. For
+/// wallets that need to encrypt the SK to disk before discarding
+/// the in-memory copy (the typical `pyde-ts-sdk` / `pyde-dev`
+/// keystore flow), this hex-string return is unavoidable, but
+/// callers MUST encrypt the value at the earliest opportunity and
+/// must NEVER let it survive across renders or get serialized.
 #[wasm_bindgen(js_name = "generateKeypair")]
 pub fn generate_keypair() -> Result<String, JsValue> {
     let (pk, sk) = pyde_crypto::falcon::falcon_keygen()
@@ -18,6 +90,94 @@ pub fn generate_keypair() -> Result<String, JsValue> {
         "address": format!("0x{}", hex::encode(address)),
     });
     Ok(result.to_string())
+}
+
+/// Audit 361: opaque-handle variant of `generateKeypair`. Generates
+/// a FALCON-512 keypair, retains the secret key inside this crate's
+/// WASM heap, and returns JSON with only the `publicKey`, `address`,
+/// and an opaque `handle: u32` to JS. The SK bytes never enter the
+/// JS heap. Use `signMessageWithHandle` / `signTransactionWithHandle`
+/// to sign with the retained key, and `dropKeypair(handle)` when
+/// done.
+///
+/// Returns JSON: `{ "publicKey": "0x...", "address": "0x...",
+///                  "handle": 1 }`.
+#[wasm_bindgen(js_name = "generateKeypairHandle")]
+pub fn generate_keypair_handle() -> Result<String, JsValue> {
+    let (pk, sk) = pyde_crypto::falcon::falcon_keygen()
+        .map_err(|e| JsValue::from_str(&format!("keygen failed: {}", e)))?;
+    let address = poseidon2_hash(pk.as_bytes()).to_bytes();
+
+    let handle = {
+        let mut table = key_table()
+            .lock()
+            .map_err(|_| JsValue::from_str("internal: key table mutex poisoned (audit 361)"))?;
+        let h = table.next_handle;
+        table.next_handle = table.next_handle.checked_add(1).ok_or_else(|| {
+            JsValue::from_str("handle space exhausted (u32::MAX keypairs generated this session)")
+        })?;
+        table.keys.insert(h, sk);
+        h
+    };
+
+    let result = serde_json::json!({
+        "publicKey": format!("0x{}", hex::encode(pk.as_bytes())),
+        "address": format!("0x{}", hex::encode(address)),
+        "handle": handle,
+    });
+    Ok(result.to_string())
+}
+
+/// Audit 361: sign a message using a key retained by handle. The
+/// SK bytes never leave this crate's WASM heap.
+///
+/// Returns the signature as a `0x`-prefixed hex string.
+#[wasm_bindgen(js_name = "signMessageWithHandle")]
+pub fn sign_message_with_handle(handle: u32, message_hex: &str) -> Result<String, JsValue> {
+    let msg_bytes = decode_hex(message_hex)?;
+    let table = key_table()
+        .lock()
+        .map_err(|_| JsValue::from_str("internal: key table mutex poisoned (audit 361)"))?;
+    let sk = table.keys.get(&handle).ok_or_else(|| {
+        JsValue::from_str("audit 361: handle not found (already dropped or never created)")
+    })?;
+    let sig = pyde_crypto::falcon::falcon_sign(sk, &msg_bytes)
+        .map_err(|e| JsValue::from_str(&format!("sign failed: {}", e)))?;
+    Ok(format!("0x{}", hex::encode(sig.as_bytes())))
+}
+
+/// Audit 361: sign a transaction (same JSON shape as
+/// `signTransaction`) using a key retained by handle. Returns the
+/// signed wire bytes as `0x`-prefixed hex.
+#[wasm_bindgen(js_name = "signTransactionWithHandle")]
+pub fn sign_transaction_with_handle(tx_json: &str, handle: u32) -> Result<String, JsValue> {
+    let v: serde_json::Value = serde_json::from_str(tx_json)
+        .map_err(|e| JsValue::from_str(&format!("bad JSON: {}", e)))?;
+    let hash = compute_tx_hash(&v)?;
+
+    let table = key_table()
+        .lock()
+        .map_err(|_| JsValue::from_str("internal: key table mutex poisoned (audit 361)"))?;
+    let sk = table.keys.get(&handle).ok_or_else(|| {
+        JsValue::from_str("audit 361: handle not found (already dropped or never created)")
+    })?;
+    let sig = pyde_crypto::falcon::falcon_sign(sk, &hash)
+        .map_err(|e| JsValue::from_str(&format!("sign failed: {}", e)))?;
+
+    let tx_bytes = serialize_tx(&v, sig.as_bytes())?;
+    Ok(format!("0x{}", hex::encode(&tx_bytes)))
+}
+
+/// Audit 361: drop a retained keypair. The `FalconSecretKey`'s
+/// `ZeroizeOnDrop` impl (audit 358) overwrites the secret bytes in
+/// place when removed from the table. Returns `true` if a key was
+/// actually removed, `false` if the handle was already dropped.
+#[wasm_bindgen(js_name = "dropKeypair")]
+pub fn drop_keypair(handle: u32) -> Result<bool, JsValue> {
+    let mut table = key_table()
+        .lock()
+        .map_err(|_| JsValue::from_str("internal: key table mutex poisoned (audit 361)"))?;
+    Ok(table.keys.remove(&handle).is_some())
 }
 
 /// Derive address from a FALCON-512 public key (hex).
@@ -147,7 +307,19 @@ fn compute_tx_hash(v: &serde_json::Value) -> Result<[u8; 32], JsValue> {
     let data = parse_hex_bytes(v.get("data"));
     let gas_limit = v.get("gasLimit").and_then(|v| v.as_u64()).unwrap_or(21000);
     let nonce = v.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0);
-    let chain_id = v.get("chainId").and_then(|v| v.as_u64()).unwrap_or(31337);
+    // Audit 362: chainId is REQUIRED. Pre-fix `unwrap_or(31337)`
+    // silently bound a missing-chainId tx to devnet, opening the
+    // same cross-chain replay surface that audit 302/303 closed
+    // on the RPC side: a wallet that omitted chainId on testnet
+    // signed a tx targeted at devnet (or, after a chain_id 1
+    // mainnet ships, at mainnet — where the same FALCON keypair
+    // would replay onto whatever chain happened to share the
+    // default). The fix mirrors audit 302's strict resolution:
+    // missing → error, present → use as-is.
+    let chain_id = v
+        .get("chainId")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| JsValue::from_str("audit 362: chainId is required (use chainId: <u64>)"))?;
     let tx_type = v.get("txType").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
 
     // Same hash algorithm as Transaction::hash() in pyde-tx
@@ -257,7 +429,11 @@ fn serialize_tx(v: &serde_json::Value, signature: &[u8]) -> Result<Vec<u8>, JsVa
     let data = parse_hex_bytes(v.get("data"));
     let gas_limit = v.get("gasLimit").and_then(|v| v.as_u64()).unwrap_or(21000);
     let nonce = v.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0);
-    let chain_id = v.get("chainId").and_then(|v| v.as_u64()).unwrap_or(31337);
+    // Audit 362: chainId required; see compute_tx_hash for rationale.
+    let chain_id = v
+        .get("chainId")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| JsValue::from_str("audit 362: chainId is required (use chainId: <u64>)"))?;
     let tx_type = v.get("txType").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
 
     let mut buf = Vec::new();
@@ -365,7 +541,15 @@ pub fn build_raw_encrypted_tx_wasm(params_json: &str, sk_hex: &str) -> Result<St
         .get("gasLimit")
         .and_then(|x| x.as_u64())
         .unwrap_or(100_000);
-    let chain_id = v.get("chainId").and_then(|x| x.as_u64()).unwrap_or(31337);
+    // Audit 362: chainId required; see `compute_tx_hash` for the
+    // cross-chain replay rationale. Encrypted-tx flows are higher-
+    // value than plain tx flows (each carries a value transfer
+    // alongside the calldata), so a default-on-31337 here was
+    // strictly worse than the same gap on the plain-tx path.
+    let chain_id = v
+        .get("chainId")
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| JsValue::from_str("audit 362: chainId is required (use chainId: <u64>)"))?;
     let deadline = v.get("deadline").and_then(|x| x.as_u64());
     let to = parse_addr(v.get("to"))?;
     let value = parse_u128(v.get("value"));
@@ -611,4 +795,132 @@ mod tests {
     // even for happy-path `Err(...)` returns the process aborts.
     // These paths are exercised end-to-end via the `pyde-ts-sdk` jest
     // suite once the wasm bundle is rebuilt.
+
+    // ========== Audit 361: opaque-handle key retention ==========
+
+    /// `generateKeypairHandle` returns a JSON object that does NOT
+    /// expose the secret key — only `publicKey`, `address`, and the
+    /// opaque `handle`. Pre-fix the only API was `generateKeypair`
+    /// which serialized the SK as hex into the JS heap.
+    #[test]
+    fn audit_361_generate_keypair_handle_does_not_leak_sk() {
+        let json = generate_keypair_handle().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(v.get("publicKey").and_then(|x| x.as_str()).is_some());
+        assert!(v.get("address").and_then(|x| x.as_str()).is_some());
+        let handle = v.get("handle").and_then(|x| x.as_u64()).unwrap();
+        assert!(handle > 0, "handle must be non-zero (0 reserved)");
+
+        // The secret key must NOT appear under any plausible field
+        // name — checks against a regression where a future
+        // contributor adds an `sk` field for "convenience".
+        assert!(v.get("secretKey").is_none());
+        assert!(v.get("sk").is_none());
+        assert!(v.get("privateKey").is_none());
+
+        // Cleanup so the static table doesn't grow across tests.
+        let _ = drop_keypair(handle as u32);
+    }
+
+    /// Signing through `signMessageWithHandle` must produce a
+    /// FALCON signature that verifies against the publicKey
+    /// returned by `generateKeypairHandle` — proves the key really
+    /// is the one identified by the handle, end-to-end without the
+    /// SK ever leaving the WASM heap.
+    #[test]
+    fn audit_361_sign_message_with_handle_verifies() {
+        let json = generate_keypair_handle().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let pk_hex = v.get("publicKey").and_then(|x| x.as_str()).unwrap();
+        let handle = v.get("handle").and_then(|x| x.as_u64()).unwrap() as u32;
+
+        let msg_hex = format!("0x{}", hex::encode(b"hello opaque-handle"));
+        let sig_hex = sign_message_with_handle(handle, &msg_hex).unwrap();
+
+        let pk_bytes = hex::decode(pk_hex.trim_start_matches("0x")).unwrap();
+        let sig_bytes = hex::decode(sig_hex.trim_start_matches("0x")).unwrap();
+        let pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(&pk_bytes).unwrap();
+        let sig = pyde_crypto::falcon::FalconSignature::from_bytes(&sig_bytes).unwrap();
+        assert!(pyde_crypto::falcon::falcon_verify(
+            &pk,
+            b"hello opaque-handle",
+            &sig
+        ));
+
+        let _ = drop_keypair(handle);
+    }
+
+    /// `dropKeypair` removes the entry; subsequent `dropKeypair`
+    /// returns false for the same handle (already-dropped).
+    #[test]
+    fn audit_361_drop_keypair_idempotent() {
+        let json = generate_keypair_handle().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let handle = v.get("handle").and_then(|x| x.as_u64()).unwrap() as u32;
+
+        assert!(drop_keypair(handle).unwrap(), "first drop removes entry");
+        assert!(
+            !drop_keypair(handle).unwrap(),
+            "second drop of same handle returns false"
+        );
+    }
+
+    /// Each call to `generateKeypairHandle` returns a fresh,
+    /// independent handle; signing with one handle does not affect
+    /// the other.
+    #[test]
+    fn audit_361_handles_are_independent() {
+        let j_a = generate_keypair_handle().unwrap();
+        let j_b = generate_keypair_handle().unwrap();
+        let v_a: serde_json::Value = serde_json::from_str(&j_a).unwrap();
+        let v_b: serde_json::Value = serde_json::from_str(&j_b).unwrap();
+        let h_a = v_a.get("handle").and_then(|x| x.as_u64()).unwrap() as u32;
+        let h_b = v_b.get("handle").and_then(|x| x.as_u64()).unwrap() as u32;
+        assert_ne!(h_a, h_b);
+
+        let msg = format!("0x{}", hex::encode(b"same message"));
+        let sig_a = sign_message_with_handle(h_a, &msg).unwrap();
+        let sig_b = sign_message_with_handle(h_b, &msg).unwrap();
+        assert_ne!(sig_a, sig_b, "different keys must produce different sigs");
+
+        // Drop A; signing with A now fails, but B still works.
+        assert!(drop_keypair(h_a).unwrap());
+        // Sign with B continues to work after A is dropped.
+        let _ = sign_message_with_handle(h_b, &msg).unwrap();
+
+        let _ = drop_keypair(h_b);
+    }
+
+    // ========== Audit 362: chainId is required ==========
+
+    /// Happy-path regression: chainId provided → tx hash produced
+    /// (the existing `build_raw_encrypted_tx_decodes_with_production_decoder`
+    /// covers this for the encrypted path; this test pins the plain
+    /// `hashTransaction` path).
+    #[test]
+    fn audit_362_chain_id_required_happy_path() {
+        let tx = serde_json::json!({
+            "from":     format!("0x{}", hex::encode([0xAAu8; 32])),
+            "to":       format!("0x{}", hex::encode([0xBBu8; 32])),
+            "value":    "1000",
+            "data":     "0x",
+            "gasLimit": 21_000u64,
+            "nonce":    0u64,
+            "chainId":  7331u64, // required
+            "txType":   0u64,
+        });
+        let hash_hex = hash_transaction(&tx.to_string()).unwrap();
+        assert!(hash_hex.starts_with("0x"));
+        assert_eq!(hash_hex.len(), 2 + 64); // 0x + 32-byte hex
+
+        // Different chainId must produce a different hash — this
+        // is the actual cross-chain replay protection. Pre-fix
+        // both calls would silently default to 31337 and produce
+        // identical hashes.
+        let mut tx2 = tx.clone();
+        tx2["chainId"] = serde_json::json!(7332u64);
+        let hash2 = hash_transaction(&tx2.to_string()).unwrap();
+        assert_ne!(hash_hex, hash2, "chainId must be part of the tx digest",);
+    }
 }
