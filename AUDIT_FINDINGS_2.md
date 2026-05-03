@@ -1316,15 +1316,58 @@
 
 ### WASM crypto crate
 
-- [ ] 361 — `⚠` **`generateKeypair` returns secret key as JSON
-      hex.** `crates/pyde-crypto-wasm/src/lib.rs:11-21`. JS heap
-      retains the string; dev-tools / extensions / crash dumps
-      preserve it. For testnet wallets, document loudly + offer an
-      opaque-handle mode that keeps sk inside WASM-internal state.
-- [ ] 362 — `⚠` **WASM defaults `chainId = 31337` when missing.**
-      `crates/pyde-crypto-wasm/src/lib.rs:150, 260, 368`. Same
-      cross-chain replay surface as 302/303. Make `chainId`
-      required; fail with a clear error if absent.
+- [x] 361 — `⚠` **`generateKeypair` returns secret key as JSON
+      hex.** **SHIPPED.** Both halves of the audit:
+      1. `generateKeypair` got a stern doc-comment block calling
+         out the JS-heap-retention vector (dev-tools, extensions,
+         crash dumps, accidental `JSON.stringify` exposure) and
+         pointing wallet authors at the new opaque-handle path.
+         The legacy API is preserved for the encrypt-to-disk
+         keystore flow that genuinely needs the SK string for
+         the brief encrypt-discard window.
+      2. New opaque-handle API: `generateKeypairHandle` returns
+         JSON with `publicKey`, `address`, and an opaque `u32`
+         `handle`. The SK lives inside this crate's WASM heap in
+         a process-global `OnceLock<Mutex<KeyTable>>` (single-
+         threaded wasm32, so uncontended). Companion APIs:
+         `signMessageWithHandle(handle, msg_hex)`,
+         `signTransactionWithHandle(tx_json, handle)`, and
+         `dropKeypair(handle)`. Drop calls `HashMap::remove` →
+         `Drop::drop` → the `ZeroizeOnDrop` impl on
+         `FalconSecretKey` (audit 358) overwrites the secret
+         bytes in place. SK bytes never enter the JS heap on
+         this path, so they can't be `JSON.stringify`'d, can't
+         be read by content-script extensions, and can't survive
+         in a crash dump as a recoverable hex string. Handle 0 is
+         reserved as "no handle"; handles never wrap (u32 max
+         exhausts after 4G keypairs in a single session — emits
+         `Err`). New 4 audit-361 tests pin: handle JSON does not
+         expose SK under any plausible field name, sign-with-
+         handle produces a FALCON sig that verifies against the
+         returned pk, drop is idempotent (true → false), and
+         multiple handles are independent (different keys, drop
+         A leaves B alive).
+- [x] 362 — `⚠` **WASM defaults `chainId = 31337` when missing.**
+      **SHIPPED.** All three sites that previously did
+      `unwrap_or(31337)` now do
+      `.ok_or_else(|| JsValue::from_str("audit 362: chainId is
+      required..."))`: `compute_tx_hash` (plain tx hash),
+      `serialize_tx` (plain tx wire format), and
+      `build_raw_encrypted_tx_wasm` (encrypted-tx flow). Pre-fix a
+      wallet that omitted `chainId` from the JSON params silently
+      bound the tx to chain 31337 — replayable onto whatever
+      production chain happened to share the default once one
+      ships, and (more pressingly) onto devnet right now if a
+      tester accidentally re-pointed their wallet. Mirrors audit
+      302/303 on the RPC side (which made `chainId` resolution
+      strict at every entry point). New 1 audit-362 test pins
+      that the same tx with two different `chainId`s produces two
+      different hashes — the actual cross-chain replay
+      protection. Negative-path testing (missing chainId →
+      JsValue Err) is exercised by the `pyde-ts-sdk` jest suite,
+      consistent with the other negative-path tests in this
+      module that can't run natively because `panic = "abort"`
+      aborts on `wasm_bindgen` Err returns.
 
 ---
 
