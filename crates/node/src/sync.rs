@@ -289,7 +289,11 @@ impl ChainSync {
         state: &mut StateManager,
         block_store: &BlockStore,
         ws_checkpoint: Option<(u64, [u8; 32])>,
-    ) -> (u64, Vec<(u64, Vec<pyde_tx::execution::Receipt>)>) {
+    ) -> (
+        u64,
+        Vec<(u64, Vec<pyde_tx::execution::Receipt>)>,
+        Vec<pyde_consensus::block::Block>,
+    ) {
         let ws_checkpoint_slot = ws_checkpoint.map(|(s, _)| s);
         self.pending.remove(&request_id);
 
@@ -297,7 +301,7 @@ impl ChainSync {
             SyncResp::ChainTip { slot, block_hash } => {
                 self.manager.update_network_tip(slot);
                 info!(slot, hash = hex::encode(block_hash), "received chain tip");
-                (0, Vec::new())
+                (0, Vec::new(), Vec::new())
             }
             SyncResp::Blocks(block_data) => {
                 let count = block_data.len();
@@ -312,6 +316,30 @@ impl ChainSync {
                 // serve over RPC even though it had executed every tx.
                 let mut receipts_batch: Vec<(u64, Vec<pyde_tx::execution::Receipt>)> =
                     Vec::with_capacity(count);
+                // Audit 319: collect synced blocks whose body has
+                // non-empty `encrypted_txs`. The sync path applies
+                // plaintext txs but does NOT bootstrap the threshold-
+                // decryption pipeline (BlockDecryptor + share
+                // broadcast); the gossip-arrival path does that in
+                // `node.rs::maybe_kick_decryption_pipeline`. A
+                // validator that reaches a block via sync (because
+                // it missed the compact-block + bundle gossip — the
+                // common case under sustained 40+ enc-tx/s load when
+                // gossipsub mesh churn drops bundle messages)
+                // therefore never broadcasts its shares. With ≥1
+                // validator silent, the share threshold stalls and
+                // the encrypted_txs in that block never decrypt or
+                // execute on ANY validator's local state — even ones
+                // that received the block via gossip — because they
+                // also need ≥ threshold shares from the broader
+                // committee. Mempool never drains, proposer
+                // re-includes the same set, chain advances on
+                // plaintext only, balance divergence appears in
+                // cross-node convergence checks. Caller (event loop)
+                // calls `maybe_kick_decryption_pipeline` per returned
+                // block to bootstrap shares from the sync-applied
+                // path.
+                let mut encrypted_blocks: Vec<pyde_consensus::block::Block> = Vec::new();
 
                 for data in &block_data {
                     // Decode full block (header + body + signature)
@@ -342,6 +370,12 @@ impl ChainSync {
                                     processed += 1;
                                     if !receipts.is_empty() {
                                         receipts_batch.push((slot, receipts));
+                                    }
+                                    // Audit 319: stash the block for
+                                    // post-sync decryption bootstrap
+                                    // if it carries encrypted txs.
+                                    if !block.body.encrypted_txs.is_empty() {
+                                        encrypted_blocks.push(block);
                                     }
                                     debug!(slot, tx_count, gas_used, "synced block");
                                 }
@@ -382,13 +416,14 @@ impl ChainSync {
                     received = count,
                     processed,
                     head = chain.head_slot,
+                    encrypted_blocks_to_decrypt = encrypted_blocks.len(),
                     "sync batch processed"
                 );
-                (processed, receipts_batch)
+                (processed, receipts_batch, encrypted_blocks)
             }
             SyncResp::Headers(_) => {
                 debug!("received headers (not used in block sync)");
-                (0, Vec::new())
+                (0, Vec::new(), Vec::new())
             }
             SyncResp::StateSnapshot {
                 state_root,
@@ -417,7 +452,7 @@ impl ChainSync {
                         reason,
                         "rejecting state snapshot"
                     );
-                    return (0, Vec::new());
+                    return (0, Vec::new(), Vec::new());
                 }
 
                 match state.import_snapshot(entries) {
@@ -444,7 +479,7 @@ impl ChainSync {
                         warn!(error = %e, "failed to import state snapshot");
                     }
                 }
-                (0, Vec::new())
+                (0, Vec::new(), Vec::new())
             }
             SyncResp::StateSnapshotChunk {
                 state_root,
@@ -473,7 +508,7 @@ impl ChainSync {
                     self.snapshot_expected_root = None;
                     self.snapshot_total_chunks = 0;
                     self.snapshot_retry_count = 0;
-                    return (0, Vec::new());
+                    return (0, Vec::new(), Vec::new());
                 }
 
                 // Verify chunk hash
@@ -504,7 +539,7 @@ impl ChainSync {
                         );
                         // Don't store the bad chunk — needs_next_chunk() will re-request it
                     }
-                    return (0, Vec::new());
+                    return (0, Vec::new(), Vec::new());
                 }
                 self.snapshot_retry_count = 0; // reset on success
 
@@ -564,7 +599,7 @@ impl ChainSync {
                         }
                     }
                 }
-                (0, Vec::new())
+                (0, Vec::new(), Vec::new())
             }
             SyncResp::NotFound => {
                 // If we're mid-chunk-sync, abort — peer can't serve the snapshot
@@ -577,7 +612,7 @@ impl ChainSync {
                 } else {
                     warn!("peer doesn't have requested data");
                 }
-                (0, Vec::new())
+                (0, Vec::new(), Vec::new())
             }
         }
     }

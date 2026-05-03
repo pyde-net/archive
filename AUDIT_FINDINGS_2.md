@@ -323,80 +323,56 @@
 
 ### Pre-existing regressions surfaced during e2e validation
 
-- [ ] 319 — `✓` **Encrypted-tx burst at audit-027 cap fails with
-      cross-node state divergence.**
-      Surfaced by running `cargo test -p pyde-node --test
-      loadgen_encrypted_burst -- --ignored` end-to-end after
-      shipping the cycle-2 P0 train. **Predates this audit cycle**
-      — the test fails at both `aee961d` (pre-fix baseline) and
-      HEAD with two distinct shapes:
-      - **Baseline (138 s):** chain advances, node-0 reaches
-        `inclusion=100%`, but node-3 has applied **zero** of the
-        40 transfers — full state divergence between nodes that
-        all voted on the same finalized chain.
-      - **HEAD (192 s):** node-0 never reaches inclusion; the
-        same 40 encrypted txs reproposed at slot 466 / 467 / 468
-        (proposer log: `encrypted=40 pending=0`) — txs included
-        in proposed blocks but never decrypt + apply, so the
-        mempool never drains.
+- [x] 319 — `✓` **Encrypted-tx burst at audit-027 cap fails with
+      cross-node state divergence.** **SHIPPED.** Three layers,
+      each addressing a distinct contributing failure:
+      1. **Sync-path decryption bootstrap.** `SyncEngine::on_response`
+         now also returns synced blocks whose
+         `body.encrypted_txs` is non-empty, and the event-loop
+         action handler runs the same
+         `maybe_kick_decryption_pipeline` against each that the
+         gossip-arrival path runs. Pre-fix the sync path
+         applied plaintext txs but never started the
+         BlockDecryptor / share-broadcast on the syncing node;
+         a validator that reached a block via sync (because it
+         missed the compact-block + bundle gossip — common
+         under sustained ≥ 25 enc-tx/s when gossipsub mesh
+         churn drops bundle messages) therefore never broadcast
+         its shares, the per-slot share threshold stalled, and
+         the encrypted txs in that block never decrypted on ANY
+         validator's local state.
+      2. **Mandatory-inclusion audit observational-only on
+         small committees.** New
+         `MEV_INCLUSION_MIN_ENFORCEMENT_COMMITTEE = 32` gate
+         downgrades the task-026 audit's "skip vote" enforcement
+         to log-only when the committee size is below the
+         threshold where 1 abstainer is < 1/128 dissent. Pre-fix
+         a 4-validator devnet/testnet committee under burst load
+         saw 3445 audit-fail warnings in a 181 s run with every
+         encrypted-tx slot blocked by unanimous abstention —
+         chain advanced on plaintext only, inclusion = 0%.
+         Mainnet's 128-validator committee continues to enforce
+         (slack of 42 dissenters before quorum lost).
+      3. **Periodic decryption-share rebroadcast.** New 100 ms
+         retry tick walks `pending_decryptors` and re-broadcasts
+         our shares for any decryptor that hasn't reached
+         threshold yet. Closes the gossipsub 1-3% loss window
+         where a single share-broadcast miss leaves the
+         cluster's per-slot share count below threshold and the
+         encrypted_txs silently never decrypt for the affected
+         validator(s). Shares are deterministic from
+         `(key_share, ciphertext)` so regeneration is cheap and
+         `BlockDecryptor::add_share` is idempotent (set-insert)
+         on the receiver. Self-heals: once threshold reached,
+         the decryptor is removed and the tick stops emitting
+         for that slot.
 
-      **Root cause sketch.** Voting on a block requires the
-      compact block (header + tx hashes); decrypting + applying
-      encrypted txs requires the `EncryptedTxBundle` published as
-      a separate gossipsub message on the Blocks topic
-      (audit-227). Under sustained 40-tx/s load, the bundle is
-      occasionally not delivered to ≥1 validator. That validator
-      still votes on the compact block (advancing finality), but
-      never applies the encrypted contents — its state silently
-      lags. The `GET_BLOCK_TXS` retry path
-      (`crates/node/src/sync.rs`) only triggers on missing-tx
-      detection at compact-block reconstruct; a node whose local
-      mempool already has the txs (RPC fan-out) reconstructs
-      successfully and never re-requests the bundle, even though
-      its threshold-decrypt path is starved.
-
-      **Where:**
-      - `crates/node/src/node.rs:1458-1510` — compact-block
-        reconstruct path, opportunistically pulls encrypted_txs
-        from queued bundles but never re-requests if the bundle
-        is missing.
-      - `crates/node/src/node.rs:1640-1661` — bundle buffering
-        with slot-bounded TTL (drops after 100 slots).
-      - `crates/node/src/sync.rs` `GET_BLOCK_TXS` — retry path
-        gated on missing-tx, not on missing-bundle.
-
-      **Reproducer.**
-      ```
-      cargo test -p pyde-node --test loadgen_encrypted_burst -- \
-        --ignored --nocapture
-      ```
-      Half-load (`PYDE_ENC_BURST_PER_SENDER=5`, 20 txs aggregate)
-      passes 100% in ~2 s. Lifecycle (1 tx) passes in ~9 s. Bug
-      is specifically a function of sustained rate ≥ ~25-40
-      encrypted txs/sec.
-
-      **Pre-launch impact:** real testnet operators submitting
-      < 20 enc-tx/s aggregate are unaffected (and our lifecycle
-      e2e proves the pipeline works at that load). A loadgen bot
-      hitting the audit-027 design ceiling will reproduce the
-      regression and produce divergent state. Flag in the testnet
-      runbook + lower the documented sustainable cap until fix
-      lands.
-
-      **Fix direction:** wire bundle re-request into the
-      threshold-decrypt pending-shares path. If a validator has
-      pending encrypted_txs in `BlockDecryptor` but no bundle
-      received within ~5 slots, send `GET_BLOCK_TXS` directly
-      (RR fallback) targeting the proposer or any other validator
-      that voted for the block. Lower priority: gossipsub
-      reliability tuning (audit P1 #334 re: peer scoring) may
-      reduce the underlying message-loss rate enough that the
-      retry rarely fires.
-
-      Bisect to root-cause commit between 2026-04-23 (audit log:
-      "5/5 stable runs at 100% inclusion") and 2026-04-29
-      (`aee961d`) is needed but deferred. ~30 commits in window
-      (PRs #300-#310 inclusive).
+      Test outcome: `loadgen_encrypted_burst` went from 0%
+      inclusion / 181 s timeout (pre-fix) to 100% inclusion in
+      ~2-3 s with full cross-node convergence on 3 consecutive
+      runs. Throughput at the audit-027 cap (40 enc-tx/s
+      aggregate via 4-sender × 10-tx fan-out) is now ~14-17
+      enc-tx/s sustained.
 
 - [x] 396 — `✓` **Cold-start sync hung at slot 0.** **SHIPPED.**
       Three independent gaps in the late-joiner pathway:
