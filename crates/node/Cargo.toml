@@ -59,6 +59,9 @@ ethnum = "1.5.2"
 directories = "5"
 hex = "0.4"
 sparse-merkle-tree = "0.6"
+# Audit 347: bounded LRU for the faucet rate-limiter map. Same
+# version pyde-state already uses — reuses workspace dep cache.
+lru = "0.16"
 # Validator keystore encryption (audit 221).
 aes-gcm = "0.10"
 rand = "0.8"

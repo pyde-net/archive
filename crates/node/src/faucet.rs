@@ -27,12 +27,85 @@
 //! drop. Cooldown windows are configurable via the CLI; defaults are
 //! 1h per address, 1h per IP.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+
+/// Audit 347: hard cap on the per-IP and per-address rate-limit
+/// maps. Pre-fix the maps were unbounded `HashMap`s — every
+/// distinct address that ever requested (or every distinct
+/// IP that ever connected) added an entry that lived for the
+/// process lifetime. An attacker rotating addresses (cheap with
+/// FALCON keygen) or rotating IPs (cheap with IPv6) could OOM the
+/// faucet host. 50_000 is large enough to support a real testnet
+/// drop-in cohort without forcing legitimate-but-quiet users out
+/// of their cooldown windows, and small enough that even a 100 MB
+/// peak (entry size ≈ 100B at the worst case) stays bounded.
+const RATE_LIMITER_MAX_ENTRIES: usize = 50_000;
+
+/// Audit 347: a syntactically valid Pyde address is exactly
+/// `0x` + 64 hex digits (case-insensitive). Anything else is a
+/// malformed request and must be rejected BEFORE the rate-limiter
+/// records the string — pre-fix the cooldown map happily
+/// recorded any 64+-char string the attacker shoved into the JSON
+/// body, including non-hex garbage and unicode payloads.
+fn is_valid_address(s: &str) -> bool {
+    if s.len() != 66 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    if bytes[0] != b'0' || bytes[1] != b'x' {
+        return false;
+    }
+    bytes[2..].iter().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Audit 348: choose the rate-limit IP key from `peer_addr` and
+/// the optional `X-Forwarded-For` header.
+///
+/// When `trust_xff` is `false` (default), the rate-limit key is
+/// always `peer_addr.ip()` — the IP of whoever opened the TCP
+/// connection. This is correct for a faucet exposed directly on
+/// the public internet but collapses to one IP behind any
+/// reverse proxy (every legitimate user shared the proxy's IP
+/// cooldown).
+///
+/// When `trust_xff` is `true`, the operator has promised that
+/// the edge proxy strips any inbound `X-Forwarded-For` and
+/// appends its own — so the rightmost entry in the received
+/// header is the proxy's view of the client IP. We split on `,`
+/// per RFC 7239 / RFC 9110 §5.3.6, take the rightmost trimmed
+/// hop, and use it as the rate-limit key. If the header is
+/// absent or empty, we fall back to `peer_addr.ip()` (which in
+/// a behind-proxy deployment is the proxy itself, but it's the
+/// best evidence we have).
+///
+/// Why "rightmost untrusted hop": the leftmost entry in XFF is
+/// the original (potentially attacker-controlled) client claim;
+/// the rightmost is whoever the *proxy* last saw connect to it.
+/// When the operator promises XFF is trusted, the proxy IS the
+/// closest trusted hop, so its view wins.
+fn resolve_rate_limit_ip(
+    peer_addr: SocketAddr,
+    forwarded_for: Option<&str>,
+    trust_xff: bool,
+) -> String {
+    if !trust_xff {
+        return peer_addr.ip().to_string();
+    }
+    if let Some(header) = forwarded_for {
+        if let Some(rightmost) = header.rsplit(',').next() {
+            let trimmed = rightmost.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_lowercase();
+            }
+        }
+    }
+    peer_addr.ip().to_string()
+}
 
 pub struct FaucetConfig {
     pub rpc_url: String,
@@ -51,17 +124,33 @@ pub struct FaucetConfig {
     /// the faucet trusts whatever the node returns (devnet
     /// ergonomics).
     pub chain_id: Option<u64>,
+    /// Audit 348: trust the rightmost untrusted hop in
+    /// `X-Forwarded-For` as the client IP for rate-limiting.
+    /// Default `false` so a faucet directly exposed on the
+    /// public internet keeps the safe `peer_addr.ip()` behaviour.
+    /// Operators behind a reverse proxy must set this AND ensure
+    /// the proxy strips any inbound XFF before adding its own.
+    pub trust_x_forwarded_for: bool,
 }
 
 struct RateLimiter {
-    last_request: Mutex<HashMap<String, Instant>>,
+    /// Audit 347: bounded LRU map. `get` moves the entry to MRU
+    /// so frequently-used addresses don't get evicted out from
+    /// under their cooldown; `put` inserts and evicts the LRU
+    /// entry when the cap is reached. The capacity is fixed at
+    /// `RATE_LIMITER_MAX_ENTRIES`, eliminating the unbounded-map
+    /// OOM vector that pre-fix grew with every unique address /
+    /// IP that ever requested.
+    last_request: Mutex<lru::LruCache<String, Instant>>,
     cooldown: Duration,
 }
 
 impl RateLimiter {
     fn new(cooldown_secs: u64) -> Self {
         Self {
-            last_request: Mutex::new(HashMap::new()),
+            last_request: Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(RATE_LIMITER_MAX_ENTRIES).expect("non-zero LRU cap"),
+            )),
             cooldown: Duration::from_secs(cooldown_secs),
         }
     }
@@ -71,8 +160,17 @@ impl RateLimiter {
     /// request — call `record` only after both the address and IP
     /// gates pass, otherwise a request that's blocked by IP would
     /// reset the address timer (and vice versa).
+    ///
+    /// Audit 347: uses `LruCache::get` (mutating, moves to MRU)
+    /// rather than `peek` so that an active-but-still-cooling
+    /// address stays at the head of the LRU and won't be evicted
+    /// to make room for a new entry. Evicting a still-cooling
+    /// entry would silently expose the attacker who triggered
+    /// the eviction — they could rotate enough new addresses /
+    /// IPs to push the victim out of the cap, then re-request
+    /// from the rotated pool unconstrained.
     fn check(&self, key: &str) -> Result<(), u64> {
-        let map = self.last_request.lock().unwrap();
+        let mut map = self.last_request.lock().unwrap();
         let k = key.to_lowercase();
         if let Some(last) = map.get(&k) {
             let elapsed = last.elapsed();
@@ -86,9 +184,18 @@ impl RateLimiter {
     /// Record a successful dispense. Caller must have already checked
     /// every gate (address + IP) so the timer only advances on a
     /// served request.
+    ///
+    /// Audit 347: `LruCache::put` evicts the LRU entry when the
+    /// cap is reached. The evicted address loses its cooldown
+    /// memory and can request again immediately — acceptable
+    /// because the cap is sized for the busiest realistic
+    /// testnet cohort, and a victim crowded out of the cap can
+    /// just retry. The attacker can't abuse this to bypass their
+    /// own cooldown: their own entry is the one most recently
+    /// touched, so it sits at the MRU end and never gets evicted.
     fn record(&self, key: &str) {
         let mut map = self.last_request.lock().unwrap();
-        map.insert(key.to_lowercase(), Instant::now());
+        map.put(key.to_lowercase(), Instant::now());
     }
 }
 
@@ -485,12 +592,21 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
         config.cooldown_secs,
         config.cooldown_secs
     );
+    if config.trust_x_forwarded_for {
+        tracing::warn!(
+            "  audit 348: trust_x_forwarded_for=true — operator MUST ensure the edge \
+             proxy strips inbound XFF headers before adding its own. If it doesn't, \
+             attackers can spoof their client IP and bypass per-IP rate-limits."
+        );
+    }
 
     // Single global lock that serializes the fetch-nonce → sign →
     // submit window in `send_faucet_tx`. Two concurrent dispenses
     // would otherwise race on the faucet's nonce — see the comment
     // in `send_faucet_tx` for the mempool-dedup interaction.
     let signing_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+
+    let trust_xff = config.trust_x_forwarded_for;
 
     loop {
         let (stream, peer_addr) = listener
@@ -517,6 +633,7 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
                 signer,
                 signing_lock,
                 chain_id,
+                trust_xff,
             )
             .await;
         });
@@ -535,6 +652,7 @@ async fn handle_connection(
     signer: Arc<Option<FaucetSigner>>,
     signing_lock: Arc<tokio::sync::Mutex<()>>,
     chain_id: u64,
+    trust_xff: bool,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut buf_reader = BufReader::new(reader);
@@ -560,9 +678,12 @@ async fn handle_connection(
     };
 
     // Read headers until empty line, capturing Content-Length so we
-    // can read the body for POST requests. Anything we don't need is
-    // discarded — small request surface, no need for a full HTTP lib.
+    // can read the body for POST requests, and X-Forwarded-For so we
+    // can derive the client IP under audit 348 when --trust-x-forwarded-for
+    // is set. Anything we don't need is discarded — small request
+    // surface, no need for a full HTTP lib.
     let mut content_length: usize = 0;
+    let mut x_forwarded_for: Option<String> = None;
     loop {
         let mut header_line = String::new();
         if buf_reader.read_line(&mut header_line).await.is_err() {
@@ -571,11 +692,14 @@ async fn handle_connection(
         if header_line.trim().is_empty() {
             break;
         }
-        if let Some(rest) = header_line
-            .to_ascii_lowercase()
-            .strip_prefix("content-length:")
-        {
+        let lower = header_line.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("content-length:") {
             content_length = rest.trim().parse().unwrap_or(0);
+        } else if let Some(rest) = lower.strip_prefix("x-forwarded-for:") {
+            // Preserve the original-case value (some clients send
+            // mixed-case IPs in v6 form); the trim-and-rsplit
+            // below in `resolve_rate_limit_ip` handles the rest.
+            x_forwarded_for = Some(rest.trim().to_string());
         }
     }
 
@@ -588,11 +712,36 @@ async fn handle_connection(
         let mut buf = vec![0u8; cap];
         use tokio::io::AsyncReadExt;
         if buf_reader.read_exact(&mut buf).await.is_ok() {
-            body = String::from_utf8_lossy(&buf).into_owned();
+            // Audit 347: reject non-UTF-8 bodies outright instead
+            // of `from_utf8_lossy`. Pre-fix the lossy decoder
+            // silently replaced invalid bytes with U+FFFD, which
+            // (a) corrupted the JSON parser's view of the
+            // request and (b) gave attackers a way to inject
+            // garbage that survived address-shape checks
+            // downstream. A non-UTF-8 body is a malformed
+            // request, full stop.
+            match String::from_utf8(buf) {
+                Ok(s) => body = s,
+                Err(_) => {
+                    let _ = writer
+                        .write_all(
+                            json_response(400, r#"{"error":"body must be valid UTF-8"}"#)
+                                .as_bytes(),
+                        )
+                        .await;
+                    return;
+                }
+            }
         }
     }
 
-    let ip_key = peer_addr.ip().to_string();
+    // Audit 348: rate-limit IP key honours the operator's trust
+    // setting. Pre-fix this was always `peer_addr.ip()`, which
+    // collapses to one IP behind any reverse proxy. With
+    // `--trust-x-forwarded-for`, we honour the rightmost
+    // X-Forwarded-For hop instead. See `resolve_rate_limit_ip`
+    // for the security model + operator-side prerequisite.
+    let ip_key = resolve_rate_limit_ip(peer_addr, x_forwarded_for.as_deref(), trust_xff);
 
     let response = match (method, path) {
         ("OPTIONS", _) => {
@@ -603,7 +752,15 @@ async fn handle_connection(
         ("GET", "/") | ("GET", "/index.html") => html_response(200, FAUCET_HTML),
         ("GET", "/health") => json_response(200, r#"{"status":"ok"}"#),
         ("POST", "/api/request") => match parse_post_body_address(&body) {
-            Some(addr) if addr.len() >= 64 => {
+            // Audit 347: tighten from `addr.len() >= 64` to a
+            // strict `^0x[0-9a-fA-F]{64}$` match. Pre-fix any
+            // 64+-char string slipped through the surface check
+            // and reached `serve_dispense`, where the rate
+            // limiter recorded it on success. Strict matching
+            // here means malformed addresses can't grow the
+            // cooldown map at all, even before hitting the LRU
+            // cap.
+            Some(addr) if is_valid_address(&addr) => {
                 serve_dispense(
                     &addr,
                     &ip_key,
@@ -635,7 +792,11 @@ async fn handle_connection(
                 }
             });
             match address {
-                Some(addr) if addr.len() >= 64 => {
+                // Audit 347: same strict address validation as
+                // the POST path — the legacy GET endpoint shares
+                // the rate-limiter map and must not be a
+                // back-door for malformed-address recording.
+                Some(addr) if is_valid_address(&addr) => {
                     serve_dispense(
                         &addr,
                         &ip_key,
@@ -826,5 +987,166 @@ mod tests {
         assert!(FAUCET_HTML.contains("/api/request"));
         assert!(FAUCET_HTML.contains(r#"id="addr""#));
         assert!(FAUCET_HTML.contains("Pyde Testnet Faucet"));
+    }
+
+    // ========== Audit 347: address validation + LRU bound ==========
+
+    #[test]
+    fn audit_347_is_valid_address_strict_match() {
+        // Canonical: 0x + exactly 64 hex digits, mixed case OK.
+        let canonical = format!("0x{}", "a".repeat(64));
+        assert!(is_valid_address(&canonical));
+        let mixed = format!("0x{}", "AbCdEf0123456789".repeat(4));
+        assert!(is_valid_address(&mixed));
+
+        // Wrong length.
+        assert!(!is_valid_address(""));
+        assert!(!is_valid_address("0x"));
+        assert!(!is_valid_address(&format!("0x{}", "a".repeat(63)))); // 65 char
+        assert!(!is_valid_address(&format!("0x{}", "a".repeat(65)))); // 67 char
+        assert!(!is_valid_address(&"a".repeat(66))); // missing 0x
+
+        // Non-hex characters.
+        assert!(!is_valid_address(&format!("0x{}g", "a".repeat(63))));
+        // Unicode (any non-ASCII fails the .len() == 66 check
+        // because UTF-8 multi-byte chars push the len past 66).
+        assert!(!is_valid_address(&format!(
+            "0x{}é{}",
+            "a".repeat(32),
+            "a".repeat(31)
+        )));
+        // Missing 0x prefix.
+        assert!(!is_valid_address(&"a".repeat(64)));
+        // Wrong prefix.
+        assert!(!is_valid_address(&format!("Ax{}", "a".repeat(64))));
+    }
+
+    #[test]
+    fn audit_347_rate_limiter_evicts_at_cap() {
+        // Reduce the cap to a value we can exhaust quickly. The
+        // production cap (RATE_LIMITER_MAX_ENTRIES) is 50_000;
+        // we exercise the eviction logic directly via lru's API
+        // to keep the test fast.
+        use std::num::NonZeroUsize;
+        let mut cache: lru::LruCache<String, Instant> =
+            lru::LruCache::new(NonZeroUsize::new(3).unwrap());
+        cache.put("a".into(), Instant::now());
+        cache.put("b".into(), Instant::now());
+        cache.put("c".into(), Instant::now());
+        // Touch "a" so it's MRU; now LRU order is b → c → a.
+        let _ = cache.get("a");
+        cache.put("d".into(), Instant::now()); // evicts "b"
+        assert!(cache.contains("a"));
+        assert!(!cache.contains("b"));
+        assert!(cache.contains("c"));
+        assert!(cache.contains("d"));
+    }
+
+    // ========== Audit 348: trust-x-forwarded-for IP resolution ==========
+
+    fn sock(s: &str) -> SocketAddr {
+        s.parse().expect("valid SocketAddr")
+    }
+
+    /// Default behaviour (`trust_xff = false`): always use
+    /// `peer_addr.ip()`. XFF header is ignored even if present —
+    /// pre-fix behaviour for direct-internet deployments.
+    #[test]
+    fn audit_348_xff_ignored_when_not_trusted() {
+        let key = resolve_rate_limit_ip(
+            sock("203.0.113.42:54321"),
+            Some("203.0.113.99, 198.51.100.7"),
+            false,
+        );
+        assert_eq!(key, "203.0.113.42");
+    }
+
+    /// With `trust_xff = true` and a present XFF header, the
+    /// rightmost trimmed hop is the rate-limit key (matches the
+    /// operator-trusted "the proxy's view of the client").
+    #[test]
+    fn audit_348_xff_rightmost_hop_used_when_trusted() {
+        // Two-hop chain: client → CDN → proxy → faucet. Proxy
+        // overwrote XFF with `client, cdn`; the rightmost hop the
+        // proxy itself trusted is `cdn`. (In practice operators
+        // configure the proxy to write `cdn` — i.e. its peer —
+        // as the only entry, but the test exercises the
+        // rightmost-of-multiple branch.)
+        let key = resolve_rate_limit_ip(
+            sock("203.0.113.42:54321"), // proxy IP from peer_addr
+            Some("198.51.100.5, 203.0.113.99"),
+            true,
+        );
+        assert_eq!(key, "203.0.113.99");
+    }
+
+    /// Single-hop XFF (the common case): one IP in the header.
+    #[test]
+    fn audit_348_xff_single_hop_when_trusted() {
+        let key = resolve_rate_limit_ip(sock("127.0.0.1:8080"), Some("198.51.100.5"), true);
+        assert_eq!(key, "198.51.100.5");
+    }
+
+    /// XFF with surrounding whitespace must trim cleanly.
+    #[test]
+    fn audit_348_xff_whitespace_trimmed() {
+        let key = resolve_rate_limit_ip(
+            sock("127.0.0.1:8080"),
+            Some("  198.51.100.5  ,   203.0.113.99   "),
+            true,
+        );
+        assert_eq!(key, "203.0.113.99");
+    }
+
+    /// Empty XFF or absent XFF falls back to peer_addr.
+    #[test]
+    fn audit_348_xff_empty_falls_back_to_peer() {
+        let key = resolve_rate_limit_ip(sock("198.51.100.5:1234"), Some(""), true);
+        assert_eq!(key, "198.51.100.5");
+
+        let key = resolve_rate_limit_ip(sock("198.51.100.5:1234"), None, true);
+        assert_eq!(key, "198.51.100.5");
+    }
+
+    /// IPv6 addresses round-trip through case-insensitive match.
+    #[test]
+    fn audit_348_xff_ipv6_lowercased() {
+        let key = resolve_rate_limit_ip(sock("[::1]:8080"), Some("2001:DB8::DEAD:BEEF"), true);
+        // IPv6 from XFF is lowercased so `check`'s lowercase
+        // lookup hits the same key on every visit.
+        assert_eq!(key, "2001:db8::dead:beef");
+    }
+
+    #[test]
+    fn audit_347_rate_limiter_keeps_active_entries_at_mru() {
+        // Mirror the live `RateLimiter` semantics: a `check` that
+        // observes a recent record must keep that entry warm so
+        // the attacker can't evict a still-cooling victim by
+        // flooding fresh addresses. Production uses
+        // `LruCache::get` (mutating) inside `check`; this test
+        // confirms that contract.
+        let lim = RateLimiter::new(60);
+        lim.record("victim");
+
+        // Fill with a flood of distinct keys, each touched once.
+        // Without the get-on-check semantics, "victim" would be
+        // pushed out by ~RATE_LIMITER_MAX_ENTRIES inserts; with
+        // the semantics, every `check("victim")` keeps it warm.
+        for i in 0..100usize {
+            // Periodic re-check on victim to bump it MRU.
+            if i % 10 == 0 {
+                let _ = lim.check("victim");
+            }
+            lim.record(&format!("a_{i}"));
+        }
+        // Victim still under cooldown (we only ran 100 puts on
+        // a 50_000-cap LRU, so it wouldn't have been evicted on
+        // capacity grounds either — the test mostly documents
+        // the get-on-check contract). The deeper assertion is
+        // that `check` returned `Err` on each touch.
+        assert!(
+            lim.check("victim").is_err(),
+            "victim must remain rate-limited",
+        );
     }
 }

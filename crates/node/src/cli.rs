@@ -145,6 +145,26 @@ pub enum Command {
         /// for mainnet, or omit on devnet bring-up.
         #[arg(long)]
         chain_id: Option<u64>,
+
+        /// Trust the rightmost untrusted hop in the
+        /// `X-Forwarded-For` header as the client IP for
+        /// rate-limiting (audit 348). Pre-fix the faucet always
+        /// rate-limited on `peer_addr.ip()`, which behind any
+        /// reverse proxy collapses every request to the proxy's
+        /// single IP — every legitimate user shared one IP-cooldown
+        /// window, while an attacker spoofing addresses still got
+        /// individual address cooldowns.
+        ///
+        /// **Operator responsibility:** when this flag is set, the
+        /// edge proxy MUST strip any `X-Forwarded-For` header
+        /// arriving from outside the trusted boundary. If the
+        /// proxy passes the header through verbatim, an attacker
+        /// can fake their client IP and bypass per-IP rate-limits
+        /// completely. Most production setups (nginx
+        /// `proxy_set_header X-Forwarded-For $remote_addr;`,
+        /// caddy default) handle this correctly; verify yours.
+        #[arg(long)]
+        trust_x_forwarded_for: bool,
     },
 }
 

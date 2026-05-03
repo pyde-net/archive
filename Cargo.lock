@@ -3690,6 +3690,7 @@ dependencies = [
  "hex",
  "jsonrpsee",
  "libp2p",
+ "lru 0.16.4",
  "metrics",
  "metrics-exporter-prometheus",
  "otic",
