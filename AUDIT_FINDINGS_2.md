@@ -458,25 +458,44 @@
       reaches its first real epoch boundary so the rotation code
       path is exercised end-to-end at production speed.
 
-- [ ] 398 — `✓` **`tx_via_full_node_reaches_validator` fails:
+- [x] 398 — `✓` **`tx_via_full_node_reaches_validator` fails:
       tx submitted to full node never appears at validator within
-      30 s.** Surfaced same e2e run. **Predates this audit cycle**
-      — fails identically on `aee961d`.
-
-      Likely the same family of failure as #396 (sync/late-joiner
-      pathway): full node accepts the tx via RPC but doesn't relay
-      to the validator mesh. The full-node-relay path is
-      `tx_relay::handle_inbound_tx` → mempool insert →
-      gossipsub publish on `Channel::Transactions`. If the full
-      node hasn't subscribed or the validators aren't peering with
-      it, the tx sits in the full-node mempool forever.
-
-      **Pre-launch impact:** dApps targeting a public-facing full
-      node (the typical end-user setup) won't reach validators.
-      This IS a launch-blocking bug for production-grade public
-      RPC; for a testnet bring-up where users dial the validators
-      directly via RPC, it's a soft warning. Same bisect window
-      as #319 / #396; investigate together.
+      30 s.** **SHIPPED.** Pre-fix the failure was misdiagnosed as
+      a relay-pathway bug; the actual root cause was a
+      port-allocation collision in the `pyde testnet` config
+      generator that sometimes prevented the test from spawning
+      4 nodes at all. The node binds two TCP ports per RPC —
+      `rpc.port` (JSON-RPC) and `rpc.port + 1` (dedicated
+      WebSocket subscription server, see
+      `node.rs::start_ws_server`) — but the genesis CLI assigned
+      RPC ports with stride 1 (`base_rpc_port + i`). With stride
+      1, node-0's WS port (base + 1) collides with node-1's RPC
+      port (base + 1) on the bind race; whichever child won the
+      race got the port, the other logged "Address already in
+      use" and ran with RPC disabled. The test polled the
+      RPC-disabled node's port for 30-45 s and timed out. The
+      failure was racy — about 30% of spawns hit the collision —
+      which is why earlier runs sometimes succeeded and obscured
+      the root cause. Fix:
+      1. `pyde testnet` writes per-node RPC ports with stride 2
+         (`base_rpc_port + 2*i`), giving each node an exclusive
+         pair `(rpc, ws)` of contiguous ports.
+      2. `pyde testnet` also writes a per-node `[fast_tx]`
+         section with `port = 9545 + i`. Pre-fix the
+         FastTxSection default (port 9545, listen 0.0.0.0) was
+         inherited by every node — only the first could bind
+         9545, the rest logged "fast_tx bind failed" (warn-only,
+         not fatal, but cosmetically alarming).
+      3. The test harness (`crates/node/tests/common/mod.rs`)
+         allocates `2 * total` contiguous TCP ports for the RPC
+         range and uses stride 2 when computing per-node
+         `rpc_port`.
+      Test outcome: `multi_node_full_node_relay` was flaky
+      (3/5 passing pre-fix → 5/5 passing post-fix) with no
+      additional churn elsewhere. Single-node-operator
+      conventions are unchanged (`pyde run --rpc-port 8545`
+      still gives RPC=8545); only multi-node `pyde testnet`
+      layouts use the new stride.
 
 - [x] 399 — `✓` **Validator restart-rejoin stalled the chain.**
       **SHIPPED.** Two distinct bugs in the late-joiner pathway,
