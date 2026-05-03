@@ -201,8 +201,20 @@ impl TestNetwork {
         // `base_port + i`, so the range must be contiguous + free at
         // startup for EVERY node (validators + full nodes). We probe by
         // binding then immediately releasing.
+        //
+        // Audit 398: RPC range needs `2 * total` slots because each
+        // node binds two TCP ports — `rpc.port` (JSON-RPC) and
+        // `rpc.port + 1` (dedicated WS subscription server). The
+        // genesis CLI assigns the per-node RPC at `base + 2 * i`, so
+        // node-0 owns base + 0..=1, node-1 owns base + 2..=3, etc.
+        // Pre-fix the harness allocated only `total` slots and
+        // `pyde testnet` used stride 1, causing node-0's WS port
+        // (base + 1) to collide with node-1's RPC port (base + 1)
+        // — multi-node testnet spawns failed intermittently with
+        // "Address already in use" depending on which child won
+        // the bind race.
         let (p2p_base, mut p2p_holders) = allocate_contiguous_udp_ports(total)?;
-        let (rpc_base, mut rpc_holders) = allocate_contiguous_tcp_ports(total)?;
+        let (rpc_base, mut rpc_holders) = allocate_contiguous_tcp_ports(2 * total)?;
 
         // Run `pyde testnet` to set up genesis + per-node configs.
         run_testnet_cli(
@@ -232,7 +244,11 @@ impl TestNetwork {
         for i in 0..total {
             let role: &'static str = if i < validators { "validator" } else { "full" };
             let node_dir = net_dir.join(format!("node-{}", i));
-            let rpc_port = rpc_base + i as u16;
+            // Audit 398: per-node RPC port follows the stride-2
+            // layout (`rpc_base + 2 * i`) so node-i's RPC + WS
+            // (which lives at rpc_port + 1) never collides with
+            // node-(i+1)'s RPC.
+            let rpc_port = rpc_base + (i as u16) * 2;
             let p2p_port = p2p_base + i as u16;
             let mut n = TestNode {
                 index: i,
@@ -244,16 +260,25 @@ impl TestNetwork {
                 output: Arc::new(Mutex::new(Vec::new())),
             };
             // Take this node's holders out of the shared vec.
+            // Audit 398: each node owns 2 contiguous TCP ports
+            // (RPC + WS), so consume both holders per node.
             let udp = p2p_holders.remove(0);
             let tcp = rpc_holders.remove(0);
+            let tcp_ws = rpc_holders.remove(0);
             if i < first_deferred_idx {
                 // Drop holders, then spawn — the OS releases the ports
                 // immediately and the child grabs them on startup.
                 drop(udp);
                 drop(tcp);
+                drop(tcp_ws);
                 start_node(&mut n, &pyde_bin, dev)?;
             } else {
                 // Keep them reserved until start_deferred() is called.
+                // The deferred-holder struct holds onto only the RPC
+                // slot (the WS slot is also reserved but goes to a
+                // throwaway — both will be reissued when the child
+                // process actually binds them on `start_deferred`).
+                drop(tcp_ws);
                 deferred_port_holders.insert(
                     i,
                     DeferredPortHolder {

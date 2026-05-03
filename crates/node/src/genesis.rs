@@ -1085,8 +1085,29 @@ pub fn generate_testnet(
             Some(addrs) => addrs[i].port,
             None => base_port + i as u16,
         };
-        let rpc_port = base_rpc_port + i as u16;
+        // Audit 398: stride-2 layout. The node binds two TCP ports
+        // per RPC: `rpc.port` (JSON-RPC) and `rpc.port + 1`
+        // (dedicated WebSocket subscription server, see
+        // `node.rs::start_ws_server`). Pre-fix the per-node stride
+        // was 1, so node-0's WS port (`rpc + 1`) collided with
+        // node-1's RPC port — multi-node testnets failed to spawn
+        // with `Address already in use` on whichever child lost
+        // the bind race. With stride 2 each node owns two
+        // contiguous ports: `base + 2i` (RPC) + `base + 2i + 1`
+        // (WS). User-facing impact is minimal — single-node
+        // operators using `--base-rpc-port 8545` still get
+        // RPC=8545; only multi-node `pyde testnet` layouts shift.
+        let rpc_port = base_rpc_port + (i as u16) * 2;
         let metrics_port = 9090 + i as u16;
+        // Audit 398: per-node fast_tx port. Pre-fix the
+        // FastTxSection default (port 9545, listen 0.0.0.0) was
+        // inherited by every node in a multi-node testnet — only
+        // the first node could bind, the rest logged "fast_tx
+        // bind failed" and ran without their fast-path TX
+        // endpoint. Stride-1 from the 9545 single-node default
+        // gives each node a unique port; far enough from the
+        // RPC range (40000+) that they never overlap.
+        let fast_tx_port = 9545 + i as u16;
         let region_comment = match node_addrs {
             Some(addrs) => format!(
                 "# region: {}\n# host:   {}\n",
@@ -1128,6 +1149,11 @@ port = {rpc_port}
 enabled = true
 port = {metrics_port}
 
+[fast_tx]
+enabled = true
+listen = "0.0.0.0"
+port = {fast_tx_port}
+
 [logging]
 level = "info"
 json = false
@@ -1138,6 +1164,7 @@ json = false
             p2p_port = p2p_port,
             rpc_port = rpc_port,
             metrics_port = metrics_port,
+            fast_tx_port = fast_tx_port,
             bootstrap = bootstrap,
             block_time_ms = block_time_ms,
         );
@@ -1188,8 +1215,24 @@ json = false
             Some(addrs) => addrs[i].port,
             None => base_port + i as u16,
         };
-        let rpc_port = base_rpc_port + i as u16;
+        // Audit 398: stride-2 layout. The node binds two TCP ports
+        // per RPC: `rpc.port` (JSON-RPC) and `rpc.port + 1`
+        // (dedicated WebSocket subscription server, see
+        // `node.rs::start_ws_server`). Pre-fix the per-node stride
+        // was 1, so node-0's WS port (`rpc + 1`) collided with
+        // node-1's RPC port — multi-node testnets failed to spawn
+        // with `Address already in use` on whichever child lost
+        // the bind race. With stride 2 each node owns two
+        // contiguous ports: `base + 2i` (RPC) + `base + 2i + 1`
+        // (WS). User-facing impact is minimal — single-node
+        // operators using `--base-rpc-port 8545` still get
+        // RPC=8545; only multi-node `pyde testnet` layouts shift.
+        let rpc_port = base_rpc_port + (i as u16) * 2;
         let metrics_port = 9090 + i as u16;
+        // Audit 398: per-node fast_tx port. See validator-config
+        // block above for rationale (audit-398 multi-node bind
+        // collision on the default 9545).
+        let fast_tx_port = 9545 + i as u16;
         let region_comment = match node_addrs {
             Some(addrs) => format!(
                 "# region: {}\n# host:   {}\n",
@@ -1231,6 +1274,11 @@ port = {rpc_port}
 enabled = true
 port = {metrics_port}
 
+[fast_tx]
+enabled = true
+listen = "0.0.0.0"
+port = {fast_tx_port}
+
 [logging]
 level = "info"
 json = false
@@ -1241,6 +1289,7 @@ json = false
             p2p_port = p2p_port,
             rpc_port = rpc_port,
             metrics_port = metrics_port,
+            fast_tx_port = fast_tx_port,
             bootstrap = bootstrap,
             block_time_ms = block_time_ms,
         );
@@ -1256,7 +1305,19 @@ json = false
 
     for i in 0..num_validators {
         let p2p_port = base_port + i as u16;
-        let rpc_port = base_rpc_port + i as u16;
+        // Audit 398: stride-2 layout. The node binds two TCP ports
+        // per RPC: `rpc.port` (JSON-RPC) and `rpc.port + 1`
+        // (dedicated WebSocket subscription server, see
+        // `node.rs::start_ws_server`). Pre-fix the per-node stride
+        // was 1, so node-0's WS port (`rpc + 1`) collided with
+        // node-1's RPC port — multi-node testnets failed to spawn
+        // with `Address already in use` on whichever child lost
+        // the bind race. With stride 2 each node owns two
+        // contiguous ports: `base + 2i` (RPC) + `base + 2i + 1`
+        // (WS). User-facing impact is minimal — single-node
+        // operators using `--base-rpc-port 8545` still get
+        // RPC=8545; only multi-node `pyde testnet` layouts shift.
+        let rpc_port = base_rpc_port + (i as u16) * 2;
         let node_dir = out_dir.join(format!("node-{}", i));
 
         if i == 0 {
@@ -1356,12 +1417,14 @@ json = false
     println!("  genesis.toml        — shared genesis");
     println!("  faucet.key          — faucet signing key");
     for i in 0..num_validators {
+        // Audit 398: stride-2 layout — keep the operator-printed
+        // RPC matching what's actually written into config.toml.
         println!(
             "  node-{}/config.toml  — node {} config (P2P:{}, RPC:{})",
             i,
             i,
             base_port + i as u16,
-            base_rpc_port + i as u16
+            base_rpc_port + (i as u16) * 2,
         );
         println!("  node-{}/validator.key — node {} signing key", i, i);
     }
