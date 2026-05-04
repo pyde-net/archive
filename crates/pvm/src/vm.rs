@@ -1189,6 +1189,18 @@ impl Vm {
                                 .checked_add(self.memory.page_gas_used)
                                 .ok_or(Trap::OutOfGas)?;
                             self.memory.page_gas_used = 0;
+                            // Audit 377: trap immediately when the drain
+                            // pushes gas past the limit. Without this,
+                            // execution returns Ok(None) and runs one
+                            // more instruction (the per-instruction
+                            // baseline at the top of `step()` will
+                            // catch it next iteration), giving the
+                            // contract a free instruction past the
+                            // budget. Mirrors the end-of-step drain
+                            // check at the bottom of `step()`.
+                            if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                                return Err(Trap::OutOfGas);
+                            }
                         }
                         return Ok(None);
                     }
@@ -1205,6 +1217,12 @@ impl Vm {
                                 .checked_add(self.memory.page_gas_used)
                                 .ok_or(Trap::OutOfGas)?;
                             self.memory.page_gas_used = 0;
+                            // Audit 377: see VerifySig invalid-pubkey
+                            // arm above. Same OOG-bypass on a different
+                            // early-return.
+                            if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                                return Err(Trap::OutOfGas);
+                            }
                         }
                         return Ok(None);
                     }
@@ -1435,6 +1453,12 @@ impl Vm {
                             .checked_add(self.memory.page_gas_used)
                             .ok_or(Trap::OutOfGas)?;
                         self.memory.page_gas_used = 0;
+                        // Audit 377: trap immediately when the drain
+                        // pushes gas past the limit. See VerifySig
+                        // early-return arms for full rationale.
+                        if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
+                            return Err(Trap::OutOfGas);
+                        }
                     }
                     return Ok(None);
                 }
@@ -4680,6 +4704,137 @@ mod tests {
         ]);
         vm.load(&code).unwrap();
         assert_eq!(vm.run().unwrap_err(), Trap::OutOfGas);
+    }
+
+    /// Audit 377: the VerifySig "invalid pk size" early-return drains
+    /// `page_gas_used` into `gas_used_total` but, pre-fix, did not
+    /// re-check `gas_limit` before returning `Ok(None)`. A contract
+    /// whose page-gas accumulation pushes total past the limit got
+    /// one free instruction's worth of execution before the per-
+    /// instruction baseline at the top of `step()` caught it.
+    /// Post-fix the trap fires inside VerifySig itself.
+    #[test]
+    fn audit_377_verifysig_invalid_pk_traps_during_drain() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::with_gas_limit(50_000);
+
+        // Build a descriptor with a malformed pk_len so VerifySig hits
+        // the invalid-pk early-return arm.
+        let msg_ptr = heap + 48;
+        let sig_ptr = msg_ptr + 4;
+        let pk_ptr = sig_ptr + 4;
+        vm.memory.store64(heap, msg_ptr as u64).unwrap();
+        vm.memory.store64(heap + 8, 4).unwrap();
+        vm.memory.store64(heap + 16, sig_ptr as u64).unwrap();
+        vm.memory.store64(heap + 24, 4).unwrap();
+        vm.memory.store64(heap + 32, pk_ptr as u64).unwrap();
+        vm.memory.store64(heap + 40, 10).unwrap(); // malformed pk size
+
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap as i32),
+            instr_bytes(Opcode::VerifySig, 2, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+
+        // Run ADDI to populate r1 with the descriptor pointer.
+        vm.step().unwrap();
+
+        // Seed: VerifySig baseline = 20_000, plus injected page-gas
+        // pushes us just past gas_limit. The early-return drain alone
+        // must trigger the trap.
+        vm.gas_used_total = 50_000 - 20_000 - 50;
+        vm.memory.page_gas_used = 100;
+
+        // Step VerifySig: post-fix returns Trap::OutOfGas inside the
+        // early-return arm. Pre-fix would return Ok(None), and the
+        // trap would only surface on the next step (the Halt's
+        // baseline charge at the top of step()).
+        let result = vm.step();
+        assert_eq!(result.unwrap_err(), Trap::OutOfGas);
+
+        // The early-return arm writes rd=0 *before* the drain, so the
+        // failure outcome is preserved (the contract sees verify=0).
+        assert_eq!(vm.cpu.read_gp(2), 0);
+
+        // pc advanced past VerifySig — the early-return bumped pc
+        // before draining. Halt did not run; gas_used_total carries
+        // only the VerifySig baseline + page-gas, no Halt baseline.
+        assert!(
+            vm.gas_used_total <= 50_000 + 100,
+            "gas_used_total ({}) must be bounded by gas_limit + page-gas; \
+             pre-fix would have added Halt's baseline (3) on top",
+            vm.gas_used_total,
+        );
+    }
+
+    /// Audit 377: same OOG-bypass on the VerifySig "invalid signature
+    /// size" early-return arm (the second match arm, line ~1198).
+    #[test]
+    fn audit_377_verifysig_invalid_sig_traps_during_drain() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::with_gas_limit(50_000);
+
+        // Generate a valid pk so it parses — but use a wrong sig size
+        // so the second early-return arm fires.
+        let (pk, _sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+
+        let msg_ptr = heap + 48;
+        let sig_ptr = msg_ptr + 4;
+        let pk_ptr = sig_ptr + 4;
+        vm.memory.store64(heap, msg_ptr as u64).unwrap();
+        vm.memory.store64(heap + 8, 4).unwrap();
+        vm.memory.store64(heap + 16, sig_ptr as u64).unwrap();
+        vm.memory.store64(heap + 24, 10).unwrap(); // malformed sig size
+        vm.memory.store64(heap + 32, pk_ptr as u64).unwrap();
+        vm.memory
+            .store64(heap + 40, pk.as_bytes().len() as u64)
+            .unwrap();
+        for (i, &b) in pk.as_bytes().iter().enumerate() {
+            vm.memory.store8(pk_ptr + i as u32, b).unwrap();
+        }
+
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap as i32),
+            instr_bytes(Opcode::VerifySig, 2, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        vm.step().unwrap();
+
+        vm.gas_used_total = 50_000 - 20_000 - 50;
+        vm.memory.page_gas_used = 100;
+
+        let result = vm.step();
+        assert_eq!(result.unwrap_err(), Trap::OutOfGas);
+        assert_eq!(vm.cpu.read_gp(2), 0);
+    }
+
+    /// Audit 377: same OOG-bypass on the MerkleVerify "proof too deep"
+    /// early-return arm (line ~1428).
+    #[test]
+    fn audit_377_merkle_verify_overdeep_proof_traps_during_drain() {
+        let heap = crate::memory::HEAP_START;
+        let mut vm = Vm::with_gas_limit(20_000);
+
+        // Descriptor: root + leaf + proof_len > 256 to hit the cap.
+        vm.memory.store64(heap.wrapping_add(64), 257u64).unwrap(); // proof_len = 257 > 256
+
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, heap as i32),
+            instr_bytes(Opcode::MerkleVerify, 2, 1, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        vm.step().unwrap();
+
+        // MerkleVerify baseline = 5_000. Seed so drain pushes over.
+        vm.gas_used_total = 20_000 - 5_000 - 50;
+        vm.memory.page_gas_used = 100;
+
+        let result = vm.step();
+        assert_eq!(result.unwrap_err(), Trap::OutOfGas);
+        assert_eq!(vm.cpu.read_gp(2), 0);
     }
 
     #[test]
