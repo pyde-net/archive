@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use pyde_crypto::falcon::{falcon_batch_verify, falcon_keygen, falcon_sign, falcon_verify};
+use pyde_crypto::falcon::{falcon_keygen, falcon_sign, falcon_verify, falcon_verify_all};
 
 fn bench_keygen() {
     println!("=== FALCON-512 keygen ===\n");
@@ -58,8 +58,8 @@ fn bench_verify() {
     );
 }
 
-fn bench_batch_verify() {
-    println!("\n=== FALCON-512 batch verify ===\n");
+fn bench_verify_all() {
+    println!("\n=== FALCON-512 verify_all (sequential N×verify) ===\n");
     let (pk, sk) = falcon_keygen().unwrap();
 
     for count in [100, 1000] {
@@ -74,7 +74,7 @@ fn bench_batch_verify() {
             .collect();
 
         let start = Instant::now();
-        std::hint::black_box(falcon_batch_verify(&items));
+        std::hint::black_box(falcon_verify_all(&items));
         let elapsed = start.elapsed();
 
         println!(
@@ -90,6 +90,6 @@ fn main() {
     bench_keygen();
     bench_sign();
     bench_verify();
-    bench_batch_verify();
+    bench_verify_all();
     println!();
 }

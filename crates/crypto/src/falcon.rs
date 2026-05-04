@@ -122,9 +122,20 @@ pub fn falcon_verify(pk: &FalconPublicKey, msg: &[u8], sig: &FalconSignature) ->
     .is_ok()
 }
 
-/// Batch verify multiple FALCON-512 signatures.
+/// Verify a list of FALCON-512 signatures sequentially.
 /// Returns true only if ALL signatures are valid.
-pub fn falcon_batch_verify(items: &[(&FalconPublicKey, &[u8], &FalconSignature)]) -> bool {
+///
+/// Audit 394: name is `_verify_all`, not `_batch_verify`, because
+/// this is a `forall` short-circuit over `falcon_verify`, NOT an
+/// algebraic batch-verification scheme that amortizes work
+/// across signatures (the way Ed25519 / BLS batch verifiers do).
+/// Pre-rename the `falcon_verify_all` name implied a
+/// per-signature cost lower than `falcon_verify` × N, which
+/// upstream `falcon-rs` (0.2.x) does not provide. Rename
+/// communicates the actual semantics. If/when upstream adds a
+/// real batch API, this function rewires under the same
+/// `_verify_all` name; callers don't need to change.
+pub fn falcon_verify_all(items: &[(&FalconPublicKey, &[u8], &FalconSignature)]) -> bool {
     items
         .iter()
         .all(|(pk, msg, sig)| falcon_verify(pk, msg, sig))
@@ -229,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_verify_all_valid() {
+    fn verify_all_with_all_valid_returns_true() {
         let (pk, sk) = falcon_keygen().unwrap();
         let msgs: &[&[u8]] = &[b"msg1", b"msg2", b"msg3"];
         let sigs: Vec<FalconSignature> =
@@ -239,11 +250,11 @@ mod tests {
             .zip(sigs.iter())
             .map(|(m, s)| (&pk, *m, s))
             .collect();
-        assert!(falcon_batch_verify(&items));
+        assert!(falcon_verify_all(&items));
     }
 
     #[test]
-    fn batch_verify_one_invalid() {
+    fn verify_all_with_one_invalid_returns_false() {
         let (pk, sk) = falcon_keygen().unwrap();
         let sig1 = falcon_sign(&sk, b"msg1").unwrap();
         let sig2 = falcon_sign(&sk, b"msg2").unwrap();
@@ -254,7 +265,7 @@ mod tests {
             (&pk, b"wrong", &sig2),
             (&pk, b"msg3", &sig3),
         ];
-        assert!(!falcon_batch_verify(&items));
+        assert!(!falcon_verify_all(&items));
     }
 
     #[test]
