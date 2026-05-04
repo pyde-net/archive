@@ -123,20 +123,28 @@ impl NonceState {
         buf
     }
 
-    /// Deserialize from bytes.
-    pub fn from_bytes(data: &[u8]) -> Self {
-        if data.len() >= 10 {
-            let mut base_bytes = [0u8; 8];
-            base_bytes.copy_from_slice(&data[0..8]);
-            let mut used_bytes = [0u8; 2];
-            used_bytes.copy_from_slice(&data[8..10]);
-            Self {
-                base: u64::from_le_bytes(base_bytes),
-                used: u16::from_le_bytes(used_bytes),
-            }
-        } else {
-            Self::new()
+    /// Deserialize from a 10-byte buffer.
+    ///
+    /// Audit 390: pre-fix the function silently returned
+    /// `Self::new()` for inputs shorter than 10 bytes — meaning a
+    /// truncated SMT read or a corrupted nonce-key value would
+    /// roll the sender's nonce window back to `base = 0` rather
+    /// than surface as a parse failure. Post-fix returns
+    /// `Option<Self>`, so the truncation is observable; callers
+    /// decide whether to default-on-missing (the EOA-with-no-prior-tx
+    /// case) or treat as a hard error.
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 10 {
+            return None;
         }
+        let mut base_bytes = [0u8; 8];
+        base_bytes.copy_from_slice(&data[0..8]);
+        let mut used_bytes = [0u8; 2];
+        used_bytes.copy_from_slice(&data[8..10]);
+        Some(Self {
+            base: u64::from_le_bytes(base_bytes),
+            used: u16::from_le_bytes(used_bytes),
+        })
     }
 }
 
@@ -288,8 +296,31 @@ mod tests {
         ns.use_nonce(45).unwrap();
 
         let bytes = ns.to_bytes();
-        let restored = NonceState::from_bytes(&bytes);
+        let restored = NonceState::from_bytes(&bytes).expect("10-byte buffer parses");
         assert_eq!(ns, restored);
+    }
+
+    /// Audit 390: short buffers must surface as `None` instead
+    /// of silently rolling back to `Self::new()`. Pre-fix a
+    /// truncated SMT read would have masqueraded as a fresh
+    /// `base = 0` nonce window — letting an attacker who corrupted
+    /// a nonce-key entry (or a node that crashed mid-write)
+    /// silently replay every nonce up to the original base.
+    #[test]
+    fn audit_390_from_bytes_short_returns_none() {
+        assert!(NonceState::from_bytes(&[]).is_none());
+        assert!(NonceState::from_bytes(&[0u8; 9]).is_none());
+        assert!(NonceState::from_bytes(&[1, 2, 3, 4]).is_none());
+    }
+
+    #[test]
+    fn audit_390_from_bytes_at_or_above_10_succeeds() {
+        // Exactly 10 bytes parses.
+        assert!(NonceState::from_bytes(&[0u8; 10]).is_some());
+        // Trailing bytes are ignored — keeps storage layouts that
+        // append fields to the nonce-key value forward-compatible
+        // with this parser.
+        assert!(NonceState::from_bytes(&[0u8; 32]).is_some());
     }
 
     // ========== Helpers ==========

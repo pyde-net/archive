@@ -736,7 +736,10 @@ fn production_simulation() {
     for acc in accounts.iter_mut() {
         let nonce_key = pyde_state::keys::nonce_key(&acc.address);
         if let Some(data) = smt.get(&nonce_key) {
-            let ns = pyde_account::nonce::NonceState::from_bytes(&data);
+            // Audit 390: from_bytes is Option<Self>; canonical
+            // store payloads always parse.
+            let ns = pyde_account::nonce::NonceState::from_bytes(&data)
+                .expect("nonce-key value must be a 10-byte NonceState");
             // Next available nonce = base + count of consecutive used bits from LSB
             acc.nonce = ns.base + ns.used.trailing_ones() as u64;
         }

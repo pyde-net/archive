@@ -35,7 +35,10 @@ fn compile(src: &str) -> Vec<u8> {
 fn sync_nonces(accounts: &mut [Acct], smt: &dyn pyde_state::smt::StateAccess) {
     for acc in accounts.iter_mut() {
         if let Some(data) = smt.get(&pyde_state::keys::nonce_key(&acc.address)) {
-            let ns = pyde_account::nonce::NonceState::from_bytes(&data);
+            // Audit 390: from_bytes is Option<Self>; canonical
+            // store payloads always parse.
+            let ns = pyde_account::nonce::NonceState::from_bytes(&data)
+                .expect("nonce-key value must be a 10-byte NonceState");
             acc.nonce = ns.base + ns.used.trailing_ones() as u64;
         }
     }
