@@ -1642,11 +1642,26 @@
       both `sk_input` and `output_input`.
       `crates/crypto/src/vrf.rs:15-16, 49-62`. Split into
       `VRF_FINGERPRINT_DOMAIN` and `VRF_OUTPUT_DOMAIN`.
-- [ ] 394 — `falcon_batch_verify` is a sequential `.all(...)`,
+- [x] 394 — `falcon_batch_verify` is a sequential `.all(...)`,
       not algebraic batch verification.
       `crates/crypto/src/falcon.rs:118-122`. Rename to
       `falcon_verify_all` until upstream supports a true batch
       API, OR wire to the upstream batch path if available.
+      **SHIPPED.** Audit's two-option recommendation: rename or
+      wire to upstream. Upstream `falcon-rs` 0.2.x (the version
+      we depend on) has no batch API (verified by grepping
+      `~/.cargo/registry/src/.../falcon-rs-0.2.4` for any
+      `batch`/`verify_batch` symbol — zero hits). Renamed
+      `falcon_batch_verify` → `falcon_verify_all` to communicate
+      the actual semantics: a `forall` short-circuit over
+      `falcon_verify`, NOT an algebraic batch scheme that
+      amortizes work across signatures (Ed25519/BLS-style).
+      Updated all callers (the standalone `falcon_bench` and
+      two unit tests). The `pyde-crypto` crate is `no_std`, so
+      rayon-parallelism would require a separate `std`-feature
+      gate; deferred. Tests `verify_all_with_all_valid_returns_true`
+      and `verify_all_with_one_invalid_returns_false` (renamed
+      from the old `batch_verify_*` names) still pin behavior.
 - [ ] 395 — `validator.key` regeneration on missing file silently
       re-keys the validator. `crates/node/src/node.rs:5181-5224`.
       Refuse on non-devnet `chain_id` unless explicit
