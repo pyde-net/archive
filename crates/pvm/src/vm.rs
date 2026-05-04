@@ -263,6 +263,23 @@ pub struct Vm {
     pub accessed_raw_slots: std::collections::HashSet<U256>,
     /// Raw slot values that were WRITTEN (subset of accessed_raw_slots).
     pub written_raw_slots: std::collections::HashSet<U256>,
+    /// Audit 379: per-caller CREATE counter for the current
+    /// transaction. Pre-fix the CREATE opcode derived its child
+    /// address as `Poseidon2(self_address || init_code)` with no
+    /// per-CREATE entropy — the address was deterministic from
+    /// the calling contract + init bytecode alone, so a front-
+    /// runner who saw a pending tx (or just guessed the init code)
+    /// could deploy malicious code at that address before the
+    /// victim's tx landed. Including a counter that increments
+    /// on each CREATE from a given caller makes back-to-back
+    /// CREATEs in the same tx land at distinct addresses; the
+    /// `tx_hash` mixed in alongside (see `do_create`) makes
+    /// cross-tx prediction impossible because every signed tx
+    /// has a unique hash. CREATE2 (which takes an explicit user-
+    /// provided salt) is unaffected — its determinism is the
+    /// feature, and salts under user control opt out of the
+    /// front-running concern by design.
+    pub create_counter: HashMap<Address, u64>,
 }
 
 /// Safe address calculation: base (u64) + offset (i64) → u32, or MemoryFault.
@@ -304,6 +321,7 @@ impl Vm {
             warm_storage_keys: std::collections::HashSet::new(),
             accessed_raw_slots: std::collections::HashSet::new(),
             written_raw_slots: std::collections::HashSet::new(),
+            create_counter: HashMap::new(),
         }
     }
 
@@ -1878,7 +1896,25 @@ impl Vm {
             .checked_read_slice(code_ptr, code_len)
             .map_err(|_| Trap::MemoryFault)?;
 
-        // Derive 32-byte contract address
+        // Derive 32-byte contract address.
+        //
+        // Audit 379: the CREATE path mixes in `tx_hash` and a
+        // per-caller CREATE counter so the resulting address is
+        // unpredictable to anyone who isn't the tx submitter.
+        // Pre-fix the derivation was `Poseidon2(self_address ||
+        // init_code)` — anyone who saw a pending tx (or just
+        // guessed the init code) could compute the resulting
+        // address and front-run by deploying malicious code there
+        // first. With `tx_hash` mixed in, every signed tx has a
+        // unique deterministic-from-the-submitter-but-different-
+        // from-everyone-else hash, so a different tx targeting
+        // the same caller + same init_code resolves to a
+        // different address. The per-caller counter
+        // (`create_counter[self_address]`) advances on each
+        // CREATE within the tx so back-to-back CREATEs from the
+        // same contract land at distinct addresses. CREATE2's
+        // salt-based determinism is preserved (its caller
+        // explicitly opted in to predictable addressing).
         let new_addr: Address = if is_create2 {
             let salt = self.cpu.read_wide_checked(0)?;
             let code_hash = pyde_crypto::poseidon2::poseidon2_hash(&init_code);
@@ -1889,8 +1925,16 @@ impl Vm {
             addr_input.extend_from_slice(&code_hash.to_bytes());
             pyde_crypto::poseidon2::poseidon2_hash(&addr_input).to_bytes()
         } else {
-            let mut addr_input = Vec::with_capacity(32 + init_code.len());
+            let create_count = self
+                .create_counter
+                .entry(self.ctx.self_address)
+                .or_insert(0);
+            let nonce = *create_count;
+            *create_count = create_count.checked_add(1).ok_or(Trap::OutOfGas)?;
+            let mut addr_input = Vec::with_capacity(32 + 32 + 8 + init_code.len());
             addr_input.extend_from_slice(&self.ctx.self_address);
+            addr_input.extend_from_slice(&self.ctx.tx_hash.to_le_bytes());
+            addr_input.extend_from_slice(&nonce.to_le_bytes());
             addr_input.extend_from_slice(&init_code);
             pyde_crypto::poseidon2::poseidon2_hash(&addr_input).to_bytes()
         };
@@ -4162,6 +4206,106 @@ mod tests {
         assert!(vm.contracts.contains_key(&new_addr));
         assert_eq!(vm.contracts[&new_addr], init_code);
     }
+
+    // ========== Audit 379: CREATE address is non-front-runnable ==========
+
+    /// Pre-fix CREATE derived `Poseidon2(self_address ||
+    /// init_code)` — a front-runner who saw a pending tx (or
+    /// guessed the init code) could deploy malicious code at the
+    /// computed address before the victim's tx landed. With
+    /// `tx_hash` mixed into the derivation, two distinct
+    /// transactions calling the same caller contract with the
+    /// same init_code resolve to DIFFERENT addresses. The
+    /// front-runner can't position their own deploy at the
+    /// victim's predicted address because their tx has a
+    /// different hash.
+    #[test]
+    fn audit_379_create_address_depends_on_tx_hash() {
+        let heap = crate::memory::HEAP_START;
+        let init_code = bytecode(&[instr_bytes(Opcode::Halt, 0, 0, 0)]);
+
+        let mut addrs = Vec::new();
+        for tx_hash_byte in [0xAA, 0xBB] {
+            let ctx = ExecutionContext {
+                self_address: addr(0x5678),
+                tx_hash: U256::from_le_bytes([tx_hash_byte; 32]),
+                ..Default::default()
+            };
+            let mut vm = Vm::with_context(ctx);
+            for (i, &b) in init_code.iter().enumerate() {
+                vm.memory.store8(heap + i as u32, b).unwrap();
+            }
+            vm.cpu.write_gp(2, heap as u64);
+            vm.cpu.write_gp(3, init_code.len() as u64);
+
+            let code = bytecode(&[
+                instr_bytes(Opcode::Create, 1, 2, 0x03),
+                instr_bytes(Opcode::Halt, 0, 0, 0),
+            ]);
+            vm.load(&code).unwrap();
+            vm.execute();
+            let new_addr: Address = vm.cpu.read_wide(1).to_le_bytes();
+            addrs.push(new_addr);
+        }
+
+        assert_ne!(
+            addrs[0], addrs[1],
+            "CREATE address must change when tx_hash changes (audit 379)",
+        );
+    }
+
+    /// Back-to-back CREATEs in the same tx from the same caller
+    /// must land at distinct addresses. Pre-fix the derivation
+    /// had no per-CREATE entropy, so two CREATE opcodes in the
+    /// same execution with the same init_code resolved to the
+    /// same address — the second one tripped the
+    /// `contracts.contains_key` collision guard and trapped,
+    /// forcing the contract author to vary init_code or use
+    /// CREATE2 with a salt. Post-fix the per-caller counter
+    /// advances on each CREATE, so identical init_code is fine.
+    #[test]
+    fn audit_379_back_to_back_create_distinct_addresses() {
+        let heap = crate::memory::HEAP_START;
+        let init_code = bytecode(&[instr_bytes(Opcode::Halt, 0, 0, 0)]);
+
+        let ctx = ExecutionContext {
+            self_address: addr(0x5678),
+            tx_hash: U256::from_le_bytes([0xCC; 32]),
+            ..Default::default()
+        };
+        let mut vm = Vm::with_context(ctx);
+        for (i, &b) in init_code.iter().enumerate() {
+            vm.memory.store8(heap + i as u32, b).unwrap();
+        }
+        vm.cpu.write_gp(2, heap as u64);
+        vm.cpu.write_gp(3, init_code.len() as u64);
+
+        // Two CREATEs back-to-back in the same VM execution.
+        let code = bytecode(&[
+            instr_bytes(Opcode::Create, 1, 2, 0x03),
+            instr_bytes(Opcode::Create, 4, 2, 0x03),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+        assert_eq!(output.outcome, Outcome::Success);
+
+        let addr1: Address = vm.cpu.read_wide(1).to_le_bytes();
+        let addr2: Address = vm.cpu.read_wide(4).to_le_bytes();
+        assert_ne!(addr1, ZERO_ADDRESS);
+        assert_ne!(addr2, ZERO_ADDRESS);
+        assert_ne!(
+            addr1, addr2,
+            "back-to-back CREATEs from the same caller must yield distinct addresses",
+        );
+    }
+
+    // CREATE2 is currently a planned-but-not-dispatched opcode
+    // (the `do_create(_, true)` branch is reachable only from a
+    // future Opcode::Create2 in `isa.rs`). When CREATE2 ships,
+    // a regression test should pin the salt-based determinism
+    // (CREATE2 is unaffected by audit 379 by design — its
+    // user-provided salt IS the front-runner protection).
 
     // ========== Task 0238: CREATE2 address is deterministic ==========
 

@@ -1442,8 +1442,33 @@
       checked_write_slice callers (Poseidon, SstoreB, Log,
       VerifySig, MerkleVerify, do_ext_call, do_create). Mirror the
       audit-215 Memcpy pre-cast bound check at every call site.
-- [ ] 379 — CREATE deterministic address has no nonce —
-      front-runnable address grabbing. `crates/pvm/src/vm.rs:1779-1782`.
+- [x] 379 — CREATE deterministic address has no nonce —
+      front-runnable address grabbing. **SHIPPED.** Pre-fix the
+      PVM CREATE opcode derived its child address as
+      `Poseidon2(self_address || init_code)` with no per-CREATE
+      entropy. A front-runner who saw a pending tx (or just
+      guessed the init code) could compute the resulting address
+      and deploy malicious code there before the victim's tx
+      landed. Post-fix the derivation is
+      `Poseidon2(self_address || tx_hash || create_count ||
+      init_code)`:
+      * `tx_hash` from `ExecutionContext` ensures every signed
+        tx produces a unique address even with identical caller
+        + init_code; a front-runner's tx (different signed bytes
+        → different hash) cannot land at the victim's predicted
+        address.
+      * `create_count` from a new per-caller `HashMap<Address,
+        u64>` advances on each CREATE within the tx so back-to-
+        back CREATEs from the same contract land at distinct
+        addresses (pre-fix the second one tripped the
+        `contracts.contains_key` collision guard and trapped,
+        forcing contract authors to vary init_code unnecessarily).
+      CREATE2 is intentionally untouched — its user-provided
+      salt is the front-runner protection by design (callers
+      explicitly opt in to predictable addressing). New 2
+      audit-379 tests pin: tx_hash variation produces distinct
+      addresses; back-to-back CREATEs in the same VM yield
+      distinct addresses.
 - [ ] 380 — Heartbeat 400ms (matches slot time). Bump to 1 s once
       peer scoring + peer-book restoration stabilize the mesh
       post-restart. `crates/net/src/node.rs:118`.
