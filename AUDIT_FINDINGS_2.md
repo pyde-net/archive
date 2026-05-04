@@ -1584,11 +1584,42 @@
 - [ ] 390 — `NonceState::from_bytes` silently returns
       `Self::new()` on invalid input; should be `Option<Self>`.
       `crates/account/src/nonce.rs:100-113`.
-- [ ] 391 — Goldilocks bias: `gl(u64::from_le_bytes(...))` reduces
+- [x] 391 — Goldilocks bias: `gl(u64::from_le_bytes(...))` reduces
       mod p, biasing values in `[p, 2^64)`.
       `crates/crypto/src/threshold.rs:55, 199, 238, 381, 484, 653,
       822`. Use rejection sampling for randomness paths; document
       the silent-remap on Kyber-seed reconstruction.
+      **SHIPPED.** Pre-fix `gl()` silently reduced any input ≥ p
+      (`p = 2^64 - 2^32 + 1`) by subtracting p, making values in
+      `[0, 2^32)` ≈ 2x more likely than values in `[2^32, p)` for
+      hash-derived inputs. Post-fix categorizes the seven cited
+      sites and applies the appropriate fix per category:
+      *(a) Randomness paths* — `random_goldilocks` (Shamir
+      polynomial coefficients) and `derive_blinding_mask`
+      (per-share unblinding mask) now rejection-sample by
+      re-hashing with an attempt counter folded into the hash
+      input. Per-attempt rejection is `(2^32 - 1) / 2^64 ≈ 2^-32`,
+      so the loop terminates after one attempt with overwhelming
+      probability. Determinism in the public arguments is
+      preserved (cross-validator agreement on shares + masks).
+      *(b) Kyber-seed reconstruction* — `threshold_keygen`
+      keeps the silent remap (rejection-sampling there would
+      mean re-running Kyber keygen, breaking the protocol's
+      determinism on the produced sk). The non-injective
+      round-trip is now documented inline with collision
+      probability bounds (≈ 2^-29 per keygen) and the operator
+      recovery path (re-keygen on first failed decap).
+      *(c) Deserialization paths* — `KeyShare::from_bytes`,
+      `DecryptionShare::from_bytes`, and
+      `RefreshContribution::from_bytes` keep the silent remap
+      (honest serialization is canonical via `gl_to_u64()`; the
+      remap only affects malformed inputs, which the downstream
+      MAC catches). Documented inline. Three regression tests
+      (`audit_391_random_goldilocks_is_canonical_and_deterministic`,
+      `audit_391_derive_blinding_mask_is_canonical_and_deterministic`,
+      `audit_391_threshold_roundtrip_after_rejection_sampling`)
+      pin the canonical-output, determinism, and end-to-end
+      decryption invariants.
 - [ ] 392 — `Hash256::from_slice` silently truncates/pads.
       `crates/crypto/src/hash.rs:24-29`. Return `Option<Hash256>`.
 - [ ] 393 — VRF input domain reuse: `VRF_DOMAIN_OUTPUT` used for
