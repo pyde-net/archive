@@ -285,16 +285,13 @@ impl PydeApiServer for RpcServer {
         // Nonce is stored separately at nonce_key (NonceState: base u64 + bitmap u16)
         let key = pyde_state::keys::nonce_key(&addr);
         let state = self.state.state.read().await;
+        // Audit 390: `from_bytes` is `Option<Self>`. Missing or
+        // structurally-invalid bytes both produce `None`, which
+        // we collapse to `base = 0` (the never-seen-EOA case).
         let nonce = state
             .get(&key)
-            .map(|b| {
-                if b.len() >= 10 {
-                    let ns = pyde_account::nonce::NonceState::from_bytes(&b);
-                    ns.base
-                } else {
-                    0
-                }
-            })
+            .and_then(|b| pyde_account::nonce::NonceState::from_bytes(&b))
+            .map(|ns| ns.base)
             .unwrap_or(0);
         Ok(nonce.to_string())
     }
@@ -521,16 +518,12 @@ impl PydeApiServer for RpcServer {
         } else {
             let state_r = self.state.state.read().await;
             let nonce_key = pyde_state::keys::nonce_key(&from);
+            // Audit 390: from_bytes is Option<Self>; missing /
+            // malformed both collapse to `base = 0`.
             let n = state_r
                 .get(&nonce_key)
-                .and_then(|bytes| {
-                    if bytes.len() >= 10 {
-                        let ns = pyde_account::nonce::NonceState::from_bytes(&bytes);
-                        Some(ns.base)
-                    } else {
-                        None
-                    }
-                })
+                .and_then(|bytes| pyde_account::nonce::NonceState::from_bytes(&bytes))
+                .map(|ns| ns.base)
                 .unwrap_or(0);
             drop(state_r);
             n
@@ -1392,9 +1385,14 @@ impl PydeApiServer for RpcServer {
                     pyde_account::types::AuthKeys::Single(pk) => Some(pk),
                     _ => None,
                 });
+            // Audit 390: from_bytes is Option<Self>. Flatten via
+            // and_then so a malformed nonce-key value collapses
+            // into the same `None` shape as a missing key — the
+            // ingress check below treats both as "no upstream
+            // window known" and skips the upper-bound rejection.
             let ns_opt = state_r
                 .get(&pyde_state::keys::nonce_key(&from))
-                .map(|bytes| pyde_account::nonce::NonceState::from_bytes(&bytes));
+                .and_then(|bytes| pyde_account::nonce::NonceState::from_bytes(&bytes));
             (pk_opt, ns_opt)
         };
 

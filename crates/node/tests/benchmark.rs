@@ -480,12 +480,12 @@ fn benchmark_realistic_block() {
         let (deployer, _) = accounts[0];
         let deploy_nonce = {
             let nk = pyde_state::keys::nonce_key(&deployer);
+            // Audit 390: from_bytes is Option<Self>; missing or
+            // malformed both collapse to base 0.
             persistent
                 .get(&nk)
-                .map(|d| {
-                    let ns = pyde_account::nonce::NonceState::from_bytes(&d);
-                    ns.base + ns.used.trailing_ones() as u64
-                })
+                .and_then(|d| pyde_account::nonce::NonceState::from_bytes(&d))
+                .map(|ns| ns.base + ns.used.trailing_ones() as u64)
                 .unwrap_or(0)
         };
         let dtx = make_deploy(deployer, counter_deploy.clone(), deploy_nonce);

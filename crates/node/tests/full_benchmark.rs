@@ -184,7 +184,11 @@ fn sync_nonces(accounts: &mut [Account], smt: &dyn StateAccess) {
     for acc in accounts.iter_mut() {
         let nonce_key = pyde_state::keys::nonce_key(&acc.address);
         if let Some(data) = smt.get(&nonce_key) {
-            let ns = pyde_account::nonce::NonceState::from_bytes(&data);
+            // Audit 390: from_bytes is Option<Self>. The store
+            // round-trips canonical 10-byte payloads, so None
+            // here would indicate state corruption.
+            let ns = pyde_account::nonce::NonceState::from_bytes(&data)
+                .expect("nonce-key value must be a 10-byte NonceState");
             acc.nonce = ns.base + ns.used.trailing_ones() as u64;
         }
     }

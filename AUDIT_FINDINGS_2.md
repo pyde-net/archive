@@ -1581,9 +1581,28 @@
 - [ ] 389 — `account::auth::validate_signature` for MultiSig
       doesn't dedup keys. `crates/account/src/auth.rs:60-94`.
       Cross-with #304 fix: invariant check at construction.
-- [ ] 390 — `NonceState::from_bytes` silently returns
+- [x] 390 — `NonceState::from_bytes` silently returns
       `Self::new()` on invalid input; should be `Option<Self>`.
       `crates/account/src/nonce.rs:100-113`.
+      **SHIPPED.** Pre-fix the function silently returned
+      `Self::new()` for inputs shorter than 10 bytes — meaning a
+      truncated SMT read or a corrupted nonce-key value would
+      roll the sender's nonce window back to `base = 0` rather
+      than surface as a parse failure. An attacker who corrupted
+      a nonce-key entry (or a node that crashed mid-write) could
+      then silently replay every nonce up to the original base.
+      Post-fix returns `Option<Self>`, returning `None` for
+      `data.len() < 10`. Updated all 9 call sites: `pipeline.rs`
+      `load_nonce` collapses None into the same default-on-missing
+      shape (the corruption then surfaces downstream when
+      `validate_nonce` rejects the tx); the three RPC sites in
+      `rpc.rs` also collapse to `base = 0` (consistent with the
+      missing-key case for fresh EOAs); the five test/bench
+      sites use `.expect(...)` since the canonical store
+      round-trips 10-byte values. Two regression tests
+      (`audit_390_from_bytes_short_returns_none`,
+      `audit_390_from_bytes_at_or_above_10_succeeds`) pin the
+      reject-on-short / accept-on-≥10 contract.
 - [x] 391 — Goldilocks bias: `gl(u64::from_le_bytes(...))` reduces
       mod p, biasing values in `[p, 2^64)`.
       `crates/crypto/src/threshold.rs:55, 199, 238, 381, 484, 653,

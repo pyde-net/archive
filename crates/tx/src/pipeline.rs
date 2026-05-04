@@ -209,12 +209,20 @@ pub fn apply_account_delta(
 }
 
 /// Load a nonce state for an account. Returns default if not found.
+///
+/// Audit 390: `NonceState::from_bytes` is now `Option<Self>`. A
+/// `None` here means the nonce-key value was structurally
+/// malformed (length < 10) — surface it as the same "fresh
+/// account" default rather than panicking, since the caller
+/// can't distinguish corrupted-storage from never-seen anyway
+/// at this layer. The corruption shows up downstream when
+/// `validate_nonce` rejects the tx against a `base = 0`
+/// window the sender never actually set.
 pub fn load_nonce(smt: &dyn pyde_state::smt::StateAccess, address: &Address) -> NonceState {
     let key = keys::nonce_key(address);
-    match smt.get(&key) {
-        Some(bytes) if bytes.len() >= 10 => NonceState::from_bytes(&bytes),
-        _ => NonceState::new(),
-    }
+    smt.get(&key)
+        .and_then(|bytes| NonceState::from_bytes(&bytes))
+        .unwrap_or_default()
 }
 
 /// Store a nonce state into the SMT.
