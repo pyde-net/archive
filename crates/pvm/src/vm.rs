@@ -1474,8 +1474,15 @@ impl Vm {
                     return Err(Trap::OutOfGas);
                 }
 
-                // Walk the proof: hash leaf with each sibling up to root
-                let mut current = pyde_crypto::hash::Hash256::from_slice(&leaf_bytes);
+                // Walk the proof: hash leaf with each sibling up to root.
+                // Audit 392: `Hash256::from_slice` now returns
+                // `Option<Self>`; the source `checked_read_slice(_, 32)`
+                // calls always produce 32-byte buffers, so `None`
+                // here is a host-side invariant violation rather
+                // than a guest-reachable case. Map to MemoryFault
+                // defensively.
+                let mut current =
+                    pyde_crypto::hash::Hash256::from_slice(&leaf_bytes).ok_or(Trap::MemoryFault)?;
                 for i in 0..proof_len {
                     let sib_offset = desc_ptr
                         .checked_add(72 + (i as u32) * 32)
@@ -1484,11 +1491,13 @@ impl Vm {
                         .memory
                         .checked_read_slice(sib_offset, 32)
                         .map_err(|_| Trap::MemoryFault)?;
-                    let sibling = pyde_crypto::hash::Hash256::from_slice(&sib_bytes);
+                    let sibling = pyde_crypto::hash::Hash256::from_slice(&sib_bytes)
+                        .ok_or(Trap::MemoryFault)?;
                     current = pyde_crypto::poseidon2::poseidon2_pair(current, sibling);
                 }
 
-                let root = pyde_crypto::hash::Hash256::from_slice(&root_bytes);
+                let root =
+                    pyde_crypto::hash::Hash256::from_slice(&root_bytes).ok_or(Trap::MemoryFault)?;
                 let verified = current == root;
                 self.cpu.write_gp(d.rd, if verified { 1 } else { 0 });
                 self.pc += 4;
