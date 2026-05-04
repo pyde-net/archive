@@ -1435,9 +1435,26 @@
       `audit_376_per_instruction_gas_overflow_cannot_bypass_oog`
       and `audit_376_call_ext_charge_cannot_bypass_oog`
       regression tests pin the fix.
-- [ ] 377 — VerifySig / MerkleVerify early-return paths skip OOG
+- [x] 377 — VerifySig / MerkleVerify early-return paths skip OOG
       check after page-gas drain. `crates/pvm/src/vm.rs:1128-1132,
       1140-1144, 1347-1355`.
+      **SHIPPED.** Three early-return arms (VerifySig invalid pubkey,
+      VerifySig invalid signature, MerkleVerify proof_len > 256) drain
+      `page_gas_used` into `gas_used_total` via `checked_add` but
+      pre-fix did not re-check `gas_limit` before returning
+      `Ok(None)`. Per-instruction baseline at the top of the next
+      `step()` would catch the over-budget condition, but only after
+      one extra instruction's grace — the contract observably ran
+      past its declared gas budget. Post-fix mirrors the canonical
+      end-of-step drain (vm.rs:1476-1487): the OOG check runs
+      immediately after the drain and traps inside the early-return.
+      Three regression tests
+      (`audit_377_verifysig_invalid_pk_traps_during_drain`,
+      `audit_377_verifysig_invalid_sig_traps_during_drain`,
+      `audit_377_merkle_verify_overdeep_proof_traps_during_drain`)
+      seed `gas_used_total` and inject `page_gas_used` so the drain
+      crosses the limit, and assert the trap fires inside the
+      VerifySig/MerkleVerify step rather than the next.
 - [ ] 378 — `len: u64 → as u32` truncation in checked_read_slice /
       checked_write_slice callers (Poseidon, SstoreB, Log,
       VerifySig, MerkleVerify, do_ext_call, do_create). Mirror the
