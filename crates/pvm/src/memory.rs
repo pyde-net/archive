@@ -306,6 +306,18 @@ impl Memory {
         if len == 0 {
             return Ok(Vec::new());
         }
+        // Audit 378: reject lengths that don't fit in PVM's u32 address
+        // space *before* the `len as u32` cast in `check_access` (which
+        // would silently truncate) and *before* `read_slice`'s
+        // `vec![0u8; len]` allocates a host-side buffer. A guest that
+        // passes `len = 0x1_0000_0000` would otherwise see the bounds
+        // check pass (truncated len = 0) while the host allocates 4 GiB
+        // — a host-OOM DoS. `MEMORY_SIZE` (4 MiB) is the natural ceiling
+        // because no guest read can exceed total guest memory; this
+        // also implies the value fits in u32 for the cast below.
+        if len > MEMORY_SIZE {
+            return Err(MemoryError::OutOfBounds(addr));
+        }
         self.check_access(addr, len as u32)?;
         Ok(self.read_slice(addr, len))
     }
@@ -314,6 +326,13 @@ impl Memory {
     pub fn checked_write_slice(&mut self, addr: u32, data: &[u8]) -> Result<(), MemoryError> {
         if data.is_empty() {
             return Ok(());
+        }
+        // Audit 378: same bounds-then-cast hazard as `checked_read_slice`.
+        // `data` is host-side so the slice itself can't grow under guest
+        // control, but a defensive check keeps `data.len() as u32`
+        // honest if a future caller hands in a > 4 GiB buffer.
+        if data.len() > MEMORY_SIZE {
+            return Err(MemoryError::OutOfBounds(addr));
         }
         self.check_access(addr, data.len() as u32)?;
         self.check_writable(addr)?;
@@ -707,5 +726,57 @@ mod tests {
         // Should only have materialized code page(s) + 1 heap page
         let materialized = m.pages_materialized();
         assert!(materialized <= 3);
+    }
+
+    // ========== Audit 378: checked_*_slice oversized len ==========
+
+    /// Pre-fix, a guest-controlled `len` was cast to `usize` by the
+    /// caller and into `len as u32` inside `check_access` — silently
+    /// truncating values larger than `u32::MAX` and letting
+    /// `read_slice` allocate a > 4 GiB host-side `Vec` before the
+    /// truncated bounds check ran. Post-fix, lengths above
+    /// `MEMORY_SIZE` (4 MiB) are rejected up front.
+    #[test]
+    fn audit_378_checked_read_slice_rejects_oversize_len() {
+        let mut m = mem();
+        // Just over MEMORY_SIZE (4 MiB) — would have allocated a
+        // 4 MiB+1 host buffer pre-fix.
+        let result = m.checked_read_slice(0, MEMORY_SIZE + 1);
+        assert!(matches!(result, Err(MemoryError::OutOfBounds(_))));
+    }
+
+    #[test]
+    fn audit_378_checked_read_slice_rejects_u32_overflow_len() {
+        let mut m = mem();
+        // A len that wraps to a small value when cast to u32 — the
+        // exact attack the audit is concerned about. Pre-fix the
+        // bounds check saw a small truncated len and passed; the
+        // host-side `vec![0u8; len]` then allocated 4 GiB+.
+        let result = m.checked_read_slice(0, 0x1_0000_0000);
+        assert!(matches!(result, Err(MemoryError::OutOfBounds(_))));
+    }
+
+    #[test]
+    fn audit_378_checked_read_slice_accepts_max_in_bounds_len() {
+        let mut m = mem();
+        // Below MEMORY_SIZE fits — confirms the rejection threshold
+        // is `len > MEMORY_SIZE`, not `>=`. Read from HEAP_START so
+        // we skip the null-page trap; len = remaining bytes.
+        let len = MEMORY_SIZE - HEAP_START as usize;
+        let result = m.checked_read_slice(HEAP_START, len);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), len);
+    }
+
+    #[test]
+    fn audit_378_checked_write_slice_rejects_oversize_data() {
+        let mut m = mem();
+        // Host-side buffer beyond MEMORY_SIZE. Defensive only — the
+        // public callers all hand in bounded slices, but the check
+        // keeps `data.len() as u32` from silently truncating if a
+        // future caller hands in a > 4 GiB buffer.
+        let oversized = vec![0u8; MEMORY_SIZE + 1];
+        let result = m.checked_write_slice(HEAP_START, &oversized);
+        assert!(matches!(result, Err(MemoryError::OutOfBounds(_))));
     }
 }
