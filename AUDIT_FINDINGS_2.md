@@ -1534,9 +1534,27 @@
       mainnet/testnet/edge values (1, 7331, 100_000, 1_000_000,
       u64::MAX) and asserts `StructuralOnly` is never returned for
       `None` sender_pk except at chain_id 31337.
-- [ ] 385 — `prune_expired` clears + rebuilds `seen_hashes` on
+- [x] 385 — `prune_expired` clears + rebuilds `seen_hashes` on
       eviction. `crates/mempool/src/pool.rs:443-451`. Track removed
       hashes incrementally.
+      **SHIPPED.** Pre-fix the function cleared `seen_hashes`,
+      iterated every retained tx to recompute its `EncryptedTx::hash()`
+      (each hash = two Poseidon2 invocations + ciphertext-to-bytes
+      copy), collected into a fresh `HashSet`, and reassigned —
+      O(N) work even when only a single tx had expired. Post-fix
+      collects the expired hashes (O(K)), early-returns if none,
+      then incrementally `seen_hashes.remove` /
+      `first_seen_slot.remove` / `release_sender_slot` for each
+      expired entry — O(K) total, where K is the per-prune
+      eviction count. On a steady-state mempool with thousands of
+      valid txs and one expired entry per block, this drops the
+      per-prune cost from "Poseidon2-bound full sweep" to "K hash
+      lookups." Two regression tests
+      (`audit_385_prune_keeps_seen_hashes_consistent` and
+      `audit_385_prune_no_op_when_nothing_expired`) pin the dedup
+      invariant: retained hashes stay in `seen_hashes` and
+      `first_seen_slot`, expired ones don't, and a no-op prune
+      doesn't mutate either map.
 - [x] 386 — Encrypted nonce-window check at RPC ingress can
       overflow on near-`u64::MAX` base. `crates/node/src/rpc.rs:1365`,
       `crates/account/src/nonce.rs:53`. Use `checked_add`.

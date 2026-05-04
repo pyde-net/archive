@@ -431,23 +431,32 @@ impl Mempool {
     /// Remove expired transactions.
     pub fn prune_expired(&mut self) {
         let current = self.current_block;
-        let before = self.txs.len();
-        let expired_senders: Vec<(Address, [u8; 32])> = self
+        // Audit 385: incrementally remove expired entries from the
+        // dedup state instead of clearing + rebuilding `seen_hashes`
+        // and re-iterating every retained tx to re-collect its hash.
+        // Pre-fix this was O(N) per prune (one Poseidon2 hash per
+        // retained tx, plus a HashSet rebuild) even when only a few
+        // entries expired; post-fix it's O(K) where K is the expired
+        // count, so a mempool with thousands of valid txs and one
+        // expired entry doesn't pay the full-sweep cost on every
+        // block.
+        let expired: Vec<(Address, [u8; 32])> = self
             .txs
             .iter()
             .filter(|tx| tx.is_expired(current))
             .map(|tx| (tx.sender, tx.hash()))
             .collect();
+
+        if expired.is_empty() {
+            return;
+        }
+
         self.txs.retain(|tx| !tx.is_expired(current));
 
-        if self.txs.len() != before {
-            self.seen_hashes.clear();
-            let kept: HashSet<[u8; 32]> = self.txs.iter().map(|tx| tx.hash()).collect();
-            self.first_seen_slot.retain(|h, _| kept.contains(h));
-            self.seen_hashes = kept;
-            for (sender, hash) in &expired_senders {
-                self.release_sender_slot(sender, hash);
-            }
+        for (sender, hash) in &expired {
+            self.seen_hashes.remove(hash);
+            self.first_seen_slot.remove(hash);
+            self.release_sender_slot(sender, hash);
         }
     }
 
@@ -839,6 +848,81 @@ mod tests {
         pool.set_current_block(200);
         pool.prune_expired();
         assert_eq!(pool.len(), 1);
+    }
+
+    /// Audit 385: pre-fix `prune_expired` cleared and rebuilt
+    /// `seen_hashes` from scratch on every prune that evicted any
+    /// tx — re-hashing every retained tx (Poseidon2-heavy) even
+    /// when only a single entry expired. Post-fix removes only the
+    /// expired hashes incrementally. Both must produce the same
+    /// final dedup state; this test pins that contract.
+    #[test]
+    fn audit_385_prune_keeps_seen_hashes_consistent() {
+        let pk = make_pk();
+        let mut pool = Mempool::new();
+
+        // Mix: tx 0 expires at slot 100, txs 1..5 don't expire.
+        let expired_tx = make_enc_tx_with_deadline(&pk, 50_000, 0, 100);
+        let expired_hash = expired_tx.hash();
+        pool.add(expired_tx).unwrap();
+        let mut retained_hashes = Vec::new();
+        for nonce in 1..5u64 {
+            let tx = make_enc_tx(&pk, 60_000, nonce);
+            retained_hashes.push(tx.hash());
+            pool.add(tx).unwrap();
+        }
+        assert_eq!(pool.len(), 5);
+
+        pool.set_current_block(200);
+        pool.prune_expired();
+
+        // 1 expired removed, 4 retained.
+        assert_eq!(pool.len(), 4);
+
+        // Expired hash gone from dedup.
+        assert!(!pool.contains(&expired_hash));
+
+        // Every retained hash still recognized as seen — re-adding
+        // any retained tx must reject as duplicate.
+        for h in &retained_hashes {
+            assert!(
+                pool.contains(h),
+                "retained hash {:?} must remain in seen_hashes",
+                h,
+            );
+        }
+
+        // first_seen_slot must not retain stale entries.
+        assert_eq!(pool.first_seen_slot.len(), 4);
+        assert!(!pool.first_seen_slot.contains_key(&expired_hash));
+        for h in &retained_hashes {
+            assert!(pool.first_seen_slot.contains_key(h));
+        }
+    }
+
+    /// Audit 385: a prune that evicts nothing must NOT touch the
+    /// dedup state. Pre-fix the function would early-return on
+    /// `txs.len() != before`; post-fix the equivalent gate is
+    /// `expired.is_empty()`. This test pins the no-op invariant.
+    #[test]
+    fn audit_385_prune_no_op_when_nothing_expired() {
+        let pk = make_pk();
+        let mut pool = Mempool::new();
+
+        let tx = make_enc_tx_with_deadline(&pk, 50_000, 0, 1_000);
+        let hash = tx.hash();
+        pool.add(tx).unwrap();
+
+        // Block far below the deadline — nothing expires.
+        pool.set_current_block(10);
+        let seen_before = pool.seen_hashes.clone();
+        let first_seen_before = pool.first_seen_slot.clone();
+        pool.prune_expired();
+
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&hash));
+        assert_eq!(pool.seen_hashes, seen_before);
+        assert_eq!(pool.first_seen_slot, first_seen_before);
     }
 
     // ========== Remove included ==========
