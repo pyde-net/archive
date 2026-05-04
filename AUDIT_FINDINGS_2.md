@@ -1620,8 +1620,24 @@
       `audit_391_threshold_roundtrip_after_rejection_sampling`)
       pin the canonical-output, determinism, and end-to-end
       decryption invariants.
-- [ ] 392 — `Hash256::from_slice` silently truncates/pads.
+- [x] 392 — `Hash256::from_slice` silently truncates/pads.
       `crates/crypto/src/hash.rs:24-29`. Return `Option<Hash256>`.
+      **SHIPPED.** Pre-fix the function silently zero-padded short
+      slices and silently truncated long ones — both behaviors hide
+      programming bugs (a 31-byte hash compared equal to a real
+      `Hash256(...)` whose 32nd byte was zero, and a 33-byte payload
+      had its trailing byte dropped without surfacing the size
+      mismatch). Post-fix returns `Option<Self>`, returning `None`
+      for any length other than exactly 32. Updated all three
+      callers in `MerkleVerify` (vm.rs:1485, 1494, 1500) to
+      `.ok_or(Trap::MemoryFault)?` — defensive since each upstream
+      `checked_read_slice(_, 32)` call always produces a 32-byte
+      buffer, so `None` here is a host invariant violation rather
+      than a guest-reachable case. Three regression tests
+      (`from_slice_exact_length`,
+      `audit_392_from_slice_short_returns_none`,
+      `audit_392_from_slice_long_returns_none`) pin the
+      reject-on-mismatch contract at slice boundaries.
 - [ ] 393 — VRF input domain reuse: `VRF_DOMAIN_OUTPUT` used for
       both `sk_input` and `output_input`.
       `crates/crypto/src/vrf.rs:15-16, 49-62`. Split into

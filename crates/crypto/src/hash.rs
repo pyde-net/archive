@@ -21,11 +21,20 @@ impl Hash256 {
         self.0
     }
 
-    pub fn from_slice(slice: &[u8]) -> Self {
-        let mut bytes = [0u8; 32];
-        let len = slice.len().min(32);
-        bytes[..len].copy_from_slice(&slice[..len]);
-        Self(bytes)
+    /// Construct a `Hash256` from a 32-byte slice.
+    ///
+    /// Audit 392: returns `None` for any other length. Pre-fix the
+    /// function silently zero-padded short slices and silently
+    /// truncated long ones — both behaviors hide programming bugs
+    /// (a malformed 31-byte hash compared equal to a real
+    /// `Hash256(...)` whose 32nd byte was zero, and a 33-byte
+    /// payload had its trailing byte dropped on the floor without
+    /// surfacing the size mismatch). Callers that genuinely need
+    /// truncation/padding should do it explicitly at the call
+    /// site.
+    pub fn from_slice(slice: &[u8]) -> Option<Self> {
+        let bytes: [u8; 32] = slice.try_into().ok()?;
+        Some(Self(bytes))
     }
 }
 
@@ -81,11 +90,29 @@ mod tests {
     }
 
     #[test]
-    fn from_slice_short() {
-        let h = Hash256::from_slice(&[1, 2, 3]);
-        let mut expected = [0u8; 32];
-        expected[..3].copy_from_slice(&[1, 2, 3]);
-        assert_eq!(h.to_bytes(), expected);
+    fn from_slice_exact_length() {
+        let bytes = [42u8; 32];
+        let h = Hash256::from_slice(&bytes).expect("32-byte slice is accepted");
+        assert_eq!(h.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn audit_392_from_slice_short_returns_none() {
+        // Pre-fix this silently zero-padded; post-fix the size
+        // mismatch surfaces as None so the caller decides what
+        // to do.
+        assert!(Hash256::from_slice(&[1, 2, 3]).is_none());
+        assert!(Hash256::from_slice(&[]).is_none());
+        assert!(Hash256::from_slice(&[0u8; 31]).is_none());
+    }
+
+    #[test]
+    fn audit_392_from_slice_long_returns_none() {
+        // Pre-fix this silently truncated; post-fix it returns
+        // None so the trailing bytes can't be lost without the
+        // caller noticing.
+        assert!(Hash256::from_slice(&[7u8; 33]).is_none());
+        assert!(Hash256::from_slice(&[7u8; 64]).is_none());
     }
 
     #[test]
