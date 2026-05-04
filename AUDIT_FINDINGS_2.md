@@ -1455,10 +1455,29 @@
       seed `gas_used_total` and inject `page_gas_used` so the drain
       crosses the limit, and assert the trap fires inside the
       VerifySig/MerkleVerify step rather than the next.
-- [ ] 378 — `len: u64 → as u32` truncation in checked_read_slice /
+- [x] 378 — `len: u64 → as u32` truncation in checked_read_slice /
       checked_write_slice callers (Poseidon, SstoreB, Log,
       VerifySig, MerkleVerify, do_ext_call, do_create). Mirror the
       audit-215 Memcpy pre-cast bound check at every call site.
+      **SHIPPED.** Centralized fix in `Memory::checked_read_slice` and
+      `Memory::checked_write_slice` themselves: reject `len > MEMORY_SIZE`
+      before the `len as u32` cast in `check_access` (which would
+      silently truncate) and before `read_slice`'s `vec![0u8; len]`
+      allocates a host-side buffer. Pre-fix, a guest passing
+      `len = 0x1_0000_0000` would see the bounds check pass (truncated
+      to 0) while the host allocated 4 GiB+ — combined with
+      `panic = "abort"`, that's a host-OOM DoS. Centralizing at the
+      bottleneck covers all 33 call sites (Poseidon, SstoreB, Log,
+      VerifySig, MerkleVerify, do_ext_call, do_create, plus aot/host,
+      pyde-dev cheatcodes/script, etc.) without per-site churn. Four
+      regression tests
+      (`audit_378_checked_read_slice_rejects_oversize_len`,
+      `audit_378_checked_read_slice_rejects_u32_overflow_len`,
+      `audit_378_checked_read_slice_accepts_max_in_bounds_len`,
+      `audit_378_checked_write_slice_rejects_oversize_data`) pin the
+      reject + boundary-accept behavior. The pre-existing audit-215
+      Memcpy pre-cast check (`vm.rs:1370-1374`) is now redundant with
+      the centralized check but kept as a defense-in-depth.
 - [x] 379 — CREATE deterministic address has no nonce —
       front-runnable address grabbing. **SHIPPED.** Pre-fix the
       PVM CREATE opcode derived its child address as
