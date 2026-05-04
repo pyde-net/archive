@@ -1845,8 +1845,18 @@ fn resolve_request_chain_id(supplied: Option<u64>, node_chain_id: u64) -> Result
 /// `send_encrypted_transaction`'s sender-FALCON binding (audit item
 /// 206). Split out as a pure function so the devnet/production
 /// branch is unit-testable without spinning up an `RpcServer`.
+///
+/// Audit 384: this enum is the single source of truth for the
+/// devnet-vs-production routing of encrypted-tx ingress. Three
+/// callers (RPC `send_encrypted_transaction`, RPC
+/// `send_raw_encrypted_transaction`, gossip ingress in `node.rs`)
+/// MUST go through `encrypted_tx_ingest_policy` rather than
+/// open-coding the match. Pre-fix the gossip path duplicated the
+/// match inline, so any future change to the structural-only
+/// devnet rule would need to be mirrored in three places — drift
+/// would silently re-open the length-only ingress on mainnet.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum EncryptedTxIngestPolicy {
+pub(crate) enum EncryptedTxIngestPolicy {
     /// Sender has an on-chain `Single` auth_key; route through full
     /// FALCON verification against it.
     Verify(Vec<u8>),
@@ -1864,7 +1874,7 @@ enum EncryptedTxIngestPolicy {
 /// sender's on-chain account (`None` means either no account or an
 /// account with `AuthKeys::None`). `chain_id == 31337` identifies
 /// devnet; any other chain_id is treated as production.
-fn encrypted_tx_ingest_policy(
+pub(crate) fn encrypted_tx_ingest_policy(
     sender_pk: Option<Vec<u8>>,
     chain_id: u64,
 ) -> EncryptedTxIngestPolicy {
@@ -2262,6 +2272,44 @@ mod tests {
                 chain_id
             );
         }
+    }
+
+    /// Audit 384: the `StructuralOnly` variant must NEVER appear on
+    /// any chain_id other than the devnet sentinel (31337). Sweep a
+    /// dense range of plausible chain_ids — including testnet (7331)
+    /// and the canonical mainnet candidates — to guard against any
+    /// future change widening the structural-only window. Pre-fix
+    /// the gossip path in `node.rs` open-coded the match, so a drift
+    /// between the RPC and gossip routing was the realistic failure
+    /// mode this test is designed to catch.
+    #[test]
+    fn ingest_policy_structural_only_is_devnet_exclusive() {
+        for chain_id in 0u64..=10_000 {
+            let policy = encrypted_tx_ingest_policy(None, chain_id);
+            if chain_id == 31337 {
+                continue; // not in range, but explicit for clarity
+            }
+            assert_ne!(
+                policy,
+                EncryptedTxIngestPolicy::StructuralOnly,
+                "chain_id {} must not produce StructuralOnly without auth_key",
+                chain_id,
+            );
+        }
+        // Spot-check the canonical chain_ids we actually care about.
+        for chain_id in [1u64, 7331, 100_000, 1_000_000, u64::MAX] {
+            assert_ne!(
+                encrypted_tx_ingest_policy(None, chain_id),
+                EncryptedTxIngestPolicy::StructuralOnly,
+                "chain_id {} must not produce StructuralOnly without auth_key",
+                chain_id,
+            );
+        }
+        // And confirm devnet IS the only chain that returns it.
+        assert_eq!(
+            encrypted_tx_ingest_policy(None, 31337),
+            EncryptedTxIngestPolicy::StructuralOnly,
+        );
     }
 
     #[test]

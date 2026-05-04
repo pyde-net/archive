@@ -1515,9 +1515,25 @@
       semaphore + 503 on saturation. `crates/node/src/faucet.rs:430-460`.
 - [ ] 383 — `pyde testnet --chain-id 1` not refused.
       `crates/node/src/genesis.rs:845-1368`.
-- [ ] 384 — Mempool `EncryptedTx` `add()` (structural-only) accepts
+- [x] 384 — Mempool `EncryptedTx` `add()` (structural-only) accepts
       sig length [500, 1000] — verify mainnet path always takes
       `Verify` or `Reject`, never `StructuralOnly`.
+      **SHIPPED.** The `encrypted_tx_ingest_policy` function in
+      `rpc.rs:1867` already mapped `(None, chain_id != 31337)` to
+      `Reject`, but the gossip ingress in `node.rs:1587` open-coded
+      the same `(sender_pk_opt, chain_id)` match inline — three
+      ingress sites, two implementations. A future change to the
+      devnet rule that updated only the RPC paths would silently
+      re-open the structural-only window on mainnet through gossip.
+      Fix promotes `EncryptedTxIngestPolicy` and
+      `encrypted_tx_ingest_policy` to `pub(crate)` and refactors
+      the gossip ingress to call the same function — single source
+      of truth across all three ingress sites. Adds
+      `ingest_policy_structural_only_is_devnet_exclusive` test that
+      sweeps `chain_id` over `[0, 10_000]` plus the canonical
+      mainnet/testnet/edge values (1, 7331, 100_000, 1_000_000,
+      u64::MAX) and asserts `StructuralOnly` is never returned for
+      `None` sender_pk except at chain_id 31337.
 - [ ] 385 — `prune_expired` clears + rebuilds `seen_hashes` on
       eviction. `crates/mempool/src/pool.rs:443-451`. Track removed
       hashes incrementally.
