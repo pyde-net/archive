@@ -50,8 +50,19 @@ impl NonceState {
         if nonce < self.base {
             return Err(NonceError::BelowWindow);
         }
-        if nonce >= self.base + WINDOW_SIZE {
-            return Err(NonceError::AboveWindow);
+        // Audit 386: `self.base + WINDOW_SIZE` overflows once `base` is
+        // within `WINDOW_SIZE` of `u64::MAX`. In debug builds that's a
+        // panic on a hot validation path; in release it wraps and the
+        // resulting comparison rejects valid nonces while accepting
+        // bogus ones near the wrap boundary. The right semantics:
+        // when the window would extend past `u64::MAX`, all remaining
+        // nonces in `[base, u64::MAX]` are still valid (there is no
+        // nonce greater than `u64::MAX` to reject), so a `checked_add`
+        // failure means "no upper-bound rejection."
+        if let Some(window_end) = self.base.checked_add(WINDOW_SIZE) {
+            if nonce >= window_end {
+                return Err(NonceError::AboveWindow);
+            }
         }
         let bit = (nonce - self.base) as u8;
         if self.used & (1 << bit) != 0 {
@@ -72,15 +83,31 @@ impl NonceState {
     /// Advance the window: skip over consecutive used nonces at the base.
     /// E.g., if base=100 and bits 0,1,2 are set, advance to base=103.
     fn advance(&mut self) {
+        // Audit 386: `self.base += 1` panics when `base == u64::MAX`. In
+        // practice this is unreachable (would require `u64::MAX` consumed
+        // nonces on a single account), but a bounded loop keeps the
+        // function total. Crucially we check the addition *before*
+        // shifting the bit out — otherwise we'd consume the slot from
+        // `used` without moving `base`, leaving the same nonce reusable.
         while self.used & 1 == 1 {
-            self.used >>= 1;
-            self.base += 1;
+            match self.base.checked_add(1) {
+                Some(b) => {
+                    self.used >>= 1;
+                    self.base = b;
+                }
+                None => break,
+            }
         }
     }
 
     /// The highest valid nonce in the current window.
     pub fn max_nonce(&self) -> u64 {
-        self.base + WINDOW_SIZE - 1
+        // Audit 386: `saturating_add` clamps the displayed upper bound
+        // at `u64::MAX` when `base` is within `WINDOW_SIZE - 1` of it.
+        // Used in the InvalidNonce error message rendered by
+        // `validate_nonce`, so the wallet sees a meaningful bound
+        // instead of a wrapped value.
+        self.base.saturating_add(WINDOW_SIZE - 1)
     }
 
     /// Number of available (unused) slots in the window.
@@ -287,5 +314,54 @@ mod tests {
     fn max_nonce() {
         let ns = NonceState::with_base(100);
         assert_eq!(ns.max_nonce(), 115);
+    }
+
+    // ========== Audit 386: u64::MAX overflow safety ==========
+
+    #[test]
+    fn validate_does_not_overflow_at_u64_max_base() {
+        // Pre-fix: `self.base + WINDOW_SIZE` panics in debug and wraps
+        // in release. Post-fix: `checked_add` returns `None`, the
+        // upper-bound check is skipped, and every nonce in
+        // `[base, u64::MAX]` is treated as in-window.
+        let ns = NonceState::with_base(u64::MAX - 5);
+        // Every nonce in [u64::MAX-5, u64::MAX] is valid (6 slots).
+        for n in (u64::MAX - 5)..=u64::MAX {
+            assert!(ns.is_valid(n), "nonce {} should be valid", n);
+        }
+        // Below-window still rejects.
+        assert_eq!(ns.validate(u64::MAX - 6), Err(NonceError::BelowWindow));
+    }
+
+    #[test]
+    fn validate_at_exact_u64_max_base() {
+        // Edge case: base == u64::MAX. Only u64::MAX itself is in window.
+        let ns = NonceState::with_base(u64::MAX);
+        assert!(ns.is_valid(u64::MAX));
+        assert_eq!(ns.validate(u64::MAX - 1), Err(NonceError::BelowWindow));
+    }
+
+    #[test]
+    fn advance_does_not_overflow_at_u64_max() {
+        // Pre-fix: `self.base += 1` panics when base reaches u64::MAX
+        // mid-advance. Post-fix: the loop breaks instead.
+        let mut ns = NonceState::with_base(u64::MAX);
+        ns.use_nonce(u64::MAX).unwrap();
+        // Base stays at u64::MAX (can't advance further), but the bit
+        // is consumed.
+        assert_eq!(ns.base, u64::MAX);
+        // Re-using the same nonce is still rejected.
+        assert_eq!(ns.validate(u64::MAX), Err(NonceError::AlreadyUsed));
+    }
+
+    #[test]
+    fn max_nonce_saturates_at_u64_max() {
+        // Pre-fix: `self.base + WINDOW_SIZE - 1` overflows.
+        // Post-fix: saturates at u64::MAX.
+        let ns = NonceState::with_base(u64::MAX - 5);
+        assert_eq!(ns.max_nonce(), u64::MAX);
+
+        let ns = NonceState::with_base(u64::MAX);
+        assert_eq!(ns.max_nonce(), u64::MAX);
     }
 }

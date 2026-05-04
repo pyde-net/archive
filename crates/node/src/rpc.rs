@@ -1417,16 +1417,24 @@ impl PydeApiServer for RpcServer {
         // (`WINDOW_SIZE = 16` per sender) instead of the wall-clock
         // submission rate.
         if let Some(ns) = &nonce_state_opt {
-            if enc_tx.nonce >= ns.base + pyde_account::nonce::WINDOW_SIZE {
-                return Err(rpc_err(
-                    -32008,
-                    format!(
-                        "encrypted-tx nonce {} is past the in-flight window [{}, {}); submit when prior nonces commit",
-                        enc_tx.nonce,
-                        ns.base,
-                        ns.base + pyde_account::nonce::WINDOW_SIZE,
-                    ),
-                ));
+            // Audit 386: `ns.base + WINDOW_SIZE` panics in debug and
+            // wraps in release once `base` is within `WINDOW_SIZE` of
+            // `u64::MAX`. `checked_add` returning `None` means the
+            // window naturally extends to `u64::MAX`, so every nonce
+            // `>= base` is in-window and we skip the upper-bound
+            // rejection.
+            if let Some(window_end) = ns.base.checked_add(pyde_account::nonce::WINDOW_SIZE) {
+                if enc_tx.nonce >= window_end {
+                    return Err(rpc_err(
+                        -32008,
+                        format!(
+                            "encrypted-tx nonce {} is past the in-flight window [{}, {}); submit when prior nonces commit",
+                            enc_tx.nonce,
+                            ns.base,
+                            window_end,
+                        ),
+                    ));
+                }
             }
             if enc_tx.nonce < ns.base {
                 return Err(rpc_err(

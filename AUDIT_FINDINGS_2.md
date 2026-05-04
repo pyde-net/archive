@@ -1485,9 +1485,24 @@
 - [ ] 385 — `prune_expired` clears + rebuilds `seen_hashes` on
       eviction. `crates/mempool/src/pool.rs:443-451`. Track removed
       hashes incrementally.
-- [ ] 386 — Encrypted nonce-window check at RPC ingress can
+- [x] 386 — Encrypted nonce-window check at RPC ingress can
       overflow on near-`u64::MAX` base. `crates/node/src/rpc.rs:1365`,
       `crates/account/src/nonce.rs:53`. Use `checked_add`.
+      **SHIPPED.** Four arithmetic sites converted to overflow-safe
+      forms: `NonceState::validate` (window-end), `NonceState::advance`
+      (base increment), `NonceState::max_nonce` (display upper bound),
+      and `send_raw_encrypted_transaction` ingress check. Pre-fix, a
+      base near `u64::MAX` would panic in debug or wrap in release; the
+      wrap caused valid nonces to be rejected and bogus ones near the
+      wrap boundary to be accepted. Post-fix semantics: when the math
+      overflows, the window naturally clamps at `u64::MAX` (no nonces
+      exist beyond it), so every nonce in `[base, u64::MAX]` is
+      in-window and the upper-bound check is skipped. The `advance`
+      loop now checks the addition *before* shifting the bit out of
+      `used` — otherwise it would consume the slot from the bitmap
+      without moving `base`, leaving the same nonce reusable. Four
+      regression tests cover `validate` at u64::MAX-near and exact
+      base, `advance` at u64::MAX, and `max_nonce` saturation.
 - [ ] 387 — `prompt_password` echoes input.
       `crates/pyde-dev/src/wallet.rs:291-298`. Use `rpassword`.
 - [ ] 388 — `is_localhost` uses `String::contains`.
