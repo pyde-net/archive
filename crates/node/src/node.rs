@@ -1583,10 +1583,25 @@ impl PydeNode {
                             };
                             let chain_id = chain.read().await.chain_id;
                             let mut relay = tx_relay.write().await;
-                            let accepted = match (sender_pk_opt, chain_id) {
-                                (Some(pk), _) => relay.receive_tx_verified(enc_tx, &pk),
-                                (None, 31337) => relay.receive_tx(enc_tx),
-                                (None, _) => {
+                            // Audit 384: route through the same
+                            // `encrypted_tx_ingest_policy` as the RPC
+                            // ingress so the devnet/production split
+                            // can't drift between the three call
+                            // sites. On any non-devnet chain_id this
+                            // function maps `None` sender_pk to
+                            // `Reject`, so the structural-only path
+                            // is unreachable on mainnet.
+                            let accepted = match crate::rpc::encrypted_tx_ingest_policy(
+                                sender_pk_opt,
+                                chain_id,
+                            ) {
+                                crate::rpc::EncryptedTxIngestPolicy::Verify(pk) => {
+                                    relay.receive_tx_verified(enc_tx, &pk)
+                                }
+                                crate::rpc::EncryptedTxIngestPolicy::StructuralOnly => {
+                                    relay.receive_tx(enc_tx)
+                                }
+                                crate::rpc::EncryptedTxIngestPolicy::Reject => {
                                     debug!(
                                         tx_hash = hex::encode(tx_hash),
                                         "dropped encrypted gossip tx: sender has no registered auth_key"
