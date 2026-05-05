@@ -32,6 +32,10 @@ hex = "0.4"
 # Wallet encryption
 aes-gcm = "0.10"
 rand = "0.8"
+# Audit 387: silent terminal input for password prompts so the
+# typed passphrase isn't echoed onto the operator's screen
+# (shoulder-surf / screencast leak).
+rpassword = "7"
 # Memory-hard KDF for keystore passphrases (audit 306).
 argon2 = "0.5"
 # Audit 358: Zeroizing<[u8; 32]> for the AES key derived from
@@ -44,6 +48,8 @@ pyde-tx = { path = "../tx" }
 # Deploy (RPC)
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Audit 388: exact-match host parsing for dev-key gate.
+url = "2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -323,13 +323,17 @@ fn load_keystore(name: &str) -> Result<Keystore, String> {
 }
 
 /// Prompt for password from stdin (no echo).
+///
+/// Audit 387: pre-fix this used `stdin().read_line` after a plain
+/// prompt write, which left the terminal in echoing mode — every
+/// keystroke of the wallet passphrase rendered to the screen.
+/// Anyone over the operator's shoulder, on a shared screen, or
+/// scrubbing back through a terminal recording could recover the
+/// passphrase verbatim. `rpassword::prompt_password` puts the TTY
+/// into no-echo mode for the duration of the read and restores
+/// afterwards, matching `sudo` / `ssh` UX.
 pub fn prompt_password(prompt: &str) -> Result<String, String> {
-    eprint!("{}", prompt);
-    let mut password = String::new();
-    std::io::stdin()
-        .read_line(&mut password)
-        .map_err(|e| format!("cannot read password: {}", e))?;
-    Ok(password.trim().to_string())
+    rpassword::prompt_password(prompt).map_err(|e| format!("cannot read password: {}", e))
 }
 
 /// Load a wallet by name, prompt for password, return the address hex.

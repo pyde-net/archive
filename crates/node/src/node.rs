@@ -177,7 +177,10 @@ impl PydeNode {
 
         // 1. Load validator identity early (needed for genesis funding)
         let early_validator_identity = if is_validator {
-            Some(load_validator_identity(datadir)?)
+            Some(load_validator_identity(
+                datadir,
+                self.config.node.chain_id,
+            )?)
         } else {
             None
         };
@@ -5738,7 +5741,25 @@ fn handle_swarm_event(
 /// The new key is saved encrypted iff `PYDE_VALIDATOR_PASSPHRASE`
 /// is set; otherwise it falls back to the legacy raw format
 /// (preserving devnet ergonomics).
-fn load_validator_identity(datadir: &Path) -> Result<ValidatorIdentity, String> {
+///
+/// Audit 395: silent regeneration on non-devnet chain_ids was an
+/// operator footgun. If a validator's `validator.key` got deleted,
+/// moved during a backup restore, or never made it into a fresh
+/// VM image, the node would silently mint a NEW keypair and
+/// rejoin under a different identity. From the chain's perspective
+/// this is a different validator (new pubkey → new
+/// derived address) — it can't sign on behalf of the original
+/// stake position, so the original validator stops voting and the
+/// chain quietly degrades to N-1 effective validators with no log
+/// signal that something is wrong. We now refuse to silently
+/// generate on non-devnet chain_ids and require the operator to
+/// explicitly opt in via `PYDE_INIT_VALIDATOR_KEY=1`. Devnet
+/// (`chain_id == 31337`) keeps the silent-generate ergonomics so
+/// laptop test infra doesn't have to set the env var.
+fn load_validator_identity(
+    datadir: &Path,
+    chain_id: u64,
+) -> Result<ValidatorIdentity, String> {
     let key_path = datadir.join("validator.key");
     let passphrase = std::env::var("PYDE_VALIDATOR_PASSPHRASE").ok();
 
@@ -5780,6 +5801,31 @@ fn load_validator_identity(datadir: &Path) -> Result<ValidatorIdentity, String> 
             (pk, sk)
         }
     } else {
+        // Audit 395: refuse to mint a fresh keypair on non-devnet
+        // chains unless the operator explicitly opted in. Devnet
+        // (`chain_id == 31337`) preserves the silent-generate
+        // ergonomics for laptop test infra.
+        let is_devnet = chain_id == pyde_net::discovery::DEVNET_CHAIN_ID;
+        let opted_in = std::env::var("PYDE_INIT_VALIDATOR_KEY")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        if !is_devnet && !opted_in {
+            return Err(format!(
+                "validator.key missing at {} on chain_id={} — refusing \
+                 to silently generate a NEW validator identity (audit 395). \
+                 If this is a fresh validator that should mint a new key, \
+                 re-run with PYDE_INIT_VALIDATOR_KEY=1. If this is an \
+                 existing validator whose key was lost or moved, restore \
+                 the original `validator.key` from backup before starting \
+                 — silently regenerating produces a new pubkey/address \
+                 the chain doesn't recognize as your stake position, \
+                 quietly degrading the network to N-1 effective \
+                 validators.",
+                key_path.display(),
+                chain_id
+            ));
+        }
+
         // Generate new validator key
         let (pk, sk) = pyde_crypto::falcon::falcon_keygen()
             .map_err(|e| format!("failed to generate validator key: {}", e))?;

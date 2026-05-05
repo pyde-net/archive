@@ -10,6 +10,7 @@
 use crate::types::{Account, AuthKeys};
 use pyde_crypto::falcon::{falcon_verify, FalconPublicKey, FalconSignature};
 use pyde_crypto::poseidon2::poseidon2_hash;
+use std::collections::BTreeSet;
 
 /// Authentication result.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +66,19 @@ pub fn validate_signature(account: &Account, message: &[u8], signatures: &[Vec<u
                 return AuthResult::Invalid;
             }
 
+            // Audit 389: dedup keys defensively. The `MultiSig` variant
+            // has public fields (no constructor invariant), so any
+            // caller could build a `keys: vec![k1, k1, k2]` set. With
+            // positional matching, that lets a single (k1, sig) pair
+            // satisfy two threshold positions — a 2-of-3 multisig
+            // collapses to 1-of-1 if k1 appears twice. We track which
+            // public-key bytes already counted toward the quorum and
+            // skip subsequent positions whose key is a repeat. The
+            // `from_bytes` constructor below also rejects duplicate
+            // keys at the deserialization boundary so stored state
+            // can never carry a duplicate; this dedup is the in-memory
+            // safety net.
+            let mut counted: BTreeSet<&[u8]> = BTreeSet::new();
             let mut valid_count = 0u32;
             for (i, pk_bytes) in keys.iter().enumerate() {
                 if i >= signatures.len() {
@@ -72,6 +86,11 @@ pub fn validate_signature(account: &Account, message: &[u8], signatures: &[Vec<u
                 }
                 if signatures[i].is_empty() {
                     continue; // skip non-signers
+                }
+                if !counted.insert(pk_bytes.as_slice()) {
+                    // duplicate key at a different position — already
+                    // counted, do not double-credit.
+                    continue;
                 }
                 let pk = match FalconPublicKey::from_bytes(pk_bytes) {
                     Some(pk) => pk,
@@ -206,6 +225,66 @@ mod tests {
         // 2 of 3 signatures — should pass
         let result = validate_signature(&account, message, &[sig1, sig2, vec![]]);
         assert_eq!(result, AuthResult::Valid);
+    }
+
+    /// Audit 389 regression: a `MultiSig` slate with the same key
+    /// repeated twice and threshold 2 must NOT validate when only
+    /// one signature is provided (with the same sig pasted into two
+    /// positions). Pre-fix, positional matching counted the (k1, sig)
+    /// pair twice and accepted the slate as 2-of-3 quorum. Post-fix,
+    /// the dedup-by-pubkey gate inside `validate_signature` only
+    /// credits k1 once even if it appears at multiple positions.
+    #[test]
+    fn multisig_duplicate_key_does_not_double_credit_audit_389() {
+        let (pk1, sk1) = falcon_keygen().unwrap();
+        let (pk2, _sk2) = falcon_keygen().unwrap();
+
+        let mut account = Account::new_eoa(pk1.as_bytes());
+        account.auth_keys = AuthKeys::MultiSig {
+            keys: vec![
+                pk1.as_bytes().to_vec(),
+                pk1.as_bytes().to_vec(), // duplicate
+                pk2.as_bytes().to_vec(),
+            ],
+            threshold: 2,
+        };
+
+        let message = b"multisig tx";
+        let sig1 = falcon_sign(&sk1, message).unwrap().as_bytes().to_vec();
+
+        // Same sig pasted into positions 0 AND 1 (both bound to pk1).
+        // Should be rejected because pk1 only counts once.
+        let result =
+            validate_signature(&account, message, &[sig1.clone(), sig1, vec![]]);
+        assert_eq!(
+            result,
+            AuthResult::Invalid,
+            "audit 389: duplicate key positions must not satisfy threshold"
+        );
+    }
+
+    /// Audit 389 regression: `AuthKeys::MultiSig::from_bytes` must
+    /// refuse a slate with duplicate keys at the deserialization
+    /// boundary, so persisted state can't carry an unsafe slate.
+    #[test]
+    fn authkeys_from_bytes_rejects_duplicate_multisig_keys_audit_389() {
+        let (pk1, _sk1) = falcon_keygen().unwrap();
+        let (pk2, _sk2) = falcon_keygen().unwrap();
+
+        let unsafe_slate = AuthKeys::MultiSig {
+            keys: vec![
+                pk1.as_bytes().to_vec(),
+                pk1.as_bytes().to_vec(), // duplicate
+                pk2.as_bytes().to_vec(),
+            ],
+            threshold: 2,
+        };
+        let bytes = unsafe_slate.to_bytes();
+        let decoded = AuthKeys::from_bytes(&bytes);
+        assert!(
+            decoded.is_none(),
+            "audit 389: from_bytes must reject MultiSig with duplicate keys"
+        );
     }
 
     #[test]

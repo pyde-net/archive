@@ -114,13 +114,22 @@ impl CompactBlock {
 }
 
 /// Generate a random nonce for short ID computation.
+///
+/// Audit 381: pre-fix this hashed `SystemTime::now()`, which is
+/// trivially predictable (an off-path observer with a rough clock
+/// can guess the nonce within microseconds). The short-ID hash is
+/// what protects compact-block transmission from collision attacks
+/// — a predictable nonce lets a Byzantine peer pre-compute a tx
+/// whose short ID collides with another peer's tx, forcing
+/// fallback `GetBlockTxs` round-trips and amplifying bandwidth.
+/// Now backed by the OS CSPRNG via `getrandom`, which is already
+/// a transitive dep through `rand` and exposed directly here.
 fn rand_nonce() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    // Mix timestamp with a counter for uniqueness
-    t.as_nanos() as u64 ^ (t.as_secs().wrapping_mul(0x517cc1b727220a95))
+    let mut buf = [0u8; 8];
+    // OS CSPRNG failure is unrecoverable for consensus security;
+    // panic rather than fall back to a predictable source.
+    getrandom::getrandom(&mut buf).expect("OS CSPRNG must be available for short-id nonce");
+    u64::from_le_bytes(buf)
 }
 
 /// Block body request: request missing transactions by short ID.
