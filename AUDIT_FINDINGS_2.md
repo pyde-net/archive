@@ -1808,6 +1808,53 @@
       slot 998 forever; post-fix the chain crossed the
       boundary and reached slot 1515 cleanly with QCs
       forming at every slot in the new epoch.
+- [x] 403 — Epoch randomness combine is non-deterministic across the
+      committee. Surfaced after audit 402 unblocked the slot 1000
+      boundary: longer 1h soak runs wedged at the *next* boundary
+      they happened to hit (slot 1999 in one run, slot 2999 in
+      another) with no `invalid VRF` / `qc_previous` errors. Per-node
+      log dumps showed two validators reporting `epoch=N
+      randomness=088436b4…` and the other two reporting `epoch=N
+      randomness=e3e4b11f…` for the same epoch — split-brain. Cause:
+      `on_randomness_share` finalized as soon as the dynamic threshold
+      (3-of-4 in devnet) was hit, but gossipsub delivers shares in
+      different orders across validators, so two nodes that saw
+      first {0,1,2} vs first {0,1,3} hashed those two different
+      sets to two different randomness bytes. Once randomness
+      diverged, half the committee computed VRF/proposals against
+      one value and the other half against the other — neither
+      side reached a 3-vote quorum and the chain stalled at the
+      first slot of the new epoch. Latent in audit 402's repro
+      because at the slot 1000 boundary epoch_randomness stays
+      `[0u8; 32]` (no shares are collected for epoch 1), so no
+      divergence; the bug only fires on the SECOND boundary
+      onward when fresh randomness lands. Diagnostic dumps live
+      at `/tmp/pyde-soak-node-{0..3}.log`; grep `epoch randomness
+      updated` for the divergent hex on the wedge run.
+      **SHIPPED.** Three coordinated changes:
+      (1) `combine_shares_with_threshold` now selects the
+      canonical subset — the `threshold` shares with the LOWEST
+      `validator_index` values — instead of combining every share
+      received. So two nodes that received different super-sets
+      converge on the same sub-set provided each has the
+      canonical members' shares.
+      (2) New `try_finalize_randomness_on_slot(slot)` on
+      `ValidatorEngine`. Driven by the node slot tick. Fires when
+      either (a) all `n` shares received, or (b) slot has crossed
+      `randomness_aggregation_trigger_slot =
+      collection_start_slot + RANDOMNESS_AGGREGATION_DELAY_SLOTS`
+      (20 slots ≈ 8s — orders of magnitude over realistic gossip
+      latency, still ~2% of an epoch). Same pattern as
+      `try_aggregate_reshare_on_slot` for cross-committee
+      resharing.
+      (3) `on_randomness_share` now buffers only and returns
+      `bool` — no race-against-gossip finalize. Both call paths
+      converge through the deterministic combine. Verified by
+      25-min soak: chain crosses slots 1000/2000/3000 cleanly to
+      slot 3710, all 4 nodes derive byte-identical randomness
+      for epochs 2/3/4 (`e1b80a7c…`, `337785f7…`, `3a93693e…`).
+      A 1h follow-up soak confirms the same across boundaries
+      4–6.
 
 ---
 
