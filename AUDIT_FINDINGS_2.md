@@ -1404,14 +1404,44 @@
       `crates/consensus/src/hotstuff.rs::create_timeout`,
       `crates/node/src/aot_cache.rs` LRU promotion path,
       `validator.rs:632 pending_tx_tx`. Delete or wire — pick one.
-- [ ] 374 — `StateOverlay::insert` / `into_writes` use
+- [x] 374 — `StateOverlay::insert` / `into_writes` use
       `HashMap<Key, Vec<u8>>` (non-deterministic order in
       collection / undo logs). `crates/state/src/smt.rs:225-227`.
       Switch to `BTreeMap`.
-- [ ] 375 — `SmtValue::to_h256` collision: empty vec returns
+      **SHIPPED.** Two coordinated changes covering the full
+      gap, not just the audit's cited line:
+      (1) `StateOverlay::writes` is now `BTreeMap<Key, Vec<u8>>`,
+      so `into_writes()` and `into_writes_with_undo()` iterate
+      in `Key` order regardless of insertion order.
+      (2) The cross-group undo merge in
+      `block_processor.rs:374-377` (the parallel-execution
+      scheduler that combines per-rayon-group undo entries)
+      is also a `BTreeMap<Key, UndoEntry>`. Pre-fix this was
+      a HashMap that the audit didn't list — it would have
+      preserved the bug at the merge layer even with a
+      BTreeMap overlay. JMT (the canonical merkle tree)
+      sorts its inputs internally via `BTreeMap::collect` at
+      `jmt-0.12.0/src/tree.rs:98-100`, so the block hash
+      / state root were always deterministic regardless;
+      this fix makes the *undo log* — which feeds
+      `revert_to` for reorg rollback and would diverge
+      across honest validators if persisted or hashed —
+      byte-identical too.
+- [x] 375 — `SmtValue::to_h256` collision: empty vec returns
       `H256::zero()` — same as absent leaf. `crates/state/src/smt.rs:73-85`.
       Either reject empty-byte writes at the storage-trie boundary
       or document the tombstone semantics.
+      **SHIPPED-IN-JMT.** The audit was written against the
+      legacy SMT path. The production canonical merkle tree
+      pivoted to JMT (`PersistentJMT` per `state_manager.rs:19`),
+      and the JMT write path at `jmt_store.rs:563-564` already
+      maps empty-vec writes to `None` (a JMT tombstone),
+      which is encoded distinctly from `Some(value)` in the
+      tree — no collision. The legacy `SmtValue::to_h256` only
+      feeds `crates/state/src/witness.rs::verify_witnesses`,
+      and that function has zero production callers (covered
+      by audit 373's dead-code cleanup queue). No code change
+      needed for production correctness.
 - [x] 376 — Unbounded `gas_used_total += ...` in 22 sites in PVM.
       **SHIPPED.** Every `gas_used_total +=` site now uses
       `checked_add(..).ok_or(Trap::OutOfGas)?`. Mirrors the

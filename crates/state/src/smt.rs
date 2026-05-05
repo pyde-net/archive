@@ -195,11 +195,23 @@ impl StateAccess for PydeSMT {
 }
 
 /// Lightweight state overlay for parallel execution.
-/// Reads from a shared base SMT (immutable), writes to a local HashMap.
+/// Reads from a shared base SMT (immutable), writes to a local BTreeMap.
 /// After execution, the writes are collected and batch-inserted into the real SMT.
 pub struct StateOverlay<'a> {
     base: &'a dyn StateAccess,
-    writes: std::collections::HashMap<Key, Vec<u8>>,
+    /// Audit 374: BTreeMap, not HashMap. The overlay backs both the
+    /// per-block SMT merge (`into_writes`) and the
+    /// undo-log construction (`into_writes_with_undo`). Pre-fix the
+    /// HashMap iteration order was non-deterministic across processes
+    /// (every Rust HashSet/HashMap reseeds its hasher on startup),
+    /// so two honest validators that produced the same WRITES could
+    /// observe them in different orders — the SMT merge order
+    /// affects the intermediate node hashes inside the trie, and the
+    /// undo log order affects the bytes used to hash the rewind
+    /// proof. Either is enough to fork the chain. BTreeMap iterates
+    /// in `Key` order regardless of insertion order, giving every
+    /// validator the same SMT batch and the same undo-log payload.
+    writes: std::collections::BTreeMap<Key, Vec<u8>>,
 }
 
 /// One pre-block undo entry: the value of `key` BEFORE the block
@@ -217,7 +229,7 @@ impl<'a> StateOverlay<'a> {
     pub fn new(base: &'a dyn StateAccess) -> Self {
         Self {
             base,
-            writes: std::collections::HashMap::new(),
+            writes: std::collections::BTreeMap::new(),
         }
     }
 
