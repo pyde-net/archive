@@ -833,41 +833,59 @@ impl PydeNode {
         // a 4-of-4 cluster with one node down + one node muted by
         // this clock skew dropped below 3-of-4 quorum and stalled.
         //
-        // For fresh-start (saved_head = 0) and for tests where the
-        // genesis block's timestamp is 0 (testnet generator
-        // doesn't stamp wall-clock), fall back to genesis-anchor
-        // == `now` so all freshly-spawned nodes' slot_clocks agree
-        // (they started within ms of each other).
+        // Audit 400: anchor the slot_clock to the genesis timestamp
+        // for BOTH fresh-start and resume paths. The previous
+        // fresh-start branch returned `0`, which made
+        // `SlotClock::with_block_time` fall back to anchoring slot 0
+        // at the per-node `Instant::now()` — a stagger between
+        // operators (4 minutes is enough) became hundreds of slots
+        // of permanent skew because each node's `current_slot()`
+        // walked from a different wall-clock origin. With genesis
+        // now stamped at bundle-generation time (see
+        // `generate_testnet`), every node can anchor its
+        // slot_clock at the SAME absolute Unix-ms regardless of
+        // when its host booted.
+        //
+        // Resume: prefer the head block's `header.timestamp` minus
+        // `head_slot * block_time_ms` (audit-399); fall back to
+        // `now - head_slot * block_time_ms` if the header was
+        // unstamped. Fresh start: read `genesis_config.timestamp`
+        // (`chain.header(0)` returns None because the genesis block
+        // isn't inserted into the chain's `headers` map). Final
+        // fallback ("anchor at now") only fires for legacy bundles
+        // with an unstamped genesis AND no saved head — i.e., the
+        // dev-loop / in-process-test case.
         let block_time_ms = self.config.consensus.block_time_ms;
         let now_ms_for_anchor = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let slot_clock_anchor_ms = if saved_head > 0 {
-            // Pull the head's block.timestamp from the in-memory
-            // chain (just restored from disk above). That timestamp
-            // is wall-clock at proposal — subtract head*block_time
-            // to get the original genesis instant.
-            let head_block_ts = chain
+        let head_block_ts = if saved_head > 0 {
+            chain
                 .read()
                 .await
                 .header(saved_head)
                 .map(|h| h.timestamp)
-                .unwrap_or(0);
-            if head_block_ts > 0 {
-                head_block_ts.saturating_sub(saved_head * block_time_ms)
-            } else {
-                // Block timestamp wasn't set (legacy/test). Fall
-                // back to the original backdate-from-now logic.
-                now_ms_for_anchor.saturating_sub(saved_head * block_time_ms)
-            }
+                .unwrap_or(0)
         } else {
-            // Fresh start: use 0 to make `with_block_time` anchor
-            // at `Instant::now()` — all peers spawned together
-            // share approximately the same instant.
+            genesis_config.timestamp
+        };
+        let slot_clock_anchor_ms = if head_block_ts > 0 {
+            head_block_ts.saturating_sub(saved_head * block_time_ms)
+        } else if saved_head > 0 {
+            now_ms_for_anchor.saturating_sub(saved_head * block_time_ms)
+        } else {
             0
         };
         let slot_clock = SlotClock::with_block_time(slot_clock_anchor_ms, block_time_ms);
+        info!(
+            saved_head,
+            head_block_ts,
+            slot_clock_anchor_ms,
+            now_ms = now_ms_for_anchor,
+            initial_slot = slot_clock.current_slot(),
+            "slot_clock initialized"
+        );
         let mut last_slot = slot_clock.current_slot();
 
         // Periodic timers

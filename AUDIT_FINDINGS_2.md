@@ -1685,6 +1685,40 @@
       re-keys the validator. `crates/node/src/node.rs:5181-5224`.
       Refuse on non-devnet `chain_id` unless explicit
       `--init-validator-key` flag.
+- [x] 400 — Slot clocks diverge by per-node startup wall-clock when
+      operators boot apart. `crates/node/src/genesis.rs:972`,
+      `crates/node/src/node.rs:846-869`.
+      **SHIPPED.** Surfaced by walking `docs/testnet-bringup.md`
+      end-to-end with a deliberate operator stagger. Pre-fix the
+      generator wrote `timestamp = 0` into `genesis.toml`, and
+      `node.rs`'s fresh-start branch returned `slot_clock_anchor_ms
+      = 0`, so `SlotClock::with_block_time` fell back to anchoring
+      slot 0 at each node's per-host `Instant::now()`. A 4-minute
+      stagger between operators became ~600 slots of permanent skew:
+      each node's `current_slot()` walked from a different
+      wall-clock origin, votes covered different
+      `(slot, block_hash)` tuples than what neighbors expected, the
+      "invalid vote signature" path fired hundreds of times per
+      second, and the chain silently stalled even though every node
+      individually looked healthy (peers connected, threshold key
+      loaded, RPC up). **Real-world severity**: any public testnet
+      where operators don't start within ~ms of each other would
+      silently fail to make progress — the runbook does not
+      mandate that. Post-fix the generator stamps
+      `genesis.timestamp = current_time_ms()`, every node anchors
+      its slot_clock to that absolute Unix-ms (regardless of
+      individual boot time), and `current_slot()` is the same
+      function of wall-clock across the network. Verified on a
+      4-validator local run with a 60-second deliberate stagger:
+      pre-fix saw 670+ "invalid vote signature" warnings and a
+      stuck chain at block 0; post-fix all four nodes anchored
+      identically (`slot_clock_anchor_ms=1777952611407`) and
+      produced 2.5 blocks/sec in lockstep with zero signature
+      errors. Adds `audit_400_generator_stamps_genesis_timestamp`
+      regression in the generator and an operational
+      "slot_clock initialized" info-log on every node startup so
+      operators can quickly confirm their anchor matches the
+      coordinator-supplied genesis timestamp.
 
 ---
 
