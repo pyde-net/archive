@@ -886,6 +886,26 @@ pub fn generate_testnet(
     if num_full_nodes > 16 {
         return Err("full_nodes must be 0..=16".into());
     }
+    // Audit 383: refuse to generate testnet artifacts for the
+    // mainnet chain_id. The `pyde testnet` command is intended
+    // for local devnets and the canonical public testnet
+    // (`chain_id == 7331`); accepting `chain_id == 1` would
+    // let an operator silently mint a fake mainnet genesis with
+    // arbitrary validator keys and a faucet pre-funded address.
+    // Anything signed against that genesis would carry the real
+    // mainnet chain_id and could be replayed onto mainnet later.
+    if chain_id == pyde_net::discovery::MAINNET_CHAIN_ID {
+        return Err(format!(
+            "refusing to generate testnet artifacts for chain_id={} \
+             (the canonical mainnet id) — `pyde testnet` is for \
+             devnets and the canonical public testnet \
+             (chain_id={}). Pick a different chain_id, or use the \
+             dedicated mainnet genesis ceremony when launching \
+             mainnet (audit 383).",
+            chain_id,
+            pyde_net::discovery::TESTNET_CHAIN_ID,
+        ));
+    }
 
     let total_nodes = num_validators + num_full_nodes;
     if let Some(addrs) = node_addrs {
@@ -1587,7 +1607,10 @@ mod tests {
                 port: 30305,
             },
         ];
-        generate_testnet(tmp.path(), 4, 0, 30303, 8545, true, 1, 400, Some(&addrs)).unwrap();
+        // Audit 383: chain_id=1 (mainnet) is now refused by
+        // `generate_testnet`. Use the canonical testnet id for
+        // tests that exercise the distributed-write surface.
+        generate_testnet(tmp.path(), 4, 0, 30303, 8545, true, pyde_net::discovery::TESTNET_CHAIN_ID, 400, Some(&addrs)).unwrap();
 
         // node-0's config must:
         //  - carry its own region/host as a comment header
@@ -1631,9 +1654,47 @@ mod tests {
             port: 1,
         }];
         // 4 validators but only 1 addr → mismatch
-        let err = generate_testnet(tmp.path(), 4, 0, 30303, 8545, true, 1, 400, Some(&addrs))
-            .unwrap_err();
+        // Audit 383: avoid chain_id=1 (mainnet) which is now refused.
+        let err = generate_testnet(
+            tmp.path(),
+            4,
+            0,
+            30303,
+            8545,
+            true,
+            pyde_net::discovery::TESTNET_CHAIN_ID,
+            400,
+            Some(&addrs),
+        )
+        .unwrap_err();
         assert!(err.contains("entries but expected"), "got: {err}");
+    }
+
+    /// Audit 383 regression: `pyde testnet --chain-id 1` (the canonical
+    /// mainnet id) must be refused. Pre-fix an operator could
+    /// silently mint a fake mainnet genesis with arbitrary validator
+    /// keys + a faucet pre-funded address; signed txs against it
+    /// could be replayed onto real mainnet later.
+    #[test]
+    fn generate_testnet_refuses_mainnet_chain_id_audit_383() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = generate_testnet(
+            tmp.path(),
+            4,
+            0,
+            30303,
+            8545,
+            true,
+            pyde_net::discovery::MAINNET_CHAIN_ID,
+            400,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("refusing to generate testnet artifacts"),
+            "expected mainnet refusal, got: {err}"
+        );
+        assert!(err.contains("audit 383"), "expected audit 383 ref, got: {err}");
     }
 
     /// Audit 400: the generator must stamp a real wall-clock
