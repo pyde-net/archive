@@ -1248,10 +1248,21 @@ impl ValidatorEngine {
         let slot = self.consensus.current_slot;
         let committee_size = self.committee_keys.len();
 
+        // Audit 402: same boundary-aware lookup as the verify path.
+        // Pre-fix this used `self.epoch_randomness` directly, which
+        // could be a stale value (the buffered next-epoch randomness
+        // hadn't been swapped in yet) or the wrong epoch's value.
+        // Result: proposers generated VRF proofs against a different
+        // randomness than verifiers used → every VRF check failed
+        // → view-change fallback fired every 20-50 slots → chain
+        // ran at ~25% throughput post-boundary. Routing through
+        // `epoch_randomness_for_slot(slot)` makes generator and
+        // verifier agree on the same input.
+        let randomness = self.epoch_randomness_for_slot(slot);
         match compute_candidacy(
             &identity.public_key,
             &identity.secret_key,
-            &self.epoch_randomness,
+            &randomness,
             slot,
             identity.address,
         ) {
