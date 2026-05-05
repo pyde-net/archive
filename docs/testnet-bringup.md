@@ -203,6 +203,10 @@ curl -s http://your-node:8545 -X POST -H 'Content-Type: application/json' \
 curl -s http://your-node:9090/metrics | grep -E 'pyde_finality_lag|pyde_block_lag'
 # pyde_finality_lag should stay under ~10 in steady state.
 # pyde_block_lag should stay under 5.
+#
+# For ongoing operator monitoring, the full dashboard is at
+# `deploy/grafana-pyde-testnet.json` and the on-call playbook
+# (panel-goes-red → recovery action) is at `docs/oncall.md`.
 
 # 5.4 — encrypted-tx pipeline alive
 # Submit a small encrypted-path test tx and confirm it commits.
