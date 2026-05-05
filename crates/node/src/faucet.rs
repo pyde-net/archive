@@ -46,6 +46,15 @@ use tokio::net::TcpListener;
 /// peak (entry size ≈ 100B at the worst case) stays bounded.
 const RATE_LIMITER_MAX_ENTRIES: usize = 50_000;
 
+/// Audit 382: ceiling on the number of in-flight requests that are
+/// allowed to be waiting on the signing-serialization lock at any
+/// moment. Beyond this, new requests get an immediate HTTP 503
+/// rather than queueing further. The signing path is intrinsically
+/// sequential (per-faucet nonce race) so adding queue capacity
+/// trades only memory; this cap pins the worst-case to single-digit
+/// MB even under sustained DoS.
+const MAX_FAUCET_QUEUE: usize = 16;
+
 /// Audit 347: a syntactically valid Pyde address is exactly
 /// `0x` + 64 hex digits (case-insensitive). Anything else is a
 /// malformed request and must be rejected BEFORE the rate-limiter
@@ -606,6 +615,22 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
     // in `send_faucet_tx` for the mempool-dedup interaction.
     let signing_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
 
+    // Audit 382: bound the queue depth on the signing serialization.
+    // The `signing_lock` mutex itself is unbounded — under DoS, every
+    // request that survives the per-IP and per-address rate limits
+    // queues on this mutex, and the queue grows linearly in spawned
+    // tokio tasks plus their captured Arc state until the runtime
+    // OOMs. The signing serialization is sequential by design (nonce
+    // race), so the only valid backpressure is to refuse new work
+    // when the queue is already deep. `signing_capacity` is a
+    // `Semaphore` with `MAX_FAUCET_QUEUE` permits; each handler
+    // calls `try_acquire_owned` before waiting on `signing_lock` and
+    // returns 503 if no permit is available. With `MAX_FAUCET_QUEUE
+    // = 16`, the worst-case queue depth on the lock is 16 (one
+    // active signer + 15 waiters), bounding RAM at single-digit MB.
+    let signing_capacity: Arc<tokio::sync::Semaphore> =
+        Arc::new(tokio::sync::Semaphore::new(MAX_FAUCET_QUEUE));
+
     let trust_xff = config.trust_x_forwarded_for;
 
     loop {
@@ -620,6 +645,7 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
         let from = from.clone();
         let signer = signer.clone();
         let signing_lock = signing_lock.clone();
+        let signing_capacity = signing_capacity.clone();
 
         tokio::spawn(async move {
             handle_connection(
@@ -632,6 +658,7 @@ pub async fn run_faucet(config: FaucetConfig) -> Result<(), String> {
                 amount,
                 signer,
                 signing_lock,
+                signing_capacity,
                 chain_id,
                 trust_xff,
             )
@@ -651,6 +678,7 @@ async fn handle_connection(
     amount: u64,
     signer: Arc<Option<FaucetSigner>>,
     signing_lock: Arc<tokio::sync::Mutex<()>>,
+    signing_capacity: Arc<tokio::sync::Semaphore>,
     chain_id: u64,
     trust_xff: bool,
 ) {
@@ -771,6 +799,7 @@ async fn handle_connection(
                     amount,
                     signer.as_ref().as_ref(),
                     &signing_lock,
+                    &signing_capacity,
                     chain_id,
                 )
                 .await
@@ -807,6 +836,7 @@ async fn handle_connection(
                         amount,
                         signer.as_ref().as_ref(),
                         &signing_lock,
+                        &signing_capacity,
                         chain_id,
                     )
                     .await
@@ -831,6 +861,7 @@ async fn serve_dispense(
     amount: u64,
     signer: Option<&FaucetSigner>,
     signing_lock: &tokio::sync::Mutex<()>,
+    signing_capacity: &Arc<tokio::sync::Semaphore>,
     chain_id: u64,
 ) -> String {
     // Both rate limits must pass. Check before dispense; record only
@@ -851,6 +882,25 @@ async fn serve_dispense(
             &format!(r#"{{"error":"ip rate limited","retryAfter":{}}}"#, secs),
         );
     }
+    // Audit 382: bound queue depth on the signing-serialization lock.
+    // `try_acquire_owned` is non-blocking; if the queue is full
+    // (`MAX_FAUCET_QUEUE` requests already waiting on `signing_lock`),
+    // shed load with HTTP 503 rather than letting tokio tasks pile
+    // up holding their captured Arc state.
+    let _queue_permit = match signing_capacity.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(
+                to = %address,
+                ip = %ip_key,
+                "faucet queue saturated — returning 503 (audit 382)"
+            );
+            return json_response(
+                503,
+                r#"{"error":"faucet queue saturated, retry shortly"}"#,
+            );
+        }
+    };
     match send_faucet_tx(rpc, from, address, amount, signer, signing_lock, chain_id).await {
         Ok(tx_hash) => {
             addr_limiter.record(address);

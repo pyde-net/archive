@@ -1549,10 +1549,32 @@
       collides with another peer's tx, forcing fallback
       `GetBlockTxs` round-trips and amplifying compact-block
       bandwidth.
-- [ ] 382 — Faucet `signing_lock` doesn't bound queue length;
+- [x] 382 — Faucet `signing_lock` doesn't bound queue length;
       semaphore + 503 on saturation. `crates/node/src/faucet.rs:430-460`.
-- [ ] 383 — `pyde testnet --chain-id 1` not refused.
+      **SHIPPED.** Added `signing_capacity:
+      Arc<tokio::sync::Semaphore>` with `MAX_FAUCET_QUEUE = 16`
+      permits alongside the existing `signing_lock`. Each
+      handler calls `try_acquire_owned` before waiting on the
+      lock; if no permit is available the request is shed
+      with HTTP 503 (`{"error":"faucet queue saturated, retry
+      shortly"}`). Worst-case waiter count is bounded to 16
+      → single-digit MB of queued tokio-task RAM under DoS,
+      vs unbounded growth pre-fix.
+- [x] 383 — `pyde testnet --chain-id 1` not refused.
       `crates/node/src/genesis.rs:845-1368`.
+      **SHIPPED.** `generate_testnet` now rejects
+      `chain_id == MAINNET_CHAIN_ID (1)` with an explicit
+      error directing the operator to the canonical testnet
+      id (7331) or the dedicated mainnet genesis ceremony.
+      Pre-fix an operator could silently mint a fake mainnet
+      genesis with arbitrary validator keys + a faucet pre-
+      funded address; anything signed against that genesis
+      carried the real mainnet `chain_id` and could be
+      replayed onto mainnet later. Two existing tests updated
+      to use `TESTNET_CHAIN_ID` instead of the hardcoded `1`,
+      plus a new regression test
+      (`generate_testnet_refuses_mainnet_chain_id_audit_383`)
+      pins the refusal contract.
 - [x] 384 — Mempool `EncryptedTx` `add()` (structural-only) accepts
       sig length [500, 1000] — verify mainnet path always takes
       `Verify` or `Reject`, never `StructuralOnly`.
