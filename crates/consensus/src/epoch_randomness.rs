@@ -126,32 +126,42 @@ fn combine_shares_with_threshold(
         return None;
     }
 
-    // Deduplicate by validator index
-    let mut seen = std::collections::HashSet::new();
-    let mut unique_shares: Vec<&RandomnessShare> = Vec::new();
+    // Audit 403: take the canonical subset — the `threshold` shares
+    // with the LOWEST `validator_index` values. Pre-fix, every share
+    // was combined regardless of count, so two validators with
+    // different gossip-arrival sets (e.g. {0,1,2} vs {0,1,3})
+    // produced different randomness for the same epoch — split-brain.
+    // Sorting by validator_index and truncating to threshold gives
+    // every node the SAME canonical set, provided each one has
+    // received the canonical members' shares. The
+    // `try_finalize_randomness_on_slot` deadline gate at the
+    // validator layer ensures gossip has converged before this
+    // function runs, so the canonical members' shares are present
+    // on every honest node.
+    let mut by_index: std::collections::BTreeMap<u8, &RandomnessShare> =
+        std::collections::BTreeMap::new();
     for share in shares {
-        if seen.insert(share.validator_index) {
-            unique_shares.push(share);
-        }
+        by_index.entry(share.validator_index).or_insert(share);
     }
-    if unique_shares.len() < threshold {
+    if by_index.len() < threshold {
         return None;
     }
 
-    // Sort shares by VRF output bytes (deterministic, order-independent)
-    let mut sorted_outputs: Vec<Hash256> = unique_shares
-        .iter()
-        .map(|s| s.vrf_output.to_hash())
-        .collect();
+    // Lowest `threshold` indices, in index order.
+    let canonical: Vec<&RandomnessShare> = by_index.values().take(threshold).copied().collect();
+
+    // Sort by VRF output bytes for last-revealer protection within
+    // the canonical subset (the input set is already deterministic;
+    // this just removes any in-set ordering signal).
+    let mut sorted_outputs: Vec<Hash256> = canonical.iter().map(|s| s.vrf_output.to_hash()).collect();
     sorted_outputs.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
-    // Combine: Poseidon2 hash of all sorted share outputs
     let combined = poseidon2_many(&sorted_outputs);
 
     Some(EpochRandomness {
         epoch,
         randomness: combined.to_bytes(),
-        share_count: unique_shares.len(),
+        share_count: canonical.len(),
     })
 }
 
@@ -208,6 +218,20 @@ impl RandomnessCollector {
     /// Number of shares collected so far.
     pub fn share_count(&self) -> usize {
         self.shares.len()
+    }
+
+    /// Whether we've collected a share from EVERY committee member.
+    /// When true, `finalize` is guaranteed deterministic across nodes
+    /// because the canonical-subset rule (lowest `threshold` indices)
+    /// resolves to the same set on every node.
+    pub fn has_full_set(&self) -> bool {
+        self.shares.len() >= self.committee_size
+    }
+
+    /// Active committee size for this collector. Drives the dynamic
+    /// threshold and the canonical-subset rule.
+    pub fn committee_size(&self) -> usize {
+        self.committee_size
     }
 
     /// Finalize: combine shares into epoch randomness using the

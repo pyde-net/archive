@@ -2101,6 +2101,24 @@ impl PydeNode {
                                 );
                             }
 
+                            // Audit 403: deterministically finalize the
+                            // buffered epoch-randomness shares once gossip
+                            // has had time to converge. Without this, every
+                            // node finalized on the FIRST 3-of-N shares it
+                            // saw — and gossipsub delivered those in
+                            // different orders to different validators,
+                            // producing split-brain randomness. The
+                            // canonical-subset combine inside the engine
+                            // makes this fire identically on every node.
+                            if let Some(new_randomness) =
+                                engine.try_finalize_randomness_on_slot(current_slot)
+                            {
+                                info!(
+                                    randomness = hex::encode(new_randomness),
+                                    "epoch randomness updated"
+                                );
+                            }
+
                             // Epoch boundary: rotate committee
                             let new_epoch = current_slot / pyde_consensus::block::EPOCH_LENGTH;
                             if new_epoch > prev_epoch && new_epoch > 0 {
@@ -4665,19 +4683,17 @@ fn handle_swarm_event(
                         {
                             match wire::decode_randomness_share(&message.data) {
                                 Ok((epoch, share)) => {
+                                    let validator_idx = share.validator_index;
                                     debug!(
                                         epoch,
-                                        validator = share.validator_index,
+                                        validator = validator_idx,
                                         "received randomness share"
                                     );
-                                    if let Some(new_randomness) = engine.on_randomness_share(share)
-                                    {
-                                        info!(
-                                            epoch,
-                                            randomness = hex::encode(new_randomness),
-                                            "epoch randomness updated"
-                                        );
-                                    }
+                                    // Audit 403: receiving a share only buffers it.
+                                    // Finalization is driven by the slot tick via
+                                    // `try_finalize_randomness_on_slot` so all nodes
+                                    // combine the same canonical set deterministically.
+                                    let _accepted = engine.on_randomness_share(share);
                                 }
                                 Err(e) => {
                                     debug!(error = e, "failed to decode randomness share");

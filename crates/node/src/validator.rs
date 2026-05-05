@@ -314,6 +314,18 @@ pub struct ValidatorEngine {
     pub pending_evidence: Vec<DoubleSignEvidence>,
     /// Epoch randomness collector (gathers VRF shares at epoch boundary).
     randomness_collector: Option<RandomnessCollector>,
+    /// Audit 403: slot at which `try_finalize_randomness_on_slot` is
+    /// allowed to combine the buffered shares. Set to
+    /// `current_slot + RANDOMNESS_AGGREGATION_DELAY_SLOTS` by
+    /// `start_epoch_randomness`. The delay closes the same race that
+    /// the resharing trigger closes: under async gossip, different
+    /// validators see different "first 3-of-4" arrival sets and used
+    /// to finalize on whichever set hit threshold first — producing
+    /// non-deterministic randomness across the committee. Waiting
+    /// for this trigger lets gossipsub deliver every member's share
+    /// to every node before we run the canonical-subset combine, so
+    /// all nodes agree on the same epoch randomness.
+    randomness_aggregation_trigger_slot: u64,
     /// PSS refresh contributions collected at epoch boundary.
     pss_contributions: Vec<RefreshContribution>,
     /// Target epoch for PSS refresh.
@@ -440,6 +452,7 @@ impl ValidatorEngine {
             last_qc_progress_ms: now_ms,
             last_seen_qc_slot: 0,
             randomness_collector: None,
+            randomness_aggregation_trigger_slot: 0,
             pss_contributions: Vec::new(),
             pss_target_epoch: 0,
             reshare_contributions: Vec::new(),
@@ -817,6 +830,20 @@ impl ValidatorEngine {
     /// contributions during the window.
     pub const RESHARE_AGGREGATION_DELAY_SLOTS: u64 = 5;
 
+    /// Audit 403: slots to wait between starting epoch-randomness
+    /// collection and combining the buffered shares. Same idea as
+    /// `RESHARE_AGGREGATION_DELAY_SLOTS` for resharing — under async
+    /// gossip the order in which 4-of-N shares arrive varies per
+    /// node, and finalizing on first threshold gave different nodes
+    /// different "first 3" subsets, producing non-deterministic
+    /// epoch randomness. Waiting this many slots lets gossipsub
+    /// fan out every share to every node, so the canonical-subset
+    /// combine resolves to identical bytes everywhere. 20 slots ≈ 8s
+    /// at 400ms/slot — orders of magnitude over realistic 4-node
+    /// localhost gossip latency, and still ~2% of an epoch so
+    /// randomness lands well before the next boundary needs it.
+    pub const RANDOMNESS_AGGREGATION_DELAY_SLOTS: u64 = 20;
+
     /// Snapshot the resharing state for disk persistence (task 034 crash
     /// safety). Returns `None` when nothing needs to be saved (engine is
     /// idle between rotations). Excludes the contribution pool — on
@@ -1188,55 +1215,104 @@ impl ValidatorEngine {
         collector.add_share(share.clone());
         self.randomness_collector = Some(collector);
 
+        // Audit 403: arm the deadline gate. `try_finalize_randomness_on_slot`
+        // will refuse to combine until the slot tick crosses this trigger,
+        // giving gossipsub time to deliver every member's share to every
+        // node before any node finalizes. Without this delay, finalize-
+        // on-first-threshold raced gossip and produced split-brain
+        // randomness across the committee.
+        self.randomness_aggregation_trigger_slot =
+            self.consensus.current_slot + Self::RANDOMNESS_AGGREGATION_DELAY_SLOTS;
+
         info!(epoch = next_epoch, "started epoch randomness collection");
         Some(share)
     }
 
-    /// Add a received randomness share from another committee member.
-    /// Returns the new epoch randomness if threshold reached.
-    pub fn on_randomness_share(&mut self, share: RandomnessShare) -> Option<[u8; 32]> {
-        let collector = self.randomness_collector.as_mut()?;
+    /// Audit 403: receive a randomness share. Buffers it in the
+    /// collector after verifying the FALCON proof — does NOT finalize.
+    /// Finalization happens deterministically in
+    /// `try_finalize_randomness_on_slot` once the deadline arrives.
+    /// Returns `true` if the share was new and accepted.
+    pub fn on_randomness_share(&mut self, share: RandomnessShare) -> bool {
+        let collector = match self.randomness_collector.as_mut() {
+            Some(c) => c,
+            None => return false,
+        };
 
         // Verify share against committee key
         let idx = share.validator_index as usize;
         if idx >= self.committee_keys.len() {
-            return None;
+            return false;
         }
-        let pk = pyde_crypto::falcon::FalconPublicKey::from_bytes(&self.committee_keys[idx])?;
+        let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&self.committee_keys[idx]) {
+            Some(pk) => pk,
+            None => return false,
+        };
         if !verify_share(&share, &pk, collector.epoch) {
             warn!(
                 epoch = collector.epoch,
                 validator = idx,
                 "invalid randomness share"
             );
+            return false;
+        }
+
+        collector.add_share(share)
+    }
+
+    /// Audit 403: deterministically finalize the buffered randomness.
+    /// Driven by the node slot tick. Two firing conditions:
+    ///
+    ///   (a) we've collected a share from EVERY committee member —
+    ///       gossip has converged, no need to wait further.
+    ///   (b) the slot tick has crossed the deadline trigger AND we
+    ///       have at least the dynamic threshold — gossip may not
+    ///       have fully converged but we have enough to combine,
+    ///       and waiting longer risks the next boundary overtaking
+    ///       this one.
+    ///
+    /// Both paths run the canonical-subset combine
+    /// (`combine_shares_with_threshold`), which selects the lowest
+    /// `threshold` shares by `validator_index`. So provided every
+    /// honest node has the canonical members' shares (case (a) is
+    /// trivially this; case (b) requires gossip convergence by the
+    /// trigger slot, which is the design contract), every node
+    /// produces identical bytes.
+    ///
+    /// Returns `Some(randomness)` exactly once per collector — once
+    /// finalized, the collector is cleared.
+    pub fn try_finalize_randomness_on_slot(&mut self, current_slot: u64) -> Option<[u8; 32]> {
+        let collector = self.randomness_collector.as_ref()?;
+        let n = self.committee_keys.len();
+        let threshold = quorum_for_committee(n);
+
+        let ready = if collector.has_full_set() {
+            true
+        } else if current_slot >= self.randomness_aggregation_trigger_slot
+            && collector.share_count() >= threshold
+        {
+            true
+        } else {
+            false
+        };
+        if !ready {
             return None;
         }
 
-        collector.add_share(share);
+        let result = collector.finalize()?;
+        info!(
+            epoch = result.epoch,
+            shares = result.share_count,
+            "epoch randomness combined (audit 403)"
+        );
 
-        // Check with dynamic threshold based on committee size
-        let threshold = quorum_for_committee(self.committee_keys.len());
-        if collector.share_count() >= threshold {
-            if let Some(result) = collector.finalize() {
-                info!(
-                    epoch = result.epoch,
-                    shares = result.share_count,
-                    "epoch randomness combined"
-                );
-                // Audit 402: buffer the freshly-combined randomness
-                // for the NEXT epoch instead of overwriting the
-                // current epoch's value mid-flight. The swap into
-                // `self.epoch_randomness` happens atomically at the
-                // next epoch boundary inside `rotate_to_epoch`, so
-                // any single epoch's VRF inputs stay constant from
-                // first slot to last — no proposer/verifier drift.
-                self.next_epoch_randomness = Some(result.randomness);
-                self.randomness_collector = None;
-                return Some(result.randomness);
-            }
-        }
-
-        None
+        // Audit 402: buffer for the NEXT epoch boundary — the swap
+        // into `self.epoch_randomness` happens atomically inside
+        // `rotate_to_epoch` so any single epoch's VRF inputs stay
+        // constant from first slot to last.
+        self.next_epoch_randomness = Some(result.randomness);
+        self.randomness_collector = None;
+        Some(result.randomness)
     }
 
     /// Compute VRF candidacy for the current slot.
