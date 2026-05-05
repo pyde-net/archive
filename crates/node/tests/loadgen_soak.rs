@@ -560,6 +560,67 @@ fn comprehensive_soak() {
         duration_s, target_tps, encrypted_pct
     );
     let measure_start = Instant::now();
+
+    // Watchdog: every 60s, snapshot per-node logs to disk and probe
+    // chain head. If head fails to advance for ≥120s, the workload
+    // task sees the wedge but the watchdog still has the on-disk
+    // logs from BEFORE the harness was killed — which is the data we
+    // need to debug epoch-boundary wedges.
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = {
+        let outputs: Vec<Arc<std::sync::Mutex<Vec<String>>>> =
+            net.nodes.iter().map(|n| n.output_handle()).collect();
+        let url = rpc_urls[0].clone();
+        let stop = Arc::clone(&stop_flag);
+        let blocking_client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("blocking client");
+        std::thread::spawn(move || {
+            let mut last_head: u64 = 0;
+            let mut stall_secs: u64 = 0;
+            let mut tick: u64 = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(5));
+                tick += 5;
+
+                // Probe head from node-0 synchronously.
+                let head = probe_head_blocking(&blocking_client, &url);
+                if head > 0 {
+                    if head == last_head {
+                        stall_secs += 5;
+                    } else {
+                        last_head = head;
+                        stall_secs = 0;
+                    }
+                }
+
+                // Every 60s: print head + dump per-node logs to disk.
+                if tick % 60 == 0 {
+                    eprintln!(
+                        "    [watchdog] head={} stall={}s",
+                        last_head, stall_secs,
+                    );
+                    for (i, out) in outputs.iter().enumerate() {
+                        if let Ok(buf) = out.lock() {
+                            let path = format!(
+                                "/tmp/pyde-soak-node-{}.log", i
+                            );
+                            let _ = std::fs::write(&path, buf.join("\n"));
+                        }
+                    }
+                }
+            }
+            // Final dump on exit (after run_workload ends).
+            for (i, out) in outputs.iter().enumerate() {
+                if let Ok(buf) = out.lock() {
+                    let path = format!("/tmp/pyde-soak-node-{}.log", i);
+                    let _ = std::fs::write(&path, buf.join("\n"));
+                }
+            }
+        })
+    };
+
     runtime.block_on(run_workload(
         &client,
         &rpc_urls,
@@ -574,20 +635,10 @@ fn comprehensive_soak() {
         true,
     ));
 
-    // Dump per-node output so a wedge-investigator can see what
-    // each validator was doing at the freeze point. Writes to
-    // /tmp/pyde-soak-node-N.log so they survive test cleanup.
-    for (i, node) in net.nodes.iter().enumerate() {
-        let snap = node.output_snapshot();
-        let path = format!("/tmp/pyde-soak-node-{}.log", i);
-        let _ = std::fs::write(&path, &snap);
-        eprintln!(
-            "dumped {} bytes from node-{} → {}",
-            snap.len(),
-            i,
-            path
-        );
-    }
+    // Stop watchdog and ensure final dump lands.
+    stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = watchdog.join();
+    eprintln!("    [watchdog] final dumps written to /tmp/pyde-soak-node-{{0..3}}.log");
     let measure_elapsed = measure_start.elapsed();
     let final_snapshot = metrics.snapshot();
     let measured = final_snapshot.minus(&warmup_snapshot);
@@ -1170,6 +1221,31 @@ async fn rpc_send_raw_encrypted_fast(
     } else {
         Ok(())
     }
+}
+
+/// Synchronous chain-head probe used by the watchdog thread.
+/// Returns 0 on any failure (RPC down, parse error) — the caller
+/// treats 0 as "no signal", not "stalled at slot 0".
+fn probe_head_blocking(client: &reqwest::blocking::Client, url: &str) -> u64 {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "pyde_blockNumber",
+        "params": [],
+    });
+    let resp = match client.post(url).json(&body).send() {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let v: serde_json::Value = match resp.json() {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let Some(s) = v.get("result").and_then(|r| r.as_str()) else {
+        return 0;
+    };
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    u64::from_str_radix(s, 16).unwrap_or(0)
 }
 
 async fn fetch_nonce(client: &reqwest::Client, url: &str, addr: &[u8; 32]) -> Option<u64> {

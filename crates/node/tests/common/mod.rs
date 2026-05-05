@@ -59,6 +59,13 @@ impl TestNode {
             .map(|o| o.join("\n"))
             .unwrap_or_else(|_| String::from("<poisoned>"))
     }
+
+    /// Cheap clone of the in-memory output handle. Lets a watchdog
+    /// thread snapshot logs concurrently with the test driver
+    /// without holding the `&TestNode` borrow.
+    pub fn output_handle(&self) -> Arc<Mutex<Vec<String>>> {
+        self.output.clone()
+    }
 }
 
 impl Drop for TestNode {
