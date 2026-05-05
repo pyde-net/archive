@@ -12,7 +12,14 @@ pub struct VrfOutput(Hash256);
 #[derive(Clone, Debug)]
 pub struct VrfProof(Vec<u8>);
 
-const VRF_DOMAIN_OUTPUT: &[u8] = b"pyde-vrf-output-v1";
+// Audit 393: separate domain tags per hash usage. Pre-fix, both
+// `compute_vrf_output`'s sk-fingerprint hash and its output hash
+// shared a single tag, so the two distinct cryptographic roles
+// (key-binding vs. output derivation) collapsed into the same
+// hash domain. Splitting them follows standard hash-domain-
+// separation hygiene and matches the audit recommendation.
+const VRF_FINGERPRINT_DOMAIN: &[u8] = b"pyde-vrf-sk-fingerprint-v1";
+const VRF_OUTPUT_DOMAIN: &[u8] = b"pyde-vrf-output-v1";
 const VRF_DOMAIN_PROOF: &[u8] = b"pyde-vrf-proof-v1";
 
 impl VrfOutput {
@@ -44,18 +51,21 @@ impl VrfProof {
 }
 
 /// Compute VRF output deterministically from secret key and input.
-/// The output is: Poseidon2(domain || sk_fingerprint || input)
-/// where sk_fingerprint = Poseidon2(domain || sk_bytes).
+/// The output is: Poseidon2(VRF_OUTPUT_DOMAIN || sk_fingerprint || input)
+/// where sk_fingerprint = Poseidon2(VRF_FINGERPRINT_DOMAIN || sk_bytes).
+/// Audit 393: the two hashes use distinct domain tags so the
+/// fingerprint can never be confused with an output value (or vice
+/// versa) by any analysis that depends on hash-domain separation.
 fn compute_vrf_output(sk: &FalconSecretKey, input: &[u8]) -> VrfOutput {
-    // Derive a deterministic fingerprint from the secret key
-    let mut sk_input = Vec::with_capacity(VRF_DOMAIN_OUTPUT.len() + sk.as_bytes().len());
-    sk_input.extend_from_slice(VRF_DOMAIN_OUTPUT);
+    // Derive a deterministic fingerprint from the secret key.
+    let mut sk_input = Vec::with_capacity(VRF_FINGERPRINT_DOMAIN.len() + sk.as_bytes().len());
+    sk_input.extend_from_slice(VRF_FINGERPRINT_DOMAIN);
     sk_input.extend_from_slice(sk.as_bytes());
     let sk_fingerprint = poseidon2_hash(&sk_input);
 
-    // Compute output = H(domain || fingerprint || input)
-    let mut output_input = Vec::with_capacity(VRF_DOMAIN_OUTPUT.len() + 32 + input.len());
-    output_input.extend_from_slice(VRF_DOMAIN_OUTPUT);
+    // Compute output = H(output_domain || fingerprint || input).
+    let mut output_input = Vec::with_capacity(VRF_OUTPUT_DOMAIN.len() + 32 + input.len());
+    output_input.extend_from_slice(VRF_OUTPUT_DOMAIN);
     output_input.extend_from_slice(sk_fingerprint.as_bytes());
     output_input.extend_from_slice(input);
     VrfOutput(poseidon2_hash(&output_input))

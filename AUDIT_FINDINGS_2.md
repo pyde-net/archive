@@ -1657,10 +1657,22 @@
       `audit_392_from_slice_short_returns_none`,
       `audit_392_from_slice_long_returns_none`) pin the
       reject-on-mismatch contract at slice boundaries.
-- [ ] 393 — VRF input domain reuse: `VRF_DOMAIN_OUTPUT` used for
+- [x] 393 — VRF input domain reuse: `VRF_DOMAIN_OUTPUT` used for
       both `sk_input` and `output_input`.
       `crates/crypto/src/vrf.rs:15-16, 49-62`. Split into
       `VRF_FINGERPRINT_DOMAIN` and `VRF_OUTPUT_DOMAIN`.
+      **SHIPPED.** `compute_vrf_output` now derives the
+      sk-fingerprint hash under `VRF_FINGERPRINT_DOMAIN` =
+      `b"pyde-vrf-sk-fingerprint-v1"` and the output hash under
+      `VRF_OUTPUT_DOMAIN` = `b"pyde-vrf-output-v1"`. Standard
+      hash-domain-separation hygiene — prevents any future
+      analysis from confusing the two distinct cryptographic
+      roles (key-binding vs. output derivation) by virtue of
+      sharing a hash tag. KAT vectors re-pinned (the output
+      changes mechanically because the fingerprint hash input
+      changes, and the FALCON proof signs `pk || input ||
+      output` so it changes too). 114 crypto tests pass + 141
+      consensus tests pass against the new vectors.
 - [x] 394 — `falcon_batch_verify` is a sequential `.all(...)`,
       not algebraic batch verification.
       `crates/crypto/src/falcon.rs:118-122`. Rename to
