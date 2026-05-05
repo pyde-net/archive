@@ -1,0 +1,271 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Pyde testnet operator dashboard. Pairs 1:1 with docs/oncall.md — every panel that can alert references a runbook row.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "icon": "doc",
+      "tags": [],
+      "title": "On-call playbook",
+      "tooltip": "What to do when a panel goes red",
+      "type": "link",
+      "url": "https://github.com/zarah-s/pyde/blob/main/docs/oncall.md"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "title": "Liveness — chain advancing?",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 100,
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Block height",
+      "description": "pyde_chain_head_slot. Should monotonically advance ~2.5 slots/sec.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 1},
+      "id": 1,
+      "targets": [{"expr": "pyde_chain_head_slot", "refId": "A"}],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Finality lag (slots)",
+      "description": "pyde_finality_lag. Alert: > 10 sustained → see oncall.md § finality-lag.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 1},
+      "id": 2,
+      "targets": [{"expr": "pyde_finality_lag", "refId": "A"}],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 5},
+              {"color": "red", "value": 10}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Block lag (slots)",
+      "description": "pyde_block_lag = network_tip − local_head. Alert: > 5 sustained → see oncall.md § block-lag.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 1},
+      "id": 3,
+      "targets": [{"expr": "pyde_block_lag", "refId": "A"}],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 3},
+              {"color": "red", "value": 5}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Peers connected",
+      "description": "pyde_peers_connected. Alert: < quorum-1 sustained → see oncall.md § peers-low.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 1},
+      "id": 4,
+      "targets": [{"expr": "pyde_peers_connected", "refId": "A"}],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 3},
+              {"color": "green", "value": 10}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Throughput",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "id": 101,
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Blocks/sec (1m rate)",
+      "description": "Healthy = 2.5/s. Below 1.5/s sustained → finality at risk.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "id": 5,
+      "targets": [{"expr": "rate(pyde_blocks_processed_total[1m])", "legendFormat": "blocks/s", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Transactions/sec (1m rate)",
+      "description": "Plaintext + encrypted, all txs that landed in committed blocks.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "id": 6,
+      "targets": [{"expr": "rate(pyde_transactions_processed_total[1m])", "legendFormat": "TPS", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Block gas used",
+      "description": "Gas budget headroom. Sustained near gas_ceiling = network at saturation.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 14},
+      "id": 7,
+      "targets": [{"expr": "pyde_block_gas_used", "legendFormat": "{{instance}}", "refId": "A"}]
+    },
+    {
+      "type": "row",
+      "title": "Mempool",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22},
+      "id": 102,
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Mempool size — plaintext",
+      "description": "pyde_mempool_size. Alert: sustained near 500K → mempool full, drops at ingress.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 23},
+      "id": 8,
+      "targets": [{"expr": "pyde_mempool_size", "legendFormat": "{{instance}}", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Mempool size — encrypted",
+      "description": "pyde_encrypted_mempool_size. Alert: sustained > 5K → decrypt pipeline backed up, see oncall.md § encrypted-mempool-grew.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 23},
+      "id": 9,
+      "targets": [{"expr": "pyde_encrypted_mempool_size", "legendFormat": "{{instance}}", "refId": "A"}]
+    },
+    {
+      "type": "row",
+      "title": "Latency",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 31},
+      "id": 103,
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Block processing time (p50 / p95 / p99)",
+      "description": "pyde_block_processing_ms. Healthy: p99 < 200ms. Slot budget: 400ms.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "id": 10,
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(pyde_block_processing_ms_bucket[5m])))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(pyde_block_processing_ms_bucket[5m])))", "legendFormat": "p95", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(pyde_block_processing_ms_bucket[5m])))", "legendFormat": "p99", "refId": "C"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "State commit time (p50 / p95 / p99)",
+      "description": "pyde_state_commit_ms. RocksDB commit latency. Spikes correlate with compaction.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "id": 11,
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(pyde_state_commit_ms_bucket[5m])))", "legendFormat": "p50", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(pyde_state_commit_ms_bucket[5m])))", "legendFormat": "p95", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(pyde_state_commit_ms_bucket[5m])))", "legendFormat": "p99", "refId": "C"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Anomalies — alert when non-zero",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 40},
+      "id": 104,
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Reorgs (5m rate, by outcome)",
+      "description": "pyde_reorgs_total. Any non-zero rate = chain instability. Alert: > 0 over 5m → see oncall.md § reorg.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 41},
+      "id": 12,
+      "targets": [{"expr": "rate(pyde_reorgs_total[5m])", "legendFormat": "{{outcome}}", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Missed proposals (5m rate)",
+      "description": "pyde_validator_missed_proposals_total. My-validator non-zero = liveness risk. Alert → see oncall.md § missed-proposals.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 41},
+      "id": 13,
+      "targets": [{"expr": "rate(pyde_validator_missed_proposals_total[5m])", "legendFormat": "missed/s", "refId": "A"}]
+    },
+    {
+      "type": "row",
+      "title": "RPC traffic",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 49},
+      "id": 105,
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "RPC requests/sec by method (top 5)",
+      "description": "pyde_rpc_requests_total. Top-5 methods. Spikes = abuse or legit usage spike.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 50},
+      "id": 14,
+      "targets": [{"expr": "topk(5, sum by (method) (rate(pyde_rpc_requests_total[1m])))", "legendFormat": "{{method}}", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "RPC error rate (5m)",
+      "description": "pyde_rpc_requests_total{outcome=\"error\"} / total. Alert: > 5% sustained → see oncall.md § rpc-errors.",
+      "datasource": {"type": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 50},
+      "id": 15,
+      "targets": [{"expr": "sum(rate(pyde_rpc_requests_total{outcome=\"error\"}[5m])) / sum(rate(pyde_rpc_requests_total[5m]))", "legendFormat": "error rate", "refId": "A"}]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["pyde", "testnet", "operator"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Pyde Testnet — Operator",
+  "uid": "pyde-testnet-operator",
+  "version": 1
+}
