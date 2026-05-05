@@ -133,6 +133,14 @@ The faucet key (`./testnet-bundle/faucet.key`) stays with whoever runs
 the faucet service (often the coordinator). It is NOT part of any
 operator bundle.
 
+The bundle root also contains an `accounts.json` file with the dev
+EOA private keys + the faucet keypair. This is intentional dev
+convenience for E2E test scripts — operators do NOT receive it.
+Keep it on the coordinator alongside `faucet.key`. (For an
+extra-paranoid public testnet, delete `accounts.json` after
+extracting whatever the faucet host needs; the dev EOAs aren't
+load-bearing.)
+
 ## 4. Operators: encrypt + start their node
 
 Each operator decrypts their bundle on their target host, then:
@@ -143,9 +151,15 @@ Each operator decrypts their bundle on their target host, then:
 #    re-keying the validator on-chain (`auth_key.rotate` flow).
 export PYDE_VALIDATOR_PASSPHRASE='your-strong-passphrase'
 
-# 2. First start: detects legacy raw-bytes validator.key, re-writes
-#    it encrypted, logs a single deprecation warning. Subsequent
-#    starts read the encrypted form silently.
+# 2. The bundle's validator.key is in legacy raw-bytes format.
+#    `pyde run` loads it and logs a deprecation warning every
+#    start until the file is re-saved encrypted. Today the
+#    encryption-on-first-load auto-upgrade is NOT wired (see
+#    audit 221) — the warning is informational and consensus
+#    proceeds normally. To silence it, rotate the validator key
+#    (auth_key.rotate flow) so the new key is generated locally
+#    *with* the passphrase set; the new keygen path writes
+#    encrypted by default.
 pyde run \
   --role validator \
   --config /var/lib/pyde/config.toml \
@@ -180,8 +194,10 @@ curl -s http://your-node:8545 -X POST -H 'Content-Type: application/json' \
 # 5.2 — committee complete
 curl -s http://your-node:8545 -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","method":"pyde_getValidators","params":[],"id":1}' \
-  | jq '.result | length'
+  | jq '.result.count'
 # Should print: 16
+# (`.result` is { count, validators }, not an array — `.result | length`
+# returns the field count of the object, which is always 2.)
 
 # 5.3 — finality progressing
 curl -s http://your-node:9090/metrics | grep -E 'pyde_finality_lag|pyde_block_lag'
