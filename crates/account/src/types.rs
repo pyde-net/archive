@@ -103,6 +103,19 @@ impl AuthKeys {
                     keys.push(data[offset..offset + klen].to_vec());
                     offset += klen;
                 }
+                // Audit 389: refuse duplicate keys at the
+                // deserialization boundary. With positional matching
+                // in `validate_signature`, duplicate keys in the slate
+                // would let one signer's (key, sig) pair count toward
+                // multiple threshold positions. Keys are FALCON-512
+                // public keys, so a "duplicate" is byte-equal pubkey
+                // bytes. Sort + adjacent-compare is O(N log N), fine
+                // for the tens-of-keys multisigs the variant supports.
+                let mut sorted: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+                sorted.sort();
+                if sorted.windows(2).any(|w| w[0] == w[1]) {
+                    return None;
+                }
                 Some(AuthKeys::MultiSig { keys, threshold })
             }
             _ => None,

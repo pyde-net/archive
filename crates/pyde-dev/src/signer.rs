@@ -175,12 +175,24 @@ fn load_wallet_signer(name: &str) -> Result<Signer, String> {
 }
 
 /// Check if an RPC URL points to localhost.
+///
+/// Audit 388: pre-fix this used `String::contains` on the
+/// lowercased URL, so `http://attacker.example/?ref=localhost`,
+/// `http://127.0.0.1.attacker.example/`, or
+/// `http://evil.example/127.0.0.1` all matched as localhost
+/// — which would unlock the devnet-auto-key fallback against
+/// an attacker-controlled RPC. We now parse the URL and exact-
+/// match the host component against the loopback set; anything
+/// that fails to parse is conservatively treated as non-local.
 fn is_localhost(url: &str) -> bool {
-    let lower = url.to_lowercase();
-    lower.contains("localhost")
-        || lower.contains("127.0.0.1")
-        || lower.contains("0.0.0.0")
-        || lower.contains("[::1]")
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    match parsed.host_str() {
+        Some(host) => matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "::1"),
+        None => false,
+    }
 }
 
 fn home_dir() -> std::path::PathBuf {

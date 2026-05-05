@@ -1508,9 +1508,17 @@
 - [ ] 380 — Heartbeat 400ms (matches slot time). Bump to 1 s once
       peer scoring + peer-book restoration stabilize the mesh
       post-restart. `crates/net/src/node.rs:118`.
-- [ ] 381 — `propagation::rand_nonce` uses SystemTime, not CSPRNG.
+- [x] 381 — `propagation::rand_nonce` uses SystemTime, not CSPRNG.
       `crates/net/src/propagation.rs:117-124`. Switch to
       `getrandom::getrandom` (already a dep).
+      **SHIPPED.** Now reads 8 bytes from `getrandom::getrandom`
+      and panics on OS CSPRNG failure (unrecoverable for
+      consensus security). Pre-fix the short-ID nonce was
+      trivially predictable from a wall-clock estimate; an
+      off-path peer could pre-compute a tx whose short ID
+      collides with another peer's tx, forcing fallback
+      `GetBlockTxs` round-trips and amplifying compact-block
+      bandwidth.
 - [ ] 382 — Faucet `signing_lock` doesn't bound queue length;
       semaphore + 503 on saturation. `crates/node/src/faucet.rs:430-460`.
 - [ ] 383 — `pyde testnet --chain-id 1` not refused.
@@ -1573,14 +1581,41 @@
       without moving `base`, leaving the same nonce reusable. Four
       regression tests cover `validate` at u64::MAX-near and exact
       base, `advance` at u64::MAX, and `max_nonce` saturation.
-- [ ] 387 — `prompt_password` echoes input.
+- [x] 387 — `prompt_password` echoes input.
       `crates/pyde-dev/src/wallet.rs:291-298`. Use `rpassword`.
-- [ ] 388 — `is_localhost` uses `String::contains`.
+      **SHIPPED.** Switched to `rpassword::prompt_password`,
+      which puts the TTY into no-echo mode for the duration
+      of the read. Pre-fix the wallet passphrase rendered to
+      the screen as it was typed — anyone over the operator's
+      shoulder, on a shared screen, or scrubbing a terminal
+      recording could recover the passphrase verbatim.
+- [x] 388 — `is_localhost` uses `String::contains`.
       `crates/pyde-dev/src/signer.rs:178-184`. Parse with
       `url::Url::host_str` and exact-match.
-- [ ] 389 — `account::auth::validate_signature` for MultiSig
+      **SHIPPED.** Now parses with `url::Url::parse` and
+      exact-matches the host component against the loopback
+      set `{localhost, 127.0.0.1, 0.0.0.0, [::1], ::1}`.
+      Pre-fix `String::contains("localhost")` matched
+      attacker URLs like `http://attacker.example/?ref=localhost`
+      or `http://127.0.0.1.attacker.example/`, which would
+      unlock the devnet-auto-key fallback against an
+      attacker-controlled RPC.
+- [x] 389 — `account::auth::validate_signature` for MultiSig
       doesn't dedup keys. `crates/account/src/auth.rs:60-94`.
       Cross-with #304 fix: invariant check at construction.
+      **SHIPPED.** Two coordinated changes:
+      (1) `validate_signature` now tracks which public-key
+      bytes already counted toward the quorum and skips
+      subsequent positions whose key is a repeat. With
+      positional matching, a `keys: vec![k1, k1, k2]` slate
+      previously let a single `(k1, sig)` pair satisfy two
+      threshold positions — collapsing 2-of-3 into 1-of-1
+      whenever k1 appeared twice. (2) `AuthKeys::from_bytes`
+      now refuses to deserialize a `MultiSig` variant whose
+      key list contains duplicates, so persisted state can
+      never carry an unsafe slate. Two regression tests
+      pinned (`multisig_duplicate_key_does_not_double_credit_audit_389`,
+      `authkeys_from_bytes_rejects_duplicate_multisig_keys_audit_389`).
 - [x] 390 — `NonceState::from_bytes` silently returns
       `Self::new()` on invalid input; should be `Option<Self>`.
       `crates/account/src/nonce.rs:100-113`.
@@ -1693,10 +1728,23 @@
       gate; deferred. Tests `verify_all_with_all_valid_returns_true`
       and `verify_all_with_one_invalid_returns_false` (renamed
       from the old `batch_verify_*` names) still pin behavior.
-- [ ] 395 — `validator.key` regeneration on missing file silently
+- [x] 395 — `validator.key` regeneration on missing file silently
       re-keys the validator. `crates/node/src/node.rs:5181-5224`.
       Refuse on non-devnet `chain_id` unless explicit
       `--init-validator-key` flag.
+      **SHIPPED.** `load_validator_identity` now takes
+      `chain_id` and refuses to mint a fresh keypair when
+      the file is missing on any non-devnet chain unless the
+      operator explicitly opts in via
+      `PYDE_INIT_VALIDATOR_KEY=1`. Pre-fix, a deleted /
+      mis-restored / never-provisioned `validator.key` would
+      silently mint a NEW keypair under a different identity —
+      the chain saw a different validator with a different
+      derived address that couldn't sign on behalf of the
+      original stake position, quietly degrading the network
+      to N-1 effective validators with no log signal.
+      Devnet (`chain_id == 31337`) keeps the silent-generate
+      ergonomics for laptop test infra.
 - [x] 400 — Slot clocks diverge by per-node startup wall-clock when
       operators boot apart. `crates/node/src/genesis.rs:972`,
       `crates/node/src/node.rs:846-869`.
