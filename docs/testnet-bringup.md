@@ -225,8 +225,11 @@ Once smoke passes:
 
 1. Stand up a public RPC fleet. Validator RPCs are loopback-bound by
    default. Run **separate full nodes** behind a load balancer with
-   TLS — never expose validator RPCs publicly. See
-   `crates/node/src/cli.rs` `Command::Run` `--role full-node`.
+   TLS — never expose validator RPCs publicly. The complete operator
+   playbook (topology, nginx template, X-Forwarded-For pairing,
+   recovery procedures) is at [`docs/public-rpc.md`](./public-rpc.md);
+   a drop-in nginx config is at
+   `deploy/nginx-pyde-rpc.conf.example`.
 2. Spin up the [pyde-explorer](../../pyde-explorer/) — its backend
    indexer needs `PYDE_RPC_URL` pointed at one full node, frontend
    `NEXT_PUBLIC_API_URL` pointed at the backend.
