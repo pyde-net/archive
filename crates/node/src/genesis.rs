@@ -967,9 +967,24 @@ pub fn generate_testnet(
         vesting: None,
     });
 
+    // Stamp the genesis with the bundle-generation wall-clock. Every
+    // validator's slot_clock anchors slot 0 to this absolute Unix-ms
+    // timestamp, so operators who boot their nodes minutes or hours
+    // apart still agree on `current_slot()` at any moment of wall-
+    // clock. Pre-fix this was hardcoded to 0, which made the node
+    // startup path fall back to anchoring slot 0 at the per-node
+    // `Instant::now()` — a 4-minute stagger between operators became
+    // 600 slots of permanent skew, votes failed signature
+    // verification because they covered different (slot, block_hash)
+    // tuples than what neighbors expected, and the chain silently
+    // stalled even though every node looked individually healthy.
+    let genesis_timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     let genesis_config = GenesisConfig {
         chain_id,
-        timestamp: 0,
+        timestamp: genesis_timestamp_ms,
         allocations,
         validators,
         initial_supply: String::new(),
@@ -1612,6 +1627,47 @@ mod tests {
         let err = generate_testnet(tmp.path(), 4, 0, 30303, 8545, true, 1, 400, Some(&addrs))
             .unwrap_err();
         assert!(err.contains("entries but expected"), "got: {err}");
+    }
+
+    /// Audit 400: the generator must stamp a real wall-clock
+    /// timestamp into `genesis.toml`. Pre-fix this was hardcoded to
+    /// 0, which made `node.rs` fall back to anchoring slot_clock at
+    /// per-node `Instant::now()` — staggered operator boots became
+    /// permanent slot-counter divergence and votes failed
+    /// signature verification because they covered different
+    /// (slot, block_hash) tuples than what neighbors expected.
+    #[test]
+    fn audit_400_generator_stamps_genesis_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        generate_testnet(tmp.path(), 4, 0, 30303, 8545, true, 31337, 400, None).unwrap();
+        let after_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let genesis_str = std::fs::read_to_string(tmp.path().join("genesis.toml")).unwrap();
+        let ts_line = genesis_str
+            .lines()
+            .find(|l| l.starts_with("timestamp"))
+            .expect("timestamp field present");
+        let ts: u64 = ts_line
+            .split('=')
+            .nth(1)
+            .and_then(|v| v.trim().parse().ok())
+            .expect("timestamp parses as u64");
+
+        assert!(
+            ts >= before_ms && ts <= after_ms,
+            "genesis timestamp {} should be in [{}, {}] (the wall-clock window of the call)",
+            ts,
+            before_ms,
+            after_ms,
+        );
+        assert!(ts > 0, "genesis timestamp must not regress to 0");
     }
 
     #[test]
