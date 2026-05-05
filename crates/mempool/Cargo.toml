@@ -8,6 +8,12 @@ edition = "2021"
 pyde-crypto = { path = "../crypto" }
 pyde-account = { path = "../account" }
 pyde-tx = { path = "../tx" }
+# Audit 401: parallelize the per-block threshold-decrypt loop in
+# `BlockDecryptor::decrypt_all`. Per-tx Lagrange combine + Kyber
+# decap + payload XOR is independent across txs (no shared state),
+# so par_iter scales linearly with core count up to the per-block
+# tx cap.
+rayon = "1.10"
 
 [lints]
 workspace = true
