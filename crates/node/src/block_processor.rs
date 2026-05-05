@@ -369,12 +369,26 @@ impl BlockProcessor {
             // and per-group undo entries (deduped — parallel groups touch
             // disjoint keys by scheduler invariant, but defensive dedupe
             // by key keeps things consistent if that invariant ever drifts).
+            //
+            // Audit 374: the per-key undo dedup map is BTreeMap, not HashMap.
+            // JMT's internal `BTreeMap` sort makes the canonical merkle
+            // root deterministic regardless of input order, so block hash
+            // is safe — but the undo log gets stored as-is and iterated
+            // by `revert_to` to roll back a reorged block. With HashMap,
+            // two validators observing the same parallel-execution result
+            // would persist undo logs in different byte orders. That
+            // diverges any node that hashes / snapshots / state-syncs
+            // the undo log, and even on nodes that don't, it makes
+            // crash-restore non-reproducible. BTreeMap keys all undo
+            // entries by `Key` order, matching the `StateOverlay::writes`
+            // BTreeMap so the whole pre-JMT pipeline is byte-identical
+            // across honest validators.
             let mut all_results: Vec<(usize, Receipt)> = Vec::new();
             let mut all_writes: Vec<(sparse_merkle_tree::H256, Vec<u8>)> = Vec::new();
-            let mut undo_by_key: std::collections::HashMap<
+            let mut undo_by_key: std::collections::BTreeMap<
                 pyde_state::smt::Key,
                 pyde_state::smt::UndoEntry,
-            > = std::collections::HashMap::new();
+            > = std::collections::BTreeMap::new();
 
             for (per_tx_results, group_undo) in group_results {
                 for (tx_idx, receipt, writes) in per_tx_results {
