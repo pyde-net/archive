@@ -1313,57 +1313,55 @@ json = false
             .map_err(|e| format!("failed to write config.toml: {}", e))?;
     }
 
-    // Write a run.sh convenience script
-    let mut run_script = String::from("#!/bin/bash\n# Auto-generated testnet launch script\n\n");
+    // Write a run.sh convenience script for local single-machine
+    // multi-process testing. Each node's `config.toml` already has
+    // `bootstrap_peers` baked in (post-task-078 distributed
+    // generator), so operators do NOT need to copy multiaddrs from
+    // each other at runtime — the script just spawns each node
+    // with `--config` + `--datadir` and lets the pre-baked
+    // bootstrap list do the wiring. Pre-fix this script echoed
+    // misleading `--bootstrap "<node-0-multiaddr>"` instructions
+    // for nodes 1+ that contradicted the runbook and caused
+    // operators to hesitate launching peers without a
+    // multiaddr-in-hand.
+    let mut run_script = String::from("#!/bin/bash\n# Auto-generated testnet launch script (local single-machine).\n# Each node's config.toml has bootstrap_peers baked in — no\n# manual multiaddr handoff required.\n\n");
     run_script.push_str("set -e\n\n");
-    run_script.push_str(&format!("TESTNET_DIR=\"{}\"\n\n", out_dir.display()));
+    run_script.push_str(&format!("TESTNET_DIR=\"{}\"\n", out_dir.display()));
+    run_script.push_str(&format!("LOG_DIR=\"{}/logs\"\n", out_dir.display()));
+    run_script.push_str("mkdir -p \"$LOG_DIR\"\n\n");
+    run_script.push_str("PIDS=()\n");
+    run_script.push_str(
+        "trap 'kill ${PIDS[@]} 2>/dev/null || true; wait 2>/dev/null || true' EXIT INT TERM\n\n",
+    );
 
     for i in 0..num_validators {
         let p2p_port = base_port + i as u16;
-        // Audit 398: stride-2 layout. The node binds two TCP ports
-        // per RPC: `rpc.port` (JSON-RPC) and `rpc.port + 1`
+        // Audit 398: stride-2 RPC layout. The node binds two TCP
+        // ports per RPC: `rpc.port` (JSON-RPC) and `rpc.port + 1`
         // (dedicated WebSocket subscription server, see
         // `node.rs::start_ws_server`). Pre-fix the per-node stride
-        // was 1, so node-0's WS port (`rpc + 1`) collided with
-        // node-1's RPC port — multi-node testnets failed to spawn
-        // with `Address already in use` on whichever child lost
-        // the bind race. With stride 2 each node owns two
-        // contiguous ports: `base + 2i` (RPC) + `base + 2i + 1`
-        // (WS). User-facing impact is minimal — single-node
-        // operators using `--base-rpc-port 8545` still get
-        // RPC=8545; only multi-node `pyde testnet` layouts shift.
+        // was 1, so node-0's WS port collided with node-1's RPC
+        // port — multi-node testnets failed to spawn with
+        // `Address already in use` on whichever child lost the
+        // bind race.
         let rpc_port = base_rpc_port + (i as u16) * 2;
         let node_dir = out_dir.join(format!("node-{}", i));
 
-        if i == 0 {
-            run_script.push_str(&format!(
-                "echo \"Starting node-0 (port {p2p_port}, RPC {rpc_port})...\"\n\
-                 pyde run --role validator --config \"{dir}/config.toml\" --datadir \"{dir}\"{dev} &\n\
-                 NODE0_PID=$!\n\
-                 sleep 2\n\n\
-                 # Get node-0's peer ID from its log output\n\
-                 echo \"Node-0 started (PID $NODE0_PID)\"\n\n",
-                p2p_port = p2p_port,
-                rpc_port = rpc_port,
-                dir = node_dir.display(),
-                dev = if dev_mode { " --dev" } else { "" },
-            ));
-        } else {
-            // Subsequent nodes bootstrap to node-0
-            // The actual multiaddr with peer ID must be provided at runtime
-            run_script.push_str(&format!(
-                "echo \"Starting node-{i} (port {p2p_port}, RPC {rpc_port})...\"\n\
-                 echo \"NOTE: Copy the bootstrap multiaddr from node-0's output and pass it:\"\n\
-                 echo \"  pyde run --role validator --config \\\"{dir}/config.toml\\\" --datadir \\\"{dir}\\\" --bootstrap \\\"<node-0-multiaddr>\\\"{dev}\"\n\n",
-                i = i,
-                p2p_port = p2p_port,
-                rpc_port = rpc_port,
-                dir = node_dir.display(),
-                dev = if dev_mode { " --dev" } else { "" },
-            ));
-        }
+        run_script.push_str(&format!(
+            "echo \"Starting node-{i} (p2p:{p2p_port} rpc:{rpc_port})...\"\n\
+             pyde run --role validator --config \"{dir}/config.toml\" --datadir \"{dir}\"{dev} > \"$LOG_DIR/node-{i}.log\" 2>&1 &\n\
+             PIDS+=($!)\n\n",
+            i = i,
+            p2p_port = p2p_port,
+            rpc_port = rpc_port,
+            dir = node_dir.display(),
+            dev = if dev_mode { " --dev" } else { "" },
+        ));
     }
 
+    run_script.push_str(
+        "echo \"All ${#PIDS[@]} validators started; logs in $LOG_DIR/. Ctrl-C to stop.\"\n",
+    );
     run_script.push_str("wait\n");
     let script_path = out_dir.join("run.sh");
     fs::write(&script_path, run_script).map_err(|e| format!("failed to write run.sh: {}", e))?;
@@ -1444,18 +1442,27 @@ json = false
         println!("  node-{}/validator.key — node {} signing key", i, i);
     }
     println!();
-    println!("To start:");
-    println!("  # Terminal 1 (node-0):");
+    println!("To start (local single-machine; configs already wire bootstrap_peers):");
+    println!(
+        "  # All-in-one (background, logs in {}/logs/):",
+        out_dir.display()
+    );
+    println!("  bash {}/run.sh", out_dir.display());
+    println!();
+    println!("  # Or manually, one terminal per node:");
     println!(
         "  pyde run --role validator --config {}/node-0/config.toml --datadir {}/node-0{}",
         out_dir.display(),
         out_dir.display(),
         if dev_mode { " --dev" } else { "" }
     );
-    println!();
-    println!("  # Terminal 2 (node-1 — copy bootstrap addr from node-0 output):");
-    println!("  pyde run --role validator --config {}/node-1/config.toml --datadir {}/node-1 --bootstrap \"<node-0-multiaddr>\"{}",
-        out_dir.display(), out_dir.display(), if dev_mode { " --dev" } else { "" });
+    println!(
+        "  pyde run --role validator --config {}/node-1/config.toml --datadir {}/node-1{}",
+        out_dir.display(),
+        out_dir.display(),
+        if dev_mode { " --dev" } else { "" }
+    );
+    println!("  # …and so on for node-2..N. No --bootstrap flag needed.");
     println!();
     println!("  # Faucet:");
     println!(
