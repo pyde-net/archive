@@ -228,6 +228,51 @@ pub struct ValidatorEngine {
     pub committee_keys: Vec<Vec<u8>>,
     /// Epoch randomness seed (for VRF proposer selection).
     pub epoch_randomness: [u8; 32],
+    /// Audit 402: committee public keys for the IMMEDIATELY-PRIOR
+    /// epoch. Pre-fix, when the chain crossed an epoch boundary
+    /// `set_committee` overwrote `committee_keys` with the new
+    /// committee. The first block of the new epoch (slot N where
+    /// `N % EPOCH_LENGTH == 0`) carries `qc_previous = QC(slot
+    /// N-1)` — signed by the OLD committee. Verifying that QC
+    /// against the NEW committee keys fails, no validator votes,
+    /// and the chain wedges forever. By keeping the prior epoch's
+    /// keys around for one slot past the boundary, the
+    /// `committee_keys_for_slot()` helper returns the right key
+    /// set for any QC whose slot fell in either the current or
+    /// the prior epoch. Caught by the 1-hour soak test
+    /// (`loadgen_soak.rs`); reproduces deterministically at slot
+    /// 1000 (= 1 × EPOCH_LENGTH).
+    pub prev_committee_keys: Vec<Vec<u8>>,
+    /// Audit 402: epoch randomness for the IMMEDIATELY-PRIOR
+    /// epoch. Same problem as `prev_committee_keys` but for VRF
+    /// verification — the proposer at the first slot of a new
+    /// epoch generated its VRF proof against the value of
+    /// `epoch_randomness` AT proposal time, but by the time the
+    /// validator verifies it, `epoch_randomness` has been
+    /// overwritten with the next epoch's randomness during the
+    /// boundary handler. The verifier looks up the right
+    /// randomness via `epoch_randomness_for_slot()`.
+    pub prev_epoch_randomness: [u8; 32],
+    /// Audit 402: which epoch this engine is currently aligned
+    /// with. The boundary handlers in `node.rs` advance this when
+    /// `set_committee` runs. Verification helpers compare
+    /// `slot / EPOCH_LENGTH` against this to decide whether to
+    /// use current or prior epoch's keys / randomness.
+    pub current_epoch: u64,
+    /// Audit 402: BUFFERED randomness for the next epoch. Pre-fix,
+    /// `on_randomness_share` directly overwrote
+    /// `self.epoch_randomness` whenever a randomness collector
+    /// finalized — typically a few slots after the rotation that
+    /// kicked off collection. That meant `self.epoch_randomness`
+    /// could mutate MID-EPOCH (between proposer's VRF generation
+    /// and verifier's VRF verification of the same slot's
+    /// proposal), so the same node would generate a VRF with one
+    /// value and verify it against another. Post-fix the share
+    /// finalize writes here; the swap into `self.epoch_randomness`
+    /// happens atomically inside `rotate_to_epoch` at the next
+    /// boundary, so any given epoch's slots all see the same
+    /// stable randomness.
+    pub next_epoch_randomness: Option<[u8; 32]>,
     /// Votes collected per slot.
     votes: HashMap<u64, SlotVotes>,
     /// View change messages collected per slot.
@@ -373,6 +418,12 @@ impl ValidatorEngine {
             timeout: TimeoutTracker::new(initial_target, now_ms),
             committee_keys: Vec::new(),
             epoch_randomness,
+            // Audit 402: prior-epoch caches start empty; populated
+            // by `rotate_to_epoch` at every boundary.
+            prev_committee_keys: Vec::new(),
+            prev_epoch_randomness: [0u8; 32],
+            current_epoch: 0,
+            next_epoch_randomness: None,
             votes: HashMap::new(),
             view_changes: HashMap::new(),
             finality_votes: HashMap::new(),
@@ -577,9 +628,79 @@ impl ValidatorEngine {
     }
 
     /// Set the committee keys for the current epoch.
+    ///
+    /// Audit 402: when called at an epoch boundary (i.e., the new
+    /// keys differ from the current set), the prior keys must be
+    /// preserved so QCs that signed the LAST slot of the prior
+    /// epoch can still be verified by the new committee. The
+    /// boundary handler in `node.rs` should call
+    /// `rotate_to_epoch(new_epoch, new_keys, new_randomness)`
+    /// instead of `set_committee` for the cleanest transition;
+    /// `set_committee` itself is kept for the genesis-bootstrap
+    /// path where `prev_committee_keys` stays empty.
     pub fn set_committee(&mut self, keys: Vec<Vec<u8>>) {
         info!(members = keys.len(), "committee keys loaded");
         self.committee_keys = keys;
+    }
+
+    /// Audit 402: atomic epoch-boundary rotation. Three things move
+    /// in lock-step:
+    ///
+    ///   1. Outgoing committee keys → `prev_committee_keys` so
+    ///      `qc_previous` (which signs the prior epoch's last slot)
+    ///      can still be verified against the right keys.
+    ///   2. Outgoing `epoch_randomness` → `prev_epoch_randomness`
+    ///      for the same reason on the VRF side.
+    ///   3. If `next_epoch_randomness` was buffered (from
+    ///      `on_randomness_share` finalizing during the prior
+    ///      epoch), it gets swapped into `epoch_randomness`. If no
+    ///      buffer is available, `epoch_randomness` keeps its prior
+    ///      value — degenerate but consistent: every node will use
+    ///      the same fallback so VRF still verifies, the chain just
+    ///      reuses entropy until the next collection finishes.
+    pub fn rotate_to_epoch(&mut self, new_epoch: u64, new_keys: Vec<Vec<u8>>) {
+        info!(
+            new_epoch,
+            members = new_keys.len(),
+            randomness_swapped = self.next_epoch_randomness.is_some(),
+            "epoch rotation: prior keys + randomness preserved for boundary verification"
+        );
+        self.prev_committee_keys = std::mem::take(&mut self.committee_keys);
+        self.prev_epoch_randomness = self.epoch_randomness;
+        self.committee_keys = new_keys;
+        if let Some(next) = self.next_epoch_randomness.take() {
+            self.epoch_randomness = next;
+        }
+        self.current_epoch = new_epoch;
+    }
+
+    /// Audit 402: return the committee keys that were active during
+    /// `slot`'s epoch. For `slot >= current_epoch * EPOCH_LENGTH`
+    /// returns the current committee. For slots in the immediately-
+    /// prior epoch (i.e., `current_epoch - 1`), returns the cached
+    /// prior keys. Slots older than that fall back to the current
+    /// committee — that's a degenerate case (we'd never legitimately
+    /// vote on a QC that old) but keeps the function total.
+    pub fn committee_keys_for_slot(&self, slot: u64) -> &[Vec<u8>] {
+        let slot_epoch = slot / pyde_consensus::block::EPOCH_LENGTH;
+        if slot_epoch + 1 == self.current_epoch && !self.prev_committee_keys.is_empty() {
+            &self.prev_committee_keys
+        } else {
+            &self.committee_keys
+        }
+    }
+
+    /// Audit 402: same boundary-aware lookup for VRF input
+    /// randomness. The proposer at slot N generated its VRF
+    /// against the randomness valid at slot N's epoch; the verifier
+    /// must use the same value or VRF verification fails.
+    pub fn epoch_randomness_for_slot(&self, slot: u64) -> [u8; 32] {
+        let slot_epoch = slot / pyde_consensus::block::EPOCH_LENGTH;
+        if slot_epoch + 1 == self.current_epoch && self.prev_epoch_randomness != [0u8; 32] {
+            self.prev_epoch_randomness
+        } else {
+            self.epoch_randomness
+        }
     }
 
     /// Start collecting epoch randomness shares for the next epoch.
@@ -1102,7 +1223,14 @@ impl ValidatorEngine {
                     shares = result.share_count,
                     "epoch randomness combined"
                 );
-                self.epoch_randomness = result.randomness;
+                // Audit 402: buffer the freshly-combined randomness
+                // for the NEXT epoch instead of overwriting the
+                // current epoch's value mid-flight. The swap into
+                // `self.epoch_randomness` happens atomically at the
+                // next epoch boundary inside `rotate_to_epoch`, so
+                // any single epoch's VRF inputs stay constant from
+                // first slot to last — no proposer/verifier drift.
+                self.next_epoch_randomness = Some(result.randomness);
                 self.randomness_collector = None;
                 return Some(result.randomness);
             }
@@ -1244,9 +1372,19 @@ impl ValidatorEngine {
         let vrf_output = pyde_crypto::vrf::VrfOutput::from_hash_bytes(vrf_output_bytes);
         let vrf_proof = VrfProof::from_bytes(vrf_proof_bytes);
 
-        // Build VRF input: epoch_randomness || slot
+        // Build VRF input: epoch_randomness || slot.
+        //
+        // Audit 402: use the randomness that was active at THIS
+        // slot's epoch, not the validator's `self.epoch_randomness`
+        // (which may have been overwritten by the boundary handler
+        // between proposal generation and proposal verification on
+        // the same node). At an epoch boundary this returns the
+        // prior epoch's randomness for the last slot of that epoch
+        // and the new epoch's randomness for the first slot of the
+        // new epoch — same lookup the proposer makes.
+        let slot_randomness = self.epoch_randomness_for_slot(slot);
         let mut vrf_input = Vec::with_capacity(40);
-        vrf_input.extend_from_slice(&self.epoch_randomness);
+        vrf_input.extend_from_slice(&slot_randomness);
         vrf_input.extend_from_slice(&slot.to_le_bytes());
 
         // Verify VRF proof
@@ -1745,6 +1883,18 @@ impl ValidatorEngine {
         // Audit 311: pass committee_keys so create_vote can verify the
         // FALCON signatures inside `header.qc_previous` before
         // promoting it into our HotStuff `highest_qc`.
+        //
+        // Audit 402: at an epoch boundary the qc_previous in this
+        // proposal was signed by the OUTGOING committee (whose last
+        // slot it covers). Look up the keys that were active at
+        // `qc_previous.slot`'s epoch — the prior-epoch cache holds
+        // them for one slot past the rotation, exactly the window
+        // we need for the boundary block. Clone to break the
+        // simultaneous immutable-borrow-of-self + mutable-borrow-
+        // of-self.consensus that `create_vote` requires.
+        let qc_keys: Vec<Vec<u8>> = self
+            .committee_keys_for_slot(header.qc_previous.slot)
+            .to_vec();
         match create_vote(
             self.chain_id,
             &mut self.consensus,
@@ -1752,7 +1902,7 @@ impl ValidatorEngine {
             identity.committee_index,
             identity.address,
             &identity.secret_key,
-            &self.committee_keys,
+            &qc_keys,
         ) {
             Ok(Some(vote)) => {
                 // create_vote mutated last_voted_slot and possibly highest_qc.

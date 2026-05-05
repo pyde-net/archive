@@ -1750,6 +1750,64 @@
       state apply via the access-list scheduler the plaintext
       path already runs) is tracked as a follow-up; it's the
       remaining 50–100 ms of the per-block budget.
+- [x] 402 — Chain liveness fails at epoch boundary under
+      sustained load. Caught by 1h soak test (`loadgen_soak.rs`).
+      Reproduces deterministically: chain produces blocks
+      cleanly for ~6.5 min then wedges at slot 999/1000 (= one
+      EPOCH_LENGTH = 1000-slot boundary). Two coupled failures:
+      (a) `failed to create vote slot=1000 error="invalid
+      qc_previous: signature verification failed"` — the new
+      committee verifies the block-1000 `qc_previous` (which
+      signs slot 999) against NEW-epoch committee keys, but
+      slot 999's QC was signed by the OLD committee → sig
+      verification fails → no vote created → no QC for slot
+      1000. (b) `invalid VRF proof from proposer slot=1000`
+      — VRF proof for the new-epoch proposer election uses
+      epoch-2 randomness (just installed by `epoch randomness
+      updated epoch=2`), but the proposer's VRF was produced
+      against epoch-1 randomness. Both are the same class of
+      bug: epoch-transition state desync. Once the chain
+      misses slot 1000's QC, every subsequent slot inherits
+      the same `qc_previous` problem and the chain never
+      recovers. Fix path: keep OLD-epoch committee keys +
+      randomness available for at least one slot past the
+      boundary, and have `verify_qc_previous` /
+      `verify_vrf` use the epoch context of the slot being
+      verified (not the validator's current-epoch context).
+      Diagnostic dumps from a 9-min repro live at
+      `/tmp/pyde-soak-node-{0..3}.log` (~500 MB each); search
+      for "invalid qc_previous" or "invalid VRF proof from
+      proposer". This is the gating bug for testnet launch
+      under sustained traffic — short-window loadgens
+      (<EPOCH_LENGTH × block_time = 400 s) miss it
+      entirely, and we shipped 18 PRs of audit fixes before
+      the 1-hour soak surfaced this in 7 minutes.
+      **SHIPPED.** Three coordinated changes in
+      `crates/node/src/validator.rs` + `node.rs`:
+      (1) New `prev_committee_keys`, `prev_epoch_randomness`,
+      `current_epoch`, and `next_epoch_randomness` fields on
+      `ConsensusEngine`. Boundary block verification now
+      consults the prior-epoch caches when `qc_previous.slot`
+      / proposal slot belong to the just-finished epoch.
+      (2) New `rotate_to_epoch(new_epoch, new_keys)` method:
+      atomically saves outgoing committee keys + randomness
+      into the prior caches and swaps the buffered
+      `next_epoch_randomness` (written by `on_randomness_share`
+      during the prior epoch) into `epoch_randomness` —
+      eliminating the proposer/verifier randomness drift that
+      wedged slot 1000 in the soak. The boundary handler in
+      `node.rs:2156` now calls `rotate_to_epoch` instead of
+      bare `set_committee`. (3) New helpers
+      `committee_keys_for_slot(slot)` and
+      `epoch_randomness_for_slot(slot)` return the right
+      key set / randomness for whichever epoch the slot
+      belongs to; the `create_vote` callsite at
+      `validator.rs::on_proposal` and the VRF verify at
+      `validate_block_header_internal` use them. Verified by
+      re-running the 9-min repro: pre-fix the chain stuck at
+      slot 998 forever; post-fix the chain crossed the
+      boundary and reached slot 1515 cleanly with QCs
+      forming at every slot in the new epoch.
 
 ---
 

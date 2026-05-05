@@ -573,6 +573,21 @@ fn comprehensive_soak() {
         Arc::clone(&metrics),
         true,
     ));
+
+    // Dump per-node output so a wedge-investigator can see what
+    // each validator was doing at the freeze point. Writes to
+    // /tmp/pyde-soak-node-N.log so they survive test cleanup.
+    for (i, node) in net.nodes.iter().enumerate() {
+        let snap = node.output_snapshot();
+        let path = format!("/tmp/pyde-soak-node-{}.log", i);
+        let _ = std::fs::write(&path, &snap);
+        eprintln!(
+            "dumped {} bytes from node-{} → {}",
+            snap.len(),
+            i,
+            path
+        );
+    }
     let measure_elapsed = measure_start.elapsed();
     let final_snapshot = metrics.snapshot();
     let measured = final_snapshot.minus(&warmup_snapshot);

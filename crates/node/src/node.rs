@@ -2153,7 +2153,21 @@ impl PydeNode {
                                                 }
                                             }
                                         }
-                                        engine.set_committee(new_keys.clone());
+                                        // Audit 402: rotate atomically — the engine
+                                        // (a) saves the outgoing committee keys +
+                                        //     epoch_randomness into prior-epoch
+                                        //     caches so the boundary block's
+                                        //     `qc_previous` (signed by the prior
+                                        //     committee) still verifies, and
+                                        // (b) swaps the buffered `next_epoch_randomness`
+                                        //     (written by `on_randomness_share`
+                                        //     during the prior epoch) into
+                                        //     `epoch_randomness` so the new epoch
+                                        //     starts with stable, agreed-upon VRF
+                                        //     input — eliminating the proposer/
+                                        //     verifier randomness drift that wedged
+                                        //     the chain at slot 1000 in the soak.
+                                        engine.rotate_to_epoch(new_epoch, new_keys.clone());
                                         info!(
                                             epoch = new_epoch,
                                             committee_size = committee.size(),
