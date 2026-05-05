@@ -1028,37 +1028,59 @@ pub fn try_decrypt_and_execute(
     // A tx that fails verification is dropped from the execution list
     // rather than aborting the whole block — matches the receipt-per-tx
     // failure model used elsewhere.
-    let mut verified_enc_indices: Vec<usize> = Vec::with_capacity(decryptor.encrypted_txs.len());
-    for (i, etx) in decryptor.encrypted_txs.iter().enumerate() {
-        let sender_key = pyde_state::keys::balance_key(&etx.sender);
-        let sender_pk: Option<Vec<u8>> = state
-            .get(&sender_key)
-            .and_then(|bytes| pyde_account::types::Account::from_bytes(&bytes))
-            .and_then(|acct| match acct.auth_keys {
-                pyde_account::types::AuthKeys::Single(pk) => Some(pk),
-                _ => None,
-            });
-        match sender_pk {
-            Some(pk) => {
-                if pyde_mempool::pool::Mempool::verify_signature_with_key(etx, &pk) {
-                    verified_enc_indices.push(i);
-                } else {
-                    warn!(
-                        slot,
-                        sender = hex::encode(etx.sender),
-                        "dropping encrypted tx with invalid FALCON signature — block may have been built by a byzantine proposer"
-                    );
+    // Audit 401: parallelize the per-tx FALCON verify against the
+    // sender's on-chain pubkey. Each iteration is a state read +
+    // FALCON-512 verify (≈ 5–10 ms per tx); pre-fix the sequential
+    // loop hit `n_txs * verify_ms` per block, capping the encrypted
+    // path at ~50 verifies per 200 ms slot budget. Post-fix par_iter
+    // scales with core count and matches the plaintext-path pattern
+    // at `block_processor.rs::process_block` line ~159. Warn-on-
+    // failure is thread-safe via `tracing`; we collect bool results
+    // and push verified indices in original order afterwards.
+    let verify_results: Vec<bool> = {
+        use rayon::prelude::*;
+        decryptor
+            .encrypted_txs
+            .par_iter()
+            .map(|etx| {
+                let sender_key = pyde_state::keys::balance_key(&etx.sender);
+                let sender_pk: Option<Vec<u8>> = state
+                    .get(&sender_key)
+                    .and_then(|bytes| pyde_account::types::Account::from_bytes(&bytes))
+                    .and_then(|acct| match acct.auth_keys {
+                        pyde_account::types::AuthKeys::Single(pk) => Some(pk),
+                        _ => None,
+                    });
+                match sender_pk {
+                    Some(pk) => {
+                        if pyde_mempool::pool::Mempool::verify_signature_with_key(etx, &pk) {
+                            true
+                        } else {
+                            warn!(
+                                slot,
+                                sender = hex::encode(etx.sender),
+                                "dropping encrypted tx with invalid FALCON signature — block may have been built by a byzantine proposer"
+                            );
+                            false
+                        }
+                    }
+                    None => {
+                        warn!(
+                            slot,
+                            sender = hex::encode(etx.sender),
+                            "dropping encrypted tx from sender with no registered auth key"
+                        );
+                        false
+                    }
                 }
-            }
-            None => {
-                warn!(
-                    slot,
-                    sender = hex::encode(etx.sender),
-                    "dropping encrypted tx from sender with no registered auth key"
-                );
-            }
-        }
-    }
+            })
+            .collect()
+    };
+    let verified_enc_indices: Vec<usize> = verify_results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, ok)| if *ok { Some(i) } else { None })
+        .collect();
 
     let decrypted_txs = match decryptor.decrypt_all() {
         Ok(t) => t,

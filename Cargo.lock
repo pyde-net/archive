@@ -3660,6 +3660,7 @@ dependencies = [
  "pyde-account",
  "pyde-crypto",
  "pyde-tx",
+ "rayon",
 ]
 
 [[package]]

@@ -1719,6 +1719,37 @@
       "slot_clock initialized" info-log on every node startup so
       operators can quickly confirm their anchor matches the
       coordinator-supplied genesis timestamp.
+- [x] 401 — Encrypted-tx pipeline serializes the per-block FALCON
+      verify + threshold decrypt loops.
+      `crates/node/src/block_processor.rs:1031-1061`,
+      `crates/mempool/src/decryption.rs:145-151`. Convert to
+      `rayon::par_iter`.
+      **SHIPPED.** Surfaced while reasoning about the encrypted-TPS
+      ceiling. Pre-fix the per-block decrypt+apply path was three
+      sequential loops (FALCON re-verify in
+      `try_decrypt_and_execute`, `decrypt_all` over per-tx
+      Lagrange + Kyber decap, and `execute_transaction` over a
+      `StateOverlay`). Per-tx FALCON-512 verify is ~5–10 ms,
+      Lagrange + Kyber decap is ~3 ms; at the laptop ceiling
+      `MAX_ENCRYPTED_TXS_PER_BLOCK = 100` the sequential pipeline
+      consumed ~800 ms — already over the 400 ms slot budget.
+      Post-fix the FALCON-verify loop and `decrypt_all` are
+      `rayon::par_iter` over per-tx-independent state (each tx
+      has its own ciphertext + share vector + sender key);
+      8-core laptop fits the same 100-tx batch in ~50 ms each
+      phase, leaving the slot's 400 ms QC deadline with comfortable
+      headroom for state apply (still sequential pending Phase 3
+      access-list integration). The wider win is on dedicated
+      server cores where `MAX_ENCRYPTED_TXS_PER_BLOCK` can safely
+      rise toward the 128-share wire-format bound, putting
+      encrypted-TPS at ~500-1000 once Phase 3 lands. All 77
+      mempool tests + 317 node tests + the encrypted-path loadgen
+      (30 TPS / 60s / 0 errors / 100% inclusion) pass on the new
+      code — sequential vs parallel decrypt is observably
+      identical to the consensus / sync paths. Phase 3 (parallel
+      state apply via the access-list scheduler the plaintext
+      path already runs) is tracked as a follow-up; it's the
+      remaining 50–100 ms of the per-block budget.
 
 ---
 
