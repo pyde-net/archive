@@ -1,0 +1,208 @@
+# Pyde public RPC reverse-proxy template.
+#
+# Architecture this is designed for:
+#
+#   internet → nginx (this config)
+#                 ↓ rate-limited, TLS-terminated, headers-normalized
+#               pyde --role full-node (loopback :8545 / :8546)
+#                 ↑ pulls block / state from validator peers via libp2p
+#
+# Validators MUST NOT have their JSON-RPC bound to a public interface;
+# this nginx fronts a *separate* full-node fleet. See `docs/public-rpc.md`
+# for the full topology + operator playbook.
+#
+# Fill in the CHANGE_ME tokens below before deploying:
+#   - server_name (your public DNS)
+#   - ssl_certificate / ssl_certificate_key (your TLS cert chain)
+#   - upstream pyde_rpc / pyde_ws addresses if you're load-balancing more
+#     than one full-node behind this proxy
+#
+# Pairs with audit 348: this config sets a single trusted X-Forwarded-For
+# entry that the pyde faucet / RPC ingress can read for per-IP
+# rate-limiting. The proxy STRIPS any inbound XFF before adding its own
+# (otherwise an attacker can forge their client IP).
+
+# ────────────────────────────────────────────────────────────────────
+# Rate-limit zones — sized for ~10K active users / public testnet.
+# ────────────────────────────────────────────────────────────────────
+#
+# Method classes:
+#   • Cheap read   (getBalance, getNonce, blockNumber, chainId, …):
+#     stateless, sub-ms response. 100 req/s/IP burst-200.
+#   • Medium read  (getBlockByNumber, getReceipt, getLogs):
+#     touches block store. 30 req/s/IP burst-60.
+#   • Expensive    (call, estimateGas, createAccessList):
+#     runs the VM against current state. 10 req/s/IP burst-20.
+#   • Write        (sendRawTransaction, sendRawEncryptedTransaction):
+#     hits mempool ingress + relay. 10 req/s/IP burst-20.
+#       Note: encrypted-tx ingress already does its own per-sender
+#       rate-limit at the mempool layer (audit 027). This zone is the
+#       outer wall against IP-level flooding.
+#   • Subscription (WebSocket /ws): 1 req/s/IP burst-3 — opening a
+#     subscription is cheap but each long-lived connection holds
+#     resources. Connection cap below tightens this further.
+#
+# Tuning: bump zone sizes if you exceed ~10K unique IPs in a 60s
+# window. Each zone entry costs ~64 bytes; 1m = ~16K entries.
+limit_req_zone $binary_remote_addr zone=rpc_cheap:1m   rate=100r/s;
+limit_req_zone $binary_remote_addr zone=rpc_medium:1m  rate=30r/s;
+limit_req_zone $binary_remote_addr zone=rpc_expensive:1m rate=10r/s;
+limit_req_zone $binary_remote_addr zone=rpc_write:1m    rate=10r/s;
+limit_req_zone $binary_remote_addr zone=rpc_subscribe:1m rate=1r/s;
+
+# Per-IP concurrent connection cap. WebSocket subscriptions count
+# here, so a misbehaved client can't open 1000s of long-lived sockets.
+limit_conn_zone $binary_remote_addr zone=conn_per_ip:1m;
+
+# ────────────────────────────────────────────────────────────────────
+# Upstream — replace with your full-node fleet IPs/hostnames.
+# ────────────────────────────────────────────────────────────────────
+upstream pyde_rpc {
+    # least_conn is the right policy for JSON-RPC: requests vary in
+    # cost (cheap balance reads vs expensive eth_call), and least_conn
+    # routes new requests to whichever upstream is least busy.
+    least_conn;
+    server 127.0.0.1:8545 max_fails=3 fail_timeout=10s;
+    # server CHANGE_ME_FULLNODE_2:8545 max_fails=3 fail_timeout=10s;
+    # server CHANGE_ME_FULLNODE_3:8545 max_fails=3 fail_timeout=10s;
+    keepalive 32;
+}
+
+upstream pyde_ws {
+    least_conn;
+    # WebSocket lives on rpc_port + 1 (audit 398's stride-2 layout).
+    server 127.0.0.1:8546 max_fails=3 fail_timeout=10s;
+    # server CHANGE_ME_FULLNODE_2:8546 max_fails=3 fail_timeout=10s;
+    keepalive 32;
+}
+
+# ────────────────────────────────────────────────────────────────────
+# JSON-RPC method classifier — a $rpc_zone variable is computed from
+# the request body so we can route different methods to different
+# rate-limit zones with one server block. Reads the JSON body on the
+# fly via `map` + `set_request_body` is not nginx-native; instead we
+# match by URI prefix or by the X-Pyde-Method client-supplied hint.
+#
+# Operators who want method-level rate-limiting should use the OpenResty
+# extension or front the upstream with a small shim that sets the
+# zone as a header. For the basic config below we apply a single
+# rate-limit (rpc_cheap) at the top level; tighten per-method limits
+# at the application layer (validator node already enforces them).
+# ────────────────────────────────────────────────────────────────────
+
+# ────────────────────────────────────────────────────────────────────
+# HTTPS server block.
+# ────────────────────────────────────────────────────────────────────
+server {
+    listen 443 ssl http2;
+    server_name CHANGE_ME_RPC_HOST;  # e.g. rpc.testnet.pyde.network
+
+    # TLS — use Let's Encrypt + certbot, or your CA's chain.
+    ssl_certificate     /etc/letsencrypt/live/CHANGE_ME_RPC_HOST/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/CHANGE_ME_RPC_HOST/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:TLS:10m;
+    ssl_session_tickets off;
+
+    # ────────────── Hardening defaults ──────────────
+
+    # Body-size cap. The encrypted-tx wire format (audit 301) is at
+    # most ~12 KB (Kyber-768 ciphertext + FALCON sig + access list).
+    # Plaintext txs are smaller. 64K leaves comfortable headroom for
+    # eth_call requests with calldata, well below "attacker streams
+    # GB to OOM the server."
+    client_max_body_size 64k;
+    client_body_buffer_size 64k;
+    client_body_timeout 10s;
+
+    # Request line + header caps. Default nginx caps are higher;
+    # tightening reduces reflection/amplification surface.
+    large_client_header_buffers 4 16k;
+    client_header_timeout 10s;
+
+    # Slowloris defenses. Keep-alive timeout pairs with the upstream
+    # `keepalive 32` — long enough for connection reuse, short enough
+    # that idle attackers can't pin sockets indefinitely.
+    keepalive_timeout 30s;
+    send_timeout 30s;
+
+    # Per-IP concurrent connection cap. 50 covers a single user with
+    # multiple browser tabs + a wallet doing background polling.
+    # Past 50 = scripting / abuse. Adjust upward if you support
+    # high-fanout dapps.
+    limit_conn conn_per_ip 50;
+
+    # Hide nginx version + tighten common header reflection.
+    server_tokens off;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # ────────────── X-Forwarded-For for audit 348 ──────────────
+    #
+    # The pyde faucet / RPC ingress reads the rightmost untrusted hop
+    # in `X-Forwarded-For` as the client IP for rate-limiting (audit
+    # 348). For that to be safe, this proxy MUST strip any inbound
+    # `X-Forwarded-For` header from the client and add its own.
+    # Otherwise an attacker can fake their client IP and bypass
+    # per-IP rate limits.
+    proxy_set_header X-Forwarded-For $remote_addr;  # override, do not append
+    proxy_set_header X-Real-IP       $remote_addr;
+    proxy_set_header Host            $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # ────────────── JSON-RPC over HTTPS ──────────────
+    location / {
+        # Default zone — most requests are cheap reads. Operators
+        # who need method-level limits can add an OpenResty/Lua
+        # classifier here. The validator node enforces stricter
+        # caps at the application layer.
+        limit_req zone=rpc_cheap burst=200 nodelay;
+
+        # Health-check whitelist — let load-balancer probes through
+        # without rate-limit collisions.
+        if ($request_uri = "/health") {
+            return 200 "ok\n";
+        }
+
+        proxy_pass http://pyde_rpc;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        # Read timeout — covers slow `eth_call` execution. The
+        # validator's per-call gas budget bounds wall time, but
+        # encrypted-tx submission paths involve threshold ops
+        # that can take ~50ms. 30s is comfortable.
+        proxy_read_timeout 30s;
+        proxy_send_timeout 30s;
+        proxy_connect_timeout 5s;
+    }
+
+    # ────────────── WebSocket subscriptions ──────────────
+    location /ws {
+        limit_req zone=rpc_subscribe burst=3 nodelay;
+
+        proxy_pass http://pyde_ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # WebSocket connections are long-lived; loosen the read
+        # timeout. Heartbeats from the client / `pyde_subscribe`
+        # confirmations from the server keep the channel active.
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+}
+
+# ────────────────────────────────────────────────────────────────────
+# HTTP → HTTPS redirect.
+# ────────────────────────────────────────────────────────────────────
+server {
+    listen 80;
+    server_name CHANGE_ME_RPC_HOST;
+    return 301 https://$host$request_uri;
+}
