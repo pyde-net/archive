@@ -1967,6 +1967,139 @@
       for epochs 2/3/4 (`e1b80a7c…`, `337785f7…`, `3a93693e…`).
       A 1h follow-up soak confirms the same across boundaries
       4–6.
+- [x] 404 — `otic::compile_all` silently bypasses the frontend
+      (resolve + typecheck + safety), so production callers and
+      test fixtures that didn't run the frontend separately got
+      a "lex + parse + lower + codegen" pipeline that accepted
+      contracts the strict typechecker rejects. Surfaced while
+      writing the bombard suite for a multi-laptop network
+      stress test: the same `SUITE_SRC` that compiled cleanly
+      via `compile_all` (the path the local soak takes) failed
+      under `pyde-dev build` with two distinct errors —
+      "signed integer type `i64` is not supported (audit 354)"
+      and "address() expects 'self' or an Address, found
+      Helper". Audit 354 already documents the codegen issue
+      (no signed-int ISA opcodes; `<`, `>`, `/`, `%`, `>>` on
+      i64/i128/i256 silently produce wrong results), and the
+      typechecker rejects those types at the AST level — but
+      the lax `compile_all` path skipped the typechecker, so
+      `loadgen_soak.rs` happily compiled `signed_val: i64` +
+      `checked_signed(delta: i64)` for hours of soak runtime
+      while reporting `ok=735 err=0` for the bucket against
+      bytecode whose comparisons were silently broken
+      (additions wrap correctly in two's complement; the
+      `assert!(self.signed_val > -1000)` line ran an unsigned
+      comparison that gave the right answer by coincidence
+      for the test's input range). The same bypass also let
+      `pyde-dev script` (the production developer toolchain)
+      compile scripts with undefined identifiers, multi-
+      constructor contracts, view functions that write state,
+      and audit-356 selector collisions — all of which the
+      typechecker / safety pass would have caught.
+
+      Production leak surface: `crates/pyde-dev/src/script.rs`
+      called `compile_all` without first running the frontend.
+      Every other production caller (`pyde-dev build`, `otic`
+      CLI) explicitly ran the frontend first.
+
+      **SHIPPED.** Three coordinated changes:
+
+      (1) `crates/otic/src/lib.rs` — split the public API.
+      `compile_all_unchecked` retains the old lex+parse+
+      lower+codegen behaviour for compiler-internal tests
+      (`crates/otic/src/codegen.rs` codegen self-tests, AOT
+      cache tests, `pyde-dev build` and `otic` CLI which run
+      the frontend explicitly first). The new strict
+      `compile_all` runs lex → parse → resolve → typecheck →
+      safety → lower → codegen and returns
+      `Result<Vec<...>, String>` with formatted diagnostics
+      on any frontend failure. Production callers that don't
+      separately run the frontend now route through this
+      path.
+
+      (2) `crates/pyde-dev/src/script.rs` — migrated to the
+      strict `compile_all`. Bubbles diagnostics up as a
+      formatted error for the operator. Pre-fix this was the
+      only production toolchain that silently accepted
+      audit-354 violations and selector collisions.
+
+      (3) `crates/node/tests/loadgen_soak.rs` — SUITE_SRC
+      cleaned of patterns the strict typechecker rejects.
+      `signed_val: i64` + `checked_signed(delta: i64)` are
+      gone (broken arithmetic per audit 354; reintroduce
+      post-codegen-signed-int-support). The `Spawner.spawn()`
+      method no longer captures the deployed child's address
+      via `address(deploy!(Helper))` (which the strict path
+      rejects); it calls `child.ping()` instead, still
+      exercising CREATE → constructor → runtime install
+      end-to-end. The default workload drops from 9 to 8
+      buckets (no more `SignedMath`).
+
+      Test files using `compile_all` in fixtures stayed on
+      the renamed `compile_all_unchecked` (`crates/tx/src/
+      pipeline.rs` test code, `crates/node/tests/*.rs`,
+      `crates/aot/src/lib.rs` AOT cache tests). They probe
+      chain pipeline behaviour against simple contracts that
+      should pass the strict frontend; migrating each one
+      individually to `compile_all` is a follow-up to
+      surface any latent contract bugs in those fixtures.
+
+      Verified by extracting the cleaned `SUITE_SRC` to a
+      `pyde-dev` project and running `pyde-dev build`:
+      Helper (135 instructions), MegaContract (951
+      instructions), Spawner (1036 instructions), all three
+      compile cleanly through the full frontend. 1714 / 1714
+      workspace lib tests pass post-fix. 25-min soak confirms
+      end-to-end: chain crosses boundaries 1/2/3 cleanly, all
+      4 nodes derive byte-identical epoch randomness, 8/8
+      workload buckets exercised, 21.1% submit err (same
+      regime as the audit-403 baseline).
+- [x] 405 — `address(<contract or interface handle>)` rejected
+      by the strict typechecker, blocking the canonical factory
+      pattern (`Spawner::spawn() -> Address` returning the
+      deployed child's address). The shape compiled silently via
+      the lax `compile_all_unchecked` path and produced WRONG
+      bytecode: the lower pass for `address(...)` always emitted
+      `BuiltinOp::AddressOfSelf` regardless of argument, so
+      `let child = deploy!(Helper); address(child)` returned the
+      factory's OWN address instead of the deployed child's.
+      `simple_factory.oti` (the otic test suite's canonical
+      factory fixture) shipped with this exact pattern; its
+      `lower_simple_factory` test passed because it only checks
+      that the IR is non-empty + Display doesn't panic, not that
+      the emitted opcodes do the right thing.
+
+      **SHIPPED.** Two coordinated changes:
+
+      (1) `crates/otic/src/typecheck.rs::call` — `address(arg)`
+      now accepts `Ty::Contract(_)` and `Ty::Interface(_)` in
+      addition to `self`, `Ty::Address`, `Ty::Unknown`, and
+      `Ty::Error`. The error message updates to
+      "expects 'self', an Address, or a Contract/Interface
+      handle".
+
+      (2) `crates/otic/src/lower.rs::Expr::Call` — the
+      `address(...)` arm differentiates by argument shape:
+      `address(self)` still emits `BuiltinOp::AddressOfSelf`,
+      but for any other argument we emit
+      `Inst::Cast(dst, src, Ty::Address)`. Codegen lowers the
+      Wide → Wide cast to a `Wmov` (or no-op if the register
+      allocator picks `dst == src`), preserving the 32-byte
+      address bits — Contract / Interface handles + Address
+      all share the same wide-register layout, so the copy is
+      bit-exact.
+
+      Regression test
+      `check_address_of_contract_handle_audit_405` in
+      `typecheck::tests` pins the typechecker rule. The full
+      otic test suite (387 unit + integration tests) is
+      green post-fix. The same 25-min soak that verified
+      audit 404 also verified this fix end-to-end (the
+      cleaned SUITE_SRC's Spawner exercises CREATE +
+      constructor + runtime install per spawn; future re-
+      introduction of the canonical
+      `address(deploy!(Helper))` capture will compile via
+      strict).
 
 ---
 

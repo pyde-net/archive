@@ -1222,9 +1222,47 @@ impl Lowerer {
                     Expr::Ident(ident) if ident.name == "hash" => {
                         self.emit(Inst::Hash(dst, arg_regs));
                     }
-                    // address(self)
+                    // address(...) — three cases the typechecker
+                    // accepts (audit 405):
+                    //   * `address(self)` → emit `AddressOfSelf`.
+                    //   * `address(<contract_or_interface_handle>)` →
+                    //     identity copy. The handle is stored as the
+                    //     32-byte address in its register, so we emit
+                    //     a `Move` from the arg register into `dst`.
+                    //   * `address(<address-typed-expr>)` → identity
+                    //     copy. Same reason.
+                    //
+                    // Pre-audit-405 this branch always emitted
+                    // `AddressOfSelf` regardless of argument, which
+                    // silently produced wrong bytecode whenever the
+                    // typechecker's lax (compile_all_unchecked) path
+                    // let `address(child)` through — the factory got
+                    // its OWN address back instead of the deployed
+                    // child's. The strict path now rejects that
+                    // shape early, but the canonical factory pattern
+                    // (capture the deployed child's address) needs
+                    // this branch to copy the handle's register.
                     Expr::Ident(ident) if ident.name == "address" => {
-                        self.emit(Inst::Builtin(dst, BuiltinOp::AddressOfSelf));
+                        let is_self_arg = args
+                            .first()
+                            .map(|a| matches!(a, Expr::SelfExpr(_)))
+                            .unwrap_or(false);
+                        if is_self_arg {
+                            self.emit(Inst::Builtin(dst, BuiltinOp::AddressOfSelf));
+                        } else if let Some(src_reg) = arg_regs.first() {
+                            // Wide → Wide cast in codegen lowers to a
+                            // `Wmov` (or no-op if dst == src after
+                            // register allocation). Contract /
+                            // Interface handles + Address all share
+                            // the 32-byte wide-register layout, so
+                            // the copy preserves the deployed-child
+                            // address bits exactly.
+                            self.emit(Inst::Cast(dst, *src_reg, Ty::Address));
+                        } else {
+                            // No args — degenerate; let the typechecker
+                            // surface the error and emit a no-op blob.
+                            self.emit(Inst::Builtin(dst, BuiltinOp::AddressOfSelf));
+                        }
                     }
                     // gas_remaining()
                     Expr::Ident(ident) if ident.name == "gas_remaining" => {
