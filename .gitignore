@@ -11,6 +11,7 @@ MAINNET_PLAN.md
 BENCH_PLAN.md
 BENCH_CONTRACTS.md
 EXPLORER_PLAN.md
+TESTNET_LAUNCH_TRACKER.md
 
 # cargo-fuzz artefacts (task 053). Crate lives outside the workspace
 # and has its own Cargo.lock + target/ dir + corpus dir which we don't
