@@ -1610,7 +1610,18 @@ mod tests {
         // Audit 383: chain_id=1 (mainnet) is now refused by
         // `generate_testnet`. Use the canonical testnet id for
         // tests that exercise the distributed-write surface.
-        generate_testnet(tmp.path(), 4, 0, 30303, 8545, true, pyde_net::discovery::TESTNET_CHAIN_ID, 400, Some(&addrs)).unwrap();
+        generate_testnet(
+            tmp.path(),
+            4,
+            0,
+            30303,
+            8545,
+            true,
+            pyde_net::discovery::TESTNET_CHAIN_ID,
+            400,
+            Some(&addrs),
+        )
+        .unwrap();
 
         // node-0's config must:
         //  - carry its own region/host as a comment header
@@ -1694,7 +1705,10 @@ mod tests {
             err.contains("refusing to generate testnet artifacts"),
             "expected mainnet refusal, got: {err}"
         );
-        assert!(err.contains("audit 383"), "expected audit 383 ref, got: {err}");
+        assert!(
+            err.contains("audit 383"),
+            "expected audit 383 ref, got: {err}"
+        );
     }
 
     /// Audit 400: the generator must stamp a real wall-clock

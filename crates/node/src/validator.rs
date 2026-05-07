@@ -18,7 +18,7 @@ use pyde_consensus::view_change::{
 };
 use pyde_crypto::falcon::{FalconPublicKey, FalconSecretKey};
 use pyde_crypto::threshold::{
-    aggregate_new_share, apply_refresh, canonical_resharing_subset, generate_refresh_contribution,
+    aggregate_new_share, canonical_resharing_subset, generate_refresh_contribution,
     generate_resharing_contribution, verify_refresh_contribution, verify_resharing_contribution,
     RefreshContribution, ResharingContribution,
 };
@@ -224,6 +224,28 @@ pub struct ValidatorEngine {
     pub finality: FinalityTracker,
     /// Timeout tracker for the current slot.
     pub timeout: TimeoutTracker,
+    /// Audit 408: wall-clock anchor for converting slot numbers into
+    /// the moment that slot actually begins. The
+    /// `PROPOSAL_TIMEOUT_MS` window for slot N is measured from
+    /// `genesis_timestamp_ms + N * block_time_ms`, NOT from the
+    /// instant the prior slot's QC happened to form. Pre-fix,
+    /// `advance_target_height` reset the tracker to wall-clock
+    /// `now`, so a slot whose QC formed early (e.g. slot 26 QC at
+    /// 100 ms into the slot) started counting timeout for slot 27
+    /// from that same moment — 200 ms later it would fire a view-
+    /// change for slot 27 even though slot 27's wall-clock window
+    /// hadn't begun yet (slot 27 starts at slot 26 + 400 ms). The
+    /// 3-min soak observed 50 % of slots view-changing under this
+    /// bug. Both fields default to 0 until `set_slot_anchor()` is
+    /// called after the runtime constructs the slot clock; while
+    /// they're 0 the engine falls back to the wall-clock-now
+    /// behavior so unit tests that don't wire a slot clock
+    /// continue to pass.
+    pub genesis_timestamp_ms: u64,
+    /// Block-time interval in milliseconds. Paired with
+    /// `genesis_timestamp_ms` for the timeout-anchor computation
+    /// described above.
+    pub block_time_ms: u64,
     /// Committee public keys for the current epoch (index → key bytes).
     pub committee_keys: Vec<Vec<u8>>,
     /// Epoch randomness seed (for VRF proposer selection).
@@ -330,6 +352,36 @@ pub struct ValidatorEngine {
     pss_contributions: Vec<RefreshContribution>,
     /// Target epoch for PSS refresh.
     pss_target_epoch: u64,
+    /// Audit 406: slot at which `try_apply_pss_on_slot` is allowed to
+    /// combine the buffered PSS contributions. Mirror of
+    /// `reshare_aggregation_trigger_slot` for cross-committee
+    /// resharing and `randomness_aggregation_trigger_slot` for epoch
+    /// randomness — under async gossip every node sees a different
+    /// "first `threshold`-of-N" arrival order, so eagerly applying
+    /// the first `threshold` contributions caused different nodes
+    /// to apply different delta subsets, breaking the PSS invariant
+    /// that all refreshed shares interpolate to the same secret.
+    /// Set to `current_slot + RESHARE_AGGREGATION_DELAY_SLOTS` by
+    /// `start_pss_refresh`; the slot tick fires
+    /// `try_apply_pss_on_slot` once `current_slot` crosses it.
+    pss_aggregation_trigger_slot: u64,
+    /// `true` once `try_apply_pss_on_slot` has fired for the current
+    /// target epoch. Prevents re-applying when additional late
+    /// contributions arrive after the canonical apply.
+    pss_aggregated: bool,
+    /// Audit 406: own PSS contribution bytes stashed for periodic
+    /// re-broadcast, mirror of `pending_reshare_rebroadcast`. Without
+    /// this a single dropped gossip message means the missing-contrib
+    /// validator's pool stays at `n - 1`, the all-N guard in
+    /// `try_apply_pss_on_slot` blocks the apply, and PSS silently
+    /// skips the epoch. With the rebroadcast loop a missed message
+    /// recovers within `PSS_REBROADCAST_INTERVAL_SLOTS` slots.
+    /// Layout: `(target_epoch, contribution_bytes)`.
+    pending_pss_rebroadcast: Option<(u64, Vec<u8>)>,
+    /// Slot at which `start_pss_refresh` published our contribution.
+    /// `maybe_rebroadcast_pss` uses this + `current_slot` to scope
+    /// the rebroadcast window.
+    pss_broadcast_start_slot: u64,
     /// Cross-committee resharing contributions collected at epoch boundary
     /// (task 034). Keyed by target epoch so late contributions from
     /// previous epochs are ignored.
@@ -428,6 +480,13 @@ impl ValidatorEngine {
             consensus,
             finality: FinalityTracker::new(),
             timeout: TimeoutTracker::new(initial_target, now_ms),
+            // Audit 408: anchor stays 0 until the runtime calls
+            // `set_slot_anchor()` post-slot-clock-construction.
+            // While 0, `slot_start_ms_for_target()` falls back to
+            // wall-clock — preserving prior behavior for tests
+            // that exercise the engine without wiring a clock.
+            genesis_timestamp_ms: 0,
+            block_time_ms: 0,
             committee_keys: Vec::new(),
             epoch_randomness,
             // Audit 402: prior-epoch caches start empty; populated
@@ -455,6 +514,10 @@ impl ValidatorEngine {
             randomness_aggregation_trigger_slot: 0,
             pss_contributions: Vec::new(),
             pss_target_epoch: 0,
+            pss_aggregation_trigger_slot: 0,
+            pss_aggregated: false,
+            pending_pss_rebroadcast: None,
+            pss_broadcast_start_slot: 0,
             reshare_contributions: Vec::new(),
             reshare_target_epoch: 0,
             reshare_new_committee: Vec::new(),
@@ -742,17 +805,69 @@ impl ValidatorEngine {
 
         self.pss_contributions = vec![contribution.clone()];
         self.pss_target_epoch = epoch;
+        // Audit 406: arm the canonical-subset apply gate. The slot
+        // tick fires `try_apply_pss_on_slot` once `current_slot`
+        // crosses this trigger; until then, contributions just pool.
+        // Mirrors `RESHARE_AGGREGATION_DELAY_SLOTS` for cross-
+        // committee resharing so PSS, randomness, and reshare all
+        // resolve their first-N-wins races identically.
+        self.pss_aggregation_trigger_slot =
+            self.consensus.current_slot + Self::RESHARE_AGGREGATION_DELAY_SLOTS;
+        self.pss_aggregated = false;
+        // Audit 406: stash bytes + window start for the rebroadcast
+        // loop. Mirror of `pending_reshare_rebroadcast` —
+        // `maybe_rebroadcast_pss` re-publishes every
+        // `RESHARE_REBROADCAST_INTERVAL_SLOTS` slots for
+        // `RESHARE_REBROADCAST_SLOTS` slots after the initial publish
+        // so a single dropped gossip message doesn't strand a
+        // validator's pool at n-1.
+        self.pending_pss_rebroadcast = Some((epoch, contribution.to_bytes()));
+        self.pss_broadcast_start_slot = self.consensus.current_slot;
         info!(epoch, "started PSS key share refresh");
         Some(contribution)
     }
 
-    /// Add a received PSS refresh contribution. Returns the new KeyShare if threshold reached.
+    /// Audit 406: return our own PSS contribution bytes for a
+    /// rebroadcast on this slot tick, or `None` if we're outside the
+    /// rebroadcast window or it isn't a rebroadcast slot. Caller
+    /// publishes the returned bytes on the consensus topic. Mirror
+    /// of `maybe_rebroadcast_reshare`.
+    pub fn maybe_rebroadcast_pss(&mut self) -> Option<(u64, Vec<u8>)> {
+        let (target_epoch, bytes) = self.pending_pss_rebroadcast.as_ref()?;
+        let now = self.consensus.current_slot;
+        let elapsed = now.saturating_sub(self.pss_broadcast_start_slot);
+        if elapsed > Self::RESHARE_REBROADCAST_SLOTS {
+            self.pending_pss_rebroadcast = None;
+            return None;
+        }
+        if elapsed == 0 {
+            return None;
+        }
+        if elapsed % Self::RESHARE_REBROADCAST_INTERVAL_SLOTS != 0 {
+            return None;
+        }
+        Some((*target_epoch, bytes.clone()))
+    }
+
+    /// Add a received PSS refresh contribution. Pools it for the
+    /// canonical-subset apply that fires on slot tick. Returns
+    /// `true` when the contribution was new (not a duplicate index)
+    /// and structurally valid; the boolean is informational only —
+    /// the actual apply lives in `try_apply_pss_on_slot`.
     pub fn on_pss_contribution(
         &mut self,
         contribution: RefreshContribution,
-        identity: &mut ValidatorIdentity,
+        _identity: &mut ValidatorIdentity,
     ) -> bool {
         let threshold = quorum_for_committee(self.committee_keys.len());
+
+        // Audit 406: drop late contributions for an already-applied
+        // refresh. Pre-fix the eager-apply bucket was cleared on
+        // first-threshold and any `from_index` could refill it;
+        // post-fix `pss_aggregated` gates this explicitly.
+        if self.pss_aggregated {
+            return false;
+        }
 
         // Verify the contribution (zero-secret reconstruction check)
         if !verify_refresh_contribution(&contribution, threshold) {
@@ -773,21 +888,81 @@ impl ValidatorEngine {
         }
 
         self.pss_contributions.push(contribution);
+        // Audit 406: NO eager apply here. The canonical-subset
+        // apply runs on slot tick via `try_apply_pss_on_slot`,
+        // after gossip has had time to fan every member's
+        // contribution out to every node, so all validators see
+        // the same pool and converge on the same canonical subset.
+        true
+    }
 
-        // If threshold reached, apply all contributions to our key share
-        if self.pss_contributions.len() >= threshold {
-            if let Some(ref old_share) = identity.key_share {
-                let new_share = apply_refresh(old_share, &self.pss_contributions);
-                identity.key_share = Some(new_share);
-                self.pss_contributions.clear();
-                self.key_share_dirty = true;
-                info!(
-                    epoch = self.pss_target_epoch,
-                    contributions = threshold,
-                    "PSS key share refreshed — genesis trust dissolved"
+    /// Audit 406: canonical-subset PSS apply, fired by the slot tick
+    /// once `current_slot` crosses the aggregation trigger. Mirror of
+    /// `try_aggregate_reshare_on_slot` for cross-committee resharing
+    /// — picks the canonical lowest-`threshold` subset (sorted by
+    /// `from_index`) and adds those zero-secret deltas to our share.
+    ///
+    /// Pre-fix `on_pss_contribution` applied refresh eagerly the
+    /// moment the pool reached `threshold` items, which under async
+    /// gossip gave every node a different "first-3-of-4" arrival set
+    /// and diverged the post-PSS shares onto different polynomials.
+    /// The fix mirrors cross-committee resharing exactly:
+    /// `start_pss_refresh` arms a deadline + seeds the pool with our
+    /// own contribution + stashes bytes for `maybe_rebroadcast_pss`,
+    /// the gossip handler just buffers, and this method commits the
+    /// canonical apply on the slot tick when the deadline has passed
+    /// AND the pool has reached `threshold` (the rebroadcast loop
+    /// fills the pool to `n` for honest committees, so all members
+    /// converge on the SAME `lowest-threshold` subset).
+    ///
+    /// Late contributions arriving after the apply are dropped (the
+    /// `pss_aggregated` gate in `on_pss_contribution`).
+    pub fn try_apply_pss_on_slot(
+        &mut self,
+        current_slot: u64,
+        identity: &mut ValidatorIdentity,
+    ) -> bool {
+        if self.pss_aggregated || self.pss_aggregation_trigger_slot == 0 {
+            return false;
+        }
+        if current_slot < self.pss_aggregation_trigger_slot {
+            return false;
+        }
+        let threshold = quorum_for_committee(self.committee_keys.len());
+        if threshold == 0 {
+            return false;
+        }
+        let canonical = match pyde_crypto::threshold::canonical_refresh_subset(
+            &self.pss_contributions,
+            threshold,
+        ) {
+            Some(c) => c,
+            None => {
+                warn!(
+                    target_epoch = self.pss_target_epoch,
+                    received = self.pss_contributions.len(),
+                    threshold,
+                    "PSS aggregation trigger fired but below threshold — waiting"
                 );
-                return true;
+                return false;
             }
+        };
+        if let Some(ref old_share) = identity.key_share {
+            let pre_idx = old_share.index;
+            let canon_indices: Vec<usize> = canonical.iter().map(|c| c.from_index).collect();
+            let new_share = pyde_crypto::threshold::apply_refresh_canonical(old_share, &canonical);
+            identity.key_share = Some(new_share);
+            self.pss_contributions.clear();
+            self.pss_aggregated = true;
+            self.key_share_dirty = true;
+            info!(
+                target_epoch = self.pss_target_epoch,
+                contributions = threshold,
+                pre_index = pre_idx,
+                canon_indices = ?canon_indices,
+                "PSS key share refreshed (canonical) — genesis trust dissolved"
+            );
+            return true;
         }
         false
     }
@@ -912,6 +1087,27 @@ impl ValidatorEngine {
             target_epoch,
             entropy.as_bytes(),
         );
+        // Audit 406: seed our own reshare pool with our own
+        // contribution. Pre-fix the local pool was filled SOLELY by
+        // gossip arrivals from peers, so each old member's own
+        // contribution never landed in its own pool. With 4-validator
+        // committees and `old_threshold = 3`, that left every node
+        // looking at a 3-of-4 pool — and `canonical_resharing_subset`
+        // (lowest-`old_threshold` `from_old_index`) picked a DIFFERENT
+        // subset on each node (each was missing the contribution from
+        // its own OLD position). The aggregated new shares ended up on
+        // different polynomials and threshold decryption failed every
+        // time. Adding own here mirrors `start_pss_refresh` and lets
+        // every old member's pool converge on the same canonical
+        // {lowest old_threshold from_old_index} once gossip finishes
+        // delivering the n-1 peer contributions.
+        if self
+            .reshare_contributions
+            .iter()
+            .all(|c| c.from_old_index != contribution.from_old_index)
+        {
+            self.reshare_contributions.push(contribution.clone());
+        }
         // Stash bytes + target epoch so `maybe_rebroadcast_reshare` can
         // re-publish during the early target-epoch slot window.
         self.pending_reshare_rebroadcast = Some((target_epoch, contribution.to_bytes()));
@@ -1172,6 +1368,8 @@ impl ValidatorEngine {
             None => return false,
         };
 
+        let post_idx = new_share.index;
+        let canon_old_indices: Vec<usize> = canonical.iter().map(|c| c.from_old_index).collect();
         identity.key_share = Some(new_share);
         self.key_share_dirty = true;
         self.reshare_aggregated = true;
@@ -1181,6 +1379,8 @@ impl ValidatorEngine {
             target_epoch = self.reshare_target_epoch,
             new_index = self.reshare_new_index,
             old_threshold,
+            post_index = post_idx,
+            canon_old_indices = ?canon_old_indices,
             "committee handoff complete — new key share derived from resharing"
         );
         true
@@ -1190,6 +1390,14 @@ impl ValidatorEngine {
     /// stale-message filtering).
     pub fn reshare_target(&self) -> u64 {
         self.reshare_target_epoch
+    }
+
+    /// Audit 406: expose the target epoch of any pending PSS refresh
+    /// for node-layer stale-message filtering. Mirror of
+    /// `reshare_target` — drops gossip from old epochs that would
+    /// otherwise pollute the canonical-subset apply.
+    pub fn pss_target(&self) -> u64 {
+        self.pss_target_epoch
     }
 
     pub fn start_epoch_randomness(
@@ -1286,15 +1494,9 @@ impl ValidatorEngine {
         let n = self.committee_keys.len();
         let threshold = quorum_for_committee(n);
 
-        let ready = if collector.has_full_set() {
-            true
-        } else if current_slot >= self.randomness_aggregation_trigger_slot
-            && collector.share_count() >= threshold
-        {
-            true
-        } else {
-            false
-        };
+        let ready = collector.has_full_set()
+            || (current_slot >= self.randomness_aggregation_trigger_slot
+                && collector.share_count() >= threshold);
         if !ready {
             return None;
         }
@@ -2278,8 +2480,14 @@ impl ValidatorEngine {
                 // and the build-side gate in
                 // `try_build_fallback_proposal` recognize that
                 // recovery is in progress.
-                let now_ms = current_time_ms();
-                let mut new_tracker = TimeoutTracker::new(slot, now_ms);
+                //
+                // Audit 408: anchor the new tracker on the slot's
+                // wall-clock start (same fix as `advance_target_height`).
+                // After a VC-QC the fallback leader gets a fresh
+                // `PROPOSAL_TIMEOUT_MS` window measured from the
+                // slot's actual start, not "now".
+                let slot_start_ms = self.slot_start_ms_for_target(slot);
+                let mut new_tracker = TimeoutTracker::new(slot, slot_start_ms);
                 new_tracker.view_change_qc = Some(vc_qc);
                 self.timeout = new_tracker;
             } else {
@@ -2652,6 +2860,28 @@ impl ValidatorEngine {
         new_slot
     }
 
+    /// Audit 408: set the slot-clock anchor on the engine. Called by
+    /// the runtime after the `SlotClock` is constructed (which
+    /// happens later in node startup than `ValidatorEngine::new`).
+    /// Once set, `advance_target_height` resets the timeout tracker
+    /// to the slot's actual wall-clock start instead of "now".
+    pub fn set_slot_anchor(&mut self, genesis_timestamp_ms: u64, block_time_ms: u64) {
+        self.genesis_timestamp_ms = genesis_timestamp_ms;
+        self.block_time_ms = block_time_ms;
+    }
+
+    /// Wall-clock instant (Unix ms) when slot `target` begins.
+    /// Falls back to `current_time_ms()` if the slot anchor hasn't
+    /// been wired yet (test paths). See `set_slot_anchor`.
+    fn slot_start_ms_for_target(&self, target: u64) -> u64 {
+        if self.block_time_ms == 0 {
+            current_time_ms()
+        } else {
+            self.genesis_timestamp_ms
+                .saturating_add(target.saturating_mul(self.block_time_ms))
+        }
+    }
+
     /// Advance `target_height` to `new_height` and reset the timeout
     /// tracker for the new height. No-op if `new_height` doesn't
     /// advance the target. Persists the consensus state.
@@ -2659,10 +2889,16 @@ impl ValidatorEngine {
     /// audit-234 part 4 (CONSENSUS_INVARIANTS.md O2): called when a
     /// vote-QC for the current target forms — the chain has moved
     /// on, recovery state for the old height is no longer needed.
+    ///
+    /// Audit 408: the new tracker's `slot_start_ms` is the wall-
+    /// clock start of `new_height` per `slot_start_ms_for_target`,
+    /// not `now`. The prior code used `now` and fired view-change
+    /// 200 ms after the *previous* slot's QC — typically before the
+    /// new slot's wall-clock window even started.
     fn advance_target_height(&mut self, new_height: u64) {
         if self.consensus.advance_target_height(new_height) {
-            let now_ms = current_time_ms();
-            self.timeout = TimeoutTracker::new(new_height, now_ms);
+            let slot_start_ms = self.slot_start_ms_for_target(new_height);
+            self.timeout = TimeoutTracker::new(new_height, slot_start_ms);
             self.persist_consensus();
             debug!(target_height = new_height, "advanced target_height");
         }

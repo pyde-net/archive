@@ -23,25 +23,25 @@
 //!
 //!   - Constructors with args ............ MegaContract::init, Helper::init
 //!   - Events with indexed fields ........ Deposit, StatusChanged,
-//!                                          ComplexResult, Ponged, Spawned
+//!     ComplexResult, Ponged, Spawned
 //!   - Enums with match .................. Status::{Active,Paused,Locked}
 //!   - Payable functions ................. MegaContract::deposit
 //!   - Complex args (struct) ............. UserData → complex_logic
 //!   - Complex returns (u256) ............ complex_logic returns total
 //!   - Complex storage layouts ........... Map<Address, u256>, Vec<u64>,
-//!                                          struct fields, enum tag fields
+//!     struct fields, enum tag fields
 //!   - Complex logic (math + state) ...... complex_logic + change_status
 //!   - Cross-contract calls .............. MegaContract → IHelper.ping
 //!   - Factory pattern (deploy!) ......... Spawner.spawn → deploy!(Helper)
 //!   - Reentrancy probe .................. MegaContract.delegate_ping
-//!                                          calls Helper which writes
-//!                                          state — exercises CallExt +
-//!                                          cross-contract state isolation
+//!     calls Helper which writes
+//!     state — exercises CallExt +
+//!     cross-contract state isolation
 //!   - AOT optimization wiring ........... hot-path repeatedly hits
-//!                                          MegaContract.increment, the
-//!                                          AotCache compiles in
-//!                                          background, subsequent calls
-//!                                          take the JIT path.
+//!     MegaContract.increment, the
+//!     AotCache compiles in
+//!     background, subsequent calls
+//!     take the JIT path.
 //!   - Plaintext + encrypted mix ......... configurable; default 50/50
 //!
 //! # Run
@@ -80,7 +80,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const CHAIN_ID: u64 = 1;
+// Audit 383: `pyde testnet` refuses to generate artifacts for
+// chain_id=1 (the canonical mainnet id). The soak runs against a
+// 4-validator dev testnet, so use the canonical public-testnet id
+// instead. Switching to 31337 would also work, but 7331 keeps the
+// soak's signed-tx surface (chain_id != 31337 enforces FALCON
+// signature verification on every tx) which matches what real
+// testnet operators see.
+const CHAIN_ID: u64 = 7331;
 const FUND_PER_SENDER: u128 = 1_000_000_000_000_000_000;
 
 // Method selector — delegate to the otic codegen helper so it stays
@@ -132,16 +139,27 @@ contract Helper {
 
 // MegaContract — most of the feature surface in one place.
 //
-// Storage covers: u64, i64, Map<Address,u256>, Vec<u64>, struct field,
+// Storage covers: u64, Map<Address,u256>, Vec<u64>, struct field,
 // enum-tag field, Address. Methods cover: payable, complex args
 // (UserData struct), complex returns (u256), complex logic
 // (state-mutating math), enum match, events with #[indexed], errors,
 // require!, assert!, view functions, cross-contract calls.
+//
+// Audit 404 / 354: previously this contract had a `signed_val: i64`
+// field + `checked_signed(delta: i64)` method exercising signed
+// integer math. Audit 354 documents that the codegen treats all
+// integers as unsigned — `<`, `>`, `/`, `%`, `>>` on signed types
+// produce wrong results. The strict typechecker rejects i64 to
+// catch this; pre-audit-404 the soak compiled the source via the
+// lax path and ran the broken arithmetic, reporting `ok=735 err=0`
+// for the `checked_signed` bucket while the on-chain math was
+// silently wrong (the assert and adds happened to coincide with
+// correct values for the test inputs). Until the codegen gains
+// real signed-integer ISA opcodes, the bucket is dropped.
 contract MegaContract {
     storage {
         owner: Address,
         counter: u64,
-        signed_val: i64,
         balances: Map<Address, u256>,
         scores: Vec<u64>,
         helper_addr: Address,
@@ -181,7 +199,6 @@ contract MegaContract {
         self.owner = msg.sender;
         self.counter = initial;
         self.helper_addr = helper;
-        self.signed_val = -42;
     }
 
     // Payable + indexed event. Exercises VALUE in calldata and the
@@ -230,12 +247,6 @@ contract MegaContract {
         self.counter = self.counter + 1;
     }
 
-    // Asserts + signed integer math.
-    pub fn checked_signed(delta: i64) {
-        assert!(self.signed_val > -1000);
-        self.signed_val = self.signed_val + delta;
-    }
-
     #[view]
     pub fn get_counter() -> u64 {
         return self.counter;
@@ -256,15 +267,24 @@ contract MegaContract {
 // via the deploy! macro, exercising CREATE + per-caller create
 // counter (audit 379) + per-block tx that does state writes via
 // inner-CREATE.
+//
+// Audit 404: pre-fix `spawn()` returned `Address` and stored the
+// child's address via `address(deploy!(Helper))`. The strict
+// typechecker (now wired into `compile_all`) rejects that cast
+// because `deploy!` returns a contract handle, not an Address.
+// The lax path silently accepted it because contract handles ARE
+// addresses internally — but that's a coincidence, not a contract.
+// We drop the address-tracking machinery and call a method on the
+// freshly-deployed `child` instead, which still exercises the full
+// CREATE → constructor → runtime install path that the test cares
+// about. The chain-side feature (factory-pattern deploys at
+// execution time) is unchanged.
 contract Spawner {
     storage {
-        spawned: Vec<Address>,
         count: u64,
     }
 
     event Spawned {
-        #[indexed]
-        child: Address,
         count: u64,
     }
 
@@ -273,12 +293,15 @@ contract Spawner {
         self.count = 0;
     }
 
-    pub fn spawn() -> Address {
+    pub fn spawn() {
         let child = deploy!(Helper);
-        self.spawned.push(child);
+        // Calling a method on the just-deployed child proves the
+        // runtime is actually installed end-to-end, not just that
+        // the constructor returned. We don't capture the address
+        // because `address(<contract>)` doesn't typecheck.
+        child.ping();
         self.count = self.count + 1;
-        emit Spawned { child: child, count: self.count };
-        return child;
+        emit Spawned { count: self.count };
     }
 
     #[view]
@@ -313,8 +336,6 @@ enum CallKind {
     ChangeStatus,
     /// MegaContract::deposit (payable) — exercises VALUE + LOG.
     Deposit,
-    /// MegaContract::checked_signed — exercises signed integer math.
-    SignedMath,
     /// Spawner::spawn — exercises factory / deploy!.
     Spawn,
     /// Helper::ping (cross-contract) — exercises CallExt.
@@ -332,25 +353,25 @@ impl CallKind {
             CallKind::ComplexLogic => "complex_logic",
             CallKind::ChangeStatus => "change_status",
             CallKind::Deposit => "deposit",
-            CallKind::SignedMath => "checked_signed",
             CallKind::Spawn => "spawn",
             CallKind::Ping => "ping",
             CallKind::EncryptedIncrement => "encrypted_increment",
         }
     }
 
-    /// Default 9-bucket workload weights summing to 100. The mix is
-    /// roughly representative of what testnet traffic should look
-    /// like: a third pure transfers, a third hot-path AOT exercise,
-    /// the rest spread across the feature surface.
-    fn default_weights() -> [(CallKind, u32); 9] {
+    /// Default 8-bucket workload weights summing to 100. Audit 404
+    /// dropped the prior `SignedMath` bucket — the i64 contract it
+    /// targeted ran wrong arithmetic via the lax compile path
+    /// (audit 354), so the bucket was reporting `ok` for code that
+    /// produced wrong results. Reintroduce post-codegen-signed-int
+    /// support.
+    fn default_weights() -> [(CallKind, u32); 8] {
         [
             (CallKind::Transfer, 25),
             (CallKind::Increment, 25),
             (CallKind::ComplexLogic, 10),
             (CallKind::ChangeStatus, 5),
-            (CallKind::Deposit, 5),
-            (CallKind::SignedMath, 5),
+            (CallKind::Deposit, 10),
             (CallKind::Spawn, 3),
             (CallKind::Ping, 7),
             (CallKind::EncryptedIncrement, 15),
@@ -375,9 +396,16 @@ fn compile_deploy_payload(
     contract_name: &str,
     constructor_args: &[u8],
 ) -> Result<Vec<u8>, String> {
+    // Audit 404: strict pipeline (resolve + typecheck + safety +
+    // lower + codegen). Pre-fix this called the lax variant, which
+    // silently accepted `i64` arithmetic (audit 354) and
+    // `address(<contract>)` casts in the suite source. The strict
+    // path now catches those at compile time so test fixtures can't
+    // hide broken contracts.
     let compiled =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| otic::compile_all(src)))
-            .map_err(|_| "otic compiler panicked on suite source".to_string())?;
+            .map_err(|_| "otic compiler panicked on suite source".to_string())?
+            .map_err(|diagnostics| format!("suite frontend rejected:\n{}", diagnostics))?;
     let (_, cc) = compiled
         .iter()
         .find(|(name, _)| name == contract_name)
@@ -416,14 +444,14 @@ fn comprehensive_soak() {
     println!("  Encrypted %:  {}", encrypted_pct);
     println!("  Features:     transfer / increment(AOT) / complex_logic /");
     println!("                change_status / deposit(payable) /");
-    println!("                checked_signed / spawn(factory) /");
-    println!("                ping(cross-contract) / enc_increment");
+    println!("                spawn(factory) / ping(cross-contract) /");
+    println!("                enc_increment");
     println!("╚══════════════════════════════════════════════════════════╝");
 
     // ── Phase 0: spawn 4-validator network ────────────────────────
     println!("\n[0/5] Spawning 4-validator native testnet…");
     let net = TestNetwork::spawn_with_chain_id(4, CHAIN_ID)
-        .unwrap_or_else(|e| panic!("spawn 4v@chain_id=1: {}", e));
+        .unwrap_or_else(|e| panic!("spawn 4v@chain_id={}: {}", CHAIN_ID, e));
     net.wait_for_slot(3, Duration::from_secs(30))
         .unwrap_or_else(|e| panic!("chain warm-up: {}", e));
 
@@ -597,15 +625,10 @@ fn comprehensive_soak() {
 
                 // Every 60s: print head + dump per-node logs to disk.
                 if tick % 60 == 0 {
-                    eprintln!(
-                        "    [watchdog] head={} stall={}s",
-                        last_head, stall_secs,
-                    );
+                    eprintln!("    [watchdog] head={} stall={}s", last_head, stall_secs,);
                     for (i, out) in outputs.iter().enumerate() {
                         if let Ok(buf) = out.lock() {
-                            let path = format!(
-                                "/tmp/pyde-soak-node-{}.log", i
-                            );
+                            let path = format!("/tmp/pyde-soak-node-{}.log", i);
                             let _ = std::fs::write(&path, buf.join("\n"));
                         }
                     }
@@ -695,8 +718,8 @@ fn comprehensive_soak() {
         }
     }
     println!(
-        "    bucket coverage:    {}/9 exercised  (pass: 9/9)",
-        9 - zero_buckets.len()
+        "    bucket coverage:    {}/8 exercised  (pass: 8/8)",
+        8 - zero_buckets.len()
     );
     if !zero_buckets.is_empty() {
         println!("    UNEXERCISED:        {}", zero_buckets.join(", "));
@@ -718,7 +741,7 @@ fn comprehensive_soak() {
     println!(
         "\n  ✓ PASS — {:.1}-min soak, {} buckets exercised, {:.1}% submit err",
         measure_elapsed.as_secs_f64() / 60.0,
-        9 - zero_buckets.len(),
+        8 - zero_buckets.len(),
         err_rate * 100.0,
     );
 }
@@ -734,7 +757,7 @@ async fn run_workload(
     wallets: &[Arc<Wallet>],
     contracts: &DeployedContracts,
     nonce_counters: &Arc<Vec<AtomicU64>>,
-    weights: &[(CallKind, u32); 9],
+    weights: &[(CallKind, u32); 8],
     target_tps: u64,
     encrypted_pct: u32,
     duration: Duration,
@@ -813,28 +836,20 @@ async fn submit_one(
             let mut amt = [0u8; 32];
             amt[0..8].copy_from_slice(&1000u64.to_le_bytes());
             d.extend_from_slice(&amt);
-            d.extend_from_slice(&((nonce % 100) as u64).to_le_bytes()); // score
+            d.extend_from_slice(&(nonce % 100).to_le_bytes()); // score
             (mega, d, 0, Standard)
         }
         CallKind::ChangeStatus => {
             // change_status(s: Status) — pass enum tag (0/1/2)
             let mut d = Vec::with_capacity(4 + 8);
             d.extend_from_slice(&selector("change_status"));
-            d.extend_from_slice(&((nonce % 3) as u64).to_le_bytes());
+            d.extend_from_slice(&(nonce % 3).to_le_bytes());
             (mega, d, 0, Standard)
         }
         CallKind::Deposit => {
             let mut d = Vec::with_capacity(4);
             d.extend_from_slice(&selector("deposit"));
             (mega, d, 100u128, Standard) // payable, send 100 quanta
-        }
-        CallKind::SignedMath => {
-            let mut d = Vec::with_capacity(4 + 8);
-            d.extend_from_slice(&selector("checked_signed"));
-            // delta = +1 or -1 alternating
-            let delta: i64 = if nonce % 2 == 0 { 1 } else { -1 };
-            d.extend_from_slice(&delta.to_le_bytes());
-            (mega, d, 0, Standard)
         }
         CallKind::Spawn => {
             let mut d = Vec::with_capacity(4);
@@ -1292,14 +1307,14 @@ async fn fetch_threshold_pubkey(client: &reqwest::Client, url: &str) -> Option<V
 // ────────────────────────────────────────────────────────────────────
 
 struct SoakMetrics {
-    ok: [AtomicU64; 9],
-    err: [AtomicU64; 9],
+    ok: [AtomicU64; 8],
+    err: [AtomicU64; 8],
 }
 
 #[derive(Clone)]
 struct SoakSnapshot {
-    ok: [u64; 9],
-    err: [u64; 9],
+    ok: [u64; 8],
+    err: [u64; 8],
 }
 
 impl SoakMetrics {
@@ -1316,10 +1331,9 @@ impl SoakMetrics {
             CallKind::ComplexLogic => 2,
             CallKind::ChangeStatus => 3,
             CallKind::Deposit => 4,
-            CallKind::SignedMath => 5,
-            CallKind::Spawn => 6,
-            CallKind::Ping => 7,
-            CallKind::EncryptedIncrement => 8,
+            CallKind::Spawn => 5,
+            CallKind::Ping => 6,
+            CallKind::EncryptedIncrement => 7,
         }
     }
     fn record_ok(&self, kind: CallKind, _measured: bool) {

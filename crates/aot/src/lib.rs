@@ -479,7 +479,7 @@ mod tests {
                 pub fn get_count() -> u64 { return self.count; }
             }
         "#;
-        let results = otic::compile_all(src);
+        let results = otic::compile_all_unchecked(src);
         assert_eq!(results.len(), 1);
         let (_, compiled) = &results[0];
         let runtime = &compiled.runtime_bytecode;
@@ -659,7 +659,7 @@ mod tests {
                 }
             }
         "#;
-        let results = otic::compile_all(src);
+        let results = otic::compile_all_unchecked(src);
         assert_eq!(results.len(), 1);
         let (_, compiled) = &results[0];
         let runtime = &compiled.runtime_bytecode;
@@ -853,7 +853,7 @@ mod tests {
                 }
             }
         "#;
-        let all = otic::compile_all(src);
+        let all = otic::compile_all_unchecked(src);
         assert_eq!(all.len(), 2, "Should compile Token and Factory");
         let (_, factory_compiled) = &all[1];
         let runtime = &factory_compiled.runtime_bytecode;

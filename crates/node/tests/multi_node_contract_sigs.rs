@@ -258,7 +258,7 @@ fn sign_tx(tx: &mut Transaction, sk: &FalconSecretKey) {
 /// Mirrors `production_sigs.rs::compile` — this is the canonical
 /// on-chain deploy envelope.
 fn compile_deploy_payload(src: &str) -> Vec<u8> {
-    let c = otic::compile_all(src);
+    let c = otic::compile_all_unchecked(src);
     let (_, cc) = &c[0];
     let mut out = Vec::with_capacity(8 + cc.constructor_bytecode.len() + cc.runtime_bytecode.len());
     out.extend_from_slice(&(cc.constructor_bytecode.len() as u32).to_le_bytes());

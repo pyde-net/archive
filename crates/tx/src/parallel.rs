@@ -21,6 +21,41 @@ use crate::types::{AccessEntry, Transaction};
 use pyde_account::address::Address;
 use std::collections::{HashMap, HashSet};
 
+/// An access list is "uninformative" when it declares no concrete
+/// `(address, key)` pairs the scheduler can use for conflict detection.
+/// This covers two equivalent shapes:
+///
+///   1. The Vec is empty (`vec![]`) — the user opted out of declaring
+///      keys altogether.
+///   2. The Vec has `AccessEntry`s, but every entry's `reads` and
+///      `writes` are both empty — the user named addresses they
+///      touch but didn't list any storage keys.
+///
+/// Both shapes mean the same thing semantically: "I touch storage,
+/// but I haven't told you which keys." The scheduler must treat
+/// uninformative txs as conflicting with everything; otherwise a
+/// caller declaring `[{addr, [], []}]` would slip past the
+/// "is_empty" check, contribute zero keys to the union-find, and
+/// land in its own parallel group — which is unsafe (e.g. multiple
+/// same-sender txs would race on `sender.nonce` since the implicit
+/// nonce-write is never declared in any AL).
+///
+/// Audit 407: `loadgen_soak`'s workload txs use shape (2) for every
+/// contract call (`[{contract, [], []}]`), which produced
+/// proposer/non-proposer state-root divergence the moment tx
+/// traffic hit a fresh 4-validator soak. The 4 non-proposers
+/// converged on the sequential single-group answer, the proposer
+/// produced a parallel-execution answer where all but the
+/// nonce-N tx reverted with `InvalidNonce` (each parallel group
+/// reads pre-block sender.nonce=N). After this fix, shape (2) is
+/// treated as shape (1) and unions with all other txs, restoring
+/// the safe sequential default.
+fn access_list_is_uninformative(access_list: &[AccessEntry]) -> bool {
+    access_list
+        .iter()
+        .all(|e| e.reads.is_empty() && e.writes.is_empty())
+}
+
 /// A group of conflicting transactions that must execute sequentially.
 /// Different groups are independent and can be proven in parallel.
 #[derive(Clone, Debug)]
@@ -104,9 +139,12 @@ impl UnionFind {
 ///
 /// Two txs touching the same contract but different keys are NOT conflicting.
 pub fn conflicts(tx_a: &Transaction, tx_b: &Transaction) -> bool {
-    // Transactions with empty access lists are treated as touching EVERYTHING.
-    // They must be sequential with all other txs (can't parallelize safely).
-    if tx_a.access_list.is_empty() || tx_b.access_list.is_empty() {
+    // A tx with no declared keys (empty AL or all-empty entries — see
+    // `access_list_is_uninformative`) is treated as touching EVERYTHING.
+    // It must be sequential with all other txs (can't parallelize safely).
+    if access_list_is_uninformative(&tx_a.access_list)
+        || access_list_is_uninformative(&tx_b.access_list)
+    {
         return true;
     }
 
@@ -182,10 +220,15 @@ pub fn schedule(txs: &[Transaction]) -> ExecutionSchedule {
         };
     }
 
-    // If NO txs have access lists, they're all potentially conflicting
-    // → put everything in one sequential group (safe default).
-    let has_any_access_list = txs.iter().any(|t| !t.access_list.is_empty());
-    if !has_any_access_list {
+    // If NO tx declared concrete (address, key) pairs, the scheduler
+    // has zero conflict information — every tx is "I touch storage,
+    // unspecified". Put everything in one sequential group (safe
+    // default). See `access_list_is_uninformative` for why an AL
+    // shaped `[{addr, [], []}]` counts the same as `vec![]` here.
+    let has_any_keyed_access_list = txs
+        .iter()
+        .any(|t| !access_list_is_uninformative(&t.access_list));
+    if !has_any_keyed_access_list {
         return ExecutionSchedule {
             groups: vec![ExecutionGroup {
                 tx_indices: (0..n).collect(),
@@ -200,14 +243,14 @@ pub fn schedule(txs: &[Transaction]) -> ExecutionSchedule {
     // When a second tx touches this key, we union them.
     let mut write_owners: HashMap<(Address, [u8; 32]), usize> = HashMap::new();
 
-    // Track the first empty-access-list tx to union all such txs together.
+    // Track the first uninformative-AL tx to union all such txs together.
     let mut empty_representative: Option<usize> = None;
 
     for (i, tx) in txs.iter().enumerate() {
-        if tx.access_list.is_empty() {
-            // Empty access list = unknown keys = conflicts with everything.
-            // Union with the representative (and the representative unions with
-            // every keyed tx below).
+        if access_list_is_uninformative(&tx.access_list) {
+            // No declared keys = unknown = conflicts with everything.
+            // Union with the representative (and the representative unions
+            // with every keyed tx below).
             match empty_representative {
                 Some(rep) => uf.union(i, rep),
                 None => empty_representative = Some(i),
@@ -334,7 +377,11 @@ pub fn schedule_from_access_lists(access_lists: &[Vec<AccessEntry>]) -> Executio
     let mut empty_rep: Option<usize> = None;
 
     for (i, al) in access_lists.iter().enumerate() {
-        if al.is_empty() {
+        // Same uninformative-AL handling as `schedule()`. See
+        // `access_list_is_uninformative` for why a list shaped
+        // `[{addr, [], []}]` must be treated as no-info, not as a
+        // declared "I touch addr" hint.
+        if access_list_is_uninformative(al) {
             match empty_rep {
                 Some(rep) => uf.union(i, rep),
                 None => {
@@ -681,6 +728,135 @@ mod tests {
         let schedule = schedule(&txs);
         assert_eq!(schedule.group_count(), 1);
         assert_eq!(schedule.groups[0].tx_indices.len(), 3);
+    }
+
+    /// Audit 407 regression: an `AccessEntry` with empty `reads` and
+    /// empty `writes` is still a non-empty `Vec`, so the pre-fix
+    /// `t.access_list.is_empty()` check missed it. Each tx ended up
+    /// alone in its own component — proposers ran them in parallel,
+    /// non-proposers (whose compact-block reconstruct hard-codes a
+    /// single-group schedule) ran them sequentially, and the two
+    /// paths produced different post-block state under any
+    /// undeclared write (sender nonce being the universal example).
+    /// The fix treats this shape as no-info and unions everything.
+    #[test]
+    fn access_list_with_only_addresses_no_keys_unions_with_all() {
+        let mega_addr = {
+            let mut a = ZERO_ADDRESS;
+            a[0] = 0xAB;
+            a
+        };
+        let only_addr_no_keys = || {
+            vec![AccessEntry {
+                address: mega_addr,
+                reads: vec![],
+                writes: vec![],
+            }]
+        };
+        let txs = vec![
+            make_tx_with_access(only_addr_no_keys()),
+            make_tx_with_access(only_addr_no_keys()),
+            make_tx_with_access(only_addr_no_keys()),
+            make_tx_with_access(only_addr_no_keys()),
+        ];
+        let schedule = schedule(&txs);
+        assert_eq!(
+            schedule.group_count(),
+            1,
+            "AL=[{{addr,[],[]}}] is uninformative — all txs must serialize"
+        );
+        assert_eq!(schedule.groups[0].tx_indices.len(), 4);
+    }
+
+    /// Same as above but mixed: one tx declares a real write key,
+    /// the others use the empty-keys shape. The keyed tx must still
+    /// land in the single group with everyone else, because the
+    /// uninformative txs union with all.
+    #[test]
+    fn uninformative_unions_with_keyed_txs() {
+        let mega_addr = {
+            let mut a = ZERO_ADDRESS;
+            a[0] = 0xAB;
+            a
+        };
+        let txs = vec![
+            // One tx with a real declared write
+            make_tx_with_access(vec![write_access(0xCC, &[[0x42; 32]])]),
+            // Three txs with the soak-loadgen shape
+            make_tx_with_access(vec![AccessEntry {
+                address: mega_addr,
+                reads: vec![],
+                writes: vec![],
+            }]),
+            make_tx_with_access(vec![AccessEntry {
+                address: mega_addr,
+                reads: vec![],
+                writes: vec![],
+            }]),
+            make_tx_with_access(vec![AccessEntry {
+                address: mega_addr,
+                reads: vec![],
+                writes: vec![],
+            }]),
+        ];
+        let schedule = schedule(&txs);
+        assert_eq!(schedule.group_count(), 1);
+        assert_eq!(schedule.groups[0].tx_indices.len(), 4);
+    }
+
+    /// Same regression check via `schedule_from_access_lists` (the
+    /// path the encrypted-tx mempool block builder uses). Both
+    /// entry points must use identical uninformative-AL semantics
+    /// — otherwise the encrypted and plaintext schedules diverge
+    /// on the same workload.
+    #[test]
+    fn schedule_from_access_lists_treats_empty_keys_as_uninformative() {
+        let mega_addr = {
+            let mut a = ZERO_ADDRESS;
+            a[0] = 0xAB;
+            a
+        };
+        let als: Vec<Vec<AccessEntry>> = (0..4)
+            .map(|_| {
+                vec![AccessEntry {
+                    address: mega_addr,
+                    reads: vec![],
+                    writes: vec![],
+                }]
+            })
+            .collect();
+        let schedule = schedule_from_access_lists(&als);
+        assert_eq!(schedule.group_count(), 1);
+        assert_eq!(schedule.groups[0].tx_indices.len(), 4);
+    }
+
+    /// `conflicts(a, b)` must also treat the uninformative shape as
+    /// "conflicts with everything", matching the scheduler's
+    /// behavior. A pre-fix `is_empty()` check missed
+    /// `[{addr,[],[]}]` and reported "no conflict", which would
+    /// break any caller that uses pairwise conflict detection
+    /// instead of the union-find scheduler.
+    #[test]
+    fn conflicts_treats_uninformative_as_conflicting() {
+        let mega_addr = {
+            let mut a = ZERO_ADDRESS;
+            a[0] = 0xAB;
+            a
+        };
+        let tx_uninformative = make_tx_with_access(vec![AccessEntry {
+            address: mega_addr,
+            reads: vec![],
+            writes: vec![],
+        }]);
+        let tx_keyed = make_tx_with_access(vec![write_access(0xCC, &[[0x77; 32]])]);
+        assert!(
+            conflicts(&tx_uninformative, &tx_keyed),
+            "uninformative AL must conflict with any other tx"
+        );
+        assert!(
+            conflicts(&tx_keyed, &tx_uninformative),
+            "uninformative AL must conflict regardless of arg order"
+        );
     }
 
     #[test]

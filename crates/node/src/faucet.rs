@@ -895,10 +895,7 @@ async fn serve_dispense(
                 ip = %ip_key,
                 "faucet queue saturated — returning 503 (audit 382)"
             );
-            return json_response(
-                503,
-                r#"{"error":"faucet queue saturated, retry shortly"}"#,
-            );
+            return json_response(503, r#"{"error":"faucet queue saturated, retry shortly"}"#);
         }
     };
     match send_faucet_tx(rpc, from, address, amount, signer, signing_lock, chain_id).await {

@@ -98,9 +98,17 @@ pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<
         return Err(format!("script has parse errors: {:?}", parse_errors[0]));
     }
 
-    // Compile script using compile_all (handles multi-contract files + inline deploy!).
-    // Merge build registry so deploy!(ImportedContract) also works.
-    let all_compiled = otic::compile_all(&source);
+    // Compile script using the strict pipeline (audit 404).
+    //
+    // Pre-fix this used `otic::compile_all` (the lax variant) which
+    // skipped resolve / typecheck / safety. Scripts that referenced
+    // undefined symbols, used signed integers (audit 354), or
+    // collided FNV-1a-32 selectors (audit 356) compiled silently to
+    // bytecode that produced wrong results at execution. The strict
+    // variant runs the full frontend; failures bubble up here as a
+    // formatted diagnostic the operator can act on.
+    let all_compiled = otic::compile_all(&source)
+        .map_err(|diagnostics| format!("script compilation failed:\n{}", diagnostics))?;
 
     // Find the target contract
     let target_name = contract_filter

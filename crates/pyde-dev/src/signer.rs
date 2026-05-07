@@ -190,7 +190,10 @@ fn is_localhost(url: &str) -> bool {
         Err(_) => return false,
     };
     match parsed.host_str() {
-        Some(host) => matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "::1"),
+        Some(host) => matches!(
+            host,
+            "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]" | "::1"
+        ),
         None => false,
     }
 }

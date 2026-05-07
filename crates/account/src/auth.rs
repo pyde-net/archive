@@ -254,8 +254,7 @@ mod tests {
 
         // Same sig pasted into positions 0 AND 1 (both bound to pk1).
         // Should be rejected because pk1 only counts once.
-        let result =
-            validate_signature(&account, message, &[sig1.clone(), sig1, vec![]]);
+        let result = validate_signature(&account, message, &[sig1.clone(), sig1, vec![]]);
         assert_eq!(
             result,
             AuthResult::Invalid,

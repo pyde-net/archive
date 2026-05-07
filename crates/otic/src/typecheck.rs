@@ -1219,20 +1219,41 @@ impl TypeChecker {
                             return Ty::Array(Box::new(Ty::U8), 32);
                         }
                         if ident.name == "address" {
-                            // address() only accepts self or Address-typed arguments
+                            // address() accepts:
+                            //   - `self` (returns this contract's address)
+                            //   - an Address-typed expression (no-op, identity)
+                            //   - a Contract/Interface handle (audit 405; the
+                            //     handle stores a 32-byte address internally,
+                            //     so coercing to Address is a register-copy
+                            //     in the lowerer). Without this case, the
+                            //     canonical factory pattern
+                            //     `let child = deploy!(Helper); address(child)`
+                            //     was rejected even though the lower pass
+                            //     already emits a contract handle that IS
+                            //     the deployed child's address. Pre-audit-
+                            //     405 this only worked through the lax
+                            //     `compile_all_unchecked` path which produced
+                            //     INCORRECT bytecode (the lowerer emitted
+                            //     `AddressOfSelf` for any `address(...)`
+                            //     call, regardless of argument — so the
+                            //     factory got its OWN address back rather
+                            //     than the child's). Fixed in lower.rs.
                             if args.len() != 1 {
                                 self.error("address() takes exactly one argument".into(), *span);
                             } else if let Some(arg) = args.first() {
                                 let is_self = matches!(arg, Expr::SelfExpr(_));
                                 let arg_ty = &arg_types[0];
+                                let is_contract_or_iface =
+                                    matches!(arg_ty, Ty::Contract(_) | Ty::Interface(_));
                                 if !is_self
+                                    && !is_contract_or_iface
                                     && *arg_ty != Ty::Address
                                     && *arg_ty != Ty::Unknown
                                     && *arg_ty != Ty::Error
                                 {
                                     self.error(
                                         format!(
-                                            "address() expects 'self' or an Address, found {}. Use Address::ZERO for zero address",
+                                            "address() expects 'self', an Address, or a Contract/Interface handle, found {}. Use Address::ZERO for zero address",
                                             arg_ty
                                         ),
                                         *span,
@@ -2775,7 +2796,7 @@ mod tests {
             }
         "#,
         );
-        assert!(errors[0].message.contains("expects 'self' or an Address"));
+        assert!(errors[0].message.contains("expects 'self'"));
     }
 
     #[test]
@@ -2789,7 +2810,7 @@ mod tests {
             }
         "#,
         );
-        assert!(errors[0].message.contains("expects 'self' or an Address"));
+        assert!(errors[0].message.contains("expects 'self'"));
     }
 
     #[test]
@@ -2801,6 +2822,39 @@ mod tests {
                 pub fn f() {
                     let sender = msg.sender;
                     let addr = address(sender);
+                }
+            }
+        "#,
+        );
+    }
+
+    /// Audit 405 regression: `address(<contract handle>)` must
+    /// typecheck. Pre-fix the canonical factory pattern
+    /// (`let child = deploy!(Helper); let a = address(child);`)
+    /// was rejected with "expects 'self' or an Address" even though
+    /// the lowerer already produced a 32-byte address handle for
+    /// the deploy!() result. The lax compile path silently let it
+    /// through and generated WRONG bytecode (the factory got its
+    /// own address back instead of the child's).
+    #[test]
+    fn check_address_of_contract_handle_audit_405() {
+        check_ok(
+            r#"
+            contract Child {
+                #[constructor]
+                pub fn init() {}
+            }
+            contract Parent {
+                storage {
+                    children: Vec<Address>,
+                }
+                #[constructor]
+                pub fn init() {}
+                pub fn spawn() -> Address {
+                    let c = deploy!(Child);
+                    let a = address(c);
+                    self.children.push(a);
+                    return a;
                 }
             }
         "#,

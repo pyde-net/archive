@@ -8403,7 +8403,10 @@ mod tests {
             }
         "#;
 
-        let results = crate::compile_all(src);
+        // Audit 404: codegen tests use the lax `compile_all_unchecked`
+        // because they probe lower / codegen invariants directly,
+        // not the full frontend.
+        let results = crate::compile_all_unchecked(src);
         assert_eq!(results.len(), 2);
 
         let (name, factory) = &results[1];
@@ -8463,7 +8466,11 @@ mod tests {
                 }
             }
         "#;
-        let runs = (0..5).map(|_| crate::compile_all(src)).collect::<Vec<_>>();
+        // Audit 404: codegen-internal determinism check uses the lax
+        // path so the test stays focused on lower / codegen output.
+        let runs = (0..5)
+            .map(|_| crate::compile_all_unchecked(src))
+            .collect::<Vec<_>>();
         // All 5 compilations produce one Token contract.
         for r in &runs {
             assert_eq!(r.len(), 1);

@@ -275,8 +275,17 @@ pub mod topics {
     /// from plaintext transactions so the receive dispatcher can
     /// decode the right wire format without probing. Audit item
     /// 227 step 4 / option E.
+    ///
+    /// The literal string MUST match the arm in
+    /// `crate::channels::Channel::from_topic`. Pre-fix this returned
+    /// `pyde/encrypted_tx/1` while `Channel::from_topic` only knew
+    /// `pyde/encrypted_transactions/1`, so every received encrypted-
+    /// tx gossip message fell into the catch-all "unknown topic"
+    /// branch and the encrypted mempool was a no-op over the network.
+    /// `topics_round_trip_through_channel_from_topic` below locks
+    /// the alignment in.
     pub fn encrypted_transactions() -> IdentTopic {
-        IdentTopic::new("pyde/encrypted_tx/1")
+        IdentTopic::new("pyde/encrypted_transactions/1")
     }
 
     /// Proposed blocks and scheduled blocks.
@@ -438,6 +447,47 @@ mod tests {
         // Last bumped when `encrypted_transactions` shipped with the
         // MEV-protected encrypted-tx flow (item 227).
         assert_eq!(topics::all().len(), 5);
+    }
+
+    /// TPL-201: every subscribed topic name must round-trip through
+    /// `Channel::from_topic`. The pre-existing
+    /// `channel_from_topic_roundtrip` in `channels.rs` only checks
+    /// `Channel::topic()` against `Channel::from_topic` — both
+    /// internal to that file — so it can't notice when a `topics::*`
+    /// function in this file drifts away from the dispatcher's
+    /// table. The bug it would have caught: pre-fix
+    /// `topics::encrypted_transactions()` returned
+    /// `pyde/encrypted_tx/1`, the dispatcher only knew
+    /// `pyde/encrypted_transactions/1`, and every received
+    /// encrypted-tx gossip silently fell into the catch-all
+    /// "unknown topic" branch — the encrypted mempool was a no-op
+    /// over the network.
+    #[test]
+    fn topics_round_trip_through_channel_from_topic() {
+        use crate::channels::Channel;
+
+        let pairs = [
+            (topics::consensus(), Channel::Consensus),
+            (topics::transactions(), Channel::Transactions),
+            (
+                topics::encrypted_transactions(),
+                Channel::EncryptedTransactions,
+            ),
+            (topics::blocks(), Channel::Blocks),
+            (topics::sync(), Channel::Sync),
+        ];
+        for (topic, expected) in pairs {
+            let name = topic.hash().to_string();
+            assert_eq!(
+                Channel::from_topic(&name),
+                Some(expected),
+                "subscribed topic {:?} (name {:?}) did not round-trip \
+                 through Channel::from_topic — receive-side dispatch \
+                 will silently drop messages on this topic",
+                expected,
+                name,
+            );
+        }
     }
 
     #[tokio::test]

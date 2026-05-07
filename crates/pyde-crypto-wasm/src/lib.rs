@@ -788,6 +788,55 @@ mod tests {
         assert_eq!(decoded.encrypted_len(), payload.len());
     }
 
+    /// REGRESSION GUARD for the bombard 100% encrypted-tx drop.
+    ///
+    /// The existing `threshold_encrypt_primitive_roundtrips` test
+    /// only verifies that the WASM-produced ciphertext bytes can
+    /// be DECODED by the real wire-format reader. It does NOT
+    /// verify that the ciphertext can actually be DECRYPTED back
+    /// to the original payload using threshold shares — exactly
+    /// the path the validator committee runs at canonical-apply.
+    /// That gap is what let the WASM ship producing ciphertexts
+    /// that decoded fine but failed the MAC check 100% of the
+    /// time.
+    ///
+    /// This test closes that gap: encrypt via WASM, decode via
+    /// the real reader, generate decryption shares from the
+    /// committee shares, combine them, and assert the recovered
+    /// plaintext matches the original.
+    #[test]
+    fn wasm_encrypt_then_real_decrypt_with_shares() {
+        let (tpk, key_shares) = threshold_keygen(4, 3).unwrap();
+        let payload = b"end-to-end encrypt-then-decrypt-with-shares smoke test";
+
+        // WASM-side encryption — same path the TS bombard / SDK
+        // uses through `threshold_encrypt` / `buildRawEncryptedTx`.
+        let ct_hex = threshold_encrypt_wasm(
+            &format!("0x{}", hex::encode(tpk.to_bytes())),
+            &format!("0x{}", hex::encode(payload)),
+        )
+        .unwrap();
+        let ct_bytes = hex::decode(ct_hex.trim_start_matches("0x")).unwrap();
+        let ct = pyde_crypto::threshold::ThresholdCiphertext::from_wire_bytes(&ct_bytes)
+            .expect("real decoder must accept WASM ciphertext");
+
+        // Validator-side: every share-holder produces a decryption
+        // share for this ciphertext, then any THRESHOLD of them
+        // combine to recover plaintext. Mirrors the on-chain
+        // `BlockDecryptor::decrypt_all` flow, minus the FALCON
+        // re-verify and tx-execution scaffolding.
+        let shares: Vec<pyde_crypto::threshold::DecryptionShare> = key_shares[..3]
+            .iter()
+            .map(|ks| pyde_crypto::threshold::generate_decryption_share(ks, &ct))
+            .collect();
+        let plaintext = pyde_crypto::threshold::combine_shares(&shares, 3, &ct)
+            .expect("WASM ciphertext must decrypt with real shares");
+        assert_eq!(
+            plaintext, payload,
+            "WASM-encrypt + real-decrypt-with-shares must round-trip the original payload"
+        );
+    }
+
     // Negative-path testing (invalid threshold pubkey, bad hex, etc.)
     // is not run natively here: the workspace profile uses
     // `panic = "abort"`, and `wasm_bindgen` functions cannot unwind a

@@ -130,12 +130,29 @@ fn extract_all_contract_signatures(
     (contract_functions, contract_constructors)
 }
 
-/// Compile all contracts in a source file. Returns a map of contract name → CompiledContract.
-/// Contracts are compiled in declaration order. Later contracts can reference earlier ones
-/// via `create!(ContractName, args)` — the compiler embeds the bytecode at compile time.
-/// Cross-contract typed dispatch (Contract::at(addr).method()) works across all contracts
-/// in the file.
-pub fn compile_all(src: &str) -> Vec<(String, codegen::CompiledContract)> {
+/// **Permissive** compile (audit 404): runs ONLY lex + parse + lower
+/// + optimize + codegen. Does **NOT** run resolve, typecheck, or
+/// safety. Production code MUST use [`compile_all`] (the strict
+/// variant), which catches all the audit-354 violations and other
+/// frontend-only checks this function silently lets through.
+///
+/// Provided for two narrow use cases:
+///   1. **Compiler-internal tests** that probe the lower / codegen
+///      pipeline against fixtures with intentionally-invalid frontend
+///      shapes (e.g., `crates/otic/src/codegen.rs` self-tests).
+///   2. **`pyde-dev build` / `otic` CLI** which already run the
+///      frontend explicitly via `run_frontend(...)` BEFORE calling
+///      this function — so a second pass would just duplicate work.
+///
+/// Audit 404 documents the gap that motivated splitting the public
+/// API: `pyde-dev script` and a dozen test fixtures used to call
+/// the lax path directly, which bypassed audit-354 (signed integer
+/// rejection) and audit-356 (selector collision detection) and let
+/// silently-broken contracts compile to bytecode. The fix routes
+/// production callers through the strict `compile_all`; this
+/// function survives only behind an opt-in name so the lax path
+/// can never be picked accidentally.
+pub fn compile_all_unchecked(src: &str) -> Vec<(String, codegen::CompiledContract)> {
     let (tokens, _) = lexer::Lexer::new(src).tokenize();
     let (file, _) = parser::Parser::new(tokens).parse();
 
@@ -197,4 +214,125 @@ pub fn compile_all(src: &str) -> Vec<(String, codegen::CompiledContract)> {
     }
 
     results
+}
+
+/// **Strict** compile (audit 404, production default): runs the full
+/// pipeline — lex, parse, **resolve**, **typecheck**, **safety**,
+/// lower, optimize, codegen. Returns formatted diagnostics on any
+/// frontend failure.
+///
+/// Use this everywhere except where you've already run the frontend
+/// in a wider build context (`pyde-dev build`, `otic` CLI) or in
+/// compiler-internal lower/codegen tests. See
+/// [`compile_all_unchecked`] for those narrow cases.
+///
+/// # Audit 404
+///
+/// Pre-fix the public `compile_all` skipped resolve/typecheck/safety
+/// entirely. That meant `pyde-dev script`, `tests/loadgen_soak.rs`,
+/// `tests/integration.rs`, the AOT cache self-tests, and a dozen
+/// other call sites silently let through:
+///
+///   - **Audit 354 violations**: `i64`/`i128`/`i256` arithmetic that
+///     the typechecker explicitly rejects (codegen treats all ints
+///     as unsigned, so signed `<`, `>`, `/`, `%`, `>>` produce wrong
+///     results). The soak test's `checked_signed` bucket was
+///     reporting `ok=735 err=0` for hours of runtime against
+///     contracts whose comparisons were silently broken.
+///   - **Undefined names**: resolve catches `nonexistent_function()`
+///     calls; without it the lower pass emits garbage bytecode.
+///   - **Visibility / view purity**: safety enforces that `#[view]`
+///     functions can't write state and contracts have at most one
+///     `#[constructor]`.
+///   - **Audit 356 selector collisions**: typecheck rejects two
+///     functions whose FNV-1a-32 selectors collide; the lax path
+///     would emit a contract whose dispatch table can only call
+///     one of the two.
+///
+/// All those checks now run by default via this function.
+pub fn compile_all(src: &str) -> Result<Vec<(String, codegen::CompiledContract)>, String> {
+    // Lex.
+    let (tokens, lex_errors) = lexer::Lexer::new(src).tokenize();
+    if !lex_errors.is_empty() {
+        let diagnostics: Vec<diagnostic::Diagnostic> = lex_errors
+            .iter()
+            .map(|err| diagnostic::Diagnostic {
+                level: diagnostic::Level::Error,
+                message: format!("lex error: {:?}", err),
+                file: "<input>".into(),
+                line: 0,
+                col: 0,
+            })
+            .collect();
+        return Err(diagnostic::format_diagnostics(&diagnostics, src));
+    }
+
+    // Parse.
+    let (file, parse_errors) = parser::Parser::new(tokens).parse();
+    if !parse_errors.is_empty() {
+        let diagnostics: Vec<diagnostic::Diagnostic> = parse_errors
+            .iter()
+            .map(|err| diagnostic::Diagnostic {
+                level: diagnostic::Level::Error,
+                message: format!("parse error: {:?}", err),
+                file: "<input>".into(),
+                line: 0,
+                col: 0,
+            })
+            .collect();
+        return Err(diagnostic::format_diagnostics(&diagnostics, src));
+    }
+
+    // Helper: collect diagnostics from any frontend pass + bail if
+    // non-empty. `errors` is a Vec of types that all expose
+    // `.message: String` and `.span: token::Span` — the three
+    // frontend passes have nearly-identical error shapes, so this
+    // closure absorbs the boilerplate.
+    fn fail_if<E>(
+        errors: &[E],
+        src: &str,
+        get: impl Fn(&E) -> (String, u32, u32),
+    ) -> Result<(), String> {
+        if errors.is_empty() {
+            return Ok(());
+        }
+        let diagnostics: Vec<diagnostic::Diagnostic> = errors
+            .iter()
+            .map(|err| {
+                let (message, line, col) = get(err);
+                diagnostic::Diagnostic {
+                    level: diagnostic::Level::Error,
+                    message,
+                    file: "<input>".into(),
+                    line,
+                    col,
+                }
+            })
+            .collect();
+        Err(diagnostic::format_diagnostics(&diagnostics, src))
+    }
+
+    // Pass 1 — name resolution. Catches undefined identifiers,
+    // duplicate definitions, scope violations.
+    let resolve_result = resolve::Resolver::new().resolve(&file);
+    fail_if(&resolve_result.errors, src, |e| {
+        (e.message.clone(), e.span.line, e.span.col)
+    })?;
+
+    // Pass 2 — type check. Catches type mismatches, audit-354 signed
+    // integers, audit-356 selector collisions, ABI shape errors.
+    let tc_result = typecheck::TypeChecker::new().check(&file);
+    fail_if(&tc_result.errors, src, |e| {
+        (e.message.clone(), e.span.line, e.span.col)
+    })?;
+
+    // Pass 3 — safety. Catches view-purity violations, multiple
+    // constructors, attribute misuse.
+    let safety_result = safety::SafetyChecker::new().check(&file);
+    fail_if(&safety_result.errors, src, |e| {
+        (e.message.clone(), e.span.line, e.span.col)
+    })?;
+
+    // All frontend passes clean — lower + optimize + codegen.
+    Ok(compile_all_unchecked(src))
 }

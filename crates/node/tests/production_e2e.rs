@@ -259,7 +259,7 @@ fn production_signed_deploy_and_call() {
     };
 
     // Compile Counter contract
-    let compiled = otic::compile_all(
+    let compiled = otic::compile_all_unchecked(
         r#"
         contract Counter {
             storage { count: u64, }

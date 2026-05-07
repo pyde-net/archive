@@ -3287,7 +3287,7 @@ mod tests {
                 pub fn get_value() -> u64 { return self.value; }
             }
         "#;
-        let compiled = otic::compile_all(src);
+        let compiled = otic::compile_all_unchecked(src);
         assert!(!compiled.is_empty());
         let (_, contract) = &compiled[0];
 
@@ -3382,7 +3382,7 @@ mod tests {
                 pub fn set_value(v: u64) { self.value = v; }
             }
         "#;
-        let compiled = otic::compile_all(src);
+        let compiled = otic::compile_all_unchecked(src);
         let (_, contract) = &compiled[0];
 
         let clen = contract.constructor_bytecode.len() as u32;
@@ -3468,7 +3468,7 @@ mod tests {
                 pub fn increment() { self.count = self.count + 1; }
             }
         "#;
-        let compiled = otic::compile_all(src);
+        let compiled = otic::compile_all_unchecked(src);
         let (_, contract) = &compiled[0];
 
         let clen = contract.constructor_bytecode.len() as u32;
