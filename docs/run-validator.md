@@ -49,7 +49,7 @@ Inspect the `# region: ... / # host: ...` header of your
 
 ## 2. Encrypt the validator key
 
-Pyde's keystore uses AES-256-GCM with a Poseidon2-derived key.
+Pyde's keystore uses AES-256-GCM with an Argon2id-derived key (`m=64 MiB, t=3, p=1`; audit 306).
 
 ```sh
 export PYDE_VALIDATOR_PASSPHRASE='your-strong-passphrase'
@@ -123,7 +123,7 @@ Pyde exposes Prometheus metrics on the configured port (default
 ```
 pyde_block_lag                 # network_tip - head_slot. Alert > 10.
 pyde_finality_lag              # slots since last hard-finality. Alert > 100.
-pyde_peers                     # connected libp2p peers. Alert < 4.
+pyde_peers_connected           # connected libp2p peers. Alert < 4.
 pyde_block_processing_ms       # p99 block-execution latency.
 pyde_state_commit_ms           # SMT/RocksDB commit p99.
 pyde_validator_missed_proposals_total  # missed proposal slots (audit 222).

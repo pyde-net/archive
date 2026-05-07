@@ -4,8 +4,10 @@
 //! secret key on disk — anyone with read access to the data
 //! directory walks away with the signing key. This module
 //! provides AES-256-GCM encryption + key derivation via
-//! Poseidon2(passphrase || salt) so the validator key file
-//! is unreadable without the operator's passphrase.
+//! Argon2id(passphrase, salt) (audit 306) so the validator key
+//! file is unreadable without the operator's passphrase. The
+//! legacy v1 Poseidon2-KDF remains supported for one-shot
+//! transparent re-encryption of pre-audit-306 keystores.
 //!
 //! ## Format
 //!
