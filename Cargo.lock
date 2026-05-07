@@ -3156,7 +3156,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "otic"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "ethnum",
  "pyde-state",
@@ -3563,7 +3563,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-account"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "pyde-crypto",
  "pyde-state",
@@ -3572,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-aot"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -3588,7 +3588,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-consensus"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "proptest",
  "pyde-account",
@@ -3600,7 +3600,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-crypto"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "falcon-rs",
  "ml-kem",
@@ -3614,7 +3614,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-crypto-wasm"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.3.4",
@@ -3629,7 +3629,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-dev"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3657,7 +3657,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-mempool"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "pyde-account",
  "pyde-crypto",
@@ -3667,7 +3667,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-net"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "futures",
  "getrandom 0.2.17",
@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-node"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3726,7 +3726,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-rust-sdk"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3749,11 +3749,11 @@ dependencies = [
 
 [[package]]
 name = "pyde-slashing"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 
 [[package]]
 name = "pyde-state"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "anyhow",
  "borsh",
@@ -3767,7 +3767,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-tx"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "ethnum",
  "hex",
@@ -3785,7 +3785,7 @@ dependencies = [
 
 [[package]]
 name = "pyde-vm"
-version = "0.1.0"
+version = "0.1.0-testnet.1"
 dependencies = [
  "ethnum",
  "pyde-crypto",

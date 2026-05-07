@@ -1,7 +1,7 @@
 [package]
 name = "pyde-dev"
 license.workspace = true
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Pyde smart contract development framework"
 
