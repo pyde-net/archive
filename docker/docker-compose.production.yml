@@ -22,12 +22,16 @@ services:
       - NODE_INDEX=0
       - VALIDATORS=4
       - DEV_MODE=false
-      - CHAIN_ID=1
+      - CHAIN_ID=7331
     volumes:
       - testnet-data:/testnet
       - node0-data:/data
     ports:
+      # RPC + WS + fast-tx + Prometheus.
+      # WS uses host-port 1854N to avoid colliding with the
+      # per-node RPC mappings on host ports 8545-8548.
       - "8545:8545"
+      - "18546:8546"
       - "9545:9545"
       - "9090:9090"
     networks:
@@ -40,11 +44,13 @@ services:
     environment:
       - NODE_INDEX=1
       - DEV_MODE=false
+      - CHAIN_ID=7331
     volumes:
       - testnet-data:/testnet
       - node1-data:/data
     ports:
       - "8546:8546"
+      - "18547:8547"
       - "9546:9546"
       - "9091:9091"
     depends_on:
@@ -59,11 +65,13 @@ services:
     environment:
       - NODE_INDEX=2
       - DEV_MODE=false
+      - CHAIN_ID=7331
     volumes:
       - testnet-data:/testnet
       - node2-data:/data
     ports:
       - "8547:8547"
+      - "18548:8548"
       - "9547:9547"
       - "9092:9092"
     depends_on:
@@ -78,11 +86,13 @@ services:
     environment:
       - NODE_INDEX=3
       - DEV_MODE=false
+      - CHAIN_ID=7331
     volumes:
       - testnet-data:/testnet
       - node3-data:/data
     ports:
       - "8548:8548"
+      - "18549:8549"
       - "9548:9548"
       - "9093:9093"
     depends_on:
@@ -112,7 +122,7 @@ services:
           --private-key /testnet/faucet.key \
           --port 8080 \
           --amount 100 \
-          --cooldown 3600
+          --cooldown 86400
     volumes:
       - testnet-data:/testnet
     ports:
@@ -138,7 +148,9 @@ services:
         CONF
         /bin/prometheus --config.file=/tmp/prometheus.yml --storage.tsdb.path=/prometheus
     ports:
-      - "9999:9090"
+      # Prometheus has no built-in auth; bind to loopback only so
+      # the operator must explicitly tunnel / front-proxy to view it.
+      - "127.0.0.1:9999:9090"
     depends_on:
       - node-0
     networks:
@@ -147,8 +159,11 @@ services:
   grafana:
     image: grafana/grafana:latest
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_AUTH_ANONYMOUS_ENABLED=true
+      # Operator MUST set GRAFANA_ADMIN_PASSWORD before `up`. No
+      # default — the prior literal `admin` here was a public-internet
+      # rake on the production compose.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required}
+      - GF_AUTH_ANONYMOUS_ENABLED=false
     ports:
       - "3000:3000"
     depends_on:

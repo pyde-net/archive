@@ -21,7 +21,7 @@ faucet, and submitting your first transaction.
 
 ## 1. Get the binary
 
-### Option A — build from source
+Build from source:
 
 ```sh
 git clone https://github.com/zarah-s/pyde
@@ -30,16 +30,9 @@ cargo build --release
 # Binary lands at ./target/release/pyde
 ```
 
-### Option B — prebuilt release
-
-Download the latest `pyde-<version>-<os>-<arch>.tar.gz` from the
-GitHub releases page and extract `pyde` into `$PATH`.
-
-```sh
-tar -xzf pyde-<version>-linux-x86_64.tar.gz
-sudo mv pyde /usr/local/bin/
-pyde --version
-```
+> **Prebuilt binaries** will be published on the GitHub releases page
+> alongside the public-testnet launch announcement. Until then, build
+> from source.
 
 ## 2. Generate a node identity
 
@@ -87,7 +80,7 @@ Edit `~/.pyde-testnet/config.toml`:
 ```toml
 [node]
 role = "full"
-chain_id = 1   # mainnet placeholder; testnet chain_id will be published at launch
+chain_id = 7331   # public testnet (`TESTNET_CHAIN_ID`)
 datadir = "/home/<you>/.pyde-testnet"
 dev_mode = false
 
@@ -253,11 +246,11 @@ Check peer count via the Prometheus metric on
 `http://127.0.0.1:9090/metrics`:
 
 ```sh
-curl -s http://127.0.0.1:9090/metrics | grep '^pyde_peers '
-# → pyde_peers 4
+curl -s http://127.0.0.1:9090/metrics | grep '^pyde_peers_connected '
+# → pyde_peers_connected 4
 ```
 
-If `pyde_peers == 0`, your bootstrap multiaddrs are wrong or your
+If `pyde_peers_connected == 0`, your bootstrap multiaddrs are wrong or your
 firewall is blocking outbound TCP/30303 (and UDP/30303 for QUIC).
 The `pyde_block_lag` gauge tells you how many slots behind the
 network tip you currently are.

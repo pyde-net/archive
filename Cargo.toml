@@ -1,9 +1,15 @@
 [workspace.package]
-# Inherited by each member crate via `license.workspace = true` in its
-# own [package] block. Apache-2.0 is the default for the Pyde codebase.
-# Rationale: compatible with MIT/BSD ecosystem deps, allows commercial
-# relicensing of forks, and is the choice of most post-quantum chains.
+# Inherited by each member crate via `license.workspace = true` /
+# `version.workspace = true` in their `[package]` blocks. Apache-2.0
+# is the default for the Pyde codebase. Rationale: compatible with
+# MIT/BSD ecosystem deps, allows commercial relicensing of forks, and
+# is the choice of most post-quantum chains.
 license = "Apache-2.0"
+# Single source of truth for the workspace-level version (TPL-113).
+# Bump per release; pre-release suffix `-testnet.N` follows semver
+# precedence rules so `cargo` orders `0.1.0-testnet.2` >
+# `0.1.0-testnet.1` < `0.1.0` (final release).
+version = "0.1.0-testnet.1"
 
 [workspace]
 resolver = "2"

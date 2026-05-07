@@ -32,7 +32,9 @@ RUN chmod +x /docker/entrypoint.sh
 RUN mkdir -p /data /testnet
 ENV PYDE_DATADIR=/data
 
-EXPOSE 30303/udp 8545 9090
+EXPOSE 30303/udp 8545 8546 9090
+# 8545 — JSON-RPC; 8546 — WebSocket subscriptions (`rpc.port + 1`,
+# bound by `crates/node/src/node.rs`); 9090 — Prometheus metrics.
 
 ENTRYPOINT ["pyde"]
 CMD ["run", "--role", "validator", "--datadir", "/data", "--log-level", "info"]

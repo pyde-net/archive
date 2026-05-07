@@ -1,0 +1,52 @@
+# Dependabot configuration.
+#
+# Three ecosystems are watched:
+#   - `cargo`  — Rust crate dependencies
+#   - `docker` — base images in `Dockerfile` and the compose files
+#   - `github-actions` — `uses:` references in workflows
+#
+# Schedule is weekly so we don't drown in PRs; auto-merge is NOT
+# enabled — every dep bump requires human review (especially for
+# `libp2p`, `aes-gcm`, `argon2`, `rocksdb` where supply-chain
+# compromise has high blast radius).
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    labels:
+      - deps
+      - deps:rust
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: UTC
+    open-pull-requests-limit: 3
+    labels:
+      - deps
+      - deps:docker
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    labels:
+      - deps
+      - deps:ci
+    commit-message:
+      prefix: "chore(ci)"
