@@ -808,6 +808,20 @@ impl BlockProcessor {
         // every slot regardless of VRF score, multiplying the
         // proposal-buffering surface and (via seen_proposals
         // dedup) the slashing-framing attack window.
+        //
+        // TPL-204 / audit-234 part 4 (CONSENSUS_INVARIANTS.md L2):
+        // pre-fix, the `len() >= 33` gate skipped the entire VRF
+        // block for fallback proofs (24 bytes — 8-byte marker + 16
+        // bytes of slot + view), and nothing else here checked them.
+        // The validator path enforces the
+        // `proposer == fallback_leader_index(slot, view, committee_size)`
+        // invariant in `buffer_fallback_proposal`, but the network
+        // block-apply path used by full nodes flows through
+        // `validate_network_block` and skipped that check entirely
+        // — so two valid Byzantine fallbacks at `(H, V)` both
+        // passed validation at full nodes, breaking the
+        // unique-leader invariant. Mirror the validator's check
+        // here.
         if header.vrf_proof.len() >= 33 {
             let vrf_output_bytes = &header.vrf_proof[..32];
             let vrf_proof_bytes = &header.vrf_proof[32..];
@@ -836,6 +850,54 @@ impl BlockProcessor {
                     committee_keys.len()
                 ));
             }
+        } else if pyde_consensus::view_change::is_fallback_proof(&header.vrf_proof) {
+            // Fallback proposal — the proposer must be the
+            // deterministic leader for `(slot, view-from-proof)`.
+            // The view comes from the proof, not from a local
+            // view counter, because honest full nodes don't track
+            // the proposer's view directly; they trust the proof
+            // because the deterministic leader formula and signed
+            // header together pin the outcome.
+            let (proof_slot, proof_view) =
+                match pyde_consensus::view_change::decode_fallback_proof(&header.vrf_proof) {
+                    Some(decoded) => decoded,
+                    None => {
+                        return Err(format!(
+                            "fallback proof at slot {} is malformed (audit-234 L2)",
+                            slot
+                        ));
+                    }
+                };
+            if proof_slot != slot {
+                return Err(format!(
+                    "fallback proof slot {} does not match header slot {} (audit-234 L2)",
+                    proof_slot, slot
+                ));
+            }
+            let expected_leader = pyde_consensus::view_change::fallback_leader_index(
+                slot,
+                proof_view,
+                committee_keys.len(),
+            );
+            if proposer_idx != expected_leader {
+                return Err(format!(
+                    "fallback proposer at committee index {} is not the deterministic \
+                     leader (expected {}) for (slot {}, view {}) (audit-234 L2)",
+                    proposer_idx, expected_leader, slot, proof_view
+                ));
+            }
+        } else {
+            // Neither a VRF proof (≥ 33 bytes: 32-byte output + ≥ 1
+            // proof byte) nor a fallback proof (8-byte marker + 16
+            // bytes). Every non-genesis block produced by the
+            // pipeline carries one or the other; an unrecognised
+            // shape can only have come from a Byzantine peer.
+            return Err(format!(
+                "block at slot {} has invalid vrf_proof: not a VRF proof and not a fallback \
+                 proof (len={}) (audit-234 L2)",
+                slot,
+                header.vrf_proof.len()
+            ));
         }
 
         // 4. Previous QC should have quorum (skip for early blocks with empty QC)
@@ -2235,6 +2297,168 @@ mod tests {
         assert!(
             !err.contains("audit 325"),
             "None parent_timestamp must skip audit-325 lower bound, got: {err}"
+        );
+    }
+
+    // ── TPL-204 / audit-234 part 4 (CONSENSUS_INVARIANTS.md L2):
+    //    full-node fallback-leader check ────────────────────────────
+
+    /// Build a signed fallback header for a given committee member.
+    /// Used by the TPL-204 tests below to exercise the new branch in
+    /// `validate_network_block`. Returns `(header, proposer_signature,
+    /// committee_keys)`.
+    fn make_signed_fallback_header(
+        chain_id: u64,
+        slot: u64,
+        view: u64,
+        proposer_idx: usize,
+        committee: &[(
+            pyde_crypto::falcon::FalconPublicKey,
+            pyde_crypto::falcon::FalconSecretKey,
+        )],
+    ) -> (BlockHeader, Vec<u8>, Vec<Vec<u8>>) {
+        use pyde_account::address::derive_eoa_address;
+        let committee_keys: Vec<Vec<u8>> = committee
+            .iter()
+            .map(|(pk, _)| pk.as_bytes().to_vec())
+            .collect();
+        let proposer_addr = derive_eoa_address(&committee_keys[proposer_idx]);
+        let mut header = dummy_header(slot);
+        header.proposer = proposer_addr;
+        header.vrf_proof = pyde_consensus::view_change::encode_fallback_proof(slot, view);
+        header.parent_hash = [0xCD; 32];
+        let block_hash = header.hash();
+        let sign_msg = pyde_consensus::hotstuff::proposer_sign_message(chain_id, slot, &block_hash);
+        let sig = pyde_crypto::falcon::falcon_sign(&committee[proposer_idx].1, &sign_msg)
+            .expect("falcon_sign")
+            .as_bytes()
+            .to_vec();
+        (header, sig, committee_keys)
+    }
+
+    fn make_committee(
+        n: usize,
+    ) -> Vec<(
+        pyde_crypto::falcon::FalconPublicKey,
+        pyde_crypto::falcon::FalconSecretKey,
+    )> {
+        (0..n)
+            .map(|_| pyde_crypto::falcon::falcon_keygen().expect("falcon_keygen"))
+            .collect()
+    }
+
+    /// TPL-204: pre-fix, the `len() >= 33` gate skipped the entire VRF
+    /// block for fallback proofs (24 bytes), so a Byzantine peer could
+    /// stamp `header.vrf_proof = encode_fallback_proof(slot, view)`
+    /// with itself as proposer and pass full-node validation, even
+    /// when it isn't the deterministic leader for `(slot, view)`.
+    /// Two valid Byzantine fallbacks at the same `(H, V)` could both
+    /// apply at full nodes — an L2 violation. Post-fix, this test
+    /// asserts the wrong-leader case is rejected with the L2 marker.
+    #[test]
+    fn validate_network_block_rejects_fallback_from_wrong_leader() {
+        let chain_id = 31337;
+        let committee = make_committee(3);
+        let slot = 5u64;
+        let view = 0u64;
+        // fallback_leader_index(5, 0, 3) = (5+0) % 3 = 2.
+        // Wrong leader: index 1 (or 0).
+        let wrong_idx = 1usize;
+        let (header, sig, committee_keys) =
+            make_signed_fallback_header(chain_id, slot, view, wrong_idx, &committee);
+        let now_ms = header.timestamp.saturating_add(1);
+        let err = BlockProcessor::validate_network_block(
+            chain_id,
+            &header,
+            &sig,
+            &committee_keys,
+            &[0u8; 32],
+            Some(&[0xCD; 32]),
+            None,
+            now_ms,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("audit-234 L2") && err.contains("not the deterministic leader"),
+            "expected fallback-leader audit-234 L2 rejection, got: {err}"
+        );
+    }
+
+    /// TPL-204: positive control — the deterministic leader for
+    /// `(slot, view)` IS allowed to ship the fallback. Without this,
+    /// the rejection test above wouldn't prove the new branch fires
+    /// on the leader bit specifically (vs. some unrelated audit
+    /// further down).
+    #[test]
+    fn validate_network_block_accepts_fallback_from_correct_leader() {
+        let chain_id = 31337;
+        let committee = make_committee(3);
+        let slot = 5u64;
+        let view = 0u64;
+        let correct_idx = 2usize; // (5+0) % 3 == 2
+        let (header, sig, committee_keys) =
+            make_signed_fallback_header(chain_id, slot, view, correct_idx, &committee);
+        let now_ms = header.timestamp.saturating_add(1);
+        let res = BlockProcessor::validate_network_block(
+            chain_id,
+            &header,
+            &sig,
+            &committee_keys,
+            &[0u8; 32],
+            Some(&[0xCD; 32]),
+            None,
+            now_ms,
+        );
+        // The QC-quorum gate (step 4) and the audit-311 sig-verify
+        // gate (step 5) might fail because dummy_header sets
+        // qc_previous.slot = slot - 1 with no signatures. We only
+        // care that the fallback-leader branch passes — assert by
+        // negative.
+        if let Err(e) = res {
+            assert!(
+                !e.contains("audit-234 L2"),
+                "correct leader must NOT trip the fallback-leader check, got: {e}"
+            );
+        }
+    }
+
+    /// TPL-204: a header with neither a VRF proof (≥ 33 bytes) nor a
+    /// fallback proof (8-byte marker) must be rejected. Pre-fix, the
+    /// `if len() >= 33` gate fell through silently for any other
+    /// length and the code accepted the block.
+    #[test]
+    fn validate_network_block_rejects_unrecognised_vrf_proof() {
+        let chain_id = 31337;
+        let committee = make_committee(3);
+        // Build a signed header but stamp a bogus 10-byte vrf_proof
+        // that is neither a real VRF proof nor a fallback marker.
+        let slot = 4u64;
+        let proposer_idx = 0usize;
+        let (mut header, _good_sig, committee_keys) =
+            make_signed_fallback_header(chain_id, slot, 0, proposer_idx, &committee);
+        header.vrf_proof = vec![0xBE; 10];
+        // Re-sign over the mutated header.
+        let block_hash = header.hash();
+        let sign_msg = pyde_consensus::hotstuff::proposer_sign_message(chain_id, slot, &block_hash);
+        let sig = pyde_crypto::falcon::falcon_sign(&committee[proposer_idx].1, &sign_msg)
+            .expect("falcon_sign")
+            .as_bytes()
+            .to_vec();
+        let now_ms = header.timestamp.saturating_add(1);
+        let err = BlockProcessor::validate_network_block(
+            chain_id,
+            &header,
+            &sig,
+            &committee_keys,
+            &[0u8; 32],
+            Some(&[0xCD; 32]),
+            None,
+            now_ms,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("audit-234 L2") && err.contains("invalid vrf_proof"),
+            "expected unrecognised-vrf_proof audit-234 L2 rejection, got: {err}"
         );
     }
 }
