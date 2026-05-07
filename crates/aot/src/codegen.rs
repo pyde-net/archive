@@ -121,11 +121,16 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // Declare host function signatures in the module
-    // host_load(ctx, addr, width) -> u64
+    // host_load(ctx, addr, width, trap_out) -> u64
+    // TPL-202: trap_out is an explicit fault channel. Pre-fix
+    // host_load returned u64::MAX on fault, which collided with a
+    // legitimate load64 of 0xFFFF_FFFF_FFFF_FFFF and produced an
+    // AOT-vs-interpreter divergence (consensus fork vector).
     let mut sig_load = module.make_signature();
     sig_load.params.push(AbiParam::new(ptr_type));
     sig_load.params.push(AbiParam::new(I64));
     sig_load.params.push(AbiParam::new(I64));
+    sig_load.params.push(AbiParam::new(ptr_type));
     sig_load.returns.push(AbiParam::new(I64));
     let fn_load = module
         .declare_function("host_load", Linkage::Import, &sig_load)
@@ -215,13 +220,30 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
         .declare_function("host_push", Linkage::Import, &sig_push)
         .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
-    // host_pop(ctx) -> u64
+    // host_pop(ctx, trap_out) -> u64
+    // TPL-202: trap_out is an explicit fault channel — see
+    // host_load above. Without it, an AOT-side `Pop` of a stack
+    // slot containing `0xFFFF_FFFF_FFFF_FFFF` trapped while the
+    // interpreter accepted the value.
+    //
+    // host_pop has its own signature (`sig_pop_with_trap`)
+    // distinct from `sig_pop` (the historical `(ctx) -> u64`
+    // shape still used by the env-query host fns below —
+    // host_block_number, host_timestamp, etc).
+    let mut sig_pop_with_trap = module.make_signature();
+    sig_pop_with_trap.params.push(AbiParam::new(ptr_type));
+    sig_pop_with_trap.params.push(AbiParam::new(ptr_type));
+    sig_pop_with_trap.returns.push(AbiParam::new(I64));
+    let fn_pop = module
+        .declare_function("host_pop", Linkage::Import, &sig_pop_with_trap)
+        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
+
+    // sig_pop: shared `(ctx) -> u64` shape for env-query host fns
+    // (host_block_number, host_timestamp, host_gas_remaining,
+    // host_tx_nonce, host_tx_gas_limit, host_drain_page_gas).
     let mut sig_pop = module.make_signature();
     sig_pop.params.push(AbiParam::new(ptr_type));
     sig_pop.returns.push(AbiParam::new(I64));
-    let fn_pop = module
-        .declare_function("host_pop", Linkage::Import, &sig_pop)
-        .map_err(|e| CodegenError::CompilationFailed(e.to_string()))?;
 
     // Environment host functions: (ctx) -> u64
     // host_caller(ctx, wd) -> u64, host_address(ctx, wd) -> u64
@@ -755,17 +777,27 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         builder.switch_to_block(cont);
                     }
                     Opcode::Pop => {
+                        // TPL-202: same out-pointer pattern as Load.
+                        // Pre-fix this checked `result == u64::MAX`
+                        // and trapped on that, but a stack slot
+                        // containing `0xFFFF_FFFF_FFFF_FFFF` is a
+                        // legitimate value — the interpreter's
+                        // `Opcode::Pop` accepts it, so AOT-only
+                        // trapping was a fork.
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        let call = builder.ins().call(fn_pop_ref, &[vm_ctx]);
+                        let z = builder.ins().iconst(I64, 0);
+                        builder.ins().stack_store(z, trap_flag_ss, 0);
+                        let trap_ptr = builder.ins().stack_addr(ptr_type, trap_flag_ss, 0);
+                        let call = builder.ins().call(fn_pop_ref, &[vm_ctx, trap_ptr]);
                         let result = builder.inst_results(call)[0];
                         emit_drain_page_gas!(builder);
-                        // Check for fault (u64::MAX)
-                        let is_err = builder.ins().icmp_imm(IntCC::Equal, result, -1i64);
+                        gp_write!(builder, d.rd, result);
+                        let flag = builder.ins().stack_load(I64, trap_flag_ss, 0);
+                        let trapped = builder.ins().icmp_imm(IntCC::NotEqual, flag, 0);
                         let cont = builder.create_block();
-                        builder.ins().brif(is_err, trap_block, &[], cont, &[]);
+                        builder.ins().brif(trapped, trap_block, &[], cont, &[]);
                         builder.seal_block(cont);
                         builder.switch_to_block(cont);
-                        gp_write!(builder, d.rd, result);
                     }
 
                     // --- Wide register ops (host calls) ---
@@ -929,6 +961,15 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
 
                     // --- Memory operations (host calls) ---
                     Opcode::Load => {
+                        // TPL-202: route the fault channel through
+                        // the shared `trap_flag_ss` slot. Pre-fix,
+                        // AOT wrote `host_load`'s return value
+                        // straight into the destination GP register
+                        // with NO trap check, so a memory fault
+                        // (interpreter trap) silently became a
+                        // u64::MAX register write on AOT — chain
+                        // fork on adversarial bytecode that hits an
+                        // OOB load.
                         let base = gp_read!(builder, d.rs1);
                         let offset = pyde_vm::isa::decode_mem_offset(d.rs2_or_imm) as i64;
                         let width = pyde_vm::isa::decode_mem_width(d.rs2_or_imm) as u64;
@@ -936,10 +977,21 @@ pub fn compile(program: &AnalyzedProgram) -> Result<CompiledCode, CodegenError> 
                         let addr = builder.ins().iadd(base, off_val);
                         let w = builder.ins().iconst(I64, width as i64);
                         let vm_ctx = builder.use_var(Variable::from_u32(VAR_VM_CTX));
-                        let call = builder.ins().call(fn_load_ref, &[vm_ctx, addr, w]);
+                        let z = builder.ins().iconst(I64, 0);
+                        builder.ins().stack_store(z, trap_flag_ss, 0);
+                        let trap_ptr = builder.ins().stack_addr(ptr_type, trap_flag_ss, 0);
+                        let call = builder
+                            .ins()
+                            .call(fn_load_ref, &[vm_ctx, addr, w, trap_ptr]);
                         let result = builder.inst_results(call)[0];
                         emit_drain_page_gas!(builder);
                         gp_write!(builder, d.rd, result);
+                        let flag = builder.ins().stack_load(I64, trap_flag_ss, 0);
+                        let trapped = builder.ins().icmp_imm(IntCC::NotEqual, flag, 0);
+                        let cont = builder.create_block();
+                        builder.ins().brif(trapped, trap_block, &[], cont, &[]);
+                        builder.seal_block(cont);
+                        builder.switch_to_block(cont);
                     }
                     Opcode::Store => {
                         let base = gp_read!(builder, d.rs1);

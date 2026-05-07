@@ -320,6 +320,68 @@ mod tests {
         assert_gas_parity(&code, 1_000_000, "Push/Pop page-gas parity");
     }
 
+    /// TPL-202: pushing `u64::MAX` and popping it back must succeed
+    /// on both backends with the popped value preserved. Pre-fix,
+    /// AOT's `Opcode::Pop` checked `host_pop`'s return against
+    /// `u64::MAX` and trapped on a match — but `0xFFFF_FFFF_FFFF_FFFF`
+    /// is a perfectly legal stack value. Interpreter accepted it,
+    /// AOT trapped → fork. The trap-out pointer split keeps the
+    /// value channel and the fault channel disjoint.
+    #[test]
+    fn pop_u64_max_stack_value_does_not_trap_aot_tpl_202() {
+        // `Addi r1, r0, -1` materialises u64::MAX in r1 by
+        // sign-extension (i32::MIN .. i32::MAX wraps into the
+        // u64 top half).
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, -1),
+            instr_bytes(Opcode::Push, 1, 0, 0),
+            instr_bytes(Opcode::Pop, 2, 0, 0),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        // Direct AOT run: confirm it succeeds (not RESULT_TRAP) and
+        // r2 == u64::MAX. compare_with_interpreter would also work,
+        // but asserting RESULT_SUCCESS + value here makes the
+        // before/after distinction obvious in test output.
+        let (aot_status, _, regs) = run_aot(&code, 1_000_000);
+        assert_eq!(aot_status, RESULT_SUCCESS);
+        assert_eq!(regs[2], u64::MAX);
+        // Interpreter parity — same value emerges from the same
+        // bytecode under interpretation.
+        compare_with_interpreter(&code, 1_000_000);
+    }
+
+    /// TPL-202: the symmetrical case for `Opcode::Load` — a memory
+    /// fault must trap on AOT (matching the interpreter), even
+    /// though `host_load` no longer encodes the fault into its
+    /// return value. Pre-fix, AOT silently wrote `u64::MAX` to the
+    /// destination register on fault and continued executing while
+    /// the interpreter trapped → fork in the other direction.
+    /// Storing `u64::MAX` into a regular heap slot and loading it
+    /// back is exercised by the existing Load parity tests.
+    #[test]
+    fn load_oob_traps_on_aot_tpl_202() {
+        // r1 = a clearly-OOB address (top of u32 space). Word-wide
+        // load of 8 bytes from there must trap.
+        let code = bytecode(&[
+            instr_ri(Opcode::Addi, 1, 0, -8),
+            // Load r2 = mem[r1 + 0] (W64) — addr = u64::MAX-7,
+            // truncated to u32 = 0xFFFF_FFF8, OOB.
+            // mem-encoding: width=3 (W64) at the right bit position.
+            instr_bytes(
+                Opcode::Load,
+                2,
+                1,
+                pyde_vm::isa::encode_mem_immediate(0, pyde_vm::isa::MemWidth::W64).unwrap(),
+            ),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        let (aot_status, _, _) = run_aot(&code, 1_000_000);
+        assert_eq!(
+            aot_status, RESULT_TRAP,
+            "OOB Load on AOT must trap, not silently write u64::MAX"
+        );
+    }
+
     #[test]
     fn poseidon_aot_charges_page_gas_parity_with_interp() {
         // host_poseidon reads `len` bytes from memory via
