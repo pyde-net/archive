@@ -4,3 +4,16 @@ node_modules/
 pyde-book/
 crates/pyde-rust-sdk/LIVE_TEST_PLAN.md
 crates/pyde-dev/CHEATCODES_ROADMAP.md
+
+# Internal planning + audit docs at repo root. AUDIT_FINDINGS{,_2}.md
+# are tracked in git but contain vulnerability detail that has no place
+# in a published image; the rest are gitignored locally and would only
+# leak via a developer-machine `docker build`. Either way, exclude.
+AUDIT_FINDINGS.md
+AUDIT_FINDINGS_2.md
+ROADMAP.md
+MAINNET_PLAN.md
+BENCH_PLAN.md
+BENCH_CONTRACTS.md
+EXPLORER_PLAN.md
+TESTNET_LAUNCH_TRACKER.md
