@@ -11,6 +11,7 @@
 use crate::encrypted::{decrypt_payload, EncryptedTx};
 use pyde_crypto::threshold::{generate_decryption_share, DecryptionShare, KeyShare};
 use pyde_tx::types::{FeePayer, Transaction, TransactionType};
+use std::fmt::Write;
 
 /// Decryption state for a single block's worth of encrypted transactions.
 #[derive(Debug)]
@@ -77,6 +78,21 @@ impl BlockDecryptor {
             .map(|tx| generate_decryption_share(key_share, &tx.ciphertext))
             .collect();
 
+        if std::env::var("PYDE_DECRYPT_DIAG").is_ok() && !self.encrypted_txs.is_empty() {
+            let kct_first8 = {
+                let wire = self.encrypted_txs[0].ciphertext.to_wire_bytes();
+                let mut out = [0u8; 8];
+                let n = 8.min(wire.len());
+                out[..n].copy_from_slice(&wire[..n]);
+                out
+            };
+            let share_index_local = shares.first().map(|s| s.index).unwrap_or(0);
+            eprintln!(
+                "[decrypt-diag-add-member] my_key_share.index={} share_local.index={} num_txs={} kct[0..8]={:02x?}",
+                key_share.index, share_index_local, self.encrypted_txs.len(), kct_first8
+            );
+        }
+
         let mut accepted = 0;
         for (i, share) in shares.into_iter().enumerate() {
             if self.add_share(i, share) {
@@ -127,11 +143,51 @@ impl BlockDecryptor {
             ));
         }
 
+        // Audit 406 diag: env-gated cross-node fingerprint so a
+        // failing decryption can be cross-correlated against the
+        // pool composition on every validator. Set
+        // `PYDE_DECRYPT_DIAG=1` on the running node.
+        if std::env::var("PYDE_DECRYPT_DIAG").is_ok() {
+            let indices: Vec<usize> = self.shares[tx_index].iter().map(|s| s.index).collect();
+            let wire = self.encrypted_txs[tx_index].ciphertext.to_wire_bytes();
+            let kct_first8 = &wire[..8.min(wire.len())];
+            let msg_len = wire.len();
+            eprintln!(
+                "[decrypt-diag] tx_index={} share_count={} threshold={} share_indices={:?} kct[0..8]={:02x?} msg_len={}",
+                tx_index, share_count, self.threshold, indices, kct_first8, msg_len
+            );
+        }
+
         let (to, value, calldata) = decrypt_payload(
             &self.encrypted_txs[tx_index].ciphertext,
             &self.shares[tx_index],
             self.threshold,
-        )?;
+        )
+        .inspect_err(|e| {
+            if std::env::var("PYDE_DECRYPT_DIAG").is_ok() {
+                let indices: Vec<usize> = self.shares[tx_index]
+                    .iter()
+                    .map(|s| s.index)
+                    .collect();
+                let to_hex = |b: &[u8]| -> String {
+                    let mut s = String::with_capacity(b.len() * 2);
+                    for x in b {
+                        let _ = write!(s, "{:02x}", x);
+                    }
+                    s
+                };
+                let wire = self.encrypted_txs[tx_index].ciphertext.to_wire_bytes();
+                let ct_hex = to_hex(&wire);
+                let shares_hex: Vec<String> = self.shares[tx_index]
+                    .iter()
+                    .map(|s| to_hex(&s.to_bytes()))
+                    .collect();
+                eprintln!(
+                    "[decrypt-diag-full] FAIL tx_index={} indices={:?} threshold={} ct={} shares={:?} err={}",
+                    tx_index, indices, self.threshold, ct_hex, shares_hex, e
+                );
+            }
+        })?;
 
         let enc_tx = &self.encrypted_txs[tx_index];
         Ok(Transaction {

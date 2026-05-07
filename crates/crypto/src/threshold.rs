@@ -947,6 +947,27 @@ pub fn apply_refresh(key_share: &KeyShare, contributions: &[RefreshContribution]
     }
 }
 
+/// Audit 406: same as `apply_refresh` but operates on the slice of
+/// references returned by `canonical_refresh_subset`, so callers
+/// don't need to clone the contributions just to satisfy the
+/// `&[RefreshContribution]` signature.
+pub fn apply_refresh_canonical(
+    key_share: &KeyShare,
+    canonical: &[&RefreshContribution],
+) -> KeyShare {
+    let validator_idx = key_share.index - 1;
+    let mut new_shares = key_share.shares.clone();
+    for contrib in canonical {
+        for elem_idx in 0..SEED_ELEMENTS {
+            new_shares[elem_idx] += contrib.deltas[validator_idx][elem_idx];
+        }
+    }
+    KeyShare {
+        index: key_share.index,
+        shares: new_shares,
+    }
+}
+
 /// Verify a refresh contribution by checking that each zero-secret polynomial
 /// evaluates correctly (the shares from this contribution alone reconstruct to zero).
 pub fn verify_refresh_contribution(contribution: &RefreshContribution, threshold: usize) -> bool {
@@ -1240,6 +1261,30 @@ pub fn canonical_resharing_subset(
     let mut refs: Vec<&ResharingContribution> = pool.iter().collect();
     refs.sort_by_key(|c| c.from_old_index);
     refs.truncate(old_threshold);
+    Some(refs)
+}
+
+/// Audit 406: same idea as `canonical_resharing_subset` but for PSS
+/// same-committee refresh contributions. Picks the `threshold`
+/// contributions with the LOWEST `from_index` so every validator
+/// applies the same delta polynomial sum to its share. Pre-fix the
+/// runtime applied whichever `threshold` contributions arrived
+/// first via gossip, which produced different `(first-N)` subsets
+/// across nodes under async delivery — exactly the failure mode
+/// audit 403 fixed for epoch randomness — and the resulting shares
+/// no longer interpolated to the same secret. Decryption then
+/// failed every time because the threshold-Kyber Lagrange
+/// reconstruction collapsed onto a wrong-secret seed.
+pub fn canonical_refresh_subset(
+    pool: &[RefreshContribution],
+    threshold: usize,
+) -> Option<Vec<&RefreshContribution>> {
+    if pool.len() < threshold {
+        return None;
+    }
+    let mut refs: Vec<&RefreshContribution> = pool.iter().collect();
+    refs.sort_by_key(|c| c.from_index);
+    refs.truncate(threshold);
     Some(refs)
 }
 
@@ -1697,6 +1742,417 @@ mod tests {
         // so they should also work. PSS only protects against partial compromise.
         let plaintext_old = combine_shares(&dec_shares_old, 3, &ct).unwrap();
         assert_eq!(plaintext_old, msg);
+    }
+
+    /// AUDIT 406 REGRESSION GUARD — reshare canonical-subset
+    /// divergence when each node's local pool is missing its own
+    /// contribution.
+    ///
+    /// The runtime symptom: every node fired `committee handoff
+    /// complete` cleanly, but each node's `canonical_resharing_subset`
+    /// returned a DIFFERENT 3-of-4 subset (each missing the
+    /// contribution from its own old position, because
+    /// `start_committee_reshare` never seeded the local pool with
+    /// the local contribution). The new shares then evaluated
+    /// different polynomials, post-reshare on-disk shares didn't
+    /// combine to recover the secret, and 100% of encrypted txs
+    /// failed to decrypt despite all four nodes having "valid-
+    /// looking" shares. This test reproduces that divergence.
+    #[test]
+    fn audit_406_reshare_local_pool_must_include_own_contribution() {
+        let (tpk, genesis_shares) = threshold_keygen(4, 3).unwrap();
+        let msg = b"reshare-own-in-pool bug repro";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+
+        // Generate one resharing contribution per old member.
+        let pool_full: Vec<ResharingContribution> = genesis_shares
+            .iter()
+            .map(|s| generate_resharing_contribution(s, 4, 3, 1, b"reshare-fix"))
+            .collect();
+
+        // BUG CASE: each node's local pool is missing the
+        // contribution from its OWN old index (mirrors what
+        // `start_committee_reshare` left behind pre-fix). canonical
+        // ends up different on every node.
+        let perm: [usize; 4] = [3, 4, 1, 2]; // genesis_idx → new_index
+        let mut buggy_new_shares: Vec<KeyShare> = Vec::with_capacity(4);
+        for missing_old_idx in 1..=4usize {
+            let local_pool: Vec<ResharingContribution> = pool_full
+                .iter()
+                .filter(|c| c.from_old_index != missing_old_idx)
+                .cloned()
+                .collect();
+            assert_eq!(local_pool.len(), 3);
+            let canonical = canonical_resharing_subset(&local_pool, 3).unwrap();
+            // canonical here is whatever 3-of-3 the local pool
+            // contains — one will be {2,3,4}, next {1,3,4}, etc.
+            let new_idx = perm[missing_old_idx - 1];
+            let new_share = aggregate_new_share(new_idx, &canonical).unwrap();
+            buggy_new_shares.push(new_share);
+        }
+
+        // Buggy: every 3-of-4 subset MUST fail to combine, because
+        // the four shares lie on four different polynomials.
+        let mut any_buggy_ok = false;
+        for skip in 0..4 {
+            let dec: Vec<DecryptionShare> = (0..4)
+                .filter(|&i| i != skip)
+                .map(|i| generate_decryption_share(&buggy_new_shares[i], &ct))
+                .collect();
+            if let Ok(plain) = combine_shares(&dec, 3, &ct) {
+                if plain == msg {
+                    any_buggy_ok = true;
+                }
+            }
+        }
+        assert!(
+            !any_buggy_ok,
+            "buggy local-pool reshare unexpectedly recovered secret — \
+             repro is wrong, the runtime divergence is something else"
+        );
+
+        // FIX CASE: every node's local pool includes its OWN
+        // contribution. canonical = lowest-3 by from_old_index =
+        // {1,2,3} on every node. New shares all interpolate to the
+        // same polynomial.
+        let canonical_fix = canonical_resharing_subset(&pool_full, 3).unwrap();
+        let fixed_new_shares: Vec<KeyShare> = (1..=4usize)
+            .map(|new_idx| aggregate_new_share(new_idx, &canonical_fix).unwrap())
+            .collect();
+
+        for skip in 0..4 {
+            let dec: Vec<DecryptionShare> = (0..4)
+                .filter(|&i| i != skip)
+                .map(|i| generate_decryption_share(&fixed_new_shares[i], &ct))
+                .collect();
+            let plain = combine_shares(&dec, 3, &ct)
+                .unwrap_or_else(|e| panic!("fixed skip {} failed: {}", skip, e));
+            assert_eq!(plain, msg, "fixed skip {} wrong plaintext", skip);
+        }
+    }
+
+    /// AUDIT 406 — `DecryptionShare` wire round-trip must preserve
+    /// every byte, otherwise the runtime — which gossips shares
+    /// across the committee — will combine round-tripped shares
+    /// that no longer interpolate to the same secret. This was the
+    /// last remaining drift hypothesis when in-process decrypt
+    /// passed the diag but every block of encrypted txs failed.
+    #[test]
+    fn audit_406_decryption_share_wire_roundtrip_decrypts() {
+        let (tpk, key_shares) = threshold_keygen(4, 3).unwrap();
+        let msg = b"share wire roundtrip";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+
+        // Generate 4 fresh decryption shares locally.
+        let local_shares: Vec<DecryptionShare> = key_shares
+            .iter()
+            .map(|ks| generate_decryption_share(ks, &ct))
+            .collect();
+
+        // Wire-roundtrip every share via `to_bytes` / `from_bytes`,
+        // mirror of what gossip does between sender and receiver.
+        let roundtripped: Vec<DecryptionShare> = local_shares
+            .iter()
+            .map(|s| {
+                let bytes = s.to_bytes();
+                DecryptionShare::from_bytes(&bytes).expect("share roundtrip")
+            })
+            .collect();
+
+        // Bytes must be identical.
+        for (orig, rt) in local_shares.iter().zip(&roundtripped) {
+            assert_eq!(orig.to_bytes(), rt.to_bytes(), "share bytes drifted");
+            assert_eq!(orig.index, rt.index, "share index drifted");
+        }
+
+        // Every threshold-sized subset of round-tripped shares must
+        // still combine to recover the secret.
+        for skip in 0..4 {
+            let subset: Vec<DecryptionShare> = roundtripped
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| if i == skip { None } else { Some(s.clone()) })
+                .collect();
+            let plain = combine_shares(&subset, 3, &ct).unwrap_or_else(|e| {
+                panic!(
+                    "skip {} round-tripped shares failed combine: {} — \
+                     wire round-trip corrupts DecryptionShare",
+                    skip, e
+                )
+            });
+            assert_eq!(plain, msg);
+        }
+    }
+
+    /// AUDIT 406 RUNTIME-PIPELINE INTEGRATION TEST.
+    ///
+    /// Simulates the exact sequence the runtime runs at every
+    /// epoch boundary: genesis keygen → cross-committee reshare
+    /// (canonical-subset aggregate) → PSS canonical-subset apply.
+    /// At the end, every 3-of-4 subset of post-pipeline shares must
+    /// still combine to the original secret behind the (unchanged)
+    /// public key. This is the property the on-disk-shares
+    /// diagnostic test (`crates/crypto/tests/encrypted_pipeline_diag.rs`)
+    /// failed to satisfy before the fix.
+    #[test]
+    fn audit_406_runtime_pipeline_preserves_secret() {
+        let (tpk, genesis_shares) = threshold_keygen(4, 3).unwrap();
+        let msg = b"runtime pipeline preserves secret";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+
+        // ---- Cross-committee resharing pass ----
+        // Each genesis-share holder generates a resharing contribution
+        // for the new committee. We use a permuted "new committee"
+        // where each validator's new_index differs from its old.
+        let new_n = 4usize;
+        let new_t = 3usize;
+        let entropy_reshare = b"runtime-test-reshare";
+        let reshare_pool: Vec<ResharingContribution> = genesis_shares
+            .iter()
+            .map(|s| generate_resharing_contribution(s, new_n, new_t, 1, entropy_reshare))
+            .collect();
+        let canonical = canonical_resharing_subset(&reshare_pool, /* old_threshold */ 3)
+            .expect("resharing canonical subset");
+
+        // Permute new positions: validator i (genesis) maps to new
+        // index P[i]. This mimics the runtime where the new committee
+        // shuffles positions per VRF.
+        let perm: [usize; 4] = [3, 4, 1, 2]; // genesis_idx → new_index (1-based)
+        let post_reshare_shares: Vec<KeyShare> = (0..4)
+            .map(|i| aggregate_new_share(perm[i], &canonical).expect("aggregate"))
+            .collect();
+
+        // Sanity: post-reshare alone must decrypt.
+        let dec_after_reshare: Vec<DecryptionShare> = post_reshare_shares[..3]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        let plain_reshare =
+            combine_shares(&dec_after_reshare, 3, &ct).expect("post-reshare alone must decrypt");
+        assert_eq!(plain_reshare, msg);
+
+        // ---- PSS canonical apply pass ----
+        // Each validator broadcasts a PSS contribution. from_index is
+        // the validator's OLD (genesis) index in the runtime — that's
+        // what start_pss_refresh uses since it runs BEFORE reshare
+        // overwrites identity.key_share.
+        let entropy_pss = b"runtime-test-pss-entropy";
+        let pss_pool: Vec<RefreshContribution> = (1..=4usize)
+            .map(|old_idx| generate_refresh_contribution(old_idx, new_n, new_t, 2, entropy_pss))
+            .collect();
+        let pss_canonical = canonical_refresh_subset(&pss_pool, 3).expect("PSS canonical subset");
+
+        // Validators apply PSS canonical to their post-reshare share.
+        // post_reshare_share.index is the NEW position (perm[i]).
+        let post_pss_shares: Vec<KeyShare> = post_reshare_shares
+            .iter()
+            .map(|s| apply_refresh_canonical(s, &pss_canonical))
+            .collect();
+
+        // The post-pipeline shares MUST still decrypt the original
+        // ciphertext via every 3-of-4 subset.
+        for skip in 0..4usize {
+            let subset_shares: Vec<KeyShare> = (0..4)
+                .filter(|&i| i != skip)
+                .map(|i| post_pss_shares[i].clone())
+                .collect();
+            let dec: Vec<DecryptionShare> = subset_shares
+                .iter()
+                .map(|s| generate_decryption_share(s, &ct))
+                .collect();
+            let plain = combine_shares(&dec, 3, &ct).unwrap_or_else(|e| {
+                panic!(
+                    "subset (skip {}) failed to decrypt: {} \
+                     — runtime pipeline did NOT preserve secret",
+                    skip, e
+                )
+            });
+            assert_eq!(plain, msg, "subset (skip {}) wrong plaintext", skip);
+        }
+    }
+
+    /// AUDIT 406 RUNTIME-PIPELINE INTEGRATION TEST — TWO CYCLES.
+    /// The single-cycle test passes; the on-disk diagnostic against
+    /// a real testnet that ran multiple cycles fails. So either two
+    /// cycles compound an error, or the PSS contribution generation
+    /// in cycle 2 reads stale state. This test runs the full
+    /// pipeline twice and asserts the original ciphertext still
+    /// decrypts at every 3-of-4 subset of the post-cycle-2 shares.
+    #[test]
+    fn audit_406_runtime_pipeline_two_cycles_preserve_secret() {
+        let (tpk, genesis_shares) = threshold_keygen(4, 3).unwrap();
+        let msg = b"two-cycle pipeline preserves secret";
+        let ct = threshold_encrypt(&tpk, msg).unwrap();
+        let new_n = 4usize;
+        let new_t = 3usize;
+
+        // ---- Cycle 1 ----
+        let cycle1_reshare_pool: Vec<ResharingContribution> = genesis_shares
+            .iter()
+            .map(|s| generate_resharing_contribution(s, new_n, new_t, 1, b"reshare-1"))
+            .collect();
+        let c1_canonical_reshare = canonical_resharing_subset(&cycle1_reshare_pool, 3).unwrap();
+        let perm1: [usize; 4] = [3, 4, 1, 2];
+        let after_c1_reshare: Vec<KeyShare> = (0..4)
+            .map(|i| aggregate_new_share(perm1[i], &c1_canonical_reshare).unwrap())
+            .collect();
+
+        // PSS contributions for cycle 1: from_index = OLD index = genesis index.
+        let cycle1_pss_pool: Vec<RefreshContribution> = (1..=4usize)
+            .map(|old_idx| generate_refresh_contribution(old_idx, new_n, new_t, 2, b"pss-1"))
+            .collect();
+        let c1_canonical_pss = canonical_refresh_subset(&cycle1_pss_pool, 3).unwrap();
+        let after_c1_pss: Vec<KeyShare> = after_c1_reshare
+            .iter()
+            .map(|s| apply_refresh_canonical(s, &c1_canonical_pss))
+            .collect();
+
+        // Sanity: post-cycle-1 must decrypt.
+        for skip in 0..4usize {
+            let dec: Vec<DecryptionShare> = (0..4)
+                .filter(|&i| i != skip)
+                .map(|i| generate_decryption_share(&after_c1_pss[i], &ct))
+                .collect();
+            let plain = combine_shares(&dec, 3, &ct)
+                .unwrap_or_else(|e| panic!("c1 skip {} fail: {}", skip, e));
+            assert_eq!(plain, msg, "c1 skip {} wrong plaintext", skip);
+        }
+
+        // ---- Cycle 2 ----
+        // Inputs: post-cycle-1 shares. Each validator's "OLD index"
+        // for cycle 2 is its CURRENT key_share.index = perm1[i].
+        let cycle2_reshare_pool: Vec<ResharingContribution> = after_c1_pss
+            .iter()
+            .map(|s| generate_resharing_contribution(s, new_n, new_t, 2, b"reshare-2"))
+            .collect();
+        let c2_canonical_reshare = canonical_resharing_subset(&cycle2_reshare_pool, 3).unwrap();
+        let perm2: [usize; 4] = [4, 2, 3, 1]; // a different permutation
+        let after_c2_reshare: Vec<KeyShare> = (0..4)
+            .map(|i| aggregate_new_share(perm2[i], &c2_canonical_reshare).unwrap())
+            .collect();
+
+        // PSS for cycle 2: from_index = current key_share.index BEFORE
+        // reshare runs. Since start_pss_refresh runs BEFORE
+        // start_committee_reshare in the runtime, key_share at
+        // generation time is still post-cycle-1 = perm1[i].
+        let cycle2_pss_pool: Vec<RefreshContribution> = (0..4)
+            .map(|i| generate_refresh_contribution(perm1[i], new_n, new_t, 3, b"pss-2"))
+            .collect();
+        let c2_canonical_pss = canonical_refresh_subset(&cycle2_pss_pool, 3).unwrap();
+        let after_c2_pss: Vec<KeyShare> = after_c2_reshare
+            .iter()
+            .map(|s| apply_refresh_canonical(s, &c2_canonical_pss))
+            .collect();
+
+        // The post-cycle-2 shares MUST still decrypt.
+        for skip in 0..4usize {
+            let dec: Vec<DecryptionShare> = (0..4)
+                .filter(|&i| i != skip)
+                .map(|i| generate_decryption_share(&after_c2_pss[i], &ct))
+                .collect();
+            let plain = combine_shares(&dec, 3, &ct).unwrap_or_else(|e| {
+                panic!(
+                    "post-cycle-2 skip {} failed: {} — \
+                     two-cycle pipeline did NOT preserve secret",
+                    skip, e
+                )
+            });
+            assert_eq!(plain, msg, "c2 skip {} wrong plaintext", skip);
+        }
+    }
+
+    /// AUDIT 406 REGRESSION GUARD.
+    ///
+    /// Pre-fix the runtime applied refresh contributions eagerly on
+    /// first-`threshold` arrival. Under async gossip every validator
+    /// saw a different "first 3 of N" arrival order, so each one
+    /// applied a different DELTA SET to its share — the shares
+    /// stopped interpolating to the same secret and every block of
+    /// encrypted txs failed to decrypt.
+    ///
+    /// This test simulates that bug directly: each validator's
+    /// share is mutated by `apply_refresh` over a DIFFERENT pool
+    /// subset. We then check that
+    ///   (a) decryption with the mutated shares fails (the bug
+    ///       manifests), AND
+    ///   (b) decryption with the canonical-subset apply succeeds
+    ///       (the fix works).
+    #[test]
+    fn pss_eager_apply_breaks_decryption_canonical_apply_fixes_it() {
+        let (epoch_mat, shares) = setup_epoch(4, 3);
+        let msg = b"audit-406 regression";
+        let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
+
+        // Generate 4 contributions, one per validator.
+        let entropy = b"audit-406-test-entropy";
+        let pool: Vec<RefreshContribution> = (1..=4usize)
+            .map(|idx| generate_refresh_contribution(idx, 4, 3, 1, entropy))
+            .collect();
+
+        // Simulate buggy runtime: each validator picks a DIFFERENT
+        // first-3-of-4 subset (whatever arrived fastest in their
+        // gossip order). Validator 1 saw {own, 2, 3} first;
+        // validator 2 saw {own, 3, 4}; validator 3 saw {own, 1, 4};
+        // validator 4 saw {own, 1, 2}. Same membership but each
+        // skips a different peer's contribution.
+        let buggy_subsets: [[usize; 3]; 4] = [
+            [1, 2, 3], // validator 1 misses 4
+            [2, 3, 4], // validator 2 misses 1
+            [3, 1, 4], // validator 3 misses 2
+            [4, 1, 2], // validator 4 misses 3
+        ];
+        let buggy_shares: Vec<KeyShare> = (0..4)
+            .map(|i| {
+                let owned: Vec<RefreshContribution> = buggy_subsets[i]
+                    .iter()
+                    .map(|&j| pool[j - 1].clone())
+                    .collect();
+                apply_refresh(&shares[i], &owned)
+            })
+            .collect();
+
+        // (a) Decryption with the buggy mixed shares should NOT
+        // recover the plaintext — the shares are on different
+        // polynomials.
+        let buggy_dec: Vec<DecryptionShare> = buggy_shares[..3]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        let buggy_result = combine_shares(&buggy_dec, 3, &ct);
+        assert!(
+            buggy_result.is_err() || buggy_result.as_ref().unwrap() != msg,
+            "buggy first-N-wins apply should NOT decrypt — \
+             this is the audit 406 failure mode"
+        );
+
+        // (b) Same starting shares + same pool, but apply the
+        // canonical subset on every validator. They must all
+        // converge on the same polynomial.
+        let canonical = canonical_refresh_subset(&pool, 3).expect("canonical subset");
+        let fixed_shares: Vec<KeyShare> = (0..4)
+            .map(|i| apply_refresh_canonical(&shares[i], &canonical))
+            .collect();
+
+        let fixed_dec: Vec<DecryptionShare> = fixed_shares[..3]
+            .iter()
+            .map(|s| generate_decryption_share(s, &ct))
+            .collect();
+        let fixed_plaintext = combine_shares(&fixed_dec, 3, &ct)
+            .expect("canonical apply must decrypt the same ciphertext");
+        assert_eq!(
+            fixed_plaintext, msg,
+            "canonical-subset apply must preserve the secret",
+        );
+
+        // Defensive: also verify the canonical subset is the
+        // lowest-from_index `threshold`-sized subset, regardless of
+        // pool ordering.
+        let mut shuffled = pool.clone();
+        shuffled.reverse();
+        let canon_shuffled =
+            canonical_refresh_subset(&shuffled, 3).expect("canonical from shuffled");
+        let canon_indices: Vec<usize> = canon_shuffled.iter().map(|c| c.from_index).collect();
+        assert_eq!(canon_indices, vec![1, 2, 3]);
     }
 
     #[test]

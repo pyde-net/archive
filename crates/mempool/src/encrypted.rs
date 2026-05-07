@@ -577,6 +577,70 @@ mod tests {
         assert!(EncryptedTx::from_bytes(&bytes).is_none());
     }
 
+    /// AUDIT 406 REGRESSION GUARD — the runtime decrypts an
+    /// EncryptedTx that was wire-roundtripped at least twice (RPC
+    /// in, block-body out → validator block-body in). Each
+    /// roundtrip must preserve the ciphertext byte-for-byte;
+    /// otherwise `ciphertext_binding_hash` differs between encrypt
+    /// and decrypt and `combine_shares` collapses onto the audit-
+    /// 360 oracle-safe error every single time.
+    #[test]
+    fn audit_406_encrypted_tx_double_roundtrip_is_byte_identical_and_decrypts() {
+        let (pk, key_shares) = make_threshold_keys();
+        let sender = derive_eoa_address(b"sender");
+        let to = derive_eoa_address(b"recipient");
+        let original = encrypt_transaction(
+            sender,
+            42,
+            500_000,
+            vec![],
+            Some(1_000_500),
+            7331,
+            vec![0xAA; 64],
+            &to,
+            1_000_000,
+            b"audit 406 double-roundtrip payload",
+            &pk,
+        )
+        .unwrap();
+
+        // First roundtrip: simulates RPC submission decode.
+        let bytes_1 = original.to_bytes();
+        let after_1 = EncryptedTx::from_bytes(&bytes_1).expect("first roundtrip");
+        let bytes_2 = after_1.to_bytes();
+        // Second roundtrip: simulates proposer block re-serialization.
+        let after_2 = EncryptedTx::from_bytes(&bytes_2).expect("second roundtrip");
+        let bytes_3 = after_2.to_bytes();
+
+        assert_eq!(bytes_1, bytes_2, "first roundtrip changed bytes");
+        assert_eq!(bytes_2, bytes_3, "second roundtrip changed bytes");
+        assert_eq!(
+            original.ciphertext.to_wire_bytes(),
+            after_2.ciphertext.to_wire_bytes(),
+            "ciphertext wire bytes drifted across two EncryptedTx roundtrips"
+        );
+
+        // Decrypt the post-double-roundtrip ciphertext via the
+        // committee's shares. This is the exact path the runtime
+        // takes: validators decode wire bytes from a block body,
+        // generate shares, and combine.
+        let dec_shares: Vec<pyde_crypto::threshold::DecryptionShare> = key_shares[..2]
+            .iter()
+            .map(|ks| pyde_crypto::threshold::generate_decryption_share(ks, &after_2.ciphertext))
+            .collect();
+        let plaintext_bytes =
+            pyde_crypto::threshold::combine_shares(&dec_shares, 2, &after_2.ciphertext)
+                .expect("post-roundtrip ciphertext must decrypt");
+        // Plaintext layout: to(32) || value(16 LE) || calldata.
+        assert_eq!(&plaintext_bytes[..32], &to);
+        let value_le: [u8; 16] = plaintext_bytes[32..48].try_into().unwrap();
+        assert_eq!(u128::from_le_bytes(value_le), 1_000_000);
+        assert_eq!(
+            &plaintext_bytes[48..],
+            b"audit 406 double-roundtrip payload"
+        );
+    }
+
     #[test]
     fn from_bytes_roundtrip_with_real_payload() {
         // Sanity: the new decoder still accepts a real, encoded

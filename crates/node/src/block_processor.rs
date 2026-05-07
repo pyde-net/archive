@@ -133,6 +133,26 @@ impl BlockProcessor {
         // 1. Validate header
         Self::validate_header_with_checkpoint(&block.header, chain, ws_checkpoint_slot)?;
 
+        // 1b. Audit 408: verify tx_root against the body BEFORE
+        // executing anything. Without this, a node whose
+        // canonical-apply path supplies a body that doesn't
+        // match `header.tx_root` (e.g. compact-block reconstruct
+        // that pulled a stale-bytes copy of a tx from this
+        // node's mempool, or a synthesize-empty-body fallback
+        // for a block whose header actually committed to a
+        // non-empty payload) silently commits diverging state.
+        // `validate_block_body` is the authoritative
+        // header↔body consistency check; it batch-verifies
+        // signatures + decodes encrypted-tx hashes + computes
+        // the merged tx_root and compares against
+        // `block.header.tx_root`. The on-receive path at
+        // `node.rs:4667` already gates apply on it; gating here
+        // too means *every* apply path gets the same protection
+        // without depending on every caller to remember the
+        // pre-check. The cost is one extra signature batch on
+        // the receive-then-apply path, paid once per block.
+        Self::validate_block_body(block, state, chain.chain_id)?;
+
         // 2. Build block context for tx execution.
         //
         // `dev_skip_signature` follows `chain_id == 31337` (devnet) so the

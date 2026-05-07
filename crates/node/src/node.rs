@@ -177,10 +177,7 @@ impl PydeNode {
 
         // 1. Load validator identity early (needed for genesis funding)
         let early_validator_identity = if is_validator {
-            Some(load_validator_identity(
-                datadir,
-                self.config.node.chain_id,
-            )?)
+            Some(load_validator_identity(datadir, self.config.node.chain_id)?)
         } else {
             None
         };
@@ -889,6 +886,19 @@ impl PydeNode {
             initial_slot = slot_clock.current_slot(),
             "slot_clock initialized"
         );
+        // Audit 408: hand the validator engine the same wall-clock
+        // anchor the slot clock uses, so its `advance_target_height`
+        // resets the proposal-timeout tracker to the new slot's
+        // actual start (genesis_ts + N * block_time) rather than
+        // wall-clock "now". Without this, the timer for slot N
+        // begins counting at the moment slot N-1's QC formed —
+        // which is typically 50–150 ms into slot N-1, so the 200 ms
+        // PROPOSAL_TIMEOUT fires ~50 ms BEFORE slot N starts and
+        // every other slot view-changes spuriously. See the
+        // `slot_start_ms_for_target` helper in validator.rs.
+        if let Some(engine) = validator_engine.as_mut() {
+            engine.set_slot_anchor(slot_clock_anchor_ms, block_time_ms);
+        }
         let mut last_slot = slot_clock.current_slot();
 
         // Periodic timers
@@ -1114,17 +1124,59 @@ impl PydeNode {
                             // `log_tag` to distinguish call sites in
                             // operator logs.
                             let _ = swarm.behaviour_mut().consensus_rr.send_response(channel, resp);
+                            // Audit 408: mirror the own-vote-QC path's
+                            // synthesize-empty-body fallback so QC
+                            // application is deterministic across all
+                            // nodes regardless of which node's own vote
+                            // closed the QC. The fallback is gated on
+                            // `header.tx_root == EMPTY_TX_ROOT` so it
+                            // only applies for blocks the proposer
+                            // committed to as empty (view-change empty
+                            // blocks, idle slots) — `compute_tx_root`
+                            // returns `[0u8; 32]` exactly when both
+                            // plaintext txs and encrypted-tx hashes are
+                            // empty (`pyde_consensus::block::compute_tx_root`).
+                            // For non-empty bodies we MUST wait on the
+                            // gossip-delivered body: pre-fix the
+                            // synthesize fallback applied an empty body
+                            // for any block the body buffer didn't hold,
+                            // and `process_full_block_…` doesn't verify
+                            // tx_root, so non-empty payloads silently
+                            // committed wrong state on the fallback path.
+                            const EMPTY_TX_ROOT: [u8; 32] = [0u8; 32];
                             let block = {
                                 let pbb = pending_block_bodies.read().await;
-                                match pbb.get(&qc_block_hash).cloned() {
-                                    Some(b) => b,
-                                    None => {
-                                        debug!(
-                                            qc_slot,
-                                            "RR-QC canonical apply: block not in buffer (sync will recover)"
-                                        );
-                                        continue;
-                                    }
+                                pbb.get(&qc_block_hash).cloned()
+                            }
+                            .or_else(|| {
+                                let engine = validator_engine.as_ref()?;
+                                let (header, sig) =
+                                    engine.buffered_proposal_for(qc_slot, &qc_block_hash)?;
+                                if header.tx_root != EMPTY_TX_ROOT {
+                                    return None;
+                                }
+                                Some(pyde_consensus::block::Block {
+                                    header,
+                                    body: pyde_consensus::block::BlockBody {
+                                        transactions: vec![],
+                                        encrypted_txs: vec![],
+                                        execution_schedule:
+                                            pyde_tx::parallel::ExecutionSchedule {
+                                                groups: vec![],
+                                                total_txs: 0,
+                                            },
+                                    },
+                                    proposer_signature: sig,
+                                })
+                            });
+                            let block = match block {
+                                Some(b) => b,
+                                None => {
+                                    debug!(
+                                        qc_slot,
+                                        "RR-QC canonical apply: body unavailable (sync will recover)"
+                                    );
+                                    continue;
                                 }
                             };
                             let mut chain_w = chain.write().await;
@@ -1448,17 +1500,46 @@ impl PydeNode {
                             // it is. Same body runs from the
                             // RR-fallback handler at line ~780 with a
                             // different log_tag.
+                            // Audit 408: same `EMPTY_TX_ROOT`-gated
+                            // synthesize fallback as the RR-QC path
+                            // above. Both paths must apply view-change
+                            // empty blocks identically. Non-empty bodies
+                            // still wait on gossip — see the rationale
+                            // attached to the RR-QC version.
+                            const EMPTY_TX_ROOT: [u8; 32] = [0u8; 32];
                             let block = {
                                 let pbb = pending_block_bodies.read().await;
-                                match pbb.get(&qc_block_hash).cloned() {
-                                    Some(b) => b,
-                                    None => {
-                                        debug!(
-                                            qc_slot,
-                                            "ApplyCanonicalAfterQc: block not in buffer (sync will recover)"
-                                        );
-                                        continue;
-                                    }
+                                pbb.get(&qc_block_hash).cloned()
+                            }
+                            .or_else(|| {
+                                let engine = validator_engine.as_ref()?;
+                                let (header, sig) =
+                                    engine.buffered_proposal_for(qc_slot, &qc_block_hash)?;
+                                if header.tx_root != EMPTY_TX_ROOT {
+                                    return None;
+                                }
+                                Some(pyde_consensus::block::Block {
+                                    header,
+                                    body: pyde_consensus::block::BlockBody {
+                                        transactions: vec![],
+                                        encrypted_txs: vec![],
+                                        execution_schedule:
+                                            pyde_tx::parallel::ExecutionSchedule {
+                                                groups: vec![],
+                                                total_txs: 0,
+                                            },
+                                    },
+                                    proposer_signature: sig,
+                                })
+                            });
+                            let block = match block {
+                                Some(b) => b,
+                                None => {
+                                    debug!(
+                                        qc_slot,
+                                        "ApplyCanonicalAfterQc: body unavailable (sync will recover)"
+                                    );
+                                    continue;
                                 }
                             };
                             let mut chain_w = chain.write().await;
@@ -2087,6 +2168,31 @@ impl PydeNode {
                                 }
                             }
 
+                            // Audit 406: re-broadcast our PSS contribution
+                            // during the same window. Without this a
+                            // dropped gossip message strands a peer's pool
+                            // at n-1 and the all-N apply guard blocks
+                            // PSS for the epoch — the share stays valid
+                            // (resharing already produced it) but the
+                            // genesis-trust-dissolution intent of PSS
+                            // doesn't fire. The rebroadcast loop here
+                            // closes that gap with the same window cross-
+                            // committee resharing already uses.
+                            if let Some((target_epoch, bytes)) = engine.maybe_rebroadcast_pss() {
+                                if is_validator {
+                                    let msg = wire::encode_pss_refresh(target_epoch, &bytes);
+                                    let topic = pyde_net::node::topics::consensus();
+                                    broadcast_consensus_with_rr_fallback(
+                                        &mut swarm,
+                                        topic,
+                                        msg,
+                                        &peer_manager,
+                                        &mut gossip_cache,
+                                    );
+                                    debug!(target_epoch, "re-broadcast PSS contribution");
+                                }
+                            }
+
                             // Task 034: deterministic aggregation trigger. We
                             // deliberately DON'T aggregate on first-threshold
                             // arrival because async gossip can deliver a
@@ -2102,6 +2208,24 @@ impl PydeNode {
                                     last_outgoing_committee_size,
                                     identity,
                                 );
+                            }
+
+                            // Audit 406: deterministic PSS apply trigger.
+                            // Same first-N-wins race that audit 403 fixed for
+                            // randomness and `try_aggregate_reshare_on_slot`
+                            // fixes for cross-committee resharing — eagerly
+                            // applying the first `threshold` PSS contributions
+                            // produced different "first 3-of-4" subsets across
+                            // nodes under async gossip, leaving each
+                            // validator's share on a different polynomial and
+                            // breaking threshold decryption (every block of
+                            // encrypted txs failed to combine, even with all
+                            // 4 shares present). Waiting through the same
+                            // RESHARE_AGGREGATION_DELAY_SLOTS lets gossipsub
+                            // deliver every contribution to every node before
+                            // we run the canonical-subset apply.
+                            if let Some(identity) = validator_identity.as_mut() {
+                                engine.try_apply_pss_on_slot(current_slot, identity);
                             }
 
                             // Audit 403: deterministically finalize the
@@ -2668,26 +2792,50 @@ impl PydeNode {
                                     if let Some((qc_slot, qc_hash)) = qc_slot_hash {
                                         if let Some((header, sig)) = engine.buffered_proposal_for(qc_slot, &qc_hash) {
                                             // Prefer the real body buffered at gossip
-                                            // receipt; fall back to the audit-234
-                                            // synthesized empty body for blocks whose
-                                            // gossip body hasn't arrived yet (RR
-                                            // fallback can deliver the QC vote before
-                                            // the Blocks-topic payload).
-                                            let block = {
+                                            // receipt; fall back to a synthesized
+                                            // empty body ONLY when the header
+                                            // commits to an empty tx_root (audit
+                                            // 408). `process_full_block_…` does NOT
+                                            // verify tx_root, so the prior
+                                            // unconditional synthesize would
+                                            // silently apply an empty body for any
+                                            // non-empty-tx block whose body hadn't
+                                            // arrived yet — diverging state across
+                                            // peers. Gate on
+                                            // `compute_tx_root([], []) == [0u8; 32]`
+                                            // so the fallback only fires for blocks
+                                            // the proposer truly committed to as
+                                            // empty (view-change empties, idle
+                                            // slots).
+                                            const EMPTY_TX_ROOT: [u8; 32] = [0u8; 32];
+                                            let buffered_block = {
                                                 let pbb = pending_block_bodies.read().await;
                                                 pbb.get(&qc_hash).cloned()
-                                            }.unwrap_or_else(|| pyde_consensus::block::Block {
-                                                header: header.clone(),
-                                                body: pyde_consensus::block::BlockBody {
-                                                    transactions: vec![],
-                                                    encrypted_txs: vec![],
-                                                    execution_schedule: pyde_tx::parallel::ExecutionSchedule {
-                                                        groups: vec![],
-                                                        total_txs: 0,
-                                                    },
-                                                },
-                                                proposer_signature: sig,
-                                            });
+                                            };
+                                            let block = match buffered_block {
+                                                Some(b) => b,
+                                                None if header.tx_root == EMPTY_TX_ROOT => {
+                                                    pyde_consensus::block::Block {
+                                                        header: header.clone(),
+                                                        body: pyde_consensus::block::BlockBody {
+                                                            transactions: vec![],
+                                                            encrypted_txs: vec![],
+                                                            execution_schedule: pyde_tx::parallel::ExecutionSchedule {
+                                                                groups: vec![],
+                                                                total_txs: 0,
+                                                            },
+                                                        },
+                                                        proposer_signature: sig,
+                                                    }
+                                                }
+                                                None => {
+                                                    debug!(
+                                                        slot = qc_slot,
+                                                        "own-vote-QC inline apply: body unavailable for non-empty block (sync will recover)"
+                                                    );
+                                                    continue;
+                                                }
+                                            };
                                             let mut chain_w = chain.write().await;
                                             let mut state_w = state.write().await;
 
@@ -4777,6 +4925,26 @@ fn handle_swarm_event(
                         if !message.data.is_empty() && message.data[0] == wire::tag::PSS_REFRESH {
                             match wire::decode_pss_refresh(&message.data) {
                                 Ok((epoch, contrib_bytes)) => {
+                                    // Audit 406: drop stale contributions
+                                    // targeted at epochs other than the
+                                    // currently-active PSS refresh.
+                                    // Without this an old-epoch contribution
+                                    // could pass the polynomial verify
+                                    // (zero-secret check is structural and
+                                    // epoch-agnostic) and pollute the
+                                    // canonical-subset pool, which
+                                    // `try_apply_pss_on_slot` then folds
+                                    // into the new share — silently breaking
+                                    // decryption for every block that
+                                    // follows.
+                                    if epoch != engine.pss_target() {
+                                        debug!(
+                                            epoch,
+                                            active = engine.pss_target(),
+                                            "ignoring stale PSS refresh contribution"
+                                        );
+                                        return PostEventAction::None;
+                                    }
                                     if let Some(contrib) =
                                         pyde_crypto::threshold::RefreshContribution::from_bytes(
                                             &contrib_bytes,
@@ -5772,10 +5940,7 @@ fn handle_swarm_event(
 /// explicitly opt in via `PYDE_INIT_VALIDATOR_KEY=1`. Devnet
 /// (`chain_id == 31337`) keeps the silent-generate ergonomics so
 /// laptop test infra doesn't have to set the env var.
-fn load_validator_identity(
-    datadir: &Path,
-    chain_id: u64,
-) -> Result<ValidatorIdentity, String> {
+fn load_validator_identity(datadir: &Path, chain_id: u64) -> Result<ValidatorIdentity, String> {
     let key_path = datadir.join("validator.key");
     let passphrase = std::env::var("PYDE_VALIDATOR_PASSPHRASE").ok();
 
