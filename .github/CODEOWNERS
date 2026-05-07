@@ -1,0 +1,36 @@
+# Code ownership.
+#
+# Paths listed below require approval from the named owners before
+# merge. Security-critical surfaces (cryptography, consensus, state,
+# the PVM) need an extra pair of eyes; CI + dep config are ownership-
+# tagged so dependency / supply-chain changes can't slip through
+# unnoticed.
+#
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner — applies when no more-specific path matches.
+*                              @zarah-s
+
+# Cryptography: PQ primitives, threshold encryption, VRF, WASM bindings.
+/crates/crypto/                @zarah-s
+/crates/pyde-crypto-wasm/      @zarah-s
+
+# Consensus + slashing: HotStuff, finality, view changes, evidence.
+/crates/consensus/             @zarah-s
+/crates/slashing/              @zarah-s
+
+# State machine: JMT, witness generation, snapshots.
+/crates/state/                 @zarah-s
+
+# Pyde Virtual Machine + AOT compiler.
+/crates/pvm/                   @zarah-s
+/crates/aot/                   @zarah-s
+
+# Workspace dep + lint config — supply-chain surface.
+/Cargo.toml                    @zarah-s
+/Cargo.lock                    @zarah-s
+/deny.toml                     @zarah-s
+/.cargo/                       @zarah-s
+
+# CI + repository automation.
+/.github/                      @zarah-s
