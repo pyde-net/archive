@@ -16,15 +16,36 @@
 //!     check load / disk
 //!   - `pyde_state_commit_ms` p99 > 500 → SMT/RocksDB write
 //!     pressure
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use std::net::SocketAddr;
+
+/// Bucket scheme for every `*_ms` histogram (TPL-102).
+///
+/// The exporter default emits summary metrics (no `_bucket` series),
+/// but the operator dashboard at `deploy/grafana-pyde-testnet.json`
+/// queries `histogram_quantile(...)` over `_bucket` series. Without
+/// explicit buckets the p50/p95/p99 panels for
+/// `pyde_block_processing_ms` and `pyde_state_commit_ms` rendered
+/// blank — operator-blind during incidents.
+///
+/// Suffix-matching `_ms` rather than naming each histogram lets future
+/// `*_ms` additions inherit the scheme automatically. The spread
+/// covers happy-path block processing (~10–50 ms) through degraded
+/// state-commit latency (~1–2 s); 10 buckets keeps cardinality
+/// bounded for Prometheus storage.
+const MS_BUCKETS: &[f64] = &[
+    1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2500.0,
+];
 
 /// Start the Prometheus metrics exporter on the given port.
 /// Returns the socket address it's bound to, or an error.
 pub fn init(port: u16) -> Result<SocketAddr, String> {
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
 
-    let builder = PrometheusBuilder::new().with_http_listener(addr);
+    let builder = PrometheusBuilder::new()
+        .with_http_listener(addr)
+        .set_buckets_for_metric(Matcher::Suffix("_ms".to_string()), MS_BUCKETS)
+        .map_err(|e| format!("set_buckets_for_metric: {}", e))?;
     builder
         .install()
         .map_err(|e| format!("failed to start metrics exporter on {}: {}", addr, e))?;
