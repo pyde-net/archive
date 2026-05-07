@@ -890,6 +890,14 @@ impl TypeChecker {
         let init_ty = self.infer_expr(&l.initializer);
 
         let declared_ty = if let Some(ref ty) = l.ty {
+            // Audit 354: the upfront `reject_signed_types_in_item`
+            // pass walks fn params, return types, and field
+            // declarations — but `let x: i64 = ...` lives inside a
+            // function body, so a signed annotation here would slip
+            // through and feed an unsigned-only codegen with a
+            // signed `Ty::I*`. Reject signed annotations on let
+            // bindings the same way we reject them on declarations.
+            self.reject_signed_in_type(ty);
             let t = self.resolve_type(ty);
             // Check compatibility — integer literals are polymorphic,
             // and Vec<?>/Unknown types are compatible with concrete types
@@ -1736,6 +1744,13 @@ impl TypeChecker {
 
             Expr::Cast(expr, target_ty, span) => {
                 let source_ty = self.infer_expr(expr);
+                // Audit 354: `expr as i64` is the other body-level
+                // doorway for signed types. The upfront reject pass
+                // doesn't visit expressions, so a contract that
+                // wrote `let x = (a as i64)` (or `(a as i64) + 1`,
+                // with no `let` annotation at all) would route a
+                // signed `Ty` straight through codegen.
+                self.reject_signed_in_type(target_ty);
                 let target = self.resolve_type(target_ty);
 
                 // Validate cast compatibility
@@ -2945,6 +2960,11 @@ mod tests {
 
     #[test]
     fn check_valid_casts() {
+        // TPL-208: `as i64` was a valid-cast positive case here
+        // before audit-354 plugged the body-level signed-type
+        // gap. Casts to signed targets are now rejected (the
+        // signed-cast path has its own `audit_354_rejects_cast_to_signed`
+        // test); this case stays as the unsigned-only happy path.
         check_ok(
             r#"
             contract T {
@@ -2952,7 +2972,7 @@ mod tests {
                     let a: u64 = 42;
                     let b = a as u256;
                     let c = b as u64;
-                    let d = a as i64;
+                    let d = a as u32;
                     let e = true as u256;
                 }
             }
@@ -3310,6 +3330,77 @@ mod tests {
                 pub fn f(x: u32) -> u8 { return 0; }
             }
             "#,
+        );
+    }
+
+    /// Audit 354: TPL-208 — `let x: i64 = 0;` inside a function body
+    /// must be rejected. The original audit-354 pre-pass walks
+    /// declarations only (params, returns, fields, aliases), so a
+    /// signed annotation on a `let` slipped through and minted a
+    /// `Ty::I64` local that downstream codegen then treated as
+    /// unsigned.
+    #[test]
+    fn audit_354_rejects_i64_in_let_binding() {
+        let errs = check_err(
+            r#"
+            contract C {
+                pub fn f() -> u64 {
+                    let x: i64 = 0;
+                    return 0;
+                }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("audit 354")),
+            "expected audit-354 error for `let x: i64`, got: {:?}",
+            errs
+        );
+    }
+
+    /// Audit 354: TPL-208 — `let v: Vec<i32> = ...` is the
+    /// container variant of the let-binding gap; reject it the
+    /// same way fields-of-Vec<i32> are rejected.
+    #[test]
+    fn audit_354_rejects_vec_signed_in_let_binding() {
+        let errs = check_err(
+            r#"
+            contract C {
+                pub fn f() -> u64 {
+                    let v: Vec<i32> = Vec::new();
+                    return 0;
+                }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("audit 354")),
+            "expected audit-354 error for `let v: Vec<i32>`, got: {:?}",
+            errs
+        );
+    }
+
+    /// Audit 354: TPL-208 — `(expr as i32)` is the cast variant of
+    /// the body-level gap. Without a `let` annotation at all, a
+    /// contract that wrote `let x = (a as i32);` would still mint
+    /// a signed `Ty` from the cast target type and route it
+    /// straight into codegen.
+    #[test]
+    fn audit_354_rejects_cast_to_signed() {
+        let errs = check_err(
+            r#"
+            contract C {
+                pub fn f(a: u64) -> u64 {
+                    let x = (a as i32);
+                    return 0;
+                }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("audit 354")),
+            "expected audit-354 error for `as i32` cast, got: {:?}",
+            errs
         );
     }
 

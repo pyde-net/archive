@@ -172,6 +172,7 @@ typecheck_fixture!(
     "fixtures/programs/games/chess_wager.oti"
 );
 typecheck_fixture!(
+    ignore = "audit 354: signed types disabled until post-mainnet ISA opcodes (HP deltas use i32)",
     typecheck_nft_battle,
     "fixtures/programs/games/nft_battle.oti"
 );
