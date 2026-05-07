@@ -21,7 +21,7 @@ faucet, and submitting your first transaction.
 
 ## 1. Get the binary
 
-### Option A — build from source
+Build from source:
 
 ```sh
 git clone https://github.com/zarah-s/pyde
@@ -30,16 +30,9 @@ cargo build --release
 # Binary lands at ./target/release/pyde
 ```
 
-### Option B — prebuilt release
-
-Download the latest `pyde-<version>-<os>-<arch>.tar.gz` from the
-GitHub releases page and extract `pyde` into `$PATH`.
-
-```sh
-tar -xzf pyde-<version>-linux-x86_64.tar.gz
-sudo mv pyde /usr/local/bin/
-pyde --version
-```
+> **Prebuilt binaries** will be published on the GitHub releases page
+> alongside the public-testnet launch announcement. Until then, build
+> from source.
 
 ## 2. Generate a node identity
 
