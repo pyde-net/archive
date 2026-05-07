@@ -21,7 +21,10 @@ services:
       - testnet-data:/testnet
       - node0-data:/data
     ports:
+      # RPC + WS (host port 1854N to avoid colliding with the
+      # per-node RPC mappings on 8545-8548) + Prometheus.
       - "8545:8545"
+      - "18546:8546"
       - "9090:9090"
     networks:
       pyde-net:
@@ -38,6 +41,7 @@ services:
       - node1-data:/data
     ports:
       - "8546:8546"
+      - "18547:8547"
       - "9091:9091"
     depends_on:
       - node-0
@@ -56,6 +60,7 @@ services:
       - node2-data:/data
     ports:
       - "8547:8547"
+      - "18548:8548"
       - "9092:9092"
     depends_on:
       - node-0
@@ -74,6 +79,7 @@ services:
       - node3-data:/data
     ports:
       - "8548:8548"
+      - "18549:8549"
       - "9093:9093"
     depends_on:
       - node-0
