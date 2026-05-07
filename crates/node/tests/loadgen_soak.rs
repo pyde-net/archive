@@ -23,25 +23,25 @@
 //!
 //!   - Constructors with args ............ MegaContract::init, Helper::init
 //!   - Events with indexed fields ........ Deposit, StatusChanged,
-//!                                          ComplexResult, Ponged, Spawned
+//!     ComplexResult, Ponged, Spawned
 //!   - Enums with match .................. Status::{Active,Paused,Locked}
 //!   - Payable functions ................. MegaContract::deposit
 //!   - Complex args (struct) ............. UserData → complex_logic
 //!   - Complex returns (u256) ............ complex_logic returns total
 //!   - Complex storage layouts ........... Map<Address, u256>, Vec<u64>,
-//!                                          struct fields, enum tag fields
+//!     struct fields, enum tag fields
 //!   - Complex logic (math + state) ...... complex_logic + change_status
 //!   - Cross-contract calls .............. MegaContract → IHelper.ping
 //!   - Factory pattern (deploy!) ......... Spawner.spawn → deploy!(Helper)
 //!   - Reentrancy probe .................. MegaContract.delegate_ping
-//!                                          calls Helper which writes
-//!                                          state — exercises CallExt +
-//!                                          cross-contract state isolation
+//!     calls Helper which writes
+//!     state — exercises CallExt +
+//!     cross-contract state isolation
 //!   - AOT optimization wiring ........... hot-path repeatedly hits
-//!                                          MegaContract.increment, the
-//!                                          AotCache compiles in
-//!                                          background, subsequent calls
-//!                                          take the JIT path.
+//!     MegaContract.increment, the
+//!     AotCache compiles in
+//!     background, subsequent calls
+//!     take the JIT path.
 //!   - Plaintext + encrypted mix ......... configurable; default 50/50
 //!
 //! # Run
@@ -402,11 +402,10 @@ fn compile_deploy_payload(
     // `address(<contract>)` casts in the suite source. The strict
     // path now catches those at compile time so test fixtures can't
     // hide broken contracts.
-    let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        otic::compile_all(src)
-    }))
-    .map_err(|_| "otic compiler panicked on suite source".to_string())?
-    .map_err(|diagnostics| format!("suite frontend rejected:\n{}", diagnostics))?;
+    let compiled =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| otic::compile_all(src)))
+            .map_err(|_| "otic compiler panicked on suite source".to_string())?
+            .map_err(|diagnostics| format!("suite frontend rejected:\n{}", diagnostics))?;
     let (_, cc) = compiled
         .iter()
         .find(|(name, _)| name == contract_name)
@@ -626,15 +625,10 @@ fn comprehensive_soak() {
 
                 // Every 60s: print head + dump per-node logs to disk.
                 if tick % 60 == 0 {
-                    eprintln!(
-                        "    [watchdog] head={} stall={}s",
-                        last_head, stall_secs,
-                    );
+                    eprintln!("    [watchdog] head={} stall={}s", last_head, stall_secs,);
                     for (i, out) in outputs.iter().enumerate() {
                         if let Ok(buf) = out.lock() {
-                            let path = format!(
-                                "/tmp/pyde-soak-node-{}.log", i
-                            );
+                            let path = format!("/tmp/pyde-soak-node-{}.log", i);
                             let _ = std::fs::write(&path, buf.join("\n"));
                         }
                     }
@@ -842,14 +836,14 @@ async fn submit_one(
             let mut amt = [0u8; 32];
             amt[0..8].copy_from_slice(&1000u64.to_le_bytes());
             d.extend_from_slice(&amt);
-            d.extend_from_slice(&((nonce % 100) as u64).to_le_bytes()); // score
+            d.extend_from_slice(&(nonce % 100).to_le_bytes()); // score
             (mega, d, 0, Standard)
         }
         CallKind::ChangeStatus => {
             // change_status(s: Status) — pass enum tag (0/1/2)
             let mut d = Vec::with_capacity(4 + 8);
             d.extend_from_slice(&selector("change_status"));
-            d.extend_from_slice(&((nonce % 3) as u64).to_le_bytes());
+            d.extend_from_slice(&(nonce % 3).to_le_bytes());
             (mega, d, 0, Standard)
         }
         CallKind::Deposit => {

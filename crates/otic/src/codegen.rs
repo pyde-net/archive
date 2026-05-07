@@ -8468,7 +8468,9 @@ mod tests {
         "#;
         // Audit 404: codegen-internal determinism check uses the lax
         // path so the test stays focused on lower / codegen output.
-        let runs = (0..5).map(|_| crate::compile_all_unchecked(src)).collect::<Vec<_>>();
+        let runs = (0..5)
+            .map(|_| crate::compile_all_unchecked(src))
+            .collect::<Vec<_>>();
         // All 5 compilations produce one Token contract.
         for r in &runs {
             assert_eq!(r.len(), 1);

@@ -1243,10 +1243,8 @@ impl TypeChecker {
                             } else if let Some(arg) = args.first() {
                                 let is_self = matches!(arg, Expr::SelfExpr(_));
                                 let arg_ty = &arg_types[0];
-                                let is_contract_or_iface = matches!(
-                                    arg_ty,
-                                    Ty::Contract(_) | Ty::Interface(_)
-                                );
+                                let is_contract_or_iface =
+                                    matches!(arg_ty, Ty::Contract(_) | Ty::Interface(_));
                                 if !is_self
                                     && !is_contract_or_iface
                                     && *arg_ty != Ty::Address

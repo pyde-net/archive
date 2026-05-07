@@ -250,9 +250,7 @@ pub fn compile_all_unchecked(src: &str) -> Vec<(String, codegen::CompiledContrac
 ///     one of the two.
 ///
 /// All those checks now run by default via this function.
-pub fn compile_all(
-    src: &str,
-) -> Result<Vec<(String, codegen::CompiledContract)>, String> {
+pub fn compile_all(src: &str) -> Result<Vec<(String, codegen::CompiledContract)>, String> {
     // Lex.
     let (tokens, lex_errors) = lexer::Lexer::new(src).tokenize();
     if !lex_errors.is_empty() {

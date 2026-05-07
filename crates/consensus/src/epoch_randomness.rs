@@ -153,7 +153,8 @@ fn combine_shares_with_threshold(
     // Sort by VRF output bytes for last-revealer protection within
     // the canonical subset (the input set is already deterministic;
     // this just removes any in-set ordering signal).
-    let mut sorted_outputs: Vec<Hash256> = canonical.iter().map(|s| s.vrf_output.to_hash()).collect();
+    let mut sorted_outputs: Vec<Hash256> =
+        canonical.iter().map(|s| s.vrf_output.to_hash()).collect();
     sorted_outputs.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
     let combined = poseidon2_many(&sorted_outputs);
