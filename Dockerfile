@@ -1,5 +1,5 @@
 # Stage 1: Build the pyde-node binary
-FROM rust:1.89-bookworm AS builder
+FROM rust:1.95-bookworm AS builder
 
 # Install build dependencies (libclang for bindgen/RocksDB, cmake for aws-lc)
 RUN apt-get update && apt-get install -y --no-install-recommends \
