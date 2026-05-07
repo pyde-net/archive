@@ -527,29 +527,57 @@ pub fn threshold_keygen(
         return Err("threshold must be >= 1");
     }
 
-    let (pk, sk) = kyber_keygen()?;
-
-    // Convert 64-byte seed to 8 Goldilocks elements.
+    // TPL-307: rejection-sample the Kyber secret-key seed so the
+    // chunk → Goldilocks-element conversion is injective.
     //
-    // Audit 391: each 8-byte chunk of the Kyber secret key is
-    // raw random bytes (not a canonical Goldilocks-element
-    // serialization), so any chunk in `[p, 2^64)` is silently
-    // remapped to `chunk - p` by `gl()`. On reconstruction the
-    // same chunk goes back through `gl_to_u64()`, yielding the
-    // remapped value `chunk - p` rather than the original
-    // `chunk` — for those chunks the round-trip is non-injective
-    // and the recovered Kyber secret is wrong. We accept this
-    // here rather than rejection-sampling because rejecting a
-    // Kyber sk byte chunk would mean re-running Kyber keygen
-    // (different sk), and the cross-validator share split has
-    // already been committed to the produced sk. Per-chunk
-    // collision probability is `(2^32 - 1) / 2^64 ≈ 2^-32`, and
-    // with 8 chunks the per-keygen failure rate is ≈ 2^-29 — low
-    // enough that we trade a vanishing failure rate for keygen
-    // determinism. If an unlucky keygen produces a corrupted
-    // round-trip, the resulting threshold key fails decapsulation
-    // on first use; the operator re-runs keygen.
-    let seed_bytes = sk.as_bytes();
+    // The 64-byte Kyber seed is split into 8 little-endian u64
+    // chunks; each chunk feeds a Goldilocks element via `gl()`.
+    // Any chunk in `[p, 2^64)` would silently remap to `chunk - p`
+    // (since `gl()` reduces mod `p`), so the round-trip back to
+    // u64 via `gl_to_u64()` yields `chunk - p`, not `chunk` — and
+    // the reconstructed Kyber secret bytes don't match the
+    // original. Pre-fix, audit 391's commentary noted the
+    // ~2^-29 per-keygen failure rate and accepted it ("operator
+    // re-runs keygen on first-use decryption failure"). That's
+    // a foot-gun for cross-validator setups: the failure
+    // surfaces only AFTER shares have been distributed and the
+    // network is up, requiring full re-keygen + redeploy. Reject
+    // bad seeds here instead, which keeps generation total under
+    // the contract that all callers see canonical-encoding
+    // shares.
+    //
+    // Per-iteration success probability is `~1 - 2^-29`, so the
+    // expected number of keygens is `~1.000000002`. The bound
+    // exists only to fail loudly if something is very wrong with
+    // the RNG; under normal conditions it's reached on the first
+    // iteration.
+    const MAX_REJECTIONS: u32 = 64;
+    let (pk, seed_bytes) = {
+        let mut rejections = 0u32;
+        loop {
+            let (pk, sk) = kyber_keygen()?;
+            let seed_bytes = sk.as_bytes().to_vec();
+            let all_canonical = (0..SEED_ELEMENTS).all(|i| {
+                let mut chunk = [0u8; 8];
+                chunk.copy_from_slice(&seed_bytes[i * 8..(i + 1) * 8]);
+                u64::from_le_bytes(chunk) < GOLDILOCKS_PRIME
+            });
+            if all_canonical {
+                break (pk, seed_bytes);
+            }
+            rejections += 1;
+            if rejections >= MAX_REJECTIONS {
+                return Err(
+                    "threshold_keygen: Kyber seed rejection-sampling exceeded retry budget",
+                );
+            }
+        }
+    };
+
+    // Convert 64-byte seed to 8 Goldilocks elements. All chunks
+    // are `< GOLDILOCKS_PRIME` by the rejection-sampling loop
+    // above, so `gl(u64::from_le_bytes(chunk))` is the same value
+    // its u64 representation will round-trip to.
     let seed_elements: Vec<Goldilocks> = (0..SEED_ELEMENTS)
         .map(|i| {
             let mut chunk = [0u8; 8];
@@ -559,7 +587,7 @@ pub fn threshold_keygen(
         .collect();
 
     // Generate entropy for random polynomial coefficients
-    let entropy = poseidon2_hash(seed_bytes);
+    let entropy = poseidon2_hash(&seed_bytes);
 
     // Split each element independently
     let all_shares: Vec<Vec<FieldShare>> = seed_elements
@@ -2636,5 +2664,59 @@ mod tests {
         let len = bytes.len();
         bytes[len - 8..].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(KeyShare::from_bytes(&bytes).is_none());
+    }
+
+    // ========== TPL-307: rejection-sample Kyber seed in threshold_keygen ==========
+
+    /// TPL-307: every share returned by `threshold_keygen` must
+    /// already be canonical (`< GOLDILOCKS_PRIME` after the
+    /// `gl_to_u64` round-trip). Pre-fix, ~2^-29 of keygens
+    /// produced a non-injective seed → element mapping that
+    /// silently corrupted the recovered Kyber sk on first use.
+    /// Run keygen many times and assert canonicality across all
+    /// shares — the test only flakes if the rejection-sampling
+    /// loop is broken AND the same RNG-improbable event hits on
+    /// the test machine, which is a far less likely conjunction
+    /// than the original bug.
+    #[test]
+    fn tpl_307_threshold_keygen_yields_canonical_shares() {
+        for _ in 0..32 {
+            let (_pk, shares) = threshold_keygen(5, 3).expect("keygen");
+            for share in &shares {
+                let bytes = share.to_bytes();
+                // Skip the 12-byte index+count header; iterate
+                // 8-byte share elements.
+                let payload = &bytes[12..];
+                for chunk in payload.chunks_exact(8) {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(chunk);
+                    let v = u64::from_le_bytes(buf);
+                    assert!(
+                        v < GOLDILOCKS_PRIME,
+                        "non-canonical share element {v:#x} >= GOLDILOCKS_PRIME"
+                    );
+                }
+            }
+        }
+    }
+
+    /// TPL-307: a roundtrip-and-decrypt is the operational
+    /// proof. Pre-fix, an unlucky keygen could yield shares that
+    /// reconstructed a Kyber sk different from the one used to
+    /// produce the threshold public key, so encrypt-then-decrypt
+    /// would silently fail (MAC mismatch on first use).
+    #[test]
+    fn tpl_307_keygen_then_encrypt_then_decrypt_roundtrips() {
+        for _ in 0..16 {
+            let (pk, shares) = threshold_keygen(5, 3).expect("keygen");
+            let ct = threshold_encrypt(&pk, b"tpl-307 round-trip").expect("encrypt");
+            let dec_shares: Vec<_> = shares
+                .iter()
+                .take(3)
+                .map(|s| generate_decryption_share(s, &ct))
+                .collect();
+            let recovered = combine_shares(&dec_shares, 3, &ct).expect("combine");
+            assert_eq!(recovered, b"tpl-307 round-trip");
+        }
     }
 }
