@@ -280,7 +280,14 @@ impl TypeChecker {
         }
     }
 
-    /// Recurse into a `Type` node looking for signed primitives.
+    /// Recurse into a `Type` node and reject:
+    ///   1. Signed integer primitives anywhere (audit 354).
+    ///   2. Wide elements inside `Vec<…>` or `[…; N]` (TPL-209).
+    ///
+    /// Both walks share the same recursion shape (visit every
+    /// container's payload), so they're folded into one pass.
+    /// Each report carries its own audit/TPL identifier so the
+    /// downstream tests pin the right error.
     fn reject_signed_in_type(&mut self, ty: &Type) {
         match ty {
             Type::Primitive(p, span) => {
@@ -309,8 +316,50 @@ impl TypeChecker {
                 }
             }
             Type::Bytes(_) => {}
-            Type::Array(elem, _, _) => self.reject_signed_in_type(elem),
-            Type::Vec(elem, _) => self.reject_signed_in_type(elem),
+            Type::Array(elem, _, span) => {
+                // TPL-209: arrays use the same 8-byte-stride
+                // codegen as Vec (`MakeArray`/`ArrayRepeat` in
+                // codegen.rs:1922-1946 store at `i * WORD_SIZE`),
+                // so a wide element silently truncates.
+                if let Some(name) = Self::wide_element_name(elem) {
+                    self.error(
+                        format!(
+                            "[{}; N] is not supported (TPL-209): the codegen stores \
+                             elements at an 8-byte stride, so a wider type silently \
+                             truncates to its low 8 bytes. Stride-aware fixed arrays \
+                             land post-mainnet.",
+                            name
+                        ),
+                        *span,
+                    );
+                }
+                self.reject_signed_in_type(elem);
+            }
+            Type::Vec(elem, span) => {
+                // TPL-209: `IndexGet`/`IndexSet` codegen
+                // (`codegen.rs:1869-1889`) reads/writes 8 bytes
+                // at `base + idx*8 + VEC_DATA_OFFSET`, regardless
+                // of the declared element type. A `Vec<Address>`
+                // multisig signer list would lose every byte
+                // past the first 8 of each address; `Vec<u256>`
+                // and `Vec<bytes>` have the same shape. Reject
+                // until per-element-pointer-and-deref (or
+                // stride-aware allocation) lands post-mainnet.
+                if let Some(name) = Self::wide_element_name(elem) {
+                    self.error(
+                        format!(
+                            "Vec<{}> is not supported (TPL-209): the codegen stores Vec \
+                             elements at an 8-byte stride, so a wider type silently \
+                             truncates to its low 8 bytes. Stride-aware Vec lands \
+                             post-mainnet; for now, store wide values via Map<u64, T> or \
+                             a fixed-size struct.",
+                            name
+                        ),
+                        *span,
+                    );
+                }
+                self.reject_signed_in_type(elem);
+            }
             Type::Map(k, v, _) => {
                 self.reject_signed_in_type(k);
                 self.reject_signed_in_type(v);
@@ -321,6 +370,29 @@ impl TypeChecker {
                     self.reject_signed_in_type(t);
                 }
             }
+        }
+    }
+
+    /// TPL-209: name the element type if it is wide (more than
+    /// 8 bytes at runtime). `Type::Bytes` is a length + heap
+    /// pointer, which doesn't fit an 8-byte slot any better than
+    /// `u256`. `Type::Named` could resolve to a struct that's
+    /// also too wide, but per-struct size analysis is post-
+    /// mainnet — for now the reject is scoped to the explicit
+    /// wide primitives + bytes from the tracker.
+    fn wide_element_name(ty: &Type) -> Option<&'static str> {
+        match ty {
+            Type::Primitive(p, _) => match p {
+                PrimitiveType::U128 => Some("u128"),
+                PrimitiveType::U256 => Some("u256"),
+                PrimitiveType::I128 => Some("i128"),
+                PrimitiveType::I256 => Some("i256"),
+                PrimitiveType::Address => Some("Address"),
+                PrimitiveType::StringType => Some("string"),
+                _ => None,
+            },
+            Type::Bytes(_) => Some("bytes"),
+            _ => None,
         }
     }
 
@@ -890,6 +962,14 @@ impl TypeChecker {
         let init_ty = self.infer_expr(&l.initializer);
 
         let declared_ty = if let Some(ref ty) = l.ty {
+            // Audit 354: the upfront `reject_signed_types_in_item`
+            // pass walks fn params, return types, and field
+            // declarations — but `let x: i64 = ...` lives inside a
+            // function body, so a signed annotation here would slip
+            // through and feed an unsigned-only codegen with a
+            // signed `Ty::I*`. Reject signed annotations on let
+            // bindings the same way we reject them on declarations.
+            self.reject_signed_in_type(ty);
             let t = self.resolve_type(ty);
             // Check compatibility — integer literals are polymorphic,
             // and Vec<?>/Unknown types are compatible with concrete types
@@ -1736,6 +1816,13 @@ impl TypeChecker {
 
             Expr::Cast(expr, target_ty, span) => {
                 let source_ty = self.infer_expr(expr);
+                // Audit 354: `expr as i64` is the other body-level
+                // doorway for signed types. The upfront reject pass
+                // doesn't visit expressions, so a contract that
+                // wrote `let x = (a as i64)` (or `(a as i64) + 1`,
+                // with no `let` annotation at all) would route a
+                // signed `Ty` straight through codegen.
+                self.reject_signed_in_type(target_ty);
                 let target = self.resolve_type(target_ty);
 
                 // Validate cast compatibility
@@ -2838,6 +2925,11 @@ mod tests {
     /// own address back instead of the child's).
     #[test]
     fn check_address_of_contract_handle_audit_405() {
+        // TPL-209 forced the `Vec<Address>` storage out of the
+        // original test (silent stride-truncation for Address).
+        // Audit-405's claim is about `address(c)` returning the
+        // CHILD's address, not the parent's, so a single
+        // `last_child: Address` slot is sufficient.
         check_ok(
             r#"
             contract Child {
@@ -2846,14 +2938,14 @@ mod tests {
             }
             contract Parent {
                 storage {
-                    children: Vec<Address>,
+                    last_child: Address,
                 }
                 #[constructor]
                 pub fn init() {}
                 pub fn spawn() -> Address {
                     let c = deploy!(Child);
                     let a = address(c);
-                    self.children.push(a);
+                    self.last_child = a;
                     return a;
                 }
             }
@@ -2945,6 +3037,11 @@ mod tests {
 
     #[test]
     fn check_valid_casts() {
+        // TPL-208: `as i64` was a valid-cast positive case here
+        // before audit-354 plugged the body-level signed-type
+        // gap. Casts to signed targets are now rejected (the
+        // signed-cast path has its own `audit_354_rejects_cast_to_signed`
+        // test); this case stays as the unsigned-only happy path.
         check_ok(
             r#"
             contract T {
@@ -2952,7 +3049,7 @@ mod tests {
                     let a: u64 = 42;
                     let b = a as u256;
                     let c = b as u64;
-                    let d = a as i64;
+                    let d = a as u32;
                     let e = true as u256;
                 }
             }
@@ -3077,11 +3174,13 @@ mod tests {
 
     #[test]
     fn check_return_after_loop() {
-        // Return after loop is fine — loop might not execute
+        // Return after loop is fine — loop might not execute.
+        // TPL-209 prohibits Vec<u256>; the test only cares about
+        // the control-flow shape, so swap to Vec<u64>.
         check_ok(
             r#"
             contract T {
-                pub fn find(items: Vec<u256>, target: u256) -> u256 {
+                pub fn find(items: Vec<u64>, target: u64) -> u64 {
                     for i in 0..10 {
                         if i == target {
                             return i;
@@ -3096,12 +3195,13 @@ mod tests {
 
     #[test]
     fn check_revert_after_loop() {
-        // Revert after loop is a valid exit path
+        // Revert after loop is a valid exit path. TPL-209 forces
+        // u256 → u64 here as in `check_return_after_loop`.
         check_ok(
             r#"
             contract T {
                 error NotFound {}
-                pub fn find(items: Vec<u256>, target: u256) -> u256 {
+                pub fn find(items: Vec<u64>, target: u64) -> u64 {
                     for i in 0..10 {
                         if i == target {
                             return i;
@@ -3209,10 +3309,13 @@ mod tests {
 
     #[test]
     fn check_valid_method_types() {
+        // TPL-209 prohibits Vec<u256>; this test exercises the
+        // method dispatch on Vec/bytes/string and doesn't depend
+        // on the element width, so swap to Vec<u64>.
         check_ok(
             r#"
             contract T {
-                storage { items: Vec<u256>, data: bytes, }
+                storage { items: Vec<u64>, data: bytes, }
                 pub fn f() {
                     let n = self.items.len();
                     let empty = self.items.is_empty();
@@ -3303,11 +3406,205 @@ mod tests {
 
     #[test]
     fn audit_354_unsigned_types_still_accepted() {
+        // TPL-209 forced `Vec<u128>` out of this positive control —
+        // stride-truncating containers are gated until post-mainnet
+        // even when the element is unsigned. The unsigned-type
+        // positive case is now just narrow primitives plus Map
+        // (which uses Sload/Sstore, not the 8-byte-stride codegen).
         check_ok(
             r#"
             contract C {
-                storage { a: u256, b: Vec<u128>, c: Map<Address, u64>, }
+                storage { a: u256, b: Vec<u64>, c: Map<Address, u64>, }
                 pub fn f(x: u32) -> u8 { return 0; }
+            }
+            "#,
+        );
+    }
+
+    /// Audit 354: TPL-208 — `let x: i64 = 0;` inside a function body
+    /// must be rejected. The original audit-354 pre-pass walks
+    /// declarations only (params, returns, fields, aliases), so a
+    /// signed annotation on a `let` slipped through and minted a
+    /// `Ty::I64` local that downstream codegen then treated as
+    /// unsigned.
+    #[test]
+    fn audit_354_rejects_i64_in_let_binding() {
+        let errs = check_err(
+            r#"
+            contract C {
+                pub fn f() -> u64 {
+                    let x: i64 = 0;
+                    return 0;
+                }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("audit 354")),
+            "expected audit-354 error for `let x: i64`, got: {:?}",
+            errs
+        );
+    }
+
+    /// Audit 354: TPL-208 — `let v: Vec<i32> = ...` is the
+    /// container variant of the let-binding gap; reject it the
+    /// same way fields-of-Vec<i32> are rejected.
+    #[test]
+    fn audit_354_rejects_vec_signed_in_let_binding() {
+        let errs = check_err(
+            r#"
+            contract C {
+                pub fn f() -> u64 {
+                    let v: Vec<i32> = Vec::new();
+                    return 0;
+                }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("audit 354")),
+            "expected audit-354 error for `let v: Vec<i32>`, got: {:?}",
+            errs
+        );
+    }
+
+    /// Audit 354: TPL-208 — `(expr as i32)` is the cast variant of
+    /// the body-level gap. Without a `let` annotation at all, a
+    /// contract that wrote `let x = (a as i32);` would still mint
+    /// a signed `Ty` from the cast target type and route it
+    /// straight into codegen.
+    #[test]
+    fn audit_354_rejects_cast_to_signed() {
+        let errs = check_err(
+            r#"
+            contract C {
+                pub fn f(a: u64) -> u64 {
+                    let x = (a as i32);
+                    return 0;
+                }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("audit 354")),
+            "expected audit-354 error for `as i32` cast, got: {:?}",
+            errs
+        );
+    }
+
+    // ========== TPL-209: Vec/Array of wide elements rejected ==========
+
+    /// TPL-209: `Vec<Address>` would silently truncate every
+    /// element to its low 8 bytes — a multisig signer list
+    /// stored this way would lose every byte past the first 8
+    /// of every address. Reject at typecheck.
+    #[test]
+    fn tpl_209_rejects_vec_address() {
+        let errs = check_err(
+            r#"
+            contract C {
+                storage { signers: Vec<Address>, }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("TPL-209")),
+            "expected TPL-209 error for `Vec<Address>`, got: {:?}",
+            errs
+        );
+    }
+
+    /// TPL-209: `Vec<u256>` is the canonical instance — the bug
+    /// description in the tracker calls it out by name.
+    #[test]
+    fn tpl_209_rejects_vec_u256() {
+        let errs = check_err(
+            r#"
+            contract C {
+                storage { values: Vec<u256>, }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("TPL-209")),
+            "expected TPL-209 error for `Vec<u256>`, got: {:?}",
+            errs
+        );
+    }
+
+    /// TPL-209: `Vec<bytes>` packs a length + heap pointer per
+    /// element, which doesn't fit the 8-byte Vec slot any better
+    /// than `u256`. Reject at typecheck.
+    #[test]
+    fn tpl_209_rejects_vec_bytes() {
+        let errs = check_err(
+            r#"
+            contract C {
+                storage { blobs: Vec<bytes>, }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("TPL-209")),
+            "expected TPL-209 error for `Vec<bytes>`, got: {:?}",
+            errs
+        );
+    }
+
+    /// TPL-209: nested-container case. `Map<K, Vec<u256>>`
+    /// recurses into the Vec value, which then trips the
+    /// element-width gate. Confirms the recursion through
+    /// containers fires, not just top-level types.
+    #[test]
+    fn tpl_209_rejects_nested_vec_u256_in_map() {
+        let errs = check_err(
+            r#"
+            contract C {
+                storage { roles: Map<u64, Vec<u256>>, }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("TPL-209")),
+            "expected TPL-209 error for `Map<u64, Vec<u256>>`, got: {:?}",
+            errs
+        );
+    }
+
+    /// TPL-209: `[Address; 4]` (fixed-size array) shares the
+    /// 8-byte-stride codegen with Vec, so the same gate applies.
+    #[test]
+    fn tpl_209_rejects_array_of_address() {
+        let errs = check_err(
+            r#"
+            contract C {
+                storage { signers: [Address; 4], }
+            }
+            "#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("TPL-209")),
+            "expected TPL-209 error for `[Address; 4]`, got: {:?}",
+            errs
+        );
+    }
+
+    /// TPL-209: positive control — `Vec<u64>` (8-byte element)
+    /// remains accepted, as do `Map<Address, u256>` (the Map
+    /// codegen uses Sload/Sstore with full 32-byte wide
+    /// registers, not the truncating Vec stride) and bare
+    /// `Address` storage.
+    #[test]
+    fn tpl_209_narrow_vec_and_map_still_accepted() {
+        check_ok(
+            r#"
+            contract C {
+                storage {
+                    nums: Vec<u64>,
+                    flags: Vec<bool>,
+                    bal: Map<Address, u256>,
+                    owner: Address,
+                }
             }
             "#,
         );

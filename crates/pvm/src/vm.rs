@@ -236,6 +236,19 @@ pub struct Vm {
     /// Keys already journaled (O(1) dedup instead of O(n) scan).
     /// Public for access list extraction after simulation.
     pub storage_journal_keys: std::collections::HashSet<U256>,
+    /// TPL-205: balance write journal for rollback. Mirrors
+    /// `storage_journal` so cross-contract value transfers
+    /// (CallExt, CREATE) can be undone if the outer call or the
+    /// transaction reverts. Pre-fix the child VM's balance changes
+    /// were dropped on the floor — both the explicit value
+    /// transfer and any nested transfer were invisible to the
+    /// parent. Fixing the merge without the journal would have
+    /// flipped the bug from "transfer never happens" to
+    /// "transfer survives a revert" (fund-loss vector).
+    balance_journal: Vec<(Address, Option<U256>)>,
+    /// Addresses already journaled in `balance_journal`. Same
+    /// O(1) dedup pattern as `storage_journal_keys`.
+    balance_journal_keys: std::collections::HashSet<Address>,
     /// Contract registry: address → deployed bytecode.
     pub contracts: HashMap<Address, Vec<u8>>,
     /// Optional code backend for lazy loading contract bytecode (e.g., from SMT).
@@ -310,6 +323,8 @@ impl Vm {
             logs: Vec::new(),
             storage_journal: Vec::new(),
             storage_journal_keys: std::collections::HashSet::new(),
+            balance_journal: Vec::new(),
+            balance_journal_keys: std::collections::HashSet::new(),
             decoded_cache: Vec::new(),
             contracts: HashMap::new(),
             code_backend: None,
@@ -1536,6 +1551,11 @@ impl Vm {
     pub fn execute(&mut self) -> ExecutionOutput {
         self.storage_journal.clear();
         self.storage_journal_keys.clear();
+        // TPL-205: balance journal mirrors storage journal across
+        // execute(). Pair every rollback_storage with rollback_balances
+        // so cross-contract value transfers undo on revert/OOG/trap.
+        self.balance_journal.clear();
+        self.balance_journal_keys.clear();
         let logs_snapshot_len = self.logs.len();
 
         let outcome = loop {
@@ -1543,6 +1563,7 @@ impl Vm {
                 Ok(Some(ExecResult::Halt)) => break Outcome::Success,
                 Ok(Some(ExecResult::Revert)) => {
                     self.rollback_storage();
+                    self.rollback_balances();
                     self.logs.truncate(logs_snapshot_len);
                     self.gas_refund = 0;
                     break Outcome::Revert;
@@ -1550,12 +1571,14 @@ impl Vm {
                 Ok(None) => {}
                 Err(Trap::OutOfGas) => {
                     self.rollback_storage();
+                    self.rollback_balances();
                     self.logs.truncate(logs_snapshot_len);
                     self.gas_refund = 0;
                     break Outcome::OutOfGas;
                 }
                 Err(trap) => {
                     self.rollback_storage();
+                    self.rollback_balances();
                     self.logs.truncate(logs_snapshot_len);
                     self.gas_refund = 0;
                     break Outcome::Trap(trap);
@@ -1565,6 +1588,8 @@ impl Vm {
 
         self.storage_journal.clear();
         self.storage_journal_keys.clear();
+        self.balance_journal.clear();
+        self.balance_journal_keys.clear();
 
         ExecutionOutput {
             outcome,
@@ -1857,6 +1882,27 @@ impl Vm {
                     self.storage.insert(*k, v.clone());
                 }
             }
+            // TPL-205: merge child's balance changes into parent.
+            // The local `balances` clone fed to the child held the
+            // post-debit/credit map; the child may have further
+            // modified its `ctx.balances` via nested CallExt /
+            // CREATE. Both kinds of change need to land in
+            // parent's `self.ctx.balances`. Journal each address
+            // BEFORE the write so a later parent revert restores
+            // the pre-call value (same pattern as the storage
+            // merge above). Skipped for `is_delegate` because
+            // delegate-call value semantics use the parent's
+            // address as caller AND callee — there is no value
+            // transfer at the delegate boundary.
+            if !is_delegate {
+                for (addr, child_bal) in &child.ctx.balances {
+                    let parent_bal = self.ctx.balances.get(addr).copied();
+                    if parent_bal != Some(*child_bal) {
+                        self.journal_balance_write(addr);
+                        self.ctx.balances.insert(*addr, *child_bal);
+                    }
+                }
+            }
             // Merge child's logs
             self.logs.extend(output.logs);
             // Accumulate refunds
@@ -2036,8 +2082,13 @@ impl Vm {
             balances,
         };
 
-        // Run constructor if present
-        if let Some(ref constructor_code) = constructor {
+        // Run constructor if present. In either branch we need
+        // the post-deploy balance map (caller -= cv, new_addr += cv,
+        // plus any further changes the constructor made via
+        // nested CallExt / CREATE) so we can journal+apply it to
+        // parent — see the TPL-205 block below.
+        let final_balances: HashMap<Address, U256> = if let Some(ref constructor_code) = constructor
+        {
             let mut child = Vm::with_gas_limit_and_context(max_forward, child_ctx.clone());
             child.contracts = self.contracts.clone();
             child.storage_backend = self.storage_backend.clone();
@@ -2072,6 +2123,28 @@ impl Vm {
             self.warm_storage_keys.extend(child.warm_storage_keys);
             self.accessed_raw_slots.extend(child.accessed_raw_slots);
             self.written_raw_slots.extend(child.written_raw_slots);
+            child.ctx.balances
+        } else {
+            // No constructor — the post-transfer map is already
+            // sitting in `child_ctx`. Pre-fix this branch dropped
+            // `child_ctx` on the floor, so a CREATE without a
+            // constructor block silently lost the deploy value
+            // transfer (caller debited nothing, new contract
+            // received nothing).
+            child_ctx.balances
+        };
+
+        // TPL-205: journal+apply the final balance map to parent.
+        // Skipping a delegate-style "no value transfer" optimisation
+        // intentionally — CREATE always has at least the
+        // (caller, new_addr) pair if `cv > 0`, and the iterator is
+        // a no-op when nothing changed.
+        for (addr, child_bal) in &final_balances {
+            let parent_bal = self.ctx.balances.get(addr).copied();
+            if parent_bal != Some(*child_bal) {
+                self.journal_balance_write(addr);
+                self.ctx.balances.insert(*addr, *child_bal);
+            }
         }
 
         let runtime_code = runtime;
@@ -2101,6 +2174,35 @@ impl Vm {
         if self.storage_journal_keys.insert(*key) {
             let old = self.storage.get(key).cloned();
             self.storage_journal.push((*key, old));
+        }
+    }
+
+    /// TPL-205: record an address's pre-write balance so a later
+    /// revert can restore it. Same first-write-wins semantics as
+    /// `journal_storage_write`.
+    #[inline]
+    pub fn journal_balance_write(&mut self, addr: &Address) {
+        if self.balance_journal_keys.insert(*addr) {
+            let old = self.ctx.balances.get(addr).copied();
+            self.balance_journal.push((*addr, old));
+        }
+    }
+
+    /// TPL-205: rollback balances to the state before journaled
+    /// writes. Drains the journal in reverse so re-runs of the
+    /// same address (which only journaled the first time) restore
+    /// the original pre-call value.
+    fn rollback_balances(&mut self) {
+        self.balance_journal_keys.clear();
+        for (addr, old_value) in self.balance_journal.drain(..).rev() {
+            match old_value {
+                Some(v) => {
+                    self.ctx.balances.insert(addr, v);
+                }
+                None => {
+                    self.ctx.balances.remove(&addr);
+                }
+            }
         }
     }
 
@@ -4196,6 +4298,153 @@ mod tests {
         assert_eq!(output.outcome, Outcome::Success);
         assert_eq!(vm.cpu.read_gp(1), 0); // child failed (OOG)
         assert_eq!(vm.cpu.read_gp(5), 99); // parent continued
+    }
+
+    // ========== TPL-205: balance journal for CallExt + CREATE ==========
+
+    /// TPL-205: a successful `CallExt` with non-zero call value
+    /// must move funds from caller to callee in the parent's
+    /// balance map. Pre-fix the local `balances` clone fed to the
+    /// child carried the debit/credit, but it was never merged
+    /// back — the parent's `ctx.balances` saw the same numbers
+    /// before and after the call. Cross-contract value transfers
+    /// were silent no-ops.
+    #[test]
+    fn call_ext_with_value_persists_to_parent_balances_tpl_205() {
+        let caller_addr = addr(0xAA);
+        let target_addr = addr(0xBB);
+        // Callee: just halts.
+        let callee_code = bytecode(&[instr_bytes(Opcode::Halt, 0, 0, 0)]);
+        // Caller: load r8 = 100 (call value), then CallExt with
+        // imm bit 13 set (has_value flag).
+        // imm = 0x143 | (1 << 13) = 0x2143 (result=r1, gas=r4, len=r3, has_value).
+        let caller_code = bytecode(&[
+            instr_ri(Opcode::Addi, 8, 0, 100),          // r8 = call value
+            instr_ri(Opcode::Addi, 3, 0, 0),            // r3 = calldata len = 0
+            instr_ri(Opcode::Addi, 4, 0, 0),            // r4 = gas = all
+            instr_bytes(Opcode::CallExt, 0, 2, 0x2143), // call_ext w0, r2, has_value
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let mut balances = HashMap::new();
+        balances.insert(caller_addr, U256::from(1000u64));
+        balances.insert(target_addr, U256::ZERO);
+        let ctx = ExecutionContext {
+            self_address: caller_addr,
+            balances,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_gas_limit_and_context(1_000_000, ctx);
+        vm.cpu.write_wide(0, U256::from_le_bytes(target_addr));
+        vm.contracts.insert(target_addr, callee_code);
+        vm.load(&caller_code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        assert_eq!(
+            vm.ctx.balances.get(&caller_addr).copied(),
+            Some(U256::from(900u64)),
+            "caller must be debited by call value"
+        );
+        assert_eq!(
+            vm.ctx.balances.get(&target_addr).copied(),
+            Some(U256::from(100u64)),
+            "target must be credited by call value"
+        );
+    }
+
+    /// TPL-205: when the parent reverts AFTER a successful child
+    /// call that moved value, the value transfer must be undone.
+    /// Pre-fix this was vacuously true because the transfer was
+    /// already a no-op; with the merge added, the journal+rollback
+    /// keeps the revert atomic.
+    #[test]
+    fn call_ext_value_rollback_on_parent_revert_tpl_205() {
+        let caller_addr = addr(0xAA);
+        let target_addr = addr(0xBB);
+        let callee_code = bytecode(&[instr_bytes(Opcode::Halt, 0, 0, 0)]);
+        let caller_code = bytecode(&[
+            instr_ri(Opcode::Addi, 8, 0, 100),
+            instr_ri(Opcode::Addi, 3, 0, 0),
+            instr_ri(Opcode::Addi, 4, 0, 0),
+            instr_bytes(Opcode::CallExt, 0, 2, 0x2143),
+            // After the (successful) call, parent reverts. The
+            // execute() loop's Revert branch should call
+            // rollback_balances and restore caller=1000 / target=0.
+            instr_bytes(Opcode::Revert, 0, 0, 0),
+        ]);
+
+        let mut balances = HashMap::new();
+        balances.insert(caller_addr, U256::from(1000u64));
+        balances.insert(target_addr, U256::ZERO);
+        let ctx = ExecutionContext {
+            self_address: caller_addr,
+            balances,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_gas_limit_and_context(1_000_000, ctx);
+        vm.cpu.write_wide(0, U256::from_le_bytes(target_addr));
+        vm.contracts.insert(target_addr, callee_code);
+        vm.load(&caller_code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Revert);
+        assert_eq!(
+            vm.ctx.balances.get(&caller_addr).copied(),
+            Some(U256::from(1000u64)),
+            "caller balance must be restored on revert"
+        );
+        assert_eq!(
+            vm.ctx.balances.get(&target_addr).copied(),
+            Some(U256::ZERO),
+            "target balance must be restored on revert"
+        );
+    }
+
+    /// TPL-205: when the CHILD reverts, the parent's balances
+    /// must remain at their pre-call state (no merge happens at
+    /// all). The pre-call `balances` clone fed to the child is
+    /// dropped, child.ctx.balances is dropped — parent's
+    /// `self.ctx.balances` was never modified.
+    #[test]
+    fn call_ext_value_not_applied_when_child_reverts_tpl_205() {
+        let caller_addr = addr(0xAA);
+        let target_addr = addr(0xBB);
+        // Callee: revert immediately.
+        let callee_code = bytecode(&[instr_bytes(Opcode::Revert, 0, 0, 0)]);
+        let caller_code = bytecode(&[
+            instr_ri(Opcode::Addi, 8, 0, 100),
+            instr_ri(Opcode::Addi, 3, 0, 0),
+            instr_ri(Opcode::Addi, 4, 0, 0),
+            instr_bytes(Opcode::CallExt, 0, 2, 0x2143),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+
+        let mut balances = HashMap::new();
+        balances.insert(caller_addr, U256::from(1000u64));
+        balances.insert(target_addr, U256::ZERO);
+        let ctx = ExecutionContext {
+            self_address: caller_addr,
+            balances,
+            ..Default::default()
+        };
+        let mut vm = Vm::with_gas_limit_and_context(1_000_000, ctx);
+        vm.cpu.write_wide(0, U256::from_le_bytes(target_addr));
+        vm.contracts.insert(target_addr, callee_code);
+        vm.load(&caller_code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        assert_eq!(
+            vm.ctx.balances.get(&caller_addr).copied(),
+            Some(U256::from(1000u64)),
+            "caller balance unchanged when child reverts"
+        );
+        assert_eq!(
+            vm.ctx.balances.get(&target_addr).copied(),
+            Some(U256::ZERO),
+            "target balance unchanged when child reverts"
+        );
     }
 
     // ========== Task 0208: CREATE deploys and returns correct address ==========

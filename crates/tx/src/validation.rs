@@ -381,8 +381,22 @@ fn validate_balance(
     sender: &Account,
     ctx: &ValidationContext,
 ) -> Result<(), ValidationError> {
-    let gas_cost = tx.gas_limit as u128 * ctx.base_fee;
-    let total_required = gas_cost + tx.value;
+    // TPL-206: bare `*` and `+` on attacker-controlled
+    // `(gas_limit, base_fee, value)` overflow `u128` and either panic
+    // in debug or wrap in release. With `panic = "abort"` workspace-
+    // wide, the panic is SIGABRT — a remote validator-kill from a
+    // single ingress tx in any base-fee-elevated regime. Reject with
+    // an `InsufficientBalance { required: u128::MAX, available }`
+    // result so operator logs surface "required = 2^128 - 1" as the
+    // overflow tell; no balance can satisfy that demand.
+    let overflow = || ValidationError::InsufficientBalance {
+        required: u128::MAX,
+        available: sender.balance.saturating_sub(ctx.sender_locked),
+    };
+    let gas_cost = (tx.gas_limit as u128)
+        .checked_mul(ctx.base_fee)
+        .ok_or_else(overflow)?;
+    let total_required = gas_cost.checked_add(tx.value).ok_or_else(overflow)?;
 
     // Vested / locked balance (slice 4.4) is subtracted from the raw
     // account balance before any solvency check. `saturating_sub`
@@ -629,6 +643,57 @@ mod tests {
         let ctx = default_ctx(); // base_fee = 1000, so 21000 * 1000 = 21M > 100
         let err = validate_transaction(&tx, &account, &nonce, &ctx).unwrap_err();
         assert!(matches!(err, ValidationError::InsufficientBalance { .. }));
+    }
+
+    /// TPL-206 regression — `gas_cost + value` (and `gas_limit *
+    /// base_fee` upstream) must not overflow `u128`. Pre-fix the
+    /// bare `+` and `*` would either panic in debug or wrap in
+    /// release; with workspace `panic = "abort"` either was a
+    /// remote-killable validator process. Post-fix every overflow
+    /// path returns `InsufficientBalance { required: u128::MAX, ..
+    /// }` so the rejection is clean and the operator log shows
+    /// `required = 2^128 - 1` as the unmistakable overflow tell.
+    #[test]
+    fn fee_overflow_rejected_as_insufficient_balance() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        // Balance is irrelevant — overflow makes `required = u128::MAX`,
+        // which exceeds any possible spendable balance regardless.
+        let account = Account {
+            balance: u128::MAX,
+            ..Account::new_eoa(&pk_bytes)
+        };
+        let nonce = NonceState::new();
+
+        // Adversarial shape: `value = u128::MAX` plus any non-zero
+        // `gas_cost` overflows on the `gas_cost + value` add.
+        let mut tx = Transaction {
+            from: account.address,
+            to: ZERO_ADDRESS,
+            value: u128::MAX,
+            data: vec![],
+            gas_limit: 21_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Standard,
+        };
+        let tx_hash = tx.hash();
+        tx.signature = falcon_sign(&sk, &tx_hash).unwrap().as_bytes().to_vec();
+
+        let ctx = default_ctx();
+        let err = validate_transaction(&tx, &account, &nonce, &ctx).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ValidationError::InsufficientBalance { required, .. } if required == u128::MAX
+            ),
+            "expected fee-overflow → InsufficientBalance{{required: u128::MAX, ..}}, got {:?}",
+            err
+        );
     }
 
     #[test]

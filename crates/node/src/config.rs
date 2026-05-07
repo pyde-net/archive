@@ -161,9 +161,19 @@ pub struct FastTxSection {
 
 impl Default for FastTxSection {
     fn default() -> Self {
+        // TPL-207: bind to loopback by default. The fast-tx listener
+        // accepts length-prefixed signed transactions and submits them
+        // straight into `pending_txs` + `tx_gossip_tx` without going
+        // through `ingress_validate` (no `MEMPOOL_*` cap, no per-IP
+        // rate-limit, no signature pre-check). The pre-fix default of
+        // `0.0.0.0` exposed every `--config` deployment that didn't
+        // explicitly override `[fast_tx].listen` to a public ingress
+        // path that drains the validator's memory until peer-banning
+        // cascades. Operators who genuinely want public fast-tx must
+        // opt in via TOML.
         Self {
             enabled: true,
-            listen: "0.0.0.0".into(),
+            listen: "127.0.0.1".into(),
             port: 9545,
         }
     }

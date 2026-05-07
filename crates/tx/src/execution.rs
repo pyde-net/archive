@@ -82,17 +82,34 @@ pub struct ExecutionState {
 
 /// Pre-execution: deduct max gas cost from fee payer.
 /// Returns the amount deducted, or error if insufficient.
+///
+/// TPL-206: `gas_limit * base_fee` and `(gas_cost) + value` are both
+/// checked for `u128` overflow. Pre-fix the bare `*` and `+` on
+/// adversarial `(gas_limit, base_fee, value)` would either panic in
+/// debug or wrap in release (workspace `panic = "abort"` makes the
+/// panic SIGABRT — remote-killable from a single submitted tx in any
+/// base-fee-elevated regime).
 pub fn pre_execution_charge(
     tx: &Transaction,
     sender_balance: &mut u128,
     gas_tank_balance: &mut u128,
     base_fee: u128,
 ) -> Result<u128, String> {
-    let max_gas_cost = tx.gas_limit as u128 * base_fee;
+    let max_gas_cost = (tx.gas_limit as u128).checked_mul(base_fee).ok_or_else(|| {
+        format!(
+            "fee overflow: gas_limit ({}) * base_fee ({}) > u128::MAX",
+            tx.gas_limit, base_fee
+        )
+    })?;
 
     match &tx.fee_payer {
         FeePayer::Sender => {
-            let total = max_gas_cost + tx.value;
+            let total = max_gas_cost.checked_add(tx.value).ok_or_else(|| {
+                format!(
+                    "fee overflow: max_gas_cost ({}) + value ({}) > u128::MAX",
+                    max_gas_cost, tx.value
+                )
+            })?;
             if *sender_balance < total {
                 return Err(format!(
                     "insufficient balance: need {total}, have {}",

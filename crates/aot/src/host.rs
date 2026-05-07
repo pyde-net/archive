@@ -28,9 +28,22 @@ pub type VmCtx = Vm;
 
 // ── Memory operations ──────────────────────────────────────────────────
 
-/// Host: load from memory. Returns the value, or u64::MAX on fault.
-/// Width: 0=8bit, 1=16bit, 2=32bit, 3=64bit
-pub extern "C" fn host_load(ctx: *mut VmCtx, addr: u64, width: u64) -> u64 {
+/// Host: load from memory. Returns the loaded value; writes the
+/// fault flag to `*trap_out` (0 = success, 1 = fault).
+/// Width: 0=8bit, 1=16bit, 2=32bit, 3=64bit.
+///
+/// TPL-202: pre-fix this packed both channels into the return —
+/// `u64::MAX` meant "fault" but was indistinguishable from a
+/// successful load64 of `0xFFFF_FFFF_FFFF_FFFF`. The interpreter's
+/// `Opcode::Load` traps on fault and writes the value on success;
+/// the AOT path took the return value at face value, so a faulted
+/// load and a successful load of `u64::MAX` ran the same code
+/// post-call. Either direction (legitimate u64::MAX silently
+/// dropped to a trap-equivalent on AOT, or a fault silently
+/// becoming a u64::MAX register write) was a consensus fork
+/// vector. Splitting the trap channel into a separate out-pointer
+/// matches the established `host_narrow` pattern.
+pub extern "C" fn host_load(ctx: *mut VmCtx, addr: u64, width: u64, trap_out: *mut u64) -> u64 {
     // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
     // safety contract (top of file). The AOT JIT's callsite emission
     // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
@@ -42,11 +55,25 @@ pub extern "C" fn host_load(ctx: *mut VmCtx, addr: u64, width: u64) -> u64 {
         1 => vm.memory.load16(addr).map(|v| v as u64),
         2 => vm.memory.load32(addr).map(|v| v as u64),
         3 => vm.memory.load64(addr),
-        _ => return u64::MAX,
+        _ => {
+            // SAFETY: `trap_out` is a valid out-pointer provided by
+            // the AOT JIT (emitted alongside the call). See
+            // module-level pointer safety contract.
+            unsafe {
+                *trap_out = 1;
+            }
+            return 0;
+        }
     };
     match result {
         Ok(v) => v,
-        Err(_) => u64::MAX, // signal fault
+        Err(_) => {
+            // SAFETY: see above.
+            unsafe {
+                *trap_out = 1;
+            }
+            0
+        }
     }
 }
 
@@ -134,8 +161,17 @@ pub extern "C" fn host_push(ctx: *mut VmCtx, value: u64) -> u64 {
     }
 }
 
-/// Host: pop a 64-bit value from stack. Returns the value, u64::MAX on fault.
-pub extern "C" fn host_pop(ctx: *mut VmCtx) -> u64 {
+/// Host: pop a 64-bit value from stack. Returns the popped value;
+/// writes the fault flag to `*trap_out` (0 = success, 1 = fault).
+///
+/// TPL-202: same `u64::MAX`-as-sentinel divergence as `host_load`.
+/// Pre-fix, the AOT codegen for `Opcode::Pop` checked
+/// `result == u64::MAX` and trapped on that — but a stack slot
+/// containing `0xFFFF_FFFF_FFFF_FFFF` is a legitimate value, and
+/// the interpreter's `Opcode::Pop` accepts it. Two backends, two
+/// outcomes for the same bytecode → fork. The trap-out pointer
+/// keeps the value channel and the fault channel disjoint.
+pub extern "C" fn host_pop(ctx: *mut VmCtx, trap_out: *mut u64) -> u64 {
     // SAFETY: `ctx` is a valid `&mut Vm` per the module-level pointer
     // safety contract (top of file). The AOT JIT's callsite emission
     // in `aot/src/codegen.rs` loads a live VM pointer into the ABI's
@@ -147,7 +183,15 @@ pub extern "C" fn host_pop(ctx: *mut VmCtx) -> u64 {
             vm.memory.stack_pointer += 8;
             val
         }
-        Err(_) => u64::MAX,
+        Err(_) => {
+            // SAFETY: `trap_out` is a valid out-pointer provided by
+            // the AOT JIT (emitted alongside the call). See
+            // module-level pointer safety contract.
+            unsafe {
+                *trap_out = 1;
+            }
+            0
+        }
     }
 }
 

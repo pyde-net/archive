@@ -153,6 +153,30 @@ fn main() {
                 config.node.dev_mode = true;
             }
 
+            // TPL-207: refuse to start with `dev_mode = true` on any
+            // chain_id other than devnet. `dev_mode` short-circuits
+            // signature verification (`validate_transaction` honours
+            // `dev_skip_signature` only when `chain_id == 31337`, but
+            // `pyde_sendTransaction` accepts unsigned txs whenever
+            // `state.dev_mode` is set). A misconfigured operator
+            // running `pyde run --dev --config testnet.toml` opens
+            // unsigned-tx ingress for the duration; this guard
+            // catches the combo at startup. Both `--dev` and a TOML
+            // `dev_mode = true` are funnelled here, so the check
+            // covers either source.
+            if config.node.dev_mode && config.node.chain_id != pyde_net::discovery::DEVNET_CHAIN_ID
+            {
+                eprintln!(
+                    "error: dev_mode is only permitted on devnet \
+                     (chain_id = {}); configured chain_id = {}. Drop \
+                     `--dev` / `[node].dev_mode = false` to run on \
+                     testnet or mainnet.",
+                    pyde_net::discovery::DEVNET_CHAIN_ID,
+                    config.node.chain_id,
+                );
+                std::process::exit(1);
+            }
+
             // Initialize logging first
             logging::init(&config.logging.level, config.logging.json);
 

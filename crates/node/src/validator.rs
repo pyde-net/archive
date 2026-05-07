@@ -1804,8 +1804,24 @@ impl ValidatorEngine {
     /// Select the best proposal (lowest VRF score) and vote for it.
     /// Called after the proposal collection window (100ms into the slot).
     /// Returns the vote to broadcast, or None if no proposals were buffered.
+    ///
+    /// audit-234 part 4 (CONSENSUS_INVARIANTS.md L1, O3): the slot used
+    /// to look up buffered proposals is `target_height`, NOT
+    /// `current_slot`. Both `try_build_fallback_proposal` and
+    /// `buffer_fallback_proposal` key on the proposer's
+    /// `target_height` (fallback header.slot = target_height), so a
+    /// receiver whose wall-clock advanced past `target_height`
+    /// during recovery (recovery > SLOT_DURATION_MS) would otherwise
+    /// look for proposals at `current_slot` and never find the
+    /// fallback that was buffered at `target_height`. The validator
+    /// then refused to vote on every fallback proposal until the
+    /// chain unstuck itself, prolonging the wedge. The two
+    /// `advance_target_height` callers (vote-QC apply path,
+    /// `advance_target_height_after_sync` from chain-sync) keep
+    /// `target_height` correctly aligned with the height we are
+    /// actively trying to commit.
     pub fn select_and_vote(&mut self, identity: &ValidatorIdentity) -> Option<ConsensusMessage> {
-        let slot = self.consensus.current_slot;
+        let slot = self.consensus.target_height;
 
         // Don't double-vote
         if self.voted_slots.contains(&slot) {
@@ -3244,6 +3260,63 @@ mod tests {
         assert!(!engine.is_inclusion_violated(slot));
         let vote = engine.select_and_vote(&identities[1]);
         assert!(vote.is_some(), "un-flagged slot should produce a vote");
+    }
+
+    /// TPL-203 / audit-234 part 4 (CONSENSUS_INVARIANTS.md L1, O3):
+    /// when recovery for a slot takes longer than `SLOT_DURATION_MS`,
+    /// a validator's wall-clock `current_slot` drifts past
+    /// `target_height`. Fallback proposals are buffered at
+    /// `header.slot = target_height` (the proposer wrote it that
+    /// way). Pre-fix, `select_and_vote` looked up
+    /// `buffered_proposals[current_slot]`, missed the fallback at
+    /// `target_height`, and silently returned None on every tick of
+    /// the recovery window. Post-fix it reads `target_height` and
+    /// finds the buffered proposal.
+    #[test]
+    fn select_and_vote_uses_target_height_not_current_slot() {
+        let (mut engine, identities) = make_engine_with_committee(3);
+        // Drift wall-clock past target_height: target_height stays at
+        // 1 (no QC formed), current_slot walks forward to 5. This is
+        // the exact shape of a recovery > SLOT_DURATION_MS — three
+        // wall-clock ticks fired after the recovery began but no
+        // vote-QC has formed at target_height yet.
+        for _ in 0..5 {
+            engine.advance_slot();
+        }
+        assert_eq!(engine.consensus.current_slot, 5);
+        assert_eq!(engine.consensus.target_height, 1);
+
+        // Buffer a proposal at target_height (where a fallback
+        // proposer would have placed it). vrf_score 0 so it wins
+        // min-by-vrf_score selection.
+        let header = BlockHeader {
+            slot: engine.consensus.target_height,
+            epoch: 0,
+            parent_hash: [0u8; 32],
+            proposer: identities[0].address,
+            vrf_proof: vec![],
+            qc_previous: QuorumCert::empty(),
+            tx_root: [0u8; 32],
+            state_root: [0u8; 32],
+            timestamp: 0,
+        };
+        engine
+            .buffered_proposals
+            .entry(engine.consensus.target_height)
+            .or_default()
+            .push(BufferedProposal {
+                header,
+                proposer_signature: vec![],
+                vrf_score: 0,
+            });
+
+        // Pre-fix: returned None because lookup was at current_slot=5
+        // but the proposal lives at target_height=1.
+        let vote = engine.select_and_vote(&identities[1]);
+        assert!(
+            vote.is_some(),
+            "select_and_vote must find the proposal at target_height even when current_slot has drifted past"
+        );
     }
 
     // ========== Task 034: cross-committee resharing ==========
