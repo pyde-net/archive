@@ -277,14 +277,20 @@ impl KeyShare {
                 data[off + 6],
                 data[off + 7],
             ]);
-            // Audit 391: `gl()` silently reduces values in
-            // `[p, 2^64)`. Honestly produced shares always
-            // serialize via `gl_to_u64()` (canonical, in `[0, p)`),
-            // so this remap only fires on malformed input.
-            // Treating malformed values as their canonical
-            // equivalents keeps deserialization total — the
-            // downstream MAC check inside `combine_shares` rejects
-            // the resulting bad keystream.
+            // TPL-305: reject non-canonical encodings. Honest
+            // shares always serialize via `gl_to_u64()` (canonical,
+            // in `[0, p)`), so a value `>= GOLDILOCKS_PRIME` can
+            // only come from a malformed wire payload. Pre-fix the
+            // code silently remapped to `gl(val)`, leaning on the
+            // downstream MAC check to catch the resulting bad
+            // keystream — but that's defense-in-depth, not
+            // verification, and non-canonical encodings are also a
+            // wire-replay surface: the same logical share carried
+            // by two different byte representations slips past
+            // dedup keyed on the byte payload.
+            if val >= GOLDILOCKS_PRIME {
+                return None;
+            }
             shares.push(gl(val));
         }
         Some(Self { index, shares })
@@ -345,9 +351,11 @@ impl DecryptionShare {
         for i in 0..count {
             let off = 12 + i * 8;
             let val = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
-            // Audit 391: see `KeyShare::from_bytes` — silent
-            // remap on malformed input is fine because the
-            // downstream MAC compare rejects bad keystreams.
+            // TPL-305: see `KeyShare::from_bytes` — same
+            // canonical-encoding gate.
+            if val >= GOLDILOCKS_PRIME {
+                return None;
+            }
             shares.push(gl(val));
         }
         Some(Self { index, shares })
@@ -913,12 +921,15 @@ impl RefreshContribution {
             let mut v = Vec::with_capacity(elems);
             for _ in 0..elems {
                 let val = u64::from_le_bytes(data[off..off + 8].try_into().ok()?);
-                // Audit 391: see `KeyShare::from_bytes` — silent
-                // remap on malformed input is fine. Honest
-                // refresh contributions serialize via canonical
-                // `gl_to_u64()`; tampering with delta bytes only
-                // corrupts the recipient's share, caught when
-                // decryption fails the MAC.
+                // TPL-305: see `KeyShare::from_bytes` — same
+                // canonical-encoding gate. RefreshContribution
+                // bytes are gossiped between validators, so a
+                // non-canonical encoding would be a particularly
+                // useful replay primitive (same delta semantics,
+                // different on-the-wire bytes evade gossip dedup).
+                if val >= GOLDILOCKS_PRIME {
+                    return None;
+                }
                 v.push(gl(val));
                 off += 8;
             }
@@ -2550,5 +2561,80 @@ mod tests {
             .collect();
         let recovered = combine_shares(&dec_shares, 3, &ct).expect("combine");
         assert_eq!(recovered, msg);
+    }
+
+    // ========== TPL-305: from_bytes rejects non-canonical encodings ==========
+
+    /// TPL-305: a `KeyShare` whose last share-element byte payload
+    /// encodes a value `>= GOLDILOCKS_PRIME` must fail
+    /// deserialization. Pre-fix the value was silently remapped
+    /// via `gl(val)`, leaning on a downstream MAC check; the
+    /// non-canonical encoding was also a wire-replay surface
+    /// (same logical share, two different byte payloads slip past
+    /// gossip dedup keyed on the bytes).
+    #[test]
+    fn tpl_305_keyshare_from_bytes_rejects_non_canonical() {
+        let (_pk, shares) = threshold_keygen(5, 3).expect("keygen");
+        let mut bytes = shares[0].to_bytes();
+        // Tamper with the LAST 8-byte share element: overwrite
+        // with `GOLDILOCKS_PRIME` (= 2^64 - 2^32 + 1), which is
+        // exactly the smallest non-canonical u64 (val == p, not
+        // val < p).
+        let len = bytes.len();
+        bytes[len - 8..].copy_from_slice(&GOLDILOCKS_PRIME.to_le_bytes());
+        assert!(
+            KeyShare::from_bytes(&bytes).is_none(),
+            "non-canonical KeyShare encoding must be rejected"
+        );
+        // Positive control: an untampered roundtrip still works.
+        let canonical = shares[0].to_bytes();
+        assert!(KeyShare::from_bytes(&canonical).is_some());
+    }
+
+    /// TPL-305: same gate on `DecryptionShare::from_bytes`.
+    #[test]
+    fn tpl_305_decryption_share_from_bytes_rejects_non_canonical() {
+        let (pk, shares) = threshold_keygen(5, 3).expect("keygen");
+        let ct = threshold_encrypt(&pk, b"tpl-305 dec").expect("encrypt");
+        let dec_share = generate_decryption_share(&shares[0], &ct);
+        let mut bytes = dec_share.to_bytes();
+        let len = bytes.len();
+        bytes[len - 8..].copy_from_slice(&GOLDILOCKS_PRIME.to_le_bytes());
+        assert!(
+            DecryptionShare::from_bytes(&bytes).is_none(),
+            "non-canonical DecryptionShare encoding must be rejected"
+        );
+        assert!(DecryptionShare::from_bytes(&dec_share.to_bytes()).is_some());
+    }
+
+    /// TPL-305: same gate on `RefreshContribution::from_bytes`.
+    /// Refresh contributions are gossiped between validators, so
+    /// non-canonical encodings would otherwise be a particularly
+    /// useful replay primitive.
+    #[test]
+    fn tpl_305_refresh_contribution_from_bytes_rejects_non_canonical() {
+        // generate_refresh_contribution is total (no Result) — it
+        // produces a zero-secret refresh poly for every elem_idx.
+        let contrib = generate_refresh_contribution(1, 5, 3, 0, b"tpl-305 entropy");
+        let mut bytes = contrib.to_bytes();
+        let len = bytes.len();
+        bytes[len - 8..].copy_from_slice(&GOLDILOCKS_PRIME.to_le_bytes());
+        assert!(
+            RefreshContribution::from_bytes(&bytes).is_none(),
+            "non-canonical RefreshContribution encoding must be rejected"
+        );
+        assert!(RefreshContribution::from_bytes(&contrib.to_bytes()).is_some());
+    }
+
+    /// TPL-305: also reject the all-`0xFF` u64 (`u64::MAX`),
+    /// which is the most extreme non-canonical value an attacker
+    /// would hand-craft.
+    #[test]
+    fn tpl_305_keyshare_from_bytes_rejects_u64_max() {
+        let (_pk, shares) = threshold_keygen(5, 3).expect("keygen");
+        let mut bytes = shares[0].to_bytes();
+        let len = bytes.len();
+        bytes[len - 8..].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(KeyShare::from_bytes(&bytes).is_none());
     }
 }
