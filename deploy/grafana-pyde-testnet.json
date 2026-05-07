@@ -250,11 +250,11 @@
     {
       "type": "timeseries",
       "title": "RPC error rate (5m)",
-      "description": "pyde_rpc_requests_total{outcome=\"error\"} / total. Alert: > 5% sustained → see oncall.md § rpc-errors.",
+      "description": "pyde_rpc_requests_total{outcome=\"err\"} / total. Alert: > 5% sustained → see oncall.md § rpc-errors.",
       "datasource": {"type": "prometheus"},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 50},
       "id": 15,
-      "targets": [{"expr": "sum(rate(pyde_rpc_requests_total{outcome=\"error\"}[5m])) / sum(rate(pyde_rpc_requests_total[5m]))", "legendFormat": "error rate", "refId": "A"}]
+      "targets": [{"expr": "sum(rate(pyde_rpc_requests_total{outcome=\"err\"}[5m])) / sum(rate(pyde_rpc_requests_total[5m]))", "legendFormat": "error rate", "refId": "A"}]
     }
   ],
   "refresh": "10s",

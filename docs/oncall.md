@@ -375,7 +375,7 @@ groups:
           runbook_url: "https://github.com/zarah-s/pyde/blob/main/docs/oncall.md#encrypted-mempool-grew"
 
       - alert: ReorgsHappening
-        expr: rate(pyde_reorgs_total{outcome="Succeeded"}[5m]) > 0
+        expr: rate(pyde_reorgs_total{outcome="succeeded"}[5m]) > 0
         for: 1m
         labels: {severity: warning, runbook: reorg}
         annotations:
@@ -392,7 +392,7 @@ groups:
 
       - alert: RpcErrorRateHigh
         expr: |
-          sum(rate(pyde_rpc_requests_total{outcome="error"}[5m])) /
+          sum(rate(pyde_rpc_requests_total{outcome="err"}[5m])) /
           sum(rate(pyde_rpc_requests_total[5m])) > 0.05
         for: 5m
         labels: {severity: warning, runbook: rpc-errors}
