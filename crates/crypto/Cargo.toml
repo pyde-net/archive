@@ -7,7 +7,7 @@ edition = "2021"
 [dependencies]
 p3-goldilocks = "0.4"
 p3-field = "0.4"
-p3-poseidon2 = "0.4"
+p3-poseidon2 = "0.5"
 p3-symmetric = "0.4"
 falcon-rs = { version = "0.2", default-features = false, features = ["getrandom"] }
 ml-kem = { version = "0.3.0-rc.0", default-features = false, features = ["getrandom"] }

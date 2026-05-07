@@ -3170,11 +3170,11 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20e42ba74a49c08c6e99f74cd9b343bfa31aa5721fea55079b18e3fd65f1dcbc"
 dependencies = [
- "p3-field",
- "p3-maybe-rayon",
+ "p3-field 0.4.2",
+ "p3-maybe-rayon 0.4.2",
  "p3-monty-31",
- "p3-symmetric",
- "p3-util",
+ "p3-symmetric 0.4.2",
+ "p3-util 0.4.2",
  "tracing",
 ]
 
@@ -3185,10 +3185,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e63fa5eb1bd12a240089e72ae3fe10350944d9c166d00a3bfd2a1794db65cf5c"
 dependencies = [
  "itertools 0.14.0",
- "p3-field",
- "p3-matrix",
- "p3-maybe-rayon",
- "p3-util",
+ "p3-field 0.4.2",
+ "p3-matrix 0.4.2",
+ "p3-maybe-rayon 0.4.2",
+ "p3-util 0.4.2",
+ "spin 0.10.0",
+ "tracing",
+]
+
+[[package]]
+name = "p3-dft"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55301e91544440254977108b85c32c09d7ea05f2f0dd61092a2825339906a4a7"
+dependencies = [
+ "itertools 0.14.0",
+ "p3-field 0.5.2",
+ "p3-matrix 0.5.2",
+ "p3-maybe-rayon 0.5.2",
+ "p3-util 0.5.2",
  "spin 0.10.0",
  "tracing",
 ]
@@ -3201,10 +3216,26 @@ checksum = "2ebfdb6ef992ae64e9e8f449ac46516ffa584f11afbdf9ee244288c2a633cdf4"
 dependencies = [
  "itertools 0.14.0",
  "num-bigint",
- "p3-maybe-rayon",
- "p3-util",
+ "p3-maybe-rayon 0.4.2",
+ "p3-util 0.4.2",
  "paste",
  "rand 0.9.4",
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "p3-field"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85affca7fc983889f260655c4cf74163eebb94605f702e4b6809ead707cba54f"
+dependencies = [
+ "itertools 0.14.0",
+ "num-bigint",
+ "p3-maybe-rayon 0.5.2",
+ "p3-util 0.5.2",
+ "paste",
+ "rand 0.10.1",
  "serde",
  "tracing",
 ]
@@ -3217,12 +3248,12 @@ checksum = "64716244b5612622d4e78a4f48b74f6d3bb7b4085b7b6b25364b1dfca7198c66"
 dependencies = [
  "num-bigint",
  "p3-challenger",
- "p3-dft",
- "p3-field",
- "p3-mds",
- "p3-poseidon2",
- "p3-symmetric",
- "p3-util",
+ "p3-dft 0.4.2",
+ "p3-field 0.4.2",
+ "p3-mds 0.4.2",
+ "p3-poseidon2 0.4.2",
+ "p3-symmetric 0.4.2",
+ "p3-util 0.4.2",
  "paste",
  "rand 0.9.4",
  "serde",
@@ -3235,13 +3266,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5542f96504dae8100c91398fb1e3f5ec669eb9c73d9e0b018a93b5fe32bad230"
 dependencies = [
  "itertools 0.14.0",
- "p3-field",
- "p3-maybe-rayon",
- "p3-util",
+ "p3-field 0.4.2",
+ "p3-maybe-rayon 0.4.2",
+ "p3-util 0.4.2",
  "rand 0.9.4",
  "serde",
  "tracing",
  "transpose",
+]
+
+[[package]]
+name = "p3-matrix"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53428126b009071563d1d07305a9de8be0d21de00b57d2475289ee32ffca6577"
+dependencies = [
+ "itertools 0.14.0",
+ "p3-field 0.5.2",
+ "p3-maybe-rayon 0.5.2",
+ "p3-util 0.5.2",
+ "rand 0.10.1",
+ "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -3251,16 +3297,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e5669ca75645f99cd001e9d0289a4eeff2bc2cd9dc3c6c3aaf22643966e83df"
 
 [[package]]
+name = "p3-maybe-rayon"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "082bf467011c06c768c579ec6eb9accb5e1e62108891634cc770396e917f978a"
+
+[[package]]
 name = "p3-mds"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "038763af23df9da653065867fd85b38626079031576c86fd537097e5be6a0da0"
 dependencies = [
- "p3-dft",
- "p3-field",
- "p3-symmetric",
- "p3-util",
+ "p3-dft 0.4.2",
+ "p3-field 0.4.2",
+ "p3-symmetric 0.4.2",
+ "p3-util 0.4.2",
  "rand 0.9.4",
+]
+
+[[package]]
+name = "p3-mds"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35209e6214102ea6ec6b8cb1b9c15a9b8e597a39f9173597c957f123bced81b3"
+dependencies = [
+ "p3-dft 0.5.2",
+ "p3-field 0.5.2",
+ "p3-symmetric 0.5.2",
+ "p3-util 0.5.2",
+ "rand 0.10.1",
 ]
 
 [[package]]
@@ -3271,14 +3336,14 @@ checksum = "57a981d60da3d8cbf8561014e2c186068578405fd69098fa75b43d4afb364a47"
 dependencies = [
  "itertools 0.14.0",
  "num-bigint",
- "p3-dft",
- "p3-field",
- "p3-matrix",
- "p3-maybe-rayon",
- "p3-mds",
- "p3-poseidon2",
- "p3-symmetric",
- "p3-util",
+ "p3-dft 0.4.2",
+ "p3-field 0.4.2",
+ "p3-matrix 0.4.2",
+ "p3-maybe-rayon 0.4.2",
+ "p3-mds 0.4.2",
+ "p3-poseidon2 0.4.2",
+ "p3-symmetric 0.4.2",
+ "p3-util 0.4.2",
  "paste",
  "rand 0.9.4",
  "serde",
@@ -3293,11 +3358,24 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "903b73e4f9a7781a18561c74dc169cf03333497b57a8dd02aaeb130c0f386599"
 dependencies = [
- "p3-field",
- "p3-mds",
- "p3-symmetric",
- "p3-util",
+ "p3-field 0.4.2",
+ "p3-mds 0.4.2",
+ "p3-symmetric 0.4.2",
+ "p3-util 0.4.2",
  "rand 0.9.4",
+]
+
+[[package]]
+name = "p3-poseidon2"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "256a668a9ba916f8767552f13d0ba50d18968bc74a623bfdafa41e2970c944d0"
+dependencies = [
+ "p3-field 0.5.2",
+ "p3-mds 0.5.2",
+ "p3-symmetric 0.5.2",
+ "p3-util 0.5.2",
+ "rand 0.10.1",
 ]
 
 [[package]]
@@ -3307,7 +3385,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3cd788f04e86dd5c35dd87cad29eefdb6371d2fd5f7664451382eeacae3c3ed0"
 dependencies = [
  "itertools 0.14.0",
- "p3-field",
+ "p3-field 0.4.2",
+ "serde",
+]
+
+[[package]]
+name = "p3-symmetric"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c60a71a1507c13611b0f2b0b6e83669fd5b76f8e3115bcbced5ccfdf3ca7807"
+dependencies = [
+ "itertools 0.14.0",
+ "p3-field 0.5.2",
+ "p3-util 0.5.2",
  "serde",
 ]
 
@@ -3318,6 +3408,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "663b16021930bc600ecada915c6c3965730a3b9d6a6c23434ccf70bfc29d6881"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "p3-util"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8b766b9e9254bf3fa98d76e42cf8a5b30628c182dfd5272d270076ee12f0fc0"
+dependencies = [
+ "serde",
+ "transpose",
 ]
 
 [[package]]
@@ -3604,10 +3704,10 @@ version = "0.1.0-testnet.1"
 dependencies = [
  "falcon-rs",
  "ml-kem",
- "p3-field",
+ "p3-field 0.4.2",
  "p3-goldilocks",
- "p3-poseidon2",
- "p3-symmetric",
+ "p3-poseidon2 0.5.2",
+ "p3-symmetric 0.4.2",
  "subtle",
  "zeroize",
 ]
@@ -3932,6 +4032,15 @@ checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+dependencies = [
+ "rand_core 0.10.1",
 ]
 
 [[package]]
