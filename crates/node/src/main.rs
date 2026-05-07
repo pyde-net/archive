@@ -164,8 +164,7 @@ fn main() {
             // catches the combo at startup. Both `--dev` and a TOML
             // `dev_mode = true` are funnelled here, so the check
             // covers either source.
-            if config.node.dev_mode
-                && config.node.chain_id != pyde_net::discovery::DEVNET_CHAIN_ID
+            if config.node.dev_mode && config.node.chain_id != pyde_net::discovery::DEVNET_CHAIN_ID
             {
                 eprintln!(
                     "error: dev_mode is only permitted on devnet \
