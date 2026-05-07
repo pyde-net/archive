@@ -7,7 +7,7 @@ edition = "2021"
 [dependencies]
 pyde-vm = { path = "../pvm" }
 pyde-crypto = { path = "../crypto" }
-cranelift-codegen = "0.116"
+cranelift-codegen = "0.131"
 cranelift-frontend = "0.116"
 cranelift-module = "0.116"
 cranelift-jit = "0.116"
