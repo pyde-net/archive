@@ -1658,7 +1658,20 @@ impl ValidatorEngine {
             warn!(slot, "proposal missing proposer signature");
             return false;
         }
-        let vrf_output = pyde_crypto::vrf::VrfOutput::from_hash_bytes(vrf_output_bytes);
+        // TPL-306: `from_hash_bytes` is Option-returning. The
+        // `vrf_output_bytes` slice is taken from
+        // `&header.vrf_proof[..32]` after a `len() >= 33` gate
+        // higher up, so the input is always exactly 32 bytes —
+        // `None` here would indicate a refactor that loosened
+        // the gate without updating this site, which we'd rather
+        // notice loudly.
+        let vrf_output = match pyde_crypto::vrf::VrfOutput::from_hash_bytes(vrf_output_bytes) {
+            Some(o) => o,
+            None => {
+                warn!(slot, "vrf output bytes are not 32 bytes");
+                return false;
+            }
+        };
         let vrf_proof = VrfProof::from_bytes(vrf_proof_bytes);
 
         // Build VRF input: epoch_randomness || slot.

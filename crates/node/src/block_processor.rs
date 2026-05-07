@@ -829,7 +829,13 @@ impl BlockProcessor {
             let pk =
                 pyde_crypto::falcon::FalconPublicKey::from_bytes(&committee_keys[proposer_idx])
                     .ok_or("invalid committee public key for VRF verification")?;
-            let vrf_output = pyde_crypto::vrf::VrfOutput::from_hash_bytes(vrf_output_bytes);
+            // TPL-306: from_hash_bytes is Option-returning. The slice
+            // `&header.vrf_proof[..32]` is exactly 32 bytes by
+            // construction (the `len() >= 33` gate above), so the
+            // `expect` is unreachable for any input that reached
+            // here.
+            let vrf_output = pyde_crypto::vrf::VrfOutput::from_hash_bytes(vrf_output_bytes)
+                .ok_or("vrf output bytes are not 32 bytes (audit 392)")?;
             let vrf_proof = pyde_crypto::vrf::VrfProof::from_bytes(vrf_proof_bytes);
 
             let mut vrf_input = Vec::with_capacity(40);

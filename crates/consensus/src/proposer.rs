@@ -312,7 +312,7 @@ mod tests {
         // same VrfOutput.
         let mut bytes = [0u8; 32];
         bytes[..8].copy_from_slice(&0xCAFEBABE_u64.to_le_bytes());
-        let output = VrfOutput::from_hash_bytes(&bytes);
+        let output = VrfOutput::from_hash_bytes(&bytes).expect("32-byte input");
         assert_eq!(score_from_output(&output), 0xCAFEBABE);
     }
 }
