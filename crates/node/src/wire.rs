@@ -141,12 +141,18 @@ pub fn decode_randomness_share(
     let address = dec.bytes32()?;
     let output_bytes = dec.var_bytes()?;
     let proof_bytes = dec.var_bytes()?;
+    // TPL-306: from_hash_bytes is Option-returning. A wire payload
+    // whose declared output_bytes is not exactly 32 bytes is
+    // malformed — propagate as a decode error rather than
+    // truncating / zero-padding the way the pre-fix code did.
+    let vrf_output = pyde_crypto::vrf::VrfOutput::from_hash_bytes(&output_bytes)
+        .ok_or("vrf_output is not 32 bytes")?;
     Ok((
         epoch,
         pyde_consensus::epoch_randomness::RandomnessShare {
             validator_index,
             address,
-            vrf_output: pyde_crypto::vrf::VrfOutput::from_hash_bytes(&output_bytes),
+            vrf_output,
             vrf_proof: pyde_crypto::vrf::VrfProof::from_bytes(&proof_bytes),
         },
     ))

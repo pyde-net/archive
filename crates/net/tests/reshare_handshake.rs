@@ -160,11 +160,21 @@ async fn resharing_end_to_end_over_gossipsub() {
         .map(|j| aggregate_new_share(j, &canonical).unwrap())
         .collect();
 
+    // TPL-301: each decryption share is FALCON-signed; generate
+    // fresh per-share-index falcon keys for the new committee.
+    let mut falcon_pks = Vec::with_capacity(NEW_N);
+    let mut falcon_sks = Vec::with_capacity(NEW_N);
+    for _ in 0..NEW_N {
+        let (pk, sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+        falcon_pks.push(pk);
+        falcon_sks.push(sk);
+    }
+
     // Threshold (4 of 6) new members decrypt the pre-rotation ciphertext.
     let dec: Vec<_> = new_shares[..NEW_T]
         .iter()
-        .map(|s| generate_decryption_share(s, &ct))
+        .map(|s| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
         .collect();
-    let plaintext = combine_shares(&dec, NEW_T, &ct).unwrap();
+    let plaintext = combine_shares(&dec, NEW_T, &ct, &falcon_pks).unwrap();
     assert_eq!(plaintext, msg);
 }

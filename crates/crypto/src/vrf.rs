@@ -32,11 +32,29 @@ impl VrfOutput {
     }
 
     /// Reconstruct a VrfOutput from raw 32-byte hash.
-    pub fn from_hash_bytes(bytes: &[u8]) -> Self {
+    ///
+    /// TPL-306: returns `None` when the input is not exactly 32
+    /// bytes. Pre-fix, oversize input was silently truncated and
+    /// undersize input zero-padded — both shape mismatches that
+    /// almost certainly indicate a malformed wire payload, not a
+    /// recoverable encoding. The caller in
+    /// `crates/node/src/wire.rs::decode_randomness_share` accepts
+    /// peer-provided var-bytes; under the pre-fix behaviour an
+    /// attacker could trim the high bytes of an honest output and
+    /// produce a different `VrfOutput` from the same wire payload
+    /// (the score is the LE u64 of the first 8 bytes, which only
+    /// the truncation case preserves — but the proof verifies
+    /// against `vrf_output.as_bytes()`, so a tampered output
+    /// would simply fail proof verification later. The hard
+    /// shape check still saves the cost of a downstream FALCON
+    /// verify on garbage input). Mirrors audit 392's pattern.
+    pub fn from_hash_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 32 {
+            return None;
+        }
         let mut arr = [0u8; 32];
-        let len = bytes.len().min(32);
-        arr[..len].copy_from_slice(&bytes[..len]);
-        Self(Hash256::from(arr))
+        arr.copy_from_slice(bytes);
+        Some(Self(Hash256::from(arr)))
     }
 }
 
@@ -214,5 +232,41 @@ mod tests {
             "VRF output distribution failed chi-squared test: {} (expected < 350)",
             chi_squared
         );
+    }
+
+    // ========== TPL-306: from_hash_bytes returns Option ==========
+
+    /// TPL-306: a 32-byte input still roundtrips through
+    /// `from_hash_bytes` → `as_bytes`. Positive control.
+    #[test]
+    fn tpl_306_from_hash_bytes_accepts_exact_32() {
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let out = VrfOutput::from_hash_bytes(&bytes).expect("32-byte input must accept");
+        assert_eq!(out.as_bytes(), &bytes);
+    }
+
+    /// TPL-306: 31-byte input (one short) is rejected. Pre-fix
+    /// the missing byte was zero-padded — silent shape coercion.
+    #[test]
+    fn tpl_306_from_hash_bytes_rejects_short_input() {
+        let bytes = [0xAA; 31];
+        assert!(VrfOutput::from_hash_bytes(&bytes).is_none());
+    }
+
+    /// TPL-306: 33-byte input (one over) is rejected. Pre-fix
+    /// the trailing byte was silently truncated.
+    #[test]
+    fn tpl_306_from_hash_bytes_rejects_long_input() {
+        let bytes = [0xBB; 33];
+        assert!(VrfOutput::from_hash_bytes(&bytes).is_none());
+    }
+
+    /// TPL-306: empty input is rejected (corner case of "short").
+    #[test]
+    fn tpl_306_from_hash_bytes_rejects_empty_input() {
+        assert!(VrfOutput::from_hash_bytes(&[]).is_none());
     }
 }

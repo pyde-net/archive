@@ -10,6 +10,7 @@
 //!             → ThresholdCiphertext (Kyber encaps + symmetric encryption + MAC)
 
 use pyde_account::address::Address;
+use pyde_crypto::falcon::FalconPublicKey;
 use pyde_crypto::poseidon2::poseidon2_hash;
 use pyde_crypto::threshold::{self, DecryptionShare, ThresholdCiphertext, ThresholdPublicKey};
 use pyde_tx::types::AccessEntry;
@@ -305,12 +306,20 @@ pub fn encrypt_transaction(
 
 /// Decrypt an encrypted transaction's payload using combined decryption shares.
 /// Returns (to, value, calldata) or error.
+///
+/// TPL-301: `committee_keys` carries the FALCON public keys of every
+/// committee member, indexed so that `committee_keys[k - 1]` matches
+/// the validator who holds share-index `k`. Each share's FALCON sig
+/// is verified against this list before the share enters Lagrange
+/// interpolation; a tampered or unsigned share is rejected with the
+/// same `ORACLE_SAFE_ERR` as a downstream MAC failure (audit 360).
 pub fn decrypt_payload(
     ciphertext: &ThresholdCiphertext,
     shares: &[DecryptionShare],
     threshold: usize,
+    committee_keys: &[FalconPublicKey],
 ) -> Result<(Address, u128, Vec<u8>), String> {
-    let plaintext = threshold::combine_shares(shares, threshold, ciphertext)
+    let plaintext = threshold::combine_shares(shares, threshold, ciphertext, committee_keys)
         .map_err(|e| format!("decryption failed: {}", e))?;
 
     if plaintext.len() < 48 {
@@ -332,15 +341,29 @@ pub fn decrypt_payload(
 mod tests {
     use super::*;
     use pyde_account::address::derive_eoa_address;
+    use pyde_crypto::falcon::{falcon_keygen, FalconSecretKey};
     use pyde_crypto::threshold::KeyShare;
 
-    fn make_threshold_keys() -> (ThresholdPublicKey, Vec<KeyShare>) {
-        threshold::threshold_keygen(3, 2).unwrap() // 2-of-3
+    fn make_threshold_keys() -> (
+        ThresholdPublicKey,
+        Vec<KeyShare>,
+        Vec<FalconPublicKey>,
+        Vec<FalconSecretKey>,
+    ) {
+        let (tpk, shares) = threshold::threshold_keygen(3, 2).unwrap(); // 2-of-3
+        let mut pks = Vec::with_capacity(3);
+        let mut sks = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let (pk, sk) = falcon_keygen().unwrap();
+            pks.push(pk);
+            sks.push(sk);
+        }
+        (tpk, shares, pks, sks)
     }
 
     #[test]
     fn encrypt_and_decrypt_roundtrip() {
-        let (pk, key_shares) = make_threshold_keys();
+        let (pk, key_shares, falcon_pks, falcon_sks) = make_threshold_keys();
         let sender = derive_eoa_address(b"sender");
         let to = derive_eoa_address(b"recipient");
 
@@ -367,13 +390,17 @@ mod tests {
         // Generate decryption shares (need 2 of 3)
         let dec_shares: Vec<DecryptionShare> = key_shares
             .iter()
+            .enumerate()
             .take(2)
-            .map(|ks| threshold::generate_decryption_share(ks, &enc_tx.ciphertext))
+            .map(|(i, ks)| {
+                threshold::generate_decryption_share(ks, &enc_tx.ciphertext, &falcon_sks[i])
+                    .unwrap()
+            })
             .collect();
 
         // Decrypt
         let (dec_to, dec_value, dec_calldata) =
-            decrypt_payload(&enc_tx.ciphertext, &dec_shares, 2).unwrap();
+            decrypt_payload(&enc_tx.ciphertext, &dec_shares, 2, &falcon_pks).unwrap();
         assert_eq!(dec_to, to);
         assert_eq!(dec_value, 1_000_000);
         assert_eq!(dec_calldata, b"swap(TOKEN_X, 500)");
@@ -381,7 +408,7 @@ mod tests {
 
     #[test]
     fn insufficient_shares_fails() {
-        let (pk, key_shares) = make_threshold_keys();
+        let (pk, key_shares, falcon_pks, falcon_sks) = make_threshold_keys();
         let sender = derive_eoa_address(b"sender");
         let to = derive_eoa_address(b"recipient");
 
@@ -404,14 +431,16 @@ mod tests {
         let dec_shares = vec![threshold::generate_decryption_share(
             &key_shares[0],
             &enc_tx.ciphertext,
-        )];
+            &falcon_sks[0],
+        )
+        .unwrap()];
 
-        assert!(decrypt_payload(&enc_tx.ciphertext, &dec_shares, 2).is_err());
+        assert!(decrypt_payload(&enc_tx.ciphertext, &dec_shares, 2, &falcon_pks).is_err());
     }
 
     #[test]
     fn hash_is_deterministic() {
-        let (pk, _) = make_threshold_keys();
+        let (pk, _, _, _) = make_threshold_keys();
         let sender = derive_eoa_address(b"sender");
         let to = derive_eoa_address(b"recipient");
 
@@ -435,7 +464,7 @@ mod tests {
 
     #[test]
     fn expired_check() {
-        let (pk, _) = make_threshold_keys();
+        let (pk, _, _, _) = make_threshold_keys();
         let sender = derive_eoa_address(b"sender");
         let to = derive_eoa_address(b"recipient");
 
@@ -461,7 +490,7 @@ mod tests {
 
     #[test]
     fn no_deadline_never_expires() {
-        let (pk, _) = make_threshold_keys();
+        let (pk, _, _, _) = make_threshold_keys();
         let sender = derive_eoa_address(b"sender");
         let to = derive_eoa_address(b"recipient");
 
@@ -586,7 +615,7 @@ mod tests {
     /// 360 oracle-safe error every single time.
     #[test]
     fn audit_406_encrypted_tx_double_roundtrip_is_byte_identical_and_decrypts() {
-        let (pk, key_shares) = make_threshold_keys();
+        let (pk, key_shares, falcon_pks, falcon_sks) = make_threshold_keys();
         let sender = derive_eoa_address(b"sender");
         let to = derive_eoa_address(b"recipient");
         let original = encrypt_transaction(
@@ -626,11 +655,23 @@ mod tests {
         // generate shares, and combine.
         let dec_shares: Vec<pyde_crypto::threshold::DecryptionShare> = key_shares[..2]
             .iter()
-            .map(|ks| pyde_crypto::threshold::generate_decryption_share(ks, &after_2.ciphertext))
+            .enumerate()
+            .map(|(i, ks)| {
+                pyde_crypto::threshold::generate_decryption_share(
+                    ks,
+                    &after_2.ciphertext,
+                    &falcon_sks[i],
+                )
+                .unwrap()
+            })
             .collect();
-        let plaintext_bytes =
-            pyde_crypto::threshold::combine_shares(&dec_shares, 2, &after_2.ciphertext)
-                .expect("post-roundtrip ciphertext must decrypt");
+        let plaintext_bytes = pyde_crypto::threshold::combine_shares(
+            &dec_shares,
+            2,
+            &after_2.ciphertext,
+            &falcon_pks,
+        )
+        .expect("post-roundtrip ciphertext must decrypt");
         // Plaintext layout: to(32) || value(16 LE) || calldata.
         assert_eq!(&plaintext_bytes[..32], &to);
         let value_le: [u8; 16] = plaintext_bytes[32..48].try_into().unwrap();
@@ -646,7 +687,7 @@ mod tests {
         // Sanity: the new decoder still accepts a real, encoded
         // EncryptedTx round-trip — i.e. the fix is panic-removal
         // not behaviour change on the happy path.
-        let (pk, _) = make_threshold_keys();
+        let (pk, _, _, _) = make_threshold_keys();
         let sender = derive_eoa_address(b"sender");
         let to = derive_eoa_address(b"recipient");
         let enc_tx = encrypt_transaction(
@@ -701,7 +742,7 @@ mod tests {
 
     #[test]
     fn size_check() {
-        let (pk, _) = make_threshold_keys();
+        let (pk, _, _, _) = make_threshold_keys();
         let sender = derive_eoa_address(b"sender");
         let to = derive_eoa_address(b"recipient");
 

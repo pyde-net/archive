@@ -191,7 +191,7 @@ fn kat_kyber_pinned_decapsulation() {
 fn kat_vrf_pinned_output_and_proof() {
     let pk = FalconPublicKey::from_bytes(&hex(VRF_KAT_PK)).expect("VRF pk must decode");
     let input = VRF_KAT_INPUT.as_bytes();
-    let output = VrfOutput::from_hash_bytes(&hex(VRF_KAT_OUTPUT));
+    let output = VrfOutput::from_hash_bytes(&hex(VRF_KAT_OUTPUT)).expect("KAT output is 32 bytes");
     let proof = VrfProof::from_bytes(&hex(VRF_KAT_PROOF));
     assert!(
         vrf_verify(&pk, input, &output, &proof),

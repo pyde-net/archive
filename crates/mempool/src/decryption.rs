@@ -9,6 +9,7 @@
 //! The decryption happens AFTER ordering is committed (QC formed).
 
 use crate::encrypted::{decrypt_payload, EncryptedTx};
+use pyde_crypto::falcon::{FalconPublicKey, FalconSecretKey};
 use pyde_crypto::threshold::{generate_decryption_share, DecryptionShare, KeyShare};
 use pyde_tx::types::{FeePayer, Transaction, TransactionType};
 use std::fmt::Write;
@@ -24,13 +25,22 @@ pub struct BlockDecryptor {
     pub threshold: usize,
     /// Whether each tx has been successfully decrypted.
     decrypted: Vec<bool>,
+    /// FALCON public keys for the current committee, indexed so that
+    /// `committee_keys[k - 1]` belongs to the validator with share
+    /// index `k`. TPL-301: combine_shares verifies each share's
+    /// signature against this list before Lagrange interpolation.
+    committee_keys: Vec<FalconPublicKey>,
 }
 
 impl BlockDecryptor {
     /// Create a new decryptor for a set of encrypted transactions.
     ///
     /// Returns an error if `threshold` is 0 or greater than 128 (committee size).
-    pub fn new(encrypted_txs: Vec<EncryptedTx>, threshold: usize) -> Result<Self, String> {
+    pub fn new(
+        encrypted_txs: Vec<EncryptedTx>,
+        threshold: usize,
+        committee_keys: Vec<FalconPublicKey>,
+    ) -> Result<Self, String> {
         if !(1..=128).contains(&threshold) {
             return Err(format!(
                 "decryption threshold must be in [1, 128], got {}",
@@ -43,6 +53,7 @@ impl BlockDecryptor {
             shares: vec![Vec::new(); n],
             threshold,
             decrypted: vec![false; n],
+            committee_keys,
         })
     }
 
@@ -70,13 +81,28 @@ impl BlockDecryptor {
     /// Add decryption shares for ALL transactions from a single committee member.
     /// This is the common case: one member generates one share per tx.
     /// Returns the number of shares successfully added (excludes duplicates).
-    pub fn add_member_shares(&mut self, key_share: &KeyShare) -> usize {
+    ///
+    /// TPL-301: each share is signed under `falcon_sk` so peers can
+    /// authenticate it via `combine_shares` against the committee's
+    /// FALCON public-key list. A signing failure on any tx aborts
+    /// the whole batch (returns 0) so we never publish a partial
+    /// set that other validators would treat as proof of
+    /// participation.
+    pub fn add_member_shares(
+        &mut self,
+        key_share: &KeyShare,
+        falcon_sk: &FalconSecretKey,
+    ) -> usize {
         // Generate all shares first to avoid borrow conflict
-        let shares: Vec<DecryptionShare> = self
+        let shares_res: Result<Vec<DecryptionShare>, &'static str> = self
             .encrypted_txs
             .iter()
-            .map(|tx| generate_decryption_share(key_share, &tx.ciphertext))
+            .map(|tx| generate_decryption_share(key_share, &tx.ciphertext, falcon_sk))
             .collect();
+        let shares = match shares_res {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
 
         if std::env::var("PYDE_DECRYPT_DIAG").is_ok() && !self.encrypted_txs.is_empty() {
             let kct_first8 = {
@@ -162,6 +188,7 @@ impl BlockDecryptor {
             &self.encrypted_txs[tx_index].ciphertext,
             &self.shares[tx_index],
             self.threshold,
+            &self.committee_keys,
         )
         .inspect_err(|e| {
             if std::env::var("PYDE_DECRYPT_DIAG").is_ok() {
@@ -249,12 +276,29 @@ mod tests {
     use super::*;
     use crate::encrypted::encrypt_transaction;
     use pyde_account::address::{derive_eoa_address, Address};
+    use pyde_crypto::falcon::{falcon_keygen, FalconPublicKey, FalconSecretKey};
     use pyde_crypto::threshold;
     use pyde_crypto::threshold::KeyShare;
     use pyde_tx::types::AccessEntry;
 
-    fn make_keys(n: usize, t: usize) -> (threshold::ThresholdPublicKey, Vec<KeyShare>) {
-        threshold::threshold_keygen(n, t).unwrap()
+    fn make_keys(
+        n: usize,
+        t: usize,
+    ) -> (
+        threshold::ThresholdPublicKey,
+        Vec<KeyShare>,
+        Vec<FalconPublicKey>,
+        Vec<FalconSecretKey>,
+    ) {
+        let (tpk, shares) = threshold::threshold_keygen(n, t).unwrap();
+        let mut pks = Vec::with_capacity(n);
+        let mut sks = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (pk, sk) = falcon_keygen().unwrap();
+            pks.push(pk);
+            sks.push(sk);
+        }
+        (tpk, shares, pks, sks)
     }
 
     fn dummy_access_list() -> Vec<AccessEntry> {
@@ -292,15 +336,15 @@ mod tests {
 
     #[test]
     fn decrypt_with_threshold_shares() {
-        let (pk, key_shares) = make_keys(128, 85);
+        let (pk, key_shares, falcon_pks, falcon_sks) = make_keys(128, 85);
         let to = derive_eoa_address(b"recipient");
         let enc_tx = make_enc_tx(&pk, to, 5_000, b"transfer()");
 
-        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 85).unwrap();
+        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 85, falcon_pks).unwrap();
 
         // Add 85 shares
-        for ks in key_shares.iter().take(85) {
-            decryptor.add_member_shares(ks);
+        for (i, ks) in key_shares.iter().enumerate().take(85) {
+            decryptor.add_member_shares(ks, &falcon_sks[i]);
         }
 
         assert!(decryptor.can_decrypt(0));
@@ -314,15 +358,15 @@ mod tests {
 
     #[test]
     fn decrypt_fails_with_insufficient_shares() {
-        let (pk, key_shares) = make_keys(128, 85);
+        let (pk, key_shares, falcon_pks, falcon_sks) = make_keys(128, 85);
         let to = derive_eoa_address(b"recipient");
         let enc_tx = make_enc_tx(&pk, to, 100, b"");
 
-        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 85).unwrap();
+        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 85, falcon_pks).unwrap();
 
         // Only 84 shares
-        for ks in key_shares.iter().take(84) {
-            decryptor.add_member_shares(ks);
+        for (i, ks) in key_shares.iter().enumerate().take(84) {
+            decryptor.add_member_shares(ks, &falcon_sks[i]);
         }
 
         assert!(!decryptor.can_decrypt(0));
@@ -333,14 +377,15 @@ mod tests {
 
     #[test]
     fn duplicate_share_rejected() {
-        let (pk, key_shares) = make_keys(3, 2);
+        let (pk, key_shares, falcon_pks, falcon_sks) = make_keys(3, 2);
         let to = derive_eoa_address(b"recipient");
         let enc_tx = make_enc_tx(&pk, to, 100, b"");
 
-        let mut decryptor = BlockDecryptor::new(vec![enc_tx.clone()], 2).unwrap();
+        let mut decryptor = BlockDecryptor::new(vec![enc_tx.clone()], 2, falcon_pks).unwrap();
 
         // Add same share twice
-        let share = generate_decryption_share(&key_shares[0], &enc_tx.ciphertext);
+        let share =
+            generate_decryption_share(&key_shares[0], &enc_tx.ciphertext, &falcon_sks[0]).unwrap();
         assert!(decryptor.add_share(0, share.clone()));
         assert!(!decryptor.add_share(0, share)); // duplicate rejected
 
@@ -351,7 +396,7 @@ mod tests {
 
     #[test]
     fn decrypt_multiple_txs() {
-        let (pk, key_shares) = make_keys(3, 2);
+        let (pk, key_shares, falcon_pks, falcon_sks) = make_keys(3, 2);
         let to1 = derive_eoa_address(b"alice");
         let to2 = derive_eoa_address(b"bob");
 
@@ -360,11 +405,11 @@ mod tests {
             make_enc_tx(&pk, to2, 2_000, b"call_b"),
         ];
 
-        let mut decryptor = BlockDecryptor::new(txs, 2).unwrap();
+        let mut decryptor = BlockDecryptor::new(txs, 2, falcon_pks).unwrap();
 
         // Add 2 members' shares for all txs
-        for ks in key_shares.iter().take(2) {
-            decryptor.add_member_shares(ks);
+        for (i, ks) in key_shares.iter().enumerate().take(2) {
+            decryptor.add_member_shares(ks, &falcon_sks[i]);
         }
 
         assert!(decryptor.all_ready());
@@ -383,7 +428,7 @@ mod tests {
 
     #[test]
     fn plaintext_fields_preserved_after_decrypt() {
-        let (pk, key_shares) = make_keys(3, 2);
+        let (pk, key_shares, falcon_pks, falcon_sks) = make_keys(3, 2);
         let sender = derive_eoa_address(b"sender");
         let to = derive_eoa_address(b"recipient");
 
@@ -402,9 +447,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 2).unwrap();
-        for ks in key_shares.iter().take(2) {
-            decryptor.add_member_shares(ks);
+        let mut decryptor = BlockDecryptor::new(vec![enc_tx], 2, falcon_pks).unwrap();
+        for (i, ks) in key_shares.iter().enumerate().take(2) {
+            decryptor.add_member_shares(ks, &falcon_sks[i]);
         }
 
         let tx = decryptor.decrypt_tx(0).unwrap();
@@ -420,22 +465,23 @@ mod tests {
 
     #[test]
     fn out_of_bounds_tx_index() {
-        let decryptor = BlockDecryptor::new(vec![], 2).unwrap();
+        let decryptor = BlockDecryptor::new(vec![], 2, Vec::new()).unwrap();
         assert!(!decryptor.can_decrypt(0));
         assert_eq!(decryptor.share_count(99), 0);
     }
 
     #[test]
     fn add_share_out_of_bounds() {
-        let (pk, key_shares) = make_keys(3, 2);
+        let (pk, key_shares, _falcon_pks, falcon_sks) = make_keys(3, 2);
         let to = derive_eoa_address(b"recipient");
         let enc_tx = make_enc_tx(&pk, to, 100, b"");
 
         // Create share from the tx's ciphertext
-        let share = generate_decryption_share(&key_shares[0], &enc_tx.ciphertext);
+        let share =
+            generate_decryption_share(&key_shares[0], &enc_tx.ciphertext, &falcon_sks[0]).unwrap();
 
         // Empty decryptor — index 0 is out of bounds
-        let mut decryptor = BlockDecryptor::new(vec![], 2).unwrap();
+        let mut decryptor = BlockDecryptor::new(vec![], 2, Vec::new()).unwrap();
         assert!(!decryptor.add_share(0, share));
     }
 }

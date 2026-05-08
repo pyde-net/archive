@@ -335,7 +335,7 @@ fn compute_tx_hash(v: &serde_json::Value) -> Result<[u8; 32], JsValue> {
     buf.extend_from_slice(&gas_limit.to_le_bytes());
     buf.extend_from_slice(&nonce.to_le_bytes());
     buf.push(0); // fee_payer tag: Sender
-    buf.extend_from_slice(&hash_access_list(v));
+    buf.extend_from_slice(&hash_access_list(v)?);
     // deadline: None → single 0 byte (matches Transaction::hash)
     buf.push(0);
     buf.push(tx_type);
@@ -343,79 +343,118 @@ fn compute_tx_hash(v: &serde_json::Value) -> Result<[u8; 32], JsValue> {
     Ok(poseidon2_hash(&buf).to_bytes())
 }
 
-fn hash_access_list(v: &serde_json::Value) -> [u8; 32] {
+fn hash_access_list(v: &serde_json::Value) -> Result<[u8; 32], JsValue> {
     let entries = match v.get("accessList").and_then(|a| a.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return poseidon2_hash(&[]).to_bytes(), // empty = hash of empty bytes
+        _ => return Ok(poseidon2_hash(&[]).to_bytes()), // empty = hash of empty bytes
     };
     // Must match Rust's hash_access_list format: NO count prefix, just entries
-    let serialized = hash_serialize_access_list(entries);
-    poseidon2_hash(&serialized).to_bytes()
+    let serialized = hash_serialize_access_list(entries).map_err(|e| JsValue::from_str(&e))?;
+    Ok(poseidon2_hash(&serialized).to_bytes())
 }
 
 /// Serialize for wire encoding (WITH count prefix — matches Rust serialize_access_list)
-fn serialize_access_list_entries(entries: &[serde_json::Value]) -> Vec<u8> {
+fn serialize_access_list_entries(entries: &[serde_json::Value]) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for entry in entries {
-        serialize_one_access_entry(entry, &mut buf);
+        serialize_one_access_entry(entry, &mut buf)?;
     }
-    buf
+    Ok(buf)
 }
 
 /// Serialize for HASHING (NO count prefix — matches Rust hash_access_list)
-fn hash_serialize_access_list(entries: &[serde_json::Value]) -> Vec<u8> {
+fn hash_serialize_access_list(entries: &[serde_json::Value]) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     for entry in entries {
-        serialize_one_access_entry(entry, &mut buf);
+        serialize_one_access_entry(entry, &mut buf)?;
     }
-    buf
+    Ok(buf)
 }
 
-fn serialize_one_access_entry(entry: &serde_json::Value, buf: &mut Vec<u8>) {
-    let addr = entry
+/// TPL-304: hard-error on any malformed access-list entry field.
+///
+/// Pre-fix this was infallible: a missing `address`, bad hex, or
+/// wrong-length address silently zero-filled to `[0u8; 32]`, and
+/// any individual `reads` / `writes` key that didn't decode to
+/// exactly 32 bytes was silently dropped via `filter_map`. A
+/// frontend SDK that mis-encoded a single key would receive back
+/// a tx whose access list disagreed with what the user intended,
+/// and the hash on the JS side would no longer match the hash
+/// the validator computed from the typed `AccessEntry`. The
+/// failure mode is "tx silently rejected on-chain after the
+/// wallet flow already showed a success" — the kind of bug that
+/// gets blamed on flaky infra instead of a wallet bug. Make
+/// every malformed-input path return an error so the wallet
+/// hits the failure synchronously, with a message naming the
+/// offending field.
+///
+/// The error type is `String` rather than `JsValue` so the
+/// helper is testable on native targets (constructing `JsValue`
+/// outside a wasm runtime aborts the process — see existing
+/// non-wasm-test comment in this module). The public entry
+/// points wrap the `String` in `JsValue::from_str` at the
+/// boundary.
+fn serialize_one_access_entry(entry: &serde_json::Value, buf: &mut Vec<u8>) -> Result<(), String> {
+    let addr_str = entry
         .get("address")
         .and_then(|v| v.as_str())
-        .map(|s| decode_hex(s).unwrap_or_default())
-        .unwrap_or_default();
-    let mut addr32 = [0u8; 32];
-    if addr.len() == 32 {
-        addr32.copy_from_slice(&addr);
+        .ok_or_else(|| {
+            "access list entry: `address` is required and must be a hex string".to_string()
+        })?;
+    let addr_bytes = hex::decode(addr_str.trim_start_matches("0x"))
+        .map_err(|e| format!("access list entry address: bad hex: {e}"))?;
+    if addr_bytes.len() != 32 {
+        return Err(format!(
+            "access list entry address must be 32 bytes, got {}",
+            addr_bytes.len()
+        ));
     }
-    buf.extend_from_slice(&addr32);
+    buf.extend_from_slice(&addr_bytes);
 
-    let parse_keys = |field: &str| -> Vec<[u8; 32]> {
-        entry
-            .get(field)
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|k| {
-                        let b = decode_hex(k.as_str().unwrap_or("")).unwrap_or_default();
-                        if b.len() == 32 {
-                            let mut k32 = [0u8; 32];
-                            k32.copy_from_slice(&b);
-                            Some(k32)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+    // Treat a missing field as an empty list (idiomatic JSON), but
+    // hard-error if the field is present and the wrong type, or
+    // any element is malformed.
+    let parse_keys = |field: &str| -> Result<Vec<[u8; 32]>, String> {
+        let arr = match entry.get(field) {
+            None => return Ok(Vec::new()),
+            Some(v) => v
+                .as_array()
+                .ok_or_else(|| format!("access list entry: `{field}` must be an array"))?,
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        for (i, k) in arr.iter().enumerate() {
+            let s = k
+                .as_str()
+                .ok_or_else(|| format!("access list entry: `{field}[{i}]` must be a hex string"))?;
+            let b = hex::decode(s.trim_start_matches("0x"))
+                .map_err(|e| format!("access list entry: `{field}[{i}]`: bad hex: {e}"))?;
+            if b.len() != 32 {
+                return Err(format!(
+                    "access list entry: `{field}[{i}]` must be 32 bytes, got {}",
+                    b.len()
+                ));
+            }
+            let mut k32 = [0u8; 32];
+            k32.copy_from_slice(&b);
+            out.push(k32);
+        }
+        Ok(out)
     };
 
-    let reads = parse_keys("reads");
+    let reads = parse_keys("reads")?;
     buf.extend_from_slice(&(reads.len() as u32).to_le_bytes());
     for k in &reads {
         buf.extend_from_slice(k);
     }
 
-    let writes = parse_keys("writes");
+    let writes = parse_keys("writes")?;
     buf.extend_from_slice(&(writes.len() as u32).to_le_bytes());
     for k in &writes {
         buf.extend_from_slice(k);
     }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -451,7 +490,9 @@ fn serialize_tx(v: &serde_json::Value, signature: &[u8]) -> Result<Vec<u8>, JsVa
                  // access_list serialization
     let al_entries = v.get("accessList").and_then(|a| a.as_array());
     let al_bytes = match al_entries {
-        Some(entries) if !entries.is_empty() => serialize_access_list_entries(entries),
+        Some(entries) if !entries.is_empty() => {
+            serialize_access_list_entries(entries).map_err(|e| JsValue::from_str(&e))?
+        }
         _ => {
             let mut b = Vec::new();
             b.extend_from_slice(&0u32.to_le_bytes());
@@ -820,6 +861,17 @@ mod tests {
         let ct = pyde_crypto::threshold::ThresholdCiphertext::from_wire_bytes(&ct_bytes)
             .expect("real decoder must accept WASM ciphertext");
 
+        // TPL-301: each decryption share is FALCON-signed; mint a
+        // committee of fresh keypairs whose pk vector indexes match
+        // the share-index assignment.
+        let mut falcon_pks = Vec::with_capacity(4);
+        let mut falcon_sks = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let (pk, sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+            falcon_pks.push(pk);
+            falcon_sks.push(sk);
+        }
+
         // Validator-side: every share-holder produces a decryption
         // share for this ciphertext, then any THRESHOLD of them
         // combine to recover plaintext. Mirrors the on-chain
@@ -827,9 +879,12 @@ mod tests {
         // re-verify and tx-execution scaffolding.
         let shares: Vec<pyde_crypto::threshold::DecryptionShare> = key_shares[..3]
             .iter()
-            .map(|ks| pyde_crypto::threshold::generate_decryption_share(ks, &ct))
+            .enumerate()
+            .map(|(i, ks)| {
+                pyde_crypto::threshold::generate_decryption_share(ks, &ct, &falcon_sks[i]).unwrap()
+            })
             .collect();
-        let plaintext = pyde_crypto::threshold::combine_shares(&shares, 3, &ct)
+        let plaintext = pyde_crypto::threshold::combine_shares(&shares, 3, &ct, &falcon_pks)
             .expect("WASM ciphertext must decrypt with real shares");
         assert_eq!(
             plaintext, payload,
@@ -971,5 +1026,117 @@ mod tests {
         tx2["chainId"] = serde_json::json!(7332u64);
         let hash2 = hash_transaction(&tx2.to_string()).unwrap();
         assert_ne!(hash_hex, hash2, "chainId must be part of the tx digest",);
+    }
+
+    // ========== TPL-304: serialize_one_access_entry hard-errors ==========
+
+    /// TPL-304: positive control — a well-formed access list with
+    /// canonical 32-byte address + reads + writes serializes
+    /// successfully and round-trips through the typed Rust
+    /// access-list encoder (i.e., the bytes are byte-identical
+    /// to what the validator computes from the typed
+    /// `AccessEntry`).
+    #[test]
+    fn tpl_304_serialize_one_access_entry_canonical_succeeds() {
+        let entry = serde_json::json!({
+            "address": format!("0x{}", hex::encode([0xAAu8; 32])),
+            "reads": [
+                format!("0x{}", hex::encode([0x11u8; 32])),
+                format!("0x{}", hex::encode([0x22u8; 32])),
+            ],
+            "writes": [format!("0x{}", hex::encode([0x33u8; 32]))],
+        });
+        let mut buf = Vec::new();
+        serialize_one_access_entry(&entry, &mut buf).expect("canonical entry must serialize");
+        // address(32) + reads_len(4) + 2*key32 + writes_len(4) + 1*key32 = 136
+        assert_eq!(buf.len(), 32 + 4 + 64 + 4 + 32);
+    }
+
+    /// TPL-304: a missing `address` field must hard-error rather
+    /// than silently zero-fill. Pre-fix, an absent `address`
+    /// produced a serialized entry whose first 32 bytes were the
+    /// zero address — silently shadowing whichever zero-address
+    /// account a contract used as a sentinel.
+    #[test]
+    fn tpl_304_serialize_one_access_entry_missing_address_errors() {
+        let entry = serde_json::json!({
+            "reads": [],
+            "writes": [],
+        });
+        let mut buf = Vec::new();
+        let msg = serialize_one_access_entry(&entry, &mut buf).unwrap_err();
+        assert!(
+            msg.contains("address"),
+            "expected error to name the missing field, got: {msg}"
+        );
+    }
+
+    /// TPL-304: a wrong-length `address` (here 16 bytes after
+    /// hex decode) must hard-error.
+    #[test]
+    fn tpl_304_serialize_one_access_entry_short_address_errors() {
+        let entry = serde_json::json!({
+            "address": format!("0x{}", hex::encode([0xAAu8; 16])),
+            "reads": [],
+            "writes": [],
+        });
+        let mut buf = Vec::new();
+        let msg = serialize_one_access_entry(&entry, &mut buf).unwrap_err();
+        assert!(msg.contains("address must be 32 bytes"));
+    }
+
+    /// TPL-304: a malformed `reads` entry must hard-error and
+    /// name the offending index. Pre-fix, `filter_map` silently
+    /// dropped the bad key, so a frontend sending 5 keys with
+    /// the third one wrong got back a 4-key access list — the
+    /// hash on the wallet side then disagreed with the validator's
+    /// hash and the tx silently failed on-chain.
+    #[test]
+    fn tpl_304_serialize_one_access_entry_short_read_key_errors() {
+        let entry = serde_json::json!({
+            "address": format!("0x{}", hex::encode([0xAAu8; 32])),
+            "reads": [
+                format!("0x{}", hex::encode([0x11u8; 32])),
+                format!("0x{}", hex::encode([0x22u8; 16])), // 16 bytes, wrong length
+                format!("0x{}", hex::encode([0x33u8; 32])),
+            ],
+            "writes": [],
+        });
+        let mut buf = Vec::new();
+        let msg = serialize_one_access_entry(&entry, &mut buf).unwrap_err();
+        assert!(
+            msg.contains("reads[1]") && msg.contains("32 bytes"),
+            "expected error to name the offending key, got: {msg}"
+        );
+    }
+
+    /// TPL-304: `writes` field present but not an array must
+    /// hard-error (pre-fix the field was silently treated as
+    /// empty via `as_array().unwrap_or_default()`).
+    #[test]
+    fn tpl_304_serialize_one_access_entry_writes_wrong_type_errors() {
+        let entry = serde_json::json!({
+            "address": format!("0x{}", hex::encode([0xAAu8; 32])),
+            "reads": [],
+            "writes": "not-an-array",
+        });
+        let mut buf = Vec::new();
+        let msg = serialize_one_access_entry(&entry, &mut buf).unwrap_err();
+        assert!(msg.contains("writes") && msg.contains("array"));
+    }
+
+    /// TPL-304: missing `reads` / `writes` is treated as empty
+    /// (idiomatic JSON), not an error. Frontends may legitimately
+    /// omit one or both fields when a contract only reads or
+    /// only writes.
+    #[test]
+    fn tpl_304_serialize_one_access_entry_missing_reads_writes_treated_as_empty() {
+        let entry = serde_json::json!({
+            "address": format!("0x{}", hex::encode([0xAAu8; 32])),
+        });
+        let mut buf = Vec::new();
+        serialize_one_access_entry(&entry, &mut buf)
+            .expect("missing reads/writes must succeed (idiomatic empty)");
+        assert_eq!(buf.len(), 32 + 4 + 4); // address + 0-len reads + 0-len writes
     }
 }
