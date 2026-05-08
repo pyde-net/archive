@@ -702,11 +702,24 @@ impl BlockProcessor {
     /// `Some(_)`. `now_ms` is the receiver's wall-clock at validation
     /// time; the header is rejected if its timestamp exceeds
     /// `now_ms + MAX_TIMESTAMP_DRIFT_MS`.
+    ///
+    /// TPL-503 / audit-402: `qc_previous_committee_keys` is the
+    /// committee whose FALCON keys verify the signatures inside
+    /// `header.qc_previous`. At an epoch boundary the proposer at
+    /// the first slot of epoch E ships a `qc_previous` covering
+    /// slot `E*EPOCH_LENGTH - 1`, signed by the OUTGOING committee
+    /// (epoch E-1). Using the current committee for that QC
+    /// verification rejects every legitimate boundary block on
+    /// sync/replay paths. When `Some(prior)` is supplied it is
+    /// used for the `has_quorum_for` and `verify_qc` checks; when
+    /// `None` (the common non-boundary case AND the full-node
+    /// fallback) the function falls back to `committee_keys`.
     pub fn validate_network_block(
         chain_id: u64,
         header: &BlockHeader,
         proposer_signature: &[u8],
         committee_keys: &[Vec<u8>],
+        qc_previous_committee_keys: Option<&[Vec<u8>]>,
         epoch_randomness: &[u8; 32],
         expected_parent_hash: Option<&[u8; 32]>,
         parent_timestamp: Option<u64>,
@@ -906,14 +919,21 @@ impl BlockProcessor {
             ));
         }
 
-        // 4. Previous QC should have quorum (skip for early blocks with empty QC)
-        let committee_size = committee_keys.len();
-        if header.qc_previous.slot > 0 && !header.qc_previous.has_quorum_for(committee_size) {
+        // 4. Previous QC should have quorum (skip for early blocks with empty QC).
+        //
+        // TPL-503: at an epoch boundary the QC was formed by the
+        // OUTGOING committee, whose size may differ from the
+        // current committee. Use `qc_previous_committee_keys` when
+        // supplied so the quorum threshold matches the committee
+        // that actually signed.
+        let qc_keys: &[Vec<u8>] = qc_previous_committee_keys.unwrap_or(committee_keys);
+        let qc_committee_size = qc_keys.len();
+        if header.qc_previous.slot > 0 && !header.qc_previous.has_quorum_for(qc_committee_size) {
             return Err(format!(
                 "previous QC at slot {} has insufficient votes ({}/{})",
                 header.qc_previous.slot,
                 header.qc_previous.vote_count(),
-                pyde_consensus::block::quorum_for_committee(committee_size),
+                pyde_consensus::block::quorum_for_committee(qc_committee_size),
             ));
         }
 
@@ -926,7 +946,10 @@ impl BlockProcessor {
         //    full FALCON verification, the lie propagated into
         //    `state.highest_qc` (via `create_vote`) and downstream
         //    finality records.
-        if !pyde_consensus::hotstuff::verify_qc(&header.qc_previous, committee_keys, chain_id) {
+        //
+        // TPL-503: verify against `qc_keys` (the OUTGOING committee
+        // at an epoch boundary, the current committee otherwise).
+        if !pyde_consensus::hotstuff::verify_qc(&header.qc_previous, qc_keys, chain_id) {
             return Err(format!(
                 "previous QC at slot {} has invalid signatures (audit 311)",
                 header.qc_previous.slot
@@ -2184,6 +2207,7 @@ mod tests {
             &header,
             &[],        // proposer_signature — irrelevant, parent_hash check fires first
             &[],        // committee_keys — same
+            None,       // qc_previous_committee_keys — same
             &[0u8; 32], // epoch_randomness
             Some(&expected),
             None, // parent_timestamp — irrelevant, parent_hash fires first
@@ -2210,6 +2234,7 @@ mod tests {
             &header,
             &[],
             &[],
+            None,
             &[0u8; 32],
             None,
             None,
@@ -2236,6 +2261,7 @@ mod tests {
             &header,
             &[],
             &[],
+            None,
             &[0u8; 32],
             Some(&expected),
             None,
@@ -2259,6 +2285,7 @@ mod tests {
             &header,
             &[],
             &[],
+            None,
             &[0u8; 32],
             Some(&[0xFF; 32]),
             None,
@@ -2286,6 +2313,7 @@ mod tests {
             &header,
             &[],
             &[],
+            None,
             &[0u8; 32],
             Some(&expected_parent_hash),
             Some(parent_ts),
@@ -2304,6 +2332,7 @@ mod tests {
             &header,
             &[],
             &[],
+            None,
             &[0u8; 32],
             Some(&expected_parent_hash),
             Some(parent_ts_higher),
@@ -2337,6 +2366,7 @@ mod tests {
             &header,
             &[],
             &[],
+            None,
             &[0u8; 32],
             Some(&expected_parent_hash),
             None, // parent_ts — skip lower bound, isolate drift check
@@ -2363,6 +2393,7 @@ mod tests {
             &header,
             &[],
             &[],
+            None,
             &[0u8; 32],
             Some(&expected_parent_hash),
             Some(header.timestamp.saturating_sub(1)),
@@ -2391,6 +2422,7 @@ mod tests {
             &header,
             &[],
             &[],
+            None,
             &[0u8; 32],
             Some(&expected_parent_hash),
             None,
@@ -2475,6 +2507,7 @@ mod tests {
             &header,
             &sig,
             &committee_keys,
+            None,
             &[0u8; 32],
             Some(&[0xCD; 32]),
             None,
@@ -2507,6 +2540,7 @@ mod tests {
             &header,
             &sig,
             &committee_keys,
+            None,
             &[0u8; 32],
             Some(&[0xCD; 32]),
             None,
@@ -2553,6 +2587,7 @@ mod tests {
             &header,
             &sig,
             &committee_keys,
+            None,
             &[0u8; 32],
             Some(&[0xCD; 32]),
             None,
@@ -2562,6 +2597,130 @@ mod tests {
         assert!(
             err.contains("audit-234 L2") && err.contains("invalid vrf_proof"),
             "expected unrecognised-vrf_proof audit-234 L2 rejection, got: {err}"
+        );
+    }
+
+    /// TPL-503 / audit-402: at the first block of a new epoch
+    /// `header.qc_previous` covers the LAST slot of the OUTGOING
+    /// epoch and was therefore signed by the OUTGOING committee.
+    /// Pre-fix, `validate_network_block` fed the CURRENT
+    /// `committee_keys` slice into `verify_qc`; FALCON
+    /// verification then failed against the wrong key set and
+    /// every legitimate epoch-boundary block was rejected on the
+    /// sync/replay path. The validator hot path was already
+    /// correct (it threaded `committee_keys_for_slot` into
+    /// `create_vote`), so the bug only surfaced for full nodes
+    /// catching up across an epoch boundary.
+    ///
+    /// Post-fix: callers thread an optional
+    /// `qc_previous_committee_keys` for QC verification. Test
+    /// asserts the SAME boundary block fails when the param is
+    /// `None` (using the new committee, the wrong keys) and
+    /// passes when `Some(prev_committee)` is supplied — the two
+    /// directions of the binding the fix introduces.
+    #[test]
+    fn tpl_503_validate_network_block_uses_qc_previous_committee_for_boundary_qc() {
+        use pyde_consensus::block::EPOCH_LENGTH;
+        use pyde_consensus::hotstuff::proposer_sign_message;
+
+        let chain_id = 31337;
+        let prev_committee = make_committee(3);
+        let new_committee = make_committee(3);
+
+        let prev_committee_keys: Vec<Vec<u8>> = prev_committee
+            .iter()
+            .map(|(pk, _)| pk.as_bytes().to_vec())
+            .collect();
+        let new_committee_keys: Vec<Vec<u8>> = new_committee
+            .iter()
+            .map(|(pk, _)| pk.as_bytes().to_vec())
+            .collect();
+
+        // First slot of a new epoch.
+        let slot = EPOCH_LENGTH;
+        let prev_slot = slot - 1;
+
+        // Build a real qc_previous covering prev_slot, signed by 2
+        // of 3 members of the OUTGOING committee — exactly quorum
+        // for a 3-member committee `(2*3).div_ceil(3) == 2`.
+        let prev_block_hash = [0xAB; 32];
+        let qc_preimage = proposer_sign_message(chain_id, prev_slot, &prev_block_hash);
+        let mut qc_signatures = Vec::new();
+        for (_, sk) in prev_committee.iter().take(2) {
+            let sig = pyde_crypto::falcon::falcon_sign(sk, &qc_preimage)
+                .expect("falcon_sign")
+                .as_bytes()
+                .to_vec();
+            qc_signatures.push(sig);
+        }
+        let qc_previous = QuorumCert {
+            slot: prev_slot,
+            block_hash: prev_block_hash,
+            voter_bitmap: 0b011, // members 0 and 1
+            signatures: qc_signatures,
+        };
+
+        // Build the boundary block. Use a fallback proof so we
+        // can isolate the QC step without spinning up VRF; the
+        // proposer must be the deterministic fallback leader for
+        // (slot, view, n).
+        let view = 0u64;
+        let leader_idx = pyde_consensus::view_change::fallback_leader_index(slot, view, 3);
+        let proposer_addr =
+            pyde_account::address::derive_eoa_address(&new_committee_keys[leader_idx]);
+        let mut header = dummy_header(slot);
+        header.proposer = proposer_addr;
+        header.vrf_proof = pyde_consensus::view_change::encode_fallback_proof(slot, view);
+        header.parent_hash = [0xCD; 32];
+        header.qc_previous = qc_previous;
+        let block_hash = header.hash();
+        let sign_msg = proposer_sign_message(chain_id, slot, &block_hash);
+        let sig = pyde_crypto::falcon::falcon_sign(&new_committee[leader_idx].1, &sign_msg)
+            .expect("falcon_sign")
+            .as_bytes()
+            .to_vec();
+        let now_ms = header.timestamp.saturating_add(1);
+
+        // Pre-fix behavior: passing only the new committee made
+        // verify_qc check sigs against the wrong keys, so the
+        // call surfaces the audit-311 invalid-signatures error.
+        let pre_fix = BlockProcessor::validate_network_block(
+            chain_id,
+            &header,
+            &sig,
+            &new_committee_keys,
+            None,
+            &[0u8; 32],
+            Some(&[0xCD; 32]),
+            None,
+            now_ms,
+        );
+        let err = pre_fix.expect_err(
+            "without prior committee keys the boundary block must fail audit-311 verify_qc",
+        );
+        assert!(
+            err.contains("audit 311") && err.contains("invalid signatures"),
+            "expected audit-311 invalid-signatures rejection, got: {err}"
+        );
+
+        // Post-fix behavior: routing the OUTGOING committee
+        // through `qc_previous_committee_keys` lets verify_qc
+        // succeed and the boundary block validates.
+        let post_fix = BlockProcessor::validate_network_block(
+            chain_id,
+            &header,
+            &sig,
+            &new_committee_keys,
+            Some(&prev_committee_keys),
+            &[0u8; 32],
+            Some(&[0xCD; 32]),
+            None,
+            now_ms,
+        );
+        assert!(
+            post_fix.is_ok(),
+            "with the outgoing committee supplied the boundary block must validate, got: {:?}",
+            post_fix.err()
         );
     }
 }

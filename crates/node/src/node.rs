@@ -4738,13 +4738,46 @@ fn handle_swarm_event(
                             // signature past the chain head, and
                             // the full node would persist + relay
                             // it without checking.
-                            let (committee_keys_ref, epoch_rand_ref): (&[Vec<u8>], &[u8; 32]) =
+                            //
+                            // TPL-503 / audit-402: the QC inside
+                            // `header.qc_previous` was signed by
+                            // the committee at THAT slot's epoch.
+                            // At an epoch boundary the slice
+                            // differs from the current committee,
+                            // so a same-committee verify rejects
+                            // legitimate boundary blocks on the
+                            // sync/replay path. Look up the right
+                            // slice via `committee_keys_for_slot`;
+                            // pass `Some(prior)` only when it
+                            // actually differs from the current
+                            // committee so the validator engine
+                            // and full-node fallback paths stay
+                            // semantically equivalent for non-
+                            // boundary blocks.
+                            let (
+                                committee_keys_ref,
+                                epoch_rand_ref,
+                                qc_prev_keys_owned,
+                            ): (&[Vec<u8>], &[u8; 32], Option<Vec<Vec<u8>>>) =
                                 if let Some(ref engine) = validator_engine {
-                                    (engine.committee_keys.as_slice(), &engine.epoch_randomness)
+                                    let cur = engine.committee_keys.as_slice();
+                                    let qc_prev = engine
+                                        .committee_keys_for_slot(block.header.qc_previous.slot);
+                                    let qc_prev_owned = if !std::ptr::eq(qc_prev.as_ptr(), cur.as_ptr()) {
+                                        Some(qc_prev.to_vec())
+                                    } else {
+                                        None
+                                    };
+                                    (
+                                        cur,
+                                        &engine.epoch_randomness,
+                                        qc_prev_owned,
+                                    )
                                 } else {
                                     (
                                         committee_keys_for_validation,
                                         epoch_randomness_for_validation,
+                                        None,
                                     )
                                 };
                             if !committee_keys_ref.is_empty() {
@@ -4753,6 +4786,7 @@ fn handle_swarm_event(
                                     &block.header,
                                     &block.proposer_signature,
                                     committee_keys_ref,
+                                    qc_prev_keys_owned.as_deref(),
                                     epoch_rand_ref,
                                     expected_parent.as_ref(),
                                     parent_timestamp,
