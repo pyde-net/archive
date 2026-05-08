@@ -1046,7 +1046,7 @@ impl PydeNode {
                                             &mut swarm,
                                             consensus_topic,
                                             data,
-                                            &peer_manager,
+                                            &mut peer_manager,
                                             &mut gossip_cache,
                                         );
                                     } else if topic == blocks_topic.hash() {
@@ -1054,6 +1054,7 @@ impl PydeNode {
                                             &mut swarm,
                                             blocks_topic,
                                             data,
+                                            &mut peer_manager,
                                             &mut gossip_cache,
                                         );
                                     }
@@ -1120,7 +1121,7 @@ impl PydeNode {
                                 &mut swarm,
                                 topic,
                                 data,
-                                &peer_manager,
+                                &mut peer_manager,
                             &mut gossip_cache,
                             );
                         }
@@ -1258,7 +1259,7 @@ impl PydeNode {
                                         &state,
                                         &block_store,
                                         &mut swarm,
-                                        &peer_manager,
+                                        &mut peer_manager,
                                         &mut gossip_cache,
                                         qc_slot,
                                         qc_block_hash,
@@ -1271,7 +1272,7 @@ impl PydeNode {
                                         &queued_shares,
                                         &pending_decryptors,
                                         &mut swarm,
-                                        &peer_manager,
+                                        &mut peer_manager,
                                         &mut gossip_cache,
                                         &block,
                                         qc_slot,
@@ -1402,7 +1403,7 @@ impl PydeNode {
                                     &queued_shares,
                                     &pending_decryptors,
                                     &mut swarm,
-                                    &peer_manager,
+                                    &mut peer_manager,
                                     &mut gossip_cache,
                                     &block,
                                     qc_slot,
@@ -1440,7 +1441,7 @@ impl PydeNode {
                                     &mut swarm,
                                     topic,
                                     data,
-                                    &peer_manager,
+                                    &mut peer_manager,
                                 &mut gossip_cache,
                                 );
                             }
@@ -1458,7 +1459,7 @@ impl PydeNode {
                                         &mut swarm,
                                         topic.clone(),
                                         data,
-                                        &peer_manager,
+                                        &mut peer_manager,
                                     &mut gossip_cache,
                                     );
                                 }
@@ -1624,7 +1625,7 @@ impl PydeNode {
                                         &state,
                                         &block_store,
                                         &mut swarm,
-                                        &peer_manager,
+                                        &mut peer_manager,
                                         &mut gossip_cache,
                                         qc_slot,
                                         qc_block_hash,
@@ -1637,7 +1638,7 @@ impl PydeNode {
                                         &queued_shares,
                                         &pending_decryptors,
                                         &mut swarm,
-                                        &peer_manager,
+                                        &mut peer_manager,
                                         &mut gossip_cache,
                                         &block,
                                         qc_slot,
@@ -2206,7 +2207,7 @@ impl PydeNode {
                                         &mut swarm,
                                         topic,
                                         msg,
-                                        &peer_manager,
+                                        &mut peer_manager,
                                     &mut gossip_cache,
                                     );
                                     debug!(target_epoch, "re-broadcast resharing contribution");
@@ -2231,7 +2232,7 @@ impl PydeNode {
                                         &mut swarm,
                                         topic,
                                         msg,
-                                        &peer_manager,
+                                        &mut peer_manager,
                                         &mut gossip_cache,
                                     );
                                     debug!(target_epoch, "re-broadcast PSS contribution");
@@ -2386,7 +2387,7 @@ impl PydeNode {
                                                     &mut swarm,
                                                     topic,
                                                     share_bytes,
-                                                    &peer_manager,
+                                                    &mut peer_manager,
                                                 &mut gossip_cache,
                                                 );
                                             }
@@ -2400,7 +2401,7 @@ impl PydeNode {
                                                     &mut swarm,
                                                     topic,
                                                     contrib_bytes,
-                                                    &peer_manager,
+                                                    &mut peer_manager,
                                                 &mut gossip_cache,
                                                 );
                                             }
@@ -2423,7 +2424,7 @@ impl PydeNode {
                                                         &mut swarm,
                                                         topic,
                                                         contrib_bytes,
-                                                        &peer_manager,
+                                                        &mut peer_manager,
                                                     &mut gossip_cache,
                                                     );
                                                 }
@@ -2713,7 +2714,8 @@ impl PydeNode {
                                         &mut swarm,
                                         topic.clone(),
                                         compact_bytes,
-                                    &mut gossip_cache,
+                                        &mut peer_manager,
+                                        &mut gossip_cache,
                                     );
 
                                     // Audit item 207: publish the encrypted_txs
@@ -2736,7 +2738,8 @@ impl PydeNode {
                                             &mut swarm,
                                             topic,
                                             bundle_bytes,
-                                        &mut gossip_cache,
+                                            &mut peer_manager,
+                                            &mut gossip_cache,
                                         );
                                     }
 
@@ -2760,7 +2763,7 @@ impl PydeNode {
                                         &mut swarm,
                                         cons_topic,
                                         proposal_bytes,
-                                        &peer_manager,
+                                        &mut peer_manager,
                                     &mut gossip_cache,
                                     );
 
@@ -2785,7 +2788,7 @@ impl PydeNode {
                                             &mut swarm,
                                             topic,
                                             bytes,
-                                            &peer_manager,
+                                            &mut peer_manager,
                                         &mut gossip_cache,
                                         );
                                     }
@@ -3026,7 +3029,7 @@ impl PydeNode {
                                         &mut swarm,
                                         topic,
                                         vote_bytes,
-                                        &peer_manager,
+                                        &mut peer_manager,
                                     &mut gossip_cache,
                                     );
 
@@ -3141,7 +3144,7 @@ impl PydeNode {
                                                 &mut swarm,
                                                 topic.clone(),
                                                 fv_bytes,
-                                                &peer_manager,
+                                                &mut peer_manager,
                                             &mut gossip_cache,
                                             );
                                             if cert_formed {
@@ -3153,7 +3156,7 @@ impl PydeNode {
                                                         &mut swarm,
                                                         topic,
                                                         cp_bytes,
-                                                        &peer_manager,
+                                                        &mut peer_manager,
                                                     &mut gossip_cache,
                                                     );
                                                 }
@@ -3256,7 +3259,7 @@ impl PydeNode {
                                                                     &mut swarm,
                                                                     topic,
                                                                     share_bytes,
-                                                                    &peer_manager,
+                                                                    &mut peer_manager,
                                                                 &mut gossip_cache,
                                                                 );
                                                                 info!(
@@ -3398,7 +3401,7 @@ impl PydeNode {
                                         &mut swarm,
                                         topic,
                                         vc_bytes,
-                                        &peer_manager,
+                                        &mut peer_manager,
                                     &mut gossip_cache,
                                     );
                                     // audit 234 part 3: also process our own
@@ -3453,7 +3456,7 @@ impl PydeNode {
                                             &mut swarm,
                                             cons_topic,
                                             bytes,
-                                            &peer_manager,
+                                            &mut peer_manager,
                                         &mut gossip_cache,
                                         );
 
@@ -3481,7 +3484,8 @@ impl PydeNode {
                                             &mut swarm,
                                             blocks_topic,
                                             compact_bytes,
-                                        &mut gossip_cache,
+                                            &mut peer_manager,
+                                            &mut gossip_cache,
                                         );
 
                                         // 3) Apply the block locally so the
@@ -3834,7 +3838,7 @@ impl PydeNode {
                                     &mut swarm,
                                     topic,
                                     share_bytes,
-                                    &peer_manager,
+                                    &mut peer_manager,
                                     &mut gossip_cache,
                                 );
                                 debug!(
@@ -4229,7 +4233,7 @@ async fn cast_finality_vote_and_persist(
     state: &std::sync::Arc<tokio::sync::RwLock<crate::state_manager::StateManager>>,
     block_store: &crate::block_store::BlockStore,
     swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
-    peer_manager: &pyde_net::peer::PeerManager,
+    peer_manager: &mut pyde_net::peer::PeerManager,
     gossip_cache: &mut crate::gossip_cache::GossipCache,
     qc_slot: u64,
     qc_block_hash: [u8; 32],
@@ -4284,7 +4288,7 @@ async fn maybe_kick_decryption_pipeline(
         >,
     >,
     swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
-    peer_manager: &pyde_net::peer::PeerManager,
+    peer_manager: &mut pyde_net::peer::PeerManager,
     gossip_cache: &mut crate::gossip_cache::GossipCache,
     block: &pyde_consensus::block::Block,
     qc_slot: u64,
@@ -4386,7 +4390,7 @@ fn broadcast_consensus_with_rr_fallback(
     swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
     topic: gossipsub::IdentTopic,
     data: Vec<u8>,
-    _peer_manager: &pyde_net::peer::PeerManager,
+    peer_manager: &mut pyde_net::peer::PeerManager,
     gossip_cache: &mut crate::gossip_cache::GossipCache,
 ) {
     // Best-effort gossip publish (cheap fan-out via mesh). On
@@ -4439,22 +4443,40 @@ fn broadcast_consensus_with_rr_fallback(
     //
     // Cost: at committee size N + F full nodes, each consensus
     // message is (N+F-1) RR send_requests on top of one gossip
-    // publish. At N=4 (devnet) ≈3 extra messages. At N=128 (mainnet)
-    // ≈127, well under 100KB per slot at FALCON sig sizes —
-    // negligible against the gossip mesh's own per-message cost.
+    // publish. At N=4 (devnet) ≈3 extra messages. At N=128
+    // (mainnet) ≈127, well under 100KB per slot at FALCON sig
+    // sizes — negligible against the gossip mesh's own
+    // per-message cost.
+    //
+    // TPL-504: gated on a per-peer in-flight cap so a stalled
+    // peer can't accumulate megabytes of queued outbound RR
+    // requests during a quadratic-fanout consensus round
+    // (N=128 broadcasting → 16K outstanding requests at FALCON
+    // sig sizes ≈ 16 MB without the cap). The gossip mesh
+    // covers happy-path delivery, so dropping a redundant RR
+    // when the queue's full is safe.
     let connected_peers: Vec<libp2p::PeerId> = swarm.connected_peers().copied().collect();
-    debug!(
-        n_peers = connected_peers.len(),
-        "consensus broadcast: RR fanout to connected peers"
-    );
-    for peer in connected_peers {
+    let mut sent = 0usize;
+    let mut dropped = 0usize;
+    for peer in &connected_peers {
+        if !peer_manager.try_acquire_rr_slot(peer) {
+            dropped += 1;
+            continue;
+        }
         swarm.behaviour_mut().consensus_rr.send_request(
-            &peer,
+            peer,
             pyde_net::consensus_protocol::ConsensusReq {
                 bytes: data.clone(),
             },
         );
+        sent += 1;
     }
+    debug!(
+        n_peers = connected_peers.len(),
+        sent,
+        dropped,
+        "consensus broadcast: RR fanout to connected peers"
+    );
 }
 
 /// Broadcast a Blocks-topic payload via gossipsub AND direct
@@ -4489,6 +4511,7 @@ fn broadcast_blocks_with_rr_fallback(
     swarm: &mut libp2p::Swarm<pyde_net::node::PydeBehaviour>,
     topic: gossipsub::IdentTopic,
     data: Vec<u8>,
+    peer_manager: &mut pyde_net::peer::PeerManager,
     gossip_cache: &mut crate::gossip_cache::GossipCache,
 ) {
     // Best-effort gossip publish (cheap fan-out via mesh). Same
@@ -4512,20 +4535,34 @@ fn broadcast_blocks_with_rr_fallback(
     // validators) avoids racing the auth handshake on
     // disconnect/reconnect; receivers FALCON-verify the block
     // header inside `validate_network_block` before applying.
+    //
+    // TPL-504: gated on the same per-peer in-flight cap as the
+    // consensus path. Compact-block + encrypted-tx-bundle payloads
+    // are larger than consensus messages, so the bandwidth blow-up
+    // when a peer stalls is even worse here without the cap.
     let connected_peers: Vec<libp2p::PeerId> = swarm.connected_peers().copied().collect();
-    debug!(
-        n_peers = connected_peers.len(),
-        bytes = data.len(),
-        "blocks broadcast: RR fanout to connected peers"
-    );
-    for peer in connected_peers {
+    let mut sent = 0usize;
+    let mut dropped = 0usize;
+    for peer in &connected_peers {
+        if !peer_manager.try_acquire_rr_slot(peer) {
+            dropped += 1;
+            continue;
+        }
         swarm.behaviour_mut().blocks_rr.send_request(
-            &peer,
+            peer,
             pyde_net::blocks_protocol::BlocksReq {
                 bytes: data.clone(),
             },
         );
+        sent += 1;
     }
+    debug!(
+        n_peers = connected_peers.len(),
+        sent,
+        dropped,
+        bytes = data.len(),
+        "blocks broadcast: RR fanout to connected peers"
+    );
 }
 
 /// Audit 234 follow-up: dial every peer the previous run was
@@ -5740,16 +5777,25 @@ fn handle_swarm_event(
         }
         SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
             request_response::Event::Message {
+                peer,
                 message: request_response::Message::Response { .. },
                 ..
             },
         )) => {
-            // Acks are best-effort confirmation; nothing to do.
+            // TPL-504: release the in-flight RR slot we acquired
+            // when the matching `send_request` fired so a follow-
+            // up broadcast can re-target this peer.
+            peer_manager.release_rr_slot(&peer);
+            // Acks are best-effort confirmation; nothing else to do.
             PostEventAction::None
         }
         SwarmEvent::Behaviour(PydeBehaviourEvent::ConsensusRr(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
+            // TPL-504: release the slot regardless of how the send
+            // ended — the substream is gone either way and no
+            // future event will fire for it.
+            peer_manager.release_rr_slot(&peer);
             // Audit 234 part 4 step 7 originally disconnected the
             // peer here on the theory that a failed RR send is the
             // canonical signal of a half-broken QUIC connection.
@@ -5903,16 +5949,23 @@ fn handle_swarm_event(
             )
         }
         SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(request_response::Event::Message {
+            peer,
             message: request_response::Message::Response { .. },
             ..
         })) => {
+            // TPL-504: release the in-flight RR slot we acquired
+            // for this peer at send time.
+            peer_manager.release_rr_slot(&peer);
             // Acks (or DecodeError responses) from peers — best-effort
-            // confirmation, nothing to do.
+            // confirmation, nothing else to do.
             PostEventAction::None
         }
         SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
+            // TPL-504: release the slot — same rationale as the
+            // consensus-RR OutboundFailure arm.
+            peer_manager.release_rr_slot(&peer);
             // Same rationale as ConsensusRr OutboundFailure: only
             // disconnect on `Timeout`. Transient failures during slot-
             // tick fanout would otherwise trigger a feedback loop on

@@ -96,6 +96,20 @@ impl PeerInfo {
     }
 }
 
+/// Maximum number of in-flight RR requests per peer (TPL-504).
+///
+/// Per-peer cap on the consensus-RR + blocks-RR fan-out queue.
+/// Without this, a 128-validator committee broadcasting a VC
+/// round produces N*(N-1) ≈ 16K outbound requests in flight at
+/// FALCON-sig payload sizes (~1KB), peaking around 16 MB of
+/// queued outbound buffers per round. The cap drops *new* sends
+/// to a peer once it already has K in flight; the gossip mesh
+/// covers the happy path, so dropping the redundant RR is safe.
+/// K = 8 leaves headroom for legitimate parallel rounds (vote
+/// + finality vote + view-change in the same window) without
+/// letting any single peer monopolize buffer space.
+pub const MAX_RR_INFLIGHT_PER_PEER: usize = 8;
+
 /// Manages connected peers and enforces limits.
 #[derive(Debug)]
 pub struct PeerManager {
@@ -111,6 +125,10 @@ pub struct PeerManager {
     rate_limits: HashMap<IpAddr, (u32, Instant)>,
     /// Max connections per IP per second.
     rate_limit_per_ip: u32,
+    /// TPL-504: per-peer count of RR requests we've sent and not
+    /// yet seen acked / failed. Gates new sends to bound queued
+    /// outbound buffers under quadratic-fanout consensus rounds.
+    outbound_rr_inflight: HashMap<PeerId, usize>,
 }
 
 impl PeerManager {
@@ -127,6 +145,7 @@ impl PeerManager {
             max_outbound,
             rate_limits: HashMap::new(),
             rate_limit_per_ip,
+            outbound_rr_inflight: HashMap::new(),
         }
     }
 
@@ -221,7 +240,48 @@ impl PeerManager {
 
     /// Remove a disconnected peer.
     pub fn remove_peer(&mut self, peer_id: &PeerId) -> Option<PeerInfo> {
+        // TPL-504: drop the in-flight counter so a re-connect
+        // doesn't inherit a stale (and now-unrecoverable) count
+        // from the prior connection — the libp2p substream is
+        // gone, so there's nothing to ack the existing slots.
+        self.outbound_rr_inflight.remove(peer_id);
         self.peers.remove(peer_id)
+    }
+
+    /// TPL-504: try to acquire an RR-send slot for a peer. Returns
+    /// `true` and increments the per-peer in-flight counter when
+    /// the peer is below `MAX_RR_INFLIGHT_PER_PEER`, otherwise
+    /// returns `false` and leaves the counter unchanged. The
+    /// caller must invoke `release_rr_slot` on RR
+    /// `Message::Response`, `OutboundFailure`, AND `InboundFailure`
+    /// for the matching peer so the counter eventually drains.
+    pub fn try_acquire_rr_slot(&mut self, peer: &PeerId) -> bool {
+        let entry = self.outbound_rr_inflight.entry(*peer).or_insert(0);
+        if *entry >= MAX_RR_INFLIGHT_PER_PEER {
+            return false;
+        }
+        *entry += 1;
+        true
+    }
+
+    /// TPL-504: release a previously-acquired RR-send slot.
+    /// Saturating-decrement so a stray release (e.g. an event the
+    /// caller can't pre-correlate to a `try_acquire_rr_slot`) is
+    /// a no-op rather than a crash. If the counter hits zero the
+    /// entry is removed to bound HashMap growth as peers churn.
+    pub fn release_rr_slot(&mut self, peer: &PeerId) {
+        if let Some(slot) = self.outbound_rr_inflight.get_mut(peer) {
+            *slot = slot.saturating_sub(1);
+            if *slot == 0 {
+                self.outbound_rr_inflight.remove(peer);
+            }
+        }
+    }
+
+    /// TPL-504: introspection for tests + metrics. Returns 0 for
+    /// peers we've never sent to.
+    pub fn rr_inflight_count(&self, peer: &PeerId) -> usize {
+        self.outbound_rr_inflight.get(peer).copied().unwrap_or(0)
     }
 
     /// Get peer info.
@@ -594,5 +654,90 @@ mod tests {
         assert_eq!(mgr.get_peer(&id).unwrap().role, PeerRole::Unknown);
         assert!(mgr.mark_validator(&id));
         assert_eq!(mgr.get_peer(&id).unwrap().role, PeerRole::Validator);
+    }
+
+    // ── TPL-504: per-peer in-flight RR cap ─────────────────────────
+
+    /// `try_acquire_rr_slot` admits up to `MAX_RR_INFLIGHT_PER_PEER`
+    /// concurrent sends per peer, then refuses further admissions
+    /// until `release_rr_slot` drains the count.
+    #[test]
+    fn tpl_504_try_acquire_rr_slot_caps_at_max() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = PeerId::random();
+
+        // First MAX_RR_INFLIGHT_PER_PEER admissions succeed.
+        for i in 0..MAX_RR_INFLIGHT_PER_PEER {
+            assert!(
+                mgr.try_acquire_rr_slot(&peer),
+                "admission #{i} below cap should succeed"
+            );
+            assert_eq!(mgr.rr_inflight_count(&peer), i + 1);
+        }
+
+        // Cap reached: further admissions are refused without
+        // mutating the counter.
+        assert!(!mgr.try_acquire_rr_slot(&peer));
+        assert_eq!(mgr.rr_inflight_count(&peer), MAX_RR_INFLIGHT_PER_PEER);
+        assert!(!mgr.try_acquire_rr_slot(&peer));
+        assert_eq!(mgr.rr_inflight_count(&peer), MAX_RR_INFLIGHT_PER_PEER);
+
+        // After a release, a new admission slots in.
+        mgr.release_rr_slot(&peer);
+        assert_eq!(mgr.rr_inflight_count(&peer), MAX_RR_INFLIGHT_PER_PEER - 1);
+        assert!(mgr.try_acquire_rr_slot(&peer));
+        assert_eq!(mgr.rr_inflight_count(&peer), MAX_RR_INFLIGHT_PER_PEER);
+    }
+
+    /// `release_rr_slot` is saturating: an unmatched release
+    /// (e.g. an event the caller couldn't pre-correlate) is a
+    /// no-op rather than a crash. And once the counter hits
+    /// zero the entry is dropped to bound HashMap growth.
+    #[test]
+    fn tpl_504_release_rr_slot_is_saturating_and_drops_zero_entries() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = PeerId::random();
+
+        // Release on a never-acquired peer is a no-op.
+        mgr.release_rr_slot(&peer);
+        assert_eq!(mgr.rr_inflight_count(&peer), 0);
+
+        // Acquire 2, release 2 → entry should be removed (count
+        // zero ⇒ no map entry, so re-acquire goes through the
+        // entry-insert path).
+        assert!(mgr.try_acquire_rr_slot(&peer));
+        assert!(mgr.try_acquire_rr_slot(&peer));
+        assert_eq!(mgr.rr_inflight_count(&peer), 2);
+        mgr.release_rr_slot(&peer);
+        mgr.release_rr_slot(&peer);
+        assert_eq!(mgr.rr_inflight_count(&peer), 0);
+
+        // Extra release after the entry is gone — still a no-op.
+        mgr.release_rr_slot(&peer);
+        assert_eq!(mgr.rr_inflight_count(&peer), 0);
+    }
+
+    /// `remove_peer` clears any in-flight slots so a re-connect
+    /// doesn't inherit an unrecoverable count from the prior
+    /// connection — the libp2p substream is gone, no events will
+    /// arrive to drain it.
+    #[test]
+    fn tpl_504_remove_peer_clears_inflight_slots() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = dummy_peer(Direction::Outbound);
+        let id = peer.peer_id;
+        assert!(mgr.add_peer(peer));
+
+        for _ in 0..3 {
+            assert!(mgr.try_acquire_rr_slot(&id));
+        }
+        assert_eq!(mgr.rr_inflight_count(&id), 3);
+
+        mgr.remove_peer(&id);
+        assert_eq!(
+            mgr.rr_inflight_count(&id),
+            0,
+            "remove_peer must drop in-flight counter"
+        );
     }
 }
