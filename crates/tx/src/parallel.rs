@@ -314,7 +314,21 @@ pub fn schedule(txs: &[Transaction]) -> ExecutionSchedule {
 }
 
 /// Check if two access lists conflict (shared key with at least one write).
+///
+/// TPL-513: an uninformative access list (`access_list_is_uninformative`)
+/// is treated as touching EVERYTHING, exactly as `conflicts()` does
+/// for two transactions. Pre-fix this function only compared
+/// declared writes/reads, so two empty access lists or two
+/// `[{addr, [], []}]`-shaped lists came back as "no conflict" —
+/// the same TPL-001 hazard `conflicts()` already guards against.
+/// `block_builder`'s post-schedule sanity assert is the only
+/// in-tree consumer today, but mirroring the rule keeps the two
+/// helpers from drifting if a future caller uses
+/// `access_lists_conflict` for a real safety decision.
 pub fn access_lists_conflict(a: &[AccessEntry], b: &[AccessEntry]) -> bool {
+    if access_list_is_uninformative(a) || access_list_is_uninformative(b) {
+        return true;
+    }
     let writes_a: HashSet<(Address, [u8; 32])> = a
         .iter()
         .flat_map(|entry| entry.writes.iter().map(move |k| (entry.address, *k)))
@@ -856,6 +870,47 @@ mod tests {
         assert!(
             conflicts(&tx_keyed, &tx_uninformative),
             "uninformative AL must conflict regardless of arg order"
+        );
+    }
+
+    /// TPL-513: `access_lists_conflict` must reuse the same
+    /// uninformative-AL rule as `conflicts()`. Pre-fix it only
+    /// compared declared writes/reads, so two empty access lists
+    /// (or `[{addr, [], []}]`-shaped lists) came back as "no
+    /// conflict". A future caller using this helper for a real
+    /// safety decision would silently let two TPL-001-shaped txs
+    /// run in parallel.
+    #[test]
+    fn tpl_513_access_lists_conflict_uninformative_treated_as_conflict() {
+        let uninformative = vec![AccessEntry {
+            address: {
+                let mut a = ZERO_ADDRESS;
+                a[0] = 0xAB;
+                a
+            },
+            reads: vec![],
+            writes: vec![],
+        }];
+        let keyed = vec![write_access(0xCC, &[[0x77; 32]])];
+
+        // Empty AL ↔ empty AL.
+        assert!(
+            access_lists_conflict(&[], &[]),
+            "two empty ALs must conflict"
+        );
+        // Uninformative AL ↔ keyed AL — both directions.
+        assert!(
+            access_lists_conflict(&uninformative, &keyed),
+            "uninformative ↔ keyed must conflict"
+        );
+        assert!(
+            access_lists_conflict(&keyed, &uninformative),
+            "uninformative ↔ keyed must conflict regardless of arg order"
+        );
+        // Uninformative ↔ uninformative.
+        assert!(
+            access_lists_conflict(&uninformative, &uninformative),
+            "two uninformative ALs must conflict"
         );
     }
 
