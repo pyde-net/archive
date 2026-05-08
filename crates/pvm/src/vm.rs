@@ -961,6 +961,11 @@ impl Vm {
                             if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                                 return Err(Trap::OutOfGas);
                             }
+                            // TPL-507: pre-trap on worst-case page gas
+                            // for the destination range so an Sload
+                            // of a multi-MB stored value can't ride
+                            // past the gas limit during the copy.
+                            self.precheck_bulk_page_budget(data.len())?;
                             self.memory
                                 .checked_write_slice(ptr, data)
                                 .map_err(|_| Trap::MemoryFault)?;
@@ -1039,6 +1044,10 @@ impl Vm {
                         if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                             return Err(Trap::OutOfGas);
                         }
+                        // TPL-507: pre-trap on worst-case page gas
+                        // for the read range BEFORE the slice copy
+                        // forces a host-side allocation.
+                        self.precheck_bulk_page_budget(len)?;
                         let data = self
                             .memory
                             .checked_read_slice(ptr, len)
@@ -1401,6 +1410,15 @@ impl Vm {
                     if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                         return Err(Trap::OutOfGas);
                     }
+                    // TPL-507: pre-trap on worst-case page gas for
+                    // src+dst before doing the copy, so a multi-MB
+                    // Memcpy can't ride past the gas limit on the
+                    // post-step flush after the host has already
+                    // finished the work. `len.saturating_mul(2)`
+                    // accounts for the source AND destination
+                    // ranges; saturating so a near-MEMORY_SIZE len
+                    // won't wrap before precheck fires its own OOG.
+                    self.precheck_bulk_page_budget(len.saturating_mul(2))?;
                     let data = self
                         .memory
                         .checked_read_slice(src_ptr, len)
@@ -2182,6 +2200,39 @@ impl Vm {
         self.contracts.insert(new_addr, runtime_code);
 
         Ok(new_addr)
+    }
+
+    /// TPL-507: pre-trap `OutOfGas` if the worst-case
+    /// page-allocation gas for a bulk memory op of `bytes`
+    /// total would push the accumulator over `gas_limit`.
+    /// Non-mutating — actual `page_gas_used` accounting still
+    /// happens via `Memory::check_access` and flushes at the
+    /// end-of-step gate (line 1524-1535). Pre-fix the page
+    /// gas was charged ONLY at end-of-step, so a guest could
+    /// hand the VM a multi-MB Memcpy `len`, the host would
+    /// finish the copy, and only THEN the post-step flush
+    /// would OOG — work-then-fail, the exact pattern this
+    /// closes. `bytes` is the SUM of memory ranges that may
+    /// be newly touched: callers like Memcpy pass `2*len`
+    /// for source+destination; one-sided ops pass just `len`.
+    /// `bytes == 0` and `gas_limit == 0` (unlimited) short-
+    /// circuit to `Ok(())`.
+    fn precheck_bulk_page_budget(&self, bytes: usize) -> Result<(), Trap> {
+        if bytes == 0 || self.gas_limit == 0 {
+            return Ok(());
+        }
+        let pages = (bytes as u64).div_ceil(crate::memory::PAGE_SIZE as u64);
+        let worst = pages
+            .checked_mul(crate::memory::PAGE_ALLOC_GAS)
+            .ok_or(Trap::OutOfGas)?;
+        let projected = self
+            .gas_used_total
+            .checked_add(worst)
+            .ok_or(Trap::OutOfGas)?;
+        if projected > self.gas_limit {
+            return Err(Trap::OutOfGas);
+        }
+        Ok(())
     }
 
     /// Record a storage key's current value in the journal before writing.
@@ -4660,6 +4711,131 @@ mod tests {
             99,
             "parent must continue executing past a reverting CREATE"
         );
+    }
+
+    // ========== TPL-507: bulk memory ops pre-charge worst-case page gas ==========
+
+    /// Pre-fix Memcpy ran the full copy and only OOG'd at the
+    /// `step()` end-of-step page-gas flush — work-then-fail.
+    /// A guest could hand the VM a multi-MB `len`, make the
+    /// host complete the entire copy, and only THEN OOG. With
+    /// Memcpy fan-out across nested CALL boundaries this is a
+    /// cheap CPU-burn primitive: the parent's gas budget kept
+    /// burning through real allocation work even though the
+    /// final post-step charge was always going to bust the
+    /// limit.
+    ///
+    /// Post-fix `precheck_bulk_page_budget(2 * len)` runs
+    /// BEFORE the copy; if the worst-case page allocation
+    /// would push past `gas_limit`, OOG fires immediately and
+    /// the destination memory stays pristine. Memory is NOT
+    /// rolled back on OOG (only storage + balances are), so
+    /// the destination's pre-call value is the cleanest
+    /// observable proof that the copy did or didn't happen.
+    #[test]
+    fn tpl_507_memcpy_pre_traps_oog_before_doing_the_copy() {
+        let heap = crate::memory::HEAP_START;
+
+        // Pre-fill SOURCE with 0xFF and verify DESTINATION is 0x00.
+        let len: usize = 256 * crate::memory::PAGE_SIZE; // 1 MB → 256 pages
+
+        let mut vm = Vm::with_gas_limit_and_context(50_000, ExecutionContext::default());
+
+        let src_ptr = heap;
+        let dst_ptr = heap + len as u32; // non-overlapping
+
+        // Touch source pages by writing 0xFF — these page allocations
+        // happen before Memcpy and are charged at end-of-step for
+        // the setup. We separately want Memcpy itself to OOG, so
+        // skip pre-touching DESTINATION pages.
+        for offset in (0..len as u32).step_by(crate::memory::PAGE_SIZE) {
+            vm.memory.store8(src_ptr + offset, 0xFF).unwrap();
+        }
+        // Sanity: destination is still all 0x00.
+        assert_eq!(vm.memory.load8(dst_ptr).unwrap(), 0x00);
+        assert_eq!(
+            vm.memory.load8(dst_ptr + (len as u32) - 1).unwrap(),
+            0x00,
+            "destination's last byte must start at 0x00"
+        );
+
+        // Set up Memcpy operands: r1=dst, r2=src, r3=len.
+        // Encoding: memcpy rd_dst=1, rs1_src=2, imm=len_reg=3.
+        vm.cpu.write_gp(1, dst_ptr as u64);
+        vm.cpu.write_gp(2, src_ptr as u64);
+        vm.cpu.write_gp(3, len as u64);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Memcpy, 1, 2, 0x03),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        // Memcpy should OOG before the copy lands.
+        // 50_000 - (~base + dynamic) leaves no room for 2*256
+        // pages * 200 = 102_400 worst-case page gas, so the
+        // precheck trips immediately.
+        assert_eq!(
+            output.outcome,
+            Outcome::OutOfGas,
+            "expected OOG; got {:?}",
+            output.outcome
+        );
+
+        // Destination memory remains 0x00 — the copy did not run.
+        // Memory is not rolled back on OOG (only storage +
+        // balances are), so the lingering 0x00 is hard
+        // evidence that we trapped BEFORE the copy.
+        assert_eq!(
+            vm.memory.load8(dst_ptr).unwrap(),
+            0x00,
+            "Memcpy must trap BEFORE writing to destination — pre-fix the entire copy ran first"
+        );
+        assert_eq!(
+            vm.memory.load8(dst_ptr + (len as u32) - 1).unwrap(),
+            0x00,
+            "destination's tail must remain pristine; pre-fix it would have been overwritten with 0xFF"
+        );
+    }
+
+    /// TPL-507 control: a small Memcpy that fits comfortably
+    /// in the gas budget MUST still complete. The precheck is
+    /// an upper-bound check only — when the worst case fits,
+    /// the actual copy runs and the post-step page-gas flush
+    /// charges the real (≤ worst) cost. Without this control
+    /// the OOG test could be passing for the wrong reason
+    /// (e.g., precheck always OOGs).
+    #[test]
+    fn tpl_507_small_memcpy_within_budget_still_runs() {
+        let heap = crate::memory::HEAP_START;
+        let len: usize = 64; // < 1 page; well within budget
+
+        let mut vm = Vm::with_gas_limit_and_context(50_000, ExecutionContext::default());
+
+        let src_ptr = heap;
+        let dst_ptr = heap + 4096; // adjacent page
+
+        for i in 0..len {
+            vm.memory.store8(src_ptr + i as u32, 0xAB).unwrap();
+        }
+
+        vm.cpu.write_gp(1, dst_ptr as u64);
+        vm.cpu.write_gp(2, src_ptr as u64);
+        vm.cpu.write_gp(3, len as u64);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Memcpy, 1, 2, 0x03),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(output.outcome, Outcome::Success);
+        // Destination got the bytes.
+        for i in 0..len {
+            assert_eq!(vm.memory.load8(dst_ptr + i as u32).unwrap(), 0xAB);
+        }
     }
 
     // ========== Audit 379: CREATE address is non-front-runnable ==========
