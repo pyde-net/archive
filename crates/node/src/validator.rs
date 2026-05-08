@@ -321,6 +321,22 @@ pub struct ValidatorEngine {
     /// unbounded FALCON cost per QC-formation attempt.
     /// Pruned alongside `view_changes` in the slot-prune loop.
     seen_view_changes: std::collections::HashSet<(u64, u8)>,
+    /// TPL-501: self-VC equivocation guard. Records every
+    /// view-change message THIS validator signed, keyed by
+    /// `slot` (target_height at sign time) with value
+    /// `(highest_qc_hash, signature)`. Persisted via
+    /// `ConsensusStateStore::save_seen_view_change_self`
+    /// BEFORE `on_timeout` returns the signed message — without
+    /// that ordering, a crash between sign + persist could let
+    /// the validator sign a different VC at the same slot post-
+    /// restart (different `highest_qc` survives the reboot,
+    /// FALCON sig over a different message → equivocation,
+    /// slashable).
+    ///
+    /// Pruned alongside `seen_proposals` / `seen_votes` in the
+    /// `advance_slot` retention loop and on disk via
+    /// `prune_evidence_before`.
+    seen_view_changes_self: std::collections::HashMap<u64, ([u8; 32], Vec<u8>)>,
     /// Audit 327: dedup set for incoming finality votes, keyed
     /// on `(slot, voter_index)`. Same rationale as
     /// `seen_view_changes` — `try_form_hard_finality` re-verifies
@@ -509,6 +525,7 @@ impl ValidatorEngine {
             seen_proposals: HashMap::new(),
             seen_votes: HashMap::new(),
             seen_view_changes: std::collections::HashSet::new(),
+            seen_view_changes_self: std::collections::HashMap::new(),
             seen_finality_votes: std::collections::HashSet::new(),
             pending_evidence: Vec::new(),
             broadcast_evidence: Vec::new(),
@@ -599,10 +616,16 @@ impl ValidatorEngine {
         // skipped by the store loader; we take whatever comes back.
         let proposals = store.load_all_seen_proposals();
         let votes = store.load_all_seen_votes();
-        if !proposals.is_empty() || !votes.is_empty() {
+        // TPL-501: also restore self-VC records so on_timeout
+        // post-restart re-broadcasts the persisted signature
+        // (when highest_qc still hashes the same) instead of
+        // signing a fresh — potentially divergent — VC.
+        let view_changes_self = store.load_all_seen_view_changes_self();
+        if !proposals.is_empty() || !votes.is_empty() || !view_changes_self.is_empty() {
             info!(
                 proposals = proposals.len(),
                 votes = votes.len(),
+                view_changes_self = view_changes_self.len(),
                 "restoring equivocation evidence from disk"
             );
         }
@@ -611,6 +634,9 @@ impl ValidatorEngine {
         }
         for (key, value) in votes {
             self.seen_votes.insert(key, value);
+        }
+        for (slot, qc_hash_and_sig) in view_changes_self {
+            self.seen_view_changes_self.insert(slot, qc_hash_and_sig);
         }
 
         // Restore the ingest queues. Without this, a validator that
@@ -2483,6 +2509,44 @@ impl ValidatorEngine {
         // already moved past, leaving the original failed slot
         // permanently uncommitted.
         let slot = self.consensus.target_height;
+        let highest_qc_hash = self.consensus.highest_qc.hash();
+
+        // TPL-501: equivocation guard. If we already signed a
+        // VC at this slot, we MUST NOT sign a different one — a
+        // FALCON sig over `(slot=N, highest_qc=Q1)` paired with
+        // a sig over `(slot=N, highest_qc=Q2)` is the textbook
+        // double-VC slashable pattern. Branches:
+        //
+        // - persisted hash matches current highest_qc.hash() →
+        //   the message we'd sign is identical to one we
+        //   already signed; rebuild it from cached signature
+        //   bytes and return it (idempotent re-broadcast covers
+        //   crash-after-sign-before-broadcast).
+        // - persisted hash differs from current highest_qc.hash()
+        //   → highest_qc has advanced (or otherwise changed) at
+        //   the same target_height between sign and the
+        //   re-fire; signing a fresh VC would equivocate.
+        //   Return None — better to forfeit our VC contribution
+        //   for this round than self-slash.
+        if let Some((persisted_hash, persisted_sig)) = self.seen_view_changes_self.get(&slot) {
+            if *persisted_hash == highest_qc_hash {
+                debug!(slot, "TPL-501: re-broadcasting persisted view-change signature");
+                return Some(ViewChangeMessage {
+                    slot,
+                    highest_qc: self.consensus.highest_qc.clone(),
+                    voter_index: identity.committee_index,
+                    voter_address: identity.address,
+                    signature: persisted_sig.clone(),
+                });
+            } else {
+                warn!(
+                    slot,
+                    "TPL-501: refusing to sign new VC at slot we already signed for — would equivocate"
+                );
+                return None;
+            }
+        }
+
         match create_view_change(
             self.chain_id,
             slot,
@@ -2492,6 +2556,22 @@ impl ValidatorEngine {
             &identity.secret_key,
         ) {
             Ok(msg) => {
+                // TPL-501: persist BEFORE returning the signed
+                // message — same pattern as `seen_proposals` /
+                // `seen_votes`. A crash between this fsync and
+                // the broadcast leaves the seen-VC record on
+                // disk; on restart, the equivocation guard
+                // above triggers and we re-broadcast the same
+                // signature instead of signing a divergent one.
+                if let Some(store) = &self.consensus_store {
+                    if let Err(e) =
+                        store.save_seen_view_change_self(slot, &highest_qc_hash, &msg.signature)
+                    {
+                        self.signal_persist_failure("seen-view-change-self", &e.to_string());
+                    }
+                }
+                self.seen_view_changes_self
+                    .insert(slot, (highest_qc_hash, msg.signature.clone()));
                 info!(slot, "created view change message");
                 Some(msg)
             }
@@ -2923,6 +3003,10 @@ impl ValidatorEngine {
             // backing per-slot Vecs so the sets don't grow unbounded
             // for long-running validators.
             self.seen_view_changes.retain(|(s, _)| *s >= prune_before);
+            // TPL-501: prune the self-VC equivocation record
+            // alongside its peers. The on-disk copy is pruned
+            // by `store.prune_evidence_before` below.
+            self.seen_view_changes_self.retain(|s, _| *s >= prune_before);
             self.seen_finality_votes.retain(|(s, _)| *s >= prune_before);
             // Audit 326: `seen_evidence` is keyed on
             // `(slot, signer)` and gates evidence ingestion to
@@ -5920,6 +6004,93 @@ mod tests {
             "view-change must target the oldest unresolved height ({target_height}), \
              not the drifted current_slot ({drifted}). \
              See CONSENSUS_INVARIANTS.md L1."
+        );
+    }
+
+    /// TPL-501: `on_timeout` MUST cache the signed VC's
+    /// `(highest_qc.hash(), signature)` into
+    /// `seen_view_changes_self` BEFORE returning. The cache is
+    /// what the equivocation guard checks on a re-fire (post-
+    /// crash restart, retry within the same window, etc.) — if
+    /// it's missing, the guard's protective branch never trips
+    /// and the validator can sign a divergent VC at the same
+    /// target_height for slashing.
+    #[test]
+    fn tpl_501_on_timeout_caches_seen_vc_record_before_returning() {
+        let (mut engine, identities) = make_engine_with_committee(4);
+        engine.consensus.target_height = 42;
+
+        let pre_count = engine.seen_view_changes_self.len();
+        let msg = engine
+            .on_timeout(&identities[0])
+            .expect("on_timeout should sign a fresh VC");
+
+        // Cache populated.
+        let cached = engine
+            .seen_view_changes_self
+            .get(&42)
+            .expect("seen_view_changes_self must contain the slot we just signed");
+        let qc_hash = engine.consensus.highest_qc.hash();
+        assert_eq!(cached.0, qc_hash, "cached qc_hash must match current");
+        assert_eq!(
+            cached.1, msg.signature,
+            "cached signature must match the returned VC's signature"
+        );
+        assert_eq!(engine.seen_view_changes_self.len(), pre_count + 1);
+    }
+
+    /// TPL-501: a second `on_timeout` call at the same slot
+    /// with the same `highest_qc` is idempotent — returns the
+    /// SAME signature bytes. This is the post-restart re-
+    /// broadcast branch: a crash between sign and broadcast
+    /// preserves the persisted record on disk; on restart we
+    /// re-derive the same VC instead of signing a fresh
+    /// (potentially-divergent) one.
+    #[test]
+    fn tpl_501_on_timeout_idempotent_when_highest_qc_unchanged() {
+        let (mut engine, identities) = make_engine_with_committee(4);
+        engine.consensus.target_height = 42;
+
+        let first = engine.on_timeout(&identities[0]).unwrap();
+        let second = engine
+            .on_timeout(&identities[0])
+            .expect("re-fire should still return the cached signature");
+
+        assert_eq!(first.signature, second.signature);
+        assert_eq!(first.slot, second.slot);
+        assert_eq!(first.highest_qc.hash(), second.highest_qc.hash());
+    }
+
+    /// TPL-501: if `highest_qc` advances at the same
+    /// `target_height` between the first sign and a re-fire,
+    /// `on_timeout` MUST refuse to sign — signing a fresh VC
+    /// over the new (higher) QC at the same slot would
+    /// equivocate against the originally-signed message. Pre-
+    /// fix this returned `Some(...)` with a divergent
+    /// signature; post-fix it returns `None`.
+    #[test]
+    fn tpl_501_on_timeout_refuses_to_sign_when_highest_qc_advanced() {
+        let (mut engine, identities) = make_engine_with_committee(4);
+        engine.consensus.target_height = 42;
+
+        let _first = engine
+            .on_timeout(&identities[0])
+            .expect("first sign should succeed");
+
+        // Mutate `highest_qc` to a different value at the same
+        // target_height — simulates a peer-vote QC arriving
+        // post-restart but pre-VC-broadcast that advances our
+        // local highest_qc to a new shape.
+        engine.consensus.highest_qc.slot = 41;
+        engine.consensus.highest_qc.block_hash = [0xCC; 32];
+        engine.consensus.highest_qc.voter_bitmap = 0b1011;
+        engine.consensus.highest_qc.signatures = vec![vec![0xAA; 666]; 3];
+
+        let second = engine.on_timeout(&identities[0]);
+        assert!(
+            second.is_none(),
+            "TPL-501: a different highest_qc at the same target_height MUST trip the equivocation guard, got {:?}",
+            second.map(|m| m.signature.len())
         );
     }
 
