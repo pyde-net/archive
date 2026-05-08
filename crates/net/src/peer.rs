@@ -110,6 +110,34 @@ impl PeerInfo {
 /// letting any single peer monopolize buffer space.
 pub const MAX_RR_INFLIGHT_PER_PEER: usize = 8;
 
+/// Maximum number of consensus-topic gossip messages we'll
+/// accept (and therefore decode + FALCON-verify) per second
+/// from an UNATTESTED `propagation_source` (TPL-505).
+///
+/// An unattested peer hasn't completed our FALCON auth
+/// handshake yet — it might be a legitimately-pending
+/// committee member during a reconnect race, or a new full
+/// node, or an attacker that opened a connection just to
+/// pump expensive messages through the mesh's forwarding
+/// path. Without a budget every consensus-topic message from
+/// such a peer costs us a FALCON verify (~100K cycles) at
+/// the app layer; an attacker holding a few inbound TCP
+/// substreams can stall the consensus loop with verify work
+/// alone. Attested + authorized committee peers bypass this
+/// budget entirely (they're trusted on the channel by
+/// definition), and attested + non-committee peers were
+/// already hard-dropped pre-fix at the `is_consensus_authorized`
+/// gate. The cap targets the "unattested forwarder" middle
+/// case, which is the only one whose CPU cost was unbounded.
+///
+/// 32 is roughly an order of magnitude above the steady-state
+/// per-peer rate honest validators produce on the consensus
+/// topic (vote + occasional FV/randomness/PSS gossip), so
+/// honest unattested peers during their handshake window stay
+/// well under it; sustained spam at 33+/s from one source
+/// gets shed.
+pub const MAX_UNATTESTED_CONSENSUS_PER_SEC: u32 = 32;
+
 /// Manages connected peers and enforces limits.
 #[derive(Debug)]
 pub struct PeerManager {
@@ -129,6 +157,11 @@ pub struct PeerManager {
     /// yet seen acked / failed. Gates new sends to bound queued
     /// outbound buffers under quadratic-fanout consensus rounds.
     outbound_rr_inflight: HashMap<PeerId, usize>,
+    /// TPL-505: per-`propagation_source` budget for consensus-
+    /// topic gossip when the peer hasn't attested a FALCON pubkey
+    /// yet. Stored as `(count, window_start)`; the count resets
+    /// every wall-clock second.
+    unattested_consensus_budget: HashMap<PeerId, (u32, Instant)>,
 }
 
 impl PeerManager {
@@ -146,6 +179,7 @@ impl PeerManager {
             rate_limits: HashMap::new(),
             rate_limit_per_ip,
             outbound_rr_inflight: HashMap::new(),
+            unattested_consensus_budget: HashMap::new(),
         }
     }
 
@@ -245,7 +279,47 @@ impl PeerManager {
         // from the prior connection — the libp2p substream is
         // gone, so there's nothing to ack the existing slots.
         self.outbound_rr_inflight.remove(peer_id);
+        // TPL-505: drop any unattested-consensus budget so a
+        // re-connecting peer starts with a clean window.
+        self.unattested_consensus_budget.remove(peer_id);
         self.peers.remove(peer_id)
+    }
+
+    /// TPL-505: try to consume one unit of the per-second
+    /// consensus-topic budget for an UNATTESTED peer. Returns
+    /// `true` if the message is admitted (budget available),
+    /// `false` if the per-second cap has been reached. Resets
+    /// the window when the prior window is older than 1 second
+    /// so honest peers post-handshake re-handshake races aren't
+    /// permanently saddled with prior-window state. Should NOT
+    /// be called for attested + authorized committee peers —
+    /// they bypass this gate entirely. Saturating-add on the
+    /// counter so a sustained-overflow attacker can't trigger
+    /// integer wrap.
+    pub fn try_consume_unattested_consensus_budget(&mut self, peer: &PeerId) -> bool {
+        let now = Instant::now();
+        let entry = self
+            .unattested_consensus_budget
+            .entry(*peer)
+            .or_insert((0, now));
+        if entry.1.elapsed().as_secs() >= 1 {
+            *entry = (1, now);
+            return true;
+        }
+        if entry.0 >= MAX_UNATTESTED_CONSENSUS_PER_SEC {
+            return false;
+        }
+        entry.0 = entry.0.saturating_add(1);
+        true
+    }
+
+    /// TPL-505: prune unattested-consensus budget entries whose
+    /// window is more than 60 s stale. Mirrors `prune_rate_limits`
+    /// for the IP rate-limiter; bounds HashMap growth from
+    /// short-lived inbound peers we'll never see again.
+    pub fn prune_unattested_consensus_budget(&mut self) {
+        self.unattested_consensus_budget
+            .retain(|_, (_, window_start)| window_start.elapsed().as_secs() < 60);
     }
 
     /// TPL-504: try to acquire an RR-send slot for a peer. Returns
@@ -739,5 +813,71 @@ mod tests {
             0,
             "remove_peer must drop in-flight counter"
         );
+    }
+
+    // ── TPL-505: unattested consensus-topic budget ─────────────────
+
+    /// `try_consume_unattested_consensus_budget` admits up to
+    /// `MAX_UNATTESTED_CONSENSUS_PER_SEC` messages per peer per
+    /// second, then refuses further admissions in the same
+    /// window without disturbing the budget state.
+    #[test]
+    fn tpl_505_unattested_consensus_budget_caps_per_second() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = PeerId::random();
+
+        for i in 0..MAX_UNATTESTED_CONSENSUS_PER_SEC {
+            assert!(
+                mgr.try_consume_unattested_consensus_budget(&peer),
+                "admission #{i} below per-second cap should succeed"
+            );
+        }
+
+        // Cap reached — further calls in the same window refuse.
+        assert!(!mgr.try_consume_unattested_consensus_budget(&peer));
+        assert!(!mgr.try_consume_unattested_consensus_budget(&peer));
+    }
+
+    /// `remove_peer` clears the budget entry so a reconnecting
+    /// peer starts with a fresh window — without this the
+    /// adversary path "open new TCP connection per second to
+    /// reset state" would already work, but a stuck stale
+    /// entry could lock out a legitimate reconnect.
+    #[test]
+    fn tpl_505_remove_peer_clears_unattested_budget() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer_info = dummy_peer(Direction::Inbound);
+        let id = peer_info.peer_id;
+        assert!(mgr.add_peer(peer_info));
+
+        for _ in 0..MAX_UNATTESTED_CONSENSUS_PER_SEC {
+            assert!(mgr.try_consume_unattested_consensus_budget(&id));
+        }
+        assert!(!mgr.try_consume_unattested_consensus_budget(&id));
+
+        mgr.remove_peer(&id);
+        // Post-disconnect: budget entry gone; a fresh
+        // re-add gets a fresh window.
+        assert!(mgr.try_consume_unattested_consensus_budget(&id));
+    }
+
+    /// `prune_unattested_consensus_budget` only drops entries
+    /// older than 60 s. A fresh entry must survive a prune.
+    #[test]
+    fn tpl_505_prune_unattested_budget_keeps_fresh_entries() {
+        let mut mgr = PeerManager::new(10, 10, 10, 100);
+        let peer = PeerId::random();
+
+        assert!(mgr.try_consume_unattested_consensus_budget(&peer));
+        // Window is fresh (< 60 s) — must survive the prune.
+        mgr.prune_unattested_consensus_budget();
+        // Asserting via behavior: the next admission counts
+        // against the existing window, so we can still
+        // exhaust it `MAX - 1` more times without creating
+        // a new entry.
+        for _ in 1..MAX_UNATTESTED_CONSENSUS_PER_SEC {
+            assert!(mgr.try_consume_unattested_consensus_budget(&peer));
+        }
+        assert!(!mgr.try_consume_unattested_consensus_budget(&peer));
     }
 }

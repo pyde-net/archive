@@ -4921,6 +4921,15 @@ fn handle_swarm_event(
                     // Unattested peers in either slot fall through to
                     // app-layer FALCON sig verification — which catches
                     // forgeries but pays the decode + verify cost.
+                    //
+                    // TPL-505: unattested propagation sources also pass
+                    // through a per-second admission budget so a peer
+                    // that opens a connection just to pump expensive
+                    // consensus messages can't burn unbounded
+                    // FALCON-verify cycles. Attested + authorized
+                    // committee peers bypass the budget; attested +
+                    // non-committee peers are hard-dropped above.
+                    let mut prop_attested_committee = false;
                     if let Some(engine) = validator_engine.as_ref() {
                         // Primary: immediate forwarder.
                         let prop_attested = peer_manager
@@ -4938,6 +4947,7 @@ fn handle_swarm_event(
                             }
                             return PostEventAction::None;
                         }
+                        prop_attested_committee = prop_attested && prop_authorized;
                         // Secondary: originator, when known.
                         if let Some(source) = message.source.as_ref() {
                             let src_attested = peer_manager.peer_falcon_pubkey(source).is_some();
@@ -4954,6 +4964,20 @@ fn handle_swarm_event(
                                 return PostEventAction::None;
                             }
                         }
+                    }
+                    // TPL-505: shed sustained unattested-source traffic
+                    // before the decode + FALCON-verify path. Skip the
+                    // gate entirely for attested + committee peers
+                    // (they're trusted on the channel by definition).
+                    if !prop_attested_committee
+                        && !peer_manager
+                            .try_consume_unattested_consensus_budget(&propagation_source)
+                    {
+                        debug!(
+                            forwarder = %propagation_source,
+                            "dropping consensus gossip from unattested source over per-second budget"
+                        );
+                        return PostEventAction::None;
                     }
                     if let Some(engine) = validator_engine.as_mut() {
                         // Check if it's a finality vote (different wire tag)
