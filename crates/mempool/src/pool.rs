@@ -18,7 +18,7 @@
 //! when mempool connects to full node state.
 
 use crate::encrypted::EncryptedTx;
-use pyde_account::address::Address;
+use pyde_account::address::{derive_eoa_address, Address};
 use pyde_crypto::falcon::{falcon_verify, FalconPublicKey, FalconSignature};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -283,12 +283,30 @@ impl Mempool {
     ///   also fail.
     ///
     /// Applies the same structural + rate-limit checks as `add`.
+    ///
+    /// TPL-407: also asserts `derive_eoa_address(sender_pubkey)
+    /// == tx.sender`. Pre-fix the FALCON sig binding closed
+    /// (sender_pubkey, tx.hash()) but NOT (sender_pubkey,
+    /// tx.sender) — an attacker could submit a tx claiming
+    /// `sender = victim`, signed by their own (attacker) pubkey,
+    /// and the sig still verified because verification only
+    /// requires the supplied pubkey to match the signing key. The
+    /// crafted tx then sat in the mempool charged to the victim's
+    /// nonce/quota slot. The address-binding check below closes
+    /// that gap: if the on-chain address derived from the supplied
+    /// pubkey doesn't match `tx.sender`, reject before either the
+    /// sig verify or any further state mutation.
     pub fn add_with_pubkey(
         &mut self,
         tx: EncryptedTx,
         sender_pubkey: &[u8],
     ) -> Result<(), MempoolError> {
         self.check_sender_rate(&tx.sender)?;
+        // TPL-407: pubkey → sender binding. Cheap (Poseidon2 over
+        // the pubkey bytes) so it goes ahead of the FALCON verify.
+        if derive_eoa_address(sender_pubkey) != tx.sender {
+            return Err(MempoolError::UnknownOrUnverifiedSender);
+        }
         if !Self::verify_signature_with_key(&tx, sender_pubkey) {
             return Err(MempoolError::UnknownOrUnverifiedSender);
         }
@@ -1207,6 +1225,44 @@ mod tests {
             MempoolError::UnknownOrUnverifiedSender,
         );
         let _ = to;
+    }
+
+    /// TPL-407: an attacker submits a tx with `sender = victim`,
+    /// signs it with their own (attacker) key, and supplies their
+    /// own pubkey. Pre-fix the FALCON verify passed (their pk
+    /// signed the hash) and the tx landed in the mempool charged
+    /// to the victim's nonce/quota slot. Post-fix the
+    /// pubkey → sender binding rejects before the sig check
+    /// because `derive_eoa_address(attacker_pk) != victim`.
+    #[test]
+    fn tpl_407_add_with_pubkey_rejects_sender_pubkey_mismatch() {
+        let pk = make_pk();
+        // Build a tx legitimately signed by attacker_sk with
+        // sender = derive_eoa_address(attacker_pk).
+        let (mut tx, attacker_pk_bytes, attacker_sk) = make_falcon_signed_tx(&pk, 50_000, 0);
+
+        // Attack: rewrite the sender field to the victim's
+        // address, then re-sign so the FALCON sig verifies against
+        // the attacker's pubkey under the new tx.hash(). Pre-fix
+        // this is enough to slip into the mempool.
+        let victim = derive_eoa_address(b"victim-target-address");
+        tx.sender = victim;
+        let new_hash = tx.hash();
+        tx.signature = pyde_crypto::falcon::falcon_sign(&attacker_sk, &new_hash)
+            .unwrap()
+            .to_vec();
+
+        // Sanity: the sig DOES verify under the supplied pubkey.
+        // The only thing keeping this tx out is the new
+        // address-binding check.
+        assert!(Mempool::verify_signature_with_key(&tx, &attacker_pk_bytes));
+
+        let mut pool = Mempool::new();
+        let err = pool
+            .add_with_pubkey(tx, &attacker_pk_bytes)
+            .expect_err("pubkey/sender mismatch must reject");
+        assert_eq!(err, MempoolError::UnknownOrUnverifiedSender);
+        assert_eq!(pool.len(), 0);
     }
 
     #[test]
