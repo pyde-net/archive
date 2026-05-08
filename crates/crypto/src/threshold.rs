@@ -1007,24 +1007,84 @@ pub fn apply_refresh_canonical(
     }
 }
 
-/// Verify a refresh contribution by checking that each zero-secret polynomial
-/// evaluates correctly (the shares from this contribution alone reconstruct to zero).
+/// Verify a refresh contribution. Two properties must hold for a
+/// PSS refresh delta to be safe to apply:
+///
+///   1. The first `threshold` deltas reconstruct to ZERO under
+///      Lagrange interpolation. This is what makes the refresh
+///      net-zero on the underlying secret — every validator's
+///      share gains the same polynomial sum, so the secret
+///      itself is unchanged after `apply_refresh`.
+///
+///   2. The remaining deltas (`[threshold..n]`) lie on the SAME
+///      polynomial as the first `threshold`. Pre-fix this
+///      property went unchecked — the verifier only looked at
+///      the first `threshold` shares and trusted that the rest
+///      "must" be consistent. A malicious member could pick a
+///      valid zero-secret polynomial, evaluate at `[1..threshold]`
+///      faithfully (so the zero-reconstruction test passes), and
+///      then substitute random / adversarial values at
+///      `[threshold..n]`. Each higher-indexed validator would
+///      receive a delta that doesn't match the agreed
+///      polynomial, and after `apply_refresh` the high-indexed
+///      shares would silently drift off the underlying secret —
+///      a slow committee-corruption attack that surfaces only
+///      when those validators next try to decrypt.
+///
+/// TPL-302: mirror the `verify_resharing_contribution` pattern at
+/// `:1239-1286` — interpolate, then re-evaluate via Lagrange at
+/// every remaining index and compare against the provided value.
 pub fn verify_refresh_contribution(contribution: &RefreshContribution, threshold: usize) -> bool {
-    // Guard: threshold must not exceed the number of deltas provided
-    if threshold > contribution.deltas.len() {
+    let n = contribution.deltas.len();
+    if threshold == 0 || threshold > n {
         return false;
     }
-    // For each seed element, take `threshold` shares and verify they reconstruct to zero
+    // Each delta row must carry SEED_ELEMENTS field elements;
+    // a malformed contribution that gets past `from_bytes`
+    // (e.g., constructed in-memory by a Byzantine path) would
+    // otherwise panic on the indexing below.
+    for row in &contribution.deltas {
+        if row.len() != SEED_ELEMENTS {
+            return false;
+        }
+    }
+
     for elem_idx in 0..SEED_ELEMENTS {
-        let field_shares: Vec<FieldShare> = (0..threshold)
+        // Property 1: reconstruct the first `threshold` shares
+        // and verify the secret is zero.
+        let interp_shares: Vec<FieldShare> = (0..threshold)
             .map(|v| FieldShare {
                 x: gl((v + 1) as u64),
                 y: contribution.deltas[v][elem_idx],
             })
             .collect();
-        let reconstructed = shamir_reconstruct(&field_shares);
+        let reconstructed = shamir_reconstruct(&interp_shares);
         if reconstructed != Goldilocks::ZERO {
             return false;
+        }
+
+        // Property 2: every remaining delta must lie on the same
+        // polynomial. Lagrange-evaluate at index `check_idx + 1`
+        // and compare against the provided `deltas[check_idx]`.
+        for check_idx in threshold..n {
+            let check_x = gl((check_idx + 1) as u64);
+            let mut y = Goldilocks::ZERO;
+            for i in 0..threshold {
+                let x_i = interp_shares[i].x;
+                let mut basis = Goldilocks::ONE;
+                for j in 0..threshold {
+                    if i != j {
+                        let x_j = interp_shares[j].x;
+                        let num = check_x - x_j;
+                        let den = x_i - x_j;
+                        basis *= num * gl_inv(den);
+                    }
+                }
+                y += interp_shares[i].y * basis;
+            }
+            if y != contribution.deltas[check_idx][elem_idx] {
+                return false;
+            }
         }
     }
     true
@@ -2718,5 +2778,90 @@ mod tests {
             let recovered = combine_shares(&dec_shares, 3, &ct).expect("combine");
             assert_eq!(recovered, b"tpl-307 round-trip");
         }
+    }
+
+    // ========== TPL-302: verify_refresh_contribution catches off-poly deltas ==========
+
+    /// TPL-302: positive control — an honest refresh contribution
+    /// passes the new threshold-many verification.
+    #[test]
+    fn tpl_302_verify_refresh_contribution_accepts_honest() {
+        let contrib = generate_refresh_contribution(1, 5, 3, 0, b"tpl-302 honest");
+        assert!(verify_refresh_contribution(&contrib, 3));
+    }
+
+    /// TPL-302: a Byzantine member who produces a valid
+    /// zero-secret polynomial of degree `threshold - 1` for the
+    /// FIRST `threshold` deltas but substitutes adversarial
+    /// values at indices `[threshold..n]` would have passed the
+    /// pre-fix verifier (which only checked that the first
+    /// `threshold` reconstruct to zero). The mirror of
+    /// `verify_resharing_contribution` re-evaluates the
+    /// polynomial at every higher index and compares against the
+    /// provided value — the tampered deltas now fail.
+    #[test]
+    fn tpl_302_verify_refresh_contribution_rejects_off_polynomial_deltas() {
+        // Honest contribution at n=5, threshold=3: deltas[0..5]
+        // all lie on a single zero-secret polynomial of degree 2.
+        let mut contrib = generate_refresh_contribution(1, 5, 3, 0, b"tpl-302 byzantine");
+
+        // Byzantine tamper: keep deltas[0..3] (the threshold
+        // subset) honest so the zero-reconstruction check still
+        // passes; replace deltas[3] with adversarial values that
+        // do NOT lie on the polynomial. Replace EVERY seed
+        // element so we don't accidentally happen to land on a
+        // valid evaluation by chance.
+        let original_seed_0 = contrib.deltas[3][0];
+        for elem in &mut contrib.deltas[3] {
+            *elem += gl(1); // shift each seed element by 1
+        }
+        // Sanity: we did mutate.
+        assert_ne!(contrib.deltas[3][0], original_seed_0);
+
+        // Pre-fix this would have returned `true` because the
+        // first `threshold` deltas still reconstruct to zero.
+        assert!(
+            !verify_refresh_contribution(&contrib, 3),
+            "off-polynomial delta at index 3 must fail TPL-302 verification"
+        );
+    }
+
+    /// TPL-302: tampering with the LAST delta (index n-1) is the
+    /// adversary's most attractive position because that
+    /// validator's share gets corrupted but the corruption only
+    /// surfaces when they next try to decrypt. Confirm the
+    /// re-evaluation catches this index too.
+    #[test]
+    fn tpl_302_verify_refresh_contribution_rejects_tampered_last_delta() {
+        let mut contrib = generate_refresh_contribution(1, 5, 3, 0, b"tpl-302 last-delta");
+        // n = 5, last index is 4 (well past threshold = 3).
+        for elem in &mut contrib.deltas[4] {
+            *elem += gl(0xDEAD_BEEF);
+        }
+        assert!(!verify_refresh_contribution(&contrib, 3));
+    }
+
+    /// TPL-302: tampering with a delta INSIDE the threshold
+    /// subset breaks the zero-reconstruction property — the
+    /// pre-fix verifier already caught this case. Pin it as a
+    /// regression so the consolidated walker doesn't lose the
+    /// behaviour.
+    #[test]
+    fn tpl_302_verify_refresh_contribution_rejects_nonzero_secret() {
+        let mut contrib = generate_refresh_contribution(1, 5, 3, 0, b"tpl-302 nonzero");
+        // Tamper inside the threshold subset (index 1).
+        contrib.deltas[1][0] += gl(7);
+        assert!(!verify_refresh_contribution(&contrib, 3));
+    }
+
+    /// TPL-302: degenerate inputs return false rather than
+    /// indexing out of bounds.
+    #[test]
+    fn tpl_302_verify_refresh_contribution_rejects_degenerate_inputs() {
+        let contrib = generate_refresh_contribution(1, 5, 3, 0, b"tpl-302 degen");
+        // threshold == 0 must reject.
+        assert!(!verify_refresh_contribution(&contrib, 0));
+        // threshold > n must reject.
+        assert!(!verify_refresh_contribution(&contrib, 6));
     }
 }
