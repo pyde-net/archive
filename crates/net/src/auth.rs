@@ -129,6 +129,15 @@ pub enum AuthOutcome {
     /// Peer previously attested a DIFFERENT pubkey on the same connection.
     /// Treated as a protocol violation; the caller should disconnect.
     RebindRejected,
+    /// TPL-510: the peer's PeerId has an operator-pinned FALCON
+    /// pubkey in `Discovery::pinned_falcon_pubkey`, but the
+    /// attested pubkey doesn't match. Either the pin is wrong,
+    /// the pinned peer rotated keys without operator coordination,
+    /// or the peer at this `(IP, port, libp2p-noise-id)` tuple is
+    /// an impostor that doesn't hold the expected FALCON sk.
+    /// Caller should hard-disconnect — the safety property of
+    /// pinning is "no acceptance under wrong identity."
+    PinnedPubkeyMismatch,
     /// Pubkey recorded in the peer manager and matched an entry in
     /// `committee_keys` — peer was promoted to `PeerRole::Validator`.
     StoredAsValidator,
@@ -148,12 +157,22 @@ pub enum AuthOutcome {
 /// Committee membership is resolved by byte-level equality with
 /// `committee_keys`, matching the rule used by
 /// `PeerManager::is_consensus_authorized`.
+///
+/// TPL-510: `pinned_falcon_pubkey` is the operator-supplied
+/// FALCON pubkey pin for this peer (resolved via
+/// `Discovery::pinned_falcon_pubkey` at the call site). When
+/// supplied, the attested pubkey MUST byte-match — a mismatch
+/// returns `AuthOutcome::PinnedPubkeyMismatch` and the caller
+/// hard-disconnects. `None` preserves the prior "trust whatever
+/// the peer attests" behavior for peers without a configured
+/// pin.
 pub fn apply_auth_response(
     peer: PeerId,
     response: &PydeAuthResp,
     pending_auth_nonces: &mut HashMap<PeerId, [u8; 32]>,
     peer_manager: &mut PeerManager,
     committee_keys: &[Vec<u8>],
+    pinned_falcon_pubkey: Option<&[u8]>,
 ) -> AuthOutcome {
     let nonce = match pending_auth_nonces.remove(&peer) {
         Some(n) => n,
@@ -170,6 +189,17 @@ pub fn apply_auth_response(
         Some(pk) => pk,
         None => return AuthOutcome::VerifyFailed,
     };
+
+    // TPL-510: bootstrap pubkey pinning. Check BEFORE
+    // recording the pubkey on `peer_manager` so a mismatch
+    // doesn't pollute the manager's state with a key that the
+    // caller will then have to disconnect. Byte-equality match
+    // mirrors `is_consensus_authorized`'s comparison rule.
+    if let Some(expected_pk) = pinned_falcon_pubkey {
+        if expected_pk != pk_bytes.as_slice() {
+            return AuthOutcome::PinnedPubkeyMismatch;
+        }
+    }
 
     if !peer_manager.set_falcon_pubkey(&peer, pk_bytes.clone()) {
         return AuthOutcome::RebindRejected;
@@ -323,7 +353,7 @@ mod tests {
         let (resp, pk_bytes, _sk) = build_real_attestation(nonce);
         let committee = vec![pk_bytes.clone()];
 
-        let outcome = apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &committee);
+        let outcome = apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &committee, None);
         assert_eq!(outcome, AuthOutcome::StoredAsValidator);
         assert_eq!(mgr.peer_falcon_pubkey(&peer), Some(pk_bytes.as_slice()));
         assert_eq!(
@@ -346,7 +376,7 @@ mod tests {
         // Empty committee — peer is attested but not in consensus.
         let committee: Vec<Vec<u8>> = vec![];
 
-        let outcome = apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &committee);
+        let outcome = apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &committee, None);
         assert_eq!(outcome, AuthOutcome::StoredAsNonValidator);
         assert_eq!(mgr.peer_falcon_pubkey(&peer), Some(pk_bytes.as_slice()));
         assert_eq!(
@@ -364,7 +394,7 @@ mod tests {
         let mut nonces = HashMap::new(); // nothing for this peer
 
         let (resp, _, _) = build_real_attestation([0x01; 32]);
-        let outcome = apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &[]);
+        let outcome = apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &[], None);
         assert_eq!(outcome, AuthOutcome::NoPendingNonce);
         assert!(mgr.peer_falcon_pubkey(&peer).is_none());
     }
@@ -380,7 +410,7 @@ mod tests {
         nonces.insert(peer, nonce_we_sent);
 
         let (resp_other_nonce, _, _) = build_real_attestation([0x22; 32]);
-        let outcome = apply_auth_response(peer, &resp_other_nonce, &mut nonces, &mut mgr, &[]);
+        let outcome = apply_auth_response(peer, &resp_other_nonce, &mut nonces, &mut mgr, &[], None);
         assert_eq!(outcome, AuthOutcome::VerifyFailed);
         assert!(mgr.peer_falcon_pubkey(&peer).is_none());
         // Nonce still consumed so the peer can't keep retrying the same slot.
@@ -398,7 +428,7 @@ mod tests {
         nonces.insert(peer, nonce_a);
         let (resp_a, _pk_a, _) = build_real_attestation(nonce_a);
         assert_eq!(
-            apply_auth_response(peer, &resp_a, &mut nonces, &mut mgr, &[]),
+            apply_auth_response(peer, &resp_a, &mut nonces, &mut mgr, &[], None),
             AuthOutcome::StoredAsNonValidator
         );
 
@@ -406,7 +436,7 @@ mod tests {
         let nonce_b = generate_nonce();
         nonces.insert(peer, nonce_b);
         let (resp_b, _pk_b, _) = build_real_attestation(nonce_b);
-        let outcome = apply_auth_response(peer, &resp_b, &mut nonces, &mut mgr, &[]);
+        let outcome = apply_auth_response(peer, &resp_b, &mut nonces, &mut mgr, &[], None);
         assert_eq!(outcome, AuthOutcome::RebindRejected);
     }
 
@@ -426,7 +456,7 @@ mod tests {
         let eoa = pyde_account::address::derive_eoa_address(&pk_bytes);
         let resp_a = build_auth_resp(&PydeAuthReq { nonce: nonce_a }, &eoa, &sk, &pk).unwrap();
         assert_eq!(
-            apply_auth_response(peer, &resp_a, &mut nonces, &mut mgr, &[]),
+            apply_auth_response(peer, &resp_a, &mut nonces, &mut mgr, &[], None),
             AuthOutcome::StoredAsNonValidator
         );
 
@@ -435,8 +465,86 @@ mod tests {
         nonces.insert(peer, nonce_b);
         let resp_b = build_auth_resp(&PydeAuthReq { nonce: nonce_b }, &eoa, &sk, &pk).unwrap();
         assert_eq!(
-            apply_auth_response(peer, &resp_b, &mut nonces, &mut mgr, &[]),
+            apply_auth_response(peer, &resp_b, &mut nonces, &mut mgr, &[], None),
             AuthOutcome::StoredAsNonValidator
         );
+    }
+
+    // ========== TPL-510: bootstrap FALCON pubkey pinning ==========
+
+    /// `apply_auth_response` accepts an attested pubkey when
+    /// the operator's pin matches it byte-for-byte.
+    #[test]
+    fn tpl_510_apply_auth_response_accepts_matching_pin() {
+        let peer = PeerId::random();
+        let mut mgr = fresh_manager_with_peer(peer);
+        let mut nonces = HashMap::new();
+        let nonce = generate_nonce();
+        nonces.insert(peer, nonce);
+
+        let (resp, pk_bytes, _sk) = build_real_attestation(nonce);
+
+        // Pin is exactly the pubkey the peer is about to attest.
+        let outcome =
+            apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &[], Some(&pk_bytes));
+        assert_eq!(outcome, AuthOutcome::StoredAsNonValidator);
+        assert_eq!(mgr.peer_falcon_pubkey(&peer), Some(pk_bytes.as_slice()));
+    }
+
+    /// `apply_auth_response` rejects an attested pubkey when
+    /// the operator's pin DOES NOT match. The peer manager is
+    /// NOT mutated — pre-fix the pubkey check happened before
+    /// the pin check, leaving a polluted manager state on a
+    /// mismatch.
+    #[test]
+    fn tpl_510_apply_auth_response_rejects_mismatched_pin() {
+        let peer = PeerId::random();
+        let mut mgr = fresh_manager_with_peer(peer);
+        let mut nonces = HashMap::new();
+        let nonce = generate_nonce();
+        nonces.insert(peer, nonce);
+
+        let (resp, _pk_bytes, _sk) = build_real_attestation(nonce);
+
+        // Pin a DIFFERENT pubkey than what the peer will attest.
+        let (other_pk, _) = falcon_keygen().unwrap();
+        let other_pk_bytes = other_pk.as_bytes().to_vec();
+        let outcome = apply_auth_response(
+            peer,
+            &resp,
+            &mut nonces,
+            &mut mgr,
+            &[],
+            Some(&other_pk_bytes),
+        );
+        assert_eq!(outcome, AuthOutcome::PinnedPubkeyMismatch);
+        assert!(
+            mgr.peer_falcon_pubkey(&peer).is_none(),
+            "pin mismatch must NOT leave the rejected pubkey on peer_manager"
+        );
+        // Nonce IS still consumed — the response was a valid
+        // FALCON sig, just not for the pinned identity. No
+        // replay-via-stuck-nonce attack.
+        assert!(!nonces.contains_key(&peer));
+    }
+
+    /// `apply_auth_response` with `None` pin preserves the
+    /// pre-TPL-510 behavior — accept any valid attestation.
+    /// This is the path for unpinned peers and for operators
+    /// who haven't configured pinning at all.
+    #[test]
+    fn tpl_510_apply_auth_response_no_pin_preserves_prior_behavior() {
+        let peer = PeerId::random();
+        let mut mgr = fresh_manager_with_peer(peer);
+        let mut nonces = HashMap::new();
+        let nonce = generate_nonce();
+        nonces.insert(peer, nonce);
+
+        let (resp, pk_bytes, _sk) = build_real_attestation(nonce);
+
+        // No pin — accept whatever the peer attests.
+        let outcome = apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &[], None);
+        assert_eq!(outcome, AuthOutcome::StoredAsNonValidator);
+        assert_eq!(mgr.peer_falcon_pubkey(&peer), Some(pk_bytes.as_slice()));
     }
 }

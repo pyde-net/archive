@@ -99,6 +99,18 @@ pub struct Discovery {
     banned: HashMap<PeerId, BanEntry>,
     /// Ban duration in seconds.
     ban_duration: u64,
+    /// TPL-510: operator-supplied FALCON pubkey pins for
+    /// specific peer ids (typically bootstrap peers and
+    /// other known infrastructure). When the auth handshake
+    /// completes, the attested FALCON pubkey is compared to
+    /// the pinned value; a mismatch is a hard-disconnect
+    /// signal. Pre-fix bootstrap entries were trusted by
+    /// multiaddr alone — anyone able to reach the operator's
+    /// claimed (IP, port, libp2p-noise-PeerId) tuple was
+    /// accepted as the bootstrap, with no ability for the
+    /// operator to additionally pin the FALCON identity that
+    /// signs blocks/votes.
+    pinned_falcon_pubkeys: HashMap<PeerId, Vec<u8>>,
 }
 
 impl Discovery {
@@ -108,6 +120,7 @@ impl Discovery {
             known_peers: HashMap::new(),
             banned: HashMap::new(),
             ban_duration: DEFAULT_BAN_DURATION_SECS,
+            pinned_falcon_pubkeys: HashMap::new(),
         }
     }
 
@@ -126,6 +139,35 @@ impl Discovery {
     /// Get bootstrap peers for initial connection.
     pub fn bootstrap_peers(&self) -> &[(PeerId, Multiaddr)] {
         &self.bootstrap_peers
+    }
+
+    /// TPL-510: register an operator-supplied FALCON pubkey
+    /// pin for a specific peer id. The auth handshake's
+    /// `apply_auth_response` rejects any attested pubkey that
+    /// doesn't byte-match the pin. Idempotent on repeat
+    /// registration of the same `(peer, pubkey)`; later calls
+    /// with a different pubkey OVERWRITE the prior pin (the
+    /// operator changed their mind in config and we trust the
+    /// most recent value).
+    pub fn add_falcon_pubkey_pin(&mut self, peer_id: PeerId, falcon_pubkey: Vec<u8>) {
+        self.pinned_falcon_pubkeys.insert(peer_id, falcon_pubkey);
+    }
+
+    /// TPL-510: look up the operator's FALCON pubkey pin for a
+    /// peer. Returns `None` if no pin is registered for that
+    /// peer id (the handshake then accepts whatever pubkey the
+    /// peer attests, same pre-fix behavior). Returns
+    /// `Some(&[u8])` to enforce a byte-equality match against
+    /// the attested pubkey.
+    pub fn pinned_falcon_pubkey(&self, peer_id: &PeerId) -> Option<&[u8]> {
+        self.pinned_falcon_pubkeys
+            .get(peer_id)
+            .map(|v| v.as_slice())
+    }
+
+    /// TPL-510: count of registered pins (for telemetry / startup logs).
+    pub fn pinned_pubkey_count(&self) -> usize {
+        self.pinned_falcon_pubkeys.len()
     }
 
     /// Record a discovered peer from DHT or gossip.
@@ -392,5 +434,36 @@ mod tests {
         let mut disco = Discovery::new();
         disco.add_bootstrap_peers(&["not_a_valid_addr".to_string()]);
         assert_eq!(disco.bootstrap_peers().len(), 0);
+    }
+
+    // ========== TPL-510: bootstrap FALCON pubkey pinning ==========
+
+    #[test]
+    fn tpl_510_pinned_falcon_pubkey_round_trips() {
+        let mut disco = Discovery::new();
+        let peer = random_peer();
+        let pk = vec![0xAB; 897];
+        disco.add_falcon_pubkey_pin(peer, pk.clone());
+
+        assert_eq!(disco.pinned_falcon_pubkey(&peer), Some(pk.as_slice()));
+        assert_eq!(disco.pinned_pubkey_count(), 1);
+    }
+
+    #[test]
+    fn tpl_510_pinned_falcon_pubkey_returns_none_for_unpinned() {
+        let disco = Discovery::new();
+        let peer = random_peer();
+        assert_eq!(disco.pinned_falcon_pubkey(&peer), None);
+        assert_eq!(disco.pinned_pubkey_count(), 0);
+    }
+
+    #[test]
+    fn tpl_510_repeated_pin_overwrites_prior_value() {
+        let mut disco = Discovery::new();
+        let peer = random_peer();
+        disco.add_falcon_pubkey_pin(peer, vec![0xAA; 897]);
+        disco.add_falcon_pubkey_pin(peer, vec![0xBB; 897]);
+        assert_eq!(disco.pinned_falcon_pubkey(&peer), Some(vec![0xBB; 897].as_slice()));
+        assert_eq!(disco.pinned_pubkey_count(), 1);
     }
 }

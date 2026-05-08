@@ -407,6 +407,53 @@ impl PydeNode {
         let mut pending_auth_nonces: std::collections::HashMap<libp2p::PeerId, [u8; 32]> =
             std::collections::HashMap::new();
 
+        // TPL-510: parse operator-supplied FALCON pubkey pins
+        // from `[network].bootstrap_pubkey_pins`. Map of
+        // base58 PeerId → hex FALCON pubkey, decoded once at
+        // startup into `HashMap<PeerId, Vec<u8>>` for the
+        // auth-handshake check. Invalid entries (unparseable
+        // PeerId or hex) are logged and skipped — better to
+        // start with fewer pins than refuse to start at all,
+        // since pinning is opt-in defense-in-depth on top of
+        // the existing PeerId+multiaddr check. An empty map
+        // preserves prior "trust whatever the peer attests"
+        // behavior.
+        let bootstrap_pubkey_pins: std::collections::HashMap<libp2p::PeerId, Vec<u8>> = {
+            let mut out = std::collections::HashMap::new();
+            for (peer_id_b58, pk_hex) in &self.config.network.bootstrap_pubkey_pins {
+                let peer_id = match peer_id_b58.parse::<libp2p::PeerId>() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(
+                            peer_id = peer_id_b58,
+                            error = %e,
+                            "skipping bootstrap_pubkey_pin: invalid PeerId"
+                        );
+                        continue;
+                    }
+                };
+                let pk_bytes = match hex::decode(pk_hex) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(
+                            peer_id = peer_id_b58,
+                            error = %e,
+                            "skipping bootstrap_pubkey_pin: invalid hex"
+                        );
+                        continue;
+                    }
+                };
+                out.insert(peer_id, pk_bytes);
+            }
+            if !out.is_empty() {
+                info!(
+                    n_pins = out.len(),
+                    "loaded operator-supplied FALCON pubkey pins"
+                );
+            }
+            out
+        };
+
         // Audit 234 follow-up: persistent peer book. Loaded at
         // startup (used to seed the dial list below); populated
         // on every `ConnectionEstablished`; persisted on a 30 s
@@ -1000,6 +1047,7 @@ impl PydeNode {
                             &mut pinned_snapshot,
                             &mut peer_manager,
                             &mut pending_auth_nonces,
+                            &bootstrap_pubkey_pins,
                             last_outgoing_committee_size,
                             &committee_keys_for_validation,
                             &epoch_randomness_for_validation,
@@ -4630,6 +4678,7 @@ fn handle_swarm_event(
     pinned_snapshot: &mut Option<crate::sync::PinnedSnapshot>,
     peer_manager: &mut pyde_net::peer::PeerManager,
     pending_auth_nonces: &mut std::collections::HashMap<PeerId, [u8; 32]>,
+    bootstrap_pubkey_pins: &std::collections::HashMap<PeerId, Vec<u8>>,
     last_outgoing_committee_size: usize,
     // Audit 341: full-node validation fallback. Validators
     // override these via their engine; non-validator full nodes
@@ -5561,12 +5610,22 @@ fn handle_swarm_event(
                 .as_ref()
                 .map(|e| e.committee_keys.clone())
                 .unwrap_or_default();
+            // TPL-510: look up an operator-supplied FALCON pubkey
+            // pin for this peer. `Some(&[u8])` enforces a byte-
+            // equality match against the attested pubkey;
+            // `None` (peer not in the pin map) preserves the
+            // prior "trust whatever the peer attests" behavior
+            // for unpinned peers.
+            let pinned_pubkey = bootstrap_pubkey_pins
+                .get(&peer)
+                .map(|pk| pk.as_slice());
             let outcome = pyde_net::auth::apply_auth_response(
                 peer,
                 &response,
                 pending_auth_nonces,
                 peer_manager,
                 &committee_keys,
+                pinned_pubkey,
             );
             use pyde_net::auth::AuthOutcome;
             match outcome {
@@ -5590,6 +5649,16 @@ fn handle_swarm_event(
                 }
                 AuthOutcome::RebindRejected => {
                     warn!(%peer, "peer attempted to rebind FALCON pubkey — ignoring");
+                }
+                AuthOutcome::PinnedPubkeyMismatch => {
+                    // TPL-510: the peer's PeerId has an
+                    // operator-supplied pin and the attested
+                    // FALCON pubkey doesn't byte-match. Disconnect
+                    // — better a missed connection than a peer
+                    // forwarding consensus messages under the
+                    // wrong identity.
+                    warn!(%peer, "TPL-510: bootstrap pubkey pin mismatch — disconnecting");
+                    return PostEventAction::DisconnectStalePeer(peer);
                 }
             }
             PostEventAction::None

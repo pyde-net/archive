@@ -61,6 +61,22 @@ pub struct NetworkSection {
     pub rate_limit_per_ip: u32,
     /// Bootstrap peer multiaddrs.
     pub bootstrap_peers: Vec<String>,
+    /// TPL-510: operator-supplied FALCON pubkey pins for
+    /// specific peer ids. Map of `peer_id_base58` →
+    /// `falcon_pubkey_hex`. When the auth handshake completes
+    /// for a peer in this map, the attested FALCON pubkey
+    /// MUST byte-match the configured value or the connection
+    /// is dropped — pre-fix bootstrap entries were trusted by
+    /// multiaddr alone, so anyone reaching the configured
+    /// `(IP, port, libp2p-noise-id)` tuple was accepted as
+    /// the bootstrap with no operator-visible binding to the
+    /// validator FALCON identity that signs blocks/votes.
+    /// Empty for devnet and for testnets where pinning isn't
+    /// configured; non-empty entries are loaded into a
+    /// `HashMap<PeerId, Vec<u8>>` at startup and passed
+    /// through `handle_swarm_event` to `apply_auth_response`.
+    #[serde(default)]
+    pub bootstrap_pubkey_pins: std::collections::HashMap<String, String>,
 }
 
 impl Default for NetworkSection {
@@ -72,6 +88,7 @@ impl Default for NetworkSection {
             max_outbound: 20,
             rate_limit_per_ip: 5,
             bootstrap_peers: Vec::new(),
+            bootstrap_pubkey_pins: std::collections::HashMap::new(),
         }
     }
 }
