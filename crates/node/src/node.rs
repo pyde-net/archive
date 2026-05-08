@@ -1898,8 +1898,34 @@ impl PydeNode {
                             // All txs found — separate into plaintext and encrypted
                             let mut transactions = Vec::new();
                             let mut encrypted_txs = Vec::new();
+                            // TPL-403: don't `unwrap` peer-supplied
+                            // matched slots. `cb.reconstruct` invariant
+                            // says every `None` index also lands in
+                            // `missing`, so the empty-missing check
+                            // above SHOULD imply every entry is `Some`.
+                            // A peer that crafts a compact block which
+                            // breaks that invariant (or any future
+                            // change in `reconstruct` that decouples
+                            // the two vectors) would otherwise crash
+                            // the validator under `panic = "abort"`.
+                            // Treat a stray `None` like a missing-tx
+                            // signal: warn, request the full block via
+                            // sync, and skip this receive.
+                            let mut had_unexpected_none = false;
                             for (i, tx_bytes_opt) in matched.iter().enumerate() {
-                                let tx_bytes = tx_bytes_opt.as_ref().unwrap();
+                                let tx_bytes = match tx_bytes_opt.as_ref() {
+                                    Some(b) => b,
+                                    None => {
+                                        warn!(
+                                            slot,
+                                            tx_idx = i,
+                                            "compact-block reconstructed entry is None despite empty `missing` — \
+                                             refusing this block path and triggering full-block sync"
+                                        );
+                                        had_unexpected_none = true;
+                                        break;
+                                    }
+                                };
                                 // Try plaintext first, then encrypted
                                 if let Ok(tx) = wire::decode_transaction(tx_bytes) {
                                     transactions.push(tx);
@@ -1908,6 +1934,11 @@ impl PydeNode {
                                 } else {
                                     warn!(slot, tx_idx = i, "failed to decode reconstructed tx");
                                 }
+                            }
+                            if had_unexpected_none {
+                                chain_sync.manager.update_network_tip(slot);
+                                chain_sync.request_next_batch(&mut swarm);
+                                continue;
                             }
 
                             let tx_count = transactions.len();
