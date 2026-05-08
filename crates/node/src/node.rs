@@ -747,6 +747,10 @@ impl PydeNode {
                 dev_mode: self.config.node.dev_mode,
                 tx_gossip_tx: tx_gossip_tx.clone(),
                 encrypted_tx_gossip_tx: encrypted_tx_gossip_tx.clone(),
+                // TPL-404: bound concurrent simulator-backed RPCs.
+                call_concurrency: Arc::new(tokio::sync::Semaphore::new(
+                    rpc::CALL_CONCURRENCY_LIMIT,
+                )),
             });
             match rpc::start_rpc_server(
                 &self.config.rpc.listen,
