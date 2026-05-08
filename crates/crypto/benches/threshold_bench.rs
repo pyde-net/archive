@@ -101,12 +101,24 @@ fn bench_pss_refresh() {
             tpk,
         };
 
+        // TPL-303: each refresh contribution is signed, so the
+        // bench needs a committee FALCON sk per share.
+        let mut falcon_sks = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (_pk, sk) = falcon_keygen().unwrap();
+            falcon_sks.push(sk);
+        }
+
         let iterations = if n <= 10 { 100 } else { 5 };
         let start = Instant::now();
         for i in 0..iterations {
             let mut current_mat = epoch_mat.clone();
             current_mat.epoch = i as u64;
-            std::hint::black_box(pss_refresh(&current_mat, std::hint::black_box(&shares)));
+            std::hint::black_box(pss_refresh(
+                &current_mat,
+                std::hint::black_box(&shares),
+                &falcon_sks,
+            ));
         }
         let elapsed = start.elapsed();
         println!(

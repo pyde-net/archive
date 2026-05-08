@@ -800,8 +800,23 @@ impl ValidatorEngine {
         private_entropy.extend_from_slice(&self.epoch_randomness);
         let entropy = pyde_crypto::poseidon2::poseidon2_hash(&private_entropy);
 
-        let contribution =
-            generate_refresh_contribution(key_share.index, n, threshold, epoch, entropy.as_bytes());
+        // TPL-303: sign the contribution with the validator's
+        // consensus FALCON sk so peers can authenticate the
+        // claimed `from_index` and reject cross-epoch replays.
+        let contribution = match generate_refresh_contribution(
+            key_share.index,
+            n,
+            threshold,
+            epoch,
+            entropy.as_bytes(),
+            &identity.secret_key,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(epoch, error = %e, "PSS refresh sig generation failed");
+                return None;
+            }
+        };
 
         self.pss_contributions = vec![contribution.clone()];
         self.pss_target_epoch = epoch;
@@ -869,8 +884,43 @@ impl ValidatorEngine {
             return false;
         }
 
-        // Verify the contribution (zero-secret reconstruction check)
-        if !verify_refresh_contribution(&contribution, threshold) {
+        // TPL-303: resolve the claimed issuer's FALCON pk from the
+        // committee table. `from_index` is 1-based, so subtract 1
+        // before indexing. An out-of-range `from_index` is rejected
+        // here without spending a Lagrange/structural verify cycle.
+        let from_idx0 = match contribution.from_index.checked_sub(1) {
+            Some(i) if i < self.committee_keys.len() => i,
+            _ => {
+                warn!(
+                    from = contribution.from_index,
+                    "PSS contribution from_index out of committee range"
+                );
+                return false;
+            }
+        };
+        let issuer_pk =
+            match pyde_crypto::falcon::FalconPublicKey::from_bytes(&self.committee_keys[from_idx0])
+            {
+                Some(pk) => pk,
+                None => {
+                    warn!(
+                        from = contribution.from_index,
+                        "committee FALCON pk decode failed for PSS contribution"
+                    );
+                    return false;
+                }
+            };
+
+        // Verify the contribution: TPL-303 epoch + sig, plus the
+        // existing structural zero-secret + polynomial-consistency
+        // checks. `pss_target_epoch` is set by `start_pss_refresh`
+        // and matches the epoch every honest contribution claims.
+        if !verify_refresh_contribution(
+            &contribution,
+            threshold,
+            self.pss_target_epoch,
+            &issuer_pk,
+        ) {
             warn!(
                 from = contribution.from_index,
                 "invalid PSS refresh contribution"
