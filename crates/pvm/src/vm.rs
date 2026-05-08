@@ -2109,8 +2109,26 @@ impl Vm {
             if self.gas_limit > 0 && self.gas_used_total > self.gas_limit {
                 return Err(Trap::OutOfGas);
             }
-            if output.outcome != Outcome::Success {
-                return Err(Trap::MemoryFault); // constructor failed
+            // TPL-506: distinguish OOG from a constructor revert
+            // when bubbling. Pre-fix every non-Success outcome
+            // collapsed to `Trap::MemoryFault`, which the
+            // `Opcode::Create` caller catches in its `Err(_)` arm
+            // and writes a zero address to the parent register.
+            // That's the right behavior for a constructor REVERT
+            // (mirrors Ethereum: caller branches on zero), but
+            // the wrong behavior for OUT-OF-GAS — the caller's
+            // explicit `Err(Trap::OutOfGas) => return ...` arm at
+            // the Create dispatch site only fires when the inner
+            // trap actually IS OutOfGas, so a child OOG was
+            // silently swallowed pre-fix. Now: OutOfGas + child
+            // traps bubble through with their original variant;
+            // Revert maps to MemoryFault so the legacy
+            // address-zero behavior is preserved.
+            match output.outcome {
+                Outcome::Success => {}
+                Outcome::OutOfGas => return Err(Trap::OutOfGas),
+                Outcome::Trap(t) => return Err(t),
+                Outcome::Revert => return Err(Trap::MemoryFault),
             }
             // Merge constructor's storage writes (audit 309:
             // journal each key BEFORE the insert so a later
@@ -4487,6 +4505,161 @@ mod tests {
         // Contract should be registered
         assert!(vm.contracts.contains_key(&new_addr));
         assert_eq!(vm.contracts[&new_addr], init_code);
+    }
+
+    // ========== TPL-506: constructor OOG bubbles, doesn't collapse to MemoryFault ==========
+
+    /// Pre-fix `do_create` translated EVERY non-Success child
+    /// outcome to `Trap::MemoryFault`, and the `Opcode::Create`
+    /// dispatcher's `Err(_)` arm wrote a zero address and let
+    /// the parent CONTINUE executing. So a constructor that
+    /// ran out of gas was indistinguishable from a constructor
+    /// that reverted: both surfaced as parent.success +
+    /// address=0. That broke tx-level gas accounting (parent
+    /// kept burning gas after the child's OOG, so a
+    /// pathological constructor could be used as a cheap
+    /// gas-burner from inside another contract).
+    ///
+    /// Post-fix: child OOG bubbles as `Trap::OutOfGas` through
+    /// `do_create`, hits the `Opcode::Create` dispatcher's
+    /// `Err(Trap::OutOfGas) => return Err(Trap::OutOfGas)` arm,
+    /// and the parent's outcome is `OutOfGas`. Revert is
+    /// preserved as the legacy address-zero behavior so
+    /// existing contracts that branch on a zero CREATE result
+    /// keep working.
+    #[test]
+    fn tpl_506_constructor_oog_bubbles_as_outofgas_not_memoryfault() {
+        let heap = crate::memory::HEAP_START;
+
+        // Constructor: 1000 cheap ops at 1 gas each = 1000 gas
+        // total. With the parent budget below the child gets
+        // ~493 forwarded gas, so the constructor OOGs partway
+        // through — deterministic and independent of any opcode
+        // table tweaks.
+        let mut constructor: Vec<u8> = (0..1000)
+            .flat_map(|_| instr_ri(Opcode::Addi, 1, 0, 1))
+            .collect();
+        constructor.extend_from_slice(&instr_bytes(Opcode::Halt, 0, 0, 0));
+
+        // Runtime: just halt. We never get here in this test
+        // (the constructor OOGs first), but the deploy frame
+        // requires `rlen > 0` to be parsed as having a
+        // constructor block at all.
+        let runtime: Vec<u8> = instr_bytes(Opcode::Halt, 0, 0, 0).to_vec();
+
+        // Deploy frame: [clen:4 LE][rlen:4 LE][constructor][runtime]
+        let mut init_code: Vec<u8> = Vec::with_capacity(8 + constructor.len() + runtime.len());
+        init_code.extend_from_slice(&(constructor.len() as u32).to_le_bytes());
+        init_code.extend_from_slice(&(runtime.len() as u32).to_le_bytes());
+        init_code.extend_from_slice(&constructor);
+        init_code.extend_from_slice(&runtime);
+
+        let ctx = ExecutionContext {
+            self_address: addr(0x9999),
+            ..Default::default()
+        };
+        // Parent budget chosen so:
+        //   - Create base (32_000) leaves available ≈ 500
+        //   - max_forward = 500 - 7 = 493 < constructor cost (1000)
+        //   - After child charge (~493), parent has ~7 gas
+        //     remaining — pre-fix that's enough for the
+        //     Addi+Halt below to land, so a non-OOG outcome
+        //     would prove the bug. Post-fix the parent traps
+        //     OOG before reaching them.
+        let mut vm = Vm::with_gas_limit_and_context(32_500, ctx);
+
+        for (i, &b) in init_code.iter().enumerate() {
+            vm.memory.store8(heap + i as u32, b).unwrap();
+        }
+        vm.cpu.write_gp(2, heap as u64);
+        vm.cpu.write_gp(3, init_code.len() as u64);
+
+        // After CREATE, write 99 to GP register 4 if execution
+        // continues. Pre-fix this lands; post-fix it doesn't.
+        let code = bytecode(&[
+            instr_bytes(Opcode::Create, 1, 2, 0x03),
+            instr_ri(Opcode::Addi, 4, 0, 99),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        assert_eq!(
+            output.outcome,
+            Outcome::OutOfGas,
+            "constructor OOG must bubble through CREATE as parent OOG, not be swallowed as MemoryFault"
+        );
+        assert_eq!(
+            vm.cpu.read_gp(4),
+            0,
+            "parent must not continue past constructor OOG (Addi after Create should not run)"
+        );
+    }
+
+    /// TPL-506 control: a constructor that explicitly REVERTs
+    /// must keep its legacy "return zero address, parent
+    /// continues" semantics. The fix only re-routes OOG;
+    /// Revert is preserved as `Trap::MemoryFault` at the
+    /// `do_create` boundary so the dispatcher's `Err(_)` arm
+    /// still writes zero and the parent runs on. Without this
+    /// pairing the OOG fix would silently break every contract
+    /// pattern that probes a CREATE for failure by checking
+    /// the result address.
+    #[test]
+    fn tpl_506_constructor_revert_preserves_zero_address_behavior() {
+        let heap = crate::memory::HEAP_START;
+
+        // Constructor: a single REVERT-equivalent — `assert r0`
+        // (where r0 is hardwired 0) panics the constructor.
+        // `Opcode::Assert` returns `ExecResult::Revert` when
+        // the operand is zero, which `execute()` maps to
+        // `Outcome::Revert`.
+        let constructor = bytecode(&[
+            instr_bytes(Opcode::Assert, 0, 0, 0), // r0 == 0 → revert
+        ]);
+        let runtime: Vec<u8> = instr_bytes(Opcode::Halt, 0, 0, 0).to_vec();
+
+        let mut init_code: Vec<u8> = Vec::with_capacity(8 + constructor.len() + runtime.len());
+        init_code.extend_from_slice(&(constructor.len() as u32).to_le_bytes());
+        init_code.extend_from_slice(&(runtime.len() as u32).to_le_bytes());
+        init_code.extend_from_slice(&constructor);
+        init_code.extend_from_slice(&runtime);
+
+        let ctx = ExecutionContext {
+            self_address: addr(0xAAAA),
+            ..Default::default()
+        };
+        // Plenty of gas — the constructor reverts after one op,
+        // not OOGs. Parent must continue post-CREATE.
+        let mut vm = Vm::with_gas_limit_and_context(100_000, ctx);
+
+        for (i, &b) in init_code.iter().enumerate() {
+            vm.memory.store8(heap + i as u32, b).unwrap();
+        }
+        vm.cpu.write_gp(2, heap as u64);
+        vm.cpu.write_gp(3, init_code.len() as u64);
+
+        let code = bytecode(&[
+            instr_bytes(Opcode::Create, 1, 2, 0x03),
+            instr_ri(Opcode::Addi, 4, 0, 99),
+            instr_bytes(Opcode::Halt, 0, 0, 0),
+        ]);
+        vm.load(&code).unwrap();
+        let output = vm.execute();
+
+        // Parent runs to completion; CREATE wrote zero address
+        // (constructor reverted), Addi wrote 99 to r4.
+        assert_eq!(output.outcome, Outcome::Success);
+        let new_addr: Address = vm.cpu.read_wide(1).to_le_bytes();
+        assert_eq!(
+            new_addr, ZERO_ADDRESS,
+            "constructor revert must yield zero address (legacy semantic preserved)"
+        );
+        assert_eq!(
+            vm.cpu.read_gp(4),
+            99,
+            "parent must continue executing past a reverting CREATE"
+        );
     }
 
     // ========== Audit 379: CREATE address is non-front-runnable ==========
