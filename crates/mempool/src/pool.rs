@@ -133,7 +133,16 @@ type SenderTxIndex = HashMap<Address, HashSet<[u8; 32]>>;
 #[derive(Debug)]
 pub struct Mempool {
     /// All transactions in arrival order.
-    txs: Vec<EncryptedTx>,
+    ///
+    /// TPL-509: switched from `Vec<EncryptedTx>` to `VecDeque<…>`
+    /// so `evict_oldest` runs in O(1) (`pop_front`) instead of
+    /// O(n) (`Vec::remove(0)` shifts every remaining element).
+    /// Under sustained near-cap load — N adds while at the size
+    /// limit — pre-fix eviction was O(n) per add → O(n²) total
+    /// for the burst, which dominated the mempool's hot path
+    /// during stress testing. `VecDeque` keeps the same arrival-
+    /// order semantics.
+    txs: VecDeque<EncryptedTx>,
     /// Set of tx hashes for deduplication.
     seen_hashes: HashSet<[u8; 32]>,
     /// Per-sender nonce tracking (sender → highest nonce seen).
@@ -168,7 +177,7 @@ pub struct Mempool {
 impl Mempool {
     pub fn new() -> Self {
         Self {
-            txs: Vec::new(),
+            txs: VecDeque::new(),
             seen_hashes: HashSet::new(),
             sender_nonces: HashMap::new(),
             first_seen_slot: HashMap::new(),
@@ -185,7 +194,7 @@ impl Mempool {
 
     pub fn with_capacity(max_size: usize) -> Self {
         Self {
-            txs: Vec::with_capacity(max_size),
+            txs: VecDeque::with_capacity(max_size),
             seen_hashes: HashSet::with_capacity(max_size),
             sender_nonces: HashMap::new(),
             first_seen_slot: HashMap::with_capacity(max_size),
@@ -387,7 +396,7 @@ impl Mempool {
         self.sender_tx_index.entry(sender).or_default().insert(hash);
         self.seen_hashes.insert(hash);
         self.first_seen_slot.insert(hash, self.current_block);
-        self.txs.push(tx);
+        self.txs.push_back(tx);
     }
 
     /// Decrement a sender's concurrent count when a tx leaves the pool.
@@ -409,11 +418,13 @@ impl Mempool {
     }
 
     /// Evict the oldest transaction (first in the list).
+    /// TPL-509: O(1) `pop_front` on a `VecDeque`. Pre-fix this was
+    /// `Vec::remove(0)`, which shifts every remaining element.
     fn evict_oldest(&mut self) {
-        if self.txs.is_empty() {
-            return;
-        }
-        let evicted = self.txs.remove(0);
+        let evicted = match self.txs.pop_front() {
+            Some(tx) => tx,
+            None => return,
+        };
         let h = evicted.hash();
         let sender = evicted.sender;
         self.seen_hashes.remove(&h);
@@ -486,8 +497,14 @@ impl Mempool {
 
     /// Get transactions in arrival order (FCFS).
     /// No fee-based priority — Pyde has no tips, everyone pays the same base fee.
-    pub fn in_arrival_order(&self) -> &[EncryptedTx] {
-        &self.txs
+    ///
+    /// TPL-509: post-VecDeque-switch, the underlying storage is no
+    /// longer a contiguous slice, so this returns `Vec<&EncryptedTx>`
+    /// (cheap — only borrowing references, not cloning the txs).
+    /// Existing call sites that iterate (`for tx in mempool.in_arrival_order()`)
+    /// or index (`txs[0]`) keep working unchanged.
+    pub fn in_arrival_order(&self) -> Vec<&EncryptedTx> {
+        self.txs.iter().collect()
     }
 
     /// Select transactions for a block in arrival order, respecting
