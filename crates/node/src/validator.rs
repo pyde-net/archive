@@ -311,16 +311,24 @@ pub struct ValidatorEngine {
     /// Seen votes per slot: (slot, voter_index) → (block_hash, signature).
     /// Used to detect double-voting (equivocation).
     seen_votes: HashMap<(u64, u8), ([u8; 32], Vec<u8>)>,
-    /// Audit 327: dedup set for incoming view-change messages,
-    /// keyed on `(slot, voter_index)`. `on_view_change` checks
-    /// this BEFORE pushing to `view_changes` so a peer that
-    /// re-broadcasts the same VC message (legitimate gossip
+    /// Audit 327: dedup map for incoming view-change messages,
+    /// keyed on `(slot, voter_index)` with value
+    /// `(highest_qc_hash, signature)`. `on_view_change` checks
+    /// the key set BEFORE pushing to `view_changes` so a peer
+    /// that re-broadcasts the same VC message (legitimate gossip
     /// reflood) or floods adversarial repeats cannot inflate the
     /// per-slot Vec — `try_form_view_change_qc` runs FALCON
     /// verification once per entry, so an unbounded Vec means
     /// unbounded FALCON cost per QC-formation attempt.
     /// Pruned alongside `view_changes` in the slot-prune loop.
-    seen_view_changes: std::collections::HashSet<(u64, u8)>,
+    ///
+    /// TPL-502: the *value* (`(qc_hash, sig)`) is stored so that
+    /// when a second VC arrives at the same `(slot,
+    /// voter_index)` with a DIFFERENT `highest_qc.hash()`, we
+    /// can construct `DoubleViewChangeEvidence` from the cached
+    /// first signature + the incoming second one and route it
+    /// through the slashing pipeline.
+    seen_view_changes: HashMap<(u64, u8), ([u8; 32], Vec<u8>)>,
     /// TPL-501: self-VC equivocation guard. Records every
     /// view-change message THIS validator signed, keyed by
     /// `slot` (target_height at sign time) with value
@@ -350,6 +358,15 @@ pub struct ValidatorEngine {
     /// on the receiving node will re-verify signatures from state —
     /// SlashResult is just a local convenience.
     pub pending_evidence: Vec<DoubleSignEvidence>,
+    /// TPL-502: queue for VC equivocation evidence detected by
+    /// `on_view_change`. Held separately from `pending_evidence`
+    /// to keep wire compatibility with the existing Slash-tx
+    /// payload (which expects `DoubleSignEvidence` shape) while
+    /// the on-chain handler integration is staged. Drained by
+    /// `drain_pending_vc_evidence`. Dedup is the same `(slot,
+    /// signer)` pair keyed off `seen_evidence`, so a piece of
+    /// evidence is queued at most once.
+    pub pending_vc_evidence: Vec<pyde_consensus::slashing::DoubleViewChangeEvidence>,
     /// Epoch randomness collector (gathers VRF shares at epoch boundary).
     randomness_collector: Option<RandomnessCollector>,
     /// Audit 403: slot at which `try_finalize_randomness_on_slot` is
@@ -524,10 +541,11 @@ impl ValidatorEngine {
             voted_slots: std::collections::HashSet::new(),
             seen_proposals: HashMap::new(),
             seen_votes: HashMap::new(),
-            seen_view_changes: std::collections::HashSet::new(),
+            seen_view_changes: HashMap::new(),
             seen_view_changes_self: std::collections::HashMap::new(),
             seen_finality_votes: std::collections::HashSet::new(),
             pending_evidence: Vec::new(),
+            pending_vc_evidence: Vec::new(),
             broadcast_evidence: Vec::new(),
             seen_evidence: std::collections::HashSet::new(),
             inclusion_violated_slots: std::collections::HashSet::new(),
@@ -2620,17 +2638,92 @@ impl ValidatorEngine {
         // `try_form_view_change_qc` runs FALCON verification on
         // every entry in the Vec, so a peer that floods repeats
         // of the same `(slot, voter_index)` would inflate the
-        // per-QC-attempt FALCON cost linearly. The HashSet entry
-        // is removed alongside the Vec in the slot-prune loop.
+        // per-QC-attempt FALCON cost linearly. The dedup map's
+        // entry is removed alongside the Vec in the slot-prune
+        // loop.
+        //
+        // TPL-502: the dedup map stores `(qc_hash, sig)` so a
+        // SECOND VC from the same `(slot, voter_index)` with a
+        // DIFFERENT `highest_qc.hash()` is detected here as
+        // equivocation. Honest validators sign at most one
+        // (slot, qc) pair via TPL-501; observing two distinct
+        // `qc_hash`es from the same voter at the same target
+        // slot is the slashable double-VC pattern.
         let dedup_key = (slot, msg.voter_index);
-        if !self.seen_view_changes.insert(dedup_key) {
-            debug!(
+        let incoming_qc_hash = msg.highest_qc.hash();
+        if let Some((prev_qc_hash, prev_sig)) = self.seen_view_changes.get(&dedup_key).cloned() {
+            if prev_qc_hash == incoming_qc_hash {
+                debug!(
+                    slot,
+                    voter_index = msg.voter_index,
+                    "dedup: replayed view-change dropped",
+                );
+                return false;
+            }
+            // Different qc_hash from the same voter at the same
+            // slot — equivocation. Verify the INCOMING sig (the
+            // first one's validity is implied by it having
+            // landed in the dedup map) before constructing
+            // evidence; a peer-injected forgery shouldn't be
+            // mistaken for an honest validator's equivocation.
+            //
+            // The verifier only proves `prev_sig` is well-formed
+            // FALCON-signed bytes against the prior preimage —
+            // we trusted it on first arrival. We re-verify
+            // `signature_2` here (the new arrival) to make sure
+            // we're not framing the offender on a corrupt sig.
+            let voter_idx = msg.voter_index as usize;
+            if voter_idx >= self.committee_keys.len() {
+                warn!(
+                    slot,
+                    voter_index = msg.voter_index,
+                    "VC voter_index outside committee — drop without ingesting evidence"
+                );
+                return false;
+            }
+            if !pyde_consensus::view_change::verify_view_change(
+                self.chain_id,
+                &msg,
+                &self.committee_keys[voter_idx],
+            ) {
+                warn!(
+                    slot,
+                    voter_index = msg.voter_index,
+                    "second VC's signature failed FALCON verify; not equivocation"
+                );
+                return false;
+            }
+            warn!(
                 slot,
                 voter_index = msg.voter_index,
-                "dedup: replayed view-change dropped",
+                offender = hex::encode(msg.voter_address),
+                "DOUBLE VIEW-CHANGE DETECTED — equivocation"
             );
+            let evidence = pyde_consensus::slashing::DoubleViewChangeEvidence {
+                slot,
+                qc_hash_1: prev_qc_hash,
+                signature_1: prev_sig,
+                qc_hash_2: incoming_qc_hash,
+                signature_2: msg.signature.clone(),
+                signer: msg.voter_address,
+                // Filled in on-chain by whichever validator
+                // broadcasts the Slash tx. The on-chain handler
+                // for double-VC evidence is a follow-up; for now
+                // the evidence is queued in
+                // `pending_vc_evidence` for the runtime to drain.
+                submitter: [0u8; 32],
+            };
+            if self.ingest_view_change_evidence(evidence) {
+                info!(
+                    slot,
+                    offender = hex::encode(msg.voter_address),
+                    "double-VC evidence queued for slashing"
+                );
+            }
             return false;
         }
+        self.seen_view_changes
+            .insert(dedup_key, (incoming_qc_hash, msg.signature.clone()));
 
         let entry = self.view_changes.entry(slot).or_default();
         entry.push(msg);
@@ -2898,6 +2991,87 @@ impl ValidatorEngine {
         true
     }
 
+    /// TPL-502: ingest VC equivocation evidence (mirror of
+    /// `ingest_evidence` for proposer/vote double-sign). The
+    /// flow is the same: dedup on `(slot, signer)`, reject if
+    /// the signer isn't in the current committee, FALCON-verify
+    /// both signatures under the local `chain_id`, queue.
+    ///
+    /// Returns `true` if the evidence was newly accepted. The
+    /// `seen_evidence` dedup key is shared with the proposer/
+    /// vote pipeline so a validator that's already been queued
+    /// for slashing once at a given slot doesn't double-queue.
+    /// (Slot-level slashing is unique per `(slot, signer)` —
+    /// the on-chain handler will reject the second instance
+    /// anyway, but pre-pipeline dedup keeps the queues lean.)
+    ///
+    /// Caveat: the on-chain Slash-tx handler currently only
+    /// understands `DoubleSignEvidence` (the proposer/vote
+    /// shape). Until the Slash payload's discriminator is
+    /// extended to cover VC equivocation, evidence queued here
+    /// stays in `pending_vc_evidence` for runtime drainage —
+    /// it isn't yet wrapped into an on-chain Slash tx. The
+    /// detection side (this method) is the security primitive;
+    /// the on-chain integration is staged separately so the
+    /// wire-format change can land in its own commit.
+    pub fn ingest_view_change_evidence(
+        &mut self,
+        evidence: pyde_consensus::slashing::DoubleViewChangeEvidence,
+    ) -> bool {
+        let key = (evidence.slot, evidence.signer);
+        if self.seen_evidence.contains(&key) {
+            return false;
+        }
+        let signer_pk = self
+            .committee_keys
+            .iter()
+            .find(|pk| pyde_account::address::derive_eoa_address(pk) == evidence.signer);
+        let pk_bytes = match signer_pk {
+            Some(pk) => pk.clone(),
+            None => {
+                debug!(
+                    slot = evidence.slot,
+                    signer = hex::encode(evidence.signer),
+                    "rejecting VC evidence: signer not in committee"
+                );
+                return false;
+            }
+        };
+        if !pyde_consensus::slashing::verify_double_view_change(
+            self.chain_id,
+            &evidence,
+            &pk_bytes,
+        ) {
+            debug!(
+                slot = evidence.slot,
+                signer = hex::encode(evidence.signer),
+                "rejecting VC evidence: signature verification failed"
+            );
+            return false;
+        }
+        self.seen_evidence.insert(key);
+        self.pending_vc_evidence.push(evidence);
+        // Persist `seen_evidence` so a crash between detection and
+        // drainage doesn't lose the dedup record (matches the
+        // proposer/vote ingest path's persistence).
+        self.persist_evidence_state();
+        true
+    }
+
+    /// TPL-502: take ownership of all queued VC equivocation
+    /// evidence, clearing the internal queue. Counterpart to
+    /// `drain_pending_evidence` for the double-sign queue.
+    /// Caller must re-queue if they fail to consume (e.g.
+    /// failed block build). Dead-code warning is expected
+    /// pre on-chain integration: this is the consumer API the
+    /// follow-up Slash-tx pipeline will call.
+    #[allow(dead_code)]
+    pub fn drain_pending_vc_evidence(
+        &mut self,
+    ) -> Vec<pyde_consensus::slashing::DoubleViewChangeEvidence> {
+        std::mem::take(&mut self.pending_vc_evidence)
+    }
+
     /// Drain the broadcast staging queue. Returns every piece of
     /// evidence that has been newly ingested (either locally detected
     /// or received via gossip) since the last call. The caller is
@@ -3002,7 +3176,7 @@ impl ValidatorEngine {
             // Audit 327: prune the dedup sets in lockstep with their
             // backing per-slot Vecs so the sets don't grow unbounded
             // for long-running validators.
-            self.seen_view_changes.retain(|(s, _)| *s >= prune_before);
+            self.seen_view_changes.retain(|(s, _), _| *s >= prune_before);
             // TPL-501: prune the self-VC equivocation record
             // alongside its peers. The on-disk copy is pruned
             // by `store.prune_evidence_before` below.
@@ -6091,6 +6265,124 @@ mod tests {
             second.is_none(),
             "TPL-501: a different highest_qc at the same target_height MUST trip the equivocation guard, got {:?}",
             second.map(|m| m.signature.len())
+        );
+    }
+
+    /// TPL-502: when a peer sends two view-change messages from
+    /// the same `(slot, voter_index)` covering different
+    /// `highest_qc.hash()`es, `on_view_change` constructs
+    /// `DoubleViewChangeEvidence` and routes it through
+    /// `ingest_view_change_evidence` — same slashing-pipeline
+    /// pattern as the proposer/vote double-sign path. Without
+    /// the equivocation guard the second VC was just dropped
+    /// at the dedup gate and the offender escaped slashing.
+    #[test]
+    fn tpl_502_on_view_change_detects_equivocation_at_same_slot() {
+        let (mut engine, identities) = make_engine_with_committee(4);
+
+        // Two distinct QCs to sign over — same slot, different
+        // highest_qc.hash().
+        let qc_1 = pyde_consensus::block::QuorumCert::empty();
+        let mut qc_2 = pyde_consensus::block::QuorumCert::empty();
+        qc_2.slot = 1;
+        qc_2.block_hash = [0xCC; 32];
+        qc_2.voter_bitmap = 0b011;
+        qc_2.signatures = vec![vec![0xAA; 666]; 2];
+        // Sanity: hashes really are distinct.
+        assert_ne!(qc_1.hash(), qc_2.hash());
+
+        let target_slot = 42;
+        let attacker = &identities[1];
+        let vc_1 = pyde_consensus::view_change::create_view_change(
+            engine.chain_id,
+            target_slot,
+            &qc_1,
+            attacker.committee_index,
+            attacker.address,
+            &attacker.secret_key,
+        )
+        .unwrap();
+        let vc_2 = pyde_consensus::view_change::create_view_change(
+            engine.chain_id,
+            target_slot,
+            &qc_2,
+            attacker.committee_index,
+            attacker.address,
+            &attacker.secret_key,
+        )
+        .unwrap();
+        // VC's preimage is `view_change || chain_id || slot ||
+        // qc_hash`, so different qc → different sig.
+        assert_ne!(vc_1.signature, vc_2.signature);
+
+        // Bootstrap engine state so on_view_change accepts the
+        // VC at target_slot (target_height must be ≤ slot).
+        engine.consensus.target_height = target_slot;
+
+        // First VC: lands clean, populates dedup map, no
+        // evidence yet.
+        engine.on_view_change(vc_1.clone());
+        assert!(engine.pending_vc_evidence.is_empty());
+
+        // Second VC at the same (slot, voter) with a DIFFERENT
+        // qc_hash: equivocation. Evidence is constructed and
+        // ingested.
+        engine.on_view_change(vc_2.clone());
+
+        let queued = &engine.pending_vc_evidence;
+        assert_eq!(
+            queued.len(),
+            1,
+            "double-VC must produce exactly one queued evidence"
+        );
+        let ev = &queued[0];
+        assert_eq!(ev.slot, target_slot);
+        assert_eq!(ev.signer, attacker.address);
+        // The two qc_hashes carried by the evidence must match
+        // what the attacker signed, in either order.
+        let pair = (qc_1.hash(), qc_2.hash());
+        let evidence_pair_a = (ev.qc_hash_1, ev.qc_hash_2);
+        let evidence_pair_b = (ev.qc_hash_2, ev.qc_hash_1);
+        assert!(
+            evidence_pair_a == pair || evidence_pair_b == pair,
+            "evidence qc_hashes must be the two distinct values the attacker signed"
+        );
+
+        // The slot's `seen_evidence` dedup record is set so a
+        // re-arrival of either VC doesn't double-queue.
+        assert!(engine.seen_evidence.contains(&(target_slot, attacker.address)));
+    }
+
+    /// TPL-502 control: a benign re-broadcast of the SAME VC
+    /// (same qc_hash) is dropped at the dedup gate without
+    /// queuing evidence. Without this the equivocation
+    /// detector could be fooled by gossip refloods into
+    /// reporting honest validators.
+    #[test]
+    fn tpl_502_on_view_change_does_not_flag_dedup_replay() {
+        let (mut engine, identities) = make_engine_with_committee(4);
+
+        let qc_1 = pyde_consensus::block::QuorumCert::empty();
+        let target_slot = 42;
+        let voter = &identities[1];
+        let vc = pyde_consensus::view_change::create_view_change(
+            engine.chain_id,
+            target_slot,
+            &qc_1,
+            voter.committee_index,
+            voter.address,
+            &voter.secret_key,
+        )
+        .unwrap();
+        engine.consensus.target_height = target_slot;
+
+        engine.on_view_change(vc.clone());
+        engine.on_view_change(vc.clone()); // gossip reflood
+        engine.on_view_change(vc); // and again
+
+        assert!(
+            engine.pending_vc_evidence.is_empty(),
+            "same-qc replay must not be flagged as equivocation"
         );
     }
 

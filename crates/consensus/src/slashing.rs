@@ -95,6 +95,45 @@ pub struct DoubleSignEvidence {
     pub submitter: Address,
 }
 
+/// TPL-502: view-change equivocation evidence — two FALCON sigs
+/// from the same validator at the same slot covering different
+/// `highest_qc.hash()` values. The double-VC slashable pattern
+/// is symmetric to `DoubleSignEvidence` (proposer/vote
+/// double-sign) but the sign-message preimage uses the
+/// `view_change` prefix instead of the proposer prefix, so the
+/// verifier rebuilds the preimage with
+/// `view_change::view_change_sign_message_from_hash`.
+///
+/// Like `DoubleSignEvidence`, the struct carries `qc_hash` rather
+/// than the full `QuorumCert`: the verifier needs nothing more
+/// than the local chain's `chain_id`, the two hashes, the two
+/// FALCON sigs, and the signer's pubkey. The `chain_id` is NOT
+/// in the struct — the verifier rebuilds the preimage with the
+/// LOCAL chain's id, mirroring the audit-240 cross-chain replay
+/// guard.
+#[derive(Clone, Debug)]
+pub struct DoubleViewChangeEvidence {
+    /// `target_height` the two VCs both targeted.
+    pub slot: u64,
+    /// `highest_qc.hash()` covered by the first VC.
+    pub qc_hash_1: [u8; 32],
+    /// FALCON signature over `view_change_sign_message_from_hash(
+    /// chain_id, slot, qc_hash_1)`.
+    pub signature_1: Vec<u8>,
+    /// `highest_qc.hash()` covered by the second VC — must
+    /// differ from `qc_hash_1`.
+    pub qc_hash_2: [u8; 32],
+    /// FALCON signature over `view_change_sign_message_from_hash(
+    /// chain_id, slot, qc_hash_2)`.
+    pub signature_2: Vec<u8>,
+    /// Address of the signer being accused.
+    pub signer: Address,
+    /// Address of the evidence submitter (receives the finder's
+    /// fee). Set by whichever validator broadcasts the on-chain
+    /// Slash tx — typically the next block proposer.
+    pub submitter: Address,
+}
+
 /// Liveness report for a validator over an epoch.
 #[derive(Clone, Debug)]
 pub struct LivenessReport {
@@ -162,6 +201,46 @@ pub fn verify_double_sign(chain_id: u64, evidence: &DoubleSignEvidence, public_k
     falcon_verify(&pk, &msg_1, &sig_1) && falcon_verify(&pk, &msg_2, &sig_2)
 }
 
+/// TPL-502: verify view-change equivocation evidence against the
+/// local chain's `chain_id`. Mirrors `verify_double_sign` but
+/// uses the VC sign-message preimage (`view_change` prefix +
+/// chain_id + slot + qc_hash) so a double-VC on chain A is not
+/// valid evidence on chain B even when FALCON keys match. Two
+/// distinct `qc_hash`es are required — equal hashes are not
+/// equivocation.
+pub fn verify_double_view_change(
+    chain_id: u64,
+    evidence: &DoubleViewChangeEvidence,
+    public_key: &[u8],
+) -> bool {
+    if evidence.qc_hash_1 == evidence.qc_hash_2 {
+        return false;
+    }
+    let pk = match FalconPublicKey::from_bytes(public_key) {
+        Some(pk) => pk,
+        None => return false,
+    };
+    let sig_1 = match FalconSignature::from_bytes(&evidence.signature_1) {
+        Some(s) => s,
+        None => return false,
+    };
+    let sig_2 = match FalconSignature::from_bytes(&evidence.signature_2) {
+        Some(s) => s,
+        None => return false,
+    };
+    let msg_1 = crate::view_change::view_change_sign_message_from_hash(
+        chain_id,
+        evidence.slot,
+        &evidence.qc_hash_1,
+    );
+    let msg_2 = crate::view_change::view_change_sign_message_from_hash(
+        chain_id,
+        evidence.slot,
+        &evidence.qc_hash_2,
+    );
+    falcon_verify(&pk, &msg_1, &sig_1) && falcon_verify(&pk, &msg_2, &sig_2)
+}
+
 // ========== Slash Computation ==========
 
 /// Compute the slash amount and finder's fee for a given offense.
@@ -216,6 +295,35 @@ pub fn slash_double_sign(
         ejected: true,
         forced_unbonding: true,
         offense: SlashingOffense::DoubleSigning,
+    })
+}
+
+/// TPL-502: process a double-VC slashing event. Mirrors
+/// `slash_double_sign` for the proposer/vote case — same 100%
+/// slash via `Equivocation`, same eject + forced-unbonding flags
+/// — so a validator caught equivocating in either layer pays
+/// the same price.
+///
+/// `current_stake` is the live stake (audit 328) so a repeat
+/// offender pays a percentage against what's actually on the
+/// books, not against the constant `VALIDATOR_STAKE`.
+pub fn slash_double_view_change(
+    chain_id: u64,
+    evidence: &DoubleViewChangeEvidence,
+    public_key: &[u8],
+    current_stake: u128,
+) -> Option<SlashResult> {
+    if !verify_double_view_change(chain_id, evidence, public_key) {
+        return None;
+    }
+    let (burned, finder_fee) = compute_slash(current_stake, &SlashingOffense::Equivocation);
+    Some(SlashResult {
+        offender: evidence.signer,
+        amount_burned: burned,
+        finder_fee,
+        ejected: true,
+        forced_unbonding: true,
+        offense: SlashingOffense::Equivocation,
     })
 }
 
@@ -790,5 +898,140 @@ mod tests {
             total_promised,
             "pre→post stake delta must equal promised slash exactly",
         );
+    }
+
+    // ========== TPL-502: VC equivocation evidence ==========
+
+    /// Helper: produce a VC sig over the canonical
+    /// `view_change_sign_message_from_hash` preimage.
+    fn sign_vc(
+        sk: &pyde_crypto::falcon::FalconSecretKey,
+        chain_id: u64,
+        slot: u64,
+        qc_hash: &[u8; 32],
+    ) -> Vec<u8> {
+        let msg = crate::view_change::view_change_sign_message_from_hash(chain_id, slot, qc_hash);
+        falcon_sign(sk, &msg).unwrap().as_bytes().to_vec()
+    }
+
+    /// `verify_double_view_change` accepts well-formed evidence:
+    /// two distinct `qc_hash`es with matching FALCON sigs.
+    #[test]
+    fn tpl_502_verify_double_vc_accepts_well_formed_evidence() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+
+        let qc_hash_1 = [0xAA; 32];
+        let qc_hash_2 = [0xBB; 32];
+
+        let evidence = DoubleViewChangeEvidence {
+            slot: 100,
+            qc_hash_1,
+            signature_1: sign_vc(&sk, TEST_CHAIN_ID, 100, &qc_hash_1),
+            qc_hash_2,
+            signature_2: sign_vc(&sk, TEST_CHAIN_ID, 100, &qc_hash_2),
+            signer: addr,
+            submitter: derive_eoa_address(b"submitter"),
+        };
+
+        assert!(verify_double_view_change(
+            TEST_CHAIN_ID,
+            &evidence,
+            &pk_bytes
+        ));
+    }
+
+    /// Two equal `qc_hash`es is not equivocation — same VC,
+    /// reject as evidence.
+    #[test]
+    fn tpl_502_verify_double_vc_rejects_equal_qc_hashes() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+
+        let qc_hash = [0xAA; 32];
+        let sig = sign_vc(&sk, TEST_CHAIN_ID, 100, &qc_hash);
+
+        let evidence = DoubleViewChangeEvidence {
+            slot: 100,
+            qc_hash_1: qc_hash,
+            signature_1: sig.clone(),
+            qc_hash_2: qc_hash,
+            signature_2: sig,
+            signer: addr,
+            submitter: addr,
+        };
+
+        assert!(!verify_double_view_change(
+            TEST_CHAIN_ID,
+            &evidence,
+            &pk_bytes
+        ));
+    }
+
+    /// Cross-chain replay guard: evidence valid under chain A
+    /// must NOT verify under chain B.
+    #[test]
+    fn tpl_502_verify_double_vc_rejects_cross_chain_replay() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+
+        let qc_hash_1 = [0xAA; 32];
+        let qc_hash_2 = [0xBB; 32];
+        let evidence = DoubleViewChangeEvidence {
+            slot: 100,
+            qc_hash_1,
+            signature_1: sign_vc(&sk, TEST_CHAIN_ID, 100, &qc_hash_1),
+            qc_hash_2,
+            signature_2: sign_vc(&sk, TEST_CHAIN_ID, 100, &qc_hash_2),
+            signer: addr,
+            submitter: addr,
+        };
+
+        // Sigs are bound to TEST_CHAIN_ID; verifier under a
+        // different chain_id rebuilds a different preimage.
+        const OTHER_CHAIN_ID: u64 = TEST_CHAIN_ID + 1;
+        assert!(!verify_double_view_change(
+            OTHER_CHAIN_ID,
+            &evidence,
+            &pk_bytes
+        ));
+    }
+
+    /// The slash result for double-VC mirrors double-sign:
+    /// 100% via `Equivocation`, ejected, forced unbonding.
+    #[test]
+    fn tpl_502_slash_double_vc_uses_current_stake_and_equivocation_offense() {
+        let (pk, sk) = falcon_keygen().unwrap();
+        let pk_bytes = pk.as_bytes().to_vec();
+        let addr = derive_eoa_address(&pk_bytes);
+
+        let qc_hash_1 = [0xAA; 32];
+        let qc_hash_2 = [0xBB; 32];
+        let evidence = DoubleViewChangeEvidence {
+            slot: 100,
+            qc_hash_1,
+            signature_1: sign_vc(&sk, TEST_CHAIN_ID, 100, &qc_hash_1),
+            qc_hash_2,
+            signature_2: sign_vc(&sk, TEST_CHAIN_ID, 100, &qc_hash_2),
+            signer: addr,
+            submitter: addr,
+        };
+
+        // Audit-328: slash against the live stake, not VALIDATOR_STAKE.
+        let live_stake = 4_000u128;
+        let result =
+            slash_double_view_change(TEST_CHAIN_ID, &evidence, &pk_bytes, live_stake).unwrap();
+        assert_eq!(result.offense, SlashingOffense::Equivocation);
+        assert!(result.ejected);
+        assert!(result.forced_unbonding);
+        assert_eq!(
+            result.amount_burned + result.finder_fee,
+            live_stake,
+            "100% slash against live stake"
+        );
+        let _ = VALIDATOR_STAKE; // keep the use; was useful for double-sign test
     }
 }
