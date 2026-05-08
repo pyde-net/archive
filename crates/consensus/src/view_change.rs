@@ -143,12 +143,24 @@ impl TimeoutTracker {
 ///   a payload whose `highest_qc.hash()` differs from the signed
 ///   preimage, and `verify_view_change` rejects.
 fn view_change_sign_message(chain_id: u64, slot: u64, highest_qc: &QuorumCert) -> Vec<u8> {
+    view_change_sign_message_from_hash(chain_id, slot, &highest_qc.hash())
+}
+
+/// TPL-502: same VC sign-message bytes as `view_change_sign_message`
+/// but takes the `highest_qc_hash` directly, so a verifier that
+/// only has the hash (e.g. `DoubleViewChangeEvidence` carrying
+/// `qc_hash` instead of the full QC) can rebuild the preimage.
+pub fn view_change_sign_message_from_hash(
+    chain_id: u64,
+    slot: u64,
+    highest_qc_hash: &[u8; 32],
+) -> Vec<u8> {
     // "view_change"(11) + chain_id(8) + slot(8) + qc_hash(32) = 59
     let mut msg = Vec::with_capacity(59);
     msg.extend_from_slice(b"view_change");
     msg.extend_from_slice(&chain_id.to_le_bytes());
     msg.extend_from_slice(&slot.to_le_bytes());
-    msg.extend_from_slice(&highest_qc.hash());
+    msg.extend_from_slice(highest_qc_hash);
     msg
 }
 

@@ -15,6 +15,12 @@
 //!                                     broadcast queues + seen dedup set)
 //!   b"p:" || slot_be8 || addr[32]   → (encoded BlockHeader, signature)
 //!   b"v:" || slot_be8 || voter_idx  → (block_hash[32], signature)
+//!   b"vcs:" || slot_be8             → (highest_qc_hash[32], signature)
+//!     [TPL-501: self-VC equivocation guard. Persisted before
+//!      `on_timeout` returns the signed VC, restored on restart.
+//!      Re-attempting a VC at the same slot reuses the persisted
+//!      signature when the highest_qc still matches; refuses to
+//!      sign a different VC at that slot otherwise.]
 
 use crate::wire;
 use pyde_account::address::Address;
@@ -30,12 +36,23 @@ const RESHARE_STATE_KEY: &[u8] = b"reshare:state";
 const FINALITY_CHECKPOINT_KEY: &[u8] = b"finality:checkpoint";
 const PROPOSAL_PREFIX: &[u8] = b"p:";
 const VOTE_PREFIX: &[u8] = b"v:";
+/// TPL-501: self-VC equivocation guard. Stored once per (slot)
+/// since voter_index is always this validator's own committee
+/// index — encoding it would add nothing.
+const VC_SELF_PREFIX: &[u8] = b"vcs:";
 
 /// A proposal seen from a proposer at a given slot (for double-propose detection).
 pub type SeenProposal = ((u64, Address), (BlockHeader, Vec<u8>));
 
 /// A vote seen from a voter at a given slot (for double-vote detection).
 pub type SeenVote = ((u64, u8), ([u8; 32], Vec<u8>));
+
+/// A view-change message we ourselves signed at a given slot.
+/// `(highest_qc_hash, signature)` is enough to (a) reject a
+/// different-content VC at the same slot post-restart and
+/// (b) idempotently re-broadcast the original signature when the
+/// current `highest_qc` still hashes to the same value.
+pub type SeenViewChangeSelf = (u64, ([u8; 32], Vec<u8>));
 
 /// RocksDB-backed store for a validator's `ConsensusState`.
 ///
@@ -271,6 +288,31 @@ impl ConsensusStateStore {
             .map_err(|e| format!("failed to save seen vote: {}", e))
     }
 
+    /// TPL-501: persist the view-change message THIS validator
+    /// signed at `slot` together with the `highest_qc_hash` it
+    /// was signed over. Called BEFORE `on_timeout` returns the
+    /// signed message — without that ordering a crash between
+    /// signing and persisting could let the validator sign a
+    /// different VC at the same slot post-restart, equivocating
+    /// itself for a slashable offense.
+    /// fsync'd before return (see struct docstring).
+    pub fn save_seen_view_change_self(
+        &self,
+        slot: u64,
+        highest_qc_hash: &[u8; 32],
+        signature: &[u8],
+    ) -> Result<(), String> {
+        let mut key = Vec::with_capacity(VC_SELF_PREFIX.len() + 8);
+        key.extend_from_slice(VC_SELF_PREFIX);
+        key.extend_from_slice(&slot.to_be_bytes());
+        let mut value = Vec::with_capacity(32 + signature.len());
+        value.extend_from_slice(highest_qc_hash);
+        value.extend_from_slice(signature);
+        self.db
+            .put_opt(&key, &value, &self.sync_opts)
+            .map_err(|e| format!("failed to save seen view-change: {}", e))
+    }
+
     /// Load all persisted seen proposals. Corrupt entries are skipped + logged.
     pub fn load_all_seen_proposals(&self) -> Vec<SeenProposal> {
         let mut out = Vec::new();
@@ -296,6 +338,46 @@ impl ConsensusStateStore {
                 Ok((header, sig)) => out.push(((slot, addr), (header, sig))),
                 Err(e) => warn!(slot, error = e, "skipping corrupt proposal value"),
             }
+        }
+        out
+    }
+
+    /// TPL-501: load all persisted self-VC records. Corrupt
+    /// entries (wrong key length, value too short to fit the
+    /// 32-byte qc_hash prefix) are skipped + logged. Called
+    /// from `attach_consensus_store` to seed the in-memory
+    /// `seen_view_changes_self` map post-restart.
+    pub fn load_all_seen_view_changes_self(&self) -> Vec<SeenViewChangeSelf> {
+        let mut out = Vec::new();
+        for item in self.db.prefix_iterator(VC_SELF_PREFIX) {
+            let (k, v) = match item {
+                Ok(kv) => kv,
+                Err(e) => {
+                    warn!(error = %e, "iterator error on self-VC records");
+                    continue;
+                }
+            };
+            if !k.starts_with(VC_SELF_PREFIX) {
+                break;
+            }
+            let slot_bytes = match k.get(VC_SELF_PREFIX.len()..VC_SELF_PREFIX.len() + 8) {
+                Some(b) => b,
+                None => {
+                    warn!("skipping self-VC key shorter than VC_SELF_PREFIX + 8");
+                    continue;
+                }
+            };
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(slot_bytes);
+            let slot = u64::from_be_bytes(buf);
+            if v.len() < 32 {
+                warn!(slot, "skipping self-VC value shorter than 32 bytes");
+                continue;
+            }
+            let mut qc_hash = [0u8; 32];
+            qc_hash.copy_from_slice(&v[..32]);
+            let signature = v[32..].to_vec();
+            out.push((slot, (qc_hash, signature)));
         }
         out
     }
@@ -329,13 +411,14 @@ impl ConsensusStateStore {
         out
     }
 
-    /// Delete all seen-proposal and seen-vote entries with slot < prune_before.
-    /// Mirrors the in-memory pruning in `ValidatorEngine::advance_slot`.
+    /// Delete all seen-proposal, seen-vote, and self-VC entries
+    /// with slot < prune_before. Mirrors the in-memory pruning
+    /// in `ValidatorEngine::advance_slot`.
     pub fn prune_evidence_before(&self, prune_before: u64) -> Result<usize, String> {
         let mut batch = WriteBatch::default();
         let mut count = 0usize;
 
-        for prefix in [PROPOSAL_PREFIX, VOTE_PREFIX] {
+        for prefix in [PROPOSAL_PREFIX, VOTE_PREFIX, VC_SELF_PREFIX] {
             for item in self
                 .db
                 .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
