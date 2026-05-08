@@ -5400,7 +5400,12 @@ mod tests {
         // Regression guard: tx.to is unconditionally loaded + written
         // back by the pipeline. If tx.to matches spend.target, the
         // recipient writeback clobbers the handler's target credit.
-        // Enforce tx.to = ZERO_ADDRESS for MultisigTx.
+        // Pre-TPL-408 the multisig handler caught this at execute
+        // time and returned a failed receipt. TPL-408 now rejects
+        // the same shape at validation, so `execute_transaction`
+        // returns `Err(Validation(UnexpectedTo { ... }))` instead
+        // of producing a non-success receipt — strict improvement
+        // (the malformed tx never even reaches the handler).
         let mut smt = PydeSMT::new();
         let ctx = make_block_ctx();
         let sks = multisig_fixture(&mut smt, 3, 2, 10_000_000);
@@ -5413,13 +5418,19 @@ mod tests {
         let sigs = sign_spend(&spend, &[&sks[0], &sks[1]], &[0, 1], 0, 1);
         let payload = crate::multisig::MultisigPayload::Spend { spend, sigs };
         let mut tx = build_multisig_spend_tx(submitter, &sub_sk, payload);
-        tx.to = target; // non-zero tx.to — would clobber target credit
+        tx.to = target; // non-zero tx.to — TPL-408 must reject
         sign_tx(&mut tx, &sub_sk);
 
         let treasury_before =
             load_account(&smt, &pyde_account::address::treasury_address()).balance;
-        let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
-        assert!(!receipt.success, "non-zero tx.to must reject");
+        let err = execute_transaction(&tx, &mut smt, &ctx)
+            .expect_err("non-zero tx.to must reject at validation (TPL-408)");
+        match err {
+            PipelineError::Validation(crate::validation::ValidationError::UnexpectedTo {
+                tx_type,
+            }) => assert_eq!(tx_type, TransactionType::MultisigTx as u8),
+            other => panic!("expected UnexpectedTo, got {other:?}"),
+        }
 
         let treasury_after = load_account(&smt, &pyde_account::address::treasury_address()).balance;
         assert!(treasury_after >= treasury_before);
