@@ -182,6 +182,82 @@ fn e2e_init_build() {
     assert!(artifact.get("constructorBytecode").is_some());
 }
 
+/// TPL-411: cross-file imports are checked against the populated
+/// module-export table. Pre-fix, `build_project` shadowed the
+/// populated `module_exports` with an empty `HashMap::new()`
+/// before invoking `run_frontend`, so the resolver's
+/// `is_known_module` always returned false and bogus imports
+/// silently compiled. This test would have passed on broken code
+/// (build succeeds despite a bad import) — post-fix it correctly
+/// fails the build.
+#[test]
+fn tpl_411_strict_frontend_rejects_undeclared_cross_file_import() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("test")).unwrap();
+    fs::create_dir_all(root.join("out")).unwrap();
+    fs::write(
+        root.join("pyde.toml"),
+        r#"
+[project]
+name = "tpl-411-test"
+version = "0.1.0"
+
+[compiler]
+optimize = false
+src = "src"
+test = "test"
+out = "out"
+"#,
+    )
+    .unwrap();
+
+    // Module that exports exactly one contract.
+    fs::write(
+        root.join("src/exporter.oti"),
+        r#"contract Exported {
+    storage { x: u64, }
+
+    #[constructor]
+    pub fn init() {
+        self.x = 0;
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Module that imports a name the exporter does NOT export.
+    // Pre-fix the resolver's `is_known_module(exporter)` returned
+    // false (empty map) so the cross-export check was skipped and
+    // build_project returned Ok. Post-fix the populated map flags
+    // `DoesNotExist` as unexported and surfaces a build error.
+    fs::write(
+        root.join("src/importer.oti"),
+        r#"use exporter::DoesNotExist;
+
+contract Importer {
+    storage { x: u64, }
+
+    #[constructor]
+    pub fn init() {
+        self.x = 0;
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let config = load_config(root);
+    let result = pyde_dev::build::build_project(&config, root);
+    assert!(
+        result.is_err(),
+        "build_project must reject the bogus cross-file import; got {:?}",
+        result.as_ref().map(|_| "Ok")
+    );
+}
+
 #[test]
 fn e2e_build_produces_registry() {
     let tmp = TempDir::new().unwrap();
