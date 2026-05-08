@@ -88,7 +88,24 @@ pub struct RpcState {
     /// gossipsub topic — otherwise only this node's proposals can
     /// ever include it.
     pub encrypted_tx_gossip_tx: tokio::sync::mpsc::Sender<pyde_mempool::encrypted::EncryptedTx>,
+    /// TPL-404: concurrency cap on simulator-backed RPCs
+    /// (`pyde_call`, `pyde_estimateGas`, `pyde_createAccessList`).
+    /// Each acquires one permit and holds it for the duration of
+    /// the call. Without the cap a single peer could spam the
+    /// public RPC node with concurrent simulator requests; each
+    /// one calls `StateManager::snapshot_reader`, which clones the
+    /// entire write-cache HashMap. Memory usage scales linearly
+    /// with concurrent requests and was unbounded pre-fix.
+    pub call_concurrency: Arc<tokio::sync::Semaphore>,
 }
+
+/// TPL-404: cap on concurrent in-flight `pyde_call` /
+/// `pyde_estimateGas` / `pyde_createAccessList` requests. Each
+/// holds a snapshot of the StateManager cache for its duration; 8
+/// is enough for legitimate dapp UX (RPCs are bursty but
+/// short-lived) and small enough to bound the worst-case memory
+/// footprint at 8 × cache_size during a flood.
+pub const CALL_CONCURRENCY_LIMIT: usize = 8;
 
 /// Define the Pyde JSON-RPC API.
 #[rpc(server)]
@@ -728,6 +745,16 @@ impl PydeApiServer for RpcServer {
     }
 
     async fn call(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
+        // TPL-404: cap concurrent simulator-backed RPCs. Without
+        // this gate a peer can flood `pyde_call` and force the
+        // public RPC node to clone the StateManager cache once
+        // per request — unbounded memory growth under load.
+        let _permit = self
+            .state
+            .call_concurrency
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| rpc_err(-32000, "server busy: too many concurrent calls".into()))?;
         let from = call_obj
             .get("from")
             .and_then(|v| v.as_str())
@@ -841,6 +868,14 @@ impl PydeApiServer for RpcServer {
     }
 
     async fn estimate_gas(&self, call_obj: serde_json::Value) -> Result<String, ErrorObjectOwned> {
+        // TPL-404: same concurrency cap as `pyde_call`. Both run
+        // through the simulator path with a snapshot-cloned cache.
+        let _permit = self
+            .state
+            .call_concurrency
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| rpc_err(-32000, "server busy: too many concurrent calls".into()))?;
         // Run the same as call but return gas used
         let from = call_obj
             .get("from")
@@ -931,6 +966,14 @@ impl PydeApiServer for RpcServer {
         &self,
         call_obj: serde_json::Value,
     ) -> Result<serde_json::Value, ErrorObjectOwned> {
+        // TPL-404: same concurrency cap as `pyde_call`. Both run
+        // through the simulator path with a snapshot-cloned cache.
+        let _permit = self
+            .state
+            .call_concurrency
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| rpc_err(-32000, "server busy: too many concurrent calls".into()))?;
         let from = call_obj
             .get("from")
             .and_then(|v| v.as_str())

@@ -985,6 +985,26 @@ impl BlockProcessor {
             ));
         }
 
+        // TPL-409: enforce the encrypted-tx-per-block cap on the
+        // validator decode path. Pre-fix the cap lived only in
+        // `Mempool::select_for_block`, so a Byzantine proposer (or
+        // a buggy patched proposer) could ship a block carrying
+        // more than `MAX_ENCRYPTED_TXS_PER_BLOCK` encrypted txs
+        // and every validator would happily decrypt the entire
+        // batch. The decryption-share gossip + Lagrange combine is
+        // O(n_txs * threshold), so an unbounded n_txs lets a
+        // proposer push validators into seconds-per-block of
+        // unrelated work — easy DoS on the consensus loop. Cap is
+        // a hard reject, not a soft warning, because honest
+        // proposers always stay below it.
+        if block.body.encrypted_txs.len() > pyde_mempool::pool::MAX_ENCRYPTED_TXS_PER_BLOCK {
+            return Err(format!(
+                "block carries {} encrypted txs, exceeds MAX_ENCRYPTED_TXS_PER_BLOCK={}",
+                block.body.encrypted_txs.len(),
+                pyde_mempool::pool::MAX_ENCRYPTED_TXS_PER_BLOCK,
+            ));
+        }
+
         let txs = &block.body.transactions;
         if txs.is_empty() && block.body.encrypted_txs.is_empty() {
             return Ok(());
@@ -1839,6 +1859,63 @@ mod tests {
         )
         .unwrap();
         (pk, shares, enc_a, enc_b, falcon_pks, falcon_sks)
+    }
+
+    /// TPL-409: a block carrying more than
+    /// `MAX_ENCRYPTED_TXS_PER_BLOCK` (=100) encrypted txs must be
+    /// rejected by `validate_block_body`. Pre-fix the cap lived
+    /// only in proposer-side selection — a Byzantine proposer
+    /// shipping 200 encrypted txs would force every honest
+    /// validator to run 2× the decryption work the protocol
+    /// budgets for.
+    #[test]
+    fn tpl_409_validate_block_body_rejects_oversize_encrypted_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateManager::open(tmp.path(), 1024).unwrap();
+
+        // Build one real encrypted tx and clone its bytes so we can
+        // pad the body up past the cap. The clone shares all fields
+        // including nonce/sender — `validate_block_body` doesn't
+        // dedup encrypted txs by hash (only plaintext does), so
+        // identical bytes are accepted as distinct count slots,
+        // which is exactly what an attacker would do.
+        let (_pk, _shares, enc_a, _enc_b, _falcon_pks, _falcon_sks) =
+            build_two_encrypted_txs_with_keys();
+        let cap = pyde_mempool::pool::MAX_ENCRYPTED_TXS_PER_BLOCK;
+        let oversize: Vec<Vec<u8>> = (0..=cap).map(|_| enc_a.to_bytes()).collect();
+        assert_eq!(oversize.len(), cap + 1);
+
+        // Header must commit to the body's tx_root so the cap check
+        // (which runs AFTER tx_root verify) is the only thing that
+        // can reject. Otherwise the test would fail on tx_root
+        // mismatch and we wouldn't be exercising TPL-409.
+        let hashes: Vec<[u8; 32]> = oversize
+            .iter()
+            .filter_map(|b| pyde_mempool::encrypted::EncryptedTx::from_bytes(b))
+            .map(|e| e.hash())
+            .collect();
+        let mut header = dummy_header(1);
+        header.tx_root = pyde_consensus::block::compute_tx_root(&[], &hashes);
+        let block = Block {
+            header,
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: oversize,
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
+            },
+            proposer_signature: vec![],
+        };
+
+        let err = BlockProcessor::validate_block_body(&block, &state, 1)
+            .expect_err("oversize encrypted-tx body must reject");
+        assert!(
+            err.contains("MAX_ENCRYPTED_TXS_PER_BLOCK"),
+            "expected MAX_ENCRYPTED_TXS_PER_BLOCK in error; got: {}",
+            err
+        );
     }
 
     fn store_block_with_encrypted_order(

@@ -29,9 +29,20 @@ const MAX_KEYS_PER_ACCESS_ENTRY: usize = 1024;
 /// FALCON-512 signatures are ~600-690 bytes in practice; the pool's
 /// structural-only path accepts [500, 1000]. Cap at 1024 for headroom.
 const MAX_SIG_LEN: usize = 1024;
-/// Threshold ciphertext is bounded by the encrypted payload, which is
-/// itself bounded by the overall tx size limit.
-const MAX_CT_LEN: usize = MAX_TX_SIZE;
+/// TPL-410: cap derived from the actual ciphertext layout, not the
+/// loose `MAX_TX_SIZE` bound. Wire format from
+/// `ThresholdCiphertext::to_wire_bytes` is
+///   `[ct_len:4][kyber_ct:1088][msg_len:4][encrypted_msg:N][mac:32]`
+/// where `N = 48-byte payload header + calldata`, and calldata is
+/// bounded by `pyde_tx::validation::MAX_CALLDATA = 64 KB`. Sum:
+///   `4 + 1088 + 4 + 48 + 65 536 + 32 = 66 712 ≈ 65 KB`.
+/// Round up to 72 KB for ~7 KB headroom against a future format bump
+/// (version byte, additional length field, etc.). Pre-fix the cap
+/// was the full 128 KB tx-size budget — a malicious peer could
+/// claim a 128 KB ciphertext, drive a `Vec::with_capacity(128 KB)`
+/// per malformed gossip blob, and trivially DoS the validator's
+/// allocator under `panic = "abort"`.
+const MAX_CT_LEN: usize = 72 * 1024;
 
 /// An encrypted transaction in the mempool.
 /// Plaintext fields are visible for validation and scheduling.
@@ -576,6 +587,28 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes()); // 0-byte signature
         bytes.extend_from_slice(&((MAX_CT_LEN as u32) + 1).to_le_bytes()); // huge ct_len
         assert!(EncryptedTx::from_bytes(&bytes).is_none());
+    }
+
+    /// TPL-410: pre-fix `MAX_CT_LEN` was the loose `MAX_TX_SIZE = 128 KB`
+    /// budget; a malicious peer could claim a 100 KB ciphertext and
+    /// trigger a `Vec::with_capacity(100 KB)` per malformed gossip
+    /// blob. Post-fix the cap is 72 KB (just over the real ciphertext
+    /// max of ~67 KB) so a 100 KB claim is rejected.
+    #[test]
+    fn tpl_410_from_bytes_rejects_100kb_ciphertext_len() {
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&[0u8; 32]); // sender
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
+        bytes.extend_from_slice(&21_000u64.to_le_bytes()); // gas
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // chain_id
+        bytes.push(0); // has_deadline = 0
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 access entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0-byte signature
+        bytes.extend_from_slice(&(100u32 * 1024).to_le_bytes()); // 100 KB ct_len
+        assert!(
+            EncryptedTx::from_bytes(&bytes).is_none(),
+            "100 KB ciphertext claim must be rejected by the tightened cap"
+        );
     }
 
     #[test]

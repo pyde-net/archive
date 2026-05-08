@@ -31,8 +31,13 @@ impl TxRelay {
     /// structural + rate-limit checks. Intended for devnet/tests.
     /// Returns true if accepted (new), false if rejected (duplicate, invalid,
     /// rate-limited, etc.).
+    ///
+    /// TPL-406: dispatches to `Mempool::add_unverified_for_devnet`,
+    /// which is the renamed version of the old `Mempool::add`. The
+    /// rename forces any future code reaching for the unverified
+    /// path to acknowledge the bypass at the call site.
     pub fn receive_tx(&mut self, tx: EncryptedTx) -> bool {
-        match self.mempool.add(tx) {
+        match self.mempool.add_unverified_for_devnet(tx) {
             Ok(()) => {
                 debug!("tx accepted into mempool");
                 true

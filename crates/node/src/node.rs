@@ -494,6 +494,16 @@ impl PydeNode {
 
             let mut engine = ValidatorEngine::new(self.config.node.chain_id, [0xAA; 32]); // devnet epoch randomness
 
+            // TPL-405: hand the engine a clone of the process-wide
+            // shutdown signal so persist failures (consensus state,
+            // evidence, finality checkpoint, reshare state, seen-
+            // proposal/vote) trigger a graceful drain instead of
+            // `panic!`. Pre-fix the engine called `panic!` directly
+            // on any of these paths; under `panic = "abort"` that's
+            // an immediate SIGABRT that bypasses the main loop's
+            // shutdown branch (peer_book save, etc.).
+            engine.attach_shutdown_signal(self.shutdown.clone());
+
             // Attach persistent ConsensusState store. If a prior state exists,
             // it is loaded here — this is what prevents last_voted_slot or
             // highest_qc from regressing after a validator crash/restart.
@@ -747,6 +757,10 @@ impl PydeNode {
                 dev_mode: self.config.node.dev_mode,
                 tx_gossip_tx: tx_gossip_tx.clone(),
                 encrypted_tx_gossip_tx: encrypted_tx_gossip_tx.clone(),
+                // TPL-404: bound concurrent simulator-backed RPCs.
+                call_concurrency: Arc::new(tokio::sync::Semaphore::new(
+                    rpc::CALL_CONCURRENCY_LIMIT,
+                )),
             });
             match rpc::start_rpc_server(
                 &self.config.rpc.listen,
@@ -1898,8 +1912,34 @@ impl PydeNode {
                             // All txs found — separate into plaintext and encrypted
                             let mut transactions = Vec::new();
                             let mut encrypted_txs = Vec::new();
+                            // TPL-403: don't `unwrap` peer-supplied
+                            // matched slots. `cb.reconstruct` invariant
+                            // says every `None` index also lands in
+                            // `missing`, so the empty-missing check
+                            // above SHOULD imply every entry is `Some`.
+                            // A peer that crafts a compact block which
+                            // breaks that invariant (or any future
+                            // change in `reconstruct` that decouples
+                            // the two vectors) would otherwise crash
+                            // the validator under `panic = "abort"`.
+                            // Treat a stray `None` like a missing-tx
+                            // signal: warn, request the full block via
+                            // sync, and skip this receive.
+                            let mut had_unexpected_none = false;
                             for (i, tx_bytes_opt) in matched.iter().enumerate() {
-                                let tx_bytes = tx_bytes_opt.as_ref().unwrap();
+                                let tx_bytes = match tx_bytes_opt.as_ref() {
+                                    Some(b) => b,
+                                    None => {
+                                        warn!(
+                                            slot,
+                                            tx_idx = i,
+                                            "compact-block reconstructed entry is None despite empty `missing` — \
+                                             refusing this block path and triggering full-block sync"
+                                        );
+                                        had_unexpected_none = true;
+                                        break;
+                                    }
+                                };
                                 // Try plaintext first, then encrypted
                                 if let Ok(tx) = wire::decode_transaction(tx_bytes) {
                                     transactions.push(tx);
@@ -1908,6 +1948,11 @@ impl PydeNode {
                                 } else {
                                     warn!(slot, tx_idx = i, "failed to decode reconstructed tx");
                                 }
+                            }
+                            if had_unexpected_none {
+                                chain_sync.manager.update_network_tip(slot);
+                                chain_sync.request_next_batch(&mut swarm);
+                                continue;
                             }
 
                             let tx_count = transactions.len();
@@ -3678,9 +3723,28 @@ impl PydeNode {
                             if let Some(identity) = validator_identity.as_ref() {
                                 if let Some(ref ks) = identity.key_share {
                                     let share_path = self.config.node.datadir.join("threshold.share");
-                                    if std::fs::write(&share_path, ks.to_bytes()).is_ok() {
-                                        engine.key_share_dirty = false;
-                                        info!("PSS: refreshed key share saved to disk");
+                                    // TPL-401: atomic + 0o600. PSS-refresh
+                                    // hits this path every refresh round,
+                                    // so the pre-fix
+                                    // `fs::write(...).is_ok()` left the
+                                    // share readable at the operator's
+                                    // umask between write and mode-set on
+                                    // every refresh — repeatedly opening
+                                    // the same race window.
+                                    match crate::genesis::write_secret_file(
+                                        &share_path,
+                                        &ks.to_bytes(),
+                                    ) {
+                                        Ok(()) => {
+                                            engine.key_share_dirty = false;
+                                            info!("PSS: refreshed key share saved to disk");
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                "PSS: failed to persist refreshed key share"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -6055,12 +6119,16 @@ fn load_validator_identity(datadir: &Path, chain_id: u64) -> Result<ValidatorIde
         // otherwise fall back to legacy raw bytes for devnet
         // ergonomics (existing test infra doesn't set the env
         // var and shouldn't have to).
+        // TPL-401: write atomically with 0o600 from the first
+        // byte. Pre-fix the bytes hit disk via `fs::write` at the
+        // operator's umask, then `set_permissions` tightened to
+        // 0o600 — a multi-tenant box could lose the FALCON sk to
+        // a poll loop running during that window.
         if let Some(pass) = passphrase.as_deref().filter(|p| !p.is_empty()) {
             let keystore = crate::keystore::encrypt(&pk, &sk, pass)?;
             let json = serde_json::to_vec_pretty(&keystore)
                 .map_err(|e| format!("failed to serialize keystore: {e}"))?;
-            std::fs::write(&key_path, &json)
-                .map_err(|e| format!("failed to write {}: {}", key_path.display(), e))?;
+            crate::genesis::write_secret_file(&key_path, &json)?;
             info!(
                 path = %key_path.display(),
                 "generated and encrypted new validator signing key"
@@ -6072,21 +6140,12 @@ fn load_validator_identity(datadir: &Path, chain_id: u64) -> Result<ValidatorIde
             buf.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(pk_bytes);
             buf.extend_from_slice(sk_bytes);
-            std::fs::write(&key_path, &buf)
-                .map_err(|e| format!("failed to write {}: {}", key_path.display(), e))?;
+            crate::genesis::write_secret_file(&key_path, &buf)?;
             info!(
                 path = %key_path.display(),
                 "generated new validator signing key (unencrypted — set \
                  PYDE_VALIDATOR_PASSPHRASE for encryption)"
             );
-        }
-
-        // Tighten permissions on the key file regardless of
-        // format — readable only by the owning user.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
         }
 
         (pk, sk)

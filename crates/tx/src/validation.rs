@@ -96,6 +96,20 @@ pub enum ValidationError {
     /// declared tx type implies nothing about. Now rejected at
     /// validation so the malformed tx never reaches the pipeline.
     UnexpectedValue { tx_type: u8, value: u128 },
+    /// `tx.tx_type` is non-`Standard`/non-`Deploy` but `tx.to` is
+    /// not `ZERO_ADDRESS` (TPL-408). Pre-fix the pipeline always
+    /// called `apply_account_delta(smt, &tx.to, ...)` regardless of
+    /// tx_type. For variants that don't carry a destination
+    /// (`Slash`, `ClaimReward`, multisig types, etc.), `tx.to` was
+    /// effectively unconstrained — a malicious proposer could set
+    /// it to any unused address, run the tx, and have the SMT
+    /// permanently store an empty `Account` record at that address.
+    /// Repeated at scale this fills the trie with junk entries at
+    /// only the cost of the per-tx gas (no per-write storage gas
+    /// because `apply_account_delta` writes a zero-balance shell).
+    /// Now rejected at validation so the malformed tx can't enter
+    /// the mempool or land in a block.
+    UnexpectedTo { tx_type: u8 },
     /// `tx.tx_type` is currently disabled at the protocol level
     /// (audit 351). `StakeWithdraw` flips a validator entry to
     /// `Unbonding` but there is no `CompleteUnbonding` tx type —
@@ -210,6 +224,34 @@ pub fn validate_transaction(
                 return Err(ValidationError::UnexpectedValue {
                     tx_type: tx.tx_type as u8,
                     value: tx.value,
+                });
+            }
+        }
+    }
+
+    // TPL-408: same shape as the value gate above for `tx.to`.
+    // `Standard` and `Deploy` are the only types whose pipeline
+    // semantics actually consume `tx.to`. For every other variant
+    // the pipeline still calls `apply_account_delta(smt, &tx.to,
+    // ...)` at write-back, which always ends in
+    // `store_account` — even when initial == final the SMT gets a
+    // fresh `Account` shell at the target address. A malicious
+    // proposer (or a loose RPC client) setting `tx.to` to an
+    // unused address per non-Standard tx writes one empty record
+    // per tx into the trie at no storage-gas cost, growing the
+    // SMT and the witness without bound.
+    //
+    // Reject at validation so the malformed input can't enter
+    // the mempool or land in a block. `RegisterPubkey` already
+    // routed away above; honest tooling for the gated variants
+    // (Slash, ClaimReward, multisig types, …) sets
+    // `tx.to = ZERO_ADDRESS`.
+    match tx.tx_type {
+        crate::types::TransactionType::Standard | crate::types::TransactionType::Deploy => {}
+        _ => {
+            if tx.to != pyde_account::address::ZERO_ADDRESS {
+                return Err(ValidationError::UnexpectedTo {
+                    tx_type: tx.tx_type as u8,
                 });
             }
         }
@@ -1249,6 +1291,74 @@ mod tests {
         }
     }
 
+    /// TPL-408: every non-Standard / non-Deploy variant with
+    /// `tx.to != ZERO_ADDRESS` must be rejected. Pre-fix the
+    /// pipeline's blanket `apply_account_delta(smt, &tx.to, ...)`
+    /// wrote an empty Account record at the supplied address
+    /// regardless of tx_type, growing the SMT for free.
+    #[test]
+    fn tpl_408_non_to_types_with_nonzero_to_rejected() {
+        let stranger = derive_eoa_address(b"tpl-408-junk-bloat");
+        // Skip RegisterPubkey (routed earlier) and StakeWithdraw
+        // (audit-351 disables it) so the new gate is what we're
+        // exercising rather than an earlier reject path.
+        let non_to_types = [
+            TransactionType::StakeDeposit,
+            TransactionType::Slash,
+            TransactionType::ClaimReward,
+            TransactionType::ClaimAirdrop,
+            TransactionType::SweepAirdrop,
+            TransactionType::MultisigTx,
+            TransactionType::RotateMultisig,
+            TransactionType::EmergencyPause,
+            TransactionType::EmergencyResume,
+        ];
+        for ty in non_to_types {
+            let (mut tx, account, nonce_state) = make_valid_tx_and_account();
+            tx.tx_type = ty;
+            tx.value = 0; // 352 gate must not trip
+            tx.to = stranger;
+            let ctx = default_ctx();
+            let err = validate_transaction(&tx, &account, &nonce_state, &ctx)
+                .expect_err(&format!("{ty:?} with non-zero tx.to must reject"));
+            match err {
+                ValidationError::UnexpectedTo { tx_type } => assert_eq!(tx_type, ty as u8),
+                other => panic!("{ty:?}: expected UnexpectedTo, got {other:?}"),
+            }
+        }
+    }
+
+    /// TPL-408 positive control: every non-`Standard`/`Deploy` variant
+    /// with `tx.to == ZERO_ADDRESS` reaches at least past the new
+    /// gate (later validation checks may still reject it for
+    /// other reasons — we only verify the gate doesn't trip here).
+    #[test]
+    fn tpl_408_non_to_types_with_zero_to_pass_gate() {
+        let non_to_types = [
+            TransactionType::StakeDeposit,
+            TransactionType::Slash,
+            TransactionType::ClaimReward,
+            TransactionType::ClaimAirdrop,
+            TransactionType::SweepAirdrop,
+            TransactionType::MultisigTx,
+            TransactionType::RotateMultisig,
+            TransactionType::EmergencyPause,
+            TransactionType::EmergencyResume,
+        ];
+        for ty in non_to_types {
+            let (mut tx, account, nonce_state) = make_valid_tx_and_account();
+            tx.tx_type = ty;
+            tx.value = 0;
+            tx.to = ZERO_ADDRESS;
+            let ctx = default_ctx();
+            let res = validate_transaction(&tx, &account, &nonce_state, &ctx);
+            // Either Ok or any error other than UnexpectedTo.
+            if let Err(ValidationError::UnexpectedTo { .. }) = res {
+                panic!("{ty:?}: ZERO_ADDRESS must clear the new gate");
+            }
+        }
+    }
+
     // ========== Audit 351: StakeWithdraw disabled at validation ==========
 
     /// `StakeWithdraw` flips a validator entry to `Unbonding` but
@@ -1262,6 +1372,7 @@ mod tests {
         let (mut tx, account, nonce_state) = make_valid_tx_and_account();
         tx.tx_type = TransactionType::StakeWithdraw;
         tx.value = 0; // 352 gate must not trip
+        tx.to = ZERO_ADDRESS; // TPL-408 gate must not trip
 
         for chain_id in [1u64, 7331, 31337] {
             tx.chain_id = chain_id;

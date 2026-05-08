@@ -183,7 +183,7 @@ mod tests {
             pk,
         )
         .unwrap();
-        pool.add(tx).unwrap();
+        pool.add_unverified_for_devnet(tx).unwrap();
     }
 
     // ========== Task 0539: Block respects gas limit ==========

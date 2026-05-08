@@ -269,7 +269,14 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
     let mut compiled_registry: HashMap<String, Vec<u8>> = HashMap::new();
     let mut contract_functions: HashMap<String, Vec<FnSig>> = HashMap::new();
     let mut contract_constructors: HashMap<String, Vec<(String, otic::types::Ty)>> = HashMap::new();
-    let module_exports: HashMap<String, ModuleExports> = HashMap::new();
+    // TPL-411: do NOT shadow `module_exports` here. The outer
+    // map (declared at the top of `build_project`) is populated
+    // from every source's exports during the dependency-graph
+    // pass; that's the table `run_frontend` needs so the resolver
+    // can validate `use foo::Bar` against real export sets. Pre-
+    // fix an empty `let module_exports = HashMap::new();` shadowed
+    // the populated outer map, neutering the cross-file import
+    // check — bogus imports compiled without diagnostics.
     let mut result = BuildResult {
         contracts: Vec::new(),
         total_bytecode: 0,
