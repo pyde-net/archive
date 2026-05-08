@@ -3678,9 +3678,28 @@ impl PydeNode {
                             if let Some(identity) = validator_identity.as_ref() {
                                 if let Some(ref ks) = identity.key_share {
                                     let share_path = self.config.node.datadir.join("threshold.share");
-                                    if std::fs::write(&share_path, ks.to_bytes()).is_ok() {
-                                        engine.key_share_dirty = false;
-                                        info!("PSS: refreshed key share saved to disk");
+                                    // TPL-401: atomic + 0o600. PSS-refresh
+                                    // hits this path every refresh round,
+                                    // so the pre-fix
+                                    // `fs::write(...).is_ok()` left the
+                                    // share readable at the operator's
+                                    // umask between write and mode-set on
+                                    // every refresh — repeatedly opening
+                                    // the same race window.
+                                    match crate::genesis::write_secret_file(
+                                        &share_path,
+                                        &ks.to_bytes(),
+                                    ) {
+                                        Ok(()) => {
+                                            engine.key_share_dirty = false;
+                                            info!("PSS: refreshed key share saved to disk");
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                error = %e,
+                                                "PSS: failed to persist refreshed key share"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -6055,12 +6074,16 @@ fn load_validator_identity(datadir: &Path, chain_id: u64) -> Result<ValidatorIde
         // otherwise fall back to legacy raw bytes for devnet
         // ergonomics (existing test infra doesn't set the env
         // var and shouldn't have to).
+        // TPL-401: write atomically with 0o600 from the first
+        // byte. Pre-fix the bytes hit disk via `fs::write` at the
+        // operator's umask, then `set_permissions` tightened to
+        // 0o600 — a multi-tenant box could lose the FALCON sk to
+        // a poll loop running during that window.
         if let Some(pass) = passphrase.as_deref().filter(|p| !p.is_empty()) {
             let keystore = crate::keystore::encrypt(&pk, &sk, pass)?;
             let json = serde_json::to_vec_pretty(&keystore)
                 .map_err(|e| format!("failed to serialize keystore: {e}"))?;
-            std::fs::write(&key_path, &json)
-                .map_err(|e| format!("failed to write {}: {}", key_path.display(), e))?;
+            crate::genesis::write_secret_file(&key_path, &json)?;
             info!(
                 path = %key_path.display(),
                 "generated and encrypted new validator signing key"
@@ -6072,21 +6095,12 @@ fn load_validator_identity(datadir: &Path, chain_id: u64) -> Result<ValidatorIde
             buf.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(pk_bytes);
             buf.extend_from_slice(sk_bytes);
-            std::fs::write(&key_path, &buf)
-                .map_err(|e| format!("failed to write {}: {}", key_path.display(), e))?;
+            crate::genesis::write_secret_file(&key_path, &buf)?;
             info!(
                 path = %key_path.display(),
                 "generated new validator signing key (unencrypted — set \
                  PYDE_VALIDATOR_PASSPHRASE for encryption)"
             );
-        }
-
-        // Tighten permissions on the key file regardless of
-        // format — readable only by the owning user.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
         }
 
         (pk, sk)

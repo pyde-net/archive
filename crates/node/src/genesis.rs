@@ -848,20 +848,82 @@ fn build_multiaddr(host: &str, port: u16, peer_id: &libp2p::PeerId) -> String {
 /// with FALCON signing material from a freshly-generated testnet
 /// bundle. Non-secret files (config.toml, genesis.toml, threshold.pk)
 /// are still written with `fs::write` directly.
-fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes)
-        .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
+/// Atomic, mode-0o600 write of a secret-bearing file (validator.key,
+/// threshold.share, node.key).
+///
+/// TPL-401: pre-fix this helper called `fs::write(path, ...)` and
+/// only set 0o600 *after* the write returned. Two failure modes:
+///   1. **Race window.** Between `write` and `set_permissions` the
+///      file existed at the operator's umask (often 0o644 → world-
+///      readable). On a multi-tenant box another local user with
+///      a tight poll loop could read the FALCON sk before the
+///      mode tightened.
+///   2. **Crash inconsistency.** A `kill -9` mid-write left a
+///      truncated key file with no atomic-replace guarantee, and
+///      on subsequent startup the loader saw a corrupt file
+///      instead of either the old or the new content.
+///
+/// Post-fix:
+///   - Unix path opens a `*.tmp` sibling with `create(true)
+///     .truncate(true).write(true).mode(0o600)` — the file exists
+///     at 0o600 from the very first byte written.
+///   - Bytes are flushed and `sync_all`'d before rename.
+///   - `rename(tmp, path)` is atomic on POSIX, so a crash either
+///     leaves the old file intact or completes the swap.
+///
+/// Non-Unix targets fall back to `fs::write` + `rename` (we don't
+/// run validators on Windows in production; covers test ergonomics
+/// only).
+pub(crate) fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let tmp_path = match path.file_name() {
+        Some(name) => {
+            let mut tmp = name.to_owned();
+            tmp.push(".tmp");
+            path.with_file_name(tmp)
+        }
+        None => return Err(format!("invalid path (no file name): {}", path.display())),
+    };
+
+    // If a prior crash left a stale tmp, drop it before we open
+    // — `create(true).truncate(true)` would clobber anyway, but
+    // unlinking first means the new file starts from a clean
+    // inode with the requested mode rather than inheriting
+    // whatever permissions the prior tmp had.
+    let _ = std::fs::remove_file(&tmp_path);
+
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-            format!(
-                "failed to set 0o600 on {} (audit 344): {}",
-                path.display(),
-                e
-            )
-        })?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .map_err(|e| format!("failed to open {}: {}", tmp_path.display(), e))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("failed to write {}: {}", tmp_path.display(), e))?;
+        f.sync_all()
+            .map_err(|e| format!("failed to fsync {}: {}", tmp_path.display(), e))?;
     }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp_path, bytes)
+            .map_err(|e| format!("failed to write {}: {}", tmp_path.display(), e))?;
+    }
+
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        // Best-effort tmp cleanup; if rename fails, leaving the
+        // tmp around helps the operator diagnose disk/perms.
+        format!(
+            "failed to rename {} → {}: {}",
+            tmp_path.display(),
+            path.display(),
+            e
+        )
+    })?;
+
     Ok(())
 }
 
@@ -2438,5 +2500,49 @@ mod tests {
         write_secret_file(&path, b"updated").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// TPL-401: a successful write leaves no `*.tmp` sibling. The
+    /// atomic-rename pattern stages bytes in `secret.bin.tmp` and
+    /// renames it onto `secret.bin`; a leftover tmp would mean the
+    /// rename never fired (functional bug) or the helper isn't using
+    /// the staging path at all (regression to the pre-fix
+    /// `fs::write` form).
+    #[test]
+    fn tpl_401_write_secret_file_leaves_no_tmp_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+        let tmp = dir.path().join("secret.bin.tmp");
+        write_secret_file(&path, b"contents").unwrap();
+        assert!(path.exists(), "final file must exist post-write");
+        assert!(
+            !tmp.exists(),
+            "atomic write must remove the staging tmp on success"
+        );
+        // Bytes round-trip.
+        let read = std::fs::read(&path).unwrap();
+        assert_eq!(read, b"contents");
+    }
+
+    /// TPL-401: a stale `*.tmp` left by a prior crashed write does
+    /// NOT block a fresh `write_secret_file` call. Pre-fix the
+    /// helper used `fs::write` directly so this case didn't apply;
+    /// post-fix the helper unlinks any stale tmp before opening the
+    /// new staging file with `mode(0o600)`, so an interrupted
+    /// previous run can't leave the operator unable to re-save the
+    /// validator's secret material.
+    #[test]
+    fn tpl_401_write_secret_file_recovers_from_stale_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+        let tmp = dir.path().join("secret.bin.tmp");
+        // Simulate a prior crash: tmp file from a previous attempt
+        // is sitting around at default umask.
+        std::fs::write(&tmp, b"stale leftover").unwrap();
+        // Fresh write must succeed (not fail because tmp exists).
+        write_secret_file(&path, b"fresh contents").unwrap();
+        let read = std::fs::read(&path).unwrap();
+        assert_eq!(read, b"fresh contents");
+        assert!(!tmp.exists(), "post-success tmp must be cleaned up");
     }
 }
