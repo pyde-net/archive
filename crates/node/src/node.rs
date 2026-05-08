@@ -494,6 +494,16 @@ impl PydeNode {
 
             let mut engine = ValidatorEngine::new(self.config.node.chain_id, [0xAA; 32]); // devnet epoch randomness
 
+            // TPL-405: hand the engine a clone of the process-wide
+            // shutdown signal so persist failures (consensus state,
+            // evidence, finality checkpoint, reshare state, seen-
+            // proposal/vote) trigger a graceful drain instead of
+            // `panic!`. Pre-fix the engine called `panic!` directly
+            // on any of these paths; under `panic = "abort"` that's
+            // an immediate SIGABRT that bypasses the main loop's
+            // shutdown branch (peer_book save, etc.).
+            engine.attach_shutdown_signal(self.shutdown.clone());
+
             // Attach persistent ConsensusState store. If a prior state exists,
             // it is loaded here — this is what prevents last_voted_slot or
             // highest_qc from regressing after a validator crash/restart.

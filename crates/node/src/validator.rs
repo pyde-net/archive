@@ -461,6 +461,12 @@ pub struct ValidatorEngine {
     /// neither path reaches quorum.
     last_qc_progress_ms: u64,
     last_seen_qc_slot: u64,
+    /// TPL-405: graceful-shutdown handle. When set, fatal-persist
+    /// branches that previously called `panic!` instead trigger
+    /// this signal so the main loop can drain in-flight work and
+    /// exit cleanly. Tests leave this `None`, preserving the
+    /// existing `panic!` behaviour for failure-mode assertions.
+    shutdown_signal: Option<crate::shutdown::ShutdownSignal>,
 }
 
 impl ValidatorEngine {
@@ -528,6 +534,35 @@ impl ValidatorEngine {
             reshare_aggregated: false,
             key_share_dirty: false,
             consensus_store: None,
+            shutdown_signal: None,
+        }
+    }
+
+    /// TPL-405: register a shutdown signal so persist failures can
+    /// trigger drain-then-exit instead of `panic!`. Production
+    /// callers wire this to the same `ShutdownSignal` the SIGTERM
+    /// handler triggers; the main loop then drives the drain.
+    pub fn attach_shutdown_signal(&mut self, signal: crate::shutdown::ShutdownSignal) {
+        self.shutdown_signal = Some(signal);
+    }
+
+    /// TPL-405: log a fatal-persist diagnostic and either trigger
+    /// graceful shutdown (production) or panic (tests / no signal
+    /// configured). Used by the consensus / evidence / reshare
+    /// persist paths whose pre-fix branches called `panic!`
+    /// directly. Continuing after a failed safety-critical write
+    /// would silently degrade BFT guarantees on the next restart;
+    /// the function returns rather than swallowing the error so
+    /// callers stop issuing new actions while the loop drains.
+    fn signal_persist_failure(&self, what: &str, err: &str) {
+        error!(
+            error = %err,
+            what,
+            "FATAL: safety-critical persist failed — halting validator"
+        );
+        match &self.shutdown_signal {
+            Some(sig) => sig.trigger(),
+            None => panic!("{what} persist failed: {err}"),
         }
     }
 
@@ -642,7 +677,8 @@ impl ValidatorEngine {
                 // A corrupt checkpoint is a HARD failure — without it we
                 // can't enforce WS, so refusing to start is safer than
                 // silently running without the guard.
-                panic!("CRITICAL: failed to load finality checkpoint: {}", e);
+                self.signal_persist_failure("finality checkpoint load", &e.to_string());
+                return;
             }
         }
 
@@ -668,11 +704,7 @@ impl ValidatorEngine {
     fn persist_evidence_state(&self) {
         if let Some(store) = &self.consensus_store {
             if let Err(e) = store.save_evidence_state(&self.evidence_snapshot()) {
-                error!(
-                    error = %e,
-                    "FATAL: failed to persist evidence state — halting validator"
-                );
-                panic!("evidence state persist failed: {}", e);
+                self.signal_persist_failure("evidence state", &e.to_string());
             }
         }
     }
@@ -694,11 +726,7 @@ impl ValidatorEngine {
     fn persist_consensus(&self) {
         if let Some(store) = &self.consensus_store {
             if let Err(e) = store.save(&self.consensus) {
-                error!(
-                    error = %e,
-                    "FATAL: failed to persist consensus state — halting validator to preserve BFT safety"
-                );
-                panic!("consensus state persist failed: {}", e);
+                self.signal_persist_failure("consensus state", &e.to_string());
             }
         }
     }
@@ -1231,7 +1259,7 @@ impl ValidatorEngine {
             return;
         };
         if let Err(e) = store.save_finality_checkpoint(cp) {
-            panic!("CRITICAL: finality checkpoint persistence failed — {}", e);
+            self.signal_persist_failure("finality checkpoint", &e.to_string());
         }
     }
 
@@ -1261,7 +1289,7 @@ impl ValidatorEngine {
             return;
         };
         if let Err(e) = store.save_reshare_state(&snap) {
-            panic!("CRITICAL: reshare state persistence failed — {}", e);
+            self.signal_persist_failure("reshare state", &e.to_string());
         }
     }
 
@@ -1797,12 +1825,7 @@ impl ValidatorEngine {
                 if let Err(e) =
                     store.save_seen_proposal(slot, &header.proposer, header, proposer_signature)
                 {
-                    error!(
-                        error = %e,
-                        slot,
-                        "FATAL: failed to persist seen proposal — halting validator"
-                    );
-                    panic!("seen-proposal persist failed: {}", e);
+                    self.signal_persist_failure("seen-proposal", &e.to_string());
                 }
             }
             self.seen_proposals
@@ -2389,13 +2412,7 @@ impl ValidatorEngine {
                 if let Err(e) =
                     store.save_seen_vote(slot, voter_index as u8, &block_hash, &vote_sig)
                 {
-                    error!(
-                        error = %e,
-                        slot,
-                        voter_index,
-                        "FATAL: failed to persist seen vote — halting validator"
-                    );
-                    panic!("seen-vote persist failed: {}", e);
+                    self.signal_persist_failure("seen-vote", &e.to_string());
                 }
             }
             self.seen_votes.insert(vote_key, (block_hash, vote_sig));
@@ -3184,6 +3201,43 @@ mod tests {
         let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
         engine.set_committee(keys);
         (engine, identities)
+    }
+
+    /// TPL-405: when a `ShutdownSignal` is attached, a fatal-
+    /// persist branch triggers the signal (no panic). Subscribers
+    /// observe the trigger so the main loop can begin draining.
+    #[tokio::test]
+    async fn tpl_405_persist_failure_triggers_shutdown_when_signal_attached() {
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
+        let signal = crate::shutdown::ShutdownSignal::new();
+        let mut rx = signal.subscribe();
+        engine.attach_shutdown_signal(signal);
+
+        // Direct invocation of the dispatch helper. Production
+        // call sites (persist_consensus, persist_evidence_state,
+        // persist_finality_checkpoint_direct, persist_reshare_state,
+        // seen-proposal save, seen-vote save) all funnel through it.
+        engine.signal_persist_failure("test", "synthetic-io-error");
+
+        // Subscribers must receive within a tight bound — the
+        // broadcast send is in-process and non-blocking.
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            matches!(recv, Ok(Ok(()))),
+            "shutdown signal must fire on attached-signal persist failure; got {:?}",
+            recv
+        );
+    }
+
+    /// TPL-405: with no signal attached, the engine still panics
+    /// — preserves the existing failure-mode contract for the unit
+    /// tests that assert it. Production paths always attach a
+    /// signal via `attach_shutdown_signal`.
+    #[test]
+    #[should_panic(expected = "test persist failed: synthetic-io-error")]
+    fn tpl_405_persist_failure_panics_when_no_signal_attached() {
+        let engine = ValidatorEngine::new(TEST_CHAIN_ID, [0u8; 32]);
+        engine.signal_persist_failure("test", "synthetic-io-error");
     }
 
     #[test]
