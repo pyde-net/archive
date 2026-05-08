@@ -3144,12 +3144,32 @@ impl PydeNode {
                                                             let threshold = pyde_consensus::block::quorum_for_committee(
                                                                 engine.committee_keys.len()
                                                             );
+                                                            // TPL-301: deserialize committee FALCON pks in
+                                                            // share-index order so combine_shares can verify
+                                                            // each share's signature.
+                                                            let committee_pks_opt: Option<Vec<pyde_crypto::falcon::FalconPublicKey>> = engine
+                                                                .committee_keys
+                                                                .iter()
+                                                                .map(|b| pyde_crypto::falcon::FalconPublicKey::from_bytes(b))
+                                                                .collect();
+                                                            let committee_pks = match committee_pks_opt {
+                                                                Some(pks) => pks,
+                                                                None => {
+                                                                    error!(
+                                                                        slot = current_slot,
+                                                                        "committee FALCON pk decode failed — \
+                                                                         abandoning decrypt round"
+                                                                    );
+                                                                    Vec::new()
+                                                                }
+                                                            };
                                                             // Create decryptor and seed with our own shares
+                                                            if !committee_pks.is_empty() {
                                                             if let Ok(mut decryptor) = pyde_mempool::decryption::BlockDecryptor::new(
-                                                                enc_txs.clone(), threshold,
+                                                                enc_txs.clone(), threshold, committee_pks,
                                                             ) {
                                                                 if let Some(ks) = &identity.key_share {
-                                                                    decryptor.add_member_shares(ks);
+                                                                    decryptor.add_member_shares(ks, &identity.secret_key);
                                                                 }
                                                                 // Store decryptor for share collection
                                                                 // Replay any queued shares that arrived before the decryptor
@@ -3296,6 +3316,7 @@ impl PydeNode {
                                                                     dec_w.remove(&current_slot);
                                                                 }
                                                             }
+                                                            } // close: if !committee_pks.is_empty()
                                                         }
                                                     }
                                                 }
@@ -4241,11 +4262,30 @@ async fn maybe_kick_decryption_pipeline(
     };
     let identity = validator_identity.as_ref().unwrap();
     let threshold = pyde_consensus::block::quorum_for_committee(engine.committee_keys.len());
-    if let Ok(mut decryptor) =
-        pyde_mempool::decryption::BlockDecryptor::new(enc_txs.clone(), threshold)
-    {
+    // TPL-301: BlockDecryptor needs the committee's FALCON pks in
+    // share-index order (validator at committee position i holds
+    // share with index i+1). Skip decryption if any pk fails to
+    // decode, since combine_shares would reject every share signed
+    // against the missing slot.
+    let committee_pks: Option<Vec<pyde_crypto::falcon::FalconPublicKey>> = engine
+        .committee_keys
+        .iter()
+        .map(|b| pyde_crypto::falcon::FalconPublicKey::from_bytes(b))
+        .collect();
+    let Some(committee_pks) = committee_pks else {
+        error!(
+            slot = qc_slot,
+            "committee FALCON pk decode failed — abandoning decrypt round"
+        );
+        return;
+    };
+    if let Ok(mut decryptor) = pyde_mempool::decryption::BlockDecryptor::new(
+        enc_txs.clone(),
+        threshold,
+        committee_pks,
+    ) {
         if let Some(ks) = &identity.key_share {
-            decryptor.add_member_shares(ks);
+            decryptor.add_member_shares(ks, &identity.secret_key);
         }
         let mut q = queued_shares.write().await;
         if let Some(queued) = q.remove(&qc_slot) {

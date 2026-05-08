@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use pyde_crypto::falcon::falcon_keygen;
 use pyde_crypto::threshold::{
     combine_shares, generate_decryption_share, pss_refresh, threshold_encrypt, threshold_keygen,
     EpochKeyMaterial,
@@ -52,9 +53,18 @@ fn bench_decrypt() {
         let msg = b"benchmark message for threshold decryption";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
+        // TPL-301: each decryption share now carries a FALCON sig.
+        let mut falcon_pks = Vec::with_capacity(n);
+        let mut falcon_sks = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (pk, sk) = falcon_keygen().unwrap();
+            falcon_pks.push(pk);
+            falcon_sks.push(sk);
+        }
         let dec_shares: Vec<_> = shares[..t]
             .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .enumerate()
+            .map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[i]).unwrap())
             .collect();
 
         let iterations = if n <= 10 { 1000 } else { 100 };
@@ -64,6 +74,7 @@ fn bench_decrypt() {
                 std::hint::black_box(&dec_shares),
                 t,
                 std::hint::black_box(&ct),
+                std::hint::black_box(&falcon_pks),
             ))
             .unwrap();
         }

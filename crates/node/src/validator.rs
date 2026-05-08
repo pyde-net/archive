@@ -3008,10 +3008,28 @@ impl ValidatorEngine {
     ) -> Option<Vec<DecryptionShare>> {
         let key_share = identity.key_share.as_ref()?;
 
+        // TPL-301: each share carries a FALCON sig over
+        // (ct_hash || index || blinded_shares_hash) signed by the
+        // validator's consensus FALCON sk. `combine_shares` verifies
+        // the sig against the committee's public-key vector before
+        // accepting the share into Lagrange interpolation.
         let shares: Vec<DecryptionShare> = encrypted_txs
             .iter()
-            .map(|tx| generate_decryption_share(key_share, &tx.ciphertext))
+            .filter_map(|tx| {
+                generate_decryption_share(key_share, &tx.ciphertext, &identity.secret_key).ok()
+            })
             .collect();
+        // Defensive: if any share generation failed, abandon the
+        // whole round so we don't broadcast a partial set with
+        // mismatched ciphertext indices.
+        if shares.len() != encrypted_txs.len() {
+            warn!(
+                txs = encrypted_txs.len(),
+                produced = shares.len(),
+                "decryption-share generation produced partial set; aborting"
+            );
+            return None;
+        }
 
         info!(
             slot = self.consensus.current_slot,
@@ -3029,12 +3047,13 @@ impl ValidatorEngine {
         identity: &ValidatorIdentity,
         encrypted_txs: Vec<EncryptedTx>,
         threshold: usize,
+        committee_keys: Vec<FalconPublicKey>,
     ) -> Result<BlockDecryptor, String> {
-        let mut decryptor = BlockDecryptor::new(encrypted_txs, threshold)?;
+        let mut decryptor = BlockDecryptor::new(encrypted_txs, threshold, committee_keys)?;
 
         // Add our own shares immediately
         if let Some(key_share) = &identity.key_share {
-            decryptor.add_member_shares(key_share);
+            decryptor.add_member_shares(key_share, &identity.secret_key);
             debug!(
                 slot = self.consensus.current_slot,
                 "added own decryption shares"
@@ -3412,12 +3431,22 @@ mod tests {
             assert!(!incoming.try_aggregate_reshare_on_slot(fire_at + 1, 5, identity));
         }
 
+        // TPL-301: combine_shares verifies each share's FALCON sig
+        // against the committee's pk vector, so deserialize the
+        // pk-bytes the engine already tracks.
+        let committee_falcon_pks: Vec<pyde_crypto::falcon::FalconPublicKey> = new_committee_keys
+            .iter()
+            .map(|b| pyde_crypto::falcon::FalconPublicKey::from_bytes(b).unwrap())
+            .collect();
         let dec_shares: Vec<_> = new_identities
             .iter()
             .take(4)
-            .map(|id| generate_decryption_share(id.key_share.as_ref().unwrap(), &ct))
+            .map(|id| {
+                generate_decryption_share(id.key_share.as_ref().unwrap(), &ct, &id.secret_key)
+                    .unwrap()
+            })
             .collect();
-        let plaintext = combine_shares(&dec_shares, 4, &ct).unwrap();
+        let plaintext = combine_shares(&dec_shares, 4, &ct, &committee_falcon_pks).unwrap();
         assert_eq!(plaintext, msg);
     }
 
@@ -3487,8 +3516,10 @@ mod tests {
         // If they were on different polynomials, `combine_shares` would
         // produce garbage.
         let shares = vec![
-            generate_decryption_share(id_a.key_share.as_ref().unwrap(), &ct),
-            generate_decryption_share(id_b.key_share.as_ref().unwrap(), &ct),
+            generate_decryption_share(id_a.key_share.as_ref().unwrap(), &ct, &id_a.secret_key)
+                .unwrap(),
+            generate_decryption_share(id_b.key_share.as_ref().unwrap(), &ct, &id_b.secret_key)
+                .unwrap(),
         ];
         // Can't combine with only 2 of 4 required — add more honest shares.
         let mut helpers: Vec<ValidatorEngine> = (3..=6)
@@ -3508,12 +3539,22 @@ mod tests {
         }
         let mut all_shares = shares;
         for id in &helper_ids[..2] {
-            all_shares.push(generate_decryption_share(
-                id.key_share.as_ref().unwrap(),
-                &ct,
-            ));
+            all_shares.push(
+                generate_decryption_share(id.key_share.as_ref().unwrap(), &ct, &id.secret_key)
+                    .unwrap(),
+            );
         }
-        let plaintext = combine_shares(&all_shares, 4, &ct).unwrap();
+        // TPL-301: build the FALCON-pk vector that combine_shares
+        // verifies against, ordered by share-index. Indices 1, 2 are
+        // id_a, id_b; indices 3..=6 come from helper_ids.
+        let mut committee_falcon_pks =
+            Vec::<pyde_crypto::falcon::FalconPublicKey>::with_capacity(6);
+        committee_falcon_pks.push(id_a.public_key.clone());
+        committee_falcon_pks.push(id_b.public_key.clone());
+        for h in &helper_ids {
+            committee_falcon_pks.push(h.public_key.clone());
+        }
+        let plaintext = combine_shares(&all_shares, 4, &ct, &committee_falcon_pks).unwrap();
         assert_eq!(
             plaintext, msg,
             "shares must be on same polynomial — canonical subset divergence would break this"
@@ -5007,7 +5048,13 @@ mod tests {
         )
         .unwrap();
 
-        let decryptor = engine.start_decryption(&identity, vec![enc_tx], 2).unwrap();
+        // TPL-301: BlockDecryptor needs the committee's FALCON pks;
+        // for this single-node smoke test the only validator IS our
+        // identity, holding share-index 1.
+        let committee_pks = vec![identity.public_key.clone()];
+        let decryptor = engine
+            .start_decryption(&identity, vec![enc_tx], 2, committee_pks)
+            .unwrap();
         assert_eq!(decryptor.tx_count(), 1);
         assert_eq!(decryptor.share_count(0), 1); // our own share added
     }
@@ -5146,6 +5193,19 @@ mod tests {
         let alice = pyde_account::address::derive_eoa_address(alice_keys.0.as_bytes());
         let bob = pyde_account::address::derive_eoa_address(b"bob-recipient");
 
+        // TPL-301: each validator gets a FALCON keypair for signing
+        // its decryption shares; the public-key vector is used by
+        // combine_shares to verify each share.
+        let mut committee_falcon_pks =
+            Vec::<pyde_crypto::falcon::FalconPublicKey>::with_capacity(3);
+        let mut committee_falcon_sks =
+            Vec::<pyde_crypto::falcon::FalconSecretKey>::with_capacity(3);
+        for _ in 0..3 {
+            let (pk, sk) = falcon_keygen().unwrap();
+            committee_falcon_pks.push(pk);
+            committee_falcon_sks.push(sk);
+        }
+
         let mut nodes: Vec<E2ENode> = key_shares
             .iter()
             .take(3)
@@ -5207,8 +5267,14 @@ mod tests {
         // ride the consensus gossip topic post-QC; we collect them directly.
         let shares: Vec<_> = nodes
             .iter()
-            .map(|n| {
-                pyde_crypto::threshold::generate_decryption_share(&n.key_share, &enc_tx.ciphertext)
+            .enumerate()
+            .map(|(i, n)| {
+                pyde_crypto::threshold::generate_decryption_share(
+                    &n.key_share,
+                    &enc_tx.ciphertext,
+                    &committee_falcon_sks[i],
+                )
+                .unwrap()
             })
             .collect();
 
@@ -5217,7 +5283,8 @@ mod tests {
         // calls — so the MEV invariant check (slice 3.1's second-chance
         // tx_root verify) fires on every node.
         for node in &mut nodes {
-            let mut decryptor = BlockDecryptor::new(vec![enc_tx.clone()], 2).unwrap();
+            let mut decryptor =
+                BlockDecryptor::new(vec![enc_tx.clone()], 2, committee_falcon_pks.clone()).unwrap();
             decryptor.add_share(0, shares[0].clone());
             decryptor.add_share(0, shares[1].clone());
             assert!(decryptor.all_ready());
@@ -5402,6 +5469,18 @@ mod tests {
         let alice = pyde_account::address::derive_eoa_address(alice_keys.0.as_bytes());
         let attacker = pyde_account::address::derive_eoa_address(b"attacker");
 
+        // TPL-301: committee FALCON keypairs for share signing /
+        // verification.
+        let mut committee_falcon_pks =
+            Vec::<pyde_crypto::falcon::FalconPublicKey>::with_capacity(3);
+        let mut committee_falcon_sks =
+            Vec::<pyde_crypto::falcon::FalconSecretKey>::with_capacity(3);
+        for _ in 0..3 {
+            let (pk, sk) = falcon_keygen().unwrap();
+            committee_falcon_pks.push(pk);
+            committee_falcon_sks.push(sk);
+        }
+
         let tmp = tempfile::tempdir().unwrap();
         let mut state = StateManager::open(tmp.path(), 1024).unwrap();
         let bs = BlockStore::open(tmp.path()).unwrap();
@@ -5480,10 +5559,19 @@ mod tests {
         // dropped BEFORE it can move her funds.
         let shares: Vec<_> = key_shares
             .iter()
+            .enumerate()
             .take(2)
-            .map(|ks| pyde_crypto::threshold::generate_decryption_share(ks, &forged.ciphertext))
+            .map(|(i, ks)| {
+                pyde_crypto::threshold::generate_decryption_share(
+                    ks,
+                    &forged.ciphertext,
+                    &committee_falcon_sks[i],
+                )
+                .unwrap()
+            })
             .collect();
-        let mut decryptor = BlockDecryptor::new(vec![forged], 2).unwrap();
+        let mut decryptor =
+            BlockDecryptor::new(vec![forged], 2, committee_falcon_pks.clone()).unwrap();
         decryptor.add_share(0, shares[0].clone());
         decryptor.add_share(0, shares[1].clone());
         let outcome = try_decrypt_and_execute(
@@ -5529,6 +5617,18 @@ mod tests {
         use pyde_crypto::threshold::threshold_keygen;
         let (tpk, shares) = threshold_keygen(3, 2).unwrap();
 
+        // TPL-301: committee FALCON keypairs for share signing /
+        // verification.
+        let mut committee_falcon_pks =
+            Vec::<pyde_crypto::falcon::FalconPublicKey>::with_capacity(3);
+        let mut committee_falcon_sks =
+            Vec::<pyde_crypto::falcon::FalconSecretKey>::with_capacity(3);
+        for _ in 0..3 {
+            let (pk, sk) = falcon_keygen().unwrap();
+            committee_falcon_pks.push(pk);
+            committee_falcon_sks.push(sk);
+        }
+
         // Both senders get FALCON-backed accounts so execute-time auth
         // verification accepts the honest txs. (Proves the ordering
         // invariant independently of the byzantine-proposer auth hole.)
@@ -5570,22 +5670,44 @@ mod tests {
         state.refresh_root();
 
         // Honest decryptor, committed order [A, B].
-        let mut honest = BlockDecryptor::new(vec![tx_a.clone(), tx_b.clone()], 2).unwrap();
+        let mut honest =
+            BlockDecryptor::new(vec![tx_a.clone(), tx_b.clone()], 2, committee_falcon_pks.clone())
+                .unwrap();
         honest.add_share(
             0,
-            pyde_crypto::threshold::generate_decryption_share(&shares[0], &tx_a.ciphertext),
+            pyde_crypto::threshold::generate_decryption_share(
+                &shares[0],
+                &tx_a.ciphertext,
+                &committee_falcon_sks[0],
+            )
+            .unwrap(),
         );
         honest.add_share(
             0,
-            pyde_crypto::threshold::generate_decryption_share(&shares[1], &tx_a.ciphertext),
+            pyde_crypto::threshold::generate_decryption_share(
+                &shares[1],
+                &tx_a.ciphertext,
+                &committee_falcon_sks[1],
+            )
+            .unwrap(),
         );
         honest.add_share(
             1,
-            pyde_crypto::threshold::generate_decryption_share(&shares[0], &tx_b.ciphertext),
+            pyde_crypto::threshold::generate_decryption_share(
+                &shares[0],
+                &tx_b.ciphertext,
+                &committee_falcon_sks[0],
+            )
+            .unwrap(),
         );
         honest.add_share(
             1,
-            pyde_crypto::threshold::generate_decryption_share(&shares[1], &tx_b.ciphertext),
+            pyde_crypto::threshold::generate_decryption_share(
+                &shares[1],
+                &tx_b.ciphertext,
+                &committee_falcon_sks[1],
+            )
+            .unwrap(),
         );
         let honest_outcome = try_decrypt_and_execute(
             &bs,
@@ -5605,7 +5727,7 @@ mod tests {
 
         // Tampered decryptor flipping to [B, A] is rejected by the
         // second-chance tx_root check in try_decrypt_and_execute.
-        let mut tampered = BlockDecryptor::new(vec![tx_b, tx_a], 2).unwrap();
+        let mut tampered = BlockDecryptor::new(vec![tx_b, tx_a], 2, committee_falcon_pks).unwrap();
         let tampered_outcome = try_decrypt_and_execute(
             &bs,
             1,

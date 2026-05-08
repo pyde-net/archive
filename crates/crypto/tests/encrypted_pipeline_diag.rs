@@ -94,10 +94,27 @@ fn loaded_keys_round_trip() {
     let ct_rt = pyde_crypto::threshold::ThresholdCiphertext::from_wire_bytes(&ct_wire)
         .expect("wire round-trip");
 
+    // TPL-301: each decryption share is FALCON-signed. The on-disk
+    // datadir doesn't carry committee FALCON keys at the indices
+    // assigned by `KeyShare.index`, so synthesize a per-index map
+    // of fresh keypairs (1-based index → keypair). Combine then
+    // verifies against the matching public-key vector.
+    let max_index = shares.iter().map(|s| s.index).max().unwrap_or(0);
+    let mut falcon_pks: Vec<pyde_crypto::falcon::FalconPublicKey> = Vec::with_capacity(max_index);
+    let mut falcon_sks: Vec<pyde_crypto::falcon::FalconSecretKey> = Vec::with_capacity(max_index);
+    for _ in 0..max_index {
+        let (pk, sk) = pyde_crypto::falcon::falcon_keygen().expect("falcon keygen");
+        falcon_pks.push(pk);
+        falcon_sks.push(sk);
+    }
+
     // 5. Decryption shares from each loaded share.
     let dec_shares: Vec<pyde_crypto::threshold::DecryptionShare> = shares
         .iter()
-        .map(|ks| pyde_crypto::threshold::generate_decryption_share(ks, &ct_rt))
+        .map(|ks| {
+            pyde_crypto::threshold::generate_decryption_share(ks, &ct_rt, &falcon_sks[ks.index - 1])
+                .expect("share gen")
+        })
         .collect();
 
     let threshold = quorum_for_committee(node_dirs.len());
@@ -121,7 +138,12 @@ fn loaded_keys_round_trip() {
                         dec_shares[j].clone(),
                         dec_shares[k].clone(),
                     ];
-                    match pyde_crypto::threshold::combine_shares(&subset, threshold, &ct_rt) {
+                    match pyde_crypto::threshold::combine_shares(
+                        &subset,
+                        threshold,
+                        &ct_rt,
+                        &falcon_pks,
+                    ) {
                         Ok(plain) => {
                             assert_eq!(plain, payload, "wrong plaintext");
                             eprintln!(

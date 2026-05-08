@@ -861,6 +861,17 @@ mod tests {
         let ct = pyde_crypto::threshold::ThresholdCiphertext::from_wire_bytes(&ct_bytes)
             .expect("real decoder must accept WASM ciphertext");
 
+        // TPL-301: each decryption share is FALCON-signed; mint a
+        // committee of fresh keypairs whose pk vector indexes match
+        // the share-index assignment.
+        let mut falcon_pks = Vec::with_capacity(4);
+        let mut falcon_sks = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let (pk, sk) = pyde_crypto::falcon::falcon_keygen().unwrap();
+            falcon_pks.push(pk);
+            falcon_sks.push(sk);
+        }
+
         // Validator-side: every share-holder produces a decryption
         // share for this ciphertext, then any THRESHOLD of them
         // combine to recover plaintext. Mirrors the on-chain
@@ -868,9 +879,12 @@ mod tests {
         // re-verify and tx-execution scaffolding.
         let shares: Vec<pyde_crypto::threshold::DecryptionShare> = key_shares[..3]
             .iter()
-            .map(|ks| pyde_crypto::threshold::generate_decryption_share(ks, &ct))
+            .enumerate()
+            .map(|(i, ks)| {
+                pyde_crypto::threshold::generate_decryption_share(ks, &ct, &falcon_sks[i]).unwrap()
+            })
             .collect();
-        let plaintext = pyde_crypto::threshold::combine_shares(&shares, 3, &ct)
+        let plaintext = pyde_crypto::threshold::combine_shares(&shares, 3, &ct, &falcon_pks)
             .expect("WASM ciphertext must decrypt with real shares");
         assert_eq!(
             plaintext, payload,

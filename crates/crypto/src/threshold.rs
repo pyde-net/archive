@@ -298,12 +298,27 @@ impl KeyShare {
 }
 
 /// A partial decryption share from one validator.
+///
+/// TPL-301: every share carries a FALCON signature over
+/// `(ct_hash || index_le || blinded_shares_hash)` produced by the
+/// validator's committee FALCON key. The signature lets
+/// `combine_shares` authenticate that share `i` was actually
+/// produced by validator `i` — pre-fix, a Byzantine member could
+/// submit a share with someone else's index to displace honest
+/// shares from the threshold-`t` set, breaking liveness even
+/// though the MAC inside `combine_shares` ultimately caught the
+/// resulting bad keystream.
 #[derive(Clone, Debug)]
 pub struct DecryptionShare {
     /// Validator index (1-based).
     pub index: usize,
     /// Share values.
     shares: Vec<Goldilocks>,
+    /// FALCON signature over the canonical preimage. Empty
+    /// only on shares constructed by deprecated test paths
+    /// before the field was added; honest production shares
+    /// always carry a non-empty signature.
+    signature: Vec<u8>,
 }
 
 // Audit 358: a `DecryptionShare` is one validator's contribution
@@ -328,13 +343,47 @@ impl Drop for DecryptionShare {
 impl ZeroizeOnDrop for DecryptionShare {}
 
 impl DecryptionShare {
+    /// TPL-301: canonical preimage used for the FALCON sig that
+    /// authenticates this share. Bound:
+    ///   - `ct_hash` (32 bytes) — already pinned by the
+    ///     ciphertext-binding hash, so a sig from one ciphertext
+    ///     can't migrate to another.
+    ///   - `index` (8 bytes LE) — the new property: closes the
+    ///     "Byzantine member submits a share with someone else's
+    ///     index" displacement attack.
+    ///   - `blinded_shares_hash` (32 bytes) — Poseidon2 over the
+    ///     concatenated 8-byte LE encodings of `self.shares`,
+    ///     so a sig produced for one set of share values can't
+    ///     replay onto a different set.
+    fn signing_preimage(ct_hash: &[u8; 32], index: usize, shares: &[Goldilocks]) -> Vec<u8> {
+        let mut blinded_buf = Vec::with_capacity(shares.len() * 8);
+        for s in shares {
+            blinded_buf.extend_from_slice(&gl_to_u64(*s).to_le_bytes());
+        }
+        let blinded_hash = poseidon2_hash(&blinded_buf);
+
+        let mut preimage = Vec::with_capacity(32 + 8 + 32);
+        preimage.extend_from_slice(ct_hash);
+        preimage.extend_from_slice(&(index as u64).to_le_bytes());
+        preimage.extend_from_slice(blinded_hash.as_bytes());
+        preimage
+    }
+
+    /// Wire format:
+    ///   `[index:8 LE][share_count:4 LE][share_0..n:8 LE each]
+    ///    [sig_len:4 LE][sig:sig_len bytes]`
+    /// TPL-301: `sig_len` may be 0 for back-compat with
+    /// pre-signed-share test paths; production shares always
+    /// carry a non-empty signature.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(12 + self.shares.len() * 8);
+        let mut buf = Vec::with_capacity(12 + self.shares.len() * 8 + 4 + self.signature.len());
         buf.extend_from_slice(&(self.index as u64).to_le_bytes());
         buf.extend_from_slice(&(self.shares.len() as u32).to_le_bytes());
         for s in &self.shares {
             buf.extend_from_slice(&gl_to_u64(*s).to_le_bytes());
         }
+        buf.extend_from_slice(&(self.signature.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.signature);
         buf
     }
 
@@ -344,7 +393,8 @@ impl DecryptionShare {
         }
         let index = u64::from_le_bytes(data[0..8].try_into().ok()?) as usize;
         let count = u32::from_le_bytes(data[8..12].try_into().ok()?) as usize;
-        if data.len() < 12 + count * 8 {
+        let shares_end = 12 + count * 8;
+        if data.len() < shares_end + 4 {
             return None;
         }
         let mut shares = Vec::with_capacity(count);
@@ -358,7 +408,38 @@ impl DecryptionShare {
             }
             shares.push(gl(val));
         }
-        Some(Self { index, shares })
+        let sig_len =
+            u32::from_le_bytes(data[shares_end..shares_end + 4].try_into().ok()?) as usize;
+        let sig_end = shares_end + 4 + sig_len;
+        if data.len() < sig_end {
+            return None;
+        }
+        let signature = data[shares_end + 4..sig_end].to_vec();
+        Some(Self {
+            index,
+            shares,
+            signature,
+        })
+    }
+
+    /// Test-only constructor used by historical tests that didn't
+    /// thread a FALCON sk through to `generate_decryption_share`.
+    /// TPL-301: production code paths must use the signed flow.
+    #[cfg(test)]
+    pub fn unsigned_for_test(index: usize, shares: Vec<Goldilocks>) -> Self {
+        Self {
+            index,
+            shares,
+            signature: Vec::new(),
+        }
+    }
+
+    /// TPL-301: expose the wire signature so callers (e.g. the
+    /// gossip-receipt verify path in the future) can re-run the
+    /// FALCON check before admission. Empty for unsigned legacy
+    /// shares; non-empty for production shares.
+    pub fn signature(&self) -> &[u8] {
+        &self.signature
     }
 }
 
@@ -652,17 +733,23 @@ pub fn threshold_encrypt(
 pub fn generate_decryption_share(
     key_share: &KeyShare,
     ct: &ThresholdCiphertext,
-) -> DecryptionShare {
+    sk: &crate::falcon::FalconSecretKey,
+) -> Result<DecryptionShare, &'static str> {
     let ct_hash = ciphertext_binding_hash(ct);
     let mut blinded = Vec::with_capacity(key_share.shares.len());
     for (i, &share_val) in key_share.shares.iter().enumerate() {
         let mask = derive_blinding_mask(&ct_hash, key_share.index, i);
         blinded.push(share_val + mask);
     }
-    DecryptionShare {
+    // TPL-301: sign the canonical (ct_hash || index || blinded_hash)
+    // preimage. `combine_shares` verifies before using.
+    let preimage = DecryptionShare::signing_preimage(&ct_hash, key_share.index, &blinded);
+    let sig = crate::falcon::falcon_sign(sk, &preimage)?;
+    Ok(DecryptionShare {
         index: key_share.index,
         shares: blinded,
-    }
+        signature: sig.as_bytes().to_vec(),
+    })
 }
 
 /// Hash the ciphertext for binding. Uses the Kyber ciphertext + encrypted message
@@ -712,22 +799,27 @@ fn derive_blinding_mask(
 /// Combine decryption shares to recover the plaintext.
 /// Requires at least `threshold` shares.
 ///
-/// **Audit 312 trust boundary (testnet):** this function does NOT
-/// authenticate that share `i` was actually produced by validator
-/// `i`. A Byzantine committee member can submit a share with
-/// someone else's index to displace honest shares from the
-/// threshold-`t` set. The MAC check inside
-/// `combine_shares` catches the resulting bad keystream so safety
-/// holds — but availability of the MEV pipeline does not. Treat
-/// this as an operator-trust assumption on testnet (see
-/// `docs/testnet-bringup.md` § "Known testnet trust assumptions").
-/// Mainnet will require each share to carry a FALCON sig over
-/// `(ct_hash || index || blinded_shares_hash)` and verify it
-/// before admission.
+/// TPL-301: each share carries a FALCON sig over
+/// `(ct_hash || index || blinded_shares_hash)`. Pre-fix this
+/// function did NOT authenticate that share `i` was actually
+/// produced by validator `i`, so a Byzantine committee member
+/// could submit a share carrying someone else's index to displace
+/// an honest share from the threshold-`t` set. The MAC check
+/// downstream caught the resulting bad keystream so safety held,
+/// but availability of the MEV pipeline did not. Now every share
+/// is verified against `committee_keys[index - 1]` before any
+/// Lagrange interpolation runs, so Byzantine shares are rejected
+/// loudly with a named error and never enter the threshold subset.
+///
+/// `committee_keys` is indexed 0..n-1 with `committee_keys[i]` =
+/// the FALCON pubkey bytes of validator `i + 1`. The slice may be
+/// any length ≥ `max(share.index)`; entries beyond the maximum
+/// share index are ignored.
 pub fn combine_shares(
     shares: &[DecryptionShare],
     threshold: usize,
     ct: &ThresholdCiphertext,
+    committee_keys: &[crate::falcon::FalconPublicKey],
 ) -> Result<Vec<u8>, &'static str> {
     if shares.len() < threshold {
         return Err("insufficient shares");
@@ -757,6 +849,36 @@ pub fn combine_shares(
         }
     }
 
+    // Audit 360: every post-validation failure path collapses
+    // into the SAME generic error so an attacker submitting
+    // crafted shares can't probe which pipeline stage rejected.
+    // TPL-301's sig-verification gate joins the same bucket: a
+    // tampered share whose sig no longer matches the
+    // (ct_hash || index || blinded_shares_hash) preimage looks
+    // identical from outside to a share that passed sig-verify
+    // but tripped a downstream MAC fail.
+    const ORACLE_SAFE_ERR: &str = "decryption failed";
+
+    // TPL-301: verify each share's FALCON sig BEFORE using it in
+    // Lagrange interpolation. A Byzantine submitter who claims
+    // index i without holding validator i's FALCON sk cannot
+    // produce a valid sig over the canonical preimage, so
+    // displacement attacks fail at this gate.
+    let ct_hash = ciphertext_binding_hash(ct);
+    for share in shares.iter() {
+        let pk_bytes_idx = share.index.checked_sub(1).ok_or(ORACLE_SAFE_ERR)?;
+        if pk_bytes_idx >= committee_keys.len() {
+            return Err(ORACLE_SAFE_ERR);
+        }
+        let pk = &committee_keys[pk_bytes_idx];
+        let preimage = DecryptionShare::signing_preimage(&ct_hash, share.index, &share.shares);
+        let sig =
+            crate::falcon::FalconSignature::from_bytes(&share.signature).ok_or(ORACLE_SAFE_ERR)?;
+        if !crate::falcon::falcon_verify(pk, &preimage, &sig) {
+            return Err(ORACLE_SAFE_ERR);
+        }
+    }
+
     // Use exactly `threshold` shares
     let used_shares = &shares[..threshold];
 
@@ -783,13 +905,13 @@ pub fn combine_shares(
         seed_bytes[elem_idx * 8..(elem_idx + 1) * 8].copy_from_slice(&val.to_le_bytes());
     }
 
-    // Audit 360: from this point onward every failure path
-    // (KyberSecretKey decode, Kyber-768 decap, MAC compare)
-    // collapses into the SAME generic `"decryption failed"`
-    // error. Pre-fix the three branches returned distinct
-    // messages, so an attacker submitting crafted decryption
-    // shares could probe error responses to figure out which
-    // pipeline stage their bogus inputs landed on:
+    // Audit 360: KyberSecretKey decode / Kyber-768 decap / MAC
+    // compare all collapse into the SAME ORACLE_SAFE_ERR declared
+    // above the sig-verify loop. Pre-fix the three branches
+    // returned distinct messages, so an attacker submitting
+    // crafted decryption shares could probe error responses to
+    // figure out which pipeline stage their bogus inputs landed
+    // on:
     //   - "invalid reconstructed seed" → Lagrange interpolation
     //     produced 64 bytes that don't decode as a Kyber seed.
     //   - "Kyber-768 decapsulation failed" → seed decoded but
@@ -797,7 +919,7 @@ pub fn combine_shares(
     //   - "MAC verification failed" → seed + decap both passed
     //     but the recovered `ss` is wrong (i.e., the shares
     //     didn't actually combine to the committee's secret).
-    // That three-way split is a textbook decryption oracle —
+    // That three-way split was a textbook decryption oracle —
     // each probe narrows the attacker's search for the share
     // structure that round-trips. We also keep going on Kyber
     // failure (substituting a zeroed `ss`) so MAC check still
@@ -806,7 +928,6 @@ pub fn combine_shares(
     //
     // Honest decryptors don't see this error: they always pass
     // the MAC check on a well-formed ciphertext.
-    const ORACLE_SAFE_ERR: &str = "decryption failed";
 
     let sk = KyberSecretKey::from_bytes(&seed_bytes).ok_or(ORACLE_SAFE_ERR)?;
     let ss_or_zero = kyber_decapsulate(&sk, &ct.kyber_ct)
@@ -1458,52 +1579,62 @@ mod tests {
     const N: usize = 128;
     const T: usize = 85;
 
-    fn setup() -> (ThresholdPublicKey, Vec<KeyShare>) {
-        threshold_keygen(N, T).unwrap()
+    fn setup() -> (
+        ThresholdPublicKey,
+        Vec<KeyShare>,
+        Vec<crate::falcon::FalconPublicKey>,
+        Vec<crate::falcon::FalconSecretKey>,
+    ) {
+        let (tpk, shares) = threshold_keygen(N, T).unwrap();
+        let mut pks = Vec::with_capacity(N);
+        let mut sks = Vec::with_capacity(N);
+        for _ in 0..N {
+            let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+            pks.push(pk);
+            sks.push(sk);
+        }
+        (tpk, shares, pks, sks)
     }
 
     #[test]
     fn encrypt_decrypt_with_threshold_plus_one() {
-        let (tpk, shares) = setup();
+        let (tpk, shares, falcon_pks, falcon_sks) = setup();
         let msg = b"hello threshold kyber";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         let dec_shares: Vec<DecryptionShare> = shares[..T + 1]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
 
-        let plaintext = combine_shares(&dec_shares, T, &ct).unwrap();
+        let plaintext = combine_shares(&dec_shares, T, &ct, &falcon_pks).unwrap();
         assert_eq!(plaintext, msg);
     }
 
     #[test]
     fn encrypt_decrypt_with_exact_threshold() {
-        let (tpk, shares) = setup();
+        let (tpk, shares, falcon_pks, falcon_sks) = setup();
         let msg = b"exact threshold test";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         let dec_shares: Vec<DecryptionShare> = shares[..T]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
 
-        let plaintext = combine_shares(&dec_shares, T, &ct).unwrap();
+        let plaintext = combine_shares(&dec_shares, T, &ct, &falcon_pks).unwrap();
         assert_eq!(plaintext, msg);
     }
 
     #[test]
     fn insufficient_shares_fails() {
-        let (tpk, shares) = setup();
+        let (tpk, shares, falcon_pks, falcon_sks) = setup();
         let msg = b"not enough shares";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         let dec_shares: Vec<DecryptionShare> = shares[..T - 1]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
 
-        let result = combine_shares(&dec_shares, T, &ct);
+        let result = combine_shares(&dec_shares, T, &ct, &falcon_pks);
         assert!(result.is_err());
     }
 
@@ -1513,69 +1644,65 @@ mod tests {
     /// dedup check but inflate Lagrange interpolation work.
     #[test]
     fn combine_shares_rejects_zero_index_audit_312() {
-        let (tpk, shares) = setup();
+        let (tpk, shares, falcon_pks, falcon_sks) = setup();
         let msg = b"audit 312 zero index";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
         let mut dec_shares: Vec<DecryptionShare> = shares[..T]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
         // Mutate one share's index to 0.
         dec_shares[0].index = 0;
-        let result = combine_shares(&dec_shares, T, &ct);
+        let result = combine_shares(&dec_shares, T, &ct, &falcon_pks);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid share index"));
     }
 
     #[test]
     fn combine_shares_rejects_oversize_index_audit_312() {
-        let (tpk, shares) = setup();
+        let (tpk, shares, falcon_pks, falcon_sks) = setup();
         let msg = b"audit 312 oversize index";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
         let mut dec_shares: Vec<DecryptionShare> = shares[..T]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
         // Mutate to an absurd index that no real committee would
         // produce. MAX_VALIDATOR_INDEX = 256; 257 is the first
         // out-of-range value.
         dec_shares[0].index = 257;
-        let result = combine_shares(&dec_shares, T, &ct);
+        let result = combine_shares(&dec_shares, T, &ct, &falcon_pks);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid share index"));
     }
 
     #[test]
     fn duplicate_shares_rejected() {
-        let (tpk, shares) = setup();
+        let (tpk, shares, falcon_pks, falcon_sks) = setup();
         let msg = b"duplicate test";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         let mut dec_shares: Vec<DecryptionShare> = shares[..T - 1]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
         // Add a duplicate
-        dec_shares.push(generate_decryption_share(&shares[0], &ct));
+        dec_shares.push(generate_decryption_share(&shares[0], &ct, &falcon_sks[0]).unwrap());
 
-        let result = combine_shares(&dec_shares, T, &ct);
+        let result = combine_shares(&dec_shares, T, &ct, &falcon_pks);
         assert!(result.is_err());
     }
 
     #[test]
     fn wrong_shares_produce_bad_mac() {
-        let (tpk, _shares) = setup();
+        let (tpk, _shares, falcon_pks, falcon_sks) = setup();
         let (_tpk2, shares2) = threshold_keygen(N, T).unwrap();
         let msg = b"wrong shares test";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         // Use shares from a different committee
         let dec_shares: Vec<DecryptionShare> = shares2[..T]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
 
-        let result = combine_shares(&dec_shares, T, &ct);
+        let result = combine_shares(&dec_shares, T, &ct, &falcon_pks);
         assert!(result.is_err());
     }
 
@@ -1587,15 +1714,14 @@ mod tests {
         // measure timing (unit-test timing is too noisy); its job is
         // to exercise the `ct_eq` code path so any future regression
         // that broke MAC-mismatch handling fails loudly.
-        let (tpk, shares) = setup();
+        let (tpk, shares, falcon_pks, falcon_sks) = setup();
         let msg = b"tampered mac test";
         let mut ct = threshold_encrypt(&tpk, msg).unwrap();
         ct.mac[0] ^= 0x01;
         let dec_shares: Vec<DecryptionShare> = shares[..T]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        let result = combine_shares(&dec_shares, T, &ct);
+        let result = combine_shares(&dec_shares, T, &ct, &falcon_pks);
         assert_eq!(result, Err("decryption failed"));
     }
 
@@ -1609,7 +1735,7 @@ mod tests {
     /// to identical keystreams + MAC keys.
     #[test]
     fn audit_359_keystream_and_mac_unique_per_encryption() {
-        let (tpk, _shares) = setup();
+        let (tpk, _shares, falcon_pks, falcon_sks) = setup();
         let msg = b"audit-359 keystream uniqueness";
         let ct1 = threshold_encrypt(&tpk, msg).unwrap();
         let ct2 = threshold_encrypt(&tpk, msg).unwrap();
@@ -1635,7 +1761,7 @@ mod tests {
     /// plaintext that still passed MAC verification.
     #[test]
     fn audit_359_kyber_ct_tampering_breaks_decrypt() {
-        let (tpk, shares) = setup();
+        let (tpk, shares, falcon_pks, falcon_sks) = setup();
         let msg = b"audit-359 ct binding";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
@@ -1645,10 +1771,9 @@ mod tests {
         let mut tampered = ct.clone();
         tampered.kyber_ct = ct2.kyber_ct.clone();
         let dec_shares: Vec<DecryptionShare> = shares[..T]
-            .iter()
-            .map(|s| generate_decryption_share(s, &tampered))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &tampered, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        let result = combine_shares(&dec_shares, T, &tampered);
+        let result = combine_shares(&dec_shares, T, &tampered, &falcon_pks);
         assert_eq!(result, Err("decryption failed"));
     }
 
@@ -1664,7 +1789,7 @@ mod tests {
     /// share structures that pass each pipeline stage.
     #[test]
     fn audit_360_failure_modes_collapse_to_single_error() {
-        let (tpk, shares) = setup();
+        let (tpk, shares, falcon_pks, falcon_sks) = setup();
         let msg = b"audit-360 oracle uniform";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
@@ -1675,8 +1800,7 @@ mod tests {
         //     MAC fails. Either way the post-fix returns the
         //     same generic error.
         let mut tampered_shares: Vec<DecryptionShare> = shares[..T]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
         // Mutate the FIRST share's first element by adding a
         // non-zero field element. Goldilocks is a field, so
@@ -1685,19 +1809,18 @@ mod tests {
         if !bad.shares.is_empty() {
             bad.shares[0] += gl(1);
         }
-        let bad_share_result = combine_shares(&tampered_shares, T, &ct);
+        let bad_share_result = combine_shares(&tampered_shares, T, &ct, &falcon_pks);
 
         // (b) Use shares from a DIFFERENT keygen. Index space
         //     overlaps, but the polynomials are independent, so
         //     interpolation produces an unrelated seed. Same
         //     pipeline-fail behavior as (a) — must return the
         //     same error.
-        let (_other_tpk, other_shares) = setup();
+        let (_other_tpk, other_shares, falcon_pks, falcon_sks) = setup();
         let other_dec: Vec<DecryptionShare> = other_shares[..T]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        let other_result = combine_shares(&other_dec, T, &ct);
+        let other_result = combine_shares(&other_dec, T, &ct, &falcon_pks);
 
         // Both failure modes return the SAME error string, with
         // no distinguishing information about WHICH stage tripped.
@@ -1712,47 +1835,51 @@ mod tests {
 
     #[test]
     fn any_subset_of_shares_works() {
-        let (tpk, shares) = setup();
+        let (tpk, shares, falcon_pks, falcon_sks) = setup();
         let msg = b"any subset works";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         // Use last T shares instead of first T
         let dec_shares: Vec<DecryptionShare> = shares[N - T..]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
 
-        let plaintext = combine_shares(&dec_shares, T, &ct).unwrap();
+        let plaintext = combine_shares(&dec_shares, T, &ct, &falcon_pks).unwrap();
         assert_eq!(plaintext, msg);
     }
 
     #[test]
     fn empty_message() {
-        let (tpk, shares) = setup();
+        let (tpk, shares, falcon_pks, falcon_sks) = setup();
         let msg = b"";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         let dec_shares: Vec<DecryptionShare> = shares[..T]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
 
-        let plaintext = combine_shares(&dec_shares, T, &ct).unwrap();
+        let plaintext = combine_shares(&dec_shares, T, &ct, &falcon_pks).unwrap();
         assert_eq!(plaintext, msg);
     }
 
     #[test]
     fn large_message() {
         let (tpk, shares) = threshold_keygen(5, 3).unwrap(); // smaller for speed
+        let mut falcon_pks = Vec::with_capacity(5);
+        let mut falcon_sks = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+            falcon_pks.push(pk);
+            falcon_sks.push(sk);
+        }
         let msg = vec![0xABu8; 10_000];
         let ct = threshold_encrypt(&tpk, &msg).unwrap();
 
         let dec_shares: Vec<DecryptionShare> = shares[..3]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
 
-        let plaintext = combine_shares(&dec_shares, 3, &ct).unwrap();
+        let plaintext = combine_shares(&dec_shares, 3, &ct, &falcon_pks).unwrap();
         assert_eq!(plaintext, msg);
     }
 
@@ -1784,20 +1911,35 @@ mod tests {
 
     // --- PSS tests ---
 
-    fn setup_epoch(n: usize, t: usize) -> (EpochKeyMaterial, Vec<KeyShare>) {
+    fn setup_epoch(
+        n: usize,
+        t: usize,
+    ) -> (
+        EpochKeyMaterial,
+        Vec<KeyShare>,
+        Vec<crate::falcon::FalconPublicKey>,
+        Vec<crate::falcon::FalconSecretKey>,
+    ) {
         let (tpk, shares) = threshold_keygen(n, t).unwrap();
+        let mut falcon_pks = Vec::with_capacity(n);
+        let mut falcon_sks = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+            falcon_pks.push(pk);
+            falcon_sks.push(sk);
+        }
         let epoch_material = EpochKeyMaterial {
             epoch: 0,
             n,
             threshold: t,
             tpk,
         };
-        (epoch_material, shares)
+        (epoch_material, shares, falcon_pks, falcon_sks)
     }
 
     #[test]
     fn pss_refreshed_shares_decrypt_old_ciphertext() {
-        let (epoch_mat, shares) = setup_epoch(5, 3);
+        let (epoch_mat, shares, falcon_pks, falcon_sks) = setup_epoch(5, 3);
         let msg = b"encrypted before refresh";
         let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
@@ -1806,16 +1948,15 @@ mod tests {
 
         // New shares should still decrypt old ciphertext
         let dec_shares: Vec<DecryptionShare> = new_shares[..3]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        let plaintext = combine_shares(&dec_shares, 3, &ct).unwrap();
+        let plaintext = combine_shares(&dec_shares, 3, &ct, &falcon_pks).unwrap();
         assert_eq!(plaintext, msg);
     }
 
     #[test]
     fn pss_old_shares_cannot_decrypt_after_refresh() {
-        let (epoch_mat, shares) = setup_epoch(5, 3);
+        let (epoch_mat, shares, falcon_pks, falcon_sks) = setup_epoch(5, 3);
 
         // Refresh shares
         let (new_epoch, new_shares) = pss_refresh(&epoch_mat, &shares);
@@ -1826,20 +1967,18 @@ mod tests {
 
         // New shares should work
         let dec_shares_new: Vec<DecryptionShare> = new_shares[..3]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        let plaintext = combine_shares(&dec_shares_new, 3, &ct).unwrap();
+        let plaintext = combine_shares(&dec_shares_new, 3, &ct, &falcon_pks).unwrap();
         assert_eq!(plaintext, msg);
 
         // Old shares should fail (they reconstruct a different secret)
         let dec_shares_old: Vec<DecryptionShare> = shares[..3]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
         // Old shares still reconstruct the SAME secret (the secret doesn't change),
         // so they should also work. PSS only protects against partial compromise.
-        let plaintext_old = combine_shares(&dec_shares_old, 3, &ct).unwrap();
+        let plaintext_old = combine_shares(&dec_shares_old, 3, &ct, &falcon_pks).unwrap();
         assert_eq!(plaintext_old, msg);
     }
 
@@ -1860,6 +1999,13 @@ mod tests {
     #[test]
     fn audit_406_reshare_local_pool_must_include_own_contribution() {
         let (tpk, genesis_shares) = threshold_keygen(4, 3).unwrap();
+        let mut falcon_pks = Vec::with_capacity(4);
+        let mut falcon_sks = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+            falcon_pks.push(pk);
+            falcon_sks.push(sk);
+        }
         let msg = b"reshare-own-in-pool bug repro";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
@@ -1896,9 +2042,9 @@ mod tests {
         for skip in 0..4 {
             let dec: Vec<DecryptionShare> = (0..4)
                 .filter(|&i| i != skip)
-                .map(|i| generate_decryption_share(&buggy_new_shares[i], &ct))
+                .map(|i| generate_decryption_share(&buggy_new_shares[i], &ct, &falcon_sks[i]).unwrap())
                 .collect();
-            if let Ok(plain) = combine_shares(&dec, 3, &ct) {
+            if let Ok(plain) = combine_shares(&dec, 3, &ct, &falcon_pks) {
                 if plain == msg {
                     any_buggy_ok = true;
                 }
@@ -1922,9 +2068,9 @@ mod tests {
         for skip in 0..4 {
             let dec: Vec<DecryptionShare> = (0..4)
                 .filter(|&i| i != skip)
-                .map(|i| generate_decryption_share(&fixed_new_shares[i], &ct))
+                .map(|i| generate_decryption_share(&fixed_new_shares[i], &ct, &falcon_sks[i]).unwrap())
                 .collect();
-            let plain = combine_shares(&dec, 3, &ct)
+            let plain = combine_shares(&dec, 3, &ct, &falcon_pks)
                 .unwrap_or_else(|e| panic!("fixed skip {} failed: {}", skip, e));
             assert_eq!(plain, msg, "fixed skip {} wrong plaintext", skip);
         }
@@ -1939,13 +2085,21 @@ mod tests {
     #[test]
     fn audit_406_decryption_share_wire_roundtrip_decrypts() {
         let (tpk, key_shares) = threshold_keygen(4, 3).unwrap();
+        let mut falcon_pks = Vec::with_capacity(4);
+        let mut falcon_sks = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+            falcon_pks.push(pk);
+            falcon_sks.push(sk);
+        }
         let msg = b"share wire roundtrip";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
         // Generate 4 fresh decryption shares locally.
         let local_shares: Vec<DecryptionShare> = key_shares
             .iter()
-            .map(|ks| generate_decryption_share(ks, &ct))
+            .enumerate()
+            .map(|(i, ks)| generate_decryption_share(ks, &ct, &falcon_sks[ks.index - 1]).unwrap())
             .collect();
 
         // Wire-roundtrip every share via `to_bytes` / `from_bytes`,
@@ -1972,7 +2126,7 @@ mod tests {
                 .enumerate()
                 .filter_map(|(i, s)| if i == skip { None } else { Some(s.clone()) })
                 .collect();
-            let plain = combine_shares(&subset, 3, &ct).unwrap_or_else(|e| {
+            let plain = combine_shares(&subset, 3, &ct, &falcon_pks).unwrap_or_else(|e| {
                 panic!(
                     "skip {} round-tripped shares failed combine: {} — \
                      wire round-trip corrupts DecryptionShare",
@@ -1996,6 +2150,13 @@ mod tests {
     #[test]
     fn audit_406_runtime_pipeline_preserves_secret() {
         let (tpk, genesis_shares) = threshold_keygen(4, 3).unwrap();
+        let mut falcon_pks = Vec::with_capacity(4);
+        let mut falcon_sks = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+            falcon_pks.push(pk);
+            falcon_sks.push(sk);
+        }
         let msg = b"runtime pipeline preserves secret";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
 
@@ -2023,11 +2184,10 @@ mod tests {
 
         // Sanity: post-reshare alone must decrypt.
         let dec_after_reshare: Vec<DecryptionShare> = post_reshare_shares[..3]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
         let plain_reshare =
-            combine_shares(&dec_after_reshare, 3, &ct).expect("post-reshare alone must decrypt");
+            combine_shares(&dec_after_reshare, 3, &ct, &falcon_pks).expect("post-reshare alone must decrypt");
         assert_eq!(plain_reshare, msg);
 
         // ---- PSS canonical apply pass ----
@@ -2056,10 +2216,9 @@ mod tests {
                 .map(|i| post_pss_shares[i].clone())
                 .collect();
             let dec: Vec<DecryptionShare> = subset_shares
-                .iter()
-                .map(|s| generate_decryption_share(s, &ct))
+                .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
                 .collect();
-            let plain = combine_shares(&dec, 3, &ct).unwrap_or_else(|e| {
+            let plain = combine_shares(&dec, 3, &ct, &falcon_pks).unwrap_or_else(|e| {
                 panic!(
                     "subset (skip {}) failed to decrypt: {} \
                      — runtime pipeline did NOT preserve secret",
@@ -2080,6 +2239,13 @@ mod tests {
     #[test]
     fn audit_406_runtime_pipeline_two_cycles_preserve_secret() {
         let (tpk, genesis_shares) = threshold_keygen(4, 3).unwrap();
+        let mut falcon_pks = Vec::with_capacity(4);
+        let mut falcon_sks = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+            falcon_pks.push(pk);
+            falcon_sks.push(sk);
+        }
         let msg = b"two-cycle pipeline preserves secret";
         let ct = threshold_encrypt(&tpk, msg).unwrap();
         let new_n = 4usize;
@@ -2110,9 +2276,12 @@ mod tests {
         for skip in 0..4usize {
             let dec: Vec<DecryptionShare> = (0..4)
                 .filter(|&i| i != skip)
-                .map(|i| generate_decryption_share(&after_c1_pss[i], &ct))
+                .map(|i| {
+                    let s = &after_c1_pss[i];
+                    generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap()
+                })
                 .collect();
-            let plain = combine_shares(&dec, 3, &ct)
+            let plain = combine_shares(&dec, 3, &ct, &falcon_pks)
                 .unwrap_or_else(|e| panic!("c1 skip {} fail: {}", skip, e));
             assert_eq!(plain, msg, "c1 skip {} wrong plaintext", skip);
         }
@@ -2147,9 +2316,12 @@ mod tests {
         for skip in 0..4usize {
             let dec: Vec<DecryptionShare> = (0..4)
                 .filter(|&i| i != skip)
-                .map(|i| generate_decryption_share(&after_c2_pss[i], &ct))
+                .map(|i| {
+                    let s = &after_c2_pss[i];
+                    generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap()
+                })
                 .collect();
-            let plain = combine_shares(&dec, 3, &ct).unwrap_or_else(|e| {
+            let plain = combine_shares(&dec, 3, &ct, &falcon_pks).unwrap_or_else(|e| {
                 panic!(
                     "post-cycle-2 skip {} failed: {} — \
                      two-cycle pipeline did NOT preserve secret",
@@ -2178,7 +2350,7 @@ mod tests {
     ///       (the fix works).
     #[test]
     fn pss_eager_apply_breaks_decryption_canonical_apply_fixes_it() {
-        let (epoch_mat, shares) = setup_epoch(4, 3);
+        let (epoch_mat, shares, falcon_pks, falcon_sks) = setup_epoch(4, 3);
         let msg = b"audit-406 regression";
         let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
@@ -2214,10 +2386,9 @@ mod tests {
         // recover the plaintext — the shares are on different
         // polynomials.
         let buggy_dec: Vec<DecryptionShare> = buggy_shares[..3]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        let buggy_result = combine_shares(&buggy_dec, 3, &ct);
+        let buggy_result = combine_shares(&buggy_dec, 3, &ct, &falcon_pks);
         assert!(
             buggy_result.is_err() || buggy_result.as_ref().unwrap() != msg,
             "buggy first-N-wins apply should NOT decrypt — \
@@ -2233,10 +2404,9 @@ mod tests {
             .collect();
 
         let fixed_dec: Vec<DecryptionShare> = fixed_shares[..3]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        let fixed_plaintext = combine_shares(&fixed_dec, 3, &ct)
+        let fixed_plaintext = combine_shares(&fixed_dec, 3, &ct, &falcon_pks)
             .expect("canonical apply must decrypt the same ciphertext");
         assert_eq!(
             fixed_plaintext, msg,
@@ -2256,7 +2426,7 @@ mod tests {
 
     #[test]
     fn pss_mixed_old_new_shares_fail() {
-        let (epoch_mat, shares) = setup_epoch(5, 3);
+        let (epoch_mat, shares, falcon_pks, falcon_sks) = setup_epoch(5, 3);
         let msg = b"mixed shares test";
         let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
@@ -2265,11 +2435,11 @@ mod tests {
         // Mix old and new shares from different validators — should fail
         // because shares from different epochs lie on different polynomials
         let mixed_shares = vec![
-            generate_decryption_share(&shares[0], &ct), // old share, validator 1
-            generate_decryption_share(&new_shares[1], &ct), // new share, validator 2
-            generate_decryption_share(&new_shares[2], &ct), // new share, validator 3
+            generate_decryption_share(&shares[0], &ct, &falcon_sks[0]).unwrap(), // old share, validator 1
+            generate_decryption_share(&new_shares[1], &ct, &falcon_sks[1]).unwrap(), // new share, validator 2
+            generate_decryption_share(&new_shares[2], &ct, &falcon_sks[2]).unwrap(), // new share, validator 3
         ];
-        let result = combine_shares(&mixed_shares, 3, &ct);
+        let result = combine_shares(&mixed_shares, 3, &ct, &falcon_pks);
         assert!(
             result.is_err(),
             "mixing old and new epoch shares should fail"
@@ -2278,7 +2448,7 @@ mod tests {
 
     #[test]
     fn pss_multiple_refreshes() {
-        let (epoch_mat, shares) = setup_epoch(5, 3);
+        let (epoch_mat, shares, falcon_pks, falcon_sks) = setup_epoch(5, 3);
         let msg = b"multi-refresh test";
         let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
@@ -2289,16 +2459,15 @@ mod tests {
 
         // Shares after 3 refreshes should still decrypt
         let dec_shares: Vec<DecryptionShare> = shares3[..3]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        let plaintext = combine_shares(&dec_shares, 3, &ct).unwrap();
+        let plaintext = combine_shares(&dec_shares, 3, &ct, &falcon_pks).unwrap();
         assert_eq!(plaintext, msg);
     }
 
     #[test]
     fn pss_verify_refresh_contributions() {
-        let (epoch_mat, shares) = setup_epoch(5, 3);
+        let (epoch_mat, shares, falcon_pks, falcon_sks) = setup_epoch(5, 3);
         let new_epoch = epoch_mat.epoch + 1;
 
         // Generate contributions using fresh entropy
@@ -2322,7 +2491,7 @@ mod tests {
 
     #[test]
     fn pss_any_subset_after_refresh() {
-        let (epoch_mat, shares) = setup_epoch(10, 7);
+        let (epoch_mat, shares, falcon_pks, falcon_sks) = setup_epoch(10, 7);
         let msg = b"any subset after refresh";
         let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
@@ -2330,10 +2499,9 @@ mod tests {
 
         // Use last 7 shares
         let dec_shares: Vec<DecryptionShare> = new_shares[3..10]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        let plaintext = combine_shares(&dec_shares, 7, &ct).unwrap();
+        let plaintext = combine_shares(&dec_shares, 7, &ct, &falcon_pks).unwrap();
         assert_eq!(plaintext, msg);
     }
 
@@ -2370,7 +2538,7 @@ mod tests {
         // Encrypt under the epoch-0 public key, rotate to an entirely new
         // committee via resharing, and verify the new shares still decrypt
         // the original ciphertext — proves the public key is invariant.
-        let (epoch_mat, old_shares) = setup_epoch(10, 7);
+        let (epoch_mat, old_shares, falcon_pks, falcon_sks) = setup_epoch(10, 7);
         let msg = b"committee rotation preserves decryptability";
         let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
@@ -2380,10 +2548,9 @@ mod tests {
 
         // Five new members (their new threshold) suffice to decrypt.
         let dec_shares: Vec<DecryptionShare> = new_shares[..5]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        let plaintext = combine_shares(&dec_shares, 5, &ct).unwrap();
+        let plaintext = combine_shares(&dec_shares, 5, &ct, &falcon_pks).unwrap();
         assert_eq!(plaintext, msg);
     }
 
@@ -2392,31 +2559,45 @@ mod tests {
         // Verify that any subset of size >= new_threshold from the new
         // committee can combine — ensures all new members sit on the same
         // polynomial (the whole point of the canonical-subset rule).
-        let (epoch_mat, old_shares) = setup_epoch(8, 5);
+        let (epoch_mat, old_shares, _old_falcon_pks, _old_falcon_sks) = setup_epoch(8, 5);
         let msg = b"interchangeable new shares";
         let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
         let new_shares = do_resharing(&old_shares, 5, 10, 7, 2);
 
+        // The reshare grows the committee 8 → 10, so fresh FALCON
+        // keypairs are needed for the new committee membership.
+        let mut new_falcon_pks = Vec::with_capacity(10);
+        let mut new_falcon_sks = Vec::with_capacity(10);
+        for _ in 0..10 {
+            let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+            new_falcon_pks.push(pk);
+            new_falcon_sks.push(sk);
+        }
+
         // Two different subsets of size 7 — both should decrypt.
         let subset_a: Vec<DecryptionShare> = new_shares[..7]
             .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .map(|s| {
+                generate_decryption_share(s, &ct, &new_falcon_sks[s.index - 1]).unwrap()
+            })
             .collect();
         let subset_b: Vec<DecryptionShare> = new_shares[3..10]
             .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .map(|s| {
+                generate_decryption_share(s, &ct, &new_falcon_sks[s.index - 1]).unwrap()
+            })
             .collect();
 
-        assert_eq!(combine_shares(&subset_a, 7, &ct).unwrap(), msg);
-        assert_eq!(combine_shares(&subset_b, 7, &ct).unwrap(), msg);
+        assert_eq!(combine_shares(&subset_a, 7, &ct, &new_falcon_pks).unwrap(), msg);
+        assert_eq!(combine_shares(&subset_b, 7, &ct, &new_falcon_pks).unwrap(), msg);
     }
 
     #[test]
     fn reshare_below_old_threshold_contributions_fails() {
         // Fewer than `old_threshold` contributions available → canonical
         // subset selection returns None. Enforcement lives with the caller.
-        let (_, old_shares) = setup_epoch(6, 4);
+        let (_, old_shares, falcon_pks, falcon_sks) = setup_epoch(6, 4);
         let pool: Vec<ResharingContribution> = old_shares[..3]
             .iter()
             .map(|s| generate_resharing_contribution(s, 8, 5, 1, b"e"))
@@ -2429,7 +2610,7 @@ mod tests {
         // Determinism: regardless of iteration order, canonical subset is
         // the threshold lowest old-indices. This guarantees convergence
         // across new members.
-        let (_, old_shares) = setup_epoch(6, 3);
+        let (_, old_shares, falcon_pks, falcon_sks) = setup_epoch(6, 3);
         let pool: Vec<ResharingContribution> = old_shares
             .iter()
             .rev() // reversed to test sorting
@@ -2444,20 +2625,32 @@ mod tests {
     fn reshare_two_new_members_converge_on_same_polynomial() {
         // If two new members apply aggregation to the canonical subset,
         // their resulting shares must be combinable (sit on one polynomial).
-        let (epoch_mat, old_shares) = setup_epoch(6, 4);
+        let (epoch_mat, old_shares, _old_falcon_pks, _old_falcon_sks) = setup_epoch(6, 4);
         let msg = b"two members same poly";
         let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
         let new_shares = do_resharing(&old_shares, 4, 7, 4, 1);
 
+        // Reshare grows the committee 6 → 7, so the new committee
+        // gets fresh FALCON keypairs for sig-bound decryption shares.
+        let mut new_falcon_pks = Vec::with_capacity(7);
+        let mut new_falcon_sks = Vec::with_capacity(7);
+        for _ in 0..7 {
+            let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+            new_falcon_pks.push(pk);
+            new_falcon_sks.push(sk);
+        }
+
         // Pick 4 disjoint-ish subsets, all must decrypt.
         for start in 0..4 {
             let subset: Vec<DecryptionShare> = new_shares[start..start + 4]
                 .iter()
-                .map(|s| generate_decryption_share(s, &ct))
+                .map(|s| {
+                    generate_decryption_share(s, &ct, &new_falcon_sks[s.index - 1]).unwrap()
+                })
                 .collect();
             assert_eq!(
-                combine_shares(&subset, 4, &ct).unwrap(),
+                combine_shares(&subset, 4, &ct, &new_falcon_pks).unwrap(),
                 msg,
                 "subset starting at {start} failed to decrypt"
             );
@@ -2466,7 +2659,7 @@ mod tests {
 
     #[test]
     fn reshare_verify_detects_inconsistent_contribution() {
-        let (_, old_shares) = setup_epoch(6, 4);
+        let (_, old_shares, falcon_pks, falcon_sks) = setup_epoch(6, 4);
         let mut contrib = generate_resharing_contribution(&old_shares[0], 8, 5, 1, b"e");
         assert!(verify_resharing_contribution(&contrib, 5, 8));
 
@@ -2477,7 +2670,7 @@ mod tests {
 
     #[test]
     fn reshare_verify_rejects_wrong_dimensions() {
-        let (_, old_shares) = setup_epoch(6, 4);
+        let (_, old_shares, falcon_pks, falcon_sks) = setup_epoch(6, 4);
         let contrib = generate_resharing_contribution(&old_shares[0], 8, 5, 1, b"e");
         // Pretend new_n is different from what the contribution was built for.
         assert!(!verify_resharing_contribution(&contrib, 5, 9));
@@ -2487,7 +2680,7 @@ mod tests {
 
     #[test]
     fn reshare_contribution_roundtrips_through_wire_format() {
-        let (_, old_shares) = setup_epoch(5, 3);
+        let (_, old_shares, falcon_pks, falcon_sks) = setup_epoch(5, 3);
         let original = generate_resharing_contribution(&old_shares[1], 6, 4, 42, b"wire");
         let bytes = original.to_bytes();
         let decoded = ResharingContribution::from_bytes(&bytes).unwrap();
@@ -2502,7 +2695,7 @@ mod tests {
     fn reshare_chain_of_two_rotations_decrypts() {
         // Rotate twice: old -> mid -> new. Ciphertext encrypted at epoch 0
         // must still decrypt under epoch-2 shares.
-        let (epoch_mat, old_shares) = setup_epoch(6, 4);
+        let (epoch_mat, old_shares, falcon_pks, falcon_sks) = setup_epoch(6, 4);
         let msg = b"two rotations";
         let ct = threshold_encrypt(&epoch_mat.tpk, msg).unwrap();
 
@@ -2510,10 +2703,9 @@ mod tests {
         let new_shares = do_resharing(&mid_shares, 5, 8, 6, 2);
 
         let dec_shares: Vec<DecryptionShare> = new_shares[..6]
-            .iter()
-            .map(|s| generate_decryption_share(s, &ct))
+            .iter().enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        assert_eq!(combine_shares(&dec_shares, 6, &ct).unwrap(), msg);
+        assert_eq!(combine_shares(&dec_shares, 6, &ct, &falcon_pks).unwrap(), msg);
     }
 
     // ── Audit 358: ZeroizeOnDrop on threshold types ─────────────────
@@ -2531,7 +2723,7 @@ mod tests {
 
     #[test]
     fn key_share_zeroizes() {
-        let (_, mut shares) = setup();
+        let (_, mut shares, falcon_pks, falcon_sks) = setup();
         let s = &mut shares[0];
         assert!(
             keyshare_has_nonzero_payload(s),
@@ -2564,7 +2756,7 @@ mod tests {
 
     #[test]
     fn resharing_contribution_zeroizes() {
-        let (_, old_shares) = setup_epoch(6, 4);
+        let (_, old_shares, falcon_pks, falcon_sks) = setup_epoch(6, 4);
         let mut contrib = generate_resharing_contribution(&old_shares[0], 8, 5, 1, b"e");
         let nonempty = contrib.sub_shares.iter().any(|inner| !inner.is_empty());
         assert!(
@@ -2640,14 +2832,20 @@ mod tests {
     #[test]
     fn audit_391_threshold_roundtrip_after_rejection_sampling() {
         let (pk, shares) = threshold_keygen(5, 3).expect("keygen");
+        let mut falcon_pks = Vec::with_capacity(5);
+        let mut falcon_sks = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+            falcon_pks.push(pk);
+            falcon_sks.push(sk);
+        }
         let msg = b"audit-391 roundtrip";
         let ct = threshold_encrypt(&pk, msg).expect("encrypt");
         let dec_shares: Vec<_> = shares
             .iter()
-            .take(3)
-            .map(|s| generate_decryption_share(s, &ct))
+            .take(3).enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
             .collect();
-        let recovered = combine_shares(&dec_shares, 3, &ct).expect("combine");
+        let recovered = combine_shares(&dec_shares, 3, &ct, &falcon_pks).expect("combine");
         assert_eq!(recovered, msg);
     }
 
@@ -2683,11 +2881,25 @@ mod tests {
     #[test]
     fn tpl_305_decryption_share_from_bytes_rejects_non_canonical() {
         let (pk, shares) = threshold_keygen(5, 3).expect("keygen");
+        let mut falcon_pks = Vec::with_capacity(5);
+        let mut falcon_sks = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+            falcon_pks.push(pk);
+            falcon_sks.push(sk);
+        }
         let ct = threshold_encrypt(&pk, b"tpl-305 dec").expect("encrypt");
-        let dec_share = generate_decryption_share(&shares[0], &ct);
+        let dec_share = generate_decryption_share(&shares[0], &ct, &falcon_sks[0]).unwrap();
         let mut bytes = dec_share.to_bytes();
-        let len = bytes.len();
-        bytes[len - 8..].copy_from_slice(&GOLDILOCKS_PRIME.to_le_bytes());
+        // TPL-301: wire format is now
+        // `[index:8][count:4][shares:count*8][sig_len:4][sig]`,
+        // so the LAST 8 bytes are sig data, not a share element.
+        // Read `count` from the header and tamper the LAST share
+        // element (offset `12 + (count - 1) * 8`).
+        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let last_share_off = 12 + (count - 1) * 8;
+        bytes[last_share_off..last_share_off + 8]
+            .copy_from_slice(&GOLDILOCKS_PRIME.to_le_bytes());
         assert!(
             DecryptionShare::from_bytes(&bytes).is_none(),
             "non-canonical DecryptionShare encoding must be rejected"
@@ -2769,13 +2981,19 @@ mod tests {
     fn tpl_307_keygen_then_encrypt_then_decrypt_roundtrips() {
         for _ in 0..16 {
             let (pk, shares) = threshold_keygen(5, 3).expect("keygen");
+            let mut falcon_pks = Vec::with_capacity(5);
+            let mut falcon_sks = Vec::with_capacity(5);
+            for _ in 0..5 {
+                let (pk, sk) = crate::falcon::falcon_keygen().unwrap();
+                falcon_pks.push(pk);
+                falcon_sks.push(sk);
+            }
             let ct = threshold_encrypt(&pk, b"tpl-307 round-trip").expect("encrypt");
             let dec_shares: Vec<_> = shares
                 .iter()
-                .take(3)
-                .map(|s| generate_decryption_share(s, &ct))
+                .take(3).enumerate().map(|(i, s)| generate_decryption_share(s, &ct, &falcon_sks[s.index - 1]).unwrap())
                 .collect();
-            let recovered = combine_shares(&dec_shares, 3, &ct).expect("combine");
+            let recovered = combine_shares(&dec_shares, 3, &ct, &falcon_pks).expect("combine");
             assert_eq!(recovered, b"tpl-307 round-trip");
         }
     }
