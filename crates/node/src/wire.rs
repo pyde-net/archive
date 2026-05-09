@@ -31,7 +31,7 @@ const MAX_DECODE_ITEMS: usize = 1_000_000;
 /// count, execution-schedule group count, and per-group tx_indices
 /// count for any wire frame that carries a block-shaped payload
 /// (Block, CompactBlock, EncryptedTxBundle).
-const MAX_TXS_PER_BLOCK: usize = 100_000;
+pub const MAX_TXS_PER_BLOCK: usize = 100_000;
 
 /// Maximum entries in a transaction's EIP-2930-style access list.
 /// Each entry costs gas to declare; 1024 is far above any sane
@@ -93,8 +93,13 @@ pub mod tag {
     /// historical committee keys, trust the slice-3.4 consensus-channel
     /// filter (validator-only publisher).
     pub const CONSENSUS_FINALITY_CHECKPOINT: u8 = 0x19;
-    pub const GET_BLOCK_TXS: u8 = 0x04;
-    pub const BLOCK_TXS_RESPONSE: u8 = 0x05;
+    // Tags 0x04 / 0x05 were `GET_BLOCK_TXS` / `BLOCK_TXS_RESPONSE`
+    // for an in-tree wire encoding of the missing-tx fetch. Both
+    // were dead code; the protocol now lives as a serde-cbor
+    // request-response on `pyde_net::block_txs_protocol` and does
+    // not reuse these tag values. Reserved to avoid accidental
+    // collision if the gossip-channel byte-tag namespace is later
+    // re-used for something else.
     /// Proposer-published bundle of encrypted_txs for a block (audit
     /// item 207 / 074b). Published on the Blocks channel immediately
     /// after the compact block. Integrity is anchored by the block
@@ -540,32 +545,12 @@ pub fn decode_compact_block(
     })
 }
 
-/// Encode a request for missing block transactions.
-pub fn encode_get_block_txs(
-    block_hash: &[u8; 32],
-    missing_sids: &[pyde_net::propagation::ShortId],
-) -> Vec<u8> {
-    let mut enc = Encoder::new();
-    enc.u8(tag::GET_BLOCK_TXS);
-    enc.bytes32(block_hash);
-    enc.u32(missing_sids.len() as u32);
-    for sid in missing_sids {
-        enc.raw(sid);
-    }
-    enc.finish()
-}
-
-/// Encode a response with the requested full transactions.
-pub fn encode_block_txs_response(block_hash: &[u8; 32], txs: &[Vec<u8>]) -> Vec<u8> {
-    let mut enc = Encoder::new();
-    enc.u8(tag::BLOCK_TXS_RESPONSE);
-    enc.bytes32(block_hash);
-    enc.u32(txs.len() as u32);
-    for tx_bytes in txs {
-        enc.var_bytes(tx_bytes);
-    }
-    enc.finish()
-}
+// Missing-tx fetch on the wire used to live here as
+// `encode_get_block_txs` / `encode_block_txs_response`. Both were
+// dead code — no decoders, no callers. The replacement is a serde-
+// cbor request-response on `pyde_net::block_txs_protocol`, which
+// carries the cb `nonce` so any peer with the txs (not just one
+// that already buffered the compact block) can answer.
 
 /// Encode an `EncryptedTxBundle` for gossip on the Blocks channel.
 /// Proposer publishes immediately after `encode_compact_block`; the
