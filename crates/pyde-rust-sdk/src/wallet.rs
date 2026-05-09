@@ -219,6 +219,26 @@ impl Wallet {
     ///   3. Call `wallet.register_pubkey(&provider).await?` once.
     ///   4. From now on, `transfer` / `send_call` etc. work normally.
     pub async fn register_pubkey(&self, provider: &Provider) -> Result<Receipt> {
+        // TPL-606: refuse to send a `RegisterPubkey` whose address-from-
+        // pubkey derivation does not match `self.address`. The chain
+        // enforces `from == Poseidon2(pubkey)` (audit 229) and would
+        // reject the tx anyway, but this surfaces as a network round-trip
+        // followed by an opaque execution failure on the caller's side.
+        // Catching the mismatch before we open an RPC connection turns
+        // it into a clear, immediate `AddressMismatch` error that the
+        // caller can act on — and rules out a subtle class of bug where
+        // a `Wallet` was constructed (e.g., via `from_keystore` against a
+        // tampered file) with a public key that no longer hashes to the
+        // recorded address.
+        let derived = derive_eoa_address(self.public_key.as_bytes());
+        if derived != self.address {
+            return Err(SdkError::Signing(format!(
+                "RegisterPubkey aborted: Poseidon2(public_key) = {} but wallet.address = {} — wallet keypair / address are inconsistent",
+                format_address(&derived),
+                format_address(&self.address),
+            )));
+        }
+
         let (nonce, chain_id) = provider.get_nonce_and_chain_id(&self.address).await?;
         let tx = Transaction {
             from: self.address,
