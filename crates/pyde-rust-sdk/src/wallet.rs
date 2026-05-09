@@ -238,6 +238,15 @@ impl Wallet {
     }
 
     /// Build, sign, send a native transfer. Returns receipt (errors on revert).
+    ///
+    /// TPL-601: gas limit is fetched via `provider.estimate_gas_with` against
+    /// the live node rather than hardcoded at 21,000. The 21,000 fallback was
+    /// only correct for transfers to an already-warm EOA with no payable
+    /// fallback; transfers that touch a cold account or land on a contract
+    /// address (which then runs the payable receive path) cost more, and the
+    /// pre-fix code over-shipped under-priced txs that reverted at the gas
+    /// gate. The override carries `from = self.address` and `value = amount`
+    /// so the simulator sees the same fee-deduction the real tx will incur.
     pub async fn transfer(
         &self,
         provider: &Provider,
@@ -246,12 +255,24 @@ impl Wallet {
     ) -> Result<Receipt> {
         let (nonce, chain_id) = provider.get_nonce_and_chain_id(&self.address).await?;
 
+        let gas_limit = provider
+            .estimate_gas_with(
+                to,
+                &[],
+                Some(&CallOverrides {
+                    from: Some(self.address),
+                    value: Some(amount),
+                    gas_limit: None,
+                }),
+            )
+            .await?;
+
         let mut tx = Transaction {
             from: self.address,
             to: *to,
             value: amount,
             data: vec![],
-            gas_limit: 21_000,
+            gas_limit,
             nonce,
             signature: vec![],
             fee_payer: FeePayer::Sender,
