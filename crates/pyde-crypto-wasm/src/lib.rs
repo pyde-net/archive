@@ -1,6 +1,6 @@
 use pyde_crypto::falcon::FalconSecretKey;
 use pyde_crypto::poseidon2::poseidon2_hash;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use wasm_bindgen::prelude::*;
 
@@ -18,7 +18,7 @@ use wasm_bindgen::prelude::*;
 // hex string, and never get accidentally logged.
 //
 // `FalconSecretKey` already derives `ZeroizeOnDrop` (audit 358), so
-// removing the entry from the map (via `HashMap::remove` →
+// removing the entry from the map (via `BTreeMap::remove` →
 // `Drop::drop`) actually zeroes the secret bytes in place.
 //
 // Why a process-global Mutex: wasm32 is currently single-threaded on
@@ -27,6 +27,23 @@ use wasm_bindgen::prelude::*;
 // than a thread_local!) means we don't need wasm-bindgen's
 // thread-local plumbing, and the API stays callable from any
 // future worker context without additional setup.
+//
+// TPL-607: backed by `BTreeMap<u32, FalconSecretKey>` rather than
+// `HashMap`. Two reasons:
+//   1. `HashMap`'s default `RandomState` hasher pulls per-process
+//      entropy from `getrandom`, which on wasm32 means an extra
+//      JS-side RNG call (and a panic path on hosts that don't yet
+//      provide one). `BTreeMap` has no RNG dependency, so the
+//      keystore initializes deterministically on every WASM host.
+//   2. Iteration order (when we add diagnostics or snapshot
+//      coverage) is sorted by handle, which is what JS-side tests
+//      and operator dumps will expect. The current API only does
+//      insert / get / remove, so the ordering change is
+//      observable-equivalent today, but locks in deterministic
+//      behaviour ahead of any future iter use-site.
+// The audit-358 zeroize story is unchanged: `BTreeMap::remove`
+// returns the value by move, dropping it triggers `ZeroizeOnDrop`
+// identically to the previous `HashMap::remove` path.
 //
 // Handle exhaustion: u32 gives 4G distinct handles before wrap.
 // The wallet UX is one keypair per browser tab, so 4G is effectively
@@ -37,14 +54,14 @@ use wasm_bindgen::prelude::*;
 // instead of silently signing under a different key.
 struct KeyTable {
     next_handle: u32,
-    keys: HashMap<u32, FalconSecretKey>,
+    keys: BTreeMap<u32, FalconSecretKey>,
 }
 
 impl KeyTable {
     fn new() -> Self {
         Self {
             next_handle: 1, // 0 is reserved as "no handle"
-            keys: HashMap::new(),
+            keys: BTreeMap::new(),
         }
     }
 }
