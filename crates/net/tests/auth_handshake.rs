@@ -109,6 +109,14 @@ async fn run_handshake(
                                 &mut nonces,
                                 &mut peer_manager,
                                 &committee_keys,
+                                // TPL-510 added an
+                                // `Option<&[u8]>` pinned-pubkey
+                                // arg. This integration test
+                                // exercises the no-pin path —
+                                // bootstrap-pubkey pinning has
+                                // its own focused unit tests in
+                                // `crates/net/src/auth.rs`.
+                                None,
                             ));
                         }
                         _ => {}

@@ -5,6 +5,14 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # TPL-705 — proptest soak runs are too expensive for per-PR CI
+  # (10 K cases × ~10 properties × FALCON-bound work ≈ tens of
+  # minutes). Trigger via cron + manual dispatch instead. The
+  # cron is once-per-week so coverage accrues without burning
+  # the GH-Actions minute budget on every push.
+  schedule:
+    - cron: "0 6 * * 1" # 06:00 UTC every Monday
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -81,3 +89,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  # TPL-705 — proptest soak. Runs ONLY on the weekly cron + on
+  # workflow_dispatch; skipped on every push / pull_request so the
+  # per-PR feedback loop stays fast. PROPTEST_CASES=10000 escalates
+  # the per-property case count from each test's
+  # `ProptestConfig::with_cases(...)` default (currently 16-256
+  # depending on property cost). The `--test 'prop_*'` filter
+  # selects only the integration-test binaries whose filename
+  # starts with `prop_` (cf. `crates/{consensus,tx}/tests/prop_*`),
+  # because the property functions inside `proptest! { ... }` blocks
+  # don't share a uniform name prefix.
+  proptest_soak:
+    name: Proptest soak (10 K cases)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cargo test (proptest soak)
+        env:
+          PROPTEST_CASES: "10000"
+        run: cargo test --workspace --release --test 'prop_*'
