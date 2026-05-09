@@ -8,8 +8,8 @@ can depend on the operating system, file I/O, or the standard library's random n
 generator at the type level.
 
 **Crate:** `crates/crypto/` (package name `pyde-crypto`)
-**Tests:** 76 unit tests, all passing
-**Benchmarks:** 4 benchmark binaries (poseidon2, falcon, threshold, vrf)
+**Tests:** 140+ unit tests across the lib modules plus an integration suite (`tests/encrypted_pipeline_diag.rs`) and a test-only Known Answer Tests module (`src/kat.rs`); all passing.
+**Benchmarks:** 4 benchmark binaries (poseidon2, falcon, threshold, vrf).
 
 ---
 
@@ -22,13 +22,18 @@ src/
   poseidon2.rs    -- Poseidon2 hash function over Goldilocks field
   falcon.rs       -- FALCON-512 post-quantum digital signatures
   kyber.rs        -- Kyber-768 (ML-KEM-768) post-quantum key encapsulation
-  threshold.rs    -- Threshold Kyber (85-of-128) + Proactive Secret Sharing
-  vrf.rs          -- Lattice-based Verifiable Random Function
+  threshold.rs    -- Threshold Kyber (86-of-128) + Proactive Secret Sharing
+  vrf.rs          -- FALCON-bound Poseidon2 Verifiable Random Function
+  kat.rs          -- (#[cfg(test)] only) Known Answer Tests pinning
+                     primitive outputs against fixed-vector expectations
 benches/
   poseidon2_bench.rs
   falcon_bench.rs
   threshold_bench.rs
   vrf_bench.rs
+tests/
+  encrypted_pipeline_diag.rs  -- diagnostic integration test for the
+                                 threshold-encryption pipeline
 ```
 
 ---
@@ -160,13 +165,24 @@ dimension of the NTRU lattice over which the trapdoor is defined.
 Key functions:
 - `falcon_keygen()`: Generates a keypair using `FnDsaKeyPair::generate(9)`. The 9 means
   2^9 = 512 polynomial degree.
-- `falcon_sign(sk, msg)`: Reconstructs the keypair from the private key bytes, signs
-  with `DomainSeparation::None` (we handle domain separation at the application level).
+- `falcon_sign(sk, msg)`: Reconstructs the keypair from the private key bytes and
+  signs with `DomainSeparation::Context(b"pyde-falcon-v1")`. Binding the FN-DSA
+  context string at the primitive layer means a Pyde-signed FALCON message cannot
+  collide with a FALCON signature produced for any other protocol that uses the
+  same key (or a malicious `DomainSeparation::None` signer trying to replay a
+  Pyde-validated message into a non-Pyde verifier). Pyde's per-call domain tags
+  for vote / VRF / multisig preimages still apply on top of the context — the
+  context is the outer crypto-primitive wrapper, the per-call tags are the inner
+  protocol-layer wrappers.
 - `falcon_verify(pk, msg, sig)`: Stateless verification — takes the raw bytes and
-  verifies using `FnDsaSignature::verify`.
-- `falcon_batch_verify(items)`: Iterates over a list of (pk, msg, sig) triples.
-  Currently sequential (the `falcon-rs` crate doesn't provide true batch verification
-  with amortization). This is a future optimization target.
+  verifies using `FnDsaSignature::verify` against the same
+  `DomainSeparation::Context(b"pyde-falcon-v1")`.
+- `falcon_verify_all(items)`: Iterates over a list of (pk, msg, sig) triples and
+  short-circuits on the first invalid signature. The name is deliberately
+  `_verify_all`, not `_batch_verify`, because there is no amortization across the
+  triples — `falcon-rs` does not yet expose batch-verification primitives. Audit
+  394 documents the naming choice. True batch verification is a future
+  optimization target.
 
 ### Why signatures are variable-length
 
@@ -235,14 +251,15 @@ draft).
 
 ---
 
-## M0.4 — Threshold Kyber 85-of-128 (Tasks 0045–0059)
+## M0.4 — Threshold Kyber 86-of-128 (Tasks 0045–0059)
 
 ### What it is
 
 Threshold Kyber allows a **committee of 128 validators** to collectively hold a single
-Kyber secret key, such that any **85 or more** of them can cooperate to decrypt, but
-84 or fewer learn nothing. The 85/128 ratio (approximately 2/3 + 1) matches the
-Byzantine fault tolerance threshold.
+Kyber secret key, such that any **86 or more** of them can cooperate to decrypt, but
+85 or fewer learn nothing. The 86/128 ratio (2f + 1 over 3f + 1 with f = 42) matches
+the Byzantine fault tolerance threshold and is the same quorum used for HotStuff
+hard finality.
 
 ### The approach: Reconstruct-then-Decrypt
 
@@ -291,9 +308,31 @@ Threshold Kyber produces a `ThresholdCiphertext` containing:
 3. **MAC** (32 bytes): Poseidon2 hash of the encrypted message, domain-separated from
    the keystream
 
-The keystream is generated in CTR mode: `keystream[i] = Poseidon2(shared_secret || counter)`.
-The MAC prevents ciphertext tampering: `MAC = Poseidon2(0xFF^8 || shared_secret || ciphertext)`.
-The 0xFF prefix domain-separates the MAC from the keystream derivation.
+The keystream and the MAC are both bound to the per-message Kyber ciphertext via
+its Poseidon2 fingerprint, with separate domain prefixes (`KS_DOMAIN`, `MAC_DOMAIN`).
+Audit 359 introduced the binding so that a hypothetical Kyber-RNG repeat cannot
+collapse two plaintexts onto the same keystream or grant a MAC-forgery cross
+between ciphertexts. The MAC is verified in constant time via `subtle::ConstantTimeEq`
+to keep timing-side-channel-driven MAC-forgery probes off the table (an early-exit
+comparison was caught and fixed during internal audit).
+
+### MEV liveness caveat
+
+Threshold encryption protects MEV by **withholding decryption from the proposer
+until 86 committee shares have been combined**. The corollary is a liveness
+property, not a safety one: if fewer than 86 honest committee members release
+decryption shares within the per-slot deadline, the encrypted-mempool path
+stalls for that ciphertext until the next decryption window, and consensus on
+plaintext content for that transaction is delayed by one slot per missed
+window. Safety is unaffected — no plaintext is revealed to anyone, and no
+incorrect order is committed — but throughput on the encrypted path degrades
+proportionally with committee unavailability. The slashing condition for
+deliberate decryption-withhold (§3.4 of the whitepaper, 2 % of stake per
+offense) is the economic backstop that keeps the cooperative-decryption
+protocol live under honest-majority assumptions; pure liveness failures in the
+absence of malice (e.g., a network partition that isolates more than f
+validators from the proposer) are acknowledged as an inherent property of
+threshold cooperative decryption rather than a bug.
 
 ### Performance
 
@@ -369,7 +408,7 @@ seconds or minutes apart), not per-block.
 
 ---
 
-## M0.6 — Lattice-Based VRF (Tasks 0067–0075)
+## M0.6 — FALCON-Bound Poseidon2 VRF (Tasks 0067–0075)
 
 ### What it is
 
@@ -385,30 +424,46 @@ and unpredictable, no one can predict or manipulate who will be elected.
 
 ### Construction
 
-True lattice VRFs (based on lattice assumptions alone) are a research topic with few
-practical implementations. Our construction uses FALCON as a building block:
+True lattice VRFs (built solely on lattice assumptions) are a research topic with few
+practical implementations. Pyde's construction is a **Poseidon2 PRF whose output is
+bound to a FALCON signature proof** — the lattice piece is FALCON, not the VRF
+construction itself.
+
+Three domain-separation strings drive the construction (audit 393 split the
+fingerprint and output domains so that a cryptanalysis result against either
+hash usage cannot pivot into the other):
+
+```
+VRF_FINGERPRINT_DOMAIN = b"pyde-vrf-sk-fingerprint-v1"
+VRF_OUTPUT_DOMAIN      = b"pyde-vrf-output-v1"
+VRF_DOMAIN_PROOF       = b"pyde-vrf-proof-v1"
+```
 
 **VRF output** (deterministic, secret-key-dependent):
 ```
-sk_fingerprint = Poseidon2("pyde-vrf-output-v1" || sk_bytes)
-output = Poseidon2("pyde-vrf-output-v1" || sk_fingerprint || input)
+sk_fingerprint = Poseidon2(VRF_FINGERPRINT_DOMAIN || sk_bytes)
+output         = Poseidon2(VRF_OUTPUT_DOMAIN      || sk_fingerprint || input)
 ```
 
-The output depends on the secret key but doesn't reveal it. The domain prefix
-`"pyde-vrf-output-v1"` prevents cross-protocol attacks.
+The output depends on the secret key but doesn't reveal it. The split domains for
+fingerprint and output mean each Poseidon2 call commits to a distinct cryptographic
+role (key-binding vs output derivation).
 
 **VRF proof** (FALCON signature):
 ```
-proof = FALCON_sign(sk, "pyde-vrf-proof-v1" || input || output)
+proof = FALCON_sign(sk, VRF_DOMAIN_PROOF || pk || input || output)
 ```
 
-The proof is a FALCON signature over the input and output. Anyone with the public key
-can verify the signature, confirming that the claimed output was computed by the holder
-of the corresponding secret key.
+The proof is a FALCON signature over the public key, input, and output. Anyone with
+the public key can verify the signature, confirming that the claimed output was
+computed by the holder of the corresponding secret key. Including `pk` in the
+preimage binds the output to a specific key — without it, two distinct keys could
+produce the same output by coincidence and a malicious signer could re-attribute
+another key holder's output.
 
 **Verification:**
 ```
-valid = FALCON_verify(pk, "pyde-vrf-proof-v1" || input || output, proof)
+valid = FALCON_verify(pk, VRF_DOMAIN_PROOF || pk || input || output, proof)
 ```
 
 ### Why the output is separate from the proof
@@ -447,6 +502,8 @@ the 1281-byte secret key). Verification is fast at ~20 us.
 | p3-symmetric  | 0.4           | Sponge construction (PaddingFreeSponge)      |
 | falcon-rs     | 0.2           | FALCON-512 signatures (FN-DSA)               |
 | ml-kem        | 0.3.0-rc.0    | ML-KEM-768 (Kyber) key encapsulation         |
+| subtle        | 2             | `ConstantTimeEq` for MAC verification (audit 360) |
+| zeroize       | 1             | `ZeroizeOnDrop` on secret-key / share types so dropped values are overwritten before deallocation (audit 358) |
 
 All dependencies use `default-features = false` where applicable to maintain `no_std`
 compatibility. The `getrandom` feature is enabled for FALCON and ML-KEM so they can
@@ -456,15 +513,22 @@ access OS-level randomness for key generation and signing.
 
 ## Test Summary
 
+The figures below are approximate (`#[test]` items per module, current as of this
+revision); the authoritative count comes from `cargo test -p pyde-crypto`. New
+tests have been added across audit waves (audit IDs cited in the per-test docstrings)
+without changing module boundaries.
+
 | Module     | Tests | What they cover                                              |
 |------------|-------|--------------------------------------------------------------|
-| hash       | 7     | Construction, display, ordering, equality, slice conversion  |
-| poseidon2  | 24    | Determinism, collision resistance, edge cases, security params |
-| falcon     | 13    | Roundtrip, tampering, wrong key, batch, serialization        |
-| kyber      | 9     | Roundtrip, implicit rejection, serialization, sizes          |
-| threshold  | 15    | Shamir SSS, threshold decrypt, PSS refresh, epoch isolation  |
-| vrf        | 8     | Roundtrip, determinism, key separation, distribution         |
-| **Total**  | **76**|                                                              |
+| hash       | ~9    | Construction, display, ordering, equality, slice conversion  |
+| poseidon2  | ~25   | Determinism, collision resistance, edge cases, security params |
+| falcon     | ~15   | Roundtrip, tampering, wrong key, batch, serialization, domain-context binding |
+| kyber      | ~11   | Roundtrip, implicit rejection, serialization, sizes          |
+| threshold  | ~58   | Shamir SSS, threshold decrypt (86-of-128), index validation (audit 312), MAC oracle defense (audit 360), MAC binding (audit 359), share masking (audit 391), PSS refresh, resharing, epoch isolation |
+| vrf        | ~12   | Roundtrip, determinism, key separation, distribution, domain-split fingerprint (audit 393) |
+| kat (test) | ~11   | Known Answer Tests pinning Poseidon2 / FALCON / Kyber / threshold / VRF outputs against fixed vectors |
+| integration | 1    | `tests/encrypted_pipeline_diag.rs` end-to-end pipeline diagnostic |
+| **Total**  | **140+** |                                                          |
 
 ---
 

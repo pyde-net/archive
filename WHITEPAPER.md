@@ -265,7 +265,7 @@ A transaction's life from submission to hard finality runs through eight stages:
 
 3. **Submit.** The client sends the (encrypted) transaction to a full node's RPC endpoint via `pyde_sendRawTransaction` or `pyde_sendRawEncryptedTransaction`. The receiving node validates wire format, FALCON signature, chain ID, nonce window, balance ≥ gas + value, gas limit, deadline, access list, and tx size — at the RPC boundary, before the transaction is added to the mempool or gossiped.
 
-4. **Gossip.** A validated transaction is added to the mempool and gossiped on the `pyde/tx-gossip/1` channel (plaintext) or `pyde/encrypted-tx-gossip/1` channel (encrypted). All committee members and full nodes subscribe; the mempool reaches a consistent view within mesh-convergence time (typically under 200 ms on the laptop devnet).
+4. **Gossip.** A validated transaction is added to the mempool and gossiped on the `pyde/transactions/1` channel (plaintext) or `pyde/encrypted_transactions/1` channel (encrypted). All committee members and full nodes subscribe; the mempool reaches a consistent view within mesh-convergence time (typically under 200 ms on the laptop devnet).
 
 5. **Propose.** When the per-slot VRF selects a proposer, the proposer reads from its local mempool view, applies global / per-sender / TTL caps, sorts by gas-then-FIFO, and assembles a candidate block. For encrypted transactions, the proposer publishes a Poseidon2 commitment to the ordered set of `(encrypted_tx_hash)` in the block header, and broadcasts the proposal to the committee.
 
@@ -371,7 +371,7 @@ Pyde's cryptography is the lattice-based stack standardized by NIST in 2024:
 | Signatures | FALCON-512 | NIST FIPS 206 | Consensus votes, transaction authorization, validator registration |
 | Public-key encryption | Kyber-768 / ML-KEM | NIST FIPS 203 | Threshold-encrypted mempool |
 | Hash | Poseidon2 (Goldilocks field) | Academic standard | Block hashes, transaction hashes, Merkle nodes, address derivation |
-| VRF | Lattice-based (Goldilocks) | Pyde construction | Proposer selection, epoch randomness |
+| VRF | FALCON-512-bound, Poseidon2-derived (Goldilocks) | Pyde construction | Proposer selection, epoch randomness |
 | Threshold encryption | Shamir over Goldilocks + Kyber + Poseidon2 MAC | Pyde construction | Mempool encryption, decryption-share aggregation |
 | Proactive secret sharing | PSS over the threshold encryption | Pyde construction | Committee rotation, key refresh at epoch boundaries |
 | Key derivation | Argon2id | RFC 9106 | Keystore encryption (wallet, validator key) |
@@ -394,11 +394,7 @@ Pyde signs with FALCON-512 at three layers:
 
 Kyber-768 (ML-KEM in NIST FIPS 203 nomenclature) is a lattice-based key encapsulation mechanism providing IND-CCA2 security. The underlying hard problem is Module-LWE (Module Learning With Errors). Public keys are 1 184 bytes; ciphertexts are 1 088 bytes; the encapsulated shared secret is 32 bytes.
 
-Pyde uses Kyber-768 in two patterns:
-
-- **Direct encryption (mempool envelope).** A client encrypts a transaction's inner payload under a fresh Kyber-768 ephemeral key, derives a symmetric key from the shared secret, and uses it with AES-GCM to encrypt the payload bytes. The resulting envelope is a Kyber-768 ciphertext plus an AES-GCM ciphertext plus a sender FALCON signature.
-
-- **Threshold encryption.** The committee jointly holds a Kyber-768 secret distributed via Shamir secret sharing over the Goldilocks field. The corresponding public key is the threshold pubkey published at epoch boundaries.
+Pyde's only protocol use of Kyber-768 is the threshold-encrypted mempool envelope (§4.5). The committee jointly holds the Kyber-768 secret key, distributed via Shamir secret sharing over the Goldilocks field; the corresponding public key is published as the threshold pubkey at every epoch boundary. There is no per-message ephemeral-key path and no AES-GCM path — every encrypted-mempool envelope encapsulates against the committee's threshold pubkey, and the per-message symmetric primitive is a Poseidon2-derived keystream with a Poseidon2 MAC, both bound to the per-message Kyber ciphertext.
 
 The `ml-kem` dependency is currently pinned at `0.3.0-rc.0` pending an upstream stable release; the pin is tracked as a dependency-watch task. The release-candidate is already a faithful FIPS 203 implementation; the upgrade is a version-string change, not a protocol change.
 
@@ -417,11 +413,11 @@ The motivation for Poseidon2 over SHA-2 is performance in finite-field operation
 
 ### 4.5 Threshold encryption
 
-The mempool-encryption protocol decomposes a single Kyber-768 secret into 128 Shamir shares over the Goldilocks field, distributed across the active committee. Reconstruction requires 86 shares (the same 86-of-128 threshold as consensus quorum). The threshold public key is published at every epoch boundary; clients use it as the encryption target for any transaction submitted to the encrypted mempool path.
+The mempool-encryption protocol is **reconstruct-then-decapsulate Kyber-768**: the committee jointly holds the Kyber-768 secret key in shared form, partial-decryption shares are combined to reconstruct that secret key, and Kyber's standard decapsulation then runs once against the per-message ciphertext. The 64-byte Kyber secret-key seed is split into eight 8-byte chunks, each interpreted as a Goldilocks field element and independently Shamir-split into 128 shares with reconstruction threshold 86 (the same 86-of-128 threshold as consensus quorum). Each validator therefore holds eight Goldilocks shares — one per seed element. The corresponding Kyber public key is the threshold pubkey published at every epoch boundary; clients use it as the encryption target for any transaction submitted to the encrypted mempool path.
 
-The encryption side is straightforward: a client calls `Kyber768.encapsulate(threshold_pubkey)` and gets a ciphertext plus shared secret, then uses AES-GCM under the shared secret to encrypt the inner transaction payload.
+The encryption side is standard Kyber: a client calls `Kyber768.encapsulate(threshold_pubkey)` and gets a per-message Kyber ciphertext plus a 32-byte shared secret. The transaction payload is XOR-encrypted under a Poseidon2-derived keystream keyed on `(shared_secret, kyber_ct)`, and the envelope carries a Poseidon2 MAC over `(shared_secret, kyber_ct, encrypted_payload)`. Keystream and MAC are domain-separated and bound to the per-message Kyber ciphertext so that a hypothetical Kyber-RNG repeat does not collapse two plaintexts onto the same keystream.
 
-The decryption side requires cooperative participation from 86 + committee members, each releasing a partial-decryption share for the ciphertext after verifying the proposer's ordering commitment (§5.2). Aggregation of shares uses Lagrange interpolation over Goldilocks; once 86 shares are collected, the original Kyber shared secret is recoverable, the AES-GCM ciphertext can be decrypted, and the inner transaction is revealed.
+The decryption side requires cooperative participation from 86 + committee members, each releasing a partial-decryption share — their eight Goldilocks shares, blinded by a deterministic `(ct_hash, validator_index)` mask — together with a FALCON-512 signature over the share's canonical preimage. After validators verify the proposer's ordering commitment (§5.2), the next proposer collects shares, verifies each FALCON signature, removes the blinding masks, and Lagrange-interpolates each of the eight elements at `x = 0` over Goldilocks. The eight reconstructed field elements assemble the original 64-byte Kyber secret-key seed; running `Kyber768.decapsulate(seed, kyber_ct)` recovers the per-message shared secret, the Poseidon2 MAC is verified, the keystream is derived, and the inner transaction is revealed. The threshold reconstruction operates on the long-lived Kyber secret-key seed, not on per-message ciphertext shares; Kyber's standard decapsulation runs once on the recovered key against each message.
 
 Two security properties matter:
 
@@ -431,7 +427,7 @@ Two security properties matter:
 
 ### 4.6 VRF and PSS
 
-Pyde's VRF is a lattice-based construction producing a 256-bit pseudorandom output and a proof of computation. The output is unforgeable (only the secret-key holder can produce it) and verifiable (anyone with the public key can verify the proof). The construction operates over the Goldilocks field for performance compatibility with Poseidon2.
+Pyde's VRF is a FALCON-signature-bound construction over Poseidon2. The 256-bit pseudorandom output is `Poseidon2(output_domain || Poseidon2(fingerprint_domain || sk) || input)` — a deterministic Poseidon2 hash of the input under a secret-key-derived fingerprint. The proof is a FALCON-512 signature over `(proof_domain || pk || input || output)`, which makes the output verifiable by anyone holding the public key and inherits FALCON's NIST FIPS 206 post-quantum security. Poseidon2 over the Goldilocks field is the hash primitive throughout; the Goldilocks choice is for in-circuit compatibility with Pyde's other Poseidon2 use sites, not for the VRF's security argument.
 
 The VRF is used at two layers:
 
@@ -472,15 +468,17 @@ CLIENT
   2. FALCON-512 sign the inner transaction
   3. Fetch threshold pubkey via pyde_getThresholdPublicKey
   4. Kyber768.encapsulate(threshold_pubkey) → (kem_ct, shared_secret)
-  5. AES-GCM-encrypt the inner-tx bytes under shared_secret → aes_ct
-  6. Build EncryptedTx { sender, nonce, gas, chain_id, kem_ct, aes_ct,
-                        poseidon2_mac, falcon_signature }
+  5. keystream = Poseidon2-PRF(shared_secret, kem_ct, len)
+     enc_msg = inner_tx_bytes XOR keystream
+  6. mac = Poseidon2(shared_secret, kem_ct, enc_msg)
+     Build EncryptedTx { sender, nonce, gas, chain_id, kem_ct, enc_msg,
+                        mac, falcon_signature }
   7. Submit via pyde_sendRawEncryptedTransaction
 
 NETWORK
   8. RPC ingress: validate FALCON sig, sender registration, nonce window,
      balance >= gas, chain ID, deadline, size, MAC (constant-time)
-  9. Add to encrypted mempool, gossip on pyde/encrypted-tx-gossip/1
+  9. Add to encrypted mempool, gossip on pyde/encrypted_transactions/1
  10. Mempool reaches consistent view across committee + full nodes
 
 PROPOSER (this slot)
@@ -498,9 +496,10 @@ EVERY COMMITTEE MEMBER
      b. Sign and gossip share on pyde/consensus/1
  18. Receive partial shares from other committee members
  19. Once 86 shares collected for a given EncryptedTx:
-     a. Aggregate via Lagrange interpolation → kyber_shared_secret
-     b. AES-GCM-decrypt → inner Transaction bytes
-     c. Verify inner FALCON signature
+     a. Lagrange-interpolate to reconstruct Kyber secret-key seed
+     b. Kyber768.decapsulate(seed, kem_ct) → shared_secret
+     c. Verify Poseidon2 MAC; derive keystream; XOR enc_msg → inner Transaction
+     d. Verify inner FALCON signature
  20. Execute decrypted block via parallel scheduler
  21. Verify mandatory-inclusion invariant: every successfully-decrypted tx
      up to gas limit appears in the sealed block in committed order
@@ -632,7 +631,7 @@ MAX_WITNESS_SIZE     = 1 MB      (per-block state-witness bound)
 PAGE_ALLOC_GAS       = 200       (one-time cost per touched 4 KB page)
 ```
 
-The 64-deep external-call limit is lower than the EVM's 1024. The reasoning is that lattice-VRF and FALCON verification overhead per call is non-trivial; a 1024-deep nested-call sequence on Pyde would consume orders of magnitude more wall-clock time than on the EVM. 64 is enough to support every realistic application pattern (proxy-impl-impl chains, cross-AMM routing, escrow-of-escrow) with comfortable headroom.
+The 64-deep external-call limit is lower than the EVM's 1024. The reasoning is that FALCON verification overhead per call is non-trivial; a 1024-deep nested-call sequence on Pyde would consume orders of magnitude more wall-clock time than on the EVM. 64 is enough to support every realistic application pattern (proxy-impl-impl chains, cross-AMM routing, escrow-of-escrow) with comfortable headroom.
 
 ---
 
@@ -671,9 +670,11 @@ otic doc   contract.oti    # Generate docs
 
 ### 7.3 The type system
 
-Otigen's primitive types are fixed-width integers from `u8` through `u256` (and signed counterparts), `bool`, `Address`, and `String`. Composite types are `Vec<T>`, `Map<K, V>`, `Tuple`, `Array<T, N>`, and user-defined `struct` and `enum`. Generics are parametric for collections; user structs are monomorphic.
+Otigen's primitive types at testnet are fixed-width **unsigned** integers from `u8` through `u256`, `bool`, `Address`, and `String`. Composite types are `Vec<T>`, `Map<K, V>`, `Tuple`, `Array<T, N>`, and user-defined `struct` and `enum`. Generics are parametric for collections; user structs are monomorphic.
 
 The integer types are checked by default: `let x: u64 = a + b;` traps on overflow. Wrapping or saturating semantics are explicit: `let x: u64 = a.wrapping_add(b);`. `u256` is a first-class type that lowers to the wide-register ISA in §6.3. There is no implicit numeric coercion: `u32` to `u64` is an explicit `as u64`.
+
+Signed integer types (`i8` through `i256`) are reserved as keywords and recognized by the parser, but the typechecker rejects them today and the PVM ISA does not yet ship signed-arithmetic opcodes (`Sdiv`, `Smul`, `Slt`, `Sgt`). This is a deliberate testnet/mainnet-launch deferral tracked under audit 354: signed types ship in a post-mainnet point release once the ISA additions and their gas-pricing pass audit. Contracts that need signed semantics today encode them explicitly over `u256` (two's-complement, manual sign tests).
 
 `Address` is a 32-byte type derived from `Poseidon2(falcon_pubkey)`. There is no plaintext-key pattern in the language; addresses are opaque values produced by key registration.
 
@@ -811,8 +812,8 @@ Pyde uses five gossipsub topics with distinct subscription and back-pressure cha
 | --- | --- | --- |
 | `pyde/blocks/1` | All nodes | Proposed and finalized blocks |
 | `pyde/consensus/1` | Committee only | Votes, QCs, evidence, decryption shares, checkpoints |
-| `pyde/tx-gossip/1` | All nodes | Plaintext transactions |
-| `pyde/encrypted-tx-gossip/1` | All nodes | Encrypted-mempool ciphertexts |
+| `pyde/transactions/1` | All nodes | Plaintext transactions |
+| `pyde/encrypted_transactions/1` | All nodes | Encrypted-mempool ciphertexts |
 | `pyde/sync/1` | Sync requesters + responders | Cold-sync and catch-up block requests |
 
 The committee-only restriction on the consensus channel is enforced cryptographically: a peer that is not a current committee member is dropped from the topic mesh, and any consensus message it broadcasts is rejected at the recipient. This is what makes the gossipsub mesh efficient at 128 validators — committee message volume scales as O(committee × messages_per_slot), not O(network_size × messages_per_slot).
@@ -967,13 +968,22 @@ Pyde at launch is a sovereign L1 with a published parachain specification but no
 
 ### 11.1 Three account types
 
-Every entity on Pyde is one of three account types:
+Every entity on Pyde is one of three account types. All addresses are the 32-byte output of a single Poseidon2 hash; the input bytes vary by derivation scheme:
 
-| Type | Address derivation | Authorization |
+| Type | Input to `Poseidon2(·) → 32 B` | Authorization |
 | --- | --- | --- |
-| Externally-owned account (EOA) | `Poseidon2(falcon_pubkey)` | FALCON-512 signature(s) under `AuthKeys::Single` or `AuthKeys::Multisig` |
-| Contract — nonce-derived | `Poseidon2(deployer_addr || deployer_nonce)` | None at the address; calls are authorized by the call-context sender |
-| Contract — salt-derived (CREATE2-style) | `Poseidon2(0xFF || deployer_addr || salt || code_hash)` | Same as nonce-derived |
+| Externally-owned account (EOA) | 897 B FALCON-512 public-key bytes | FALCON-512 signature(s) under `AuthKeys::Single` or `AuthKeys::Multisig` |
+| Contract — nonce-derived (`CREATE`-style) | 32 B `deployer_addr` ‖ 8 B `deployer_nonce` (little-endian `u64`) = 40 B | None at the address; calls are authorized by the call-context sender |
+| Contract — salt-derived (`CREATE2`-style) | 1 B `0xFF` ‖ 32 B `deployer_addr` ‖ 32 B `salt` ‖ 32 B `code_hash` = 97 B | Same as nonce-derived |
+
+`code_hash` for `CREATE2` is itself `Poseidon2(deploy_bytecode)`. The leading `0xFF` byte mirrors the EVM's `CREATE2` convention so that `CREATE` and `CREATE2` outputs cannot collide for any deployer/nonce/salt triple. The canonical source is `crates/account/src/address.rs::derive_eoa_address`, `derive_create_address`, and `derive_create2_address`; serialization layouts here match those functions byte for byte.
+
+Two well-known addresses are derived from fixed ASCII byte strings rather than from a key or deployer chain:
+
+| Address | Input to `Poseidon2(·)` | Role |
+| --- | --- | --- |
+| Treasury | `b"pyde-treasury"` (13 B) | Accumulates the 10 % treasury share of every transaction's base fee (§12.3) |
+| Airdrop pool | `b"pyde-airdrop-pool"` (17 B) | Pre-minted at genesis with the total claimable airdrop; debited by `ClaimAirdrop`, swept post-deadline (§11.5) |
 
 Addresses are 32 bytes regardless of type. There is no distinction at the type level between an EOA and a contract from the perspective of a transaction recipient — a transaction sending value to an address that turns out to be a contract triggers the contract's payable-fallback path; sending to an EOA simply credits the balance.
 
@@ -1600,6 +1610,25 @@ Pyde's roadmap is structured around a testnet-MVP → fundraise → audit → ma
 
 This whitepaper is the technical credibility document for that sequence. It is not a prospectus; specific token-allocation figures and capital-raise structure are out of scope here and live in separate fundraise material.
 
+### 18.4 Current testnet limitations
+
+The shipping testnet is the substrate for this whitepaper's claims, but it is not yet mainnet. Section 19 catalogues capabilities that are explicitly post-mainnet by design; this section is the honest counterpart for capabilities that ship at mainnet but operate in a reduced or unvalidated form on the current testnet. Operators running validators against the testnet, dApp authors targeting it, and auditors evaluating the surface should treat the items below as known gaps to be closed on the path-to-mainnet (§18.2), not as design choices.
+
+| Area | Testnet today | Mainnet target | Reference |
+| --- | --- | --- | --- |
+| Throughput validation | 4 K TPS sustained / 7 K burst on a four-validator laptop devnet (thermal-bound at ~ 4.5 K) | 12.5 K sustained / 50 K peak on cloud-class hardware × 10 min soak | §16.2, §18.2 |
+| Encrypted-path throughput | Lifecycle test passes 5/5; sustained measurement TBD | Characterized under sustained load with the same 10-minute soak structure as the plaintext path | §5.1, §16.2 |
+| Threshold-key generation | Centralized `threshold_keygen` (caller sees all shares) — fine for devnet/testnet under a trusted operator | Multi-party DKG ceremony followed by PSS epoch refresh that dissolves the genesis trust after epoch 1 | §4.5, §3.6 |
+| Validator key custody | Argon2id-encrypted on-disk keystore | HSM-backed signing as the recommended operator path; keystore remains the fallback | §4.7 |
+| Fuzzing and proptest soak | Default `PROPTEST_CASES = 256` in CI; fuzz targets exist but no 72 + hour corpus runs yet | `PROPTEST_CASES = 10,000` periodic CI + 72 + hour `cargo-fuzz` runs with corpus accumulation pre-mainnet | §15.4, §19.11 |
+| Otigen signed integers | Reserved keywords (`i8`–`i256`) parsed but rejected at typecheck (audit 354) | Signed types ship in a post-mainnet point release once the PVM ISA additions for signed arithmetic pass audit | §7.3 |
+| Mempool censorship slashing | Local-view enforcement only — committee members reject blocks omitting txs they have seen (safety holds; liveness is the only failure mode) | Signed mempool commitments + cryptographic slashing of proposers excluding txs in ≥ f + 1 commitments (audit 026, §19.4) | §5.3, §19.4 |
+| Networking stack | libp2p 0.54 with 7 RUSTSEC advisories ignored | libp2p 0.56 + (clears the ignores) before mainnet; verified against the same multi-node lifecycle suite | §9.1 |
+| Reorg / Byzantine harness | Single-tier reorg + double-sign + 2-of-7-offline tests pass | Two-tier reorg-Byzantine harness covering simultaneous-SIGKILL recovery for ≥ 4 of 4 validators (CHURN_RESIDUAL.md) | §15.4 |
+| Mainnet chain id | Provisional `MAINNET_CHAIN_ID = 1` — collides with Ethereum mainnet under chainlist.org / EIP-155, surfacing as wallet, explorer, and bridge-router ambiguity (signature preimages don't collide cross-protocol because Pyde signs FALCON-512, not secp256k1-over-RLP) | Final id picked at the genesis ceremony, registered with chainlist.org so the value is unambiguous across every wallet and bridge | `crates/net/src/discovery.rs::MAINNET_CHAIN_ID` |
+
+The list is the testnet-specific complement to §19. Items in this table are tracked as launch-gating; items in §19 are explicitly post-mainnet. An auditor reviewing the system should expect every row here to be either closed or downgraded in severity by the mainnet genesis ceremony described in §18.2 step 4.
+
 ---
 
 ## 19. Post-Mainnet Appendix
@@ -1858,6 +1887,6 @@ A consolidated reference for every protocol constant referenced in this paper. T
 
 **Verifiable computation network (post-mainnet).** Pyde's long-horizon ZK direction: across three phases, the chain plus its parachain layer evolves into a system where every operation — every block, every cross-chain message, every oracle attestation, every off-chain compute result — can be cryptographically proved when the cost-benefit ratio justifies it. Phase 2 adds STARK execution proofs as a parallel finality path; Phase 3 adds ZK proofs as a parachain attestation mode (§19.1).
 
-**VRF (Verifiable Random Function).** A function that produces a pseudorandom output and a proof that the output is correctly computed under a given key. Pyde's VRF is lattice-based, used for proposer selection and epoch randomness seeding.
+**VRF (Verifiable Random Function).** A function that produces a pseudorandom output and a proof that the output is correctly computed under a given key. Pyde's VRF derives the output via Poseidon2 from a secret-key fingerprint and binds it to a FALCON-512 signature proof, used for proposer selection and epoch randomness seeding.
 
 **Weak subjectivity.** A property of long-lived proof-of-stake chains that requires a new node to start syncing from a recent trusted checkpoint rather than from genesis. Pyde publishes weak-subjectivity checkpoints every 64 epochs.
