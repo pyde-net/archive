@@ -81,6 +81,47 @@ fn default_out() -> String {
     "out".into()
 }
 
+/// TPL-605: validate that a path string is safe to join under the
+/// project root — must be relative and must not contain any `..`
+/// (parent-dir) components. Pre-fix, `compiler.{src,test,out}` from
+/// `pyde.toml` and `pyde-dev script <file>` from the CLI were both
+/// passed through `root.join(...)` without checking, so a malicious
+/// pyde.toml could redirect `out` to `../../../some/path` and a
+/// malicious script argument could read `../../etc/passwd`. The
+/// canonical Rust path-jail is to walk `Path::components()` and
+/// refuse `Component::ParentDir` plus any absolute-prefix marker.
+///
+/// `label` appears in the error message (e.g. `compiler.out`,
+/// `script file`) so the operator can tell which path tripped the
+/// check.
+pub fn ensure_path_within_root(value: &str, label: &str) -> Result<(), String> {
+    let p = std::path::Path::new(value);
+    if p.is_absolute() {
+        return Err(format!(
+            "{}: absolute paths are not allowed (got `{}`)",
+            label, value
+        ));
+    }
+    for component in p.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(format!(
+                    "{}: `..` (parent-dir) components are not allowed (got `{}`)",
+                    label, value
+                ));
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(format!(
+                    "{}: absolute paths are not allowed (got `{}`)",
+                    label, value
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Find pyde.toml by walking up from the current directory.
 /// Returns (config, project_root_dir).
 pub fn load_config() -> Result<(ProjectConfig, PathBuf), String> {
@@ -94,6 +135,15 @@ pub fn load_config() -> Result<(ProjectConfig, PathBuf), String> {
                 .map_err(|e| format!("cannot read {}: {}", config_path.display(), e))?;
             let config: ProjectConfig =
                 toml::from_str(&content).map_err(|e| format!("invalid pyde.toml: {}", e))?;
+
+            // TPL-605: validate compiler.{src,test,out} so a hostile
+            // pyde.toml cannot redirect build / test / artifact writes
+            // outside the project root via `..` traversal or an
+            // absolute path.
+            ensure_path_within_root(&config.compiler.src, "compiler.src")?;
+            ensure_path_within_root(&config.compiler.test, "compiler.test")?;
+            ensure_path_within_root(&config.compiler.out, "compiler.out")?;
+
             return Ok((config, dir));
         }
         if !dir.pop() {
@@ -217,4 +267,49 @@ pub fn get_rpc_url(network: &str) -> Result<String, String> {
         .get(network)
         .ok_or_else(|| format!("network '{}' not found in pyde.toml", network))?;
     Ok(net.rpc_url.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TPL-605 — path-jail helper coverage.
+
+    #[test]
+    fn path_jail_accepts_simple_relative() {
+        ensure_path_within_root("src", "compiler.src").unwrap();
+        ensure_path_within_root("script", "compiler.test").unwrap();
+        ensure_path_within_root("out", "compiler.out").unwrap();
+        ensure_path_within_root("Counter.oti", "script file").unwrap();
+    }
+
+    #[test]
+    fn path_jail_accepts_nested_relative() {
+        ensure_path_within_root("src/contracts", "compiler.src").unwrap();
+        ensure_path_within_root("script/deploy/Token.oti", "script file").unwrap();
+    }
+
+    #[test]
+    fn path_jail_rejects_parent_dir() {
+        let err = ensure_path_within_root("..", "x").unwrap_err();
+        assert!(err.contains("`..`"), "{err}");
+        let err = ensure_path_within_root("../etc/passwd", "x").unwrap_err();
+        assert!(err.contains("`..`"), "{err}");
+        let err = ensure_path_within_root("script/../../etc", "x").unwrap_err();
+        assert!(err.contains("`..`"), "{err}");
+        let err = ensure_path_within_root("a/b/../c", "x").unwrap_err();
+        assert!(err.contains("`..`"), "{err}");
+    }
+
+    #[test]
+    fn path_jail_rejects_absolute_unix() {
+        let err = ensure_path_within_root("/etc/passwd", "x").unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn path_jail_label_appears_in_error() {
+        let err = ensure_path_within_root("..", "compiler.out").unwrap_err();
+        assert!(err.starts_with("compiler.out:"), "{err}");
+    }
 }

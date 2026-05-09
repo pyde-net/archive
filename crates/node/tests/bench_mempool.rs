@@ -109,7 +109,7 @@ fn bench_preloaded_mempool() {
     let num_contracts = 20usize;
     println!("  Deploying {} complex contracts...", num_contracts);
 
-    let compiled = otic::compile_all_unchecked(
+    let compiled = otic::__compile_all_unchecked(
         r#"
         struct Stats { sum: u256, count: u64, min: u64, max: u64 }
         contract HeavyWork {

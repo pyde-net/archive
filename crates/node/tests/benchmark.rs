@@ -91,7 +91,7 @@ fn make_transfer(from: [u8; 32], to: [u8; 32], nonce: u64) -> Transaction {
 }
 
 fn compile(source: &str) -> Vec<u8> {
-    let compiled = otic::compile_all_unchecked(source);
+    let compiled = otic::__compile_all_unchecked(source);
     let (_, c) = &compiled[0];
     let mut data = Vec::new();
     data.extend_from_slice(&(c.constructor_bytecode.len() as u32).to_le_bytes());

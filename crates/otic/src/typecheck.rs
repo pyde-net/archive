@@ -1312,7 +1312,7 @@ impl TypeChecker {
                             //     already emits a contract handle that IS
                             //     the deployed child's address. Pre-audit-
                             //     405 this only worked through the lax
-                            //     `compile_all_unchecked` path which produced
+                            //     `__compile_all_unchecked` path which produced
                             //     INCORRECT bytecode (the lowerer emitted
                             //     `AddressOfSelf` for any `address(...)`
                             //     call, regardless of argument — so the

@@ -155,10 +155,10 @@ fn cmd_build(path: &str) {
     //
     // Audit 404: this binary already ran the full frontend (resolve +
     // typecheck + safety) inside `run_frontend(path)` above, so we
-    // intentionally use the lax `compile_all_unchecked` here to avoid
+    // intentionally use the lax `__compile_all_unchecked` here to avoid
     // re-running the same checks. The strict `compile_all` is for
     // callers that haven't yet run the frontend separately.
-    let results = otic::compile_all_unchecked(&src);
+    let results = otic::__compile_all_unchecked(&src);
 
     if results.is_empty() {
         eprintln!("error: no contracts found in {}", path);
@@ -228,72 +228,178 @@ fn cmd_test(path: &str) {
     let (file, _src) = run_frontend(path);
 
     // Lower + codegen (no optimize for tests — preserve all test functions)
-    let ir = otic::lower::lower(&file);
+    let mut ir = otic::lower::lower(&file);
 
-    let test_fns: Vec<&otic::ir::IrFunction> = ir.functions.iter().filter(|f| f.is_test).collect();
+    // Snapshot the test set + per-test metadata before mutating IR.
+    let test_metas: Vec<(String, bool, Option<String>)> = ir
+        .functions
+        .iter()
+        .filter(|f| f.is_test)
+        .map(|f| (f.name.clone(), f.should_panic, f.expected_error.clone()))
+        .collect();
 
-    if test_fns.is_empty() {
+    if test_metas.is_empty() {
         println!("  {} — no #[test] functions found", path);
         return;
     }
 
+    // Promote test fns to pub so codegen includes them in the dispatch table.
+    for func in &mut ir.functions {
+        if func.is_test {
+            func.is_pub = true;
+            func.is_test = false;
+        }
+    }
+
+    // TPL-602: contracts compile with default `emit_guards = true` and the
+    // tests dispatch through the runtime selector, so reentrancy + payable
+    // guard prologues run on every test call — the pre-fix path stripped
+    // them out and let test fixtures pass against bytecode that diverged
+    // from what the chain would deploy. Pure-library files (`module foo;`
+    // with no contract block) have no contract surface to guard, so they
+    // keep the single-fn-as-entry path; the guard machinery doesn't apply.
+    let is_contract = !ir.contract_name.is_empty();
+
     let mut passed = 0;
     let mut failed = 0;
 
-    for func in &test_fns {
-        // Build a minimal program with just this test function
-        let mut test_ir = ir.clone();
-        test_ir.functions = vec![(*func).clone()];
-        // Mark as pub so codegen treats it as entry
-        test_ir.functions[0].is_pub = true;
-        test_ir.functions[0].is_test = false;
+    if is_contract {
+        let codegen = otic::codegen::CodeGen::new();
+        let compiled = codegen.generate(&ir);
 
-        let mut codegen = otic::codegen::CodeGen::new();
-        codegen.emit_guards = false;
-        let compiled = codegen.generate(&test_ir);
-
-        // Run on PVM
-        let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
-        if let Err(e) = vm.load(&compiled.bytecode) {
-            eprintln!("failed to load bytecode: {:?}", e);
-            std::process::exit(1);
-        }
-
-        let mut steps = 0;
-        let mut result = None;
-        loop {
-            match vm.step() {
-                Ok(Some(r)) => {
-                    result = Some(r);
-                    break;
+        // Run constructor (if any) to seed shared storage state.
+        let constructor_storage: std::collections::HashMap<_, _> =
+            if !compiled.constructor_bytecode.is_empty() {
+                let mut vm = pyde_vm::vm::Vm::with_gas_limit(100_000_000);
+                if let Err(e) = vm.load(&compiled.constructor_bytecode) {
+                    eprintln!("constructor load error: {:?}", e);
+                    process::exit(1);
                 }
-                Ok(None) => {
-                    steps += 1;
-                    if steps > 100_000 {
-                        break;
-                    }
+                let output = vm.execute();
+                if output.outcome != pyde_vm::vm::Outcome::Success {
+                    eprintln!("constructor failed: {:?}", output.outcome);
+                    process::exit(1);
                 }
-                Err(_) => break,
+                vm.storage.clone()
+            } else {
+                std::collections::HashMap::new()
+            };
+
+        for (name, should_panic, expected_error) in &test_metas {
+            // Snapshot per test for isolation.
+            let snapshot = constructor_storage.clone();
+
+            // 4-byte selector dispatch. Setting `vm.calldata` BEFORE `load`
+            // matches the pyde-dev runner so `map_calldata()` runs during load.
+            let selector = otic::codegen::compute_selector(name);
+            let calldata = selector.to_be_bytes().to_vec();
+
+            let mut vm = pyde_vm::vm::Vm::with_gas_limit(100_000_000);
+            vm.calldata = calldata;
+            if let Err(e) = vm.load(&compiled.runtime_bytecode) {
+                println!("  test {} ... FAILED (load: {:?})", name, e);
+                failed += 1;
+                continue;
+            }
+            vm.storage = snapshot;
+
+            let output = vm.execute();
+
+            let ok = if *should_panic {
+                match output.outcome {
+                    pyde_vm::vm::Outcome::Revert => match expected_error {
+                        Some(expected) => {
+                            let expected_selector = otic::codegen::compute_selector(expected);
+                            let actual_selector = if vm.return_data.len() >= 8 {
+                                u64::from_le_bytes(vm.return_data[..8].try_into().unwrap_or([0; 8]))
+                            } else {
+                                0
+                            };
+                            actual_selector == expected_selector as u64
+                        }
+                        None => true,
+                    },
+                    _ => false,
+                }
+            } else {
+                matches!(output.outcome, pyde_vm::vm::Outcome::Success)
+            };
+
+            if ok {
+                println!("  test {} ... ok", name);
+                passed += 1;
+            } else {
+                println!("  test {} ... FAILED ({:?})", name, output.outcome);
+                failed += 1;
             }
         }
+    } else {
+        // Library / module path: no contract dispatcher to thread tests
+        // through. Compile each test in isolation as the single entry, with
+        // guards disabled — there is no contract storage state for a
+        // reentrancy guard to key on. This is the pre-fix `otic test` flow
+        // preserved verbatim for library files; `cargo test` against the
+        // `tests/` integration suite is the path that exercises helper-fn
+        // calls, so this CLI stays as a quick-check for self-contained
+        // `#[test]` fns.
+        for (name, should_panic, _expected_error) in &test_metas {
+            let func = match ir.functions.iter().find(|f| &f.name == name) {
+                Some(f) => f.clone(),
+                None => {
+                    println!("  test {} ... FAILED (missing in IR)", name);
+                    failed += 1;
+                    continue;
+                }
+            };
 
-        let should_panic = func
-            .doc
-            .as_ref()
-            .is_some_and(|d| d.contains("should_panic"));
+            let mut entry = func;
+            entry.is_pub = true;
+            entry.is_test = false;
+            let mut test_ir = ir.clone();
+            test_ir.functions = vec![entry];
 
-        let ok = match result {
-            Some(pyde_vm::vm::ExecResult::Halt) => !should_panic,
-            Some(pyde_vm::vm::ExecResult::Revert) => should_panic,
-            _ => false,
-        };
+            let mut codegen = otic::codegen::CodeGen::new();
+            codegen.emit_guards = false;
+            let compiled = codegen.generate(&test_ir);
 
-        if ok {
-            println!("  test {} ... ok", func.name);
-            passed += 1;
-        } else {
-            println!("  test {} ... FAILED", func.name);
-            failed += 1;
+            let mut vm = pyde_vm::vm::Vm::with_gas_limit(1_000_000);
+            if let Err(e) = vm.load(&compiled.bytecode) {
+                println!("  test {} ... FAILED (load: {:?})", name, e);
+                failed += 1;
+                continue;
+            }
+
+            let mut steps = 0;
+            let mut result = None;
+            loop {
+                match vm.step() {
+                    Ok(Some(r)) => {
+                        result = Some(r);
+                        break;
+                    }
+                    Ok(None) => {
+                        steps += 1;
+                        if steps > 100_000 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            let ok = match result {
+                Some(pyde_vm::vm::ExecResult::Halt) => !*should_panic,
+                Some(pyde_vm::vm::ExecResult::Revert) => *should_panic,
+                _ => false,
+            };
+
+            if ok {
+                println!("  test {} ... ok", name);
+                passed += 1;
+            } else {
+                println!("  test {} ... FAILED", name);
+                failed += 1;
+            }
         }
     }
 

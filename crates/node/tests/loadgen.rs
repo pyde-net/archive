@@ -173,7 +173,7 @@ fn load_test_full_pipeline() {
             }
         }
     "#;
-    let compiled = otic::compile_all_unchecked(heavy_source);
+    let compiled = otic::__compile_all_unchecked(heavy_source);
     let (_, cc) = &compiled[0];
     let mut deploy_data = Vec::new();
     deploy_data.extend_from_slice(&(cc.constructor_bytecode.len() as u32).to_le_bytes());

@@ -316,10 +316,10 @@ pub fn build_project(config: &ProjectConfig, root: &Path) -> Result<BuildResult,
         //
         // Audit 404: `run_frontend` above already ran resolve +
         // typecheck + safety on this source. Use the lax
-        // `compile_all_unchecked` so we don't repeat the same
+        // `__compile_all_unchecked` so we don't repeat the same
         // checks; if `run_frontend` had any failures we already
         // continued past this contract via `had_errors = true`.
-        let contracts = otic::compile_all_unchecked(source);
+        let contracts = otic::__compile_all_unchecked(source);
         if contracts.is_empty() {
             println!("  {} — no contracts", rel.display());
             continue;

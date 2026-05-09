@@ -45,6 +45,18 @@ pub fn run(file: &str, network: &str, signer: &crate::signer::Signer) -> Result<
         (file, None)
     };
 
+    // TPL-605: path-jail on the user-supplied script argument.
+    // Reject absolute paths and any `..` components before touching
+    // the filesystem. Without this gate, `pyde-dev script
+    // /etc/passwd` would happily read an absolute path because the
+    // first branch only checks `Path::new(file_part).exists()`,
+    // and `pyde-dev script ../../etc/passwd` would resolve the
+    // second `root.join("script").join(file_part)` branch out of
+    // `root/script/` and into the operator's filesystem. Both
+    // surfaces are closed by the same `ensure_path_within_root`
+    // helper that `pyde.toml` config values go through.
+    project::ensure_path_within_root(file_part, "script file")?;
+
     // Resolve script file path
     let script_path = if Path::new(file_part).exists() {
         file_part.to_string()

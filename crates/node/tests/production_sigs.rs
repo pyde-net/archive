@@ -22,7 +22,7 @@ fn sign(tx: &mut Transaction, sk: &pyde_crypto::falcon::FalconSecretKey) {
 }
 
 fn compile(src: &str) -> Vec<u8> {
-    let c = otic::compile_all_unchecked(src);
+    let c = otic::__compile_all_unchecked(src);
     let (_, cc) = &c[0];
     let mut d = Vec::new();
     d.extend_from_slice(&(cc.constructor_bytecode.len() as u32).to_le_bytes());

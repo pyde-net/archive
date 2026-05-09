@@ -1235,7 +1235,7 @@ impl Lowerer {
                     // Pre-audit-405 this branch always emitted
                     // `AddressOfSelf` regardless of argument, which
                     // silently produced wrong bytecode whenever the
-                    // typechecker's lax (compile_all_unchecked) path
+                    // typechecker's lax (__compile_all_unchecked) path
                     // let `address(child)` through — the factory got
                     // its OWN address back instead of the deployed
                     // child's. The strict path now rejects that
