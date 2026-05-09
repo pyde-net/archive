@@ -1601,6 +1601,24 @@ Pyde's roadmap is structured around a testnet-MVP → fundraise → audit → ma
 
 This whitepaper is the technical credibility document for that sequence. It is not a prospectus; specific token-allocation figures and capital-raise structure are out of scope here and live in separate fundraise material.
 
+### 18.4 Current testnet limitations
+
+The shipping testnet is the substrate for this whitepaper's claims, but it is not yet mainnet. Section 19 catalogues capabilities that are explicitly post-mainnet by design; this section is the honest counterpart for capabilities that ship at mainnet but operate in a reduced or unvalidated form on the current testnet. Operators running validators against the testnet, dApp authors targeting it, and auditors evaluating the surface should treat the items below as known gaps to be closed on the path-to-mainnet (§18.2), not as design choices.
+
+| Area | Testnet today | Mainnet target | Reference |
+| --- | --- | --- | --- |
+| Throughput validation | 4 K TPS sustained / 7 K burst on a four-validator laptop devnet (thermal-bound at ~ 4.5 K) | 12.5 K sustained / 50 K peak on cloud-class hardware × 10 min soak | §16.2, §18.2 |
+| Encrypted-path throughput | Lifecycle test passes 5/5; sustained measurement TBD | Characterized under sustained load with the same 10-minute soak structure as the plaintext path | §5.1, §16.2 |
+| Threshold-key generation | Centralized `threshold_keygen` (caller sees all shares) — fine for devnet/testnet under a trusted operator | Multi-party DKG ceremony followed by PSS epoch refresh that dissolves the genesis trust after epoch 1 | §4.5, §3.6 |
+| Validator key custody | Argon2id-encrypted on-disk keystore | HSM-backed signing as the recommended operator path; keystore remains the fallback | §4.7 |
+| Fuzzing and proptest soak | Default `PROPTEST_CASES = 256` in CI; fuzz targets exist but no 72 + hour corpus runs yet | `PROPTEST_CASES = 10,000` periodic CI + 72 + hour `cargo-fuzz` runs with corpus accumulation pre-mainnet | §15.4, §19.11 |
+| Otigen signed integers | Reserved keywords (`i8`–`i256`) parsed but rejected at typecheck (audit 354) | Signed types ship in a post-mainnet point release once the PVM ISA additions for signed arithmetic pass audit | §7.3 |
+| Mempool censorship slashing | Local-view enforcement only — committee members reject blocks omitting txs they have seen (safety holds; liveness is the only failure mode) | Signed mempool commitments + cryptographic slashing of proposers excluding txs in ≥ f + 1 commitments (audit 026, §19.4) | §5.3, §19.4 |
+| Networking stack | libp2p 0.54 with 7 RUSTSEC advisories ignored | libp2p 0.56 + (clears the ignores) before mainnet; verified against the same multi-node lifecycle suite | §9.1 |
+| Reorg / Byzantine harness | Single-tier reorg + double-sign + 2-of-7-offline tests pass | Two-tier reorg-Byzantine harness covering simultaneous-SIGKILL recovery for ≥ 4 of 4 validators (CHURN_RESIDUAL.md) | §15.4 |
+
+The list is the testnet-specific complement to §19. Items in this table are tracked as launch-gating; items in §19 are explicitly post-mainnet. An auditor reviewing the system should expect every row here to be either closed or downgraded in severity by the mainnet genesis ceremony described in §18.2 step 4.
+
 ---
 
 ## 19. Post-Mainnet Appendix
