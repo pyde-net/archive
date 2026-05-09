@@ -968,13 +968,22 @@ Pyde at launch is a sovereign L1 with a published parachain specification but no
 
 ### 11.1 Three account types
 
-Every entity on Pyde is one of three account types:
+Every entity on Pyde is one of three account types. All addresses are the 32-byte output of a single Poseidon2 hash; the input bytes vary by derivation scheme:
 
-| Type | Address derivation | Authorization |
+| Type | Input to `Poseidon2(·) → 32 B` | Authorization |
 | --- | --- | --- |
-| Externally-owned account (EOA) | `Poseidon2(falcon_pubkey)` | FALCON-512 signature(s) under `AuthKeys::Single` or `AuthKeys::Multisig` |
-| Contract — nonce-derived | `Poseidon2(deployer_addr || deployer_nonce)` | None at the address; calls are authorized by the call-context sender |
-| Contract — salt-derived (CREATE2-style) | `Poseidon2(0xFF || deployer_addr || salt || code_hash)` | Same as nonce-derived |
+| Externally-owned account (EOA) | 897 B FALCON-512 public-key bytes | FALCON-512 signature(s) under `AuthKeys::Single` or `AuthKeys::Multisig` |
+| Contract — nonce-derived (`CREATE`-style) | 32 B `deployer_addr` ‖ 8 B `deployer_nonce` (little-endian `u64`) = 40 B | None at the address; calls are authorized by the call-context sender |
+| Contract — salt-derived (`CREATE2`-style) | 1 B `0xFF` ‖ 32 B `deployer_addr` ‖ 32 B `salt` ‖ 32 B `code_hash` = 97 B | Same as nonce-derived |
+
+`code_hash` for `CREATE2` is itself `Poseidon2(deploy_bytecode)`. The leading `0xFF` byte mirrors the EVM's `CREATE2` convention so that `CREATE` and `CREATE2` outputs cannot collide for any deployer/nonce/salt triple. The canonical source is `crates/account/src/address.rs::derive_eoa_address`, `derive_create_address`, and `derive_create2_address`; serialization layouts here match those functions byte for byte.
+
+Two well-known addresses are derived from fixed ASCII byte strings rather than from a key or deployer chain:
+
+| Address | Input to `Poseidon2(·)` | Role |
+| --- | --- | --- |
+| Treasury | `b"pyde-treasury"` (13 B) | Accumulates the 10 % treasury share of every transaction's base fee (§12.3) |
+| Airdrop pool | `b"pyde-airdrop-pool"` (17 B) | Pre-minted at genesis with the total claimable airdrop; debited by `ClaimAirdrop`, swept post-deadline (§11.5) |
 
 Addresses are 32 bytes regardless of type. There is no distinction at the type level between an EOA and a contract from the perspective of a transaction recipient — a transaction sending value to an address that turns out to be a contract triggers the contract's payable-fallback path; sending to an EOA simply credits the balance.
 
