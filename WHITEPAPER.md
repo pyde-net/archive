@@ -670,9 +670,11 @@ otic doc   contract.oti    # Generate docs
 
 ### 7.3 The type system
 
-Otigen's primitive types are fixed-width integers from `u8` through `u256` (and signed counterparts), `bool`, `Address`, and `String`. Composite types are `Vec<T>`, `Map<K, V>`, `Tuple`, `Array<T, N>`, and user-defined `struct` and `enum`. Generics are parametric for collections; user structs are monomorphic.
+Otigen's primitive types at testnet are fixed-width **unsigned** integers from `u8` through `u256`, `bool`, `Address`, and `String`. Composite types are `Vec<T>`, `Map<K, V>`, `Tuple`, `Array<T, N>`, and user-defined `struct` and `enum`. Generics are parametric for collections; user structs are monomorphic.
 
 The integer types are checked by default: `let x: u64 = a + b;` traps on overflow. Wrapping or saturating semantics are explicit: `let x: u64 = a.wrapping_add(b);`. `u256` is a first-class type that lowers to the wide-register ISA in §6.3. There is no implicit numeric coercion: `u32` to `u64` is an explicit `as u64`.
+
+Signed integer types (`i8` through `i256`) are reserved as keywords and recognized by the parser, but the typechecker rejects them today and the PVM ISA does not yet ship signed-arithmetic opcodes (`Sdiv`, `Smul`, `Slt`, `Sgt`). This is a deliberate testnet/mainnet-launch deferral tracked under audit 354: signed types ship in a post-mainnet point release once the ISA additions and their gas-pricing pass audit. Contracts that need signed semantics today encode them explicitly over `u256` (two's-complement, manual sign tests).
 
 `Address` is a 32-byte type derived from `Poseidon2(falcon_pubkey)`. There is no plaintext-key pattern in the language; addresses are opaque values produced by key registration.
 
