@@ -77,6 +77,24 @@ pub struct NetworkSection {
     /// through `handle_swarm_event` to `apply_auth_response`.
     #[serde(default)]
     pub bootstrap_pubkey_pins: std::collections::HashMap<String, String>,
+    /// TPL-208: bind libp2p TCP on `127.0.0.1` instead of
+    /// `0.0.0.0`. Production default is `false` (bind all
+    /// interfaces); set to `true` for multi-validator localhost
+    /// testnets to keep peers on the loopback path. Pre-TPL-208
+    /// this was implicit in `node.dev_mode`, conflating the
+    /// loopback-bind ergonomic with the unsigned-RPC unlock —
+    /// they're now independent so a non-devnet chain_id can run
+    /// the bind ergonomic without tripping TPL-207.
+    #[serde(default)]
+    pub bind_loopback: bool,
+    /// TPL-208: skip QUIC listener startup, leaving libp2p
+    /// TCP-only. Used by multi-validator localhost tests where
+    /// the dual-transport (TCP + QUIC) race produces flapping
+    /// connections via libp2p's per-transport dedupe — see the
+    /// comment in `node.rs` near the listen-on calls. Default
+    /// `false` (QUIC enabled) for production.
+    #[serde(default)]
+    pub disable_quic: bool,
 }
 
 impl Default for NetworkSection {
@@ -89,6 +107,8 @@ impl Default for NetworkSection {
             rate_limit_per_ip: 5,
             bootstrap_peers: Vec::new(),
             bootstrap_pubkey_pins: std::collections::HashMap::new(),
+            bind_loopback: false,
+            disable_quic: false,
         }
     }
 }

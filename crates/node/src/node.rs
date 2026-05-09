@@ -706,8 +706,10 @@ impl PydeNode {
         // resolution; QUIC is available so peers that prefer it can
         // negotiate it from a `/udp/PORT/quic-v1` address.
         //
-        // In dev mode, bind only to loopback and skip QUIC entirely.
-        // Two reasons:
+        // Multi-validator localhost testnets bind 127.0.0.1 + skip
+        // QUIC via `network.bind_loopback` / `network.disable_quic`.
+        // Two reasons (TPL-208 made these explicit, previously gated
+        // implicitly on `dev_mode`):
         //  - 0.0.0.0 binds advertise every reachable interface
         //    (loopback + LAN + others) via Identify. With every node
         //    running on the same host, peers learn 2-3 addresses for
@@ -718,13 +720,13 @@ impl PydeNode {
         //    churn and drop ~33% of consensus messages.
         //  - QUIC + TCP simultaneously is the same problem one
         //    layer down: same peer reachable via two transports,
-        //    libp2p tries both. Single-transport dev mode dodges
-        //    that race.
+        //    libp2p tries both. Single-transport binds dodge that
+        //    race.
         // Production binds remain on 0.0.0.0 with both transports
         // because real peers come from different hosts and the
         // multi-address advertising is what makes connectivity work
         // through NAT/firewall paths.
-        let bind_ip = if self.config.node.dev_mode {
+        let bind_ip = if self.config.network.bind_loopback {
             "127.0.0.1"
         } else {
             "0.0.0.0"
@@ -737,7 +739,7 @@ impl PydeNode {
             .listen_on(tcp_listen_addr)
             .map_err(|e| format!("failed to listen on tcp: {}", e))?;
 
-        if !self.config.node.dev_mode {
+        if !self.config.network.disable_quic {
             let quic_listen_addr: libp2p::Multiaddr =
                 format!("/ip4/0.0.0.0/udp/{}/quic-v1", self.config.network.port)
                     .parse()
