@@ -9,14 +9,18 @@ use pyde_tx::types::Transaction;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
-/// Audit 325: maximum allowed clock-drift between a block's
+/// Audit 325 / TPL-924: maximum allowed clock-drift between a block's
 /// claimed timestamp and the local wall-clock at receive time, in
 /// milliseconds. A header with `timestamp > now_ms + DRIFT` is
-/// rejected. 15 s is generous (~37 slots at 400 ms) but matches
-/// realistic NTP skew between honest validators while still
-/// preventing arbitrary fake-future timestamps that smart contracts
-/// would observe via `block.timestamp`.
-pub const MAX_TIMESTAMP_DRIFT_MS: u64 = 15_000;
+/// rejected. 5 s ≈ 12 slots at 400 ms — comfortably above realistic
+/// NTP skew between honest validators (sub-second on a well-managed
+/// pool) while bounding how far a Byzantine proposer can push
+/// `block.timestamp` ahead of true wall-clock. Smart contracts read
+/// `block.timestamp` via the PVM (e.g., time-locked withdrawals,
+/// expired-deadline races), so a tighter forward window directly
+/// shrinks that contract-level attack surface — was 15 s in the
+/// original audit-325 fix.
+pub const MAX_TIMESTAMP_DRIFT_MS: u64 = 5_000;
 
 /// Processes incoming blocks: validates header, executes transactions, updates state.
 pub struct BlockProcessor;
