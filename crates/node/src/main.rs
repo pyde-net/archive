@@ -17,6 +17,7 @@ mod node;
 mod peer_book;
 mod receipt_store;
 mod rpc;
+mod rpc_rate_limit;
 mod shutdown;
 mod slot_clock;
 mod state_manager;

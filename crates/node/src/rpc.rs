@@ -10,6 +10,7 @@ use crate::tx_relay::TxRelay;
 use crate::wire;
 use jsonrpsee::core::async_trait;
 use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::server::middleware::rpc::RpcServiceBuilder;
 use jsonrpsee::server::Server;
 use jsonrpsee::types::ErrorObjectOwned;
 use pyde_tx::execution::Receipt;
@@ -1684,6 +1685,18 @@ pub async fn start_rpc_server(
     const MAX_RESPONSE_BODY_BYTES: u32 = 16_777_216; // 16 MB
     const MAX_CONNECTIONS: u32 = 1024;
     const MAX_REQUESTS_PER_BATCH: u32 = 32;
+
+    // TPL-931: per-connection request rate-limit. Without this, the
+    // body / batch / connection caps above still leave room for one
+    // peer to flood the RPC from a single TCP connection. The limiter
+    // is a token bucket per `ConnectionId`; see
+    // `crate::rpc_rate_limit` for the per-second / burst constants.
+    let rate_limit_state = crate::rpc_rate_limit::RpcRateLimitState::new();
+    let rpc_middleware = RpcServiceBuilder::new()
+        .layer(crate::rpc_rate_limit::RpcRateLimitLayer::new(
+            rate_limit_state,
+        ));
+
     let server = Server::builder()
         .max_request_body_size(MAX_REQUEST_BODY_BYTES)
         .max_response_body_size(MAX_RESPONSE_BODY_BYTES)
@@ -1691,6 +1704,7 @@ pub async fn start_rpc_server(
         .set_batch_request_config(jsonrpsee::server::BatchRequestConfig::Limit(
             MAX_REQUESTS_PER_BATCH,
         ))
+        .set_rpc_middleware(rpc_middleware)
         .build(addr)
         .await
         .map_err(|e| format!("failed to start RPC server: {}", e))?;
