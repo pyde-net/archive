@@ -529,22 +529,7 @@ impl PydeApiServer for RpcServer {
         let chain_id = chain_r.chain_id;
         drop(chain_r);
 
-        // Auto-fetch nonce from state if not provided
-        let nonce: u64 = if let Some(n) = tx_obj.get("nonce").and_then(|v| v.as_u64()) {
-            n
-        } else {
-            let state_r = self.state.state.read().await;
-            let nonce_key = pyde_state::keys::nonce_key(&from);
-            // Audit 390: from_bytes is Option<Self>; missing /
-            // malformed both collapse to `base = 0`.
-            let n = state_r
-                .get(&nonce_key)
-                .and_then(|bytes| pyde_account::nonce::NonceState::from_bytes(&bytes))
-                .map(|ns| ns.base)
-                .unwrap_or(0);
-            drop(state_r);
-            n
-        };
+        let explicit_nonce = tx_obj.get("nonce").and_then(|v| v.as_u64());
 
         let tx_type = match tx_obj.get("txType").and_then(|v| v.as_str()) {
             Some("stakeDeposit") => pyde_tx::types::TransactionType::StakeDeposit,
@@ -569,6 +554,48 @@ impl PydeApiServer for RpcServer {
         // [clen:4 LE][rlen:4 LE][constructor][runtime][args]
         // Pass through as-is. The SDK/CLI constructs this format.
         let deploy_data = data;
+
+        // TPL-927: auto-fetch nonce, ingress validation, mempool dedup,
+        // and insert all happen under one `pending_txs.write()`. Pre-fix
+        // the auto-fetch read on-chain state with no awareness of
+        // in-flight pending txs from the same sender, so two concurrent
+        // dev-mode `send_transaction` calls would both pick the same N
+        // and the second one fell through to a duplicate-nonce error
+        // from the dedup pass. `ingress_validate` and the on-chain
+        // nonce read use independent locks (state, chain) and never
+        // touch `pending_txs`, so holding `pending` through them is
+        // deadlock-free given the codebase-wide convention that
+        // pending_txs is the outer lock.
+        let mut pending = self.state.pending_txs.write().await;
+
+        let nonce: u64 = if let Some(n) = explicit_nonce {
+            n
+        } else {
+            let on_chain = {
+                let state_r = self.state.state.read().await;
+                let nonce_key = pyde_state::keys::nonce_key(&from);
+                // Audit 390: from_bytes is Option<Self>; missing /
+                // malformed both collapse to `base = 0`.
+                state_r
+                    .get(&nonce_key)
+                    .and_then(|bytes| pyde_account::nonce::NonceState::from_bytes(&bytes))
+                    .map(|ns| ns.base)
+                    .unwrap_or(0)
+            };
+            // Walk pending txs from this sender so concurrent auto-fetch
+            // submissions don't both land on the same nonce. This is the
+            // same O(N) scan the dedup pass below already does; we just
+            // fold "max nonce for sender" into the same thinking.
+            let max_pending = pending
+                .values()
+                .filter(|t| t.from == from)
+                .map(|t| t.nonce)
+                .max();
+            match max_pending {
+                Some(p) => p.saturating_add(1).max(on_chain),
+                None => on_chain,
+            }
+        };
 
         let tx = pyde_tx::types::Transaction {
             from,
@@ -595,7 +622,6 @@ impl PydeApiServer for RpcServer {
 
         // Global cap (M3) + per-sender cap (M1) + (sender, nonce) dedup
         // (M6), all atomic with the insert under one write lock.
-        let mut pending = self.state.pending_txs.write().await;
         if pending.len() >= MEMPOOL_GLOBAL_CAP {
             return Err(rpc_err(
                 -32011,
