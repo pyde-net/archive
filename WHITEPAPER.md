@@ -265,7 +265,7 @@ A transaction's life from submission to hard finality runs through eight stages:
 
 3. **Submit.** The client sends the (encrypted) transaction to a full node's RPC endpoint via `pyde_sendRawTransaction` or `pyde_sendRawEncryptedTransaction`. The receiving node validates wire format, FALCON signature, chain ID, nonce window, balance ≥ gas + value, gas limit, deadline, access list, and tx size — at the RPC boundary, before the transaction is added to the mempool or gossiped.
 
-4. **Gossip.** A validated transaction is added to the mempool and gossiped on the `pyde/tx-gossip/1` channel (plaintext) or `pyde/encrypted-tx-gossip/1` channel (encrypted). All committee members and full nodes subscribe; the mempool reaches a consistent view within mesh-convergence time (typically under 200 ms on the laptop devnet).
+4. **Gossip.** A validated transaction is added to the mempool and gossiped on the `pyde/transactions/1` channel (plaintext) or `pyde/encrypted_transactions/1` channel (encrypted). All committee members and full nodes subscribe; the mempool reaches a consistent view within mesh-convergence time (typically under 200 ms on the laptop devnet).
 
 5. **Propose.** When the per-slot VRF selects a proposer, the proposer reads from its local mempool view, applies global / per-sender / TTL caps, sorts by gas-then-FIFO, and assembles a candidate block. For encrypted transactions, the proposer publishes a Poseidon2 commitment to the ordered set of `(encrypted_tx_hash)` in the block header, and broadcasts the proposal to the committee.
 
@@ -478,7 +478,7 @@ CLIENT
 NETWORK
   8. RPC ingress: validate FALCON sig, sender registration, nonce window,
      balance >= gas, chain ID, deadline, size, MAC (constant-time)
-  9. Add to encrypted mempool, gossip on pyde/encrypted-tx-gossip/1
+  9. Add to encrypted mempool, gossip on pyde/encrypted_transactions/1
  10. Mempool reaches consistent view across committee + full nodes
 
 PROPOSER (this slot)
@@ -812,8 +812,8 @@ Pyde uses five gossipsub topics with distinct subscription and back-pressure cha
 | --- | --- | --- |
 | `pyde/blocks/1` | All nodes | Proposed and finalized blocks |
 | `pyde/consensus/1` | Committee only | Votes, QCs, evidence, decryption shares, checkpoints |
-| `pyde/tx-gossip/1` | All nodes | Plaintext transactions |
-| `pyde/encrypted-tx-gossip/1` | All nodes | Encrypted-mempool ciphertexts |
+| `pyde/transactions/1` | All nodes | Plaintext transactions |
+| `pyde/encrypted_transactions/1` | All nodes | Encrypted-mempool ciphertexts |
 | `pyde/sync/1` | Sync requesters + responders | Cold-sync and catch-up block requests |
 
 The committee-only restriction on the consensus channel is enforced cryptographically: a peer that is not a current committee member is dropped from the topic mesh, and any consensus message it broadcasts is rejected at the recipient. This is what makes the gossipsub mesh efficient at 128 validators — committee message volume scales as O(committee × messages_per_slot), not O(network_size × messages_per_slot).
