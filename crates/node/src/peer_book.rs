@@ -95,10 +95,17 @@ impl PeerBook {
         book
     }
 
-    /// Atomically persist the current set. Writes to
-    /// `peer_book.json.tmp` then `rename`s into place so a
-    /// `kill -9` mid-write either lands the new file or leaves the
-    /// old one untouched.
+    /// Atomically persist the current set with mode `0o600` on Unix
+    /// (TPL-935). Pre-fix the save path called `fs::write(...)`
+    /// directly, which left the file at the operator's umask
+    /// (typically `0o644`, world-readable). The peer book leaks the
+    /// validator's recently-connected `(PeerId, Multiaddr)` set,
+    /// which is enough for a co-located unprivileged process to
+    /// enumerate the validator's peer mesh and feed it into a
+    /// targeted-eclipse / surveillance flow. Routed through the
+    /// shared `write_secret_file` helper so the same atomic-rename
+    /// + create-with-mode-0o600 + fsync sequence used for
+    /// validator.key / threshold.share also covers this file.
     pub fn save(&self, datadir: &Path) -> Result<(), String> {
         let entries: Vec<PeerEntry> = self
             .peers
@@ -111,10 +118,7 @@ impl PeerBook {
         let file = PeerBookFile { peers: entries };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
         let final_path = datadir.join(PEER_BOOK_FILENAME);
-        let tmp_path = datadir.join(format!("{}.tmp", PEER_BOOK_FILENAME));
-        std::fs::write(&tmp_path, bytes).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp_path, &final_path).map_err(|e| e.to_string())?;
-        Ok(())
+        crate::genesis::write_secret_file(&final_path, &bytes)
     }
 
     /// Record an observed `(peer, addr)` pair. Idempotent —
@@ -193,5 +197,27 @@ mod tests {
         std::fs::write(dir.path().join("peer_book.json"), b"not-json").unwrap();
         let book = PeerBook::load(dir.path());
         assert!(book.is_empty());
+    }
+
+    /// TPL-935: persisted peer_book.json must land at mode `0o600`,
+    /// not the umask-derived default. A co-located unprivileged
+    /// process should not be able to read the validator's
+    /// recently-connected peer set off disk.
+    #[cfg(unix)]
+    #[test]
+    fn tpl_935_save_writes_mode_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut book = PeerBook::new();
+        let (p, a) = random_peer_addr();
+        book.record(p, a);
+        book.save(dir.path()).unwrap();
+        let meta = std::fs::metadata(dir.path().join(PEER_BOOK_FILENAME)).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "expected peer_book.json at mode 0o600, got {:o}",
+            mode
+        );
     }
 }

@@ -17,11 +17,53 @@ use pyde_tx::types::{AccessEntry, FeePayer, Transaction, TransactionType};
 /// Umbrella cap on any length field decoded from an untrusted wire
 /// message before `Vec::with_capacity` is called with it. Prevents a
 /// peer from forcing huge preallocations by stuffing a giant u32/u16
-/// count into a well-formed frame. 1M items is well above any
-/// legitimate protocol structure; sites with a tighter semantic
-/// bound (committee size, multisig signer set, etc.) pass that
-/// instead via `u16_count` / `u32_count`.
+/// count into a well-formed frame. Every concrete decoder site below
+/// passes a tighter semantic bound (committee size, multisig signer
+/// set, block tx cap, etc.); this constant is retained as a last-line
+/// umbrella for any future site whose protocol shape doesn't bind to
+/// one of the tighter caps.
+#[allow(dead_code)]
 const MAX_DECODE_ITEMS: usize = 1_000_000;
+
+/// Maximum transactions in a single block, derived from the elastic
+/// gas ceiling: `BLOCK_GAS_MAX (1.6B) / MIN_TX_GAS (21k) ≈ 76k`,
+/// rounded up to 100k for headroom. Bounds `tx_count`, encrypted-tx
+/// count, execution-schedule group count, and per-group tx_indices
+/// count for any wire frame that carries a block-shaped payload
+/// (Block, CompactBlock, EncryptedTxBundle).
+const MAX_TXS_PER_BLOCK: usize = 100_000;
+
+/// Maximum entries in a transaction's EIP-2930-style access list.
+/// Each entry costs gas to declare; 1024 is far above any sane
+/// real-world access list while staying well below the u16 wire
+/// ceiling (65 535). A peer cannot force `access_list` allocation
+/// past this cap on a freshly-decoded transaction.
+const MAX_ACCESS_LIST_ENTRIES: usize = 1024;
+
+/// Maximum read or write storage keys per access-list entry. Each
+/// declared key costs gas; 1024 keys per entry is an order of
+/// magnitude above any observed access pattern, and bounds the
+/// per-entry inner allocations during `decode_access_entry`.
+const MAX_ACCESS_KEYS_PER_ENTRY: usize = 1024;
+
+/// Maximum pending votes or timeouts in a `ConsensusState` sync
+/// payload. HotStuff carries one vote and one timeout per validator
+/// per view; `4 * COMMITTEE_SIZE` allows several queued views during
+/// catch-up without giving a sync peer room to force a multi-MB
+/// `Vec::with_capacity`.
+const MAX_PENDING_CONSENSUS_PER_STATE: usize = COMMITTEE_SIZE * 4;
+
+/// Maximum slashing-evidence backlog (pending or broadcast queue) in
+/// an `EvidenceState` blob. One double-sign per validator over a
+/// pessimistic catch-up window is well under this; tighter than the
+/// 1M umbrella so a malicious sync responder can't force a
+/// 10M-entry evidence preallocation.
+const MAX_EVIDENCE_BACKLOG: usize = 10_000;
+
+/// Maximum dedup `(slot, signer)` pairs persisted in `EvidenceState`.
+/// One entry per (validator, slot) over a generous tail of recent
+/// slots; bounds the `seen` Vec allocation during decode.
+const MAX_EVIDENCE_SEEN: usize = 200_000;
 
 /// Message type tags for wire encoding.
 pub mod tag {
@@ -409,7 +451,7 @@ pub fn decode_compact_block(
     }
     let header = dec.var_bytes()?;
     let nonce = dec.u64()?;
-    let sid_count = dec.u32_count(MAX_DECODE_ITEMS)?;
+    let sid_count = dec.u32_count(MAX_TXS_PER_BLOCK)?;
     let mut short_tx_ids = Vec::with_capacity(sid_count);
     for _ in 0..sid_count {
         let mut sid = [0u8; pyde_net::propagation::SHORT_ID_LEN];
@@ -417,7 +459,7 @@ pub fn decode_compact_block(
         sid.copy_from_slice(raw);
         short_tx_ids.push(sid);
     }
-    let prefill_count = dec.u16_count(MAX_DECODE_ITEMS)?;
+    let prefill_count = dec.u16_count(MAX_TXS_PER_BLOCK)?;
     let mut prefilled_txs = Vec::with_capacity(prefill_count);
     for _ in 0..prefill_count {
         let idx = dec.u16()?;
@@ -477,7 +519,7 @@ pub fn encode_encrypted_tx_bundle(bundle: &pyde_net::propagation::EncryptedTxBun
 }
 
 /// Decode an `EncryptedTxBundle`. Rejects oversized item counts via
-/// `u32_count(MAX_DECODE_ITEMS)`; per-entry byte length is indirectly
+/// `u32_count(MAX_TXS_PER_BLOCK)`; per-entry byte length is indirectly
 /// bounded by the channel's frame-size cap (4 MB for Blocks).
 pub fn decode_encrypted_tx_bundle(
     data: &[u8],
@@ -489,7 +531,7 @@ pub fn decode_encrypted_tx_bundle(
     }
     let slot = dec.u64()?;
     let block_hash = dec.bytes32()?;
-    let count = dec.u32_count(MAX_DECODE_ITEMS)?;
+    let count = dec.u32_count(MAX_TXS_PER_BLOCK)?;
     let mut encrypted_txs = Vec::with_capacity(count);
     for _ in 0..count {
         encrypted_txs.push(dec.var_bytes()?);
@@ -783,12 +825,12 @@ fn encode_access_entry(enc: &mut Encoder, entry: &AccessEntry) {
 
 fn decode_access_entry(dec: &mut Decoder) -> Result<AccessEntry, &'static str> {
     let address = dec.bytes32()?;
-    let read_count = dec.u16_count(MAX_DECODE_ITEMS)?;
+    let read_count = dec.u16_count(MAX_ACCESS_KEYS_PER_ENTRY)?;
     let mut reads = Vec::with_capacity(read_count);
     for _ in 0..read_count {
         reads.push(dec.bytes32()?);
     }
-    let write_count = dec.u16_count(MAX_DECODE_ITEMS)?;
+    let write_count = dec.u16_count(MAX_ACCESS_KEYS_PER_ENTRY)?;
     let mut writes = Vec::with_capacity(write_count);
     for _ in 0..write_count {
         writes.push(dec.bytes32()?);
@@ -850,7 +892,7 @@ pub fn decode_transaction(data: &[u8]) -> Result<Transaction, &'static str> {
         2 => FeePayer::Paymaster(dec.bytes32()?),
         _ => return Err("invalid fee_payer tag"),
     };
-    let access_count = dec.u16_count(MAX_DECODE_ITEMS)?;
+    let access_count = dec.u16_count(MAX_ACCESS_LIST_ENTRIES)?;
     let mut access_list = Vec::with_capacity(access_count);
     for _ in 0..access_count {
         access_list.push(decode_access_entry(&mut dec)?);
@@ -924,7 +966,7 @@ pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
     // Proposer signature
     let proposer_signature = dec.var_bytes()?;
     // Transactions
-    let tx_count = dec.u32_count(MAX_DECODE_ITEMS)?;
+    let tx_count = dec.u32_count(MAX_TXS_PER_BLOCK)?;
     let mut transactions = Vec::with_capacity(tx_count);
     for _ in 0..tx_count {
         let tx_bytes = dec.var_bytes()?;
@@ -932,7 +974,7 @@ pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
     }
     // Encrypted transactions
     let enc_count = if dec.remaining() >= 4 {
-        dec.u32_count(MAX_DECODE_ITEMS)?
+        dec.u32_count(MAX_TXS_PER_BLOCK)?
     } else {
         0
     };
@@ -942,13 +984,13 @@ pub fn decode_block(data: &[u8]) -> Result<Block, &'static str> {
     }
     // Execution schedule
     let group_count = if dec.remaining() >= 2 {
-        dec.u16_count(MAX_DECODE_ITEMS)?
+        dec.u16_count(MAX_TXS_PER_BLOCK)?
     } else {
         0
     };
     let mut groups = Vec::with_capacity(group_count);
     for _ in 0..group_count {
-        let idx_count = dec.u16_count(MAX_DECODE_ITEMS)?;
+        let idx_count = dec.u16_count(MAX_TXS_PER_BLOCK)?;
         let mut tx_indices = Vec::with_capacity(idx_count);
         for _ in 0..idx_count {
             tx_indices.push(dec.u32()? as usize);
@@ -1126,14 +1168,14 @@ pub fn decode_consensus_state(
     let target_height = dec.u64()?;
     let current_view = dec.u64()?;
 
-    let votes_count = dec.u16_count(MAX_DECODE_ITEMS)?;
+    let votes_count = dec.u16_count(MAX_PENDING_CONSENSUS_PER_STATE)?;
     let mut pending_votes = Vec::with_capacity(votes_count);
     for _ in 0..votes_count {
         let msg_bytes = dec.var_bytes()?;
         pending_votes.push(decode_consensus_message(&msg_bytes)?);
     }
 
-    let timeouts_count = dec.u16_count(MAX_DECODE_ITEMS)?;
+    let timeouts_count = dec.u16_count(MAX_PENDING_CONSENSUS_PER_STATE)?;
     let mut pending_timeouts = Vec::with_capacity(timeouts_count);
     for _ in 0..timeouts_count {
         let msg_bytes = dec.var_bytes()?;
@@ -1284,17 +1326,17 @@ pub fn decode_evidence_state(data: &[u8]) -> Result<EvidenceState, &'static str>
     if version != EVIDENCE_STATE_VERSION {
         return Err("unsupported evidence state version");
     }
-    let pending_count = dec.u16_count(MAX_DECODE_ITEMS)?;
+    let pending_count = dec.u16_count(MAX_EVIDENCE_BACKLOG)?;
     let mut pending = Vec::with_capacity(pending_count);
     for _ in 0..pending_count {
         pending.push(decode_double_sign_evidence(&dec.var_bytes()?)?);
     }
-    let broadcast_count = dec.u16_count(MAX_DECODE_ITEMS)?;
+    let broadcast_count = dec.u16_count(MAX_EVIDENCE_BACKLOG)?;
     let mut broadcast = Vec::with_capacity(broadcast_count);
     for _ in 0..broadcast_count {
         broadcast.push(decode_double_sign_evidence(&dec.var_bytes()?)?);
     }
-    let seen_count = dec.u32_count(MAX_DECODE_ITEMS)?;
+    let seen_count = dec.u32_count(MAX_EVIDENCE_SEEN)?;
     let mut seen = Vec::with_capacity(seen_count);
     for _ in 0..seen_count {
         let slot = dec.u64()?;
@@ -1790,11 +1832,12 @@ mod tests {
     #[test]
     fn compact_block_rejects_huge_short_id_count() {
         // Construct a compact-block frame by hand with sid_count set to
-        // MAX_DECODE_ITEMS + 1, proving the cap is wired through.
+        // MAX_TXS_PER_BLOCK + 1, proving the per-message cap is wired
+        // through (TPL-923).
         let mut bytes = vec![tag::COMPACT_BLOCK];
         bytes.extend_from_slice(&0u32.to_le_bytes()); // var_bytes(header) len = 0
         bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
-        bytes.extend_from_slice(&((MAX_DECODE_ITEMS as u32) + 1).to_le_bytes());
+        bytes.extend_from_slice(&((MAX_TXS_PER_BLOCK as u32) + 1).to_le_bytes());
         let result = decode_compact_block(&bytes);
         assert_eq!(result.err(), Some("decoded count exceeds max"));
     }
@@ -1865,13 +1908,70 @@ mod tests {
     #[test]
     fn encrypted_bundle_rejects_huge_count() {
         // Hand-construct a frame whose declared count exceeds
-        // MAX_DECODE_ITEMS; decode must reject before allocating.
+        // MAX_TXS_PER_BLOCK; decode must reject before allocating
+        // (TPL-923 — per-message bound is the block tx ceiling, not
+        // the umbrella MAX_DECODE_ITEMS).
         let mut bytes = vec![tag::ENCRYPTED_TX_BUNDLE];
         bytes.extend_from_slice(&42u64.to_le_bytes()); // slot
         bytes.extend_from_slice(&[0u8; 32]); // block_hash
-        bytes.extend_from_slice(&((MAX_DECODE_ITEMS as u32) + 1).to_le_bytes());
+        bytes.extend_from_slice(&((MAX_TXS_PER_BLOCK as u32) + 1).to_le_bytes());
         assert_eq!(
             decode_encrypted_tx_bundle(&bytes).err(),
+            Some("decoded count exceeds max")
+        );
+    }
+
+    // ========== TPL-923: per-message tight bounds ==========
+
+    #[test]
+    fn tpl_923_evidence_state_rejects_over_backlog_pending() {
+        // Pending count one past MAX_EVIDENCE_BACKLOG must be rejected
+        // before the EvidenceState pending Vec is preallocated.
+        let mut bytes = vec![EVIDENCE_STATE_VERSION];
+        bytes.extend_from_slice(&((MAX_EVIDENCE_BACKLOG as u16) + 1).to_le_bytes());
+        assert_eq!(
+            decode_evidence_state(&bytes).err(),
+            Some("decoded count exceeds max")
+        );
+    }
+
+    #[test]
+    fn tpl_923_evidence_state_rejects_over_seen() {
+        // Seen-pair count one past MAX_EVIDENCE_SEEN must be rejected;
+        // pending and broadcast are zero so the decoder reaches seen.
+        let mut bytes = vec![EVIDENCE_STATE_VERSION];
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // pending = 0
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // broadcast = 0
+        bytes.extend_from_slice(&((MAX_EVIDENCE_SEEN as u32) + 1).to_le_bytes());
+        assert_eq!(
+            decode_evidence_state(&bytes).err(),
+            Some("decoded count exceeds max")
+        );
+    }
+
+    #[test]
+    fn tpl_923_consensus_state_rejects_over_max_pending_votes() {
+        // Pending-votes count one past MAX_PENDING_CONSENSUS_PER_STATE
+        // must be rejected before the consensus-state Vec is preallocated.
+        let mut bytes = vec![CONSENSUS_STATE_VERSION];
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // current_slot
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // current_epoch
+        // QC: slot, hash, bitmap, sig_count = 0 (no signatures)
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&0u128.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        // last_voted_slot, last_committed_hash, last_committed_slot
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        // target_height, current_view
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        // votes_count: one past the cap
+        bytes.extend_from_slice(&((MAX_PENDING_CONSENSUS_PER_STATE as u16) + 1).to_le_bytes());
+        assert_eq!(
+            decode_consensus_state(&bytes).err(),
             Some("decoded count exceeds max")
         );
     }

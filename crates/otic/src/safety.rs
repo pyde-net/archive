@@ -54,6 +54,22 @@ fn is_known_attribute(content: &str) -> bool {
     KNOWN_ATTRIBUTES.contains(&name)
 }
 
+/// TPL-941: macros that are allowed inside `#[view]` (pure) functions.
+/// Pre-fix the purity check used a *blocklist* (`cross_call`, `raw_call`)
+/// so any macro not in that list — `deploy!`, `create!`, future macros,
+/// or any user-defined macro the parser admits — slipped through and
+/// silently violated the view-purity contract that smart-contract
+/// callers, the optimizer, and the JMT-read-only execution path all
+/// rely on. Default-deny: only macros known to be side-effect-free and
+/// safe inside a read-only context belong here.
+///
+/// Allowed:
+///   * `require!` — branches on a condition; on failure reverts. No
+///     state mutation, no events, no external calls.
+///   * `assert!`  — same shape as `require!` without a custom error.
+///   * `revert!`  — terminates execution with an error; doesn't write.
+const VIEW_PURE_MACROS: &[&str] = &["require", "assert", "revert"];
+
 // ============================================================================
 // Safety Checker
 // ============================================================================
@@ -583,8 +599,17 @@ impl SafetyChecker {
 
     fn expr_is_impure(&self, expr: &Expr, call_targets: &mut Vec<String>) -> bool {
         match expr {
-            Expr::MacroCall(name, _, _) if name.name == "cross_call" => true,
-            Expr::MacroCall(name, _, _) if name.name == "raw_call" => true,
+            // TPL-941: any macro call not on the view-pure allowlist
+            // marks the enclosing function as impure for transitive
+            // purity propagation. Pre-fix this was a blocklist of
+            // `cross_call` + `raw_call`, so e.g. `deploy!` propagated
+            // as pure and a wrapper `fn x() { deploy!(...) }` was
+            // (silently) callable from a `#[view]` function.
+            Expr::MacroCall(name, _, _)
+                if !VIEW_PURE_MACROS.contains(&name.name.as_str()) =>
+            {
+                true
+            }
             _ if self.is_storage_mutating_call(expr) => true,
             Expr::If(_, then_block, else_clause, _) => {
                 let mut impure = self.scan_direct_impurity(then_block, call_targets);
@@ -697,20 +722,7 @@ impl SafetyChecker {
                 Stmt::For(f) => self.check_block_purity_direct(&f.body, func_name),
                 Stmt::While(w) => self.check_block_purity_direct(&w.body, func_name),
                 Stmt::Expr(e) => {
-                    if let Expr::MacroCall(name, _, _) = &e.expr {
-                        if name.name == "cross_call" {
-                            self.error(
-                                format!("#[view] function '{}' cannot make cross_call!", func_name),
-                                e.span,
-                            );
-                        }
-                        if name.name == "raw_call" {
-                            self.error(
-                                format!("#[view] function '{}' cannot make raw_call!", func_name),
-                                e.span,
-                            );
-                        }
-                    }
+                    self.check_view_macros_in_expr(&e.expr, func_name);
                     if self.is_storage_mutating_call(&e.expr) {
                         self.error(
                             format!(
@@ -722,8 +734,101 @@ impl SafetyChecker {
                     }
                     self.check_expr_purity_direct(&e.expr, func_name);
                 }
+                Stmt::Let(l) => {
+                    // TPL-941: a macro on the RHS of `let x = ...` is in
+                    // expression position, so it never reaches the
+                    // `Stmt::Expr` arm above. Pre-fix that meant
+                    // `let x = cross_call!(...)` slipped past the
+                    // direct-purity check. Walk the initializer through
+                    // the same allowlist-based check.
+                    self.check_view_macros_in_expr(&l.initializer, func_name);
+                }
+                Stmt::Return(r) => {
+                    if let Some(ref val) = r.value {
+                        // Same rationale as Stmt::Let above: the return
+                        // expression is in value position.
+                        self.check_view_macros_in_expr(val, func_name);
+                    }
+                }
                 _ => {}
             }
+        }
+    }
+
+    /// TPL-941: walk an expression tree and emit a purity error for
+    /// every macro call whose name is not on the `VIEW_PURE_MACROS`
+    /// allowlist. Recurses through binops, function-call args, struct
+    /// fields, etc. so a macro hidden inside an expression (e.g.
+    /// `let x = a + bad_macro!()`) is still caught.
+    fn check_view_macros_in_expr(&mut self, expr: &Expr, func_name: &str) {
+        match expr {
+            Expr::MacroCall(name, args, span) => {
+                if !VIEW_PURE_MACROS.contains(&name.name.as_str()) {
+                    self.error(
+                        format!(
+                            "#[view] function '{}' cannot use macro '{}!'; only require!, assert!, revert! are permitted in pure context (TPL-941)",
+                            func_name, name.name
+                        ),
+                        *span,
+                    );
+                }
+                for a in args {
+                    let inner = match a {
+                        MacroArg::Positional(e) => e,
+                        MacroArg::Named(_, e) => e,
+                    };
+                    self.check_view_macros_in_expr(inner, func_name);
+                }
+            }
+            Expr::Call(callee, args, _, _) => {
+                self.check_view_macros_in_expr(callee, func_name);
+                for a in args {
+                    self.check_view_macros_in_expr(a, func_name);
+                }
+            }
+            Expr::Binary(lhs, _, rhs, _) => {
+                self.check_view_macros_in_expr(lhs, func_name);
+                self.check_view_macros_in_expr(rhs, func_name);
+            }
+            Expr::Unary(_, operand, _) => {
+                self.check_view_macros_in_expr(operand, func_name)
+            }
+            Expr::FieldAccess(obj, _, _) => self.check_view_macros_in_expr(obj, func_name),
+            Expr::Index(obj, idx, _) => {
+                self.check_view_macros_in_expr(obj, func_name);
+                self.check_view_macros_in_expr(idx, func_name);
+            }
+            Expr::If(cond, _, _, _) => {
+                // The then/else blocks are walked separately by
+                // `check_expr_purity_direct` → `check_block_purity_direct`,
+                // which routes Stmt::Expr / Let / Return through here.
+                // Just check the condition position.
+                self.check_view_macros_in_expr(cond, func_name);
+            }
+            Expr::Match(scrut, arms, _) => {
+                self.check_view_macros_in_expr(scrut, func_name);
+                for arm in arms {
+                    self.check_view_macros_in_expr(&arm.body, func_name);
+                }
+            }
+            Expr::Cast(inner, _, _) | Expr::Try(inner, _) => {
+                self.check_view_macros_in_expr(inner, func_name)
+            }
+            Expr::Tuple(elems, _) | Expr::ArrayLiteral(elems, _) => {
+                for e in elems {
+                    self.check_view_macros_in_expr(e, func_name);
+                }
+            }
+            Expr::ArrayRepeat(val, _, _) => self.check_view_macros_in_expr(val, func_name),
+            Expr::StructInit(_, fields, _) => {
+                for f in fields {
+                    self.check_view_macros_in_expr(&f.value, func_name);
+                }
+            }
+            // Block expressions are walked by check_block_purity_direct
+            // via check_expr_purity_direct; no need to descend here.
+            // Leaves: Literal, SelfExpr, Ident, Path, Block — nothing to do.
+            _ => {}
         }
     }
 
@@ -1215,7 +1320,16 @@ mod tests {
             }
         "#,
         );
-        assert!(errors[0].message.contains("cannot make cross_call!"));
+        // TPL-941: switched from blocklist (`cannot make cross_call!`)
+        // to allowlist phrasing — still rejects, just with a more
+        // generic message that covers every disallowed macro.
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("cannot use macro 'cross_call!'")),
+            "expected default-deny rejection of cross_call! in #[view], got: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -1475,7 +1589,14 @@ mod tests {
             }
         "#,
         );
-        assert!(errors[0].message.contains("cannot make raw_call!"));
+        // TPL-941: see comment on `error_view_cross_call`.
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("cannot use macro 'raw_call!'")),
+            "expected default-deny rejection of raw_call! in #[view], got: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -1493,6 +1614,84 @@ mod tests {
                 }
             }
         "#,
+        );
+    }
+
+    /// TPL-941: `deploy!` is not on the view-pure allowlist — it's
+    /// state-mutating (creates a new contract). Pre-fix, the
+    /// `cross_call`/`raw_call`-only blocklist let it through.
+    #[test]
+    fn tpl_941_view_rejects_deploy_macro() {
+        let errors = check_err(
+            r#"
+            contract Inner {
+                pub fn x() -> u64 { return 1; }
+            }
+            contract T {
+                #[view]
+                pub fn bad() -> u64 {
+                    deploy!(Inner);
+                    return 0;
+                }
+            }
+        "#,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("cannot use macro 'deploy!'")),
+            "expected default-deny rejection of deploy! in #[view], got: {:?}",
+            errors
+        );
+    }
+
+    /// TPL-941: pure macros (`require!`, `assert!`, `revert!`) stay
+    /// allowed. This guards the allowlist boundary against an
+    /// over-broad fix that would lock out legitimate view code.
+    #[test]
+    fn tpl_941_view_allows_require_assert_revert() {
+        check_ok(
+            r#"
+            error MustBePositive { x: u64 }
+            contract T {
+                storage { count: u64, }
+                #[view]
+                pub fn check_pos(x: u64) -> u64 {
+                    require!(x > 0, MustBePositive { x: x });
+                    assert!(x < 1000);
+                    if x == 42 {
+                        revert!("not 42");
+                    }
+                    return x;
+                }
+            }
+        "#,
+        );
+    }
+
+    /// TPL-941: a macro on the RHS of `let` is in expression
+    /// position, so the pre-fix `Stmt::Expr`-only direct-purity
+    /// check missed it. Walking `Stmt::Let.initializer` through
+    /// the same allowlist closes the gap.
+    #[test]
+    fn tpl_941_view_rejects_macro_in_let_initializer() {
+        let errors = check_err(
+            r#"
+            contract T {
+                #[view]
+                pub fn bad() -> u64 {
+                    let x = raw_call!(msg.sender, 0);
+                    return 0;
+                }
+            }
+        "#,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("cannot use macro 'raw_call!'")),
+            "expected raw_call! in let initializer to be rejected, got: {:?}",
+            errors
         );
     }
 

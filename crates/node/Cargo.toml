@@ -44,6 +44,10 @@ metrics-exporter-prometheus = "0.16"
 
 # RPC
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
+# TPL-931: needed to define the per-connection rate-limit middleware
+# as a `tower::Layer<S>` for jsonrpsee's `set_rpc_middleware`. Pinned
+# to the same major version jsonrpsee 0.24 uses (`tower = "0.4"`).
+tower = "0.4"
 
 # WebSocket subscriptions (bypasses jsonrpsee sink delivery bug)
 tokio-tungstenite = "0.24"

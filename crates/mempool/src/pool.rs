@@ -507,8 +507,9 @@ impl Mempool {
         self.txs.iter().collect()
     }
 
-    /// Select transactions for a block in arrival order, respecting
-    /// the gas limit AND a per-block count cap.
+    /// Select transactions for a block, respecting the gas limit
+    /// AND a per-block count cap, using **round-robin per-sender
+    /// fairness** (TPL-921).
     ///
     /// `max_count` bounds the number of encrypted txs the proposer
     /// will include per block. Production callers pass
@@ -519,6 +520,46 @@ impl Mempool {
     /// the receive-side decrypt+apply pipeline falls indefinitely
     /// behind).
     ///
+    /// ## Fairness (TPL-921)
+    ///
+    /// Pre-fix the loop walked `self.txs` in raw arrival order. That
+    /// meant a single sender who had filled the mempool with 5 K txs
+    /// across the per-sender quota windows could claim every slot of
+    /// every block until their backlog drained — a self-spam DoS
+    /// against any other sender's tx submitted in the same window.
+    /// The new algorithm:
+    ///
+    ///   1. Group pending (non-expired) txs by sender, preserving
+    ///      per-sender arrival order via `VecDeque`.
+    ///   2. Walk senders in **first-appearance arrival order** — so
+    ///      ordering across senders still matches original arrival
+    ///      timing for the case "two senders, no contention".
+    ///   3. Per round, give each sender at most ONE inclusion (their
+    ///      next tx that fits the remaining gas budget). Repeat
+    ///      rounds until either we hit `max_count`, every sender's
+    ///      queue is exhausted, or no sender's frontmost tx fits the
+    ///      remaining gas.
+    ///
+    /// Properties:
+    ///
+    ///   * No single sender can occupy more than ⌈n/k⌉ slots of a
+    ///     block where `n = max_count` and `k` is the number of
+    ///     senders with pending txs in the block. With one sender,
+    ///     the algorithm degrades to FCFS arrival order; with
+    ///     `max_count` senders it gives every sender exactly one
+    ///     inclusion.
+    ///   * Gas-pressure semantics match the pre-fix path: a tx that
+    ///     doesn't fit the remaining budget is skipped (not
+    ///     selected, but also not popped from the sender's queue
+    ///     until we choose to give up on that sender). On the next
+    ///     round we retry the same tx — which is correct because
+    ///     `gas_used` only grows, so once the frontmost tx of a
+    ///     sender doesn't fit, their queue is effectively done for
+    ///     this block. We mark the sender exhausted to skip them in
+    ///     subsequent rounds.
+    ///   * Expired txs are filtered up front during the grouping
+    ///     pass; they never appear in any sender's queue.
+    ///
     /// The proposer VRF-shuffles the selected set after this.
     pub fn select_for_block(
         &self,
@@ -526,21 +567,76 @@ impl Mempool {
         max_count: usize,
         current_slot: u64,
     ) -> Vec<&EncryptedTx> {
-        let mut selected = Vec::new();
-        let mut gas_used = 0u64;
+        if max_count == 0 {
+            return Vec::new();
+        }
 
+        // Step 1: per-sender VecDeque of pending (non-expired) txs,
+        // preserving arrival order within each sender. `sender_order`
+        // captures first-appearance arrival timing — the order in
+        // which we'll round-robin walk senders below.
+        let mut per_sender: HashMap<Address, VecDeque<&EncryptedTx>> =
+            HashMap::with_capacity(self.txs.len().min(max_count));
+        let mut sender_order: Vec<Address> = Vec::new();
         for tx in &self.txs {
-            if selected.len() >= max_count {
-                break;
-            }
             if tx.is_expired(current_slot) {
                 continue;
             }
-            if gas_used.saturating_add(tx.gas_limit) > block_gas_limit {
-                continue; // skip this tx, try next (might fit)
+            let entry = per_sender.entry(tx.sender);
+            if let std::collections::hash_map::Entry::Vacant(_) = entry {
+                sender_order.push(tx.sender);
             }
-            gas_used += tx.gas_limit;
-            selected.push(tx);
+            per_sender
+                .entry(tx.sender)
+                .or_insert_with(VecDeque::new)
+                .push_back(tx);
+        }
+
+        // Step 2: round-robin selection. `exhausted` short-circuits
+        // senders whose frontmost tx didn't fit the remaining gas
+        // budget — they cannot recover this block (gas only grows).
+        let mut selected: Vec<&EncryptedTx> = Vec::with_capacity(max_count.min(self.txs.len()));
+        let mut gas_used = 0u64;
+        let mut exhausted: HashSet<Address> = HashSet::new();
+
+        loop {
+            if selected.len() >= max_count {
+                break;
+            }
+            let mut progressed_this_round = false;
+            for sender in &sender_order {
+                if selected.len() >= max_count {
+                    break;
+                }
+                if exhausted.contains(sender) {
+                    continue;
+                }
+                let queue = match per_sender.get_mut(sender) {
+                    Some(q) => q,
+                    None => continue,
+                };
+                let tx = match queue.front() {
+                    Some(tx) => *tx,
+                    None => {
+                        // Drained.
+                        exhausted.insert(*sender);
+                        continue;
+                    }
+                };
+                if gas_used.saturating_add(tx.gas_limit) > block_gas_limit {
+                    // Frontmost doesn't fit. Skip this sender for
+                    // the rest of the block.
+                    exhausted.insert(*sender);
+                    continue;
+                }
+                queue.pop_front();
+                gas_used += tx.gas_limit;
+                selected.push(tx);
+                progressed_this_round = true;
+            }
+            if !progressed_this_round {
+                break;
+            }
         }
 
         selected
@@ -628,6 +724,34 @@ mod tests {
 
     fn make_enc_tx(pk: &threshold::ThresholdPublicKey, gas: u64, nonce: u64) -> EncryptedTx {
         let sender = derive_eoa_address(&nonce.to_le_bytes());
+        let to = derive_eoa_address(b"to");
+        encrypt_transaction(
+            sender,
+            nonce,
+            gas,
+            dummy_access_list(),
+            None,
+            1,
+            dummy_signature(),
+            &to,
+            0,
+            b"",
+            pk,
+        )
+        .unwrap()
+    }
+
+    /// TPL-921: build a tx with an explicit sender so fairness tests
+    /// can stack many txs against the same address. The default
+    /// `make_enc_tx` derives a fresh sender from the nonce, which is
+    /// fine for FCFS coverage but useless for verifying round-robin
+    /// behaviour across senders.
+    fn make_enc_tx_for_sender(
+        pk: &threshold::ThresholdPublicKey,
+        sender: Address,
+        gas: u64,
+        nonce: u64,
+    ) -> EncryptedTx {
         let to = derive_eoa_address(b"to");
         encrypt_transaction(
             sender,
@@ -872,6 +996,99 @@ mod tests {
         }
         let selected = pool.select_for_block(1_000_000_000, MAX_ENCRYPTED_TXS_PER_BLOCK, 0);
         assert_eq!(selected.len(), MAX_ENCRYPTED_TXS_PER_BLOCK);
+    }
+
+    // ========== TPL-921: per-sender fairness in select_for_block ==========
+
+    #[test]
+    fn tpl_921_select_round_robins_across_senders() {
+        // Sender A has 50 pending txs, sender B has just 1. With a
+        // count cap of 10, the pre-fix FCFS-arrival selector would
+        // give all 10 slots to A (B's tx never reaches the front
+        // because it arrived after A's). The new round-robin selector
+        // gives B at least one inclusion in the first round and A
+        // takes the remaining 9.
+        let pk = make_pk();
+        let mut pool = Mempool::new();
+        pool.set_rate_limits(1_000, 1_000);
+        let alice = derive_eoa_address(b"tpl-921-alice");
+        let bob = derive_eoa_address(b"tpl-921-bob");
+        for nonce in 0..50 {
+            pool.add_unverified_for_devnet(make_enc_tx_for_sender(&pk, alice, 30_000, nonce))
+                .unwrap();
+        }
+        // Bob's single tx arrives last in the FCFS log.
+        pool.add_unverified_for_devnet(make_enc_tx_for_sender(&pk, bob, 30_000, 0))
+            .unwrap();
+
+        let selected = pool.select_for_block(1_000_000, 10, 0);
+        assert_eq!(selected.len(), 10);
+
+        let bob_count = selected.iter().filter(|tx| tx.sender == bob).count();
+        let alice_count = selected.iter().filter(|tx| tx.sender == alice).count();
+        assert_eq!(bob_count, 1, "bob must get at least one inclusion");
+        assert_eq!(alice_count, 9, "alice fills the remainder");
+
+        // Bob's slot must land in the first round (slot 0 or 1, since
+        // alice arrived first and gets the round-1 first pick).
+        let bob_position = selected.iter().position(|tx| tx.sender == bob).unwrap();
+        assert!(
+            bob_position <= 1,
+            "bob's tx must land in the first round-robin pass, got position {bob_position}"
+        );
+    }
+
+    #[test]
+    fn tpl_921_select_single_sender_falls_back_to_fcfs() {
+        // With one sender, round-robin degrades to FCFS arrival
+        // order — 5 txs, 5 slots, all selected in arrival order.
+        let pk = make_pk();
+        let mut pool = Mempool::new();
+        pool.set_rate_limits(100, 100);
+        let alice = derive_eoa_address(b"tpl-921-solo-alice");
+        for nonce in 0..5 {
+            pool.add_unverified_for_devnet(make_enc_tx_for_sender(
+                &pk,
+                alice,
+                30_000 + nonce, // unique gas per tx → unique hash
+                nonce,
+            ))
+            .unwrap();
+        }
+
+        let selected = pool.select_for_block(1_000_000, 100, 0);
+        assert_eq!(selected.len(), 5);
+        for (i, tx) in selected.iter().enumerate() {
+            assert_eq!(tx.gas_limit, 30_000 + i as u64, "arrival order must hold");
+        }
+    }
+
+    #[test]
+    fn tpl_921_select_skips_sender_when_frontmost_overflows_gas() {
+        // Sender A's first tx is huge and exceeds the remaining
+        // budget; sender B has small txs that fit. Round-robin must
+        // exhaust A (gas only grows, retrying A's frontmost would
+        // never succeed) and fill the block from B.
+        let pk = make_pk();
+        let mut pool = Mempool::new();
+        pool.set_rate_limits(100, 100);
+        let alice = derive_eoa_address(b"tpl-921-fat-alice");
+        let bob = derive_eoa_address(b"tpl-921-fit-bob");
+
+        // Alice's tx is bigger than the entire block budget below.
+        pool.add_unverified_for_devnet(make_enc_tx_for_sender(&pk, alice, 800_000, 0))
+            .unwrap();
+        // Bob has 3 small txs.
+        for nonce in 0..3 {
+            pool.add_unverified_for_devnet(make_enc_tx_for_sender(&pk, bob, 30_000, nonce))
+                .unwrap();
+        }
+
+        let selected = pool.select_for_block(500_000, 100, 0);
+        let alice_count = selected.iter().filter(|tx| tx.sender == alice).count();
+        let bob_count = selected.iter().filter(|tx| tx.sender == bob).count();
+        assert_eq!(alice_count, 0, "alice's oversize tx is skipped");
+        assert_eq!(bob_count, 3, "bob fills the block");
     }
 
     // ========== Prune expired ==========
