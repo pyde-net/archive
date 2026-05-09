@@ -17,6 +17,23 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// preimage (proposer headers, votes, view-change votes, slashing
 /// evidence, multisig payloads) so a signature on one network
 /// cannot be replayed on another even when FALCON keys match.
+///
+/// TPL-808 (pre-launch decision pending): the value `1` collides
+/// with **Ethereum mainnet** under the chainlist.org / EIP-155
+/// chain-id registry. The collision does not produce
+/// cross-protocol signature replay (Pyde signs FALCON-512 over a
+/// different preimage than Ethereum's secp256k1-over-RLP), but
+/// every wallet, block explorer, SDK, and cross-chain protocol
+/// uses the chain id as a network identifier — a user adding a
+/// "Pyde mainnet" RPC to MetaMask at id 1 would conflict with
+/// their Ethereum config; a bridge that keys on chain id alone
+/// could route Pyde traffic into an Ethereum surface or vice
+/// versa. The mainnet-genesis ceremony (§18.2 step 4) must
+/// resolve this by either registering a unique id with
+/// chainlist.org or choosing a clearly-vacant slot. Until that
+/// decision lands, the constant stays `1` so existing test
+/// fixtures and signing preimages don't churn; treat the value
+/// as PROVISIONAL.
 pub const MAINNET_CHAIN_ID: u64 = 1;
 
 /// Pyde public testnet chain ID. Distinct from devnet (`31337`)
