@@ -394,11 +394,7 @@ Pyde signs with FALCON-512 at three layers:
 
 Kyber-768 (ML-KEM in NIST FIPS 203 nomenclature) is a lattice-based key encapsulation mechanism providing IND-CCA2 security. The underlying hard problem is Module-LWE (Module Learning With Errors). Public keys are 1 184 bytes; ciphertexts are 1 088 bytes; the encapsulated shared secret is 32 bytes.
 
-Pyde uses Kyber-768 in two patterns:
-
-- **Direct encryption (mempool envelope).** A client encrypts a transaction's inner payload under a fresh Kyber-768 ephemeral key, derives a symmetric key from the shared secret, and uses it with AES-GCM to encrypt the payload bytes. The resulting envelope is a Kyber-768 ciphertext plus an AES-GCM ciphertext plus a sender FALCON signature.
-
-- **Threshold encryption.** The committee jointly holds a Kyber-768 secret distributed via Shamir secret sharing over the Goldilocks field. The corresponding public key is the threshold pubkey published at epoch boundaries.
+Pyde's only protocol use of Kyber-768 is the threshold-encrypted mempool envelope (§4.5). The committee jointly holds the Kyber-768 secret key, distributed via Shamir secret sharing over the Goldilocks field; the corresponding public key is published as the threshold pubkey at every epoch boundary. There is no per-message ephemeral-key path and no AES-GCM path — every encrypted-mempool envelope encapsulates against the committee's threshold pubkey, and the per-message symmetric primitive is a Poseidon2-derived keystream with a Poseidon2 MAC, both bound to the per-message Kyber ciphertext.
 
 The `ml-kem` dependency is currently pinned at `0.3.0-rc.0` pending an upstream stable release; the pin is tracked as a dependency-watch task. The release-candidate is already a faithful FIPS 203 implementation; the upgrade is a version-string change, not a protocol change.
 
@@ -417,11 +413,11 @@ The motivation for Poseidon2 over SHA-2 is performance in finite-field operation
 
 ### 4.5 Threshold encryption
 
-The mempool-encryption protocol decomposes a single Kyber-768 secret into 128 Shamir shares over the Goldilocks field, distributed across the active committee. Reconstruction requires 86 shares (the same 86-of-128 threshold as consensus quorum). The threshold public key is published at every epoch boundary; clients use it as the encryption target for any transaction submitted to the encrypted mempool path.
+The mempool-encryption protocol is **reconstruct-then-decapsulate Kyber-768**: the committee jointly holds the Kyber-768 secret key in shared form, partial-decryption shares are combined to reconstruct that secret key, and Kyber's standard decapsulation then runs once against the per-message ciphertext. The 64-byte Kyber secret-key seed is split into eight 8-byte chunks, each interpreted as a Goldilocks field element and independently Shamir-split into 128 shares with reconstruction threshold 86 (the same 86-of-128 threshold as consensus quorum). Each validator therefore holds eight Goldilocks shares — one per seed element. The corresponding Kyber public key is the threshold pubkey published at every epoch boundary; clients use it as the encryption target for any transaction submitted to the encrypted mempool path.
 
-The encryption side is straightforward: a client calls `Kyber768.encapsulate(threshold_pubkey)` and gets a ciphertext plus shared secret, then uses AES-GCM under the shared secret to encrypt the inner transaction payload.
+The encryption side is standard Kyber: a client calls `Kyber768.encapsulate(threshold_pubkey)` and gets a per-message Kyber ciphertext plus a 32-byte shared secret. The transaction payload is XOR-encrypted under a Poseidon2-derived keystream keyed on `(shared_secret, kyber_ct)`, and the envelope carries a Poseidon2 MAC over `(shared_secret, kyber_ct, encrypted_payload)`. Keystream and MAC are domain-separated and bound to the per-message Kyber ciphertext so that a hypothetical Kyber-RNG repeat does not collapse two plaintexts onto the same keystream.
 
-The decryption side requires cooperative participation from 86 + committee members, each releasing a partial-decryption share for the ciphertext after verifying the proposer's ordering commitment (§5.2). Aggregation of shares uses Lagrange interpolation over Goldilocks; once 86 shares are collected, the original Kyber shared secret is recoverable, the AES-GCM ciphertext can be decrypted, and the inner transaction is revealed.
+The decryption side requires cooperative participation from 86 + committee members, each releasing a partial-decryption share — their eight Goldilocks shares, blinded by a deterministic `(ct_hash, validator_index)` mask — together with a FALCON-512 signature over the share's canonical preimage. After validators verify the proposer's ordering commitment (§5.2), the next proposer collects shares, verifies each FALCON signature, removes the blinding masks, and Lagrange-interpolates each of the eight elements at `x = 0` over Goldilocks. The eight reconstructed field elements assemble the original 64-byte Kyber secret-key seed; running `Kyber768.decapsulate(seed, kyber_ct)` recovers the per-message shared secret, the Poseidon2 MAC is verified, the keystream is derived, and the inner transaction is revealed. The threshold reconstruction operates on the long-lived Kyber secret-key seed, not on per-message ciphertext shares; Kyber's standard decapsulation runs once on the recovered key against each message.
 
 Two security properties matter:
 
@@ -472,9 +468,11 @@ CLIENT
   2. FALCON-512 sign the inner transaction
   3. Fetch threshold pubkey via pyde_getThresholdPublicKey
   4. Kyber768.encapsulate(threshold_pubkey) → (kem_ct, shared_secret)
-  5. AES-GCM-encrypt the inner-tx bytes under shared_secret → aes_ct
-  6. Build EncryptedTx { sender, nonce, gas, chain_id, kem_ct, aes_ct,
-                        poseidon2_mac, falcon_signature }
+  5. keystream = Poseidon2-PRF(shared_secret, kem_ct, len)
+     enc_msg = inner_tx_bytes XOR keystream
+  6. mac = Poseidon2(shared_secret, kem_ct, enc_msg)
+     Build EncryptedTx { sender, nonce, gas, chain_id, kem_ct, enc_msg,
+                        mac, falcon_signature }
   7. Submit via pyde_sendRawEncryptedTransaction
 
 NETWORK
@@ -498,9 +496,10 @@ EVERY COMMITTEE MEMBER
      b. Sign and gossip share on pyde/consensus/1
  18. Receive partial shares from other committee members
  19. Once 86 shares collected for a given EncryptedTx:
-     a. Aggregate via Lagrange interpolation → kyber_shared_secret
-     b. AES-GCM-decrypt → inner Transaction bytes
-     c. Verify inner FALCON signature
+     a. Lagrange-interpolate to reconstruct Kyber secret-key seed
+     b. Kyber768.decapsulate(seed, kem_ct) → shared_secret
+     c. Verify Poseidon2 MAC; derive keystream; XOR enc_msg → inner Transaction
+     d. Verify inner FALCON signature
  20. Execute decrypted block via parallel scheduler
  21. Verify mandatory-inclusion invariant: every successfully-decrypted tx
      up to gas limit appears in the sealed block in committed order
