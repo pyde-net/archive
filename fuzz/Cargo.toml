@@ -16,6 +16,12 @@ license = "Apache-2.0"
 #   cargo +nightly fuzz run tx_decoder
 #   cargo +nightly fuzz run wire_transaction
 #   cargo +nightly fuzz run encrypted_tx_decoder
+#   cargo +nightly fuzz run wire_block             # TPL-701
+#   cargo +nightly fuzz run wire_block_header      # TPL-701
+#   cargo +nightly fuzz run wire_consensus_message # TPL-701
+#   cargo +nightly fuzz run wire_consensus_state   # TPL-701
+#   cargo +nightly fuzz run encrypted_tx_bundle    # TPL-701
+#   cargo +nightly fuzz run otic_parser            # TPL-701
 
 [package.metadata]
 cargo-fuzz = true
@@ -26,6 +32,7 @@ pyde-vm = { path = "../crates/pvm" }
 pyde-tx = { path = "../crates/tx" }
 pyde-node = { path = "../crates/node" }
 pyde-mempool = { path = "../crates/mempool" }
+otic = { path = "../crates/otic" }
 
 [[bin]]
 name = "pvm_interpreter"
@@ -51,6 +58,58 @@ bench = false
 [[bin]]
 name = "encrypted_tx_decoder"
 path = "fuzz_targets/encrypted_tx_decoder.rs"
+test = false
+doc = false
+bench = false
+
+# TPL-701: six new targets covering the wire-level decoders that
+# run BEFORE peer auth / proposer signature / committee membership
+# are verified. Each is reachable from any peer that completes the
+# libp2p noise handshake — combined with `panic = "abort"`, a
+# reachable panic is a remote validator-kill DoS. The
+# `otic_parser` target covers the developer-tooling surface
+# (`pyde-dev build`, `otic build`) and turns "this contract won't
+# compile" into "this contract crashes my toolchain" if the
+# front-end ever panics on hostile input.
+
+[[bin]]
+name = "wire_block"
+path = "fuzz_targets/wire_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_block_header"
+path = "fuzz_targets/wire_block_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_consensus_message"
+path = "fuzz_targets/wire_consensus_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_consensus_state"
+path = "fuzz_targets/wire_consensus_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encrypted_tx_bundle"
+path = "fuzz_targets/encrypted_tx_bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otic_parser"
+path = "fuzz_targets/otic_parser.rs"
 test = false
 doc = false
 bench = false

@@ -7,17 +7,21 @@ would poison the stable-toolchain build.
 
 ## Targets
 
-| Target              | What it fuzzes                                    | Why it matters                                                                                 |
-| ------------------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `pvm_interpreter`   | `Vm::load` + `Vm::execute` on arbitrary bytecode  | Contract-deploy bytecode is attacker-supplied; a panic here crashes validators post-deploy.    |
-| `tx_decoder`        | `pyde_tx::types::Transaction::from_bytes`         | RPC-ingress + gossip bytes hit this before validation. Must return `Option`, never panic.      |
-| `wire_transaction`  | `pyde_node::wire::decode_transaction`             | Compact-block + gossip decoder; distinct from `from_bytes`. Reached via `pyde-node`'s lib target. |
+| Target                    | What it fuzzes                                              | Why it matters                                                                                 |
+| ------------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `pvm_interpreter`         | `Vm::load` + `Vm::execute` on arbitrary bytecode            | Contract-deploy bytecode is attacker-supplied; a panic here crashes validators post-deploy.    |
+| `tx_decoder`              | `pyde_tx::types::Transaction::from_bytes`                   | RPC-ingress + gossip bytes hit this before validation. Must return `Option`, never panic.      |
+| `wire_transaction`        | `pyde_node::wire::decode_transaction`                       | Compact-block + gossip decoder; distinct from `from_bytes`. Reached via `pyde-node`'s lib target. |
+| `encrypted_tx_decoder`    | `pyde_mempool::encrypted::EncryptedTx::from_bytes`          | Per-tx envelope from `pyde_sendRawEncryptedTransaction` and the `pyde/encrypted_transactions/1` topic. Anonymous-RPC reachable. |
+| `wire_block`              | `pyde_node::wire::decode_block`                             | TPL-701: full-block decode runs BEFORE proposer-signature verification on `pyde/blocks/1`. Reachable to any authenticated peer. |
+| `wire_block_header`       | `pyde_node::wire::decode_block_header`                      | TPL-701: header decoder also called directly on `pyde/sync/1` light-client paths.              |
+| `wire_consensus_message`  | `pyde_node::wire::decode_consensus_message`                 | TPL-701: entry point for everything on `pyde/consensus/1` — votes, view-changes, finality, decryption shares, slashing evidence. Committee-membership check is downstream of the decode. |
+| `wire_consensus_state`    | `pyde_node::wire::decode_consensus_state`                   | TPL-701: cold-sync HotStuff state response on `pyde/sync/1`. Malformed response is a remote-kill against a node restarting from a checkpoint. |
+| `encrypted_tx_bundle`     | `pyde_node::wire::decode_encrypted_tx_bundle`               | TPL-701: proposer-side ordering-commitment bundle on `pyde/blocks/1`. Decoded before the proposer signature is checked. |
+| `otic_parser`             | `otic` lex + parse + resolve + typecheck + safety           | TPL-701: developer-tooling DoS surface. A hostile `.oti` source must not crash `pyde-dev build`, `otic build/check/test`, or any IDE plugin that runs the front-end. |
 
 ## Planned follow-up targets
 
-- `wire_block` / `wire_consensus_message` — the lib target now
-  exists, so these are one-liner additions once we want them.
-- `otic_parser` — fuzz `.oti` source parsing.
 - `falcon_verify` / `kyber_decrypt` — fuzz PQ crypto deserialisers
   (likely thin wrappers; real coverage comes from upstream fuzzing).
 
@@ -33,6 +37,14 @@ cd fuzz
 cargo +nightly fuzz run pvm_interpreter
 cargo +nightly fuzz run tx_decoder
 cargo +nightly fuzz run wire_transaction
+cargo +nightly fuzz run encrypted_tx_decoder
+# TPL-701 targets:
+cargo +nightly fuzz run wire_block
+cargo +nightly fuzz run wire_block_header
+cargo +nightly fuzz run wire_consensus_message
+cargo +nightly fuzz run wire_consensus_state
+cargo +nightly fuzz run encrypted_tx_bundle
+cargo +nightly fuzz run otic_parser
 ```
 
 By default libfuzzer runs forever, discovering new inputs + storing
