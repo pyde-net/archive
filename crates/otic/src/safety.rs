@@ -62,6 +62,17 @@ pub struct SafetyChecker {
     errors: Vec<SafetyError>,
     /// All function names in the current contract (for callback validation).
     contract_functions: Vec<String>,
+    /// Names of storage fields whose declared type is `Map<K, V>` in the
+    /// current contract. Populated at the top of `check_contract` and
+    /// cleared at the end so the set never bleeds across contracts in the
+    /// same `SourceFile`. Used by the for-loop iteration diagnostic
+    /// (TPL-603) to flag `for _ in self.<map_field> { ... }` — the IR
+    /// codegen has no `StorageMapIter` opcode (see `crates/otic/src/ir.rs`
+    /// at the StorageMapGet/Set comments around L256-259), so iteration
+    /// over a `Map` lowers to nothing useful and silently runs an empty
+    /// body. Catching it in the safety pass turns the silent-no-op into a
+    /// loud compile error pointing at the offending `for` line.
+    storage_maps: HashSet<String>,
 }
 
 impl Default for SafetyChecker {
@@ -75,6 +86,7 @@ impl SafetyChecker {
         Self {
             errors: Vec::new(),
             contract_functions: Vec::new(),
+            storage_maps: HashSet::new(),
         }
     }
 
@@ -138,6 +150,20 @@ impl SafetyChecker {
         for item in &contract.items {
             if let ContractItem::Function(f) = item {
                 self.contract_functions.push(f.name.name.clone());
+            }
+        }
+
+        // TPL-603: collect names of storage fields declared as `Map<K, V>`
+        // (or any nesting where the outer type is `Map`) so the for-loop
+        // diagnostic can fire on `for _ in self.<map_field>`.
+        self.storage_maps.clear();
+        for item in &contract.items {
+            if let ContractItem::Storage(storage) = item {
+                for field in &storage.fields {
+                    if matches!(field.ty, Type::Map(..)) {
+                        self.storage_maps.insert(field.name.name.clone());
+                    }
+                }
             }
         }
 
@@ -221,10 +247,105 @@ impl SafetyChecker {
                 self.check_receive_rules(f);
                 self.check_fallback_rules(f);
                 self.check_cross_call_callbacks(f);
+                self.check_map_iteration(&f.body);
             }
         }
 
         self.contract_functions.clear();
+        self.storage_maps.clear();
+    }
+
+    // ========================================================================
+    // TPL-603 — Map iteration diagnostic
+    // ========================================================================
+
+    /// Walk a block looking for `for _ in self.<storage_map_field>`. The
+    /// IR has no `StorageMapIter` opcode, so an iterator like that lowers
+    /// to a no-op body that runs zero times — silently. Emit a loud
+    /// compile error pointing at the `for` line so authors don't write
+    /// contract logic that depends on iteration that never happens.
+    fn check_map_iteration(&mut self, block: &Block) {
+        for stmt in &block.stmts {
+            self.check_stmt_map_iteration(stmt);
+        }
+    }
+
+    fn check_stmt_map_iteration(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::For(f) => {
+                if let Some(name) = self.iterator_targets_storage_map(&f.iterator) {
+                    self.error(
+                        format!(
+                            "iteration over `Map` is not supported: storage field `self.{}` is `Map<K, V>`, which has no in-IR iterator. Track keys explicitly via a `Vec<K>` companion field, or rewrite the loop to walk the key set you maintain on writes.",
+                            name
+                        ),
+                        f.span,
+                    );
+                }
+                self.check_map_iteration(&f.body);
+            }
+            Stmt::While(w) => self.check_map_iteration(&w.body),
+            Stmt::Expr(e) => self.check_expr_map_iteration(&e.expr),
+            Stmt::Let(l) => self.check_expr_map_iteration(&l.initializer),
+            Stmt::Assign(a) => {
+                self.check_expr_map_iteration(&a.target);
+                self.check_expr_map_iteration(&a.value);
+            }
+            Stmt::Return(r) => {
+                if let Some(v) = &r.value {
+                    self.check_expr_map_iteration(v);
+                }
+            }
+            Stmt::Emit(e) => {
+                for f in &e.fields {
+                    self.check_expr_map_iteration(&f.value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_expr_map_iteration(&mut self, expr: &Expr) {
+        match expr {
+            Expr::If(_, then_block, else_clause, _) => {
+                self.check_map_iteration(then_block);
+                if let Some(clause) = else_clause {
+                    match clause {
+                        ElseClause::ElseBlock(b) => self.check_map_iteration(b),
+                        ElseClause::ElseIf(e) => self.check_expr_map_iteration(e),
+                    }
+                }
+            }
+            Expr::Match(_, arms, _) => {
+                for arm in arms {
+                    if let Expr::Block(b) = &arm.body {
+                        self.check_map_iteration(b);
+                    }
+                }
+            }
+            Expr::Block(block) => self.check_map_iteration(block),
+            _ => {}
+        }
+    }
+
+    /// If the iterator expression is `self.<field>` (or `(self.<field>)`)
+    /// and `<field>` is a known storage Map, return its name. Otherwise
+    /// return None (the iterator is some other expression — a Vec, a
+    /// range, a function-returned iterator, etc., all of which are
+    /// supported and not the concern of this diagnostic).
+    fn iterator_targets_storage_map(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::FieldAccess(obj, field, _) => {
+                if matches!(obj.as_ref(), Expr::SelfExpr(_))
+                    && self.storage_maps.contains(&field.name)
+                {
+                    Some(field.name.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     // ========================================================================
@@ -1534,5 +1655,69 @@ mod tests {
         assert!(errors[0]
             .message
             .contains("#[constructor] and #[test] cannot be combined"));
+    }
+
+    // ========== TPL-603: Map iteration diagnostic ==========
+
+    #[test]
+    fn error_for_iterates_storage_map() {
+        let errors = check_err(
+            r#"
+            contract T {
+                storage { balances: Map<Address, u256>, count: u64, }
+                pub fn walk() {
+                    for entry in self.balances {
+                        self.count = self.count + 1u64;
+                    }
+                }
+            }
+        "#,
+        );
+        assert!(errors
+            .iter()
+            .any(|e| e.message.contains("iteration over `Map` is not supported")
+                && e.message.contains("self.balances")));
+    }
+
+    #[test]
+    fn for_iterates_storage_vec_ok() {
+        // Vec iteration is supported and must NOT fire the new diagnostic.
+        check_ok(
+            r#"
+            contract T {
+                storage { items: Vec<u64>, }
+                pub fn sum() -> u64 {
+                    let mut total: u64 = 0u64;
+                    for x in self.items {
+                        total = total + x;
+                    }
+                    return total;
+                }
+            }
+        "#,
+        );
+    }
+
+    #[test]
+    fn error_nested_for_in_storage_map() {
+        // The diagnostic must reach `for` loops nested inside `if`/`while`,
+        // not just top-level statements.
+        let errors = check_err(
+            r#"
+            contract T {
+                storage { balances: Map<Address, u256>, count: u64, }
+                pub fn walk(flag: bool) {
+                    if flag {
+                        for entry in self.balances {
+                            self.count = self.count + 1u64;
+                        }
+                    }
+                }
+            }
+        "#,
+        );
+        assert!(errors
+            .iter()
+            .any(|e| e.message.contains("iteration over `Map` is not supported")));
     }
 }
