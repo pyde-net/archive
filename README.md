@@ -5,7 +5,7 @@ High-performance, post-quantum Layer 1 blockchain with native MEV protection.
 ## Architecture
 
 - **Monolith binary** — consensus + execution in a single process
-- **Post-quantum cryptography** — FALCON-512 signatures, Kyber-768 KEM, Poseidon2 hashing, lattice-based VRF
+- **Post-quantum cryptography** — FALCON-512 signatures, Kyber-768 KEM, Poseidon2 hashing, FALCON-bound VRF over Poseidon2
 - **PVM (Pyde Virtual Machine)** — custom register-based VM with 32-bit fixed-width ISA
 - **Encrypted mempool** — threshold decryption prevents MEV extraction
 - **EIP-1559 gas model** — no tips, elastic 4x blocks, 70% burn / 20% validator / 10% treasury

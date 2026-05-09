@@ -371,7 +371,7 @@ Pyde's cryptography is the lattice-based stack standardized by NIST in 2024:
 | Signatures | FALCON-512 | NIST FIPS 206 | Consensus votes, transaction authorization, validator registration |
 | Public-key encryption | Kyber-768 / ML-KEM | NIST FIPS 203 | Threshold-encrypted mempool |
 | Hash | Poseidon2 (Goldilocks field) | Academic standard | Block hashes, transaction hashes, Merkle nodes, address derivation |
-| VRF | Lattice-based (Goldilocks) | Pyde construction | Proposer selection, epoch randomness |
+| VRF | FALCON-512-bound, Poseidon2-derived (Goldilocks) | Pyde construction | Proposer selection, epoch randomness |
 | Threshold encryption | Shamir over Goldilocks + Kyber + Poseidon2 MAC | Pyde construction | Mempool encryption, decryption-share aggregation |
 | Proactive secret sharing | PSS over the threshold encryption | Pyde construction | Committee rotation, key refresh at epoch boundaries |
 | Key derivation | Argon2id | RFC 9106 | Keystore encryption (wallet, validator key) |
@@ -431,7 +431,7 @@ Two security properties matter:
 
 ### 4.6 VRF and PSS
 
-Pyde's VRF is a lattice-based construction producing a 256-bit pseudorandom output and a proof of computation. The output is unforgeable (only the secret-key holder can produce it) and verifiable (anyone with the public key can verify the proof). The construction operates over the Goldilocks field for performance compatibility with Poseidon2.
+Pyde's VRF is a FALCON-signature-bound construction over Poseidon2. The 256-bit pseudorandom output is `Poseidon2(output_domain || Poseidon2(fingerprint_domain || sk) || input)` — a deterministic Poseidon2 hash of the input under a secret-key-derived fingerprint. The proof is a FALCON-512 signature over `(proof_domain || pk || input || output)`, which makes the output verifiable by anyone holding the public key and inherits FALCON's NIST FIPS 206 post-quantum security. Poseidon2 over the Goldilocks field is the hash primitive throughout; the Goldilocks choice is for in-circuit compatibility with Pyde's other Poseidon2 use sites, not for the VRF's security argument.
 
 The VRF is used at two layers:
 
@@ -632,7 +632,7 @@ MAX_WITNESS_SIZE     = 1 MB      (per-block state-witness bound)
 PAGE_ALLOC_GAS       = 200       (one-time cost per touched 4 KB page)
 ```
 
-The 64-deep external-call limit is lower than the EVM's 1024. The reasoning is that lattice-VRF and FALCON verification overhead per call is non-trivial; a 1024-deep nested-call sequence on Pyde would consume orders of magnitude more wall-clock time than on the EVM. 64 is enough to support every realistic application pattern (proxy-impl-impl chains, cross-AMM routing, escrow-of-escrow) with comfortable headroom.
+The 64-deep external-call limit is lower than the EVM's 1024. The reasoning is that FALCON verification overhead per call is non-trivial; a 1024-deep nested-call sequence on Pyde would consume orders of magnitude more wall-clock time than on the EVM. 64 is enough to support every realistic application pattern (proxy-impl-impl chains, cross-AMM routing, escrow-of-escrow) with comfortable headroom.
 
 ---
 
@@ -1858,6 +1858,6 @@ A consolidated reference for every protocol constant referenced in this paper. T
 
 **Verifiable computation network (post-mainnet).** Pyde's long-horizon ZK direction: across three phases, the chain plus its parachain layer evolves into a system where every operation — every block, every cross-chain message, every oracle attestation, every off-chain compute result — can be cryptographically proved when the cost-benefit ratio justifies it. Phase 2 adds STARK execution proofs as a parallel finality path; Phase 3 adds ZK proofs as a parachain attestation mode (§19.1).
 
-**VRF (Verifiable Random Function).** A function that produces a pseudorandom output and a proof that the output is correctly computed under a given key. Pyde's VRF is lattice-based, used for proposer selection and epoch randomness seeding.
+**VRF (Verifiable Random Function).** A function that produces a pseudorandom output and a proof that the output is correctly computed under a given key. Pyde's VRF derives the output via Poseidon2 from a secret-key fingerprint and binds it to a FALCON-512 signature proof, used for proposer selection and epoch randomness seeding.
 
 **Weak subjectivity.** A property of long-lived proof-of-stake chains that requires a new node to start syncing from a recent trusted checkpoint rather than from genesis. Pyde publishes weak-subjectivity checkpoints every 64 epochs.
