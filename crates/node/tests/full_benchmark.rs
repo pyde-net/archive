@@ -57,7 +57,7 @@ struct BlockMetrics {
 // ═══════════════════════════════════════════════════════════════════
 
 fn compile_single(source: &str) -> Vec<u8> {
-    let compiled = otic::compile_all_unchecked(source);
+    let compiled = otic::__compile_all_unchecked(source);
     let (_, c) = &compiled[0];
     let mut data = Vec::new();
     data.extend_from_slice(&(c.constructor_bytecode.len() as u32).to_le_bytes());
@@ -68,7 +68,7 @@ fn compile_single(source: &str) -> Vec<u8> {
 }
 
 fn compile_last(source: &str) -> Vec<u8> {
-    let compiled = otic::compile_all_unchecked(source);
+    let compiled = otic::__compile_all_unchecked(source);
     let (_, c) = compiled.last().unwrap();
     let mut data = Vec::new();
     data.extend_from_slice(&(c.constructor_bytecode.len() as u32).to_le_bytes());

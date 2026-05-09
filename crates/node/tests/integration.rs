@@ -121,7 +121,7 @@ fn call_tx(
 }
 
 fn compile_contract(source: &str) -> (Vec<u8>, String) {
-    let compiled = otic::compile_all_unchecked(source);
+    let compiled = otic::__compile_all_unchecked(source);
     assert!(!compiled.is_empty(), "compilation produced no contracts");
     let (name, contract) = &compiled[0];
     let clen = contract.constructor_bytecode.len() as u32;
@@ -739,7 +739,7 @@ fn cross_contract_storage_visibility() {
     // Driver deploys Vault, calls withdraw twice, reads balance back.
     // Tests that Vault.withdraw()'s storage changes are visible to
     // the next Vault.get_balance() call within the same transaction.
-    let compiled = otic::compile_all_unchecked(
+    let compiled = otic::__compile_all_unchecked(
         r#"
         contract Vault {
             storage { balance: u64, }
@@ -814,7 +814,7 @@ fn reentrancy_attack_blocked() {
     // Vault: withdraw calls back to caller via raw_call! (simulates ETH transfer callback).
     // Attacker: on_hook() tries to re-enter Vault.withdraw().
     // Without #[reentrant], the guard should block the re-entry.
-    let compiled = otic::compile_all_unchecked(
+    let compiled = otic::__compile_all_unchecked(
         r#"
         contract Vault {
             storage { balance: u64, }

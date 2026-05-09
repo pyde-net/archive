@@ -155,10 +155,10 @@ fn cmd_build(path: &str) {
     //
     // Audit 404: this binary already ran the full frontend (resolve +
     // typecheck + safety) inside `run_frontend(path)` above, so we
-    // intentionally use the lax `compile_all_unchecked` here to avoid
+    // intentionally use the lax `__compile_all_unchecked` here to avoid
     // re-running the same checks. The strict `compile_all` is for
     // callers that haven't yet run the frontend separately.
-    let results = otic::compile_all_unchecked(&src);
+    let results = otic::__compile_all_unchecked(&src);
 
     if results.is_empty() {
         eprintln!("error: no contracts found in {}", path);

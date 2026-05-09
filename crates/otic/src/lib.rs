@@ -152,7 +152,19 @@ fn extract_all_contract_signatures(
 /// production callers through the strict `compile_all`; this
 /// function survives only behind an opt-in name so the lax path
 /// can never be picked accidentally.
-pub fn compile_all_unchecked(src: &str) -> Vec<(String, codegen::CompiledContract)> {
+///
+/// TPL-604: marked `#[doc(hidden)]` and renamed to
+/// `__compile_all_unchecked` so that an out-of-workspace toolchain
+/// browsing the otic crate's rustdoc does not discover the
+/// frontend-bypassing path. The double-underscore prefix is the
+/// Rust convention for "implementation detail; do not call." All
+/// in-workspace callers that legitimately have already run the
+/// frontend (`pyde-dev build`, `otic build`, the aot/node/tx test
+/// suites) are updated to the new name; new callers should use
+/// `compile_all` unless they can document why bypassing safety is
+/// correct.
+#[doc(hidden)]
+pub fn __compile_all_unchecked(src: &str) -> Vec<(String, codegen::CompiledContract)> {
     let (tokens, _) = lexer::Lexer::new(src).tokenize();
     let (file, _) = parser::Parser::new(tokens).parse();
 
@@ -224,7 +236,7 @@ pub fn compile_all_unchecked(src: &str) -> Vec<(String, codegen::CompiledContrac
 /// Use this everywhere except where you've already run the frontend
 /// in a wider build context (`pyde-dev build`, `otic` CLI) or in
 /// compiler-internal lower/codegen tests. See
-/// [`compile_all_unchecked`] for those narrow cases.
+/// [`__compile_all_unchecked`] for those narrow cases.
 ///
 /// # Audit 404
 ///
@@ -334,5 +346,5 @@ pub fn compile_all(src: &str) -> Result<Vec<(String, codegen::CompiledContract)>
     })?;
 
     // All frontend passes clean — lower + optimize + codegen.
-    Ok(compile_all_unchecked(src))
+    Ok(__compile_all_unchecked(src))
 }
