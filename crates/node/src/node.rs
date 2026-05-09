@@ -389,6 +389,22 @@ impl PydeNode {
             RwLock<std::collections::HashMap<(u64, [u8; 32]), Vec<Vec<u8>>>>,
         > = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
+        // Compact blocks that failed reconstruction because some
+        // short_ids didn't match the local mempool. Keyed by the
+        // header's block_hash so a `BlockTxsResp` arrival can pop
+        // the right one and re-run reconstruction. The body fetch
+        // is fire-and-forget — if the response never comes (peer
+        // doesn't have the txs, timeout) the entry stays here
+        // until the maintenance-tick prune evicts it. Pre-fix the
+        // failed-reconstruct branch fired `update_network_tip(slot)
+        // + GetBlocks(slot)`, which storms peers with `NotFound`
+        // for unfinalized slots and starves consensus — see the
+        // audit-396 sibling-fix rationale in
+        // `block_txs_protocol.rs`.
+        let pending_compact_reconstructions: Arc<
+            RwLock<std::collections::HashMap<[u8; 32], pyde_net::propagation::CompactBlock>>,
+        > = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
         // 4. Chain sync
         let mut chain_sync = ChainSync::new();
         chain_sync.manager.local_tip = chain.read().await.head_slot;
@@ -1056,7 +1072,14 @@ impl PydeNode {
                         )
                     };
 
-                    // Execute post-event actions that need swarm access
+                    // Execute post-event actions that need swarm access.
+                    // The match runs in a loop so an action can tail-call
+                    // another by setting `next_action = Some(...)` —
+                    // currently used by `BlockTxsResponseReceived` to
+                    // re-emit `ReconstructCompactBlock(cb)` once the
+                    // missing txs have been spliced into mempool_index.
+                    let mut next_action: Option<PostEventAction> = Some(action);
+                    while let Some(action) = next_action.take() {
                     match action {
                         PostEventAction::None => {}
                         PostEventAction::RequestChainTip(peer) => {
@@ -1237,9 +1260,9 @@ impl PydeNode {
                             let block = match block {
                                 Some(b) => b,
                                 None => {
-                                    debug!(
+                                    info!(
                                         qc_slot,
-                                        "RR-QC canonical apply: body unavailable (sync will recover)"
+                                        "RR-QC canonical apply: body unavailable"
                                     );
                                     continue;
                                 }
@@ -1405,6 +1428,120 @@ impl PydeNode {
                         }
                         PostEventAction::SendBlocksRrResponse(channel, resp) => {
                             let _ = swarm.behaviour_mut().blocks_rr.send_response(channel, resp);
+                        }
+                        PostEventAction::SendBlockTxsRrResponse(channel, resp) => {
+                            let _ = swarm
+                                .behaviour_mut()
+                                .block_txs_rr
+                                .send_response(channel, resp);
+                        }
+                        PostEventAction::AnswerBlockTxsReq(channel, req) => {
+                            // Recompute short_ids over the local plaintext mempool
+                            // and encrypted-tx relay using the requester's nonce,
+                            // then answer with the matching tx bytes (or None per
+                            // unmatched slot). The lookup runs here because
+                            // mempool_index + tx_relay are async-locked and the
+                            // swarm-event handler is sync.
+                            let mut sid_to_bytes: std::collections::HashMap<
+                                pyde_net::propagation::ShortId,
+                                Vec<u8>,
+                            > = std::collections::HashMap::new();
+                            {
+                                let idx = mempool_index.read().await;
+                                for (tx_hash, tx_bytes) in idx.iter() {
+                                    let sid = pyde_net::propagation::compute_short_id(
+                                        tx_hash, req.nonce,
+                                    );
+                                    sid_to_bytes.entry(sid).or_insert_with(|| tx_bytes.clone());
+                                }
+                            }
+                            {
+                                let relay_r = tx_relay.read().await;
+                                for etx in relay_r.mempool().iter_txs() {
+                                    let hash = etx.hash();
+                                    let sid = pyde_net::propagation::compute_short_id(
+                                        &hash, req.nonce,
+                                    );
+                                    sid_to_bytes.entry(sid).or_insert_with(|| etx.to_bytes());
+                                }
+                            }
+                            let txs: Vec<Option<Vec<u8>>> = req
+                                .short_ids
+                                .iter()
+                                .map(|sid| sid_to_bytes.get(sid).cloned())
+                                .collect();
+                            let resp = pyde_net::block_txs_protocol::BlockTxsResp {
+                                block_hash: req.block_hash,
+                                txs,
+                            };
+                            let _ = swarm
+                                .behaviour_mut()
+                                .block_txs_rr
+                                .send_response(channel, resp);
+                        }
+                        PostEventAction::BlockTxsResponseReceived(resp) => {
+                            // Splice the responded txs into mempool_index so the
+                            // caller's pending compact-block reconstruction can
+                            // re-run via ReconstructCompactBlock. Plaintext txs
+                            // and encrypted blobs both round-trip through the
+                            // same mempool-snapshot path (see the
+                            // ReconstructCompactBlock body), so adding them here
+                            // is sufficient — we don't have to know the type up
+                            // front. The retry itself is queued by the caller
+                            // that issued the BlockTxsReq via
+                            // `pending_compact_reconstructions`.
+                            let mut filled = 0usize;
+                            {
+                                let mut idx = mempool_index.write().await;
+                                for tx_opt in resp.txs.iter() {
+                                    if let Some(tx_bytes) = tx_opt {
+                                        // Try plaintext decode first to compute
+                                        // the canonical tx_hash; fall back to
+                                        // encrypted-tx hash. Either way, the
+                                        // mempool index stores `(tx_hash,
+                                        // tx_bytes)` so subsequent compact-block
+                                        // reconstructions can match by short_id.
+                                        if let Ok(tx) = wire::decode_transaction(tx_bytes) {
+                                            idx.insert(tx.hash(), tx_bytes.clone());
+                                            filled += 1;
+                                        } else if let Some(etx) =
+                                            pyde_mempool::encrypted::EncryptedTx::from_bytes(
+                                                tx_bytes,
+                                            )
+                                        {
+                                            idx.insert(etx.hash(), tx_bytes.clone());
+                                            filled += 1;
+                                        } else {
+                                            debug!("BlockTxs response had undecodable tx blob");
+                                        }
+                                    }
+                                }
+                            }
+                            // Pop the buffered compact block for this
+                            // block_hash and re-emit it as a
+                            // ReconstructCompactBlock event so the standard
+                            // path re-runs reconstruction with the now-
+                            // augmented mempool view.
+                            let cb_to_retry = {
+                                let mut pending = pending_compact_reconstructions.write().await;
+                                pending.remove(&resp.block_hash)
+                            };
+                            if let Some(cb) = cb_to_retry {
+                                info!(
+                                    block_hash = hex::encode(resp.block_hash),
+                                    filled,
+                                    "BlockTxsResp received — retrying compact-block reconstruction"
+                                );
+                                next_action = Some(
+                                    PostEventAction::ReconstructCompactBlock(cb),
+                                );
+                            } else {
+                                debug!(
+                                    block_hash = hex::encode(resp.block_hash),
+                                    filled,
+                                    "BlockTxsResp arrived for unknown block_hash — ignoring"
+                                );
+                            }
                         }
                         PostEventAction::DisconnectStalePeer(peer) => {
                             // Audit 234 part 4 step 7: force-drop the
@@ -1600,7 +1737,7 @@ impl PydeNode {
                             let block = match block {
                                 Some(b) => b,
                                 None => {
-                                    debug!(
+                                    info!(
                                         qc_slot,
                                         "ApplyCanonicalAfterQc: body unavailable (sync will recover)"
                                     );
@@ -1948,15 +2085,53 @@ impl PydeNode {
                             let (matched, missing) = cb.reconstruct(&mempool_txs);
 
                             if !missing.is_empty() {
-                                // Can't fully reconstruct — request full block via sync.
-                                // Update network tip so sync manager knows to fetch this slot.
-                                debug!(
+                                // Audit-396 sibling fix: don't fall back to
+                                // GetBlocks(slot). The slot has no QC yet —
+                                // peers respond NotFound and the tight retry
+                                // loop starves consensus. Pre-fix this path
+                                // bumped network_tip + fired GetBlocks; the
+                                // result was the chain stall reproduced under
+                                // encrypted-tx load (chain head=12 stall
+                                // ~120s, 100% submit errors).
+                                //
+                                // Instead: buffer this compact block keyed by
+                                // its block_hash, fire a fine-grained
+                                // BlockTxsReq for the missing short_ids, and
+                                // wait for the response. When BlockTxsResp
+                                // arrives the action loop splices the txs
+                                // into mempool_index and re-emits a
+                                // ReconstructCompactBlock(cb) that finishes
+                                // the body via this same arm.
+                                info!(
                                     slot,
                                     missing = missing.len(),
-                                    "compact block missing txs — triggering sync for full block"
+                                    block_hash = hex::encode(block_hash),
+                                    "compact block missing txs — fetching via BlockTxsReq"
                                 );
-                                chain_sync.manager.update_network_tip(slot);
-                                chain_sync.request_next_batch(&mut swarm);
+                                {
+                                    let mut pending =
+                                        pending_compact_reconstructions.write().await;
+                                    pending.insert(block_hash, cb.clone());
+                                }
+                                let peer_pick: Option<libp2p::PeerId> =
+                                    swarm.connected_peers().next().copied();
+                                if let Some(peer) = peer_pick {
+                                    let req = pyde_net::block_txs_protocol::BlockTxsReq {
+                                        block_hash,
+                                        nonce: cb.nonce,
+                                        short_ids: missing,
+                                    };
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .block_txs_rr
+                                        .send_request(&peer, req);
+                                } else {
+                                    debug!(
+                                        slot,
+                                        "no connected peer to issue BlockTxsReq; \
+                                         compact block buffered until proposer's RR retry"
+                                    );
+                                }
                                 continue;
                             }
 
@@ -2255,6 +2430,7 @@ impl PydeNode {
                             }
                         }
                     }
+                    } // while let Some(action) = next_action.take()
                 }
                 _ = slot_interval.tick() => {
                     let current_slot = slot_clock.current_slot();
@@ -4113,6 +4289,31 @@ enum PostEventAction {
         request_response::ResponseChannel<pyde_net::blocks_protocol::BlocksResp>,
         pyde_net::blocks_protocol::BlocksResp,
     ),
+    /// TPL-208 follow-up / audit-396 sibling fix: serve a fine-
+    /// grained missing-tx fetch. The main loop holds the async
+    /// `mempool_index` + `tx_relay` locks; this action carries the
+    /// request from the swarm-event handler so the lookup happens
+    /// where the locks are reachable, then the response gets sent
+    /// back through `block_txs_rr.send_response`.
+    AnswerBlockTxsReq(
+        request_response::ResponseChannel<pyde_net::block_txs_protocol::BlockTxsResp>,
+        pyde_net::block_txs_protocol::BlockTxsReq,
+    ),
+    /// Send a pre-built BlockTxsResp through the RR channel. Used
+    /// by the swarm-event handler for deny-path responses (spam
+    /// threshold, oversized requests) where no mempool lookup is
+    /// needed.
+    SendBlockTxsRrResponse(
+        request_response::ResponseChannel<pyde_net::block_txs_protocol::BlockTxsResp>,
+        pyde_net::block_txs_protocol::BlockTxsResp,
+    ),
+    /// Result of a successful BlockTxs response: the requester's
+    /// pending compact-block reconstruction is now complete (or
+    /// has new state to retry). Carries the rebuilt CompactBlock
+    /// + the txs we just learned. The action loop splices the
+    /// new txs into `mempool_index` so the standard
+    /// `ReconstructCompactBlock` retry path can finish the body.
+    BlockTxsResponseReceived(pyde_net::block_txs_protocol::BlockTxsResp),
     /// Audit 234 follow-up: record a `(PeerId, Multiaddr)` pair into the
     /// persistent peer book AND fire the FALCON auth handshake (task
     /// 029). Both are side-effects of `SwarmEvent::ConnectionEstablished`;
@@ -6122,6 +6323,92 @@ fn handle_swarm_event(
             PostEventAction::None
         }
         SwarmEvent::Behaviour(PydeBehaviourEvent::BlocksRr(
+            request_response::Event::ResponseSent { .. },
+        )) => PostEventAction::None,
+
+        // --- BlockTxsRr: fine-grained missing-tx fetch ---
+        // (audit-396 sibling fix; replaces the GetBlocks(unfinalized
+        // slot) storm that fired when compact-block reconstruction
+        // hit short-id misses).
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlockTxsRr(
+            request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            },
+        )) => {
+            // Same per-peer spam threshold as BlocksRr — closes
+            // the "open N connections, request 64K short_ids each"
+            // CPU-burn vector. Honest reconstruct callers cap their
+            // request size at the cb's tx count (bounded by the
+            // block-tx limit), so they stay at 0.
+            const BLOCK_TXS_RR_SPAM_THRESHOLD: u64 = 5;
+            let invalid = peer_manager
+                .get_peer(&peer)
+                .map(|p| p.invalid_messages)
+                .unwrap_or(0);
+            if invalid >= BLOCK_TXS_RR_SPAM_THRESHOLD {
+                debug!(%peer, invalid, "dropping BlockTxsReq from peer over spam threshold");
+                let resp = pyde_net::block_txs_protocol::BlockTxsResp {
+                    block_hash: request.block_hash,
+                    txs: vec![None; request.short_ids.len()],
+                };
+                return PostEventAction::SendBlockTxsRrResponse(channel, resp);
+            }
+            // Bound the response size — a peer asking for more
+            // short_ids than the per-block tx cap is malformed.
+            // `MAX_TXS_PER_BLOCK` is the same limit applied to
+            // every other tx-count field on the wire.
+            if request.short_ids.len() > wire::MAX_TXS_PER_BLOCK {
+                debug!(
+                    %peer,
+                    requested = request.short_ids.len(),
+                    "BlockTxsReq exceeds MAX_TXS_PER_BLOCK; refusing"
+                );
+                if let Some(info) = peer_manager.get_peer_mut(&peer) {
+                    info.invalid_messages = info.invalid_messages.saturating_add(1);
+                }
+                let resp = pyde_net::block_txs_protocol::BlockTxsResp {
+                    block_hash: request.block_hash,
+                    txs: vec![],
+                };
+                return PostEventAction::SendBlockTxsRrResponse(channel, resp);
+            }
+            PostEventAction::AnswerBlockTxsReq(channel, request)
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlockTxsRr(
+            request_response::Event::Message {
+                peer,
+                message: request_response::Message::Response { response, .. },
+                ..
+            },
+        )) => {
+            peer_manager.release_rr_slot(&peer);
+            PostEventAction::BlockTxsResponseReceived(response)
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlockTxsRr(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            peer_manager.release_rr_slot(&peer);
+            let is_timeout = matches!(error, request_response::OutboundFailure::Timeout);
+            if is_timeout {
+                debug!(%peer, ?error, "block-txs RR timeout; dropping stale connection");
+                PostEventAction::DisconnectStalePeer(peer)
+            } else {
+                debug!(%peer, ?error, "block-txs RR transient failure; keeping connection");
+                PostEventAction::None
+            }
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlockTxsRr(
+            request_response::Event::InboundFailure { peer, error, .. },
+        )) => {
+            debug!(%peer, ?error, "block-txs RR inbound failed");
+            PostEventAction::None
+        }
+        SwarmEvent::Behaviour(PydeBehaviourEvent::BlockTxsRr(
             request_response::Event::ResponseSent { .. },
         )) => PostEventAction::None,
 

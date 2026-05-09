@@ -155,23 +155,11 @@ fn rand_nonce() -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Block body request: request missing transactions by short ID.
-#[derive(Clone, Debug)]
-pub struct GetBlockTxs {
-    /// Block hash.
-    pub block_hash: [u8; 32],
-    /// Short IDs of missing transactions.
-    pub missing_short_ids: Vec<ShortId>,
-}
-
-/// Block body response: the requested transactions.
-#[derive(Clone, Debug)]
-pub struct BlockTxsResponse {
-    /// Block hash.
-    pub block_hash: [u8; 32],
-    /// Missing transactions (raw bytes), in order of request.
-    pub transactions: Vec<Vec<u8>>,
-}
+// Block-body missing-tx fetch lives in `block_txs_protocol::{BlockTxsReq,
+// BlockTxsResp}` — a request-response channel with serde-codec
+// types. The earlier in-tree `GetBlockTxs` / `BlockTxsResponse` stubs
+// (and their wire encoders) had no callers and were superseded
+// without a migration window.
 
 /// Encrypted-tx bundle: proposer→validators payload carrying the
 /// block's `encrypted_txs: Vec<Vec<u8>>` out-of-band from the

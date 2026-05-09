@@ -5,6 +5,7 @@
 //! identity has no authority over consensus, blocks, or transactions.
 
 use crate::auth::{self, PydeAuthReq, PydeAuthResp};
+use crate::block_txs_protocol::{self, BlockTxsReq, BlockTxsResp};
 use crate::blocks_protocol::{self, BlocksReq, BlocksResp};
 use crate::config::NetworkConfig;
 use crate::consensus_protocol::{self, ConsensusReq, ConsensusResp};
@@ -38,6 +39,12 @@ pub struct PydeBehaviour {
     /// silent-drop failure mode as consensus_rr (audit 234 part 4
     /// follow-up).
     pub blocks_rr: request_response::cbor::Behaviour<BlocksReq, BlocksResp>,
+    /// Request-response for fine-grained missing-tx fetch when a
+    /// compact block can't be reconstructed from the local mempool.
+    /// Replaces the audit-396-style storm of `GetBlocks(slot)` for
+    /// unfinalized slots — see `block_txs_protocol.rs` for the full
+    /// rationale.
+    pub block_txs_rr: request_response::cbor::Behaviour<BlockTxsReq, BlockTxsResp>,
 }
 
 /// Generate a new node keypair. Call once on first run, then persist.
@@ -240,6 +247,11 @@ pub fn create_node(
             // Direct Blocks-topic delivery (audit 234 part 4 follow-up).
             let blocks_rr = blocks_protocol::blocks_behaviour();
 
+            // Fine-grained missing-tx fetch — replaces the audit-396
+            // storm of GetBlocks for unfinalized slots when a compact
+            // block can't be reconstructed from the local mempool.
+            let block_txs_rr = block_txs_protocol::block_txs_behaviour();
+
             Ok(PydeBehaviour {
                 gossipsub,
                 kademlia,
@@ -248,6 +260,7 @@ pub fn create_node(
                 auth,
                 consensus_rr,
                 blocks_rr,
+                block_txs_rr,
             })
         })
         .map_err(|e| format!("behaviour error: {e}"))?
