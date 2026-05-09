@@ -1181,7 +1181,7 @@ fn run_testnet_cli(
     Ok(())
 }
 
-fn start_node(node: &mut TestNode, pyde: &Path, dev: bool) -> Result<(), String> {
+fn start_node(node: &mut TestNode, pyde: &Path, _dev: bool) -> Result<(), String> {
     let config_path = node.datadir.join("config.toml");
     let mut cmd = Command::new(pyde);
     cmd.arg("run")
@@ -1193,9 +1193,12 @@ fn start_node(node: &mut TestNode, pyde: &Path, dev: bool) -> Result<(), String>
         .arg(&node.datadir)
         .arg("--log-level")
         .arg("info");
-    if dev {
-        cmd.arg("--dev");
-    }
+    // TPL-208: don't pass `--dev` to `pyde run`. The node-side
+    // TPL-207 gate refuses startup with `dev_mode = true` on
+    // chain_id != 31337, and the localhost ergonomics that used
+    // to ride on `--dev` (loopback bind, TCP-only) now flow
+    // through `network.bind_loopback` / `network.disable_quic`
+    // which `pyde testnet --dev` writes into config.toml.
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()

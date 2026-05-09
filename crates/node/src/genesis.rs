@@ -969,6 +969,25 @@ pub fn generate_testnet(
         ));
     }
 
+    // TPL-208 + TPL-207: `dev_mode = true` is only legal on devnet
+    // (`chain_id == 31337`). The runtime gate in `main.rs` refuses
+    // to start with it set on any other chain_id, so emit
+    // `dev_mode = false` for non-devnet configs even when --dev was
+    // passed at genesis time. The other --dev effects (auto-funded
+    // faucet at genesis, localhost binds at runtime) are independent
+    // of `node.dev_mode` and stay active under their own controls.
+    let effective_dev_mode = dev_mode && chain_id == pyde_net::discovery::DEVNET_CHAIN_ID;
+
+    // TPL-208: when --dev is set and we're generating a localhost
+    // setup (no `--node-addrs` host file), enable the loopback bind
+    // + TCP-only ergonomics that prevent libp2p's per-transport
+    // dedupe from flapping connections in a fully meshed local
+    // devnet/testnet. For distributed setups the production binds
+    // (0.0.0.0 + QUIC) remain correct because real peers come from
+    // different hosts and multi-address advertising is what makes
+    // connectivity work through NAT/firewall paths.
+    let local_test_ergonomics = dev_mode && node_addrs.is_none();
+
     let total_nodes = num_validators + num_full_nodes;
     if let Some(addrs) = node_addrs {
         if addrs.len() != total_nodes {
@@ -1227,6 +1246,8 @@ max_inbound = 30
 max_outbound = 20
 rate_limit_per_ip = 5
 bootstrap_peers = {bootstrap}
+bind_loopback = {bind_loopback}
+disable_quic = {disable_quic}
 
 [consensus]
 block_time_ms = {block_time_ms}
@@ -1257,12 +1278,14 @@ json = false
 "#,
             region_comment = region_comment,
             datadir = node_dir.display(),
-            dev = dev_mode,
+            dev = effective_dev_mode,
             p2p_port = p2p_port,
             rpc_port = rpc_port,
             metrics_port = metrics_port,
             fast_tx_port = fast_tx_port,
             bootstrap = bootstrap,
+            bind_loopback = local_test_ergonomics,
+            disable_quic = local_test_ergonomics,
             block_time_ms = block_time_ms,
         );
 
@@ -1352,6 +1375,8 @@ max_inbound = 30
 max_outbound = 20
 rate_limit_per_ip = 5
 bootstrap_peers = {bootstrap}
+bind_loopback = {bind_loopback}
+disable_quic = {disable_quic}
 
 [consensus]
 block_time_ms = {block_time_ms}
@@ -1382,12 +1407,14 @@ json = false
 "#,
             region_comment = region_comment,
             datadir = node_dir.display(),
-            dev = dev_mode,
+            dev = effective_dev_mode,
             p2p_port = p2p_port,
             rpc_port = rpc_port,
             metrics_port = metrics_port,
             fast_tx_port = fast_tx_port,
             bootstrap = bootstrap,
+            bind_loopback = local_test_ergonomics,
+            disable_quic = local_test_ergonomics,
             block_time_ms = block_time_ms,
         );
 
