@@ -10,6 +10,53 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 
+/// TPL-932: per-subscription event rate-limit. Sustained refill rate
+/// of events the subscription is allowed to forward to the connection's
+/// outgoing channel. At a 400 ms slot time the chain produces ~2.5
+/// new heads / second, so 50/s gives 20× headroom for a `newHeads`
+/// subscription while still capping a runaway `logs` subscription
+/// that, on a busy contract slot, would otherwise be able to dump
+/// hundreds of events into the connection's bounded mpsc and starve
+/// other subscriptions on the same socket.
+const SUB_RATE_PER_SEC: f64 = 50.0;
+
+/// TPL-932: burst capacity per subscription. A subscription that has
+/// been idle accumulates up to this many tokens, so a brief burst of
+/// events (e.g., a backlog drain after a brief stall) clears without
+/// throttling.
+const SUB_BURST: f64 = 100.0;
+
+/// Lazy token-bucket: refilled on each `try_consume` call from
+/// `tokio::time::Instant` deltas, no background task. One per
+/// spawned subscription task, so each subscription's rate is
+/// isolated from siblings on the same WS connection.
+struct SubRateLimiter {
+    tokens: f64,
+    last_refill: tokio::time::Instant,
+}
+
+impl SubRateLimiter {
+    fn new() -> Self {
+        Self {
+            tokens: SUB_BURST,
+            last_refill: tokio::time::Instant::now(),
+        }
+    }
+
+    fn try_consume(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * SUB_RATE_PER_SEC).min(SUB_BURST);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub async fn start_ws_server(
     listen: &str,
     port: u16,
@@ -111,9 +158,20 @@ async fn handle_connection(
                     );
 
                     tasks.push(tokio::spawn(async move {
+                        let mut rl = SubRateLimiter::new();
                         loop {
                             match rx.recv().await {
                                 Ok(header) => {
+                                    // TPL-932: per-subscription rate-limit.
+                                    // Drop events past the per-second cap so
+                                    // one runaway sub can't monopolize the
+                                    // connection's bounded outgoing channel.
+                                    // newHeads at ~2.5/s never trips the
+                                    // 50/s cap in practice.
+                                    if !rl.try_consume() {
+                                        debug!(sub_id, "newHeads sub rate-limit: dropped event (TPL-932)");
+                                        continue;
+                                    }
                                     let notif = serde_json::json!({
                                         "jsonrpc":"2.0",
                                         "method":"pyde_subscription",
@@ -166,6 +224,7 @@ async fn handle_connection(
                     debug!(sub_id, "logs subscription created");
 
                     tasks.push(tokio::spawn(async move {
+                        let mut rl = SubRateLimiter::new();
                         loop {
                             match rx.recv().await {
                                 Ok(log) => {
@@ -177,6 +236,15 @@ async fn handle_connection(
                                         if log_addr.as_deref() != Some(addr.as_str()) {
                                             continue;
                                         }
+                                    }
+                                    // TPL-932: per-subscription rate-limit.
+                                    // Caps how fast one logs sub can pump
+                                    // events into the connection's outgoing
+                                    // channel. Filter-pass is checked first
+                                    // so dropped logs don't burn tokens.
+                                    if !rl.try_consume() {
+                                        debug!(sub_id, "logs sub rate-limit: dropped event (TPL-932)");
+                                        continue;
                                     }
                                     let notif = serde_json::json!({
                                         "jsonrpc":"2.0",
@@ -213,4 +281,55 @@ async fn handle_connection(
         t.abort();
     }
     writer.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn tpl_932_sub_rate_limiter_allows_burst_then_throttles() {
+        let mut rl = SubRateLimiter::new();
+        let mut allowed = 0;
+        for _ in 0..(SUB_BURST as usize + 50) {
+            if rl.try_consume() {
+                allowed += 1;
+            }
+        }
+        // The tight loop is fast enough that real-time refill during
+        // the loop contributes only sub-millisecond fractional tokens
+        // (≪ 1), so allowed ~= BURST. Allow ±1 of slop for the
+        // last_refill timestamp delta on slow CI machines.
+        assert!(
+            (SUB_BURST as usize..=SUB_BURST as usize + 1).contains(&allowed),
+            "expected ~{} allowed in tight loop, got {}",
+            SUB_BURST as usize,
+            allowed
+        );
+    }
+
+    #[test]
+    fn tpl_932_sub_rate_limiter_refills_over_time() {
+        let mut rl = SubRateLimiter::new();
+        // Drain the bucket.
+        for _ in 0..(SUB_BURST as usize) {
+            assert!(rl.try_consume());
+        }
+        assert!(!rl.try_consume(), "bucket should be empty");
+        // 100 ms at 50/s → ~5 tokens refilled.
+        std::thread::sleep(Duration::from_millis(100));
+        let mut after_refill = 0;
+        for _ in 0..10 {
+            if rl.try_consume() {
+                after_refill += 1;
+            }
+        }
+        assert!(
+            (4..=7).contains(&after_refill),
+            "100ms refill at {} req/s should yield ~5 tokens (got {})",
+            SUB_RATE_PER_SEC as u32,
+            after_refill
+        );
+    }
 }
