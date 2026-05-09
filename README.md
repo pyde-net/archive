@@ -49,8 +49,9 @@ Features: 30 keywords, storage maps, structs, enums, Vec with realloc, events, c
 
 ## Targets
 
-- 400M sustained / 1.6B max block gas
-- ~50,000 sustained / ~500,000 peak TPS (native execution + parallel tx + cached state)
+- 400M target / 1.6B max block gas
+- ~12,500 sustained / ~50,000 peak TPS design target on cloud-class hardware
+  (4K sustained / 7K burst measured today on a four-validator laptop devnet against full FALCON signatures at 100% inclusion)
 
 ## Building
 
