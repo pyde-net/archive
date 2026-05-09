@@ -18,19 +18,37 @@ pub const ERASURE_THRESHOLD: usize = 256 * 1024; // 256KB
 /// An 8-byte short transaction ID.
 pub type ShortId = [u8; SHORT_ID_LEN];
 
-/// Compact block: header + short IDs + prefilled txs.
-/// Reduces per-tx overhead from 32 bytes to 6 bytes.
+/// Compact block: header + short IDs + prefilled txs + execution schedule.
+/// Reduces per-tx overhead from 32 bytes to 8 bytes for short IDs +
+/// 2 bytes for group ID = 10 bytes total.
 #[derive(Clone, Debug)]
 pub struct CompactBlock {
     /// Block header bytes.
     pub header: Vec<u8>,
-    /// Short IDs: first 6 bytes of Poseidon2(tx_hash || nonce).
+    /// Short IDs: first 8 bytes of Poseidon2(tx_hash || nonce).
     pub short_tx_ids: Vec<ShortId>,
     /// Pre-filled transactions the sender expects the peer not to have.
     /// (index, raw tx bytes).
     pub prefilled_txs: Vec<(u16, Vec<u8>)>,
     /// Nonce used for short ID computation (randomized per announcement).
     pub nonce: u64,
+    /// Audit 408: per-tx execution-group ID. `group_ids[i]` is the
+    /// group containing the tx at position `i` in `short_tx_ids`. Two
+    /// txs share a group iff they share a group_id. Receivers
+    /// reconstruct the full `ExecutionSchedule` from this vector
+    /// rather than recomputing it locally — pre-fix the receiver
+    /// hardcoded a single sequential group at `node.rs:1833`,
+    /// throwing away the proposer's parallel plan and forcing every
+    /// non-proposer to take the sequential `block_processor` path
+    /// even when the proposer ran rayon-parallel. The schedule was
+    /// already in the full `encode_block` format (see
+    /// `crates/node/src/wire.rs:885`); this just propagates it
+    /// through the steady-state compact-block channel too. `u16`
+    /// supports up to 65535 distinct groups per block — well above
+    /// any realistic scheduler output (typical mainnet block has
+    /// tens to low hundreds of groups, capped by the active
+    /// sender / contract count).
+    pub group_ids: Vec<u16>,
 }
 
 /// Compute a short ID from a tx hash and nonce.
@@ -50,11 +68,15 @@ pub const PREFILL_FRESHNESS_MS: u64 = 200;
 impl CompactBlock {
     /// Build a compact block from a full block.
     /// Prefills transactions received within PREFILL_FRESHNESS_MS.
+    /// `group_ids[i]` is the execution-group label for the tx at
+    /// position `i`; pass an empty slice for legacy callers and the
+    /// receiver will fall back to a single sequential group.
     pub fn from_block(
         header_bytes: Vec<u8>,
         tx_hashes: &[[u8; 32]],
         prefill_indices: &[usize],
         prefill_tx_bytes: &[Vec<u8>],
+        group_ids: &[u16],
     ) -> Self {
         let nonce = rand_nonce();
         let short_tx_ids: Vec<ShortId> = tx_hashes
@@ -73,6 +95,7 @@ impl CompactBlock {
             short_tx_ids,
             prefilled_txs,
             nonce,
+            group_ids: group_ids.to_vec(),
         }
     }
 

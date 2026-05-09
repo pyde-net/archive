@@ -2005,11 +2005,41 @@ impl PydeNode {
                             }
 
                             let tx_count = transactions.len();
-                            let exec_schedule = pyde_tx::parallel::ExecutionSchedule {
-                                groups: vec![pyde_tx::parallel::ExecutionGroup {
-                                    tx_indices: (0..tx_count).collect(),
-                                }],
-                                total_txs: tx_count,
+                            // Audit 408: prefer the proposer's
+                            // execution-group labels carried in
+                            // `cb.group_ids` so non-proposers run the
+                            // same parallel partition the proposer
+                            // built. Pre-fix this site hardcoded a
+                            // single sequential group, throwing away
+                            // the schedule and forcing every receiver
+                            // onto the slow `groups.len() <= 1` path
+                            // even when the proposer used rayon.
+                            // Length must match `transactions.len()`
+                            // because `group_ids` covers only the
+                            // plaintext prefix of the compact block;
+                            // any divergence (or empty group_ids from
+                            // a legacy sender) falls back to a single
+                            // sequential group.
+                            let exec_schedule = if !cb.group_ids.is_empty()
+                                && cb.group_ids.len() == tx_count
+                            {
+                                wire::group_ids_to_schedule(&cb.group_ids)
+                            } else {
+                                if !cb.group_ids.is_empty() {
+                                    warn!(
+                                        slot,
+                                        group_ids_len = cb.group_ids.len(),
+                                        tx_count,
+                                        "compact-block group_ids length mismatch \
+                                         — falling back to single-group sequential"
+                                    );
+                                }
+                                pyde_tx::parallel::ExecutionSchedule {
+                                    groups: vec![pyde_tx::parallel::ExecutionGroup {
+                                        tx_indices: (0..tx_count).collect(),
+                                    }],
+                                    total_txs: tx_count,
+                                }
                             };
                             let block = pyde_consensus::block::Block {
                                 header: header.clone(),
@@ -2745,11 +2775,21 @@ impl PydeNode {
                                             all_tx_hashes.push(etx.hash());
                                         }
                                     }
+                                    // Audit 408: include the proposer's
+                                    // execution-group labels for the plaintext
+                                    // tx prefix. Without this, every receiver
+                                    // hardcoded a single sequential group on
+                                    // line ~2008, throwing away the proposer's
+                                    // parallel scheduling work.
+                                    let group_ids = wire::schedule_to_group_ids(
+                                        &block.body.execution_schedule,
+                                    );
                                     let compact = pyde_net::propagation::CompactBlock::from_block(
                                         header_bytes,
                                         &all_tx_hashes,
                                         &[],
                                         &[],
+                                        &group_ids,
                                     );
                                     let compact_bytes = wire::encode_compact_block(&compact);
                                     let topic = pyde_net::node::topics::blocks();
@@ -3525,6 +3565,7 @@ impl PydeNode {
                                             &[], // no tx hashes (empty fallback)
                                             &[],
                                             &[],
+                                            &[], // empty group_ids — fallback path has no txs
                                         );
                                         let compact_bytes = wire::encode_compact_block(&compact);
                                         let blocks_topic = pyde_net::node::topics::blocks();

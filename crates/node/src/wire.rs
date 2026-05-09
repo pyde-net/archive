@@ -422,6 +422,55 @@ pub fn decode_reshare_state(data: &[u8]) -> Result<ReshareState, &'static str> {
 // Compact Block
 // ============================================================
 
+/// Audit 408: flatten an ExecutionSchedule into a per-tx group-id
+/// vector for compact-block transmission. `out[i]` is the group label
+/// of the tx at position `i` in `block.body.transactions`. Indices
+/// outside `total_txs` are silently dropped (defensive — should not
+/// occur with a well-formed schedule). Returns an empty vec when the
+/// schedule has more groups than `u16::MAX` can label, in which case
+/// the receiver falls back to single-group sequential apply.
+pub fn schedule_to_group_ids(
+    schedule: &pyde_tx::parallel::ExecutionSchedule,
+) -> Vec<u16> {
+    if schedule.groups.len() > u16::MAX as usize {
+        return Vec::new();
+    }
+    let mut out = vec![0u16; schedule.total_txs];
+    for (gidx, group) in schedule.groups.iter().enumerate() {
+        let label = gidx as u16;
+        for &tx_idx in &group.tx_indices {
+            if tx_idx < out.len() {
+                out[tx_idx] = label;
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of `schedule_to_group_ids`: rebuild an ExecutionSchedule
+/// from the per-tx group labels. Group ordering in the rebuilt
+/// schedule is by ascending label value (BTreeMap iteration), which
+/// is deterministic but does not have to match the original group
+/// ordering — execution semantics depend only on the partition, not
+/// on group order.
+pub fn group_ids_to_schedule(
+    group_ids: &[u16],
+) -> pyde_tx::parallel::ExecutionSchedule {
+    use std::collections::BTreeMap;
+    let mut by_group: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
+    for (tx_idx, &gid) in group_ids.iter().enumerate() {
+        by_group.entry(gid).or_default().push(tx_idx);
+    }
+    let groups: Vec<pyde_tx::parallel::ExecutionGroup> = by_group
+        .into_values()
+        .map(|tx_indices| pyde_tx::parallel::ExecutionGroup { tx_indices })
+        .collect();
+    pyde_tx::parallel::ExecutionSchedule {
+        groups,
+        total_txs: group_ids.len(),
+    }
+}
+
 pub fn encode_compact_block(cb: &pyde_net::propagation::CompactBlock) -> Vec<u8> {
     let mut enc = Encoder::new();
     enc.u8(tag::COMPACT_BLOCK);
@@ -437,6 +486,12 @@ pub fn encode_compact_block(cb: &pyde_net::propagation::CompactBlock) -> Vec<u8>
     for (idx, bytes) in &cb.prefilled_txs {
         enc.u16(*idx);
         enc.var_bytes(bytes);
+    }
+    // Audit 408: per-tx execution-group labels. Empty = legacy
+    // sender; receiver falls back to single sequential group.
+    enc.u32(cb.group_ids.len() as u32);
+    for &gid in &cb.group_ids {
+        enc.u16(gid);
     }
     enc.finish()
 }
@@ -466,11 +521,22 @@ pub fn decode_compact_block(
         let bytes = dec.var_bytes()?;
         prefilled_txs.push((idx, bytes));
     }
+    // Audit 408: empty group_ids = legacy compact block; receiver
+    // falls back to single sequential group at apply time.
+    let gid_count = dec.u32_count(MAX_TXS_PER_BLOCK)?;
+    if gid_count != 0 && gid_count != sid_count {
+        return Err("group_ids length mismatch");
+    }
+    let mut group_ids = Vec::with_capacity(gid_count);
+    for _ in 0..gid_count {
+        group_ids.push(dec.u16()?);
+    }
     Ok(pyde_net::propagation::CompactBlock {
         header,
         short_tx_ids,
         prefilled_txs,
         nonce,
+        group_ids,
     })
 }
 
@@ -1840,6 +1906,101 @@ mod tests {
         bytes.extend_from_slice(&((MAX_TXS_PER_BLOCK as u32) + 1).to_le_bytes());
         let result = decode_compact_block(&bytes);
         assert_eq!(result.err(), Some("decoded count exceeds max"));
+    }
+
+    #[test]
+    fn compact_block_group_ids_roundtrip() {
+        // Audit 408: build a CompactBlock with non-trivial group_ids,
+        // round-trip through encode+decode, confirm labels survive.
+        let cb = pyde_net::propagation::CompactBlock {
+            header: vec![1, 2, 3, 4],
+            short_tx_ids: vec![[0xaa; 8], [0xbb; 8], [0xcc; 8], [0xdd; 8]],
+            prefilled_txs: vec![(1, vec![9, 9, 9])],
+            nonce: 0xdead_beef_cafe_babe,
+            group_ids: vec![0, 1, 0, 2],
+        };
+        let bytes = encode_compact_block(&cb);
+        let restored = decode_compact_block(&bytes).expect("decode");
+        assert_eq!(restored.header, cb.header);
+        assert_eq!(restored.short_tx_ids, cb.short_tx_ids);
+        assert_eq!(restored.prefilled_txs, cb.prefilled_txs);
+        assert_eq!(restored.nonce, cb.nonce);
+        assert_eq!(restored.group_ids, cb.group_ids);
+    }
+
+    #[test]
+    fn compact_block_empty_group_ids_roundtrip() {
+        // Legacy compatibility: empty group_ids must survive the round
+        // trip so receivers can take the single-group fallback path.
+        let cb = pyde_net::propagation::CompactBlock {
+            header: vec![],
+            short_tx_ids: vec![[0u8; 8]; 3],
+            prefilled_txs: vec![],
+            nonce: 0,
+            group_ids: vec![],
+        };
+        let bytes = encode_compact_block(&cb);
+        let restored = decode_compact_block(&bytes).expect("decode");
+        assert!(restored.group_ids.is_empty());
+        assert_eq!(restored.short_tx_ids.len(), 3);
+    }
+
+    #[test]
+    fn compact_block_rejects_group_ids_length_mismatch() {
+        // group_ids length must be either 0 (legacy) or equal to
+        // short_tx_ids length. Any other length is a wire-format
+        // violation and the decoder must reject before any execution
+        // schedule is reconstructed.
+        let mut bytes = vec![tag::COMPACT_BLOCK];
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // header bytes len
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // 3 short ids
+        bytes.extend_from_slice(&[0u8; 8 * 3]);       // short ids
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // 0 prefilled
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // 2 group_ids (mismatch)
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        let result = decode_compact_block(&bytes);
+        assert_eq!(result.err(), Some("group_ids length mismatch"));
+    }
+
+    #[test]
+    fn schedule_to_group_ids_partition_invariant() {
+        // The labeling encoding must round-trip through
+        // group_ids_to_schedule and produce a partition equivalent to
+        // the original — same equivalence classes on tx indices, even
+        // if group ordering or label values differ.
+        let schedule = pyde_tx::parallel::ExecutionSchedule {
+            groups: vec![
+                pyde_tx::parallel::ExecutionGroup { tx_indices: vec![0, 2, 5] },
+                pyde_tx::parallel::ExecutionGroup { tx_indices: vec![1, 4] },
+                pyde_tx::parallel::ExecutionGroup { tx_indices: vec![3] },
+            ],
+            total_txs: 6,
+        };
+        let gids = schedule_to_group_ids(&schedule);
+        assert_eq!(gids.len(), 6);
+        // 0 and 2 share a group; 1 and 4 share; 3 is alone.
+        assert_eq!(gids[0], gids[2]);
+        assert_eq!(gids[2], gids[5]);
+        assert_eq!(gids[1], gids[4]);
+        assert_ne!(gids[0], gids[1]);
+        assert_ne!(gids[0], gids[3]);
+        assert_ne!(gids[1], gids[3]);
+
+        let restored = group_ids_to_schedule(&gids);
+        assert_eq!(restored.total_txs, 6);
+        assert_eq!(restored.groups.len(), 3);
+        // Each restored group is a partition cell; sum of sizes = total.
+        let total: usize = restored.groups.iter().map(|g| g.tx_indices.len()).sum();
+        assert_eq!(total, 6);
+        // Each tx index appears exactly once across all groups.
+        let mut seen = std::collections::HashSet::new();
+        for g in &restored.groups {
+            for &i in &g.tx_indices {
+                assert!(seen.insert(i), "tx index {} appeared in two groups", i);
+            }
+        }
     }
 
     #[test]
