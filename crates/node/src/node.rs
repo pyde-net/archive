@@ -2075,7 +2075,14 @@ impl PydeNode {
                                             mempool_txs.push((etx.hash(), bytes));
                                         }
                                     }
-                                    debug!(
+                                    // Task #94: info — same diagnostic
+                                    // rationale as `compact block
+                                    // reconstructed and buffered`. The
+                                    // encrypted-tx bundle arrives on a
+                                    // separate gossipsub message; loss
+                                    // here is a known cause of body-
+                                    // unavailable cascades.
+                                    info!(
                                         slot,
                                         "reassembled compact block using queued encrypted-tx bundle"
                                     );
@@ -2322,12 +2329,24 @@ impl PydeNode {
                                 let mut pbb = pending_block_bodies.write().await;
                                 pbb.insert(block_hash, block.clone());
                             }
-                            debug!(
+                            // Task #94: keep this at info. Distinguishing
+                            // "compact block never arrived" from "arrived
+                            // but failed to reconstruct" from "arrived,
+                            // reconstructed, but apply skipped" requires
+                            // seeing the success path in operator logs.
+                            // Pre-promotion the reconstruct-success path
+                            // was silent at info level, so the only
+                            // visible chain-stall signal was
+                            // `body unavailable` — which fires on multiple
+                            // upstream causes — and root-causing took
+                            // hours of guesswork. ~1 line per (node, slot)
+                            // under healthy operation, an acceptable cost.
+                            info!(
                                 slot,
                                 block_hash = hex::encode(block_hash),
                                 txs = block.body.transactions.len(),
                                 encrypted = block.body.encrypted_txs.len(),
-                                "compact block reconstructed and buffered (awaiting QC)"
+                                "compact block reconstructed and buffered"
                             );
                         }
                         PostEventAction::BlockProcessed { slot, receipts: receipts_list, tx_hashes } => {

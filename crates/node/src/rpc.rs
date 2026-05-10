@@ -151,6 +151,19 @@ pub trait PydeApi {
     #[method(name = "pyde_stateRoot")]
     async fn state_root(&self) -> Result<String, ErrorObjectOwned>;
 
+    /// Live SMT root from `StateManager::root()` — the root that
+    /// `block_processor` logs as `state_root` after each apply.
+    /// Distinct from `pyde_stateRoot` which returns
+    /// `chain.state_root` (the field copied from the most recently
+    /// applied header). Header-side `state_root` is `[0u8; 32]` for
+    /// most current-codebase blocks because proposers leave it
+    /// blank, so the older RPC is not a useful cross-node
+    /// convergence signal. Task #94: this method exists so the
+    /// chain-wedge regression test can assert that all 4 nodes hold
+    /// identical state after each applied slot.
+    #[method(name = "pyde_smtRoot")]
+    async fn smt_root(&self) -> Result<String, ErrorObjectOwned>;
+
     #[method(name = "pyde_syncing")]
     async fn syncing(&self) -> Result<serde_json::Value, ErrorObjectOwned>;
 
@@ -432,6 +445,11 @@ impl PydeApiServer for RpcServer {
     async fn state_root(&self) -> Result<String, ErrorObjectOwned> {
         let chain = self.state.chain.read().await;
         Ok(format!("0x{}", hex::encode(chain.state_root)))
+    }
+
+    async fn smt_root(&self) -> Result<String, ErrorObjectOwned> {
+        let state = self.state.state.read().await;
+        Ok(format!("0x{}", hex::encode(state.root())))
     }
 
     async fn syncing(&self) -> Result<serde_json::Value, ErrorObjectOwned> {

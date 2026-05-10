@@ -512,6 +512,16 @@ impl TestNetwork {
         rpc_state_root(&self.nodes[node_idx].rpc_url())
     }
 
+    /// Live SMT root via `pyde_smtRoot`. Use this for cross-node
+    /// convergence assertions — `state_root` (`pyde_stateRoot`)
+    /// returns `chain.state_root` which today is `[0u8; 32]` for
+    /// most blocks because proposers don't fill in the header field.
+    /// Task #94 regression tests rely on `smt_root` to detect actual
+    /// post-apply state divergence across the cluster.
+    pub fn smt_root(&self, node_idx: usize) -> Result<String, String> {
+        rpc_smt_root(&self.nodes[node_idx].rpc_url())
+    }
+
     // --------------------------------------------------------------
     // Slashing helpers (slice 6.6)
     // --------------------------------------------------------------
@@ -1284,6 +1294,11 @@ fn rpc_block_number(rpc_url: &str) -> Result<u64, String> {
 
 fn rpc_state_root(rpc_url: &str) -> Result<String, String> {
     let resp = rpc_call(rpc_url, "pyde_stateRoot", "[]")?;
+    parse_hex_result(&resp)
+}
+
+fn rpc_smt_root(rpc_url: &str) -> Result<String, String> {
+    let resp = rpc_call(rpc_url, "pyde_smtRoot", "[]")?;
     parse_hex_result(&resp)
 }
 
