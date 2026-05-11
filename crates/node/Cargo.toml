@@ -50,7 +50,7 @@ jsonrpsee = { version = "0.24", features = ["server", "macros"] }
 tower = "0.4"
 
 # WebSocket subscriptions (bypasses jsonrpsee sink delivery bug)
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 
 # Storage
