@@ -303,8 +303,28 @@ pub struct ValidatorEngine {
     finality_votes: HashMap<u64, Vec<FinalityVote>>,
     /// Buffered proposals per slot (collected during proposal phase, voted after selection).
     buffered_proposals: HashMap<u64, Vec<BufferedProposal>>,
-    /// Whether we've already voted for a given slot (after proposal selection).
-    voted_slots: std::collections::HashSet<u64>,
+    /// Highest view at which we've voted on each slot (audit-94).
+    /// Voting at `(slot, view=0)` does NOT lock out voting at
+    /// `(slot, view=1)` on the deterministic recovery proposal —
+    /// that's the case the view change exists to recover from.
+    /// Sentinel `u64::MAX` means inclusion-violated: voting on
+    /// this slot is permanently disabled regardless of view.
+    voted_view_per_slot: std::collections::HashMap<u64, u64>,
+    /// audit-94: highest view at which this validator has built a
+    /// fallback proposal for each slot. Prevents the double-build
+    /// race where both the gossip and RR view-change-QC paths
+    /// trigger `try_build_fallback_proposal` for the same
+    /// `(slot, view)`. Each build re-stamps `timestamp = now_ms()`
+    /// → different `block_hash` → peers split their fallback votes
+    /// across the two versions → vote-QC never forms → chain
+    /// wedges at the slot the fallback was supposed to recover.
+    /// The companion `buffered_proposals`-based dedup at the top
+    /// of `try_build_fallback_proposal` doesn't catch this: the
+    /// proposer deliberately omits its own fallback from
+    /// `buffered_proposals` (Phase 2 — preserves the
+    /// min-by-`vrf_score` tie-break for cluster-wide vote
+    /// dynamics). This map IS the proposer-side dedup.
+    last_built_fallback_view_per_slot: std::collections::HashMap<u64, u64>,
     /// Seen proposals per slot: (slot, proposer_address) → (header, signature).
     /// Used to detect double-proposing.
     seen_proposals: HashMap<(u64, Address), (BlockHeader, Vec<u8>)>,
@@ -538,7 +558,8 @@ impl ValidatorEngine {
             view_changes: HashMap::new(),
             finality_votes: HashMap::new(),
             buffered_proposals: HashMap::new(),
-            voted_slots: std::collections::HashSet::new(),
+            voted_view_per_slot: std::collections::HashMap::new(),
+            last_built_fallback_view_per_slot: std::collections::HashMap::new(),
             seen_proposals: HashMap::new(),
             seen_votes: HashMap::new(),
             seen_view_changes: HashMap::new(),
@@ -1706,10 +1727,23 @@ impl ValidatorEngine {
     pub fn buffer_proposal(&mut self, header: &BlockHeader, proposer_signature: &[u8]) -> bool {
         let slot = header.slot;
 
-        // Don't buffer if we've already voted for this slot
-        if self.voted_slots.contains(&slot) {
-            debug!(slot, "ignoring late proposal (already voted)");
-            return false;
+        // View-aware late-proposal dedup (audit-94). Voting at view 0
+        // (happy path) does not block buffering a fallback recovery
+        // proposal at view ≥1 — splitting view-0 votes across the
+        // committee is exactly the case the recovery exists for.
+        let proposal_view = pyde_consensus::view_change::decode_fallback_proof(&header.vrf_proof)
+            .map(|(_, v)| v)
+            .unwrap_or(0);
+        if let Some(&voted_view) = self.voted_view_per_slot.get(&slot) {
+            if proposal_view <= voted_view {
+                debug!(
+                    slot,
+                    proposal_view,
+                    voted_view,
+                    "ignoring late proposal (already voted at this or higher view)"
+                );
+                return false;
+            }
         }
 
         // Audit 234 part 3: fallback proposals (built by the
@@ -1916,6 +1950,28 @@ impl ValidatorEngine {
             .map(|p| (p.header.clone(), p.proposer_signature.clone()))
     }
 
+    /// audit-94: resolve the view a buffered proposal was produced
+    /// at by decoding `vrf_proof`. Used by `on_vote`'s equivocation
+    /// detection to distinguish a legit cross-view re-vote (view
+    /// 0 happy-path → view 1 fallback recovery) from a genuine
+    /// same-view double-vote that warrants slashing.
+    ///
+    /// Returns `None` when no buffered proposal at this slot
+    /// matches the hash — caller defensively treats unknown views
+    /// as the same view, preserving the safety property of the
+    /// pre-audit-94 slashing path under partial buffer state.
+    fn view_for_block_hash(&self, slot: u64, block_hash: &[u8; 32]) -> Option<u64> {
+        self.buffered_proposals
+            .get(&slot)?
+            .iter()
+            .find(|p| p.header.hash() == *block_hash)
+            .map(|p| {
+                pyde_consensus::view_change::decode_fallback_proof(&p.header.vrf_proof)
+                    .map(|(_, v)| v)
+                    .unwrap_or(0)
+            })
+    }
+
     /// Flag a slot as having failed the mandatory-inclusion audit (task 026).
     /// Caller is the compact-block reception path in node.rs. A flagged slot
     /// causes `select_and_vote` to skip its vote for this proposal, whatever
@@ -1952,10 +2008,16 @@ impl ValidatorEngine {
     /// actively trying to commit.
     pub fn select_and_vote(&mut self, identity: &ValidatorIdentity) -> Option<ConsensusMessage> {
         let slot = self.consensus.target_height;
+        let current_view = self.consensus.current_view;
 
-        // Don't double-vote
-        if self.voted_slots.contains(&slot) {
-            return None;
+        // View-aware double-vote dedup (audit-94). Re-open the gate
+        // when a view-change-QC has bumped current_view past what we
+        // last voted at, so the fallback recovery proposal becomes
+        // votable.
+        if let Some(&voted_view) = self.voted_view_per_slot.get(&slot) {
+            if voted_view >= current_view {
+                return None;
+            }
         }
 
         // Task 026 — skip vote if the local inclusion audit flagged this slot.
@@ -1964,35 +2026,58 @@ impl ValidatorEngine {
         // the proposal while gas budget remained.
         if self.inclusion_violated_slots.contains(&slot) {
             warn!(slot, "skipping vote: mandatory-inclusion audit failed");
-            // Mark voted so a later arriving compact block that clears the
-            // flag doesn't cause us to belatedly cast a vote. The decision
-            // is final for this slot.
-            self.voted_slots.insert(slot);
+            // Mark voted at MAX view so a later arriving compact block that
+            // clears the flag — even at a higher view — doesn't cause us to
+            // belatedly cast a vote. The decision is final for this slot.
+            self.voted_view_per_slot.insert(slot, u64::MAX);
             return None;
         }
 
+        // View-aware proposal selection. After a VC QC bumps
+        // current_view, only proposals at the current view are
+        // legitimate candidates: a stale view-0 happy-path proposal
+        // sitting in the buffer would otherwise win min-by-vrf-score
+        // (raw VRF bytes can be smaller than fallback's
+        // committee_index) and pull us back into voting on the
+        // wrong view. Filter buffered proposals to those whose
+        // encoded view matches `current_view`.
         let proposals = self.buffered_proposals.get(&slot)?;
         if proposals.is_empty() {
             return None;
         }
-
-        // Pick the proposal with the lowest VRF score (clone to release borrow)
-        let best = proposals.iter().min_by_key(|p| p.vrf_score)?;
+        let best = proposals
+            .iter()
+            .filter(|p| {
+                let v = pyde_consensus::view_change::decode_fallback_proof(&p.header.vrf_proof)
+                    .map(|(_, v)| v)
+                    .unwrap_or(0);
+                v == current_view
+            })
+            .min_by_key(|p| p.vrf_score)?;
         let best_header = best.header.clone();
         let best_score = best.vrf_score;
         let best_proposer = best.header.proposer;
 
         info!(
             slot,
+            current_view,
             vrf_score = best_score,
             proposer = hex::encode(best_proposer),
             "selected best proposal"
         );
 
-        // Vote for the best proposal
+        // Vote for the best proposal. The view we record matches
+        // the proposal's encoded view (= current_view, by filter).
         let vote = self.on_proposal(&best_header, identity);
         if vote.is_some() {
-            self.voted_slots.insert(slot);
+            self.voted_view_per_slot
+                .entry(slot)
+                .and_modify(|v| {
+                    if current_view > *v {
+                        *v = current_view;
+                    }
+                })
+                .or_insert(current_view);
         }
         vote
     }
@@ -2196,12 +2281,48 @@ impl ValidatorEngine {
             mine = identity.committee_index,
             "DBG fallback: I am the deterministic leader for (target_height, current_view); building"
         );
-        // Don't double-build.
-        if self
-            .buffered_proposals
-            .get(&slot)
-            .is_some_and(|v| v.iter().any(|p| p.header.proposer == identity.address))
-        {
+        // audit-94: proposer-side build dedup. Both the gossip-VC and
+        // the RR-VC paths can independently trigger this builder
+        // within the same view-change-QC formation window — without
+        // this gate, we build TWO fallback proposals at the same
+        // `(slot, view)`. Each carries `timestamp = now_ms()` so
+        // their `block_hash`es differ. Peers receive both, vote-split
+        // 1+1+1 across the two block_hashes, and the vote-QC never
+        // reaches quorum even though three legitimate votes were
+        // cast. The chain wedges at the very slot the fallback was
+        // supposed to recover. Witness: diag stall, slot 1, two
+        // back-to-back "built fallback proposal" logs ~1.4ms apart,
+        // zero subsequent "QC formed" until the test panics.
+        //
+        // The `buffered_proposals`-based dedup just below is a
+        // separate guard against happy-path proposal interference;
+        // it can't catch this one because the proposer deliberately
+        // omits its own fallback from `buffered_proposals`.
+        if let Some(&built_view) = self.last_built_fallback_view_per_slot.get(&slot) {
+            if built_view >= view {
+                info!(
+                    slot,
+                    view,
+                    built_view,
+                    "fallback skip: already built fallback at this view"
+                );
+                return None;
+            }
+        }
+        // Don't double-build at the SAME (slot, view) via the
+        // buffered-proposals path either: a happy-path (view-0)
+        // proposal from this node MUST NOT block building a
+        // higher-view fallback recovery proposal — that's exactly
+        // the case the view change exists to recover from. Only skip
+        // if a fallback proposal from this node at THIS exact view
+        // is already buffered (e.g. via a gossip-echo round-trip).
+        if self.buffered_proposals.get(&slot).is_some_and(|v| {
+            v.iter().any(|p| {
+                p.header.proposer == identity.address
+                    && pyde_consensus::view_change::decode_fallback_proof(&p.header.vrf_proof)
+                        .is_some_and(|(_, v)| v == view)
+            })
+        }) {
             return None;
         }
 
@@ -2231,8 +2352,20 @@ impl ValidatorEngine {
 
         info!(
             slot,
+            view,
             "built fallback proposal as deterministic view-change fallback proposer"
         );
+        // Record the (slot, view) build so the second trigger from
+        // the dual gossip+RR view-change-QC path bails out instead
+        // of producing a second timestamped block_hash.
+        self.last_built_fallback_view_per_slot
+            .entry(slot)
+            .and_modify(|v| {
+                if view > *v {
+                    *v = view;
+                }
+            })
+            .or_insert(view);
         Some(Block {
             header,
             body: BlockBody {
@@ -2411,42 +2544,97 @@ impl ValidatorEngine {
         }
 
         // --- Double-vote (equivocation) detection ---
-        // Note: `vote_key` is already declared above for the audit-327
-        // dedup short-circuit. We re-use the same binding here.
-        // Clone the prior vote out so we can drop the `seen_votes` borrow
-        // before calling `ingest_evidence` (which needs `&mut self`).
+        // audit-94: equivocation is defined within a single
+        // `(slot, view)` window. A validator that votes at view 0
+        // (happy-path) and again at view 1 (deterministic recovery
+        // after the view-change-QC) signs two different block_hashes
+        // for the same `(slot, voter_index)` — but those are
+        // legitimate, non-equivocating votes. Pre-audit-94 the check
+        // here was view-blind and would slash honest validators
+        // wedged into recovery. We resolve each block_hash's view
+        // via `view_for_block_hash` (which inspects buffered
+        // proposals) and only slash when both votes were cast at
+        // the same view.
+        //
+        // Defensive default: when a view is unknown (proposal not
+        // buffered locally), treat it as the same view as the other
+        // — preserves the original slashing behaviour under partial
+        // buffer state, accepting some false-positive risk over
+        // missing a real equivocation.
         if let Some((prev_hash, prev_sig)) = self.seen_votes.get(&vote_key).cloned() {
             if prev_hash != block_hash {
-                warn!(
-                    slot,
-                    voter_index,
-                    offender = hex::encode(voter_address),
-                    "DOUBLE VOTE DETECTED — equivocation"
+                let prev_view = self.view_for_block_hash(slot, &prev_hash);
+                let cur_view = self.view_for_block_hash(slot, &block_hash);
+                // Only slash when we KNOW both votes were cast at the
+                // SAME view. Unknown view = vote arrived before its
+                // proposal was buffered (legitimate race under load) —
+                // treat as cross-view and track the new vote rather
+                // than risk slashing an honest validator. This loses
+                // some real-equivocation detection coverage; a
+                // malicious slasher could still construct evidence
+                // and submit it as a Slash tx, and the chain-side
+                // `verify_double_sign` would still accept it. Mainnet
+                // hardening requires committing `view` to the vote
+                // signature so the on-chain verifier can refuse
+                // cross-view evidence.
+                let confirmed_same_view = matches!(
+                    (prev_view, cur_view),
+                    (Some(p), Some(c)) if p == c
                 );
-                // Construct evidence from both votes and route through
-                // `ingest_evidence`, mirroring the double-propose path.
-                // ingest_evidence re-verifies both signatures, dedups on
-                // (slot, signer), pushes to pending + broadcast queues,
-                // and persists to disk before returning — a crash between
-                // detection and the next slot can no longer drop the
-                // evidence (finder's-fee + slashing preserved).
-                let evidence = DoubleSignEvidence {
-                    slot,
-                    block_hash_1: prev_hash,
-                    signature_1: prev_sig,
-                    block_hash_2: block_hash,
-                    signature_2: vote_sig.clone(),
-                    signer: voter_address,
-                    // Filled in by whichever validator broadcasts the
-                    // Slash tx — typically the next block proposer.
-                    submitter: [0u8; 32],
-                };
-                if self.ingest_evidence(evidence) {
-                    info!(
+                if confirmed_same_view {
+                    warn!(
                         slot,
+                        voter_index,
                         offender = hex::encode(voter_address),
-                        "double-vote evidence queued for slashing"
+                        "DOUBLE VOTE DETECTED — equivocation"
                     );
+                    // Construct evidence from both votes and route through
+                    // `ingest_evidence`, mirroring the double-propose path.
+                    // ingest_evidence re-verifies both signatures, dedups on
+                    // (slot, signer), pushes to pending + broadcast queues,
+                    // and persists to disk before returning — a crash between
+                    // detection and the next slot can no longer drop the
+                    // evidence (finder's-fee + slashing preserved).
+                    let evidence = DoubleSignEvidence {
+                        slot,
+                        block_hash_1: prev_hash,
+                        signature_1: prev_sig,
+                        block_hash_2: block_hash,
+                        signature_2: vote_sig.clone(),
+                        signer: voter_address,
+                        // Filled in by whichever validator broadcasts the
+                        // Slash tx — typically the next block proposer.
+                        submitter: [0u8; 32],
+                    };
+                    if self.ingest_evidence(evidence) {
+                        info!(
+                            slot,
+                            offender = hex::encode(voter_address),
+                            "double-vote evidence queued for slashing"
+                        );
+                    }
+                } else {
+                    debug!(
+                        slot,
+                        voter_index,
+                        prev_view = ?prev_view,
+                        cur_view = ?cur_view,
+                        "cross-view re-vote — not equivocation, tracking new vote"
+                    );
+                    // Track the latest vote so future same-view re-votes
+                    // from this voter are still detected.
+                    if let Some(store) = &self.consensus_store {
+                        if let Err(e) = store.save_seen_vote(
+                            slot,
+                            voter_index as u8,
+                            &block_hash,
+                            &vote_sig,
+                        ) {
+                            self.signal_persist_failure("seen-vote", &e.to_string());
+                        }
+                    }
+                    self.seen_votes
+                        .insert(vote_key, (block_hash, vote_sig.clone()));
                 }
             }
         } else {
@@ -3163,14 +3351,30 @@ impl ValidatorEngine {
         self.persist_consensus();
         let new_slot = self.consensus.current_slot;
 
-        // Clean up old vote/view-change data (keep last 10 slots)
+        // Clean up old vote/view-change data (keep last 10 slots).
+        // audit-94: NEVER prune `target_height` itself, regardless of
+        // how far wall-clock has raced ahead. Pre-fix, a wedged
+        // target_height + 10+-slot wall-clock drift erased the
+        // recovery data for the wedged slot, making the wedge
+        // permanent. The `prune_floor = min(prune_before, target)`
+        // clamp keeps target_height (and everything above) intact
+        // on the wedged path while preserving the original 10-slot
+        // window on the healthy path. Equivocation-detection state
+        // (`seen_votes`, `seen_proposals`, `seen_view_changes`)
+        // still anchors on the original wall-clock window so its
+        // gossip-replay protection isn't affected by wedges.
         if new_slot > 10 {
             let prune_before = new_slot - 10;
-            self.votes.retain(|s, _| *s >= prune_before);
-            self.view_changes.retain(|s, _| *s >= prune_before);
-            self.finality_votes.retain(|s, _| *s >= prune_before);
-            self.buffered_proposals.retain(|s, _| *s >= prune_before);
-            self.voted_slots.retain(|s| *s >= prune_before);
+            let prune_floor = std::cmp::min(prune_before, self.consensus.target_height);
+            self.votes.retain(|s, _| *s >= prune_floor);
+            self.view_changes.retain(|s, _| *s >= prune_floor);
+            self.finality_votes.retain(|s, _| *s >= prune_floor);
+            self.buffered_proposals
+                .retain(|s, _| *s >= prune_floor);
+            self.voted_view_per_slot
+                .retain(|s, _| *s >= prune_floor);
+            self.last_built_fallback_view_per_slot
+                .retain(|s, _| *s >= prune_floor);
             self.seen_proposals.retain(|(s, _), _| *s >= prune_before);
             self.seen_votes.retain(|(s, _), _| *s >= prune_before);
             // Audit 327: prune the dedup sets in lockstep with their
@@ -3222,6 +3426,28 @@ impl ValidatorEngine {
     pub fn set_slot_anchor(&mut self, genesis_timestamp_ms: u64, block_time_ms: u64) {
         self.genesis_timestamp_ms = genesis_timestamp_ms;
         self.block_time_ms = block_time_ms;
+
+        // Audit-94: re-anchor the *initial* TimeoutTracker now that
+        // the slot clock is known. The tracker created in `new()`
+        // was anchored to engine-creation-time because the genesis
+        // timestamp wasn't available yet — and engine creation
+        // typically runs 100–300 ms before slot 1's wall-clock
+        // window begins. Without this re-anchor, the 200 ms
+        // `PROPOSAL_TIMEOUT_MS` expires before slot 1 even starts,
+        // firing a spurious view-change. That early VC cascades:
+        // peers form a VC-QC at slot 1, then every subsequent
+        // wall-clock tick layers a happy-path proposal on top of
+        // a chain still in recovery, splitting votes between
+        // forward progress and the fallback candidate and wedging
+        // the chain permanently at startup.
+        //
+        // Only the initial tracker needs this fix; `advance_target_
+        // height` (audit 408) already anchors to the new slot's
+        // wall-clock start once the chain is moving.
+        if !self.timeout.proposal_received && self.timeout.view_change_qc.is_none() {
+            let slot_start_ms = self.slot_start_ms_for_target(self.timeout.slot);
+            self.timeout.slot_start_ms = slot_start_ms;
+        }
     }
 
     /// Wall-clock instant (Unix ms) when slot `target` begins.
@@ -3617,7 +3843,7 @@ mod tests {
         // engine should treat the slot as "voted" for this round, so that
         // a compact block that clears the flag late cannot cause a
         // belated vote.
-        assert!(engine.voted_slots.contains(&slot));
+        assert!(engine.voted_view_per_slot.contains_key(&slot));
         assert!(engine.select_and_vote(&identities[1]).is_none());
     }
 
@@ -4831,7 +5057,14 @@ mod tests {
         // produce DoubleSignEvidence in `pending_evidence` instead of
         // just a log line. Before this fix, a validator that crashed
         // between detection and the next slot lost the slashing signal.
+        //
+        // Audit-94 update: equivocation slashing is now view-aware to
+        // avoid false-positives on honest cross-view re-votes. The
+        // detector requires KNOWN same-view for both votes (via the
+        // proposals buffered for those hashes); construct two real
+        // headers at view 0 and buffer them so the lookup resolves.
         use pyde_consensus::hotstuff::{proposer_sign_message, ConsensusMessage};
+        use pyde_consensus::block::{BlockHeader, QuorumCert};
         use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
 
         let (pk, sk) = falcon_keygen().unwrap();
@@ -4843,8 +5076,32 @@ mod tests {
         engine.set_committee(vec![pk_bytes]);
 
         let slot = 7u64;
-        let hash_a = [0x01u8; 32];
-        let hash_b = [0x02u8; 32];
+
+        // Build two distinct headers at view 0 (vrf_proof omitted →
+        // decode_fallback_proof returns None → view defaults to 0).
+        let mut header_a = BlockHeader {
+            slot,
+            epoch: 0,
+            parent_hash: [0u8; 32],
+            proposer: signer,
+            vrf_proof: vec![],
+            qc_previous: QuorumCert::empty(),
+            tx_root: [0u8; 32],
+            state_root: [0u8; 32],
+            timestamp: 100,
+        };
+        let mut header_b = header_a.clone();
+        header_b.timestamp = 200; // differ in one byte → different hash
+        let hash_a = header_a.hash();
+        let hash_b = header_b.hash();
+        assert_ne!(hash_a, hash_b);
+
+        engine.buffered_proposals.entry(slot).or_default().push(
+            BufferedProposal { header: header_a, proposer_signature: vec![], vrf_score: 0 },
+        );
+        engine.buffered_proposals.entry(slot).or_default().push(
+            BufferedProposal { header: header_b, proposer_signature: vec![], vrf_score: 0 },
+        );
 
         let sign_vote = |h: &[u8; 32]| -> Vec<u8> {
             falcon_sign(&sk, &proposer_sign_message(TEST_CHAIN_ID, slot, h))
@@ -5273,6 +5530,11 @@ mod tests {
             },
         );
 
+        // Audit-94: prune_floor = min(slot - 10, target_height). To
+        // exercise the steady-state pruning path (not the wedged-
+        // chain protective clamp), advance target_height beyond
+        // the prune_before cutoff so the floor is `slot - 10`.
+        engine.consensus.target_height = 10;
         // Advance past slot 15 to trigger pruning (prune < slot - 10 = 5)
         engine.consensus.current_slot = 14;
         engine.advance_slot(); // now at 15

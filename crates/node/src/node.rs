@@ -1290,9 +1290,18 @@ impl PydeNode {
                             let block = match block {
                                 Some(b) => b,
                                 None => {
+                                    // Task #94: same recovery path as the
+                                    // gossip-VC body-unavailable site below.
+                                    let fired = chain_sync.request_block_by_hash(
+                                        &mut swarm,
+                                        qc_slot,
+                                        qc_block_hash,
+                                        4,
+                                    );
                                     info!(
                                         qc_slot,
-                                        "RR-QC canonical apply: body unavailable"
+                                        recovery_requests = fired,
+                                        "RR-QC canonical apply: body unavailable — fired GetBlockByHash"
                                     );
                                     continue;
                                 }
@@ -1804,9 +1813,30 @@ impl PydeNode {
                             let block = match block {
                                 Some(b) => b,
                                 None => {
+                                    // Task #94: fire `GetBlockByHash` to a few
+                                    // connected peers. The proposer holds the
+                                    // body in its `block_store`; the response
+                                    // handler will populate
+                                    // `pending_block_bodies` and re-emit
+                                    // `ApplyCanonicalAfterQc` so this branch
+                                    // retries the apply with the body in hand.
+                                    // Without this recovery path the QC apply
+                                    // here was silent — sync's `GetBlocks`
+                                    // is slot-keyed and useless under load
+                                    // because every peer reports the same
+                                    // head; only a hash-keyed request can
+                                    // reach the one peer that actually has
+                                    // the body.
+                                    let fired = chain_sync.request_block_by_hash(
+                                        &mut swarm,
+                                        qc_slot,
+                                        qc_block_hash,
+                                        4,
+                                    );
                                     info!(
                                         qc_slot,
-                                        "ApplyCanonicalAfterQc: body unavailable (sync will recover)"
+                                        recovery_requests = fired,
+                                        "ApplyCanonicalAfterQc: body unavailable — fired GetBlockByHash"
                                     );
                                     continue;
                                 }
@@ -1910,6 +1940,57 @@ impl PydeNode {
                                     );
                                 }
                             }
+                        }
+                        PostEventAction::RecoveredBlockByHashForQc {
+                            qc_slot,
+                            qc_block_hash,
+                            block_bytes,
+                        } => {
+                            // Task #94: a peer responded to our
+                            // GetBlockByHash recovery request. Decode
+                            // the bytes, validate the header hashes
+                            // to the expected `qc_block_hash`
+                            // (defense-in-depth against a peer
+                            // returning the wrong block — the QC
+                            // ultimately gates apply but we'd rather
+                            // not pollute `pending_block_bodies`),
+                            // seed the body buffer, and tail-call
+                            // `ApplyCanonicalAfterQc` to retry the
+                            // apply with the recovered body in hand.
+                            let block = match wire::decode_block(&block_bytes) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!(
+                                        qc_slot,
+                                        error = e,
+                                        "task #94: GetBlockByHash response failed to decode"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let actual_hash = block.header.hash();
+                            if actual_hash != qc_block_hash {
+                                warn!(
+                                    qc_slot,
+                                    expected = hex::encode(qc_block_hash),
+                                    got = hex::encode(actual_hash),
+                                    "task #94: GetBlockByHash response hash mismatch — discarding"
+                                );
+                                continue;
+                            }
+                            {
+                                let mut pbb = pending_block_bodies.write().await;
+                                pbb.insert(actual_hash, block);
+                            }
+                            info!(
+                                qc_slot,
+                                qc_block_hash = hex::encode(qc_block_hash),
+                                "task #94: recovered block via GetBlockByHash — retrying canonical apply"
+                            );
+                            next_action = Some(PostEventAction::ApplyCanonicalAfterQc {
+                                qc_slot,
+                                qc_block_hash,
+                            });
                         }
                         PostEventAction::BufferCompetingBlock(block) => {
                             // Audit 232: a competing block at our head slot
@@ -3229,9 +3310,24 @@ impl PydeNode {
                                                     }
                                                 }
                                                 None => {
-                                                    debug!(
+                                                    // Task #94: same recovery
+                                                    // path as the other two
+                                                    // body-unavailable sites
+                                                    // — fan out
+                                                    // `GetBlockByHash` so the
+                                                    // proposer (who has the
+                                                    // body in `block_store`)
+                                                    // can serve it back.
+                                                    let fired = chain_sync.request_block_by_hash(
+                                                        &mut swarm,
+                                                        qc_slot,
+                                                        qc_hash,
+                                                        4,
+                                                    );
+                                                    info!(
                                                         slot = qc_slot,
-                                                        "own-vote-QC inline apply: body unavailable for non-empty block (sync will recover)"
+                                                        recovery_requests = fired,
+                                                        "own-vote-QC inline apply: body unavailable — fired GetBlockByHash"
                                                     );
                                                     continue;
                                                 }
@@ -4314,6 +4410,21 @@ enum PostEventAction {
     ApplyCanonicalAfterQc {
         qc_slot: u64,
         qc_block_hash: [u8; 32],
+    },
+    /// Task #94: a `GetBlockByHash` response arrived carrying a
+    /// candidate full-block payload for `qc_block_hash`. The async
+    /// handler decodes the bytes, validates the header hashes to
+    /// the expected QC block_hash (rejects byte-flips and
+    /// peer-injected mismatches), seeds `pending_block_bodies`,
+    /// and re-emits `ApplyCanonicalAfterQc` so the canonical apply
+    /// path retries with the recovered body in hand. Drives the
+    /// QC-apply body-unavailable recovery path — without this the
+    /// chain wedges any time the compact-block gossip is dropped
+    /// before reaching all peers.
+    RecoveredBlockByHashForQc {
+        qc_slot: u64,
+        qc_block_hash: [u8; 32],
+        block_bytes: Vec<u8>,
     },
     /// Reply to an inbound `PydeAuthReq` with a signed attestation over
     /// `(nonce, our_peer_id)`. The response channel holds the pending
@@ -5855,6 +5966,42 @@ fn handle_swarm_event(
                 },
             ..
         })) => {
+            // Task #94: special-case `BlockByHash` BEFORE the
+            // batch-style `on_response` dispatch. This response
+            // shape carries one full-block bytes blob keyed by the
+            // hash we requested at the body-unavailable recovery
+            // site; we validate the hash, populate
+            // `pending_block_bodies`, and re-emit
+            // `ApplyCanonicalAfterQc` so the apply path retries
+            // with the recovered body. Pre-handling here keeps
+            // `on_response` focused on the slot-keyed batch path.
+            if let SyncResp::BlockByHash(maybe_bytes) = &response {
+                let pending_entry = chain_sync
+                    .pending_block_by_hash
+                    .remove(&request_id);
+                chain_sync.release_pending(request_id);
+                if let Some((qc_slot, qc_block_hash)) = pending_entry {
+                    if let Some(bytes) = maybe_bytes {
+                        return PostEventAction::RecoveredBlockByHashForQc {
+                            qc_slot,
+                            qc_block_hash,
+                            block_bytes: bytes.clone(),
+                        };
+                    } else {
+                        debug!(
+                            qc_slot,
+                            qc_block_hash = hex::encode(qc_block_hash),
+                            "task #94: BlockByHash recovery — peer didn't have the block"
+                        );
+                        return PostEventAction::None;
+                    }
+                } else {
+                    debug!(
+                        "task #94: BlockByHash response with no matching pending entry"
+                    );
+                    return PostEventAction::None;
+                }
+            }
             // Audit 241: hand the snapshot path the full WS anchor
             // (slot + state_root) so it can reject snapshots that
             // either regress past the checkpoint or land on a

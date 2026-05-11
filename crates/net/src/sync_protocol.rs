@@ -23,6 +23,14 @@ pub enum SyncReq {
     GetStateSnapshot,
     /// Request a single chunk of a state snapshot (for large states).
     GetStateSnapshotChunk { chunk_index: u32, chunk_size: u32 },
+    /// Task #94: request a single block by its block_hash. Used by
+    /// the QC-apply body-unavailable recovery path: we have the QC
+    /// (so we know the canonical block_hash) but no body — slot-
+    /// based GetBlocks is useless here because every peer at the
+    /// same head reports "I'm at slot N too" without distinguishing
+    /// who actually has the body. The proposer always does, and
+    /// will respond. Other peers respond with `BlockByHash(None)`.
+    GetBlockByHash([u8; 32]),
 }
 
 /// Sync response from peer.
@@ -49,6 +57,14 @@ pub enum SyncResp {
         chunk_hash: [u8; 32],
         entries: Vec<(Vec<u8>, Vec<u8>)>,
     },
+    /// Task #94: response to `GetBlockByHash`. `Some(bytes)` is the
+    /// wire-encoded full block (header + body + proposer_signature)
+    /// keyed by the requested block_hash; `None` means the peer
+    /// doesn't have it. Distinct from top-level `NotFound` so the
+    /// caller can tell "peer doesn't have THIS block" (try another
+    /// peer) from "peer didn't understand the request" (protocol
+    /// error).
+    BlockByHash(Option<Vec<u8>>),
     /// Peer doesn't have the requested data.
     NotFound,
 }
@@ -90,5 +106,36 @@ mod tests {
         let resp = SyncResp::NotFound;
         let bytes = serde_json::to_vec(&resp).unwrap();
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn get_block_by_hash_roundtrip() {
+        // Task #94: GetBlockByHash carries a 32-byte hash and the
+        // response is `Option<Vec<u8>>` so receivers can distinguish
+        // "I don't have this block" from "I don't understand this
+        // request". Cover both cases.
+        let req = SyncReq::GetBlockByHash([0xAB; 32]);
+        let req_bytes = serde_json::to_vec(&req).unwrap();
+        let req_back: SyncReq = serde_json::from_slice(&req_bytes).unwrap();
+        match req_back {
+            SyncReq::GetBlockByHash(h) => assert_eq!(h, [0xAB; 32]),
+            _ => panic!("wrong variant after roundtrip"),
+        }
+
+        let resp_some = SyncResp::BlockByHash(Some(b"block-bytes".to_vec()));
+        let bytes = serde_json::to_vec(&resp_some).unwrap();
+        let back: SyncResp = serde_json::from_slice(&bytes).unwrap();
+        match back {
+            SyncResp::BlockByHash(Some(b)) => assert_eq!(b, b"block-bytes"),
+            other => panic!("wrong variant: {:?}", other),
+        }
+
+        let resp_none = SyncResp::BlockByHash(None);
+        let bytes = serde_json::to_vec(&resp_none).unwrap();
+        let back: SyncResp = serde_json::from_slice(&bytes).unwrap();
+        match back {
+            SyncResp::BlockByHash(None) => {}
+            other => panic!("wrong variant: {:?}", other),
+        }
     }
 }

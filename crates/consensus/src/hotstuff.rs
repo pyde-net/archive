@@ -98,8 +98,15 @@ pub struct ConsensusState {
     pub current_epoch: u64,
     /// The highest QC this validator has seen.
     pub highest_qc: QuorumCert,
-    /// The last voted slot (prevent double voting).
+    /// Last voted slot, paired with `last_voted_view` to form the
+    /// HotStuff `(slot, view)` lex-monotonic safety predicate. A
+    /// vote on `(N, 0)` does not preclude a vote on `(N, V≥1)` —
+    /// the higher-view vote is the recovery proposal that breaks
+    /// happy-path wedges (audit-94).
     pub last_voted_slot: u64,
+    /// View of the last vote. 0 for happy-path proposals, ≥1 for
+    /// fallback recovery proposals.
+    pub last_voted_view: u64,
     /// The last committed block hash.
     pub last_committed_hash: [u8; 32],
     /// Last committed slot.
@@ -123,6 +130,7 @@ impl ConsensusState {
             current_epoch: 0,
             highest_qc: QuorumCert::empty(),
             last_voted_slot: 0,
+            last_voted_view: 0,
             last_committed_hash: [0u8; 32],
             last_committed_slot: 0,
             // Genesis is at slot 0; the first slot we try to commit is 1.
@@ -182,7 +190,11 @@ impl Default for ConsensusState {
 ///
 /// Safety rule: only vote if:
 /// 1. The proposal extends the highest QC we've seen
-/// 2. We haven't voted for this slot yet
+/// 2. `(slot, proposal_view)` is strictly greater than
+///    `(last_voted_slot, last_voted_view)` in lex order — the
+///    HotStuff `(slot, view)` monotonic-voting predicate.
+///    Voting at `(N, 0)` does not lock out `(N, V≥1)` recovery
+///    (audit-94).
 pub fn create_vote(
     chain_id: u64,
     state: &mut ConsensusState,
@@ -192,8 +204,16 @@ pub fn create_vote(
     voter_sk: &pyde_crypto::falcon::FalconSecretKey,
     committee_keys: &[Vec<u8>],
 ) -> Result<Option<ConsensusMessage>, &'static str> {
-    // Safety: don't double-vote
-    if header.slot <= state.last_voted_slot {
+    // Decode the proposal's view from `vrf_proof`: encoded by
+    // `encode_fallback_proof` for fallback proposals, absent
+    // (raw VRF bytes) for happy-path proposals which are
+    // implicitly view 0.
+    let proposal_view = crate::view_change::decode_fallback_proof(&header.vrf_proof)
+        .map(|(_, v)| v)
+        .unwrap_or(0);
+    // Safety: lex monotonicity over `(slot, view)`. Strictly
+    // greater — equality is "we already cast this exact vote".
+    if (header.slot, proposal_view) <= (state.last_voted_slot, state.last_voted_view) {
         return Ok(None);
     }
 
@@ -225,6 +245,7 @@ pub fn create_vote(
         pyde_crypto::falcon::falcon_sign(voter_sk, &vote_msg).map_err(|_| "vote signing failed")?;
 
     state.last_voted_slot = header.slot;
+    state.last_voted_view = proposal_view;
 
     Ok(Some(ConsensusMessage::Vote {
         slot: header.slot,

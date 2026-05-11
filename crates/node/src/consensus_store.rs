@@ -580,6 +580,7 @@ mod tests {
                 signatures: vec![vec![0x11; 600], vec![0x22; 600]],
             },
             last_voted_slot: 100,
+            last_voted_view: 0,
             last_committed_hash: [0xCD; 32],
             last_committed_slot: 98,
             target_height: 100,
