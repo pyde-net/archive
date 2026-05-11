@@ -5,7 +5,7 @@ version.workspace = true
 edition = "2021"
 
 [dependencies]
-p3-goldilocks = "0.4"
+p3-goldilocks = "0.5"
 p3-field = "0.4"
 p3-poseidon2 = "0.4"
 p3-symmetric = "0.4"
