@@ -41,6 +41,21 @@ pub struct ValidatorIdentity {
     pub committee_index: u8,
     /// Threshold decryption key share for MEV-protected mempool.
     pub key_share: Option<KeyShare>,
+    /// Task #95: long-lived per-validator KEM keypair used for
+    /// receiving encrypted shares during DKG. Other committee members
+    /// encrypt this validator's `delta[v]` row to `kem_public_key`
+    /// using Kyber-KEM + AEAD; only the holder of `kem_secret_key`
+    /// can decrypt their share. Persisted at `<datadir>/kem.key`,
+    /// pk is published on-chain as part of the validator's
+    /// `ValidatorEntry` so peers can discover it.
+    ///
+    /// Long-lived rather than per-epoch: simpler bookkeeping at the
+    /// cost of forward secrecy — a stolen `kem_secret_key` lets the
+    /// attacker decrypt every past DKG share addressed to this
+    /// validator. Forward-secret per-epoch ephemeral KEM keys are a
+    /// follow-up once the long-lived path is stable.
+    pub kem_public_key: pyde_crypto::kyber::KyberPublicKey,
+    pub kem_secret_key: pyde_crypto::kyber::KyberSecretKey,
 }
 
 /// Verify that a validator has sufficient stake on-chain.
@@ -112,6 +127,7 @@ pub fn load_validator_set_from_state(
                 stake: entry.stake,
                 status,
                 registered_epoch: 0,
+                kem_pk: entry.kem_pk,
             });
         }
     }
@@ -3437,12 +3453,15 @@ mod tests {
         let (pk, sk) = falcon_keygen().unwrap();
         let pk_bytes = pk.as_bytes().to_vec();
         let address = derive_eoa_address(&pk_bytes);
+        let (kem_pk, kem_sk) = pyde_crypto::kyber::kyber_keygen().unwrap();
         ValidatorIdentity {
             address,
             public_key: pk,
             secret_key: sk,
             committee_index: index,
             key_share: None,
+            kem_public_key: kem_pk,
+            kem_secret_key: kem_sk,
         }
     }
 
@@ -4980,12 +4999,15 @@ mod tests {
         // is the validator that will build the block and submit evidence.
         let (pk, sk) = falcon_keygen().unwrap();
         let submitter_addr = pyde_account::address::derive_eoa_address(pk.as_bytes());
+        let (kem_pk, kem_sk) = pyde_crypto::kyber::kyber_keygen().unwrap();
         let identity = ValidatorIdentity {
             address: submitter_addr,
             public_key: pk.clone(),
             secret_key: sk,
             committee_index: 0,
             key_share: None,
+            kem_public_key: kem_pk,
+            kem_secret_key: kem_sk,
         };
 
         let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
@@ -5039,6 +5061,7 @@ mod tests {
             status: 0x00,
             last_claimed_at: 0,
             exit_block: None,
+            kem_pk: None,
         };
         smt.insert(
             pyde_state::keys::validator_key(&offender_addr),
@@ -5084,12 +5107,15 @@ mod tests {
             .to_vec();
 
         // Push into the engine's queue, exactly as the detection site does.
+        let (sub_kem_pk, sub_kem_sk) = pyde_crypto::kyber::kyber_keygen().unwrap();
         let identity = ValidatorIdentity {
             address: submitter_addr,
             public_key: submitter_pk,
             secret_key: submitter_sk,
             committee_index: 0,
             key_share: None,
+            kem_public_key: sub_kem_pk,
+            kem_secret_key: sub_kem_sk,
         };
         // Engine is bound to the same chain_id as the block context so
         // its `ingest_evidence` (when used) and on-chain handler agree.
@@ -5338,6 +5364,7 @@ mod tests {
 
         // Create threshold keys and assign one share
         let (tpk, key_shares) = pyde_crypto::threshold::threshold_keygen(3, 2).unwrap();
+        let (kem_pk_a, kem_sk_a) = pyde_crypto::kyber::kyber_keygen().unwrap();
 
         let identity = ValidatorIdentity {
             address,
@@ -5345,6 +5372,8 @@ mod tests {
             secret_key: sk,
             committee_index: 0,
             key_share: Some(key_shares[0].clone()),
+            kem_public_key: kem_pk_a,
+            kem_secret_key: kem_sk_a,
         };
 
         // Create an encrypted tx to generate shares for
@@ -5381,6 +5410,7 @@ mod tests {
         let address = derive_eoa_address(&pk_bytes);
 
         let (tpk, key_shares) = pyde_crypto::threshold::threshold_keygen(3, 2).unwrap();
+        let (kem_pk_b, kem_sk_b) = pyde_crypto::kyber::kyber_keygen().unwrap();
 
         let identity = ValidatorIdentity {
             address,
@@ -5388,6 +5418,8 @@ mod tests {
             secret_key: sk,
             committee_index: 0,
             key_share: Some(key_shares[0].clone()),
+            kem_public_key: kem_pk_b,
+            kem_secret_key: kem_sk_b,
         };
 
         let to = derive_eoa_address(b"to");

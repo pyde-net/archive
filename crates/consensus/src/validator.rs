@@ -43,6 +43,13 @@ pub struct Validator {
     pub status: ValidatorStatus,
     /// Epoch when registered.
     pub registered_epoch: u64,
+    /// Task #95: Kyber-768 KEM public key for receiving encrypted DKG
+    /// shares during per-epoch key generation. `None` for legacy
+    /// validators that registered before KEM-key registration was
+    /// required; they can join the committee but cannot participate
+    /// in DKG (other members would have nowhere to send their share
+    /// rows). Genesis-bundled validators always have this populated.
+    pub kem_pk: Option<Vec<u8>>,
 }
 
 /// The active committee for an epoch.
@@ -125,6 +132,7 @@ impl ValidatorSet {
             stake: VALIDATOR_STAKE, // exactly 10K, excess returned
             status: ValidatorStatus::Active,
             registered_epoch: current_epoch,
+            kem_pk: None,
         });
 
         Ok(())
