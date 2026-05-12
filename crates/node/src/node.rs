@@ -6985,13 +6985,71 @@ fn load_validator_identity(datadir: &Path, chain_id: u64) -> Result<ValidatorIde
         None
     };
 
+    let (kem_pk, kem_sk) = load_or_generate_kem_key(datadir)?;
+
     Ok(ValidatorIdentity {
         address,
         public_key: pk,
         secret_key: sk,
         committee_index: 0, // assigned when joining committee
         key_share,
+        kem_public_key: kem_pk,
+        kem_secret_key: kem_sk,
     })
+}
+
+/// Task #95: load the validator's long-lived KEM keypair from
+/// `<datadir>/kem.key`, generating + persisting a fresh one if the
+/// file doesn't exist. The KEM pk goes on-chain in the validator's
+/// `ValidatorEntry`; the sk stays on this validator's disk
+/// indefinitely. Used by other committee members to encrypt DKG share
+/// rows to this validator during per-epoch key generation.
+///
+/// File format: `pk_len(4 LE) || pk || sk`. Mode 0o600 via
+/// `genesis::write_secret_file`. Silent-regeneration is allowed
+/// because the KEM key is a per-validator local artifact — unlike
+/// `validator.key` where regeneration desyncs the validator from
+/// its on-chain stake position, a regenerated KEM key just means
+/// the validator can't decrypt shares addressed to its old kem_pk
+/// until the on-chain entry is updated (a self-healing condition,
+/// not a chain corruption).
+fn load_or_generate_kem_key(
+    datadir: &Path,
+) -> Result<(pyde_crypto::kyber::KyberPublicKey, pyde_crypto::kyber::KyberSecretKey), String> {
+    use pyde_crypto::kyber::{KyberPublicKey, KyberSecretKey};
+    let kem_path = datadir.join("kem.key");
+    if kem_path.exists() {
+        let buf = std::fs::read(&kem_path)
+            .map_err(|e| format!("failed to read {}: {}", kem_path.display(), e))?;
+        if buf.len() < 4 {
+            return Err(format!("{} is corrupted (too short)", kem_path.display()));
+        }
+        let pk_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        if buf.len() < 4 + pk_len {
+            return Err(format!("{} pk truncated", kem_path.display()));
+        }
+        let pk = KyberPublicKey::from_bytes(&buf[4..4 + pk_len])
+            .ok_or_else(|| format!("{} has invalid kem pk", kem_path.display()))?;
+        let sk = KyberSecretKey::from_bytes(&buf[4 + pk_len..])
+            .ok_or_else(|| format!("{} has invalid kem sk", kem_path.display()))?;
+        info!("loaded kem.key (Kyber-768 KEM identity)");
+        Ok((pk, sk))
+    } else {
+        let (pk, sk) = pyde_crypto::kyber::kyber_keygen()
+            .map_err(|e| format!("kem keygen failed: {}", e))?;
+        let pk_bytes = pk.as_bytes();
+        let sk_bytes = sk.as_bytes();
+        let mut buf = Vec::with_capacity(4 + pk_bytes.len() + sk_bytes.len());
+        buf.extend_from_slice(&(pk_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(pk_bytes);
+        buf.extend_from_slice(sk_bytes);
+        crate::genesis::write_secret_file(&kem_path, &buf)?;
+        info!(
+            path = %kem_path.display(),
+            "generated new validator KEM keypair"
+        );
+        Ok((pk, sk))
+    }
 }
 
 /// Load node identity from disk, or generate and persist a new one.

@@ -1442,6 +1442,17 @@ pub struct ValidatorEntry {
     /// Block at which unbonding was initiated. Only populated when
     /// `status == 0x01` (Unbonding).
     pub exit_block: Option<u64>,
+    /// Task #95: long-lived Kyber-768 KEM public key. Committee
+    /// members encrypt this validator's DKG share rows to `kem_pk`
+    /// during per-epoch key generation; only the validator (holding
+    /// the matching sk on disk) can decrypt. Optional for backward
+    /// compatibility with pre-task-#95 entries — `None` means the
+    /// validator hasn't registered a KEM key on-chain yet and can
+    /// receive DKG shares only via fallback paths (or be excluded
+    /// from the round). Genesis bundles populate this; post-genesis
+    /// `StakeDeposit` carries it as a follow-up wire change (see
+    /// task #95 Phase A4 followups).
+    pub kem_pk: Option<Vec<u8>>,
 }
 
 impl ValidatorEntry {
@@ -1462,10 +1473,35 @@ impl ValidatorEntry {
         let last_claimed_at =
             u128::from_le_bytes(bytes[claim_start..claim_start + 16].try_into().ok()?);
         let exit_start = claim_start + 16;
-        let exit_block = if status == 0x01 && bytes.len() >= exit_start + 8 {
-            Some(u64::from_le_bytes(
-                bytes[exit_start..exit_start + 8].try_into().ok()?,
-            ))
+        let (exit_block, mut tail_pos) = if status == 0x01 && bytes.len() >= exit_start + 8 {
+            (
+                Some(u64::from_le_bytes(
+                    bytes[exit_start..exit_start + 8].try_into().ok()?,
+                )),
+                exit_start + 8,
+            )
+        } else {
+            (None, exit_start)
+        };
+        // Task #95: optional kem_pk trailer — `kem_pk_len(4 LE) || kem_pk`.
+        // Older entries (genesis pre-task-#95, or any entry that
+        // hasn't re-keyed) end at `tail_pos`; the trailer is absent
+        // and `kem_pk` is `None`. Newer entries append it. Reading
+        // it is non-fatal: a malformed trailer downgrades to `None`
+        // rather than rejecting the whole entry, so a forward-going
+        // operator can't lose a validator's stake position by
+        // garbling the KEM bytes.
+        let kem_pk = if bytes.len() >= tail_pos + 4 {
+            let kem_pk_len =
+                u32::from_le_bytes(bytes[tail_pos..tail_pos + 4].try_into().ok()?) as usize;
+            tail_pos += 4;
+            if kem_pk_len > 0 && bytes.len() >= tail_pos + kem_pk_len {
+                Some(bytes[tail_pos..tail_pos + kem_pk_len].to_vec())
+            } else if kem_pk_len == 0 {
+                None
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1475,11 +1511,14 @@ impl ValidatorEntry {
             status,
             last_claimed_at,
             exit_block,
+            kem_pk,
         })
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(VALIDATOR_ENTRY_BASE_LEN + 8);
+        let kem_pk_len = self.kem_pk.as_ref().map(|b| b.len()).unwrap_or(0);
+        let mut buf =
+            Vec::with_capacity(VALIDATOR_ENTRY_BASE_LEN + 8 + 4 + kem_pk_len);
         buf.extend_from_slice(&(self.pk.len() as u32).to_le_bytes());
         buf.extend_from_slice(&self.pk);
         buf.extend_from_slice(&self.stake.to_le_bytes());
@@ -1487,6 +1526,14 @@ impl ValidatorEntry {
         buf.extend_from_slice(&self.last_claimed_at.to_le_bytes());
         if let Some(eb) = self.exit_block {
             buf.extend_from_slice(&eb.to_le_bytes());
+        }
+        // Task #95: kem_pk trailer. Absence is encoded as `0_u32`,
+        // so a new decoder reading a pre-task-#95 entry (no trailer
+        // bytes) and a new decoder reading an explicit-absent
+        // trailer reach the same `kem_pk = None`.
+        buf.extend_from_slice(&(kem_pk_len as u32).to_le_bytes());
+        if let Some(kp) = &self.kem_pk {
+            buf.extend_from_slice(kp);
         }
         buf
     }
@@ -4364,6 +4411,7 @@ mod tests {
             status: status_byte,
             last_claimed_at: 0,
             exit_block: None,
+            kem_pk: None,
         };
         let key = pyde_state::keys::validator_key(addr);
         smt.insert(key, entry.encode()).unwrap();

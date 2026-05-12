@@ -258,6 +258,15 @@ pub struct GenesisValidator {
     pub public_key: String,
     /// Staked amount in quanta as string.
     pub stake: String,
+    /// Task #95: hex-encoded Kyber-768 KEM public key. Optional for
+    /// backward compatibility with pre-task-#95 genesis bundles —
+    /// missing means the validator can't receive encrypted DKG shares
+    /// at registration time and must register a KEM key via a future
+    /// StakeDeposit / KEM-rotation transaction before participating in
+    /// the next DKG round. Genesis bundles produced by `pyde testnet`
+    /// always populate this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem_public_key: Option<String>,
 }
 
 impl GenesisValidator {
@@ -265,6 +274,20 @@ impl GenesisValidator {
         self.stake
             .parse::<u128>()
             .map_err(|e| format!("invalid stake '{}': {}", self.stake, e))
+    }
+
+    /// Decode the hex-encoded KEM pk into raw bytes, or `None` if the
+    /// validator didn't supply one at genesis.
+    pub fn kem_pk_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        match &self.kem_public_key {
+            Some(hex_pk) => {
+                let stripped = hex_pk.strip_prefix("0x").unwrap_or(hex_pk);
+                let raw = hex::decode(stripped)
+                    .map_err(|e| format!("invalid kem_public_key hex: {}", e))?;
+                Ok(Some(raw))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -458,12 +481,14 @@ pub fn initialize_genesis(
             hex::decode(pk_hex).map_err(|e| format!("invalid validator pk for registry: {}", e))?;
         let stake = val.stake_u128()?;
 
+        let kem_pk = val.kem_pk_bytes()?;
         let entry = pyde_tx::pipeline::ValidatorEntry {
             pk: pk_bytes,
             stake,
             status: 0x00, // Active
             last_claimed_at: 0,
             exit_block: None,
+            kem_pk,
         };
 
         let key = pyde_state::keys::validator_key(&address);
@@ -1009,8 +1034,22 @@ pub fn generate_testnet(
     let mut validators = Vec::new();
     let mut accounts = Vec::new();
 
-    // Generate FALCON keypairs for each validator
+    // Task #95: per-validator KEM keypair, generated ahead of the
+    // accounts loop so each `GenesisValidator` can be populated with
+    // its `kem_public_key` inline. Same trust boundary as the FALCON
+    // keypairs that follow — this binary holds all secrets briefly
+    // and writes them out per node directory; the operator is
+    // expected to distribute and discard.
+    let mut kem_keypairs: Vec<(pyde_crypto::kyber::KyberPublicKey, pyde_crypto::kyber::KyberSecretKey)> =
+        Vec::with_capacity(num_validators);
     for _ in 0..num_validators {
+        let kp = pyde_crypto::kyber::kyber_keygen()
+            .map_err(|e| format!("validator kem keygen failed: {}", e))?;
+        kem_keypairs.push(kp);
+    }
+
+    // Generate FALCON keypairs for each validator
+    for i in 0..num_validators {
         let (pk, sk) = falcon_keygen().map_err(|e| format!("keygen failed: {}", e))?;
         let address = derive_eoa_address(pk.as_bytes());
 
@@ -1026,6 +1065,7 @@ pub fn generate_testnet(
             address: hex::encode(address),
             public_key: hex::encode(pk.as_bytes()),
             stake: funding.to_string(),
+            kem_public_key: Some(hex::encode(kem_keypairs[i].0.as_bytes())),
         });
 
         accounts.push(DevnetAccount {
@@ -1124,6 +1164,11 @@ pub fn generate_testnet(
         pyde_crypto::threshold::threshold_keygen(num_validators, threshold)
             .map_err(|e| format!("threshold keygen failed: {}", e))?;
 
+    // Task #95: the per-validator KEM keypairs were already generated
+    // above (before the accounts loop) so each `GenesisValidator` could
+    // be populated with its `kem_public_key` inline. They live in
+    // `kem_keypairs[i]` and are written to per-node `kem.key` below.
+
     // Pre-generate node identity keys (Ed25519 for libp2p) so we know peer IDs
     // and can write full bootstrap multiaddrs in each config.
     //
@@ -1171,6 +1216,20 @@ pub fn generate_testnet(
         // Write threshold public key (shared — same for all nodes)
         fs::write(node_dir.join("threshold.pk"), threshold_pk.to_bytes())
             .map_err(|e| format!("failed to write threshold.pk: {}", e))?;
+
+        // Task #95: write per-validator KEM keypair as
+        // `pk_len(4 LE) || pk || sk` — same format
+        // `load_or_generate_kem_key` in node.rs expects. 0o600 via
+        // `write_secret_file` because `sk` is signing material for
+        // share-receipt during DKG.
+        let kem_pk_bytes = kem_keypairs[i].0.as_bytes();
+        let kem_sk_bytes = kem_keypairs[i].1.as_bytes();
+        let mut kem_buf =
+            Vec::with_capacity(4 + kem_pk_bytes.len() + kem_sk_bytes.len());
+        kem_buf.extend_from_slice(&(kem_pk_bytes.len() as u32).to_le_bytes());
+        kem_buf.extend_from_slice(kem_pk_bytes);
+        kem_buf.extend_from_slice(kem_sk_bytes);
+        write_secret_file(&node_dir.join("kem.key"), &kem_buf)?;
 
         // Copy genesis.toml into each node's directory
         fs::write(node_dir.join("genesis.toml"), genesis_config.to_toml())
