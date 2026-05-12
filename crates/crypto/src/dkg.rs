@@ -1,24 +1,40 @@
 //! DKG (Distributed Key Generation) primitives.
 //!
-//! Phase B: lattice-friendly VSS commitments. Each DKG contributor
-//! commits to a vector of share-rows (one per recipient) by Merkle-
-//! hashing the rows and Falcon-signing the root + tree metadata.
-//! Receivers can later check their share against the root via a
-//! Merkle proof, and the signature binds the root to a specific
-//! (epoch, contributor_index, n, threshold) tuple so commitments
-//! can't be replayed across DKG rounds.
+//! Two pieces:
+//!
+//! 1. **VSS commitments.** Each DKG contributor commits to a vector
+//!    of share-rows (one per recipient) by Merkle-hashing the rows
+//!    and Falcon-signing the root + tree metadata. Receivers later
+//!    check their share against the root via a Merkle proof, and
+//!    the signature binds the root to a specific (epoch,
+//!    contributor_index, n, threshold) tuple so commitments can't
+//!    be replayed across DKG rounds.
+//!
+//! 2. **Per-recipient encrypted share envelopes.** Each contributor
+//!    encrypts each recipient's share-row under that recipient's
+//!    Kyber-768 public key using a Poseidon2-keystream + Poseidon2-
+//!    MAC AEAD construction. The keystream and MAC are bound to
+//!    (epoch, from_index, recipient_index) so an envelope can't be
+//!    replayed across rounds, contributors, or recipients.
 //!
 //! All hashing uses Poseidon2 with explicit domain-separation tags
-//! per node role (leaf / internal / empty). No KZG, no Pedersen —
-//! the entire stack stays post-quantum.
+//! per role (leaf / internal node / empty / commit sig / AEAD KS /
+//! AEAD MAC). No KZG, no Pedersen — the entire stack stays
+//! post-quantum.
 
 #![allow(clippy::needless_range_loop)]
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use p3_goldilocks::Goldilocks;
+use subtle::ConstantTimeEq;
 
 use crate::falcon::{falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature};
+use crate::kyber::{
+    kyber_decapsulate, kyber_encapsulate, KyberCiphertext, KyberPublicKey, KyberSecretKey,
+    SharedSecret,
+};
 use crate::poseidon2::poseidon2_hash;
 use crate::threshold::{gl, gl_to_u64, GOLDILOCKS_PRIME, SEED_ELEMENTS};
 
@@ -36,6 +52,13 @@ pub const DKG_MERKLE_NODE_DOMAIN: &[u8] = b"PYDE_DKG_MERKLE_NODE_V1\0";
 /// so padding from one contributor's tree can't be reused as a
 /// real leaf in another's.
 pub const DKG_MERKLE_EMPTY_DOMAIN: &[u8] = b"PYDE_DKG_MERKLE_EMPTY_V1\0";
+
+/// Domain separator for the keystream KDF used to encrypt a
+/// recipient's share-row under their Kyber public key.
+pub const DKG_AEAD_KS_DOMAIN: &[u8] = b"PYDE_DKG_AEAD_KS_V1\0";
+
+/// Domain separator for the MAC over an encrypted share-row.
+pub const DKG_AEAD_MAC_DOMAIN: &[u8] = b"PYDE_DKG_AEAD_MAC_V1\0";
 
 /// A single recipient's share-row from one DKG contributor.
 ///
@@ -372,10 +395,226 @@ impl DkgCommitment {
     }
 }
 
+// --- Per-recipient encrypted share-row envelope ---
+
+/// Poseidon2-derived keystream of `len` bytes, keyed by the Kyber
+/// shared secret and the kyber_ct plus the per-envelope binding
+/// tuple. Binding both the keystream and the MAC (see
+/// [`dkg_aead_mac`]) to `(epoch, from_index, recipient_index)`
+/// means an envelope intended for one (round, contributor,
+/// recipient) cannot be replayed under a different tuple even if
+/// Kyber accidentally produced the same `(ss, ct)` (which under
+/// IND-CCA Kyber it won't).
+fn dkg_aead_keystream(
+    ss: &SharedSecret,
+    kyber_ct: &[u8],
+    epoch: u64,
+    from_index: usize,
+    recipient_index: usize,
+    len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut counter: u64 = 0;
+    while out.len() < len {
+        let mut input = Vec::with_capacity(
+            DKG_AEAD_KS_DOMAIN.len() + 32 + kyber_ct.len() + 8 + 4 + 4 + 8,
+        );
+        input.extend_from_slice(DKG_AEAD_KS_DOMAIN);
+        input.extend_from_slice(ss.as_bytes());
+        input.extend_from_slice(kyber_ct);
+        input.extend_from_slice(&epoch.to_le_bytes());
+        input.extend_from_slice(&(from_index as u32).to_le_bytes());
+        input.extend_from_slice(&(recipient_index as u32).to_le_bytes());
+        input.extend_from_slice(&counter.to_le_bytes());
+        let block = poseidon2_hash(&input);
+        out.extend_from_slice(block.as_bytes());
+        counter += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+/// Poseidon2-keyed MAC over the AEAD envelope's ciphertext, with
+/// the same `(epoch, from_index, recipient_index)` binding that
+/// keys the keystream.
+fn dkg_aead_mac(
+    ss: &SharedSecret,
+    kyber_ct: &[u8],
+    epoch: u64,
+    from_index: usize,
+    recipient_index: usize,
+    ciphertext: &[u8],
+) -> [u8; 32] {
+    let mut input = Vec::with_capacity(
+        DKG_AEAD_MAC_DOMAIN.len() + 32 + kyber_ct.len() + 8 + 4 + 4 + ciphertext.len(),
+    );
+    input.extend_from_slice(DKG_AEAD_MAC_DOMAIN);
+    input.extend_from_slice(ss.as_bytes());
+    input.extend_from_slice(kyber_ct);
+    input.extend_from_slice(&epoch.to_le_bytes());
+    input.extend_from_slice(&(from_index as u32).to_le_bytes());
+    input.extend_from_slice(&(recipient_index as u32).to_le_bytes());
+    input.extend_from_slice(ciphertext);
+    *poseidon2_hash(&input).as_bytes()
+}
+
+/// One contributor's encrypted share-row for one recipient.
+///
+/// `kyber_ct` is the Kyber-768 ciphertext used to deliver the
+/// per-envelope shared secret; `ciphertext` is the keystream-XOR
+/// of [`ShareRow`]'s byte form; `mac` is the Poseidon2-keyed MAC
+/// over (ciphertext, binding tuple). Tampering with any of these
+/// fields, or trying to replay the envelope under a different
+/// `(epoch, from_index, recipient_index)`, breaks the MAC and
+/// causes decryption to fail uniformly with `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DkgShareEnvelope {
+    pub kyber_ct: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub mac: [u8; 32],
+}
+
+impl DkgShareEnvelope {
+    /// Wire format: `kyber_ct_len(4 LE) || kyber_ct || ciphertext_len(4 LE) || ciphertext || mac(32)`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out =
+            Vec::with_capacity(4 + self.kyber_ct.len() + 4 + self.ciphertext.len() + 32);
+        out.extend_from_slice(&(self.kyber_ct.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.kyber_ct);
+        out.extend_from_slice(&(self.ciphertext.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.ciphertext);
+        out.extend_from_slice(&self.mac);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 4 {
+            return None;
+        }
+        let ct_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let after_kct = 4 + ct_len;
+        if bytes.len() < after_kct + 4 {
+            return None;
+        }
+        let kyber_ct = bytes[4..after_kct].to_vec();
+        let cipher_len = u32::from_le_bytes([
+            bytes[after_kct],
+            bytes[after_kct + 1],
+            bytes[after_kct + 2],
+            bytes[after_kct + 3],
+        ]) as usize;
+        let after_cipher = after_kct + 4 + cipher_len;
+        if bytes.len() != after_cipher + 32 {
+            return None;
+        }
+        let ciphertext = bytes[after_kct + 4..after_cipher].to_vec();
+        let mut mac = [0u8; 32];
+        mac.copy_from_slice(&bytes[after_cipher..after_cipher + 32]);
+        Some(Self {
+            kyber_ct,
+            ciphertext,
+            mac,
+        })
+    }
+}
+
+/// Encrypt `row` for `recipient_pk`, binding the envelope to
+/// `(epoch, from_index, row.receiver_index)`. The recipient_index
+/// comes from the row itself so a caller can't accidentally encrypt
+/// row j's data under recipient i's key but tag it with i's index.
+pub fn encrypt_share_row(
+    row: &ShareRow,
+    recipient_pk: &KyberPublicKey,
+    epoch: u64,
+    from_index: usize,
+) -> Result<DkgShareEnvelope, &'static str> {
+    let (kct, ss) = kyber_encapsulate(recipient_pk)?;
+    let plaintext = row.to_bytes();
+    let keystream = dkg_aead_keystream(
+        &ss,
+        kct.as_bytes(),
+        epoch,
+        from_index,
+        row.receiver_index,
+        plaintext.len(),
+    );
+    let mut ciphertext = Vec::with_capacity(plaintext.len());
+    for i in 0..plaintext.len() {
+        ciphertext.push(plaintext[i] ^ keystream[i]);
+    }
+    let mac = dkg_aead_mac(
+        &ss,
+        kct.as_bytes(),
+        epoch,
+        from_index,
+        row.receiver_index,
+        &ciphertext,
+    );
+    Ok(DkgShareEnvelope {
+        kyber_ct: kct.to_vec(),
+        ciphertext,
+        mac,
+    })
+}
+
+/// Decrypt and verify a share-row envelope. Returns `None` for any
+/// failure (malformed wire, wrong-size Kyber CT, MAC mismatch,
+/// post-decrypt index mismatch). The function does not short-
+/// circuit on Kyber failure: on a bad CT it computes the MAC under
+/// a zero shared-secret and lets the constant-time compare reject
+/// uniformly, so an attacker can't time-distinguish "bad CT" from
+/// "bad MAC" (audit 360 pattern).
+pub fn decrypt_share_row(
+    envelope: &DkgShareEnvelope,
+    recipient_sk: &KyberSecretKey,
+    epoch: u64,
+    from_index: usize,
+    expected_receiver_index: usize,
+) -> Option<ShareRow> {
+    let ss = match KyberCiphertext::from_bytes(&envelope.kyber_ct) {
+        Some(kct) => kyber_decapsulate(recipient_sk, &kct)
+            .unwrap_or_else(|_| SharedSecret::zero_for_constant_time_mac_check()),
+        None => SharedSecret::zero_for_constant_time_mac_check(),
+    };
+    let expected_mac = dkg_aead_mac(
+        &ss,
+        &envelope.kyber_ct,
+        epoch,
+        from_index,
+        expected_receiver_index,
+        &envelope.ciphertext,
+    );
+    if expected_mac.ct_eq(&envelope.mac).unwrap_u8() != 1 {
+        return None;
+    }
+    let keystream = dkg_aead_keystream(
+        &ss,
+        &envelope.kyber_ct,
+        epoch,
+        from_index,
+        expected_receiver_index,
+        envelope.ciphertext.len(),
+    );
+    let mut plaintext = vec![0u8; envelope.ciphertext.len()];
+    for i in 0..envelope.ciphertext.len() {
+        plaintext[i] = envelope.ciphertext[i] ^ keystream[i];
+    }
+    let row = ShareRow::from_bytes(&plaintext)?;
+    // Belt-and-suspenders: the binding tuple already prevents
+    // cross-recipient replay via the MAC, but checking the decoded
+    // row's own index catches a malicious contributor who tries to
+    // send recipient i a row that internally claims receiver_index j.
+    if row.receiver_index != expected_receiver_index {
+        return None;
+    }
+    Some(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::falcon::falcon_keygen;
+    use crate::kyber::{kyber_keygen, KyberCiphertext};
     use alloc::vec;
 
     fn make_row(receiver_index: usize, seed: u64) -> ShareRow {
@@ -634,5 +873,195 @@ mod tests {
             // Proof depth for a 128-leaf tree is exactly 7.
             assert_eq!(proof.siblings.len(), 7);
         }
+    }
+
+    // --- Phase C: envelope tests ---
+
+    #[test]
+    fn envelope_encrypt_decrypt_roundtrip() {
+        let (pk, sk) = kyber_keygen().expect("kyber_keygen");
+        let row = make_row(4, 0xCAFE_BABE_F00D_DEAD);
+        let env = encrypt_share_row(&row, &pk, 9, 2).expect("encrypt");
+        let decoded = decrypt_share_row(&env, &sk, 9, 2, 4).expect("decrypt");
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn envelope_kyber_ct_has_expected_size() {
+        let (pk, _sk) = kyber_keygen().expect("kyber_keygen");
+        let row = make_row(1, 1);
+        let env = encrypt_share_row(&row, &pk, 0, 0).expect("encrypt");
+        assert_eq!(env.kyber_ct.len(), KyberCiphertext::SIZE);
+        assert_eq!(env.ciphertext.len(), ShareRow::WIRE_LEN);
+    }
+
+    #[test]
+    fn envelope_rejects_tampered_ciphertext() {
+        let (pk, sk) = kyber_keygen().expect("kyber_keygen");
+        let row = make_row(2, 7);
+        let mut env = encrypt_share_row(&row, &pk, 1, 1).expect("encrypt");
+        env.ciphertext[0] ^= 0x01;
+        assert!(decrypt_share_row(&env, &sk, 1, 1, 2).is_none());
+    }
+
+    #[test]
+    fn envelope_rejects_tampered_mac() {
+        let (pk, sk) = kyber_keygen().expect("kyber_keygen");
+        let row = make_row(2, 7);
+        let mut env = encrypt_share_row(&row, &pk, 1, 1).expect("encrypt");
+        env.mac[0] ^= 0xFF;
+        assert!(decrypt_share_row(&env, &sk, 1, 1, 2).is_none());
+    }
+
+    #[test]
+    fn envelope_rejects_tampered_kyber_ct() {
+        let (pk, sk) = kyber_keygen().expect("kyber_keygen");
+        let row = make_row(2, 7);
+        let mut env = encrypt_share_row(&row, &pk, 1, 1).expect("encrypt");
+        env.kyber_ct[0] ^= 0xFF;
+        // Tampered kyber_ct decapsulates to an implicit-reject SS,
+        // so the MAC computed at decrypt time won't match.
+        assert!(decrypt_share_row(&env, &sk, 1, 1, 2).is_none());
+    }
+
+    #[test]
+    fn envelope_rejects_wrong_recipient_key() {
+        let (pk_a, _sk_a) = kyber_keygen().expect("keygen a");
+        let (_pk_b, sk_b) = kyber_keygen().expect("keygen b");
+        let row = make_row(3, 11);
+        // A encrypts for A; B tries to decrypt with B's key.
+        let env = encrypt_share_row(&row, &pk_a, 1, 1).expect("encrypt");
+        assert!(decrypt_share_row(&env, &sk_b, 1, 1, 3).is_none());
+    }
+
+    #[test]
+    fn envelope_rejects_wrong_recipient_index_at_decrypt() {
+        let (pk, sk) = kyber_keygen().expect("kyber_keygen");
+        let row = make_row(3, 11);
+        let env = encrypt_share_row(&row, &pk, 1, 1).expect("encrypt");
+        // Sent for receiver 3 but verifier expects receiver 4.
+        assert!(decrypt_share_row(&env, &sk, 1, 1, 4).is_none());
+    }
+
+    #[test]
+    fn envelope_rejects_cross_epoch_replay() {
+        let (pk, sk) = kyber_keygen().expect("kyber_keygen");
+        let row = make_row(2, 22);
+        let env = encrypt_share_row(&row, &pk, 5, 1).expect("encrypt");
+        assert!(decrypt_share_row(&env, &sk, 5, 1, 2).is_some());
+        // Same envelope, different epoch — must reject.
+        assert!(decrypt_share_row(&env, &sk, 6, 1, 2).is_none());
+    }
+
+    #[test]
+    fn envelope_rejects_cross_contributor_replay() {
+        let (pk, sk) = kyber_keygen().expect("kyber_keygen");
+        let row = make_row(2, 22);
+        let env = encrypt_share_row(&row, &pk, 5, 1).expect("encrypt");
+        // Same envelope, different contributor — must reject.
+        assert!(decrypt_share_row(&env, &sk, 5, 2, 2).is_none());
+    }
+
+    #[test]
+    fn envelope_rejects_internal_index_mismatch() {
+        // Defense-in-depth: even if a contributor lies about
+        // receiver_index inside the row, the post-decrypt check
+        // catches it. We forge an envelope whose plaintext row
+        // internally claims receiver_index=7 but whose MAC binding
+        // says recipient=3.
+        let (pk, sk) = kyber_keygen().expect("kyber_keygen");
+        // Encrypt a row whose internal index is 7, bound to MAC
+        // tuple (..., recipient_index=7). Then ask decryptor to
+        // verify it as recipient_index=3 — MAC binding mismatch
+        // already rejects this. Re-bind the envelope to recipient 3
+        // by re-encrypting with row.receiver_index=7 forced into the
+        // MAC at index 3 via a hand-crafted construction.
+        //
+        // To exercise the explicit `row.receiver_index !=
+        // expected_receiver_index` post-decrypt check, we have to
+        // re-encrypt manually with the MAC tuple = (epoch=1, from=1,
+        // recipient=3) but the plaintext row carries index 7.
+        let plaintext_row = make_row(7, 99);
+        let (kct, ss) = kyber_encapsulate(&pk).expect("encap");
+        let plaintext = plaintext_row.to_bytes();
+        let keystream =
+            dkg_aead_keystream(&ss, kct.as_bytes(), 1, 1, 3, plaintext.len());
+        let mut ciphertext = Vec::with_capacity(plaintext.len());
+        for i in 0..plaintext.len() {
+            ciphertext.push(plaintext[i] ^ keystream[i]);
+        }
+        let mac = dkg_aead_mac(&ss, kct.as_bytes(), 1, 1, 3, &ciphertext);
+        let env = DkgShareEnvelope {
+            kyber_ct: kct.to_vec(),
+            ciphertext,
+            mac,
+        };
+        // MAC verifies (recipient=3 in tuple), but the decrypted
+        // row's internal receiver_index is 7 — must reject.
+        assert!(decrypt_share_row(&env, &sk, 1, 1, 3).is_none());
+    }
+
+    #[test]
+    fn envelope_wire_roundtrip() {
+        let (pk, _sk) = kyber_keygen().expect("kyber_keygen");
+        let row = make_row(2, 7);
+        let env = encrypt_share_row(&row, &pk, 1, 1).expect("encrypt");
+        let bytes = env.to_bytes();
+        let decoded = DkgShareEnvelope::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, env);
+    }
+
+    #[test]
+    fn envelope_wire_rejects_short_input() {
+        assert!(DkgShareEnvelope::from_bytes(&[]).is_none());
+        assert!(DkgShareEnvelope::from_bytes(&[0u8; 3]).is_none());
+        // Claims kyber_ct_len=100 but supplies only 10 bytes.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 10]);
+        assert!(DkgShareEnvelope::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn envelope_wire_rejects_size_mismatch() {
+        let (pk, _sk) = kyber_keygen().expect("kyber_keygen");
+        let row = make_row(2, 7);
+        let env = encrypt_share_row(&row, &pk, 1, 1).expect("encrypt");
+        let mut bytes = env.to_bytes();
+        // Append a garbage trailer — must reject.
+        bytes.push(0xAA);
+        assert!(DkgShareEnvelope::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn envelope_decrypt_rejects_wrong_kyber_ct_length() {
+        // Hand-craft an envelope with a kyber_ct of the wrong length
+        // (e.g. 100 bytes). `decrypt_share_row` should still return
+        // None without panicking — the wrong-length path is taken,
+        // SS becomes zero, MAC check fails uniformly.
+        let (_pk, sk) = kyber_keygen().expect("keygen");
+        let bad = DkgShareEnvelope {
+            kyber_ct: vec![0u8; 100],
+            ciphertext: vec![0u8; ShareRow::WIRE_LEN],
+            mac: [0u8; 32],
+        };
+        assert!(decrypt_share_row(&bad, &sk, 1, 1, 1).is_none());
+    }
+
+    #[test]
+    fn envelope_decryption_is_deterministic_in_keys() {
+        // Same row, same keys, different invocations → encryption
+        // is randomized (Kyber picks fresh randomness), so two
+        // envelopes for the same row differ — but BOTH decrypt
+        // back to the same row.
+        let (pk, sk) = kyber_keygen().expect("kyber_keygen");
+        let row = make_row(2, 42);
+        let env1 = encrypt_share_row(&row, &pk, 1, 1).expect("encrypt 1");
+        let env2 = encrypt_share_row(&row, &pk, 1, 1).expect("encrypt 2");
+        assert_ne!(env1, env2, "Kyber encapsulation is randomized");
+        let r1 = decrypt_share_row(&env1, &sk, 1, 1, 2).expect("decrypt 1");
+        let r2 = decrypt_share_row(&env2, &sk, 1, 1, 2).expect("decrypt 2");
+        assert_eq!(r1, r2);
+        assert_eq!(r1, row);
     }
 }
