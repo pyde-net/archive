@@ -689,7 +689,7 @@ impl PydeNode {
         info!(%local_peer_id, port = self.config.network.port, "P2P transport ready");
 
         // 7. Subscribe to gossipsub topics
-        subscribe_topics(&mut swarm, is_validator)?;
+        subscribe_topics(&mut swarm, is_validator, crate::MEV_PROTECTION_ENABLED)?;
         info!("gossipsub topics subscribed");
 
         // 8. Dial bootstrap peers. Audit 219: the
@@ -2944,7 +2944,7 @@ impl PydeNode {
                                     // and the chain falls indefinitely behind. See the
                                     // const's doc-comment in `pyde-mempool::pool` for the
                                     // measurement that motivates the value.
-                                    let encrypted_blobs = {
+                                    let encrypted_blobs: Vec<Vec<u8>> = if crate::MEV_PROTECTION_ENABLED {
                                         let relay_r = tx_relay.read().await;
                                         let selected = relay_r.mempool().select_for_block(
                                             gas_ceiling,
@@ -2952,7 +2952,16 @@ impl PydeNode {
                                             current_slot,
                                         );
                                         // Serialize each EncryptedTx to bytes for block inclusion
-                                        selected.iter().map(|etx| etx.to_bytes()).collect::<Vec<Vec<u8>>>()
+                                        selected.iter().map(|etx| etx.to_bytes()).collect()
+                                    } else {
+                                        // MEV protection disabled — never include
+                                        // encrypted txs in proposed blocks. The
+                                        // encrypted mempool path stays unsubscribed
+                                        // at the network layer, so this list is
+                                        // already always empty in practice; the
+                                        // explicit short-circuit keeps the slot-hot
+                                        // path off the mempool read lock entirely.
+                                        Vec::new()
                                     };
 
                                     // Always produce blocks to advance the chain.

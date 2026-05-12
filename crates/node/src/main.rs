@@ -1,3 +1,40 @@
+/// Chain-wide compile-time gate for the encrypted-mempool (MEV-
+/// protection) pipeline.
+///
+/// When `false`, the encrypted-tx path is fully disabled end-to-end:
+/// - The RPC endpoints `pyde_sendRawEncryptedTransaction` and
+///   `pyde_getThresholdPublicKey` return errors.
+/// - The node does not subscribe to or publish on the
+///   `pyde/encrypted_transactions/1` gossip topic.
+/// - Block proposers select no encrypted txs and do not emit an
+///   `EncryptedTxBundle`.
+/// - Genesis does not write `threshold.pk` or per-validator key
+///   shares.
+///
+/// This is a **compile-time** const rather than a runtime config
+/// flag because the encrypted path is a consensus-level concern:
+/// every node in the network must agree on whether encrypted txs
+/// are part of the protocol. A binary built with this flag flipped
+/// is incompatible at the consensus layer with one where it is not
+/// flipped. Treat it as a hard-fork-level switch — don't mix
+/// builds on the same network.
+///
+/// **Currently off** while we soak-test correctness, throughput
+/// and stability without the threshold-encryption layer. The
+/// underlying primitives (Kyber-768 threshold KEM via `pyde-crypto`,
+/// per-block decryption coordinator, encrypted gossip topic) stay
+/// compiled in and exercised by their own unit tests; we are only
+/// removing them from the runtime pipeline.
+///
+/// **Trust framing for marketing copy:** the threshold-encryption
+/// design in this codebase is rotating-dealer per-epoch key
+/// escrow, NOT trustless threshold ML-KEM (which is a 2025-2026
+/// research frontier). Re-enabling this flag for production
+/// requires either landing the post-fundraise lattice-DKG work
+/// (task #101) or explicit documented acceptance of the rotating-
+/// dealer trust model.
+pub const MEV_PROTECTION_ENABLED: bool = false;
+
 mod aot_cache;
 mod block_builder;
 mod block_processor;

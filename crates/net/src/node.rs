@@ -405,18 +405,21 @@ pub fn dial_bootstrap_peers(swarm: &mut Swarm<PydeBehaviour>, bootstrap_peers: &
 pub fn subscribe_topics(
     swarm: &mut Swarm<PydeBehaviour>,
     is_validator: bool,
+    mev_protection_enabled: bool,
 ) -> Result<(), String> {
-    // All nodes subscribe to transactions (plaintext + encrypted), blocks, sync
+    // All nodes subscribe to transactions (plaintext), blocks, sync
     swarm
         .behaviour_mut()
         .gossipsub
         .subscribe(&topics::transactions())
         .map_err(|e| format!("subscribe error: {e}"))?;
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&topics::encrypted_transactions())
-        .map_err(|e| format!("subscribe error: {e}"))?;
+    if mev_protection_enabled {
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&topics::encrypted_transactions())
+            .map_err(|e| format!("subscribe error: {e}"))?;
+    }
     swarm
         .behaviour_mut()
         .gossipsub
@@ -550,14 +553,14 @@ mod tests {
     async fn create_validator_node() {
         let config = NetworkConfig::validator(30303);
         let (mut swarm, _) = create_node(&config, generate_keypair()).unwrap();
-        subscribe_topics(&mut swarm, true).unwrap();
+        subscribe_topics(&mut swarm, true, true).unwrap();
     }
 
     #[tokio::test]
     async fn create_full_node() {
         let config = NetworkConfig::full_node(30304);
         let (mut swarm, _) = create_node(&config, generate_keypair()).unwrap();
-        subscribe_topics(&mut swarm, false).unwrap();
+        subscribe_topics(&mut swarm, false, true).unwrap();
     }
 
     #[tokio::test]

@@ -1290,6 +1290,12 @@ impl PydeApiServer for RpcServer {
     }
 
     async fn get_threshold_public_key(&self) -> Result<String, ErrorObjectOwned> {
+        if !crate::MEV_PROTECTION_ENABLED {
+            return Err(rpc_err(
+                -32000,
+                "MEV protection disabled in this build".to_string(),
+            ));
+        }
         let pk =
             self.state.threshold_pk.as_ref().ok_or_else(|| {
                 rpc_err(-32000, "threshold encryption not configured".to_string())
@@ -1301,6 +1307,12 @@ impl PydeApiServer for RpcServer {
         &self,
         tx_obj: serde_json::Value,
     ) -> Result<String, ErrorObjectOwned> {
+        if !crate::MEV_PROTECTION_ENABLED {
+            return Err(rpc_err(
+                -32000,
+                "MEV protection disabled in this build".to_string(),
+            ));
+        }
         let tpk =
             self.state.threshold_pk.as_ref().ok_or_else(|| {
                 rpc_err(-32000, "threshold encryption not configured".to_string())
@@ -1438,6 +1450,12 @@ impl PydeApiServer for RpcServer {
         &self,
         tx_hex: String,
     ) -> Result<String, ErrorObjectOwned> {
+        if !crate::MEV_PROTECTION_ENABLED {
+            return Err(rpc_err(
+                -32000,
+                "MEV protection disabled in this build".to_string(),
+            ));
+        }
         // Decode hex-encoded EncryptedTx wire frame produced by the
         // client via `EncryptedTx::to_bytes`.
         let tx_bytes = hex::decode(tx_hex.strip_prefix("0x").unwrap_or(&tx_hex))

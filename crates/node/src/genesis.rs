@@ -1160,6 +1160,17 @@ pub fn generate_testnet(
     // PSS refresh is wired into epoch boundary (node.rs:767, validator.rs:284).
     // Multi-party ceremony: use `pyde testnet` for distributed keygen.
     let threshold = pyde_consensus::block::quorum_for_committee(num_validators);
+    // When MEV protection is disabled at compile time, the
+    // encrypted-mempool pipeline is fully off (gossipsub topic
+    // unsubscribed, RPC endpoints return errors, proposer selects
+    // no encrypted txs). Threshold keygen still has to run because
+    // downstream consumers (validator-set wire format, RPC state)
+    // expect a `ThresholdPublicKey` to exist — but we use the
+    // generated material only to populate that scaffolding; the
+    // shares are never written to disk and the pubkey is never
+    // gossiped. Result: a fresh testnet bundle with MEV off
+    // contains NO threshold-share files, no per-validator escrow,
+    // and no on-disk encrypted-mempool keying material.
     let (threshold_pk, key_shares) =
         pyde_crypto::threshold::threshold_keygen(num_validators, threshold)
             .map_err(|e| format!("threshold keygen failed: {}", e))?;
@@ -1210,12 +1221,17 @@ pub fn generate_testnet(
             .map_err(|e| format!("failed to serialize node key: {}", e))?;
         write_secret_file(&node_dir.join("node.key"), &node_key_bytes)?;
 
-        // Write threshold key share (binary) for MEV-protected decryption
-        write_secret_file(&node_dir.join("threshold.share"), &key_shares[i].to_bytes())?;
+        // Write threshold key share (binary) for MEV-protected
+        // decryption. Skipped entirely when MEV protection is off
+        // — no on-disk encrypted-mempool keying material exists in
+        // that build.
+        if crate::MEV_PROTECTION_ENABLED {
+            write_secret_file(&node_dir.join("threshold.share"), &key_shares[i].to_bytes())?;
 
-        // Write threshold public key (shared — same for all nodes)
-        fs::write(node_dir.join("threshold.pk"), threshold_pk.to_bytes())
-            .map_err(|e| format!("failed to write threshold.pk: {}", e))?;
+            // Write threshold public key (shared — same for all nodes)
+            fs::write(node_dir.join("threshold.pk"), threshold_pk.to_bytes())
+                .map_err(|e| format!("failed to write threshold.pk: {}", e))?;
+        }
 
         // Task #95: write per-validator KEM keypair as
         // `pk_len(4 LE) || pk || sk` — same format
@@ -1367,9 +1383,12 @@ json = false
             .map_err(|e| format!("failed to serialize node key: {}", e))?;
         write_secret_file(&node_dir.join("node.key"), &node_key_bytes)?;
 
-        // threshold.pk (shared — same for every node).
-        fs::write(node_dir.join("threshold.pk"), threshold_pk.to_bytes())
-            .map_err(|e| format!("failed to write threshold.pk: {}", e))?;
+        // threshold.pk (shared — same for every node). Skipped
+        // when MEV protection is disabled at compile time.
+        if crate::MEV_PROTECTION_ENABLED {
+            fs::write(node_dir.join("threshold.pk"), threshold_pk.to_bytes())
+                .map_err(|e| format!("failed to write threshold.pk: {}", e))?;
+        }
 
         // Copy genesis.toml.
         fs::write(node_dir.join("genesis.toml"), genesis_config.to_toml())

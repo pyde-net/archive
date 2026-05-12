@@ -16,11 +16,16 @@
 //!     gossip + post-QC seal-then-execute. The MEV-protected path
 //!     real DeFi traffic uses.
 //!
-//! The default 60/30/10 mix matches what most L1 production traffic
-//! looks like in practice (most txs are simple value movement; a
-//! large minority is contract activity; a small slice is the
-//! MEV-target DeFi/swap traffic that self-selects encrypted). Tunable
-//! via `PYDE_LOADGEN_MIX=transfer:60,call:30,encrypted:10`.
+//! The intended 60/30/10 mix matches what most L1 production
+//! traffic looks like in practice (most txs are simple value
+//! movement; a large minority is contract activity; a small slice
+//! is the MEV-target DeFi/swap traffic that self-selects
+//! encrypted). While the MEV-protection pipeline is disabled at
+//! compile time (see `MEV_PROTECTION_ENABLED` in
+//! `crates/node/src/main.rs`), the default falls back to 70/30/0
+//! — encrypted txs would be rejected at the RPC layer. Tunable
+//! via `PYDE_LOADGEN_MIX=transfer:60,call:30,encrypted:10` once
+//! the encrypted-tx path is re-enabled.
 //!
 //! Output: per-type submit/inclusion counts plus aggregate. The
 //! aggregate is the headline number quotable at testnet launch —
@@ -37,7 +42,7 @@
 //!   PYDE_LOADGEN_DURATION    — measurement duration in seconds (default 300)
 //!   PYDE_LOADGEN_WARMUP      — warm-up in seconds (default 30)
 //!   PYDE_LOADGEN_SENDERS     — funded sender count (default 200)
-//!   PYDE_LOADGEN_MIX         — weight string (default "transfer:60,call:30,encrypted:10")
+//!   PYDE_LOADGEN_MIX         — weight string (default "transfer:70,call:30,encrypted:0" while MEV is off; intended mix once re-enabled is "transfer:60,call:30,encrypted:10")
 //!   PYDE_LOADGEN_FUND        — per-sender fund override
 //!
 //! # On sender count
@@ -117,10 +122,14 @@ struct MixWeights {
 
 impl MixWeights {
     fn parse(s: &str) -> Self {
-        // "transfer:60,call:30,encrypted:10" → MixWeights{60,30,10}
-        let mut transfer = 60u32;
+        // "transfer:70,call:30,encrypted:0" → MixWeights{70,30,0}
+        // Default encrypted=0 while MEV protection is disabled in
+        // the build (see `MEV_PROTECTION_ENABLED` in
+        // `crates/node/src/main.rs`). Override the mix string once
+        // the encrypted path is wired back in.
+        let mut transfer = 70u32;
         let mut call = 30u32;
-        let mut encrypted = 10u32;
+        let mut encrypted = 0u32;
         for part in s.split(',') {
             if let Some((k, v)) = part.split_once(':') {
                 let val = v.trim().parse::<u32>().unwrap_or(0);
