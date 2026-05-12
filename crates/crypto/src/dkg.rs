@@ -890,6 +890,393 @@ pub fn verify_complaint(
     }
 }
 
+// --- Phase E.1: contribution generation, share verification, share aggregation ---
+
+/// Cap on Goldilocks rejection-sampling retries before we declare
+/// the supplied entropy or RNG broken. The per-iteration success
+/// probability is `~1 - 2^-32`; in practice the very first draw
+/// succeeds.
+const MAX_REJECTION_RETRIES: u32 = 64;
+
+/// Domain separator for sampling the contributor's secret seed
+/// elements from `rng_seed`.
+const DKG_SECRET_SEED_DOMAIN: &[u8] = b"PYDE_DKG_SECRET_SEED_V1\0";
+
+/// Domain separator for sampling Shamir polynomial coefficients
+/// (non-constant terms) from `rng_seed`.
+const DKG_POLY_COEFF_DOMAIN: &[u8] = b"PYDE_DKG_POLY_COEFF_V1\0";
+
+/// Sample one canonical Goldilocks element keyed by
+/// `(domain, rng_seed, from_index, element_idx, coeff_idx)`.
+/// `coeff_idx = 0` is the constant term (the secret); higher
+/// indices are polynomial coefficients. Rejection-samples values
+/// `< GOLDILOCKS_PRIME` so the distribution is uniform on the
+/// field (audit-391 pattern).
+fn sample_goldilocks(
+    domain: &[u8],
+    rng_seed: &[u8; 32],
+    from_index: usize,
+    element_idx: usize,
+    coeff_idx: usize,
+) -> Result<Goldilocks, &'static str> {
+    let mut attempt: u64 = 0;
+    loop {
+        if attempt as u32 >= MAX_REJECTION_RETRIES {
+            return Err("DKG sampling exceeded rejection-retry budget");
+        }
+        let mut input =
+            Vec::with_capacity(domain.len() + 32 + 4 + 4 + 4 + 8);
+        input.extend_from_slice(domain);
+        input.extend_from_slice(rng_seed);
+        input.extend_from_slice(&(from_index as u32).to_le_bytes());
+        input.extend_from_slice(&(element_idx as u32).to_le_bytes());
+        input.extend_from_slice(&(coeff_idx as u32).to_le_bytes());
+        input.extend_from_slice(&attempt.to_le_bytes());
+        let hash = poseidon2_hash(&input);
+        let bytes = hash.as_bytes();
+        let val = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        if val < GOLDILOCKS_PRIME {
+            return Ok(gl(val));
+        }
+        attempt += 1;
+    }
+}
+
+/// Shamir-split a single Goldilocks element into `n` y-values at
+/// `x = 1..=n`. Polynomial coefficients are sampled deterministically
+/// from `(rng_seed, from_index, element_idx)` via
+/// [`sample_goldilocks`]. The constant term is the secret.
+fn dkg_shamir_split_y(
+    secret: Goldilocks,
+    n: usize,
+    threshold: usize,
+    rng_seed: &[u8; 32],
+    from_index: usize,
+    element_idx: usize,
+) -> Result<Vec<Goldilocks>, &'static str> {
+    let mut coeffs = Vec::with_capacity(threshold);
+    coeffs.push(secret);
+    for k in 1..threshold {
+        coeffs.push(sample_goldilocks(
+            DKG_POLY_COEFF_DOMAIN,
+            rng_seed,
+            from_index,
+            element_idx,
+            k,
+        )?);
+    }
+    let mut ys = Vec::with_capacity(n);
+    for j in 1..=n {
+        let x = gl(j as u64);
+        let mut y = Goldilocks::default();
+        let mut x_pow = gl(1);
+        for c in &coeffs {
+            y += *c * x_pow;
+            x_pow *= x;
+        }
+        ys.push(y);
+    }
+    Ok(ys)
+}
+
+/// One DKG contributor's outputs for round `epoch`: the signed
+/// Merkle-root commitment, per-recipient encrypted share envelopes
+/// + Merkle proofs, and the contributor's own share-row (which
+/// they retain for the aggregation step instead of mailing to
+/// themselves).
+#[derive(Clone, Debug)]
+pub struct DkgContribution {
+    pub commitment: DkgCommitment,
+    /// Length `n`. `recipient_envelopes[j - 1]` is the envelope +
+    /// proof addressed to committee member `j` (1-based).
+    pub recipient_envelopes: Vec<(DkgShareEnvelope, MerkleProof)>,
+    /// The contributor's own share-row at position `from_index`.
+    pub own_share_row: ShareRow,
+    /// Merkle inclusion proof for `own_share_row`.
+    pub own_merkle_proof: MerkleProof,
+}
+
+/// Why a recipient rejected a contributor's share. Maps directly
+/// onto the inputs of a [`DkgComplaint`] (see Phase D).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareVerificationError {
+    /// Contributor's Falcon signature on their `DkgCommitment`
+    /// doesn't verify under their published Falcon pk.
+    CommitmentSignatureInvalid,
+    /// The commitment's `(epoch, from_index, n, threshold)` header
+    /// doesn't match the round parameters the recipient expects.
+    CommitmentHeaderMismatch,
+    /// The envelope's MAC fails, the ciphertext doesn't decode as
+    /// a `ShareRow`, or the row's `receiver_index` doesn't match
+    /// the recipient's position. (All three collapse to a single
+    /// rejection so the rejection is timing-uniform.)
+    EnvelopeUndecryptable,
+    /// `merkle_proof.leaf_index + 1` doesn't match the recipient's
+    /// own committee position.
+    MerkleProofPositionMismatch,
+    /// The row's leaf hash + supplied Merkle proof do not
+    /// reconstruct the contributor's signed Merkle root.
+    MerkleProofMismatch,
+}
+
+/// One validator's share of the threshold master secret, formed
+/// by element-wise summing share-rows from all non-faulty
+/// contributors. The values are y-values of an implicit master
+/// polynomial whose constant term is `Σ_i seed_i` (the sum of
+/// contributors' fresh per-round secrets).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MasterShare {
+    /// 1-based committee position of the holder.
+    pub index: usize,
+    /// Aggregated y-values, one per seed element.
+    pub values: [Goldilocks; SEED_ELEMENTS],
+}
+
+impl MasterShare {
+    /// Wire size: 4 (index) + 8 * SEED_ELEMENTS bytes.
+    pub const WIRE_LEN: usize = 4 + 8 * SEED_ELEMENTS;
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::WIRE_LEN);
+        out.extend_from_slice(&(self.index as u32).to_le_bytes());
+        for v in &self.values {
+            out.extend_from_slice(&gl_to_u64(*v).to_le_bytes());
+        }
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::WIRE_LEN {
+            return None;
+        }
+        let index = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let mut values = [Goldilocks::default(); SEED_ELEMENTS];
+        for i in 0..SEED_ELEMENTS {
+            let off = 4 + i * 8;
+            let raw = u64::from_le_bytes([
+                bytes[off],
+                bytes[off + 1],
+                bytes[off + 2],
+                bytes[off + 3],
+                bytes[off + 4],
+                bytes[off + 5],
+                bytes[off + 6],
+                bytes[off + 7],
+            ]);
+            if raw >= GOLDILOCKS_PRIME {
+                return None;
+            }
+            values[i] = gl(raw);
+        }
+        Some(Self { index, values })
+    }
+}
+
+/// Build a full DKG contribution as committee member `from_index`.
+///
+/// The contributor's fresh secret seed is sampled deterministically
+/// from `(rng_seed, from_index)` — callers should feed in a fresh
+/// per-round random `rng_seed` for security; reusing the same seed
+/// across rounds reproduces the same secret.
+///
+/// `recipient_kem_pks[j - 1]` must be committee member `j`'s Kyber
+/// public key. The contributor's own slot in this list is allowed
+/// to be any valid Kyber pk — the function does not encrypt the
+/// contributor's own share-row (it goes back via `own_share_row`).
+pub fn generate_dkg_contribution(
+    rng_seed: &[u8; 32],
+    epoch: u64,
+    from_index: usize,
+    n: usize,
+    threshold: usize,
+    recipient_kem_pks: &[KyberPublicKey],
+    falcon_sk: &FalconSecretKey,
+) -> Result<DkgContribution, &'static str> {
+    if from_index == 0 || from_index > n {
+        return Err("from_index out of range (must be 1..=n)");
+    }
+    if threshold == 0 || threshold > n {
+        return Err("threshold out of range (must be 1..=n)");
+    }
+    if recipient_kem_pks.len() != n {
+        return Err("recipient_kem_pks length must equal n");
+    }
+
+    // Sample the contributor's 8-element secret seed.
+    let mut secret = [Goldilocks::default(); SEED_ELEMENTS];
+    for k in 0..SEED_ELEMENTS {
+        secret[k] = sample_goldilocks(
+            DKG_SECRET_SEED_DOMAIN,
+            rng_seed,
+            from_index,
+            k,
+            0,
+        )?;
+    }
+
+    // Per-element Shamir split. `ys[k]` is the length-`n` vector
+    // of y-values for the k-th polynomial; `ys[k][j-1]` is the
+    // y-value at x = j.
+    let mut ys: Vec<Vec<Goldilocks>> = Vec::with_capacity(SEED_ELEMENTS);
+    for k in 0..SEED_ELEMENTS {
+        ys.push(dkg_shamir_split_y(
+            secret[k],
+            n,
+            threshold,
+            rng_seed,
+            from_index,
+            k,
+        )?);
+    }
+
+    // Build the n share-rows and their leaf hashes.
+    let mut rows: Vec<ShareRow> = Vec::with_capacity(n);
+    let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(n);
+    for j in 1..=n {
+        let mut values = [Goldilocks::default(); SEED_ELEMENTS];
+        for k in 0..SEED_ELEMENTS {
+            values[k] = ys[k][j - 1];
+        }
+        let row = ShareRow {
+            receiver_index: j,
+            values,
+        };
+        leaves.push(row.leaf_hash(epoch, from_index));
+        rows.push(row);
+    }
+
+    // Merkle root + Falcon-signed commitment.
+    let merkle_root = compute_merkle_root(&leaves, epoch, from_index);
+    let mut commitment =
+        DkgCommitment::new_unsigned(epoch, from_index, n, threshold, merkle_root);
+    commitment.sign(falcon_sk)?;
+
+    // Pre-compute per-recipient Merkle proofs.
+    let proofs: Vec<MerkleProof> = (0..n)
+        .map(|j| {
+            merkle_proof(&leaves, j, epoch, from_index)
+                .expect("leaves and indices are in range by construction")
+        })
+        .collect();
+
+    // Encrypt each recipient's row under their KEM pk. The
+    // contributor's OWN row is not encrypted — it's returned as a
+    // plaintext `own_share_row` so the contributor can feed it
+    // directly into [`aggregate_local_share`].
+    let mut recipient_envelopes: Vec<(DkgShareEnvelope, MerkleProof)> = Vec::with_capacity(n);
+    let mut own_share_row: Option<ShareRow> = None;
+    let mut own_merkle_proof: Option<MerkleProof> = None;
+    for (j_minus_one, row) in rows.into_iter().enumerate() {
+        let j = j_minus_one + 1;
+        if j == from_index {
+            // Slot still occupied in recipient_envelopes for
+            // index alignment, but with a self-addressed envelope
+            // that the contributor will skip.
+            let env = encrypt_share_row(&row, &recipient_kem_pks[j - 1], epoch, from_index)?;
+            recipient_envelopes.push((env, proofs[j_minus_one].clone()));
+            own_share_row = Some(row);
+            own_merkle_proof = Some(proofs[j_minus_one].clone());
+        } else {
+            let env = encrypt_share_row(&row, &recipient_kem_pks[j - 1], epoch, from_index)?;
+            recipient_envelopes.push((env, proofs[j_minus_one].clone()));
+        }
+    }
+
+    Ok(DkgContribution {
+        commitment,
+        recipient_envelopes,
+        own_share_row: own_share_row.expect("from_index in 1..=n by check above"),
+        own_merkle_proof: own_merkle_proof.expect("from_index in 1..=n by check above"),
+    })
+}
+
+/// Verify a received share from a single contributor, returning
+/// the decrypted [`ShareRow`] on success or a
+/// [`ShareVerificationError`] indicating which check failed
+/// (suitable for constructing a [`DkgComplaint`]).
+///
+/// Checks (in order):
+/// 1. Commitment signature is valid under `contributor_falcon_pk`.
+/// 2. Commitment header matches the expected round parameters.
+/// 3. Merkle proof's `leaf_index + 1 == recipient_index`.
+/// 4. Envelope decapsulates + decrypts to a well-formed row at
+///    `recipient_index`.
+/// 5. Row's leaf hash + proof reconstruct `commitment.merkle_root`.
+pub fn verify_received_share(
+    envelope: &DkgShareEnvelope,
+    proof: &MerkleProof,
+    contributor_commitment: &DkgCommitment,
+    contributor_falcon_pk: &FalconPublicKey,
+    expected_epoch: u64,
+    expected_from_index: usize,
+    expected_n: usize,
+    expected_threshold: usize,
+    recipient_index: usize,
+    recipient_kem_sk: &KyberSecretKey,
+) -> Result<ShareRow, ShareVerificationError> {
+    if !contributor_commitment.verify(contributor_falcon_pk) {
+        return Err(ShareVerificationError::CommitmentSignatureInvalid);
+    }
+    if contributor_commitment.epoch != expected_epoch
+        || contributor_commitment.from_index != expected_from_index
+        || contributor_commitment.n != expected_n
+        || contributor_commitment.threshold != expected_threshold
+    {
+        return Err(ShareVerificationError::CommitmentHeaderMismatch);
+    }
+    if proof.leaf_index + 1 != recipient_index {
+        return Err(ShareVerificationError::MerkleProofPositionMismatch);
+    }
+    let Some(row) = decrypt_share_row(
+        envelope,
+        recipient_kem_sk,
+        expected_epoch,
+        expected_from_index,
+        recipient_index,
+    ) else {
+        return Err(ShareVerificationError::EnvelopeUndecryptable);
+    };
+    let leaf = row.leaf_hash(expected_epoch, expected_from_index);
+    if !verify_merkle_proof(&contributor_commitment.merkle_root, &leaf, proof) {
+        return Err(ShareVerificationError::MerkleProofMismatch);
+    }
+    Ok(row)
+}
+
+/// Aggregate per-contributor share-rows into the holder's local
+/// share of the master secret. All input rows must address the
+/// same holder (`receiver_index == holder_index`); per-element
+/// summing is over the Goldilocks field.
+///
+/// Returns an `Err` for defensively-invalid inputs (empty input,
+/// index mismatch). A degenerate `MasterShare` (`values` all zero,
+/// e.g. every contributor was excluded) is a legitimate output
+/// signaling "all contributors faulted" — callers decide whether
+/// to treat that as a round failure.
+pub fn aggregate_local_share(
+    holder_index: usize,
+    verified_share_rows: &[ShareRow],
+) -> Result<MasterShare, &'static str> {
+    if verified_share_rows.is_empty() {
+        return Err("aggregate_local_share: no contributors");
+    }
+    let mut values = [Goldilocks::default(); SEED_ELEMENTS];
+    for row in verified_share_rows {
+        if row.receiver_index != holder_index {
+            return Err("aggregate_local_share: row addressed to a different holder");
+        }
+        for k in 0..SEED_ELEMENTS {
+            values[k] += row.values[k];
+        }
+    }
+    Ok(MasterShare {
+        index: holder_index,
+        values,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1811,5 +2198,458 @@ mod tests {
             verify_complaint(&complaint, &c_pk, &root),
             ComplaintVerdict::Slander
         );
+    }
+
+    // --- Phase E.1: contribution / verification / aggregation tests ---
+
+    use crate::threshold::gl_inv as test_gl_inv;
+
+    /// Lagrange interpolation at x=0 over Goldilocks. Used by tests
+    /// to check that t MasterShares reconstruct the master secret.
+    fn lagrange_at_zero(points: &[(Goldilocks, Goldilocks)]) -> Goldilocks {
+        let t = points.len();
+        let mut result = Goldilocks::default();
+        for i in 0..t {
+            let mut basis = gl(1);
+            for j in 0..t {
+                if i != j {
+                    let num = Goldilocks::default() - points[j].0;
+                    let den = points[i].0 - points[j].0;
+                    basis *= num * test_gl_inv(den);
+                }
+            }
+            result += points[i].1 * basis;
+        }
+        result
+    }
+
+    fn make_committee(n: usize) -> (Vec<KyberPublicKey>, Vec<crate::kyber::KyberSecretKey>, Vec<FalconPublicKey>, Vec<FalconSecretKey>) {
+        let mut kem_pks = Vec::with_capacity(n);
+        let mut kem_sks = Vec::with_capacity(n);
+        let mut fal_pks = Vec::with_capacity(n);
+        let mut fal_sks = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (kpk, ksk) = kyber_keygen().expect("kyber keygen");
+            let (fpk, fsk) = falcon_keygen().expect("falcon keygen");
+            kem_pks.push(kpk);
+            kem_sks.push(ksk);
+            fal_pks.push(fpk);
+            fal_sks.push(fsk);
+        }
+        (kem_pks, kem_sks, fal_pks, fal_sks)
+    }
+
+    fn run_full_dkg(
+        epoch: u64,
+        n: usize,
+        threshold: usize,
+    ) -> (
+        Vec<DkgContribution>,
+        Vec<MasterShare>,
+        Vec<KyberPublicKey>,
+        Vec<crate::kyber::KyberSecretKey>,
+        Vec<FalconPublicKey>,
+        Vec<FalconSecretKey>,
+    ) {
+        let (kem_pks, kem_sks, fal_pks, fal_sks) = make_committee(n);
+        let mut contributions: Vec<DkgContribution> = Vec::with_capacity(n);
+        for i in 1..=n {
+            let mut seed = [0u8; 32];
+            seed[0] = i as u8;
+            seed[1] = epoch as u8;
+            let contrib = generate_dkg_contribution(
+                &seed,
+                epoch,
+                i,
+                n,
+                threshold,
+                &kem_pks,
+                &fal_sks[i - 1],
+            )
+            .expect("contribution");
+            contributions.push(contrib);
+        }
+
+        let mut master_shares: Vec<MasterShare> = Vec::with_capacity(n);
+        for j in 1..=n {
+            let mut rows: Vec<ShareRow> = Vec::with_capacity(n);
+            for (i_minus_one, contrib) in contributions.iter().enumerate() {
+                let i = i_minus_one + 1;
+                let row = if i == j {
+                    // Own row — contributor uses the plaintext directly.
+                    contrib.own_share_row.clone()
+                } else {
+                    let (env, proof) = &contrib.recipient_envelopes[j - 1];
+                    verify_received_share(
+                        env,
+                        proof,
+                        &contrib.commitment,
+                        &fal_pks[i - 1],
+                        epoch,
+                        i,
+                        n,
+                        threshold,
+                        j,
+                        &kem_sks[j - 1],
+                    )
+                    .expect("share verifies in honest run")
+                };
+                rows.push(row);
+            }
+            master_shares.push(aggregate_local_share(j, &rows).expect("aggregate"));
+        }
+
+        (contributions, master_shares, kem_pks, kem_sks, fal_pks, fal_sks)
+    }
+
+    #[test]
+    fn dkg_end_to_end_threshold_reconstructs_master_seed() {
+        let epoch = 42;
+        let n = 5;
+        let threshold = 3;
+        let (contributions, master_shares, _, _, _, _) = run_full_dkg(epoch, n, threshold);
+
+        // Master secret = element-wise sum of contributors' secret
+        // seeds. We can derive each contributor's seed by Lagrange-
+        // reconstructing their own n-of-n shares — or, more
+        // simply, by re-sampling using the same rng_seed deriviation
+        // we used during contribution. Use t shares to reconstruct
+        // each element of the MASTER seed and check it matches the
+        // sum of per-contributor seeds reconstructed the same way.
+        let pick: Vec<&MasterShare> = master_shares.iter().take(threshold).collect();
+        let mut master_seed = [Goldilocks::default(); SEED_ELEMENTS];
+        for k in 0..SEED_ELEMENTS {
+            let points: Vec<(Goldilocks, Goldilocks)> = pick
+                .iter()
+                .map(|ms| (gl(ms.index as u64), ms.values[k]))
+                .collect();
+            master_seed[k] = lagrange_at_zero(&points);
+        }
+
+        // Reconstruct from each contributor's OWN share-rows.
+        let mut expected = [Goldilocks::default(); SEED_ELEMENTS];
+        for contrib in &contributions {
+            // Take any threshold of this contributor's row pieces.
+            // We have only `own_share_row` directly, plus envelopes
+            // for others — to avoid a second decryption pass, build
+            // up the rows from the contributor's own perspective by
+            // re-running sample_goldilocks. Simpler: rebuild by
+            // calling generate_dkg_contribution again with the same
+            // seed and reading out the secret directly.
+            let from_index = contrib.commitment.from_index;
+            let mut seed = [0u8; 32];
+            seed[0] = from_index as u8;
+            seed[1] = epoch as u8;
+            for k in 0..SEED_ELEMENTS {
+                let s = sample_goldilocks(
+                    DKG_SECRET_SEED_DOMAIN,
+                    &seed,
+                    from_index,
+                    k,
+                    0,
+                )
+                .expect("sample");
+                expected[k] += s;
+            }
+        }
+        assert_eq!(master_seed, expected);
+    }
+
+    #[test]
+    fn dkg_distinct_threshold_subsets_reconstruct_same_master_seed() {
+        let epoch = 10;
+        let n = 6;
+        let threshold = 4;
+        let (_contribs, master_shares, _, _, _, _) = run_full_dkg(epoch, n, threshold);
+
+        // First t shares.
+        let pick_a: Vec<&MasterShare> = master_shares[0..threshold].iter().collect();
+        // Last t shares.
+        let pick_b: Vec<&MasterShare> = master_shares[n - threshold..].iter().collect();
+
+        let mut seed_a = [Goldilocks::default(); SEED_ELEMENTS];
+        let mut seed_b = [Goldilocks::default(); SEED_ELEMENTS];
+        for k in 0..SEED_ELEMENTS {
+            let pts_a: Vec<(Goldilocks, Goldilocks)> = pick_a
+                .iter()
+                .map(|m| (gl(m.index as u64), m.values[k]))
+                .collect();
+            let pts_b: Vec<(Goldilocks, Goldilocks)> = pick_b
+                .iter()
+                .map(|m| (gl(m.index as u64), m.values[k]))
+                .collect();
+            seed_a[k] = lagrange_at_zero(&pts_a);
+            seed_b[k] = lagrange_at_zero(&pts_b);
+        }
+        assert_eq!(
+            seed_a, seed_b,
+            "any threshold-sized subset must reconstruct the same master seed"
+        );
+    }
+
+    #[test]
+    fn dkg_below_threshold_does_not_reconstruct() {
+        // With fewer than `t` shares, Lagrange interpolation at x=0
+        // produces some value that is NOT the actual master_seed —
+        // i.e. the shares look independent of the secret. Test that
+        // we don't accidentally reconstruct the right value.
+        let epoch = 99;
+        let n = 7;
+        let threshold = 5;
+        let (_contribs, master_shares, _, _, _, _) = run_full_dkg(epoch, n, threshold);
+
+        let full: Vec<&MasterShare> = master_shares.iter().take(threshold).collect();
+        let mut full_seed = [Goldilocks::default(); SEED_ELEMENTS];
+        for k in 0..SEED_ELEMENTS {
+            let pts: Vec<(Goldilocks, Goldilocks)> = full
+                .iter()
+                .map(|m| (gl(m.index as u64), m.values[k]))
+                .collect();
+            full_seed[k] = lagrange_at_zero(&pts);
+        }
+
+        let partial: Vec<&MasterShare> =
+            master_shares.iter().take(threshold - 1).collect();
+        let mut partial_seed = [Goldilocks::default(); SEED_ELEMENTS];
+        for k in 0..SEED_ELEMENTS {
+            let pts: Vec<(Goldilocks, Goldilocks)> = partial
+                .iter()
+                .map(|m| (gl(m.index as u64), m.values[k]))
+                .collect();
+            partial_seed[k] = lagrange_at_zero(&pts);
+        }
+        assert_ne!(
+            full_seed, partial_seed,
+            "t-1 shares must not match the t-share reconstruction"
+        );
+    }
+
+    #[test]
+    fn dkg_verify_share_rejects_commitment_signature() {
+        let epoch = 7;
+        let n = 4;
+        let threshold = 3;
+        let (kem_pks, kem_sks, fal_pks, fal_sks) = make_committee(n);
+        let mut seed = [0u8; 32];
+        seed[0] = 1;
+        let contrib = generate_dkg_contribution(
+            &seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0],
+        )
+        .expect("contribution");
+        let (env, proof) = &contrib.recipient_envelopes[1];
+        // Attacker's Falcon pk — sig should fail verify under it.
+        let (attacker_pk, _attacker_sk) = falcon_keygen().expect("attacker");
+        let _ = &fal_pks; // silence unused warning
+        let err = verify_received_share(
+            env,
+            proof,
+            &contrib.commitment,
+            &attacker_pk,
+            epoch,
+            1,
+            n,
+            threshold,
+            2,
+            &kem_sks[1],
+        )
+        .unwrap_err();
+        assert_eq!(err, ShareVerificationError::CommitmentSignatureInvalid);
+    }
+
+    #[test]
+    fn dkg_verify_share_rejects_commitment_header_mismatch() {
+        let epoch = 7;
+        let n = 4;
+        let threshold = 3;
+        let (kem_pks, kem_sks, fal_pks, fal_sks) = make_committee(n);
+        let mut seed = [0u8; 32];
+        seed[0] = 1;
+        let contrib = generate_dkg_contribution(
+            &seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0],
+        )
+        .expect("contribution");
+        let (env, proof) = &contrib.recipient_envelopes[1];
+        // Wrong expected_epoch.
+        let err = verify_received_share(
+            env,
+            proof,
+            &contrib.commitment,
+            &fal_pks[0],
+            epoch + 1, // <-- mismatch
+            1,
+            n,
+            threshold,
+            2,
+            &kem_sks[1],
+        )
+        .unwrap_err();
+        assert_eq!(err, ShareVerificationError::CommitmentHeaderMismatch);
+    }
+
+    #[test]
+    fn dkg_verify_share_rejects_proof_position_mismatch() {
+        let epoch = 7;
+        let n = 4;
+        let threshold = 3;
+        let (kem_pks, kem_sks, fal_pks, fal_sks) = make_committee(n);
+        let mut seed = [0u8; 32];
+        seed[0] = 1;
+        let contrib = generate_dkg_contribution(
+            &seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0],
+        )
+        .expect("contribution");
+        let (env, _proof_for_j2) = &contrib.recipient_envelopes[1];
+        // Use proof for j=3 while claiming we're j=2.
+        let proof_for_j3 = contrib.recipient_envelopes[2].1.clone();
+        let err = verify_received_share(
+            env,
+            &proof_for_j3,
+            &contrib.commitment,
+            &fal_pks[0],
+            epoch,
+            1,
+            n,
+            threshold,
+            2, // <-- but proof.leaf_index = 2 (j=3 - 1)
+            &kem_sks[1],
+        )
+        .unwrap_err();
+        assert_eq!(err, ShareVerificationError::MerkleProofPositionMismatch);
+    }
+
+    #[test]
+    fn dkg_verify_share_rejects_envelope_undecryptable() {
+        let epoch = 7;
+        let n = 4;
+        let threshold = 3;
+        let (kem_pks, kem_sks, fal_pks, fal_sks) = make_committee(n);
+        let mut seed = [0u8; 32];
+        seed[0] = 1;
+        let contrib = generate_dkg_contribution(
+            &seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0],
+        )
+        .expect("contribution");
+        let (env, proof) = &contrib.recipient_envelopes[1];
+        // Try decrypting with the WRONG recipient's KEM sk (j=3
+        // instead of j=2 it was encrypted for).
+        let err = verify_received_share(
+            env,
+            proof,
+            &contrib.commitment,
+            &fal_pks[0],
+            epoch,
+            1,
+            n,
+            threshold,
+            2,
+            &kem_sks[2], // wrong sk
+        )
+        .unwrap_err();
+        assert_eq!(err, ShareVerificationError::EnvelopeUndecryptable);
+    }
+
+    #[test]
+    fn dkg_verify_share_rejects_merkle_mismatch() {
+        let epoch = 7;
+        let n = 4;
+        let threshold = 3;
+        let (kem_pks, kem_sks, fal_pks, fal_sks) = make_committee(n);
+        let mut seed = [0u8; 32];
+        seed[0] = 1;
+        let mut contrib = generate_dkg_contribution(
+            &seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0],
+        )
+        .expect("contribution");
+        // Tamper with the commitment's merkle_root AFTER signing.
+        // The Falcon sig still validates against the *original*
+        // root, so we have to re-sign over the tampered root for
+        // the test to reach the Merkle-mismatch branch instead of
+        // failing earlier at the sig check.
+        contrib.commitment.merkle_root[0] ^= 0xFF;
+        contrib.commitment.sign(&fal_sks[0]).expect("re-sign");
+        let (env, proof) = &contrib.recipient_envelopes[1];
+        let err = verify_received_share(
+            env,
+            proof,
+            &contrib.commitment,
+            &fal_pks[0],
+            epoch,
+            1,
+            n,
+            threshold,
+            2,
+            &kem_sks[1],
+        )
+        .unwrap_err();
+        assert_eq!(err, ShareVerificationError::MerkleProofMismatch);
+    }
+
+    #[test]
+    fn dkg_aggregate_local_share_rejects_empty() {
+        let err = aggregate_local_share(3, &[]).unwrap_err();
+        assert!(err.contains("no contributors"));
+    }
+
+    #[test]
+    fn dkg_aggregate_local_share_rejects_index_mismatch() {
+        let row_for_2 = make_row(2, 42);
+        let err = aggregate_local_share(3, &[row_for_2]).unwrap_err();
+        assert!(err.contains("different holder"));
+    }
+
+    #[test]
+    fn dkg_generate_contribution_validates_inputs() {
+        let (kem_pks, _kem_sks, _fal_pks, fal_sks) = make_committee(4);
+        let seed = [1u8; 32];
+
+        // from_index 0
+        assert!(
+            generate_dkg_contribution(&seed, 1, 0, 4, 3, &kem_pks, &fal_sks[0]).is_err()
+        );
+        // from_index > n
+        assert!(
+            generate_dkg_contribution(&seed, 1, 5, 4, 3, &kem_pks, &fal_sks[0]).is_err()
+        );
+        // threshold > n
+        assert!(
+            generate_dkg_contribution(&seed, 1, 1, 4, 5, &kem_pks, &fal_sks[0]).is_err()
+        );
+        // threshold 0
+        assert!(
+            generate_dkg_contribution(&seed, 1, 1, 4, 0, &kem_pks, &fal_sks[0]).is_err()
+        );
+        // wrong recipient_kem_pks length
+        let short_pks = &kem_pks[..3];
+        assert!(
+            generate_dkg_contribution(&seed, 1, 1, 4, 3, short_pks, &fal_sks[0]).is_err()
+        );
+    }
+
+    #[test]
+    fn master_share_wire_roundtrip() {
+        let mut values = [Goldilocks::default(); SEED_ELEMENTS];
+        for k in 0..SEED_ELEMENTS {
+            values[k] = gl(1000 + k as u64);
+        }
+        let ms = MasterShare { index: 4, values };
+        let bytes = ms.to_bytes();
+        assert_eq!(bytes.len(), MasterShare::WIRE_LEN);
+        let decoded = MasterShare::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, ms);
+    }
+
+    #[test]
+    fn master_share_wire_rejects_wrong_length() {
+        assert!(MasterShare::from_bytes(&[]).is_none());
+        assert!(MasterShare::from_bytes(&[0u8; MasterShare::WIRE_LEN - 1]).is_none());
+        assert!(MasterShare::from_bytes(&[0u8; MasterShare::WIRE_LEN + 1]).is_none());
+    }
+
+    #[test]
+    fn master_share_wire_rejects_non_canonical_goldilocks() {
+        let mut bytes = vec![0u8; MasterShare::WIRE_LEN];
+        bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[4..12].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(MasterShare::from_bytes(&bytes).is_none());
     }
 }
