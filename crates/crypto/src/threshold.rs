@@ -60,17 +60,17 @@ fn zeroize_goldilocks_vec_vec(v: &mut Vec<Vec<Goldilocks>>) {
 /// introduces over the range `[p, 2^64)`. Pre-fix, values in
 /// `[0, 2^32)` were ~2x more likely to be produced than values
 /// in `[2^32, p)`.
-const GOLDILOCKS_PRIME: u64 = 0xFFFF_FFFF_0000_0001;
+pub(crate) const GOLDILOCKS_PRIME: u64 = 0xFFFF_FFFF_0000_0001;
 
-fn gl(val: u64) -> Goldilocks {
+pub(crate) fn gl(val: u64) -> Goldilocks {
     PrimeCharacteristicRing::from_u64(val)
 }
 
-fn gl_to_u64(el: Goldilocks) -> u64 {
+pub(crate) fn gl_to_u64(el: Goldilocks) -> u64 {
     el.as_canonical_u64()
 }
 
-fn gl_inv(x: Goldilocks) -> Goldilocks {
+pub(crate) fn gl_inv(x: Goldilocks) -> Goldilocks {
     // Fermat's little theorem: x^(p-2) mod p
     // p = 2^64 - 2^32 + 1, so p-2 = 2^64 - 2^32 - 1
     // Use the field's built-in inverse
@@ -518,7 +518,7 @@ impl ThresholdCiphertext {
 
 // --- Symmetric encryption using Poseidon2-derived keystream ---
 
-const SEED_ELEMENTS: usize = 8; // 64-byte seed = 8 × 8-byte elements
+pub(crate) const SEED_ELEMENTS: usize = 8; // 64-byte seed = 8 × 8-byte elements
 
 /// Audit 359: domain-separation prefix for the keystream KDF.
 /// Prevents accidental cross-use of a keystream block as a MAC
