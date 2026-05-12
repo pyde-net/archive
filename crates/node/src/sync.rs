@@ -31,6 +31,15 @@ pub struct ChainSync {
     pub manager: SyncManager,
     /// Outstanding outbound requests: request_id → peer.
     pending: HashMap<OutboundRequestId, PeerId>,
+    /// Task #94: outstanding `GetBlockByHash` requests:
+    /// `request_id → (qc_slot, qc_block_hash)`. Populated when the
+    /// QC-apply body-unavailable branch fires the request and
+    /// drained when the response arrives. Carrying both qc_slot
+    /// and qc_block_hash lets the response handler validate the
+    /// returned bytes hash to the expected QC and re-emit
+    /// `ApplyCanonicalAfterQc` so the apply path retries with the
+    /// recovered body now seeded into `pending_block_bodies`.
+    pub pending_block_by_hash: HashMap<OutboundRequestId, (u64, [u8; 32])>,
     /// Whether initial sync has completed at least once.
     pub initial_sync_done: bool,
     /// Chunked snapshot receiver state.
@@ -57,6 +66,7 @@ impl ChainSync {
         Self {
             manager: SyncManager::new(),
             pending: HashMap::new(),
+            pending_block_by_hash: HashMap::new(),
             initial_sync_done: false,
             snapshot_chunks: Vec::new(),
             snapshot_expected_root: None,
@@ -170,6 +180,65 @@ impl ChainSync {
             .sync
             .send_request(&peer, SyncReq::GetChainTip);
         debug!(%peer, "requested chain tip");
+    }
+
+    /// Task #94: fan out `GetBlockByHash` to up to `max_peers`
+    /// connected peers for the recovery path that runs when
+    /// QC-apply hits body-unavailable. Each request is registered
+    /// in `pending_block_by_hash` so the response handler can
+    /// validate the returned bytes match `qc_block_hash` and
+    /// re-trigger the canonical apply for `qc_slot`.
+    ///
+    /// Why fan-out: the proposer always has the body in its
+    /// `block_store`, but we don't know which connected peer is
+    /// the proposer. Asking 3-4 peers minimises latency without
+    /// generating a request flood (per-peer rate-limit lives at
+    /// the responder side).
+    ///
+    /// Returns the number of requests fired. 0 means we have no
+    /// connected peers — caller should retry on the next sync
+    /// tick.
+    /// Task #94: drop a `pending` entry without going through
+    /// `on_response`. The BlockByHash recovery path special-cases
+    /// the response in `node.rs` and so won't visit
+    /// `on_response.pending.remove(...)`; it calls this helper
+    /// instead so we don't leak request_ids.
+    pub fn release_pending(&mut self, request_id: OutboundRequestId) {
+        self.pending.remove(&request_id);
+    }
+
+    pub fn request_block_by_hash(
+        &mut self,
+        swarm: &mut Swarm<PydeBehaviour>,
+        qc_slot: u64,
+        qc_block_hash: [u8; 32],
+        max_peers: usize,
+    ) -> usize {
+        let peers: Vec<PeerId> = swarm
+            .connected_peers()
+            .copied()
+            .take(max_peers)
+            .collect();
+        let mut fired = 0;
+        for peer in peers {
+            let request_id = swarm
+                .behaviour_mut()
+                .sync
+                .send_request(&peer, SyncReq::GetBlockByHash(qc_block_hash));
+            self.pending_block_by_hash
+                .insert(request_id, (qc_slot, qc_block_hash));
+            self.pending.insert(request_id, peer);
+            fired += 1;
+        }
+        if fired > 0 {
+            info!(
+                qc_slot,
+                qc_block_hash = hex::encode(qc_block_hash),
+                fired,
+                "task #94: GetBlockByHash fan-out for body recovery"
+            );
+        }
+        fired
     }
 
     /// Request a state snapshot from a peer (for fast sync when far behind).
@@ -614,6 +683,15 @@ impl ChainSync {
                 }
                 (0, Vec::new(), Vec::new())
             }
+            SyncResp::BlockByHash(_) => {
+                // Task #94: handled outside `on_response` (the swarm
+                // event arm in node.rs special-cases this variant
+                // before calling here). Reaching this branch means
+                // a malformed request_id mapping or a peer responded
+                // to an unexpected request — log and ignore.
+                debug!("on_response: unexpected BlockByHash — request was not registered");
+                (0, Vec::new(), Vec::new())
+            }
         }
     }
 
@@ -762,6 +840,21 @@ impl ChainSync {
                     chunk_hash,
                     entries: chunk_entries,
                 }
+            }
+            SyncReq::GetBlockByHash(hash) => {
+                // Task #94: hash-based block lookup. Resolve to slot
+                // via the chain's `hash_to_slot` index, then fetch
+                // the wire-encoded full block from `block_store`.
+                // `BlockByHash(None)` is the "I don't have this
+                // block" signal — distinct from top-level `NotFound`
+                // so the caller knows the request was understood
+                // and the peer just doesn't hold this hash, vs a
+                // protocol-level error.
+                let resp = chain
+                    .hash_to_slot
+                    .get(hash)
+                    .and_then(|slot| block_store.get_block_raw(*slot));
+                SyncResp::BlockByHash(resp)
             }
         }
     }

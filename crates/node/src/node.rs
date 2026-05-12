@@ -1198,6 +1198,36 @@ impl PydeNode {
                             &mut gossip_cache,
                             );
                         }
+                        PostEventAction::SendConsensusRrResponseAndBroadcastFallbackProposalAndBufferBody(
+                            channel,
+                            resp,
+                            block,
+                            bytes,
+                        ) => {
+                            // Task #94: ack the RR sender, seed the body
+                            // buffer, then broadcast. Same ordering
+                            // rationale as the gossip-side variant.
+                            let _ = swarm.behaviour_mut().consensus_rr.send_response(channel, resp);
+                            let block_hash = block.header.hash();
+                            let slot = block.header.slot;
+                            {
+                                let mut pbb = pending_block_bodies.write().await;
+                                pbb.insert(block_hash, block);
+                            }
+                            debug!(
+                                slot,
+                                block_hash = hex::encode(block_hash),
+                                "task #94: seeded own fallback block into pending_block_bodies (RR-VC-QC)"
+                            );
+                            let topic = pyde_net::node::topics::consensus();
+                            broadcast_consensus_with_rr_fallback(
+                                &mut swarm,
+                                topic,
+                                bytes,
+                                &mut peer_manager,
+                                &mut gossip_cache,
+                            );
+                        }
                         PostEventAction::SendConsensusRrResponseAndApplyQcd(
                             channel,
                             resp,
@@ -1260,9 +1290,18 @@ impl PydeNode {
                             let block = match block {
                                 Some(b) => b,
                                 None => {
+                                    // Task #94: same recovery path as the
+                                    // gossip-VC body-unavailable site below.
+                                    let fired = chain_sync.request_block_by_hash(
+                                        &mut swarm,
+                                        qc_slot,
+                                        qc_block_hash,
+                                        4,
+                                    );
                                     info!(
                                         qc_slot,
-                                        "RR-QC canonical apply: body unavailable"
+                                        recovery_requests = fired,
+                                        "RR-QC canonical apply: body unavailable — fired GetBlockByHash"
                                     );
                                     continue;
                                 }
@@ -1633,6 +1672,43 @@ impl PydeNode {
                                 );
                             }
                         }
+                        PostEventAction::BroadcastFallbackProposalAndBufferBody { block, bytes } => {
+                            // Task #94: same audit-218 egress check as
+                            // BroadcastConsensus.
+                            if !is_validator {
+                                warn!(
+                                    "non-validator attempted BroadcastFallbackProposalAndBufferBody; \
+                                     dropped (audit 218)"
+                                );
+                            } else {
+                                // Seed the body buffer FIRST so a fast
+                                // QC arrival sees it on its
+                                // `pending_block_bodies` lookup. The
+                                // gossip-broadcast and the QC race
+                                // (especially with the RR fallback
+                                // pushing votes synchronously), so
+                                // ordering matters.
+                                let block_hash = block.header.hash();
+                                let slot = block.header.slot;
+                                {
+                                    let mut pbb = pending_block_bodies.write().await;
+                                    pbb.insert(block_hash, block);
+                                }
+                                debug!(
+                                    slot,
+                                    block_hash = hex::encode(block_hash),
+                                    "task #94: seeded own fallback block into pending_block_bodies"
+                                );
+                                let topic = pyde_net::node::topics::consensus();
+                                broadcast_consensus_with_rr_fallback(
+                                    &mut swarm,
+                                    topic,
+                                    bytes,
+                                    &mut peer_manager,
+                                    &mut gossip_cache,
+                                );
+                            }
+                        }
                         PostEventAction::BroadcastConsensusMany(messages) => {
                             if !is_validator {
                                 warn!(
@@ -1737,9 +1813,30 @@ impl PydeNode {
                             let block = match block {
                                 Some(b) => b,
                                 None => {
+                                    // Task #94: fire `GetBlockByHash` to a few
+                                    // connected peers. The proposer holds the
+                                    // body in its `block_store`; the response
+                                    // handler will populate
+                                    // `pending_block_bodies` and re-emit
+                                    // `ApplyCanonicalAfterQc` so this branch
+                                    // retries the apply with the body in hand.
+                                    // Without this recovery path the QC apply
+                                    // here was silent — sync's `GetBlocks`
+                                    // is slot-keyed and useless under load
+                                    // because every peer reports the same
+                                    // head; only a hash-keyed request can
+                                    // reach the one peer that actually has
+                                    // the body.
+                                    let fired = chain_sync.request_block_by_hash(
+                                        &mut swarm,
+                                        qc_slot,
+                                        qc_block_hash,
+                                        4,
+                                    );
                                     info!(
                                         qc_slot,
-                                        "ApplyCanonicalAfterQc: body unavailable (sync will recover)"
+                                        recovery_requests = fired,
+                                        "ApplyCanonicalAfterQc: body unavailable — fired GetBlockByHash"
                                     );
                                     continue;
                                 }
@@ -1843,6 +1940,57 @@ impl PydeNode {
                                     );
                                 }
                             }
+                        }
+                        PostEventAction::RecoveredBlockByHashForQc {
+                            qc_slot,
+                            qc_block_hash,
+                            block_bytes,
+                        } => {
+                            // Task #94: a peer responded to our
+                            // GetBlockByHash recovery request. Decode
+                            // the bytes, validate the header hashes
+                            // to the expected `qc_block_hash`
+                            // (defense-in-depth against a peer
+                            // returning the wrong block — the QC
+                            // ultimately gates apply but we'd rather
+                            // not pollute `pending_block_bodies`),
+                            // seed the body buffer, and tail-call
+                            // `ApplyCanonicalAfterQc` to retry the
+                            // apply with the recovered body in hand.
+                            let block = match wire::decode_block(&block_bytes) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!(
+                                        qc_slot,
+                                        error = e,
+                                        "task #94: GetBlockByHash response failed to decode"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let actual_hash = block.header.hash();
+                            if actual_hash != qc_block_hash {
+                                warn!(
+                                    qc_slot,
+                                    expected = hex::encode(qc_block_hash),
+                                    got = hex::encode(actual_hash),
+                                    "task #94: GetBlockByHash response hash mismatch — discarding"
+                                );
+                                continue;
+                            }
+                            {
+                                let mut pbb = pending_block_bodies.write().await;
+                                pbb.insert(actual_hash, block);
+                            }
+                            info!(
+                                qc_slot,
+                                qc_block_hash = hex::encode(qc_block_hash),
+                                "task #94: recovered block via GetBlockByHash — retrying canonical apply"
+                            );
+                            next_action = Some(PostEventAction::ApplyCanonicalAfterQc {
+                                qc_slot,
+                                qc_block_hash,
+                            });
                         }
                         PostEventAction::BufferCompetingBlock(block) => {
                             // Audit 232: a competing block at our head slot
@@ -2075,7 +2223,14 @@ impl PydeNode {
                                             mempool_txs.push((etx.hash(), bytes));
                                         }
                                     }
-                                    debug!(
+                                    // Task #94: info — same diagnostic
+                                    // rationale as `compact block
+                                    // reconstructed and buffered`. The
+                                    // encrypted-tx bundle arrives on a
+                                    // separate gossipsub message; loss
+                                    // here is a known cause of body-
+                                    // unavailable cascades.
+                                    info!(
                                         slot,
                                         "reassembled compact block using queued encrypted-tx bundle"
                                     );
@@ -2322,12 +2477,24 @@ impl PydeNode {
                                 let mut pbb = pending_block_bodies.write().await;
                                 pbb.insert(block_hash, block.clone());
                             }
-                            debug!(
+                            // Task #94: keep this at info. Distinguishing
+                            // "compact block never arrived" from "arrived
+                            // but failed to reconstruct" from "arrived,
+                            // reconstructed, but apply skipped" requires
+                            // seeing the success path in operator logs.
+                            // Pre-promotion the reconstruct-success path
+                            // was silent at info level, so the only
+                            // visible chain-stall signal was
+                            // `body unavailable` — which fires on multiple
+                            // upstream causes — and root-causing took
+                            // hours of guesswork. ~1 line per (node, slot)
+                            // under healthy operation, an acceptable cost.
+                            info!(
                                 slot,
                                 block_hash = hex::encode(block_hash),
                                 txs = block.body.transactions.len(),
                                 encrypted = block.body.encrypted_txs.len(),
-                                "compact block reconstructed and buffered (awaiting QC)"
+                                "compact block reconstructed and buffered"
                             );
                         }
                         PostEventAction::BlockProcessed { slot, receipts: receipts_list, tx_hashes } => {
@@ -3143,9 +3310,24 @@ impl PydeNode {
                                                     }
                                                 }
                                                 None => {
-                                                    debug!(
+                                                    // Task #94: same recovery
+                                                    // path as the other two
+                                                    // body-unavailable sites
+                                                    // — fan out
+                                                    // `GetBlockByHash` so the
+                                                    // proposer (who has the
+                                                    // body in `block_store`)
+                                                    // can serve it back.
+                                                    let fired = chain_sync.request_block_by_hash(
+                                                        &mut swarm,
+                                                        qc_slot,
+                                                        qc_hash,
+                                                        4,
+                                                    );
+                                                    info!(
                                                         slot = qc_slot,
-                                                        "own-vote-QC inline apply: body unavailable for non-empty block (sync will recover)"
+                                                        recovery_requests = fired,
+                                                        "own-vote-QC inline apply: body unavailable — fired GetBlockByHash"
                                                     );
                                                     continue;
                                                 }
@@ -4176,6 +4358,19 @@ enum PostEventAction {
         encrypted_blocks_to_decrypt: Vec<pyde_consensus::block::Block>,
     },
     BroadcastConsensus(Vec<u8>),
+    /// Task #94: broadcast our own VC fallback Proposal AND seed the
+    /// full block into `pending_block_bodies`. The deterministic
+    /// fallback proposer never sees its own gossip publish, and the
+    /// sync `handle_swarm_event` context can't take the async
+    /// `pending_block_bodies` write lock. Carry the block via this
+    /// action so the main loop's async handler does the insert +
+    /// broadcast atomically — see
+    /// `build_and_encode_fallback_proposal` for the failure mode
+    /// this addresses.
+    BroadcastFallbackProposalAndBufferBody {
+        block: pyde_consensus::block::Block,
+        bytes: Vec<u8>,
+    },
     /// Batch-publish multiple consensus messages in one post-event
     /// action. Used for slashing evidence: a single received proposal
     /// can cause the engine to queue several messages at once (e.g. if
@@ -4216,6 +4411,21 @@ enum PostEventAction {
         qc_slot: u64,
         qc_block_hash: [u8; 32],
     },
+    /// Task #94: a `GetBlockByHash` response arrived carrying a
+    /// candidate full-block payload for `qc_block_hash`. The async
+    /// handler decodes the bytes, validates the header hashes to
+    /// the expected QC block_hash (rejects byte-flips and
+    /// peer-injected mismatches), seeds `pending_block_bodies`,
+    /// and re-emits `ApplyCanonicalAfterQc` so the canonical apply
+    /// path retries with the recovered body in hand. Drives the
+    /// QC-apply body-unavailable recovery path — without this the
+    /// chain wedges any time the compact-block gossip is dropped
+    /// before reaching all peers.
+    RecoveredBlockByHashForQc {
+        qc_slot: u64,
+        qc_block_hash: [u8; 32],
+        block_bytes: Vec<u8>,
+    },
     /// Reply to an inbound `PydeAuthReq` with a signed attestation over
     /// `(nonce, our_peer_id)`. The response channel holds the pending
     /// outbound stream to the requester.
@@ -4242,6 +4452,16 @@ enum PostEventAction {
     SendConsensusRrResponseAndBroadcast(
         request_response::ResponseChannel<pyde_net::consensus_protocol::ConsensusResp>,
         pyde_net::consensus_protocol::ConsensusResp,
+        Vec<u8>,
+    ),
+    /// Task #94: same as `SendConsensusRrResponseAndBroadcast`, but
+    /// also seeds `pending_block_bodies` with the proposer's own
+    /// fallback block. RR-VC-QC twin of
+    /// `BroadcastFallbackProposalAndBufferBody`.
+    SendConsensusRrResponseAndBroadcastFallbackProposalAndBufferBody(
+        request_response::ResponseChannel<pyde_net::consensus_protocol::ConsensusResp>,
+        pyde_net::consensus_protocol::ConsensusResp,
+        pyde_consensus::block::Block,
         Vec<u8>,
     ),
     /// Path A: an RR-receive of a Vote closed the soft QC. The
@@ -4370,7 +4590,7 @@ fn build_and_encode_fallback_proposal(
     engine: &mut ValidatorEngine,
     identity: Option<&ValidatorIdentity>,
     chain: &ChainState,
-) -> Option<Vec<u8>> {
+) -> Option<(pyde_consensus::block::Block, Vec<u8>)> {
     let identity = identity?;
     let parent_hash = chain
         .headers
@@ -4380,11 +4600,35 @@ fn build_and_encode_fallback_proposal(
     // state_root is intentionally [0u8;32] at proposal time — see the
     // primary `build_proposal` call site for the rationale.
     let block = engine.try_build_fallback_proposal(identity, parent_hash, [0u8; 32])?;
+    // Task #94: return the full block alongside the encoded proposal
+    // so the caller can seed it into `pending_block_bodies` before
+    // broadcasting. Without this, the deterministic VC fallback
+    // proposer never has its own block in any local lookup table —
+    // gossip never echoes its own publish — so when the vote-QC
+    // forms and the canonical-apply path checks
+    // `pending_block_bodies.get(qc_block_hash)` it misses, the
+    // synthesize-empty-body fallback's `buffered_proposal_for`
+    // also misses (the proposer never buffered its own header
+    // either), and the proposer silently skips applying its own
+    // slot. Every later slot then applies onto state one slot
+    // behind the rest of the cluster — every state_root from
+    // there diverges (witnessed in soak v15 baseline:
+    // multi_node_state_convergence catches this in 5/5 runs).
+    //
+    // We deliberately do NOT call `engine.buffer_proposal` here:
+    // that would push the proposal into `buffered_proposals` with
+    // `vrf_score = proposer_idx` (small), distorting the
+    // min-by-vrf_score tie-break in `select_and_vote` and
+    // shifting cluster-wide vote dynamics. Witnessed regression
+    // when tried earlier this session: 50/50 wallet funding ->
+    // 0/50 pubkey registrations under sustained load. The body
+    // buffer is the only state we need — vote selection stays
+    // untouched.
     let msg = pyde_consensus::hotstuff::ConsensusMessage::Proposal {
-        header: block.header,
-        proposer_signature: block.proposer_signature,
+        header: block.header.clone(),
+        proposer_signature: block.proposer_signature.clone(),
     };
-    Some(wire::encode_consensus_message(&msg))
+    Some((block, wire::encode_consensus_message(&msg)))
 }
 
 /// Path A canonical-apply sub-helper: synchronously commit the
@@ -5633,12 +5877,17 @@ fn handle_swarm_event(
                                             };
                                         if engine.on_view_change(vc_msg) {
                                             info!(slot, "view change QC formed — fallback proposer can proceed");
-                                            if let Some(bytes) = build_and_encode_fallback_proposal(
-                                                engine,
-                                                validator_identity.as_ref(),
-                                                chain,
-                                            ) {
-                                                return PostEventAction::BroadcastConsensus(bytes);
+                                            if let Some((block, bytes)) =
+                                                build_and_encode_fallback_proposal(
+                                                    engine,
+                                                    validator_identity.as_ref(),
+                                                    chain,
+                                                )
+                                            {
+                                                return PostEventAction::BroadcastFallbackProposalAndBufferBody {
+                                                    block,
+                                                    bytes,
+                                                };
                                             }
                                         }
                                     }
@@ -5717,6 +5966,42 @@ fn handle_swarm_event(
                 },
             ..
         })) => {
+            // Task #94: special-case `BlockByHash` BEFORE the
+            // batch-style `on_response` dispatch. This response
+            // shape carries one full-block bytes blob keyed by the
+            // hash we requested at the body-unavailable recovery
+            // site; we validate the hash, populate
+            // `pending_block_bodies`, and re-emit
+            // `ApplyCanonicalAfterQc` so the apply path retries
+            // with the recovered body. Pre-handling here keeps
+            // `on_response` focused on the slot-keyed batch path.
+            if let SyncResp::BlockByHash(maybe_bytes) = &response {
+                let pending_entry = chain_sync
+                    .pending_block_by_hash
+                    .remove(&request_id);
+                chain_sync.release_pending(request_id);
+                if let Some((qc_slot, qc_block_hash)) = pending_entry {
+                    if let Some(bytes) = maybe_bytes {
+                        return PostEventAction::RecoveredBlockByHashForQc {
+                            qc_slot,
+                            qc_block_hash,
+                            block_bytes: bytes.clone(),
+                        };
+                    } else {
+                        debug!(
+                            qc_slot,
+                            qc_block_hash = hex::encode(qc_block_hash),
+                            "task #94: BlockByHash recovery — peer didn't have the block"
+                        );
+                        return PostEventAction::None;
+                    }
+                } else {
+                    debug!(
+                        "task #94: BlockByHash response with no matching pending entry"
+                    );
+                    return PostEventAction::None;
+                }
+            }
             // Audit 241: hand the snapshot path the full WS anchor
             // (slot + state_root) so it can reject snapshots that
             // either regress past the checkpoint or land on a
@@ -5952,6 +6237,16 @@ fn handle_swarm_event(
             // the auth handshake re-completion after restart cycles —
             // exactly the failure mode this RR fallback exists to fix.
             let mut pending_fallback_broadcast: Option<Vec<u8>> = None;
+            // Task #94: separate slot for the deterministic VC fallback
+            // proposal so we can also seed the body buffer (carries the
+            // full Block alongside the broadcast bytes). The existing
+            // `pending_fallback_broadcast` is overloaded — the
+            // hard-finality-checkpoint path also uses it — so we can't
+            // change its type without spilling into that handler.
+            let mut pending_fallback_proposal_with_body: Option<(
+                pyde_consensus::block::Block,
+                Vec<u8>,
+            )> = None;
             let mut pending_share_msg: Option<wire::DecryptionShareMsg> = None;
             // Path A: when an RR-fallback Vote closes the soft QC, the
             // bottom-of-arm dispatch emits a combo action that acks the
@@ -6026,12 +6321,15 @@ fn handle_swarm_event(
                                 };
                                 if engine.on_view_change(vc_msg) {
                                     info!(slot, "view change QC formed (via RR fallback) — fallback proposer can proceed");
-                                    if let Some(bytes) = build_and_encode_fallback_proposal(
-                                        engine,
-                                        validator_identity.as_ref(),
-                                        chain,
-                                    ) {
-                                        pending_fallback_broadcast = Some(bytes);
+                                    if let Some((block, bytes)) =
+                                        build_and_encode_fallback_proposal(
+                                            engine,
+                                            validator_identity.as_ref(),
+                                            chain,
+                                        )
+                                    {
+                                        pending_fallback_proposal_with_body =
+                                            Some((block, bytes));
                                     }
                                 }
                             }
@@ -6095,14 +6393,18 @@ fn handle_swarm_event(
                     pyde_net::consensus_protocol::ConsensusResp::DecodeError
                 }
             };
-            // Four-way dispatch: ack the RR sender, then route the
+            // Five-way dispatch: ack the RR sender, then route the
             // decoded payload through the same PostEventAction queue
-            // as the gossip-receive arm. The four pending_* slots
-            // are mutually exclusive because the decode branches are.
+            // as the gossip-receive arm. The pending_* slots are
+            // mutually exclusive because the decode branches are.
             if let Some(share_msg) = pending_share_msg {
                 PostEventAction::SendConsensusRrResponseAndAddShares(channel, resp, share_msg)
             } else if let Some((qc_slot, qc_hash)) = pending_apply_qcd {
                 PostEventAction::SendConsensusRrResponseAndApplyQcd(channel, resp, qc_slot, qc_hash)
+            } else if let Some((block, bytes)) = pending_fallback_proposal_with_body {
+                PostEventAction::SendConsensusRrResponseAndBroadcastFallbackProposalAndBufferBody(
+                    channel, resp, block, bytes,
+                )
             } else {
                 match pending_fallback_broadcast {
                     Some(bytes) => {

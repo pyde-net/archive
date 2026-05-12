@@ -1178,7 +1178,11 @@ pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, &'stati
 /// `current_view` after the existing fields. Pre-mainnet: no
 /// migration support — devnets/tests start with a fresh store on
 /// version mismatch.
-const CONSENSUS_STATE_VERSION: u8 = 2;
+// v3 (audit-94): added `last_voted_view` after `last_voted_slot` so
+// the `(slot, view)` lex-monotonic HotStuff safety predicate
+// survives restarts. v2 state files are pre-mainnet — nodes
+// carrying a v2 file fail decode and start fresh from genesis.
+const CONSENSUS_STATE_VERSION: u8 = 3;
 
 pub fn encode_consensus_state(state: &pyde_consensus::hotstuff::ConsensusState) -> Vec<u8> {
     let mut enc = Encoder::new();
@@ -1187,6 +1191,7 @@ pub fn encode_consensus_state(state: &pyde_consensus::hotstuff::ConsensusState) 
     enc.u64(state.current_epoch);
     encode_qc(&mut enc, &state.highest_qc);
     enc.u64(state.last_voted_slot);
+    enc.u64(state.last_voted_view);
     enc.bytes32(&state.last_committed_hash);
     enc.u64(state.last_committed_slot);
     enc.u64(state.target_height);
@@ -1214,6 +1219,7 @@ pub fn decode_consensus_state(
     let current_epoch = dec.u64()?;
     let highest_qc = decode_qc(&mut dec)?;
     let last_voted_slot = dec.u64()?;
+    let last_voted_view = dec.u64()?;
     let last_committed_hash = dec.bytes32()?;
     let last_committed_slot = dec.u64()?;
     let target_height = dec.u64()?;
@@ -1238,6 +1244,7 @@ pub fn decode_consensus_state(
         current_epoch,
         highest_qc,
         last_voted_slot,
+        last_voted_view,
         last_committed_hash,
         last_committed_slot,
         target_height,
@@ -1681,6 +1688,7 @@ mod tests {
             current_epoch: 3,
             highest_qc: dummy_qc(41),
             last_voted_slot: 42,
+            last_voted_view: 1,
             last_committed_hash: [0x77; 32],
             last_committed_slot: 40,
             target_height: 41,
@@ -2107,7 +2115,8 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 32]);
         bytes.extend_from_slice(&0u128.to_le_bytes());
         bytes.extend_from_slice(&0u16.to_le_bytes());
-        // last_voted_slot, last_committed_hash, last_committed_slot
+        // last_voted_slot, last_voted_view, last_committed_hash, last_committed_slot
+        bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&[0u8; 32]);
         bytes.extend_from_slice(&0u64.to_le_bytes());
