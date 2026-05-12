@@ -113,6 +113,16 @@ impl SharedSecret {
     pub(crate) fn zero_for_constant_time_mac_check() -> Self {
         Self([0u8; 32])
     }
+
+    /// Reconstruct a `SharedSecret` from raw bytes. `pub(crate)`
+    /// because no public callsite should be building shared
+    /// secrets out of arbitrary data — the only legitimate
+    /// in-crate user is the DKG complaint mechanism, which
+    /// receives a `revealed_ss: [u8; 32]` over the wire and needs
+    /// to feed it back into the AEAD MAC for verification.
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
 fn ek_from_bytes(bytes: &[u8]) -> Result<ml_kem::EncapsulationKey768, &'static str> {
