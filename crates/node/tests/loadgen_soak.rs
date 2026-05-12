@@ -428,7 +428,11 @@ fn comprehensive_soak() {
     let duration_s: u64 = env_var_u64("PYDE_SOAK_DURATION", 3600);
     let warmup_s: u64 = env_var_u64("PYDE_SOAK_WARMUP", 60);
     let num_senders: usize = env_var_u64("PYDE_SOAK_SENDERS", 50) as usize;
-    let encrypted_pct: u32 = env_var_u64("PYDE_SOAK_ENCRYPTED_PCT", 30) as u32;
+    // Default is 0 while MEV protection is disabled in the build
+    // (see `MEV_PROTECTION_ENABLED` in `crates/node/src/main.rs`).
+    // Override with PYDE_SOAK_ENCRYPTED_PCT once the encrypted-tx
+    // path is wired back in.
+    let encrypted_pct: u32 = env_var_u64("PYDE_SOAK_ENCRYPTED_PCT", 0) as u32;
 
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║  Pyde Comprehensive Soak Test                            ║");
