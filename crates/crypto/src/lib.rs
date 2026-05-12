@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod dkg;
 pub mod falcon;
 pub mod hash;
 pub mod kyber;
