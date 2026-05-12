@@ -60,6 +60,9 @@ pub const DKG_AEAD_KS_DOMAIN: &[u8] = b"PYDE_DKG_AEAD_KS_V1\0";
 /// Domain separator for the MAC over an encrypted share-row.
 pub const DKG_AEAD_MAC_DOMAIN: &[u8] = b"PYDE_DKG_AEAD_MAC_V1\0";
 
+/// Domain separator for the Falcon signature over a DKG complaint.
+pub const DKG_COMPLAINT_SIG_DOMAIN: &[u8] = b"PYDE_DKG_COMPLAINT_V1\0";
+
 /// A single recipient's share-row from one DKG contributor.
 ///
 /// Each contributor i samples a 64-byte seed which they unpack into
@@ -610,6 +613,283 @@ pub fn decrypt_share_row(
     Some(row)
 }
 
+// --- Reveal-share complaint mechanism ---
+
+/// The outcome of verifying a [`DkgComplaint`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComplaintVerdict {
+    /// The complainant's Falcon signature over the complaint
+    /// preimage doesn't verify against the supplied public key.
+    /// The complaint is structurally invalid; no party is implicated.
+    InvalidSignature,
+    /// The complaint is internally malformed in a way that doesn't
+    /// involve cryptography — e.g. the attached Merkle proof's
+    /// declared leaf index doesn't match the complainant's stated
+    /// committee position. No party is implicated.
+    Malformed,
+    /// Recomputing the envelope MAC under the revealed shared
+    /// secret doesn't match the MAC in the envelope. Either the
+    /// complainant published a fake shared secret or the envelope
+    /// is corrupt — in either case the complaint can't be settled
+    /// from the supplied evidence. The caller's policy decides
+    /// whether to fall back to interactive re-broadcast or treat
+    /// the accused as faulty.
+    EnvelopeUnverifiable,
+    /// The complaint settles AGAINST the accused contributor:
+    /// either the envelope decrypts to malformed bytes, or the
+    /// decoded row has the wrong receiver_index, or the row's
+    /// leaf hash + supplied Merkle proof do not reconstruct the
+    /// contributor's signed Merkle root.
+    ContributorFaulty,
+    /// The complaint settles AGAINST the complainant: the
+    /// envelope decrypts to a well-formed row at the correct
+    /// receiver_index, and that row's leaf hash + supplied Merkle
+    /// proof reconstruct the contributor's signed Merkle root.
+    /// The complainant is slandering an honest contributor.
+    Slander,
+}
+
+/// A signed accusation that contributor `from_index` sent the
+/// complainant (committee position `against_index`) a share-row
+/// that is inconsistent with the contributor's signed Merkle root
+/// for `epoch`.
+///
+/// To make the accusation publicly verifiable without forcing the
+/// complainant to reveal their long-term Kyber secret key, the
+/// complaint carries `revealed_ss` — the per-envelope shared
+/// secret derived from `envelope.kyber_ct` via decapsulation. The
+/// leak is bounded to this one envelope; the long-term key stays
+/// private.
+///
+/// Slander is detected because revealing a fake `revealed_ss`
+/// breaks the envelope MAC (handled by `EnvelopeUnverifiable`),
+/// and revealing the real one lets verifiers re-derive the
+/// plaintext and re-check the Merkle inclusion against the
+/// contributor's signed root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DkgComplaint {
+    pub epoch: u64,
+    /// 1-based index of the contributor being accused.
+    pub from_index: usize,
+    /// 1-based committee position of the complainant.
+    pub against_index: usize,
+    /// The envelope the complainant claims they received.
+    pub envelope: DkgShareEnvelope,
+    /// The shared secret the complainant decapsulated from
+    /// `envelope.kyber_ct`. Revealed so verifiers can replay
+    /// keystream derivation and MAC check.
+    pub revealed_ss: [u8; 32],
+    /// The Merkle inclusion proof for the complainant's leaf
+    /// position in the contributor's tree.
+    pub merkle_proof: MerkleProof,
+    /// Falcon-512 signature from the complainant over the
+    /// canonical preimage.
+    pub signature: Vec<u8>,
+}
+
+impl DkgComplaint {
+    pub fn new_unsigned(
+        epoch: u64,
+        from_index: usize,
+        against_index: usize,
+        envelope: DkgShareEnvelope,
+        revealed_ss: [u8; 32],
+        merkle_proof: MerkleProof,
+    ) -> Self {
+        Self {
+            epoch,
+            from_index,
+            against_index,
+            envelope,
+            revealed_ss,
+            merkle_proof,
+            signature: Vec::new(),
+        }
+    }
+
+    /// Canonical signing preimage. Includes the domain tag, the
+    /// `(epoch, from_index, against_index)` tuple, a hash binding
+    /// the envelope wire bytes, the revealed shared secret, and a
+    /// hash binding the Merkle proof wire bytes. Hashing the wire
+    /// bytes keeps the preimage a fixed prefix length regardless
+    /// of envelope / proof size.
+    pub fn signing_preimage(&self) -> Vec<u8> {
+        let envelope_hash = poseidon2_hash(&self.envelope.to_bytes()).to_bytes();
+        let proof_hash = poseidon2_hash(&self.merkle_proof.to_bytes()).to_bytes();
+        let mut buf = Vec::with_capacity(
+            DKG_COMPLAINT_SIG_DOMAIN.len() + 8 + 4 + 4 + 32 + 32 + 32,
+        );
+        buf.extend_from_slice(DKG_COMPLAINT_SIG_DOMAIN);
+        buf.extend_from_slice(&self.epoch.to_le_bytes());
+        buf.extend_from_slice(&(self.from_index as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.against_index as u32).to_le_bytes());
+        buf.extend_from_slice(&envelope_hash);
+        buf.extend_from_slice(&self.revealed_ss);
+        buf.extend_from_slice(&proof_hash);
+        buf
+    }
+
+    /// Falcon-sign the complaint in place.
+    pub fn sign(&mut self, sk: &FalconSecretKey) -> Result<(), &'static str> {
+        let msg = self.signing_preimage();
+        let sig = falcon_sign(sk, &msg)?;
+        self.signature = sig.to_vec();
+        Ok(())
+    }
+
+    /// Wire encoding:
+    /// `epoch(8) || from_index(4) || against_index(4)
+    ///   || env_len(4) || env_bytes
+    ///   || revealed_ss(32)
+    ///   || proof_len(4) || proof_bytes
+    ///   || sig_len(4) || sig_bytes`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let env_bytes = self.envelope.to_bytes();
+        let proof_bytes = self.merkle_proof.to_bytes();
+        let mut out = Vec::with_capacity(
+            8 + 4 + 4 + 4 + env_bytes.len() + 32 + 4 + proof_bytes.len() + 4 + self.signature.len(),
+        );
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&(self.from_index as u32).to_le_bytes());
+        out.extend_from_slice(&(self.against_index as u32).to_le_bytes());
+        out.extend_from_slice(&(env_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&env_bytes);
+        out.extend_from_slice(&self.revealed_ss);
+        out.extend_from_slice(&(proof_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&proof_bytes);
+        out.extend_from_slice(&(self.signature.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 8 + 4 + 4 + 4 {
+            return None;
+        }
+        let epoch = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let from_index =
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        let against_index =
+            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+        let env_len =
+            u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
+        let env_end = 20 + env_len;
+        if bytes.len() < env_end + 32 + 4 {
+            return None;
+        }
+        let envelope = DkgShareEnvelope::from_bytes(&bytes[20..env_end])?;
+        let mut revealed_ss = [0u8; 32];
+        revealed_ss.copy_from_slice(&bytes[env_end..env_end + 32]);
+        let proof_len_off = env_end + 32;
+        let proof_len = u32::from_le_bytes([
+            bytes[proof_len_off],
+            bytes[proof_len_off + 1],
+            bytes[proof_len_off + 2],
+            bytes[proof_len_off + 3],
+        ]) as usize;
+        let proof_end = proof_len_off + 4 + proof_len;
+        if bytes.len() < proof_end + 4 {
+            return None;
+        }
+        let merkle_proof = MerkleProof::from_bytes(&bytes[proof_len_off + 4..proof_end])?;
+        let sig_len = u32::from_le_bytes([
+            bytes[proof_end],
+            bytes[proof_end + 1],
+            bytes[proof_end + 2],
+            bytes[proof_end + 3],
+        ]) as usize;
+        if bytes.len() != proof_end + 4 + sig_len {
+            return None;
+        }
+        let signature = bytes[proof_end + 4..].to_vec();
+        Some(Self {
+            epoch,
+            from_index,
+            against_index,
+            envelope,
+            revealed_ss,
+            merkle_proof,
+            signature,
+        })
+    }
+}
+
+/// Verify a [`DkgComplaint`] against the complainant's Falcon
+/// public key and the contributor's signed Merkle root for the
+/// epoch. See [`ComplaintVerdict`] for the possible outcomes; this
+/// function never panics.
+pub fn verify_complaint(
+    complaint: &DkgComplaint,
+    complainant_falcon_pk: &FalconPublicKey,
+    contributor_merkle_root: &[u8; 32],
+) -> ComplaintVerdict {
+    // 1. Falcon signature over the canonical preimage.
+    let Some(sig) = FalconSignature::from_bytes(&complaint.signature) else {
+        return ComplaintVerdict::InvalidSignature;
+    };
+    let preimage = complaint.signing_preimage();
+    if !falcon_verify(complainant_falcon_pk, &preimage, &sig) {
+        return ComplaintVerdict::InvalidSignature;
+    }
+
+    // 2. Merkle proof must declare the complainant's position.
+    if complaint.merkle_proof.leaf_index + 1 != complaint.against_index {
+        return ComplaintVerdict::Malformed;
+    }
+
+    // 3. Reconstruct the SharedSecret from the revealed bytes and
+    //    recompute the AEAD MAC over the envelope. Mismatch means
+    //    the revealed_ss is wrong or the envelope is corrupt.
+    let ss = SharedSecret::from_bytes(complaint.revealed_ss);
+    let expected_mac = dkg_aead_mac(
+        &ss,
+        &complaint.envelope.kyber_ct,
+        complaint.epoch,
+        complaint.from_index,
+        complaint.against_index,
+        &complaint.envelope.ciphertext,
+    );
+    if expected_mac.ct_eq(&complaint.envelope.mac).unwrap_u8() != 1 {
+        return ComplaintVerdict::EnvelopeUnverifiable;
+    }
+
+    // 4. MAC OK → derive keystream and decrypt the ciphertext.
+    let keystream = dkg_aead_keystream(
+        &ss,
+        &complaint.envelope.kyber_ct,
+        complaint.epoch,
+        complaint.from_index,
+        complaint.against_index,
+        complaint.envelope.ciphertext.len(),
+    );
+    let mut plaintext = vec![0u8; complaint.envelope.ciphertext.len()];
+    for i in 0..plaintext.len() {
+        plaintext[i] = complaint.envelope.ciphertext[i] ^ keystream[i];
+    }
+    // Malformed plaintext or wrong internal receiver_index ⇒ contributor faulty.
+    let Some(row) = ShareRow::from_bytes(&plaintext) else {
+        return ComplaintVerdict::ContributorFaulty;
+    };
+    if row.receiver_index != complaint.against_index {
+        return ComplaintVerdict::ContributorFaulty;
+    }
+
+    // 5. Merkle inclusion check against the contributor's signed root.
+    let leaf = row.leaf_hash(complaint.epoch, complaint.from_index);
+    if verify_merkle_proof(contributor_merkle_root, &leaf, &complaint.merkle_proof) {
+        // Row is committed under the contributor's signed root at
+        // the right position — there's nothing to complain about.
+        ComplaintVerdict::Slander
+    } else {
+        // Row decrypts cleanly but the contributor's commitment
+        // disowns it — contributor was equivocating between the
+        // committed root and the encrypted share.
+        ComplaintVerdict::ContributorFaulty
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,5 +1343,473 @@ mod tests {
         let r2 = decrypt_share_row(&env2, &sk, 1, 1, 2).expect("decrypt 2");
         assert_eq!(r1, r2);
         assert_eq!(r1, row);
+    }
+
+    // --- Phase D: complaint tests ---
+
+    /// Build a contributor's tree, encrypt one of the rows for a
+    /// specific recipient, decapsulate to expose the shared secret,
+    /// and return everything needed for complaint testing.
+    fn build_complaint_fixture(
+        epoch: u64,
+        from_index: usize,
+        n: usize,
+        target_recipient: usize, // 1-based
+    ) -> (
+        Vec<ShareRow>,
+        [u8; 32], // contributor merkle root
+        DkgShareEnvelope,
+        [u8; 32], // revealed ss
+        MerkleProof,
+        FalconPublicKey,
+        FalconSecretKey,
+        crate::kyber::KyberSecretKey,
+    ) {
+        let rows: Vec<ShareRow> = (1..=n).map(|i| make_row(i, 1000 + i as u64)).collect();
+        let leaves: Vec<[u8; 32]> = rows.iter().map(|r| r.leaf_hash(epoch, from_index)).collect();
+        let root = compute_merkle_root(&leaves, epoch, from_index);
+        let proof = merkle_proof(&leaves, target_recipient - 1, epoch, from_index)
+            .expect("merkle proof exists");
+
+        let (recipient_pk, recipient_sk) = kyber_keygen().expect("kyber_keygen recipient");
+        let (kct, ss) = kyber_encapsulate(&recipient_pk).expect("encap");
+        let row = &rows[target_recipient - 1];
+        // Hand-encrypt so we can keep the SS around.
+        let plaintext = row.to_bytes();
+        let keystream = dkg_aead_keystream(
+            &ss,
+            kct.as_bytes(),
+            epoch,
+            from_index,
+            target_recipient,
+            plaintext.len(),
+        );
+        let mut ciphertext = Vec::with_capacity(plaintext.len());
+        for i in 0..plaintext.len() {
+            ciphertext.push(plaintext[i] ^ keystream[i]);
+        }
+        let mac = dkg_aead_mac(
+            &ss,
+            kct.as_bytes(),
+            epoch,
+            from_index,
+            target_recipient,
+            &ciphertext,
+        );
+        let envelope = DkgShareEnvelope {
+            kyber_ct: kct.to_vec(),
+            ciphertext,
+            mac,
+        };
+        let (complainant_pk, complainant_sk) = falcon_keygen().expect("falcon");
+
+        (
+            rows,
+            root,
+            envelope,
+            *ss.as_bytes(),
+            proof,
+            complainant_pk,
+            complainant_sk,
+            recipient_sk,
+        )
+    }
+
+    #[test]
+    fn complaint_slander_when_row_matches_root() {
+        // Honest contributor case: row at position j IS in the
+        // tree under root r. Complainant tries to file a complaint
+        // anyway. Verdict must be Slander.
+        let epoch = 11;
+        let from_index = 2;
+        let n = 5;
+        let target = 3;
+        let (_rows, root, envelope, ss, proof, c_pk, c_sk, _sk) =
+            build_complaint_fixture(epoch, from_index, n, target);
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            ss,
+            proof,
+        );
+        complaint.sign(&c_sk).expect("sign");
+        assert_eq!(
+            verify_complaint(&complaint, &c_pk, &root),
+            ComplaintVerdict::Slander
+        );
+    }
+
+    #[test]
+    fn complaint_contributor_faulty_when_root_is_wrong() {
+        // Adversarial contributor case: the complainant supplies
+        // a proof against a root that the row's leaf hash does NOT
+        // reconstruct to. Verdict must be ContributorFaulty.
+        let epoch = 11;
+        let from_index = 2;
+        let target = 3;
+        let (_rows, _real_root, envelope, ss, proof, c_pk, c_sk, _sk) =
+            build_complaint_fixture(epoch, from_index, 5, target);
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            ss,
+            proof,
+        );
+        complaint.sign(&c_sk).expect("sign");
+        let bogus_root = [0xAAu8; 32];
+        assert_eq!(
+            verify_complaint(&complaint, &c_pk, &bogus_root),
+            ComplaintVerdict::ContributorFaulty
+        );
+    }
+
+    #[test]
+    fn complaint_contributor_faulty_on_malformed_plaintext() {
+        // Encrypt random bytes (NOT a valid ShareRow) but with a
+        // valid MAC. After decryption, the plaintext fails to
+        // decode → ContributorFaulty.
+        let epoch = 3;
+        let from_index = 1;
+        let target = 2;
+        let (_rows, root, _envelope_real, _ss_real, proof, c_pk, c_sk, _sk) =
+            build_complaint_fixture(epoch, from_index, 4, target);
+
+        // Build a forged envelope: a "well-formed-by-MAC" envelope
+        // whose plaintext is garbage that won't decode as a
+        // ShareRow.
+        let (recipient_pk, _recipient_sk) = kyber_keygen().expect("recipient");
+        let (kct, ss) = kyber_encapsulate(&recipient_pk).expect("encap");
+        let mut garbage = vec![0xFFu8; ShareRow::WIRE_LEN];
+        // First 4 bytes = receiver_index; everything else is the
+        // 8 Goldilocks values. Set every Goldilocks value to
+        // u64::MAX (which is >= GOLDILOCKS_PRIME so ShareRow
+        // rejects it during decode).
+        garbage[0..4].copy_from_slice(&(target as u32).to_le_bytes());
+        let keystream =
+            dkg_aead_keystream(&ss, kct.as_bytes(), epoch, from_index, target, garbage.len());
+        let mut ciphertext = Vec::with_capacity(garbage.len());
+        for i in 0..garbage.len() {
+            ciphertext.push(garbage[i] ^ keystream[i]);
+        }
+        let mac = dkg_aead_mac(
+            &ss,
+            kct.as_bytes(),
+            epoch,
+            from_index,
+            target,
+            &ciphertext,
+        );
+        let envelope = DkgShareEnvelope {
+            kyber_ct: kct.to_vec(),
+            ciphertext,
+            mac,
+        };
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            *ss.as_bytes(),
+            proof,
+        );
+        complaint.sign(&c_sk).expect("sign");
+        assert_eq!(
+            verify_complaint(&complaint, &c_pk, &root),
+            ComplaintVerdict::ContributorFaulty
+        );
+    }
+
+    #[test]
+    fn complaint_contributor_faulty_on_wrong_internal_index() {
+        // Contributor encrypts a row whose internal receiver_index
+        // is 5, but binds the MAC under recipient_index=2. The
+        // complaint settles ContributorFaulty.
+        let epoch = 3;
+        let from_index = 1;
+        let target = 2;
+        let (_rows, root, _env, _ss_real, proof, c_pk, c_sk, _sk) =
+            build_complaint_fixture(epoch, from_index, 4, target);
+        let (recipient_pk, _recipient_sk) = kyber_keygen().expect("recipient");
+        let (kct, ss) = kyber_encapsulate(&recipient_pk).expect("encap");
+        let plaintext_row = make_row(5, 7);
+        let plaintext = plaintext_row.to_bytes();
+        let keystream = dkg_aead_keystream(
+            &ss,
+            kct.as_bytes(),
+            epoch,
+            from_index,
+            target,
+            plaintext.len(),
+        );
+        let mut ciphertext = Vec::with_capacity(plaintext.len());
+        for i in 0..plaintext.len() {
+            ciphertext.push(plaintext[i] ^ keystream[i]);
+        }
+        let mac = dkg_aead_mac(
+            &ss,
+            kct.as_bytes(),
+            epoch,
+            from_index,
+            target,
+            &ciphertext,
+        );
+        let envelope = DkgShareEnvelope {
+            kyber_ct: kct.to_vec(),
+            ciphertext,
+            mac,
+        };
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            *ss.as_bytes(),
+            proof,
+        );
+        complaint.sign(&c_sk).expect("sign");
+        assert_eq!(
+            verify_complaint(&complaint, &c_pk, &root),
+            ComplaintVerdict::ContributorFaulty
+        );
+    }
+
+    #[test]
+    fn complaint_envelope_unverifiable_on_tampered_mac() {
+        // Honest envelope, but the complainant submits a tampered
+        // MAC (or a fake revealed_ss). Either way the MAC check
+        // fails → EnvelopeUnverifiable.
+        let epoch = 3;
+        let from_index = 1;
+        let target = 2;
+        let (_rows, root, mut envelope, ss, proof, c_pk, c_sk, _sk) =
+            build_complaint_fixture(epoch, from_index, 4, target);
+        envelope.mac[0] ^= 0xFF;
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            ss,
+            proof,
+        );
+        complaint.sign(&c_sk).expect("sign");
+        assert_eq!(
+            verify_complaint(&complaint, &c_pk, &root),
+            ComplaintVerdict::EnvelopeUnverifiable
+        );
+    }
+
+    #[test]
+    fn complaint_envelope_unverifiable_on_fake_revealed_ss() {
+        // The complainant reveals a wrong SS. The recomputed MAC
+        // won't match the real envelope's MAC.
+        let epoch = 3;
+        let from_index = 1;
+        let target = 2;
+        let (_rows, root, envelope, _real_ss, proof, c_pk, c_sk, _sk) =
+            build_complaint_fixture(epoch, from_index, 4, target);
+        let fake_ss = [0xAAu8; 32];
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            fake_ss,
+            proof,
+        );
+        complaint.sign(&c_sk).expect("sign");
+        assert_eq!(
+            verify_complaint(&complaint, &c_pk, &root),
+            ComplaintVerdict::EnvelopeUnverifiable
+        );
+    }
+
+    #[test]
+    fn complaint_invalid_signature_when_signed_by_wrong_key() {
+        let epoch = 3;
+        let from_index = 1;
+        let target = 2;
+        let (_rows, root, envelope, ss, proof, c_pk_legit, _c_sk_legit, _sk) =
+            build_complaint_fixture(epoch, from_index, 4, target);
+        let (_pk_attacker, sk_attacker) = falcon_keygen().expect("attacker keys");
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            ss,
+            proof,
+        );
+        complaint.sign(&sk_attacker).expect("sign with attacker");
+        assert_eq!(
+            verify_complaint(&complaint, &c_pk_legit, &root),
+            ComplaintVerdict::InvalidSignature
+        );
+    }
+
+    #[test]
+    fn complaint_invalid_signature_on_tampered_field() {
+        let epoch = 3;
+        let from_index = 1;
+        let target = 2;
+        let (_rows, root, envelope, ss, proof, c_pk, c_sk, _sk) =
+            build_complaint_fixture(epoch, from_index, 4, target);
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            ss,
+            proof,
+        );
+        complaint.sign(&c_sk).expect("sign");
+        // Flip the epoch after signing — preimage changes, sig stays.
+        complaint.epoch = epoch + 1;
+        assert_eq!(
+            verify_complaint(&complaint, &c_pk, &root),
+            ComplaintVerdict::InvalidSignature
+        );
+    }
+
+    #[test]
+    fn complaint_malformed_when_proof_index_mismatch() {
+        let epoch = 3;
+        let from_index = 1;
+        let target = 2;
+        let (_rows, root, envelope, ss, mut proof, c_pk, c_sk, _sk) =
+            build_complaint_fixture(epoch, from_index, 4, target);
+        // Force proof.leaf_index to a different position than
+        // against_index suggests.
+        proof.leaf_index = 0; // against_index 2 → expected 1
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            ss,
+            proof,
+        );
+        complaint.sign(&c_sk).expect("sign");
+        assert_eq!(
+            verify_complaint(&complaint, &c_pk, &root),
+            ComplaintVerdict::Malformed
+        );
+    }
+
+    #[test]
+    fn complaint_wire_roundtrip() {
+        let epoch = 9;
+        let from_index = 2;
+        let target = 3;
+        let (_rows, _root, envelope, ss, proof, _c_pk, c_sk, _sk) =
+            build_complaint_fixture(epoch, from_index, 6, target);
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            ss,
+            proof,
+        );
+        complaint.sign(&c_sk).expect("sign");
+        let bytes = complaint.to_bytes();
+        let decoded = DkgComplaint::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, complaint);
+    }
+
+    #[test]
+    fn complaint_wire_rejects_truncation_and_garbage_trailer() {
+        let epoch = 9;
+        let from_index = 2;
+        let target = 3;
+        let (_rows, _root, envelope, ss, proof, _c_pk, c_sk, _sk) =
+            build_complaint_fixture(epoch, from_index, 6, target);
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            ss,
+            proof,
+        );
+        complaint.sign(&c_sk).expect("sign");
+        let bytes = complaint.to_bytes();
+        assert!(DkgComplaint::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+        let mut padded = bytes.clone();
+        padded.push(0xAA);
+        assert!(DkgComplaint::from_bytes(&padded).is_none());
+        assert!(DkgComplaint::from_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn complaint_preimage_starts_with_domain() {
+        let epoch = 1;
+        let from_index = 1;
+        let target = 1;
+        let (_rows, _root, envelope, ss, proof, _c_pk, _c_sk, _sk) =
+            build_complaint_fixture(epoch, from_index, 2, target);
+        let complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            envelope,
+            ss,
+            proof,
+        );
+        assert!(complaint
+            .signing_preimage()
+            .starts_with(DKG_COMPLAINT_SIG_DOMAIN));
+    }
+
+    #[test]
+    fn complaint_real_dkg_flow_end_to_end() {
+        // End-to-end: a contributor sends shares via encrypt_share_row,
+        // recipient decrypts via decrypt_share_row, recipient files a
+        // complaint with the recovered SS by recapsulating their own
+        // envelope.
+        let epoch = 50;
+        let from_index = 3;
+        let target = 4;
+
+        // Build contributor's tree.
+        let n = 7;
+        let rows: Vec<ShareRow> = (1..=n).map(|i| make_row(i, 200 + i as u64)).collect();
+        let leaves: Vec<[u8; 32]> =
+            rows.iter().map(|r| r.leaf_hash(epoch, from_index)).collect();
+        let root = compute_merkle_root(&leaves, epoch, from_index);
+        let proof = merkle_proof(&leaves, target - 1, epoch, from_index).expect("proof");
+
+        // Recipient generates Kyber keys.
+        let (recipient_pk, recipient_sk) = kyber_keygen().expect("kyber");
+        // Contributor encrypts row j for the recipient.
+        let env = encrypt_share_row(&rows[target - 1], &recipient_pk, epoch, from_index)
+            .expect("encrypt");
+        // Recipient decrypts.
+        let recovered = decrypt_share_row(&env, &recipient_sk, epoch, from_index, target)
+            .expect("decrypt");
+        assert_eq!(recovered, rows[target - 1]);
+
+        // Recipient's view: the share is consistent. Filing a
+        // complaint anyway → must be Slander.
+        let kct = KyberCiphertext::from_bytes(&env.kyber_ct).expect("kct from bytes");
+        let ss = kyber_decapsulate(&recipient_sk, &kct).expect("decap");
+        let (c_pk, c_sk) = falcon_keygen().expect("falcon");
+        let mut complaint = DkgComplaint::new_unsigned(
+            epoch,
+            from_index,
+            target,
+            env,
+            *ss.as_bytes(),
+            proof,
+        );
+        complaint.sign(&c_sk).expect("sign");
+        assert_eq!(
+            verify_complaint(&complaint, &c_pk, &root),
+            ComplaintVerdict::Slander
+        );
     }
 }
