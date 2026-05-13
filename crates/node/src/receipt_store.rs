@@ -29,7 +29,43 @@ impl ReceiptStore {
     }
 
     /// Store receipts for a block.
+    ///
+    /// Audit 411: first-write-wins. The same block can be executed
+    /// twice on the same validator under race conditions:
+    ///   1. The canonical-apply path (after QC) executes the block,
+    ///      writes state, advances `chain.head_slot`, and inserts
+    ///      `success=true` receipts.
+    ///   2. The gossip-blocks topic delivers the SAME block at
+    ///      slot S. `validate_header_with_checkpoint` rejects
+    ///      `slot <= chain.head_slot`, but the validate read isn't
+    ///      synchronized against the canonical-apply chain.write()
+    ///      lock — a stale-head read lets the gossip-blocks path
+    ///      re-enter `process_full_block`, which now executes
+    ///      against the post-canonical state. Every tx in the
+    ///      block sees its sender's nonce already past the window
+    ///      and the pipeline emits `success=false` receipts via
+    ///      `emit_failed_execution_receipt`.
+    /// Pre-411 the gossip-blocks `BlockProcessed` handler then
+    /// re-inserted the stale `success=false` receipts on top of
+    /// the canonical `success=true` ones, breaking
+    /// `pyde_getTransactionReceipt` for every tx in the block.
+    /// State changes (balances, nonces) were unaffected because
+    /// `process_full_block` wrote to a fresh overlay that the
+    /// stale-head path's `take_pending_writes` swallowed — only
+    /// the receipt metadata diverged. First-write-wins closes the
+    /// metadata divergence at the cheapest layer: callers don't
+    /// need head_slot guards before invoking, and any other future
+    /// race (reorg, sync replay) lands in the same defensive
+    /// posture.
     pub fn insert_block_receipts(&mut self, slot: u64, receipts: Vec<Receipt>) {
+        if self
+            .slot_txs
+            .get(&slot)
+            .map(|h| !h.is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
         let hashes: Vec<[u8; 32]> = receipts.iter().map(|r| r.tx_hash).collect();
         for receipt in receipts {
             self.receipts.insert(receipt.tx_hash, receipt);
@@ -145,6 +181,28 @@ mod tests {
         let r = store.get(&hash).unwrap();
         assert_eq!(r.gas_used, 21000);
         assert!(r.success);
+    }
+
+    /// Audit 411: a second `insert_block_receipts` for an already-
+    /// populated slot is a no-op. Pre-411 the stale-head gossip-
+    /// blocks re-execution path overwrote canonical `success=true`
+    /// receipts with `success=false` ones; this guard preserves the
+    /// canonical apply's metadata regardless of arrival order.
+    #[test]
+    fn duplicate_insert_does_not_overwrite() {
+        let mut store = ReceiptStore::new();
+        let hash = [0xAA; 32];
+        let mut good = dummy_receipt(hash, 21000);
+        good.success = true;
+        store.insert_block_receipts(1, vec![good]);
+
+        let mut bad = dummy_receipt(hash, 0);
+        bad.success = false;
+        store.insert_block_receipts(1, vec![bad]);
+
+        let r = store.get(&hash).unwrap();
+        assert!(r.success, "first-write-wins: success flag preserved");
+        assert_eq!(r.gas_used, 21000, "first-write-wins: gas preserved");
     }
 
     #[test]
