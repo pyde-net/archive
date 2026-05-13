@@ -454,6 +454,7 @@ fn mixed_workload_load_test() {
     );
 
     let counts = Arc::new(MixCounts::new());
+    let submitted_hashes = Arc::new(SubmittedHashes::default());
     let run_start = Instant::now();
     let measurement_start_at = run_start + Duration::from_secs(warmup_s);
     let run_deadline = run_start + Duration::from_secs(total_run_s);
@@ -465,6 +466,7 @@ fn mixed_workload_load_test() {
             let cli = client.clone();
             let url = rpc_urls[i % rpc_urls.len()].clone();
             let counts = counts.clone();
+            let submitted_hashes = submitted_hashes.clone();
             let interval = per_acct_interval;
             let measure_at = measurement_start_at;
             let deadline = run_deadline;
@@ -488,32 +490,56 @@ fn mixed_workload_load_test() {
                     let kind = mix.pick(submit_idx);
                     submit_idx += 1;
 
-                    let result = match kind {
-                        TxKind::Transfer => submit_transfer(&cli, &url, &wallet, nonce).await,
+                    let result: Result<Option<[u8; 32]>, ()> = match kind {
+                        TxKind::Transfer => submit_transfer(&cli, &url, &wallet, nonce)
+                            .await
+                            .map(Some),
                         TxKind::Call => {
                             if cnt_addr == [0u8; 32] {
-                                Ok(()) // skipped; treat as no-op
+                                Ok(None) // skipped; treat as no-op
                             } else {
-                                submit_counter_call(&cli, &url, &wallet, nonce, &cnt_addr).await
+                                submit_counter_call(&cli, &url, &wallet, nonce, &cnt_addr)
+                                    .await
+                                    .map(Some)
                             }
                         }
                         TxKind::Encrypted => {
                             if let Some(ref tpk) = tpk_bytes {
-                                submit_encrypted(&cli, &url, &wallet, nonce, tpk).await
+                                submit_encrypted(&cli, &url, &wallet, nonce, tpk)
+                                    .await
+                                    .map(Some)
                             } else {
-                                Ok(())
+                                Ok(None)
                             }
                         }
                     };
 
                     let in_measure = Instant::now() >= measure_at;
                     match result {
-                        Ok(()) => {
+                        Ok(maybe_hash) => {
                             counts.record_ok(kind, in_measure);
+                            if in_measure {
+                                if let Some(hash) = maybe_hash {
+                                    submitted_hashes.record(kind, hash);
+                                }
+                            }
                             nonce += 1;
                         }
                         Err(_) => {
                             counts.record_err(kind, in_measure);
+                            // The chain may have committed the tx
+                            // even though the HTTP response failed
+                            // (3 s timeout) — resync the nonce from
+                            // chain state before retrying, otherwise
+                            // we burn this sender's slot forever on
+                            // `InvalidNonce(BelowWindow)`.
+                            if let Some(chain_nonce) =
+                                fetch_nonce(&cli, &url, &wallet.address).await
+                            {
+                                if chain_nonce > nonce {
+                                    nonce = chain_nonce;
+                                }
+                            }
                             tokio::time::sleep(Duration::from_millis(400)).await;
                             next_submit = Instant::now();
                         }
@@ -604,6 +630,59 @@ fn mixed_workload_load_test() {
     println!("    encrypted:   {}", snap.encrypted_err);
     println!("    AGGREGATE:   {}", total_errors);
     println!("╚══════════════════════════════════════════════════════╝");
+    dump_err_pattern_top(10);
+
+    // ── Verification phase ──────────────────────────────────────
+    // Submit-OK rate (above) only proves RPC accepted the tx into
+    // its mempool. The 5 checks below verify the txs actually
+    // landed in committed blocks AND executed correctly:
+    //   (1) include-rate via receipt lookups (cheaper + more accurate
+    //       than the per-slot transactionHashes walk, which is subject
+    //       to a pre-existing chain bug where slot_txs is overwritten
+    //       on re-apply paths)
+    //   (2) receipts: sample submitted hashes, count success=true
+    //   (3) sender balances: spot-check expected debits
+    //   (4) Counter.value(): contract storage matches included calls
+    //   (5) RECIPIENT balance: matches (transfer + encrypted) * value
+    //
+    // RPC nodes rate-limit at 100 req/s sustained per connection
+    // (-32429). We route across all 4 nodes to multiply the
+    // effective budget, and add a short pacing delay between calls.
+    runtime.block_on(async {
+        run_verifications(
+            &client,
+            &rpc_urls,
+            &wallets,
+            &submitted_hashes,
+            &snap,
+            counter_addr,
+            fund_per_sender,
+        )
+        .await;
+    });
+
+    // Per-node validator output: full log to /tmp + last 60 lines to
+    // stderr. The on-disk file captures the measurement-phase window
+    // (the stderr tail alone is always settle-phase empty blocks).
+    for n in &net.nodes {
+        let snap = n.output_snapshot();
+        let path = format!("/tmp/pyde-loadgen-mixed-node-{}.log", n.index);
+        if let Err(e) = std::fs::write(&path, &snap) {
+            eprintln!("failed to write {}: {}", path, e);
+        } else {
+            eprintln!(
+                "\n=== node-{} (rpc {}) full log → {} ({} bytes) ===",
+                n.index,
+                n.rpc_port,
+                path,
+                snap.len()
+            );
+        }
+        let last: Vec<&str> = snap.lines().rev().take(60).collect();
+        for line in last.into_iter().rev() {
+            eprintln!("{}", line);
+        }
+    }
 
     // We don't fail the test on TPS — this is a measurement
     // instrument, not a regression gate. Operators inspect the
@@ -619,7 +698,7 @@ async fn submit_transfer(
     url: &str,
     wallet: &Wallet,
     nonce: u64,
-) -> Result<(), ()> {
+) -> Result<[u8; 32], ()> {
     let mut tx = Transaction {
         from: wallet.address,
         to: RECIPIENT,
@@ -634,9 +713,11 @@ async fn submit_transfer(
         chain_id: CHAIN_ID,
         tx_type: TransactionType::Standard,
     };
-    let sig = falcon_sign(&wallet.sk, &tx.hash()).map_err(|_| ())?;
+    let tx_hash = tx.hash();
+    let sig = falcon_sign(&wallet.sk, &tx_hash).map_err(|_| ())?;
     tx.signature = sig.as_bytes().to_vec();
-    rpc_send_raw_fast(client, url, &hex::encode(tx.to_bytes())).await
+    rpc_send_raw_fast(client, url, &hex::encode(tx.to_bytes())).await?;
+    Ok(tx_hash)
 }
 
 async fn submit_counter_call(
@@ -645,7 +726,7 @@ async fn submit_counter_call(
     wallet: &Wallet,
     nonce: u64,
     counter_addr: &[u8; 32],
-) -> Result<(), ()> {
+) -> Result<[u8; 32], ()> {
     let selector = otic::codegen::compute_selector("increment");
     let calldata = selector.to_be_bytes().to_vec();
     let mut tx = Transaction {
@@ -662,9 +743,11 @@ async fn submit_counter_call(
         chain_id: CHAIN_ID,
         tx_type: TransactionType::Standard,
     };
-    let sig = falcon_sign(&wallet.sk, &tx.hash()).map_err(|_| ())?;
+    let tx_hash = tx.hash();
+    let sig = falcon_sign(&wallet.sk, &tx_hash).map_err(|_| ())?;
     tx.signature = sig.as_bytes().to_vec();
-    rpc_send_raw_fast(client, url, &hex::encode(tx.to_bytes())).await
+    rpc_send_raw_fast(client, url, &hex::encode(tx.to_bytes())).await?;
+    Ok(tx_hash)
 }
 
 /// Submit an encrypted value tx via `pyde_sendRawEncryptedTransaction`.
@@ -679,7 +762,7 @@ async fn submit_encrypted(
     wallet: &Wallet,
     nonce: u64,
     threshold_pk_bytes: &[u8],
-) -> Result<(), ()> {
+) -> Result<[u8; 32], ()> {
     let tpk =
         pyde_crypto::threshold::ThresholdPublicKey::from_bytes(threshold_pk_bytes).ok_or(())?;
     // Same structural scaffolding as the
@@ -735,7 +818,44 @@ async fn submit_encrypted(
     if !pyde_crypto::falcon::falcon_verify(&pk, &enc_tx.hash(), &sig_obj) {
         return Err(());
     }
-    Ok(())
+    Ok(tx_hash)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Inclusion + execution verification
+// ════════════════════════════════════════════════════════════════════
+
+/// Tx hashes successfully submitted (RPC-accepted) during the
+/// measurement window. Stored under a Mutex per kind so the
+/// post-run verifier can sample receipts, walk the chain, and
+/// compare submit-count vs include-count.
+#[derive(Default)]
+struct SubmittedHashes {
+    transfer: std::sync::Mutex<Vec<[u8; 32]>>,
+    call: std::sync::Mutex<Vec<[u8; 32]>>,
+    encrypted: std::sync::Mutex<Vec<[u8; 32]>>,
+}
+
+impl SubmittedHashes {
+    fn record(&self, kind: TxKind, hash: [u8; 32]) {
+        let target = match kind {
+            TxKind::Transfer => &self.transfer,
+            TxKind::Call => &self.call,
+            TxKind::Encrypted => &self.encrypted,
+        };
+        if let Ok(mut v) = target.lock() {
+            v.push(hash);
+        }
+    }
+
+    fn snapshot(&self, kind: TxKind) -> Vec<[u8; 32]> {
+        let src = match kind {
+            TxKind::Transfer => &self.transfer,
+            TxKind::Call => &self.call,
+            TxKind::Encrypted => &self.encrypted,
+        };
+        src.lock().map(|v| v.clone()).unwrap_or_default()
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -836,6 +956,370 @@ impl MixSnapshot {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// Verification: did the chain actually execute these txs?
+// ════════════════════════════════════════════════════════════════════
+
+const BALANCE_SAMPLE_SIZE: usize = 10;
+/// Per-connection sustained budget is 100 req/s (-32429 kicks in
+/// above), so 11 ms between calls gives ~90 req/s/conn — under the
+/// limit even if one of the 4 nodes is briefly slow.
+const RPC_PACING_MS: u64 = 11;
+
+/// Round-robin URL picker so consecutive verification calls hit
+/// different RPC endpoints and each conn stays under its own
+/// sustained budget.
+struct UrlPool<'a> {
+    urls: &'a [String],
+    cursor: std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> UrlPool<'a> {
+    fn new(urls: &'a [String]) -> Self {
+        Self {
+            urls,
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn next(&self) -> &str {
+        let i = self
+            .cursor
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        &self.urls[i % self.urls.len()]
+    }
+}
+
+/// Look up every submitted hash via `pyde_getTransactionReceipt` and
+/// classify (success / failed / missing). Reliable because it queries
+/// the per-hash receipt map directly — unaffected by the slot_txs
+/// overwrite bug on re-apply paths.
+async fn full_receipt_audit(
+    client: &reqwest::Client,
+    pool: &UrlPool<'_>,
+    hashes: &[[u8; 32]],
+) -> (u64, u64, u64) {
+    let mut ok = 0u64;
+    let mut failed = 0u64;
+    let mut missing = 0u64;
+    for h in hashes {
+        let resp = rpc_call(
+            client,
+            pool.next(),
+            "pyde_getTransactionReceipt",
+            &format!("\"0x{}\"", hex::encode(h)),
+        )
+        .await;
+        match resp.get("result") {
+            Some(v) if v.is_null() => missing += 1,
+            Some(v) => match v.get("success").and_then(|s| s.as_bool()) {
+                Some(true) => ok += 1,
+                Some(false) => failed += 1,
+                None => missing += 1,
+            },
+            None => missing += 1,
+        }
+        tokio::time::sleep(Duration::from_millis(RPC_PACING_MS)).await;
+    }
+    (ok, failed, missing)
+}
+
+/// Run all 5 post-soak verification checks and print a VERIFICATION
+/// block analogous to RESULTS. We don't panic on failure here — the
+/// numbers go to stdout/stderr and the operator decides whether the
+/// chain executed the load correctly.
+async fn run_verifications(
+    client: &reqwest::Client,
+    urls: &[String],
+    wallets: &[Arc<Wallet>],
+    submitted: &SubmittedHashes,
+    submit_snap: &MixSnapshot,
+    counter_addr: [u8; 32],
+    fund_per_sender: u128,
+) {
+    let pool = UrlPool::new(urls);
+    let transfer_hashes = submitted.snapshot(TxKind::Transfer);
+    let call_hashes = submitted.snapshot(TxKind::Call);
+
+    println!("\n╔══════════════════════════════════════════════════════╗");
+    println!("║  VERIFICATION                                        ║");
+    println!("╠══════════════════════════════════════════════════════╣");
+
+    let head_slot = fetch_block_number(client, pool.next()).await.unwrap_or(0);
+    tokio::time::sleep(Duration::from_millis(RPC_PACING_MS)).await;
+
+    // ── (1) Include-rate via full receipt audit ─────────────────
+    // Look up every measurement-window hash. Definitive count of
+    // which txs actually executed (success or failure).
+    println!(
+        "  (1) include-rate (full receipt audit, head_slot={})",
+        head_slot
+    );
+    let (t_ok, t_fail, t_miss) = full_receipt_audit(client, &pool, &transfer_hashes).await;
+    let (c_ok, c_fail, c_miss) = full_receipt_audit(client, &pool, &call_hashes).await;
+    let t_landed = t_ok + t_fail;
+    let c_landed = c_ok + c_fail;
+    let submitted_measure =
+        submit_snap.transfer_ok_measure + submit_snap.call_ok_measure;
+    println!(
+        "      transfer landed:  {} / {} submitted ({}%)",
+        t_landed,
+        transfer_hashes.len(),
+        if transfer_hashes.is_empty() {
+            0
+        } else {
+            t_landed as usize * 100 / transfer_hashes.len()
+        }
+    );
+    println!(
+        "      call landed:      {} / {} submitted ({}%)",
+        c_landed,
+        call_hashes.len(),
+        if call_hashes.is_empty() {
+            0
+        } else {
+            c_landed as usize * 100 / call_hashes.len()
+        }
+    );
+    println!(
+        "      aggregate landed: {} / {} measurement-window submits",
+        t_landed + c_landed,
+        submitted_measure
+    );
+    println!("  (2) execution success vs. failure");
+    println!(
+        "      transfer:  success={} failed={} missing={}",
+        t_ok, t_fail, t_miss
+    );
+    println!(
+        "      call:      success={} failed={} missing={}",
+        c_ok, c_fail, c_miss
+    );
+    println!(
+        "      encrypted: skipped — encrypted-wrapper hash != inner-receipt hash; \
+         covered by RECIPIENT balance below"
+    );
+
+    // ── (3) Sender balance spot-check ───────────────────────────
+    println!(
+        "  (3) sender balances (sampled, {} of {})",
+        BALANCE_SAMPLE_SIZE,
+        wallets.len()
+    );
+    let step = (wallets.len() / BALANCE_SAMPLE_SIZE).max(1);
+    let mut sample_count = 0usize;
+    let mut debited = 0usize;
+    for w in wallets.iter().step_by(step) {
+        if sample_count >= BALANCE_SAMPLE_SIZE {
+            break;
+        }
+        sample_count += 1;
+        let bal = fetch_balance(client, pool.next(), &w.address).await.unwrap_or(0);
+        tokio::time::sleep(Duration::from_millis(RPC_PACING_MS)).await;
+        let nonce = fetch_nonce(client, pool.next(), &w.address).await.unwrap_or(0);
+        tokio::time::sleep(Duration::from_millis(RPC_PACING_MS)).await;
+        // After register (nonce 0) + any successful sends, nonce on chain ≥ 2.
+        // Any included tx debits ≥ 1 quanta + base_fee*gas → balance drops.
+        if nonce >= 2 && bal < fund_per_sender {
+            debited += 1;
+        }
+        if sample_count <= 3 {
+            println!(
+                "      0x{}…: nonce={}, balance={}",
+                hex::encode(&w.address[..6]),
+                nonce,
+                bal
+            );
+        }
+    }
+    println!(
+        "      {} of {} sampled senders show post-tx state (nonce≥2 AND balance<fund)",
+        debited, sample_count
+    );
+
+    // ── (4) Counter contract value ──────────────────────────────
+    // Counter exposes `get_count()` as its view function (see
+    // `COUNTER_SRC` near the top of this file). Selector mismatch
+    // would surface as a `Revert` since `compute_selector("value")`
+    // wouldn't match any function in the contract dispatch table.
+    let value_selector = otic::codegen::compute_selector("get_count");
+    let calldata = value_selector.to_be_bytes();
+    let counter_value =
+        fetch_call_u64(client, pool.next(), &counter_addr, &hex::encode(calldata)).await;
+    tokio::time::sleep(Duration::from_millis(RPC_PACING_MS)).await;
+    println!("  (4) Counter contract storage");
+    println!(
+        "      counter.value():      {}",
+        counter_value
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<call failed>".to_string())
+    );
+    println!("      execution-success calls (chain-side, measurement window):  {}", c_ok);
+    println!("      submitted calls (RPC-accepted, total): {}", submit_snap.call_ok);
+
+    // ── (5) RECIPIENT balance ───────────────────────────────────
+    let recipient_balance = fetch_balance(client, pool.next(), &RECIPIENT)
+        .await
+        .unwrap_or(0);
+    let expected_max = (submit_snap.transfer_ok as u128 + submit_snap.encrypted_ok as u128)
+        * TX_VALUE;
+    println!("  (5) RECIPIENT (0x42…42) balance");
+    println!(
+        "      observed balance: {} (= {} txs of value {})",
+        recipient_balance,
+        if TX_VALUE > 0 {
+            recipient_balance / TX_VALUE
+        } else {
+            0
+        },
+        TX_VALUE
+    );
+    println!(
+        "      expected ≤ {} (transfer+encrypted submitted × {})",
+        expected_max, TX_VALUE
+    );
+    println!("╚══════════════════════════════════════════════════════╝");
+}
+
+/// Query `pyde_blockNumber`. Returns the current head slot.
+async fn fetch_block_number(client: &reqwest::Client, url: &str) -> Option<u64> {
+    let resp = rpc_call(client, url, "pyde_blockNumber", "").await;
+    let raw = resp.get("result")?.as_str()?;
+    u64::from_str_radix(raw.strip_prefix("0x").unwrap_or(raw), 16).ok()
+}
+
+/// Query `pyde_getBlockByNumber(slot)` and return:
+///   (plaintext_tx_hashes, encrypted_tx_count)
+#[allow(dead_code)]
+async fn fetch_block_tx_hashes(
+    client: &reqwest::Client,
+    url: &str,
+    slot: u64,
+) -> Option<(Vec<[u8; 32]>, u64)> {
+    let resp = rpc_call(
+        client,
+        url,
+        "pyde_getBlockByNumber",
+        &format!("{},true", slot),
+    )
+    .await;
+    let block = resp.get("result")?;
+    if block.is_null() {
+        return None;
+    }
+    let mut hashes = Vec::new();
+    if let Some(hs) = block.get("transactionHashes").and_then(|v| v.as_array()) {
+        for h in hs {
+            if let Some(s) = h.as_str() {
+                if let Ok(bytes) = hex::decode(s.strip_prefix("0x").unwrap_or(s)) {
+                    if bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        hashes.push(arr);
+                    }
+                }
+            }
+        }
+    }
+    // Encrypted txs aren't in transactionHashes (those are the
+    // INNER decrypted-tx hashes, which get receipts separately).
+    // We use the block's `transactions` field — but the wrapper
+    // shape may include encrypted entries; for now we approximate
+    // by treating encrypted count as 0 here and relying on check
+    // (5) to verify recipient balance. A future improvement: add
+    // an `encrypted_count` field to `pyde_getBlockByNumber`.
+    Some((hashes, 0))
+}
+
+/// Sample up to `n` hashes evenly across the input, query each
+/// receipt, and return (success_count, failed_count, missing_count).
+#[allow(dead_code)]
+async fn sample_receipts(
+    client: &reqwest::Client,
+    url: &str,
+    hashes: &[[u8; 32]],
+    n: usize,
+) -> (u64, u64, u64) {
+    if hashes.is_empty() {
+        return (0, 0, 0);
+    }
+    let step = (hashes.len() / n.max(1)).max(1);
+    let mut ok = 0u64;
+    let mut failed = 0u64;
+    let mut missing = 0u64;
+    let mut sampled = 0usize;
+    for h in hashes.iter().step_by(step) {
+        if sampled >= n {
+            break;
+        }
+        sampled += 1;
+        let resp = rpc_call(
+            client,
+            url,
+            "pyde_getTransactionReceipt",
+            &format!("\"0x{}\"", hex::encode(h)),
+        )
+        .await;
+        match resp.get("result") {
+            Some(v) if v.is_null() => missing += 1,
+            Some(v) => match v.get("success").and_then(|s| s.as_bool()) {
+                Some(true) => ok += 1,
+                Some(false) => failed += 1,
+                None => missing += 1,
+            },
+            None => missing += 1,
+        }
+    }
+    (ok, failed, missing)
+}
+
+/// Call a view-function and decode the result as u64 (last 8 bytes
+/// of the returned u256, big-endian). For Counter.value(), the
+/// return data is a 32-byte big-endian u256.
+async fn fetch_call_u64(
+    client: &reqwest::Client,
+    url: &str,
+    to: &[u8; 32],
+    data_hex: &str,
+) -> Option<u64> {
+    let params = format!(
+        r#"{{"to":"0x{}","data":"0x{}"}}"#,
+        hex::encode(to),
+        data_hex
+    );
+    let resp = rpc_call(client, url, "pyde_call", &params).await;
+    // Diagnostic: surface the raw response so a `<call failed>`
+    // result tells us *why* — rate-limit, no-code, revert, etc.
+    let raw_opt = resp.get("result").and_then(|v| v.as_str());
+    if raw_opt.is_none() {
+        eprintln!("DEBUG counter pyde_call result-missing: {}", resp);
+        return None;
+    }
+    let raw = raw_opt.unwrap();
+    let bytes = match hex::decode(raw.strip_prefix("0x").unwrap_or(raw)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "DEBUG counter pyde_call hex decode failed: {} (raw={:?})",
+                e, raw
+            );
+            return None;
+        }
+    };
+    if bytes.len() < 8 {
+        eprintln!(
+            "DEBUG counter pyde_call short return: {} bytes (raw={:?})",
+            bytes.len(),
+            raw
+        );
+        return None;
+    }
+    let start = bytes.len() - 8;
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[start..]);
+    Some(u64::from_be_bytes(buf))
+}
+
+// ════════════════════════════════════════════════════════════════════
 // HTTP helpers
 // ════════════════════════════════════════════════════════════════════
 
@@ -880,6 +1364,35 @@ async fn rpc_send_raw(client: &reqwest::Client, url: &str, tx_hex: &str) -> serd
     }
 }
 
+/// Global histogram of `rpc_send_raw_fast` error patterns so the
+/// final report shows what's actually failing across the run. The
+/// counters reset between processes, so each test run starts clean.
+fn err_pattern_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn record_err_pattern(msg: &str) {
+    if let Ok(mut m) = err_pattern_map().lock() {
+        *m.entry(msg.to_string()).or_insert(0) += 1;
+    }
+}
+
+fn dump_err_pattern_top(n: usize) {
+    let m = match err_pattern_map().lock() {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let mut v: Vec<(String, u64)> = m.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("  ─ top {} error patterns ─", n);
+    for (k, count) in v.iter().take(n) {
+        eprintln!("    {:>6}  {}", count, k);
+    }
+}
+
 async fn rpc_send_raw_fast(client: &reqwest::Client, url: &str, tx_hex: &str) -> Result<(), ()> {
     let body = format!(
         r#"{{"jsonrpc":"2.0","id":1,"method":"pyde_sendRawTransaction","params":["0x{}"]}}"#,
@@ -892,12 +1405,26 @@ async fn rpc_send_raw_fast(client: &reqwest::Client, url: &str, tx_hex: &str) ->
         .timeout(Duration::from_secs(3))
         .send()
         .await
-        .map_err(|_| ())?;
+        .map_err(|e| {
+            record_err_pattern(&format!("transport:{}", e));
+        })?;
     if !resp.status().is_success() {
+        record_err_pattern(&format!("http:{}", resp.status()));
         return Err(());
     }
     let text = resp.text().await.map_err(|_| ())?;
     if text.contains(r#""error""#) {
+        // Extract the error message (between `"message":"` and `"`).
+        if let Some(start) = text.find(r#""message":""#) {
+            let after = &text[start + r#""message":""#.len()..];
+            if let Some(end) = after.find('"') {
+                // Capture enough to distinguish InvalidNonce variants
+                // (BelowWindow vs TooFarInFuture) plus the window/got
+                // values that pin down whether we're behind or ahead.
+                let msg = &after[..end.min(200)];
+                record_err_pattern(msg);
+            }
+        }
         return Err(());
     }
     Ok(())
