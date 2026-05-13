@@ -1685,12 +1685,14 @@ impl ValidatorEngine {
         let slot = self.consensus.current_slot;
         let committee_size = self.committee_keys.len();
 
-        // Audit 410: single-leader gate for small committees. See
-        // `pyde_consensus::proposer::is_view0_proposer` for the
-        // motivation — pre-410 every member of a ≤5-validator
-        // committee proposed every slot, and under load the
-        // gossip-convergence-before-vote race scattered votes
-        // across 3-4 block hashes and wedged the chain.
+        // Audit-410-extended: universal round-robin view-0 leader.
+        // See `pyde_consensus::proposer::is_view0_proposer` for the
+        // motivation — the multi-leader VRF design scattered votes
+        // across competing proposals under load (originally observed
+        // at 4-validator committees, later re-observed at 6).
+        // Round-robin is the sole view-0 eligibility gate for every
+        // committee size; view-1+ recovery still uses
+        // `fallback_leader_index`.
         if !pyde_consensus::proposer::is_view0_proposer(
             slot,
             identity.committee_index as usize,
@@ -3773,8 +3775,10 @@ mod tests {
 
     #[test]
     fn check_proposer_respects_vrf_threshold() {
-        // With 3 validators, threshold = (U64::MAX / 3) * 3 / 2 ≈ U64::MAX / 2.
-        // Try multiple slots — at least one should qualify (probabilistic but reliable).
+        // Audit-410-extended: view-0 leader is round-robin
+        // (`slot % committee_size`). With 3 validators, identity 0 is
+        // the leader at slots 0, 3, 6, 9, ... and is rejected at other
+        // slots. 20 advances guarantee at least 6 hits for index 0.
         let (mut engine, identities) = make_engine_with_committee(3);
         let mut found_proposer = false;
         for _ in 0..20 {
@@ -3794,7 +3798,8 @@ mod tests {
     #[test]
     fn single_validator_always_proposes() {
         let (engine, identities) = make_engine_with_committee(1);
-        // Single validator: threshold = U64::MAX, always qualifies
+        // Audit-410-extended: with N=1 the round-robin trivially picks
+        // index 0 every slot, so check_proposer always returns Some.
         let candidate = engine.check_proposer(&identities[0]);
         assert!(candidate.is_some());
     }

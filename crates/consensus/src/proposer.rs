@@ -41,62 +41,68 @@ pub fn score_from_output(output: &VrfOutput) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Eligibility threshold for proposer selection given a committee
-/// size. A validator's VRF score must be `≤ threshold` to be eligible
-/// to propose at a given slot. Targets ~5 expected proposers per
-/// slot for reliability:
-///   threshold = min(u64::MAX, 5 * u64::MAX / committee_size)
-///   P(0 proposers) ≈ e^(-5) ≈ 0.67%  (virtually no empty slots)
-/// For small committees (≤ 5 members) every validator is eligible
-/// every slot (threshold = u64::MAX). Audit 323: lifted out of
-/// `validator::check_proposer` so the receive path
-/// (`validate_network_block`) can apply the same gate.
-pub fn vrf_proposer_threshold(committee_size: usize) -> u64 {
-    const TARGET_PROPOSERS: u64 = 5;
-    if committee_size as u64 <= TARGET_PROPOSERS {
-        u64::MAX
-    } else {
-        (u64::MAX / committee_size as u64).saturating_mul(TARGET_PROPOSERS)
-    }
+/// Eligibility threshold for a proposer's VRF score given a
+/// committee size. Historically this targeted ~5 expected proposers
+/// per slot via `5 * u64::MAX / N`. Audit-410-extended (universal
+/// round-robin, see `is_view0_proposer`) makes view-0 leader
+/// selection a deterministic single-proposer rotation for ALL
+/// committee sizes, so the VRF score-vs-threshold gate has nothing
+/// to filter — the round-robin already picks exactly one leader per
+/// slot. The threshold is now `u64::MAX` unconditionally; the VRF
+/// proof itself is still computed and verified to bind the
+/// proposer's randomness commitment to this slot (anti-grinding /
+/// epoch-randomness liveness), but the score check is a no-op pass.
+///
+/// Kept as a function (rather than removed) because both sender
+/// (`validator::check_proposer`) and receiver
+/// (`block_processor::validate_network_block`) call it, and a future
+/// design that re-introduces a probabilistic eligibility layer
+/// (e.g. for an opt-in fast-path on very large committees) would
+/// flow through here.
+pub fn vrf_proposer_threshold(_committee_size: usize) -> u64 {
+    u64::MAX
 }
 
-/// Audit 410: deterministic single-leader gate for small committees.
+/// Audit 410 (and audit-410-extended): deterministic single-leader
+/// gate for the view-0 happy path.
 ///
 /// Returns whether the validator at `committee_index` is the sole
-/// eligible proposer for `slot` under view 0 (happy path). For
-/// committees ≤ 5, returns `true` only for `slot % committee_size ==
-/// committee_index`; for committees > 5, always returns `true` and
-/// VRF eligibility (`vrf_proposer_threshold`) is the only gate.
+/// eligible proposer for `slot`. Universal round-robin:
+///   `(slot % committee_size) == committee_index`
 ///
-/// Pre-410 the multi-leader design ran every committee member as an
-/// eligible proposer for committees ≤ 5 (VRF threshold = u64::MAX).
-/// Under sustained mixed load on 4-validator testnets, gossip
-/// delivery of competing proposals slipped past the 100 ms vote
-/// deadline, so different validators voted on different "best of
-/// buffered" subsets, scattering 4 votes across 3-4 block hashes
-/// and wedging consensus at slot ~16-262 of every soak. The
-/// deterministic gate eliminates the race entirely at small N
-/// (one proposer per slot, no scatter possible) while preserving
-/// the VRF-randomized multi-leader design at production-sized
-/// committees where gossip fan-out is robust enough.
+/// Pre-410, view-0 used VRF multi-leader selection: every committee
+/// member with a low-enough VRF score (`≤ vrf_proposer_threshold(N)`)
+/// could propose, targeting ~5 eligible proposers per slot. Under
+/// sustained mixed load, gossip delivery of competing proposals
+/// slipped past the 100 ms vote deadline, so different honest
+/// validators voted on different "best of buffered" subsets,
+/// scattering votes across competing block hashes and wedging
+/// consensus. Audit-410 first introduced the round-robin gate for
+/// committees ≤ 5 (where fan-out is too small for the
+/// gossip-convergence race to settle in time). A subsequent
+/// 6-validator soak proved the same race re-emerges above the
+/// cutoff, so the gate is now universal: every committee size uses
+/// the single deterministic leader per `(slot, view=0)`.
+///
+/// Tradeoff: an offline view-0 leader stalls one slot per N until
+/// view-change kicks in (~200 ms baseline timeout, exponential
+/// backoff per attempt). The original multi-leader design hid
+/// single-validator outages behind redundancy; with universal
+/// round-robin, view-change is the sole recovery mechanism — which
+/// is what it was designed for. Vote-coherence under load wins over
+/// latency-hiding under churn.
 ///
 /// View-1+ fallbacks remain governed by `fallback_leader_index`
 /// (slot + view rotation) — this gate only governs the view-0
 /// happy path. Used in:
 /// - `validator::check_proposer` to suppress non-leader proposals
 /// - `block_processor::validate_network_block` to reject any
-///   small-committee block whose proposer index is not the
-///   round-robin leader.
+///   view-0 block whose proposer index is not the round-robin leader.
 pub fn is_view0_proposer(slot: u64, committee_index: usize, committee_size: usize) -> bool {
-    const SMALL_COMMITTEE_CUTOFF: usize = 5;
     if committee_size == 0 {
         return false;
     }
-    if committee_size <= SMALL_COMMITTEE_CUTOFF {
-        (slot % committee_size as u64) as usize == committee_index
-    } else {
-        true
-    }
+    (slot % committee_size as u64) as usize == committee_index
 }
 
 /// A proposer candidate: validator address + VRF output + proof.
@@ -313,41 +319,28 @@ mod tests {
         assert!(select_proposer(&[]).is_none());
     }
 
-    // ── Audit 323: vrf_proposer_threshold helper ──────────────────────
+    // ── vrf_proposer_threshold helper ─────────────────────────────────
 
     #[test]
-    fn vrf_proposer_threshold_small_committee_is_max() {
-        // Committees ≤ 5 are too small for a meaningful eligibility
-        // gate; everyone proposes every slot (threshold = u64::MAX).
-        for n in 1..=5usize {
+    fn vrf_proposer_threshold_is_universally_permissive() {
+        // Audit-410-extended: universal round-robin makes the score
+        // gate a no-op. The threshold must be u64::MAX for every N
+        // so the round-robin-chosen leader is never additionally
+        // filtered by VRF score.
+        for n in [1usize, 4, 5, 6, 7, 8, 32, 128, 256] {
             assert_eq!(
                 vrf_proposer_threshold(n),
                 u64::MAX,
-                "small committee n={n} must allow every score"
+                "threshold must be u64::MAX for n={n} (universal round-robin)"
             );
         }
     }
 
     #[test]
-    fn vrf_proposer_threshold_scales_linearly_with_committee() {
-        // For committee_size N > 5, threshold ≈ 5 * u64::MAX / N.
-        // Verifies the formula picks the same expected number of
-        // eligible proposers regardless of N (~5/slot).
-        let t128 = vrf_proposer_threshold(128);
-        let t256 = vrf_proposer_threshold(256);
-        // Threshold is proportional to 1/N, so doubling N halves the
-        // threshold (within saturating_mul precision).
-        assert!(t128 > t256);
-        // Sanity: threshold for N=128 is ≈ 5/128 of u64::MAX.
-        let expected_128 = (u64::MAX / 128).saturating_mul(5);
-        assert_eq!(t128, expected_128);
-    }
-
-    #[test]
-    fn is_view0_proposer_small_committee_round_robin() {
-        // Audit 410: at committee_size ≤ 5, exactly one index is
-        // eligible per slot, and it cycles slot % N.
-        for n in 1..=5usize {
+    fn is_view0_proposer_universal_round_robin() {
+        // Audit-410-extended: for every committee size, exactly one
+        // index is eligible per slot, and it cycles `slot % N`.
+        for n in [1usize, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128] {
             for slot in 0u64..(n as u64 * 3) {
                 let expected = (slot % n as u64) as usize;
                 for idx in 0..n {
@@ -357,18 +350,6 @@ mod tests {
                         "n={n} slot={slot} idx={idx}"
                     );
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn is_view0_proposer_large_committee_open() {
-        // For committee_size > 5 the gate is open and VRF eligibility
-        // is the only thing that matters.
-        for n in [6usize, 7, 32, 128] {
-            for idx in [0usize, n / 2, n - 1] {
-                assert!(is_view0_proposer(0, idx, n));
-                assert!(is_view0_proposer(99, idx, n));
             }
         }
     }
