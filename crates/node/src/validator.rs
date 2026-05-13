@@ -1685,6 +1685,20 @@ impl ValidatorEngine {
         let slot = self.consensus.current_slot;
         let committee_size = self.committee_keys.len();
 
+        // Audit 410: single-leader gate for small committees. See
+        // `pyde_consensus::proposer::is_view0_proposer` for the
+        // motivation — pre-410 every member of a ≤5-validator
+        // committee proposed every slot, and under load the
+        // gossip-convergence-before-vote race scattered votes
+        // across 3-4 block hashes and wedged the chain.
+        if !pyde_consensus::proposer::is_view0_proposer(
+            slot,
+            identity.committee_index as usize,
+            committee_size,
+        ) {
+            return None;
+        }
+
         // Audit 402: same boundary-aware lookup as the verify path.
         // Pre-fix this used `self.epoch_randomness` directly, which
         // could be a stale value (the buffered next-epoch randomness
