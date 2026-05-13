@@ -185,6 +185,7 @@ fn mixed_workload_load_test() {
     let duration_s: u64 = env_var_u64("PYDE_LOADGEN_DURATION", 300);
     let warmup_s: u64 = env_var_u64("PYDE_LOADGEN_WARMUP", 30);
     let num_senders: usize = env_var_u64("PYDE_LOADGEN_SENDERS", 200) as usize;
+    let num_validators: usize = env_var_u64("PYDE_LOADGEN_VALIDATORS", 4) as usize;
     let fund_per_sender: u128 = env_var_u64("PYDE_LOADGEN_FUND", FUND_PER_SENDER as u64) as u128;
     let mix = MixWeights::parse(
         &std::env::var("PYDE_LOADGEN_MIX")
@@ -221,10 +222,13 @@ fn mixed_workload_load_test() {
     println!("  chain_id:     {} (FALCON sig verification ON)", CHAIN_ID);
     println!("╚══════════════════════════════════════════════════════╝");
 
-    // ── Phase 0: spawn 4-validator testnet ──────────────────────
-    println!("\n[0/4] Spawning 4-validator native testnet at chain_id = {CHAIN_ID}…");
-    let net = TestNetwork::spawn_with_chain_id(4, CHAIN_ID)
-        .unwrap_or_else(|e| panic!("spawn 4v@chain_id={CHAIN_ID}: {}", e));
+    // ── Phase 0: spawn validator testnet ────────────────────────
+    println!(
+        "\n[0/4] Spawning {}-validator native testnet at chain_id = {CHAIN_ID}…",
+        num_validators
+    );
+    let net = TestNetwork::spawn_with_chain_id(num_validators, CHAIN_ID)
+        .unwrap_or_else(|e| panic!("spawn {}v@chain_id={CHAIN_ID}: {}", num_validators, e));
     net.wait_for_slot(3, Duration::from_secs(30))
         .unwrap_or_else(|e| panic!("chain warm-up: {}", e));
 
@@ -964,6 +968,13 @@ const BALANCE_SAMPLE_SIZE: usize = 10;
 /// above), so 11 ms between calls gives ~90 req/s/conn — under the
 /// limit even if one of the 4 nodes is briefly slow.
 const RPC_PACING_MS: u64 = 11;
+/// Receipt audit caps at this sample count per kind. For short
+/// soaks the cap is rarely reached; for 6-hour soaks with millions
+/// of measurement-window submits, full audit would take hours of
+/// paced RPC calls. 2000 samples / kind gives ±2% statistical
+/// confidence on the success rate, which is what we actually
+/// care about reporting.
+const RECEIPT_AUDIT_CAP: usize = 2000;
 
 /// Round-robin URL picker so consecutive verification calls hit
 /// different RPC endpoints and each conn stays under its own
@@ -1001,7 +1012,12 @@ async fn full_receipt_audit(
     let mut ok = 0u64;
     let mut failed = 0u64;
     let mut missing = 0u64;
-    for h in hashes {
+    let step = if hashes.len() > RECEIPT_AUDIT_CAP {
+        hashes.len() / RECEIPT_AUDIT_CAP
+    } else {
+        1
+    };
+    for h in hashes.iter().step_by(step.max(1)) {
         let resp = rpc_call(
             client,
             pool.next(),
