@@ -897,6 +897,24 @@ impl BlockProcessor {
                     committee_keys.len()
                 ));
             }
+
+            // Audit 410: small-committee single-leader gate. View-0
+            // happy-path proposals on committees ≤ 5 must come from
+            // the round-robin leader (slot % committee_size).
+            // View-1+ fallbacks are handled in the
+            // `is_fallback_proof` branch below.
+            if !pyde_consensus::proposer::is_view0_proposer(
+                slot,
+                proposer_idx,
+                committee_keys.len(),
+            ) {
+                return Err(format!(
+                    "small-committee view-0 proposer mismatch: slot {} expected index {}, got {} (audit 410)",
+                    slot,
+                    slot as usize % committee_keys.len(),
+                    proposer_idx,
+                ));
+            }
         } else if pyde_consensus::view_change::is_fallback_proof(&header.vrf_proof) {
             // Fallback proposal — the proposer must be the
             // deterministic leader for `(slot, view-from-proof)`.

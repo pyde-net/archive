@@ -139,6 +139,13 @@ These are what audit 234 surfaced. Each maps to an invariant above:
 - **The happy-path proposer is multi-proposer (lowest VRF score).**
   This is the latency-optimization that makes the chain fast on the
   happy path. Only the recovery (V≥1) leader is single-proposer.
+  Audit 410: at committee_size ≤ 5 the happy path is also a
+  single-proposer round-robin (`slot % N`) because, with only a
+  handful of validators, the gossip-convergence-before-vote race
+  scatters votes across competing proposals and wedges the chain
+  under sustained mixed load. The multi-proposer design re-engages
+  at committee_size > 5 where fan-out is robust enough for the
+  100 ms selection window.
 - **Wall-clock fairness.** Different validators may observe slot
   boundaries at slightly different `now_ms`. The state machine is
   resilient to this skew via L3 and L5.
