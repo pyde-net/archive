@@ -65,13 +65,25 @@ messages still target `(145, V)`, not `(150, *)`. The chain does
 not skip past unresolved heights.
 
 **L2 — Single deterministic leader per (H, V).**
-For a given `(H, V)`, there is exactly one designated proposer:
-`committee[fallback_index(H, V, committee_keys.len())]`. All
-honest validators compute the same answer. Multiple
-fallback-proposal candidates per `(H, V)` are NOT permitted.
+For a given `(H, V)`, there is exactly one designated proposer.
+All honest validators compute the same answer. Multiple
+proposal candidates per `(H, V)` are NOT permitted.
 
-> Note: the happy-path proposer (V=0) is selected by VRF as today.
-> This invariant only applies to recovery views (V ≥ 1).
+- **V = 0 (happy path):** `committee[H mod N]` (round-robin),
+  enforced by `pyde_consensus::proposer::is_view0_proposer`.
+- **V ≥ 1 (recovery):** `committee[fallback_leader_index(H, V, N)]`,
+  enforced by `pyde_consensus::view_change::fallback_leader_index`.
+
+> Audit-410-extended (2026-05-13): the V=0 leader was originally
+> VRF multi-leader (~5 expected proposers per slot, lowest score
+> wins). Audit-410 made V=0 deterministic round-robin for
+> committees ≤ 5 after a 4-validator soak wedged on
+> gossip-convergence-before-vote vote scatter. A subsequent
+> 6-validator soak re-surfaced the same race above the cutoff,
+> so the round-robin gate is now universal for all N. The
+> tradeoff (an offline V=0 leader stalls one slot per N until
+> view-change recovers, ~200 ms baseline) is accepted in favour
+> of vote-coherence under load.
 
 **L3 — View advancement.**
 A validator advances `view` for height `H` when EITHER:
@@ -136,16 +148,6 @@ These are what audit 234 surfaced. Each maps to an invariant above:
 
 ## Non-invariants (deliberate design choices, NOT properties to enforce)
 
-- **The happy-path proposer is multi-proposer (lowest VRF score).**
-  This is the latency-optimization that makes the chain fast on the
-  happy path. Only the recovery (V≥1) leader is single-proposer.
-  Audit 410: at committee_size ≤ 5 the happy path is also a
-  single-proposer round-robin (`slot % N`) because, with only a
-  handful of validators, the gossip-convergence-before-vote race
-  scatters votes across competing proposals and wedges the chain
-  under sustained mixed load. The multi-proposer design re-engages
-  at committee_size > 5 where fan-out is robust enough for the
-  100 ms selection window.
 - **Wall-clock fairness.** Different validators may observe slot
   boundaries at slightly different `now_ms`. The state machine is
   resilient to this skew via L3 and L5.
