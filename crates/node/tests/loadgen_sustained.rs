@@ -2,8 +2,9 @@
 //! instrument.
 //!
 //! Spawns its own 4-validator network via `common::TestNetwork` (native
-//! subprocess `pyde` binaries at `chain_id = 1`, FALCON sig verification
-//! ON), funds N senders from the faucet, then holds a target submit
+//! subprocess `pyde` binaries at `chain_id = 7331`, FALCON sig verification
+//! ON — audit 383 refuses `chain_id = 1` at the testnet generator), funds
+//! N senders from the faucet, then holds a target submit
 //! rate for a configurable duration and records steady-state throughput
 //! + inclusion. Native subprocesses (not Docker) — removes the Linux-VM
 //! hop on macOS.
@@ -70,7 +71,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const CHAIN_ID: u64 = 1;
+// audit 383: `pyde testnet` refuses chain_id=1 (mainnet). 7331 is the
+// canonical public testnet id and still triggers production-mode sig
+// verification — `dev_skip_signature` only fires at 31337.
+const CHAIN_ID: u64 = 7331;
 const RECIPIENT: [u8; 32] = [0x42u8; 32];
 const TX_VALUE: u128 = 1;
 // 1 000 000 000 PYDE (= 10^18 base units). Fee per tx is gas_limit * base_fee,
@@ -156,9 +160,9 @@ fn sustained_rate_load_test() {
     println!("╚══════════════════════════════════════════════════════╝");
 
     // --- Phase 0: spawn 4-validator testnet ---
-    println!("\n[0/3] Spawning 4-validator native testnet at chain_id = 1…");
+    println!("\n[0/3] Spawning 4-validator native testnet at chain_id = {CHAIN_ID}…");
     let net = TestNetwork::spawn_with_chain_id(4, CHAIN_ID)
-        .unwrap_or_else(|e| panic!("spawn 4v@chain_id=1: {}", e));
+        .unwrap_or_else(|e| panic!("spawn 4v@chain_id={CHAIN_ID}: {}", e));
 
     // Wait for chain to warm up.
     net.wait_for_slot(3, Duration::from_secs(30))

@@ -18,7 +18,8 @@
 //!     — `pyde_call(get_count)` from every node must return 42.
 //!
 //! Flow:
-//!  - 4 validators at chain_id=1 (production mode).
+//!  - 4 validators at chain_id=7331 (production mode — audit 383
+//!    refuses mainnet id 1 at the testnet generator).
 //!  - Compile the on-chain `Counter` contract (same source used by
 //!    `production_sigs.rs` — has `init()`, `set_count(n)`,
 //!    `get_count()`).
@@ -53,11 +54,13 @@ contract Counter {
 #[test]
 #[ignore = "multi-node — subprocess-based, run via --ignored"]
 fn contract_deploy_and_call_with_real_sigs() {
-    // chain_id=1 → block processor enforces FALCON sig verification
-    // on every tx. See `crates/node/src/block_processor.rs` — the
-    // `dev_skip_signature` flag is false for any chain_id != 31337.
-    let net = TestNetwork::spawn_with_chain_id(4, 1)
-        .unwrap_or_else(|e| panic!("spawn 4v@chain_id=1: {}", e));
+    // chain_id=7331 (canonical public testnet id) → block processor
+    // still enforces FALCON sig verification on every tx because
+    // `dev_skip_signature` is only true at 31337. audit 383 refuses
+    // the mainnet id (1) at the `pyde testnet` generator, so we use
+    // 7331 for production-mode subprocess tests.
+    let net = TestNetwork::spawn_with_chain_id(4, 7331)
+        .unwrap_or_else(|e| panic!("spawn 4v@chain_id=7331: {}", e));
 
     // Wait for chain to advance so the first tx has somewhere to land.
     net.wait_for_slot(3, Duration::from_secs(30))
@@ -100,7 +103,7 @@ fn contract_deploy_and_call_with_real_sigs() {
         fee_payer: FeePayer::Sender,
         access_list: vec![],
         deadline: None,
-        chain_id: 1,
+        chain_id: 7331,
         tx_type: TransactionType::Deploy,
     };
     sign_tx(&mut deploy_tx, &faucet_sk);
@@ -183,7 +186,7 @@ fn contract_deploy_and_call_with_real_sigs() {
         fee_payer: FeePayer::Sender,
         access_list: vec![],
         deadline: None,
-        chain_id: 1,
+        chain_id: 7331,
         tx_type: TransactionType::Standard,
     };
     sign_tx(&mut call_tx, &faucet_sk);

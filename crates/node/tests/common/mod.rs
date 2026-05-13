@@ -522,6 +522,22 @@ impl TestNetwork {
         rpc_smt_root(&self.nodes[node_idx].rpc_url())
     }
 
+    /// Fetch the committee's threshold public key via
+    /// `pyde_getThresholdPublicKey`. The returned bytes encode a
+    /// `ThresholdPublicKey`. PSS share refresh preserves the
+    /// underlying secret, so the pubkey bytes are stable across
+    /// epoch boundaries even though each validator's share rotates.
+    pub fn get_threshold_pubkey(&self, node_idx: usize) -> Result<Vec<u8>, String> {
+        let resp = rpc_call(
+            &self.nodes[node_idx].rpc_url(),
+            "pyde_getThresholdPublicKey",
+            "[]",
+        )?;
+        let hex_str = parse_hex_result(&resp)?;
+        hex::decode(hex_str.trim_start_matches("0x"))
+            .map_err(|e| format!("decode threshold pk hex: {}", e))
+    }
+
     // --------------------------------------------------------------
     // Slashing helpers (slice 6.6)
     // --------------------------------------------------------------

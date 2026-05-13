@@ -209,6 +209,21 @@ impl BlockProcessor {
             }
         }
 
+        // Skipped-slot base-fee catch-up: if this block is more than
+        // one slot ahead of head, treat the intermediate (skipped)
+        // slots as empty blocks for fee math. Without this, a node
+        // that misses slot N-1's gossip but receives slot N applies
+        // slot N with a stale `chain.base_fee` — fee receipts and
+        // burn accounting then diverge from peers who saw the full
+        // slot sequence, even though everyone agrees on the canonical
+        // block contents (audit: TPL-?? fee-receipt divergence
+        // surfaced by `multi_node_propagation` + `_full_node_relay`).
+        let gas_target_for_catchup = pyde_tx::fee::GAS_TARGET;
+        let slots_to_skip = slot.saturating_sub(chain.head_slot.saturating_add(1));
+        for _ in 0..slots_to_skip {
+            chain.base_fee =
+                adjust_base_fee(chain.base_fee, 0, gas_target_for_catchup);
+        }
         let block_ctx = BlockContext {
             height: slot,
             timestamp: block.header.timestamp,
@@ -646,7 +661,16 @@ impl BlockProcessor {
         Self::validate_header_with_checkpoint(&header, chain, ws_checkpoint_slot)?;
 
         let gas_target = pyde_tx::fee::GAS_TARGET;
-        chain.base_fee = adjust_base_fee(chain.base_fee, 0, gas_target);
+        // Skipped-slot base-fee catch-up — same rationale as
+        // `process_full_block_with_aot_and_checkpoint`. Header-only
+        // apply means total_gas at *this* block is 0 (no body to
+        // observe), but we still need to fold in adjustments for
+        // every skipped slot between `head_slot+1` and `header.slot`
+        // inclusive. After the loop we've covered all of them.
+        let slots_to_advance = header.slot.saturating_sub(chain.head_slot);
+        for _ in 0..slots_to_advance {
+            chain.base_fee = adjust_base_fee(chain.base_fee, 0, gas_target);
+        }
         chain.advance(header);
 
         Ok((0, 0))
