@@ -19,8 +19,9 @@
 //!      one-time + correct shape.
 //!   4. Now `transfer` from the fresh wallet succeeds.
 //!
-//! Production-mode (chain_id=1) so block_processor enforces real
-//! FALCON signature verification — no `dev_skip_signature` cheating.
+//! Production-mode (chain_id=7331 — audit 383 refuses mainnet id 1
+//! at the testnet generator) so block_processor enforces real FALCON
+//! signature verification — no `dev_skip_signature` cheating.
 
 mod common;
 
@@ -38,9 +39,13 @@ fn sign_tx(tx: &mut Transaction, sk: &FalconSecretKey) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "multi-node — subprocess-based, run via --ignored"]
 async fn register_pubkey_unblocks_first_tx_for_fresh_account() {
-    // chain_id=1 → block_processor enforces FALCON sigs on every tx.
-    let net = TestNetwork::spawn_with_chain_id(4, 1)
-        .unwrap_or_else(|e| panic!("spawn 4v@chain_id=1: {}", e));
+    // chain_id=7331 (canonical public testnet id) — block_processor
+    // still enforces FALCON sigs on every tx because
+    // `dev_skip_signature` only fires at 31337. audit 383 refuses
+    // the mainnet id (1) at the `pyde testnet` generator, so we use
+    // 7331 for production-mode subprocess tests.
+    let net = TestNetwork::spawn_with_chain_id(4, 7331)
+        .unwrap_or_else(|e| panic!("spawn 4v@chain_id=7331: {}", e));
 
     // Wait so the first tx has a slot to land in.
     net.wait_for_slot(3, Duration::from_secs(30))
@@ -59,11 +64,17 @@ async fn register_pubkey_unblocks_first_tx_for_fresh_account() {
     let fresh_addr = *fresh.address();
     eprintln!("fresh wallet address: 0x{}", hex::encode(fresh_addr));
 
-    // ── 2. Faucet sends 100 PYDE to fresh address ───────────────
+    // ── 2. Faucet sends 2M PYDE to fresh address ────────────────
+    // Enough to cover a real-base-fee transfer + register pubkey
+    // overhead. At GENESIS_BASE_FEE (50 gwei × 21 K gas ≈ 1 M PYDE
+    // per transfer in the worst case) the previous 100 PYDE was
+    // insufficient — the test was always going to hit
+    // `InsufficientBalance` once `chain_id != 1` (audit 383) forced
+    // it onto the same generator-produced genesis as production.
     let mut faucet_tx = Transaction {
         from: faucet_addr,
         to: fresh_addr,
-        value: 100_000_000_000, // 100 PYDE in quanta (10^9 quanta = 1 PYDE)
+        value: 2_000_000 * 1_000_000_000, // 2M PYDE in quanta (10^9 quanta = 1 PYDE)
         data: vec![],
         gas_limit: 21_000,
         nonce: 0,
@@ -71,7 +82,7 @@ async fn register_pubkey_unblocks_first_tx_for_fresh_account() {
         fee_payer: FeePayer::Sender,
         access_list: vec![],
         deadline: None,
-        chain_id: 1,
+        chain_id: 7331,
         tx_type: TransactionType::Standard,
     };
     sign_tx(&mut faucet_tx, &faucet_sk);
@@ -86,8 +97,9 @@ async fn register_pubkey_unblocks_first_tx_for_fresh_account() {
         .get_balance(0, &fresh_addr)
         .unwrap_or_else(|e| panic!("balance after drip: {}", e));
     assert_eq!(
-        fresh_balance_before, 100_000_000_000,
-        "faucet drip should give fresh wallet 100 PYDE"
+        fresh_balance_before,
+        2_000_000 * 1_000_000_000,
+        "faucet drip should give fresh wallet 2M PYDE"
     );
 
     // ── 3. Confirm normal signed tx is REJECTED before registration
@@ -134,8 +146,8 @@ async fn register_pubkey_unblocks_first_tx_for_fresh_account() {
         "post-register transfer should succeed"
     );
 
-    // Final balance sanity: fresh wallet started with 100 PYDE,
-    // sent 1 PYDE, paid gas. Should have a bit less than 99 PYDE.
+    // Final balance sanity: fresh wallet started with 2M PYDE,
+    // sent 1 PYDE, paid gas. Should be a bit less than 2M PYDE.
     let fresh_balance_after = net
         .get_balance(0, &fresh_addr)
         .unwrap_or_else(|e| panic!("balance after: {}", e));

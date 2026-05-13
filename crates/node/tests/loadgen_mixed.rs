@@ -71,7 +71,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const CHAIN_ID: u64 = 1;
+// audit 383: `pyde testnet` refuses chain_id=1 (mainnet). 7331 is the
+// canonical public testnet id and still triggers production-mode sig
+// verification — `dev_skip_signature` only fires at 31337.
+const CHAIN_ID: u64 = 7331;
 const RECIPIENT: [u8; 32] = [0x42u8; 32];
 const TX_VALUE: u128 = 1;
 // 1 PYDE = 10^9 quanta. Each sender gets enough headroom to cover
@@ -219,9 +222,9 @@ fn mixed_workload_load_test() {
     println!("╚══════════════════════════════════════════════════════╝");
 
     // ── Phase 0: spawn 4-validator testnet ──────────────────────
-    println!("\n[0/4] Spawning 4-validator native testnet at chain_id = 1…");
+    println!("\n[0/4] Spawning 4-validator native testnet at chain_id = {CHAIN_ID}…");
     let net = TestNetwork::spawn_with_chain_id(4, CHAIN_ID)
-        .unwrap_or_else(|e| panic!("spawn 4v@chain_id=1: {}", e));
+        .unwrap_or_else(|e| panic!("spawn 4v@chain_id={CHAIN_ID}: {}", e));
     net.wait_for_slot(3, Duration::from_secs(30))
         .unwrap_or_else(|e| panic!("chain warm-up: {}", e));
 
