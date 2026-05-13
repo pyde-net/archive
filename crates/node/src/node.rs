@@ -981,7 +981,17 @@ impl PydeNode {
         let mut last_slot = slot_clock.current_slot();
 
         // Periodic timers
-        let mut slot_interval = tokio::time::interval(std::time::Duration::from_millis(100)); // check slot every 100ms
+        // Poll the slot clock 4× per slot so slot transitions are
+        // detected promptly and per-tick consensus actions (proposal
+        // selection at ~25 % into the slot) actually fire — a fixed
+        // 100 ms cadence works for the production 400 ms slot but
+        // collapses to one tick per slot at faster test cadences,
+        // missing the proposal-selection threshold. Clamp keeps the
+        // poll loop from spinning sub-10 ms or sleeping longer than
+        // 100 ms regardless of the configured slot time.
+        let poll_interval_ms = (block_time_ms / 4).clamp(10, 100);
+        let mut slot_interval =
+            tokio::time::interval(std::time::Duration::from_millis(poll_interval_ms));
         let mut maintenance_interval = tokio::time::interval(std::time::Duration::from_secs(10));
         let mut sync_interval = tokio::time::interval(std::time::Duration::from_secs(2));
         // Gossip retry: re-publish uncommitted pending txs every 2 slots.
@@ -1041,8 +1051,11 @@ impl PydeNode {
         // from `(key_share, ciphertext)` so regeneration is cheap
         // and `BlockDecryptor::add_share` is idempotent (set-insert)
         // on the receiver side.
+        // Decryption-share retry cadence tracks the slot poll
+        // cadence — re-broadcast unacked shares ≈4× per slot until
+        // the receiver acks or the slot moves on.
         let mut decryption_share_retry_interval =
-            tokio::time::interval(std::time::Duration::from_millis(100));
+            tokio::time::interval(std::time::Duration::from_millis(poll_interval_ms));
         decryption_share_retry_interval.tick().await; // skip immediate first firing
 
         loop {
@@ -3242,14 +3255,19 @@ impl PydeNode {
                         }
                     }
 
-                    // --- Per-tick consensus actions (run every 100ms, not just on new slots) ---
+                    // --- Per-tick consensus actions (fire each poll tick, not just on new slots) ---
                     if let Some(engine) = validator_engine.as_mut() {
                         let current_slot = slot_clock.current_slot();
                         let ms_in_slot = slot_clock.ms_into_slot();
 
-                        // Proposal selection phase: 100ms into the slot, select the
-                        // best proposal (lowest VRF score) and vote for it.
-                        if ms_in_slot >= 100 {
+                        // Proposal selection phase: 25% into the slot,
+                        // select the best proposal (lowest VRF score) and
+                        // vote for it. Threshold scales with slot time so
+                        // the same "wait a quarter slot for proposals to
+                        // settle, then vote" logic holds at faster test
+                        // cadences (at 400 ms slot this is 100 ms; at
+                        // 100 ms slot it is 25 ms).
+                        if ms_in_slot >= block_time_ms / 4 {
                             if let Some(identity) = validator_identity.as_ref() {
                                 if let Some(vote) = engine.select_and_vote(identity) {
                                     // Add own vote to collection
