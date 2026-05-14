@@ -935,6 +935,29 @@ impl PydeNode {
         // with an unstamped genesis AND no saved head — i.e., the
         // dev-loop / in-process-test case.
         let block_time_ms = self.config.consensus.block_time_ms;
+        // Pin the consensus engine's slot-duration getter to the
+        // same value that drives SlotClock. Otherwise the
+        // view-change timeout would still fire at the spec default
+        // (400 ms) while wall-clock slots advance at the operator's
+        // configured cadence — guaranteed spurious view-changes on
+        // any deployment that doesn't run at 400 ms (WAN testnets,
+        // soak environments, etc.). `set_slot_duration_ms` is
+        // first-writer-wins, so this is the canonical pin for the
+        // process lifetime.
+        let effective_slot_duration_ms =
+            pyde_consensus::view_change::set_slot_duration_ms(block_time_ms);
+        if effective_slot_duration_ms != block_time_ms {
+            warn!(
+                requested_block_time_ms = block_time_ms,
+                effective_slot_duration_ms,
+                "block_time_ms clamped to valid range",
+            );
+        } else {
+            info!(
+                slot_duration_ms = effective_slot_duration_ms,
+                "consensus slot duration set",
+            );
+        }
         let now_ms_for_anchor = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

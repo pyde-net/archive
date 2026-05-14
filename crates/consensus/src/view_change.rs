@@ -26,8 +26,83 @@ pub const PROPOSAL_TIMEOUT_MS: u64 = 200;
 /// inconsistency is recovered within a few seconds.
 pub const PROGRESS_TIMEOUT_MS: u64 = 2_000;
 
-/// Slot duration (milliseconds).
+/// Default slot duration (milliseconds). The protocol spec value
+/// for local / same-region deployments. Operators running across
+/// regions (especially WAN with > 50 ms RTTs) override this at
+/// startup via `set_slot_duration_ms` so vote propagation has time
+/// to complete inside a slot. The runtime getter `slot_duration_ms`
+/// reads the override if set, else returns this default.
 pub const SLOT_DURATION_MS: u64 = 400;
+
+/// Lower bound on the configurable slot duration (ms). Anything
+/// shorter starves the consensus pipeline of vote-aggregation time
+/// even on a single-machine deployment. The HotStuff round needs:
+/// proposer broadcast → vote → QC formation; 100 ms is the empirical
+/// floor on healthy hardware.
+pub const MIN_SLOT_DURATION_MS: u64 = 100;
+
+/// Upper bound on the configurable slot duration (ms). Beyond this
+/// the chain is effectively halted from an apps-layer perspective;
+/// 10 s is generous for any plausible WAN deployment.
+pub const MAX_SLOT_DURATION_MS: u64 = 10_000;
+
+/// Runtime-overrideable slot duration. `0` = unset, fall back to
+/// `SLOT_DURATION_MS`. Set once at process startup from the
+/// operator's `consensus.block_time_ms` config (so SlotClock and
+/// view-change timeouts share one value) or from
+/// `PYDE_SLOT_DURATION_MS` for ad-hoc tuning. Subsequent calls
+/// after the first commit are no-ops — slot duration must be
+/// stable for the process lifetime to keep timing deterministic.
+static SLOT_DURATION_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Effective slot duration in milliseconds. Reads the runtime
+/// override if set (via `set_slot_duration_ms` or the
+/// `PYDE_SLOT_DURATION_MS` env var on first access), else returns
+/// the default `SLOT_DURATION_MS`.
+pub fn slot_duration_ms() -> u64 {
+    let override_val = SLOT_DURATION_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if override_val != 0 {
+        return override_val;
+    }
+    // First-access fallback: honour the env var if the operator set
+    // one but never called `set_slot_duration_ms` (e.g., the value
+    // is consumed by code reachable before node startup like a
+    // standalone tool, or the override commit lost a race).
+    if let Some(env_ms) = std::env::var("PYDE_SLOT_DURATION_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| (MIN_SLOT_DURATION_MS..=MAX_SLOT_DURATION_MS).contains(&v))
+    {
+        // Cache so subsequent calls are lock-free; first-writer-wins
+        // matches the operator-set path so we can't flip values
+        // mid-process.
+        let _ = SLOT_DURATION_OVERRIDE_MS.compare_exchange(
+            0,
+            env_ms,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return env_ms;
+    }
+    SLOT_DURATION_MS
+}
+
+/// Pin the slot duration to `ms` for the rest of this process.
+/// Clamped to `[MIN_SLOT_DURATION_MS, MAX_SLOT_DURATION_MS]` and
+/// applied first-writer-wins so a misordered late call can't yank
+/// the timing out from under the consensus engine. Returns the
+/// value that's now in effect.
+pub fn set_slot_duration_ms(ms: u64) -> u64 {
+    let clamped = ms.clamp(MIN_SLOT_DURATION_MS, MAX_SLOT_DURATION_MS);
+    let _ = SLOT_DURATION_OVERRIDE_MS.compare_exchange(
+        0,
+        clamped,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    slot_duration_ms()
+}
 
 /// A view change message broadcast when a proposer fails.
 #[derive(Clone, Debug)]
@@ -108,7 +183,7 @@ impl TimeoutTracker {
 
     /// Check if the entire slot duration has elapsed.
     pub fn slot_elapsed(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.slot_start_ms) >= SLOT_DURATION_MS
+        now_ms.saturating_sub(self.slot_start_ms) >= slot_duration_ms()
     }
 
     /// Milliseconds remaining until proposal timeout.
