@@ -312,21 +312,31 @@ fn mixed_workload_load_test() {
             signed_hex.push(hex::encode(tx.to_bytes()));
             faucet_nonce += 1;
         }
-        // Stream funding in nonce-window-friendly chunks.
+        // Stream funding in nonce-window-friendly chunks, spreading
+        // submissions across all RPC endpoints to avoid starving any
+        // one node's consensus path with RPC-write-lock pressure.
         let mut chunk_idx = 0usize;
+        let mut submit_idx = 0usize;
         for chunk in signed_hex.chunks(15) {
             for hex_tx in chunk {
-                let _ = rpc_send_raw(&client, &rpc_urls[0], hex_tx).await;
+                let url = &rpc_urls[submit_idx % rpc_urls.len()];
+                let _ = rpc_send_raw(&client, url, hex_tx).await;
+                submit_idx += 1;
             }
             chunk_idx += 1;
             tokio::time::sleep(Duration::from_millis(800)).await;
         }
-        // Wait for all funded.
+        // Wait for all funded. Poll round-robin across RPC URLs so a
+        // single node falling slightly behind on apply (e.g. from its
+        // own RPC pressure) doesn't make us declare the cluster wedged.
         let poll_deadline = Instant::now() + Duration::from_secs(60);
+        let mut poll_idx = 0usize;
         loop {
             let mut funded = 0usize;
             for w in &wallets {
-                if fetch_balance(&client, &rpc_urls[0], &w.address)
+                let url = &rpc_urls[poll_idx % rpc_urls.len()];
+                poll_idx += 1;
+                if fetch_balance(&client, url, &w.address)
                     .await
                     .unwrap_or(0)
                     > 0
@@ -376,10 +386,13 @@ fn mixed_workload_load_test() {
         iter(futs).buffer_unordered(32).collect::<Vec<()>>().await;
 
         let poll_deadline = Instant::now() + Duration::from_secs(60);
+        let mut reg_poll_idx = 0usize;
         loop {
             let mut registered = 0usize;
             for w in &wallets {
-                if fetch_nonce(&client, &rpc_urls[0], &w.address)
+                let url = &rpc_urls[reg_poll_idx % rpc_urls.len()];
+                reg_poll_idx += 1;
+                if fetch_nonce(&client, url, &w.address)
                     .await
                     .unwrap_or(0)
                     >= 1
@@ -391,7 +404,26 @@ fn mixed_workload_load_test() {
                 break;
             }
             if Instant::now() >= poll_deadline {
-                panic!("RegisterPubkey timed out: {}/{}", registered, wallets.len());
+                let mut per_node = Vec::new();
+                for url in &rpc_urls {
+                    let mut n = 0usize;
+                    for w in &wallets {
+                        if fetch_nonce(&client, url, &w.address).await.unwrap_or(0) >= 1 {
+                            n += 1;
+                        }
+                    }
+                    per_node.push((url.clone(), n));
+                }
+                let breakdown: Vec<String> = per_node
+                    .iter()
+                    .map(|(u, n)| format!("{}={}", u, n))
+                    .collect();
+                panic!(
+                    "RegisterPubkey timed out: {}/{} (per-node: {})",
+                    registered,
+                    wallets.len(),
+                    breakdown.join(", ")
+                );
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
