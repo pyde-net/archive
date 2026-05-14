@@ -1124,6 +1124,37 @@ impl PydeNode {
                         PostEventAction::SendSyncResponse(channel, response) => {
                             let _ = swarm.behaviour_mut().sync.send_response(channel, response);
                         }
+                        PostEventAction::AnswerGetBlockByHash(channel, hash) => {
+                            // Resolve in two steps so the proposer (or any
+                            // validator that's already reconstructed the
+                            // body via compact-block) can serve a hash
+                            // that hasn't been applied yet. The original
+                            // sync-side handler only sees applied blocks
+                            // through `chain.hash_to_slot →
+                            // block_store.get_block_raw`, so at 6v+ load
+                            // every peer answered `None` for QC'd-but-
+                            // not-yet-applied slots and the recovery
+                            // path stalled forever.
+                            let from_pending: Option<Vec<u8>> = {
+                                let pbb = pending_block_bodies.read().await;
+                                pbb.get(&hash).map(wire::encode_block)
+                            };
+                            let body_bytes: Option<Vec<u8>> = match from_pending {
+                                Some(bytes) => Some(bytes),
+                                None => {
+                                    let chain_r = chain.read().await;
+                                    chain_r
+                                        .hash_to_slot
+                                        .get(&hash)
+                                        .copied()
+                                        .and_then(|slot| block_store.get_block_raw(slot))
+                                }
+                            };
+                            let _ = swarm
+                                .behaviour_mut()
+                                .sync
+                                .send_response(channel, SyncResp::BlockByHash(body_bytes));
+                        }
                         PostEventAction::ReplayCachedGossip(topic) => {
                             // Audit 234 follow-up: race-resolution
                             // replay. Drain every cached message
@@ -1328,11 +1359,19 @@ impl PydeNode {
                                 None => {
                                     // Task #94: same recovery path as the
                                     // gossip-VC body-unavailable site below.
+                                    // max_peers = 0 → fan out to every
+                                    // connected peer so the slot's
+                                    // proposer (whichever one holds the
+                                    // body in `pending_block_bodies`) is
+                                    // always queried regardless of
+                                    // committee size. 4v needed only 4
+                                    // peers; 6v wedged because the cap
+                                    // excluded the one peer with the body.
                                     let fired = chain_sync.request_block_by_hash(
                                         &mut swarm,
                                         qc_slot,
                                         qc_block_hash,
-                                        4,
+                                        0,
                                     );
                                     info!(
                                         qc_slot,
@@ -1863,11 +1902,19 @@ impl PydeNode {
                                     // head; only a hash-keyed request can
                                     // reach the one peer that actually has
                                     // the body.
+                                    // max_peers = 0 → fan out to every
+                                    // connected peer so the slot's
+                                    // proposer (whichever one holds the
+                                    // body in `pending_block_bodies`) is
+                                    // always queried regardless of
+                                    // committee size. 4v needed only 4
+                                    // peers; 6v wedged because the cap
+                                    // excluded the one peer with the body.
                                     let fired = chain_sync.request_block_by_hash(
                                         &mut swarm,
                                         qc_slot,
                                         qc_block_hash,
-                                        4,
+                                        0,
                                     );
                                     info!(
                                         qc_slot,
@@ -3369,7 +3416,7 @@ impl PydeNode {
                                                         &mut swarm,
                                                         qc_slot,
                                                         qc_hash,
-                                                        4,
+                                                        0,
                                                     );
                                                     info!(
                                                         slot = qc_slot,
@@ -4372,7 +4419,7 @@ impl PydeNode {
     }
 }
 
-use pyde_net::sync_protocol::SyncResp;
+use pyde_net::sync_protocol::{SyncReq, SyncResp};
 
 /// Action to take after processing a swarm event (avoids borrow conflicts with swarm).
 enum PostEventAction {
@@ -4380,6 +4427,22 @@ enum PostEventAction {
     #[allow(dead_code)]
     RequestChainTip(PeerId),
     SendSyncResponse(request_response::ResponseChannel<SyncResp>, SyncResp),
+    /// `GetBlockByHash` resolved with access to `pending_block_bodies`.
+    /// The sync handler's synchronous path can only see
+    /// `chain.hash_to_slot` + `block_store`, both of which are
+    /// populated on apply — so a peer that has the body in
+    /// `pending_block_bodies` (received-but-not-yet-applied) answers
+    /// `BlockByHash(None)` even though it holds exactly the bytes
+    /// the requester needs. At 6+ validators under sustained load
+    /// the recovery path then never finds a peer that can serve
+    /// the body and the chain wedges on `target_height` waiting
+    /// for an apply that can't happen.
+    ///
+    /// The action loop processes this variant: snapshots
+    /// `pending_block_bodies` for the hash, falls back to
+    /// `chain.hash_to_slot → block_store.get_block_raw`, and sends
+    /// the encoded bytes (or `None` if neither source has it).
+    AnswerGetBlockByHash(request_response::ResponseChannel<SyncResp>, [u8; 32]),
     /// Audit 396: emitted after a Sync RR response has been applied.
     /// Carries the per-slot receipts batch produced by sync-applied
     /// blocks so the action handler can persist them in the same
@@ -5994,14 +6057,23 @@ fn handle_swarm_event(
             peer,
         })) => {
             debug!(%peer, "inbound sync request");
-            let response = ChainSync::handle_inbound_request(
-                &request,
-                chain,
-                state,
-                block_store,
-                pinned_snapshot,
-            );
-            PostEventAction::SendSyncResponse(channel, response)
+            // Defer `GetBlockByHash` to the action loop where
+            // `pending_block_bodies` is reachable — needed for
+            // received-but-not-yet-applied recovery (the 6v+ wedge).
+            // Everything else resolves synchronously from
+            // chain/state/block_store/pinned_snapshot.
+            if let SyncReq::GetBlockByHash(hash) = &request {
+                PostEventAction::AnswerGetBlockByHash(channel, *hash)
+            } else {
+                let response = ChainSync::handle_inbound_request(
+                    &request,
+                    chain,
+                    state,
+                    block_store,
+                    pinned_snapshot,
+                );
+                PostEventAction::SendSyncResponse(channel, response)
+            }
         }
 
         // --- Sync: response to our outbound request ---

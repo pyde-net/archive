@@ -214,11 +214,18 @@ impl ChainSync {
         qc_block_hash: [u8; 32],
         max_peers: usize,
     ) -> usize {
-        let peers: Vec<PeerId> = swarm
-            .connected_peers()
-            .copied()
-            .take(max_peers)
-            .collect();
+        // `max_peers == 0` means "query every connected peer". The
+        // capped variant exists for the warm-path fan-outs that
+        // don't want to broadcast-amplify; recovery callers should
+        // pass 0 so the actual block proposer always lands in the
+        // query set even at large committees (the 6v wedge was
+        // exactly this: 4-peer cap with 5 connected peers excluded
+        // the one proposer that held the body).
+        let peers: Vec<PeerId> = if max_peers == 0 {
+            swarm.connected_peers().copied().collect()
+        } else {
+            swarm.connected_peers().copied().take(max_peers).collect()
+        };
         let mut fired = 0;
         for peer in peers {
             let request_id = swarm
