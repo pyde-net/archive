@@ -3006,27 +3006,24 @@ impl PydeNode {
                                     let _head = chain_r.head_slot;
                                     drop(chain_r);
 
-                                    // Auto-infer access lists for parallel scheduling.
-                                    // Only run when there are enough txs to benefit from parallelism
-                                    // AND enough CPU headroom (infer cost = ~1 simulation per contract call).
-                                    // On small blocks or resource-constrained nodes, the sequential path
-                                    // is faster than infer + parallel.
-                                    if txs.len() >= 100 {
-                                        let state_r = state.read().await;
-                                        let infer_ctx = pyde_tx::pipeline::BlockContext {
-                                            height: current_slot,
-                                            timestamp: slot_clock.slot_timestamp(current_slot),
-                                            base_fee: chain.read().await.base_fee,
-                                            block_gas_limit: gas_ceiling,
-                                            chain_id: self.config.node.chain_id,
-                                            validator_address: identity.address,
-                                            dev_skip_signature: false,
-                                            block_sigs_pre_verified: false,
-                                        };
-                                        pyde_tx::access_infer::infer_access_lists_batch(
-                                            &mut txs, &*state_r, &infer_ctx,
-                                        );
-                                    }
+                                    // Access lists are part of the FALCON-signed
+                                    // tx preimage (see `Transaction::hash`). The
+                                    // proposer MUST NOT mutate `tx.access_list`
+                                    // — doing so changes `tx.hash()` and breaks
+                                    // signature verification at apply, which
+                                    // shows up as 100% `InvalidSignature`
+                                    // failures on every contract-call tx and
+                                    // cascading view-change fallbacks that
+                                    // wedge the chain.
+                                    //
+                                    // Parallelism for txs that ship empty
+                                    // access lists is a separate redesign:
+                                    // move the proposer-inferred hint into a
+                                    // non-signed scheduling field, or have
+                                    // the SDK fill the access list before
+                                    // signing. Until then, `schedule()` reads
+                                    // the as-signed lists; unkeyed calls fall
+                                    // back to sequential execution.
 
                                     // Build execution schedule: group non-conflicting txs
                                     // for parallel execution (Sealevel-style).
