@@ -2710,15 +2710,29 @@ impl ValidatorEngine {
                 if mutated {
                     self.persist_consensus();
                 }
-                // audit-234 part 4 (CONSENSUS_INVARIANTS.md O2): a QC
-                // for slot `slot` certifies the block at that height.
-                // Advance `target_height` to `slot + 1` so subsequent
-                // recovery (view-change, fallback) targets the next
-                // height we need to commit, not the one we just
-                // certified. `advance_target_height` is monotonic
-                // (no-op if a later QC already advanced past us) and
-                // resets the timeout tracker for the new target.
-                self.advance_target_height(slot + 1);
+                // CONSENSUS_INVARIANTS.md O2 (Apply-then-advance):
+                // `target_height` is advanced ONLY after canonical-apply
+                // completes, NOT on QC formation. The previous
+                // implementation advanced here on QC formation, which
+                // caused target_height to bifurcate across the cluster
+                // under sustained overload — QCs form asymmetrically
+                // when gossipsub vote delivery is delayed, so some
+                // validators advanced while others didn't, the cluster
+                // split on which (H, V) view-change should target, and
+                // view-change quorum could never re-form. By tying
+                // target_height to apply completion, every validator
+                // only advances when its own apply path has actually
+                // processed the block body — keeping the cluster aligned.
+                //
+                // The audit-234 concern (view-change repeatedly targeting
+                // a slot that already has a QC) is now handled by the
+                // lock-then-vote safety rule (S2/S3): validators locked
+                // on a higher QC refuse to vote on lower-view fallbacks,
+                // so the certified block wins once its body applies.
+                //
+                // Apply sites (search `applied block from QC` in
+                // `node.rs`) call `engine.advance_target_height(qc_slot
+                // + 1)` after each apply completes.
                 // Record soft finality. Pass the active committee
                 // size so devnet/testnet committees (smaller than the
                 // production 128) compute the correct quorum threshold.
@@ -2748,6 +2762,29 @@ impl ValidatorEngine {
         // permanently uncommitted.
         let slot = self.consensus.target_height;
         let highest_qc_hash = self.consensus.highest_qc.hash();
+
+        // O2 (apply-then-advance) interlock: when target_height is
+        // gated on canonical-apply completing, the slot's view-change
+        // timer can fire while a QC for this slot already exists
+        // locally — the QC formed in `on_vote`, but `apply_block_from_qc`
+        // hasn't returned yet (commit_jmt_writes still running, or
+        // block body still being fetched). Firing a view-change at
+        // that point is wasteful: the slot is already certified, we
+        // just need apply to finish. Skip the VC; the apply path will
+        // advance target_height itself.
+        //
+        // Safety: if `highest_qc.slot < target_height` this branch
+        // doesn't fire — the node hasn't seen the QC (e.g. its votes
+        // didn't aggregate to quorum locally), and view-change is the
+        // right recovery path.
+        if self.consensus.highest_qc.slot >= slot {
+            debug!(
+                slot,
+                highest_qc_slot = self.consensus.highest_qc.slot,
+                "skipping view-change: target_height already QC'd, waiting on apply"
+            );
+            return None;
+        }
 
         // TPL-501: equivocation guard. If we already signed a
         // VC at this slot, we MUST NOT sign a different one — a
@@ -3507,7 +3544,11 @@ impl ValidatorEngine {
     /// not `now`. The prior code used `now` and fired view-change
     /// 200 ms after the *previous* slot's QC — typically before the
     /// new slot's wall-clock window even started.
-    fn advance_target_height(&mut self, new_height: u64) {
+    ///
+    /// `pub(crate)` so the canonical-apply sites in `node.rs` can
+    /// call it after `commit_jmt_writes` completes (enforcing
+    /// CONSENSUS_INVARIANTS.md O2: apply-then-advance).
+    pub(crate) fn advance_target_height(&mut self, new_height: u64) {
         if self.consensus.advance_target_height(new_height) {
             let slot_start_ms = self.slot_start_ms_for_target(new_height);
             self.timeout = TimeoutTracker::new(new_height, slot_start_ms);

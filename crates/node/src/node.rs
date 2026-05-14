@@ -1440,6 +1440,14 @@ impl PydeNode {
                                         proposer = hex::encode(block.header.proposer),
                                         "applied block from QC (canonical, RR path)"
                                     );
+                                    // CONSENSUS_INVARIANTS.md O2 (apply-then-advance):
+                                    // target_height advances only after canonical-apply
+                                    // completes, not on QC formation. See the comment
+                                    // at `validator.rs::on_vote` for the bifurcation
+                                    // analysis this commit closes.
+                                    if let Some(engine) = validator_engine.as_mut() {
+                                        engine.advance_target_height(qc_slot + 1);
+                                    }
                                     cast_finality_vote_and_persist(
                                         &mut validator_engine,
                                         &validator_identity,
@@ -1986,6 +1994,10 @@ impl PydeNode {
                                         proposer = hex::encode(block.header.proposer),
                                         "applied block from QC (canonical)"
                                     );
+                                    // CONSENSUS_INVARIANTS.md O2 (apply-then-advance).
+                                    if let Some(engine) = validator_engine.as_mut() {
+                                        engine.advance_target_height(qc_slot + 1);
+                                    }
                                     cast_finality_vote_and_persist(
                                         &mut validator_engine,
                                         &validator_identity,
@@ -3550,6 +3562,12 @@ impl PydeNode {
                                                         proposer = hex::encode(block.header.proposer),
                                                         "applied block from QC"
                                                     );
+                                                    // CONSENSUS_INVARIANTS.md O2: target_height
+                                                    // advances after apply. `engine` is the outer
+                                                    // scope's `validator_engine.as_mut()` binding
+                                                    // from line ~3338; re-borrowing
+                                                    // `validator_engine` here would conflict.
+                                                    engine.advance_target_height(qc_slot + 1);
                                                 }
                                                 Err(e) => {
                                                     drop(state_w);
