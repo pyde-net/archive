@@ -1055,10 +1055,11 @@ async fn full_receipt_audit(
     client: &reqwest::Client,
     pool: &UrlPool<'_>,
     hashes: &[[u8; 32]],
-) -> (u64, u64, u64) {
+) -> (u64, u64, u64, u64) {
     let mut ok = 0u64;
     let mut failed = 0u64;
     let mut missing = 0u64;
+    let mut sampled = 0u64;
     let step = if hashes.len() > RECEIPT_AUDIT_CAP {
         hashes.len() / RECEIPT_AUDIT_CAP
     } else {
@@ -1081,9 +1082,10 @@ async fn full_receipt_audit(
             },
             None => missing += 1,
         }
+        sampled += 1;
         tokio::time::sleep(Duration::from_millis(RPC_PACING_MS)).await;
     }
-    (ok, failed, missing)
+    (ok, failed, missing, sampled)
 }
 
 /// Run all 5 post-soak verification checks and print a VERIFICATION
@@ -1117,35 +1119,42 @@ async fn run_verifications(
         "  (1) include-rate (full receipt audit, head_slot={})",
         head_slot
     );
-    let (t_ok, t_fail, t_miss) = full_receipt_audit(client, &pool, &transfer_hashes).await;
-    let (c_ok, c_fail, c_miss) = full_receipt_audit(client, &pool, &call_hashes).await;
+    let (t_ok, t_fail, t_miss, t_sampled) = full_receipt_audit(client, &pool, &transfer_hashes).await;
+    let (c_ok, c_fail, c_miss, c_sampled) = full_receipt_audit(client, &pool, &call_hashes).await;
     let t_landed = t_ok + t_fail;
     let c_landed = c_ok + c_fail;
     let submitted_measure =
         submit_snap.transfer_ok_measure + submit_snap.call_ok_measure;
+    // Audit caps sampling at `RECEIPT_AUDIT_CAP` per kind for large
+    // soaks (else hours of RPC pacing). Report rate as landed/sampled
+    // — extrapolation against `hashes.len()` would underreport the
+    // actual chain-wide include rate when `sampled << submitted`.
     println!(
-        "      transfer landed:  {} / {} submitted ({}%)",
+        "      transfer landed:  {} / {} sampled ({}% of {} submitted)",
         t_landed,
-        transfer_hashes.len(),
-        if transfer_hashes.is_empty() {
+        t_sampled,
+        if t_sampled == 0 {
             0
         } else {
-            t_landed as usize * 100 / transfer_hashes.len()
-        }
+            t_landed as usize * 100 / t_sampled as usize
+        },
+        transfer_hashes.len()
     );
     println!(
-        "      call landed:      {} / {} submitted ({}%)",
+        "      call landed:      {} / {} sampled ({}% of {} submitted)",
         c_landed,
-        call_hashes.len(),
-        if call_hashes.is_empty() {
+        c_sampled,
+        if c_sampled == 0 {
             0
         } else {
-            c_landed as usize * 100 / call_hashes.len()
-        }
+            c_landed as usize * 100 / c_sampled as usize
+        },
+        call_hashes.len()
     );
     println!(
-        "      aggregate landed: {} / {} measurement-window submits",
+        "      aggregate landed: {} / {} sampled ({} measurement-window submits)",
         t_landed + c_landed,
+        t_sampled + c_sampled,
         submitted_measure
     );
     println!("  (2) execution success vs. failure");
