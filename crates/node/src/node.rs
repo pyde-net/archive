@@ -1587,6 +1587,65 @@ impl PydeNode {
                                     sid_to_bytes.entry(sid).or_insert_with(|| etx.to_bytes());
                                 }
                             }
+                            // Proposers prune committed txs from their mempool — serve them from the block body instead.
+                            {
+                                let pbb = pending_block_bodies.read().await;
+                                if let Some(block) = pbb.get(&req.block_hash) {
+                                    for tx in &block.body.transactions {
+                                        let hash = tx.hash();
+                                        let sid = pyde_net::propagation::compute_short_id(
+                                            &hash, req.nonce,
+                                        );
+                                        sid_to_bytes
+                                            .entry(sid)
+                                            .or_insert_with(|| wire::encode_transaction(tx));
+                                    }
+                                    for blob in &block.body.encrypted_txs {
+                                        if let Some(etx) =
+                                            pyde_mempool::encrypted::EncryptedTx::from_bytes(blob)
+                                        {
+                                            let hash = etx.hash();
+                                            let sid = pyde_net::propagation::compute_short_id(
+                                                &hash, req.nonce,
+                                            );
+                                            sid_to_bytes
+                                                .entry(sid)
+                                                .or_insert_with(|| blob.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            // Applied blocks are no longer in `pending_block_bodies`; fall through to `block_store`.
+                            if let Some(slot) = block_store.get_slot_by_hash(&req.block_hash) {
+                                if let Some(block_bytes) = block_store.get_block_raw(slot) {
+                                    if let Ok(block) = wire::decode_block(&block_bytes) {
+                                        for tx in &block.body.transactions {
+                                            let hash = tx.hash();
+                                            let sid = pyde_net::propagation::compute_short_id(
+                                                &hash, req.nonce,
+                                            );
+                                            sid_to_bytes
+                                                .entry(sid)
+                                                .or_insert_with(|| wire::encode_transaction(tx));
+                                        }
+                                        for blob in &block.body.encrypted_txs {
+                                            if let Some(etx) =
+                                                pyde_mempool::encrypted::EncryptedTx::from_bytes(
+                                                    blob,
+                                                )
+                                            {
+                                                let hash = etx.hash();
+                                                let sid = pyde_net::propagation::compute_short_id(
+                                                    &hash, req.nonce,
+                                                );
+                                                sid_to_bytes
+                                                    .entry(sid)
+                                                    .or_insert_with(|| blob.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             let txs: Vec<Option<Vec<u8>>> = req
                                 .short_ids
                                 .iter()
