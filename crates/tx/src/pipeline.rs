@@ -12,8 +12,8 @@
 //! 9. Generate receipt
 
 use crate::execution::{
-    distribute_fee, generate_receipt, post_execution_refund, pre_execution_charge, transfer_value,
-    LogEntry, Receipt,
+    generate_receipt, post_execution_refund, pre_execution_charge, transfer_value, LogEntry,
+    Receipt,
 };
 use crate::types::{FeePayer, Transaction, TransactionType};
 use crate::validation::{validate_transaction, ValidationContext, ValidationError};
@@ -102,6 +102,46 @@ pub fn store_account(
     let key = keys::balance_key(&account.address);
     smt.insert(key, account.to_bytes())
         .map_err(|e| PipelineError::StateError(e.to_string()))?;
+    Ok(())
+}
+
+/// Credit a block's per-tx fee shares to the proposer and treasury
+/// in two writes. Replaces the per-tx credits the execution path
+/// used to do directly.
+///
+/// Per-tx writes were unsafe under parallel scheduling because
+/// every tx in a block touches the same `(proposer, balance_key)`
+/// and `(treasury, balance_key)` pairs. Either every tx had to
+/// declare those keys in its access list (forcing the whole
+/// block into one sequential group) or the parallel-exec merge
+/// silently dropped all but one group's fee credit. Moving the
+/// credit to a single post-execution step makes the disjoint-key
+/// invariant the scheduler depends on actually hold, AND restores
+/// the fee math.
+///
+/// `receipts` is the full per-tx receipt slice for this block (in
+/// any order — only the sum matters). Skips writes when both
+/// totals round to zero so an all-failure block doesn't touch
+/// state needlessly.
+pub fn apply_block_fees(
+    smt: &mut dyn pyde_state::smt::StateAccess,
+    proposer: &Address,
+    receipts: &[crate::execution::Receipt],
+) -> Result<(), PipelineError> {
+    let validator_total: u128 = receipts.iter().map(|r| r.fee_validator).sum();
+    let treasury_total: u128 = receipts.iter().map(|r| r.fee_treasury).sum();
+
+    if validator_total > 0 {
+        let mut proposer_acct = load_account(smt, proposer);
+        proposer_acct.balance += validator_total;
+        store_account(smt, &proposer_acct)?;
+    }
+    if treasury_total > 0 {
+        let treasury_addr = pyde_account::address::treasury_address();
+        let mut treasury_acct = load_account(smt, &treasury_addr);
+        treasury_acct.balance += treasury_total;
+        store_account(smt, &treasury_acct)?;
+    }
     Ok(())
 }
 
@@ -323,23 +363,15 @@ fn emit_failed_execution_receipt(
 
     apply_account_delta(smt, &tx.from, sender_initial, &sender)?;
 
-    // Distribute the charged fee. Mirrors the success-path
-    // distribute_fee logic so a failed tx doesn't grant the
-    // validator / treasury different yield than a successful one
-    // for the same metered cost.
-    let fee_dist = distribute_fee(effective_gas_charged, block_ctx.base_fee);
-    if fee_dist.validator > 0 {
-        let mut validator_acct = load_account(smt, &block_ctx.validator_address);
-        validator_acct.balance += fee_dist.validator;
-        store_account(smt, &validator_acct)?;
-    }
-    if fee_dist.treasury > 0 {
-        let treasury_addr = pyde_account::address::treasury_address();
-        let mut treasury_acct = load_account(smt, &treasury_addr);
-        treasury_acct.balance += fee_dist.treasury;
-        store_account(smt, &treasury_acct)?;
-    }
-
+    // Fee distribution to validator / treasury is deferred to a
+    // single post-block accumulation step (`apply_block_fees`).
+    // Per-tx writes to those two shared accounts would force every
+    // tx in a block into one sequential group under parallel
+    // execution — and were already silently overwriting one
+    // group's fee credit with another's at the merge boundary
+    // before this rewrite. The receipt below records the per-tx
+    // share so the block-level apply can sum them and credit the
+    // proposer + treasury once.
     let state_root = smt.root();
     Ok(generate_receipt(
         tx,
@@ -853,23 +885,25 @@ fn execute_transaction_inner(
         FeePayer::Paymaster(_) => {}
     }
 
-    // 8. Fee distribution: 70% burned (implicit — never credited), 20% validator, 10% treasury
-    let fee_dist = distribute_fee(effective_gas, block_ctx.base_fee);
-
-    // Credit validator (20%)
-    let mut validator_account = load_account(smt, &block_ctx.validator_address);
-    validator_account.balance += fee_dist.validator;
-    store_account(smt, &validator_account)?;
-
-    // Credit treasury (10%) — well-known address: Poseidon2("pyde-treasury")
-    if fee_dist.treasury > 0 {
-        let treasury_addr = pyde_account::address::treasury_address();
-        let mut treasury_account = load_account(smt, &treasury_addr);
-        treasury_account.balance += fee_dist.treasury;
-        store_account(smt, &treasury_account)?;
-    }
-
-    // Burn (70%): implicit — charged from sender in step 3, never credited to anyone.
+    // 8. Fee distribution: 70% burned (implicit — never credited),
+    // 20% validator, 10% treasury. The per-tx receipt records each
+    // tx's split (see `generate_receipt`); actual credits to the
+    // proposer / treasury accounts are deferred to
+    // `apply_block_fees`, called once per block by the block
+    // processor after parallel execution merges.
+    //
+    // Doing the credit per-tx in this hot loop would force every
+    // tx in the block into one sequential group (every tx
+    // writes the same proposer/treasury balance keys) and was
+    // additionally silently losing fee credit at the parallel-
+    // exec merge boundary: each group's StateOverlay read the
+    // pre-block proposer balance independently, applied its own
+    // delta, and the merge picked one group's write to keep —
+    // discarding the rest. Post-block accumulation makes the
+    // disjoint-write invariant the scheduler relies on actually
+    // hold AND restores correct fee math.
+    //
+    // Burn (70%) is unchanged: charged from sender in step 3, never credited.
     // Total supply decreases by fee_dist.burned each transaction.
 
     // 9. Save updated accounts via delta-apply (audit 307).
@@ -2644,6 +2678,10 @@ mod tests {
         assert!(receipt.fee_validator > 0);
         assert!(receipt.fee_burned > 0);
 
+        // Apply the block-level fee accumulation (proposer/treasury
+        // credits are no longer a per-tx state mutation).
+        apply_block_fees(&mut smt, &block_ctx.validator_address, &[receipt.clone()]).unwrap();
+
         // Validator account should have received fees
         let validator = load_account(&smt, &block_ctx.validator_address);
         assert_eq!(validator.balance, receipt.fee_validator);
@@ -2781,9 +2819,17 @@ mod tests {
         let receipt = execute_transaction(&tx, &mut smt, &block_ctx).unwrap();
         assert!(receipt.success);
 
+        // Apply the block-level fee accumulation so the
+        // proposer-self-tx credit lands on top of the tx's sender debit.
+        apply_block_fees(&mut smt, &block_ctx.validator_address, &[receipt.clone()]).unwrap();
+
         // The validator credit is 20% of effective_gas * base_fee
         // (see distribute_fee). A non-zero credit confirms the
-        // line-609 store survived past the line-623 sender store.
+        // post-block apply_block_fees step credits the proposer
+        // AFTER the tx's debit landed (audit 307 — the original
+        // hazard was the per-tx late store_account clobbering the
+        // earlier validator credit; with credit deferred, this is
+        // structurally safe).
         let final_balance = load_account(&smt, &sender_addr).balance;
         let gas_paid = receipt.gas_used as u128 * block_ctx.base_fee;
         let validator_credit = (gas_paid * 20) / 100;
@@ -2817,6 +2863,8 @@ mod tests {
         let tx = make_signed_tx(sender_addr, recipient_addr, 1_000, 21_000, 0, &sk);
         let receipt = execute_transaction(&tx, &mut smt, &block_ctx).unwrap();
         assert!(receipt.success);
+
+        apply_block_fees(&mut smt, &block_ctx.validator_address, &[receipt.clone()]).unwrap();
 
         let final_balance = load_account(&smt, &recipient_addr).balance;
         let gas_paid = receipt.gas_used as u128 * block_ctx.base_fee;
@@ -2859,6 +2907,8 @@ mod tests {
 
         let receipt = execute_transaction(&tx, &mut smt, &block_ctx).unwrap();
         assert!(receipt.success);
+
+        apply_block_fees(&mut smt, &block_ctx.validator_address, &[receipt.clone()]).unwrap();
 
         let final_balance = load_account(&smt, &treasury_addr).balance;
         let gas_paid = receipt.gas_used as u128 * block_ctx.base_fee;
@@ -6308,7 +6358,9 @@ mod tests {
             "sender must be debited baseline gas (21k * base_fee) on failed execution",
         );
 
-        // Validator + treasury credited proportionally.
+        // Validator + treasury credited proportionally — applied at
+        // block boundary, not per-tx.
+        apply_block_fees(&mut smt, &block_ctx.validator_address, &[receipt.clone()]).unwrap();
         let validator_acct = load_account(&smt, &block_ctx.validator_address);
         assert!(
             validator_acct.balance > 0,

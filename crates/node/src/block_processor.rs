@@ -475,6 +475,8 @@ impl BlockProcessor {
         // The set is small (4 keys per block), so the overhead is
         // negligible compared to the safety it gives the reorg path.
         let proposer_balance_key = pyde_state::keys::balance_key(&block.header.proposer);
+        let treasury_addr = pyde_account::address::treasury_address();
+        let treasury_balance_key = pyde_state::keys::balance_key(&treasury_addr);
         let rpv_key = pyde_state::keys::rewards_per_validator_key();
         let supply_key = pyde_state::keys::supply_key();
         let total_burned_key = pyde_state::keys::total_burned_key();
@@ -482,6 +484,10 @@ impl BlockProcessor {
             pyde_state::smt::UndoEntry {
                 key: proposer_balance_key,
                 old_value: state.get(&proposer_balance_key),
+            },
+            pyde_state::smt::UndoEntry {
+                key: treasury_balance_key,
+                old_value: state.get(&treasury_balance_key),
             },
             pyde_state::smt::UndoEntry {
                 key: rpv_key,
@@ -496,6 +502,15 @@ impl BlockProcessor {
                 old_value: state.get(&total_burned_key),
             },
         ];
+
+        // Credit per-tx fee shares (validator + treasury) accumulated
+        // across the parallel-exec receipts in a single post-block
+        // step. See `pyde_tx::pipeline::apply_block_fees` for why
+        // this can't be done per-tx without breaking parallel
+        // scheduling. Runs after the undo snapshot above so the
+        // proposer / treasury balance keys are revertable.
+        pyde_tx::pipeline::apply_block_fees(state, &block.header.proposer, &receipts)
+            .map_err(|e| format!("apply_block_fees: {:?}", e))?;
 
         // 4. Block reward: mint + split between service + pool shares (Phase 4 slice 4.1).
         //
