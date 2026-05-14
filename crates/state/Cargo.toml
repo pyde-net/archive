@@ -8,6 +8,7 @@ edition = "2021"
 pyde-crypto = { path = "../crypto" }
 sparse-merkle-tree = "0.6"
 jmt = { version = "0.12", default-features = false, features = ["std"] }
+blake3 = "1"
 anyhow = "1"
 borsh = { version = "1", features = ["derive"] }
 rocksdb = "0.24"
