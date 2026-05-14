@@ -114,6 +114,13 @@ struct Wallet {
     address: [u8; 32],
     pk_bytes: Vec<u8>,
     sk: FalconSecretKey,
+    /// Per-wallet dedicated recipient. Spreading transfers + encrypted
+    /// payouts across N distinct recipients lets Phase A's parallel
+    /// scheduler avoid unioning every value-bearing tx on a single
+    /// `(RECIPIENT, balance_key)` write conflict. Real-world traffic
+    /// has varied recipients; pinning every tx to one address is an
+    /// artifact of the simpler earlier test design.
+    recipient: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -260,13 +267,21 @@ fn mixed_workload_load_test() {
     let setup_start = Instant::now();
     let wallets: Vec<Arc<Wallet>> = runtime.block_on(async {
         let mut wallets = Vec::with_capacity(num_senders);
-        for _ in 0..num_senders {
+        for i in 0..num_senders {
             let (pk, sk) = falcon_keygen().expect("keygen");
             let address = derive_eoa_address(pk.as_bytes());
+            // Dedicated recipient per wallet. Deterministic so the
+            // verification path can fetch + sum balances later. The
+            // domain tag `"loadgen-mixed-recipient-"` keeps these
+            // addresses well away from any other test artifacts.
+            let mut seed = b"loadgen-mixed-recipient-".to_vec();
+            seed.extend_from_slice(&(i as u64).to_le_bytes());
+            let recipient = derive_eoa_address(&seed);
             wallets.push(Arc::new(Wallet {
                 address,
                 pk_bytes: pk.as_bytes().to_vec(),
                 sk,
+                recipient,
             }));
         }
 
@@ -705,7 +720,7 @@ async fn submit_transfer(
 ) -> Result<[u8; 32], ()> {
     let mut tx = Transaction {
         from: wallet.address,
-        to: RECIPIENT,
+        to: wallet.recipient,
         value: TX_VALUE,
         data: vec![],
         gas_limit: 50_000,
@@ -774,7 +789,7 @@ async fn submit_encrypted(
     // (mempool requires non-empty), 100K gas, sign AFTER encryption
     // because the hash covers the ciphertext.
     let access_list = vec![AccessEntry {
-        address: RECIPIENT,
+        address: wallet.recipient,
         reads: Vec::new(),
         writes: Vec::new(),
     }];
@@ -786,7 +801,7 @@ async fn submit_encrypted(
         None,
         CHAIN_ID,
         Vec::new(),
-        &RECIPIENT,
+        &wallet.recipient,
         TX_VALUE,
         &[],
         &tpk,
@@ -1172,22 +1187,39 @@ async fn run_verifications(
     println!("      execution-success calls (chain-side, measurement window):  {}", c_ok);
     println!("      submitted calls (RPC-accepted, total): {}", submit_snap.call_ok);
 
-    // ── (5) RECIPIENT balance ───────────────────────────────────
-    let recipient_balance = fetch_balance(client, pool.next(), &RECIPIENT)
+    // ── (5) Aggregate recipient balance ─────────────────────────
+    // Each wallet has a dedicated recipient (so parallel scheduling
+    // isn't bottlenecked on a single shared `(RECIPIENT, balance)`
+    // write). Sum each wallet's recipient balance and the legacy
+    // 0x42…42 sentinel (kept around to catch any stray test path
+    // still targeting it) for the equivalent of the old single-
+    // recipient observation.
+    let mut aggregate_recipient_balance: u128 = 0;
+    for w in wallets {
+        let bal = fetch_balance(client, pool.next(), &w.recipient)
+            .await
+            .unwrap_or(0);
+        aggregate_recipient_balance = aggregate_recipient_balance.saturating_add(bal);
+    }
+    let legacy_recipient_balance = fetch_balance(client, pool.next(), &RECIPIENT)
         .await
         .unwrap_or(0);
+    aggregate_recipient_balance =
+        aggregate_recipient_balance.saturating_add(legacy_recipient_balance);
+
     let expected_max = (submit_snap.transfer_ok as u128 + submit_snap.encrypted_ok as u128)
         * TX_VALUE;
-    println!("  (5) RECIPIENT (0x42…42) balance");
+    println!("  (5) per-sender recipient balances (aggregate)");
     println!(
-        "      observed balance: {} (= {} txs of value {})",
-        recipient_balance,
+        "      observed: {} (= {} txs of value {}); legacy 0x42…42 balance: {}",
+        aggregate_recipient_balance,
         if TX_VALUE > 0 {
-            recipient_balance / TX_VALUE
+            aggregate_recipient_balance / TX_VALUE
         } else {
             0
         },
-        TX_VALUE
+        TX_VALUE,
+        legacy_recipient_balance,
     );
     println!(
         "      expected ≤ {} (transfer+encrypted submitted × {})",
