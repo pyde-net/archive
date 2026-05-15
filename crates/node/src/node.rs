@@ -522,6 +522,7 @@ impl PydeNode {
                 address = hex::encode(identity.address),
                 "validator identity loaded"
             );
+            crate::metrics::set_local_address(identity.address);
 
             // Check stake if state is available (non-genesis)
             {
@@ -3254,6 +3255,7 @@ impl PydeNode {
                                         pbb.insert(block.header.hash(), block.clone());
                                     }
                                     let slot_ms = slot_t0.elapsed().as_secs_f64() * 1000.0;
+                                    crate::metrics::set_current_proposer(block.header.proposer);
                                     info!(
                                         slot = current_slot,
                                         txs = block.body.transactions.len(),
@@ -4250,7 +4252,11 @@ impl PydeNode {
                     // network tip; finality_lag = how far behind the
                     // last hard-finality checkpoint. Stable values
                     // for finality_lag are ~2 slots in steady state.
-                    let local_head = chain.read().await.head_slot;
+                    let chain_r = chain.read().await;
+                    let local_head = chain_r.head_slot;
+                    let base_fee_now = chain_r.base_fee;
+                    let epoch_now = chain_r.epoch;
+                    drop(chain_r);
                     let network_tip = chain_sync.manager.network_tip;
                     crate::metrics::record_block_lag(local_head, network_tip);
                     let last_cp = validator_engine
@@ -4258,6 +4264,21 @@ impl PydeNode {
                         .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot))
                         .unwrap_or(0);
                     crate::metrics::record_finality_lag(local_head, last_cp);
+
+                    // Snapshot refresh for TUI dashboard. These
+                    // values change infrequently relative to per-block
+                    // throughput, so populating them here (10s ticks)
+                    // is more than fresh enough for a 1Hz render.
+                    crate::metrics::set_finalized_slot(last_cp);
+                    // base_fee is u128 on-chain but always fits in
+                    // u64 within human-meaningful bounds (cap is
+                    // ~10^14 quanta). Saturate just in case.
+                    crate::metrics::set_base_fee(base_fee_now.min(u64::MAX as u128) as u64);
+                    crate::metrics::set_epoch(epoch_now);
+                    if let Some(eng) = validator_engine.as_ref() {
+                        let cs = eng.committee_keys_for_slot(local_head).len();
+                        crate::metrics::set_committee_size(cs);
+                    }
 
                     // Plaintext mempool TTL sweep (MAINNET_PLAN M2).
                     // Any tx that's been pending for more than
@@ -5997,6 +6018,7 @@ fn handle_swarm_event(
                                         ref proposer_signature,
                                     } => {
                                         info!(slot = header.slot, "received proposal");
+                                        crate::metrics::set_current_proposer(header.proposer);
                                         // Buffer the proposal for VRF-based selection.
                                         // Voting happens after the proposal collection window
                                         // via select_and_vote (triggered by slot timer).

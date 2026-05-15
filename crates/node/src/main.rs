@@ -59,6 +59,7 @@ mod shutdown;
 mod slot_clock;
 mod state_manager;
 mod sync;
+mod tui;
 mod tx_relay;
 mod validator;
 pub mod wire;
@@ -161,6 +162,7 @@ fn main() {
             rpc_port,
             dev,
             bootstrap,
+            tui,
         } => {
             // Load config from file (if provided) or use defaults
             let mut config = match &config_path {
@@ -215,8 +217,28 @@ fn main() {
                 std::process::exit(1);
             }
 
-            // Initialize logging first
-            logging::init(&config.logging.level, config.logging.json);
+            // Initialize logging first. With --tui we redirect to a
+            // log file under datadir so stdout is free for the
+            // dashboard; without --tui keep the existing stdout
+            // behavior so headless / systemd / CI runs don't change.
+            if tui {
+                let log_path = config.node.datadir.join("pyde.log");
+                if let Err(e) = logging::init_file(
+                    &config.logging.level,
+                    config.logging.json,
+                    &log_path,
+                ) {
+                    eprintln!("error: --tui log file init failed: {}", e);
+                    std::process::exit(1);
+                }
+                eprintln!("pyde-tui: logs → {}", log_path.display());
+            } else {
+                logging::init(&config.logging.level, config.logging.json);
+            }
+
+            // Stamp the local validator role into the metrics snapshot
+            // so the TUI header reads correctly from start.
+            metrics::set_is_validator(matches!(role, cli::Role::Validator));
 
             // Build async runtime and run
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
@@ -227,11 +249,40 @@ fn main() {
                 // Spawn signal handler
                 tokio::spawn(shutdown::wait_for_signal(shutdown_clone));
 
+                // Optional TUI dashboard. Runs on a blocking thread
+                // so its sync render loop doesn't share a tokio
+                // worker with the node; flips `tui_quit` on q/Esc
+                // and pipes that into the broadcast shutdown so the
+                // node tears down with the dashboard.
+                let tui_quit = if tui {
+                    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let flag_for_thread = flag.clone();
+                    let shutdown_for_tui = shutdown.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = tui::run(flag_for_thread) {
+                            eprintln!("tui exited with error: {}", e);
+                        }
+                        shutdown_for_tui.trigger();
+                    });
+                    Some(flag)
+                } else {
+                    None
+                };
+
                 // Run the node
                 let node = PydeNode::new(config, shutdown);
-                if let Err(e) = node.run().await {
-                    tracing::error!("node exited with error: {}", e);
-                    std::process::exit(1);
+                let exit_code = match node.run().await {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        tracing::error!("node exited with error: {}", e);
+                        1
+                    }
+                };
+                if let Some(q) = tui_quit {
+                    q.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
                 }
             });
         }

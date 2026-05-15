@@ -82,6 +82,13 @@ argon2 = "0.5"
 # would leak the encryption key.
 zeroize = { version = "1", features = ["alloc"] }
 
+# Terminal dashboard (--tui flag). Reads from the same metrics
+# snapshot the Prometheus exporter publishes; refresh @1Hz adds
+# <1% CPU. crossterm is the cross-platform backend ratatui uses
+# for keyboard/raw-mode handling.
+ratatui = "0.29"
+crossterm = "0.28"
+
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 otic = { path = "../otic" }
