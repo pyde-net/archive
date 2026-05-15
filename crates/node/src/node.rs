@@ -1003,6 +1003,14 @@ impl PydeNode {
             engine.set_slot_anchor(slot_clock_anchor_ms, block_time_ms);
         }
         let mut last_slot = slot_clock.current_slot();
+        // Track the engine's target_height between slot-interval ticks
+        // so the proposer block can fire when chain progress lands a
+        // new target inside the same wall-clock slot (catch-up mode).
+        // See the gate in the `slot_interval.tick()` arm below.
+        let mut last_target_height: u64 = validator_engine
+            .as_ref()
+            .map(|e| e.consensus.target_height)
+            .unwrap_or(0);
 
         // Periodic timers
         // Poll the slot clock 4× per slot so slot transitions are
@@ -2756,13 +2764,53 @@ impl PydeNode {
                 }
                 _ = slot_interval.tick() => {
                     let current_slot = slot_clock.current_slot();
-                    if current_slot > last_slot {
-                        last_slot = current_slot;
+                    let current_target_height = validator_engine
+                        .as_ref()
+                        .map(|e| e.consensus.target_height)
+                        .unwrap_or(0);
+                    let wall_clock_advanced = current_slot > last_slot;
+                    let target_advanced = current_target_height > last_target_height;
+                    // Fire the slot-tick maintenance + proposer block on
+                    // either wall-clock advance OR target-height advance.
+                    // The target-height arm makes catch-up viable: during
+                    // a cold-boot where wall-clock raced ahead of chain
+                    // head by N slots, the chain advances one slot per
+                    // QC (every ~30-50 ms), but the slot_interval poll
+                    // only fires the proposer on wall-clock-slot advance
+                    // (every 400 ms). Without this arm, the happy-path
+                    // proposer for the freshly-advanced target_height
+                    // can't propose until the next wall-clock-slot tick,
+                    // by which point view-change has already fired and
+                    // the cluster is committed to a view-1 fallback. The
+                    // arm lets check_proposer fire as soon as
+                    // target_height advances, so view-0 happy-path
+                    // engages every slot in catch-up.
+                    //
+                    // Most of the inner maintenance (reshare/PSS
+                    // rebroadcast, randomness finalization, epoch
+                    // rotation) is keyed on `engine.consensus.current_slot`
+                    // which only advances on wall-clock, so those calls
+                    // are no-ops on target-only ticks. The check_proposer
+                    // path is the one that benefits, and `check_proposer`
+                    // itself dedups via `seen_proposals[(target_height,
+                    // own_address)]` so a fired-twice condition (target
+                    // advanced AND wall-clock advanced at the same tick)
+                    // can't double-propose.
+                    if wall_clock_advanced || target_advanced {
+                        if wall_clock_advanced {
+                            last_slot = current_slot;
+                        }
+                        if target_advanced {
+                            last_target_height = current_target_height;
+                        }
 
                         // New slot — validator block production
                         if let Some(engine) = validator_engine.as_mut() {
                             let prev_epoch = engine.consensus.current_slot / pyde_consensus::block::EPOCH_LENGTH;
-                            // Sync engine slot to clock (not just +1)
+                            // Sync engine slot to clock (not just +1).
+                            // No-op on target-only ticks (engine already
+                            // at current wall-clock-slot from the prior
+                            // wall-clock-advance entry).
                             while engine.consensus.current_slot < current_slot {
                                 engine.advance_slot();
                             }
