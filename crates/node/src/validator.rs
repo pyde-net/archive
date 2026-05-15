@@ -3011,7 +3011,10 @@ impl ValidatorEngine {
                 // wall-clock start (same fix as `advance_target_height`).
                 // After a VC-QC the fallback leader gets a fresh
                 // `PROPOSAL_TIMEOUT_MS` window measured from the
-                // slot's actual start, not "now".
+                // slot's actual start, not "now". During catch-up
+                // `slot_start_ms_for_target` collapses to `now`, so
+                // the fallback leader still gets a real window when
+                // wall-clock-start is already in the past.
                 let slot_start_ms = self.slot_start_ms_for_target(slot);
                 let mut new_tracker = TimeoutTracker::new(slot, slot_start_ms);
                 new_tracker.view_change_qc = Some(vc_qc);
@@ -3519,16 +3522,44 @@ impl ValidatorEngine {
         }
     }
 
-    /// Wall-clock instant (Unix ms) when slot `target` begins.
+    /// Slot-start anchor (Unix ms) for the timeout tracker at
+    /// `target`. Returns `max(wall_clock_start, now_ms)`:
+    ///
+    /// - **Steady state** (chain caught up to wall-clock):
+    ///   `wall_clock_start >= now_ms` → returns `wall_clock_start`,
+    ///   matching the original audit-408 wall-clock anchor. Late-
+    ///   booting operators still align on the shared `genesis_ts`
+    ///   so the `(slot, view, slot_start_ms)` tuple is identical
+    ///   across the cluster.
+    ///
+    /// - **Catch-up** (validators booted N seconds after `genesis_ts`,
+    ///   chain head far behind wall-clock-slot): `wall_clock_start`
+    ///   is in the past, so its `PROPOSAL_TIMEOUT_MS` window has
+    ///   already expired the moment `advance_target_height` installs
+    ///   the new tracker. View-change then fires on the very next
+    ///   slot-interval tick, every slot — view-1 fallback becomes
+    ///   the only path that ever produces a block. Anchoring to
+    ///   `now_ms` instead gives each newly-advanced target a fresh
+    ///   `PROPOSAL_TIMEOUT_MS` window, so view-0 happy-path has time
+    ///   to engage.
+    ///
+    /// `max` is the right operator (rather than always-`now`)
+    /// because steady-state correctness depends on the wall-clock
+    /// anchor: under load, a vote-QC for slot N can land slightly
+    /// before slot N+1's wall-clock window begins, and anchoring
+    /// N+1 to `now` would let view-change fire ~200 ms early.
+    ///
     /// Falls back to `current_time_ms()` if the slot anchor hasn't
     /// been wired yet (test paths). See `set_slot_anchor`.
     fn slot_start_ms_for_target(&self, target: u64) -> u64 {
+        let now = current_time_ms();
         if self.block_time_ms == 0 {
-            current_time_ms()
-        } else {
-            self.genesis_timestamp_ms
-                .saturating_add(target.saturating_mul(self.block_time_ms))
+            return now;
         }
+        let wall_clock_start = self
+            .genesis_timestamp_ms
+            .saturating_add(target.saturating_mul(self.block_time_ms));
+        wall_clock_start.max(now)
     }
 
     /// Advance `target_height` to `new_height` and reset the timeout
@@ -3539,11 +3570,13 @@ impl ValidatorEngine {
     /// vote-QC for the current target forms — the chain has moved
     /// on, recovery state for the old height is no longer needed.
     ///
-    /// Audit 408: the new tracker's `slot_start_ms` is the wall-
-    /// clock start of `new_height` per `slot_start_ms_for_target`,
-    /// not `now`. The prior code used `now` and fired view-change
-    /// 200 ms after the *previous* slot's QC — typically before the
-    /// new slot's wall-clock window even started.
+    /// Audit 408: the new tracker's `slot_start_ms` comes from
+    /// `slot_start_ms_for_target(new_height)` — the wall-clock
+    /// start of `new_height` in steady state, or `now_ms` during
+    /// catch-up (see that helper's doc-comment for the rationale).
+    /// The prior code used `now` unconditionally and fired view-
+    /// change 200 ms after the *previous* slot's QC — typically
+    /// before the new slot's wall-clock window even started.
     ///
     /// `pub(crate)` so the canonical-apply sites in `node.rs` can
     /// call it after `commit_jmt_writes` completes (enforcing
