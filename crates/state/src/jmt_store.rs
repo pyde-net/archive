@@ -34,26 +34,49 @@ use sparse_merkle_tree::H256;
 use std::sync::Mutex;
 
 use crate::smt::StateAccess;
-use pyde_crypto::poseidon2::poseidon2_hash;
 
-/// Poseidon2 adapter for jmt's `SimpleHasher`. JMT calls this to derive
-/// key hashes and internal node hashes, so the PQ-safe hash function
-/// feeds directly through to every Merkle commitment.
-pub struct Poseidon2JmtHasher {
-    buf: Vec<u8>,
+/// Blake3 adapter for jmt's `SimpleHasher`. JMT calls this to derive
+/// key hashes and internal node hashes — every Merkle commitment flows
+/// through here.
+///
+/// Why Blake3 (not Poseidon2) on the state-tree hot path:
+/// - The state-tree is the per-block hot path. 20k-tx peak blocks
+///   touch ~80k leaves, requiring O(N + shared-path-nodes) hashes per
+///   commit. Poseidon2 over Goldilocks costs ~5 μs/merge even with
+///   Plonky3 SIMD; Blake3 is ~15 ns/merge — a ~300× per-hash speedup
+///   that drops a 20k-tx commit from ~1.5 s to ~5 ms.
+/// - Blake3 is cryptographically strong (256-bit output, 128-bit
+///   collision resistance, well-vetted production hash).
+/// - Pyde's post-quantum surface is FALCON + Kyber, not the state
+///   hash. Both Blake3 and Poseidon2 survive quantum under the same
+///   Grover bound, so the PQ guarantee is unchanged.
+/// - ZK-friendliness loss (Poseidon proves cheaply in-circuit; Blake3
+///   does not) is acceptable: ZK is off the mainnet critical path
+///   (post-mainnet +18-30mo per the roadmap). If/when STARK proving
+///   lands, a hard-fork-to-Poseidon migration is a tractable option,
+///   or Blake3-in-circuit proves with more constraints but still
+///   feasible.
+///
+/// Poseidon2 stays in use for address & state-key derivation
+/// (`crates/state/src/keys.rs`) and elsewhere it appears (e.g.
+/// per-discriminator state keys, randomness commitments). Only the
+/// tree-internal-node and key-hash that JMT itself invokes is
+/// swapped.
+pub struct Blake3JmtHasher {
+    hasher: blake3::Hasher,
 }
 
-impl SimpleHasher for Poseidon2JmtHasher {
+impl SimpleHasher for Blake3JmtHasher {
     fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(64),
+            hasher: blake3::Hasher::new(),
         }
     }
     fn update(&mut self, data: &[u8]) {
-        self.buf.extend_from_slice(data);
+        self.hasher.update(data);
     }
     fn finalize(self) -> [u8; 32] {
-        poseidon2_hash(&self.buf).into()
+        self.hasher.finalize().into()
     }
 }
 
@@ -478,12 +501,12 @@ impl PersistentJMT {
         // (the JMT convention: the first committed version is 0).
         let root = match version {
             Some(v) => {
-                let tree = JellyfishMerkleTree::<_, Poseidon2JmtHasher>::new(&store);
+                let tree = JellyfishMerkleTree::<_, Blake3JmtHasher>::new(&store);
                 tree.get_root_hash(v)
                     .map_err(|e| format!("recover root: {}", e))?
             }
             None => {
-                RootHash(JellyfishMerkleTree::<JmtRocksStore, Poseidon2JmtHasher>::EMPTY_ROOT.0)
+                RootHash(JellyfishMerkleTree::<JmtRocksStore, Blake3JmtHasher>::EMPTY_ROOT.0)
             }
         };
 
@@ -505,7 +528,7 @@ impl PersistentJMT {
             store,
             current_version: Mutex::new(u64::MAX),
             current_root: Mutex::new(RootHash(
-                JellyfishMerkleTree::<JmtRocksStore, Poseidon2JmtHasher>::EMPTY_ROOT.0,
+                JellyfishMerkleTree::<JmtRocksStore, Blake3JmtHasher>::EMPTY_ROOT.0,
             )),
         })
     }
@@ -528,7 +551,7 @@ impl PersistentJMT {
 
         let kh_bytes: [u8; 32] = key.as_slice().try_into().ok()?;
         let kh = KeyHash(kh_bytes);
-        let tree = JellyfishMerkleTree::<_, Poseidon2JmtHasher>::new(&self.store);
+        let tree = JellyfishMerkleTree::<_, Blake3JmtHasher>::new(&self.store);
         match tree.get(kh, version) {
             Ok(Some(v)) if !v.is_empty() => Some(v),
             _ => None,
@@ -566,7 +589,7 @@ impl PersistentJMT {
             })
             .collect();
 
-        let tree = JellyfishMerkleTree::<_, Poseidon2JmtHasher>::new(&self.store);
+        let tree = JellyfishMerkleTree::<_, Blake3JmtHasher>::new(&self.store);
         let (new_root, batch) = tree
             .put_value_set(value_set, next_version)
             .map_err(|_| "JMT put_value_set failed")?;
@@ -715,7 +738,7 @@ mod tests {
         // The version pointer and the readable tree state agree:
         // every key inserted across the two commits is present at
         // the latest version.
-        let tree = JellyfishMerkleTree::<_, Poseidon2JmtHasher>::new(&jmt.store);
+        let tree = JellyfishMerkleTree::<_, Blake3JmtHasher>::new(&jmt.store);
         let v = after_second.unwrap();
         let kh1 = KeyHash(<[u8; 32]>::try_from(key_from_bytes(b"k1").as_slice()).unwrap());
         let kh2 = KeyHash(<[u8; 32]>::try_from(key_from_bytes(b"k2").as_slice()).unwrap());

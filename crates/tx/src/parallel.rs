@@ -17,9 +17,48 @@
 //! 2. Find connected components via union-find (O(n * alpha(n)))
 //! 3. Each component = one group of transitively conflicting transactions
 
-use crate::types::{AccessEntry, Transaction};
+use crate::types::{AccessEntry, Transaction, TransactionType};
 use pyde_account::address::Address;
 use std::collections::{HashMap, HashSet};
+
+/// Implicit write keys that every tx of the given type touches by
+/// virtue of executing — independent of `tx.access_list`. The
+/// scheduler folds these in so two transfers from different senders
+/// to different recipients can run in parallel even when the senders
+/// shipped empty access lists, while two transfers from the same
+/// sender (or to the same recipient) still serialise correctly.
+///
+/// Returns `None` for tx types whose touch-set the scheduler can't
+/// derive from header fields alone (Slash, ClaimReward, multisig,
+/// etc.). Those types fall back to the existing "uninformative AL
+/// conflicts with everything" rule via the `unknown_representative`
+/// path in `schedule`.
+///
+/// Fee distribution to the block proposer and the treasury is
+/// intentionally NOT listed here. Every tx in a block credits the
+/// same proposer/treasury account, so declaring it would union the
+/// entire block into one sequential group. The block processor
+/// instead defers fee credit into a single post-block accumulation
+/// step (see `pyde_tx::pipeline::apply_block_fees`).
+fn implicit_writes(tx: &Transaction) -> Option<Vec<(Address, [u8; 32])>> {
+    match tx.tx_type {
+        TransactionType::Standard
+        | TransactionType::Deploy
+        | TransactionType::RegisterPubkey => {
+            let from_balance: [u8; 32] =
+                pyde_state::keys::balance_key(&tx.from).into();
+            let from_nonce: [u8; 32] = pyde_state::keys::nonce_key(&tx.from).into();
+            let mut writes = vec![(tx.from, from_balance), (tx.from, from_nonce)];
+            if matches!(tx.tx_type, TransactionType::Standard) && tx.to != [0u8; 32] {
+                let to_balance: [u8; 32] =
+                    pyde_state::keys::balance_key(&tx.to).into();
+                writes.push((tx.to, to_balance));
+            }
+            Some(writes)
+        }
+        _ => None,
+    }
+}
 
 /// An access list is "uninformative" when it declares no concrete
 /// `(address, key)` pairs the scheduler can use for conflict detection.
@@ -220,73 +259,81 @@ pub fn schedule(txs: &[Transaction]) -> ExecutionSchedule {
         };
     }
 
-    // If NO tx declared concrete (address, key) pairs, the scheduler
-    // has zero conflict information — every tx is "I touch storage,
-    // unspecified". Put everything in one sequential group (safe
-    // default). See `access_list_is_uninformative` for why an AL
-    // shaped `[{addr, [], []}]` counts the same as `vec![]` here.
-    let has_any_keyed_access_list = txs
-        .iter()
-        .any(|t| !access_list_is_uninformative(&t.access_list));
-    if !has_any_keyed_access_list {
-        return ExecutionSchedule {
-            groups: vec![ExecutionGroup {
-                tx_indices: (0..n).collect(),
-            }],
-            total_txs: n,
-        };
-    }
-
     let mut uf = UnionFind::new(n);
 
     // Inverted index: (address, key) → tx index that writes this key.
     // When a second tx touches this key, we union them.
     let mut write_owners: HashMap<(Address, [u8; 32]), usize> = HashMap::new();
 
-    // Track the first uninformative-AL tx to union all such txs together.
-    let mut empty_representative: Option<usize> = None;
+    // Representative for txs whose touch-set the scheduler can't
+    // derive (tx types without `implicit_writes` support AND with
+    // uninformative `access_list`). All such txs collapse to one
+    // sequential group at the end.
+    let mut unknown_representative: Option<usize> = None;
 
     for (i, tx) in txs.iter().enumerate() {
-        if access_list_is_uninformative(&tx.access_list) {
-            // No declared keys = unknown = conflicts with everything.
-            // Union with the representative (and the representative unions
-            // with every keyed tx below).
-            match empty_representative {
+        let implicit = implicit_writes(tx);
+        let explicit_informative = !access_list_is_uninformative(&tx.access_list);
+
+        if implicit.is_none() && !explicit_informative {
+            // Unknown tx type, no useful AL — conflicts with everything.
+            match unknown_representative {
                 Some(rep) => uf.union(i, rep),
-                None => empty_representative = Some(i),
+                None => unknown_representative = Some(i),
             }
             continue;
         }
 
-        // For each write key: check if another tx already claimed it
-        for entry in &tx.access_list {
-            for key in &entry.writes {
-                let addr_key = (entry.address, *key);
-                match write_owners.get(&addr_key) {
+        // Claim every implicit write. Two txs whose implicit sets
+        // overlap (same sender, or one sender == other recipient,
+        // or shared recipient) get unioned here.
+        if let Some(writes) = &implicit {
+            for ak in writes {
+                match write_owners.get(ak) {
                     Some(&other) => uf.union(i, other),
                     None => {
-                        write_owners.insert(addr_key, i);
+                        write_owners.insert(*ak, i);
                     }
                 }
             }
         }
 
-        // For each read key: check if another tx WRITES it (read-write conflict)
-        for entry in &tx.access_list {
-            for key in &entry.reads {
-                let addr_key = (entry.address, *key);
-                if let Some(&writer) = write_owners.get(&addr_key) {
-                    if writer != i {
-                        uf.union(i, writer);
+        // Claim explicit writes from the access list.
+        if explicit_informative {
+            for entry in &tx.access_list {
+                for key in &entry.writes {
+                    let addr_key = (entry.address, *key);
+                    match write_owners.get(&addr_key) {
+                        Some(&other) => uf.union(i, other),
+                        None => {
+                            write_owners.insert(addr_key, i);
+                        }
+                    }
+                }
+            }
+
+            // Read-vs-write conflicts (explicit reads only — the
+            // implicit reads are subsumed by the implicit writes
+            // claimed above for the same key).
+            for entry in &tx.access_list {
+                for key in &entry.reads {
+                    let addr_key = (entry.address, *key);
+                    if let Some(&writer) = write_owners.get(&addr_key) {
+                        if writer != i {
+                            uf.union(i, writer);
+                        }
                     }
                 }
             }
         }
     }
 
-    // If any txs had empty access lists, union their representative with
-    // every other tx (they conflict with everything).
-    if let Some(rep) = empty_representative {
+    // Union the unknown-rep with every other tx — it conflicts with
+    // everything. Same shape as the prior `empty_representative`
+    // sweep, just gated on the unknown-tx-type case (a Standard tx
+    // with empty AL is no longer unknown because `implicit_writes`
+    // returns its sender/recipient touches).
+    if let Some(rep) = unknown_representative {
         for i in 0..n {
             if i != rep {
                 uf.union(i, rep);
@@ -455,10 +502,23 @@ mod tests {
     use crate::types::{FeePayer, TransactionType};
     use pyde_account::address::{derive_eoa_address, ZERO_ADDRESS};
 
+    /// Per-call unique seed so `make_tx_with_access` produces txs with
+    /// distinct senders + recipients. Without this, every test tx
+    /// would share `(from, balance/nonce)` and `(to, balance)` keys
+    /// under the implicit-write rule and the scheduler would union
+    /// everything into one group — masking the explicit-AL union-find
+    /// behavior the surrounding tests are actually trying to assert.
+    static TX_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn make_tx_with_access(access_list: Vec<AccessEntry>) -> Transaction {
+        let seed = TX_SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut from_seed = [0xAAu8; 897];
+        from_seed[..8].copy_from_slice(&seed.to_le_bytes());
+        let mut to_seed = [0xBBu8; 897];
+        to_seed[..8].copy_from_slice(&seed.to_le_bytes());
         Transaction {
-            from: derive_eoa_address(&[0xAA; 897]),
-            to: derive_eoa_address(&[0xBB; 897]),
+            from: derive_eoa_address(&from_seed),
+            to: derive_eoa_address(&to_seed),
             value: 0,
             data: vec![],
             gas_limit: 21_000,
@@ -733,15 +793,86 @@ mod tests {
 
     #[test]
     fn empty_access_lists_all_in_one_group() {
-        // Txs without access lists conflict with everything → all in one group
-        let txs = vec![
-            make_tx_with_access(vec![]),
-            make_tx_with_access(vec![]),
-            make_tx_with_access(vec![]),
-        ];
+        // For tx types the scheduler can't derive implicit writes for
+        // (Slash here — any non-{Standard, Deploy, RegisterPubkey}
+        // works), empty access lists collapse every tx into one
+        // sequential group. Standard txs go through the implicit-
+        // write path instead and are covered by `same_sender_standard_txs_unioned_via_implicit`.
+        let mut a = make_tx_with_access(vec![]);
+        a.tx_type = TransactionType::Slash;
+        let mut b = make_tx_with_access(vec![]);
+        b.tx_type = TransactionType::Slash;
+        let mut c = make_tx_with_access(vec![]);
+        c.tx_type = TransactionType::Slash;
+        let txs = vec![a, b, c];
         let schedule = schedule(&txs);
         assert_eq!(schedule.group_count(), 1);
         assert_eq!(schedule.groups[0].tx_indices.len(), 3);
+    }
+
+    /// Phase-A counterpart: two Standard txs from the SAME sender
+    /// must still serialise even with empty `access_list`, because
+    /// the scheduler derives the implicit `(from, nonce_key)` write
+    /// from `tx.from` + `tx.tx_type`. Without this, the audit-407
+    /// hazard (proposer parallel vs non-proposer serial, diverging
+    /// on undeclared sender-nonce writes) would re-open.
+    #[test]
+    fn same_sender_standard_txs_unioned_via_implicit() {
+        let sender = derive_eoa_address(b"audit-407-sender");
+        let mk = |nonce: u64| Transaction {
+            from: sender,
+            to: derive_eoa_address(b"audit-407-recipient"),
+            value: 0,
+            data: vec![],
+            gas_limit: 21_000,
+            nonce,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Standard,
+        };
+        let schedule = schedule(&[mk(0), mk(1), mk(2)]);
+        assert_eq!(
+            schedule.group_count(),
+            1,
+            "same-sender Standard txs MUST serialise via implicit (from, nonce_key) conflict (audit 407)"
+        );
+        assert_eq!(schedule.groups[0].tx_indices, vec![0, 1, 2]);
+    }
+
+    /// Phase-A win: two Standard txs from DIFFERENT senders to
+    /// DIFFERENT recipients with empty `access_list` get to run in
+    /// parallel. Pre-Phase-A this collapsed to one sequential group;
+    /// the loadgen-mixed soak wedge at 2k TPS / 4v was the headline
+    /// symptom.
+    #[test]
+    fn different_sender_standard_txs_parallel_via_implicit() {
+        let mk = |sender_seed: &[u8], to_seed: &[u8]| Transaction {
+            from: derive_eoa_address(sender_seed),
+            to: derive_eoa_address(to_seed),
+            value: 0,
+            data: vec![],
+            gas_limit: 21_000,
+            nonce: 0,
+            signature: vec![],
+            fee_payer: FeePayer::Sender,
+            access_list: vec![],
+            deadline: None,
+            chain_id: 1,
+            tx_type: TransactionType::Standard,
+        };
+        let schedule = schedule(&[
+            mk(b"sender-a", b"recipient-a"),
+            mk(b"sender-b", b"recipient-b"),
+            mk(b"sender-c", b"recipient-c"),
+        ]);
+        assert_eq!(
+            schedule.group_count(),
+            3,
+            "three Standard txs with disjoint (sender, recipient) pairs MUST be schedulable in parallel"
+        );
     }
 
     /// Audit 407 regression: an `AccessEntry` with empty `reads` and
@@ -752,7 +883,14 @@ mod tests {
     /// single-group schedule) ran them sequentially, and the two
     /// paths produced different post-block state under any
     /// undeclared write (sender nonce being the universal example).
-    /// The fix treats this shape as no-info and unions everything.
+    ///
+    /// The original fix treated this shape as no-info and unioned
+    /// everything. Phase A replaces that workaround with implicit
+    /// `(sender, balance/nonce)` writes for Standard/Deploy/
+    /// RegisterPubkey — so this regression is now covered
+    /// STRUCTURALLY by `same_sender_standard_txs_unioned_via_implicit`.
+    /// The test below preserves the old shape for tx types whose
+    /// touch-set the scheduler still can't derive (Slash here).
     #[test]
     fn access_list_with_only_addresses_no_keys_unions_with_all() {
         let mega_addr = {
@@ -767,17 +905,17 @@ mod tests {
                 writes: vec![],
             }]
         };
-        let txs = vec![
-            make_tx_with_access(only_addr_no_keys()),
-            make_tx_with_access(only_addr_no_keys()),
-            make_tx_with_access(only_addr_no_keys()),
-            make_tx_with_access(only_addr_no_keys()),
-        ];
+        let mut txs: Vec<Transaction> = (0..4)
+            .map(|_| make_tx_with_access(only_addr_no_keys()))
+            .collect();
+        for tx in &mut txs {
+            tx.tx_type = TransactionType::Slash;
+        }
         let schedule = schedule(&txs);
         assert_eq!(
             schedule.group_count(),
             1,
-            "AL=[{{addr,[],[]}}] is uninformative — all txs must serialize"
+            "AL=[{{addr,[],[]}}] is uninformative for tx types without implicit writes — all txs must serialize"
         );
         assert_eq!(schedule.groups[0].tx_indices.len(), 4);
     }
@@ -785,7 +923,9 @@ mod tests {
     /// Same as above but mixed: one tx declares a real write key,
     /// the others use the empty-keys shape. The keyed tx must still
     /// land in the single group with everyone else, because the
-    /// uninformative txs union with all.
+    /// uninformative txs union with all. Phase A: scenario applies
+    /// to tx types without implicit writes (Slash here); Standard
+    /// txs go through the implicit-write path tested separately.
     #[test]
     fn uninformative_unions_with_keyed_txs() {
         let mega_addr = {
@@ -793,26 +933,22 @@ mod tests {
             a[0] = 0xAB;
             a
         };
-        let txs = vec![
+        let only_addr_no_keys = vec![AccessEntry {
+            address: mega_addr,
+            reads: vec![],
+            writes: vec![],
+        }];
+        let mut txs = vec![
             // One tx with a real declared write
             make_tx_with_access(vec![write_access(0xCC, &[[0x42; 32]])]),
             // Three txs with the soak-loadgen shape
-            make_tx_with_access(vec![AccessEntry {
-                address: mega_addr,
-                reads: vec![],
-                writes: vec![],
-            }]),
-            make_tx_with_access(vec![AccessEntry {
-                address: mega_addr,
-                reads: vec![],
-                writes: vec![],
-            }]),
-            make_tx_with_access(vec![AccessEntry {
-                address: mega_addr,
-                reads: vec![],
-                writes: vec![],
-            }]),
+            make_tx_with_access(only_addr_no_keys.clone()),
+            make_tx_with_access(only_addr_no_keys.clone()),
+            make_tx_with_access(only_addr_no_keys.clone()),
         ];
+        for tx in &mut txs {
+            tx.tx_type = TransactionType::Slash;
+        }
         let schedule = schedule(&txs);
         assert_eq!(schedule.group_count(), 1);
         assert_eq!(schedule.groups[0].tx_indices.len(), 4);
@@ -1003,14 +1139,18 @@ mod tests {
 
         assert_eq!(sched.total_txs, 10_000);
         assert_eq!(sched.group_count(), 100); // 100 hot keys → 100 groups
-                                              // Sanity floor for scheduler complexity — 200 ms is deliberately
+                                              // Sanity floor for scheduler complexity — 2000 ms is deliberately
                                               // loose because this runs in a debug build under contention with
                                               // the rest of `cargo test --workspace`. A regression to O(n²)
                                               // would take seconds, which this catches; tighter timings belong
-                                              // in `cargo bench`, not in the regression suite.
+                                              // in `cargo bench`, not in the regression suite. The threshold
+                                              // was bumped from 200 ms when the scheduler started deriving
+                                              // implicit `(sender, balance/nonce)` writes per tx — that adds
+                                              // two Poseidon2 hashes per tx, ~100 µs each in debug, so 10K
+                                              // txs is bounded by ~2 s of hashing in the worst case.
         assert!(
-            elapsed.as_millis() < 200,
-            "10K scheduling took {}ms, must be <200ms (expected ~few ms under release)",
+            elapsed.as_millis() < 2000,
+            "10K scheduling took {}ms, must be <2000ms (expected ~few ms under release)",
             elapsed.as_millis()
         );
     }

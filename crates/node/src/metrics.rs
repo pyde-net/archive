@@ -18,6 +18,8 @@
 //!     pressure
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Bucket scheme for every `*_ms` histogram (TPL-102).
 ///
@@ -60,14 +62,30 @@ pub fn record_block(slot: u64, tx_count: u64, gas_used: u64, elapsed_ms: u64) {
     metrics::counter!("pyde_transactions_processed_total").increment(tx_count);
     metrics::gauge!("pyde_block_gas_used").set(gas_used as f64);
     metrics::histogram!("pyde_block_processing_ms").record(elapsed_ms as f64);
+    let snap = snapshot();
+    snap.chain_head_slot.store(slot, Ordering::Relaxed);
+    snap.blocks_processed_total.fetch_add(1, Ordering::Relaxed);
+    snap.txs_committed_total
+        .fetch_add(tx_count, Ordering::Relaxed);
+    snap.last_block_slot.store(slot, Ordering::Relaxed);
+    snap.last_block_txs.store(tx_count, Ordering::Relaxed);
+    snap.last_block_gas.store(gas_used, Ordering::Relaxed);
+    snap.last_block_ms.store(elapsed_ms, Ordering::Relaxed);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    snap.last_block_at_unix_ms.store(now_ms, Ordering::Relaxed);
 }
 
 pub fn record_peers(count: usize) {
     metrics::gauge!("pyde_peers_connected").set(count as f64);
+    snapshot().peers.store(count, Ordering::Relaxed);
 }
 
 pub fn record_mempool(size: usize) {
     metrics::gauge!("pyde_mempool_size").set(size as f64);
+    snapshot().mempool_plain.store(size, Ordering::Relaxed);
 }
 
 /// Encrypted-tx mempool depth, separate from the plaintext
@@ -77,6 +95,7 @@ pub fn record_mempool(size: usize) {
 /// decryption pipeline is wedged.
 pub fn record_encrypted_mempool(size: usize) {
     metrics::gauge!("pyde_encrypted_mempool_size").set(size as f64);
+    snapshot().mempool_encrypted.store(size, Ordering::Relaxed);
 }
 
 /// Block-lag: how many slots behind the observed network tip
@@ -153,4 +172,122 @@ pub fn record_rpc_request(method: &'static str, ok: bool) {
     let outcome = if ok { "ok" } else { "err" };
     metrics::counter!("pyde_rpc_requests_total", "method" => method, "outcome" => outcome)
         .increment(1);
+    let snap = snapshot();
+    if ok {
+        snap.rpc_accepts_total.fetch_add(1, Ordering::Relaxed);
+    } else {
+        snap.rpc_rejects_total.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// In-process metrics snapshot. Both the Prometheus exporter and
+/// the optional TUI dashboard read from the same numbers — the
+/// TUI just needs a non-HTTP, lock-free read path. Atomics for
+/// counters/gauges; `RwLock` for the address fields where atomic
+/// fixed-size byte arrays aren't a thing in std.
+pub struct Snapshot {
+    pub chain_head_slot: AtomicU64,
+    pub chain_finalized_slot: AtomicU64,
+    pub chain_base_fee: AtomicU64,
+    pub epoch: AtomicU64,
+    pub peers: AtomicUsize,
+    pub committee_size: AtomicUsize,
+    pub mempool_plain: AtomicUsize,
+    pub mempool_encrypted: AtomicUsize,
+    pub txs_committed_total: AtomicU64,
+    pub blocks_processed_total: AtomicU64,
+    pub rpc_accepts_total: AtomicU64,
+    pub rpc_rejects_total: AtomicU64,
+    pub last_block_slot: AtomicU64,
+    pub last_block_txs: AtomicU64,
+    pub last_block_gas: AtomicU64,
+    pub last_block_ms: AtomicU64,
+    pub last_block_at_unix_ms: AtomicU64,
+    pub current_proposer: RwLock<[u8; 32]>,
+    pub local_address: RwLock<[u8; 32]>,
+    pub is_validator: std::sync::atomic::AtomicBool,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            chain_head_slot: AtomicU64::new(0),
+            chain_finalized_slot: AtomicU64::new(0),
+            chain_base_fee: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
+            peers: AtomicUsize::new(0),
+            committee_size: AtomicUsize::new(0),
+            mempool_plain: AtomicUsize::new(0),
+            mempool_encrypted: AtomicUsize::new(0),
+            txs_committed_total: AtomicU64::new(0),
+            blocks_processed_total: AtomicU64::new(0),
+            rpc_accepts_total: AtomicU64::new(0),
+            rpc_rejects_total: AtomicU64::new(0),
+            last_block_slot: AtomicU64::new(0),
+            last_block_txs: AtomicU64::new(0),
+            last_block_gas: AtomicU64::new(0),
+            last_block_ms: AtomicU64::new(0),
+            last_block_at_unix_ms: AtomicU64::new(0),
+            current_proposer: RwLock::new([0u8; 32]),
+            local_address: RwLock::new([0u8; 32]),
+            is_validator: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+static SNAPSHOT: OnceLock<Arc<Snapshot>> = OnceLock::new();
+
+/// Returns the process-wide metrics snapshot, initializing it on
+/// first call. Cheap on the hot path: cloning the `Arc` is one
+/// atomic increment.
+pub fn snapshot() -> Arc<Snapshot> {
+    SNAPSHOT
+        .get_or_init(|| Arc::new(Snapshot::default()))
+        .clone()
+}
+
+/// Setters the call sites that already publish to Prometheus also
+/// invoke. Centralizes the snapshot writes so the
+/// Prometheus-export-only fns above don't grow a parallel set of
+/// `snapshot().X.store(...)` lines.
+pub fn set_finalized_slot(slot: u64) {
+    metrics::gauge!("pyde_chain_finalized_slot").set(slot as f64);
+    snapshot()
+        .chain_finalized_slot
+        .store(slot, Ordering::Relaxed);
+}
+
+pub fn set_base_fee(fee: u64) {
+    metrics::gauge!("pyde_chain_base_fee").set(fee as f64);
+    snapshot().chain_base_fee.store(fee, Ordering::Relaxed);
+}
+
+pub fn set_epoch(epoch: u64) {
+    metrics::gauge!("pyde_chain_epoch").set(epoch as f64);
+    snapshot().epoch.store(epoch, Ordering::Relaxed);
+}
+
+pub fn set_committee_size(size: usize) {
+    metrics::gauge!("pyde_committee_size").set(size as f64);
+    snapshot()
+        .committee_size
+        .store(size, Ordering::Relaxed);
+}
+
+pub fn set_current_proposer(addr: [u8; 32]) {
+    if let Ok(mut w) = snapshot().current_proposer.write() {
+        *w = addr;
+    }
+}
+
+pub fn set_local_address(addr: [u8; 32]) {
+    if let Ok(mut w) = snapshot().local_address.write() {
+        *w = addr;
+    }
+}
+
+pub fn set_is_validator(v: bool) {
+    snapshot()
+        .is_validator
+        .store(v, Ordering::Relaxed);
 }

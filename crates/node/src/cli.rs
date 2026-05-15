@@ -51,6 +51,12 @@ pub enum Command {
         /// Bootstrap peer addresses (multiaddr).
         #[arg(long)]
         bootstrap: Vec<String>,
+
+        /// Render a 1Hz terminal dashboard instead of streaming logs
+        /// to stdout. Logs are sent to `<datadir>/pyde.log` so they
+        /// remain available for grep / tail / log shippers.
+        #[arg(long)]
+        tui: bool,
     },
 
     /// Print default configuration.

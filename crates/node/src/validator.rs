@@ -1676,14 +1676,47 @@ impl ValidatorEngine {
         Some(result.randomness)
     }
 
-    /// Compute VRF candidacy for the current slot.
+    /// Compute VRF candidacy for the chain's next target slot.
     /// Only propose if VRF score is below threshold (targets ~1 proposer per slot).
     /// Threshold = U64::MAX / committee_size. With N validators, on average 1 score
     /// falls below this threshold per slot. If 0 qualify → timeout/view change.
     /// If 2+ qualify → proposal buffering picks the lowest score.
+    ///
+    /// Targets `consensus.target_height` (next slot to commit), NOT
+    /// `consensus.current_slot` (wall-clock slot). When validators
+    /// boot N seconds after `pyde testnet` stamps `genesis_ts`, the
+    /// wall-clock slot has already raced ahead of the chain head —
+    /// proposing for `current_slot` produces a block at slot=N that
+    /// the cluster can't apply until target_height catches up to N,
+    /// by which time the proposal's `parent_hash` references a
+    /// long-superseded chain head and is rejected. Targeting
+    /// `target_height` keeps `header.slot = head_slot + 1` so the
+    /// happy-path proposal lands on the chain head everyone agrees
+    /// on. Steady-state behavior is unchanged (target_height tracks
+    /// wall-clock-slot once caught up).
     pub fn check_proposer(&self, identity: &ValidatorIdentity) -> Option<ProposerCandidate> {
-        let slot = self.consensus.current_slot;
+        let slot = self.consensus.target_height;
         let committee_size = self.committee_keys.len();
+
+        // Self-equivocation guard: with `slot = target_height` the
+        // RR rotation no longer changes on every wall-clock tick.
+        // If `target_height` doesn't advance between two slot-ticks
+        // (e.g., the previous slot's vote-QC hasn't formed yet),
+        // `is_view0_proposer` would return true twice for the same
+        // (slot, view=0) — re-firing this code path would build a
+        // second block with a fresh `timestamp`, a different
+        // block_hash, and the proposer-side `buffer_proposal` would
+        // recognise our own equivocation and queue a self-slash.
+        // Bail out if we've already buffered a proposal at this
+        // target_height under our address. Different-view proposals
+        // (view ≥1 fallback) go through `try_build_fallback_proposal`,
+        // not this path, so they aren't affected.
+        if self
+            .seen_proposals
+            .contains_key(&(slot, identity.address))
+        {
+            return None;
+        }
 
         // Audit-410-extended: universal round-robin view-0 leader.
         // See `pyde_consensus::proposer::is_view0_proposer` for the
@@ -2425,7 +2458,15 @@ impl ValidatorEngine {
         encrypted_txs: Vec<Vec<u8>>,
         execution_schedule: ExecutionSchedule,
     ) -> Block {
-        let slot = self.consensus.current_slot;
+        // Stamp the block at `target_height`, NOT `current_slot`.
+        // See `check_proposer`'s doc-comment for the rationale —
+        // `parent_hash` is the chain head and `target_height =
+        // head_slot + 1`, so this keeps the slot chain contiguous
+        // even during catch-up. The VRF inputs the proposer signed
+        // in `check_proposer` were also computed against
+        // `target_height`, so the verifier (which keys on
+        // `header.slot`) reconstructs the same VRF input.
+        let slot = self.consensus.target_height;
         let epoch = slot / EPOCH_LENGTH;
 
         let header = BlockHeader {
@@ -2710,15 +2751,29 @@ impl ValidatorEngine {
                 if mutated {
                     self.persist_consensus();
                 }
-                // audit-234 part 4 (CONSENSUS_INVARIANTS.md O2): a QC
-                // for slot `slot` certifies the block at that height.
-                // Advance `target_height` to `slot + 1` so subsequent
-                // recovery (view-change, fallback) targets the next
-                // height we need to commit, not the one we just
-                // certified. `advance_target_height` is monotonic
-                // (no-op if a later QC already advanced past us) and
-                // resets the timeout tracker for the new target.
-                self.advance_target_height(slot + 1);
+                // CONSENSUS_INVARIANTS.md O2 (Apply-then-advance):
+                // `target_height` is advanced ONLY after canonical-apply
+                // completes, NOT on QC formation. The previous
+                // implementation advanced here on QC formation, which
+                // caused target_height to bifurcate across the cluster
+                // under sustained overload — QCs form asymmetrically
+                // when gossipsub vote delivery is delayed, so some
+                // validators advanced while others didn't, the cluster
+                // split on which (H, V) view-change should target, and
+                // view-change quorum could never re-form. By tying
+                // target_height to apply completion, every validator
+                // only advances when its own apply path has actually
+                // processed the block body — keeping the cluster aligned.
+                //
+                // The audit-234 concern (view-change repeatedly targeting
+                // a slot that already has a QC) is now handled by the
+                // lock-then-vote safety rule (S2/S3): validators locked
+                // on a higher QC refuse to vote on lower-view fallbacks,
+                // so the certified block wins once its body applies.
+                //
+                // Apply sites (search `applied block from QC` in
+                // `node.rs`) call `engine.advance_target_height(qc_slot
+                // + 1)` after each apply completes.
                 // Record soft finality. Pass the active committee
                 // size so devnet/testnet committees (smaller than the
                 // production 128) compute the correct quorum threshold.
@@ -2748,6 +2803,29 @@ impl ValidatorEngine {
         // permanently uncommitted.
         let slot = self.consensus.target_height;
         let highest_qc_hash = self.consensus.highest_qc.hash();
+
+        // O2 (apply-then-advance) interlock: when target_height is
+        // gated on canonical-apply completing, the slot's view-change
+        // timer can fire while a QC for this slot already exists
+        // locally — the QC formed in `on_vote`, but `apply_block_from_qc`
+        // hasn't returned yet (commit_jmt_writes still running, or
+        // block body still being fetched). Firing a view-change at
+        // that point is wasteful: the slot is already certified, we
+        // just need apply to finish. Skip the VC; the apply path will
+        // advance target_height itself.
+        //
+        // Safety: if `highest_qc.slot < target_height` this branch
+        // doesn't fire — the node hasn't seen the QC (e.g. its votes
+        // didn't aggregate to quorum locally), and view-change is the
+        // right recovery path.
+        if self.consensus.highest_qc.slot >= slot {
+            debug!(
+                slot,
+                highest_qc_slot = self.consensus.highest_qc.slot,
+                "skipping view-change: target_height already QC'd, waiting on apply"
+            );
+            return None;
+        }
 
         // TPL-501: equivocation guard. If we already signed a
         // VC at this slot, we MUST NOT sign a different one — a
@@ -2974,7 +3052,10 @@ impl ValidatorEngine {
                 // wall-clock start (same fix as `advance_target_height`).
                 // After a VC-QC the fallback leader gets a fresh
                 // `PROPOSAL_TIMEOUT_MS` window measured from the
-                // slot's actual start, not "now".
+                // slot's actual start, not "now". During catch-up
+                // `slot_start_ms_for_target` collapses to `now`, so
+                // the fallback leader still gets a real window when
+                // wall-clock-start is already in the past.
                 let slot_start_ms = self.slot_start_ms_for_target(slot);
                 let mut new_tracker = TimeoutTracker::new(slot, slot_start_ms);
                 new_tracker.view_change_qc = Some(vc_qc);
@@ -3482,16 +3563,44 @@ impl ValidatorEngine {
         }
     }
 
-    /// Wall-clock instant (Unix ms) when slot `target` begins.
+    /// Slot-start anchor (Unix ms) for the timeout tracker at
+    /// `target`. Returns `max(wall_clock_start, now_ms)`:
+    ///
+    /// - **Steady state** (chain caught up to wall-clock):
+    ///   `wall_clock_start >= now_ms` → returns `wall_clock_start`,
+    ///   matching the original audit-408 wall-clock anchor. Late-
+    ///   booting operators still align on the shared `genesis_ts`
+    ///   so the `(slot, view, slot_start_ms)` tuple is identical
+    ///   across the cluster.
+    ///
+    /// - **Catch-up** (validators booted N seconds after `genesis_ts`,
+    ///   chain head far behind wall-clock-slot): `wall_clock_start`
+    ///   is in the past, so its `PROPOSAL_TIMEOUT_MS` window has
+    ///   already expired the moment `advance_target_height` installs
+    ///   the new tracker. View-change then fires on the very next
+    ///   slot-interval tick, every slot — view-1 fallback becomes
+    ///   the only path that ever produces a block. Anchoring to
+    ///   `now_ms` instead gives each newly-advanced target a fresh
+    ///   `PROPOSAL_TIMEOUT_MS` window, so view-0 happy-path has time
+    ///   to engage.
+    ///
+    /// `max` is the right operator (rather than always-`now`)
+    /// because steady-state correctness depends on the wall-clock
+    /// anchor: under load, a vote-QC for slot N can land slightly
+    /// before slot N+1's wall-clock window begins, and anchoring
+    /// N+1 to `now` would let view-change fire ~200 ms early.
+    ///
     /// Falls back to `current_time_ms()` if the slot anchor hasn't
     /// been wired yet (test paths). See `set_slot_anchor`.
     fn slot_start_ms_for_target(&self, target: u64) -> u64 {
+        let now = current_time_ms();
         if self.block_time_ms == 0 {
-            current_time_ms()
-        } else {
-            self.genesis_timestamp_ms
-                .saturating_add(target.saturating_mul(self.block_time_ms))
+            return now;
         }
+        let wall_clock_start = self
+            .genesis_timestamp_ms
+            .saturating_add(target.saturating_mul(self.block_time_ms));
+        wall_clock_start.max(now)
     }
 
     /// Advance `target_height` to `new_height` and reset the timeout
@@ -3502,12 +3611,18 @@ impl ValidatorEngine {
     /// vote-QC for the current target forms — the chain has moved
     /// on, recovery state for the old height is no longer needed.
     ///
-    /// Audit 408: the new tracker's `slot_start_ms` is the wall-
-    /// clock start of `new_height` per `slot_start_ms_for_target`,
-    /// not `now`. The prior code used `now` and fired view-change
-    /// 200 ms after the *previous* slot's QC — typically before the
-    /// new slot's wall-clock window even started.
-    fn advance_target_height(&mut self, new_height: u64) {
+    /// Audit 408: the new tracker's `slot_start_ms` comes from
+    /// `slot_start_ms_for_target(new_height)` — the wall-clock
+    /// start of `new_height` in steady state, or `now_ms` during
+    /// catch-up (see that helper's doc-comment for the rationale).
+    /// The prior code used `now` unconditionally and fired view-
+    /// change 200 ms after the *previous* slot's QC — typically
+    /// before the new slot's wall-clock window even started.
+    ///
+    /// `pub(crate)` so the canonical-apply sites in `node.rs` can
+    /// call it after `commit_jmt_writes` completes (enforcing
+    /// CONSENSUS_INVARIANTS.md O2: apply-then-advance).
+    pub(crate) fn advance_target_height(&mut self, new_height: u64) {
         if self.consensus.advance_target_height(new_height) {
             let slot_start_ms = self.slot_start_ms_for_target(new_height);
             self.timeout = TimeoutTracker::new(new_height, slot_start_ms);
@@ -3776,13 +3891,15 @@ mod tests {
     #[test]
     fn check_proposer_respects_vrf_threshold() {
         // Audit-410-extended: view-0 leader is round-robin
-        // (`slot % committee_size`). With 3 validators, identity 0 is
-        // the leader at slots 0, 3, 6, 9, ... and is rejected at other
-        // slots. 20 advances guarantee at least 6 hits for index 0.
+        // (`target_height % committee_size`). With 3 validators,
+        // identity 0 is the leader at target_heights 3, 6, 9, ...
+        // (and target_height starts at 1, so the first hit is at 3
+        // after two advances). 20 advances guarantee multiple hits.
         let (mut engine, identities) = make_engine_with_committee(3);
         let mut found_proposer = false;
-        for _ in 0..20 {
+        for h in 2..=21 {
             engine.advance_slot();
+            engine.advance_target_height(h);
             if let Some(candidate) = engine.check_proposer(&identities[0]) {
                 assert_eq!(candidate.address, identities[0].address);
                 found_proposer = true;
@@ -3791,7 +3908,7 @@ mod tests {
         }
         assert!(
             found_proposer,
-            "should find at least 1 slot to propose in 20 tries"
+            "should find at least 1 target_height to propose in 20 tries"
         );
     }
 
@@ -5606,7 +5723,10 @@ mod tests {
             },
         );
 
-        assert_eq!(block.slot(), 0);
+        // `build_proposal` stamps `header.slot = target_height`,
+        // which `ConsensusState::new()` initializes to 1 (the first
+        // post-genesis slot a fresh engine wants to commit).
+        assert_eq!(block.slot(), 1);
         assert_eq!(block.header.proposer, identities[0].address);
         assert_eq!(block.header.state_root, [0xBB; 32]);
         assert_eq!(block.header.tx_root, [0xCC; 32]);

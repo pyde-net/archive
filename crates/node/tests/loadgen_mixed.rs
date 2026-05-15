@@ -114,6 +114,13 @@ struct Wallet {
     address: [u8; 32],
     pk_bytes: Vec<u8>,
     sk: FalconSecretKey,
+    /// Per-wallet dedicated recipient. Spreading transfers + encrypted
+    /// payouts across N distinct recipients lets Phase A's parallel
+    /// scheduler avoid unioning every value-bearing tx on a single
+    /// `(RECIPIENT, balance_key)` write conflict. Real-world traffic
+    /// has varied recipients; pinning every tx to one address is an
+    /// artifact of the simpler earlier test design.
+    recipient: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -241,6 +248,10 @@ fn mixed_workload_load_test() {
     println!("  faucet: 0x{}", hex::encode(faucet_addr));
 
     let rpc_urls: Vec<String> = net.nodes.iter().map(|n| n.rpc_url()).collect();
+    // Capture node-output handles up front so the async block can dump
+    // per-node logs on panic without needing a back-reference to `net`.
+    let node_outputs: Vec<Arc<std::sync::Mutex<Vec<String>>>> =
+        net.nodes.iter().map(|n| n.output_handle()).collect();
 
     // ── Phase 1: fund + register pubkeys for N senders ──────────
     println!(
@@ -260,13 +271,21 @@ fn mixed_workload_load_test() {
     let setup_start = Instant::now();
     let wallets: Vec<Arc<Wallet>> = runtime.block_on(async {
         let mut wallets = Vec::with_capacity(num_senders);
-        for _ in 0..num_senders {
+        for i in 0..num_senders {
             let (pk, sk) = falcon_keygen().expect("keygen");
             let address = derive_eoa_address(pk.as_bytes());
+            // Dedicated recipient per wallet. Deterministic so the
+            // verification path can fetch + sum balances later. The
+            // domain tag `"loadgen-mixed-recipient-"` keeps these
+            // addresses well away from any other test artifacts.
+            let mut seed = b"loadgen-mixed-recipient-".to_vec();
+            seed.extend_from_slice(&(i as u64).to_le_bytes());
+            let recipient = derive_eoa_address(&seed);
             wallets.push(Arc::new(Wallet {
                 address,
                 pk_bytes: pk.as_bytes().to_vec(),
                 sk,
+                recipient,
             }));
         }
 
@@ -297,21 +316,31 @@ fn mixed_workload_load_test() {
             signed_hex.push(hex::encode(tx.to_bytes()));
             faucet_nonce += 1;
         }
-        // Stream funding in nonce-window-friendly chunks.
+        // Stream funding in nonce-window-friendly chunks, spreading
+        // submissions across all RPC endpoints to avoid starving any
+        // one node's consensus path with RPC-write-lock pressure.
         let mut chunk_idx = 0usize;
+        let mut submit_idx = 0usize;
         for chunk in signed_hex.chunks(15) {
             for hex_tx in chunk {
-                let _ = rpc_send_raw(&client, &rpc_urls[0], hex_tx).await;
+                let url = &rpc_urls[submit_idx % rpc_urls.len()];
+                let _ = rpc_send_raw(&client, url, hex_tx).await;
+                submit_idx += 1;
             }
             chunk_idx += 1;
             tokio::time::sleep(Duration::from_millis(800)).await;
         }
-        // Wait for all funded.
+        // Wait for all funded. Poll round-robin across RPC URLs so a
+        // single node falling slightly behind on apply (e.g. from its
+        // own RPC pressure) doesn't make us declare the cluster wedged.
         let poll_deadline = Instant::now() + Duration::from_secs(60);
+        let mut poll_idx = 0usize;
         loop {
             let mut funded = 0usize;
             for w in &wallets {
-                if fetch_balance(&client, &rpc_urls[0], &w.address)
+                let url = &rpc_urls[poll_idx % rpc_urls.len()];
+                poll_idx += 1;
+                if fetch_balance(&client, url, &w.address)
                     .await
                     .unwrap_or(0)
                     > 0
@@ -349,22 +378,40 @@ fn mixed_workload_load_test() {
             signed_register.push(hex::encode(tx.to_bytes()));
         }
         use futures_util::stream::{iter, StreamExt};
+        let reg_err_counts: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let mut futs = Vec::new();
         for (i, hex_tx) in signed_register.iter().enumerate() {
             let url = rpc_urls[i % rpc_urls.len()].clone();
             let cli = client.clone();
             let hex_tx = hex_tx.clone();
+            let errs = reg_err_counts.clone();
             futs.push(async move {
-                let _ = rpc_send_raw(&cli, &url, &hex_tx).await;
+                let resp = rpc_send_raw(&cli, &url, &hex_tx).await;
+                if let Some(err) = resp.get("error") {
+                    let msg = err
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    *errs.lock().unwrap().entry(msg).or_insert(0) += 1;
+                }
             });
         }
         iter(futs).buffer_unordered(32).collect::<Vec<()>>().await;
+        let reg_err_snapshot: Vec<(String, u64)> = {
+            let map = reg_err_counts.lock().unwrap();
+            map.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        };
 
         let poll_deadline = Instant::now() + Duration::from_secs(60);
+        let mut reg_poll_idx = 0usize;
         loop {
             let mut registered = 0usize;
             for w in &wallets {
-                if fetch_nonce(&client, &rpc_urls[0], &w.address)
+                let url = &rpc_urls[reg_poll_idx % rpc_urls.len()];
+                reg_poll_idx += 1;
+                if fetch_nonce(&client, url, &w.address)
                     .await
                     .unwrap_or(0)
                     >= 1
@@ -376,7 +423,67 @@ fn mixed_workload_load_test() {
                 break;
             }
             if Instant::now() >= poll_deadline {
-                panic!("RegisterPubkey timed out: {}/{}", registered, wallets.len());
+                // Query head_slot FIRST, while RPC is idle. With 600 nonce
+                // queries downstream, by the time we get to fetch_block_number
+                // the RPC may be saturated and time out, returning 0 — making
+                // the chain look stalled when it's just throttled.
+                let mut per_node = Vec::new();
+                let mut heads = Vec::new();
+                for url in &rpc_urls {
+                    let head = fetch_block_number(&client, url).await;
+                    heads.push(head);
+                }
+                for (url, head_opt) in rpc_urls.iter().zip(heads.iter()) {
+                    let mut n = 0usize;
+                    for w in &wallets {
+                        if fetch_nonce(&client, url, &w.address).await.unwrap_or(0) >= 1 {
+                            n += 1;
+                        }
+                    }
+                    per_node.push((
+                        url.clone(),
+                        n,
+                        head_opt.map(|h| h as i64).unwrap_or(-1),
+                    ));
+                }
+                let breakdown: Vec<String> = per_node
+                    .iter()
+                    .map(|(u, n, h)| format!("{}=reg={},head={}", u, n, h))
+                    .collect();
+                let mut errs_sorted = reg_err_snapshot.clone();
+                errs_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                let errs_str: Vec<String> = errs_sorted
+                    .iter()
+                    .map(|(k, v)| format!("[{}] x{}", k, v))
+                    .collect();
+                let total_errs: u64 = reg_err_snapshot.iter().map(|(_, v)| *v).sum();
+                eprintln!("\n  RegisterPubkey submission errors ({} total):", total_errs);
+                for line in &errs_str {
+                    eprintln!("    {}", line);
+                }
+                // Dump last ~200 lines of each validator's stdout to
+                // /tmp so the panic message + dumps form a complete
+                // picture of what each node was doing at panic time.
+                for (i, handle) in node_outputs.iter().enumerate() {
+                    let lines = handle.lock().unwrap().clone();
+                    let path = format!("/tmp/loadgen-mixed-panic-node-{}.log", i);
+                    let tail: Vec<String> = lines
+                        .iter()
+                        .rev()
+                        .take(400)
+                        .rev()
+                        .cloned()
+                        .collect();
+                    let _ = std::fs::write(&path, tail.join("\n"));
+                    eprintln!("    [node-{}] tail dumped → {}", i, path);
+                }
+                panic!(
+                    "RegisterPubkey timed out: {}/{} (submit_errors={}, per-node: {})",
+                    registered,
+                    wallets.len(),
+                    total_errs,
+                    breakdown.join(", ")
+                );
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -705,7 +812,7 @@ async fn submit_transfer(
 ) -> Result<[u8; 32], ()> {
     let mut tx = Transaction {
         from: wallet.address,
-        to: RECIPIENT,
+        to: wallet.recipient,
         value: TX_VALUE,
         data: vec![],
         gas_limit: 50_000,
@@ -774,7 +881,7 @@ async fn submit_encrypted(
     // (mempool requires non-empty), 100K gas, sign AFTER encryption
     // because the hash covers the ciphertext.
     let access_list = vec![AccessEntry {
-        address: RECIPIENT,
+        address: wallet.recipient,
         reads: Vec::new(),
         writes: Vec::new(),
     }];
@@ -786,7 +893,7 @@ async fn submit_encrypted(
         None,
         CHAIN_ID,
         Vec::new(),
-        &RECIPIENT,
+        &wallet.recipient,
         TX_VALUE,
         &[],
         &tpk,
@@ -1008,10 +1115,11 @@ async fn full_receipt_audit(
     client: &reqwest::Client,
     pool: &UrlPool<'_>,
     hashes: &[[u8; 32]],
-) -> (u64, u64, u64) {
+) -> (u64, u64, u64, u64) {
     let mut ok = 0u64;
     let mut failed = 0u64;
     let mut missing = 0u64;
+    let mut sampled = 0u64;
     let step = if hashes.len() > RECEIPT_AUDIT_CAP {
         hashes.len() / RECEIPT_AUDIT_CAP
     } else {
@@ -1034,9 +1142,10 @@ async fn full_receipt_audit(
             },
             None => missing += 1,
         }
+        sampled += 1;
         tokio::time::sleep(Duration::from_millis(RPC_PACING_MS)).await;
     }
-    (ok, failed, missing)
+    (ok, failed, missing, sampled)
 }
 
 /// Run all 5 post-soak verification checks and print a VERIFICATION
@@ -1070,35 +1179,42 @@ async fn run_verifications(
         "  (1) include-rate (full receipt audit, head_slot={})",
         head_slot
     );
-    let (t_ok, t_fail, t_miss) = full_receipt_audit(client, &pool, &transfer_hashes).await;
-    let (c_ok, c_fail, c_miss) = full_receipt_audit(client, &pool, &call_hashes).await;
+    let (t_ok, t_fail, t_miss, t_sampled) = full_receipt_audit(client, &pool, &transfer_hashes).await;
+    let (c_ok, c_fail, c_miss, c_sampled) = full_receipt_audit(client, &pool, &call_hashes).await;
     let t_landed = t_ok + t_fail;
     let c_landed = c_ok + c_fail;
     let submitted_measure =
         submit_snap.transfer_ok_measure + submit_snap.call_ok_measure;
+    // Audit caps sampling at `RECEIPT_AUDIT_CAP` per kind for large
+    // soaks (else hours of RPC pacing). Report rate as landed/sampled
+    // — extrapolation against `hashes.len()` would underreport the
+    // actual chain-wide include rate when `sampled << submitted`.
     println!(
-        "      transfer landed:  {} / {} submitted ({}%)",
+        "      transfer landed:  {} / {} sampled ({}% of {} submitted)",
         t_landed,
-        transfer_hashes.len(),
-        if transfer_hashes.is_empty() {
+        t_sampled,
+        if t_sampled == 0 {
             0
         } else {
-            t_landed as usize * 100 / transfer_hashes.len()
-        }
+            t_landed as usize * 100 / t_sampled as usize
+        },
+        transfer_hashes.len()
     );
     println!(
-        "      call landed:      {} / {} submitted ({}%)",
+        "      call landed:      {} / {} sampled ({}% of {} submitted)",
         c_landed,
-        call_hashes.len(),
-        if call_hashes.is_empty() {
+        c_sampled,
+        if c_sampled == 0 {
             0
         } else {
-            c_landed as usize * 100 / call_hashes.len()
-        }
+            c_landed as usize * 100 / c_sampled as usize
+        },
+        call_hashes.len()
     );
     println!(
-        "      aggregate landed: {} / {} measurement-window submits",
+        "      aggregate landed: {} / {} sampled ({} measurement-window submits)",
         t_landed + c_landed,
+        t_sampled + c_sampled,
         submitted_measure
     );
     println!("  (2) execution success vs. failure");
@@ -1172,22 +1288,39 @@ async fn run_verifications(
     println!("      execution-success calls (chain-side, measurement window):  {}", c_ok);
     println!("      submitted calls (RPC-accepted, total): {}", submit_snap.call_ok);
 
-    // ── (5) RECIPIENT balance ───────────────────────────────────
-    let recipient_balance = fetch_balance(client, pool.next(), &RECIPIENT)
+    // ── (5) Aggregate recipient balance ─────────────────────────
+    // Each wallet has a dedicated recipient (so parallel scheduling
+    // isn't bottlenecked on a single shared `(RECIPIENT, balance)`
+    // write). Sum each wallet's recipient balance and the legacy
+    // 0x42…42 sentinel (kept around to catch any stray test path
+    // still targeting it) for the equivalent of the old single-
+    // recipient observation.
+    let mut aggregate_recipient_balance: u128 = 0;
+    for w in wallets {
+        let bal = fetch_balance(client, pool.next(), &w.recipient)
+            .await
+            .unwrap_or(0);
+        aggregate_recipient_balance = aggregate_recipient_balance.saturating_add(bal);
+    }
+    let legacy_recipient_balance = fetch_balance(client, pool.next(), &RECIPIENT)
         .await
         .unwrap_or(0);
+    aggregate_recipient_balance =
+        aggregate_recipient_balance.saturating_add(legacy_recipient_balance);
+
     let expected_max = (submit_snap.transfer_ok as u128 + submit_snap.encrypted_ok as u128)
         * TX_VALUE;
-    println!("  (5) RECIPIENT (0x42…42) balance");
+    println!("  (5) per-sender recipient balances (aggregate)");
     println!(
-        "      observed balance: {} (= {} txs of value {})",
-        recipient_balance,
+        "      observed: {} (= {} txs of value {}); legacy 0x42…42 balance: {}",
+        aggregate_recipient_balance,
         if TX_VALUE > 0 {
-            recipient_balance / TX_VALUE
+            aggregate_recipient_balance / TX_VALUE
         } else {
             0
         },
-        TX_VALUE
+        TX_VALUE,
+        legacy_recipient_balance,
     );
     println!(
         "      expected ≤ {} (transfer+encrypted submitted × {})",

@@ -522,6 +522,7 @@ impl PydeNode {
                 address = hex::encode(identity.address),
                 "validator identity loaded"
             );
+            crate::metrics::set_local_address(identity.address);
 
             // Check stake if state is available (non-genesis)
             {
@@ -935,6 +936,29 @@ impl PydeNode {
         // with an unstamped genesis AND no saved head — i.e., the
         // dev-loop / in-process-test case.
         let block_time_ms = self.config.consensus.block_time_ms;
+        // Pin the consensus engine's slot-duration getter to the
+        // same value that drives SlotClock. Otherwise the
+        // view-change timeout would still fire at the spec default
+        // (400 ms) while wall-clock slots advance at the operator's
+        // configured cadence — guaranteed spurious view-changes on
+        // any deployment that doesn't run at 400 ms (WAN testnets,
+        // soak environments, etc.). `set_slot_duration_ms` is
+        // first-writer-wins, so this is the canonical pin for the
+        // process lifetime.
+        let effective_slot_duration_ms =
+            pyde_consensus::view_change::set_slot_duration_ms(block_time_ms);
+        if effective_slot_duration_ms != block_time_ms {
+            warn!(
+                requested_block_time_ms = block_time_ms,
+                effective_slot_duration_ms,
+                "block_time_ms clamped to valid range",
+            );
+        } else {
+            info!(
+                slot_duration_ms = effective_slot_duration_ms,
+                "consensus slot duration set",
+            );
+        }
         let now_ms_for_anchor = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -979,6 +1003,14 @@ impl PydeNode {
             engine.set_slot_anchor(slot_clock_anchor_ms, block_time_ms);
         }
         let mut last_slot = slot_clock.current_slot();
+        // Track the engine's target_height between slot-interval ticks
+        // so the proposer block can fire when chain progress lands a
+        // new target inside the same wall-clock slot (catch-up mode).
+        // See the gate in the `slot_interval.tick()` arm below.
+        let mut last_target_height: u64 = validator_engine
+            .as_ref()
+            .map(|e| e.consensus.target_height)
+            .unwrap_or(0);
 
         // Periodic timers
         // Poll the slot clock 4× per slot so slot transitions are
@@ -1100,6 +1132,37 @@ impl PydeNode {
                         }
                         PostEventAction::SendSyncResponse(channel, response) => {
                             let _ = swarm.behaviour_mut().sync.send_response(channel, response);
+                        }
+                        PostEventAction::AnswerGetBlockByHash(channel, hash) => {
+                            // Resolve in two steps so the proposer (or any
+                            // validator that's already reconstructed the
+                            // body via compact-block) can serve a hash
+                            // that hasn't been applied yet. The original
+                            // sync-side handler only sees applied blocks
+                            // through `chain.hash_to_slot →
+                            // block_store.get_block_raw`, so at 6v+ load
+                            // every peer answered `None` for QC'd-but-
+                            // not-yet-applied slots and the recovery
+                            // path stalled forever.
+                            let from_pending: Option<Vec<u8>> = {
+                                let pbb = pending_block_bodies.read().await;
+                                pbb.get(&hash).map(wire::encode_block)
+                            };
+                            let body_bytes: Option<Vec<u8>> = match from_pending {
+                                Some(bytes) => Some(bytes),
+                                None => {
+                                    let chain_r = chain.read().await;
+                                    chain_r
+                                        .hash_to_slot
+                                        .get(&hash)
+                                        .copied()
+                                        .and_then(|slot| block_store.get_block_raw(slot))
+                                }
+                            };
+                            let _ = swarm
+                                .behaviour_mut()
+                                .sync
+                                .send_response(channel, SyncResp::BlockByHash(body_bytes));
                         }
                         PostEventAction::ReplayCachedGossip(topic) => {
                             // Audit 234 follow-up: race-resolution
@@ -1305,11 +1368,19 @@ impl PydeNode {
                                 None => {
                                     // Task #94: same recovery path as the
                                     // gossip-VC body-unavailable site below.
+                                    // max_peers = 0 → fan out to every
+                                    // connected peer so the slot's
+                                    // proposer (whichever one holds the
+                                    // body in `pending_block_bodies`) is
+                                    // always queried regardless of
+                                    // committee size. 4v needed only 4
+                                    // peers; 6v wedged because the cap
+                                    // excluded the one peer with the body.
                                     let fired = chain_sync.request_block_by_hash(
                                         &mut swarm,
                                         qc_slot,
                                         qc_block_hash,
-                                        4,
+                                        0,
                                     );
                                     info!(
                                         qc_slot,
@@ -1378,6 +1449,14 @@ impl PydeNode {
                                         proposer = hex::encode(block.header.proposer),
                                         "applied block from QC (canonical, RR path)"
                                     );
+                                    // CONSENSUS_INVARIANTS.md O2 (apply-then-advance):
+                                    // target_height advances only after canonical-apply
+                                    // completes, not on QC formation. See the comment
+                                    // at `validator.rs::on_vote` for the bifurcation
+                                    // analysis this commit closes.
+                                    if let Some(engine) = validator_engine.as_mut() {
+                                        engine.advance_target_height(qc_slot + 1);
+                                    }
                                     cast_finality_vote_and_persist(
                                         &mut validator_engine,
                                         &validator_identity,
@@ -1515,6 +1594,65 @@ impl PydeNode {
                                         &hash, req.nonce,
                                     );
                                     sid_to_bytes.entry(sid).or_insert_with(|| etx.to_bytes());
+                                }
+                            }
+                            // Proposers prune committed txs from their mempool — serve them from the block body instead.
+                            {
+                                let pbb = pending_block_bodies.read().await;
+                                if let Some(block) = pbb.get(&req.block_hash) {
+                                    for tx in &block.body.transactions {
+                                        let hash = tx.hash();
+                                        let sid = pyde_net::propagation::compute_short_id(
+                                            &hash, req.nonce,
+                                        );
+                                        sid_to_bytes
+                                            .entry(sid)
+                                            .or_insert_with(|| wire::encode_transaction(tx));
+                                    }
+                                    for blob in &block.body.encrypted_txs {
+                                        if let Some(etx) =
+                                            pyde_mempool::encrypted::EncryptedTx::from_bytes(blob)
+                                        {
+                                            let hash = etx.hash();
+                                            let sid = pyde_net::propagation::compute_short_id(
+                                                &hash, req.nonce,
+                                            );
+                                            sid_to_bytes
+                                                .entry(sid)
+                                                .or_insert_with(|| blob.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            // Applied blocks are no longer in `pending_block_bodies`; fall through to `block_store`.
+                            if let Some(slot) = block_store.get_slot_by_hash(&req.block_hash) {
+                                if let Some(block_bytes) = block_store.get_block_raw(slot) {
+                                    if let Ok(block) = wire::decode_block(&block_bytes) {
+                                        for tx in &block.body.transactions {
+                                            let hash = tx.hash();
+                                            let sid = pyde_net::propagation::compute_short_id(
+                                                &hash, req.nonce,
+                                            );
+                                            sid_to_bytes
+                                                .entry(sid)
+                                                .or_insert_with(|| wire::encode_transaction(tx));
+                                        }
+                                        for blob in &block.body.encrypted_txs {
+                                            if let Some(etx) =
+                                                pyde_mempool::encrypted::EncryptedTx::from_bytes(
+                                                    blob,
+                                                )
+                                            {
+                                                let hash = etx.hash();
+                                                let sid = pyde_net::propagation::compute_short_id(
+                                                    &hash, req.nonce,
+                                                );
+                                                sid_to_bytes
+                                                    .entry(sid)
+                                                    .or_insert_with(|| blob.clone());
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             let txs: Vec<Option<Vec<u8>>> = req
@@ -1840,11 +1978,19 @@ impl PydeNode {
                                     // head; only a hash-keyed request can
                                     // reach the one peer that actually has
                                     // the body.
+                                    // max_peers = 0 → fan out to every
+                                    // connected peer so the slot's
+                                    // proposer (whichever one holds the
+                                    // body in `pending_block_bodies`) is
+                                    // always queried regardless of
+                                    // committee size. 4v needed only 4
+                                    // peers; 6v wedged because the cap
+                                    // excluded the one peer with the body.
                                     let fired = chain_sync.request_block_by_hash(
                                         &mut swarm,
                                         qc_slot,
                                         qc_block_hash,
-                                        4,
+                                        0,
                                     );
                                     info!(
                                         qc_slot,
@@ -1916,6 +2062,10 @@ impl PydeNode {
                                         proposer = hex::encode(block.header.proposer),
                                         "applied block from QC (canonical)"
                                     );
+                                    // CONSENSUS_INVARIANTS.md O2 (apply-then-advance).
+                                    if let Some(engine) = validator_engine.as_mut() {
+                                        engine.advance_target_height(qc_slot + 1);
+                                    }
                                     cast_finality_vote_and_persist(
                                         &mut validator_engine,
                                         &validator_identity,
@@ -2614,13 +2764,53 @@ impl PydeNode {
                 }
                 _ = slot_interval.tick() => {
                     let current_slot = slot_clock.current_slot();
-                    if current_slot > last_slot {
-                        last_slot = current_slot;
+                    let current_target_height = validator_engine
+                        .as_ref()
+                        .map(|e| e.consensus.target_height)
+                        .unwrap_or(0);
+                    let wall_clock_advanced = current_slot > last_slot;
+                    let target_advanced = current_target_height > last_target_height;
+                    // Fire the slot-tick maintenance + proposer block on
+                    // either wall-clock advance OR target-height advance.
+                    // The target-height arm makes catch-up viable: during
+                    // a cold-boot where wall-clock raced ahead of chain
+                    // head by N slots, the chain advances one slot per
+                    // QC (every ~30-50 ms), but the slot_interval poll
+                    // only fires the proposer on wall-clock-slot advance
+                    // (every 400 ms). Without this arm, the happy-path
+                    // proposer for the freshly-advanced target_height
+                    // can't propose until the next wall-clock-slot tick,
+                    // by which point view-change has already fired and
+                    // the cluster is committed to a view-1 fallback. The
+                    // arm lets check_proposer fire as soon as
+                    // target_height advances, so view-0 happy-path
+                    // engages every slot in catch-up.
+                    //
+                    // Most of the inner maintenance (reshare/PSS
+                    // rebroadcast, randomness finalization, epoch
+                    // rotation) is keyed on `engine.consensus.current_slot`
+                    // which only advances on wall-clock, so those calls
+                    // are no-ops on target-only ticks. The check_proposer
+                    // path is the one that benefits, and `check_proposer`
+                    // itself dedups via `seen_proposals[(target_height,
+                    // own_address)]` so a fired-twice condition (target
+                    // advanced AND wall-clock advanced at the same tick)
+                    // can't double-propose.
+                    if wall_clock_advanced || target_advanced {
+                        if wall_clock_advanced {
+                            last_slot = current_slot;
+                        }
+                        if target_advanced {
+                            last_target_height = current_target_height;
+                        }
 
                         // New slot — validator block production
                         if let Some(engine) = validator_engine.as_mut() {
                             let prev_epoch = engine.consensus.current_slot / pyde_consensus::block::EPOCH_LENGTH;
-                            // Sync engine slot to clock (not just +1)
+                            // Sync engine slot to clock (not just +1).
+                            // No-op on target-only ticks (engine already
+                            // at current wall-clock-slot from the prior
+                            // wall-clock-advance entry).
                             while engine.consensus.current_slot < current_slot {
                                 engine.advance_slot();
                             }
@@ -3006,27 +3196,24 @@ impl PydeNode {
                                     let _head = chain_r.head_slot;
                                     drop(chain_r);
 
-                                    // Auto-infer access lists for parallel scheduling.
-                                    // Only run when there are enough txs to benefit from parallelism
-                                    // AND enough CPU headroom (infer cost = ~1 simulation per contract call).
-                                    // On small blocks or resource-constrained nodes, the sequential path
-                                    // is faster than infer + parallel.
-                                    if txs.len() >= 100 {
-                                        let state_r = state.read().await;
-                                        let infer_ctx = pyde_tx::pipeline::BlockContext {
-                                            height: current_slot,
-                                            timestamp: slot_clock.slot_timestamp(current_slot),
-                                            base_fee: chain.read().await.base_fee,
-                                            block_gas_limit: gas_ceiling,
-                                            chain_id: self.config.node.chain_id,
-                                            validator_address: identity.address,
-                                            dev_skip_signature: false,
-                                            block_sigs_pre_verified: false,
-                                        };
-                                        pyde_tx::access_infer::infer_access_lists_batch(
-                                            &mut txs, &*state_r, &infer_ctx,
-                                        );
-                                    }
+                                    // Access lists are part of the FALCON-signed
+                                    // tx preimage (see `Transaction::hash`). The
+                                    // proposer MUST NOT mutate `tx.access_list`
+                                    // — doing so changes `tx.hash()` and breaks
+                                    // signature verification at apply, which
+                                    // shows up as 100% `InvalidSignature`
+                                    // failures on every contract-call tx and
+                                    // cascading view-change fallbacks that
+                                    // wedge the chain.
+                                    //
+                                    // Parallelism for txs that ship empty
+                                    // access lists is a separate redesign:
+                                    // move the proposer-inferred hint into a
+                                    // non-signed scheduling field, or have
+                                    // the SDK fill the access list before
+                                    // signing. Until then, `schedule()` reads
+                                    // the as-signed lists; unkeyed calls fall
+                                    // back to sequential execution.
 
                                     // Build execution schedule: group non-conflicting txs
                                     // for parallel execution (Sealevel-style).
@@ -3116,6 +3303,7 @@ impl PydeNode {
                                         pbb.insert(block.header.hash(), block.clone());
                                     }
                                     let slot_ms = slot_t0.elapsed().as_secs_f64() * 1000.0;
+                                    crate::metrics::set_current_proposer(block.header.proposer);
                                     info!(
                                         slot = current_slot,
                                         txs = block.body.transactions.len(),
@@ -3349,7 +3537,7 @@ impl PydeNode {
                                                         &mut swarm,
                                                         qc_slot,
                                                         qc_hash,
-                                                        4,
+                                                        0,
                                                     );
                                                     info!(
                                                         slot = qc_slot,
@@ -3483,6 +3671,12 @@ impl PydeNode {
                                                         proposer = hex::encode(block.header.proposer),
                                                         "applied block from QC"
                                                     );
+                                                    // CONSENSUS_INVARIANTS.md O2: target_height
+                                                    // advances after apply. `engine` is the outer
+                                                    // scope's `validator_engine.as_mut()` binding
+                                                    // from line ~3338; re-borrowing
+                                                    // `validator_engine` here would conflict.
+                                                    engine.advance_target_height(qc_slot + 1);
                                                 }
                                                 Err(e) => {
                                                     drop(state_w);
@@ -4106,7 +4300,11 @@ impl PydeNode {
                     // network tip; finality_lag = how far behind the
                     // last hard-finality checkpoint. Stable values
                     // for finality_lag are ~2 slots in steady state.
-                    let local_head = chain.read().await.head_slot;
+                    let chain_r = chain.read().await;
+                    let local_head = chain_r.head_slot;
+                    let base_fee_now = chain_r.base_fee;
+                    let epoch_now = chain_r.epoch;
+                    drop(chain_r);
                     let network_tip = chain_sync.manager.network_tip;
                     crate::metrics::record_block_lag(local_head, network_tip);
                     let last_cp = validator_engine
@@ -4114,6 +4312,21 @@ impl PydeNode {
                         .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|cp| cp.slot))
                         .unwrap_or(0);
                     crate::metrics::record_finality_lag(local_head, last_cp);
+
+                    // Snapshot refresh for TUI dashboard. These
+                    // values change infrequently relative to per-block
+                    // throughput, so populating them here (10s ticks)
+                    // is more than fresh enough for a 1Hz render.
+                    crate::metrics::set_finalized_slot(last_cp);
+                    // base_fee is u128 on-chain but always fits in
+                    // u64 within human-meaningful bounds (cap is
+                    // ~10^14 quanta). Saturate just in case.
+                    crate::metrics::set_base_fee(base_fee_now.min(u64::MAX as u128) as u64);
+                    crate::metrics::set_epoch(epoch_now);
+                    if let Some(eng) = validator_engine.as_ref() {
+                        let cs = eng.committee_keys_for_slot(local_head).len();
+                        crate::metrics::set_committee_size(cs);
+                    }
 
                     // Plaintext mempool TTL sweep (MAINNET_PLAN M2).
                     // Any tx that's been pending for more than
@@ -4352,7 +4565,7 @@ impl PydeNode {
     }
 }
 
-use pyde_net::sync_protocol::SyncResp;
+use pyde_net::sync_protocol::{SyncReq, SyncResp};
 
 /// Action to take after processing a swarm event (avoids borrow conflicts with swarm).
 enum PostEventAction {
@@ -4360,6 +4573,22 @@ enum PostEventAction {
     #[allow(dead_code)]
     RequestChainTip(PeerId),
     SendSyncResponse(request_response::ResponseChannel<SyncResp>, SyncResp),
+    /// `GetBlockByHash` resolved with access to `pending_block_bodies`.
+    /// The sync handler's synchronous path can only see
+    /// `chain.hash_to_slot` + `block_store`, both of which are
+    /// populated on apply — so a peer that has the body in
+    /// `pending_block_bodies` (received-but-not-yet-applied) answers
+    /// `BlockByHash(None)` even though it holds exactly the bytes
+    /// the requester needs. At 6+ validators under sustained load
+    /// the recovery path then never finds a peer that can serve
+    /// the body and the chain wedges on `target_height` waiting
+    /// for an apply that can't happen.
+    ///
+    /// The action loop processes this variant: snapshots
+    /// `pending_block_bodies` for the hash, falls back to
+    /// `chain.hash_to_slot → block_store.get_block_raw`, and sends
+    /// the encoded bytes (or `None` if neither source has it).
+    AnswerGetBlockByHash(request_response::ResponseChannel<SyncResp>, [u8; 32]),
     /// Audit 396: emitted after a Sync RR response has been applied.
     /// Carries the per-slot receipts batch produced by sync-applied
     /// blocks so the action handler can persist them in the same
@@ -5837,6 +6066,7 @@ fn handle_swarm_event(
                                         ref proposer_signature,
                                     } => {
                                         info!(slot = header.slot, "received proposal");
+                                        crate::metrics::set_current_proposer(header.proposer);
                                         // Buffer the proposal for VRF-based selection.
                                         // Voting happens after the proposal collection window
                                         // via select_and_vote (triggered by slot timer).
@@ -5974,14 +6204,23 @@ fn handle_swarm_event(
             peer,
         })) => {
             debug!(%peer, "inbound sync request");
-            let response = ChainSync::handle_inbound_request(
-                &request,
-                chain,
-                state,
-                block_store,
-                pinned_snapshot,
-            );
-            PostEventAction::SendSyncResponse(channel, response)
+            // Defer `GetBlockByHash` to the action loop where
+            // `pending_block_bodies` is reachable — needed for
+            // received-but-not-yet-applied recovery (the 6v+ wedge).
+            // Everything else resolves synchronously from
+            // chain/state/block_store/pinned_snapshot.
+            if let SyncReq::GetBlockByHash(hash) = &request {
+                PostEventAction::AnswerGetBlockByHash(channel, *hash)
+            } else {
+                let response = ChainSync::handle_inbound_request(
+                    &request,
+                    chain,
+                    state,
+                    block_store,
+                    pinned_snapshot,
+                );
+                PostEventAction::SendSyncResponse(channel, response)
+            }
         }
 
         // --- Sync: response to our outbound request ---
