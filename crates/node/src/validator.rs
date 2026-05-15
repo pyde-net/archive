@@ -3547,8 +3547,18 @@ impl ValidatorEngine {
             self.seen_evidence.retain(|(s, _)| *s >= prune_before);
             // Mirror the same pruning on disk so the evidence index does not
             // grow unbounded. Best-effort: a failure here just delays cleanup.
+            //
+            // PROPOSAL_PREFIX uses `prune_floor` to match in-memory
+            // `seen_proposals` — without it, a crash-during-wedge →
+            // restart loses the self-dedup entry for the stuck
+            // target_height on disk and the post-restart proposer
+            // can re-build at `(target_height, view=0)` with a
+            // fresh `timestamp`, equivocating against its own pre-
+            // crash proposal. VOTE_PREFIX and VC_SELF_PREFIX use
+            // the wall-clock window because their write paths are
+            // inbound-only.
             if let Some(store) = &self.consensus_store {
-                if let Err(e) = store.prune_evidence_before(prune_before) {
+                if let Err(e) = store.prune_evidence_before(prune_floor, prune_before) {
                     warn!(error = %e, "failed to prune evidence on disk");
                 }
             }

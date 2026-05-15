@@ -411,14 +411,38 @@ impl ConsensusStateStore {
         out
     }
 
-    /// Delete all seen-proposal, seen-vote, and self-VC entries
-    /// with slot < prune_before. Mirrors the in-memory pruning
-    /// in `ValidatorEngine::advance_slot`.
-    pub fn prune_evidence_before(&self, prune_before: u64) -> Result<usize, String> {
+    /// Delete on-disk evidence-index entries below the per-bucket
+    /// floors. Mirrors the in-memory pruning in
+    /// `ValidatorEngine::advance_slot`.
+    ///
+    /// `proposal_floor` governs `PROPOSAL_PREFIX` entries. It MUST
+    /// match the in-memory `seen_proposals` clamp
+    /// (`prune_floor = min(wall-clock-window, target_height)`).
+    /// Without that match, a crash-during-wedge → restart erases
+    /// the self-dedup entry for the stuck `target_height` on disk;
+    /// the post-restart proposer then rebuilds the same
+    /// `(target_height, view=0)` with a fresh `timestamp` (different
+    /// `block_hash`), which is a proposer-equivocation signature
+    /// honest peers slash on.
+    ///
+    /// `vote_vc_floor` governs `VOTE_PREFIX` and `VC_SELF_PREFIX`
+    /// entries. The strict wall-clock window
+    /// (`current_slot - 10`) is the right floor for these — they
+    /// are read by inbound-message handlers only, not by our own
+    /// build path, so wedges don't alter their correctness window.
+    pub fn prune_evidence_before(
+        &self,
+        proposal_floor: u64,
+        vote_vc_floor: u64,
+    ) -> Result<usize, String> {
         let mut batch = WriteBatch::default();
         let mut count = 0usize;
 
-        for prefix in [PROPOSAL_PREFIX, VOTE_PREFIX, VC_SELF_PREFIX] {
+        for (prefix, floor) in [
+            (PROPOSAL_PREFIX, proposal_floor),
+            (VOTE_PREFIX, vote_vc_floor),
+            (VC_SELF_PREFIX, vote_vc_floor),
+        ] {
             for item in self
                 .db
                 .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
@@ -437,7 +461,7 @@ impl ConsensusStateStore {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(slot_bytes);
                 let slot = u64::from_be_bytes(buf);
-                if slot < prune_before {
+                if slot < floor {
                     batch.delete(&k);
                     count += 1;
                 }
@@ -453,7 +477,12 @@ impl ConsensusStateStore {
             self.db
                 .write_opt(batch, &self.sync_opts)
                 .map_err(|e| format!("failed to prune evidence: {}", e))?;
-            debug!(pruned = count, prune_before, "evidence pruned");
+            debug!(
+                pruned = count,
+                proposal_floor,
+                vote_vc_floor,
+                "evidence pruned"
+            );
         }
         Ok(count)
     }
@@ -750,8 +779,9 @@ mod tests {
         assert_eq!(store.load_all_seen_proposals().len(), 15);
         assert_eq!(store.load_all_seen_votes().len(), 15);
 
-        // Keep last 10 slots: slots < 6 should be pruned.
-        let pruned = store.prune_evidence_before(6).unwrap();
+        // Steady-state pruning (both floors at 6): slots < 6 pruned
+        // across PROPOSAL + VOTE prefixes.
+        let pruned = store.prune_evidence_before(6, 6).unwrap();
         assert_eq!(pruned, 10); // 5 proposals + 5 votes
 
         let props = store.load_all_seen_proposals();
@@ -760,6 +790,41 @@ mod tests {
         assert_eq!(votes.len(), 10);
         assert!(props.iter().all(|((slot, _), _)| *slot >= 6));
         assert!(votes.iter().all(|((slot, _), _)| *slot >= 6));
+    }
+
+    /// Wedge-protection on disk: when `target_height` is stuck
+    /// below the wall-clock window, `proposal_floor` clamps to
+    /// `target_height` while `vote_vc_floor` keeps the wall-clock
+    /// window. Verifies that PROPOSAL_PREFIX entries survive while
+    /// VOTE_PREFIX prunes normally.
+    #[test]
+    fn prune_keeps_proposals_for_wedged_target_height() {
+        let dir = tempdir().unwrap();
+        let store = ConsensusStateStore::open(dir.path()).unwrap();
+
+        for slot in 1..=15u64 {
+            store
+                .save_seen_proposal(slot, &[0xAA; 32], &dummy_header(slot), &[0x11; 10])
+                .unwrap();
+            store
+                .save_seen_vote(slot, 0, &[0x77; 32], &[0x22; 10])
+                .unwrap();
+        }
+
+        // proposal_floor = 4 (target_height stuck at 4), vote_vc_floor = 6
+        // (wall-clock - 10). Proposals 4-15 survive (12); votes 6-15
+        // survive (10). Pruned = 3 + 5 = 8.
+        let pruned = store.prune_evidence_before(4, 6).unwrap();
+        assert_eq!(pruned, 8);
+
+        let props = store.load_all_seen_proposals();
+        let votes = store.load_all_seen_votes();
+        assert_eq!(props.len(), 12);
+        assert_eq!(votes.len(), 10);
+        assert!(props.iter().all(|((slot, _), _)| *slot >= 4));
+        assert!(votes.iter().all(|((slot, _), _)| *slot >= 6));
+        // The wedge-anchor entry survives.
+        assert!(props.iter().any(|((slot, _), _)| *slot == 4));
     }
 
     #[test]
