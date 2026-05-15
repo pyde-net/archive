@@ -3473,9 +3473,36 @@ impl ValidatorEngine {
         // clamp keeps target_height (and everything above) intact
         // on the wedged path while preserving the original 10-slot
         // window on the healthy path. Equivocation-detection state
-        // (`seen_votes`, `seen_proposals`, `seen_view_changes`)
-        // still anchors on the original wall-clock window so its
-        // gossip-replay protection isn't affected by wedges.
+        // (`seen_votes`, `seen_view_changes`) still anchors on the
+        // original wall-clock window so its gossip-replay
+        // protection isn't affected by wedges — those entries are
+        // read-only at use time.
+        //
+        // `seen_proposals` is the exception: in addition to
+        // equivocation detection (`buffer_proposal` checks for an
+        // existing entry at `(slot, proposer)` to fire
+        // double-propose evidence), `check_proposer` reads it to
+        // gate self-proposal at view 0 — once we've built a
+        // proposal at `target_height = N`, we MUST NOT build a
+        // second one (different `timestamp` → different
+        // `block_hash`), or honest peers see two valid signed
+        // headers from us at the same `(slot, view=0)` and slash
+        // us. With wall-clock-only pruning, a >10-slot wedge
+        // erased our self-dedup entry for the wedged
+        // `target_height` while wall-clock kept advancing — the
+        // proposer then rebuilt the same `(target_height, view=0)`
+        // every tick. The 2-2 split-brain wedge observed under
+        // 1500 TPS load happened to prune in lockstep across the
+        // cluster so no peer caught the equivocation, but a
+        // peer that recovered late would. Clamping `seen_proposals`
+        // with `prune_floor` keeps our self-dedup entry alive for
+        // the duration of the wedge at no detectable memory cost
+        // (max 4 entries per stuck slot in a 4-validator
+        // committee). The same argument doesn't apply to
+        // `seen_votes` / `seen_view_changes` — those are written
+        // by inbound-message handlers, not consulted by our own
+        // build path, so the original 10-slot wall-clock window
+        // is correct for them.
         if new_slot > 10 {
             let prune_before = new_slot - 10;
             let prune_floor = std::cmp::min(prune_before, self.consensus.target_height);
@@ -3488,7 +3515,7 @@ impl ValidatorEngine {
                 .retain(|s, _| *s >= prune_floor);
             self.last_built_fallback_view_per_slot
                 .retain(|s, _| *s >= prune_floor);
-            self.seen_proposals.retain(|(s, _), _| *s >= prune_before);
+            self.seen_proposals.retain(|(s, _), _| *s >= prune_floor);
             self.seen_votes.retain(|(s, _), _| *s >= prune_before);
             // Audit 327: prune the dedup sets in lockstep with their
             // backing per-slot Vecs so the sets don't grow unbounded
@@ -4999,6 +5026,15 @@ mod tests {
         assert_eq!(engine.seen_proposals.len(), 15);
         assert_eq!(engine.seen_votes.len(), 15);
 
+        // Simulate that the chain has progressed past slot 5 too,
+        // so the `seen_proposals` `prune_floor = min(prune_before,
+        // target_height)` clamp doesn't pin entries for the wedged-
+        // chain case (see `advance_slot`'s doc-comment). With
+        // target_height = 1 (default), the clamp would keep slots
+        // 1-4 in memory and this test would assert against the
+        // wedge-protected behaviour, not the steady-state prune we
+        // want to verify here.
+        engine.consensus.target_height = 5;
         // Jump to slot 15 (prune removes slot < new_slot - 10 = 5).
         engine.consensus.current_slot = 14;
         engine.advance_slot(); // new_slot = 15, prune_before = 5
@@ -5012,6 +5048,47 @@ mod tests {
         let on_disk_votes = store.load_all_seen_votes();
         assert!(on_disk_props.iter().all(|((s, _), _)| *s >= 5));
         assert!(on_disk_votes.iter().all(|((s, _), _)| *s >= 5));
+    }
+
+    /// Companion to `advance_slot_prunes_evidence_on_disk`: when
+    /// the chain is wedged (`target_height` stuck while wall-clock
+    /// advances past the 10-slot window), `seen_proposals` entries
+    /// for slots ≥ `target_height` MUST survive pruning. Without
+    /// this, `check_proposer`'s self-dedup gate evaporates and the
+    /// proposer rebuilds the same `(target_height, view=0)` every
+    /// wall-clock tick — each build has a fresh `timestamp` so the
+    /// block_hash differs, which is the proposer-equivocation
+    /// signature peers slash on.
+    #[test]
+    fn advance_slot_keeps_seen_proposals_for_wedged_target_height() {
+        let mut engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
+        // Seed proposer-self entries at slots 1..=15 directly so we
+        // don't need the on-disk plumbing for this test.
+        for slot in 1..=15u64 {
+            engine.seen_proposals.insert(
+                (slot, [0xAA; 32]),
+                (evidence_header(slot, [0x33; 32]), vec![0x11; 10]),
+            );
+        }
+        assert_eq!(engine.seen_proposals.len(), 15);
+
+        // Wedge: target_height pinned at 4, wall-clock racing ahead.
+        // Pre-fix this would have pruned all entries below `slot - 10`
+        // (= 5), erasing slot 4's self-dedup entry while target_height
+        // is still trying to commit there.
+        engine.consensus.target_height = 4;
+        engine.consensus.current_slot = 14;
+        engine.advance_slot(); // new_slot = 15, prune_before = 5
+
+        // prune_floor = min(5, 4) = 4 → slot-1..=3 pruned, slot-4+
+        // kept (including the wedge-anchor entry at slot 4).
+        assert!(
+            engine
+                .seen_proposals
+                .contains_key(&(4u64, [0xAA; 32])),
+            "self-dedup entry at wedged target_height must survive prune"
+        );
+        assert!(engine.seen_proposals.iter().all(|((s, _), _)| *s >= 4));
     }
 
     // ========== Pending evidence drain/push ==========
