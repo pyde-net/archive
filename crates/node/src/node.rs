@@ -4186,33 +4186,6 @@ impl PydeNode {
                                             let _ = block_store.put_header(&header);
                                             let _ = block_store.put_head(fallback_slot);
                                             chain_sync.on_block_processed(fallback_slot);
-                                            // audit-413: every other apply site
-                                            // calls `engine.advance_target_height`
-                                            // alongside the chain-head update —
-                                            // see lines 1458, 2067, 3679 (the
-                                            // canonical-apply paths). Without
-                                            // this call here the proposer's own
-                                            // fallback applies the block to its
-                                            // chain head but leaves the
-                                            // validator engine pinned to the
-                                            // old `target_height`, so
-                                            // `select_and_vote` keeps querying
-                                            // buffered_proposals at the stale
-                                            // slot and the next slot's
-                                            // proposal sits unvoted in the
-                                            // buffer. Caught at slot 6626 in
-                                            // soak v18: node-3 built the
-                                            // fallback (mine=3), `applied own
-                                            // fallback block` logged at
-                                            // 19:26:03.350, but at
-                                            // 19:26:03.754 target_height was
-                                            // still 6626 — slot 6627's vote
-                                            // came up 2-of-4 because of this
-                                            // node alone, and the cluster
-                                            // wedged.
-                                            engine.advance_target_height(
-                                                fallback_slot + 1,
-                                            );
                                             info!(slot = fallback_slot, "applied own fallback block");
                                         }
                                         drop(state_w);
