@@ -570,6 +570,16 @@ fn mixed_workload_load_test() {
     let measurement_start_at = run_start + Duration::from_secs(warmup_s);
     let run_deadline = run_start + Duration::from_secs(total_run_s);
 
+    // Watchdog: shared flag flipped by the watchdog task when it
+    // observes no head advance for `WEDGE_STALL_THRESHOLD`. Sender
+    // tasks check this flag and early-exit instead of hammering a
+    // wedged chain for the rest of the soak window (a 4 h run
+    // wasting 3 h 50 min after a wedge at minute 10 is worse than
+    // useless — it makes the post-run digest harder to read and
+    // burns CI / operator time).
+    let wedge_detected =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     runtime.block_on(async {
         let mut tasks = Vec::with_capacity(num_senders);
         for (i, w) in wallets.iter().enumerate() {
@@ -583,6 +593,7 @@ fn mixed_workload_load_test() {
             let deadline = run_deadline;
             let cnt_addr = counter_addr;
             let tpk_bytes = threshold_pk_bytes.clone();
+            let wedge_flag = wedge_detected.clone();
 
             tasks.push(tokio::spawn(async move {
                 let mut nonce = 1u64; // nonce 0 was RegisterPubkey
@@ -591,6 +602,15 @@ fn mixed_workload_load_test() {
                 loop {
                     let now = Instant::now();
                     if now >= deadline {
+                        break;
+                    }
+                    if wedge_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Watchdog flagged a wedge — early-exit so we
+                        // don't keep submitting txs into a chain that
+                        // can't include them. Avoids drowning the
+                        // wedge-dump tail in InvalidNonce::AboveWindow
+                        // noise that would otherwise mask the root
+                        // cause in the per-node log dumps.
                         break;
                     }
                     if now < next_submit {
@@ -692,11 +712,114 @@ fn mixed_workload_load_test() {
             }
         });
 
+        // Wedge watchdog: poll each node's `eth_blockNumber` every
+        // `WATCHDOG_POLL_INTERVAL`. If no node has advanced its head
+        // for `WATCHDOG_STALL_THRESHOLD`, dump the last N lines of
+        // each node's stdout (captured via `node_outputs`), set the
+        // shared `wedge_detected` flag (which early-exits the sender
+        // tasks), and return. The outer `block_on` finishes, and the
+        // post-block_on `wedge_detected` check panics the test with
+        // a descriptive message + file pointers — instead of letting
+        // a wedge at minute 10 of a 4 h soak burn the remaining 3 h
+        // 50 min sending traffic into a chain that can't include it.
+        //
+        // 30 s poll / 60 s stall threshold gives the chain one full
+        // wall-clock-slot epoch (= 75 slots at 400 ms cadence) to
+        // recover via view-change + fallback before we call it
+        // wedged. Lower thresholds catch shorter wedges; higher ones
+        // tolerate brief stalls (e.g. heavy compaction). 60 s is
+        // generous given the chain's normal heartbeat is < 1 s.
+        const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(30);
+        const WATCHDOG_STALL_THRESHOLD: Duration = Duration::from_secs(60);
+        const WATCHDOG_DUMP_LINES: usize = 5_000;
+        let wd_flag = wedge_detected.clone();
+        let wd_outputs = node_outputs.clone();
+        let wd_urls = rpc_urls.clone();
+        let wd_client = client.clone();
+        let wd_deadline = run_deadline;
+        let watchdog_task = tokio::spawn(async move {
+            let mut last_heads: Vec<Option<u64>> = vec![None; wd_urls.len()];
+            let mut last_advance = Instant::now();
+            loop {
+                tokio::time::sleep(WATCHDOG_POLL_INTERVAL).await;
+                if Instant::now() >= wd_deadline {
+                    break;
+                }
+                let mut current_heads = Vec::with_capacity(wd_urls.len());
+                let mut any_advanced = false;
+                for (i, url) in wd_urls.iter().enumerate() {
+                    let head = fetch_block_number(&wd_client, url).await;
+                    current_heads.push(head);
+                    match (head, last_heads[i]) {
+                        (Some(curr), Some(prev)) if curr > prev => any_advanced = true,
+                        (Some(_), None) => any_advanced = true,
+                        _ => {}
+                    }
+                }
+                if any_advanced {
+                    last_advance = Instant::now();
+                    last_heads = current_heads.clone();
+                    println!(
+                        "  [watchdog] heads: {:?} (last advance: just now)",
+                        current_heads,
+                    );
+                    continue;
+                }
+                let stalled_for = Instant::now().duration_since(last_advance);
+                println!(
+                    "  [watchdog] heads: {:?} (NO ADVANCE for {} s)",
+                    current_heads,
+                    stalled_for.as_secs(),
+                );
+                if stalled_for >= WATCHDOG_STALL_THRESHOLD {
+                    eprintln!(
+                        "\n*** WEDGE DETECTED: no head advance for {} s ***",
+                        stalled_for.as_secs(),
+                    );
+                    eprintln!(
+                        "    per-node last head: {:?}",
+                        current_heads,
+                    );
+                    for (i, handle) in wd_outputs.iter().enumerate() {
+                        let lines = handle.lock().unwrap().clone();
+                        let path = format!(
+                            "/tmp/pyde-soak-wedge-node-{}.log",
+                            i,
+                        );
+                        let tail: Vec<String> = lines
+                            .iter()
+                            .rev()
+                            .take(WATCHDOG_DUMP_LINES)
+                            .rev()
+                            .cloned()
+                            .collect();
+                        let _ = std::fs::write(&path, tail.join("\n"));
+                        eprintln!(
+                            "    [node-{}] last head={:?}, log tail ({} lines) → {}",
+                            i,
+                            current_heads.get(i).and_then(|h| *h),
+                            tail.len(),
+                            path,
+                        );
+                    }
+                    wd_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+
         for t in tasks {
             let _ = t.await;
         }
         let _ = progress_task.await;
+        let _ = watchdog_task.await;
     });
+
+    if wedge_detected.load(std::sync::atomic::Ordering::SeqCst) {
+        panic!(
+            "soak watchdog flagged a wedge — see /tmp/pyde-soak-wedge-node-*.log for per-node tails"
+        );
+    }
 
     // ── Settle + report ─────────────────────────────────────────
     println!("\n  Settling 20 s for final inclusion…");
