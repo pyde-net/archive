@@ -6071,6 +6071,68 @@ fn handle_swarm_event(
                                         // Voting happens after the proposal collection window
                                         // via select_and_vote (triggered by slot timer).
                                         engine.buffer_proposal(header, proposer_signature);
+
+                                        // Single-slot catch-up via embedded qc_previous.
+                                        // Symptom we're patching: under sustained mixed
+                                        // load (1500 TPS soak), gossipsub vote delivery
+                                        // slips just enough that the cluster splits 2-2
+                                        // on QC formation — pair A forms QC for slot N
+                                        // and advances target_height to N+1, while
+                                        // pair B has its own vote + one peer's vote
+                                        // (only 2 of 3 needed for QC) and gets stuck at
+                                        // target_height = N. The N+1 proposal pair A
+                                        // sends carries `qc_previous = QC(slot N)`
+                                        // (verifiable via committee_keys), which is
+                                        // exactly the proof pair B is missing. Pre-fix
+                                        // pair B buffered this proposal but its
+                                        // `select_and_vote` path keys on
+                                        // `target_height` (N, not N+1) so create_vote
+                                        // never ran and the embedded QC was dropped on
+                                        // the floor. Triggering the canonical-apply
+                                        // path here makes pair B self-heal from the
+                                        // next proposer's parent QC.
+                                        //
+                                        // Single-slot only (`head + 1`); multi-slot lag
+                                        // still needs the chain-sync protocol because
+                                        // the canonical-apply path applies one slot per
+                                        // call (the next slot's body / parent_hash
+                                        // chain hasn't been assembled). `verify_qc`
+                                        // against the slot's committee keys catches a
+                                        // byzantine proposer trying to fabricate a
+                                        // qc_previous to force-apply a bad block.
+                                        // Promoting into `highest_qc` mirrors what
+                                        // `create_vote` would have done if the proposal
+                                        // had been selected for voting, so the
+                                        // apply-then-advance bookkeeping that runs in
+                                        // `ApplyCanonicalAfterQc` sees consistent
+                                        // state.
+                                        let head = chain.head_slot;
+                                        if header.qc_previous.slot > 0
+                                            && header.qc_previous.slot == head + 1
+                                            && header.qc_previous.slot
+                                                > engine.consensus.highest_qc.slot
+                                        {
+                                            let qc_keys = engine
+                                                .committee_keys_for_slot(
+                                                    header.qc_previous.slot,
+                                                )
+                                                .to_vec();
+                                            if pyde_consensus::hotstuff::verify_qc(
+                                                &header.qc_previous,
+                                                &qc_keys,
+                                                chain.chain_id,
+                                            ) {
+                                                engine.consensus.highest_qc =
+                                                    header.qc_previous.clone();
+                                                return PostEventAction::ApplyCanonicalAfterQc {
+                                                    qc_slot: header.qc_previous.slot,
+                                                    qc_block_hash: header
+                                                        .qc_previous
+                                                        .block_hash,
+                                                };
+                                            }
+                                        }
+
                                         // Same detection-then-relay pattern as when we
                                         // produce our own proposal: buffering a received
                                         // proposal can reveal it conflicts with one we
