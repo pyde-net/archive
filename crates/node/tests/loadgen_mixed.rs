@@ -808,11 +808,79 @@ fn mixed_workload_load_test() {
             }
         });
 
+        // Soak checkpoint task: every 5 min, emit a per-node summary
+        // line so a tail -F of the run output is enough to track
+        // mid-soak progress without grepping validator logs. Distinct
+        // from the 10 s progress reporter (which reports SENDER-side
+        // tx counts) and the 30 s watchdog (which only fires on
+        // wedge): this one is the chain-side health heartbeat for
+        // multi-hour runs. Cheap (one `pyde_blockNumber` +
+        // `pyde_mempoolSize` per node per 5 min) so it stays on even
+        // for short runs — short runs just see one entry.
+        const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(300);
+        let cp_urls = rpc_urls.clone();
+        let cp_client = client.clone();
+        let cp_deadline = run_deadline;
+        let cp_flag = wedge_detected.clone();
+        let checkpoint_task = tokio::spawn(async move {
+            // Track ms-since-last-head-advance per node so a slow drift
+            // (cadence inching past 400 ms) is visible per-checkpoint
+            // even if the watchdog's stall threshold isn't crossed.
+            let mut last_heads: Vec<Option<u64>> = vec![None; cp_urls.len()];
+            let mut last_advance_at: Vec<Instant> =
+                vec![Instant::now(); cp_urls.len()];
+            loop {
+                tokio::time::sleep(CHECKPOINT_INTERVAL).await;
+                if Instant::now() >= cp_deadline {
+                    break;
+                }
+                if cp_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Watchdog already flagged a wedge — don't compete
+                    // with its dump output.
+                    break;
+                }
+                let now = Instant::now();
+                println!(
+                    "  [chkpt @ T+{:>5}s] node | head | epoch | ms_since_apply | mempool",
+                    now.duration_since(run_start).as_secs(),
+                );
+                for (i, url) in cp_urls.iter().enumerate() {
+                    let head = fetch_block_number(&cp_client, url).await;
+                    let mempool = fetch_mempool_size(&cp_client, url).await;
+                    if let (Some(curr), Some(prev)) = (head, last_heads[i]) {
+                        if curr > prev {
+                            last_advance_at[i] = now;
+                        }
+                    } else if head.is_some() && last_heads[i].is_none() {
+                        last_advance_at[i] = now;
+                    }
+                    last_heads[i] = head;
+                    let head_str = head
+                        .map(|h| h.to_string())
+                        .unwrap_or_else(|| "??".into());
+                    let epoch_str = head
+                        .map(|h| (h / pyde_consensus::block::EPOCH_LENGTH).to_string())
+                        .unwrap_or_else(|| "??".into());
+                    let ms_since = now
+                        .duration_since(last_advance_at[i])
+                        .as_millis();
+                    let mempool_str = mempool
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "??".into());
+                    println!(
+                        "             node-{} | {:>5} | {:>5} | {:>14} | {:>7}",
+                        i, head_str, epoch_str, ms_since, mempool_str,
+                    );
+                }
+            }
+        });
+
         for t in tasks {
             let _ = t.await;
         }
         let _ = progress_task.await;
         let _ = watchdog_task.await;
+        let _ = checkpoint_task.await;
     });
 
     if wedge_detected.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1455,6 +1523,15 @@ async fn run_verifications(
 /// Query `pyde_blockNumber`. Returns the current head slot.
 async fn fetch_block_number(client: &reqwest::Client, url: &str) -> Option<u64> {
     let resp = rpc_call(client, url, "pyde_blockNumber", "").await;
+    let raw = resp.get("result")?.as_str()?;
+    u64::from_str_radix(raw.strip_prefix("0x").unwrap_or(raw), 16).ok()
+}
+
+/// Query `pyde_mempoolSize` — used by the soak checkpoint task to
+/// surface monotonic mempool growth (a leak signature) during
+/// multi-hour runs without needing to grep validator logs.
+async fn fetch_mempool_size(client: &reqwest::Client, url: &str) -> Option<u64> {
+    let resp = rpc_call(client, url, "pyde_mempoolSize", "").await;
     let raw = resp.get("result")?.as_str()?;
     u64::from_str_radix(raw.strip_prefix("0x").unwrap_or(raw), 16).ok()
 }
