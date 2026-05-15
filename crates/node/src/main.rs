@@ -19,21 +19,23 @@
 /// flipped. Treat it as a hard-fork-level switch — don't mix
 /// builds on the same network.
 ///
-/// **Currently off** while we soak-test correctness, throughput
-/// and stability without the threshold-encryption layer. The
-/// underlying primitives (Kyber-768 threshold KEM via `pyde-crypto`,
-/// per-block decryption coordinator, encrypted gossip topic) stay
-/// compiled in and exercised by their own unit tests; we are only
-/// removing them from the runtime pipeline.
+/// **On for testnet.** Public testnet ships with the threshold-
+/// encryption pipeline live end-to-end: the RPC endpoints accept
+/// encrypted-tx payloads, validators subscribe to the encrypted-
+/// tx gossip topic, proposers include encrypted-tx bundles in
+/// blocks, and the per-block decryption coordinator runs against
+/// real gossip. Earlier `false` was a soak-test convenience while
+/// we stabilised the chain without the threshold-encryption
+/// layer; that exercise is complete.
 ///
 /// **Trust framing for marketing copy:** the threshold-encryption
 /// design in this codebase is rotating-dealer per-epoch key
 /// escrow, NOT trustless threshold ML-KEM (which is a 2025-2026
-/// research frontier). Re-enabling this flag for production
-/// requires either landing the post-fundraise lattice-DKG work
-/// (task #101) or explicit documented acceptance of the rotating-
-/// dealer trust model.
-pub const MEV_PROTECTION_ENABLED: bool = false;
+/// research frontier). The testnet trust model is therefore
+/// rotating-dealer; mainnet either lands the post-fundraise
+/// lattice-DKG work (task #101) or ships with explicit documented
+/// acceptance of the rotating-dealer model.
+pub const MEV_PROTECTION_ENABLED: bool = true;
 
 mod aot_cache;
 mod block_builder;
