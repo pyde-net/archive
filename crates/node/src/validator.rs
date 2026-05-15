@@ -319,6 +319,22 @@ pub struct ValidatorEngine {
     finality_votes: HashMap<u64, Vec<FinalityVote>>,
     /// Buffered proposals per slot (collected during proposal phase, voted after selection).
     buffered_proposals: HashMap<u64, Vec<BufferedProposal>>,
+    /// audit-412: fallback proposals that arrived BEFORE this node's
+    /// view-change-QC for the slot formed. Pre-412 these were
+    /// dropped (`buffer_fallback_proposal` returned false). Under
+    /// load the race window between gossip-receive of the proposal
+    /// and local VC-QC formation is ~10–150 ms, long enough that
+    /// peers' gossipsub-level dedup then suppresses any re-delivery
+    /// — the proposal was permanently lost on the late-VC-QC node,
+    /// and 2-of-4 votes from the other peers couldn't form a vote
+    /// QC (3-of-4 required). Result: chain wedged at the post-rotation
+    /// view-1 fallback slot 3459 in a 1000-TPS soak. We now stash
+    /// the proposal here and drain it the instant our VC-QC forms
+    /// (see `on_view_change` first-formation branch). Size-capped per
+    /// slot so a malicious peer can't fill memory with garbage
+    /// fallback headers; honest validators emit one fallback per
+    /// view, so a small cap is sufficient.
+    deferred_fallback_proposals: HashMap<u64, Vec<(BlockHeader, Vec<u8>)>>,
     /// Highest view at which we've voted on each slot (audit-94).
     /// Voting at `(slot, view=0)` does NOT lock out voting at
     /// `(slot, view=1)` on the deterministic recovery proposal —
@@ -574,6 +590,7 @@ impl ValidatorEngine {
             view_changes: HashMap::new(),
             finality_votes: HashMap::new(),
             buffered_proposals: HashMap::new(),
+            deferred_fallback_proposals: HashMap::new(),
             voted_view_per_slot: std::collections::HashMap::new(),
             last_built_fallback_view_per_slot: std::collections::HashMap::new(),
             seen_proposals: HashMap::new(),
@@ -2198,13 +2215,44 @@ impl ValidatorEngine {
 
         // Local view-change-QC for this slot is required to
         // recognize the legitimate fallback proposer. Without it,
-        // we have no way to validate the proposal; reject and let
-        // our own view-change-QC formation catch up.
+        // we have no way to validate the proposal here.
+        //
+        // audit-412: stash the proposal in `deferred_fallback_proposals`
+        // so `on_view_change` can drain + re-attempt it the instant
+        // our own VC-QC forms. Pre-412 this branch dropped the
+        // proposal outright; the gossipsub mesh's own dedup then
+        // suppressed any re-delivery and the late-VC-QC node could
+        // never vote. With 4 validators that single drop sinks the
+        // vote-QC (2 of 4 ≠ quorum).
+        //
+        // Per-slot cap of 8 is generous: an honest fallback
+        // proposer emits one proposal per view, and the only way
+        // to stack more is multiple consecutive view-changes for
+        // the same slot. A malicious peer can still try to flood
+        // with bogus fallback headers, but the cap caps memory
+        // and the validation (`buffer_fallback_proposal` body) at
+        // drain time rejects everything that isn't the
+        // deterministic leader's signed block — so a flood costs
+        // memory linear in `cap × #slots-in-flight`, not throughput.
+        const DEFERRED_FALLBACK_CAP_PER_SLOT: usize = 8;
         if self.timeout.slot != slot || self.timeout.view_change_qc.is_none() {
-            debug!(
-                slot,
-                "fallback proposal received without local view-change-QC; deferring"
-            );
+            let queue = self
+                .deferred_fallback_proposals
+                .entry(slot)
+                .or_default();
+            if queue.len() < DEFERRED_FALLBACK_CAP_PER_SLOT {
+                queue.push((header.clone(), proposer_signature.to_vec()));
+                debug!(
+                    slot,
+                    queue_len = queue.len(),
+                    "fallback proposal received without local view-change-QC; deferred"
+                );
+            } else {
+                debug!(
+                    slot,
+                    "fallback proposal deferred queue full; dropping (per-slot cap)"
+                );
+            }
             return false;
         }
         let vc_qc = self.timeout.view_change_qc.as_ref().unwrap();
@@ -3153,6 +3201,37 @@ impl ValidatorEngine {
                 let mut new_tracker = TimeoutTracker::new(slot, slot_start_ms);
                 new_tracker.view_change_qc = Some(vc_qc);
                 self.timeout = new_tracker;
+
+                // audit-412: any fallback proposals that arrived
+                // BEFORE our VC-QC formed are sitting in
+                // `deferred_fallback_proposals[slot]`. Now that the
+                // VC-QC + timeout tracker are in place we can re-run
+                // them through `buffer_fallback_proposal` and let
+                // `select_and_vote` pick them up on the next tick.
+                // Without this drain the chain wedges at any slot
+                // where gossip delivered the fallback proposal
+                // faster than this node's own VC messages reached
+                // quorum locally — observed wedge at slot 3459 in
+                // soak v17 with this race window ~150 ms wide.
+                if let Some(deferred) =
+                    self.deferred_fallback_proposals.remove(&slot)
+                {
+                    let count = deferred.len();
+                    let mut accepted = 0usize;
+                    for (header, sig) in deferred {
+                        if self.buffer_fallback_proposal(&header, &sig) {
+                            accepted += 1;
+                        }
+                    }
+                    if count > 0 {
+                        info!(
+                            slot,
+                            deferred = count,
+                            accepted,
+                            "drained deferred fallback proposals on VC-QC formation"
+                        );
+                    }
+                }
             } else {
                 // VC-QC already installed — idempotent late-arriving
                 // VC messages just refresh the QC contents.
@@ -3610,6 +3689,12 @@ impl ValidatorEngine {
             self.view_changes.retain(|s, _| *s >= prune_floor);
             self.finality_votes.retain(|s, _| *s >= prune_floor);
             self.buffered_proposals
+                .retain(|s, _| *s >= prune_floor);
+            // audit-412: deferred fallback proposals follow the
+            // same prune floor as `buffered_proposals` — a slot we
+            // would no longer accept a fresh proposal for is also
+            // a slot we won't drain deferred entries onto.
+            self.deferred_fallback_proposals
                 .retain(|s, _| *s >= prune_floor);
             self.voted_view_per_slot
                 .retain(|s, _| *s >= prune_floor);
@@ -7207,6 +7292,154 @@ mod tests {
             "exactly ONE validator should build a fallback per (H, V); got {proposal_count}. \
              Today every validator with a local VC-QC builds, leading to vote splits under \
              asymmetric gossip delivery. See CONSENSUS_INVARIANTS.md L2."
+        );
+    }
+
+    /// audit-412: a fallback proposal that arrives at a node BEFORE
+    /// that node's own view-change-QC forms must be deferred — not
+    /// dropped — so it can be drained into `buffered_proposals` once
+    /// the VC-QC lands. Reproduces the slot-3459 wedge in soak v17
+    /// where the receiver lost a 21 ms race between the gossip-
+    /// delivered fallback and its own VC-QC formation; with the
+    /// proposal lost, the 4-validator network was 1 vote short of
+    /// the 3-of-4 quorum required for the vote-QC and the chain
+    /// wedged. Pre-fix this test would fail at the "drained into
+    /// buffered_proposals" assertion — the receiver's buffer stays
+    /// empty for the slot.
+    #[test]
+    fn audit_412_deferred_fallback_drains_on_vc_qc_formation() {
+        let n = 4;
+
+        let mut identities = Vec::new();
+        let mut keys = Vec::new();
+        for i in 0..n {
+            let id = make_identity(i as u8);
+            keys.push(id.public_key.as_bytes().to_vec());
+            identities.push(id);
+        }
+
+        // Leader-side engine: builds the fallback proposal.
+        let mut leader_engine = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
+        leader_engine.set_committee(keys.clone());
+        leader_engine.advance_slot();
+        let target_slot = leader_engine.consensus.current_slot;
+
+        // Form a VC-QC on the leader so it can build (mirrors what
+        // happens on a real node once all 4 VC messages converge).
+        let vc_messages: Vec<_> = identities
+            .iter()
+            .map(|id| {
+                pyde_consensus::view_change::create_view_change(
+                    TEST_CHAIN_ID,
+                    target_slot,
+                    &pyde_consensus::block::QuorumCert::empty(),
+                    id.committee_index,
+                    id.address,
+                    &id.secret_key,
+                )
+                .unwrap()
+            })
+            .collect();
+        for msg in &vc_messages {
+            leader_engine.on_view_change(msg.clone());
+        }
+
+        // Whichever validator's committee_index matches the view-1
+        // fallback_leader_index is the builder.
+        let view = leader_engine.consensus.current_view;
+        let leader_idx = pyde_consensus::view_change::fallback_leader_index(
+            target_slot,
+            view,
+            keys.len(),
+        );
+
+        let block = leader_engine
+            .try_build_fallback_proposal(
+                &identities[leader_idx],
+                [0u8; 32],
+                [0u8; 32],
+            )
+            .expect("leader must produce a fallback proposal");
+        let header = block.header;
+        let proposer_sig = block.proposer_signature;
+
+        // Receiver-side engine: a peer who has NOT yet formed its
+        // local VC-QC when the fallback arrives. Pick a non-leader
+        // index so the receiver isn't the proposer.
+        let receiver_idx = (leader_idx + 1) % n;
+        let mut receiver = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
+        receiver.set_committee(keys.clone());
+        receiver.advance_slot();
+        assert_eq!(receiver.consensus.current_slot, target_slot);
+
+        // Race step 1: fallback proposal arrives BEFORE any VC msg
+        // reaches the receiver. Pre-412 this `buffer_proposal` call
+        // returned false and discarded the proposal. With audit-412
+        // it returns false but stashes the proposal in the deferred
+        // queue.
+        let accepted_before_vc_qc =
+            receiver.buffer_proposal(&header, &proposer_sig);
+        assert!(
+            !accepted_before_vc_qc,
+            "buffer_proposal returns false when VC-QC missing"
+        );
+        assert!(
+            receiver.buffered_proposals.get(&target_slot).is_none()
+                || receiver
+                    .buffered_proposals
+                    .get(&target_slot)
+                    .map(|v| v.is_empty())
+                    .unwrap_or(true),
+            "pre-VC-QC the proposal must NOT be in buffered_proposals"
+        );
+        let deferred = receiver
+            .deferred_fallback_proposals
+            .get(&target_slot)
+            .expect("deferred queue must hold the proposal");
+        assert_eq!(deferred.len(), 1, "exactly one deferred entry");
+        let _ = receiver_idx;
+
+        // Race step 2: VC messages reach the receiver and quorum
+        // forms. The first-formation branch in on_view_change drains
+        // the deferred queue.
+        for msg in &vc_messages {
+            receiver.on_view_change(msg.clone());
+        }
+        assert!(
+            receiver.timeout.view_change_qc.is_some(),
+            "VC-QC must be installed after quorum"
+        );
+
+        // Drain ran: the proposal is now in buffered_proposals and
+        // out of the deferred queue.
+        let buffered = receiver
+            .buffered_proposals
+            .get(&target_slot)
+            .expect("drain must move the proposal into buffered_proposals");
+        assert_eq!(
+            buffered.len(),
+            1,
+            "exactly one buffered proposal after drain"
+        );
+        assert_eq!(
+            buffered[0].header.hash(),
+            header.hash(),
+            "drained proposal must be the one we deferred"
+        );
+        assert!(
+            !receiver
+                .deferred_fallback_proposals
+                .contains_key(&target_slot),
+            "deferred queue must be empty after drain"
+        );
+
+        // The downstream signal: `select_and_vote` can now find the
+        // proposal and produce a vote. Pre-412 this returned None
+        // (empty buffer) and the chain wedged at the slot.
+        let vote = receiver.select_and_vote(&identities[receiver_idx]);
+        assert!(
+            vote.is_some(),
+            "select_and_vote must produce a vote on the drained proposal"
         );
     }
 
