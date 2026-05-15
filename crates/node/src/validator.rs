@@ -875,6 +875,36 @@ impl ValidatorEngine {
         }
     }
 
+    /// audit-411: companion to `committee_keys_for_slot`. A vote (or
+    /// view-change, or finality-vote) for slot N must carry the
+    /// validator's position in the committee that was active during
+    /// slot N's epoch — not their current-epoch position. Pre-411 the
+    /// validator stamped `identity.committee_index`, which the
+    /// rotation handler updates atomically at epoch boundaries; a vote
+    /// for the boundary-slot signed in the ~150 ms after rotation
+    /// then carried the NEW position, so the formed QC's bitmap
+    /// indexed into the NEW committee while `verify_qc` (correctly,
+    /// per audit-402) looked up the PRIOR committee at that bit. The
+    /// chain wedged: every peer rejected the boundary block's
+    /// `qc_previous` as "invalid signature".
+    ///
+    /// Returns the validator's index in `committee_keys_for_slot(slot)`,
+    /// falling back to `identity.committee_index` only when the
+    /// validator is absent from the resolved committee (degenerate —
+    /// should only happen for a recently-exiting validator).
+    pub fn committee_index_for_slot(
+        &self,
+        slot: u64,
+        identity: &ValidatorIdentity,
+    ) -> u8 {
+        let keys = self.committee_keys_for_slot(slot);
+        let id_pk = identity.public_key.as_bytes();
+        keys.iter()
+            .position(|pk| pk.as_slice() == id_pk)
+            .map(|i| i as u8)
+            .unwrap_or(identity.committee_index)
+    }
+
     /// Audit 402: same boundary-aware lookup for VRF input
     /// randomness. The proposer at slot N generated its VRF
     /// against the randomness valid at slot N's epoch; the verifier
@@ -1696,7 +1726,16 @@ impl ValidatorEngine {
     /// wall-clock-slot once caught up).
     pub fn check_proposer(&self, identity: &ValidatorIdentity) -> Option<ProposerCandidate> {
         let slot = self.consensus.target_height;
-        let committee_size = self.committee_keys.len();
+        // audit-411: under a rotation race target_height may still be
+        // in the prior epoch even after `rotate_to_epoch` has flipped
+        // `self.committee_keys` to the new committee. Resolve both
+        // the committee size and our own index against the slot's
+        // epoch so the RR view-0 leader matches what peers expect for
+        // that slot (audit-410-extended universal RR is a function of
+        // `(slot, position-in-slot's-committee)`).
+        let slot_committee_keys = self.committee_keys_for_slot(slot);
+        let committee_size = slot_committee_keys.len();
+        let slot_committee_index = self.committee_index_for_slot(slot, identity);
 
         // Self-equivocation guard: with `slot = target_height` the
         // RR rotation no longer changes on every wall-clock tick.
@@ -1728,7 +1767,7 @@ impl ValidatorEngine {
         // `fallback_leader_index`.
         if !pyde_consensus::proposer::is_view0_proposer(
             slot,
-            identity.committee_index as usize,
+            slot_committee_index as usize,
             committee_size,
         ) {
             return None;
@@ -2325,16 +2364,24 @@ impl ValidatorEngine {
         // so the only candidate proposal carries a single committee
         // index that all receivers agree on.
         let view = self.consensus.current_view;
+        // audit-411: same slot-aware resolution as the happy-path
+        // `check_proposer`. The fallback leader for slot N is
+        // `fallback_leader_index(slot=N, view, committee_size(N))`
+        // and must match our position WITHIN that committee, not the
+        // engine's currently-active committee (which may have flipped
+        // mid-flight).
+        let fb_committee_keys = self.committee_keys_for_slot(slot);
+        let fb_committee_index = self.committee_index_for_slot(slot, identity);
         let leader_idx = pyde_consensus::view_change::fallback_leader_index(
             slot,
             view,
-            self.committee_keys.len(),
+            fb_committee_keys.len(),
         );
-        if (identity.committee_index as usize) != leader_idx {
+        if (fb_committee_index as usize) != leader_idx {
             debug!(
                 slot,
                 view,
-                mine = identity.committee_index,
+                mine = fb_committee_index,
                 leader = leader_idx,
                 "fallback skip: not the deterministic leader for this view"
             );
@@ -2343,7 +2390,7 @@ impl ValidatorEngine {
         info!(
             slot,
             view,
-            mine = identity.committee_index,
+            mine = fb_committee_index,
             "DBG fallback: I am the deterministic leader for (target_height, current_view); building"
         );
         // audit-94: proposer-side build dedup. Both the gossip-VC and
@@ -2536,11 +2583,21 @@ impl ValidatorEngine {
         let qc_keys: Vec<Vec<u8>> = self
             .committee_keys_for_slot(header.qc_previous.slot)
             .to_vec();
+        // audit-411: stamp the vote with our position in the committee
+        // active during THIS slot's epoch, not `identity.committee_index`
+        // (which the rotation handler atomically updates to the new
+        // committee). Without this, a vote signed in the ~150 ms after
+        // a wall-clock rotation but for the prior epoch's slot carries
+        // the new-epoch position, and the QC's bitmap+sigs then index
+        // into a committee that the verifier (correctly per audit-402)
+        // never uses for that slot — chain wedges with
+        // "invalid qc_previous: signature verification failed".
+        let voter_index = self.committee_index_for_slot(slot, identity);
         match create_vote(
             self.chain_id,
             &mut self.consensus,
             header,
-            identity.committee_index,
+            voter_index,
             identity.address,
             &identity.secret_key,
             &qc_keys,
@@ -2608,9 +2665,15 @@ impl ValidatorEngine {
             }
         }
 
-        // Verify vote signature
-        if voter_index < self.committee_keys.len()
-            && !verify_vote(self.chain_id, &vote, &self.committee_keys[voter_index])
+        // Verify vote signature.
+        // audit-411: a vote for slot N carries the voter's position
+        // in the committee that was active during N's epoch (see
+        // `committee_index_for_slot`). Verify against that committee
+        // — `self.committee_keys` is the CURRENT committee and would
+        // index into the wrong validator when N straddles a rotation.
+        let vote_committee_keys = self.committee_keys_for_slot(slot);
+        if voter_index < vote_committee_keys.len()
+            && !verify_vote(self.chain_id, &vote, &vote_committee_keys[voter_index])
         {
             warn!(slot, voter_index, "invalid vote signature");
             return None;
@@ -2723,6 +2786,18 @@ impl ValidatorEngine {
             self.seen_votes.insert(vote_key, (block_hash, vote_sig));
         }
 
+        // audit-411: pin the slot's committee BEFORE we take a
+        // mutable borrow on `self.votes` below — `committee_keys_for_slot`
+        // takes `&self`, so resolving it here keeps the QC-form branch
+        // borrow-checker-clean while still aggregating against the
+        // committee active during `slot`'s epoch (not the current
+        // engine committee). Without the slot-aware view, a slot
+        // straddling a rotation would form a QC whose bitmap indexes
+        // into the wrong committee and every peer's `verify_qc`
+        // (slot-aware via audit-402) rejects it.
+        let slot_committee_keys: Vec<Vec<u8>> =
+            self.committee_keys_for_slot(slot).to_vec();
+
         // Collect vote
         let entry = self.votes.entry(slot).or_insert_with(|| SlotVotes {
             block_hash,
@@ -2731,14 +2806,14 @@ impl ValidatorEngine {
         entry.votes.push(vote);
 
         // Try to form QC (dynamic quorum based on actual committee size)
-        let threshold = quorum_for_committee(self.committee_keys.len());
+        let threshold = quorum_for_committee(slot_committee_keys.len());
         if entry.votes.len() >= threshold {
             let qc = try_form_qc(
                 self.chain_id,
                 slot,
                 block_hash,
                 &entry.votes,
-                &self.committee_keys,
+                &slot_committee_keys,
             );
             if let Some(ref qc) = qc {
                 info!(slot, votes = qc.vote_count(), "QC formed");
@@ -2844,13 +2919,19 @@ impl ValidatorEngine {
         //   re-fire; signing a fresh VC would equivocate.
         //   Return None — better to forfeit our VC contribution
         //   for this round than self-slash.
+        // audit-411: VC for slot N indexes into N's epoch committee,
+        // for the same reason vote.voter_index does. The cached re-
+        // broadcast and the fresh sign path both use the slot-aware
+        // index so a VC signed in the rotation window stays valid for
+        // the prior-epoch slot it targets.
+        let vc_voter_index = self.committee_index_for_slot(slot, identity);
         if let Some((persisted_hash, persisted_sig)) = self.seen_view_changes_self.get(&slot) {
             if *persisted_hash == highest_qc_hash {
                 debug!(slot, "TPL-501: re-broadcasting persisted view-change signature");
                 return Some(ViewChangeMessage {
                     slot,
                     highest_qc: self.consensus.highest_qc.clone(),
-                    voter_index: identity.committee_index,
+                    voter_index: vc_voter_index,
                     voter_address: identity.address,
                     signature: persisted_sig.clone(),
                 });
@@ -2867,7 +2948,7 @@ impl ValidatorEngine {
             self.chain_id,
             slot,
             &self.consensus.highest_qc,
-            identity.committee_index,
+            vc_voter_index,
             identity.address,
             &identity.secret_key,
         ) {
@@ -2971,7 +3052,11 @@ impl ValidatorEngine {
             // `signature_2` here (the new arrival) to make sure
             // we're not framing the offender on a corrupt sig.
             let voter_idx = msg.voter_index as usize;
-            if voter_idx >= self.committee_keys.len() {
+            // audit-411: resolve the committee for slot N's epoch, not
+            // the engine's current committee. A VC for a prior-epoch
+            // slot indexes into the prior committee.
+            let vc_slot_keys = self.committee_keys_for_slot(slot);
+            if voter_idx >= vc_slot_keys.len() {
                 warn!(
                     slot,
                     voter_index = msg.voter_index,
@@ -2982,7 +3067,7 @@ impl ValidatorEngine {
             if !pyde_consensus::view_change::verify_view_change(
                 self.chain_id,
                 &msg,
-                &self.committee_keys[voter_idx],
+                &vc_slot_keys[voter_idx],
             ) {
                 warn!(
                     slot,
@@ -3023,12 +3108,20 @@ impl ValidatorEngine {
         self.seen_view_changes
             .insert(dedup_key, (incoming_qc_hash, msg.signature.clone()));
 
+        // audit-411: pin the slot's committee BEFORE the mutable
+        // borrow on `self.view_changes` so the borrow-checker stays
+        // happy. The semantics are the same as the vote-QC site:
+        // the VC-QC bitmap must reference slot N's epoch committee
+        // because that's what every receiver looks up via
+        // `committee_keys_for_slot` to verify it.
+        let vc_form_keys: Vec<Vec<u8>> = self.committee_keys_for_slot(slot).to_vec();
+
         let entry = self.view_changes.entry(slot).or_default();
         entry.push(msg);
 
-        // Try to form view change QC
+        // Try to form view change QC.
         if let Some(vc_qc) =
-            try_form_view_change_qc(self.chain_id, slot, entry, &self.committee_keys)
+            try_form_view_change_qc(self.chain_id, slot, entry, &vc_form_keys)
         {
             let first_formation = self.timeout.view_change_qc.is_none();
             if first_formation {
@@ -3093,11 +3186,18 @@ impl ValidatorEngine {
             return false;
         }
 
+        // audit-411: pin the slot's committee BEFORE mutable borrow
+        // on `self.finality_votes`. Finality votes for slot N must
+        // index into N's epoch committee for the cert to be
+        // verifiable by every other node (whose `verify_hard_finality`
+        // re-runs the slot-aware key lookup).
+        let fin_slot_keys: Vec<Vec<u8>> = self.committee_keys_for_slot(slot).to_vec();
+
         let entry = self.finality_votes.entry(slot).or_default();
         entry.push(vote);
 
-        // Try to form hard finality cert (dynamic quorum)
-        let threshold = quorum_for_committee(self.committee_keys.len());
+        // Try to form hard finality cert (dynamic quorum).
+        let threshold = quorum_for_committee(fin_slot_keys.len());
         if entry.len() >= threshold {
             if let Some(cert) = try_form_hard_finality(
                 self.chain_id,
@@ -3105,7 +3205,7 @@ impl ValidatorEngine {
                 block_hash,
                 state_root,
                 entry,
-                &self.committee_keys,
+                &fin_slot_keys,
             ) {
                 info!(slot, "hard finality achieved");
                 // Audit item 207a: persist BEFORE in-memory mutation.
@@ -5759,6 +5859,124 @@ mod tests {
         let qc = collector.on_vote(votes[1].clone());
         assert!(qc.is_some(), "2/2 votes should form QC");
         assert_eq!(qc.unwrap().vote_count(), 2);
+    }
+
+    /// audit-411: reproduces the rotation-race wedge that froze a
+    /// 4-validator 1000-TPS soak at slot 2834. Walks through the
+    /// exact split-second: 2-of-4 votes for slot N arrive pre-
+    /// rotation, the quorum-completing vote arrives post-rotation
+    /// (with the committee in a shuffled order), and the formed QC
+    /// must verify against `committee_keys_for_slot(N)` — which
+    /// resolves to the SLOT's epoch committee, not the engine's
+    /// current one.
+    #[test]
+    fn audit_411_rotation_race_qc_verifies_under_old_committee_keys() {
+        use pyde_consensus::hotstuff::verify_qc;
+
+        let (mut collector, mut identities) = make_engine_with_committee(4);
+        let epoch0_keys: Vec<Vec<u8>> = identities
+            .iter()
+            .map(|id| id.public_key.as_bytes().to_vec())
+            .collect();
+
+        // slot 999 — last slot of epoch 0 with EPOCH_LENGTH=1000.
+        // This is the slot most likely to straddle the wall-clock
+        // rotation race in production.
+        let header = BlockHeader {
+            slot: 999,
+            epoch: 0,
+            parent_hash: [0u8; 32],
+            proposer: identities[0].address,
+            vrf_proof: vec![],
+            qc_previous: QuorumCert::empty(),
+            tx_root: [0u8; 32],
+            state_root: [0u8; 32],
+            timestamp: 0,
+        };
+
+        collector.consensus.current_slot = 999;
+        collector.consensus.target_height = 999;
+
+        // Phase 1: 2 of 4 votes arrive pre-rotation (collector still
+        // in epoch 0). Quorum is 3-of-4 so neither call returns a QC.
+        for i in 0..2 {
+            let mut voter = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
+            voter.set_committee(epoch0_keys.clone());
+            voter.consensus.current_slot = 999;
+            voter.consensus.target_height = 999;
+            let vote = voter
+                .on_proposal(&header, &identities[i])
+                .expect("pre-rotation vote should be created");
+            assert!(
+                collector.on_vote(vote).is_none(),
+                "2 votes < 3-of-4 quorum"
+            );
+        }
+
+        // Phase 2: rotate to epoch 1 with a SHUFFLED committee — same
+        // 4 validators, different positions. This is what
+        // `select_committee` does at every boundary (the score is
+        // `hash(randomness || epoch || addr)`, so positions reshuffle
+        // even with stable membership).
+        let epoch1_shuffled: Vec<Vec<u8>> = vec![
+            identities[2].public_key.as_bytes().to_vec(),
+            identities[3].public_key.as_bytes().to_vec(),
+            identities[0].public_key.as_bytes().to_vec(),
+            identities[1].public_key.as_bytes().to_vec(),
+        ];
+        collector.rotate_to_epoch(1, epoch1_shuffled.clone());
+
+        // Mirror node.rs's atomic post-rotation update of every
+        // validator's `committee_index`. identities[i]'s new position
+        // is its index in the shuffled vec — [2,3,0,1] in this fixture.
+        identities[0].committee_index = 2;
+        identities[1].committee_index = 3;
+        identities[2].committee_index = 0;
+        identities[3].committee_index = 1;
+
+        // Phase 3: validator 2 votes post-rotation. Its
+        // `identity.committee_index` is now 0 (epoch 1 position),
+        // but the slot it's voting for is in epoch 0 where its
+        // position was 2.
+        let mut voter3 = ValidatorEngine::new(TEST_CHAIN_ID, [0xAA; 32]);
+        voter3.set_committee(epoch0_keys.clone());
+        voter3.consensus.current_slot = 999;
+        voter3.consensus.target_height = 999;
+        voter3.rotate_to_epoch(1, epoch1_shuffled.clone());
+        let vote3 = voter3
+            .on_proposal(&header, &identities[2])
+            .expect("post-rotation vote should be created");
+
+        // Sanity: the vote must carry the EPOCH-0 position (= 2), not
+        // the epoch-1 position (= 0). This is the audit-411 fix on
+        // the emit side — pre-fix the vote would have carried 0.
+        if let ConsensusMessage::Vote { voter_index, .. } = &vote3 {
+            assert_eq!(
+                *voter_index, 2u8,
+                "audit-411 emit: vote for slot 999 (epoch 0) must carry \
+                 epoch-0 position 2, not epoch-1 position 0 (got {})",
+                voter_index
+            );
+        } else {
+            panic!("expected Vote variant");
+        }
+
+        let qc = collector
+            .on_vote(vote3)
+            .expect("3-of-4 quorum should form QC post-rotation");
+
+        // The QC must verify against the slot's epoch committee —
+        // which `committee_keys_for_slot(999)` correctly resolves to
+        // `prev_committee_keys` (epoch 0 keys). Pre-411 the QC's
+        // bitmap indexed into epoch-1 positions and this assertion
+        // failed; the running chain wedged with peers emitting
+        // "invalid qc_previous: signature verification failed".
+        let slot_keys = collector.committee_keys_for_slot(999).to_vec();
+        assert!(
+            verify_qc(&qc, &slot_keys, TEST_CHAIN_ID),
+            "audit-411 form: QC for an old-epoch slot must verify \
+             against committee_keys_for_slot(slot) = prev_committee_keys"
+        );
     }
 
     #[test]
