@@ -248,6 +248,10 @@ fn mixed_workload_load_test() {
     println!("  faucet: 0x{}", hex::encode(faucet_addr));
 
     let rpc_urls: Vec<String> = net.nodes.iter().map(|n| n.rpc_url()).collect();
+    // Capture node-output handles up front so the async block can dump
+    // per-node logs on panic without needing a back-reference to `net`.
+    let node_outputs: Vec<Arc<std::sync::Mutex<Vec<String>>>> =
+        net.nodes.iter().map(|n| n.output_handle()).collect();
 
     // ── Phase 1: fund + register pubkeys for N senders ──────────
     println!(
@@ -374,16 +378,31 @@ fn mixed_workload_load_test() {
             signed_register.push(hex::encode(tx.to_bytes()));
         }
         use futures_util::stream::{iter, StreamExt};
+        let reg_err_counts: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let mut futs = Vec::new();
         for (i, hex_tx) in signed_register.iter().enumerate() {
             let url = rpc_urls[i % rpc_urls.len()].clone();
             let cli = client.clone();
             let hex_tx = hex_tx.clone();
+            let errs = reg_err_counts.clone();
             futs.push(async move {
-                let _ = rpc_send_raw(&cli, &url, &hex_tx).await;
+                let resp = rpc_send_raw(&cli, &url, &hex_tx).await;
+                if let Some(err) = resp.get("error") {
+                    let msg = err
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    *errs.lock().unwrap().entry(msg).or_insert(0) += 1;
+                }
             });
         }
         iter(futs).buffer_unordered(32).collect::<Vec<()>>().await;
+        let reg_err_snapshot: Vec<(String, u64)> = {
+            let map = reg_err_counts.lock().unwrap();
+            map.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        };
 
         let poll_deadline = Instant::now() + Duration::from_secs(60);
         let mut reg_poll_idx = 0usize;
@@ -404,24 +423,65 @@ fn mixed_workload_load_test() {
                 break;
             }
             if Instant::now() >= poll_deadline {
+                // Query head_slot FIRST, while RPC is idle. With 600 nonce
+                // queries downstream, by the time we get to fetch_block_number
+                // the RPC may be saturated and time out, returning 0 — making
+                // the chain look stalled when it's just throttled.
                 let mut per_node = Vec::new();
+                let mut heads = Vec::new();
                 for url in &rpc_urls {
+                    let head = fetch_block_number(&client, url).await;
+                    heads.push(head);
+                }
+                for (url, head_opt) in rpc_urls.iter().zip(heads.iter()) {
                     let mut n = 0usize;
                     for w in &wallets {
                         if fetch_nonce(&client, url, &w.address).await.unwrap_or(0) >= 1 {
                             n += 1;
                         }
                     }
-                    per_node.push((url.clone(), n));
+                    per_node.push((
+                        url.clone(),
+                        n,
+                        head_opt.map(|h| h as i64).unwrap_or(-1),
+                    ));
                 }
                 let breakdown: Vec<String> = per_node
                     .iter()
-                    .map(|(u, n)| format!("{}={}", u, n))
+                    .map(|(u, n, h)| format!("{}=reg={},head={}", u, n, h))
                     .collect();
+                let mut errs_sorted = reg_err_snapshot.clone();
+                errs_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                let errs_str: Vec<String> = errs_sorted
+                    .iter()
+                    .map(|(k, v)| format!("[{}] x{}", k, v))
+                    .collect();
+                let total_errs: u64 = reg_err_snapshot.iter().map(|(_, v)| *v).sum();
+                eprintln!("\n  RegisterPubkey submission errors ({} total):", total_errs);
+                for line in &errs_str {
+                    eprintln!("    {}", line);
+                }
+                // Dump last ~200 lines of each validator's stdout to
+                // /tmp so the panic message + dumps form a complete
+                // picture of what each node was doing at panic time.
+                for (i, handle) in node_outputs.iter().enumerate() {
+                    let lines = handle.lock().unwrap().clone();
+                    let path = format!("/tmp/loadgen-mixed-panic-node-{}.log", i);
+                    let tail: Vec<String> = lines
+                        .iter()
+                        .rev()
+                        .take(400)
+                        .rev()
+                        .cloned()
+                        .collect();
+                    let _ = std::fs::write(&path, tail.join("\n"));
+                    eprintln!("    [node-{}] tail dumped → {}", i, path);
+                }
                 panic!(
-                    "RegisterPubkey timed out: {}/{} (per-node: {})",
+                    "RegisterPubkey timed out: {}/{} (submit_errors={}, per-node: {})",
                     registered,
                     wallets.len(),
+                    total_errs,
                     breakdown.join(", ")
                 );
             }
