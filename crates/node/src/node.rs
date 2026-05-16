@@ -1392,24 +1392,40 @@ impl PydeNode {
                                     continue;
                                 }
                             };
+                            // Audit-omega commit 3: same skip-to-reorg
+                            // conversion as commit 2, applied to the
+                            // RR-QC arrival path. The RR-fallback
+                            // delivery is what audit-411 hardened; the
+                            // skip at `head_slot >= qc_slot` here had
+                            // the same shape (and the same silent-fork
+                            // failure mode) as the gossip-QC path.
                             let mut chain_w = chain.write().await;
                             let mut state_w = state.write().await;
-                            if chain_w.head_slot >= qc_slot {
-                                drop(state_w);
-                                drop(chain_w);
-                                continue;
-                            }
                             let ws_slot = validator_engine
                                 .as_ref()
                                 .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|c| c.slot));
-                            match BlockProcessor::process_full_block_with_aot_and_checkpoint(
+                            let outcome = canonical_commit::commit_canonical(
                                 &mut chain_w,
                                 &mut state_w,
-                                &block,
                                 Some(&aot_cache),
                                 ws_slot,
-                            ) {
-                                Ok((tc, gas, ref receipts_list)) => {
+                                qc_slot,
+                                qc_block_hash,
+                                &block,
+                                Some(&mut competing_blocks),
+                                canonical_commit::CanonicalSource::RrFallback,
+                            );
+                            match outcome {
+                                canonical_commit::CommitOutcome::Applied {
+                                    txs: tc,
+                                    gas,
+                                    receipts: ref receipts_list,
+                                }
+                                | canonical_commit::CommitOutcome::Reorged {
+                                    txs: tc,
+                                    gas,
+                                    receipts: ref receipts_list,
+                                } => {
                                     let pending_writes = state_w.take_pending_writes();
                                     let smt_handle = state_w.smt_handle();
                                     drop(state_w);
@@ -1486,14 +1502,42 @@ impl PydeNode {
                                     )
                                     .await;
                                 }
-                                Err(e) => {
+                                canonical_commit::CommitOutcome::Idempotent => {
+                                    drop(state_w);
+                                    drop(chain_w);
+                                    let mut pbb = pending_block_bodies.write().await;
+                                    pbb.remove(&qc_block_hash);
+                                }
+                                canonical_commit::CommitOutcome::DivergenceUnresolved {
+                                    local_hash,
+                                } => {
                                     drop(state_w);
                                     drop(chain_w);
                                     warn!(
                                         slot = qc_slot,
-                                        error = %e,
-                                        "RR canonical apply failed"
+                                        local = hex::encode(local_hash),
+                                        canonical = hex::encode(qc_block_hash),
+                                        "RR-QC canonical apply: divergence unresolved (likely past WS checkpoint)"
                                     );
+                                    let mut pbb = pending_block_bodies.write().await;
+                                    pbb.remove(&qc_block_hash);
+                                }
+                                canonical_commit::CommitOutcome::Gap {
+                                    head_slot,
+                                    qc_slot: qc,
+                                } => {
+                                    drop(state_w);
+                                    drop(chain_w);
+                                    debug!(
+                                        head_slot,
+                                        qc_slot = qc,
+                                        "RR-QC canonical apply: gap will be filled by sync"
+                                    );
+                                }
+                                canonical_commit::CommitOutcome::Failed { error: _ } => {
+                                    drop(state_w);
+                                    drop(chain_w);
+                                    // commit_canonical already warn-logged.
                                 }
                             }
                         }
