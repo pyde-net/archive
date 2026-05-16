@@ -6551,27 +6551,68 @@ fn handle_swarm_event(
                                         }
                                     }
                                     ConsensusMessage::QcAnnounce { qc } => {
-                                        // Audit-418: standalone QC broadcast.
-                                        // Commit 1 lands the wire variant and an
-                                        // observation-only receive stub — no state
-                                        // mutation yet. Commit 2 wires the
-                                        // broadcast on local QC formation; commit
-                                        // 3 lifts this arm into the full
-                                        // `commit_canonical`-backed apply path
-                                        // (verify against
-                                        // `committee_keys_for_slot(qc.slot)`,
-                                        // fetch body via existing GetBlockByHash
-                                        // if missing, then commit). Until then,
-                                        // matching this arm prevents a non-
-                                        // exhaustive-match compile error and the
-                                        // debug! gives us a soak-log signal that
-                                        // QcAnnounce traffic is flowing on the
-                                        // wire.
-                                        debug!(
-                                            qc_slot = qc.slot,
-                                            qc_votes = qc.vote_count(),
-                                            "received QcAnnounce (commit 1 stub — no apply yet)"
-                                        );
+                                        // Audit-418 commit 3: receive a
+                                        // standalone QC. Verify FALCON
+                                        // signatures against the QC's slot
+                                        // committee (audit-411 slot-bound
+                                        // resolution — the QC may be from a
+                                        // slot whose committee differs from
+                                        // engine.committee_keys after a
+                                        // mid-flight rotation), then route
+                                        // through ApplyCanonicalAfterQc.
+                                        // The main loop's handler already
+                                        // does the full dance: look up the
+                                        // body in pending_block_bodies; if
+                                        // missing fire GetBlockByHash; once
+                                        // available call commit_canonical
+                                        // (audit-ω plumbing handles
+                                        // Applied/Idempotent/Reorged/
+                                        // DivergenceUnresolved/Gap/Failed).
+                                        //
+                                        // We do NOT re-broadcast a received
+                                        // QcAnnounce — gossipsub mesh
+                                        // already handles propagation, and
+                                        // re-broadcasting would amplify
+                                        // traffic exponentially.
+                                        let head = chain.head_slot;
+                                        if qc.slot <= head {
+                                            debug!(
+                                                qc_slot = qc.slot,
+                                                head,
+                                                "QcAnnounce idempotent: head already at or past QC slot"
+                                            );
+                                        } else {
+                                            let qc_keys = engine
+                                                .committee_keys_for_slot(qc.slot)
+                                                .to_vec();
+                                            if pyde_consensus::hotstuff::verify_qc(
+                                                &qc,
+                                                &qc_keys,
+                                                chain.chain_id,
+                                            ) {
+                                                if qc.slot > engine.consensus.highest_qc.slot {
+                                                    engine.consensus.highest_qc = qc.clone();
+                                                }
+                                                info!(
+                                                    qc_slot = qc.slot,
+                                                    qc_votes = qc.vote_count(),
+                                                    head,
+                                                    "QcAnnounce verified — triggering canonical apply"
+                                                );
+                                                return PostEventAction::ApplyCanonicalAfterQc {
+                                                    qc_slot: qc.slot,
+                                                    qc_block_hash: qc.block_hash,
+                                                };
+                                            } else {
+                                                warn!(
+                                                    qc_slot = qc.slot,
+                                                    qc_votes = qc.vote_count(),
+                                                    "rejected QcAnnounce: FALCON signatures \
+                                                     do not verify against \
+                                                     committee_keys_for_slot"
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -7069,15 +7110,50 @@ fn handle_swarm_event(
                                 }
                             }
                             ConsensusMessage::QcAnnounce { qc } => {
-                                // Audit-418 commit 1: RR-fallback receive
-                                // stub. Same observation-only treatment as
-                                // the gossip-receive arm above; commit 3
-                                // lifts both into the full apply path.
-                                debug!(
-                                    qc_slot = qc.slot,
-                                    qc_votes = qc.vote_count(),
-                                    "received QcAnnounce via RR fallback (commit 1 stub)"
-                                );
+                                // Audit-418 commit 3: RR-fallback receive
+                                // for a standalone QC. Same verification +
+                                // dispatch as the gossip-receive arm. We
+                                // set pending_apply_qcd but explicitly do
+                                // NOT set pending_qc_announce_bytes — the
+                                // dispatch then routes through
+                                // SendConsensusRrResponseAndApplyQcd (no
+                                // re-broadcast), because we're just
+                                // applying a QC we received, not
+                                // announcing a fresh one we formed.
+                                let head = chain.head_slot;
+                                if qc.slot <= head {
+                                    debug!(
+                                        qc_slot = qc.slot,
+                                        head,
+                                        "QcAnnounce idempotent via RR fallback"
+                                    );
+                                } else {
+                                    let qc_keys = engine
+                                        .committee_keys_for_slot(qc.slot)
+                                        .to_vec();
+                                    if pyde_consensus::hotstuff::verify_qc(
+                                        &qc,
+                                        &qc_keys,
+                                        chain.chain_id,
+                                    ) {
+                                        if qc.slot > engine.consensus.highest_qc.slot {
+                                            engine.consensus.highest_qc = qc.clone();
+                                        }
+                                        info!(
+                                            qc_slot = qc.slot,
+                                            qc_votes = qc.vote_count(),
+                                            head,
+                                            "QcAnnounce verified via RR fallback — triggering apply"
+                                        );
+                                        pending_apply_qcd = Some((qc.slot, qc.block_hash));
+                                    } else {
+                                        warn!(
+                                            qc_slot = qc.slot,
+                                            qc_votes = qc.vote_count(),
+                                            "rejected QcAnnounce via RR fallback: FALCON sigs invalid"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
