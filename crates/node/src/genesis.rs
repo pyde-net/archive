@@ -1095,8 +1095,13 @@ pub fn generate_testnet(
         });
     }
 
-    // Generate dedicated faucet account (1 trillion PYDE for dispensing)
-    let faucet_balance: u128 = 1_000_000_000_000 * 1_000_000_000; // 1T PYDE in quanta
+    // Generate dedicated faucet account (10 trillion PYDE for dispensing).
+    // Bumped from 1T to 10T to support the 4-hour mixed-load soak: 200
+    // sender wallets × 10^19 quanta per-wallet funding = 2 * 10^21
+    // quanta, plus contract deploys + recipient txs + headroom for
+    // sustained loadgen rounds. 1T was sized for short test fixtures
+    // and ran out during the audit-416 soak at ~T+10min.
+    let faucet_balance: u128 = 10_000_000_000_000 * 1_000_000_000; // 10T PYDE in quanta
     let (faucet_pk, faucet_sk) =
         falcon_keygen().map_err(|e| format!("faucet keygen failed: {}", e))?;
     let faucet_address = derive_eoa_address(faucet_pk.as_bytes());
