@@ -1114,6 +1114,7 @@ impl PydeNode {
                             last_outgoing_committee_size,
                             &committee_keys_for_validation,
                             &epoch_randomness_for_validation,
+                            &local_peer_id,
                         )
                     };
 
@@ -5430,6 +5431,14 @@ fn handle_swarm_event(
     // the check.
     committee_keys_for_validation: &[Vec<u8>],
     epoch_randomness_for_validation: &[u8; 32],
+    // audit-414: needed for the self-origin bypass in the
+    // Channel::Consensus branch. gossipsub's `allow_self_origin = true`
+    // loops our own broadcasts back to this handler with
+    // `propagation_source = local_peer_id`; without comparing to
+    // our local peer id, the rate-limit gate treats those loopbacks
+    // as unattested external peers and silently drops them once
+    // the 32 msgs/sec budget exhausts under burst load.
+    local_peer_id: &PeerId,
 ) -> PostEventAction {
     match event {
         // --- Gossipsub message received ---
@@ -5696,6 +5705,26 @@ fn handle_swarm_event(
                     }
                 }
                 Some(Channel::Consensus) => {
+                    // audit-414: self-origin messages (our own broadcasts
+                    // looped back via gossipsub's `allow_self_origin = true`)
+                    // must bypass the auth + rate-limit gates entirely.
+                    // The local node is NOT in its own `peer_manager.peers`
+                    // map (`add_peer` only fires on inbound/outbound
+                    // connections to OTHER peers), so without this short-
+                    // circuit `peer_falcon_pubkey` returns None and the
+                    // `try_consume_unattested_consensus_budget` gate
+                    // silently drops our own loopbacks once the 32-msg/s
+                    // budget exhausts under burst load (view-change
+                    // cascades + finality votes + decryption shares
+                    // stacked on a slot tick). That silent drop is what
+                    // caused the v17/v18 proposer-not-voting-on-its-own-
+                    // fallback pattern: the proposal was published, looped
+                    // back, dropped by the rate limiter before reaching
+                    // `buffer_proposal`, and the proposer then had no
+                    // buffered copy to vote on. With a 4-validator cluster,
+                    // one missing vote = 2-of-4, below the 3-of-4 vote-QC
+                    // quorum — chain wedges. We trust ourselves.
+                    let is_self_origin = &propagation_source == local_peer_id;
                     // Task 030: block non-validator relays of consensus
                     // gossip. Two layered checks:
                     //
@@ -5722,55 +5751,59 @@ fn handle_swarm_event(
                     // FALCON-verify cycles. Attested + authorized
                     // committee peers bypass the budget; attested +
                     // non-committee peers are hard-dropped above.
-                    let mut prop_attested_committee = false;
-                    if let Some(engine) = validator_engine.as_ref() {
-                        // Primary: immediate forwarder.
-                        let prop_attested = peer_manager
-                            .peer_falcon_pubkey(&propagation_source)
-                            .is_some();
-                        let prop_authorized = peer_manager
-                            .is_consensus_authorized(&propagation_source, &engine.committee_keys);
-                        if prop_attested && !prop_authorized {
-                            debug!(
-                                forwarder = %propagation_source,
-                                "dropping consensus gossip relayed by non-committee attested peer"
-                            );
-                            if let Some(info) = peer_manager.get_peer_mut(&propagation_source) {
-                                info.invalid_messages = info.invalid_messages.saturating_add(1);
-                            }
-                            return PostEventAction::None;
-                        }
-                        prop_attested_committee = prop_attested && prop_authorized;
-                        // Secondary: originator, when known.
-                        if let Some(source) = message.source.as_ref() {
-                            let src_attested = peer_manager.peer_falcon_pubkey(source).is_some();
-                            let src_authorized = peer_manager
-                                .is_consensus_authorized(source, &engine.committee_keys);
-                            if src_attested && !src_authorized {
+                    let mut prop_attested_committee = is_self_origin;
+                    if !is_self_origin {
+                        if let Some(engine) = validator_engine.as_ref() {
+                            // Primary: immediate forwarder.
+                            let prop_attested = peer_manager
+                                .peer_falcon_pubkey(&propagation_source)
+                                .is_some();
+                            let prop_authorized = peer_manager
+                                .is_consensus_authorized(&propagation_source, &engine.committee_keys);
+                            if prop_attested && !prop_authorized {
                                 debug!(
-                                    %source,
-                                    "dropping consensus gossip originated by non-committee attested peer"
+                                    forwarder = %propagation_source,
+                                    "dropping consensus gossip relayed by non-committee attested peer"
                                 );
-                                if let Some(info) = peer_manager.get_peer_mut(source) {
+                                if let Some(info) = peer_manager.get_peer_mut(&propagation_source) {
                                     info.invalid_messages = info.invalid_messages.saturating_add(1);
                                 }
                                 return PostEventAction::None;
                             }
+                            prop_attested_committee = prop_attested && prop_authorized;
+                            // Secondary: originator, when known.
+                            if let Some(source) = message.source.as_ref() {
+                                let src_attested = peer_manager.peer_falcon_pubkey(source).is_some();
+                                let src_authorized = peer_manager
+                                    .is_consensus_authorized(source, &engine.committee_keys);
+                                if src_attested && !src_authorized {
+                                    debug!(
+                                        %source,
+                                        "dropping consensus gossip originated by non-committee attested peer"
+                                    );
+                                    if let Some(info) = peer_manager.get_peer_mut(source) {
+                                        info.invalid_messages = info.invalid_messages.saturating_add(1);
+                                    }
+                                    return PostEventAction::None;
+                                }
+                            }
                         }
-                    }
-                    // TPL-505: shed sustained unattested-source traffic
-                    // before the decode + FALCON-verify path. Skip the
-                    // gate entirely for attested + committee peers
-                    // (they're trusted on the channel by definition).
-                    if !prop_attested_committee
-                        && !peer_manager
-                            .try_consume_unattested_consensus_budget(&propagation_source)
-                    {
-                        debug!(
-                            forwarder = %propagation_source,
-                            "dropping consensus gossip from unattested source over per-second budget"
-                        );
-                        return PostEventAction::None;
+                        // TPL-505: shed sustained unattested-source traffic
+                        // before the decode + FALCON-verify path. Skip the
+                        // gate entirely for attested + committee peers
+                        // (they're trusted on the channel by definition)
+                        // and for self-origin (audit-414, handled by the
+                        // `is_self_origin` short-circuit above).
+                        if !prop_attested_committee
+                            && !peer_manager
+                                .try_consume_unattested_consensus_budget(&propagation_source)
+                        {
+                            debug!(
+                                forwarder = %propagation_source,
+                                "dropping consensus gossip from unattested source over per-second budget"
+                            );
+                            return PostEventAction::None;
+                        }
                     }
                     if let Some(engine) = validator_engine.as_mut() {
                         // Check if it's a finality vote (different wire tag)

@@ -861,6 +861,39 @@ mod tests {
         assert!(mgr.try_consume_unattested_consensus_budget(&id));
     }
 
+    /// audit-414: pins the precondition that made the self-origin
+    /// gossipsub drop bug possible. `PeerManager.peers` is populated
+    /// ONLY by `add_peer`, and `add_peer` is called only on inbound /
+    /// outbound connections to OTHER peers — never for the local node
+    /// itself. So `peer_falcon_pubkey(local)` returns None and
+    /// `is_consensus_authorized(local, ...)` returns false. Without
+    /// the audit-414 short-circuit in `handle_swarm_event`'s
+    /// Channel::Consensus arm, a self-origin gossipsub loopback
+    /// (`allow_self_origin = true`) would route through the
+    /// unattested-budget path and get silently dropped under burst
+    /// load. This test pins the peer-manager invariant; a refactor
+    /// that ever auto-registers the local PeerId here would mask the
+    /// bug in a way that hides regressions of the handler-side
+    /// bypass. If this test starts failing, audit-414's handler
+    /// short-circuit may no longer be needed — but the dual approach
+    /// (peer-manager-side + handler-side) keeps "trust ourselves"
+    /// explicit at both layers.
+    #[test]
+    fn audit_414_local_peer_not_in_peer_table() {
+        let mgr = PeerManager::new(10, 10, 10, 100);
+        let local = PeerId::random();
+        assert!(
+            mgr.peer_falcon_pubkey(&local).is_none(),
+            "local peer must not auto-appear in peer_manager.peers; \
+             handle_swarm_event's audit-414 bypass relies on this"
+        );
+        assert!(
+            !mgr.is_consensus_authorized(&local, &[]),
+            "local peer must not auto-clear the consensus-auth gate; \
+             handle_swarm_event's audit-414 bypass relies on this"
+        );
+    }
+
     /// `prune_unattested_consensus_budget` only drops entries
     /// older than 60 s. A fresh entry must survive a prune.
     #[test]
