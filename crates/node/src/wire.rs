@@ -93,6 +93,15 @@ pub mod tag {
     /// historical committee keys, trust the slice-3.4 consensus-channel
     /// filter (validator-only publisher).
     pub const CONSENSUS_FINALITY_CHECKPOINT: u8 = 0x19;
+    /// Audit-418: standalone QC announcement on the consensus topic.
+    /// Broadcast when a validator forms a local QC so lagging peers
+    /// can apply the corresponding block without waiting for the
+    /// next slot's proposal to carry it as `qc_previous`. Closes
+    /// the 2-vs-2 head-divergence deadlock observed at slot 9687
+    /// in the 200-TPS soak (nodes 2,3 formed QC9688 locally; nodes
+    /// 0,1 stuck at 9687; slot 9689 couldn't form quorum to
+    /// propagate the QC).
+    pub const CONSENSUS_QC_ANNOUNCE: u8 = 0x1A;
     // Tags 0x04 / 0x05 were `GET_BLOCK_TXS` / `BLOCK_TXS_RESPONSE`
     // for an in-tree wire encoding of the missing-tx fetch. Both
     // were dead code; the protocol now lives as a serde-cbor
@@ -1116,6 +1125,10 @@ pub fn encode_consensus_message(msg: &ConsensusMessage) -> Vec<u8> {
             enc.bytes32(voter_address);
             enc.var_bytes(signature);
         }
+        ConsensusMessage::QcAnnounce { qc } => {
+            enc.u8(tag::CONSENSUS_QC_ANNOUNCE);
+            encode_qc(&mut enc, qc);
+        }
     }
     enc.finish()
 }
@@ -1165,6 +1178,10 @@ pub fn decode_consensus_message(data: &[u8]) -> Result<ConsensusMessage, &'stati
                 voter_address,
                 signature,
             })
+        }
+        tag::CONSENSUS_QC_ANNOUNCE => {
+            let qc = decode_qc(&mut dec)?;
+            Ok(ConsensusMessage::QcAnnounce { qc })
         }
         _ => Err("unknown consensus message tag"),
     }
@@ -1645,6 +1662,33 @@ mod tests {
                 assert_eq!(highest_qc.slot, 11);
             }
             _ => panic!("expected Timeout"),
+        }
+    }
+
+    /// Audit-418: `ConsensusMessage::QcAnnounce` wire round-trip.
+    /// Encoded form is `[tag CONSENSUS_QC_ANNOUNCE][encoded_qc]`; the
+    /// receive side decodes and routes the QC through
+    /// `commit_canonical` to close the 2-vs-2 head-divergence
+    /// deadlock observed in the 200-TPS soak.
+    #[test]
+    fn consensus_qc_announce_roundtrip() {
+        let qc = dummy_qc(42);
+        let msg = ConsensusMessage::QcAnnounce { qc: qc.clone() };
+
+        let bytes = encode_consensus_message(&msg);
+        // First byte is the discriminator tag — confirms we're on
+        // the new wire path, not aliasing an existing variant.
+        assert_eq!(bytes[0], tag::CONSENSUS_QC_ANNOUNCE);
+
+        let restored = decode_consensus_message(&bytes).unwrap();
+        match restored {
+            ConsensusMessage::QcAnnounce { qc: restored_qc } => {
+                assert_eq!(restored_qc.slot, qc.slot);
+                assert_eq!(restored_qc.block_hash, qc.block_hash);
+                assert_eq!(restored_qc.voter_bitmap, qc.voter_bitmap);
+                assert_eq!(restored_qc.signatures.len(), qc.signatures.len());
+            }
+            _ => panic!("expected QcAnnounce"),
         }
     }
 

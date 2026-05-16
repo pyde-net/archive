@@ -6400,6 +6400,29 @@ fn handle_swarm_event(
                                             debug!(slot, "updated highest QC from NewView");
                                         }
                                     }
+                                    ConsensusMessage::QcAnnounce { qc } => {
+                                        // Audit-418: standalone QC broadcast.
+                                        // Commit 1 lands the wire variant and an
+                                        // observation-only receive stub — no state
+                                        // mutation yet. Commit 2 wires the
+                                        // broadcast on local QC formation; commit
+                                        // 3 lifts this arm into the full
+                                        // `commit_canonical`-backed apply path
+                                        // (verify against
+                                        // `committee_keys_for_slot(qc.slot)`,
+                                        // fetch body via existing GetBlockByHash
+                                        // if missing, then commit). Until then,
+                                        // matching this arm prevents a non-
+                                        // exhaustive-match compile error and the
+                                        // debug! gives us a soak-log signal that
+                                        // QcAnnounce traffic is flowing on the
+                                        // wire.
+                                        debug!(
+                                            qc_slot = qc.slot,
+                                            qc_votes = qc.vote_count(),
+                                            "received QcAnnounce (commit 1 stub — no apply yet)"
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -6871,6 +6894,17 @@ fn handle_swarm_event(
                                 if highest_qc.slot > engine.consensus.highest_qc.slot {
                                     engine.consensus.highest_qc = highest_qc;
                                 }
+                            }
+                            ConsensusMessage::QcAnnounce { qc } => {
+                                // Audit-418 commit 1: RR-fallback receive
+                                // stub. Same observation-only treatment as
+                                // the gossip-receive arm above; commit 3
+                                // lifts both into the full apply path.
+                                debug!(
+                                    qc_slot = qc.slot,
+                                    qc_votes = qc.vote_count(),
+                                    "received QcAnnounce via RR fallback (commit 1 stub)"
+                                );
                             }
                         }
                     }

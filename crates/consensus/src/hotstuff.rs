@@ -67,6 +67,24 @@ pub enum ConsensusMessage {
         voter_address: Address,
         signature: Vec<u8>,
     },
+    /// Standalone QC announcement (audit-418). Broadcast immediately
+    /// when a validator forms a local QC, so a lagging peer can apply
+    /// the corresponding block without having to wait for the next
+    /// slot's proposal to carry it as `qc_previous`. Closes the
+    /// 2-vs-2 head-divergence deadlock: when a QC for slot N forms
+    /// on a subset of the cluster but the slot N+1 proposer can't
+    /// form quorum (because the other subset is still at N-1 and
+    /// won't vote for N+1 without parent N), QcAnnounce gives the
+    /// lagging subset the QC directly so they can catch up via
+    /// `commit_canonical` + existing body-recovery.
+    ///
+    /// The QC carries its own signatures, so the receiver verifies
+    /// authority against `committee_keys_for_slot(qc.slot)` before
+    /// any state mutation. Anyone can send a fake QcAnnounce;
+    /// signature verification rejects them at the receive boundary.
+    /// Cost is bounded: at most 1 extra message per slot in the
+    /// happy path (QCs form ≤1× per slot).
+    QcAnnounce { qc: QuorumCert },
 }
 
 /// The state machine for a single validator's consensus participation.
