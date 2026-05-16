@@ -1488,7 +1488,7 @@ impl PydeNode {
                                 Err(e) => {
                                     drop(state_w);
                                     drop(chain_w);
-                                    debug!(
+                                    warn!(
                                         slot = qc_slot,
                                         error = %e,
                                         "RR canonical apply failed"
@@ -2097,7 +2097,7 @@ impl PydeNode {
                                 Err(e) => {
                                     drop(state_w);
                                     drop(chain_w);
-                                    debug!(
+                                    warn!(
                                         slot = qc_slot,
                                         error = %e,
                                         "canonical apply failed"
@@ -3682,7 +3682,7 @@ impl PydeNode {
                                                 Err(e) => {
                                                     drop(state_w);
                                                     drop(chain_w);
-                                                    debug!(slot = qc_slot, error = %e, "QC-gated apply failed");
+                                                    warn!(slot = qc_slot, error = %e, "QC-gated apply failed");
                                                 }
                                             }
                                         }

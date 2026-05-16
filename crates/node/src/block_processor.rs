@@ -123,7 +123,10 @@ impl BlockProcessor {
     /// Full-block processing with an explicit weak-subjectivity checkpoint
     /// slot (Phase 4 slice 4.3). Callers that have a live `FinalityTracker`
     /// should pass `tracker.latest_checkpoint.as_ref().map(|c| c.slot)` —
-    /// any block at or before the checkpoint slot is rejected.
+    /// any block strictly before the checkpoint slot is rejected. A block
+    /// whose slot equals the checkpoint slot IS the canonical block being
+    /// cemented and is allowed (audit-415 — see
+    /// `validate_header_with_checkpoint`).
     pub fn process_full_block_with_aot_and_checkpoint(
         chain: &mut ChainState,
         state: &mut StateManager,
@@ -699,13 +702,26 @@ impl BlockProcessor {
     /// Weak-subjectivity-aware header validation (Phase 4 slice 4.3, task 042).
     ///
     /// When `ws_checkpoint_slot` is `Some(cp)`, any header with
-    /// `slot <= cp` is rejected regardless of cryptographic validity.
+    /// `slot < cp` is rejected regardless of cryptographic validity.
     /// This defends against long-range attacks where an attacker
     /// acquires retired-validator keys and constructs a crypto-valid
     /// alternate chain starting from an old state. Without this check,
     /// a node with a cleared `ConsensusState` (e.g. after disk
     /// corruption or a fresh install without a configured checkpoint)
     /// would accept such a chain.
+    ///
+    /// Audit 415: header.slot == cp_slot is ALLOWED because this is the
+    /// canonical block being cemented by the checkpoint itself — every
+    /// caller is a QC-bound apply path (ApplyCanonicalAfterQc / RR
+    /// fallback / decryption-applied), the body hash is matched against
+    /// the QC's block hash before this gate, and the `head_slot >=
+    /// qc_slot` skip above prevents double-apply. Using `<=` here
+    /// silently wedged lagging nodes: the peer-gossiped WS-checkpoint
+    /// for slot N could arrive before the local canonical apply for
+    /// slot N (sync mechanism deliberately runs ahead of local state),
+    /// after which `slot == cp_slot` rejected the very block being
+    /// canonicalized, and the lagging node was stuck at head=N-1
+    /// forever. Reproduced as the slot-1324 mixed-load wedge.
     ///
     /// `None` means no checkpoint available yet (pre-first-hard-finality
     /// or bootstrap of a devnet) — falls back to the head-advancement
@@ -716,9 +732,9 @@ impl BlockProcessor {
         ws_checkpoint_slot: Option<u64>,
     ) -> Result<(), String> {
         if let Some(cp_slot) = ws_checkpoint_slot {
-            if header.slot <= cp_slot {
+            if header.slot < cp_slot {
                 return Err(format!(
-                    "block slot {} is at or before hard-final checkpoint {}",
+                    "block slot {} is before hard-final checkpoint {}",
                     header.slot, cp_slot
                 ));
             }
@@ -1695,15 +1711,24 @@ mod tests {
     }
 
     #[test]
-    fn validate_header_rejects_block_at_checkpoint() {
-        // Block slot EQUAL to checkpoint is rejected (the checkpoint
-        // itself is already canonical; re-submitting at the same slot
-        // is always an attempted fork).
+    fn audit_415_validate_header_accepts_block_at_checkpoint() {
+        // Audit 415: a block whose slot EQUALS the WS checkpoint slot
+        // must be accepted, because every caller of this validator is
+        // a QC-bound canonical-apply path and the checkpoint slot IS
+        // the slot of the canonical block being cemented. Pre-fix this
+        // check used `<=` and the lagging-node wedge (slot-1324 mixed-
+        // load soak) happened: peer-gossiped finality cert advanced
+        // `latest_checkpoint.slot` to N before the local canonical
+        // apply for slot N had a chance to run; the retry-after-body-
+        // recovery path then re-entered `validate_header_with_
+        // checkpoint(slot=N, cp_slot=N)` and got rejected, leaving
+        // head stuck at N-1 forever. Below-checkpoint blocks are
+        // still rejected — that's the other case covered below.
         let chain = ChainState::genesis([0u8; 32], 31337);
         let header = dummy_header(50);
-        let err =
-            BlockProcessor::validate_header_with_checkpoint(&header, &chain, Some(50)).unwrap_err();
-        assert!(err.contains("hard-final checkpoint"), "got: {}", err);
+        BlockProcessor::validate_header_with_checkpoint(&header, &chain, Some(50)).expect(
+            "audit-415: block at the WS checkpoint slot must validate (it IS the canonical block)",
+        );
     }
 
     #[test]
@@ -1764,6 +1789,56 @@ mod tests {
         // Chain head did not advance, state root unchanged.
         assert_eq!(chain.head_slot, 0);
         assert_eq!(chain.state_root, root_before);
+    }
+
+    #[test]
+    fn audit_415_apply_block_when_ws_checkpoint_matches_block_slot() {
+        // Reproduces the slot-1324 mixed-load wedge: a peer's gossiped
+        // hard-finality checkpoint advanced the local
+        // `latest_checkpoint.slot` to N before this node's canonical
+        // apply for slot N had run. The retry path then called
+        // `process_full_block_with_aot_and_checkpoint` with
+        // `ws_checkpoint_slot = Some(N)` and `block.header.slot = N`.
+        // Pre-fix the `<=` check silently rejected this with
+        // "block slot N is at or before hard-final checkpoint N",
+        // head_slot stuck at N-1, view-change couldn't even run
+        // (target_height != timeout_slot). Audit-415 changes the check
+        // to `<`, so the canonical block AT the checkpoint slot can be
+        // applied — exactly the case every QC-bound apply path needs.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = StateManager::open(tmp.path(), 1024).unwrap();
+        let mut chain = ChainState::genesis(state.root(), 31337);
+        let pre_head = chain.head_slot;
+
+        let header = dummy_header(7);
+        let block = Block {
+            header,
+            body: BlockBody {
+                transactions: vec![],
+                encrypted_txs: vec![],
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
+            },
+            proposer_signature: vec![],
+        };
+
+        BlockProcessor::process_full_block_with_aot_and_checkpoint(
+            &mut chain,
+            &mut state,
+            &block,
+            None,
+            Some(7),
+        )
+        .expect("audit-415: block whose slot equals the WS checkpoint must apply");
+
+        assert_eq!(
+            chain.head_slot,
+            7,
+            "head must advance even though ws_checkpoint == block.slot (was {})",
+            pre_head
+        );
     }
 
     // ========== tx_root commits to full transaction order ==========
