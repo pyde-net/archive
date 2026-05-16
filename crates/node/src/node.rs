@@ -1393,22 +1393,8 @@ impl PydeNode {
                             let mut chain_w = chain.write().await;
                             let mut state_w = state.write().await;
                             if chain_w.head_slot >= qc_slot {
-                                let head_when_skipping = chain_w.head_slot;
                                 drop(state_w);
                                 drop(chain_w);
-                                // audit-413 (v2): same target_height-advance fix
-                                // as the gossip-side canonical-apply path. When
-                                // the proposer's own-fallback apply has already
-                                // moved head to qc_slot, this RR-canonical-apply
-                                // arm sees `head >= qc_slot` and skips. Without
-                                // the advance the engine's target_height stays
-                                // pinned and the next slot wedges (see soak v18,
-                                // slot 6626).
-                                if head_when_skipping == qc_slot {
-                                    if let Some(engine) = validator_engine.as_mut() {
-                                        engine.advance_target_height(qc_slot + 1);
-                                    }
-                                }
                                 continue;
                             }
                             let ws_slot = validator_engine
@@ -2020,18 +2006,8 @@ impl PydeNode {
                             // (e.g. the own-vote-QC inline path got there
                             // first this turn).
                             if chain_w.head_slot >= qc_slot {
-                                let head_when_skipping = chain_w.head_slot;
                                 drop(state_w);
                                 drop(chain_w);
-                                // audit-413 (v2): advance target_height on the
-                                // proposer-self-apply path's QC arrival. See
-                                // the matching block at line ~3608 and the RR
-                                // arm at line ~1395 for the wedge analysis.
-                                if head_when_skipping == qc_slot {
-                                    if let Some(engine) = validator_engine.as_mut() {
-                                        engine.advance_target_height(qc_slot + 1);
-                                    }
-                                }
                                 continue;
                             }
                             let ws_slot = validator_engine
@@ -3630,7 +3606,6 @@ impl PydeNode {
                                             };
 
                                             if !need_apply {
-                                                let head_when_skipping = chain_w.head_slot;
                                                 drop(state_w);
                                                 drop(chain_w);
                                                 // Drop buffered body even when we skip apply
@@ -3639,22 +3614,6 @@ impl PydeNode {
                                                 // a duplicate from gossip).
                                                 let mut pbb = pending_block_bodies.write().await;
                                                 pbb.remove(&qc_hash);
-                                                // audit-413 (v2): advance target_height when
-                                                // skipping because head is already AT qc_slot
-                                                // (proposer's own fallback applied the block
-                                                // before the QC came back; without this, the
-                                                // engine's target_height stays pinned to
-                                                // qc_slot, `select_and_vote` queries the wrong
-                                                // bucket on the next slot, the proposer never
-                                                // votes, and the cluster wedges one vote short
-                                                // of quorum). Soak v18 hit this at slot 6626.
-                                                // For `head > qc_slot` (older QC for a slot
-                                                // we already moved past) target_height is
-                                                // already further along — `advance_target_height`
-                                                // is a no-op in that case.
-                                                if head_when_skipping == qc_slot {
-                                                    engine.advance_target_height(qc_slot + 1);
-                                                }
                                                 continue;
                                             }
 
