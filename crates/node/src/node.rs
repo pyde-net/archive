@@ -1,5 +1,6 @@
 use crate::block_processor::BlockProcessor;
 use crate::block_store::BlockStore;
+use crate::canonical_commit;
 use crate::chain::ChainState;
 use crate::config::NodeConfig;
 use crate::consensus_store::ConsensusStateStore;
@@ -2001,27 +2002,45 @@ impl PydeNode {
                                     continue;
                                 }
                             };
+                            // Audit-omega commit 2: route through
+                            // `commit_canonical` instead of the
+                            // bespoke skip-or-apply block. The prior
+                            // `chain_w.head_slot >= qc_slot { continue }`
+                            // silently masked the slot-3251 wedge (local
+                            // had applied its own view-1 fallback at the
+                            // same slot but with a different hash; the
+                            // canonical QC arrived and was silently
+                            // skipped). `commit_canonical` compares the
+                            // local hash at `qc_slot` against
+                            // `qc_block_hash` and reorganizes on mismatch
+                            // — same semantic across all apply paths.
                             let mut chain_w = chain.write().await;
                             let mut state_w = state.write().await;
-                            // Skip if we've already applied this slot
-                            // (e.g. the own-vote-QC inline path got there
-                            // first this turn).
-                            if chain_w.head_slot >= qc_slot {
-                                drop(state_w);
-                                drop(chain_w);
-                                continue;
-                            }
                             let ws_slot = validator_engine
                                 .as_ref()
                                 .and_then(|e| e.finality.latest_checkpoint.as_ref().map(|c| c.slot));
-                            match BlockProcessor::process_full_block_with_aot_and_checkpoint(
+                            let outcome = canonical_commit::commit_canonical(
                                 &mut chain_w,
                                 &mut state_w,
-                                &block,
                                 Some(&aot_cache),
                                 ws_slot,
-                            ) {
-                                Ok((tc, gas, ref receipts_list)) => {
+                                qc_slot,
+                                qc_block_hash,
+                                &block,
+                                Some(&mut competing_blocks),
+                                canonical_commit::CanonicalSource::ApplyCanonicalAfterQc,
+                            );
+                            match outcome {
+                                canonical_commit::CommitOutcome::Applied {
+                                    txs: tc,
+                                    gas,
+                                    receipts: ref receipts_list,
+                                }
+                                | canonical_commit::CommitOutcome::Reorged {
+                                    txs: tc,
+                                    gas,
+                                    receipts: ref receipts_list,
+                                } => {
                                     let pending_writes = state_w.take_pending_writes();
                                     let smt_handle = state_w.smt_handle();
                                     drop(state_w);
@@ -2094,14 +2113,60 @@ impl PydeNode {
                                     )
                                     .await;
                                 }
-                                Err(e) => {
+                                canonical_commit::CommitOutcome::Idempotent => {
                                     drop(state_w);
                                     drop(chain_w);
+                                    // Defensive: drain the body from
+                                    // pending_block_bodies since this
+                                    // slot is settled and the body
+                                    // memory is no longer useful.
+                                    let mut pbb = pending_block_bodies.write().await;
+                                    pbb.remove(&qc_block_hash);
+                                }
+                                canonical_commit::CommitOutcome::DivergenceUnresolved {
+                                    local_hash,
+                                } => {
+                                    drop(state_w);
+                                    drop(chain_w);
+                                    // commit_canonical already logged a
+                                    // warn. Don't escalate further here
+                                    // — the most likely cause is a
+                                    // pre-WS-checkpoint reorg refusal,
+                                    // which is the right safety
+                                    // behavior. Slot is dropped from
+                                    // pbb so a future identical apply
+                                    // doesn't retry the same path.
                                     warn!(
                                         slot = qc_slot,
-                                        error = %e,
-                                        "canonical apply failed"
+                                        local = hex::encode(local_hash),
+                                        canonical = hex::encode(qc_block_hash),
+                                        "ApplyCanonicalAfterQc: divergence unresolved (likely past WS checkpoint)"
                                     );
+                                    let mut pbb = pending_block_bodies.write().await;
+                                    pbb.remove(&qc_block_hash);
+                                }
+                                canonical_commit::CommitOutcome::Gap {
+                                    head_slot,
+                                    qc_slot: qc,
+                                } => {
+                                    drop(state_w);
+                                    drop(chain_w);
+                                    // commit_canonical already logged
+                                    // an info. The standard sync path
+                                    // (RequestChainTip / GetBlocks)
+                                    // fills in the gap via existing
+                                    // bg machinery — nothing to do
+                                    // synchronously here.
+                                    debug!(
+                                        head_slot,
+                                        qc_slot = qc,
+                                        "ApplyCanonicalAfterQc: gap will be filled by sync"
+                                    );
+                                }
+                                canonical_commit::CommitOutcome::Failed { error: _ } => {
+                                    drop(state_w);
+                                    drop(chain_w);
+                                    // commit_canonical already warn-logged.
                                 }
                             }
                         }
