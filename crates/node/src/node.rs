@@ -3657,89 +3657,56 @@ impl PydeNode {
                                                     continue;
                                                 }
                                             };
+                                            // Audit-omega commit 4: the four-case
+                                            // own-vote-QC apply (forward / idempotent /
+                                            // revert+apply / skip) collapses into a
+                                            // single commit_canonical call. The
+                                            // function's outcomes map 1:1 to the
+                                            // cases:
+                                            //   Applied      ← head < qc_slot
+                                            //   Idempotent   ← head == qc_slot && hashes match
+                                            //   Reorged      ← head == qc_slot && hashes differ
+                                            //                  (uses reorg_to_block, which does
+                                            //                  the same state.revert_to +
+                                            //                  chain.revert + process_full_block
+                                            //                  dance the inline code did, with
+                                            //                  the added WS-checkpoint safety
+                                            //                  audit-415 baked in)
+                                            //   Gap          ← head + 1 < qc_slot
+                                            //   Idempotent   ← head > qc_slot (pruned header)
+                                            // The pending_block_bodies cleanup runs on
+                                            // every outcome so a duplicate body never
+                                            // leaks if the canonical apply went via a
+                                            // different path.
                                             let mut chain_w = chain.write().await;
                                             let mut state_w = state.write().await;
-
-                                            // Three cases at QC time:
-                                            //   1. chain head < qc_slot — we never applied
-                                            //      anything for this slot; apply forward.
-                                            //   2. chain head == qc_slot && hashes match —
-                                            //      we ARE the winning proposer and self-
-                                            //      applied earlier in the tick (line ~2002,
-                                            //      needed for our header's state_root). The
-                                            //      block is already canonical; skip apply.
-                                            //   3. chain head == qc_slot && hashes differ —
-                                            //      we self-applied a block but lost the VRF
-                                            //      tournament. Roll back the speculative
-                                            //      slot via the audit-230 revert/revert_to
-                                            //      pair, then apply the canonical block.
-                                            //   4. chain head > qc_slot — multi-slot reorg
-                                            //      territory; defer to the sync path
-                                            //      instead of trying here.
-                                            let need_apply = if chain_w.head_slot == qc_slot {
-                                                let our_block_hash = chain_w
-                                                    .header(qc_slot)
-                                                    .map(|h| h.hash());
-                                                if our_block_hash == Some(qc_hash) {
-                                                    debug!(slot = qc_slot, "QC matches our self-applied block — already canonical");
-                                                    false
-                                                } else {
-                                                    let target = qc_slot.saturating_sub(1);
-                                                    if let Err(e) = chain_w.revert(target) {
-                                                        warn!(slot = qc_slot, error = %e, "chain revert before QC apply failed");
-                                                    }
-                                                    match state_w.revert_to(target) {
-                                                        Ok(_) => {
-                                                            info!(
-                                                                slot = qc_slot,
-                                                                from = hex::encode(our_block_hash.unwrap_or([0u8; 32])),
-                                                                to = hex::encode(qc_hash),
-                                                                "rolled back speculative self-proposal — applying canonical block"
-                                                            );
-                                                            true
-                                                        }
-                                                        Err(e) => {
-                                                            warn!(slot = qc_slot, error = %e, "state revert before QC apply failed");
-                                                            false
-                                                        }
-                                                    }
-                                                }
-                                            } else if chain_w.head_slot < qc_slot {
-                                                true
-                                            } else {
-                                                debug!(
-                                                    qc_slot,
-                                                    head = chain_w.head_slot,
-                                                    "QC behind our chain head — skipping (handled by reorg path)"
-                                                );
-                                                false
-                                            };
-
-                                            if !need_apply {
-                                                drop(state_w);
-                                                drop(chain_w);
-                                                // Drop buffered body even when we skip apply
-                                                // (winner case: we already have the canonical
-                                                // copy via self-apply; the buffered copy is
-                                                // a duplicate from gossip).
-                                                let mut pbb = pending_block_bodies.write().await;
-                                                pbb.remove(&qc_hash);
-                                                continue;
-                                            }
-
                                             let ws_slot = engine
                                                 .finality
                                                 .latest_checkpoint
                                                 .as_ref()
                                                 .map(|cp| cp.slot);
-                                            match BlockProcessor::process_full_block_with_aot_and_checkpoint(
+                                            let outcome = canonical_commit::commit_canonical(
                                                 &mut chain_w,
                                                 &mut state_w,
-                                                &block,
                                                 Some(&aot_cache),
                                                 ws_slot,
-                                            ) {
-                                                Ok((tc, gas, ref receipts_list)) => {
+                                                qc_slot,
+                                                qc_hash,
+                                                &block,
+                                                Some(&mut competing_blocks),
+                                                canonical_commit::CanonicalSource::OwnVoteInline,
+                                            );
+                                            match outcome {
+                                                canonical_commit::CommitOutcome::Applied {
+                                                    txs: tc,
+                                                    gas,
+                                                    receipts: ref receipts_list,
+                                                }
+                                                | canonical_commit::CommitOutcome::Reorged {
+                                                    txs: tc,
+                                                    gas,
+                                                    receipts: ref receipts_list,
+                                                } => {
                                                     let pending_writes = state_w.take_pending_writes();
                                                     let smt_handle = state_w.smt_handle();
                                                     drop(state_w);
@@ -3783,15 +3750,47 @@ impl PydeNode {
                                                     );
                                                     // CONSENSUS_INVARIANTS.md O2: target_height
                                                     // advances after apply. `engine` is the outer
-                                                    // scope's `validator_engine.as_mut()` binding
-                                                    // from line ~3338; re-borrowing
-                                                    // `validator_engine` here would conflict.
+                                                    // scope's `validator_engine.as_mut()` binding;
+                                                    // re-borrowing `validator_engine` here would
+                                                    // conflict.
                                                     engine.advance_target_height(qc_slot + 1);
                                                 }
-                                                Err(e) => {
+                                                canonical_commit::CommitOutcome::Idempotent => {
                                                     drop(state_w);
                                                     drop(chain_w);
-                                                    warn!(slot = qc_slot, error = %e, "QC-gated apply failed");
+                                                    let mut pbb = pending_block_bodies.write().await;
+                                                    pbb.remove(&qc_hash);
+                                                }
+                                                canonical_commit::CommitOutcome::DivergenceUnresolved {
+                                                    local_hash,
+                                                } => {
+                                                    drop(state_w);
+                                                    drop(chain_w);
+                                                    warn!(
+                                                        slot = qc_slot,
+                                                        local = hex::encode(local_hash),
+                                                        canonical = hex::encode(qc_hash),
+                                                        "own-vote QC apply: divergence unresolved (likely past WS checkpoint)"
+                                                    );
+                                                    let mut pbb = pending_block_bodies.write().await;
+                                                    pbb.remove(&qc_hash);
+                                                }
+                                                canonical_commit::CommitOutcome::Gap {
+                                                    head_slot,
+                                                    qc_slot: qc,
+                                                } => {
+                                                    drop(state_w);
+                                                    drop(chain_w);
+                                                    debug!(
+                                                        head_slot,
+                                                        qc_slot = qc,
+                                                        "own-vote QC apply: gap will be filled by sync"
+                                                    );
+                                                }
+                                                canonical_commit::CommitOutcome::Failed { error: _ } => {
+                                                    drop(state_w);
+                                                    drop(chain_w);
+                                                    // commit_canonical already warn-logged.
                                                 }
                                             }
                                         }
