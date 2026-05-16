@@ -5761,7 +5761,13 @@ fn handle_swarm_event(
                             let prop_authorized = peer_manager
                                 .is_consensus_authorized(&propagation_source, &engine.committee_keys);
                             if prop_attested && !prop_authorized {
-                                debug!(
+                                // audit-416 visibility: was debug!; silent
+                                // drops here masked the slot-1413 wedge
+                                // (peer-vote messages from committee members
+                                // mis-classified, QC never formed on lagging
+                                // nodes). Bump to warn! — any drop on
+                                // mainnet is a real signal worth surfacing.
+                                warn!(
                                     forwarder = %propagation_source,
                                     "dropping consensus gossip relayed by non-committee attested peer"
                                 );
@@ -5777,7 +5783,8 @@ fn handle_swarm_event(
                                 let src_authorized = peer_manager
                                     .is_consensus_authorized(source, &engine.committee_keys);
                                 if src_attested && !src_authorized {
-                                    debug!(
+                                    // audit-416 visibility: see note above.
+                                    warn!(
                                         %source,
                                         "dropping consensus gossip originated by non-committee attested peer"
                                     );
@@ -5798,7 +5805,15 @@ fn handle_swarm_event(
                             && !peer_manager
                                 .try_consume_unattested_consensus_budget(&propagation_source)
                         {
-                            debug!(
+                            // audit-416 visibility: was debug!. This is the
+                            // gate the slot-1413 wedge hypothesis points at —
+                            // 1000 TPS makes decryption shares saturate the
+                            // 32 msg/sec/peer budget so a peer-vote
+                            // arriving the same tick gets silently shed.
+                            // Bumping to warn! so the drop rate is visible
+                            // in soak logs and we can correlate against
+                            // the QC-not-forming pattern.
+                            warn!(
                                 forwarder = %propagation_source,
                                 "dropping consensus gossip from unattested source over per-second budget"
                             );
