@@ -3209,8 +3209,11 @@ impl PydeNode {
 
                                     let t_build = std::time::Instant::now();
                                     let gas_ceiling = self.config.consensus.gas_ceiling;
-                                    let (mut txs, _remaining) =
-                                        crate::block_builder::build_tx_list(all_pending, gas_ceiling);
+                                    let (mut txs, _remaining) = crate::block_builder::build_tx_list(
+                                        all_pending,
+                                        gas_ceiling,
+                                        crate::block_builder::MAX_TXS_PER_BLOCK,
+                                    );
                                     let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
 
                                     // Drain any queued double-sign evidence into Slash txs and

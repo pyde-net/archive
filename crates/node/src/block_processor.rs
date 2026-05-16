@@ -1105,6 +1105,27 @@ impl BlockProcessor {
             ));
         }
 
+        // Audit-417: enforce the plaintext-tx-per-block cap on the
+        // validator decode path. Mirrors the encrypted-tx cap
+        // immediately above. Without this, a Byzantine proposer
+        // shipping a 2000-tx block would force every honest
+        // validator to spend >200 ms applying it (sig verify +
+        // parallel exec + receipt accumulation), exceeding
+        // `PROGRESS_TIMEOUT_MS` and triggering view-1 fallback on
+        // the rest of the cluster — the exact failure mode that
+        // produced the slot-2228 wedge during the 1000-TPS soak.
+        // Honest proposers stay under the cap via
+        // `block_builder::build_tx_list`; this is the consensus-
+        // level enforcement that makes the cap a hard rule rather
+        // than a proposer policy.
+        if block.body.transactions.len() > crate::block_builder::MAX_TXS_PER_BLOCK {
+            return Err(format!(
+                "block carries {} plaintext txs, exceeds MAX_TXS_PER_BLOCK={}",
+                block.body.transactions.len(),
+                crate::block_builder::MAX_TXS_PER_BLOCK,
+            ));
+        }
+
         let txs = &block.body.transactions;
         if txs.is_empty() && block.body.encrypted_txs.is_empty() {
             return Ok(());
@@ -2073,6 +2094,59 @@ mod tests {
         assert!(
             err.contains("MAX_ENCRYPTED_TXS_PER_BLOCK"),
             "expected MAX_ENCRYPTED_TXS_PER_BLOCK in error; got: {}",
+            err
+        );
+    }
+
+    /// Audit-417: a block carrying more than
+    /// `MAX_TXS_PER_BLOCK` (=500) plaintext txs must be rejected
+    /// by `validate_block_body`. This is the validator-side
+    /// defense-in-depth for the proposer-side cap in
+    /// `block_builder::build_tx_list`. Pre-fix the cap lived
+    /// only in proposer selection — a Byzantine proposer
+    /// shipping an oversized block forces honest validators
+    /// past the `PROGRESS_TIMEOUT_MS` budget (slot-2228 failure
+    /// mode) and triggers view-1 fallback on the rest of the
+    /// cluster.
+    #[test]
+    fn audit_417_validate_block_body_rejects_oversize_plaintext_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateManager::open(tmp.path(), 1024).unwrap();
+
+        // Build cap+1 distinct (sender, nonce) txs so the dedup
+        // pass earlier in `validate_block_body` doesn't trip first.
+        let cap = crate::block_builder::MAX_TXS_PER_BLOCK;
+        let oversize: Vec<Transaction> = (0..=cap)
+            .map(|i| {
+                let mut sender = [0u8; 32];
+                sender[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                make_transfer_tx(sender, [0xCC; 32], 1, 0)
+            })
+            .collect();
+        assert_eq!(oversize.len(), cap + 1);
+
+        // Header tx_root must match the body so the cap check
+        // (which runs AFTER tx_root verify) is the failing branch.
+        let mut header = dummy_header(1);
+        header.tx_root = pyde_consensus::block::compute_tx_root(&oversize, &[]);
+        let block = Block {
+            header,
+            body: BlockBody {
+                transactions: oversize,
+                encrypted_txs: vec![],
+                execution_schedule: ExecutionSchedule {
+                    groups: vec![],
+                    total_txs: 0,
+                },
+            },
+            proposer_signature: vec![],
+        };
+
+        let err = BlockProcessor::validate_block_body(&block, &state, 1)
+            .expect_err("oversize plaintext-tx body must reject");
+        assert!(
+            err.contains("MAX_TXS_PER_BLOCK"),
+            "expected MAX_TXS_PER_BLOCK in error; got: {}",
             err
         );
     }
