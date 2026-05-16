@@ -79,18 +79,9 @@ const RECIPIENT: [u8; 32] = [0x42u8; 32];
 const TX_VALUE: u128 = 1;
 // 1 PYDE = 10^9 quanta. Each sender gets enough headroom to cover
 // gas at the genesis base-fee (50 gwei × 100 K gas ≈ 5 K PYDE upper
-// bound per-tx) over a 4-hour run at the per-sender rate.
-//
-// Empirical: the audit-416 4h soak showed each wallet survived ~3500
-// txs over ~12 minutes at 10^18 quanta funding before balance ran
-// out and +T/C/E went to zero. Each wallet sends 5 tx/sec × 14400s
-// = 72k txs over the full run. Bumped to 10^19 quanta so a wallet
-// can absorb ~10× its observed burn before exhaustion, leaving
-// margin for the base-fee escalator at peak slots. The base-fee
-// model under EIP-1559 is elastic, so this isn't an exact bound —
-// it just needs to be high enough that no wallet is the first to
-// drain inside a 4h window.
-const FUND_PER_SENDER: u128 = 10_000_000_000_000_000_000;
+// bound per-tx) over a 5-minute run at the per-sender rate. Default
+// fund matches the plaintext loadgen.
+const FUND_PER_SENDER: u128 = 1_000_000_000_000_000_000;
 
 /// Counter contract source — same one used across the multi-node
 /// test suite. Tiny ctor, single u64 storage slot, `increment()`
