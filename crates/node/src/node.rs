@@ -2265,6 +2265,80 @@ impl PydeNode {
                                 qc_block_hash,
                             });
                         }
+                        PostEventAction::BroadcastQcAnnounceAndApplyCanonical {
+                            qc_announce_bytes,
+                            qc_slot,
+                            qc_block_hash,
+                        } => {
+                            // Audit-418: locally-formed QC arrived via
+                            // gossip-receive Vote. Broadcast the QC as a
+                            // standalone announce (so lagging peer
+                            // subsets without 3-of-4 votes can apply
+                            // directly), then re-enter the existing
+                            // canonical-apply orchestration via
+                            // next_action. The validator-only egress
+                            // check matches the audit-218 guard on
+                            // `BroadcastConsensus`; non-validators can't
+                            // reach this arm because the consensus
+                            // topic is validator-only on ingress, but
+                            // the belt-and-suspenders check stays.
+                            if !is_validator {
+                                warn!(
+                                    "non-validator attempted BroadcastQcAnnounceAndApplyCanonical; \
+                                     dropped (audit 218)"
+                                );
+                            } else {
+                                let topic = pyde_net::node::topics::consensus();
+                                broadcast_consensus_with_rr_fallback(
+                                    &mut swarm,
+                                    topic,
+                                    qc_announce_bytes,
+                                    &mut peer_manager,
+                                    &mut gossip_cache,
+                                );
+                            }
+                            next_action = Some(PostEventAction::ApplyCanonicalAfterQc {
+                                qc_slot,
+                                qc_block_hash,
+                            });
+                        }
+                        PostEventAction::SendConsensusRrResponseAndBroadcastQcAnnounceAndApplyQcd(
+                            channel,
+                            resp,
+                            qc_announce_bytes,
+                            qc_slot,
+                            qc_block_hash,
+                        ) => {
+                            // Audit-418: RR-fallback equivalent. Ack
+                            // the RR sender, broadcast the standalone
+                            // QC announce, then queue the canonical
+                            // apply through next_action so the
+                            // existing ApplyCanonicalAfterQc handler
+                            // body runs without duplication.
+                            let _ = swarm
+                                .behaviour_mut()
+                                .consensus_rr
+                                .send_response(channel, resp);
+                            if !is_validator {
+                                warn!(
+                                    "non-validator attempted RR-fallback QcAnnounce; \
+                                     dropped (audit 218)"
+                                );
+                            } else {
+                                let topic = pyde_net::node::topics::consensus();
+                                broadcast_consensus_with_rr_fallback(
+                                    &mut swarm,
+                                    topic,
+                                    qc_announce_bytes,
+                                    &mut peer_manager,
+                                    &mut gossip_cache,
+                                );
+                            }
+                            next_action = Some(PostEventAction::ApplyCanonicalAfterQc {
+                                qc_slot,
+                                qc_block_hash,
+                            });
+                        }
                         PostEventAction::BufferCompetingBlock(block) => {
                             // Audit 232: a competing block at our head slot
                             // was just received. Buffer it keyed by
@@ -3574,6 +3648,33 @@ impl PydeNode {
                                     // Add own vote to collection
                                     let (qc_formed, qc_slot_hash) = if let Some(qc) = engine.on_vote(vote.clone()) {
                                         info!(slot = current_slot, votes = qc.vote_count(), "QC formed after VRF selection");
+                                        // Audit-418: broadcast the QC
+                                        // as a standalone QcAnnounce
+                                        // so any lagging peer subset
+                                        // — which under the 200-TPS
+                                        // soak's gossipsub-mesh
+                                        // asymmetry might have
+                                        // received fewer than 3 votes
+                                        // for this slot — can apply
+                                        // the block directly via
+                                        // commit_canonical instead of
+                                        // waiting for the next slot's
+                                        // proposal to embed qc_previous.
+                                        // Closes the 2-vs-2 deadlock
+                                        // observed at slot 9687.
+                                        let qc_announce_bytes = wire::encode_consensus_message(
+                                            &pyde_consensus::hotstuff::ConsensusMessage::QcAnnounce {
+                                                qc: qc.clone(),
+                                            },
+                                        );
+                                        let cons_topic = pyde_net::node::topics::consensus();
+                                        broadcast_consensus_with_rr_fallback(
+                                            &mut swarm,
+                                            cons_topic,
+                                            qc_announce_bytes,
+                                            &mut peer_manager,
+                                            &mut gossip_cache,
+                                        );
                                         (true, Some((qc.slot, qc.block_hash)))
                                     } else {
                                         (false, None)
@@ -4859,6 +4960,38 @@ enum PostEventAction {
     SendConsensusRrResponseAndApplyQcd(
         request_response::ResponseChannel<pyde_net::consensus_protocol::ConsensusResp>,
         pyde_net::consensus_protocol::ConsensusResp,
+        u64,
+        [u8; 32],
+    ),
+    /// Audit-418: a peer Vote arrived via gossip-receive and the
+    /// vote closed a QC locally. Broadcast the QC as a standalone
+    /// `QcAnnounce` so any lagging peer subset that hasn't seen
+    /// enough votes to form the QC themselves can apply directly,
+    /// then queue the canonical apply via `next_action`. Closes
+    /// the 2-vs-2 head-divergence deadlock at slot 9687 from the
+    /// 200-TPS soak: pre-fix the QC could only propagate as
+    /// `qc_previous` in the next slot's proposal, but when the
+    /// other half of the cluster wouldn't vote for the next slot
+    /// (no parent), the QC stayed trapped.
+    BroadcastQcAnnounceAndApplyCanonical {
+        qc_announce_bytes: Vec<u8>,
+        qc_slot: u64,
+        qc_block_hash: [u8; 32],
+    },
+    /// Audit-418: RR-fallback equivalent of
+    /// `BroadcastQcAnnounceAndApplyCanonical`. Ack the RR sender,
+    /// broadcast the standalone QC, then queue the canonical apply
+    /// via `next_action`. The apply runs through the existing
+    /// `ApplyCanonicalAfterQc` handler — no need to duplicate the
+    /// ~200-line orchestration that already powers
+    /// `SendConsensusRrResponseAndApplyQcd`. The Ack and broadcast
+    /// happen up front because the RR `ResponseChannel` is consumed
+    /// by `send_response` and can't survive into a follow-up
+    /// action.
+    SendConsensusRrResponseAndBroadcastQcAnnounceAndApplyQcd(
+        request_response::ResponseChannel<pyde_net::consensus_protocol::ConsensusResp>,
+        pyde_net::consensus_protocol::ConsensusResp,
+        Vec<u8>,
         u64,
         [u8; 32],
     ),
@@ -6347,7 +6480,24 @@ fn handle_swarm_event(
                                             // commit (e.g. an older client) — kept
                                             // wired but no longer the steady-state
                                             // path.
-                                            return PostEventAction::ApplyCanonicalAfterQc {
+                                            //
+                                            // Audit-418: this is a local QC
+                                            // formation event — broadcast as a
+                                            // standalone QcAnnounce so lagging
+                                            // peer subsets (which under
+                                            // gossipsub-mesh asymmetry may not
+                                            // have collected 3 votes locally)
+                                            // can apply the block directly.
+                                            // The main loop handles the
+                                            // broadcast + apply in one
+                                            // compound action.
+                                            let qc_announce_bytes = wire::encode_consensus_message(
+                                                &pyde_consensus::hotstuff::ConsensusMessage::QcAnnounce {
+                                                    qc: qc.clone(),
+                                                },
+                                            );
+                                            return PostEventAction::BroadcastQcAnnounceAndApplyCanonical {
+                                                qc_announce_bytes,
                                                 qc_slot: slot,
                                                 qc_block_hash: qc.block_hash,
                                             };
@@ -6782,6 +6932,15 @@ fn handle_swarm_event(
             // slots because only one ConsensusMessage variant fires per
             // RR message.
             let mut pending_apply_qcd: Option<(u64, [u8; 32])> = None;
+            // Audit-418: companion to pending_apply_qcd. When the Vote
+            // arm forms a local QC, encode the standalone QcAnnounce
+            // so the dispatch at the bottom of this branch can route
+            // through the combo BroadcastQcAnnounce+ApplyQcd action.
+            // Always set in tandem with pending_apply_qcd in the Vote
+            // arm; left None when pending_apply_qcd is set by any
+            // path that doesn't represent a fresh local formation
+            // (currently none — only the Vote arm sets either).
+            let mut pending_qc_announce_bytes: Option<Vec<u8>> = None;
             let resp = {
                 // Tag-byte routing: the consensus topic carries
                 // FinalityVote alongside the ConsensusMessage variants
@@ -6877,6 +7036,20 @@ fn handle_swarm_event(
                                         votes = qc.vote_count(),
                                         "QC formed (via RR fallback)"
                                     );
+                                    // Audit-418: encode the standalone
+                                    // QcAnnounce alongside the apply
+                                    // marker; the bottom-of-arm
+                                    // dispatch routes through the
+                                    // BroadcastQcAnnounce+ApplyQcd
+                                    // combo action so lagging peers
+                                    // can apply without waiting for
+                                    // the next slot's proposal.
+                                    pending_qc_announce_bytes =
+                                        Some(wire::encode_consensus_message(
+                                            &pyde_consensus::hotstuff::ConsensusMessage::QcAnnounce {
+                                                qc: qc.clone(),
+                                            },
+                                        ));
                                     pending_apply_qcd = Some((slot, qc.block_hash));
                                 }
                             }
@@ -6935,10 +7108,32 @@ fn handle_swarm_event(
             // decoded payload through the same PostEventAction queue
             // as the gossip-receive arm. The pending_* slots are
             // mutually exclusive because the decode branches are.
+            //
+            // Audit-418: when pending_apply_qcd is set by the Vote
+            // arm, pending_qc_announce_bytes is set in tandem.
+            // Prefer the BroadcastQcAnnounce+ApplyQcd combo so the
+            // QC propagates to lagging peers immediately. Fall back
+            // to the original ApplyQcd-only variant only if the
+            // announce slot is somehow None — which today doesn't
+            // happen but the explicit fallback keeps the dispatch
+            // safe under any future invariant changes.
             if let Some(share_msg) = pending_share_msg {
                 PostEventAction::SendConsensusRrResponseAndAddShares(channel, resp, share_msg)
             } else if let Some((qc_slot, qc_hash)) = pending_apply_qcd {
-                PostEventAction::SendConsensusRrResponseAndApplyQcd(channel, resp, qc_slot, qc_hash)
+                match pending_qc_announce_bytes {
+                    Some(qc_announce_bytes) => {
+                        PostEventAction::SendConsensusRrResponseAndBroadcastQcAnnounceAndApplyQcd(
+                            channel,
+                            resp,
+                            qc_announce_bytes,
+                            qc_slot,
+                            qc_hash,
+                        )
+                    }
+                    None => PostEventAction::SendConsensusRrResponseAndApplyQcd(
+                        channel, resp, qc_slot, qc_hash,
+                    ),
+                }
             } else if let Some((block, bytes)) = pending_fallback_proposal_with_body {
                 PostEventAction::SendConsensusRrResponseAndBroadcastFallbackProposalAndBufferBody(
                     channel, resp, block, bytes,
