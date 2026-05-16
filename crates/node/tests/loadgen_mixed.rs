@@ -599,6 +599,20 @@ fn mixed_workload_load_test() {
                 let mut nonce = 1u64; // nonce 0 was RegisterPubkey
                 let mut next_submit = Instant::now();
                 let mut submit_idx: u64 = (i as u64) * 7919; // staggered seed so senders don't all pick the same kind in lockstep
+                // Sustained-load nonce-drift detection. The error
+                // path resyncs reactively, but a tx accepted by the
+                // RPC ingress (HTTP 200) can still silently fail to
+                // land — mempool eviction under burst load, reorgs,
+                // network-level body drops. If that happens, the
+                // local nonce ratchets forward while the chain's
+                // doesn't, and every subsequent submission collides
+                // with "(sender, nonce) above window". The reactive
+                // resync used to bail (`chain_nonce > nonce`); now
+                // it unconditionally trusts the chain. Periodic
+                // drift checks every DRIFT_CHECK_EVERY successes
+                // catch the silent-failure case before it cascades.
+                const DRIFT_CHECK_EVERY: u64 = 50;
+                let mut consecutive_oks: u64 = 0;
                 loop {
                     let now = Instant::now();
                     if now >= deadline {
@@ -655,21 +669,57 @@ fn mixed_workload_load_test() {
                                 }
                             }
                             nonce += 1;
+                            consecutive_oks += 1;
+
+                            // Periodic drift detection: after every
+                            // DRIFT_CHECK_EVERY accepted submissions,
+                            // verify the chain has actually advanced
+                            // our nonce. If `chain_nonce` is BELOW
+                            // local `nonce`, txs are getting lost
+                            // post-acceptance — clamp to whatever
+                            // chain says (+ remaining in-flight
+                            // tolerance). Done unconditionally on
+                            // BOTH sides of the comparison so this
+                            // also handles "chain leapt ahead via
+                            // some external observer" (e.g.
+                            // restart).
+                            if consecutive_oks >= DRIFT_CHECK_EVERY {
+                                consecutive_oks = 0;
+                                if let Some(chain_nonce) =
+                                    fetch_nonce(&cli, &url, &wallet.address).await
+                                {
+                                    // Allow up to SENDER_INFLIGHT
+                                    // tolerance (mempool window for
+                                    // this sender). If we're more
+                                    // than that ahead, txs are
+                                    // silently dropping.
+                                    const SENDER_INFLIGHT: u64 = 16;
+                                    if nonce > chain_nonce.saturating_add(SENDER_INFLIGHT) {
+                                        nonce = chain_nonce;
+                                    } else if chain_nonce > nonce {
+                                        nonce = chain_nonce;
+                                    }
+                                }
+                            }
                         }
                         Err(_) => {
                             counts.record_err(kind, in_measure);
-                            // The chain may have committed the tx
-                            // even though the HTTP response failed
-                            // (3 s timeout) — resync the nonce from
-                            // chain state before retrying, otherwise
-                            // we burn this sender's slot forever on
-                            // `InvalidNonce(BelowWindow)`.
+                            consecutive_oks = 0;
+                            // Unconditionally trust the chain on
+                            // error. Previously this only ratcheted
+                            // forward (`chain_nonce > nonce`); the
+                            // "loadgen ahead" failure mode — local
+                            // counter incremented on HTTP-200 but
+                            // the tx never landed on-chain — left
+                            // the sender wedged on every subsequent
+                            // submission with "above window"
+                            // rejections. Trusting chain state on
+                            // any error path closes both
+                            // directions.
                             if let Some(chain_nonce) =
                                 fetch_nonce(&cli, &url, &wallet.address).await
                             {
-                                if chain_nonce > nonce {
-                                    nonce = chain_nonce;
-                                }
+                                nonce = chain_nonce;
                             }
                             tokio::time::sleep(Duration::from_millis(400)).await;
                             next_submit = Instant::now();
