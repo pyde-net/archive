@@ -4267,38 +4267,55 @@ impl PydeNode {
                                             &mut gossip_cache,
                                         );
 
-                                        // 3) Apply the block locally so the
-                                        //    proposer's chain.head advances.
-                                        //    Mirrors the regular self-proposal
-                                        //    path at the slot tick — fallback
-                                        //    needs the same so chain progress
-                                        //    isn't predicated on receiving the
-                                        //    block back via gossip.
-                                        let mut chain_w = chain.write().await;
-                                        let mut state_w = state.write().await;
-                                        let ws_slot = engine
-                                            .finality
-                                            .latest_checkpoint
-                                            .as_ref()
-                                            .map(|cp| cp.slot);
-                                        if let Err(e) = BlockProcessor::process_full_block_with_aot_and_checkpoint(
-                                            &mut chain_w,
-                                            &mut state_w,
-                                            &block,
-                                            Some(&aot_cache),
-                                            ws_slot,
-                                        ) {
-                                            warn!(slot = fallback_slot, error = %e, "failed to process own fallback block");
-                                        } else {
-                                            let _ = state_w.flush_pending();
-                                            state_w.refresh_root();
-                                            let _ = block_store.put_header(&header);
-                                            let _ = block_store.put_head(fallback_slot);
-                                            chain_sync.on_block_processed(fallback_slot);
-                                            info!(slot = fallback_slot, "applied own fallback block");
+                                        // 3) Audit-omega commit 5/5: stage the
+                                        //    block instead of speculatively
+                                        //    committing it. This was the
+                                        //    last pre-QC commit path in the
+                                        //    node — the happy-path
+                                        //    proposer at the slot tick
+                                        //    (line ~3373 "Path A: do NOT
+                                        //    execute the block here")
+                                        //    already follows this pattern;
+                                        //    the fallback was the lone
+                                        //    holdout. It caused the slot-
+                                        //    3251 wedge: the proposer
+                                        //    advanced its chain.head to a
+                                        //    speculative fallback block,
+                                        //    the canonical QC arrived for
+                                        //    a different block at the same
+                                        //    slot, the `head_slot >=
+                                        //    qc_slot` skip then silently
+                                        //    refused to reorg.
+                                        //
+                                        //    With the staging pattern, the
+                                        //    block sits in
+                                        //    `pending_block_bodies` (same
+                                        //    place the happy-path
+                                        //    proposer puts its block) and
+                                        //    is promoted to canonical
+                                        //    only when the matching QC
+                                        //    arrives via own-vote-QC
+                                        //    inline apply, ApplyCanonical
+                                        //    AfterQc, or RR-fallback —
+                                        //    all three now route through
+                                        //    `commit_canonical`. If a
+                                        //    DIFFERENT QC wins instead,
+                                        //    this staged entry is dropped
+                                        //    when the QC's apply finishes
+                                        //    (the canonical-apply paths
+                                        //    remove their own
+                                        //    `qc_block_hash` entry from
+                                        //    `pending_block_bodies` on
+                                        //    every outcome).
+                                        {
+                                            let mut pbb =
+                                                pending_block_bodies.write().await;
+                                            pbb.insert(block.header.hash(), block.clone());
                                         }
-                                        drop(state_w);
-                                        drop(chain_w);
+                                        info!(
+                                            slot = fallback_slot,
+                                            "staged own fallback block (awaiting QC for canonical apply)"
+                                        );
                                     }
                                 }
                             }
