@@ -14,17 +14,43 @@ use pyde_crypto::falcon::{
     falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature,
 };
 
-/// Timeout duration before declaring proposer failure (milliseconds).
-pub const PROPOSAL_TIMEOUT_MS: u64 = 200;
+/// Floor value for the proposer-failure timeout. The legacy default
+/// (50% of `SLOT_DURATION_MS = 400` = 200 ms) when the protocol is
+/// run at default slot timing. The effective timeout is reported by
+/// `proposal_timeout_ms()` — at a non-default slot duration it
+/// derives as `slot_duration_ms() / 2` unless an explicit override
+/// has been installed via `set_proposal_timeout_ms` or the
+/// `PYDE_PROPOSAL_TIMEOUT_MS` env var.
+pub const PROPOSAL_TIMEOUT_DEFAULT_MS: u64 = 200;
+
+/// Lower bound for proposal timeout overrides (ms). Anything below
+/// 50 ms can't cover a single FALCON sign + libp2p hop even on
+/// loopback.
+pub const MIN_PROPOSAL_TIMEOUT_MS: u64 = 50;
+
+/// Upper bound for proposal timeout overrides (ms). 5 s is generous
+/// even for cross-region WAN where 220 ms one-way is the worst pair.
+pub const MAX_PROPOSAL_TIMEOUT_MS: u64 = 5_000;
 
 /// Audit 234 part 3: secondary timeout. After voting for a proposal,
 /// if no QC for the slot is observed within this window, the
-/// validator triggers view-change as a liveness fallback. Set well
-/// above the 400ms slot time so a healthy chain never trips it
-/// (a slot that gets its QC promptly clears the validator's
-/// state before this fires), but low enough that gossip-mesh
-/// inconsistency is recovered within a few seconds.
-pub const PROGRESS_TIMEOUT_MS: u64 = 2_000;
+/// validator triggers view-change as a liveness fallback. The
+/// legacy default (`5 × SLOT_DURATION_MS = 2_000 ms`) is calibrated
+/// to be well above one slot so a healthy chain never trips it, but
+/// low enough that gossip-mesh inconsistency is recovered within a
+/// few seconds. The effective timeout is reported by
+/// `progress_timeout_ms()` — at a non-default slot duration it
+/// derives as `slot_duration_ms() * 5` unless overridden via
+/// `set_progress_timeout_ms` or `PYDE_PROGRESS_TIMEOUT_MS`.
+pub const PROGRESS_TIMEOUT_DEFAULT_MS: u64 = 2_000;
+
+/// Lower bound for progress timeout overrides (ms).
+pub const MIN_PROGRESS_TIMEOUT_MS: u64 = 500;
+
+/// Upper bound for progress timeout overrides (ms). 60 s is the
+/// effective ceiling — beyond that the chain has clearly halted and
+/// view-change is no longer a useful fallback.
+pub const MAX_PROGRESS_TIMEOUT_MS: u64 = 60_000;
 
 /// Default slot duration (milliseconds). The protocol spec value
 /// for local / same-region deployments. Operators running across
@@ -104,6 +130,106 @@ pub fn set_slot_duration_ms(ms: u64) -> u64 {
     slot_duration_ms()
 }
 
+/// Runtime-overrideable proposal timeout. `0` = unset, fall back to
+/// `slot_duration_ms() / 2` (which matches the legacy
+/// `PROPOSAL_TIMEOUT_DEFAULT_MS = 200` at the default 400 ms slot).
+/// Set once at process startup from
+/// `consensus.proposal_timeout_ms` config or
+/// `PYDE_PROPOSAL_TIMEOUT_MS` env var. First-writer-wins.
+static PROPOSAL_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Runtime-overrideable progress timeout. `0` = unset, fall back to
+/// `slot_duration_ms() * 5` (which matches the legacy
+/// `PROGRESS_TIMEOUT_DEFAULT_MS = 2_000` at the default 400 ms slot).
+/// Set once at process startup from
+/// `consensus.progress_timeout_ms` config or
+/// `PYDE_PROGRESS_TIMEOUT_MS` env var. First-writer-wins.
+static PROGRESS_TIMEOUT_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Effective proposal timeout in milliseconds. Reads the runtime
+/// override if set, otherwise the `PYDE_PROPOSAL_TIMEOUT_MS` env
+/// var (cached on first access), otherwise derives as half of
+/// `slot_duration_ms()`. At the default 400 ms slot this returns
+/// 200, matching pre-refactor behaviour exactly.
+pub fn proposal_timeout_ms() -> u64 {
+    let override_val = PROPOSAL_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if override_val != 0 {
+        return override_val;
+    }
+    if let Some(env_ms) = std::env::var("PYDE_PROPOSAL_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| (MIN_PROPOSAL_TIMEOUT_MS..=MAX_PROPOSAL_TIMEOUT_MS).contains(&v))
+    {
+        let _ = PROPOSAL_TIMEOUT_OVERRIDE_MS.compare_exchange(
+            0,
+            env_ms,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return env_ms;
+    }
+    // Derived: half-slot for proposal, half for vote/QC.
+    slot_duration_ms() / 2
+}
+
+/// Pin the proposal timeout to `ms`. Clamped to
+/// `[MIN_PROPOSAL_TIMEOUT_MS, MAX_PROPOSAL_TIMEOUT_MS]` and
+/// first-writer-wins. Returns the value now in effect.
+pub fn set_proposal_timeout_ms(ms: u64) -> u64 {
+    let clamped = ms.clamp(MIN_PROPOSAL_TIMEOUT_MS, MAX_PROPOSAL_TIMEOUT_MS);
+    let _ = PROPOSAL_TIMEOUT_OVERRIDE_MS.compare_exchange(
+        0,
+        clamped,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    proposal_timeout_ms()
+}
+
+/// Effective progress timeout in milliseconds. Reads the runtime
+/// override if set, otherwise the `PYDE_PROGRESS_TIMEOUT_MS` env
+/// var (cached on first access), otherwise derives as
+/// `slot_duration_ms() * 5`. At the default 400 ms slot this
+/// returns 2 000, matching pre-refactor behaviour exactly.
+pub fn progress_timeout_ms() -> u64 {
+    let override_val = PROGRESS_TIMEOUT_OVERRIDE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if override_val != 0 {
+        return override_val;
+    }
+    if let Some(env_ms) = std::env::var("PYDE_PROGRESS_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| (MIN_PROGRESS_TIMEOUT_MS..=MAX_PROGRESS_TIMEOUT_MS).contains(&v))
+    {
+        let _ = PROGRESS_TIMEOUT_OVERRIDE_MS.compare_exchange(
+            0,
+            env_ms,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return env_ms;
+    }
+    // Derived: 5 slot durations for view-change liveness budget.
+    slot_duration_ms().saturating_mul(5)
+}
+
+/// Pin the progress timeout to `ms`. Clamped to
+/// `[MIN_PROGRESS_TIMEOUT_MS, MAX_PROGRESS_TIMEOUT_MS]` and
+/// first-writer-wins. Returns the value now in effect.
+pub fn set_progress_timeout_ms(ms: u64) -> u64 {
+    let clamped = ms.clamp(MIN_PROGRESS_TIMEOUT_MS, MAX_PROGRESS_TIMEOUT_MS);
+    let _ = PROGRESS_TIMEOUT_OVERRIDE_MS.compare_exchange(
+        0,
+        clamped,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    progress_timeout_ms()
+}
+
 /// A view change message broadcast when a proposer fails.
 #[derive(Clone, Debug)]
 pub struct ViewChangeMessage {
@@ -178,7 +304,7 @@ impl TimeoutTracker {
     pub fn is_expired(&self, now_ms: u64) -> bool {
         !self.proposal_received
             && self.view_change_qc.is_none()
-            && now_ms.saturating_sub(self.slot_start_ms) >= PROPOSAL_TIMEOUT_MS
+            && now_ms.saturating_sub(self.slot_start_ms) >= proposal_timeout_ms()
     }
 
     /// Check if the entire slot duration has elapsed.
@@ -189,7 +315,7 @@ impl TimeoutTracker {
     /// Milliseconds remaining until proposal timeout.
     pub fn ms_until_timeout(&self, now_ms: u64) -> u64 {
         let elapsed = now_ms.saturating_sub(self.slot_start_ms);
-        PROPOSAL_TIMEOUT_MS.saturating_sub(elapsed)
+        proposal_timeout_ms().saturating_sub(elapsed)
     }
 }
 

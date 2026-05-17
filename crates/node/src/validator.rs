@@ -1044,39 +1044,37 @@ impl ValidatorEngine {
         // committee table. `from_index` is 1-based, so subtract 1
         // before indexing. An out-of-range `from_index` is rejected
         // here without spending a Lagrange/structural verify cycle.
+        //
+        // Audit-411 family: at epoch boundary, contributions in flight
+        // may be signed by the just-deposed committee. `committee_keys`
+        // has already rotated to the new committee, so a direct lookup
+        // can give a stale pk. Try the current committee first, then
+        // fall back to `prev_committee_keys` — mirrors what consensus
+        // voting paths do via `committee_keys_for_slot`.
         let from_idx0 = match contribution.from_index.checked_sub(1) {
-            Some(i) if i < self.committee_keys.len() => i,
-            _ => {
+            Some(i) => i,
+            None => {
                 warn!(
                     from = contribution.from_index,
-                    "PSS contribution from_index out of committee range"
+                    "PSS contribution from_index out of committee range (0)"
                 );
                 return false;
             }
         };
-        let issuer_pk =
-            match pyde_crypto::falcon::FalconPublicKey::from_bytes(&self.committee_keys[from_idx0])
-            {
-                Some(pk) => pk,
-                None => {
-                    warn!(
-                        from = contribution.from_index,
-                        "committee FALCON pk decode failed for PSS contribution"
-                    );
-                    return false;
-                }
-            };
 
-        // Verify the contribution: TPL-303 epoch + sig, plus the
-        // existing structural zero-secret + polynomial-consistency
-        // checks. `pss_target_epoch` is set by `start_pss_refresh`
-        // and matches the epoch every honest contribution claims.
-        if !verify_refresh_contribution(
-            &contribution,
-            threshold,
-            self.pss_target_epoch,
-            &issuer_pk,
-        ) {
+        let target = self.pss_target_epoch;
+        let try_verify = |table: &[Vec<u8>]| -> bool {
+            if from_idx0 >= table.len() {
+                return false;
+            }
+            let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&table[from_idx0]) {
+                Some(pk) => pk,
+                None => return false,
+            };
+            verify_refresh_contribution(&contribution, threshold, target, &pk)
+        };
+
+        if !try_verify(&self.committee_keys) && !try_verify(&self.prev_committee_keys) {
             warn!(
                 from = contribution.from_index,
                 "invalid PSS refresh contribution"
@@ -1653,18 +1651,31 @@ impl ValidatorEngine {
             None => return false,
         };
 
-        // Verify share against committee key
+        // Verify share against committee key.
+        //
+        // Audit-411 family: at epoch boundary, shares in flight may be
+        // signed by the just-deposed committee. `committee_keys` has
+        // already rotated to the new committee, so a direct lookup can
+        // give a stale pk. Try the current committee first, then fall
+        // back to `prev_committee_keys` — mirrors the PSS fix and what
+        // `committee_keys_for_slot` does for consensus voting.
         let idx = share.validator_index as usize;
-        if idx >= self.committee_keys.len() {
-            return false;
-        }
-        let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&self.committee_keys[idx]) {
-            Some(pk) => pk,
-            None => return false,
+        let epoch = collector.epoch;
+
+        let try_with = |table: &[Vec<u8>]| -> bool {
+            if idx >= table.len() {
+                return false;
+            }
+            let pk = match pyde_crypto::falcon::FalconPublicKey::from_bytes(&table[idx]) {
+                Some(pk) => pk,
+                None => return false,
+            };
+            verify_share(&share, &pk, epoch)
         };
-        if !verify_share(&share, &pk, collector.epoch) {
+
+        if !try_with(&self.committee_keys) && !try_with(&self.prev_committee_keys) {
             warn!(
-                epoch = collector.epoch,
+                epoch,
                 validator = idx,
                 "invalid randomness share"
             );
@@ -3903,7 +3914,7 @@ impl ValidatorEngine {
         let elapsed = now_ms.saturating_sub(self.last_qc_progress_ms);
         if !progressed
             && !already_view_changed
-            && elapsed >= pyde_consensus::view_change::PROGRESS_TIMEOUT_MS
+            && elapsed >= pyde_consensus::view_change::progress_timeout_ms()
         {
             tracing::info!(
                 slot = self.consensus.current_slot,

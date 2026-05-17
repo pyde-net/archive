@@ -32,6 +32,23 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60); // 1 ho
 /// Rate limit: max inbound connections per second per IP.
 pub const DEFAULT_RATE_LIMIT_PER_IP: u32 = 5;
 
+/// Default request-response timeout for direct delivery protocols
+/// (blocks, consensus, block_txs). Tuned for same-region cluster
+/// (audit 234 part 4 step 7); cross-region operators should raise
+/// this — typically `slot_duration_ms * 3` — via
+/// `NetworkConfig::request_timeout` and the
+/// `network.request_timeout_ms` config field.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Default sync request-response timeout (block-batch fetch).
+/// Sync carries heavier payloads than the consensus/blocks/block_txs
+/// protocols (full block bodies in batches), so it gets its own
+/// budget. 10s matches libp2p's pre-refactor implicit default;
+/// cross-region operators raise this — typically
+/// `slot_duration_ms * 10` — via `NetworkConfig::sync_request_timeout`
+/// and the `network.sync_request_timeout_ms` config field.
+pub const DEFAULT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Network configuration.
 #[derive(Clone, Debug)]
 pub struct NetworkConfig {
@@ -47,6 +64,16 @@ pub struct NetworkConfig {
     pub idle_timeout: Duration,
     /// Rate limit per IP (connections per second).
     pub rate_limit_per_ip: u32,
+    /// Request-response timeout for direct delivery protocols (blocks,
+    /// consensus, block_txs). Operator-configurable; cross-region
+    /// deployments typically scale this to `slot_duration_ms * 3`.
+    pub request_timeout: Duration,
+    /// Request-response timeout for the sync protocol (block-batch
+    /// fetch). Separate from `request_timeout` because sync carries
+    /// heavier payloads (full block bodies). Operator-configurable;
+    /// cross-region deployments typically scale this to
+    /// `slot_duration_ms * 10`.
+    pub sync_request_timeout: Duration,
     /// Bootstrap peer addresses.
     pub bootstrap_peers: Vec<String>,
     /// Whether this node is a validator.
@@ -75,6 +102,8 @@ impl Default for NetworkConfig {
             max_outbound: DEFAULT_MAX_OUTBOUND,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             rate_limit_per_ip: DEFAULT_RATE_LIMIT_PER_IP,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            sync_request_timeout: DEFAULT_SYNC_REQUEST_TIMEOUT,
             bootstrap_peers: Vec::new(),
             is_validator: false,
             // Default to devnet chain_id; production callers

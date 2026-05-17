@@ -68,9 +68,10 @@ pub struct BlockTxsResp {
 /// `OutboundFailure` so the caller can move on to a different peer
 /// rather than holding the slot open while a stale connection
 /// times out.
-pub fn block_txs_behaviour() -> request_response::cbor::Behaviour<BlockTxsReq, BlockTxsResp> {
-    let cfg = request_response::Config::default()
-        .with_request_timeout(std::time::Duration::from_millis(1500));
+pub fn block_txs_behaviour(
+    request_timeout: std::time::Duration,
+) -> request_response::cbor::Behaviour<BlockTxsReq, BlockTxsResp> {
+    let cfg = request_response::Config::default().with_request_timeout(request_timeout);
     request_response::cbor::Behaviour::new(
         [(BLOCK_TXS_PROTOCOL, request_response::ProtocolSupport::Full)],
         cfg,

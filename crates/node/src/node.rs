@@ -666,7 +666,30 @@ impl PydeNode {
         let peer_id = libp2p::PeerId::from(keypair.public());
         info!(%peer_id, "node identity loaded");
 
-        // 5. Build network config from node config
+        // 5. Build network config from node config.
+        //
+        // Request-response timeout (blocks, consensus, block_txs) uses
+        // operator override if set, else `max(1500, block_time_ms * 3)`
+        // so same-region clusters retain the legacy 1500 ms floor and
+        // cross-region operators get proportional scaling from their
+        // configured slot duration.
+        let request_timeout_ms = self.config.network.request_timeout_ms.unwrap_or_else(|| {
+            std::cmp::max(
+                pyde_net::config::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64,
+                self.config.consensus.block_time_ms.saturating_mul(3),
+            )
+        });
+        // Sync gets its own derived default — `max(10_000,
+        // block_time_ms * 10)` — because sync carries block-batch
+        // payloads heavier than the small-message RR protocols. At
+        // default 400 ms slot this returns 10 000, matching the
+        // pre-refactor libp2p default exactly.
+        let sync_request_timeout_ms = self.config.network.sync_request_timeout_ms.unwrap_or_else(|| {
+            std::cmp::max(
+                pyde_net::config::DEFAULT_SYNC_REQUEST_TIMEOUT.as_millis() as u64,
+                self.config.consensus.block_time_ms.saturating_mul(10),
+            )
+        });
         let net_config = NetworkConfig {
             port: self.config.network.port,
             max_peers: self.config.network.max_peers,
@@ -678,6 +701,8 @@ impl PydeNode {
             // alive long enough to block 4-of-4 churn recovery.
             idle_timeout: pyde_net::config::DEFAULT_IDLE_TIMEOUT,
             rate_limit_per_ip: self.config.network.rate_limit_per_ip,
+            request_timeout: std::time::Duration::from_millis(request_timeout_ms),
+            sync_request_timeout: std::time::Duration::from_millis(sync_request_timeout_ms),
             bootstrap_peers: self.config.network.bootstrap_peers.clone(),
             is_validator,
             // Audit 340: bake chain_id into the identify
@@ -959,6 +984,29 @@ impl PydeNode {
                 slot_duration_ms = effective_slot_duration_ms,
                 "consensus slot duration set",
             );
+        }
+        // Operator overrides for the consensus timeouts. When unset
+        // these are derived at-read-time from `slot_duration_ms`
+        // (proposal = slot/2, progress = slot*5), preserving the
+        // legacy 200/2000 ms values exactly at the default 400 ms slot
+        // and scaling cleanly when operators pin a longer slot for
+        // cross-region deployments. When set, the value is clamped to
+        // the per-timeout MIN/MAX bounds in `view_change`.
+        if let Some(ms) = self.config.consensus.proposal_timeout_ms {
+            let effective = pyde_consensus::view_change::set_proposal_timeout_ms(ms);
+            if effective != ms {
+                warn!(requested_ms = ms, effective_ms = effective, "proposal_timeout_ms clamped");
+            } else {
+                info!(proposal_timeout_ms = effective, "consensus proposal timeout pinned");
+            }
+        }
+        if let Some(ms) = self.config.consensus.progress_timeout_ms {
+            let effective = pyde_consensus::view_change::set_progress_timeout_ms(ms);
+            if effective != ms {
+                warn!(requested_ms = ms, effective_ms = effective, "progress_timeout_ms clamped");
+            } else {
+                info!(progress_timeout_ms = effective, "consensus progress timeout pinned");
+            }
         }
         let now_ms_for_anchor = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

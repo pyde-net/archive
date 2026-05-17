@@ -70,10 +70,22 @@ pub enum SyncResp {
 }
 
 /// Create the request-response behaviour for sync.
-pub fn sync_behaviour() -> request_response::cbor::Behaviour<SyncReq, SyncResp> {
+///
+/// `request_timeout` is operator-configurable via
+/// `NetworkConfig::sync_request_timeout`. Sync carries heavier
+/// payloads than the consensus/blocks/block_txs RR protocols
+/// (block batches with full tx bodies), so it gets its own
+/// configurable budget separate from the small-message
+/// `NetworkConfig::request_timeout`. Default 10s matches libp2p's
+/// pre-refactor implicit default; cross-region operators typically
+/// scale this to `block_time_ms * 10`.
+pub fn sync_behaviour(
+    request_timeout: std::time::Duration,
+) -> request_response::cbor::Behaviour<SyncReq, SyncResp> {
+    let cfg = request_response::Config::default().with_request_timeout(request_timeout);
     request_response::cbor::Behaviour::new(
         [(SYNC_PROTOCOL, request_response::ProtocolSupport::Full)],
-        request_response::Config::default(),
+        cfg,
     )
 }
 

@@ -95,6 +95,23 @@ pub struct NetworkSection {
     /// `false` (QUIC enabled) for production.
     #[serde(default)]
     pub disable_quic: bool,
+    /// Request-response timeout (ms) for the direct delivery
+    /// protocols (blocks, consensus, block_txs). When unset, the
+    /// runtime derives `max(1500, block_time_ms * 3)` so
+    /// same-region clusters keep the legacy 1500 ms floor while
+    /// cross-region deployments scale up proportionally to the
+    /// configured slot duration. Operators with unusual link
+    /// profiles can pin a value here.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// Request-response timeout (ms) for the sync protocol.
+    /// Separate from `request_timeout_ms` because sync carries
+    /// heavier payloads (block batches with tx bodies). When unset,
+    /// the runtime derives `max(10000, block_time_ms * 10)` so
+    /// same-region clusters keep the libp2p-default 10 s floor and
+    /// cross-region deployments scale up.
+    #[serde(default)]
+    pub sync_request_timeout_ms: Option<u64>,
 }
 
 impl Default for NetworkSection {
@@ -109,6 +126,8 @@ impl Default for NetworkSection {
             bootstrap_pubkey_pins: std::collections::HashMap::new(),
             bind_loopback: false,
             disable_quic: false,
+            request_timeout_ms: None,
+            sync_request_timeout_ms: None,
         }
     }
 }
@@ -137,6 +156,19 @@ pub struct ConsensusSection {
     /// checkpoint overrides this value.
     #[serde(default)]
     pub initial_ws_checkpoint_slot: Option<u64>,
+    /// Operator override for the proposer-failure timeout (ms).
+    /// When unset, the runtime derives `slot_duration_ms / 2`
+    /// (which matches the legacy 200 ms at the default 400 ms
+    /// slot). Cross-region operators can pin a higher value here
+    /// if they don't want the derived default.
+    #[serde(default)]
+    pub proposal_timeout_ms: Option<u64>,
+    /// Operator override for the secondary view-change liveness
+    /// timeout (ms). When unset, the runtime derives
+    /// `slot_duration_ms * 5` (which matches the legacy 2 000 ms
+    /// at the default 400 ms slot).
+    #[serde(default)]
+    pub progress_timeout_ms: Option<u64>,
 }
 
 impl Default for ConsensusSection {
@@ -146,6 +178,8 @@ impl Default for ConsensusSection {
             gas_target: 400_000_000,
             gas_ceiling: 1_600_000_000,
             initial_ws_checkpoint_slot: None,
+            proposal_timeout_ms: None,
+            progress_timeout_ms: None,
         }
     }
 }

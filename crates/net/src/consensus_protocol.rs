@@ -60,9 +60,10 @@ pub enum ConsensusResp {
 /// drops the stale connection, and the next dial reconnects fresh
 /// (gossipsub re-sends SUBSCRIBE only on first connection — dropping
 /// the stale connection is what makes the redial count as "first").
-pub fn consensus_behaviour() -> request_response::cbor::Behaviour<ConsensusReq, ConsensusResp> {
-    let cfg = request_response::Config::default()
-        .with_request_timeout(std::time::Duration::from_millis(1500));
+pub fn consensus_behaviour(
+    request_timeout: std::time::Duration,
+) -> request_response::cbor::Behaviour<ConsensusReq, ConsensusResp> {
+    let cfg = request_response::Config::default().with_request_timeout(request_timeout);
     request_response::cbor::Behaviour::new(
         [(CONSENSUS_PROTOCOL, request_response::ProtocolSupport::Full)],
         cfg,

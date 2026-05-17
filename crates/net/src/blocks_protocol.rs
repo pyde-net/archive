@@ -50,13 +50,16 @@ pub enum BlocksResp {
 
 /// Create the request-response behaviour for direct block delivery.
 ///
-/// Audit 234 part 4 step 7: 1500ms timeout (same rationale as
-/// `consensus_behaviour` — fast OutboundFailure under post-restart
-/// stale-connection conditions, so the connection-cleanup handler
-/// can drop and redial within a slot rather than waiting 10s).
-pub fn blocks_behaviour() -> request_response::cbor::Behaviour<BlocksReq, BlocksResp> {
-    let cfg = request_response::Config::default()
-        .with_request_timeout(std::time::Duration::from_millis(1500));
+/// `request_timeout` is operator-configurable via
+/// `NetworkConfig::request_timeout`. The legacy default of 1500ms
+/// (audit 234 part 4 step 7) is tuned for fast OutboundFailure under
+/// post-restart stale-connection conditions on same-region clusters;
+/// cross-region operators should scale this up (typically
+/// `slot_duration_ms * 3`).
+pub fn blocks_behaviour(
+    request_timeout: std::time::Duration,
+) -> request_response::cbor::Behaviour<BlocksReq, BlocksResp> {
+    let cfg = request_response::Config::default().with_request_timeout(request_timeout);
     request_response::cbor::Behaviour::new(
         [(BLOCKS_PROTOCOL, request_response::ProtocolSupport::Full)],
         cfg,

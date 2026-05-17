@@ -1,4 +1,5 @@
 target/
+target-linux/
 .claude/
 pyde-book/
 ROADMAP.md
@@ -30,6 +31,16 @@ fuzz/artifacts/
 two-laptop-net/
 testnet/
 net/
+aws-*-net/
+
+# Operator-private node-address topology files for cloud deployments.
+# These contain real public IPs of validator instances and live next
+# to the placeholder-only two-laptops.toml — never commit them.
+crates/node/testdata/aws-*.toml
+
+# Ad-hoc operator notes (IP lists, scratch files) under scripts/.
+scripts/.txt
+scripts/*.local
 
 # macOS Finder metadata
 .DS_Store

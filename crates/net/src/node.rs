@@ -77,6 +77,18 @@ pub fn create_node(
     local_key: identity::Keypair,
 ) -> Result<(Swarm<PydeBehaviour>, PeerId), String> {
     let local_peer_id = PeerId::from(local_key.public());
+    // Captured into the swarm-builder closure so each request-response
+    // protocol (consensus, blocks, block_txs) uses the operator-configured
+    // timeout. Cross-region operators raise this via
+    // `network.request_timeout_ms` in config; same-region uses the
+    // legacy 1500ms default.
+    let request_timeout = config.request_timeout;
+    // Sync gets its own timeout because it carries heavier payloads
+    // (block batches with tx bodies) and the legacy libp2p default
+    // of 10s was tuned for that. Cross-region operators raise this
+    // via `network.sync_request_timeout_ms`; same-region uses the
+    // 10s floor.
+    let sync_request_timeout = config.sync_request_timeout;
 
     // Build swarm
     //
@@ -236,21 +248,21 @@ pub fn create_node(
             let identify = identify::Behaviour::new(identify::Config::new(proto_ver, key.public()));
 
             // Sync request-response protocol
-            let sync = sync_protocol::sync_behaviour();
+            let sync = sync_protocol::sync_behaviour(sync_request_timeout);
 
             // FALCON peer-attestation protocol (tasks 029/030).
             let auth = auth::auth_behaviour();
 
             // Direct consensus message delivery (audit 234 part 3).
-            let consensus_rr = consensus_protocol::consensus_behaviour();
+            let consensus_rr = consensus_protocol::consensus_behaviour(request_timeout);
 
             // Direct Blocks-topic delivery (audit 234 part 4 follow-up).
-            let blocks_rr = blocks_protocol::blocks_behaviour();
+            let blocks_rr = blocks_protocol::blocks_behaviour(request_timeout);
 
             // Fine-grained missing-tx fetch — replaces the audit-396
             // storm of GetBlocks for unfinalized slots when a compact
             // block can't be reconstructed from the local mempool.
-            let block_txs_rr = block_txs_protocol::block_txs_behaviour();
+            let block_txs_rr = block_txs_protocol::block_txs_behaviour(request_timeout);
 
             Ok(PydeBehaviour {
                 gossipsub,
