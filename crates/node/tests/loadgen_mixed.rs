@@ -45,6 +45,18 @@
 //!   PYDE_LOADGEN_MIX         — weight string (default "transfer:70,call:30,encrypted:0" while MEV is off; intended mix once re-enabled is "transfer:60,call:30,encrypted:10")
 //!   PYDE_LOADGEN_FUND        — per-sender fund override
 //!
+//!   PYDE_LOADGEN_EXTERNAL_RPC_URLS — comma-separated RPC URLs of an
+//!                                    already-running testnet (skips
+//!                                    internal validator spawn). Used
+//!                                    by the two-laptop distributed
+//!                                    soak (docs/two-laptop-soak.md).
+//!   PYDE_LOADGEN_EXTERNAL_FAUCET_KEY — path to faucet.key file
+//!                                      produced by `pyde testnet`
+//!                                      (same format as the internal
+//!                                      TestNetwork::load_faucet_key
+//!                                      consumes). Required when
+//!                                      EXTERNAL_RPC_URLS is set.
+//!
 //! # On sender count
 //!
 //! The mempool enforces a per-sender nonce window of 16. With ~400 ms
@@ -229,35 +241,10 @@ fn mixed_workload_load_test() {
     println!("  chain_id:     {} (FALCON sig verification ON)", CHAIN_ID);
     println!("╚══════════════════════════════════════════════════════╝");
 
-    // ── Phase 0: spawn validator testnet ────────────────────────
-    println!(
-        "\n[0/4] Spawning {}-validator native testnet at chain_id = {CHAIN_ID}…",
-        num_validators
-    );
-    let net = TestNetwork::spawn_with_chain_id(num_validators, CHAIN_ID)
-        .unwrap_or_else(|e| panic!("spawn {}v@chain_id={CHAIN_ID}: {}", num_validators, e));
-    net.wait_for_slot(3, Duration::from_secs(30))
-        .unwrap_or_else(|e| panic!("chain warm-up: {}", e));
-
-    let (faucet_pk_bytes, faucet_sk_bytes) = net
-        .load_faucet_key()
-        .unwrap_or_else(|e| panic!("load faucet.key: {}", e));
-    let faucet_sk =
-        FalconSecretKey::from_bytes(&faucet_sk_bytes).expect("invalid FALCON secret key");
-    let faucet_addr = derive_eoa_address(&faucet_pk_bytes);
-    println!("  faucet: 0x{}", hex::encode(faucet_addr));
-
-    let rpc_urls: Vec<String> = net.nodes.iter().map(|n| n.rpc_url()).collect();
-    // Capture node-output handles up front so the async block can dump
-    // per-node logs on panic without needing a back-reference to `net`.
-    let node_outputs: Vec<Arc<std::sync::Mutex<Vec<String>>>> =
-        net.nodes.iter().map(|n| n.output_handle()).collect();
-
-    // ── Phase 1: fund + register pubkeys for N senders ──────────
-    println!(
-        "\n[1/4] Funding + registering {} sender wallets…",
-        num_senders
-    );
+    // Tokio runtime + reqwest client built up front so both the
+    // internal-testnet warmup and the external-testnet warmup poll
+    // can share them. Internal mode used to build these in Phase 1;
+    // hoisting is benign because both phases want them.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -267,6 +254,92 @@ fn mixed_workload_load_test() {
         .pool_idle_timeout(Duration::from_secs(60))
         .build()
         .expect("reqwest client");
+
+    // ── Phase 0: spawn validator testnet OR attach to external ──
+    //
+    // Two modes:
+    //   * Internal (default): spawn N validators in-process, drive the
+    //     full lifecycle here. The original soak path.
+    //   * External: when PYDE_LOADGEN_EXTERNAL_RPC_URLS is set, skip
+    //     the spawn and drive an already-running testnet (typically
+    //     the two-laptop distributed setup — see
+    //     docs/two-laptop-soak.md). PYDE_LOADGEN_EXTERNAL_FAUCET_KEY
+    //     points at the `faucet.key` file from `pyde testnet`'s
+    //     output dir. node_outputs is empty in external mode —
+    //     per-validator logs live on the remote machines.
+    let external_rpc_env = std::env::var("PYDE_LOADGEN_EXTERNAL_RPC_URLS").ok();
+    let external_faucet_env = std::env::var("PYDE_LOADGEN_EXTERNAL_FAUCET_KEY").ok();
+
+    let (
+        net_opt,
+        rpc_urls,
+        faucet_pk_bytes,
+        faucet_sk_bytes,
+        node_outputs,
+    ): (
+        Option<TestNetwork>,
+        Vec<String>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<Arc<std::sync::Mutex<Vec<String>>>>,
+    ) = match (external_rpc_env, external_faucet_env) {
+        (Some(urls_csv), Some(faucet_path)) => {
+            let urls: Vec<String> = urls_csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            assert!(
+                !urls.is_empty(),
+                "PYDE_LOADGEN_EXTERNAL_RPC_URLS is set but parsed to zero URLs"
+            );
+            println!(
+                "\n[0/4] Attaching to external testnet ({} RPC endpoints)…",
+                urls.len()
+            );
+            for u in &urls {
+                println!("  rpc: {}", u);
+            }
+            runtime
+                .block_on(wait_for_external_chain_warmup(&client, &urls))
+                .unwrap_or_else(|e| panic!("external chain warmup: {}", e));
+            let (pk, sk) = load_faucet_key_from_file(&faucet_path)
+                .unwrap_or_else(|e| panic!("load external faucet key from {}: {}", faucet_path, e));
+            (None, urls, pk, sk, Vec::new())
+        }
+        (Some(_), None) | (None, Some(_)) => panic!(
+            "external mode requires BOTH PYDE_LOADGEN_EXTERNAL_RPC_URLS and \
+             PYDE_LOADGEN_EXTERNAL_FAUCET_KEY to be set (set only one is a misconfiguration)"
+        ),
+        (None, None) => {
+            println!(
+                "\n[0/4] Spawning {}-validator native testnet at chain_id = {CHAIN_ID}…",
+                num_validators
+            );
+            let net = TestNetwork::spawn_with_chain_id(num_validators, CHAIN_ID)
+                .unwrap_or_else(|e| panic!("spawn {}v@chain_id={CHAIN_ID}: {}", num_validators, e));
+            net.wait_for_slot(3, Duration::from_secs(30))
+                .unwrap_or_else(|e| panic!("chain warm-up: {}", e));
+            let (pk, sk) = net
+                .load_faucet_key()
+                .unwrap_or_else(|e| panic!("load faucet.key: {}", e));
+            let urls: Vec<String> = net.nodes.iter().map(|n| n.rpc_url()).collect();
+            let outs: Vec<Arc<std::sync::Mutex<Vec<String>>>> =
+                net.nodes.iter().map(|n| n.output_handle()).collect();
+            (Some(net), urls, pk, sk, outs)
+        }
+    };
+    let _net_keepalive = net_opt;
+    let faucet_sk =
+        FalconSecretKey::from_bytes(&faucet_sk_bytes).expect("invalid FALCON secret key");
+    let faucet_addr = derive_eoa_address(&faucet_pk_bytes);
+    println!("  faucet: 0x{}", hex::encode(faucet_addr));
+
+    // ── Phase 1: fund + register pubkeys for N senders ──────────
+    println!(
+        "\n[1/4] Funding + registering {} sender wallets…",
+        num_senders
+    );
 
     let setup_start = Instant::now();
     let wallets: Vec<Arc<Wallet>> = runtime.block_on(async {
@@ -522,14 +595,33 @@ fn mixed_workload_load_test() {
             .expect("deploy sig")
             .as_bytes()
             .to_vec();
-        let deploy_hash = net
-            .submit_raw_tx(0, &deploy_tx.to_bytes())
-            .unwrap_or_else(|e| panic!("submit deploy: {}", e));
-        let receipts = net
-            .wait_for_receipt_on_all(&deploy_hash, Duration::from_secs(60))
+        // Route the deploy through the same RPC path the per-tx
+        // submitters use so external-mode (no TestNetwork handle)
+        // works identically. The receipt is polled across all rpc
+        // urls until each returns non-null, matching the original
+        // wait_for_receipt_on_all semantics.
+        let deploy_hash = deploy_tx.hash();
+        runtime
+            .block_on(rpc_send_raw_fast(
+                &client,
+                &rpc_urls[0],
+                &hex::encode(deploy_tx.to_bytes()),
+            ))
+            .unwrap_or_else(|()| panic!("submit deploy via rpc_send_raw_fast"));
+        let raw_receipt = runtime
+            .block_on(wait_for_receipt_on_all_rpc(
+                &client,
+                &rpc_urls,
+                &deploy_hash,
+                Duration::from_secs(60),
+            ))
             .unwrap_or_else(|e| panic!("deploy receipt: {}", e));
-        assert!(receipts[0].success, "deploy failed: {}", receipts[0].raw);
-        let return_bytes = TestNetwork::decode_return_data(&receipts[0].raw)
+        assert!(
+            raw_receipt.contains(r#""success":true"#),
+            "deploy failed: {}",
+            raw_receipt
+        );
+        let return_bytes = TestNetwork::decode_return_data(&raw_receipt)
             .unwrap_or_else(|e| panic!("decode deploy returnData: {}", e));
         counter_addr.copy_from_slice(&return_bytes);
         println!(
@@ -1016,24 +1108,34 @@ fn mixed_workload_load_test() {
     // Per-node validator output: full log to /tmp + last 60 lines to
     // stderr. The on-disk file captures the measurement-phase window
     // (the stderr tail alone is always settle-phase empty blocks).
-    for n in &net.nodes {
-        let snap = n.output_snapshot();
-        let path = format!("/tmp/pyde-loadgen-mixed-node-{}.log", n.index);
-        if let Err(e) = std::fs::write(&path, &snap) {
-            eprintln!("failed to write {}: {}", path, e);
-        } else {
-            eprintln!(
-                "\n=== node-{} (rpc {}) full log → {} ({} bytes) ===",
-                n.index,
-                n.rpc_port,
-                path,
-                snap.len()
-            );
+    // External mode: this iteration is a no-op (_net_keepalive is
+    // None and validators live on remote machines — operators
+    // capture their own logs via `tee /tmp/node-N.log` per the
+    // two-laptop runbook).
+    if let Some(net) = _net_keepalive.as_ref() {
+        for n in &net.nodes {
+            let snap = n.output_snapshot();
+            let path = format!("/tmp/pyde-loadgen-mixed-node-{}.log", n.index);
+            if let Err(e) = std::fs::write(&path, &snap) {
+                eprintln!("failed to write {}: {}", path, e);
+            } else {
+                eprintln!(
+                    "\n=== node-{} (rpc {}) full log → {} ({} bytes) ===",
+                    n.index,
+                    n.rpc_port,
+                    path,
+                    snap.len()
+                );
+            }
+            let last: Vec<&str> = snap.lines().rev().take(60).collect();
+            for line in last.into_iter().rev() {
+                eprintln!("{}", line);
+            }
         }
-        let last: Vec<&str> = snap.lines().rev().take(60).collect();
-        for line in last.into_iter().rev() {
-            eprintln!("{}", line);
-        }
+    } else {
+        eprintln!(
+            "\n=== external testnet — per-validator logs available on the remote machines ===",
+        );
     }
 
     // We don't fail the test on TPS — this is a measurement
@@ -1872,4 +1974,144 @@ fn env_var_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+/// Parse the `faucet.key` file produced by `pyde testnet` into its
+/// (pk_bytes, sk_bytes) components. Same format as the internal
+/// `TestNetwork::load_faucet_key` consumes (4-byte u32 LE pk length,
+/// then pk, then sk). Used by the external-endpoint mode so a
+/// distributed soak (two-laptop or cloud) can authenticate as the
+/// faucet without going through TestNetwork's spawn lifecycle.
+fn load_faucet_key_from_file(path: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let raw = std::fs::read(path).map_err(|e| format!("read {}: {}", path, e))?;
+    if raw.len() < 4 {
+        return Err(format!("faucet.key too short: {} bytes", raw.len()));
+    }
+    let pk_len = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+    if raw.len() < 4 + pk_len {
+        return Err(format!(
+            "faucet.key truncated: header says pk_len={}, file is {} bytes",
+            pk_len,
+            raw.len()
+        ));
+    }
+    let pk = raw[4..4 + pk_len].to_vec();
+    let sk = raw[4 + pk_len..].to_vec();
+    Ok((pk, sk))
+}
+
+/// Async equivalent of `TestNetwork::wait_for_receipt_on_all`.
+/// Polls `pyde_getTransactionReceipt` against every supplied RPC
+/// URL until each returns non-null (receipt has appeared on that
+/// node). Returns the raw receipt JSON string from the first URL
+/// — the deploy path then drills into it for the contract address
+/// and the success flag via `TestNetwork::decode_return_data` and
+/// a substring check. Used in both internal and external modes so
+/// the deploy step has no dependency on the TestNetwork harness.
+async fn wait_for_receipt_on_all_rpc(
+    client: &reqwest::Client,
+    rpc_urls: &[String],
+    tx_hash: &[u8; 32],
+    timeout: Duration,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    let params = format!(r#"["0x{}"]"#, hex::encode(tx_hash));
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"pyde_getTransactionReceipt","params":{}}}"#,
+        params
+    );
+    loop {
+        let mut all_present = true;
+        let mut first_raw: Option<String> = None;
+        for url in rpc_urls {
+            let resp = client
+                .post(url)
+                .header("Content-Type", "application/json")
+                .body(body.clone())
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await
+                .map_err(|e| format!("rpc {} transport: {}", url, e))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| format!("rpc {} body: {}", url, e))?;
+            // Receipt absent → `"result":null`; receipt present →
+            // `"result":{...}`. The result-null match works because
+            // the JSON-RPC spec mandates the field is present even
+            // when the receipt is missing.
+            if text.contains(r#""result":null"#) || text.contains(r#""result": null"#) {
+                all_present = false;
+                break;
+            }
+            if first_raw.is_none() {
+                first_raw = Some(text);
+            }
+        }
+        if all_present {
+            if let Some(raw) = first_raw {
+                return Ok(raw);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "receipt for 0x{} not on all {} nodes within {:?}",
+                hex::encode(tx_hash),
+                rpc_urls.len(),
+                timeout
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Wait for an externally-run testnet to be reachable + advancing
+/// (block number > 2). Polls every 500 ms with a 30 s deadline.
+/// Probes every supplied RPC URL on each round so a single-node
+/// hiccup doesn't fail warmup spuriously.
+async fn wait_for_external_chain_warmup(
+    client: &reqwest::Client,
+    rpc_urls: &[String],
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_err: String = "no probe attempted".into();
+    while Instant::now() < deadline {
+        for url in rpc_urls {
+            match client
+                .post(url)
+                .header("Content-Type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":1,"method":"pyde_blockNumber","params":[]}"#)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+            {
+                Ok(resp) => match resp.text().await {
+                    Ok(body) => {
+                        if let Some(start) = body.find(r#""result":"0x"#) {
+                            let after = &body[start + r#""result":""#.len()..];
+                            if let Some(end) = after.find('"') {
+                                let hex = after[..end].trim_start_matches("0x");
+                                if let Ok(n) = u64::from_str_radix(hex, 16) {
+                                    if n > 2 {
+                                        println!("  ✓ external chain reachable at {} (head={})", url, n);
+                                        return Ok(());
+                                    }
+                                    last_err = format!("head={} at {}, waiting", n, url);
+                                }
+                            }
+                        } else {
+                            last_err = format!("unexpected blockNumber response from {}: {}", url, body);
+                        }
+                    }
+                    Err(e) => last_err = format!("{} body decode: {}", url, e),
+                },
+                Err(e) => last_err = format!("{} connect: {}", url, e),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "external chain did not advance past slot 2 within 30 s — last: {}",
+        last_err
+    ))
 }

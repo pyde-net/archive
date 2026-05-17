@@ -1,0 +1,55 @@
+# Two-laptop distributed-soak topology — TEMPLATE.
+#
+# Validates the chain across two physical machines on the same LAN —
+# real socket-level gossipsub, real libp2p TCP handshakes, two
+# independent CPUs / thermal envelopes — without needing cloud
+# infrastructure. Intermediate step between the single-laptop harness
+# and the canonical 16-validator / 3-region cloud deployment in
+# `testnet-16v-3region.toml`.
+#
+# Topology:
+#   * Laptop A: runs nodes 0 and 1
+#   * Laptop B: runs nodes 2 and 3
+#   * 4 validators total, quorum = 3-of-4 — neither laptop alone
+#     can form quorum, so any "everything works" result requires
+#     real cross-laptop traffic.
+#
+# Before running: replace the placeholder hosts below with your
+# laptops' actual LAN IPs (find via `ifconfig | grep inet` on each).
+# DO NOT commit your real IPs to a public repo.
+#
+# Usage:
+#   1. On laptop A:
+#      pyde testnet --validators 4 \
+#        --node-addrs crates/node/testdata/two-laptops.toml \
+#        --out ./net
+#   2. Copy net/node-2 and net/node-3 to laptop B.
+#   3. Each laptop runs its two validators via:
+#      pyde run --role validator --config net/node-N/config.toml \
+#        --datadir net/node-N
+#
+# Full runbook: docs/two-laptop-soak.md
+
+[[nodes]]
+index = 0
+region = "laptop-a"
+host = "LAPTOP_A_LAN_IP"
+port = 30303
+
+[[nodes]]
+index = 1
+region = "laptop-a"
+host = "LAPTOP_A_LAN_IP"
+port = 30304
+
+[[nodes]]
+index = 2
+region = "laptop-b"
+host = "LAPTOP_B_LAN_IP"
+port = 30303
+
+[[nodes]]
+index = 3
+region = "laptop-b"
+host = "LAPTOP_B_LAN_IP"
+port = 30304
