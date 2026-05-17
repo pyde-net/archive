@@ -31,7 +31,7 @@ hex = "0.4"
 
 # Wallet encryption
 aes-gcm = "0.10"
-rand = "0.8"
+rand = "0.9"
 # Audit 387: silent terminal input for password prompts so the
 # typed passphrase isn't echoed onto the operator's screen
 # (shoulder-surf / screencast leak).
