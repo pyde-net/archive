@@ -21,7 +21,7 @@ pyde-mempool = { path = "../mempool" }
 pyde-net = { path = "../net" }
 pyde-slashing = { path = "../slashing" }
 rayon = "1.10"
-libp2p = { version = "0.54", features = ["quic", "gossipsub", "kad", "noise", "yamux", "tokio", "macros", "identify", "request-response", "cbor", "serde"] }
+libp2p = { version = "0.56", features = ["quic", "gossipsub", "kad", "noise", "yamux", "tokio", "macros", "identify", "request-response", "cbor", "serde"] }
 serde_json = "1"
 
 # CLI
