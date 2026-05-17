@@ -24,9 +24,13 @@ latency. The two-laptop step covers the first four cheaply.
 | Node    | Host             | P2P port | RPC port |
 | ------- | ---------------- | -------- | -------- |
 | node-0  | laptop A         | 30303    | 8545     |
-| node-1  | laptop A         | 30304    | 8546     |
-| node-2  | laptop B         | 30303    | 8547     |
-| node-3  | laptop B         | 30304    | 8548     |
+| node-1  | laptop A         | 30304    | 8547     |
+| node-2  | laptop B         | 30303    | 8549     |
+| node-3  | laptop B         | 30304    | 8551     |
+
+(`pyde testnet` allocates RPC ports in strides of 2 — each node also
+binds an admin RPC at port+2 internally, so consecutive node RPC
+ports are 8545, 8547, 8549, 8551 — not 8545-8548.)
 
 The `[[nodes]]` entries live in
 [`crates/node/testdata/two-laptops.toml`](../crates/node/testdata/two-laptops.toml).
@@ -61,6 +65,23 @@ ping <LAPTOP_B_LAN_IP>   # from laptop A
 If `ping` fails: same Wi-Fi network? macOS firewall blocking ICMP?
 (`System Settings → Network → Firewall` on macOS — allow `pyde`
 inbound, or temporarily disable for the soak.)
+
+For a more thorough pre-flight check that catches the common
+failure mode (iPhone hotspot AP isolation blocks cross-laptop
+traffic even though ping appears to work in some setups), run
+the connectivity script. From laptop A:
+
+```bash
+# On laptop B first, open temporary listeners on the P2P ports:
+./scripts/check-lan-connectivity.sh --serve
+
+# Then from laptop A, probe laptop B:
+./scripts/check-lan-connectivity.sh <LAPTOP_B_LAN_IP>
+```
+
+Repeat in the other direction. Both probes must PASS before
+proceeding — the chain cannot advance unless P2P ports
+30303/30304 are reachable in BOTH directions.
 
 ## Step 1 — Generate genesis (laptop A only)
 
@@ -156,14 +177,16 @@ LAPTOP_A=<LAPTOP_A_LAN_IP>
 LAPTOP_B=<LAPTOP_B_LAN_IP>
 
 # Confirm all 4 nodes report the same head slot (within ±1).
-for port in 8545 8546; do
+# RPC ports are 8545, 8547, 8549, 8551 (stride of 2 — each node
+# binds an admin RPC at port+2 internally).
+for port in 8545 8547; do
   echo "node @ ${LAPTOP_A}:${port}:"
   curl -s -X POST http://${LAPTOP_A}:${port} \
     -H 'Content-Type: application/json' \
     -d '{"jsonrpc":"2.0","id":1,"method":"pyde_blockNumber","params":[]}' \
     | jq .result
 done
-for port in 8547 8548; do
+for port in 8549 8551; do
   echo "node @ ${LAPTOP_B}:${port}:"
   curl -s -X POST http://${LAPTOP_B}:${port} \
     -H 'Content-Type: application/json' \
@@ -196,7 +219,7 @@ From **laptop A** (where the `faucet.key` lives), substitute
 LAPTOP_A=<LAPTOP_A_LAN_IP>
 LAPTOP_B=<LAPTOP_B_LAN_IP>
 
-PYDE_LOADGEN_EXTERNAL_RPC_URLS="http://${LAPTOP_A}:8545,http://${LAPTOP_A}:8546,http://${LAPTOP_B}:8547,http://${LAPTOP_B}:8548" \
+PYDE_LOADGEN_EXTERNAL_RPC_URLS="http://${LAPTOP_A}:8545,http://${LAPTOP_A}:8547,http://${LAPTOP_B}:8549,http://${LAPTOP_B}:8551" \
 PYDE_LOADGEN_EXTERNAL_FAUCET_KEY="$(pwd)/two-laptop-net/faucet.key" \
 PYDE_LOADGEN_TPS=200 \
 PYDE_LOADGEN_DURATION=14400 \

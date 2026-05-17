@@ -21,3 +21,15 @@ fuzz/Cargo.lock
 fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
+
+# Generated testnet output directories from `pyde testnet`. These
+# contain validator Falcon keys, threshold-encryption per-validator
+# shares, and the faucet signing key — all operator-private. The
+# two-laptop runbook (docs/two-laptop-soak.md) writes to
+# `two-laptop-net/`; other ad-hoc runs use `net/` or `testnet/`.
+two-laptop-net/
+testnet/
+net/
+
+# macOS Finder metadata
+.DS_Store
