@@ -17,7 +17,7 @@ pyde-account = { path = "../account" }
 pyde-mempool = { path = "../mempool" }
 
 # Async HTTP + WebSocket
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 tokio = { version = "1", features = ["time", "sync", "macros"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
