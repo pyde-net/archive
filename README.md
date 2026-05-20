@@ -1,8 +1,33 @@
-# Pyde
+# Pyde — Archive (pre-pivot)
+
+> ## ⚠️ ARCHIVED — DO NOT USE FOR CURRENT WORK
+>
+> This repository is the **pre-pivot codebase** archived for reference
+> after the **May 2026 architectural pivot**. It contains the in-house
+> HotStuff consensus variant whose persistent wedges and 400ms-slot
+> stalls motivated the rebuild to Mysticeti-style DAG consensus.
+>
+> **The current active codebase is split into separate repos under the
+> [pyde-net](https://github.com/pyde-net) organization:**
+> [engine](https://github.com/pyde-net/engine) (execution + crypto),
+> [otic](https://github.com/pyde-net/otic) (Otigen compiler),
+> [pyde-dev](https://github.com/pyde-net/pyde-dev),
+> [pyde-book](https://github.com/pyde-net/pyde-book) (technical reference).
+>
+> For the rationale behind the pivot, see the
+> [pyde-book MIGRATION_NOTES](https://github.com/pyde-net/pyde-book/blob/main/src/MIGRATION_NOTES.md).
+>
+> The content below describes the **pre-pivot** architecture. The PVM,
+> Otigen, JMT state layer, and execution-layer crypto survived the
+> pivot intact and live in the engine repo. The consensus, mempool,
+> networking, and node crates are being rebuilt design-first against
+> the new Mysticeti DAG architecture.
+
+---
 
 High-performance, post-quantum Layer 1 blockchain with native MEV protection.
 
-## Architecture
+## Architecture (pre-pivot)
 
 - **Monolith binary** — consensus + execution in a single process
 - **Post-quantum cryptography** — FALCON-512 signatures, Kyber-768 KEM, Poseidon2 hashing, FALCON-bound VRF over Poseidon2
@@ -10,7 +35,7 @@ High-performance, post-quantum Layer 1 blockchain with native MEV protection.
 - **Encrypted mempool** — threshold decryption prevents MEV extraction
 - **EIP-1559 gas model** — no tips, elastic 4x blocks, 70% burn / 20% validator / 10% treasury
 - **Otigen language** (.oti) — purpose-built smart contract language with Rust-like syntax
-- **HotStuff BFT consensus** — committee-based with VRF proposer selection
+- **HotStuff BFT consensus** *(archived — replaced post-pivot by Mysticeti DAG)* — committee-based with VRF proposer selection
 
 ## Workspace
 
