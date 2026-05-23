@@ -12,10 +12,10 @@
 > [engine](https://github.com/pyde-net/engine) (execution + crypto),
 > [otic](https://github.com/pyde-net/otic) (Otigen compiler),
 > [pyde-dev](https://github.com/pyde-net/pyde-dev),
-> [pyde-book](https://github.com/pyde-net/pyde-book) (technical reference).
+> [pyde-book](https://book.pyde.network) (technical reference).
 >
 > For the rationale behind the pivot, see the
-> [pyde-book MIGRATION_NOTES](https://github.com/pyde-net/pyde-book/blob/main/src/MIGRATION_NOTES.md).
+> [pyde-book MIGRATION_NOTES](https://book.pyde.network/MIGRATION_NOTES).
 >
 > The content below describes the **pre-pivot** architecture. The PVM,
 > Otigen, JMT state layer, and execution-layer crypto survived the
