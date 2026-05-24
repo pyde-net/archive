@@ -1551,8 +1551,7 @@ impl ValidatorEntry {
 
     pub fn encode(&self) -> Vec<u8> {
         let kem_pk_len = self.kem_pk.as_ref().map(|b| b.len()).unwrap_or(0);
-        let mut buf =
-            Vec::with_capacity(VALIDATOR_ENTRY_BASE_LEN + 8 + 4 + kem_pk_len);
+        let mut buf = Vec::with_capacity(VALIDATOR_ENTRY_BASE_LEN + 8 + 4 + kem_pk_len);
         buf.extend_from_slice(&(self.pk.len() as u32).to_le_bytes());
         buf.extend_from_slice(&self.pk);
         buf.extend_from_slice(&self.stake.to_le_bytes());
